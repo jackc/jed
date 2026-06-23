@@ -229,6 +229,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.window_named",
   // Window functions combined with GROUP BY / aggregates in one query (window.md §2/§5.1).
   "query.window_grouped",
+  // Base-window-extending definitions: OVER (w ORDER BY …) / WINDOW w2 AS (w …) (S9, window.md §5).
+  "query.window_base_extend",
   // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
   "query.union",
   "query.intersect",

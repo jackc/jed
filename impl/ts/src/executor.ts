@@ -6905,13 +6905,19 @@ export class Database {
             window: { base: scope.width(), windowSpecs: [] },
           }
       : { collecting: isAgg, groupKeys, specs: [] };
-    // Desugar `OVER name` references to their WINDOW-clause definitions before resolution
-    // (window.md §5). The projection resolves against the desugared items; a reference to an
-    // undefined window is 42704. A plain query with no window clause/refs clones nothing extra.
+    // Resolve the WINDOW clause: an entry may extend an earlier entry (`w2 AS (w ORDER BY …)` —
+    // window.md §5), so each is merged against the already-resolved earlier entries (a missing/
+    // forward/self base is 42704; PARTITION/ORDER overrides and a framed base are 42P20). Every
+    // entry is resolved, even unreferenced ones, matching PostgreSQL. The result is all-inline
+    // (base = null) definitions the desugar pass copies/extends from.
+    const windowsResolved = sel.windows.length > 0 ? resolveWindowClause(sel.windows) : sel.windows;
+    // Desugar `OVER name` / `OVER (base …)` references to their WINDOW-clause definitions before
+    // resolution (window.md §5). The projection resolves against the desugared items; a reference to
+    // an undefined window is 42704. A plain query with no window clause/refs clones nothing extra.
     let itemsRef = sel.items;
     if (hasWindowSyntax) {
       const cloned = structuredClone(sel.items);
-      desugarItems(cloned, sel.windows);
+      desugarItems(cloned, windowsResolved);
       itemsRef = cloned;
     }
     const {
@@ -10906,10 +10912,72 @@ function exprHasWindow(e: Expr): boolean {
   }
 }
 
-// desugarItems rewrites `OVER name` references in a select list to their WINDOW-clause definitions
-// before resolution (spec/design/window.md §5): each window call carrying `overName` gets the named
-// definition copied into `over`; an undefined name is 42704. After this every window call carries an
-// inline `over`, so resolution (S0–S4) handles named and inline windows uniformly. Mutates `items`.
+// extendWindow applies the base-window merge rules (spec/design/window.md §5, PostgreSQL
+// transformWindowDefinitions): a definition that names a base copies the base's PARTITION BY and —
+// if the base has one — its ORDER BY, and supplies its own frame. The extender may not add a
+// PARTITION BY (42P20, even when the base has none), may add an ORDER BY only when the base has
+// none (42P20 otherwise), and the base must not carry a frame (42P20). The three checks fire in
+// PostgreSQL's priority order: PARTITION, then ORDER, then frame. Returns the merged inline
+// definition (base = null).
+function extendWindow(base: WindowDef, ext: WindowDef, baseName: string): WindowDef {
+  if (ext.partition.length > 0) {
+    throw engineError(
+      "windowing_error",
+      `cannot override PARTITION BY clause of window "${baseName}"`,
+    );
+  }
+  if ((base.order?.length ?? 0) > 0 && ext.order.length > 0) {
+    throw engineError("windowing_error", `cannot override ORDER BY clause of window "${baseName}"`);
+  }
+  if (base.frame != null) {
+    throw engineError(
+      "windowing_error",
+      `cannot copy window "${baseName}" because it has a frame clause`,
+    );
+  }
+  return {
+    base: null,
+    partition: base.partition,
+    order: base.order.length > 0 ? base.order : ext.order,
+    frame: ext.frame,
+  };
+}
+
+// resolveWindowClause resolves a WINDOW clause into all-inline definitions (spec/design/window.md
+// §5). Entries are processed left-to-right; an entry naming a base extends an already-resolved
+// earlier entry (a self- or forward-reference is therefore "does not exist" — 42704), via
+// extendWindow. Every entry is resolved — even ones no OVER references — matching PostgreSQL's
+// whole-clause check.
+function resolveWindowClause(windows: [string, WindowDef][]): [string, WindowDef][] {
+  const resolved: [string, WindowDef][] = [];
+  for (const [name, def] of windows) {
+    let r = def;
+    if (def.base != null && def.base !== "") {
+      const base = lookupWindow(resolved, def.base);
+      r = extendWindow(base, def, def.base);
+    }
+    resolved.push([name, r]);
+  }
+  return resolved;
+}
+
+// lookupWindow finds a (resolved, base = null) window definition by name in `windows`,
+// case-insensitively, returning a structured clone (to avoid aliasing), or throws 42704
+// `window "<name>" does not exist`.
+function lookupWindow(windows: [string, WindowDef][], name: string): WindowDef {
+  const found = windows.find(([n]) => n.toLowerCase() === name.toLowerCase());
+  if (found === undefined) {
+    throw engineError("undefined_object", `window "${name}" does not exist`);
+  }
+  return structuredClone(found[1]);
+}
+
+// desugarItems rewrites `OVER name` / `OVER (base …)` references in a select list to their
+// WINDOW-clause definitions before resolution (spec/design/window.md §5): a pure `overName`
+// reference gets the named definition copied into `over`, an inline `over` with a base is merged
+// onto the named base (extendWindow); an undefined name is 42704. After this every window call
+// carries an inline `over` (base = null), so resolution (S0–S4) handles named and inline windows
+// uniformly. Mutates `items`.
 function desugarItems(items: SelectItems, windows: [string, WindowDef][]): void {
   if (items.kind === "all") return;
   for (const it of items.items) {
@@ -10925,13 +10993,14 @@ function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
   switch (e.kind) {
     case "funcCall":
       if (e.overName != null) {
-        const name = e.overName;
-        const found = windows.find(([n]) => n.toLowerCase() === name.toLowerCase());
-        if (found === undefined) {
-          throw engineError("undefined_object", `window "${name}" does not exist`);
-        }
-        e.over = structuredClone(found[1]);
+        // `OVER name` — a pure reference: copy the named definition whole, frame included (no merge
+        // rules; copying a framed window is forbidden only for the extend form below — §5).
+        e.over = lookupWindow(windows, e.overName);
         e.overName = null;
+      } else if (e.over != null && e.over.base != null && e.over.base !== "") {
+        // `OVER (base …)` — an extend: merge the inline definition onto the named base.
+        const base = lookupWindow(windows, e.over.base);
+        e.over = extendWindow(base, e.over, e.over.base);
       }
       for (const a of e.args) desugarNamedWindows(a, windows);
       return;

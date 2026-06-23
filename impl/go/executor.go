@@ -9362,12 +9362,24 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			projAgg.windowBase = width
 		}
 	}
-	// Desugar `OVER name` references to their WINDOW-clause definitions before resolution
-	// (window.md §5). The projection resolves against the desugared items; a reference to an
-	// undefined window is 42704. A plain query with no window clause/refs uses sel.Items unchanged.
+	// Resolve the WINDOW clause: an entry may extend an earlier entry (`w2 AS (w ORDER BY …)` —
+	// window.md §5), so each is merged against the already-resolved earlier entries (a missing/
+	// forward/self base is 42704; PARTITION/ORDER overrides and a framed base are 42P20). Every
+	// entry is resolved, even unreferenced ones, matching PostgreSQL. The result is all-inline
+	// (Base == "") definitions the desugar pass copies/extends from.
+	windowsResolved := sel.Windows
+	if len(sel.Windows) > 0 {
+		windowsResolved, err = resolveWindowClause(sel.Windows)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Desugar `OVER name` / `OVER (base …)` references to their WINDOW-clause definitions before
+	// resolution (window.md §5). The projection resolves against the desugared items; a reference to
+	// an undefined window is 42704. A plain query with no window clause/refs uses sel.Items unchanged.
 	items := sel.Items
 	if hasWindowSyntax {
-		items, err = desugarItems(sel.Items, sel.Windows)
+		items, err = desugarItems(sel.Items, windowsResolved)
 		if err != nil {
 			return nil, err
 		}
@@ -14035,12 +14047,72 @@ func exprHasWindow(e Expr) bool {
 	}
 }
 
-// desugarItems desugars `OVER name` references in a select list to their WINDOW-clause definitions
-// before resolution (spec/design/window.md §5): each window call carrying OverName gets the named
-// definition copied into Over; an undefined name is 42704. After this every window call carries an
-// inline Over, so resolution (S0–S4) handles named and inline windows uniformly. Returns a fresh
-// SelectItems (the original AST is not mutated — the FuncCall pointers along each rewritten path are
-// freshly allocated).
+// extendWindow applies the base-window merge rules (spec/design/window.md §5, PostgreSQL
+// transformWindowDefinitions): a definition that names a base copies the base's PARTITION BY and —
+// if the base has one — its ORDER BY, and supplies its own frame. The extender may not add a
+// PARTITION BY (42P20, even when the base has none), may add an ORDER BY only when the base has
+// none (42P20 otherwise), and the base must not carry a frame (42P20). The three checks fire in
+// PostgreSQL's priority order: PARTITION, then ORDER, then frame. Returns the merged inline
+// definition (Base == "").
+func extendWindow(base, ext WindowDef, baseName string) (WindowDef, error) {
+	if len(ext.Partition) > 0 {
+		return WindowDef{}, NewError(WindowingError, fmt.Sprintf("cannot override PARTITION BY clause of window %q", baseName))
+	}
+	if len(base.Order) > 0 && len(ext.Order) > 0 {
+		return WindowDef{}, NewError(WindowingError, fmt.Sprintf("cannot override ORDER BY clause of window %q", baseName))
+	}
+	if base.Frame != nil {
+		return WindowDef{}, NewError(WindowingError, fmt.Sprintf("cannot copy window %q because it has a frame clause", baseName))
+	}
+	order := ext.Order
+	if len(base.Order) > 0 {
+		order = base.Order
+	}
+	return WindowDef{Base: "", Partition: base.Partition, Order: order, Frame: ext.Frame}, nil
+}
+
+// resolveWindowClause resolves a WINDOW clause into all-inline definitions (spec/design/window.md
+// §5). Entries are processed left-to-right; an entry naming a base extends an already-resolved
+// earlier entry (a self- or forward-reference is therefore "does not exist" — 42704), via
+// extendWindow. Every entry is resolved — even ones no OVER references — matching PostgreSQL's
+// whole-clause check.
+func resolveWindowClause(windows []NamedWindow) ([]NamedWindow, error) {
+	resolved := make([]NamedWindow, 0, len(windows))
+	for _, nw := range windows {
+		r := nw.Def
+		if nw.Def.Base != "" {
+			base, err := lookupWindow(resolved, nw.Def.Base)
+			if err != nil {
+				return nil, err
+			}
+			r, err = extendWindow(base, nw.Def, nw.Def.Base)
+			if err != nil {
+				return nil, err
+			}
+		}
+		resolved = append(resolved, NamedWindow{Name: nw.Name, Def: r})
+	}
+	return resolved, nil
+}
+
+// lookupWindow finds a (resolved, Base == "") window definition by name in windows,
+// case-insensitively, or raises 42704 `window "<name>" does not exist`.
+func lookupWindow(windows []NamedWindow, name string) (WindowDef, error) {
+	for i := range windows {
+		if strings.EqualFold(windows[i].Name, name) {
+			return windows[i].Def, nil
+		}
+	}
+	return WindowDef{}, NewError(UndefinedObject, fmt.Sprintf("window %q does not exist", name))
+}
+
+// desugarItems desugars `OVER name` / `OVER (base …)` references in a select list to their
+// WINDOW-clause definitions before resolution (spec/design/window.md §5): a pure OverName reference
+// gets the named definition copied into Over, an inline Over with a Base is merged onto the named
+// base (extendWindow); an undefined name is 42704. After this every window call carries an inline
+// Over (Base == ""), so resolution (S0–S4) handles named and inline windows uniformly. Returns a
+// fresh SelectItems (the original AST is not mutated — the FuncCall pointers along each rewritten
+// path are freshly allocated).
 func desugarItems(items SelectItems, windows []NamedWindow) (SelectItems, error) {
 	if items.All {
 		return items, nil
@@ -14067,20 +14139,25 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 	case ExprFuncCall:
 		fc := *e.FuncCall // shallow copy; we replace Args/Over/OverName below
 		if fc.OverName != "" {
-			name := fc.OverName
-			var def *WindowDef
-			for i := range windows {
-				if strings.EqualFold(windows[i].Name, name) {
-					d := windows[i].Def
-					def = &d
-					break
-				}
+			// `OVER name` — a pure reference: copy the named definition whole, frame included (no
+			// merge rules; copying a framed window is forbidden only for the extend form below — §5).
+			def, err := lookupWindow(windows, fc.OverName)
+			if err != nil {
+				return Expr{}, err
 			}
-			if def == nil {
-				return Expr{}, NewError(UndefinedObject, fmt.Sprintf("window %q does not exist", name))
-			}
-			fc.Over = def
+			fc.Over = &def
 			fc.OverName = ""
+		} else if fc.Over != nil && fc.Over.Base != "" {
+			// `OVER (base …)` — an extend: merge the inline definition onto the named base.
+			base, err := lookupWindow(windows, fc.Over.Base)
+			if err != nil {
+				return Expr{}, err
+			}
+			merged, err := extendWindow(base, *fc.Over, fc.Over.Base)
+			if err != nil {
+				return Expr{}, err
+			}
+			fc.Over = &merged
 		}
 		if len(fc.Args) > 0 {
 			args := make([]*Expr, len(fc.Args))

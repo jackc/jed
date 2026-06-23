@@ -253,10 +253,16 @@ export type OrderKey = {
 };
 
 // WindowDef is the body of an `OVER (...)` clause (spec/design/window.md §3). S0 carries
-// `PARTITION BY` columns and an `ORDER BY`; the frame clause and a base-window name are deferred
-// (S4/S5). `partition` is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing — general
-// expressions are a follow-on); `order` reuses the query ORDER BY sort keys.
+// `PARTITION BY` columns and an `ORDER BY`. `partition` is narrowed to columns in S0 (the GROUP
+// BY/ORDER BY narrowing — general expressions are a follow-on); `order` reuses the query ORDER BY
+// sort keys.
 export type WindowDef = {
+  // An optional leading base-window name (`OVER (w ORDER BY …)`, `WINDOW w2 AS (w …)` — §5): the
+  // definition extends the named base, inheriting its `PARTITION BY` (and its `ORDER BY` if any) and
+  // supplying its own frame. A resolve-time pass (resolveWindowClause / desugarNamedWindows) merges
+  // the base in and clears `base` to null, so every definition is inline (`base == null`) at the
+  // window stage.
+  base?: string | null;
   partition: Expr[];
   order: OrderKey[];
   // An explicit frame clause (`ROWS BETWEEN … AND …`), else null for the default frame

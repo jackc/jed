@@ -2155,10 +2155,9 @@ func (p *Parser) parseSelectCore() (*Select, error) {
 }
 
 // parseWindowClause parses `window_clause ::= "WINDOW" identifier "AS" "(" window_definition ")"
-// ("," …)*` (window.md §5) into sel.Windows. Each entry is a full inline window definition (a
-// base-window reference inside the definition is deferred). Empty when no WINDOW keyword is present.
-// WINDOW is non-reserved. Each definition reuses the same partition/order/frame parsing as the
-// inline OVER.
+// ("," …)*` (window.md §5) into sel.Windows. Each entry is a full window definition (which may
+// extend an earlier entry via a leading base-window name — §5). Empty when no WINDOW keyword is
+// present. WINDOW is non-reserved. Each definition reuses parseWindowDefinition with the inline OVER.
 func (p *Parser) parseWindowClause(sel *Select) error {
 	if p.peekKeyword() != "window" {
 		return nil
@@ -2175,49 +2174,78 @@ func (p *Parser) parseWindowClause(sel *Select) error {
 		if err := p.expect(TokLParen); err != nil {
 			return err
 		}
-		var partition []Expr
-		if p.peekKeyword() == "partition" {
-			p.advance()
-			if err := p.expectKeyword("by"); err != nil {
-				return err
-			}
-			for {
-				qualifier, col, err := p.parseColumnRef()
-				if err != nil {
-					return err
-				}
-				if qualifier != "" {
-					partition = append(partition, Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col})
-				} else {
-					partition = append(partition, Expr{Kind: ExprColumn, Column: col})
-				}
-				if p.peek().Kind != TokComma {
-					break
-				}
-				p.advance()
-			}
-		}
-		order, err := p.parseWindowOrderBy()
-		if err != nil {
-			return err
-		}
-		frame, err := p.parseWindowFrame()
+		def, err := p.parseWindowDefinition()
 		if err != nil {
 			return err
 		}
 		if err := p.expect(TokRParen); err != nil {
 			return err
 		}
-		sel.Windows = append(sel.Windows, NamedWindow{
-			Name: name,
-			Def:  WindowDef{Partition: partition, Order: order, Frame: frame},
-		})
+		sel.Windows = append(sel.Windows, NamedWindow{Name: name, Def: def})
 		if p.peek().Kind != TokComma {
 			break
 		}
 		p.advance()
 	}
 	return nil
+}
+
+// parseWindowDefinition parses a window definition body `[base] [PARTITION BY …] [ORDER BY …]
+// [frame]` between the already-consumed `(` and the closing `)` (spec/design/window.md §3, §5).
+// The optional leading base-window name (a bareword that is not a clause-introducing keyword) marks
+// a definition that extends a named window — the resolver merges it in (§5). Used by both the
+// inline `OVER ( … )` and the `WINDOW name AS ( … )` clause so the two spellings parse identically.
+func (p *Parser) parseWindowDefinition() (WindowDef, error) {
+	base := p.parseOptBaseWindowName()
+	var partition []Expr
+	if p.peekKeyword() == "partition" {
+		p.advance()
+		if err := p.expectKeyword("by"); err != nil {
+			return WindowDef{}, err
+		}
+		for {
+			qualifier, col, err := p.parseColumnRef()
+			if err != nil {
+				return WindowDef{}, err
+			}
+			if qualifier != "" {
+				partition = append(partition, Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col})
+			} else {
+				partition = append(partition, Expr{Kind: ExprColumn, Column: col})
+			}
+			if p.peek().Kind != TokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+	order, err := p.parseWindowOrderBy()
+	if err != nil {
+		return WindowDef{}, err
+	}
+	frame, err := p.parseWindowFrame()
+	if err != nil {
+		return WindowDef{}, err
+	}
+	return WindowDef{Base: base, Partition: partition, Order: order, Frame: frame}, nil
+}
+
+// parseOptBaseWindowName returns the optional leading base-window name of a window definition
+// (spec/design/window.md §5). Present when the next token is a bareword that is not a
+// clause-introducing keyword (PARTITION/ORDER/ROWS/RANGE/GROUPS) — those start the definition's own
+// clauses, so an unquoted occurrence is the keyword, never a base name (matching PostgreSQL; a
+// window named like a keyword would need quoting, which jed's window names do not support).
+func (p *Parser) parseOptBaseWindowName() string {
+	t := p.peek()
+	if t.Kind != TokWord {
+		return ""
+	}
+	switch toLowerASCII(t.Word) {
+	case "partition", "order", "rows", "range", "groups":
+		return ""
+	}
+	p.advance()
+	return t.Word
 }
 
 // parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first
@@ -3800,43 +3828,16 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 		if err := p.expect(TokLParen); err != nil {
 			return Expr{}, err
 		}
-		// PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
-		var partition []Expr
-		if p.peekKeyword() == "partition" {
-			p.advance()
-			if err := p.expectKeyword("by"); err != nil {
-				return Expr{}, err
-			}
-			for {
-				qualifier, col, err := p.parseColumnRef()
-				if err != nil {
-					return Expr{}, err
-				}
-				if qualifier != "" {
-					partition = append(partition, Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col})
-				} else {
-					partition = append(partition, Expr{Kind: ExprColumn, Column: col})
-				}
-				if p.peek().Kind != TokComma {
-					break
-				}
-				p.advance()
-			}
-		}
-		// ORDER BY <sort_key> (, ...) — optional (empty if absent), consuming ORDER BY.
-		order, err := p.parseWindowOrderBy()
-		if err != nil {
-			return Expr{}, err
-		}
-		// An optional frame clause (ROWS/RANGE/GROUPS …), else the default frame.
-		frame, err := p.parseWindowFrame()
+		// `[base] [PARTITION BY cols] [ORDER BY …] [frame]` — the shared definition body. A leading
+		// base-window name (window.md §5) extends a named window; merged at resolve.
+		def, err := p.parseWindowDefinition()
 		if err != nil {
 			return Expr{}, err
 		}
 		if err := p.expect(TokRParen); err != nil {
 			return Expr{}, err
 		}
-		fc.Over = &WindowDef{Partition: partition, Order: order, Frame: frame}
+		fc.Over = &def
 	}
 	return Expr{Kind: ExprFuncCall, FuncCall: fc}, nil
 }

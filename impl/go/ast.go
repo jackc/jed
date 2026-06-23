@@ -1077,12 +1077,18 @@ type OrderKey struct {
 }
 
 // WindowDef is a window definition — the body of an OVER (...) clause (spec/design/window.md §3).
-// S0 carries PARTITION BY columns and an ORDER BY; a base-window name is deferred (S5). Partition
-// is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing — general expressions are a
-// follow-on); Order reuses the query ORDER BY sort keys. Frame carries an explicit frame clause
-// (`ROWS BETWEEN … AND …`), or nil for the default frame (spec/design/window.md §6). S4 supports
-// ROWS mode; explicit RANGE/GROUPS and EXCLUDE are parsed but rejected 0A000 at resolve.
+// S0 carries PARTITION BY columns and an ORDER BY. Partition is narrowed to columns in S0 (the
+// GROUP BY/ORDER BY narrowing — general expressions are a follow-on); Order reuses the query ORDER
+// BY sort keys. Frame carries an explicit frame clause (`ROWS BETWEEN … AND …`), or nil for the
+// default frame (spec/design/window.md §6). S4 supports ROWS mode; explicit RANGE/GROUPS and
+// EXCLUDE are parsed but rejected 0A000 at resolve.
+//
+// Base is an optional leading base-window name (`OVER (w ORDER BY …)`, `WINDOW w2 AS (w …)` — §5):
+// the definition extends the named base, inheriting its PARTITION BY (and its ORDER BY if any) and
+// supplying its own frame. A resolve-time pass (resolveWindowClause / desugarNamedWindows) merges
+// the base in and clears Base to "", so every definition is inline (Base == "") at the window stage.
 type WindowDef struct {
+	Base      string
 	Partition []Expr
 	Order     []OrderKey
 	Frame     *WindowFrame

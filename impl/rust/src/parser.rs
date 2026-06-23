@@ -1815,37 +1815,9 @@ impl Parser {
             let name = self.expect_identifier()?;
             self.expect_keyword("as")?;
             self.expect(&Token::LParen)?;
-            let mut partition = Vec::new();
-            if self.peek_keyword().as_deref() == Some("partition") {
-                self.advance();
-                self.expect_keyword("by")?;
-                loop {
-                    let (q, c) = self.parse_column_ref()?;
-                    partition.push(match q {
-                        Some(q) => Expr::QualifiedColumn {
-                            qualifier: q,
-                            name: c,
-                        },
-                        None => Expr::Column(c),
-                    });
-                    if matches!(self.peek(), Token::Comma) {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            let order = self.parse_order_by()?;
-            let frame = self.parse_window_frame()?;
+            let def = self.parse_window_definition()?;
             self.expect(&Token::RParen)?;
-            windows.push((
-                name,
-                WindowDef {
-                    partition,
-                    order,
-                    frame,
-                },
-            ));
+            windows.push((name, def));
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             } else {
@@ -1853,6 +1825,64 @@ impl Parser {
             }
         }
         Ok(windows)
+    }
+
+    /// Parse a window definition body `[base] [PARTITION BY …] [ORDER BY …] [frame]` between the
+    /// already-consumed `(` and the closing `)` (spec/design/window.md §3, §5). The optional leading
+    /// **base-window name** (a bareword that is not a clause-introducing keyword) marks a definition
+    /// that extends a named window — the resolver merges it in (§5). Used by both the inline
+    /// `OVER ( … )` and the `WINDOW name AS ( … )` clause so the two spellings parse identically.
+    fn parse_window_definition(&mut self) -> Result<WindowDef> {
+        let base = self.parse_opt_base_window_name();
+        let mut partition = Vec::new();
+        if self.peek_keyword().as_deref() == Some("partition") {
+            self.advance();
+            self.expect_keyword("by")?;
+            loop {
+                let (q, c) = self.parse_column_ref()?;
+                partition.push(match q {
+                    Some(q) => Expr::QualifiedColumn {
+                        qualifier: q,
+                        name: c,
+                    },
+                    None => Expr::Column(c),
+                });
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        let order = self.parse_order_by()?;
+        let frame = self.parse_window_frame()?;
+        Ok(WindowDef {
+            base,
+            partition,
+            order,
+            frame,
+        })
+    }
+
+    /// The optional leading base-window name of a window definition (spec/design/window.md §5).
+    /// Present when the next token is a bareword that is **not** a clause-introducing keyword
+    /// (`PARTITION`/`ORDER`/`ROWS`/`RANGE`/`GROUPS`) — those start the definition's own clauses, so
+    /// an unquoted occurrence is the keyword, never a base name (matching PostgreSQL; a window named
+    /// like a keyword would need quoting, which jed's window names do not support).
+    fn parse_opt_base_window_name(&mut self) -> Option<String> {
+        let is_base = match self.peek() {
+            Token::Word(w) => !matches!(
+                w.to_ascii_lowercase().as_str(),
+                "partition" | "order" | "rows" | "range" | "groups"
+            ),
+            _ => false,
+        };
+        if is_base {
+            if let Token::Word(w) = self.advance() {
+                return Some(w);
+            }
+        }
+        None
     }
 
     /// `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and before ORDER BY.
@@ -3230,37 +3260,11 @@ impl Parser {
                 });
             }
             self.expect(&Token::LParen)?;
-            // PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
-            let mut partition = Vec::new();
-            if self.peek_keyword().as_deref() == Some("partition") {
-                self.advance();
-                self.expect_keyword("by")?;
-                loop {
-                    let (q, c) = self.parse_column_ref()?;
-                    partition.push(match q {
-                        Some(q) => Expr::QualifiedColumn {
-                            qualifier: q,
-                            name: c,
-                        },
-                        None => Expr::Column(c),
-                    });
-                    if matches!(self.peek(), Token::Comma) {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            // ORDER BY <sort_key> (, ...) — self-guards (empty if absent), consumes ORDER BY.
-            let order = self.parse_order_by()?;
-            // An optional frame clause (ROWS/RANGE/GROUPS …), else the default frame.
-            let frame = self.parse_window_frame()?;
+            // `[base] [PARTITION BY cols] [ORDER BY …] [frame]` — the shared definition body. A
+            // leading base-window name (window.md §5) extends a named window; merged at resolve.
+            let def = self.parse_window_definition()?;
             self.expect(&Token::RParen)?;
-            Some(Box::new(WindowDef {
-                partition,
-                order,
-                frame,
-            }))
+            Some(Box::new(def))
         } else {
             None
         };

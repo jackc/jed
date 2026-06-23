@@ -999,6 +999,12 @@ pub struct OrderKey {
 /// expressions are a follow-on); `order` reuses the query ORDER BY sort keys.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WindowDef {
+    /// An optional leading base-window name (`OVER (w ORDER BY …)`, `WINDOW w2 AS (w …)` —
+    /// spec/design/window.md §5). The definition extends the named base: it inherits the base's
+    /// `PARTITION BY` (and its `ORDER BY` if any) and supplies its own frame. A resolve-time pass
+    /// (`resolve_window_clause` / `desugar_named_windows`) merges the base in and clears this to
+    /// `None`, so every definition is inline (`base = None`) by the time the window stage runs.
+    pub base: Option<String>,
     pub partition: Vec<Expr>,
     pub order: Vec<OrderKey>,
     /// An explicit frame clause (`ROWS BETWEEN … AND …`), else `None` for the default frame

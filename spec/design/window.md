@@ -10,16 +10,19 @@
 > change the data/grammar and here in the same edit. PostgreSQL is the behavioral default
 > (CLAUDE.md §1); the deliberate divergences are the ledger in §10.
 
-> **Status: COMPLETE (S0–S8, all three cores).** Every function below is landed — row_number,
+> **Status: COMPLETE (S0–S9, all three cores).** Every function below is landed — row_number,
 > rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, the aggregates as window functions
 > (running + explicit `ROWS`/`RANGE`/`GROUPS` frames, including value-based `RANGE` offsets over an
 > integer or decimal ordering key, with `EXCLUDE CURRENT ROW`/`GROUP`/`TIES`/`NO OTHERS`),
-> first_value/last_value/nth_value, and named windows — and **window functions combine with GROUP BY
+> first_value/last_value/nth_value, and named windows — **window functions combine with GROUP BY
 > / aggregates in one query** (S8): the window stage runs over the grouped rows, an aggregate may sit
 > inside a window argument (`sum(sum(x)) OVER ()`), and a window's column keys must be grouping
-> columns. The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) / timestamp /
-> date ordering key (§6/§11), and **general-expression window keys** (an aggregate or expression as a
-> `PARTITION BY`/`ORDER BY` key, e.g. `ORDER BY sum(x)` — §11) — are deferred follow-ons, not gaps.
+> columns — and a window definition may **extend a named base window** (S9): `OVER (w ORDER BY …)`
+> and `WINDOW w2 AS (w …)` inherit the base's `PARTITION BY` (and its `ORDER BY` if any) and supply
+> their own frame (§5). The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) /
+> timestamp / date ordering key (§6/§11), and **general-expression window keys** (an aggregate or
+> expression as a `PARTITION BY`/`ORDER BY` key, e.g. `ORDER BY sum(x)` — §11) — are deferred
+> follow-ons, not gaps.
 
 A **window function** computes a value for **each row** from a *set* of related rows — its
 **window frame** — without collapsing the rows the way an aggregate does. `row_number() OVER
@@ -78,6 +81,14 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
    function there is `42P20`); a window function nested in an aggregate argument is `42803`.
    General-expression window keys (an aggregate/expression as a key, `ORDER BY sum(x)`) stay deferred
    (§11). Capability `query.window_grouped`.
+9. **S9 — base-window-extending definitions.** A window definition may begin with the name of an
+   earlier `WINDOW`-clause entry to **extend** it: `OVER (w ORDER BY …)` and `WINDOW w2 AS (w …)`.
+   The extending definition inherits the base's `PARTITION BY` (and its `ORDER BY` if the base has
+   one) and supplies its own frame; the rules (all `42P20`, in PostgreSQL's priority order
+   PARTITION → ORDER → frame): the extender may not add a `PARTITION BY`, may add an `ORDER BY` only
+   if the base has none, and the base must not carry a frame. A base that does not exist — including
+   a self- or forward-reference within the `WINDOW` clause — is `42704`. Capability
+   `query.window_base_extend`. (See §5 for the full merge contract.)
 
 Locked scope decisions: **the within-partition order is always fully resolved** (§3,
 deterministic — a divergence-adjacent strictness, §10); **`percent_rank`/`cume_dist` →
@@ -259,6 +270,38 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
      the **frame**.
 4. The per-spec **finalize** (the `percent_rank`/`cume_dist`/`avg` division, the `Acc` finalize)
    is **unmetered**, like `AVG`'s division today.
+
+### 5.3 Named windows and base-window extension (S5 / S9)
+
+The `WINDOW name AS ( … )` clause names reusable window definitions; an `OVER name` reference reuses
+one (S5), and a definition may **extend** an earlier one by naming it as a leading **base** (S9).
+Both are handled **before resolution**, by rewriting the AST into all-inline definitions — the
+window operator (§5.2) never sees a name or a base. Two passes, in this order:
+
+1. **Resolve the `WINDOW` clause** (`resolve_window_clause`). Each entry is processed left-to-right;
+   an entry that names a base extends an **already-resolved earlier** entry. Every entry is resolved,
+   **even one no `OVER` references** — matching PostgreSQL's whole-clause check. The output is a list
+   of inline definitions (no remaining base).
+2. **Desugar the select-list references** (`desugar_named_windows`) against that resolved list: a
+   pure `OVER name` copies the named definition **whole, frame included** (no merge rules); an inline
+   `OVER (base … )` is **merged** onto its named base.
+
+**The merge contract** (`extend_window`, PostgreSQL `transformWindowDefinitions`). An extending
+definition inherits the base's `PARTITION BY`, and the base's `ORDER BY` when the base has one, and
+supplies its **own** frame. The three rules fire in PostgreSQL's priority order and all raise
+`42P20` (`windowing_error`):
+
+| # | Condition | Error |
+|---|---|---|
+| 1 | the extender adds a `PARTITION BY` (even one identical to the base's) | `cannot override PARTITION BY clause of window "<b>"` |
+| 2 | the base has an `ORDER BY` **and** the extender adds one | `cannot override ORDER BY clause of window "<b>"` |
+| 3 | the base carries a frame (even for a bare `OVER (b)`) | `cannot copy window "<b>" because it has a frame clause` |
+
+A base that does not exist — including a **self- or forward-reference** within the `WINDOW` clause,
+since the base must be an *earlier* entry — is `42704` (`undefined_object`), the same code as a
+missing `OVER name`. The crucial distinction: the merge rules apply only to the **parenthesized
+extend** form (`OVER (b … )` / `WINDOW w AS (b … )`). A bare **`OVER b`** is a pure reference that
+copies `b` whole, so a framed `b` is fine via `OVER b` but `42P20` via `OVER (b)` — oracle-verified.
 
 ## 6. Frames
 

@@ -8139,13 +8139,25 @@ impl Database {
         } else {
             AggCtx::Forbidden
         };
-        // Desugar `OVER name` references to their WINDOW-clause definitions before resolution
-        // (window.md §5). The projection resolves against the desugared items; a reference to an
-        // undefined window is 42704. A plain query with no window clause/refs clones nothing extra.
+        // Resolve the WINDOW clause: an entry may **extend** an earlier entry (`w2 AS (w ORDER BY
+        // …)` — window.md §5), so each is merged against the already-resolved earlier entries (the
+        // base-window rules: a base must exist and precede — 42704; PARTITION/ORDER overrides and a
+        // framed base — 42P20). Every entry is resolved, even unreferenced ones, matching PostgreSQL.
+        // The result is all-inline (`base = None`) definitions the desugar pass copies/extends from.
+        let resolved_windows;
+        let windows_ref: &[(String, WindowDef)] = if sel.windows.is_empty() {
+            &sel.windows
+        } else {
+            resolved_windows = resolve_window_clause(&sel.windows)?;
+            &resolved_windows
+        };
+        // Desugar `OVER name` / `OVER (base …)` references to their WINDOW-clause definitions before
+        // resolution (window.md §5). The projection resolves against the desugared items; a reference
+        // to an undefined window is 42704. A plain query with no window clause/refs clones nothing.
         let desugared_items;
         let items_ref = if has_window_syntax {
             let mut it = sel.items.clone();
-            desugar_items(&mut it, &sel.windows)?;
+            desugar_items(&mut it, windows_ref)?;
             desugared_items = it;
             &desugared_items
         } else {
@@ -13729,6 +13741,77 @@ fn desugar_items(items: &mut SelectItems, windows: &[(String, WindowDef)]) -> Re
     Ok(())
 }
 
+/// Apply the base-window merge rules (spec/design/window.md §5, PostgreSQL
+/// `transformWindowDefinitions`): a definition that names a base copies the base's `PARTITION BY`
+/// and — if the base has one — its `ORDER BY`, and supplies its own frame. The extender may **not**
+/// add a `PARTITION BY` (42P20, even when the base has none), may add an `ORDER BY` only when the
+/// base has none (42P20 otherwise), and the base must **not** carry a frame (42P20). The three
+/// checks fire in PostgreSQL's priority order: PARTITION, then ORDER, then frame. Returns the
+/// merged inline definition (`base = None`).
+fn extend_window(base: &WindowDef, ext: &WindowDef, base_name: &str) -> Result<WindowDef> {
+    if !ext.partition.is_empty() {
+        return Err(EngineError::new(
+            SqlState::WindowingError,
+            format!("cannot override PARTITION BY clause of window \"{base_name}\""),
+        ));
+    }
+    if !base.order.is_empty() && !ext.order.is_empty() {
+        return Err(EngineError::new(
+            SqlState::WindowingError,
+            format!("cannot override ORDER BY clause of window \"{base_name}\""),
+        ));
+    }
+    if base.frame.is_some() {
+        return Err(EngineError::new(
+            SqlState::WindowingError,
+            format!("cannot copy window \"{base_name}\" because it has a frame clause"),
+        ));
+    }
+    Ok(WindowDef {
+        base: None,
+        partition: base.partition.clone(),
+        order: if base.order.is_empty() {
+            ext.order.clone()
+        } else {
+            base.order.clone()
+        },
+        frame: ext.frame.clone(),
+    })
+}
+
+/// Resolve a WINDOW clause into all-inline definitions (spec/design/window.md §5). Entries are
+/// processed left-to-right; an entry naming a base extends an **already-resolved earlier** entry
+/// (a self- or forward-reference is therefore "does not exist" — 42704), via `extend_window`. Every
+/// entry is resolved — even ones no `OVER` references — matching PostgreSQL's whole-clause check.
+fn resolve_window_clause(windows: &[(String, WindowDef)]) -> Result<Vec<(String, WindowDef)>> {
+    let mut resolved: Vec<(String, WindowDef)> = Vec::with_capacity(windows.len());
+    for (name, def) in windows {
+        let r = if let Some(base_name) = &def.base {
+            let base = lookup_window(&resolved, base_name)?;
+            extend_window(&base, def, base_name)?
+        } else {
+            def.clone()
+        };
+        resolved.push((name.clone(), r));
+    }
+    Ok(resolved)
+}
+
+/// Find a (resolved, `base = None`) window definition by name in `windows`, case-insensitively, or
+/// raise 42704 `window "<name>" does not exist`. Returns an owned clone to avoid borrow conflicts.
+fn lookup_window(windows: &[(String, WindowDef)], name: &str) -> Result<WindowDef> {
+    windows
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, d)| d.clone())
+        .ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedObject,
+                format!("window \"{name}\" does not exist"),
+            )
+        })
+}
+
 fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)]) -> Result<()> {
     match e {
         Expr::FuncCall {
@@ -13738,17 +13821,17 @@ fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)]) -> Resul
             ..
         } => {
             if let Some(name) = over_name.take() {
-                let def = windows
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(&name))
-                    .map(|(_, d)| d.clone())
-                    .ok_or_else(|| {
-                        EngineError::new(
-                            SqlState::UndefinedObject,
-                            format!("window \"{name}\" does not exist"),
-                        )
-                    })?;
+                // `OVER name` — a pure reference: copy the named definition whole, frame included
+                // (no merge rules; copying a framed window is only forbidden for the parenthesized
+                // extend form below — window.md §5).
+                let def = lookup_window(windows, &name)?;
                 *over = Some(Box::new(def));
+            } else if over.as_ref().is_some_and(|d| d.base.is_some()) {
+                // `OVER (base …)` — an extend: merge the inline definition onto the named base.
+                let d = over.as_deref_mut().expect("base implies over is Some");
+                let base_name = d.base.take().expect("base.is_some() checked");
+                let base = lookup_window(windows, &base_name)?;
+                *d = extend_window(&base, d, &base_name)?;
             }
             for a in args.iter_mut() {
                 desugar_named_windows(a, windows)?;

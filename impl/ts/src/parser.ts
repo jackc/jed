@@ -1687,9 +1687,9 @@ class Parser {
   }
 
   // parseWindowClause parses `window_clause ::= "WINDOW" identifier "AS" "(" window_definition ")"
-  // ("," …)*` (window.md §5). Each entry is a full inline window definition (a base-window reference
-  // inside the definition is deferred). Empty when no WINDOW keyword is present. WINDOW is
-  // non-reserved.
+  // ("," …)*` (window.md §5). Each entry is a full window definition (which may extend an earlier
+  // entry via a leading base-window name — §5). Empty when no WINDOW keyword is present. WINDOW is
+  // non-reserved. Each definition reuses parseWindowDefinition with the inline OVER.
   private parseWindowClause(): [string, WindowDef][] {
     if (this.peekKeyword() !== "window") return [];
     this.advance();
@@ -1698,28 +1698,9 @@ class Parser {
       const name = this.expectIdentifier();
       this.expectKeyword("as");
       this.expect("lparen");
-      const partition: Expr[] = [];
-      if (this.peekKeyword() === "partition") {
-        this.advance();
-        this.expectKeyword("by");
-        for (;;) {
-          const [qualifier, col] = this.parseColumnRef();
-          partition.push(
-            qualifier !== null
-              ? { kind: "qualifiedColumn", qualifier, name: col }
-              : { kind: "column", name: col },
-          );
-          if (this.peek().kind === "comma") {
-            this.advance();
-          } else {
-            break;
-          }
-        }
-      }
-      const order = this.parseOrderBy();
-      const frame = this.parseWindowFrame();
+      const def = this.parseWindowDefinition();
       this.expect("rparen");
-      windows.push([name, { partition, order, frame }]);
+      windows.push([name, def]);
       if (this.peek().kind === "comma") {
         this.advance();
       } else {
@@ -1727,6 +1708,56 @@ class Parser {
       }
     }
     return windows;
+  }
+
+  // parseWindowDefinition parses a window definition body `[base] [PARTITION BY …] [ORDER BY …]
+  // [frame]` between the already-consumed `(` and the closing `)` (spec/design/window.md §3, §5).
+  // The optional leading base-window name (a bareword that is not a clause-introducing keyword)
+  // marks a definition that extends a named window — the resolver merges it in (§5). Used by both
+  // the inline `OVER ( … )` and the `WINDOW name AS ( … )` clause so the two spellings parse alike.
+  private parseWindowDefinition(): WindowDef {
+    const base = this.parseOptBaseWindowName();
+    const partition: Expr[] = [];
+    if (this.peekKeyword() === "partition") {
+      this.advance();
+      this.expectKeyword("by");
+      for (;;) {
+        const [qualifier, col] = this.parseColumnRef();
+        partition.push(
+          qualifier !== null
+            ? { kind: "qualifiedColumn", qualifier, name: col }
+            : { kind: "column", name: col },
+        );
+        if (this.peek().kind === "comma") {
+          this.advance();
+        } else {
+          break;
+        }
+      }
+    }
+    const order = this.parseOrderBy();
+    const frame = this.parseWindowFrame();
+    return { base, partition, order, frame };
+  }
+
+  // parseOptBaseWindowName returns the optional leading base-window name of a window definition
+  // (spec/design/window.md §5), else null. Present when the next token is a bareword that is not a
+  // clause-introducing keyword (PARTITION/ORDER/ROWS/RANGE/GROUPS) — those start the definition's
+  // own clauses, so an unquoted occurrence is the keyword, never a base name (matching PostgreSQL;
+  // a window named like a keyword would need quoting, which jed's window names do not support).
+  private parseOptBaseWindowName(): string | null {
+    const t = this.peek();
+    if (t.kind !== "word") return null;
+    switch (lower(t.word!)) {
+      case "partition":
+      case "order":
+      case "rows":
+      case "range":
+      case "groups":
+        return null;
+    }
+    this.advance();
+    return t.word!;
   }
 
   // parseHaving parses `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and
@@ -2836,31 +2867,10 @@ class Parser {
         return { kind: "funcCall", name, args, argNames, star, variadic, over: null, overName };
       }
       this.expect("lparen");
-      // PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
-      const partition: Expr[] = [];
-      if (this.peekKeyword() === "partition") {
-        this.advance();
-        this.expectKeyword("by");
-        for (;;) {
-          const [qualifier, name] = this.parseColumnRef();
-          partition.push(
-            qualifier !== null
-              ? { kind: "qualifiedColumn", qualifier, name }
-              : { kind: "column", name },
-          );
-          if (this.peek().kind === "comma") {
-            this.advance();
-          } else {
-            break;
-          }
-        }
-      }
-      // ORDER BY <sort_key> (, ...) — self-guards (empty if absent), consumes ORDER BY.
-      const order = this.parseOrderBy();
-      // An optional frame clause (ROWS/RANGE/GROUPS …), else the default frame.
-      const frame = this.parseWindowFrame();
+      // `[base] [PARTITION BY cols] [ORDER BY …] [frame]` — the shared definition body. A leading
+      // base-window name (window.md §5) extends a named window; merged at resolve.
+      over = this.parseWindowDefinition();
       this.expect("rparen");
-      over = { partition, order, frame };
     }
     return { kind: "funcCall", name, args, argNames, star, variadic, over, overName };
   }
