@@ -12446,6 +12446,11 @@ const (
 	// for its single range argument; `rfunc` selects the kernel. All are STRICT (a NULL range → NULL,
 	// handled in the kernel). The result type lives in the surrounding resolvedType.
 	reRangeFunc
+	// reRegexFunc is a regex scalar function call (spec/design/regex.md §8 — regexp_replace → text,
+	// regexp_match → text[]). Like reArrayFunc the result type lives in the surrounding resolvedType;
+	// `rxFunc` selects the kernel and its arg nodes reuse `sargs`. STRICT (a NULL arg → NULL). A
+	// constant pattern is precompiled into rxProgram (regex.md §5), charged once via rxCompileCharged.
+	reRegexFunc
 	// reRangeCtor is a range CONSTRUCTOR call (spec/design/range-functions.md §2 — i32range(lo, hi[,
 	// bounds]) and the five siblings), evaluated per row. `relem` is the range's element scalar (the
 	// result range type is recovered from it, a bijection); its 2 bound nodes plus an optional
@@ -12622,6 +12627,14 @@ const (
 	rfUpperInf                  // upper_inf(anyrange) → boolean (false for the empty range)
 )
 
+// regexFunc selects a regex scalar function kernel (spec/design/regex.md §8). Kernels in regex.go.
+type regexFunc int
+
+const (
+	rxReplace regexFunc = iota // regexp_replace(source, pattern, replacement [, flags]) → text
+	rxMatch                    // regexp_match(source, pattern [, flags]) → text[]
+)
+
 // rangeOp selects a range BOOLEAN operator (spec/design/range-functions.md §3, RF3). Each is a binary
 // infix operator returning a definite boolean (a NULL operand short-circuits to NULL at eval, like the
 // array containment operators). roContainsElem/roElemContainedBy are the element overloads of @>/<@
@@ -12690,12 +12703,14 @@ type rExpr struct {
 	// atTzToTimestamptz selects the AT TIME ZONE direction (reAtTimeZone): false is timestamptz→
 	// timestamp, true is timestamp→timestamptz (timezones.md §6).
 	atTzToTimestamptz bool
-	// reRegex: rxProgram is the precompiled NFA for a CONSTANT pattern (compiled once at resolve,
-	// the `col ~ 'literal'` case — regex.md §5); nil means the pattern is non-constant (compiled per
-	// row at eval). rxCompileCharged is the one-shot flag charging a precompiled program's
-	// regex_compile cost once per statement execution (on first eval), not per row.
+	// reRegex / reRegexFunc: rxProgram is the precompiled NFA for a CONSTANT pattern (compiled once at
+	// resolve, the `col ~ 'literal'` case — regex.md §5); nil means the pattern is non-constant
+	// (compiled per row at eval). rxCompileCharged is the one-shot flag charging a precompiled
+	// program's regex_compile cost once per statement execution (on first eval), not per row. rxFunc
+	// selects the reRegexFunc kernel (regexp_replace / regexp_match); its arg nodes reuse `sargs`.
 	rxProgram        *regexProgram
 	rxCompileCharged bool
+	rxFunc           regexFunc
 	// collation is the derived collation of a reCompare (spec/design/collation.md §7). nil is the
 	// C / default byte order (the unchanged fast path); non-nil is a loaded collation that orders the
 	// ORDERING comparisons (< <= > >=) by its UCA sort key. =/<> stay byte-equality regardless
@@ -14285,6 +14300,72 @@ func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	return &rExpr{kind: reArrayFunc, afunc: arrayFuncID(name), sargs: rargs}, result, nil
 }
 
+// resolveRegexFunc resolves regexp_replace/regexp_match (regex.md §8) → a reRegexFunc node whose
+// result type (text / text[]) lives in the surrounding resolvedType. Both are STRICT (text args,
+// NULL propagates). A constant pattern is precompiled once here (regex.md §5) — but only when the
+// case-insensitive `i` flag is statically known (the flags arg absent or a constant).
+func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	name := toLowerASCII(fc.Name)
+	var rfn regexFunc
+	flagsIdx := -1
+	switch {
+	case name == "regexp_replace" && len(fc.Args) == 3:
+		rfn = rxReplace
+	case name == "regexp_replace" && len(fc.Args) == 4:
+		rfn, flagsIdx = rxReplace, 3
+	case name == "regexp_match" && len(fc.Args) == 2:
+		rfn = rxMatch
+	case name == "regexp_match" && len(fc.Args) == 3:
+		rfn, flagsIdx = rxMatch, 2
+	default:
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	textHint := Text
+	rargs := make([]*rExpr, len(fc.Args))
+	for i := range fc.Args {
+		r, t, err := resolve(s, *fc.Args[i], &textHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireTextOrNull(t); err != nil {
+			return nil, resolvedType{}, err
+		}
+		rargs[i] = r
+	}
+	// Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
+	insensitiveKnown, insensitive := true, false
+	if flagsIdx >= 0 {
+		if rargs[flagsIdx].kind == reConstText {
+			insensitive = strings.Contains(rargs[flagsIdx].cText, "i")
+		} else {
+			insensitiveKnown = false
+		}
+	}
+	var prog *regexProgram
+	if rargs[1].kind == reConstText && insensitiveKnown {
+		pat := rargs[1].cText
+		if insensitive {
+			pat = FoldLowerSimple(pat, LoadedProperty())
+		}
+		var err error
+		prog, err = compileRegex(pat)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+	}
+	var result resolvedType
+	if rfn == rxReplace {
+		result = resolvedType{kind: rtText}
+	} else {
+		elem := resolvedType{kind: rtText}
+		result = resolvedType{kind: rtArray, elem: &elem}
+	}
+	return &rExpr{kind: reRegexFunc, rxFunc: rfn, sargs: rargs, rxProgram: prog}, result, nil
+}
+
 // isRangeFuncName reports whether name (lowercased) is a polymorphic range function — a
 // Kind=="function" catalog row whose ArgFamilies mention anyrange (range-functions.md §1).
 // Data-driven, so a new range-function row wires here without touching this gate.
@@ -15085,6 +15166,14 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		return resolveRangeCtor(s, fc, ag, params)
+	}
+	// The regex scalar functions (regex.md §8) are Kind=="function" too, but return text / text[] via
+	// a dedicated reRegexFunc node, so they are intercepted before the generic scalar path.
+	if name == "regexp_replace" || name == "regexp_match" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveRegexFunc(s, fc, ag, params)
 	}
 	if isScalarFuncName(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
@@ -19051,6 +19140,96 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		// negated carries !~ / !~*: matched != negated flips for the negated form.
 		return BoolValue(matched != e.negated), nil
+	case reRegexFunc:
+		m.Charge(Costs.OperatorEval)
+		// STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
+		vals := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.Kind == ValNull {
+				return NullValue(), nil
+			}
+			vals[i] = v
+		}
+		source, pattern := vals[0].Str, vals[1].Str
+		var replacement, flags string
+		if e.rxFunc == rxReplace {
+			replacement = vals[2].Str
+			if len(vals) > 3 {
+				flags = vals[3].Str
+			}
+		} else if len(vals) > 2 {
+			flags = vals[2].Str
+		}
+		// Validate flags: `i` (both), `g` (replace only); anything else is 2201B.
+		for _, c := range flags {
+			if !(c == 'i' || (c == 'g' && e.rxFunc == rxReplace)) {
+				return Value{}, NewError(InvalidRegularExpression,
+					fmt.Sprintf("invalid regular expression: invalid option %q", string(c)))
+			}
+		}
+		insensitive := strings.ContainsRune(flags, 'i')
+		global := strings.ContainsRune(flags, 'g')
+		// The original-case subject (for output/captures) and the matched subject (folded when
+		// case-insensitive — same length, so offsets carry over, regex.md §8).
+		origRunes := []rune(source)
+		matchRunes := origRunes
+		var prop *PropertyTable
+		if insensitive {
+			prop = LoadedProperty()
+			matchRunes = []rune(FoldLowerSimple(source, prop))
+		}
+		var prog *regexProgram
+		if e.rxProgram != nil {
+			if !e.rxCompileCharged {
+				e.rxCompileCharged = true
+				m.Charge(Costs.RegexCompile * int64(e.rxProgram.ninst()))
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+			}
+			prog = e.rxProgram
+		} else {
+			pat := pattern
+			if insensitive {
+				pat = FoldLowerSimple(pattern, prop)
+			}
+			var err error
+			prog, err = compileRegex(pat)
+			if err != nil {
+				return Value{}, err
+			}
+			m.Charge(Costs.RegexCompile * int64(prog.ninst()))
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+		}
+		if e.rxFunc == rxReplace {
+			out, err := prog.regexpReplace(matchRunes, origRunes, []rune(replacement), global, m)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(out), nil
+		}
+		groups, ok, err := prog.regexpMatch(matchRunes, origRunes, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if !ok {
+			return NullValue(), nil
+		}
+		elems := make([]Value, len(groups))
+		for i, g := range groups {
+			if g == nil {
+				elems[i] = NullValue()
+			} else {
+				elems[i] = TextValue(*g)
+			}
+		}
+		return ArrayValue(elems), nil
 	case reCasing:
 		m.Charge(Costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)

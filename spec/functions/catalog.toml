@@ -2753,6 +2753,61 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
+# compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
+#  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL
+#    with the `g` flag) by the replacement TEMPLATE (\1..\9 = capture group, \& = whole match, \\ =
+#    literal backslash). No match → source unchanged.
+#  - regexp_match(source, pattern [, flags]) → text[]: the capture array of the FIRST match (groups
+#    1..n, or a 1-element [whole match] when the pattern has no group); an unset group element is
+#    NULL; NO match → NULL (the whole result).
+# `flags` is a short text: `i` (case-insensitive, = the `~*` fold), `g` (global, regexp_replace only);
+# an unknown flag is 2201B. These are the first text- and text[]-returning functions, resolved via a
+# dedicated RegexFunc node (the array/range-function precedent) rather than the scalar-result path.
+[[operator]]
+name           = "regexp_replace"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_replace"
+kind           = "function"
+arity          = 4
+arg_families   = ["text", "text", "text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_match"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_match"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
 [[operator]]
 name           = "isempty"
 kind           = "function"

@@ -783,13 +783,20 @@ impl Program {
         Ok(self.run(input, m)?.is_some())
     }
 
-    /// Run the Pike VM (regex.md §4). Returns the winning thread's capture slots on a match (code-
-    /// point offsets; `-1` = unset), or `None`. Charges `regex_step` per explored state and guards
-    /// once per input position.
-    // `sp` is a logical input POSITION that must reach `len` (one past the end) so the final
-    // epsilon-closure can fire `AssertEnd`/`Match` — enumerate() cannot express `0..=len`.
-    #[allow(clippy::needless_range_loop)]
+    /// Run the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
+    /// capture slots on a match (code-point offsets; `-1` = unset), or `None`.
     pub fn run(&self, input: &[char], m: &mut Meter) -> Result<Option<Vec<i64>>> {
+        self.search(input, 0, m)
+    }
+
+    /// Run the Pike VM, considering only matches that START at code-point position `start` or later
+    /// (the unanchored search seeds its lazy `.*?` prefix at `start`). `^`/`$` still anchor at the
+    /// true input bounds (absolute `sp == 0` / `sp == len`). Used by `regexp_replace`'s global loop.
+    /// Charges `regex_step` per explored state and guards once per input position.
+    // `sp` is a logical input POSITION that must reach `len` (one past the end) so the final
+    // epsilon-closure can fire `AssertEnd`/`Match` — enumerate() cannot express `start..=len`.
+    #[allow(clippy::needless_range_loop)]
+    pub fn search(&self, input: &[char], start: usize, m: &mut Meter) -> Result<Option<Vec<i64>>> {
         let nslots = 2 * (self.ngroups + 1);
         let len = input.len();
         let mut seen = vec![0u32; self.insts.len()];
@@ -805,12 +812,12 @@ impl Program {
             generation,
             0,
             Rc::new(vec![-1; nslots]),
-            0,
+            start,
             len,
             m,
         )?;
 
-        for sp in 0..=len {
+        for sp in start..=len {
             generation += 1;
             nlist.clear();
             let mut i = 0;
@@ -929,6 +936,113 @@ impl Program {
             }
         }
         Ok(())
+    }
+
+    /// `regexp_match(source, …)` capture extraction (regex.md §8). Searches once; on a match returns
+    /// the capture group strings (groups 1..n, or a 1-element whole-match list when the pattern has
+    /// no group — the PG rule), an unset group being `None`. Returns `None` (the whole result) on no
+    /// match. `match_input` is the (possibly case-folded) subject the VM matches; `orig_input` is the
+    /// ORIGINAL-case subject the returned substrings are sliced from (same length, regex.md §8).
+    pub fn regexp_match(
+        &self,
+        match_input: &[char],
+        orig_input: &[char],
+        m: &mut Meter,
+    ) -> Result<Option<Vec<Option<String>>>> {
+        let Some(saves) = self.search(match_input, 0, m)? else {
+            return Ok(None);
+        };
+        let groups = if self.ngroups == 0 {
+            // No capturing group: PG returns a 1-element array of the whole match.
+            vec![slice_group(orig_input, saves[0], saves[1])]
+        } else {
+            (1..=self.ngroups)
+                .map(|g| slice_group(orig_input, saves[2 * g], saves[2 * g + 1]))
+                .collect()
+        };
+        Ok(Some(groups))
+    }
+
+    /// `regexp_replace(source, pattern, replacement, …)` (regex.md §8). Replaces the first match (or
+    /// all when `global`) by the replacement TEMPLATE (`\1`..`\9` = capture group, `\&` = whole
+    /// match, `\\` = literal backslash). Non-matched text and captured substrings come from
+    /// `orig_input` (original case); the VM matches over `match_input` (possibly case-folded).
+    pub fn regexp_replace(
+        &self,
+        match_input: &[char],
+        orig_input: &[char],
+        replacement: &[char],
+        global: bool,
+        m: &mut Meter,
+    ) -> Result<String> {
+        let mut out = String::new();
+        let mut pos = 0usize;
+        loop {
+            let Some(saves) = self.search(match_input, pos, m)? else {
+                break;
+            };
+            let s = saves[0] as usize;
+            let e = saves[1] as usize;
+            out.extend(orig_input[pos..s].iter());
+            splice_replacement(&mut out, replacement, &saves, orig_input);
+            if !global {
+                out.extend(orig_input[e..].iter());
+                return Ok(out);
+            }
+            if e > s {
+                pos = e;
+            } else {
+                // Empty match: emit the char at `e` (if any) and advance past it, so a pattern that
+                // can match empty (`a*`) cannot loop forever — the PG global rule.
+                if e < orig_input.len() {
+                    out.push(orig_input[e]);
+                }
+                pos = e + 1;
+            }
+            if pos > orig_input.len() {
+                return Ok(out);
+            }
+        }
+        out.extend(orig_input[pos..].iter());
+        Ok(out)
+    }
+}
+
+/// Slice `orig[start..end]` to an owned `String`, or `None` for an unset (`-1`) group.
+fn slice_group(orig: &[char], start: i64, end: i64) -> Option<String> {
+    if start < 0 || end < 0 {
+        return None;
+    }
+    Some(orig[start as usize..end as usize].iter().collect())
+}
+
+/// Append a replacement template to `out`, expanding `\1`..`\9` (capture group), `\&` (whole match),
+/// `\\` (literal backslash), and `\<other>` (the literal `<other>`). A trailing lone `\` is literal.
+fn splice_replacement(out: &mut String, repl: &[char], saves: &[i64], orig: &[char]) {
+    let mut i = 0;
+    while i < repl.len() {
+        let c = repl[i];
+        if c == '\\' && i + 1 < repl.len() {
+            let n = repl[i + 1];
+            if let Some(d) = n.to_digit(10) {
+                let g = d as usize;
+                if 2 * g + 1 < saves.len() {
+                    if let Some(s) = slice_group(orig, saves[2 * g], saves[2 * g + 1]) {
+                        out.push_str(&s);
+                    }
+                }
+            } else if n == '&' {
+                if let Some(s) = slice_group(orig, saves[0], saves[1]) {
+                    out.push_str(&s);
+                }
+            } else {
+                out.push(n); // \\ -> \, and \<other> -> <other>
+            }
+            i += 2;
+        } else {
+            out.push(c);
+            i += 1;
+        }
     }
 }
 

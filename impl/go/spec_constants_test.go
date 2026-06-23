@@ -505,6 +505,18 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			}
 			continue
 		}
+		if o.Name == "regexp_replace" || o.Name == "regexp_match" {
+			// A regex scalar function (regex.md §8): no scalar kernel id — the kernel is the reRegexFunc
+			// eval, reached from resolveRegexFunc. Its result is text / a concrete text[] code.
+			concreteArray := false
+			if base, ok := strings.CutSuffix(o.Result, "[]"); ok {
+				_, concreteArray = ScalarTypeFromName(base)
+			}
+			if _, ok := ScalarTypeFromName(o.Result); !ok && !concreteArray {
+				t.Fatalf("regex function %s has unhandled result code %s", o.Name, o.Result)
+			}
+			continue
+		}
 		tys := make([]resolvedType, len(o.ArgFamilies))
 		for j, fam := range o.ArgFamilies {
 			tys[j] = probe(fam)

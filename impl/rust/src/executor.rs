@@ -9371,6 +9371,7 @@ impl Database {
             RExpr::ScalarFunc { args, .. }
             | RExpr::ArrayFunc { args, .. }
             | RExpr::RangeFunc { args, .. }
+            | RExpr::RegexFunc { args, .. }
             | RExpr::RangeCtor { args, .. }
             | RExpr::RangeOp { args, .. }
             | RExpr::RangeSetOp { args, .. }
@@ -10514,6 +10515,16 @@ enum RangeFunc {
     UpperInf,
 }
 
+/// The regular-expression scalar functions (spec/design/regex.md §8). The kernel id; the eval
+/// recovers the arg shape (3/4 for replace, 2/3 for match) from `args.len()`. Kernels in `regex.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegexFunc {
+    /// regexp_replace(source, pattern, replacement [, flags]) → text.
+    Replace,
+    /// regexp_match(source, pattern [, flags]) → text[].
+    Match,
+}
+
 /// The range BOOLEAN operators (spec/design/range-functions.md §3, RF3). Each is a binary infix
 /// operator returning a definite boolean (a NULL operand short-circuits to NULL at eval, like the
 /// array containment operators). `ContainsElem`/`ElemContainedBy` are the element overloads of
@@ -10772,6 +10783,18 @@ enum RExpr {
     RangeFunc {
         func: RangeFunc,
         args: Vec<RExpr>,
+    },
+    /// A regular-expression scalar function (spec/design/regex.md §8 — `regexp_replace` → text,
+    /// `regexp_match` → text[]). Like [`RExpr::ArrayFunc`] the result type lives in the surrounding
+    /// `ResolvedType` (text or text[]), not a scalar `result`. STRICT (a NULL arg → NULL, short-
+    /// circuited in eval). `args` are the resolved text operands (source, pattern, [replacement,]
+    /// [flags]); `program` is the precompiled NFA for a constant pattern (regex.md §5), `compile_charged`
+    /// the one-shot flag charging its `regex_compile` cost once per execution.
+    RegexFunc {
+        func: RegexFunc,
+        args: Vec<RExpr>,
+        program: Option<crate::regex::Program>,
+        compile_charged: std::cell::Cell<bool>,
     },
     /// A range CONSTRUCTOR call (spec/design/range-functions.md §2 — `i32range(lo, hi[, bounds])` and
     /// the five siblings). `elem` is the range's element scalar (the result range type is recovered
@@ -12108,6 +12131,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
+        | RExpr::RegexFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
@@ -13534,6 +13558,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
+        | RExpr::RegexFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
@@ -13645,6 +13670,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
+        | RExpr::RegexFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
@@ -14635,6 +14661,19 @@ fn resolve_func_call(
         }
         return resolve_range_ctor(scope, &lname, args, agg, params);
     }
+    // The regex scalar functions (regex.md §8) are kind="function" too, but return text / text[] via
+    // a dedicated RegexFunc node — the scalar-result path cannot carry the array result — so they are
+    // intercepted before it, like the array/range functions above.
+    if lname == "regexp_replace" || lname == "regexp_match" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_regex_func(scope, &lname, args, agg, params);
+    }
     if is_scalar_func_name(&lname) {
         reject_named(&lname, arg_names)?;
         return resolve_scalar_func(scope, &lname, args, star, agg, params);
@@ -14642,6 +14681,64 @@ fn resolve_func_call(
     Err(EngineError::new(
         SqlState::UndefinedFunction,
         format!("function does not exist: {name}"),
+    ))
+}
+
+/// Resolve `regexp_replace`/`regexp_match` (regex.md §8) → a [`RExpr::RegexFunc`] whose result type
+/// (text / text[]) lives in the surrounding [`ResolvedType`]. Both are STRICT (text args, NULL
+/// propagates). A constant pattern is precompiled once here (the precompilation contract, regex.md
+/// §5) — but only when the case-insensitive `i` flag is statically known (the flags arg absent or a
+/// constant), since `i` folds the pattern at compile time.
+fn resolve_regex_func(
+    scope: &Scope,
+    name: &str, // already lowercased
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (func, flags_idx) = match name {
+        "regexp_replace" if args.len() == 3 => (RegexFunc::Replace, None),
+        "regexp_replace" if args.len() == 4 => (RegexFunc::Replace, Some(3)),
+        "regexp_match" if args.len() == 2 => (RegexFunc::Match, None),
+        "regexp_match" if args.len() == 3 => (RegexFunc::Match, Some(2)),
+        _ => return Err(no_func_overload(name)),
+    };
+    let mut rargs = Vec::with_capacity(args.len());
+    for a in args {
+        let (r, t) = resolve(scope, a, Some(ScalarType::Text), agg, params)?;
+        require_text_or_null(&t)?;
+        rargs.push(r);
+    }
+    // Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
+    let insensitive = match flags_idx.map(|i| &rargs[i]) {
+        Some(RExpr::ConstText(f)) => Some(f.contains('i')),
+        None => Some(false),
+        Some(_) => None, // non-constant flags: defer compilation (and the `i` decision) to eval.
+    };
+    let program = match (&rargs[1], insensitive) {
+        (RExpr::ConstText(pat), Some(insensitive)) => {
+            let pat = if insensitive {
+                let prop = crate::collation::loaded_property();
+                crate::collation::fold_lower_simple(pat, prop.as_deref())
+            } else {
+                pat.clone()
+            };
+            Some(crate::regex::compile(&pat)?)
+        }
+        _ => None,
+    };
+    let result = match func {
+        RegexFunc::Replace => ResolvedType::Text,
+        RegexFunc::Match => ResolvedType::Array(Box::new(ResolvedType::Text)),
+    };
+    Ok((
+        RExpr::RegexFunc {
+            func,
+            args: rargs,
+            program,
+            compile_charged: std::cell::Cell::new(false),
+        },
+        result,
     ))
 }
 
@@ -21055,6 +21152,105 @@ impl RExpr {
                 // `negated` carries !~ / !~*: matched != negated flips for the negated form.
                 Ok(Value::Bool(matched != *negated))
             }
+            RExpr::RegexFunc {
+                func,
+                args,
+                program,
+                compile_charged,
+            } => {
+                m.charge(COSTS.operator_eval);
+                // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = a.eval(row, env, m)?;
+                    if matches!(v, Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    vals.push(v);
+                }
+                let text = |v: &Value| -> String {
+                    match v {
+                        Value::Text(s) => s.clone(),
+                        _ => unreachable!("resolver requires text regexp_* operands"),
+                    }
+                };
+                let source = text(&vals[0]);
+                let pattern = text(&vals[1]);
+                let (replacement, flags) = match func {
+                    RegexFunc::Replace => (Some(text(&vals[2])), vals.get(3).map(text)),
+                    RegexFunc::Match => (None, vals.get(2).map(text)),
+                };
+                let flags = flags.unwrap_or_default();
+                // Validate flags: `i` (both), `g` (replace only); anything else is 2201B.
+                for c in flags.chars() {
+                    let ok = c == 'i' || (c == 'g' && *func == RegexFunc::Replace);
+                    if !ok {
+                        return Err(EngineError::new(
+                            SqlState::InvalidRegularExpression,
+                            format!("invalid regular expression: invalid option \"{c}\""),
+                        ));
+                    }
+                }
+                let insensitive = flags.contains('i');
+                let global = flags.contains('g');
+                // The original-case subject (for output/captures) and the matched subject (folded
+                // when case-insensitive — same length, so offsets carry over, regex.md §8).
+                let orig_chars: Vec<char> = source.chars().collect();
+                let prop = if insensitive {
+                    crate::collation::loaded_property()
+                } else {
+                    None
+                };
+                let match_chars: Vec<char> = if insensitive {
+                    crate::collation::fold_lower_simple(&source, prop.as_deref())
+                        .chars()
+                        .collect()
+                } else {
+                    orig_chars.clone()
+                };
+                // The compiled program: precompiled (constant pattern + statically-known `i`), else
+                // compiled now (charging regex_compile once per row).
+                let owned_prog;
+                let prog: &crate::regex::Program = match program {
+                    Some(p) => {
+                        if !compile_charged.get() {
+                            compile_charged.set(true);
+                            m.charge(COSTS.regex_compile * p.ninst() as i64);
+                            m.guard()?;
+                        }
+                        p
+                    }
+                    None => {
+                        let pat = if insensitive {
+                            crate::collation::fold_lower_simple(&pattern, prop.as_deref())
+                        } else {
+                            pattern.clone()
+                        };
+                        owned_prog = crate::regex::compile(&pat)?;
+                        m.charge(COSTS.regex_compile * owned_prog.ninst() as i64);
+                        m.guard()?;
+                        &owned_prog
+                    }
+                };
+                match func {
+                    RegexFunc::Replace => {
+                        let repl: Vec<char> = replacement.unwrap().chars().collect();
+                        let out =
+                            prog.regexp_replace(&match_chars, &orig_chars, &repl, global, m)?;
+                        Ok(Value::Text(out))
+                    }
+                    RegexFunc::Match => match prog.regexp_match(&match_chars, &orig_chars, m)? {
+                        None => Ok(Value::Null),
+                        Some(groups) => {
+                            let elems: Vec<Value> = groups
+                                .into_iter()
+                                .map(|g| g.map_or(Value::Null, Value::Text))
+                                .collect();
+                            Ok(Value::Array(ArrayVal::one_dim(elems)))
+                        }
+                    },
+                }
+            }
             RExpr::Casing { upper, arg } => {
                 m.charge(COSTS.operator_eval);
                 match arg.eval(row, env, m)? {
@@ -22437,6 +22633,22 @@ mod registry_tests {
                 assert!(
                     ScalarType::from_name(o.result).is_some(),
                     "variadic function {} has unhandled result code {}",
+                    o.name,
+                    o.result
+                );
+                continue;
+            }
+            if o.name == "regexp_replace" || o.name == "regexp_match" {
+                // A regex scalar function (regex.md §8): no scalar kernel id — the kernel is the
+                // `RExpr::RegexFunc` eval, reached from `resolve_regex_func`. Its result is text or a
+                // concrete text[] code.
+                let concrete_array = o
+                    .result
+                    .strip_suffix("[]")
+                    .is_some_and(|b| ScalarType::from_name(b).is_some());
+                assert!(
+                    ScalarType::from_name(o.result).is_some() || concrete_array,
+                    "regex function {} has unhandled result code {}",
                     o.name,
                     o.result
                 );

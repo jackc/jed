@@ -244,7 +244,14 @@ import {
   rangeUnion,
 } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
-import { compileRegex, type RegexProgram, regexIsMatch, regexNinst } from "./regex.ts";
+import {
+  compileRegex,
+  type RegexProgram,
+  regexIsMatch,
+  regexNinst,
+  regexpMatch,
+  regexpReplace,
+} from "./regex.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
 // UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
@@ -7809,6 +7816,7 @@ export class Database {
         return e;
       case "scalarFunc":
       case "arrayFunc":
+      case "regexFunc":
       case "rangeFunc":
       case "rangeCtor":
       case "rangeOp":
@@ -8156,6 +8164,7 @@ function rexprIsConstant(e: RExpr): boolean {
       );
     case "scalarFunc":
     case "arrayFunc":
+    case "regexFunc":
     case "rangeFunc":
     case "rangeCtor":
     case "rangeOp":
@@ -9118,6 +9127,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       );
     case "scalarFunc":
     case "arrayFunc":
+    case "regexFunc":
     case "rangeFunc":
     case "rangeCtor":
     case "rangeOp":
@@ -9212,6 +9222,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "scalarFunc":
     case "arrayFunc":
+    case "regexFunc":
     case "rangeFunc":
     case "rangeCtor":
     case "rangeOp":
@@ -9572,6 +9583,17 @@ type RExpr =
   // node; the kernel recovers everything from the operand range value (self-describing). All are
   // STRICT (a NULL range → NULL), handled in the eval kernel.
   | { kind: "rangeFunc"; func: RangeFuncName; args: RExpr[] }
+  // A regex scalar function (spec/design/regex.md §8 — regexp_replace → text, regexp_match → text[]).
+  // Like "arrayFunc" the result type lives in the surrounding ResolvedType. STRICT (a NULL arg →
+  // NULL). `program` is the precompiled NFA for a constant pattern (regex.md §5), `compileCharged`
+  // the one-shot flag charging its regex_compile cost once per execution.
+  | {
+      kind: "regexFunc";
+      func: "replace" | "match";
+      args: RExpr[];
+      program: RegexProgram | null;
+      compileCharged: boolean;
+    }
   // A range CONSTRUCTOR call (spec/design/range-functions.md §2 — `i32range(lo, hi[, bounds])` and
   // the five siblings, plus the int4range/int8range aliases). `elem` is the range's element scalar
   // (the result range type is recovered from it, a bijection); `args` are the 2 bounds plus an
@@ -10845,11 +10867,63 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveRangeCtor(scope, e, ag, params);
   }
+  // The regex scalar functions (regex.md §8) are kind === "function" too, but return text / text[]
+  // via a dedicated regexFunc node, so they are intercepted before the generic scalar path.
+  if (lname === "regexp_replace" || lname === "regexp_match") {
+    rejectNamed(lname, e.argNames);
+    return resolveRegexFunc(scope, e, ag, params);
+  }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);
   }
   throw engineError("undefined_function", "function does not exist: " + e.name);
+}
+
+// resolveRegexFunc resolves regexp_replace/regexp_match (regex.md §8) → a regexFunc node whose result
+// type (text / text[]) lives in the surrounding ResolvedType. Both are STRICT (text args, NULL
+// propagates). A constant pattern is precompiled once here (regex.md §5) — but only when the
+// case-insensitive `i` flag is statically known (the flags arg absent or a constant).
+function resolveRegexFunc(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const name = e.name.toLowerCase();
+  let func: "replace" | "match";
+  let flagsIdx = -1;
+  if (name === "regexp_replace" && e.args.length === 3) func = "replace";
+  else if (name === "regexp_replace" && e.args.length === 4) {
+    func = "replace";
+    flagsIdx = 3;
+  } else if (name === "regexp_match" && e.args.length === 2) func = "match";
+  else if (name === "regexp_match" && e.args.length === 3) {
+    func = "match";
+    flagsIdx = 2;
+  } else throw noFuncOverload(name);
+
+  const rargs: RExpr[] = [];
+  for (const a of e.args) {
+    const r = resolve(scope, a, "text", ag, params);
+    requireTextOrNull(r.type);
+    rargs.push(r.node);
+  }
+  // Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
+  let insensitive: boolean | null = false;
+  if (flagsIdx >= 0) {
+    const f = rargs[flagsIdx];
+    insensitive = f.kind === "constText" ? f.value.includes("i") : null;
+  }
+  let program: RegexProgram | null = null;
+  if (rargs[1].kind === "constText" && insensitive !== null) {
+    const pat = insensitive ? foldLowerSimple(rargs[1].value, loadedProperty()) : rargs[1].value;
+    program = compileRegex(pat);
+  }
+  const type: ResolvedType =
+    func === "replace" ? { kind: "text" } : { kind: "array", elem: { kind: "text" } };
+  return { node: { kind: "regexFunc", func, args: rargs, program, compileCharged: false }, type };
 }
 
 // rejectNamed throws 42883 if any argument is named — named notation is valid only for a function
@@ -17243,6 +17317,65 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       // negated carries !~ / !~*: matched !== negated flips for the negated form.
       return { kind: "bool", value: matched !== e.negated };
+    }
+    case "regexFunc": {
+      m.charge(COSTS.operatorEval);
+      // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
+      const vals: Value[] = [];
+      for (const a of e.args) {
+        const v = evalExpr(a, row, env, m);
+        if (v.kind === "null") return nullValue();
+        vals.push(v);
+      }
+      const text = (v: Value): string => {
+        if (v.kind !== "text")
+          throw new Error("unreachable: resolver requires text regexp_* operands");
+        return v.text;
+      };
+      const source = text(vals[0]);
+      const pattern = text(vals[1]);
+      const replacement = e.func === "replace" ? text(vals[2]) : "";
+      const flags =
+        e.func === "replace" ? (vals[3] ? text(vals[3]) : "") : vals[2] ? text(vals[2]) : "";
+      // Validate flags: `i` (both), `g` (replace only); anything else is 2201B.
+      for (const c of flags) {
+        if (!(c === "i" || (c === "g" && e.func === "replace"))) {
+          throw engineError(
+            "invalid_regular_expression",
+            `invalid regular expression: invalid option "${c}"`,
+          );
+        }
+      }
+      const insensitive = flags.includes("i");
+      const global = flags.includes("g");
+      // The original-case subject (for output/captures) and the matched subject (folded when
+      // case-insensitive — same length, so offsets carry over, regex.md §8).
+      const origCps = Array.from(source, (ch) => ch.codePointAt(0) as number);
+      const prop = insensitive ? loadedProperty() : undefined;
+      const matchCps = insensitive
+        ? Array.from(foldLowerSimple(source, prop), (ch) => ch.codePointAt(0) as number)
+        : origCps;
+      let prog: RegexProgram;
+      if (e.program !== null) {
+        if (!e.compileCharged) {
+          e.compileCharged = true;
+          m.charge(COSTS.regexCompile * BigInt(regexNinst(e.program)));
+          m.guard();
+        }
+        prog = e.program;
+      } else {
+        const pat = insensitive ? foldLowerSimple(pattern, prop) : pattern;
+        prog = compileRegex(pat);
+        m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
+        m.guard();
+      }
+      if (e.func === "replace") {
+        const repl = Array.from(replacement, (ch) => ch.codePointAt(0) as number);
+        return { kind: "text", text: regexpReplace(prog, matchCps, origCps, repl, global, m) };
+      }
+      const groups = regexpMatch(prog, matchCps, origCps, m);
+      if (groups === null) return nullValue();
+      return arrayValue(groups.map((g) => (g === null ? nullValue() : { kind: "text", text: g })));
     }
     case "casing": {
       m.charge(COSTS.operatorEval);

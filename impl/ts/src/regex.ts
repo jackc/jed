@@ -666,10 +666,22 @@ export function regexIsMatch(p: RegexProgram, input: number[], m: Meter): boolea
   return regexRun(p, input, m) !== null;
 }
 
-// regexRun executes the Pike VM (regex.md §4). Returns the winning thread's capture slots on a match
-// (code-point offsets; -1 = unset), or null. Charges regex_step per explored state and guards once
-// per input position.
+// regexRun executes the Pike VM from the start of the input (regex.md §4). Returns the winning
+// thread's capture slots on a match (code-point offsets; -1 = unset), or null.
 export function regexRun(p: RegexProgram, input: number[], m: Meter): number[] | null {
+  return regexSearch(p, input, 0, m);
+}
+
+// regexSearch runs the Pike VM, considering only matches that START at code-point position `start` or
+// later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
+// input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
+// guards once per input position.
+export function regexSearch(
+  p: RegexProgram,
+  input: number[],
+  start: number,
+  m: Meter,
+): number[] | null {
   const nslots = 2 * (p.ngroups + 1);
   const len = input.length;
   const seen = new Int32Array(p.insts.length);
@@ -679,10 +691,10 @@ export function regexRun(p: RegexProgram, input: number[], m: Meter): number[] |
   let matched: number[] | null = null;
 
   generation++;
-  const start = new Array<number>(nslots).fill(-1);
-  addThread(p, clist, seen, generation, 0, start, 0, len, m);
+  const initSaves = new Array<number>(nslots).fill(-1);
+  addThread(p, clist, seen, generation, 0, initSaves, start, len, m);
 
-  for (let sp = 0; sp <= len; sp++) {
+  for (let sp = start; sp <= len; sp++) {
     generation++;
     nlist.length = 0;
     inner: for (let i = 0; i < clist.length; i++) {
@@ -765,6 +777,98 @@ function addThread(
         // char / any / class / match — parked for the consume loop.
         list.push({ pc: top.pc, saves: top.saves });
         break;
+    }
+  }
+}
+
+// regexpMatch is regexp_match(source, …) capture extraction (regex.md §8). Searches once; on a match
+// returns the capture group strings (groups 1..n, or a 1-element whole-match list when the pattern
+// has no group — the PG rule), an unset group being null. Returns null (the whole result) on no
+// match. matchInput is the (possibly case-folded) subject the VM matches; origInput is the
+// ORIGINAL-case subject the returned substrings are sliced from (same length).
+export function regexpMatch(
+  p: RegexProgram,
+  matchInput: number[],
+  origInput: number[],
+  m: Meter,
+): (string | null)[] | null {
+  const saves = regexSearch(p, matchInput, 0, m);
+  if (saves === null) return null;
+  if (p.ngroups === 0) return [sliceGroup(origInput, saves[0], saves[1])];
+  const groups: (string | null)[] = [];
+  for (let g = 1; g <= p.ngroups; g++) {
+    groups.push(sliceGroup(origInput, saves[2 * g], saves[2 * g + 1]));
+  }
+  return groups;
+}
+
+// regexpReplace is regexp_replace(source, pattern, replacement, …) (regex.md §8). Replaces the first
+// match (or all when global) by the replacement TEMPLATE (\1..\9 = capture group, \& = whole match,
+// \\ = literal backslash). Non-matched text and captured substrings come from origInput (original
+// case); the VM matches over matchInput (possibly case-folded).
+export function regexpReplace(
+  p: RegexProgram,
+  matchInput: number[],
+  origInput: number[],
+  replacement: number[],
+  global: boolean,
+  m: Meter,
+): string {
+  const out: number[] = [];
+  let pos = 0;
+  for (;;) {
+    const saves = regexSearch(p, matchInput, pos, m);
+    if (saves === null) break;
+    const s = saves[0];
+    const e = saves[1];
+    for (let i = pos; i < s; i++) out.push(origInput[i]);
+    spliceReplacement(out, replacement, saves, origInput);
+    if (!global) {
+      for (let i = e; i < origInput.length; i++) out.push(origInput[i]);
+      return String.fromCodePoint(...out);
+    }
+    if (e > s) {
+      pos = e;
+    } else {
+      // Empty match: emit the char at `e` (if any) and advance past it (the PG global rule).
+      if (e < origInput.length) out.push(origInput[e]);
+      pos = e + 1;
+    }
+    if (pos > origInput.length) return String.fromCodePoint(...out);
+  }
+  for (let i = pos; i < origInput.length; i++) out.push(origInput[i]);
+  return String.fromCodePoint(...out);
+}
+
+// sliceGroup slices orig[start..end] to a string, or null for an unset (-1) group.
+function sliceGroup(orig: number[], start: number, end: number): string | null {
+  if (start < 0 || end < 0) return null;
+  return String.fromCodePoint(...orig.slice(start, end));
+}
+
+// spliceReplacement appends a replacement template to out, expanding \1..\9 (capture group), \&
+// (whole match), \\ (literal backslash), and \<other> (the literal <other>). A trailing lone \ is
+// literal.
+function spliceReplacement(out: number[], repl: number[], saves: number[], orig: number[]): void {
+  for (let i = 0; i < repl.length; i++) {
+    const c = repl[i];
+    if (c === 0x5c /* \ */ && i + 1 < repl.length) {
+      const n = repl[i + 1];
+      if (n >= 0x30 && n <= 0x39 /* 0-9 */) {
+        const g = n - 0x30;
+        if (2 * g + 1 < saves.length) {
+          const grp = sliceGroup(orig, saves[2 * g], saves[2 * g + 1]);
+          if (grp !== null) for (const cp of grp) out.push(cp.codePointAt(0) as number);
+        }
+      } else if (n === 0x26 /* & */) {
+        const grp = sliceGroup(orig, saves[0], saves[1]);
+        if (grp !== null) for (const cp of grp) out.push(cp.codePointAt(0) as number);
+      } else {
+        out.push(n); // \\ -> \, and \<other> -> <other>
+      }
+      i++;
+    } else {
+      out.push(c);
     }
   }
 }

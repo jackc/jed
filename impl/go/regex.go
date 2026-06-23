@@ -812,10 +812,17 @@ func (p *regexProgram) isMatch(input []rune, m *Meter) (bool, error) {
 	return caps != nil, err
 }
 
-// run executes the Pike VM (regex.md §4). Returns the winning thread's capture slots on a match
-// (code-point offsets; -1 = unset), or nil. Charges regex_step per explored state and guards once
-// per input position.
+// run executes the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
+// capture slots on a match (code-point offsets; -1 = unset), or nil.
 func (p *regexProgram) run(input []rune, m *Meter) ([]int64, error) {
+	return p.search(input, 0, m)
+}
+
+// search runs the Pike VM, considering only matches that START at code-point position `start` or
+// later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
+// input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
+// guards once per input position.
+func (p *regexProgram) search(input []rune, start int, m *Meter) ([]int64, error) {
 	nslots := 2 * (p.ngroups + 1)
 	length := len(input)
 	seen := make([]uint32, len(p.insts))
@@ -825,15 +832,15 @@ func (p *regexProgram) run(input []rune, m *Meter) ([]int64, error) {
 	var matched []int64
 
 	generation++
-	start := make([]int64, nslots)
-	for i := range start {
-		start[i] = -1
+	initSaves := make([]int64, nslots)
+	for i := range initSaves {
+		initSaves[i] = -1
 	}
-	if err := p.addThread(&clist, seen, generation, 0, start, 0, length, m); err != nil {
+	if err := p.addThread(&clist, seen, generation, 0, initSaves, start, length, m); err != nil {
 		return nil, err
 	}
 
-	for sp := 0; sp <= length; sp++ {
+	for sp := start; sp <= length; sp++ {
 		generation++
 		nlist = nlist[:0]
 	inner:
@@ -920,4 +927,107 @@ func (p *regexProgram) addThread(list *[]regexThread, seen []uint32, generation 
 		}
 	}
 	return nil
+}
+
+// regexpMatch is regexp_match(source, …) capture extraction (regex.md §8). Searches once; on a match
+// returns the capture group strings (groups 1..n, or a 1-element whole-match list when the pattern
+// has no group — the PG rule), an unset group being a nil pointer. Returns ok=false on no match.
+// matchInput is the (possibly case-folded) subject the VM matches; origInput is the ORIGINAL-case
+// subject the returned substrings are sliced from (same length).
+func (p *regexProgram) regexpMatch(matchInput, origInput []rune, m *Meter) (groups []*string, ok bool, err error) {
+	saves, err := p.search(matchInput, 0, m)
+	if err != nil {
+		return nil, false, err
+	}
+	if saves == nil {
+		return nil, false, nil
+	}
+	if p.ngroups == 0 {
+		return []*string{sliceGroup(origInput, saves[0], saves[1])}, true, nil
+	}
+	groups = make([]*string, p.ngroups)
+	for g := 1; g <= p.ngroups; g++ {
+		groups[g-1] = sliceGroup(origInput, saves[2*g], saves[2*g+1])
+	}
+	return groups, true, nil
+}
+
+// regexpReplace is regexp_replace(source, pattern, replacement, …) (regex.md §8). Replaces the first
+// match (or all when global) by the replacement TEMPLATE (\1..\9 = capture group, \& = whole match,
+// \\ = literal backslash). Non-matched text and captured substrings come from origInput (original
+// case); the VM matches over matchInput (possibly case-folded).
+func (p *regexProgram) regexpReplace(matchInput, origInput, replacement []rune, global bool, m *Meter) (string, error) {
+	var out []rune
+	pos := 0
+	for {
+		saves, err := p.search(matchInput, pos, m)
+		if err != nil {
+			return "", err
+		}
+		if saves == nil {
+			break
+		}
+		s := int(saves[0])
+		e := int(saves[1])
+		out = append(out, origInput[pos:s]...)
+		out = spliceReplacement(out, replacement, saves, origInput)
+		if !global {
+			out = append(out, origInput[e:]...)
+			return string(out), nil
+		}
+		if e > s {
+			pos = e
+		} else {
+			// Empty match: emit the char at `e` (if any) and advance past it (the PG global rule).
+			if e < len(origInput) {
+				out = append(out, origInput[e])
+			}
+			pos = e + 1
+		}
+		if pos > len(origInput) {
+			return string(out), nil
+		}
+	}
+	out = append(out, origInput[pos:]...)
+	return string(out), nil
+}
+
+// sliceGroup slices orig[start:end] to a string pointer, or nil for an unset (-1) group.
+func sliceGroup(orig []rune, start, end int64) *string {
+	if start < 0 || end < 0 {
+		return nil
+	}
+	s := string(orig[start:end])
+	return &s
+}
+
+// spliceReplacement appends a replacement template to out, expanding \1..\9 (capture group), \&
+// (whole match), \\ (literal backslash), and \<other> (the literal <other>). A trailing lone \ is
+// literal.
+func spliceReplacement(out, repl []rune, saves []int64, orig []rune) []rune {
+	for i := 0; i < len(repl); i++ {
+		c := repl[i]
+		if c == '\\' && i+1 < len(repl) {
+			n := repl[i+1]
+			switch {
+			case n >= '0' && n <= '9':
+				g := int(n - '0')
+				if 2*g+1 < len(saves) {
+					if grp := sliceGroup(orig, saves[2*g], saves[2*g+1]); grp != nil {
+						out = append(out, []rune(*grp)...)
+					}
+				}
+			case n == '&':
+				if grp := sliceGroup(orig, saves[0], saves[1]); grp != nil {
+					out = append(out, []rune(*grp)...)
+				}
+			default:
+				out = append(out, n) // \\ -> \, and \<other> -> <other>
+			}
+			i++
+		} else {
+			out = append(out, c)
+		}
+	}
+	return out
 }

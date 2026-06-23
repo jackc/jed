@@ -1,0 +1,110 @@
+# Regular-expression scalar functions regexp_replace / regexp_match (spec/design/regex.md §8). jed's
+# RE2-able flavor over the same Pike VM as the `~` operators, but the BASIC subset tested here AGREES
+# with PostgreSQL, so these rows oracle-check. regexp_replace(source, pattern, replacement [, flags])
+# → text replaces the first match (or all with `g`) by the replacement TEMPLATE (\1..\9 group, \&
+# whole match, \\ backslash). regexp_match(source, pattern [, flags]) → text[] is the FIRST match's
+# capture array (groups 1..n, or [whole match] with no group; unset group → NULL; no match → NULL).
+# Both STRICT (NULL arg → NULL). flags: `i` case-insensitive, `g` global (replace only). Verified
+# against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, func.regexp_replace, func.regexp_match, expr.regex_match, types.i32, types.text, types.array, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# regexp_replace replaces the FIRST match by default.
+# Cost (cost.md §3): operatorEval + regex_compile (pattern 'o' = 7 instructions, once) + regex_step
+# (16 — one search over 'foobar') + 1 scanned + 1 page + 1 produced = 1+1+1+7+16+1.
+# names: regexp_replace
+# cost: 27
+query T nosort
+SELECT regexp_replace('foobar', 'o', 'X') FROM one
+----
+fXobar
+
+# The `g` flag replaces ALL matches.
+query T nosort
+SELECT regexp_replace('foobar', 'o', 'X', 'g') FROM one
+----
+fXXbar
+
+# The replacement is a TEMPLATE: \1 splices capture group 1.
+query T nosort
+SELECT regexp_replace('foobar', '(o+)', '[\1]') FROM one
+----
+f[oo]bar
+
+# \& splices the whole match.
+query T nosort
+SELECT regexp_replace('abc', 'b', '<\&>') FROM one
+----
+a<b>c
+
+# A pattern with no match leaves the source unchanged.
+query T nosort
+SELECT regexp_replace('abc', 'x', 'Y') FROM one
+----
+abc
+
+# The `i` flag matches case-insensitively; the spliced/unmatched text keeps its ORIGINAL case.
+query T nosort
+SELECT regexp_replace('FOO', 'o', 'X', 'i') FROM one
+----
+FXO
+
+# Global replace over a class.
+query T nosort
+SELECT regexp_replace('a1b2c3', '\d', '#', 'g') FROM one
+----
+a#b#c#
+
+# regexp_match with NO capturing group returns a 1-element array of the whole match.
+query T nosort
+SELECT regexp_match('foobar', 'o+') FROM one
+----
+{oo}
+
+# With capturing groups, the array holds groups 1..n.
+query T nosort
+SELECT regexp_match('foobar', '(o+)(b)') FROM one
+----
+{oo,b}
+
+# An unset (non-participating) optional group is a NULL element.
+query T nosort
+SELECT regexp_match('ac', '(a)(b)?(c)') FROM one
+----
+{a,NULL,c}
+
+# No match → NULL (the whole result, not an empty array).
+query T nosort
+SELECT regexp_match('abc', 'x') FROM one
+----
+NULL
+
+# Case-insensitive match returns the ORIGINAL-case captured text.
+query T nosort
+SELECT regexp_match('FOObar', '(o+)', 'i') FROM one
+----
+{OO}
+
+# STRICT: a NULL argument propagates to NULL.
+query T nosort
+SELECT regexp_replace(NULL, 'a', 'b') FROM one
+----
+NULL
+
+query T nosort
+SELECT regexp_match('abc', NULL) FROM one
+----
+NULL
+
+# A malformed pattern is 2201B (the compile-time error, surfaced at eval).
+statement error 2201B
+SELECT regexp_replace('a', '(', 'b') FROM one
+
+statement error 2201B
+SELECT regexp_match('a', 'a{2,1}') FROM one

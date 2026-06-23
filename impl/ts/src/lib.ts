@@ -88,6 +88,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
   // (array_append/prepend/cat).
   "func.array",
+  // Regex scalar functions (regex.md §8): regexp_replace → text and regexp_match → text[], over the
+  // same Pike VM as the operators; the first text- and text[]-returning scalar functions.
+  "func.regexp_replace",
+  "func.regexp_match",
   // Array function surface AF3 (array-functions.md §9): the polymorphic SRF unnest(anyarray) — a
   // FROM-clause row source expanding an array into one row per element (functions.md §10).
   "func.unnest",
