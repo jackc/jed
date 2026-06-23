@@ -1,0 +1,88 @@
+# Window functions S1 — ntile(n): distribute the partition into n ranked buckets (window.md §4).
+#
+# ntile(n) splits the partition's rows (in window ORDER BY order) into n buckets as evenly as
+# possible, larger buckets first, numbered 1..n. The bucket count is an integer evaluated once per
+# partition. i64, position-based (not peer-based), matching PostgreSQL. n <= 0 is 22014; a NULL n
+# yields NULL for every row.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_ntile, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 2, 40), (5, 2, 50)
+
+# ntile(2) over 5 rows: base=2, rem=1 → bucket 1 has 3 rows, bucket 2 has 2. v order = id order.
+# names: id, nt
+# cost: 16
+query II nosort
+SELECT id, ntile(2) OVER (ORDER BY v) AS nt FROM t ORDER BY id
+----
+1
+1
+2
+1
+3
+1
+4
+2
+5
+2
+
+# ntile(3) over 5 rows: 1,1,2,2,3 (buckets of size 2,2,1).
+# names: id, nt
+query II nosort
+SELECT id, ntile(3) OVER (ORDER BY v) AS nt FROM t ORDER BY id
+----
+1
+1
+2
+1
+3
+2
+4
+2
+5
+3
+
+# ntile(1) puts every row in bucket 1.
+# names: id, nt
+query II nosort
+SELECT id, ntile(1) OVER (ORDER BY v) AS nt FROM t ORDER BY id
+----
+1
+1
+2
+1
+3
+1
+4
+1
+5
+1
+
+# PARTITION BY g, ntile(2) within each partition. g=1 {id1,id2,id3} -> base=1,rem=1: 1,1,2;
+# g=2 {id4,id5} -> 1 each bucket: 1,2.
+# names: id, g, nt
+query III nosort
+SELECT id, g, ntile(2) OVER (PARTITION BY g ORDER BY v) AS nt FROM t ORDER BY id
+----
+1
+1
+1
+2
+1
+1
+3
+1
+2
+4
+2
+1
+5
+2
+2
+
+# ntile(0) is 22014 (argument must be greater than zero).
+statement error 22014
+SELECT ntile(0) OVER (ORDER BY v) FROM t

@@ -67,6 +67,13 @@ name = "division_by_zero"
 class = "data exception"
 template = "division by zero"
 
+# The bucket-count argument of ntile() must be > 0 (spec/design/window.md §4). PostgreSQL's code.
+[[error]]
+code = "22014"
+name = "invalid_argument_for_ntile"
+class = "data exception"
+template = "argument of ntile must be greater than zero"
+
 # nextval past a sequence bound without CYCLE (../design/sequences.md §4/§9).
 [[error]]
 code = "2200H"

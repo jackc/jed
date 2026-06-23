@@ -3795,4 +3795,15 @@ pub const WINDOWS: &[WindowDesc] = &[
         null: "never",
         errors: &[],
     },
+    WindowDesc {
+        name: "ntile",
+        surface: "NTILE",
+        args: "one",
+        arg_families: &["integer"],
+        result: "i64",
+        frame_sensitive: false,
+        requires_order: false,
+        null: "frame",
+        errors: &["22014"],
+    },
 ];

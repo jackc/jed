@@ -3793,4 +3793,15 @@ var Windows = []WindowDesc{
 		Null:           "never",
 		Errors:         []string{},
 	},
+	{
+		Name:           "ntile",
+		Surface:        "NTILE",
+		Args:           "one",
+		ArgFamilies:    []string{"integer"},
+		Result:         "i64",
+		FrameSensitive: false,
+		RequiresOrder:  false,
+		Null:           "frame",
+		Errors:         []string{"22014"},
+	},
 }

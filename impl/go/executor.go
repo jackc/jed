@@ -11342,7 +11342,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// keep their scan order, and the query ORDER BY below re-sorts the extended rows. A window query
 	// never enters the streaming fast-paths above.
 	if plan.hasWindow {
-		if err := applyWindowStage(rows, plan.windowSpecs, meter); err != nil {
+		if err := applyWindowStage(rows, plan.windowSpecs, env, meter); err != nil {
 			return selectResult{}, err
 		}
 	}
@@ -13301,6 +13301,10 @@ type windowSpec struct {
 	plan      windowPlan
 	partition []int
 	order     []orderSlot
+	// args holds the resolved function arguments (empty for the no-argument ranking functions;
+	// ntile's bucket count is one integer argument, evaluated once per partition). Future
+	// offset/value functions (lag/lead/nth_value, S2+) carry their value/offset/default here.
+	args []*rExpr
 }
 
 // windowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
@@ -13318,6 +13322,9 @@ const (
 	planPercentRank
 	// planCumeDist — CUME_DIST(): (rows through the current peer group)/N; decimal (divergence D2).
 	planCumeDist
+	// planNtile — NTILE(n): distribute the partition into n ranked buckets (larger first),
+	// numbered 1..n. Position-based (not peer-based); n <= 0 → 22014; NULL n → NULL for every row.
+	planNtile
 )
 
 // aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
@@ -14139,6 +14146,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		"percent_rank": planPercentRank,
 		"cume_dist":    planCumeDist,
 	}[name]
+	var wargs []*rExpr
 	switch {
 	case isNoArg:
 		if fc.Star || len(fc.Args) != 0 {
@@ -14152,6 +14160,22 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		}
 		plan = noArgDec
 		result = resolvedType{kind: rtDecimal}
+	case name == "ntile":
+		// ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh
+		// Forbidden sub-context (no aggregate/window nesting in a window argument).
+		if fc.Star || len(fc.Args) != 1 {
+			return nil, resolvedType{}, NewError(UndefinedFunction, "ntile takes exactly one argument")
+		}
+		anode, aty, err := resolve(s, *fc.Args[0], nil, &aggCtx{}, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if aty.kind != rtInt && aty.kind != rtNull {
+			return nil, resolvedType{}, typeError("argument of ntile must be integer")
+		}
+		wargs = append(wargs, anode)
+		plan = planNtile
+		result = resolvedType{kind: rtInt, intTy: Int64}
 	case isAggregateName(name):
 		return nil, resolvedType{}, NewError(FeatureNotSupported, "aggregate window functions are not supported yet")
 	default:
@@ -14169,7 +14193,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		return nil, resolvedType{}, NewError(WindowingError, "window functions are not allowed here")
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
-	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order})
+	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -20753,7 +20777,7 @@ func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
 // are unmetered (like ORDER BY / GROUP BY); each computed result charges window_result and guards
 // the ceiling. S0: row_number() only; partitions bucket value-canonically via an insertion-ordered
 // list, so no map iteration order leaks (CLAUDE.md §8/§10).
-func applyWindowStage(rows []Row, specs []windowSpec, meter *Meter) error {
+func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter) error {
 	n := len(rows)
 	if n == 0 {
 		return nil
@@ -20849,6 +20873,51 @@ func applyWindowStage(rows []Row, specs []windowSpec, meter *Meter) error {
 							}
 							results[ri] = DecimalValue(d)
 						}
+					}
+				}
+			case planNtile:
+				// ntile(n): distribute the partition into n ranked buckets, larger buckets first
+				// (window.md §4). n is evaluated once (the first sorted row); NULL n → NULL for all;
+				// n <= 0 → 22014. Position-based: bucket boundaries are by sorted position, not peers.
+				np := len(ordered)
+				nv, err := spec.args[0].eval(rows[ordered[0]], env, meter)
+				if err != nil {
+					return err
+				}
+				switch {
+				case nv.IsNull():
+					// NULL bucket count → NULL for every row (PG).
+					for _, ri := range ordered {
+						if err := meter.Guard(); err != nil {
+							return err
+						}
+						meter.Charge(Costs.WindowResult)
+						results[ri] = NullValue()
+					}
+				default:
+					nbuckets := nv.Int
+					if nbuckets <= 0 {
+						return NewError(InvalidArgumentForNtile, "argument of ntile must be greater than zero")
+					}
+					nb := int(nbuckets)
+					base := np / nb         // floor rows per bucket
+					rem := np % nb          // the first `rem` buckets get one extra row
+					big := rem * (base + 1) // rows in the larger (base+1) buckets
+					for pos, ri := range ordered {
+						if err := meter.Guard(); err != nil {
+							return err
+						}
+						meter.Charge(Costs.WindowResult)
+						// Larger buckets first: positions [0, big) → (base+1)-sized buckets, the rest
+						// → base-sized buckets. `base` is 0 only when nbuckets > np, and then every
+						// pos < big so the else branch never divides by 0.
+						var bucket int
+						if pos < big {
+							bucket = pos/(base+1) + 1
+						} else {
+							bucket = rem + (pos-big)/base + 1
+						}
+						results[ri] = IntValue(int64(bucket))
 					}
 				}
 			}

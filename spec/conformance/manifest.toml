@@ -281,6 +281,10 @@ id = "query.window_ratio"
 description = "Window ratio functions percent_rank() and cume_dist() (window.md §4, S1): peer-aware relative ranks. percent_rank = (rank-1)/(N-1), 0 when N=1; cume_dist = (rows through the current peer group)/N. Result DECIMAL via the exact division (select_div_scale + half-away, the AVG path), NOT PG float8 — divergence D2. Builds on query.window_ranking"
 
 [[capability]]
+id = "query.window_ntile"
+description = "Window ntile(n) (window.md §4, S1): distribute the partition into n ranked buckets, larger first, numbered 1..n; n an integer evaluated once per partition; n<=0 is 22014, NULL n yields NULL for all rows. i64, position-based, matching PostgreSQL. Builds on query.window"
+
+[[capability]]
 id = "query.union"
 description = "UNION / UNION ALL — combine two SELECTs' result rows; the bare form deduplicates (NULL-safe, value-canonical), ALL keeps multiplicities; output column count + names come from the left operand; per-column type unification (integer max-rank, integer<->decimal, all-NULL->text); arity mismatch 42601, type mismatch 42804; INTERSECT binds tighter; optional trailing ORDER BY/LIMIT/OFFSET resolves by output column name (spec/design/grammar.md §25)"
 

@@ -291,6 +291,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.window_ranking",
     // Window ratio functions percent_rank() / cume_dist() (S1, decimal — divergence D2, window.md §4).
     "query.window_ratio",
+    // Window ntile(n) (S1, window.md §4).
+    "query.window_ntile",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",

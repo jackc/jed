@@ -3306,6 +3306,22 @@ requires_order = false
 null           = "never"
 errors         = []
 
+# ntile(n) — distribute the partition's rows into n ranked buckets as evenly as possible (larger
+# buckets first), numbered 1..n. The bucket-count argument is an integer evaluated once per
+# partition; n <= 0 is 22014; a NULL n yields NULL for every row (PG). Position-based (NOT
+# peer-based), i64. (S1)
+[[window]]
+name           = "ntile"
+kind           = "window"
+surface        = "NTILE"
+args           = "one"
+arg_families   = ["integer"]
+result         = "i64"
+frame_sensitive = false
+requires_order = false
+null           = "frame"
+errors         = ["22014"]
+
 # === set-returning functions =================================================
 # A set-returning function (SRF) EXPANDS its arguments into a ROW SET — it fits neither the
 # operator mold (one value from infix operands) nor the aggregate mold (one value from a group):

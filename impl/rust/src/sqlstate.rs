@@ -26,6 +26,8 @@ pub enum SqlState {
     DatetimeFieldOverflow,
     /// 22012 — division by zero
     DivisionByZero,
+    /// 22014 — argument of ntile must be greater than zero
+    InvalidArgumentForNtile,
     /// 2200H — nextval: reached {bound} value of sequence {sequence}
     SequenceGeneratorLimitExceeded,
     /// 2201W — LIMIT must not be negative
@@ -145,6 +147,7 @@ impl SqlState {
             SqlState::InvalidDatetimeFormat => "22007",
             SqlState::DatetimeFieldOverflow => "22008",
             SqlState::DivisionByZero => "22012",
+            SqlState::InvalidArgumentForNtile => "22014",
             SqlState::SequenceGeneratorLimitExceeded => "2200H",
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInOffsetClause => "2201X",
@@ -221,6 +224,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "22007", name: "invalid_datetime_format", class: "data exception" },
     ErrorDesc { code: "22008", name: "datetime_field_overflow", class: "data exception" },
     ErrorDesc { code: "22012", name: "division_by_zero", class: "data exception" },
+    ErrorDesc { code: "22014", name: "invalid_argument_for_ntile", class: "data exception" },
     ErrorDesc { code: "2200H", name: "sequence_generator_limit_exceeded", class: "data exception" },
     ErrorDesc { code: "2201W", name: "invalid_row_count_in_limit_clause", class: "data exception" },
     ErrorDesc { code: "2201X", name: "invalid_row_count_in_offset_clause", class: "data exception" },

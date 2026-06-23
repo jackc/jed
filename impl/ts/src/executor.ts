@@ -7661,7 +7661,7 @@ export class Database {
     // keep their scan order, and the query ORDER BY below re-sorts the extended rows. A window query
     // never enters the streaming fast-paths above.
     if (plan.hasWindow) {
-      applyWindowStage(rows, plan.windowSpecs, meter);
+      applyWindowStage(rows, plan.windowSpecs, env, meter);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
@@ -10310,6 +10310,9 @@ type WindowSpec = {
   plan: WindowPlan;
   partition: number[];
   order: OrderSlot[];
+  // Resolved function arguments (empty for the no-argument ranking functions; ntile's bucket-count
+  // argument is the one entry). Evaluated against the partition's first sorted row (window.md §4).
+  args: RExpr[];
 };
 
 // WindowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
@@ -10324,7 +10327,9 @@ type WindowPlan =
   // PERCENT_RANK() — (rank-1)/(N-1), 0 when N=1; decimal (divergence D2).
   | "percentRank"
   // CUME_DIST() — (rows through the current peer group)/N; decimal (divergence D2).
-  | "cumeDist";
+  | "cumeDist"
+  // NTILE(n) — distribute the partition into n ranked buckets, larger buckets first; i64.
+  | "ntile";
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
 // For float SUM/AVG the inputs are COLLECTED in `floats` (the canonical fold needs all values up
@@ -10999,6 +11004,9 @@ function resolveWindowCall(
     percent_rank: "percentRank",
     cume_dist: "cumeDist",
   };
+  // Resolved function arguments (empty for the no-argument ranking functions; ntile's bucket-count
+  // argument is the one entry — window.md §4).
+  const wargs: RExpr[] = [];
   if (lname in noArgI64) {
     if (e.star || e.args.length !== 0) {
       throw engineError("undefined_function", `${lname} takes no arguments`);
@@ -11011,6 +11019,21 @@ function resolveWindowCall(
     }
     plan = noArgDecimal[lname]!;
     result = { kind: "decimal" };
+  } else if (lname === "ntile") {
+    // ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh Forbidden
+    // sub-context (no aggregate/window nesting in a window argument). The argument must be int or
+    // null (42804).
+    if (e.star || e.args.length !== 1) {
+      throw engineError("undefined_function", "ntile takes exactly one argument");
+    }
+    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const r = resolve(scope, e.args[0]!, null, sub, params);
+    if (r.type.kind !== "int" && r.type.kind !== "null") {
+      throw typeError("argument of ntile must be integer");
+    }
+    wargs.push(r.node);
+    plan = "ntile";
+    result = { kind: "int", ty: "i64" };
   } else if (isAggregateName(lname)) {
     throw engineError("feature_not_supported", "aggregate window functions are not supported yet");
   } else {
@@ -11025,7 +11048,7 @@ function resolveWindowCall(
     throw engineError("windowing_error", "window functions are not allowed here");
   }
   const slot = ag.window.base + ag.window.windowSpecs.length;
-  ag.window.windowSpecs.push({ plan, partition, order });
+  ag.window.windowSpecs.push({ plan, partition, order, args: wargs });
   return { node: { kind: "column", index: slot }, type: result };
 }
 
@@ -18847,7 +18870,7 @@ function not3(a: ThreeValued): ThreeValued {
 // the ceiling. S0: row_number() only; partitions bucket value-canonically via an insertion-ordered
 // list keyed by the value-canonical distinctRowKey (the aggregate-grouping discipline), so no
 // hash-map iteration order leaks (CLAUDE.md §8/§10).
-function applyWindowStage(rows: Row[], specs: WindowSpec[], meter: Meter): void {
+function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter: Meter): void {
   const n = rows.length;
   if (n === 0) return;
   // Copy each input row to a fresh array BEFORE appending: the scan yields references to the stored
@@ -18929,6 +18952,49 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], meter: Meter): void 
                   Decimal.fromBigInt(BigInt(end)).div(Decimal.fromBigInt(BigInt(np))),
                 );
               }
+            }
+          }
+          break;
+        }
+        // ntile(n): distribute the partition into n ranked buckets, larger buckets first
+        // (window.md §4). n is evaluated once (the first sorted row); NULL n → NULL for all;
+        // n ≤ 0 → 22014. Position-based: bucket boundaries are by sorted position, not peers.
+        case "ntile": {
+          const np = ordered.length;
+          const nval = evalExpr(spec.args[0]!, rows[ordered[0]!]!, env, meter);
+          if (nval.kind === "null") {
+            // NULL bucket count → NULL for every row (PG).
+            for (const ri of ordered) {
+              meter.guard();
+              meter.charge(COSTS.windowResult);
+              results[ri] = nullValue();
+            }
+          } else if (nval.kind === "int") {
+            if (nval.int <= 0n) {
+              throw engineError(
+                "invalid_argument_for_ntile",
+                "argument of ntile must be greater than zero",
+              );
+            }
+            // np is a safe number; nbuckets is an i64 bigint. base = floor(np/nbuckets),
+            // rem = np % nbuckets, big = rem*(base+1) — computed in bigint to avoid any
+            // precision loss for a huge nbuckets, then narrowed to number (all ≤ np, safe).
+            const npb = BigInt(np);
+            const base = Number(npb / nval.int); // floor rows per bucket
+            const rem = Number(npb % nval.int); // the first `rem` buckets get one extra row
+            const big = rem * (base + 1); // rows in the larger (base+1) buckets
+            for (let pos = 0; pos < ordered.length; pos++) {
+              const ri = ordered[pos]!;
+              meter.guard();
+              meter.charge(COSTS.windowResult);
+              // Larger buckets first: positions [0, big) → (base+1)-sized buckets, the rest →
+              // base-sized buckets. `base` is 0 only when nbuckets > np, and then every pos < big
+              // so the else branch never divides by 0.
+              const bucket =
+                pos < big
+                  ? Math.floor(pos / (base + 1)) + 1
+                  : rem + Math.floor((pos - big) / base) + 1;
+              results[ri] = intValue(BigInt(bucket));
             }
           }
           break;

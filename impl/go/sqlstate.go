@@ -29,6 +29,8 @@ const (
 	DatetimeFieldOverflow
 	// DivisionByZero is 22012 — division by zero.
 	DivisionByZero
+	// InvalidArgumentForNtile is 22014 — argument of ntile must be greater than zero.
+	InvalidArgumentForNtile
 	// SequenceGeneratorLimitExceeded is 2200H — nextval: reached {bound} value of sequence {sequence}.
 	SequenceGeneratorLimitExceeded
 	// InvalidRowCountInLimitClause is 2201W — LIMIT must not be negative.
@@ -154,6 +156,8 @@ func (s SqlState) Code() string {
 		return "22008"
 	case DivisionByZero:
 		return "22012"
+	case InvalidArgumentForNtile:
+		return "22014"
 	case SequenceGeneratorLimitExceeded:
 		return "2200H"
 	case InvalidRowCountInLimitClause:
@@ -283,6 +287,7 @@ var Errors = []ErrorDesc{
 	{Code: "22007", Name: "invalid_datetime_format", Class: "data exception"},
 	{Code: "22008", Name: "datetime_field_overflow", Class: "data exception"},
 	{Code: "22012", Name: "division_by_zero", Class: "data exception"},
+	{Code: "22014", Name: "invalid_argument_for_ntile", Class: "data exception"},
 	{Code: "2200H", Name: "sequence_generator_limit_exceeded", Class: "data exception"},
 	{Code: "2201W", Name: "invalid_row_count_in_limit_clause", Class: "data exception"},
 	{Code: "2201X", Name: "invalid_row_count_in_offset_clause", Class: "data exception"},

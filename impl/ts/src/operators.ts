@@ -3687,4 +3687,15 @@ export const WINDOWS: readonly WindowDesc[] = [
     null: "never",
     errors: [],
   },
+  {
+    name: "ntile",
+    surface: "NTILE",
+    args: "one",
+    argFamilies: ["integer"],
+    result: "i64",
+    frameSensitive: false,
+    requiresOrder: false,
+    null: "frame",
+    errors: ["22014"],
+  },
 ];

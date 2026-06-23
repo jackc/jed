@@ -9106,7 +9106,7 @@ impl Database {
         // `input_width + i`); the rows keep their scan order, and the query ORDER BY below re-sorts
         // the extended rows. A window query never enters the streaming fast-paths above.
         if plan.has_window {
-            apply_window_stage(&mut rows, &plan.window_specs, &mut meter)?;
+            apply_window_stage(&mut rows, &plan.window_specs, &env, &mut meter)?;
         }
 
         // ORDER BY: a stable sort applying each key left to right — the first non-equal key
@@ -13071,6 +13071,10 @@ struct WindowSpec {
     plan: WindowPlan,
     partition: Vec<usize>,
     order: Vec<crate::spill::SortKey>,
+    /// Resolved function arguments (empty for the no-argument ranking functions; `ntile`'s bucket
+    /// count is one integer argument, evaluated once per partition). Future offset/value functions
+    /// (lag/lead/nth_value, S2+) carry their value/offset/default here.
+    args: Vec<RExpr>,
 }
 
 /// The runtime plan for one window function (spec/design/window.md §4). S0: `row_number` only;
@@ -13087,6 +13091,9 @@ enum WindowPlan {
     PercentRank,
     /// `CUME_DIST()` — (# rows through the current peer group) / N; decimal (divergence D2).
     CumeDist,
+    /// `NTILE(n)` — distribute the partition into n ranked buckets (larger first), numbered 1..n.
+    /// Position-based (not peer-based); n ≤ 0 → 22014; NULL n → NULL for every row.
+    Ntile,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
@@ -14998,6 +15005,7 @@ fn resolve_window_call(
         "cume_dist" => Some(WindowPlan::CumeDist),
         _ => None,
     };
+    let mut wargs: Vec<RExpr> = Vec::new();
     let (plan, result) = if let Some(p) = no_arg_i64 {
         if star || !args.is_empty() {
             return Err(EngineError::new(
@@ -15014,6 +15022,22 @@ fn resolve_window_call(
             ));
         }
         (p, ResolvedType::Decimal)
+    } else if lname == "ntile" {
+        // ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh
+        // Forbidden sub-context (no aggregate/window nesting in a window argument).
+        if star || args.len() != 1 {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                "ntile takes exactly one argument",
+            ));
+        }
+        let mut sub = AggCtx::Forbidden;
+        let (anode, aty) = resolve(scope, &args[0], None, &mut sub, params)?;
+        if !matches!(aty, ResolvedType::Int(_) | ResolvedType::Null) {
+            return Err(type_error("argument of ntile must be integer"));
+        }
+        wargs.push(anode);
+        (WindowPlan::Ntile, ResolvedType::Int(ScalarType::Int64))
     } else if is_aggregate_name(&lname) {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
@@ -15044,6 +15068,7 @@ fn resolve_window_call(
         plan,
         partition,
         order,
+        args: wargs,
     });
     Ok((RExpr::Column(slot), result))
 }
@@ -23211,7 +23236,12 @@ fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()>
 /// (like ORDER BY / GROUP BY); each computed result charges `window_result` and guards the ceiling.
 /// S0: `row_number()` only; partitions bucket value-canonically via an insertion-ordered list, so
 /// no hash-map iteration order leaks (CLAUDE.md §8/§10).
-fn apply_window_stage(rows: &mut [Row], specs: &[WindowSpec], meter: &mut Meter) -> Result<()> {
+fn apply_window_stage(
+    rows: &mut [Row],
+    specs: &[WindowSpec],
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<()> {
     let n = rows.len();
     if n == 0 {
         return Ok(());
@@ -23299,6 +23329,48 @@ fn apply_window_stage(rows: &mut [Row], specs: &[WindowSpec], meter: &mut Meter)
                                 ),
                             };
                         }
+                    }
+                }
+                // ntile(n): distribute the partition into n ranked buckets, larger buckets first
+                // (window.md §4). n is evaluated once (the first sorted row); NULL n → NULL for all;
+                // n ≤ 0 → 22014. Position-based: bucket boundaries are by sorted position, not peers.
+                WindowPlan::Ntile => {
+                    let np = ordered.len();
+                    match spec.args[0].eval(&rows[ordered[0]], env, meter)? {
+                        // NULL bucket count → NULL for every row (PG).
+                        Value::Null => {
+                            for &ri in &ordered {
+                                meter.guard()?;
+                                meter.charge(COSTS.window_result);
+                                results[ri] = Value::Null;
+                            }
+                        }
+                        Value::Int(nbuckets) => {
+                            if nbuckets <= 0 {
+                                return Err(EngineError::new(
+                                    SqlState::InvalidArgumentForNtile,
+                                    "argument of ntile must be greater than zero",
+                                ));
+                            }
+                            let nbuckets = nbuckets as usize;
+                            let base = np / nbuckets; // floor rows per bucket
+                            let rem = np % nbuckets; // the first `rem` buckets get one extra row
+                            let big = rem * (base + 1); // rows in the larger (base+1) buckets
+                            for (pos, &ri) in ordered.iter().enumerate() {
+                                meter.guard()?;
+                                meter.charge(COSTS.window_result);
+                                // Larger buckets first: positions [0, big) → (base+1)-sized buckets,
+                                // the rest → base-sized buckets. `base` is 0 only when nbuckets > np,
+                                // and then every pos < big so the else branch never divides by 0.
+                                let bucket = if pos < big {
+                                    pos / (base + 1) + 1
+                                } else {
+                                    rem + (pos - big) / base + 1
+                                };
+                                results[ri] = Value::Int(bucket as i64);
+                            }
+                        }
+                        _ => unreachable!("ntile argument resolved to integer"),
                     }
                 }
             }
