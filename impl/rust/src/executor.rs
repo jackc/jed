@@ -9364,13 +9364,22 @@ impl Database {
             // Whole-table aggregation (no GROUP BY) is one pre-created empty-key group, so it
             // emits ONE row even over zero input (COUNT 0, others NULL); GROUP BY over an empty
             // table creates no groups -> zero rows.
+            // Per group: its key values, one Acc per aggregate, and one DISTINCT dedup set per
+            // DISTINCT aggregate (`None` for a plain aggregate — `COUNT(DISTINCT x)`,
+            // aggregates.md §5). The set is value-canonical (`Value`'s own Eq/Hash, so `1.5`/`1.50`
+            // and `-0`/`+0` collapse, identical to the group-key bucketing).
+            let new_accs =
+                || -> Vec<Acc> { plan.agg_specs.iter().map(|s| Acc::new(s.plan)).collect() };
+            let new_seen = || -> Vec<Option<HashSet<Value>>> {
+                plan.agg_specs
+                    .iter()
+                    .map(|s| s.distinct.then(HashSet::new))
+                    .collect()
+            };
             let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
-            let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
+            let mut groups: Vec<(Vec<Value>, Vec<Acc>, Vec<Option<HashSet<Value>>>)> = Vec::new();
             if plan.group_keys.is_empty() {
-                groups.push((
-                    Vec::new(),
-                    plan.agg_specs.iter().map(|s| Acc::new(s.plan)).collect(),
-                ));
+                groups.push((Vec::new(), new_accs(), new_seen()));
                 index.insert(Vec::new(), 0);
             }
             for row in &rows {
@@ -9381,10 +9390,7 @@ impl Database {
                     None => {
                         let i = groups.len();
                         index.insert(key.clone(), i);
-                        groups.push((
-                            key,
-                            plan.agg_specs.iter().map(|s| Acc::new(s.plan)).collect(),
-                        ));
+                        groups.push((key, new_accs(), new_seen()));
                         i
                     }
                 };
@@ -9394,12 +9400,21 @@ impl Database {
                         Some(op) => op.eval(row, &env, &mut meter)?,
                         None => Value::Null, // COUNT(*) ignores the value
                     };
+                    // DISTINCT: skip a NULL (never folded by any aggregate) and any value already
+                    // folded into this group — the FIRST occurrence in scan order wins, so the set
+                    // of folded values (and the decimal_work fold charges) is order-deterministic
+                    // and cross-core identical. `insert` returns false when the value is a repeat.
+                    if let Some(seen) = &mut groups[gi].2[si]
+                        && (matches!(v, Value::Null) || !seen.insert(v.clone()))
+                    {
+                        continue;
+                    }
                     groups[gi].1[si].fold(v, &mut meter)?;
                 }
             }
             // Build one synthetic row per group: [group_key_values..., aggregate_results...].
             let mut group_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-            for (key, accs) in groups {
+            for (key, accs, _seen) in groups {
                 let mut srow = key;
                 for acc in accs {
                     srow.push(acc.finalize()?);
@@ -13431,10 +13446,14 @@ enum AggPlan {
 }
 
 /// One resolved aggregate: its plan and its resolved argument expression (evaluated per
-/// input row against the real row). `operand` is `None` for COUNT(*).
+/// input row against the real row). `operand` is `None` for COUNT(*). `distinct` (`COUNT(DISTINCT
+/// x)`, aggregates.md §5) folds only the distinct non-NULL argument values — the fold loop keeps a
+/// per-group value-canonical set and skips a value already seen. Only set in the aggregation stage;
+/// a window aggregate is never DISTINCT (0A000, rejected at resolve).
 struct AggSpec {
     plan: AggPlan,
     operand: Option<RExpr>,
+    distinct: bool,
 }
 
 /// A running aggregate accumulator (one per AggSpec), folded per input row then finalized.
@@ -15533,6 +15552,7 @@ fn resolve_aggregate(
     name: &str,
     args: &[Expr],
     star: bool,
+    distinct: bool,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
@@ -15582,7 +15602,11 @@ fn resolve_aggregate(
     match agg {
         AggCtx::Collect { group_keys, specs } => {
             let slot = group_keys.len() + specs.len();
-            specs.push(AggSpec { plan, operand });
+            specs.push(AggSpec {
+                plan,
+                operand,
+                distinct,
+            });
             Ok((RExpr::Column(slot), result))
         }
         AggCtx::GroupedWindow {
@@ -15591,7 +15615,11 @@ fn resolve_aggregate(
             ..
         } => {
             let slot = group_keys.len() + agg_specs.len();
-            agg_specs.push(AggSpec { plan, operand });
+            agg_specs.push(AggSpec {
+                plan,
+                operand,
+                distinct,
+            });
             Ok((RExpr::Column(slot), result))
         }
         _ => unreachable!("an aggregate in a non-collecting context is handled above"),
@@ -16155,11 +16183,21 @@ fn resolve_func_call(
     args: &[Expr],
     arg_names: Option<&[Option<String>]>,
     star: bool,
+    distinct: bool,
     variadic: bool,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     let lname = name.to_ascii_lowercase();
+    // DISTINCT is an aggregate-only modifier: `abs(DISTINCT x)` is 42809 (PG's wrong_object_type,
+    // "DISTINCT specified, but <fn> is not an aggregate function" — aggregates.md §5). Checked
+    // before the per-kind dispatch so it covers every non-aggregate path (scalar, array, …).
+    if distinct && !is_aggregate_name(&lname) {
+        return Err(EngineError::new(
+            SqlState::WrongObjectType,
+            format!("DISTINCT specified, but {lname} is not an aggregate function"),
+        ));
+    }
     // The VARIADIC keyword is only valid on a VARIADIC function (array-functions.md §12). It
     // cannot decorate make_interval / an aggregate / an ordinary scalar function (PG: "VARIADIC
     // argument must be an array" arises only on a variadic function; a non-variadic function with
@@ -16220,7 +16258,7 @@ fn resolve_func_call(
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
     if is_aggregate_name(&lname) {
         reject_named(&lname, arg_names)?;
-        return resolve_aggregate(scope, &lname, args, star, agg, params);
+        return resolve_aggregate(scope, &lname, args, star, distinct, agg, params);
     }
     // The polymorphic array functions (array-functions.md §2) are also kind="function", so they
     // must be intercepted BEFORE the generic scalar path — their `anyarray`/`anyelement` slots need
@@ -18005,12 +18043,21 @@ fn resolve(
             args,
             arg_names,
             star,
+            distinct,
             variadic,
             over,
             over_name: _, // desugared to `over` before resolution (window.md §5)
         } => {
             // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
             if let Some(wd) = over {
+                // DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5):
+                // a window aggregate folds over a frame, where per-frame de-duplication is undefined.
+                if *distinct {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "DISTINCT is not implemented for window functions",
+                    ));
+                }
                 return resolve_window_call(scope, name, args, *star, wd, agg, params);
             }
             // A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's
@@ -18026,7 +18073,9 @@ fn resolve(
                 ));
             }
             let names = arg_names.as_deref().map(Vec::as_slice);
-            resolve_func_call(scope, name, args, names, *star, *variadic, agg, params)
+            resolve_func_call(
+                scope, name, args, names, *star, *distinct, *variadic, agg, params,
+            )
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),

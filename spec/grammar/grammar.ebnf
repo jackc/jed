@@ -927,8 +927,12 @@ extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
  * for a function that declares parameter names (make_interval); elsewhere it is 42883. The
  * final argument may be prefixed with the VARIADIC keyword (passing an array directly to a
  * variadic parameter — num_nulls(VARIADIC arr), ../design/array-functions.md §12); VARIADIC may
- * mark ONLY the last argument and does not combine with a name (parser-enforced, 42601). */
-function_call  ::= identifier "(" ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" over_clause?
+ * mark ONLY the last argument and does not combine with a name (parser-enforced, 42601).
+ * A leading DISTINCT (COUNT(DISTINCT x), ../design/aggregates.md §5) folds only the distinct
+ * argument values; it requires an argument (DISTINCT ")" is 42601) and may NOT combine with "*"
+ * (DISTINCT "*" is 42601). DISTINCT on a non-aggregate is 42809, on a window function 0A000
+ * (parser admits it; the resolver rejects). */
+function_call  ::= identifier "(" "DISTINCT"? ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" over_clause?
 function_arg   ::= ( identifier "=>" )? expr
 variadic_arg   ::= "VARIADIC" expr
 

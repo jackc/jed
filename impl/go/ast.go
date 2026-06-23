@@ -964,9 +964,9 @@ type IsDistinctExpr struct {
 // an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar function (abs/round, kind = "function",
 // spec/design/functions.md §9), or 42883 (undefined_function). Star is the COUNT(*) row-count
 // form (then Args is empty); otherwise Args is the comma-separated argument list — aggregates
-// and abs take one, round one or two. DISTINCT inside the parens is rejected at parse (42601).
-// An aggregate in WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md);
-// a scalar function is legal anywhere an expression is.
+// and abs take one, round one or two. Distinct carries a leading DISTINCT inside the parens
+// (COUNT(DISTINCT x), aggregates.md §5). An aggregate in WHERE/ON or nested in another aggregate
+// is 42803 (spec/design/aggregates.md); a scalar function is legal anywhere an expression is.
 //
 // ArgNames carries PostgreSQL named notation (name => value, grammar.md §17): nil ⇒ every
 // argument positional (the common case); otherwise it is parallel to Args, with a non-nil
@@ -981,6 +981,11 @@ type FuncCallExpr struct {
 	Args     []*Expr
 	ArgNames []*string
 	Star     bool
+	// Distinct is true when the argument was prefixed with DISTINCT (COUNT(DISTINCT x) —
+	// aggregates.md §5): the aggregate folds only the distinct non-NULL argument values. Only an
+	// aggregate accepts it — DISTINCT on a scalar function is 42809, on a window function 0A000,
+	// and f(DISTINCT *) / f(DISTINCT) is a 42601 syntax error.
+	Distinct bool
 	Variadic bool
 	// Over is set when the call carries a trailing OVER (...) window clause (a WINDOW-function
 	// call — spec/design/window.md). nil for an ordinary scalar/aggregate/SRF call. A window-only

@@ -11573,9 +11573,23 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		// group, so it emits ONE row even over zero input; GROUP BY over an empty table creates no
 		// groups -> zero rows. Each (row × aggregate) charges aggregate_accumulate; the operand's
 		// own operator_evals accrue via eval; the bucketing/finalize is unmetered (cost.md §3).
+		// Per group: its key values, one acc per aggregate, and one DISTINCT dedup set per
+		// DISTINCT aggregate (nil for a plain aggregate — COUNT(DISTINCT x), aggregates.md §5).
+		// The set keys on distinctRowKey, the same value-canonical form as the group-key
+		// bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
 		type group struct {
 			keys []Value
 			accs []*acc
+			seen []map[string]bool
+		}
+		newSeen := func() []map[string]bool {
+			s := make([]map[string]bool, len(plan.aggSpecs))
+			for i, spec := range plan.aggSpecs {
+				if spec.distinct {
+					s[i] = make(map[string]bool)
+				}
+			}
+			return s
 		}
 		newAccs := func() []*acc {
 			a := make([]*acc, len(plan.aggSpecs))
@@ -11587,7 +11601,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		index := make(map[string]int)
 		var groups []group
 		if len(plan.groupKeys) == 0 {
-			groups = append(groups, group{keys: nil, accs: newAccs()})
+			groups = append(groups, group{keys: nil, accs: newAccs(), seen: newSeen()})
 			index[""] = 0
 		}
 		for _, row := range rows {
@@ -11603,7 +11617,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 			if !ok {
 				gi = len(groups)
 				index[k] = gi
-				groups = append(groups, group{keys: keys, accs: newAccs()})
+				groups = append(groups, group{keys: keys, accs: newAccs(), seen: newSeen()})
 			}
 			for i, spec := range plan.aggSpecs {
 				meter.Charge(Costs.AggregateAccumulate)
@@ -11613,6 +11627,20 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 					if v, verr = spec.operand.eval(row, env, meter); verr != nil {
 						return selectResult{}, verr
 					}
+				}
+				// DISTINCT: skip a NULL (never folded by any aggregate) and any value already
+				// folded into this group — the FIRST occurrence in scan order wins, so the set of
+				// folded values (and the decimal_work fold charges) is order-deterministic and
+				// cross-core identical.
+				if seen := groups[gi].seen[i]; seen != nil {
+					if v.IsNull() {
+						continue
+					}
+					dk := distinctRowKey([]Value{v})
+					if seen[dk] {
+						continue
+					}
+					seen[dk] = true
 				}
 				if ferr := groups[gi].accs[i].fold(v, meter); ferr != nil {
 					return selectResult{}, ferr
@@ -13665,10 +13693,14 @@ const (
 )
 
 // aggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
-// row against the real row). operand is nil for COUNT(*).
+// row against the real row). operand is nil for COUNT(*). distinct (COUNT(DISTINCT x),
+// aggregates.md §5) folds only the distinct non-NULL argument values — the fold loop keeps a
+// per-group value-canonical set and skips a value already seen. Only set in the aggregation
+// stage; a window aggregate is never DISTINCT (0A000, rejected at resolve).
 type aggSpec struct {
-	plan    aggPlan
-	operand *rExpr
+	plan     aggPlan
+	operand  *rExpr
+	distinct bool
 }
 
 // acc is a running aggregate accumulator (one per aggSpec), folded per input row then finalized.
@@ -14866,7 +14898,7 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	}
 	// Aggregate results follow the group-key values in the synthetic row.
 	slot := len(ag.groupKeys) + len(ag.specs)
-	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand})
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -16724,6 +16756,13 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 // that declares parameter names (make_interval); on every other function it is 42883.
 func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	name := toLowerASCII(fc.Name)
+	// DISTINCT is an aggregate-only modifier: `abs(DISTINCT x)` is 42809 (PG's wrong_object_type,
+	// "DISTINCT specified, but <fn> is not an aggregate function" — aggregates.md §5). Checked
+	// before the per-kind dispatch so it covers every non-aggregate path (scalar, array, …).
+	if fc.Distinct && !isAggregateName(name) {
+		return nil, resolvedType{}, NewError(WrongObjectType,
+			fmt.Sprintf("DISTINCT specified, but %s is not an aggregate function", name))
+	}
 	// The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
 	// other (non-variadic) name it is 42883 (no such overload). Caught before the per-kind dispatch.
 	if fc.Variadic && !isVariadicFuncName(name) {
@@ -17820,6 +17859,12 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 	case ExprFuncCall:
 		// A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
 		if e.FuncCall.Over != nil {
+			// DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5):
+			// a window aggregate folds over a frame, where per-frame de-duplication is undefined.
+			if e.FuncCall.Distinct {
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"DISTINCT is not implemented for window functions")
+			}
 			return resolveWindowCall(s, e.FuncCall, ag, params)
 		}
 		// A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's wrong_object_type,

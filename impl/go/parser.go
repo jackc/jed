@@ -3749,11 +3749,21 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	if err := p.expect(TokLParen); err != nil {
 		return Expr{}, err
 	}
-	// DISTINCT inside a function call (COUNT(DISTINCT x)) is deferred — reject at parse.
-	if p.peekKeyword() == "distinct" {
-		return Expr{}, NewError(SyntaxError, "DISTINCT inside an aggregate is not supported yet")
-	}
 	fc := &FuncCallExpr{Name: name}
+	// A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct argument
+	// values. It is not reserved, but here — right after `(` — it is always the modifier.
+	// `DISTINCT *` and `DISTINCT )` (no argument) are both 42601 syntax errors (PG); the resolver
+	// rejects DISTINCT on a non-aggregate (42809) or a window function (0A000).
+	if p.peekKeyword() == "distinct" {
+		p.advance()
+		if p.peek().Kind == TokStar {
+			return Expr{}, NewError(SyntaxError, "DISTINCT cannot be used with *")
+		}
+		if p.peek().Kind == TokRParen {
+			return Expr{}, NewError(SyntaxError, "DISTINCT requires an aggregate argument")
+		}
+		fc.Distinct = true
+	}
 	anyNamed := false
 	switch {
 	case p.peek().Kind == TokStar:

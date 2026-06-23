@@ -2750,6 +2750,7 @@ impl Parser {
                 args: vec![zone, lhs],
                 arg_names: None,
                 star: false,
+                distinct: false,
                 variadic: false,
                 over: None,
                 over_name: None,
@@ -3159,6 +3160,7 @@ impl Parser {
                     args: Vec::new(),
                     arg_names: None,
                     star: false,
+                    distinct: false,
                     variadic: false,
                     over: None,
                     over_name: None,
@@ -3210,10 +3212,23 @@ impl Parser {
     fn parse_function_call(&mut self) -> Result<Expr> {
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
-        // DISTINCT inside a function call (COUNT(DISTINCT x)) is deferred — reject at parse.
-        if self.peek_keyword().as_deref() == Some("distinct") {
-            return Err(syntax("DISTINCT inside an aggregate is not supported yet"));
-        }
+        // A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct
+        // argument values. It is not reserved (a column may be named `distinct`), but here — right
+        // after `(` — it is always the modifier. `DISTINCT *` and `DISTINCT )` (no argument) are
+        // both 42601 syntax errors (PG); the resolver rejects DISTINCT on a non-aggregate (42809)
+        // or a window function (0A000).
+        let distinct = if self.peek_keyword().as_deref() == Some("distinct") {
+            self.advance();
+            if matches!(self.peek(), Token::Star) {
+                return Err(syntax("DISTINCT cannot be used with *"));
+            }
+            if matches!(self.peek(), Token::RParen) {
+                return Err(syntax("DISTINCT requires an aggregate argument"));
+            }
+            true
+        } else {
+            false
+        };
         let mut args = Vec::new();
         let mut arg_names: Vec<Option<String>> = Vec::new();
         let mut any_named = false;
@@ -3289,6 +3304,7 @@ impl Parser {
                     args,
                     arg_names,
                     star,
+                    distinct,
                     variadic,
                     over: None,
                     over_name,
@@ -3308,6 +3324,7 @@ impl Parser {
             args,
             arg_names,
             star,
+            distinct,
             variadic,
             over,
             over_name,

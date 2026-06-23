@@ -859,9 +859,10 @@ pub enum Expr {
     /// AVG, kind = "aggregate"), a scalar function (abs/round, kind = "function",
     /// spec/design/functions.md §9), or 42883 (undefined_function). `star` is the `COUNT(*)`
     /// row-count form (then `args` is empty); otherwise `args` is the comma-separated argument
-    /// list — aggregates and `abs` take one, `round` one or two. DISTINCT inside the parens is
-    /// rejected at parse (42601). An aggregate in WHERE/ON or nested in another aggregate is
-    /// 42803 (spec/design/aggregates.md); a scalar function is legal anywhere an expression is.
+    /// list — aggregates and `abs` take one, `round` one or two. `distinct` carries a leading
+    /// `DISTINCT` inside the parens (`COUNT(DISTINCT x)`, aggregates.md §5). An aggregate in
+    /// WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md); a scalar
+    /// function is legal anywhere an expression is.
     /// `arg_names` carries PostgreSQL named notation (`name => value`, grammar.md §17): `None`
     /// ⇒ every argument positional (the common case — no allocation, and the hot `Expr` enum
     /// stays small); `Some(boxed)` is a per-argument name vector parallel to `args` (`Some(name)`
@@ -872,6 +873,11 @@ pub enum Expr {
         args: Vec<Expr>,
         arg_names: Option<Box<Vec<Option<String>>>>,
         star: bool,
+        /// `true` when the argument was prefixed with `DISTINCT` (`COUNT(DISTINCT x)` —
+        /// aggregates.md §5): the aggregate folds only the distinct non-NULL argument values.
+        /// Only an aggregate accepts it — `DISTINCT` on a scalar function is 42809, on a window
+        /// function 0A000, and `f(DISTINCT *)` / `f(DISTINCT)` is a 42601 syntax error.
+        distinct: bool,
         /// `true` when the final argument was prefixed with the `VARIADIC` keyword
         /// (`num_nulls(VARIADIC arr)`, array-functions.md §12 / grammar.md §17): the array is
         /// passed directly to a variadic parameter rather than spreading individual arguments.

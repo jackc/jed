@@ -1,7 +1,8 @@
 # Whole-table aggregation (no GROUP BY) — multiple aggregates in one row, aggregates mixed
 # with constants/operators, and the misplacement errors (spec/design/aggregates.md §4/§5/§6).
 # An aggregate in WHERE / nested in another aggregate / a non-aggregated column alongside an
-# aggregate are all 42803; an unknown function is 42883; DISTINCT in an aggregate is 42601.
+# aggregate are all 42803; an unknown function is 42883. (DISTINCT in an aggregate is supported
+# — aggregates/distinct.test.)
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.i32, types.decimal, resource.cost_metering
 
 statement ok
@@ -56,9 +57,7 @@ SELECT SUM(COUNT(a)) FROM t
 statement error 42883
 SELECT bogus(a) FROM t
 
-# DISTINCT inside an aggregate is deferred -> 42601 (parse-time).
-statement error 42601
-SELECT COUNT(DISTINCT a) FROM t
+# DISTINCT inside an aggregate (COUNT(DISTINCT x)) is supported — see aggregates/distinct.test.
 
 # G29 — every aggregate over an EMPTY table yields ONE row: COUNT is 0 but SUM/AVG/MIN/MAX are all
 # NULL (count is the only aggregate with an identity element). Nothing is scanned; 1 produced = 1.

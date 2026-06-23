@@ -2481,6 +2481,7 @@ class Parser {
         args: [zone, lhs],
         argNames: [],
         star: false,
+        distinct: false,
         variadic: false,
       };
     }
@@ -2806,6 +2807,7 @@ class Parser {
           args: [],
           argNames: [],
           star: false,
+          distinct: false,
           variadic: false,
         };
       }
@@ -2835,9 +2837,20 @@ class Parser {
   private parseFunctionCall(): Expr {
     const name = this.expectIdentifier();
     this.expect("lparen");
-    // DISTINCT inside a function call (COUNT(DISTINCT x)) is deferred — reject at parse.
+    // A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct argument
+    // values. It is not reserved, but here — right after `(` — it is always the modifier.
+    // `DISTINCT *` and `DISTINCT )` (no argument) are both 42601 syntax errors (PG); the resolver
+    // rejects DISTINCT on a non-aggregate (42809) or a window function (0A000).
+    let distinct = false;
     if (this.peekKeyword() === "distinct") {
-      throw engineError("syntax_error", "DISTINCT inside an aggregate is not supported yet");
+      this.advance();
+      if (this.peek().kind === "star") {
+        throw engineError("syntax_error", "DISTINCT cannot be used with *");
+      }
+      if (this.peek().kind === "rparen") {
+        throw engineError("syntax_error", "DISTINCT requires an aggregate argument");
+      }
+      distinct = true;
     }
     const args: Expr[] = [];
     const names: (string | null)[] = [];
@@ -2897,7 +2910,17 @@ class Parser {
       // inline definition. A named reference is desugared to its definition at resolve.
       if (this.peek().kind !== "lparen") {
         overName = this.expectIdentifier();
-        return { kind: "funcCall", name, args, argNames, star, variadic, over: null, overName };
+        return {
+          kind: "funcCall",
+          name,
+          args,
+          argNames,
+          star,
+          distinct,
+          variadic,
+          over: null,
+          overName,
+        };
       }
       this.expect("lparen");
       // `[base] [PARTITION BY cols] [ORDER BY …] [frame]` — the shared definition body. A leading
@@ -2905,7 +2928,7 @@ class Parser {
       over = this.parseWindowDefinition();
       this.expect("rparen");
     }
-    return { kind: "funcCall", name, args, argNames, star, variadic, over, overName };
+    return { kind: "funcCall", name, args, argNames, star, distinct, variadic, over, overName };
   }
 
   // parseWindowFrame parses an optional window frame clause

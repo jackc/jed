@@ -7839,10 +7839,15 @@ export class Database {
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
       const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "f64"));
+      // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
+      // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
+      // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
+      const newSeen = (): (Set<string> | null)[] =>
+        plan.aggSpecs.map((s) => (s.distinct ? new Set<string>() : null));
       const index = new Map<string, number>();
-      const groups: { keys: Value[]; accs: Acc[] }[] = [];
+      const groups: { keys: Value[]; accs: Acc[]; seen: (Set<string> | null)[] }[] = [];
       if (plan.groupKeys.length === 0) {
-        groups.push({ keys: [], accs: newAccs() });
+        groups.push({ keys: [], accs: newAccs(), seen: newSeen() });
         index.set("", 0);
       }
       for (const row of rows) {
@@ -7853,12 +7858,23 @@ export class Database {
         if (gi === undefined) {
           gi = groups.length;
           index.set(k, gi);
-          groups.push({ keys, accs: newAccs() });
+          groups.push({ keys, accs: newAccs(), seen: newSeen() });
         }
         const accs = groups[gi]!.accs;
+        const seen = groups[gi]!.seen;
         plan.aggSpecs.forEach((spec, i) => {
           meter.charge(COSTS.aggregateAccumulate);
           const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
+          // DISTINCT: skip a NULL (never folded by any aggregate) and any value already folded into
+          // this group — the FIRST occurrence in scan order wins, so the set of folded values (and
+          // the decimalWork fold charges) is order-deterministic and cross-core identical.
+          const dedup = seen[i];
+          if (dedup) {
+            if (v.kind === "null") return;
+            const dk = distinctRowKey([v]);
+            if (dedup.has(dk)) return;
+            dedup.add(dk);
+          }
           foldAcc(accs[i]!, v, meter);
         });
       }
@@ -10534,11 +10550,15 @@ type AggPlan =
   | "max";
 
 // AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
-// row against the real row). operand is null for COUNT(*).
+// row against the real row). operand is null for COUNT(*). distinct (COUNT(DISTINCT x),
+// aggregates.md §5) folds only the distinct non-NULL argument values — the fold loop keeps a
+// per-group value-canonical set and skips a value already seen. Only set in the aggregation stage;
+// a window aggregate is never DISTINCT (0A000, rejected at resolve).
 type AggSpec = {
   plan: AggPlan;
   operand: RExpr | null;
   floatWidth?: ScalarType;
+  distinct?: boolean;
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -11409,7 +11429,7 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
 function resolveAggregate(
   scope: Scope,
-  e: { name: string; args: Expr[]; star: boolean },
+  e: { name: string; args: Expr[]; star: boolean; distinct: boolean },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -11456,7 +11476,7 @@ function resolveAggregate(
   }
   // Aggregate results follow the group-key values in the synthetic row.
   const slot = ag.groupKeys.length + ag.specs.length;
-  ag.specs.push({ plan, operand, floatWidth });
+  ag.specs.push({ plan, operand, floatWidth, distinct: e.distinct });
   return { node: { kind: "column", index: slot }, type: result };
 }
 
@@ -12082,12 +12102,22 @@ function resolveFuncCall(
     args: Expr[];
     argNames: (string | null)[];
     star: boolean;
+    distinct: boolean;
     variadic: boolean;
   },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   const lname = e.name.toLowerCase();
+  // DISTINCT is an aggregate-only modifier: `abs(DISTINCT x)` is 42809 (PG's wrong_object_type,
+  // "DISTINCT specified, but <fn> is not an aggregate function" — aggregates.md §5). Checked before
+  // the per-kind dispatch so it covers every non-aggregate path (scalar, array, …).
+  if (e.distinct && !isAggregateName(lname)) {
+    throw engineError(
+      "wrong_object_type",
+      `DISTINCT specified, but ${lname} is not an aggregate function`,
+    );
+  }
   // The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
   // other (non-variadic) name it is 42883 (no such overload). Caught before the per-kind dispatch.
   if (e.variadic && !isVariadicFuncName(lname)) throw noFuncOverload(lname);
@@ -14900,6 +14930,14 @@ function resolve(
     case "funcCall": {
       // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
       if (e.over !== undefined && e.over !== null) {
+        // DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5): a window
+        // aggregate folds over a frame, where per-frame de-duplication is undefined.
+        if (e.distinct) {
+          throw engineError(
+            "feature_not_supported",
+            "DISTINCT is not implemented for window functions",
+          );
+        }
         return resolveWindowCall(
           scope,
           { name: e.name, args: e.args, star: e.star, over: e.over },

@@ -258,7 +258,11 @@ description = "Qualified column references `rel.col` — resolved against the na
 
 [[capability]]
 id = "query.aggregates"
-description = "Scalar aggregate functions COUNT/SUM/MIN/MAX/AVG over the whole table (no GROUP BY): single-row result; COUNT(*) counts rows, COUNT(expr)/SUM/AVG/MIN/MAX skip NULL; COUNT->0 and SUM/AVG/MIN/MAX->NULL over empty/all-NULL; PG widening (SUM i16/i32->i64, i64->decimal, decimal->decimal; AVG->decimal; MIN/MAX->input type); overflow 22003; aggregate in WHERE/nested is 42803; unknown function 42883; DISTINCT-in-aggregate 42601 (spec/design/aggregates.md)"
+description = "Scalar aggregate functions COUNT/SUM/MIN/MAX/AVG over the whole table (no GROUP BY): single-row result; COUNT(*) counts rows, COUNT(expr)/SUM/AVG/MIN/MAX skip NULL; COUNT->0 and SUM/AVG/MIN/MAX->NULL over empty/all-NULL; PG widening (SUM i16/i32->i64, i64->decimal, decimal->decimal; AVG->decimal; MIN/MAX->input type); overflow 22003; aggregate in WHERE/nested is 42803; unknown function 42883; DISTINCT-in-aggregate is query.aggregate_distinct (spec/design/aggregates.md)"
+
+[[capability]]
+id = "query.aggregate_distinct"
+description = "DISTINCT inside an aggregate — COUNT(DISTINCT x), SUM/AVG/MIN/MAX(DISTINCT x) (aggregates.md §5): the aggregate folds only the distinct non-NULL argument values, deduplicated value-canonically (the same Eq/Hash as group-key bucketing, so 1.5 == 1.50 and -0.0 == 0.0) keeping the first occurrence in scan order; an all-NULL/empty distinct group is COUNT 0 and SUM/AVG NULL like any aggregate. Works whole-table and per GROUP. DISTINCT on a window function is 0A000 (DISTINCT is not implemented for window functions), on a non-aggregate (scalar) function is 42809; agg(DISTINCT *) and agg(DISTINCT) (no argument) are 42601; a wrong argument count stays 42883. Cost: aggregate_accumulate is still charged per (input row x aggregate); only the actual fold (and any decimal_work) is skipped for a duplicate, so the metered cost is deterministic and cross-core identical. Builds on query.aggregates"
 
 [[capability]]
 id = "query.group_by"

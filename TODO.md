@@ -121,7 +121,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Aggregates `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` + `GROUP BY` + `HAVING`** — first
       function-call syntax, whole-table + grouped aggregation, PG widening (SUM int→i64/decimal,
       AVG→decimal), grouping-error `42803`. → [aggregates.md](spec/design/aggregates.md)
-  - [ ] _follow-on:_ `COUNT(DISTINCT x)`, `SELECT DISTINCT` in an aggregate query, GROUP BY by
+  - [x] **`COUNT(DISTINCT x)` / aggregate `DISTINCT`** — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX(DISTINCT x)`
+        fold only the distinct non-NULL argument values, deduplicated value-canonically (the same
+        Eq/Hash as group-key bucketing, so `1.5 == 1.50` / `-0.0 == 0.0`), first occurrence in scan
+        order; composes with GROUP BY. `DISTINCT` on a window function is `0A000`, on a scalar
+        function `42809`; `agg(DISTINCT *)` / `agg(DISTINCT)` are `42601`. New capability
+        `query.aggregate_distinct`; cost unchanged (dedup is unmetered). → aggregates.md §5
+  - [ ] _follow-on:_ `SELECT DISTINCT` in an aggregate query, GROUP BY by
         expression/ordinal/alias, functional-dependency grouping, `GROUPING SETS`/`FILTER`/ordered-set.
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
       optimization.** Per-row values folded over a related row set in a dedicated **window stage**

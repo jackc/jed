@@ -654,9 +654,11 @@ by `COUNT`; `*` to any other function is a resolve error. Otherwise a call takes
 **comma-separated list of general expressions**: each aggregate takes exactly **one**
 (`SUM(a + 1)`, `MIN(t.c)`, `COUNT(expr)`) — a second argument matches no aggregate overload
 and is `42883`; `abs` takes **one** (`abs(a - b)`); `round` takes **one or two**
-(`round(x)`, `round(x, 2)`). **`DISTINCT` inside the parens** (`COUNT(DISTINCT x)`) is
-**deferred** — the parsers reject the `DISTINCT` token in an argument position as `42601`
-(it is added as a follow-on).
+(`round(x)`, `round(x, 2)`). **`DISTINCT` inside the parens** (`COUNT(DISTINCT x)`) folds
+only the distinct argument values ([aggregates.md](aggregates.md) §5): the parser accepts a
+leading `DISTINCT` (an argument is required, `DISTINCT )` is `42601`; it may not combine with
+`*`, `DISTINCT *` is `42601`), and the resolver rejects it on a non-aggregate (`42809`) or a
+window function (`0A000`).
 
 **The `*` token.** `*` is the same token as the `SELECT *` glob and the `mul` operator,
 disambiguated by position (§4): inside a function call's argument it is the `COUNT(*)`

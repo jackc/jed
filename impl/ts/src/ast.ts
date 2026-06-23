@@ -139,9 +139,10 @@ export type Expr =
   // spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
   // scalar function (abs/round, kind = "function", spec/design/functions.md §9), or 42883. `star`
   // is the COUNT(*) row-count form (then `args` is empty); otherwise `args` is the comma-separated
-  // argument list — aggregates and abs take one, round one or two. DISTINCT inside the parens is
-  // rejected at parse (42601). An aggregate in WHERE/ON or nested in another aggregate is 42803
-  // (spec/design/aggregates.md); a scalar function is legal anywhere an expression is. `argNames`
+  // argument list — aggregates and abs take one, round one or two. `distinct` carries a leading
+  // DISTINCT inside the parens (COUNT(DISTINCT x), aggregates.md §5). An aggregate in WHERE/ON or
+  // nested in another aggregate is 42803 (spec/design/aggregates.md); a scalar function is legal
+  // anywhere an expression is. `argNames`
   // carries PostgreSQL named notation (name => value, grammar.md §17): empty ⇒ every argument
   // positional (the common case); otherwise it is parallel to `args`, with a string for a named
   // slot and null for a positional one. The parser rejects a positional arg after a named one.
@@ -154,6 +155,11 @@ export type Expr =
       args: Expr[];
       argNames: (string | null)[];
       star: boolean;
+      // true when the argument was prefixed with DISTINCT (COUNT(DISTINCT x) — aggregates.md §5):
+      // the aggregate folds only the distinct non-NULL argument values. Only an aggregate accepts
+      // it — DISTINCT on a scalar function is 42809, on a window function 0A000, and
+      // f(DISTINCT *) / f(DISTINCT) is a 42601 syntax error.
+      distinct: boolean;
       variadic: boolean;
       // Set when the call carries a trailing `OVER (...)` window clause (a WINDOW-function call —
       // spec/design/window.md). null/undefined for an ordinary scalar/aggregate/SRF call. A

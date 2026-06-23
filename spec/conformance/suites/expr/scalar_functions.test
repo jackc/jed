@@ -230,5 +230,7 @@ INSERT INTO tx VALUES (1, 'hi')
 statement error 42883
 SELECT abs(s) FROM tx
 
-statement error 42601
+# DISTINCT is an aggregate-only modifier; on a scalar function it is 42809 (PG's
+# wrong_object_type, "DISTINCT specified, but abs is not an aggregate function" — aggregates.md §5).
+statement error 42809
 SELECT abs(DISTINCT i32) FROM n
