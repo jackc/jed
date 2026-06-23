@@ -1031,6 +1031,9 @@ pub enum BinaryOp {
     JsonHasKey,
     JsonHasAnyKey,
     JsonHasAllKeys,
+    // jsonb delete-at-path operator (spec/design/json-sql-functions.md §1, J6): `#-`. (The `||`
+    // concat reuses `Concat`, and `-` delete reuses `Sub` — both dispatched by operand type.)
+    JsonDeletePath,
 }
 
 /// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL

@@ -890,3 +890,183 @@ func jsonHasKey(node *JsonNode, key string) bool {
 		return false
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// Mutation operators (`|| - #-`, spec/design/json-sql-functions.md §1, J6).
+// ---------------------------------------------------------------------------------------------
+
+// cannotDelete builds the 22023 (invalid_parameter_value) error for an illegal delete target.
+func cannotDelete(msg string) *EngineError {
+	return NewError(InvalidParameterValue, msg)
+}
+
+// jsonConcat is `a || b` — concatenate / shallow-merge (PG): two objects merge with the RIGHT side
+// winning on a key conflict (result re-canonicalized); otherwise each operand is treated as an array
+// (an array stays, a non-array becomes a one-element array) and the two are concatenated.
+func jsonConcat(a, b *JsonNode) JsonNode {
+	if a.Kind == JObject && b.Kind == JObject {
+		out := make([]JsonMember, len(a.Obj))
+		copy(out, a.Obj)
+		for _, m := range b.Obj {
+			found := false
+			for i := range out {
+				if out[i].Key == m.Key {
+					out[i].Val = m.Val
+					found = true
+					break
+				}
+			}
+			if !found {
+				out = append(out, m)
+			}
+		}
+		// Insertion sort by canonical key order (small objects; byte-identical across cores).
+		for i := 1; i < len(out); i++ {
+			for j := i; j > 0 && jsonKeyCmp(out[j].Key, out[j-1].Key) < 0; j-- {
+				out[j], out[j-1] = out[j-1], out[j]
+			}
+		}
+		return JsonNode{Kind: JObject, Obj: out}
+	}
+	elems := jsonToArrayElems(a)
+	elems = append(elems, jsonToArrayElems(b)...)
+	return JsonNode{Kind: JArray, Arr: elems}
+}
+
+// jsonToArrayElems treats a node as an array for `||`: an array contributes its elements, any other
+// node becomes a single one-element list.
+func jsonToArrayElems(n *JsonNode) []JsonNode {
+	if n.Kind == JArray {
+		out := make([]JsonNode, len(n.Arr))
+		copy(out, n.Arr)
+		return out
+	}
+	return []JsonNode{*n}
+}
+
+// jsonDeleteKey is `jsonb - text` — delete a key from an object, or delete every matching string
+// element from an array; a scalar is `22023` ("cannot delete from scalar").
+func jsonDeleteKey(node *JsonNode, key string) (JsonNode, error) {
+	switch node.Kind {
+	case JObject:
+		out := make([]JsonMember, 0, len(node.Obj))
+		for _, m := range node.Obj {
+			if m.Key != key {
+				out = append(out, m)
+			}
+		}
+		return JsonNode{Kind: JObject, Obj: out}, nil
+	case JArray:
+		out := make([]JsonNode, 0, len(node.Arr))
+		for i := range node.Arr {
+			if node.Arr[i].Kind == JString && node.Arr[i].S == key {
+				continue
+			}
+			out = append(out, node.Arr[i])
+		}
+		return JsonNode{Kind: JArray, Arr: out}, nil
+	default:
+		return JsonNode{}, cannotDelete("cannot delete from scalar")
+	}
+}
+
+// jsonDeleteIndex is `jsonb - int` — delete the array element at an index (negative from the end;
+// out of range is a no-op). An object is `22023` ("cannot delete from object using integer index");
+// a scalar is `22023` ("cannot delete from scalar").
+func jsonDeleteIndex(node *JsonNode, idx int64) (JsonNode, error) {
+	switch node.Kind {
+	case JArray:
+		length := int64(len(node.Arr))
+		i := idx
+		if i < 0 {
+			i = length + i
+		}
+		if i < 0 || i >= length {
+			return *node, nil
+		}
+		out := make([]JsonNode, 0, len(node.Arr)-1)
+		out = append(out, node.Arr[:i]...)
+		out = append(out, node.Arr[i+1:]...)
+		return JsonNode{Kind: JArray, Arr: out}, nil
+	case JObject:
+		return JsonNode{}, cannotDelete("cannot delete from object using integer index")
+	default:
+		return JsonNode{}, cannotDelete("cannot delete from scalar")
+	}
+}
+
+// jsonDeleteKeys is `jsonb - text[]` — delete each key in turn (the `- text` rule applied per
+// element).
+func jsonDeleteKeys(node *JsonNode, keys []string) (JsonNode, error) {
+	cur := *node
+	for _, k := range keys {
+		next, err := jsonDeleteKey(&cur, k)
+		if err != nil {
+			return JsonNode{}, err
+		}
+		cur = next
+	}
+	return cur, nil
+}
+
+// jsonDeletePath is `jsonb #- text[]` — delete the element at a path. An empty path is a no-op (even
+// on a scalar); otherwise navigate to the parent and delete the last step (a key from an object, an
+// index from an array, negative from the end, out of range a no-op; a missing intermediate step a
+// no-op). A non-empty path that reaches a scalar is `22023` ("cannot delete path in scalar").
+func jsonDeletePath(node *JsonNode, path []string) (JsonNode, error) {
+	if len(path) == 0 {
+		return *node, nil
+	}
+	step, rest := path[0], path[1:]
+	switch node.Kind {
+	case JObject:
+		out := make([]JsonMember, len(node.Obj))
+		copy(out, node.Obj)
+		pos := -1
+		for i := range out {
+			if out[i].Key == step {
+				pos = i
+				break
+			}
+		}
+		if pos >= 0 {
+			if len(rest) == 0 {
+				out = append(out[:pos], out[pos+1:]...)
+			} else {
+				child, err := jsonDeletePath(&out[pos].Val, rest)
+				if err != nil {
+					return JsonNode{}, err
+				}
+				out[pos].Val = child
+			}
+		}
+		return JsonNode{Kind: JObject, Obj: out}, nil
+	case JArray:
+		idx, err := strconv.ParseInt(strings.TrimSpace(step), 10, 64)
+		if err != nil {
+			return *node, nil // a non-integer step misses
+		}
+		length := int64(len(node.Arr))
+		i := idx
+		if i < 0 {
+			i = length + i
+		}
+		if i < 0 || i >= length {
+			return *node, nil // out of range, no-op
+		}
+		out := make([]JsonNode, len(node.Arr))
+		copy(out, node.Arr)
+		if len(rest) == 0 {
+			out = append(out[:i], out[i+1:]...)
+		} else {
+			child, err := jsonDeletePath(&out[i], rest)
+			if err != nil {
+				return JsonNode{}, err
+			}
+			out[i] = child
+		}
+		return JsonNode{Kind: JArray, Arr: out}, nil
+	default:
+		return JsonNode{}, cannotDelete("cannot delete path in scalar")
+	}
+}

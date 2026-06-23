@@ -665,6 +665,139 @@ pub fn has_key(node: &JsonNode, key: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Mutation operators (`|| - #-`, spec/design/json-sql-functions.md §1, J6).
+// ---------------------------------------------------------------------------------------------
+
+fn cannot_delete(msg: &'static str) -> EngineError {
+    EngineError::new(SqlState::InvalidParameterValue, msg)
+}
+
+/// `a || b` — concatenate / shallow-merge (PG): two objects merge with the RIGHT side winning on a
+/// key conflict (result re-canonicalized); otherwise each operand is treated as an array (an array
+/// stays, a non-array becomes a one-element array) and the two are concatenated.
+pub fn concat(a: &JsonNode, b: &JsonNode) -> JsonNode {
+    match (a, b) {
+        (JsonNode::Object(ma), JsonNode::Object(mb)) => {
+            let mut out = ma.clone();
+            for (k, v) in mb {
+                if let Some(slot) = out.iter_mut().find(|(ek, _)| ek == k) {
+                    slot.1 = v.clone();
+                } else {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            out.sort_by(|(ka, _), (kb, _)| key_cmp(ka, kb));
+            JsonNode::Object(out)
+        }
+        _ => {
+            let mut elems = to_array_elems(a);
+            elems.extend(to_array_elems(b));
+            JsonNode::Array(elems)
+        }
+    }
+}
+
+fn to_array_elems(n: &JsonNode) -> Vec<JsonNode> {
+    match n {
+        JsonNode::Array(e) => e.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+/// `jsonb - text` — delete a key from an object, or delete every matching string element from an
+/// array; a scalar is `22023` ("cannot delete from scalar").
+pub fn delete_key(node: &JsonNode, key: &str) -> Result<JsonNode> {
+    match node {
+        JsonNode::Object(m) => Ok(JsonNode::Object(
+            m.iter().filter(|(k, _)| k != key).cloned().collect(),
+        )),
+        JsonNode::Array(e) => Ok(JsonNode::Array(
+            e.iter()
+                .filter(|x| !matches!(x, JsonNode::String(s) if s == key))
+                .cloned()
+                .collect(),
+        )),
+        _ => Err(cannot_delete("cannot delete from scalar")),
+    }
+}
+
+/// `jsonb - int` — delete the array element at an index (negative from the end; out of range is a
+/// no-op). An object is `22023` ("cannot delete from object using integer index"); a scalar is
+/// `22023` ("cannot delete from scalar").
+pub fn delete_index(node: &JsonNode, idx: i64) -> Result<JsonNode> {
+    match node {
+        JsonNode::Array(e) => {
+            let len = e.len() as i64;
+            let i = if idx < 0 { len + idx } else { idx };
+            if i >= 0 && i < len {
+                let mut out = e.clone();
+                out.remove(i as usize);
+                Ok(JsonNode::Array(out))
+            } else {
+                Ok(node.clone())
+            }
+        }
+        JsonNode::Object(_) => Err(cannot_delete(
+            "cannot delete from object using integer index",
+        )),
+        _ => Err(cannot_delete("cannot delete from scalar")),
+    }
+}
+
+/// `jsonb - text[]` — delete each key in turn (the `- text` rule applied per element).
+pub fn delete_keys(node: &JsonNode, keys: &[String]) -> Result<JsonNode> {
+    let mut cur = node.clone();
+    for k in keys {
+        cur = delete_key(&cur, k)?;
+    }
+    Ok(cur)
+}
+
+/// `jsonb #- text[]` — delete the element at a path. An empty path is a no-op (even on a scalar);
+/// otherwise navigate to the parent and delete the last step (a key from an object, an index from
+/// an array, negative from the end, out of range a no-op; a missing intermediate step a no-op). A
+/// non-empty path that reaches a scalar is `22023` ("cannot delete path in scalar").
+pub fn delete_path(node: &JsonNode, path: &[String]) -> Result<JsonNode> {
+    if path.is_empty() {
+        return Ok(node.clone());
+    }
+    let (step, rest) = (&path[0], &path[1..]);
+    match node {
+        JsonNode::Object(m) => {
+            // Find the keyed child; if absent, no-op.
+            let mut out = m.clone();
+            if let Some(pos) = out.iter().position(|(k, _)| k == step) {
+                if rest.is_empty() {
+                    out.remove(pos);
+                } else {
+                    out[pos].1 = delete_path(&out[pos].1, rest)?;
+                }
+            }
+            Ok(JsonNode::Object(out))
+        }
+        JsonNode::Array(e) => {
+            let idx: i64 = match step.trim().parse() {
+                Ok(v) => v,
+                Err(_) => return Ok(node.clone()), // a non-integer step misses
+            };
+            let len = e.len() as i64;
+            let i = if idx < 0 { len + idx } else { idx };
+            if i < 0 || i >= len {
+                return Ok(node.clone()); // out of range, no-op
+            }
+            let mut out = e.clone();
+            if rest.is_empty() {
+                out.remove(i as usize);
+            } else {
+                out[i as usize] = delete_path(&out[i as usize], rest)?;
+            }
+            Ok(JsonNode::Array(out))
+        }
+        _ => Err(cannot_delete("cannot delete path in scalar")),
+    }
+}
+
 /// JSON-escape a string the way PG `escape_json` does: quote, escape `"` and `\`, the short
 /// escapes for `\b \f \n \r \t`, other control chars (< 0x20) as `\u00XX`; `/` is NOT escaped
 /// and non-ASCII is emitted as raw UTF-8.

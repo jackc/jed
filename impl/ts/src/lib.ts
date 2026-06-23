@@ -88,6 +88,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.jsonb_access",
   // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).
   "func.jsonb_contains",
+  // jsonb mutation operators (J6) — `||` `-` `#-` (json-sql-functions.md §1).
+  "func.jsonb_mutate",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

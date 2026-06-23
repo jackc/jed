@@ -77,7 +77,11 @@ export type BinaryOp =
   // `?&` all keys exist. `boolean` result.
   | "jsonHasKey"
   | "jsonHasAnyKey"
-  | "jsonHasAllKeys";
+  | "jsonHasAllKeys"
+  // jsonDeletePath is the jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1,
+  // J6). (The `||` concat reuses "concat", and `-` delete reuses "sub" — both dispatched by operand
+  // type.)
+  | "jsonDeletePath";
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
 // The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A

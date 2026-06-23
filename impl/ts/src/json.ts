@@ -13,7 +13,7 @@
 // same C-collation byte order text uses), and the parser iterates over UTF-8 bytes.
 
 import { Decimal, EXP_LIMIT, decimalFromParts } from "./decimal.ts";
-import { engineError } from "./errors.ts";
+import { type EngineError, engineError } from "./errors.ts";
 
 // JsonNode is a `jsonb` node — the in-memory canonical tree (spec/design/json.md §2). Object members
 // are kept in canonical key order (shorter key first, ties bytewise) with duplicates removed
@@ -759,5 +759,140 @@ export function hasKey(node: JsonNode, key: string): boolean {
       return node.value === key;
     default:
       return false;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mutation operators (`|| - #-`, spec/design/json-sql-functions.md §1, J6).
+// ---------------------------------------------------------------------------------------------
+
+// cannotDelete builds the 22023 (invalid_parameter_value) error for an illegal delete target.
+function cannotDelete(msg: string): EngineError {
+  return engineError("invalid_parameter_value", msg);
+}
+
+// concat is `a || b` — concatenate / shallow-merge (PG): two objects merge with the RIGHT side
+// winning on a key conflict (result re-canonicalized); otherwise each operand is treated as an array
+// (an array stays, a non-array becomes a one-element array) and the two are concatenated.
+export function concat(a: JsonNode, b: JsonNode): JsonNode {
+  if (a.kind === "object" && b.kind === "object") {
+    const out: JsonMember[] = a.members.map((m) => ({ key: m.key, value: m.value }));
+    for (const m of b.members) {
+      let found = false;
+      for (let i = 0; i < out.length; i++) {
+        if (out[i]!.key === m.key) {
+          out[i]!.value = m.value;
+          found = true;
+          break;
+        }
+      }
+      if (!found) out.push({ key: m.key, value: m.value });
+    }
+    // Insertion sort by canonical key order (small objects; byte-identical across cores).
+    for (let i = 1; i < out.length; i++) {
+      for (let j = i; j > 0 && keyCmp(out[j]!.key, out[j - 1]!.key) < 0; j--) {
+        const tmp = out[j]!;
+        out[j] = out[j - 1]!;
+        out[j - 1] = tmp;
+      }
+    }
+    return { kind: "object", members: out };
+  }
+  const elems = toArrayElems(a);
+  elems.push(...toArrayElems(b));
+  return { kind: "array", elements: elems };
+}
+
+// toArrayElems treats a node as an array for `||`: an array contributes its elements, any other node
+// becomes a single one-element list.
+function toArrayElems(n: JsonNode): JsonNode[] {
+  if (n.kind === "array") return n.elements.slice();
+  return [n];
+}
+
+// deleteKey is `jsonb - text` — delete a key from an object, or delete every matching string element
+// from an array; a scalar is `22023` ("cannot delete from scalar").
+export function deleteKey(node: JsonNode, key: string): JsonNode {
+  switch (node.kind) {
+    case "object":
+      return { kind: "object", members: node.members.filter((m) => m.key !== key) };
+    case "array":
+      return {
+        kind: "array",
+        elements: node.elements.filter((e) => !(e.kind === "string" && e.value === key)),
+      };
+    default:
+      throw cannotDelete("cannot delete from scalar");
+  }
+}
+
+// deleteIndex is `jsonb - int` — delete the array element at an index (negative from the end; out of
+// range is a no-op). An object is `22023` ("cannot delete from object using integer index"); a scalar
+// is `22023` ("cannot delete from scalar").
+export function deleteIndex(node: JsonNode, idx: bigint): JsonNode {
+  switch (node.kind) {
+    case "array": {
+      const len = BigInt(node.elements.length);
+      const i = idx < 0n ? len + idx : idx;
+      if (i < 0n || i >= len) return node;
+      const out = node.elements.slice();
+      out.splice(Number(i), 1);
+      return { kind: "array", elements: out };
+    }
+    case "object":
+      throw cannotDelete("cannot delete from object using integer index");
+    default:
+      throw cannotDelete("cannot delete from scalar");
+  }
+}
+
+// deleteKeys is `jsonb - text[]` — delete each key in turn (the `- text` rule applied per element).
+export function deleteKeys(node: JsonNode, keys: string[]): JsonNode {
+  let cur = node;
+  for (const k of keys) cur = deleteKey(cur, k);
+  return cur;
+}
+
+// deletePath is `jsonb #- text[]` — delete the element at a path. An empty path is a no-op (even on a
+// scalar); otherwise navigate to the parent and delete the last step (a key from an object, an index
+// from an array, negative from the end, out of range a no-op; a missing intermediate step a no-op). A
+// non-empty path that reaches a scalar is `22023` ("cannot delete path in scalar").
+export function deletePath(node: JsonNode, path: string[]): JsonNode {
+  if (path.length === 0) return node;
+  const step = path[0]!;
+  const rest = path.slice(1);
+  switch (node.kind) {
+    case "object": {
+      const out: JsonMember[] = node.members.map((m) => ({ key: m.key, value: m.value }));
+      const pos = out.findIndex((m) => m.key === step);
+      if (pos >= 0) {
+        if (rest.length === 0) {
+          out.splice(pos, 1);
+        } else {
+          out[pos]!.value = deletePath(out[pos]!.value, rest);
+        }
+      }
+      return { kind: "object", members: out };
+    }
+    case "array": {
+      // A non-integer (or out-of-i64-range) step misses (no-op), matching Rust/Go ParseInt<i64>.
+      // Parse the trimmed step as a base-10 integer bounded to the signed-64-bit range.
+      const trimmed = step.trim();
+      if (!/^[+-]?\d+$/.test(trimmed)) return node;
+      const idx = BigInt(trimmed);
+      if (idx < -(2n ** 63n) || idx > 2n ** 63n - 1n) return node;
+      const len = BigInt(node.elements.length);
+      const i = idx < 0n ? len + idx : idx;
+      if (i < 0n || i >= len) return node; // out of range, no-op
+      const out = node.elements.slice();
+      if (rest.length === 0) {
+        out.splice(Number(i), 1);
+      } else {
+        out[Number(i)] = deletePath(out[Number(i)]!, rest);
+      }
+      return { kind: "array", elements: out };
+    }
+    default:
+      throw cannotDelete("cannot delete path in scalar");
   }
 }

@@ -511,6 +511,8 @@ var SupportedCapabilities = []string{
 	"func.jsonb_access",
 	// jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).
 	"func.jsonb_contains",
+	// jsonb mutation operators (J6) — `||` `-` `#-` (json-sql-functions.md §1).
+	"func.jsonb_mutate",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

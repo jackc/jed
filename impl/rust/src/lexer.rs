@@ -280,14 +280,17 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 }
             }
             b'#' => {
-                // `#>>` / `#>` are the jsonb get-at-path operators (json-sql-functions.md §1),
-                // scanned greedily (`#>>` before `#>`). `#-` (delete-at-path) is a J6 follow-on.
-                // A lone `#` is not part of jed's surface — 42601.
+                // `#>>` / `#>` (get-at-path) and `#-` (delete-at-path) are the jsonb path operators
+                // (json-sql-functions.md §1), scanned greedily (`#>>` before `#>`). A lone `#` is not
+                // part of jed's surface — 42601.
                 if bytes.get(i + 1) == Some(&b'>') && bytes.get(i + 2) == Some(&b'>') {
                     tokens.push(Token::HashArrowText);
                     i += 3;
                 } else if bytes.get(i + 1) == Some(&b'>') {
                     tokens.push(Token::HashArrow);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'-') {
+                    tokens.push(Token::HashMinus);
                     i += 2;
                 } else {
                     return Err(syntax("unexpected character '#'".to_string()));

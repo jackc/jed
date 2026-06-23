@@ -894,6 +894,10 @@ const (
 	OpJsonHasKey
 	OpJsonHasAnyKey
 	OpJsonHasAllKeys
+	// OpJsonDeletePath is the jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md
+	// §1, J6). (The `||` concat reuses OpConcat, and `-` delete reuses OpSub — both dispatched by
+	// operand type.)
+	OpJsonDeletePath
 )
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.

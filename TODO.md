@@ -342,7 +342,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         existence over text/text[]. Strict; `@>`/`<@` via the shared set-op dispatcher (json operand
         `42883`); `?` reuses a new token. New `RExpr::JsonContains`/`JsonHasKey`. Cap
         `func.jsonb_contains`. → json-sql-functions.md §1
-  - [ ] **J6** — mutation operators `||` / `-` / `#-`. → json-sql-functions.md §1
+  - [x] **J6** — ✅ mutation operators `||` (concat/shallow-merge: objects merge right-wins, else
+        array-wrap+concat) / `-` (delete key/element/keys: text key, int index neg-from-end, text[]
+        keys) / `#-` (delete at a text[] path); strict; delete-from-scalar / int-index-into-object /
+        path-in-scalar `22023`. `||` reuses `Concat`, `-` reuses `Sub` (dispatched by operand type);
+        `#-` a new token. A bare `'{a,c}'` is a single text KEY for `-` (verbatim, like PG) but a
+        text[] PATH for `#-`. New `RExpr::JsonConcat`/`JsonDelete`. Cap `func.jsonb_mutate`.
+        → json-sql-functions.md §1
   - [ ] **C0** — shared FROM-clause **column-definition-list** facility + multi-column synthetic
         table (the keystone for record functions, `json[b]_each`, and `JSON_TABLE`). → json-table.md §1
   - [ ] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +

@@ -254,7 +254,12 @@ import {
 } from "./value.ts";
 import {
   type JsonNode,
+  concat as jsonConcatKernel,
   contains as jsonContainsKernel,
+  deleteIndex as jsonDeleteIndex,
+  deleteKey as jsonDeleteKey,
+  deleteKeys as jsonDeleteKeys,
+  deletePath as jsonDeletePathKernel,
   getField,
   getIndex,
   getPath,
@@ -8211,10 +8216,12 @@ export class Database {
         return e;
       case "jsonGet":
       case "jsonHasKey":
+      case "jsonDelete":
         e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
         e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
         return e;
       case "jsonContains":
+      case "jsonConcat":
         e.a = this.foldUncorrelatedInRExpr(e.a, bound, ctes, cost);
         e.b = this.foldUncorrelatedInRExpr(e.b, bound, ctes, cost);
         return e;
@@ -8621,8 +8628,10 @@ function rexprIsConstant(e: RExpr): boolean {
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
     case "jsonGet":
     case "jsonHasKey":
+    case "jsonDelete":
       return rexprIsConstant(e.base) && rexprIsConstant(e.arg);
     case "jsonContains":
+    case "jsonConcat":
       return rexprIsConstant(e.a) && rexprIsConstant(e.b);
     case "casing":
       return rexprIsConstant(e.arg);
@@ -9598,8 +9607,10 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
     case "jsonGet":
     case "jsonHasKey":
+    case "jsonDelete":
       return rexprReferencesOuter(e.base, depth) || rexprReferencesOuter(e.arg, depth);
     case "jsonContains":
+    case "jsonConcat":
       return rexprReferencesOuter(e.a, depth) || rexprReferencesOuter(e.b, depth);
     case "casing":
       return rexprReferencesOuter(e.arg, depth);
@@ -9707,10 +9718,12 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "jsonGet":
     case "jsonHasKey":
+    case "jsonDelete":
       collectTouched(e.base, depth, touched);
       collectTouched(e.arg, depth, touched);
       return;
     case "jsonContains":
+    case "jsonConcat":
       collectTouched(e.a, depth, touched);
       collectTouched(e.b, depth, touched);
       return;
@@ -10311,6 +10324,14 @@ type RExpr =
   // `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (spec/design/json-sql-functions.md §1,
   // J5). `hasKeyKind` selects one-key / any-key / all-keys. Boolean; strict.
   | { kind: "jsonHasKey"; hasKeyKind: HasKeyKind; base: RExpr; arg: RExpr }
+  // `a || b` jsonb concatenate / shallow-merge (spec/design/json-sql-functions.md §1, J6). Result
+  // jsonb; strict (a NULL operand → SQL NULL).
+  | { kind: "jsonConcat"; a: RExpr; b: RExpr }
+  // `jsonb - text|int|text[]` (delete key/index/keys) and `jsonb #- text[]` (delete at path) — the J6
+  // mutation deletes (spec/design/json-sql-functions.md §1). `deleteKind` selects the form; `base` is
+  // the jsonb document, `arg` the key/index/key-array/path. Result jsonb; strict; a delete from a
+  // scalar (or an integer index into an object) is `22023`.
+  | { kind: "jsonDelete"; deleteKind: DeleteKind; base: RExpr; arg: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean; insensitive: boolean }
@@ -10459,6 +10480,12 @@ type JsonGetOp = "arrow" | "arrowText" | "hashArrow" | "hashArrowText";
 // (spec/design/json-sql-functions.md §1, J5): "one" `?` — a single key (text) exists; "any" `?|` —
 // any key of a `text[]` exists; "all" `?&` — all keys of a `text[]` exist.
 type HasKeyKind = "one" | "any" | "all";
+
+// DeleteKind selects which jsonb delete form a "jsonDelete" RExpr applies
+// (spec/design/json-sql-functions.md §1, J6): "key" `jsonb - text` — delete a key (object) or
+// matching string elements (array); "index" `jsonb - int` — delete the array element at an index;
+// "keys" `jsonb - text[]` — delete each key; "path" `jsonb #- text[]` — delete the element at a path.
+type DeleteKind = "key" | "index" | "keys" | "path";
 
 // ScalarFuncName is the internal identity of a scalar-function node. abs/round span int/decimal
 // AND float overloads; the rest (ceil…tan) are float-only (spec/design/float.md §8). The
@@ -16307,6 +16334,16 @@ function resolveBinary(
     case "mul":
     case "div":
     case "mod": {
+      // jsonb `-` is the delete operator (json-sql-functions.md §1, J6), NOT arithmetic — its right
+      // operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a jsonb LHS with
+      // `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ * / %` over a jsonb
+      // operand fall through and 42804 in the numeric path.)
+      if (op === "sub") {
+        const peek = resolve(scope, lhs, null, ag, params);
+        if (peek.type.kind === "jsonb") {
+          return resolveJsonbDelete(scope, false, rhs, peek.node, ag, params);
+        }
+      }
       // Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
       // integer literal adapts to an integer sibling), then pick the family: both integer →
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
@@ -16440,6 +16477,18 @@ function resolveBinary(
       return resolveJsonHasKey(scope, "any", lhs, rhs, ag, params);
     case "jsonHasAllKeys":
       return resolveJsonHasKey(scope, "all", lhs, rhs, ag, params);
+    // The jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1, J6). `||` and
+    // `-` (delete) are dispatched by operand type in resolveConcat / the arithmetic arm.
+    case "jsonDeletePath": {
+      const rbase = resolve(scope, lhs, "jsonb", ag, params);
+      if (rbase.type.kind !== "jsonb" && rbase.type.kind !== "null") {
+        throw engineError(
+          "undefined_function",
+          `operator does not exist: ${rtName(rbase.type)} #- text[]`,
+        );
+      }
+      return resolveJsonbDelete(scope, true, rhs, rbase.node, ag, params);
+    }
     default: {
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
@@ -16478,6 +16527,10 @@ function resolveConcat(
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
   let rr = resolve(scope, rhs, null, ag, params);
+  // JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
+  if (rl.type.kind === "jsonb" || rr.type.kind === "jsonb") {
+    return resolveJsonbConcat(scope, lhs, rhs, ag, params);
+  }
   // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
   let hint: ScalarType | null = null;
   if (rl.type.kind === "array") hint = elemScalarHint(rl.type.elem);
@@ -16779,6 +16832,94 @@ function hasKeySymbol(kind: HasKeyKind): string {
   }
 }
 
+// resolveJsonbConcat resolves a jsonb `||` concatenation/merge (json-sql-functions.md §1, J6). Both
+// operands must be jsonb (a string literal adapts via `jsonbIn`). Result jsonb; strict.
+function resolveJsonbConcat(
+  scope: Scope,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const resolveJsonb = (e: Expr): RExpr => {
+    const { node, type } = resolve(scope, e, "jsonb", ag, params);
+    if (type.kind === "jsonb" || type.kind === "null") return node;
+    throw engineError("undefined_function", `operator does not exist: ${rtName(type)} || jsonb`);
+  };
+  const a = resolveJsonb(lhs);
+  const b = resolveJsonb(rhs);
+  return { node: { kind: "jsonConcat", a, b }, type: { kind: "jsonb" } };
+}
+
+// resolveJsonbDelete resolves a jsonb delete operator: `-` (key `text` / index `int` / keys
+// `text[]`) or `#-` (path `text[]`) — json-sql-functions.md §1, J6. The base is already resolved
+// (rbase, jsonb-typed). The form is chosen by the argument type; a bare `'{a,b}'` string literal
+// adapts to `text[]` only for `#-` (for `-` it is a single text key, verbatim like PG). Result
+// jsonb; strict.
+function resolveJsonbDelete(
+  scope: Scope,
+  isPath: boolean,
+  rhs: Expr,
+  rbase: RExpr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  let kind: DeleteKind;
+  let rarg: RExpr;
+  if (isPath) {
+    // `#-` always takes a text[] path (a bare '{a,b}' literal adapts via array_in).
+    kind = "path";
+    rarg = resolveTextArrayArg(scope, rhs, "#-", ag, params);
+  } else if (rhs.kind === "literal" && rhs.literal.kind === "text") {
+    // A bare string literal is a text key (`jsonb - 'a'`), NOT a text[].
+    const r = resolve(scope, rhs, "text", ag, params);
+    kind = "key";
+    rarg = r.node;
+  } else {
+    const r = resolve(scope, rhs, null, ag, params);
+    const t = r.type;
+    if (t.kind === "text" || t.kind === "null") {
+      kind = "key";
+      rarg = r.node;
+    } else if (t.kind === "int") {
+      kind = "index";
+      rarg = r.node;
+    } else if (t.kind === "array" && t.elem.kind === "text") {
+      kind = "keys";
+      rarg = r.node;
+    } else {
+      throw engineError(
+        "undefined_function",
+        `operator does not exist: jsonb - ${rtName(t)} (expected text, integer, or text[])`,
+      );
+    }
+  }
+  return {
+    node: { kind: "jsonDelete", deleteKind: kind, base: rbase, arg: rarg },
+    type: { kind: "jsonb" },
+  };
+}
+
+// resolveTextArrayArg resolves a `text[]` operator argument (the `#-` path): a bare string literal
+// `'{a,b}'` adapts via `coerceStringToArray`; otherwise the resolved type must be `text[]` (or NULL).
+// `sym` is the operator symbol for the error message.
+function resolveTextArrayArg(
+  scope: Scope,
+  rhs: Expr,
+  sym: string,
+  ag: AggCtx,
+  params: ParamTypes,
+): RExpr {
+  if (rhs.kind === "literal" && rhs.literal.kind === "text") {
+    const val = coerceStringToArray(rhs.literal.text, { kind: "scalar", scalar: "text" });
+    return valueToRExpr(val);
+  }
+  const r = resolve(scope, rhs, null, ag, params);
+  const t = r.type;
+  if ((t.kind === "array" && t.elem.kind === "text") || t.kind === "null") return r.node;
+  throw engineError("undefined_function", `the ${sym} operator's right argument must be text[]`);
+}
+
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).
 function rangeOpFor(op: BinaryOp): RangeOpName {
   switch (op) {
@@ -17066,6 +17207,8 @@ function binaryOpSymbol(op: BinaryOp): string {
       return "?|";
     case "jsonHasAllKeys":
       return "?&";
+    case "jsonDeletePath":
+      return "#-";
   }
 }
 
@@ -19632,6 +19775,64 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
       }
       return { kind: "bool", value: result };
+    }
+    case "jsonConcat": {
+      // `a || b` jsonb concatenate / shallow-merge (json-sql-functions.md §1, J6). One
+      // operator_eval; STRICT — a NULL operand yields SQL NULL.
+      m.charge(COSTS.operatorEval);
+      const av = evalExpr(e.a, row, env, m);
+      const bv = evalExpr(e.b, row, env, m);
+      m.guard();
+      if (av.kind === "null" || bv.kind === "null") return nullValue();
+      if (av.kind !== "jsonb" || bv.kind !== "jsonb")
+        throw new Error("resolver guarantees jsonb operands for ||");
+      return jsonbValue(jsonConcatKernel(av.node, bv.node));
+    }
+    case "jsonDelete": {
+      // `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
+      // J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
+      m.charge(COSTS.operatorEval);
+      const bv = evalExpr(e.base, row, env, m);
+      const av = evalExpr(e.arg, row, env, m);
+      m.guard();
+      if (bv.kind === "null" || av.kind === "null") return nullValue();
+      if (bv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb base for - / #-");
+      const node = bv.node;
+      // Extract a text[] argument's keys (a NULL element propagates to a NULL result, PG).
+      const textArray = (v: Value): string[] | null => {
+        if (v.kind !== "array") return null;
+        const keys: string[] = [];
+        for (const el of v.elements) {
+          if (el.kind !== "text") return null; // a NULL element → NULL result
+          keys.push(el.text);
+        }
+        return keys;
+      };
+      let result: JsonNode;
+      switch (e.deleteKind) {
+        case "key":
+          if (av.kind !== "text") throw new Error("resolver guarantees a text arg for - key");
+          result = jsonDeleteKey(node, av.text);
+          break;
+        case "index":
+          if (av.kind !== "int") throw new Error("resolver guarantees an int arg for - index");
+          result = jsonDeleteIndex(node, av.int);
+          break;
+        case "keys": {
+          const keys = textArray(av);
+          if (keys === null) return nullValue();
+          result = jsonDeleteKeys(node, keys);
+          break;
+        }
+        default: {
+          // "path"
+          const path = textArray(av);
+          if (path === null) return nullValue();
+          result = jsonDeletePathKernel(node, path);
+          break;
+        }
+      }
+      return jsonbValue(result);
     }
     case "isNull": {
       m.charge(COSTS.operatorEval);

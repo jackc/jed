@@ -13325,6 +13325,14 @@ const (
 	// (spec/design/json-sql-functions.md §1, J5). `hasKey` selects one-key / any-key / all-keys;
 	// `lhs` is the jsonb base, `rhs` the text key or text[] of keys. Boolean; strict.
 	reJsonHasKey
+	// reJsonConcat is `a || b` jsonb concatenate / shallow-merge (spec/design/json-sql-functions.md
+	// §1, J6). `lhs`/`rhs` are the two jsonb operands. Result jsonb; strict (a NULL operand → NULL).
+	reJsonConcat
+	// reJsonDelete is `jsonb - text|int|text[]` (delete key/index/keys) and `jsonb #- text[]` (delete
+	// at path) — the J6 mutation deletes (spec/design/json-sql-functions.md §1). `delKind` selects the
+	// form; `lhs` is the jsonb document, `rhs` the key/index/key-array/path. Result jsonb; strict; a
+	// delete from a scalar (or an integer index into an object) is `22023`.
+	reJsonDelete
 )
 
 // jsonGetOp selects which jsonb accessor operator an reJsonGet node applies
@@ -13346,6 +13354,17 @@ const (
 	hkOne hasKeyKind = iota // `?` — a single key (text) exists.
 	hkAny                   // `?|` — any key of a `text[]` exists.
 	hkAll                   // `?&` — all keys of a `text[]` exist.
+)
+
+// deleteKind selects which jsonb delete form an reJsonDelete node applies
+// (spec/design/json-sql-functions.md §1, J6).
+type deleteKind int
+
+const (
+	dkKey   deleteKind = iota // `jsonb - text` — delete a key (object) or matching string elements (array).
+	dkIndex                   // `jsonb - int` — delete the array element at an index.
+	dkKeys                    // `jsonb - text[]` — delete each key.
+	dkPath                    // `jsonb #- text[]` — delete the element at a path.
 )
 
 // subqueryKind selects which subquery form an reSubquery node is (spec/design/grammar.md §26).
@@ -13603,6 +13622,10 @@ type rExpr struct {
 	// reJsonHasKey: which key-existence operator (`?`/`?|`/`?&`) — one-key / any-key / all-keys.
 	// `lhs` is the jsonb base, `rhs` the text key (`?`) or text[] of keys (`?|`/`?&`).
 	hasKey hasKeyKind
+
+	// reJsonDelete: which delete form (`-` key/index/keys, `#-` path). `lhs` is the jsonb base,
+	// `rhs` the key (text) / index (int) / keys-or-path (text[]) argument.
+	delKind deleteKind
 
 	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
 	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
@@ -16777,6 +16800,10 @@ func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rE
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
+	// JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
+	if lt.kind == rtJsonb || rt.kind == rtJsonb {
+		return resolveJSONbConcat(s, lhs, rhs, ag, params)
+	}
 	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
 	var hint *ScalarType
 	if lt.kind == rtArray {
@@ -17335,6 +17362,104 @@ func hasKeySymbol(kind hasKeyKind) string {
 	}
 }
 
+// resolveJSONbConcat resolves a jsonb `||` concatenation/merge (json-sql-functions.md §1, J6). Both
+// operands must be jsonb (a string literal adapts via `jsonbIn`). Result jsonb; strict.
+func resolveJSONbConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	jsonbHint := Jsonb
+	resolveJSONb := func(e Expr) (*rExpr, error) {
+		r, t, err := resolve(s, e, &jsonbHint, ag, params)
+		if err != nil {
+			return nil, err
+		}
+		switch t.kind {
+		case rtJsonb, rtNull:
+			return r, nil
+		default:
+			return nil, NewError(UndefinedFunction,
+				fmt.Sprintf("operator does not exist: %s || jsonb", rtName(t)))
+		}
+	}
+	a, err := resolveJSONb(lhs)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	b, err := resolveJSONb(rhs)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	return &rExpr{kind: reJsonConcat, lhs: a, rhs: b}, resolvedType{kind: rtJsonb}, nil
+}
+
+// resolveJSONbDelete resolves a jsonb delete operator: `-` (key `text` / index `int` / keys
+// `text[]`) or `#-` (path `text[]`) — json-sql-functions.md §1, J6. The base is already resolved
+// (rbase, jsonb-typed). The form is chosen by the argument type; a bare `'{a,b}'` string literal
+// adapts to `text[]` only for `#-` (for `-` it is a single text key, verbatim like PG). Result
+// jsonb; strict.
+func resolveJSONbDelete(s *scope, isPath bool, rhs Expr, rbase *rExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	var kind deleteKind
+	var rarg *rExpr
+	switch {
+	case isPath:
+		// `#-` always takes a text[] path (a bare '{a,b}' literal adapts via array_in).
+		r, err := resolveTextArrayArg(s, rhs, "#-", ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		kind, rarg = dkPath, r
+	case rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText:
+		// A bare string literal is a text key (`jsonb - 'a'`), NOT a text[].
+		textHint := Text
+		r, _, err := resolve(s, rhs, &textHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		kind, rarg = dkKey, r
+	default:
+		r, t, err := resolve(s, rhs, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		switch {
+		case t.kind == rtText || t.kind == rtNull:
+			kind, rarg = dkKey, r
+		case t.kind == rtInt:
+			kind, rarg = dkIndex, r
+		case t.kind == rtArray && t.elem != nil && t.elem.kind == rtText:
+			kind, rarg = dkKeys, r
+		default:
+			return nil, resolvedType{}, NewError(UndefinedFunction,
+				fmt.Sprintf("operator does not exist: jsonb - %s (expected text, integer, or text[])", rtName(t)))
+		}
+	}
+	return &rExpr{kind: reJsonDelete, delKind: kind, lhs: rbase, rhs: rarg}, resolvedType{kind: rtJsonb}, nil
+}
+
+// resolveTextArrayArg resolves a `text[]` operator argument (the `#-` path): a bare string literal
+// `'{a,b}'` adapts via `coerceStringToArray`; otherwise the resolved type must be `text[]` (or NULL).
+// `sym` is the operator symbol for the error message.
+func resolveTextArrayArg(s *scope, rhs Expr, sym string, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+	if rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText {
+		val, err := coerceStringToArray(rhs.Literal.Str, ScalarColType(Text))
+		if err != nil {
+			return nil, err
+		}
+		return valueToRExpr(val), nil
+	}
+	r, t, err := resolve(s, rhs, nil, ag, params)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case t.kind == rtArray && t.elem != nil && t.elem.kind == rtText:
+		return r, nil
+	case t.kind == rtNull:
+		return r, nil
+	default:
+		return nil, NewError(UndefinedFunction,
+			fmt.Sprintf("the %s operator's right argument must be text[]", sym))
+	}
+}
+
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
 // `operator does not exist` message (only the comparison operators reach resolveQuantified).
 func binaryOpSymbol(op BinaryOp) string {
@@ -17395,8 +17520,10 @@ func binaryOpSymbol(op BinaryOp) string {
 		return "?"
 	case OpJsonHasAnyKey:
 		return "?|"
-	default: // OpJsonHasAllKeys
+	case OpJsonHasAllKeys:
 		return "?&"
+	default: // OpJsonDeletePath
+		return "#-"
 	}
 }
 
@@ -19476,6 +19603,19 @@ func collatedCmp(coll *Collation, a, b string) (int, error) {
 func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch b.Op {
 	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
+		// jsonb `-` is the delete operator (json-sql-functions.md §1, J6), NOT arithmetic — its right
+		// operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a jsonb LHS with
+		// `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ * / %` over a jsonb
+		// operand fall through and 42804 in the numeric path.)
+		if b.Op == OpSub {
+			rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if lt.kind == rtJsonb {
+				return resolveJSONbDelete(s, false, b.Rhs, rl, ag, params)
+			}
+		}
 		// Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
 		// integer literal adapts to an integer sibling), then pick the family: both integer →
 		// integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
@@ -19596,6 +19736,21 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		return resolveJSONHasKey(s, hkAny, b.Lhs, b.Rhs, ag, params)
 	case OpJsonHasAllKeys:
 		return resolveJSONHasKey(s, hkAll, b.Lhs, b.Rhs, ag, params)
+	// The jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1, J6). `||` and
+	// `-` (delete) are dispatched by operand type in resolveConcat / the arithmetic arm.
+	case OpJsonDeletePath:
+		jsonbHint := Jsonb
+		rbase, baseTy, err := resolve(s, b.Lhs, &jsonbHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		switch baseTy.kind {
+		case rtJsonb, rtNull:
+		default:
+			return nil, resolvedType{}, NewError(UndefinedFunction,
+				fmt.Sprintf("operator does not exist: %s #- text[]", rtName(baseTy)))
+		}
+		return resolveJSONbDelete(s, true, b.Rhs, rbase, ag, params)
 	default: // OpAnd, OpOr
 		rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 		if err != nil {
@@ -21857,6 +22012,82 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 		}
 		return BoolValue(result), nil
+	case reJsonConcat:
+		// `a || b` jsonb concatenate / shallow-merge (json-sql-functions.md §1, J6). One
+		// operator_eval; STRICT — a NULL operand yields SQL NULL.
+		m.Charge(Costs.OperatorEval)
+		av, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		bv, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		if av.Kind == ValNull || bv.Kind == ValNull {
+			return NullValue(), nil
+		}
+		// resolver guarantees jsonb operands for ||.
+		return JsonbValue(jsonConcat(av.Json, bv.Json)), nil
+	case reJsonDelete:
+		// `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
+		// J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
+		m.Charge(Costs.OperatorEval)
+		bv, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		av, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		if bv.Kind == ValNull || av.Kind == ValNull {
+			return NullValue(), nil
+		}
+		node := bv.Json // resolver guarantees a jsonb base for - / #-
+		// Extract a text[] argument's keys (a NULL element propagates to a NULL result, PG).
+		textArray := func(v Value) ([]string, bool) {
+			if v.Kind != ValArray {
+				return nil, false
+			}
+			keys := make([]string, 0, len(v.Array.Elements))
+			for _, el := range v.Array.Elements {
+				if el.Kind != ValText {
+					return nil, false // a NULL element → NULL result
+				}
+				keys = append(keys, el.Str)
+			}
+			return keys, true
+		}
+		var result JsonNode
+		switch e.delKind {
+		case dkKey:
+			result, err = jsonDeleteKey(node, av.Str) // resolver guarantees a text arg for - key
+		case dkIndex:
+			result, err = jsonDeleteIndex(node, av.Int) // resolver guarantees an int arg for - index
+		case dkKeys:
+			keys, ok := textArray(av)
+			if !ok {
+				return NullValue(), nil
+			}
+			result, err = jsonDeleteKeys(node, keys)
+		default: // dkPath
+			path, ok := textArray(av)
+			if !ok {
+				return NullValue(), nil
+			}
+			result, err = jsonDeletePath(node, path)
+		}
+		if err != nil {
+			return Value{}, err
+		}
+		return JsonbValue(result), nil
 	case reAnd:
 		m.Charge(Costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)

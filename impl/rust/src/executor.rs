@@ -9888,11 +9888,13 @@ impl Database {
                 self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(r, bound, ctes, cost)
             }
-            RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
+            RExpr::JsonGet { base, arg, .. }
+            | RExpr::JsonHasKey { base, arg, .. }
+            | RExpr::JsonDelete { base, arg, .. } => {
                 self.fold_uncorrelated_in_rexpr(base, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(arg, bound, ctes, cost)
             }
-            RExpr::JsonContains { a, b } => {
+            RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
                 self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(b, bound, ctes, cost)
             }
@@ -11152,6 +11154,19 @@ enum RSubscript {
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
 /// a row. Arithmetic nodes carry their (promotion-tower) result type so the computed
 /// value can be range-checked against it (the i16+i16 → i16 boundary).
+/// Which jsonb delete form a [`RExpr::JsonDelete`] applies (json-sql-functions.md §1, J6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeleteKind {
+    /// `jsonb - text` — delete a key (object) or matching string elements (array).
+    Key,
+    /// `jsonb - int` — delete the array element at an index.
+    Index,
+    /// `jsonb - text[]` — delete each key.
+    Keys,
+    /// `jsonb #- text[]` — delete the element at a path.
+    Path,
+}
+
 /// Which jsonb key-existence operator a [`RExpr::JsonHasKey`] applies (json-sql-functions.md §1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HasKeyKind {
@@ -11294,6 +11309,21 @@ enum RExpr {
     /// J5). `kind` selects one-key / any-key / all-keys. Boolean; strict.
     JsonHasKey {
         kind: HasKeyKind,
+        base: Box<RExpr>,
+        arg: Box<RExpr>,
+    },
+    /// `a || b` jsonb concatenate / shallow-merge (spec/design/json-sql-functions.md §1, J6). Result
+    /// jsonb; strict (a NULL operand → SQL NULL).
+    JsonConcat {
+        a: Box<RExpr>,
+        b: Box<RExpr>,
+    },
+    /// `jsonb - text|int|text[]` (delete key/index/keys) and `jsonb #- text[]` (delete at path) —
+    /// the J6 mutation deletes (spec/design/json-sql-functions.md §1). `kind` selects the form;
+    /// `base` is the jsonb document, `arg` the key/index/key-array/path. Result jsonb; strict; a
+    /// delete from a scalar (or an integer index into an object) is `22023`.
+    JsonDelete {
+        kind: DeleteKind,
         base: Box<RExpr>,
         arg: Box<RExpr>,
     },
@@ -12867,10 +12897,12 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::Regex { lhs, rhs, .. }
         | RExpr::And(lhs, rhs)
         | RExpr::Or(lhs, rhs) => rexpr_is_constant(lhs) && rexpr_is_constant(rhs),
-        RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
-            rexpr_is_constant(base) && rexpr_is_constant(arg)
+        RExpr::JsonGet { base, arg, .. }
+        | RExpr::JsonHasKey { base, arg, .. }
+        | RExpr::JsonDelete { base, arg, .. } => rexpr_is_constant(base) && rexpr_is_constant(arg),
+        RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
+            rexpr_is_constant(a) && rexpr_is_constant(b)
         }
-        RExpr::JsonContains { a, b } => rexpr_is_constant(a) && rexpr_is_constant(b),
         RExpr::IsNull { operand, .. } => rexpr_is_constant(operand),
         RExpr::Case { arms, els, .. } => {
             arms.iter()
@@ -14748,10 +14780,12 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::Regex { lhs, rhs, .. } => {
             rexpr_references_outer(lhs, depth) || rexpr_references_outer(rhs, depth)
         }
-        RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
+        RExpr::JsonGet { base, arg, .. }
+        | RExpr::JsonHasKey { base, arg, .. }
+        | RExpr::JsonDelete { base, arg, .. } => {
             rexpr_references_outer(base, depth) || rexpr_references_outer(arg, depth)
         }
-        RExpr::JsonContains { a, b } => {
+        RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
             rexpr_references_outer(a, depth) || rexpr_references_outer(b, depth)
         }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
@@ -14877,11 +14911,13 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched(lhs, depth, touched);
             collect_touched(rhs, depth, touched);
         }
-        RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
+        RExpr::JsonGet { base, arg, .. }
+        | RExpr::JsonHasKey { base, arg, .. }
+        | RExpr::JsonDelete { base, arg, .. } => {
             collect_touched(base, depth, touched);
             collect_touched(arg, depth, touched);
         }
-        RExpr::JsonContains { a, b } => {
+        RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
             collect_touched(a, depth, touched);
             collect_touched(b, depth, touched);
         }
@@ -19702,6 +19738,16 @@ fn resolve_binary(
 ) -> Result<(RExpr, ResolvedType)> {
     match op {
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+            // jsonb `-` is the delete operator (json-sql-functions.md §1, J6), NOT arithmetic — its
+            // right operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a
+            // jsonb LHS with `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ *
+            // / %` over a jsonb operand fall through and 42804 in the numeric path.)
+            if matches!(op, BinaryOp::Sub) {
+                let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+                if matches!(lt, ResolvedType::Jsonb) {
+                    return resolve_jsonb_delete(scope, false, lhs, rhs, rl, agg, params);
+                }
+            }
             // Arithmetic is overloaded across integer and decimal. Resolve the operand pair
             // (an integer literal adapts to an integer sibling), then pick the family: both
             // integer → integer arithmetic (promotion tower); at least one decimal → decimal
@@ -19903,6 +19949,21 @@ fn resolve_binary(
         }
         BinaryOp::JsonHasAllKeys => {
             resolve_json_has_key(scope, HasKeyKind::All, lhs, rhs, agg, params)
+        }
+        // The jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1, J6). `||`
+        // and `-` (delete) are dispatched by operand type in resolve_concat / the arithmetic arm.
+        BinaryOp::JsonDeletePath => {
+            let (rbase, base_ty) = resolve(scope, lhs, Some(ScalarType::Jsonb), agg, params)?;
+            match base_ty {
+                ResolvedType::Jsonb | ResolvedType::Null => {}
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedFunction,
+                        format!("operator does not exist: {} #- text[]", base_ty.type_name()),
+                    ));
+                }
+            }
+            resolve_jsonb_delete(scope, true, lhs, rhs, rbase, agg, params)
         }
     }
 }
@@ -20213,6 +20274,115 @@ fn has_key_symbol(kind: HasKeyKind) -> &'static str {
     }
 }
 
+/// Resolve a jsonb `||` concatenation/merge (json-sql-functions.md §1, J6). Both operands must be
+/// jsonb (a string literal adapts via `jsonb_in`). Result jsonb; strict.
+fn resolve_jsonb_concat(
+    scope: &Scope,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let resolve_jsonb = |e: &Expr, agg: &mut AggCtx, params: &mut ParamTypes| -> Result<RExpr> {
+        let (r, t) = resolve(scope, e, Some(ScalarType::Jsonb), agg, params)?;
+        match t {
+            ResolvedType::Jsonb | ResolvedType::Null => Ok(r),
+            _ => Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!("operator does not exist: {} || jsonb", t.type_name()),
+            )),
+        }
+    };
+    let a = resolve_jsonb(lhs, agg, params)?;
+    let b = resolve_jsonb(rhs, agg, params)?;
+    Ok((
+        RExpr::JsonConcat {
+            a: Box::new(a),
+            b: Box::new(b),
+        },
+        ResolvedType::Jsonb,
+    ))
+}
+
+/// Resolve a jsonb delete operator: `-` (key `text` / index `int` / keys `text[]`) or `#-` (path
+/// `text[]`) — json-sql-functions.md §1, J6. The base must be jsonb (a json base is 42883). The
+/// form is chosen by the argument type; a bare `'{a,b}'` string literal adapts to `text[]`. Result
+/// jsonb; strict.
+fn resolve_jsonb_delete(
+    scope: &Scope,
+    is_path: bool,
+    lhs: &Expr,
+    rhs: &Expr,
+    rbase: RExpr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let sym = if is_path { "#-" } else { "-" };
+    let _ = lhs;
+    // `#-` always takes a text[] path; `-` takes text / int / text[].
+    let (kind, rarg) = if is_path {
+        (
+            DeleteKind::Path,
+            resolve_text_array_arg(scope, rhs, sym, agg, params)?,
+        )
+    } else if let Expr::Literal(Literal::Text(_)) = rhs {
+        // A bare string literal is a text key (`jsonb - 'a'`), NOT a text[].
+        let (r, _) = resolve(scope, rhs, Some(ScalarType::Text), agg, params)?;
+        (DeleteKind::Key, r)
+    } else {
+        let (r, t) = resolve(scope, rhs, None, agg, params)?;
+        match t {
+            ResolvedType::Text | ResolvedType::Null => (DeleteKind::Key, r),
+            ResolvedType::Int(_) => (DeleteKind::Index, r),
+            ResolvedType::Array(elem) if matches!(*elem, ResolvedType::Text) => {
+                (DeleteKind::Keys, r)
+            }
+            _ => {
+                return Err(EngineError::new(
+                    SqlState::UndefinedFunction,
+                    format!(
+                        "operator does not exist: jsonb - {} (expected text, integer, or text[])",
+                        t.type_name()
+                    ),
+                ));
+            }
+        }
+    };
+    Ok((
+        RExpr::JsonDelete {
+            kind,
+            base: Box::new(rbase),
+            arg: Box::new(rarg),
+        },
+        ResolvedType::Jsonb,
+    ))
+}
+
+/// Resolve a `text[]` operator argument (the `#-` path / the `?|`/`?&` style): a bare string literal
+/// `'{a,b}'` adapts via `array_in`; otherwise the resolved type must be `text[]` (or NULL). `sym` is
+/// the operator symbol for the error message.
+fn resolve_text_array_arg(
+    scope: &Scope,
+    rhs: &Expr,
+    sym: &str,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<RExpr> {
+    if let Expr::Literal(Literal::Text(s)) = rhs {
+        let val = coerce_string_to_array(s, &ColType::Scalar(ScalarType::Text))?;
+        return Ok(value_to_rexpr(&val));
+    }
+    let (r, t) = resolve(scope, rhs, None, agg, params)?;
+    match t {
+        ResolvedType::Array(elem) if matches!(*elem, ResolvedType::Text) => Ok(r),
+        ResolvedType::Null => Ok(r),
+        _ => Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            format!("the {sym} operator's right argument must be text[]"),
+        )),
+    }
+}
+
 /// Map a containment/positional `BinaryOp` to its range-against-range kernel (`RangeOp`).
 fn range_op_for(op: BinaryOp) -> RangeOp {
     match op {
@@ -20491,6 +20661,7 @@ fn binary_op_symbol(op: BinaryOp) -> &'static str {
         BinaryOp::JsonHasKey => "?",
         BinaryOp::JsonHasAnyKey => "?|",
         BinaryOp::JsonHasAllKeys => "?&",
+        BinaryOp::JsonDeletePath => "#-",
     }
 }
 
@@ -20520,6 +20691,10 @@ fn resolve_concat(
     // Pass 1: resolve both operands with no hint.
     let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
     let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    // JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
+    if matches!(lt, ResolvedType::Jsonb) || matches!(rt, ResolvedType::Jsonb) {
+        return resolve_jsonb_concat(scope, lhs, rhs, agg, params);
+    }
     // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
     let hint = match (&lt, &rt) {
         (ResolvedType::Array(e), _) => elem_scalar_hint(e),
@@ -23947,6 +24122,66 @@ impl RExpr {
                     },
                 };
                 Ok(Value::Bool(result))
+            }
+            RExpr::JsonConcat { a, b } => {
+                m.charge(COSTS.operator_eval);
+                let av = a.eval(row, env, m)?;
+                let bv = b.eval(row, env, m)?;
+                m.guard()?;
+                match (&av, &bv) {
+                    (Value::Jsonb(na), Value::Jsonb(nb)) => Ok(Value::Jsonb(json::concat(na, nb))),
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    _ => unreachable!("resolver guarantees jsonb operands for ||"),
+                }
+            }
+            RExpr::JsonDelete { kind, base, arg } => {
+                m.charge(COSTS.operator_eval);
+                let bv = base.eval(row, env, m)?;
+                let av = arg.eval(row, env, m)?;
+                m.guard()?;
+                let node = match &bv {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Jsonb(n) => n,
+                    _ => unreachable!("resolver guarantees a jsonb base for - / #-"),
+                };
+                if matches!(av, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                // Extract a text[] argument's keys (a NULL element propagates to a NULL result, PG).
+                let text_array = |v: &Value| -> Option<Vec<String>> {
+                    match v {
+                        Value::Array(arr) => {
+                            let mut keys = Vec::with_capacity(arr.elements.len());
+                            for e in &arr.elements {
+                                match e {
+                                    Value::Text(s) => keys.push(s.clone()),
+                                    _ => return None, // a NULL element → NULL result
+                                }
+                            }
+                            Some(keys)
+                        }
+                        _ => None,
+                    }
+                };
+                let result = match kind {
+                    DeleteKind::Key => match &av {
+                        Value::Text(k) => json::delete_key(node, k)?,
+                        _ => unreachable!("resolver guarantees a text arg for - key"),
+                    },
+                    DeleteKind::Index => match &av {
+                        Value::Int(i) => json::delete_index(node, *i)?,
+                        _ => unreachable!("resolver guarantees an int arg for - index"),
+                    },
+                    DeleteKind::Keys => match text_array(&av) {
+                        Some(keys) => json::delete_keys(node, &keys)?,
+                        None => return Ok(Value::Null),
+                    },
+                    DeleteKind::Path => match text_array(&av) {
+                        Some(path) => json::delete_path(node, &path)?,
+                        None => return Ok(Value::Null),
+                    },
+                };
+                Ok(Value::Jsonb(result))
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);

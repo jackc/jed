@@ -90,6 +90,8 @@ const (
 	TokQuestionPipe
 	// TokQuestionAmp is the "?&" jsonb all-keys-exist operator (doc ?& '{a,b}'). "?" then "&", scanned greedily.
 	TokQuestionAmp
+	// TokHashMinus is the "#-" jsonb delete-at-path operator (doc #- '{a,b}'). "#" then "-", scanned greedily.
+	TokHashMinus
 	// TokContains is the "@>" array containment operator (a @> b — does a contain b). "@" then ">"
 	// scanned greedily; a lone "@" is a 42601 syntax error. spec/design/grammar.md §40.
 	TokContains

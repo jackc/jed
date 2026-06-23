@@ -221,14 +221,17 @@ func Lex(sql string) ([]Token, error) {
 				return nil, NewError(SyntaxError, "unexpected character '@'")
 			}
 		case c == '#':
-			// `#>>` / `#>` are the jsonb get-at-path operators (json-sql-functions.md §1), scanned
-			// greedily (`#>>` before `#>`). `#-` (delete-at-path) is a J6 follow-on. A lone `#` is not
+			// `#>>` / `#>` (get-at-path) and `#-` (delete-at-path) are the jsonb path operators
+			// (json-sql-functions.md §1), scanned greedily (`#>>` before `#>`). A lone `#` is not
 			// part of jed's surface — 42601.
 			if i+2 < len(b) && b[i+1] == '>' && b[i+2] == '>' {
 				tokens = append(tokens, Token{Kind: TokHashArrowText})
 				i += 3
 			} else if i+1 < len(b) && b[i+1] == '>' {
 				tokens = append(tokens, Token{Kind: TokHashArrow})
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '-' {
+				tokens = append(tokens, Token{Kind: TokHashMinus})
 				i += 2
 			} else {
 				return nil, NewError(SyntaxError, "unexpected character '#'")

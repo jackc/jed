@@ -230,14 +230,17 @@ export function lex(sql: string): Token[] {
         throw engineError("syntax_error", "unexpected character '@'");
       }
     } else if (c === "#") {
-      // `#>>` / `#>` are the jsonb get-at-path operators (json-sql-functions.md §1), scanned
-      // greedily (`#>>` before `#>`). `#-` (delete-at-path) is a J6 follow-on. A lone `#` is not
+      // `#>>` / `#>` (get-at-path) and `#-` (delete-at-path) are the jsonb path operators
+      // (json-sql-functions.md §1), scanned greedily (`#>>` before `#>`). A lone `#` is not
       // part of jed's surface — 42601.
       if (i + 2 < n && sql[i + 1] === ">" && sql[i + 2] === ">") {
         tokens.push({ kind: "hashArrowText" });
         i += 3;
       } else if (i + 1 < n && sql[i + 1] === ">") {
         tokens.push({ kind: "hashArrow" });
+        i += 2;
+      } else if (i + 1 < n && sql[i + 1] === "-") {
+        tokens.push({ kind: "hashMinus" });
         i += 2;
       } else {
         throw engineError("syntax_error", "unexpected character '#'");

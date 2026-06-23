@@ -82,6 +82,8 @@ pub enum Token {
     QuestionPipe,
     /// The `?&` jsonb all-keys-exist operator (`doc ?& '{a,b}'`). `?` then `&`, scanned greedily.
     QuestionAmp,
+    /// The `#-` jsonb delete-at-path operator (`doc #- '{a,b}'`). `#` then `-`, scanned greedily.
+    HashMinus,
     /// The `@>` array containment operator (`a @> b` — does `a` contain `b`). `@` then `>`, scanned
     /// greedily; a lone `@` is a 42601 syntax error. See spec/design/grammar.md §40, array-functions.md §10.
     Contains,

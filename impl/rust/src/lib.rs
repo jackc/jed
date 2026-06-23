@@ -600,6 +600,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.jsonb_access",
     // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).
     "func.jsonb_contains",
+    // jsonb mutation operators (J6) — `||` `-` `#-` (json-sql-functions.md §1).
+    "func.jsonb_mutate",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

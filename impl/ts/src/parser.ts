@@ -2499,6 +2499,8 @@ class Parser {
       else if (k === "question") op = "jsonHasKey";
       else if (k === "questionPipe") op = "jsonHasAnyKey";
       else if (k === "questionAmp") op = "jsonHasAllKeys";
+      // The jsonb delete-at-path operator (json-sql-functions.md §1, J6) — same precedence level.
+      else if (k === "hashMinus") op = "jsonDeletePath";
       else {
         this.depth = base;
         return lhs;
@@ -3330,6 +3332,8 @@ function renderToken(t: Token): string {
       return "?|";
     case "questionAmp":
       return "?&";
+    case "hashMinus":
+      return "#-";
     case "tilde":
       return "~";
     case "tildeStar":

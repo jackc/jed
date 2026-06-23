@@ -2765,6 +2765,7 @@ impl Parser {
                 Token::Question => BinaryOp::JsonHasKey,
                 Token::QuestionPipe => BinaryOp::JsonHasAnyKey,
                 Token::QuestionAmp => BinaryOp::JsonHasAllKeys,
+                Token::HashMinus => BinaryOp::JsonDeletePath,
                 _ => break,
             };
             self.deepen()?; // each chained operator is one more AST level
@@ -3719,6 +3720,7 @@ fn render_token(t: &Token) -> String {
         Token::Question => "?".into(),
         Token::QuestionPipe => "?|".into(),
         Token::QuestionAmp => "?&".into(),
+        Token::HashMinus => "#-".into(),
         Token::Tilde => "~".into(),
         Token::TildeStar => "~*".into(),
         Token::BangTilde => "!~".into(),
