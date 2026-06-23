@@ -999,3 +999,16 @@ reason = "jed: a window function combined with aggregates / GROUP BY is 0A000 th
 file = "window/row_number.test"
 sql = "SELECT id, row_number() OVER w FROM t"
 reason = "jed: a named window (OVER name / the WINDOW clause) is 0A000 this slice (window.md §1 — deferred to S5), rejected at parse. PostgreSQL parses OVER w and then reports 42704 (window \"w\" does not exist, since no WINDOW clause defines it). Both reject; a documented divergence until S5."
+
+# --- Window ratio functions (window.md §10, divergence D2): percent_rank()/cume_dist() return
+# DECIMAL in jed (the exact division — select_div_scale + half-away, the AVG path), NOT PG's float8.
+# The ratios are identical; only the type + rendering differ, so jed's committed rows are kept.
+[[override]]
+file = "window/ratio.test"
+sql = "SELECT id, percent_rank() OVER (ORDER BY v) AS pr, cume_dist() OVER (ORDER BY v) AS cd FROM t ORDER BY id"
+reason = "jed: percent_rank()/cume_dist() return decimal (divergence D2, window.md §10 — the exact decimal division keeps binary floats out of the value path, CLAUDE.md §8). PostgreSQL returns float8 (0.6666666666666666 etc.). The ratio values are identical; only the type + textual rendering differ. jed's decimal rows are kept."
+
+[[override]]
+file = "window/ratio.test"
+sql = "SELECT id, percent_rank() OVER () AS pr, cume_dist() OVER () AS cd FROM t ORDER BY id"
+reason = "jed: percent_rank()/cume_dist() return decimal not float8 (divergence D2, window.md §10). With no window ORDER BY every row is one peer group, so percent_rank = 0 and cume_dist = 1 for all rows; jed renders them as decimals (0.000…/1.000…). PostgreSQL returns float8. jed's decimal rows are kept."

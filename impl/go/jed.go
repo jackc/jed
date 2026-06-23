@@ -214,6 +214,7 @@ var SupportedCapabilities = []string{
 	// window-only function without OVER is 42809; a window function in WHERE/HAVING is 42P20.
 	"query.window",
 	"query.window_ranking",
+	"query.window_ratio",
 	// Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
 	"query.union",
 	"query.intersect",

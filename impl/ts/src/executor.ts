@@ -10320,7 +10320,11 @@ type WindowPlan =
   // RANK() — 1 + rows in earlier peer groups (ties share a rank, then a gap).
   | "rank"
   // DENSE_RANK() — 1 + earlier peer groups (ties share a rank, no gap).
-  | "denseRank";
+  | "denseRank"
+  // PERCENT_RANK() — (rank-1)/(N-1), 0 when N=1; decimal (divergence D2).
+  | "percentRank"
+  // CUME_DIST() — (rows through the current peer group)/N; decimal (divergence D2).
+  | "cumeDist";
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
 // For float SUM/AVG the inputs are COLLECTED in `floats` (the canonical fold needs all values up
@@ -10989,12 +10993,24 @@ function resolveWindowCall(
     rank: "rank",
     dense_rank: "denseRank",
   };
+  // The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → decimal
+  // (divergence D2 — PG's float8; jed uses the exact decimal division, window.md §10).
+  const noArgDecimal: Record<string, WindowPlan> = {
+    percent_rank: "percentRank",
+    cume_dist: "cumeDist",
+  };
   if (lname in noArgI64) {
     if (e.star || e.args.length !== 0) {
       throw engineError("undefined_function", `${lname} takes no arguments`);
     }
     plan = noArgI64[lname]!;
     result = { kind: "int", ty: "i64" };
+  } else if (lname in noArgDecimal) {
+    if (e.star || e.args.length !== 0) {
+      throw engineError("undefined_function", `${lname} takes no arguments`);
+    }
+    plan = noArgDecimal[lname]!;
+    result = { kind: "decimal" };
   } else if (isAggregateName(lname)) {
     throw engineError("feature_not_supported", "aggregate window functions are not supported yet");
   } else {
@@ -18873,23 +18889,47 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], meter: Meter): void 
           }
           break;
         case "rank":
-        case "denseRank": {
-          // Peer-aware ranking (window.md §3): peers are rows EQUAL on the window ORDER BY keys
-          // only. rank = 1 + rows in earlier peer groups; dense_rank = 1 + earlier peer groups. An
-          // empty ORDER BY makes every row a peer, so both are 1 for all rows.
-          let rank = 1n;
-          let dense = 1n;
-          for (let pos = 0; pos < ordered.length; pos++) {
-            meter.guard();
-            meter.charge(COSTS.windowResult);
-            if (pos > 0) {
-              const prev = ordered[pos - 1]!;
-              if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[prev]!, spec.order) !== 0) {
-                rank = BigInt(pos + 1);
-                dense += 1n;
+        case "denseRank":
+        case "percentRank":
+        case "cumeDist": {
+          // Peer-aware ranking (window.md §3/§4): peers are rows EQUAL on the window ORDER BY keys
+          // only. A single pass identifies peer-group spans [start, end) over the sorted partition;
+          // an empty ORDER BY makes the whole partition one peer group. rank = start+1, dense_rank =
+          // group ordinal, percent_rank = start/(N-1) (0 if N=1), cume_dist = end/N (the ratios are
+          // decimal — divergence D2, window.md §10).
+          const np = ordered.length;
+          const groups: Array<[number, number]> = []; // peer-group spans [start, end)
+          let s = 0;
+          for (let pos = 1; pos < np; pos++) {
+            if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, spec.order) !== 0) {
+              groups.push([s, pos]);
+              s = pos;
+            }
+          }
+          if (np > 0) groups.push([s, np]);
+          for (let gi = 0; gi < groups.length; gi++) {
+            const [start, end] = groups[gi]!;
+            for (let k = start; k < end; k++) {
+              const ri = ordered[k]!;
+              meter.guard();
+              meter.charge(COSTS.windowResult);
+              if (spec.plan === "rank") {
+                results[ri] = intValue(BigInt(start + 1));
+              } else if (spec.plan === "denseRank") {
+                results[ri] = intValue(BigInt(gi + 1));
+              } else if (spec.plan === "percentRank") {
+                results[ri] =
+                  np <= 1
+                    ? decimalValue(Decimal.fromBigInt(0n))
+                    : decimalValue(
+                        Decimal.fromBigInt(BigInt(start)).div(Decimal.fromBigInt(BigInt(np - 1))),
+                      );
+              } else {
+                results[ri] = decimalValue(
+                  Decimal.fromBigInt(BigInt(end)).div(Decimal.fromBigInt(BigInt(np))),
+                );
               }
             }
-            results[ordered[pos]!] = intValue(spec.plan === "denseRank" ? dense : rank);
           }
           break;
         }

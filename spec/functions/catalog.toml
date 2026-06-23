@@ -3280,6 +3280,32 @@ requires_order = false
 null           = "never"
 errors         = []
 
+# percent_rank / cume_dist — relative ranking ratios, peer-aware. percent_rank = (rank-1)/(N-1)
+# (0 when N=1); cume_dist = (# rows through the current peer group)/N. Result DECIMAL (the exact
+# division via select_div_scale + half-away, the AVG path), NOT PG's float8 — a documented
+# divergence D2 (window.md §10) keeping binary floats out of the value path (CLAUDE.md §8).
+[[window]]
+name           = "percent_rank"
+kind           = "window"
+surface        = "PERCENT_RANK"
+args           = "none"
+result         = "decimal"
+frame_sensitive = false
+requires_order = false
+null           = "never"
+errors         = []
+
+[[window]]
+name           = "cume_dist"
+kind           = "window"
+surface        = "CUME_DIST"
+args           = "none"
+result         = "decimal"
+frame_sensitive = false
+requires_order = false
+null           = "never"
+errors         = []
+
 # === set-returning functions =================================================
 # A set-returning function (SRF) EXPANDS its arguments into a ROW SET — it fits neither the
 # operator mold (one value from infix operands) nor the aggregate mold (one value from a group):

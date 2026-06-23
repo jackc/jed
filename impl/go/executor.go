@@ -13314,6 +13314,10 @@ const (
 	planRank
 	// planDenseRank — DENSE_RANK(): 1 + the number of earlier peer groups (ties share, no gap).
 	planDenseRank
+	// planPercentRank — PERCENT_RANK(): (rank-1)/(N-1), 0 when N=1; decimal (divergence D2).
+	planPercentRank
+	// planCumeDist — CUME_DIST(): (rows through the current peer group)/N; decimal (divergence D2).
+	planCumeDist
 )
 
 // aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
@@ -14129,6 +14133,12 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		"rank":       planRank,
 		"dense_rank": planDenseRank,
 	}[name]
+	// The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → decimal
+	// (divergence D2 — PG's float8; jed uses the exact decimal division, window.md §10).
+	noArgDec, isNoArgDec := map[string]windowPlan{
+		"percent_rank": planPercentRank,
+		"cume_dist":    planCumeDist,
+	}[name]
 	switch {
 	case isNoArg:
 		if fc.Star || len(fc.Args) != 0 {
@@ -14136,6 +14146,12 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		}
 		plan = noArgI64
 		result = resolvedType{kind: rtInt, intTy: Int64}
+	case isNoArgDec:
+		if fc.Star || len(fc.Args) != 0 {
+			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes no arguments")
+		}
+		plan = noArgDec
+		result = resolvedType{kind: rtDecimal}
 	case isAggregateName(name):
 		return nil, resolvedType{}, NewError(FeatureNotSupported, "aggregate window functions are not supported yet")
 	default:
@@ -20786,28 +20802,53 @@ func applyWindowStage(rows []Row, specs []windowSpec, meter *Meter) error {
 					meter.Charge(Costs.WindowResult)
 					results[ri] = IntValue(int64(pos) + 1)
 				}
-			case planRank, planDenseRank:
-				// Peer-aware ranking (window.md §3): peers are rows EQUAL on the window ORDER BY
-				// keys only. rank = 1 + rows in earlier peer groups; dense_rank = 1 + earlier peer
-				// groups. An empty ORDER BY makes every row a peer, so both are 1 for all rows.
-				rank := int64(1)
-				dense := int64(1)
-				for pos, ri := range ordered {
-					if err := meter.Guard(); err != nil {
-						return err
+			case planRank, planDenseRank, planPercentRank, planCumeDist:
+				// Peer-aware ranking (window.md §3/§4): peers are rows EQUAL on the window ORDER BY
+				// keys only. A single pass identifies peer-group spans [start, end) over the sorted
+				// partition; an empty ORDER BY makes the whole partition one peer group. rank =
+				// start+1, dense_rank = group ordinal, percent_rank = start/(N-1) (0 if N=1),
+				// cume_dist = end/N (the ratios are decimal — divergence D2, window.md §10).
+				np := len(ordered)
+				type span struct{ start, end int }
+				var groups []span
+				s := 0
+				for pos := 1; pos < np; pos++ {
+					if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], spec.order) != 0 {
+						groups = append(groups, span{s, pos})
+						s = pos
 					}
-					meter.Charge(Costs.WindowResult)
-					if pos > 0 {
-						prev := ordered[pos-1]
-						if cmpRowsByOrder(rows[ri], rows[prev], spec.order) != 0 {
-							rank = int64(pos) + 1
-							dense++
+				}
+				if np > 0 {
+					groups = append(groups, span{s, np})
+				}
+				for gi, g := range groups {
+					for _, ri := range ordered[g.start:g.end] {
+						if err := meter.Guard(); err != nil {
+							return err
 						}
-					}
-					if spec.plan == planDenseRank {
-						results[ri] = IntValue(dense)
-					} else {
-						results[ri] = IntValue(rank)
+						meter.Charge(Costs.WindowResult)
+						switch spec.plan {
+						case planRank:
+							results[ri] = IntValue(int64(g.start) + 1)
+						case planDenseRank:
+							results[ri] = IntValue(int64(gi) + 1)
+						case planPercentRank:
+							if np <= 1 {
+								results[ri] = DecimalValue(DecimalFromInt64(0))
+							} else {
+								d, err := DecimalFromInt64(int64(g.start)).Div(DecimalFromInt64(int64(np) - 1))
+								if err != nil {
+									return err
+								}
+								results[ri] = DecimalValue(d)
+							}
+						default: // planCumeDist
+							d, err := DecimalFromInt64(int64(g.end)).Div(DecimalFromInt64(int64(np)))
+							if err != nil {
+								return err
+							}
+							results[ri] = DecimalValue(d)
+						}
 					}
 				}
 			}

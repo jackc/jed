@@ -1,0 +1,52 @@
+# Window functions S1 — relative-rank ratios: percent_rank() and cume_dist() (window.md §4).
+#
+# percent_rank() = (rank-1)/(N-1), 0 when N=1; cume_dist() = (rows through the current peer group)/N.
+# Both are peer-aware (peers = rows equal on the window ORDER BY only). The result is DECIMAL via the
+# exact division (select_div_scale + half-away — the AVG path), NOT PostgreSQL's float8: a documented
+# divergence D2 (window.md §10), so these rows are recorded in oracle_overrides.toml.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_ratio, query.order_by, types.i32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 10), (3, 30), (4, 40)
+
+# ORDER BY v — peer groups {10:id1,id2}[0,2), {30:id3}[2,3), {40:id4}[3,4); N=4.
+# percent_rank: 0/3, 0/3, 2/3, 3/3 ; cume_dist: 2/4, 2/4, 3/4, 4/4.
+# names: id, pr, cd
+# cost: 17
+query IRR nosort
+SELECT id, percent_rank() OVER (ORDER BY v) AS pr, cume_dist() OVER (ORDER BY v) AS cd FROM t ORDER BY id
+----
+1
+0.00000000000000000000
+0.50000000000000000000
+2
+0.00000000000000000000
+0.50000000000000000000
+3
+0.66666666666666666667
+0.75000000000000000000
+4
+1.00000000000000000000
+1.00000000000000000000
+
+# No window ORDER BY — the whole partition is one peer group [0,4): percent_rank = 0/3 = 0 for all,
+# cume_dist = 4/4 = 1 for all.
+# names: id, pr, cd
+query IRR nosort
+SELECT id, percent_rank() OVER () AS pr, cume_dist() OVER () AS cd FROM t ORDER BY id
+----
+1
+0.00000000000000000000
+1.00000000000000000000
+2
+0.00000000000000000000
+1.00000000000000000000
+3
+0.00000000000000000000
+1.00000000000000000000
+4
+0.00000000000000000000
+1.00000000000000000000

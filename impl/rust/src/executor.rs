@@ -13083,6 +13083,10 @@ enum WindowPlan {
     Rank,
     /// `DENSE_RANK()` — 1 + the number of earlier peer groups (ties share a rank, no gap).
     DenseRank,
+    /// `PERCENT_RANK()` — (rank − 1) / (N − 1), 0 when N = 1; decimal (divergence D2).
+    PercentRank,
+    /// `CUME_DIST()` — (# rows through the current peer group) / N; decimal (divergence D2).
+    CumeDist,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
@@ -14987,6 +14991,13 @@ fn resolve_window_call(
         "dense_rank" => Some(WindowPlan::DenseRank),
         _ => None,
     };
+    // The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → decimal
+    // (divergence D2 — PG's float8; jed uses the exact decimal division, window.md §10).
+    let no_arg_decimal = match lname.as_str() {
+        "percent_rank" => Some(WindowPlan::PercentRank),
+        "cume_dist" => Some(WindowPlan::CumeDist),
+        _ => None,
+    };
     let (plan, result) = if let Some(p) = no_arg_i64 {
         if star || !args.is_empty() {
             return Err(EngineError::new(
@@ -14995,6 +15006,14 @@ fn resolve_window_call(
             ));
         }
         (p, ResolvedType::Int(ScalarType::Int64))
+    } else if let Some(p) = no_arg_decimal {
+        if star || !args.is_empty() {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!("{lname} takes no arguments"),
+            ));
+        }
+        (p, ResolvedType::Decimal)
     } else if is_aggregate_name(&lname) {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
@@ -23232,31 +23251,54 @@ fn apply_window_stage(rows: &mut [Row], specs: &[WindowSpec], meter: &mut Meter)
                         results[ri] = Value::Int(pos as i64 + 1);
                     }
                 }
-                // Peer-aware ranking (window.md §3): peers are rows EQUAL on the window ORDER BY
-                // keys only (the PK tie-break sequences peers but does not split a peer group). rank
-                // = 1 + rows in earlier peer groups; dense_rank = 1 + earlier peer groups. With no
-                // ORDER BY every row is one peer group, so both are 1 for all rows.
-                WindowPlan::Rank | WindowPlan::DenseRank => {
-                    let mut rank = 1i64; // the rank assigned to the current peer group
-                    let mut dense = 1i64; // the dense rank of the current peer group
-                    for (pos, &ri) in ordered.iter().enumerate() {
-                        meter.guard()?;
-                        meter.charge(COSTS.window_result);
-                        if pos > 0 {
-                            let prev = ordered[pos - 1];
-                            // A new peer group starts when this row differs from the previous on the
-                            // ORDER BY keys. An empty ORDER BY makes every row a peer (Equal).
-                            if cmp_rows_by_order(&rows[ri], &rows[prev], &spec.order)
-                                != std::cmp::Ordering::Equal
-                            {
-                                rank = pos as i64 + 1; // rank skips to the 1-based position
-                                dense += 1; // dense rank advances by exactly one
-                            }
+                // Peer-aware ranking (window.md §3/§4): peers are rows EQUAL on the window ORDER BY
+                // keys only (the PK tie-break sequences peers but does not split a peer group). A
+                // single pass identifies peer-group spans [start, end) over the sorted partition; an
+                // empty ORDER BY makes the whole partition one peer group. From each row's span:
+                // rank = start+1, dense_rank = group ordinal, percent_rank = start/(N-1) (0 if N=1),
+                // cume_dist = end/N (the ratios are decimal — divergence D2, window.md §10).
+                WindowPlan::Rank
+                | WindowPlan::DenseRank
+                | WindowPlan::PercentRank
+                | WindowPlan::CumeDist => {
+                    let np = ordered.len();
+                    let mut groups: Vec<(usize, usize)> = Vec::new(); // peer-group spans [start, end)
+                    let mut s = 0usize;
+                    for pos in 1..np {
+                        if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], &spec.order)
+                            != std::cmp::Ordering::Equal
+                        {
+                            groups.push((s, pos));
+                            s = pos;
                         }
-                        results[ri] = Value::Int(match spec.plan {
-                            WindowPlan::DenseRank => dense,
-                            _ => rank,
-                        });
+                    }
+                    if np > 0 {
+                        groups.push((s, np));
+                    }
+                    for (gi, &(start, end)) in groups.iter().enumerate() {
+                        for &ri in &ordered[start..end] {
+                            meter.guard()?;
+                            meter.charge(COSTS.window_result);
+                            results[ri] = match spec.plan {
+                                WindowPlan::Rank => Value::Int(start as i64 + 1),
+                                WindowPlan::DenseRank => Value::Int(gi as i64 + 1),
+                                WindowPlan::PercentRank => {
+                                    if np <= 1 {
+                                        Value::Decimal(Decimal::from_i64(0))
+                                    } else {
+                                        Value::Decimal(
+                                            Decimal::from_i64(start as i64)
+                                                .div(&Decimal::from_i64(np as i64 - 1))?,
+                                        )
+                                    }
+                                }
+                                // cume_dist: rows through the current peer group / N.
+                                _ => Value::Decimal(
+                                    Decimal::from_i64(end as i64)
+                                        .div(&Decimal::from_i64(np as i64))?,
+                                ),
+                            };
+                        }
                     }
                 }
             }
