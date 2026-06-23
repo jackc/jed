@@ -465,6 +465,9 @@ impl Type {
     pub fn is_decimal(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_decimal())
     }
+    pub fn is_float(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_float())
+    }
     pub fn is_bool(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_bool())
     }

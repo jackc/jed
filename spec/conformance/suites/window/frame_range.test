@@ -2,9 +2,10 @@
 #
 # ROWS counts physical rows; GROUPS counts peer groups; RANGE works on the ordering-key VALUE.
 # A RANGE value offset (n PRECEDING/FOLLOWING) frames the rows whose key is within n of the current
-# key, and requires exactly one ORDER BY column (42P20 otherwise) of an integer/decimal type
-# (0A000 otherwise). GROUPS requires an ORDER BY (42P20). CURRENT ROW spans the current peer group
-# in both RANGE and GROUPS. Explicit EXCLUDE stays deferred 0A000.
+# key, and requires exactly one ORDER BY column (42P20 otherwise) of an integer/decimal/float type
+# (a timestamp/date key is the deferred D4 follow-on, any other type is 0A000). GROUPS requires an
+# ORDER BY (42P20). CURRENT ROW spans the current peer group in both RANGE and GROUPS. Explicit
+# EXCLUDE stays deferred 0A000.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_aggregate, query.window_frame, query.window_frame_range, query.order_by, types.i32, types.decimal, types.f64, resource.cost_metering
 
 statement ok
@@ -284,13 +285,201 @@ INSERT INTO tt VALUES (1, 'a', 1), (2, 'b', 2)
 statement error 0A000
 SELECT sum(x) OVER (ORDER BY s RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tt
 
-# A float ordering key cannot take a RANGE value offset — 0A000 (divergence D3: keep floats out of
-# the comparison path; PostgreSQL supports float8 RANGE offsets — oracle-overridden).
+# --- RANGE value offsets over a FLOAT ordering key (window.md §6; the former divergence D3, now ----
+# removed). The bound `key ± offset` and the comparison are computed in f64 — PG's
+# in_range_float*_float8, where the offset is float8 even for an f32 key — via the in-contract
+# correctly-rounded +/- kernel (float.md §5), so jed is bit-identical cross-core and to PostgreSQL.
+# These were formerly 0A000; the test is now oracle-clean (no override).
 statement ok
 CREATE TABLE tf (id i32 PRIMARY KEY, f f64, x i32)
 
 statement ok
-INSERT INTO tf VALUES (1, 1.0, 1), (2, 2.0, 2)
+INSERT INTO tf VALUES (1,1.0,10), (2,1.5,20), (3,2.0,30), (4,2.5,40), (5,5.0,50)
 
-statement error 0A000
-SELECT sum(x) OVER (ORDER BY f RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tf
+# f64 key with a decimal offset: keys in [f-1.0, f+1.0]. f=1.5 sees {1.0,1.5,2.0,2.5}=100; the
+# outlier f=5.0 sees only itself=50.
+# names: id, s
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY f RANGE BETWEEN 1.0 PRECEDING AND 1.0 FOLLOWING) AS s FROM tf ORDER BY id
+----
+1
+60
+2
+100
+3
+100
+4
+90
+5
+50
+
+# An integer offset widens to the float key (running by value): keys in [f-1, f]. f=2.0 sees
+# {1.0,1.5,2.0}=60.
+# names: id, s
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY f RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM tf ORDER BY id
+----
+1
+10
+2
+30
+3
+60
+4
+90
+5
+50
+
+# DESC ordering flips the offset sides; the frame is still keys within [f-1.0, f+1.0].
+# names: id, s
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY f DESC RANGE BETWEEN 1.0 PRECEDING AND 1.0 FOLLOWING) AS s FROM tf ORDER BY id
+----
+1
+60
+2
+100
+3
+100
+4
+90
+5
+50
+
+# first_value / last_value over a float RANGE frame pick the ordering key at the frame edges.
+# names: id, fv, lv
+query IRR nosort
+SELECT id, first_value(f) OVER w AS fv, last_value(f) OVER w AS lv FROM tf WINDOW w AS (ORDER BY f RANGE BETWEEN 1.0 PRECEDING AND 1.0 FOLLOWING) ORDER BY id
+----
+1
+1
+2
+2
+1
+2.5
+3
+1
+2.5
+4
+1.5
+2.5
+5
+5
+5
+
+# An f32 key: the offset and bound are still computed in f64 (PG's in_range_float4_float8), so
+# the 0.5 offset frames the same keys as for an f64 key.
+statement ok
+CREATE TABLE th (id i32 PRIMARY KEY, f f32, x i32)
+
+statement ok
+INSERT INTO th VALUES (1,1.0,10), (2,1.5,20), (3,2.5,30), (4,3.0,40)
+
+# names: id, s
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY f RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) AS s FROM th ORDER BY id
+----
+1
+30
+2
+30
+3
+70
+4
+70
+
+# IEEE special values follow PG's in_range NaN/infinity rule (NaN sorts after every non-NaN; an
+# infinite key ± a finite offset stays that infinity). A NaN current key frames only its NaN peers;
+# ±Infinity keys frame only their own infinity for a finite offset.
+statement ok
+CREATE TABLE tg (id i32 PRIMARY KEY, f f64, x i32)
+
+statement ok
+INSERT INTO tg VALUES (2, -1.0, 2), (3, 0.0, 4), (4, 1.0, 8)
+
+statement ok
+INSERT INTO tg SELECT 1, f64 '-Infinity', 1
+
+statement ok
+INSERT INTO tg SELECT 5, f64 'Infinity', 16
+
+statement ok
+INSERT INTO tg SELECT 6, f64 'NaN', 32
+
+# RANGE 1 PRECEDING AND 1 FOLLOWING: -inf sees only {-inf}=1; 0 sees {-1,0,1}=14; +inf sees only
+# {+inf}=16; NaN sees only its NaN peer=32.
+# names: id, f, s
+query IRI nosort
+SELECT id, f, sum(x) OVER (ORDER BY f RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM tg ORDER BY id
+----
+1
+-Infinity
+1
+2
+-1
+6
+3
+0
+14
+4
+1
+12
+5
+Infinity
+16
+6
+NaN
+32
+
+# UNBOUNDED PRECEDING AND CURRENT ROW over the same partition: a running count in sorted order
+# (-inf < -1 < 0 < 1 < +inf < NaN), so each row's frame is every row through itself.
+# names: id, f, c
+query IRI nosort
+SELECT id, f, count(*) OVER (ORDER BY f RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS c FROM tg ORDER BY id
+----
+1
+-Infinity
+1
+2
+-1
+2
+3
+0
+3
+4
+1
+4
+5
+Infinity
+5
+6
+NaN
+6
+
+# CURRENT ROW AND UNBOUNDED FOLLOWING: the reverse running sum (each row through the partition end).
+# names: id, f, s
+query IRI nosort
+SELECT id, f, sum(x) OVER (ORDER BY f RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS s FROM tg ORDER BY id
+----
+1
+-Infinity
+63
+2
+-1
+62
+3
+0
+60
+4
+1
+56
+5
+Infinity
+48
+6
+NaN
+32
+
+# A negative float RANGE offset is still rejected — 22013.
+statement error 22013
+SELECT sum(x) OVER (ORDER BY f RANGE BETWEEN -1.0 PRECEDING AND CURRENT ROW) FROM tf

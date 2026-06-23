@@ -993,10 +993,8 @@ reason = "jed: a window function combined with aggregates / GROUP BY is 0A000 th
 # integers that convert exactly to binary64, so jed's value is bit-identical to PostgreSQL's float8
 # (window.md §4, float.md §5). window/ratio.test is now oracle-clean, needing no override here.
 
-# --- Explicit RANGE value-offset frames over a FLOAT ordering key (window.md §10, divergence D3):
-# jed refuses them 0A000 to keep binary floats out of the comparison/ordering path; PostgreSQL has
-# in_range support for float8 and the query SUCCEEDS. jed's 0A000 is kept.
-[[override]]
-file = "window/frame_range.test"
-sql = "SELECT sum(x) OVER (ORDER BY f RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tf"
-reason = "jed: a RANGE value offset over a float ordering key is 0A000 (divergence D3, window.md §10 — key ± offset over a float re-imports float ordering into a comparison path, which jed keeps floats out of, CLAUDE.md §8). PostgreSQL supports float8 RANGE offsets and the query succeeds. A deliberate, documented refusal; jed's 0A000 is kept."
+# NOTE: the former divergence D3 (a RANGE value offset over a FLOAT ordering key being 0A000) is
+# GONE — float-keyed RANGE offsets now compute `key ± offset` and the comparison in f64 (PG's
+# in_range_float*_float8) via the in-contract correctly-rounded kernel, so jed is bit-identical to
+# PostgreSQL (window.md §6, float.md §5). window/frame_range.test's float cases are oracle-clean,
+# needing no override here.

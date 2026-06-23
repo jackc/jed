@@ -155,6 +155,7 @@ import {
   typeIsBoolean,
   typeIsBytea,
   typeIsDecimal,
+  typeIsFloat,
   typeIsInteger,
   typeIsText,
   typeIsTimestamp,
@@ -11760,9 +11761,9 @@ function resolveWindowDef(
 }
 
 // resolveFrame resolves an explicit frame clause (spec/design/window.md §6). GROUPS requires an
-// ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer
-// or decimal type (else 0A000 — float is divergence D3, timestamp/date are deferred follow-ons). A
-// negative offset is 22013. Mirrors Rust's resolve_frame.
+// ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer,
+// decimal, or float type (a timestamp/date key is the deferred D4 follow-on, any other type is
+// 0A000). A negative offset is 22013. Mirrors Rust's resolve_frame.
 function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): ResolvedFrame {
   const isOffset = (b: FrameBound): boolean => b.kind === "preceding" || b.kind === "following";
   const hasOffset = isOffset(f.start) || isOffset(f.end);
@@ -11793,7 +11794,7 @@ function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): R
           );
         }
         const kt = orderTypes[0]!;
-        if (!(typeIsInteger(kt) || typeIsDecimal(kt))) {
+        if (!(typeIsInteger(kt) || typeIsDecimal(kt) || typeIsFloat(kt))) {
           throw engineError(
             "feature_not_supported",
             `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${typeCanonicalName(kt)}`,
@@ -11850,7 +11851,10 @@ function resolveIntBound(b: FrameBound): ResolvedBound {
 
 // resolveRangeBound resolves a RANGE value-offset bound (window.md §6). The offset literal must be a
 // non-negative numeric matching the ordering key type: an integer key takes an integer offset (a
-// decimal offset is 0A000, matching PG); a decimal key takes an integer (widened) or decimal offset.
+// decimal offset is 0A000, matching PG); a decimal key takes an integer (widened) or decimal offset;
+// a float key takes an integer or decimal offset converted to f64 (PG's in_range_float*_float8 — the
+// offset is float8 for both f32 and f64 keys). The decimal→f64 conversion traps 22003 on overflow
+// (jed's float-cast rule); an int offset is always finite.
 function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
   const offsetOf = (e: Expr): Value => {
     if (e.kind === "literal" && e.literal.kind === "int") {
@@ -11861,15 +11865,10 @@ function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
           "frame starting or ending offset must not be negative",
         );
       }
+      if (typeIsFloat(kt)) return float64Value(Number(n));
       return typeIsDecimal(kt) ? decimalValue(Decimal.fromBigInt(n)) : intValue(n);
     }
     if (e.kind === "literal" && e.literal.kind === "decimal") {
-      if (!typeIsDecimal(kt)) {
-        throw engineError(
-          "feature_not_supported",
-          `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${typeCanonicalName(kt)} and offset type decimal`,
-        );
-      }
       // The select items (and so this frame offset) are structuredClone'd during window desugaring,
       // which strips the Decimal prototype — rebuild a real Decimal from its parts.
       const lit = e.literal.dec;
@@ -11878,6 +11877,18 @@ function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
         throw engineError(
           "invalid_preceding_or_following_size",
           "frame starting or ending offset must not be negative",
+        );
+      }
+      if (typeIsFloat(kt)) {
+        // PG computes in_range_float*_float8 in float8 (even for an f32 key), so the offset is f64.
+        const f = Number(d.render());
+        if (!Number.isFinite(f)) throw overflow("f64");
+        return float64Value(f);
+      }
+      if (!typeIsDecimal(kt)) {
+        throw engineError(
+          "feature_not_supported",
+          `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${typeCanonicalName(kt)} and offset type decimal`,
         );
       }
       return decimalValue(d);
@@ -19658,7 +19669,13 @@ function offsetCount(v: Value, np: number): number {
 
 // rangeVVsBound returns the sign of v - (cur ∓ off) for a RANGE value offset (window.md §6),
 // computed exactly: integer keys use bigint so the bound cannot overflow (matching Rust's i128);
-// decimal keys use exact decimal arithmetic. subtract chooses cur - off vs cur + off. Mirrors Rust's
+// decimal keys use exact decimal arithmetic; float keys widen to f64 and compute the bound with the
+// in-contract correctly-rounded +/- kernel (float.md §5 — bit-identical cross-core), comparing with
+// the PG float total order (floatTotalCmp). The total order reproduces PG's in_range NaN handling for
+// free: a NaN current key makes the bound NaN (NaN ∓ finite = NaN), so a NaN row equals it and any
+// non-NaN row is below it, while a NaN row against a non-NaN bound sorts above. The offset is always
+// finite (an int offset, or a decimal one that would otherwise overflow already trapped at resolve),
+// so cur ∓ off never produces NaN itself. subtract chooses cur - off vs cur + off. Mirrors Rust's
 // range_v_vs_bound.
 function rangeVVsBound(v: Value, cur: Value, off: Value, subtract: boolean): number {
   if (cur.kind === "int" && off.kind === "int" && v.kind === "int") {
@@ -19668,6 +19685,16 @@ function rangeVVsBound(v: Value, cur: Value, off: Value, subtract: boolean): num
   if (cur.kind === "decimal" && off.kind === "decimal" && v.kind === "decimal") {
     const b = subtract ? cur.dec.sub(off.dec) : cur.dec.add(off.dec);
     return v.dec.cmpValue(b);
+  }
+  // Float key: f32 values are already Math.fround'd, so `.value` is the exact f64 widening (PG
+  // computes in_range_float*_float8's sum in float8 even for an f32 key).
+  if (
+    (cur.kind === "f32" || cur.kind === "f64") &&
+    off.kind === "f64" &&
+    (v.kind === "f32" || v.kind === "f64")
+  ) {
+    const b = subtract ? cur.value - off.value : cur.value + off.value;
+    return floatTotalCmp(v.value, b);
   }
   throw new Error("range offset resolved to a matching numeric type");
 }

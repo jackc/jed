@@ -30,9 +30,9 @@
 > an identical `PARTITION BY` + `ORDER BY` are partitioned and sorted **once**, and a no-`EXCLUDE`
 > aggregate **slides** its frame accumulator (an expanding frame folds each row once for every
 > aggregate; a moving `count` un-folds the left edge) instead of re-folding each frame. The remaining
-> `0A000` items — `RANGE` offsets over a float (divergence D3) / timestamp / date ordering key
-> (§6/§11), and a **correlated** window key (an enclosing-query column in a `PARTITION BY` / `ORDER BY`
-> — §11) — are deferred follow-ons, not gaps.
+> `0A000` items — `RANGE` offsets over a timestamp / date ordering key (the deferred D4 follow-on,
+> §6/§11; a float key is now supported, the former D3) and a **correlated** window key (an
+> enclosing-query column in a `PARTITION BY` / `ORDER BY` — §11) — are deferred follow-ons, not gaps.
 
 A **window function** computes a value for **each row** from a *set* of related rows — its
 **window frame** — without collapsing the rows the way an aggregate does. `row_number() OVER
@@ -74,9 +74,10 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
 6. **S6 — explicit `RANGE`/`GROUPS` frames + value offsets.** `GROUPS BETWEEN …` (peer-group
    integer offsets, requires an `ORDER BY` → `42P20`); `RANGE BETWEEN …` with `UNBOUNDED`/`CURRENT
    ROW` bounds over any ordering (peer/edge based), and value-based `n PRECEDING`/`FOLLOWING`
-   offsets over a **single** integer or decimal ordering key (else `42P20`/`0A000`). `CURRENT ROW`
-   spans the current peer group in both modes; a NULL ordering key frames only its NULL peers for
-   offset/CURRENT bounds. `RANGE` offsets over a float (D3) / timestamp / date key stay `0A000`.
+   offsets over a **single** integer, decimal, or float ordering key (else `42P20`/`0A000`).
+   `CURRENT ROW` spans the current peer group in both modes; a NULL ordering key frames only its
+   NULL peers for offset/CURRENT bounds. `RANGE` offsets over a timestamp / date key stay `0A000`
+   (the deferred D4 follow-on; a float key is supported, the former D3).
    Capability `query.window_frame_range`.
 7. **S7 — frame `EXCLUDE`.** `EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS` on any explicit frame:
    after the `[lo, hi)` frame is computed, drop the current row (`CURRENT ROW`), its whole peer
@@ -392,11 +393,17 @@ folds over, *per current row*. The frame is `{ROWS | RANGE | GROUPS} frame_exten
   with only `UNBOUNDED`/`CURRENT ROW` bounds (no value offset) it is peer/edge based and works over
   **any** number of `ORDER BY` keys (or none → one peer group). A value offset (`n PRECEDING`/
   `FOLLOWING`) frames the rows whose key is within `n` of the current key and requires **exactly
-  one** `ORDER BY` key (else `42P20`) of an **integer** (integer offset) or **decimal** (integer/
-  decimal offset) type; an integer key with a decimal offset, a float key (divergence D3), a
-  timestamp/date key (deferred), or any other type is **`0A000`**. A **NULL** current key frames
-  only its NULL peers for offset/`CURRENT ROW` bounds, while `UNBOUNDED` bounds still reach the
-  partition edge (matching PG). Integer bound arithmetic is exact (i128 / bigint, so it never
+  one** `ORDER BY` key (else `42P20`) of an **integer** (integer offset), **decimal** (integer/
+  decimal offset), or **float** (integer/decimal offset converted to `f64`) type; an integer key
+  with a decimal offset, a timestamp/date key (deferred D4), or any other type is **`0A000`**. Over
+  a **float** key the bound `key ± offset` and the comparison are computed in `f64` (PG's
+  `in_range_float*_float8` — the offset is `float8` for both an `f32` and an `f64` key, the `f32`
+  widening to `f64`) via the in-contract correctly-rounded kernel ([float.md](float.md) §5) and the
+  PG float total order, so it is bit-identical cross-core and to PG; the total order gives PG's
+  `in_range` NaN/±Infinity rule for free (a NaN current key → a NaN bound, NaN sorts after every
+  non-NaN). A **NULL** current key frames only its NULL peers for offset/`CURRENT ROW` bounds, while
+  `UNBOUNDED` bounds still reach the partition edge (matching PG). Integer bound arithmetic is exact
+  (i128 / bigint, so it never
   overflows — matching PG's saturating frame edge).
 - **`GROUPS`** — peer-group offsets (`GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW`). A bound `g
   PRECEDING`/`FOLLOWING` lands on the `cg ∓ g`-th peer group's start/end. `GROUPS` requires an
@@ -410,10 +417,11 @@ folds over, *per current row*. The frame is `{ROWS | RANGE | GROUPS} frame_exten
   always `NO OTHERS` (no clause ⇒ no exclusion).
 
 S4 shipped explicit `ROWS BETWEEN frame_start AND frame_end`; **S6** added `RANGE`/`GROUPS` and
-value-based `RANGE` offsets (integer/decimal keys); **S7** added `EXCLUDE`. `RANGE` offsets over a
-float (D3) / timestamp / date key stay `0A000`. A frame bound that contains a window function, an
-aggregate, a column reference, or a negative offset is rejected (`42P20`/`42803`/`0A000`/`22013` as
-appropriate, matching PG); a malformed `EXCLUDE` is `42601`.
+value-based `RANGE` offsets (integer/decimal keys); **S7** added `EXCLUDE`; a later slice added
+**float**-keyed `RANGE` offsets (the former D3). `RANGE` offsets over a timestamp / date key stay
+`0A000` (the deferred D4 follow-on). A frame bound that contains a window function, an aggregate, a
+column reference, or a negative offset is rejected (`42P20`/`42803`/`0A000`/`22013` as appropriate,
+matching PG); a malformed `EXCLUDE` is `42601`.
 
 Frame evaluation **slides** for a no-`EXCLUDE` aggregate (§5.2/§8): the sorted partition makes the
 frame bounds `[lo, hi)` monotonic non-decreasing, so the accumulator is carried across rows — an
@@ -513,11 +521,20 @@ Deliberate divergences from PostgreSQL, each registered in
   divergence existed only to keep binary floats out of the value path before the `f64` type landed;
   with `f64` available, removing the divergence costs no determinism (D-numbering kept stable —
   D1/D3/D4 unchanged).
-- **D3 — `float`-keyed `RANGE`-offset frames are `0A000`.** A `RANGE BETWEEN n PRECEDING` needs
-  `order_key ± n` over the single ordering key; over `float` that re-imports float ordering into a
-  comparison path, so it is refused (matching the float-PK `0A000` and the date strict-island
-  precedents). PG supports `float8` RANGE offsets; jed's `0A000` is oracle-overridden.
-  `ROWS`/`GROUPS` frames over a float key are fine (no key arithmetic).
+- **~~D3 — `float`-keyed `RANGE`-offset frames are `0A000`~~ (RESOLVED — no longer a divergence).**
+  A `RANGE BETWEEN n PRECEDING` over a `float` ordering key now computes the bound `order_key ± n`
+  and the comparison **in `f64`** — PG's `in_range_float*_float8`, where the offset is `float8` for
+  both an `f32` and an `f64` key (the `f32` key widens to `f64` for the arithmetic). The `±` is the
+  in-contract correctly-rounded kernel ([float.md](float.md) §5) and the comparison is the PG float
+  total order, so jed is bit-identical cross-core and to PostgreSQL; `window/frame_range.test`'s
+  float cases are oracle-clean (no override). The float total order reproduces PG's `in_range`
+  NaN/±Infinity handling for free (a NaN current key makes the bound NaN, NaN sorts after every
+  non-NaN, and an infinite key ± a finite offset stays that infinity). An offset that overflows
+  `f64` traps `22003` (jed's float-cast rule — a negligible micro-divergence from PG's
+  accept-infinite-offset). The original divergence existed only to keep binary floats out of the
+  comparison path before the `f64` type landed; with `f64` available, removing it costs no
+  determinism. (D-numbering kept stable — D1/D4 unchanged.) `ROWS`/`GROUPS` frames over a float key
+  were always fine (no key arithmetic).
 - **D4 — `timestamp`/`timestamptz`/`date`-keyed `RANGE`-offset frames are `0A000` (deferred).** PG
   supports an `interval` offset over a timestamp key (and the standard's `'1 day' PRECEDING`); jed
   defers the timestamp/date families (only integer/decimal ordering keys take a value offset this
@@ -537,9 +554,9 @@ Deliberate divergences from PostgreSQL, each registered in
   level; PG supports a correlated window inside a subquery, an oracle-overridden divergence in
   `window/expr_keys.test`).
 - **`RANGE` value offsets over a timestamp/timestamptz/date key** (an `interval`/integer offset, D4)
-  — deferred; only integer/decimal ordering keys take a value offset this slice. A float key stays
-  `0A000` permanently (D3). Non-literal/expression frame offsets are also out (literals only, like
-  the `ROWS` narrowing).
+  — deferred; integer, decimal, and **float** ordering keys take a value offset (float was the former
+  D3, now landed). Non-literal/expression frame offsets are also out (literals only, like the `ROWS`
+  narrowing).
 - **Wider sharing / sliding** — *cost-lowering only, never correctness; the landed core is §5.2/§8.*
   The shared partition/sort pass groups specs with an **identical** partition+order; PostgreSQL's
   prefix-**compatible** sharing (a shorter `ORDER BY` reusing a longer one's sort) is not yet done.

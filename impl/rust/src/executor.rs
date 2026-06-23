@@ -15978,9 +15978,9 @@ fn window_key_slot(rexpr: RExpr, clause: &str, window_keys: &mut Vec<RExpr>) -> 
 }
 
 /// Resolve an explicit frame clause (spec/design/window.md §6). `GROUPS` requires an ORDER BY
-/// (`42P20`); a `RANGE` value offset requires exactly one ORDER BY column (`42P20`) of an integer or
-/// decimal type (else `0A000` — float is divergence D3, timestamp/date are deferred follow-ons). A
-/// negative offset is `22013`; `EXCLUDE` was already rejected at parse.
+/// (`42P20`); a `RANGE` value offset requires exactly one ORDER BY column (`42P20`) of an integer,
+/// decimal, or float type (a timestamp/date key is the deferred D4 follow-on, any other type is
+/// `0A000`). A negative offset is `22013`; `EXCLUDE` was already rejected at parse.
 fn resolve_frame(
     f: &crate::ast::WindowFrame,
     order: &[crate::spill::SortKey],
@@ -16019,7 +16019,7 @@ fn resolve_frame(
                 ));
             }
             let kt = &order_types[0];
-            if !(kt.is_integer() || kt.is_decimal()) {
+            if !(kt.is_integer() || kt.is_decimal() || kt.is_float()) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     format!(
@@ -16074,41 +16074,50 @@ fn resolve_int_bound(b: &crate::ast::FrameBound) -> Result<ResolvedBound> {
 
 /// Resolve a RANGE value-offset bound (window.md §6). The offset literal must be a non-negative
 /// numeric matching the ordering key type: an integer key takes an integer offset (a decimal offset
-/// is `0A000`, matching PG); a decimal key takes an integer (widened) or decimal offset.
+/// is `0A000`, matching PG); a decimal key takes an integer (widened) or decimal offset; a **float**
+/// key takes an integer or decimal offset converted to `f64` (PG's `in_range_float*_float8` — the
+/// offset is `float8` for both `f32` and `f64` keys, window.md §6). The decimal→`f64` conversion
+/// traps `22003` on overflow (jed's float-cast rule, a negligible micro-divergence from PG's
+/// accept-infinite-offset); an int offset is always finite.
 fn resolve_range_bound(b: &crate::ast::FrameBound, kt: &Type) -> Result<ResolvedBound> {
     use crate::ast::FrameBound;
+    let neg = || {
+        EngineError::new(
+            SqlState::InvalidPrecedingOrFollowingSize,
+            "frame starting or ending offset must not be negative",
+        )
+    };
     let offset = |e: &Expr| -> Result<Value> {
         match e {
             Expr::Literal(Literal::Int(n)) => {
                 if *n < 0 {
-                    return Err(EngineError::new(
-                        SqlState::InvalidPrecedingOrFollowingSize,
-                        "frame starting or ending offset must not be negative",
-                    ));
+                    return Err(neg());
                 }
-                if kt.is_decimal() {
+                if kt.is_float() {
+                    Ok(Value::Float64(*n as f64))
+                } else if kt.is_decimal() {
                     Ok(Value::Decimal(Decimal::from_i64(*n)))
                 } else {
                     Ok(Value::Int(*n))
                 }
             }
             Expr::Literal(Literal::Decimal(d)) => {
-                if !kt.is_decimal() {
-                    return Err(EngineError::new(
+                if d.is_negative() {
+                    return Err(neg());
+                }
+                if kt.is_float() {
+                    decimal_to_float(d, ScalarType::Float64)
+                } else if kt.is_decimal() {
+                    Ok(Value::Decimal(d.clone()))
+                } else {
+                    Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!(
                             "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {} and offset type decimal",
                             kt.canonical_name()
                         ),
-                    ));
+                    ))
                 }
-                if d.is_negative() {
-                    return Err(EngineError::new(
-                        SqlState::InvalidPrecedingOrFollowingSize,
-                        "frame starting or ending offset must not be negative",
-                    ));
-                }
-                Ok(Value::Decimal(d.clone()))
             }
             _ => Err(EngineError::new(
                 SqlState::FeatureNotSupported,
@@ -24229,7 +24238,14 @@ fn offset_count(v: &Value) -> i128 {
 
 /// The sign of `v − (cur ∓ off)` for a `RANGE` value offset (window.md §6), computed in a wide
 /// enough type to avoid overflow: integer keys compute the bound in `i128`; decimal keys use exact
-/// decimal arithmetic. `subtract` chooses `cur − off` vs `cur + off`.
+/// decimal arithmetic; **float** keys widen to `f64` and compute the bound with the in-contract
+/// correctly-rounded `+`/`-` kernel (float.md §5 — bit-identical cross-core), then compare with the
+/// PG float total order (`total_cmp_f64`). The total order reproduces PG's `in_range` NaN handling
+/// for free: a NaN current key makes the bound NaN (NaN ∓ finite = NaN), so a NaN row equals it and
+/// any non-NaN row is below it, while a NaN row against a non-NaN bound sorts above — exactly PG's
+/// "NaN sorts after non-NaN" rule. The offset is always finite (an int offset, or a decimal one that
+/// would otherwise overflow already trapped at resolve), so `cur ∓ off` never produces NaN itself.
+/// `subtract` chooses `cur − off` vs `cur + off`.
 fn range_v_vs_bound(
     v: &Value,
     cur: &Value,
@@ -24252,6 +24268,22 @@ fn range_v_vs_bound(
         (Value::Decimal(c), Value::Decimal(o)) => {
             let b = if subtract { c.sub(o)? } else { c.add(o)? };
             Ok(value_cmp(v, &Value::Decimal(b)))
+        }
+        // Float key: widen to f64 (PG computes `in_range_float*_float8`'s sum in float8 even for an
+        // f32 key) and compare in the float total order.
+        (Value::Float32(_) | Value::Float64(_), Value::Float64(o)) => {
+            let c = match cur {
+                Value::Float32(c) => *c as f64,
+                Value::Float64(c) => *c,
+                _ => unreachable!(),
+            };
+            let x = match v {
+                Value::Float32(x) => *x as f64,
+                Value::Float64(x) => *x,
+                _ => unreachable!("RANGE float-key value is a float"),
+            };
+            let b = if subtract { c - *o } else { c + *o };
+            Ok(crate::value::total_cmp_f64(x, b))
         }
         _ => unreachable!("RANGE offset resolved to a matching numeric type"),
     }

@@ -15178,9 +15178,9 @@ func resolveWindowDef(s *scope, wd *WindowDef, keyCtx *aggCtx, windowKeys *[]*rE
 }
 
 // resolveFrame resolves an explicit frame clause (spec/design/window.md §6). GROUPS requires an
-// ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer
-// or decimal type (else 0A000 — float is divergence D3, timestamp/date are deferred follow-ons). A
-// negative offset is 22013. Mirrors Rust's resolve_frame.
+// ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer,
+// decimal, or float type (a timestamp/date key is the deferred D4 follow-on, any other type is
+// 0A000). A negative offset is 22013. Mirrors Rust's resolve_frame.
 func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolvedFrame, error) {
 	isOffset := func(b FrameBound) bool { return b.Kind == FramePreceding || b.Kind == FrameFollowing }
 	hasOffset := isOffset(f.Start) || isOffset(f.End)
@@ -15215,7 +15215,7 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 					"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
 			}
 			kt := orderTypes[0]
-			if !(kt.IsInteger() || kt.IsDecimal()) {
+			if !(kt.IsInteger() || kt.IsDecimal() || kt.IsFloat()) {
 				return nil, NewError(FeatureNotSupported, fmt.Sprintf(
 					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s", kt.CanonicalName(),
 				))
@@ -15283,7 +15283,10 @@ func resolveIntBound(b FrameBound) (resolvedBound, error) {
 
 // resolveRangeBound resolves a RANGE value-offset bound (window.md §6). The offset literal must be a
 // non-negative numeric matching the ordering key type: an integer key takes an integer offset (a
-// decimal offset is 0A000, matching PG); a decimal key takes an integer (widened) or decimal offset.
+// decimal offset is 0A000, matching PG); a decimal key takes an integer (widened) or decimal offset;
+// a float key takes an integer or decimal offset converted to f64 (PG's in_range_float*_float8 — the
+// offset is float8 for both f32 and f64 keys). The decimal→f64 conversion traps 22003 on overflow
+// (jed's float-cast rule); an int offset is always finite.
 func resolveRangeBound(b FrameBound, kt Type) (resolvedBound, error) {
 	offset := func(e Expr) (Value, error) {
 		if e.Kind != ExprLiteral || e.Literal == nil {
@@ -15295,20 +15298,30 @@ func resolveRangeBound(b FrameBound, kt Type) (resolvedBound, error) {
 				return Value{}, NewError(InvalidPrecedingOrFollowingSize,
 					"frame starting or ending offset must not be negative")
 			}
+			if kt.IsFloat() {
+				return Float64Value(float64(e.Literal.Int)), nil
+			}
 			if kt.IsDecimal() {
 				return DecimalValue(DecimalFromInt64(e.Literal.Int)), nil
 			}
 			return IntValue(e.Literal.Int), nil
 		case LiteralDecimal:
+			if e.Literal.Dec.Neg && !e.Literal.Dec.IsZero() {
+				return Value{}, NewError(InvalidPrecedingOrFollowingSize,
+					"frame starting or ending offset must not be negative")
+			}
+			if kt.IsFloat() {
+				f, err := decimalToFloat64(e.Literal.Dec)
+				if err != nil {
+					return Value{}, err
+				}
+				return Float64Value(f), nil
+			}
 			if !kt.IsDecimal() {
 				return Value{}, NewError(FeatureNotSupported, fmt.Sprintf(
 					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s and offset type decimal",
 					kt.CanonicalName(),
 				))
-			}
-			if e.Literal.Dec.Neg && !e.Literal.Dec.IsZero() {
-				return Value{}, NewError(InvalidPrecedingOrFollowingSize,
-					"frame starting or ending offset must not be negative")
 			}
 			return DecimalValue(e.Literal.Dec), nil
 		default:
@@ -21854,7 +21867,13 @@ func offsetCount(v Value, np int) int {
 
 // rangeVVsBound returns the sign of v - (cur ∓ off) for a RANGE value offset (window.md §6),
 // computed exactly: integer keys use math/big so the bound never overflows int64 (matching Rust's
-// i128 / TS's bigint); decimal keys use exact decimal arithmetic. subtract chooses cur - off vs
+// i128 / TS's bigint); decimal keys use exact decimal arithmetic; float keys widen to f64 and
+// compute the bound with the in-contract correctly-rounded +/- kernel (float.md §5 — bit-identical
+// cross-core), comparing with the PG float total order (floatTotalCmp). The total order reproduces
+// PG's in_range NaN handling for free: a NaN current key makes the bound NaN (NaN ∓ finite = NaN), so
+// a NaN row equals it and any non-NaN row is below it, while a NaN row against a non-NaN bound sorts
+// above. The offset is always finite (an int offset, or a decimal one that would otherwise overflow
+// already trapped at resolve), so cur ∓ off never produces NaN itself. subtract chooses cur - off vs
 // cur + off. Mirrors Rust's range_v_vs_bound.
 func rangeVVsBound(v, cur, off Value, subtract bool) (int, error) {
 	if cur.Kind == ValInt {
@@ -21865,6 +21884,19 @@ func rangeVVsBound(v, cur, off Value, subtract bool) (int, error) {
 			b.Add(b, big.NewInt(off.Int))
 		}
 		return big.NewInt(v.Int).Cmp(b), nil
+	}
+	// Float key: widen to f64 (PG computes in_range_float*_float8's sum in float8 even for an f32
+	// key) and compare in the float total order.
+	if cur.IsFloat() {
+		c := cur.asF64()
+		x := v.asF64()
+		var b float64
+		if subtract {
+			b = c - off.F64()
+		} else {
+			b = c + off.F64()
+		}
+		return floatTotalCmp(x, b), nil
 	}
 	var (
 		b   Decimal

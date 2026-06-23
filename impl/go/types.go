@@ -435,6 +435,9 @@ func (t Type) IsInteger() bool { return t.isScalar() && t.Scalar.IsInteger() }
 // IsDecimal reports whether this is the scalar decimal type (false for a composite/array).
 func (t Type) IsDecimal() bool { return t.isScalar() && t.Scalar.IsDecimal() }
 
+// IsFloat reports whether this is one of the binary float types (false for a composite/array).
+func (t Type) IsFloat() bool { return t.isScalar() && t.Scalar.IsFloat() }
+
 // IsBool reports whether this is the scalar boolean type (false for a composite/array).
 func (t Type) IsBool() bool { return t.isScalar() && t.Scalar.IsBool() }
 

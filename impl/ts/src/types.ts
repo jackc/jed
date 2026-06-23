@@ -481,6 +481,9 @@ export function typeIsInteger(t: Type): boolean {
 export function typeIsDecimal(t: Type): boolean {
   return t.kind === "scalar" && isDecimal(t.scalar);
 }
+export function typeIsFloat(t: Type): boolean {
+  return t.kind === "scalar" && isFloat(t.scalar);
+}
 export function typeIsBoolean(t: Type): boolean {
   return t.kind === "scalar" && isBool(t.scalar);
 }

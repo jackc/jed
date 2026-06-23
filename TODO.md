@@ -140,10 +140,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `window_running_sum`/`window_moving_count` benchmarks guard it). New codes 42P20/22013/22014/22016;
       cost units `window_result`/`window_frame_step`; the `[[window]]` catalog array. Divergences:
       within-partition order fully resolved (D1), percent_rank/cume_dist → f64 (PG's float8 — D2
-      RESOLVED, the in-contract correctly-rounded division), float-keyed RANGE frames 0A000 (D3),
-      correlated window keys 0A000. Deferred follow-ons:
-      prefix-compatible (not just identical) sort sharing, a safely-invertible moving
-      `sum`/`avg`/`min`/`max`/float slide, RANGE offsets over a float (D3) / timestamp / date key, a
+      RESOLVED, the in-contract correctly-rounded division), float-keyed RANGE frames → f64 (PG's
+      in_range_float*_float8 — D3 RESOLVED, bit-identical to PG), correlated window keys 0A000.
+      Deferred follow-ons: prefix-compatible (not just identical) sort sharing, a safely-invertible
+      moving `sum`/`avg`/`min`/`max`/float slide, RANGE offsets over a timestamp / date key (D4), a
       correlated window key, `FILTER`/`WITHIN GROUP`, `IGNORE NULLS`. → [window.md](spec/design/window.md)
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions (`kind = "function"`).
       → [functions.md §9](spec/design/functions.md)
