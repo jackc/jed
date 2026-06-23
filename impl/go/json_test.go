@@ -342,3 +342,14 @@ func TestJsonbSetNullPathElementPropagatesNull(t *testing.T) {
 		t.Errorf("jsonb_insert(NULL path element) = %q, want NULL", got)
 	}
 }
+
+// TestArrayToJsonMultidimIs0A000: array_to_json of a MULTIDIMENSIONAL array is a deferred 0A000 (the
+// to_jsonb multidim deferral) — a documented divergence from PostgreSQL, which renders nested arrays.
+// The 1-D case is oracle-clean in suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs
+// array_to_json_multidim_is_0a000.
+func TestArrayToJsonMultidimIs0A000(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, "SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]])"); got != "0A000" {
+		t.Errorf("array_to_json(multidim): got %s, want 0A000", got)
+	}
+}

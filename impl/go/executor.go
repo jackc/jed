@@ -13679,6 +13679,7 @@ const (
 	afReplace                      // array_replace(anyarray, anyelement, anyelement) → anyarray; any dim, shape preserved
 	afPosition                     // array_position(anyarray, anyelement[, integer]) → i32; 1-D/empty (0A000); NULL start 22004
 	afPositions                    // array_positions(anyarray, anyelement) → i32[]; 1-D/empty only (0A000)
+	afToJson                       // array_to_json(anyarray) → json; compact to_jsonb kernel; STRICT; multidim 0A000
 	afContains                     // a @> b (anyarray, anyarray) → boolean; does a contain b; strict eq; any dim (§10)
 	afContainedBy                  // a <@ b (anyarray, anyarray) → boolean; is a contained by b (b @> a) (§10)
 	afOverlaps                     // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
@@ -16511,6 +16512,8 @@ func arrayFuncID(name string) arrayFunc {
 		return afPosition
 	case "array_positions":
 		return afPositions
+	case "array_to_json":
+		return afToJson
 	default:
 		panic("arrayFuncID: " + name + " is not a catalog array function")
 	}
@@ -21304,6 +21307,17 @@ func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
 		return arrayPositionValue(vals[0], vals[1], start)
 	case afPositions:
 		return arrayPositionsValue(vals[0], vals[1])
+	case afToJson:
+		// array_to_json(anyarray) → the array's compact JSON image (the to_jsonb node kernel). STRICT;
+		// a multidimensional array propagates the to_jsonb 0A000.
+		if vals[0].Kind == ValNull {
+			return NullValue(), nil
+		}
+		node, err := valueToNode(vals[0])
+		if err != nil {
+			return NullValue(), err
+		}
+		return JsonValue(jsonCompactOut(&node)), nil
 	case afContains:
 		return arrayContainsValue(vals[0], vals[1])
 	case afContainedBy:

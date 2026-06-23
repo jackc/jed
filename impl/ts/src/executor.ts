@@ -10839,6 +10839,7 @@ type ArrayFuncName =
   | "array_replace"
   | "array_position"
   | "array_positions"
+  | "array_to_json"
   // The containment/overlap operators `@>`/`<@`/`&&` (array-functions.md §10) — not catalog function
   // names; resolved via resolveContainment, which selects these kernel ids directly.
   | "contains"
@@ -18670,6 +18671,13 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
       return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
     case "array_positions":
       return arrayPositionsValue(vals[0]!, vals[1]!);
+    case "array_to_json": {
+      // array_to_json(anyarray) → the array's compact JSON image (the to_jsonb node kernel). STRICT;
+      // a multidimensional array propagates the to_jsonb 0A000.
+      const a = vals[0]!;
+      if (a.kind === "null") return nullValue();
+      return jsonValue(jsonCompactOut(valueToNode(a)));
+    }
     case "contains":
       return arrayContainsValue(vals[0]!, vals[1]!);
     case "contained_by":

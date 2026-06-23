@@ -269,6 +269,21 @@ fn json_builder_deferred_element_source_is_0a000() {
     );
 }
 
+/// `array_to_json` of a MULTIDIMENSIONAL array is a deferred `0A000` (the to_jsonb multidim
+/// deferral) — a documented divergence from PostgreSQL, which renders nested arrays. The 1-D case is
+/// oracle-clean in suites/json/json_builders.test.
+#[test]
+fn array_to_json_multidim_is_0a000() {
+    let mut db = Database::new();
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]])"
+        ),
+        "0A000"
+    );
+}
+
 /// A non-scalar `json[b]_build_object` KEY (e.g. a date) is a deferred `0A000` — only text / integer /
 /// decimal / boolean keys coerce to text this slice. PostgreSQL renders any type's text output as the
 /// key, so this is a documented divergence (the text/int/bool key coercions are oracle-clean in the

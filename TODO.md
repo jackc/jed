@@ -371,6 +371,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           exact, text/bool, json/jsonb canonicalize, 1-D array recursive incl. NULL→json null); STRICT;
           `value_to_node` kernel (reused by B4). Float / composite / datetime / uuid / bytea / interval /
           multidim-array sources deferred `0A000`. All 3 cores, cap `func.to_jsonb`, oracle-clean.
+    - [x] **B1 builders — `array_to_json`** — ✅ `array_to_json(anyarray)` → the array's compact json
+          image (the to_jsonb node kernel over an array), a polymorphic array function; STRICT; a
+          multidimensional array → `0A000` (the to_jsonb deferral, a documented divergence; per-core
+          test). All 3 cores, in `func.json_builders`, oracle-clean. _The only remaining builder is
+          `row_to_json` (composite → json), blocked on the composite→json deferral (to_jsonb composite
+          is `0A000`) — a deferred follow-on with the composite-image un-deferral._
     - [x] **B1 builders — object-from-array subset** — ✅ `json_object(text[])` / `json_object(text[],
           text[])` and the `jsonb_object` variants: build an object from one array of alternating
           keys/values or two equal-length key/value arrays. Every value → a JSON string (a NULL value →

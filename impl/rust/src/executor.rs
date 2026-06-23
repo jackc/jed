@@ -11298,6 +11298,10 @@ enum ArrayFunc {
     /// `a && b` (anyarray, anyarray) → boolean — do `a` and `b` OVERLAP: share at least one element
     /// (STRICT equality) over the flattened multiset, any dimensionality (§10).
     Overlaps,
+    /// `array_to_json(anyarray)` → json — the array as a JSON array, rendered COMPACT (the `to_jsonb`
+    /// node kernel). STRICT. A multidimensional array is a deferred `0A000` (like to_jsonb); the
+    /// optional 2nd `pretty boolean` argument is a deferred follow-on. (json-sql-functions.md §2)
+    ArrayToJson,
 }
 
 /// The polymorphic range ACCESSOR functions (spec/design/range-functions.md §1, RF1). Like
@@ -15879,6 +15883,7 @@ fn array_func_id(name: &str) -> ArrayFunc {
         "array_replace" => ArrayFunc::ArrayReplace,
         "array_position" => ArrayFunc::ArrayPosition,
         "array_positions" => ArrayFunc::ArrayPositions,
+        "array_to_json" => ArrayFunc::ArrayToJson,
         _ => unreachable!("array_func_id: {name} is not a catalog array function"),
     }
 }
@@ -22016,6 +22021,14 @@ fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value> {
             Value::Array(a) if a.ndim() == 0 => Ok(Value::Null),
             Value::Array(a) => Ok(Value::Text(array_dims_text(a))),
             _ => unreachable!("array_dims: array operand"),
+        },
+        // array_to_json(anyarray) → the array's compact JSON image (the to_jsonb node kernel). STRICT;
+        // a multidimensional array propagates the to_jsonb 0A000.
+        ArrayFunc::ArrayToJson => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            _ => Ok(Value::Json(json::json_compact_out(&value_to_node(
+                &vals[0],
+            )?))),
         },
         // array_length / array_lower / array_upper (anyarray, dim): propagate either NULL arg,
         // and return NULL for an empty array or an out-of-range dimension.

@@ -226,3 +226,15 @@ test("jsonb_set null path element propagates null", () => {
   assert.deepEqual(query(db, `SELECT jsonb_set('{"a":1}', ARRAY['a', NULL], '99')`), [["NULL"]]);
   assert.deepEqual(query(db, `SELECT jsonb_insert('{"a":1}', ARRAY[NULL], '99')`), [["NULL"]]);
 });
+
+// array_to_json of a MULTIDIMENSIONAL array is a deferred 0A000 (the to_jsonb multidim deferral) — a
+// documented divergence from PostgreSQL, which renders nested arrays. The 1-D case is oracle-clean in
+// suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs array_to_json_multidim_is_0a000 and
+// impl/go/json_test.go.
+test("array_to_json multidim is 0A000", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]])")),
+    "0A000",
+  );
+});

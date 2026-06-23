@@ -88,6 +88,14 @@ SELECT jsonb_build_object('a')
 statement error 22023
 SELECT jsonb_build_object(NULL, 1)
 
+# array_to_json renders an array as a compact json array (the to_jsonb image); STRICT.
+query TTT nosort
+SELECT array_to_json(ARRAY[1,2,3]), array_to_json(ARRAY['a','b']), array_to_json(NULL::i32[])
+----
+[1,2,3]
+["a","b"]
+NULL
+
 # Over stored columns: build an object/array per row from scalar columns.
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, name text, score i32)

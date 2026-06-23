@@ -2367,6 +2367,19 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# array_to_json(anyarray) → the array as a `json` array, rendered COMPACT (the to_jsonb node kernel
+# over an array). STRICT. A multidimensional array is a deferred 0A000 follow-on (like to_jsonb); the
+# optional 2nd `pretty boolean` argument is a deferred follow-on. (json-sql-functions.md §2)
+[[operator]]
+name           = "array_to_json"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyarray"]
+arg_resolution = "none"
+result         = "json"
+null           = "propagates"
+errors         = ["0A000"]
+
 [[operator]]
 name           = "array_append"
 kind           = "function"
