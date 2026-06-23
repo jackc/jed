@@ -3322,6 +3322,35 @@ requires_order = false
 null           = "frame"
 errors         = ["22014"]
 
+# lag / lead — the value of the row `offset` positions BEFORE (lag) / AFTER (lead) the current row
+# within the partition (in window ORDER BY order). offset is an integer (default 1); when the
+# target falls outside the partition the result is the `default` argument, else NULL. The value
+# expression's type is the result type (same_as_input). Frame-INSENSITIVE (offset is by position,
+# not the frame). (S2)
+[[window]]
+name           = "lag"
+kind           = "window"
+surface        = "LAG"
+args           = "value_offset_default"
+arg_families   = ["any"]
+result         = "same_as_input"
+frame_sensitive = false
+requires_order = false
+null           = "offset"
+errors         = []
+
+[[window]]
+name           = "lead"
+kind           = "window"
+surface        = "LEAD"
+args           = "value_offset_default"
+arg_families   = ["any"]
+result         = "same_as_input"
+frame_sensitive = false
+requires_order = false
+null           = "offset"
+errors         = []
+
 # === set-returning functions =================================================
 # A set-returning function (SRF) EXPANDS its arguments into a ROW SET — it fits neither the
 # operator mold (one value from infix operands) nor the aggregate mold (one value from a group):

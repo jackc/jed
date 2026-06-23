@@ -285,6 +285,10 @@ id = "query.window_ntile"
 description = "Window ntile(n) (window.md §4, S1): distribute the partition into n ranked buckets, larger first, numbered 1..n; n an integer evaluated once per partition; n<=0 is 22014, NULL n yields NULL for all rows. i64, position-based, matching PostgreSQL. Builds on query.window"
 
 [[capability]]
+id = "query.window_offset"
+description = "Window offset functions lag() and lead() (window.md §4, S2): the value `offset` rows before (lag) / after (lead) the current row within the partition (window ORDER BY order); offset defaults to 1, a negative offset flips direction; out-of-partition yields the default argument else NULL; NULL offset yields NULL for all rows. Result = the value expression type (same_as_input). Frame-insensitive, matching PostgreSQL. Builds on query.window"
+
+[[capability]]
 id = "query.union"
 description = "UNION / UNION ALL — combine two SELECTs' result rows; the bare form deduplicates (NULL-safe, value-canonical), ALL keeps multiplicities; output column count + names come from the left operand; per-column type unification (integer max-rank, integer<->decimal, all-NULL->text); arity mismatch 42601, type mismatch 42804; INTERSECT binds tighter; optional trailing ORDER BY/LIMIT/OFFSET resolves by output column name (spec/design/grammar.md §25)"
 

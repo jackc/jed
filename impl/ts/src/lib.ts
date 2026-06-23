@@ -221,6 +221,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.window_ranking",
   "query.window_ratio",
   "query.window_ntile",
+  "query.window_offset",
   // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
   "query.union",
   "query.intersect",

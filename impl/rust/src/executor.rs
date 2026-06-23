@@ -13094,6 +13094,10 @@ enum WindowPlan {
     /// `NTILE(n)` — distribute the partition into n ranked buckets (larger first), numbered 1..n.
     /// Position-based (not peer-based); n ≤ 0 → 22014; NULL n → NULL for every row.
     Ntile,
+    /// `LAG(v [,off [,def]])` / `LEAD(...)` — the value `off` positions back / forward in the
+    /// partition; `def` (or NULL) when the offset leaves the partition. Frame-insensitive.
+    Lag,
+    Lead,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
@@ -15038,6 +15042,45 @@ fn resolve_window_call(
         }
         wargs.push(anode);
         (WindowPlan::Ntile, ResolvedType::Int(ScalarType::Int64))
+    } else if lname == "lag" || lname == "lead" {
+        // lag/lead(value [, offset [, default]]) — window.md §4. The value expression's type is the
+        // result; offset is an integer (default 1); default (returned when the offset leaves the
+        // partition) must match the value type. Args resolved in a fresh Forbidden sub-context.
+        if star || args.is_empty() || args.len() > 3 {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!("{lname} takes 1 to 3 arguments"),
+            ));
+        }
+        let mut sub = AggCtx::Forbidden;
+        let (vnode, vty) = resolve(scope, &args[0], None, &mut sub, params)?;
+        let hint = match &vty {
+            ResolvedType::Int(s) | ResolvedType::Float(s) => Some(*s),
+            _ => None,
+        };
+        wargs.push(vnode);
+        if args.len() >= 2 {
+            let (onode, oty) = resolve(scope, &args[1], None, &mut sub, params)?;
+            if !matches!(oty, ResolvedType::Int(_) | ResolvedType::Null) {
+                return Err(type_error(format!("offset of {lname} must be integer")));
+            }
+            wargs.push(onode);
+        }
+        if args.len() == 3 {
+            let (dnode, dty) = resolve(scope, &args[2], hint, &mut sub, params)?;
+            if dty != ResolvedType::Null && dty != vty {
+                return Err(type_error(format!(
+                    "default of {lname} must match the value type"
+                )));
+            }
+            wargs.push(dnode);
+        }
+        let plan = if lname == "lag" {
+            WindowPlan::Lag
+        } else {
+            WindowPlan::Lead
+        };
+        (plan, vty)
     } else if is_aggregate_name(&lname) {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
@@ -23371,6 +23414,48 @@ fn apply_window_stage(
                             }
                         }
                         _ => unreachable!("ntile argument resolved to integer"),
+                    }
+                }
+                // lag/lead (window.md §4): the value `offset` positions back (lag) / forward (lead)
+                // in the partition, else the default (or NULL). Frame-insensitive — offset is by
+                // sorted position. The value is evaluated for every row; offset once (NULL → all
+                // NULL); the default per out-of-range row.
+                WindowPlan::Lag | WindowPlan::Lead => {
+                    let np = ordered.len();
+                    let mut vals: Vec<Value> = Vec::with_capacity(np);
+                    for &ri in &ordered {
+                        vals.push(spec.args[0].eval(&rows[ri], env, meter)?);
+                    }
+                    let offset = if spec.args.len() >= 2 {
+                        match spec.args[1].eval(&rows[ordered[0]], env, meter)? {
+                            Value::Null => None, // NULL offset → NULL for every row (PG)
+                            Value::Int(o) => Some(o),
+                            _ => unreachable!("lag/lead offset resolved to integer"),
+                        }
+                    } else {
+                        Some(1)
+                    };
+                    let dir: i64 = if matches!(spec.plan, WindowPlan::Lead) {
+                        1
+                    } else {
+                        -1
+                    };
+                    for (pos, &ri) in ordered.iter().enumerate() {
+                        meter.guard()?;
+                        meter.charge(COSTS.window_result);
+                        results[ri] = match offset {
+                            None => Value::Null,
+                            Some(o) => {
+                                let target = pos as i64 + dir * o;
+                                if target >= 0 && (target as usize) < np {
+                                    vals[target as usize].clone()
+                                } else if spec.args.len() == 3 {
+                                    spec.args[2].eval(&rows[ri], env, meter)?
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                        };
                     }
                 }
             }

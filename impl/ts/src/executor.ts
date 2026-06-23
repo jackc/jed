@@ -10329,7 +10329,12 @@ type WindowPlan =
   // CUME_DIST() — (rows through the current peer group)/N; decimal (divergence D2).
   | "cumeDist"
   // NTILE(n) — distribute the partition into n ranked buckets, larger buckets first; i64.
-  | "ntile";
+  | "ntile"
+  // LAG(value [, offset [, default]]) — the value `offset` rows BEFORE the current row (by sorted
+  // position); the result type is the value expression's type.
+  | "lag"
+  // LEAD(value [, offset [, default]]) — the value `offset` rows AFTER the current row.
+  | "lead";
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
 // For float SUM/AVG the inputs are COLLECTED in `floats` (the canonical fold needs all values up
@@ -11034,6 +11039,36 @@ function resolveWindowCall(
     wargs.push(r.node);
     plan = "ntile";
     result = { kind: "int", ty: "i64" };
+  } else if (lname === "lag" || lname === "lead") {
+    // lag/lead(value [, offset [, default]]) — window.md §4. The value expression's type is the
+    // result; offset is an integer (default 1); default (returned when the offset leaves the
+    // partition) must match the value type. Args resolved in a fresh Forbidden sub-context.
+    if (e.star || e.args.length === 0 || e.args.length > 3) {
+      throw engineError("undefined_function", `${lname} takes 1 to 3 arguments`);
+    }
+    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const vr = resolve(scope, e.args[0]!, null, sub, params);
+    const vty = vr.type;
+    // A scalar hint for the default argument: an int(s)/float(s) value type carries its width down
+    // so an integer/float default literal resolves to the same scalar (matching the value type).
+    const hint: ScalarType | null = vty.kind === "int" || vty.kind === "float" ? vty.ty : null;
+    wargs.push(vr.node);
+    if (e.args.length >= 2) {
+      const or = resolve(scope, e.args[1]!, null, sub, params);
+      if (or.type.kind !== "int" && or.type.kind !== "null") {
+        throw typeError(`offset of ${lname} must be integer`);
+      }
+      wargs.push(or.node);
+    }
+    if (e.args.length === 3) {
+      const dr = resolve(scope, e.args[2]!, hint, sub, params);
+      if (dr.type.kind !== "null" && !resolvedTypeEqual(dr.type, vty)) {
+        throw typeError(`default of ${lname} must match the value type`);
+      }
+      wargs.push(dr.node);
+    }
+    plan = lname === "lag" ? "lag" : "lead";
+    result = vty;
   } else if (isAggregateName(lname)) {
     throw engineError("feature_not_supported", "aggregate window functions are not supported yet");
   } else {
@@ -18995,6 +19030,47 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
                   ? Math.floor(pos / (base + 1)) + 1
                   : rem + Math.floor((pos - big) / base) + 1;
               results[ri] = intValue(BigInt(bucket));
+            }
+          }
+          break;
+        }
+        // lag/lead (window.md §4): the value `offset` positions back (lag) / forward (lead) in the
+        // partition, else the default (or NULL). Frame-insensitive — offset is by sorted position.
+        // The value is evaluated for every row; offset once (NULL → all NULL); the default per
+        // out-of-range row.
+        case "lag":
+        case "lead": {
+          const np = ordered.length;
+          const vals: Value[] = new Array(np);
+          for (let i = 0; i < np; i++) {
+            vals[i] = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+          }
+          // offset: evaluated once from the first sorted row. NULL → NULL for every row (PG);
+          // absent → 1. A small offset, but compared in number space (a huge offset just lands
+          // out of range → default/NULL).
+          let offset: number | null;
+          if (spec.args.length >= 2) {
+            const ov = evalExpr(spec.args[1]!, rows[ordered[0]!]!, env, meter);
+            offset = ov.kind === "null" ? null : Number((ov as { int: bigint }).int);
+          } else {
+            offset = 1;
+          }
+          const dir = spec.plan === "lead" ? 1 : -1;
+          for (let pos = 0; pos < np; pos++) {
+            const ri = ordered[pos]!;
+            meter.guard();
+            meter.charge(COSTS.windowResult);
+            if (offset === null) {
+              results[ri] = nullValue();
+            } else {
+              const target = pos + dir * offset;
+              if (target >= 0 && target < np) {
+                results[ri] = vals[target]!;
+              } else if (spec.args.length === 3) {
+                results[ri] = evalExpr(spec.args[2]!, rows[ri]!, env, meter);
+              } else {
+                results[ri] = nullValue();
+              }
             }
           }
           break;

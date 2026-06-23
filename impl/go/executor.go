@@ -13325,6 +13325,12 @@ const (
 	// planNtile — NTILE(n): distribute the partition into n ranked buckets (larger first),
 	// numbered 1..n. Position-based (not peer-based); n <= 0 → 22014; NULL n → NULL for every row.
 	planNtile
+	// planLag — LAG(value [, offset [, default]]): value `offset` rows EARLIER in the partition
+	// (default offset 1); out-of-range → default (or NULL). Frame-insensitive (sorted position).
+	planLag
+	// planLead — LEAD(value [, offset [, default]]): value `offset` rows LATER in the partition;
+	// otherwise identical to LAG (the offset direction flips).
+	planLead
 )
 
 // aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
@@ -14176,6 +14182,59 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		wargs = append(wargs, anode)
 		plan = planNtile
 		result = resolvedType{kind: rtInt, intTy: Int64}
+	case name == "lag" || name == "lead":
+		// lag/lead(value [, offset [, default]]) — window.md §4. The value expression's type is the
+		// result; offset is an integer (default 1); default (returned when the offset leaves the
+		// partition) must match the value type. Args resolved in a fresh Forbidden sub-context.
+		if fc.Star || len(fc.Args) == 0 || len(fc.Args) > 3 {
+			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes 1 to 3 arguments")
+		}
+		sub := &aggCtx{}
+		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		// The scalar hint for resolving the default literal: the value's scalar for an int/float
+		// value type, else none (mirrors Rust's Int(s) | Float(s) => Some(*s)).
+		var hint *ScalarType
+		switch vty.kind {
+		case rtInt:
+			h := vty.intTy
+			hint = &h
+		case rtFloat32:
+			h := Float32
+			hint = &h
+		case rtFloat64:
+			h := Float64
+			hint = &h
+		}
+		wargs = append(wargs, vnode)
+		if len(fc.Args) >= 2 {
+			onode, oty, err := resolve(s, *fc.Args[1], nil, sub, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if oty.kind != rtInt && oty.kind != rtNull {
+				return nil, resolvedType{}, typeError("offset of " + name + " must be integer")
+			}
+			wargs = append(wargs, onode)
+		}
+		if len(fc.Args) == 3 {
+			dnode, dty, err := resolve(s, *fc.Args[2], hint, sub, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if dty.kind != rtNull && !resolvedTypeEqual(dty, vty) {
+				return nil, resolvedType{}, typeError("default of " + name + " must match the value type")
+			}
+			wargs = append(wargs, dnode)
+		}
+		if name == "lag" {
+			plan = planLag
+		} else {
+			plan = planLead
+		}
+		result = vty
 	case isAggregateName(name):
 		return nil, resolvedType{}, NewError(FeatureNotSupported, "aggregate window functions are not supported yet")
 	default:
@@ -20918,6 +20977,66 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 							bucket = rem + (pos-big)/base + 1
 						}
 						results[ri] = IntValue(int64(bucket))
+					}
+				}
+			case planLag, planLead:
+				// lag/lead (window.md §4): the value `offset` positions back (lag) / forward (lead)
+				// in the partition, else the default (or NULL). Frame-insensitive — offset is by
+				// sorted position. The value is evaluated for every row; offset once (NULL → all
+				// NULL); the default per out-of-range row.
+				np := len(ordered)
+				vals := make([]Value, np)
+				for pos, ri := range ordered {
+					v, err := spec.args[0].eval(rows[ri], env, meter)
+					if err != nil {
+						return err
+					}
+					vals[pos] = v
+				}
+				// offset: evaluated once from the first sorted row; NULL → NULL for every row;
+				// absent → 1. A negative offset reverses the direction (lag(v,-1) acts like lead).
+				var offset int64
+				offsetNull := false
+				if len(spec.args) >= 2 {
+					ov, err := spec.args[1].eval(rows[ordered[0]], env, meter)
+					if err != nil {
+						return err
+					}
+					if ov.IsNull() {
+						offsetNull = true
+					} else {
+						offset = ov.Int
+					}
+				} else {
+					offset = 1
+				}
+				var dir int64 = -1
+				if spec.plan == planLead {
+					dir = 1
+				}
+				for pos, ri := range ordered {
+					if err := meter.Guard(); err != nil {
+						return err
+					}
+					meter.Charge(Costs.WindowResult)
+					switch {
+					case offsetNull:
+						results[ri] = NullValue()
+					default:
+						target := int64(pos) + dir*offset
+						if target >= 0 && target < int64(np) {
+							// vals[target] is a Value; copy it (the slot is reassigned per row).
+							v := vals[target]
+							results[ri] = v
+						} else if len(spec.args) == 3 {
+							v, err := spec.args[2].eval(rows[ri], env, meter)
+							if err != nil {
+								return err
+							}
+							results[ri] = v
+						} else {
+							results[ri] = NullValue()
+						}
 					}
 				}
 			}

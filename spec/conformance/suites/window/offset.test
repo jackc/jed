@@ -1,0 +1,93 @@
+# Window functions S2 — offset functions: lag() and lead() (spec/design/window.md §4).
+#
+# lag(v [,off [,def]]) is the value `off` rows BEFORE the current row in the partition (window ORDER
+# BY order); lead() is `off` rows AFTER. off defaults to 1; when the target falls outside the
+# partition the result is `def`, else NULL. Frame-insensitive (offset is by position). The result
+# type is the value expression's type, matching PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_offset, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 2, 40), (5, 2, 50)
+
+# lag(v) — previous row's v (NULL for the first); lead(v) — next row's v (NULL for the last).
+# names: id, prev, next
+# cost: 21
+query III nosort
+SELECT id, lag(v) OVER (ORDER BY id) AS prev, lead(v) OVER (ORDER BY id) AS next FROM t ORDER BY id
+----
+1
+NULL
+20
+2
+10
+30
+3
+20
+40
+4
+30
+50
+5
+40
+NULL
+
+# lag(v, 2) — two rows back; lag(v, 1, -1) — one back, default -1 when out of range.
+# names: id, lag2, lagdef
+query III nosort
+SELECT id, lag(v, 2) OVER (ORDER BY id) AS lag2, lag(v, 1, -1) OVER (ORDER BY id) AS lagdef FROM t ORDER BY id
+----
+1
+NULL
+-1
+2
+NULL
+10
+3
+10
+20
+4
+20
+30
+5
+30
+40
+
+# PARTITION BY g — lag restarts at each partition boundary. g=1 {id1,id2,id3}, g=2 {id4,id5}.
+# names: id, g, prev
+query III nosort
+SELECT id, g, lag(v) OVER (PARTITION BY g ORDER BY id) AS prev FROM t ORDER BY id
+----
+1
+1
+NULL
+2
+1
+10
+3
+1
+20
+4
+2
+NULL
+5
+2
+40
+
+# A negative offset flips the direction: lag(v, -1) is the NEXT row (like lead).
+# names: id, nextlike
+query II nosort
+SELECT id, lag(v, -1) OVER (ORDER BY id) AS nextlike FROM t ORDER BY id
+----
+1
+20
+2
+30
+3
+40
+4
+50
+5
+NULL

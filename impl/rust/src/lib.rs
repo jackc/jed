@@ -293,6 +293,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.window_ratio",
     // Window ntile(n) (S1, window.md §4).
     "query.window_ntile",
+    // Window offset functions lag() / lead() (S2, window.md §4).
+    "query.window_offset",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",
