@@ -10316,7 +10316,11 @@ type WindowSpec = {
 // row_number only; ranking / offset / aggregate-window / frame plans land in S1–S4.
 type WindowPlan =
   // ROW_NUMBER() — the 1-based sequence position within the partition (frame-insensitive).
-  "rowNumber";
+  | "rowNumber"
+  // RANK() — 1 + rows in earlier peer groups (ties share a rank, then a gap).
+  | "rank"
+  // DENSE_RANK() — 1 + earlier peer groups (ties share a rank, no gap).
+  | "denseRank";
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
 // For float SUM/AVG the inputs are COLLECTED in `floats` (the canonical fold needs all values up
@@ -10979,11 +10983,17 @@ function resolveWindowCall(
   // OVER (a window aggregate) is deferred to S3; any other name is 42883.
   let plan: WindowPlan;
   let result: ResolvedType;
-  if (lname === "row_number") {
+  // The frame-insensitive no-argument ranking functions (S0/S1): row_number/rank/dense_rank → i64.
+  const noArgI64: Record<string, WindowPlan> = {
+    row_number: "rowNumber",
+    rank: "rank",
+    dense_rank: "denseRank",
+  };
+  if (lname in noArgI64) {
     if (e.star || e.args.length !== 0) {
-      throw engineError("undefined_function", "row_number takes no arguments");
+      throw engineError("undefined_function", `${lname} takes no arguments`);
     }
-    plan = "rowNumber";
+    plan = noArgI64[lname]!;
     result = { kind: "int", ty: "i64" };
   } else if (isAggregateName(lname)) {
     throw engineError("feature_not_supported", "aggregate window functions are not supported yet");
@@ -18862,6 +18872,27 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], meter: Meter): void 
             results[ordered[pos]!] = intValue(BigInt(pos + 1));
           }
           break;
+        case "rank":
+        case "denseRank": {
+          // Peer-aware ranking (window.md §3): peers are rows EQUAL on the window ORDER BY keys
+          // only. rank = 1 + rows in earlier peer groups; dense_rank = 1 + earlier peer groups. An
+          // empty ORDER BY makes every row a peer, so both are 1 for all rows.
+          let rank = 1n;
+          let dense = 1n;
+          for (let pos = 0; pos < ordered.length; pos++) {
+            meter.guard();
+            meter.charge(COSTS.windowResult);
+            if (pos > 0) {
+              const prev = ordered[pos - 1]!;
+              if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[prev]!, spec.order) !== 0) {
+                rank = BigInt(pos + 1);
+                dense += 1n;
+              }
+            }
+            results[ordered[pos]!] = intValue(spec.plan === "denseRank" ? dense : rank);
+          }
+          break;
+        }
       }
     }
     for (let i = 0; i < n; i++) rows[i]!.push(results[i]!);

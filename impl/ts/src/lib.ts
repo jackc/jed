@@ -218,6 +218,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Window functions — OVER (PARTITION BY / ORDER BY), the window stage, row_number() (S0,
   // spec/design/window.md).
   "query.window",
+  "query.window_ranking",
   // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
   "query.union",
   "query.intersect",

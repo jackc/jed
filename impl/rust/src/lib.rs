@@ -287,6 +287,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Window functions — OVER (PARTITION BY / ORDER BY), the window stage, row_number() (S0,
     // spec/design/window.md).
     "query.window",
+    // Window ranking functions rank() / dense_rank() (S1, peer-aware — spec/design/window.md §4).
+    "query.window_ranking",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",

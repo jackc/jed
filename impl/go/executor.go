@@ -13310,6 +13310,10 @@ type windowPlan int
 const (
 	// planRowNumber — ROW_NUMBER(): the 1-based sequence position within the partition.
 	planRowNumber windowPlan = iota
+	// planRank — RANK(): 1 + the number of rows in earlier peer groups (ties share a rank, gap).
+	planRank
+	// planDenseRank — DENSE_RANK(): 1 + the number of earlier peer groups (ties share, no gap).
+	planDenseRank
 )
 
 // aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
@@ -14119,12 +14123,18 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		plan   windowPlan
 		result resolvedType
 	)
+	// The frame-insensitive no-argument ranking functions (S0/S1): row_number/rank/dense_rank → i64.
+	noArgI64, isNoArg := map[string]windowPlan{
+		"row_number": planRowNumber,
+		"rank":       planRank,
+		"dense_rank": planDenseRank,
+	}[name]
 	switch {
-	case name == "row_number":
+	case isNoArg:
 		if fc.Star || len(fc.Args) != 0 {
-			return nil, resolvedType{}, NewError(UndefinedFunction, "row_number takes no arguments")
+			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes no arguments")
 		}
-		plan = planRowNumber
+		plan = noArgI64
 		result = resolvedType{kind: rtInt, intTy: Int64}
 	case isAggregateName(name):
 		return nil, resolvedType{}, NewError(FeatureNotSupported, "aggregate window functions are not supported yet")
@@ -20775,6 +20785,30 @@ func applyWindowStage(rows []Row, specs []windowSpec, meter *Meter) error {
 					}
 					meter.Charge(Costs.WindowResult)
 					results[ri] = IntValue(int64(pos) + 1)
+				}
+			case planRank, planDenseRank:
+				// Peer-aware ranking (window.md §3): peers are rows EQUAL on the window ORDER BY
+				// keys only. rank = 1 + rows in earlier peer groups; dense_rank = 1 + earlier peer
+				// groups. An empty ORDER BY makes every row a peer, so both are 1 for all rows.
+				rank := int64(1)
+				dense := int64(1)
+				for pos, ri := range ordered {
+					if err := meter.Guard(); err != nil {
+						return err
+					}
+					meter.Charge(Costs.WindowResult)
+					if pos > 0 {
+						prev := ordered[pos-1]
+						if cmpRowsByOrder(rows[ri], rows[prev], spec.order) != 0 {
+							rank = int64(pos) + 1
+							dense++
+						}
+					}
+					if spec.plan == planDenseRank {
+						results[ri] = IntValue(dense)
+					} else {
+						results[ri] = IntValue(rank)
+					}
 				}
 			}
 		}

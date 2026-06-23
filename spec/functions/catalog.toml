@@ -3255,6 +3255,31 @@ requires_order = false
 null           = "never"
 errors         = []
 
+# rank / dense_rank — peer-aware ranking (peers = rows equal on the window ORDER BY only; the PK
+# tie-break orders peers for row_number but does NOT split a peer group — window.md §3). rank skips
+# ranks after a tie (1,1,3); dense_rank does not (1,1,2). Both i64, frame-insensitive (S1).
+[[window]]
+name           = "rank"
+kind           = "window"
+surface        = "RANK"
+args           = "none"
+result         = "i64"
+frame_sensitive = false
+requires_order = false
+null           = "never"
+errors         = []
+
+[[window]]
+name           = "dense_rank"
+kind           = "window"
+surface        = "DENSE_RANK"
+args           = "none"
+result         = "i64"
+frame_sensitive = false
+requires_order = false
+null           = "never"
+errors         = []
+
 # === set-returning functions =================================================
 # A set-returning function (SRF) EXPANDS its arguments into a ROW SET — it fits neither the
 # operator mold (one value from infix operands) nor the aggregate mold (one value from a group):

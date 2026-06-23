@@ -13079,6 +13079,10 @@ struct WindowSpec {
 enum WindowPlan {
     /// `ROW_NUMBER()` — the 1-based sequence position within the partition (frame-insensitive).
     RowNumber,
+    /// `RANK()` — 1 + the number of rows in earlier peer groups (ties share a rank, then a gap).
+    Rank,
+    /// `DENSE_RANK()` — 1 + the number of earlier peer groups (ties share a rank, no gap).
+    DenseRank,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
@@ -14976,14 +14980,21 @@ fn resolve_window_call(
     let lname = name.to_ascii_lowercase();
     // The plan + result type from the function name. S0: only row_number(); an aggregate name with
     // OVER (a window aggregate) is deferred to S3; any other name is 42883.
-    let (plan, result) = if lname == "row_number" {
+    // The frame-insensitive no-argument ranking functions (S0/S1): row_number/rank/dense_rank → i64.
+    let no_arg_i64 = match lname.as_str() {
+        "row_number" => Some(WindowPlan::RowNumber),
+        "rank" => Some(WindowPlan::Rank),
+        "dense_rank" => Some(WindowPlan::DenseRank),
+        _ => None,
+    };
+    let (plan, result) = if let Some(p) = no_arg_i64 {
         if star || !args.is_empty() {
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
-                "row_number takes no arguments",
+                format!("{lname} takes no arguments"),
             ));
         }
-        (WindowPlan::RowNumber, ResolvedType::Int(ScalarType::Int64))
+        (p, ResolvedType::Int(ScalarType::Int64))
     } else if is_aggregate_name(&lname) {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
@@ -23219,6 +23230,33 @@ fn apply_window_stage(rows: &mut [Row], specs: &[WindowSpec], meter: &mut Meter)
                         meter.guard()?; // enforce the cost ceiling per result (CLAUDE.md §13)
                         meter.charge(COSTS.window_result);
                         results[ri] = Value::Int(pos as i64 + 1);
+                    }
+                }
+                // Peer-aware ranking (window.md §3): peers are rows EQUAL on the window ORDER BY
+                // keys only (the PK tie-break sequences peers but does not split a peer group). rank
+                // = 1 + rows in earlier peer groups; dense_rank = 1 + earlier peer groups. With no
+                // ORDER BY every row is one peer group, so both are 1 for all rows.
+                WindowPlan::Rank | WindowPlan::DenseRank => {
+                    let mut rank = 1i64; // the rank assigned to the current peer group
+                    let mut dense = 1i64; // the dense rank of the current peer group
+                    for (pos, &ri) in ordered.iter().enumerate() {
+                        meter.guard()?;
+                        meter.charge(COSTS.window_result);
+                        if pos > 0 {
+                            let prev = ordered[pos - 1];
+                            // A new peer group starts when this row differs from the previous on the
+                            // ORDER BY keys. An empty ORDER BY makes every row a peer (Equal).
+                            if cmp_rows_by_order(&rows[ri], &rows[prev], &spec.order)
+                                != std::cmp::Ordering::Equal
+                            {
+                                rank = pos as i64 + 1; // rank skips to the 1-based position
+                                dense += 1; // dense rank advances by exactly one
+                            }
+                        }
+                        results[ri] = Value::Int(match spec.plan {
+                            WindowPlan::DenseRank => dense,
+                            _ => rank,
+                        });
                     }
                 }
             }
