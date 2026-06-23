@@ -1026,6 +1026,11 @@ pub enum BinaryOp {
     JsonGetText,
     JsonGetPath,
     JsonGetPathText,
+    // jsonb key-existence operators (spec/design/json-sql-functions.md §1, J5): `?` a key exists,
+    // `?|` any key of a text[] exists, `?&` all keys exist. `boolean` result.
+    JsonHasKey,
+    JsonHasAnyKey,
+    JsonHasAllKeys,
 }
 
 /// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL

@@ -71,7 +71,13 @@ export type BinaryOp =
   | "jsonGet"
   | "jsonGetText"
   | "jsonGetPath"
-  | "jsonGetPathText";
+  | "jsonGetPathText"
+  // jsonHasKey/jsonHasAnyKey/jsonHasAllKeys are the jsonb key-existence operators `?`/`?|`/`?&`
+  // (spec/design/json-sql-functions.md §1, J5): `?` a key exists, `?|` any key of a text[] exists,
+  // `?&` all keys exist. `boolean` result.
+  | "jsonHasKey"
+  | "jsonHasAnyKey"
+  | "jsonHasAllKeys";
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
 // The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A

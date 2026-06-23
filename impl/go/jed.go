@@ -509,6 +509,8 @@ var SupportedCapabilities = []string{
 	"types.json_casts",
 	// jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
 	"func.jsonb_access",
+	// jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).
+	"func.jsonb_contains",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

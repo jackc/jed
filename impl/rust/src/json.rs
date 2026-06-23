@@ -601,6 +601,70 @@ pub fn node_to_text(node: &JsonNode) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Containment / existence operators (`@> <@ ? ?| ?&`, spec/design/json-sql-functions.md §1, J5).
+// ---------------------------------------------------------------------------------------------
+
+/// `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains`)? The rules,
+/// pinned against the postgres:18 oracle:
+///   - object @> object: every member of `b` has a matching key in `a` whose value contains it.
+///   - array @> array: every element of `b` is "contained in" `a` — a SCALAR element must EQUAL a
+///     direct element of `a` (no recursion into `a`'s sub-containers); an OBJECT/ARRAY element must
+///     be contained in some same-kind direct element of `a`.
+///   - array @> scalar: the scalar is a direct element of the array (by value equality).
+///   - scalar @> scalar: value equality.
+///   - any other top-level pairing (object vs array, scalar vs array/object, …) is false.
+pub fn contains(a: &JsonNode, b: &JsonNode) -> bool {
+    match (a, b) {
+        (JsonNode::Object(ma), JsonNode::Object(mb)) => mb.iter().all(|(k, vb)| {
+            ma.iter()
+                .find(|(ka, _)| ka == k)
+                .is_some_and(|(_, va)| contains(va, vb))
+        }),
+        (JsonNode::Array(ea), JsonNode::Array(eb)) => eb.iter().all(|e| element_in_array(ea, e)),
+        // array @> a scalar: the scalar is a direct element of the array.
+        (JsonNode::Array(ea), b) if !is_container(b) => ea.iter().any(|x| x == b),
+        // scalar @> scalar: value equality (a container `a` against a scalar `b` already fell
+        // through; two scalars compare by the structural `==`).
+        (a, b) if !is_container(a) && !is_container(b) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether `e` (an element of the right array) is "contained in" the left array `arr`: a scalar
+/// element must EQUAL a direct element of `arr`; an object/array element must be contained in some
+/// same-kind direct element of `arr`.
+fn element_in_array(arr: &[JsonNode], e: &JsonNode) -> bool {
+    match e {
+        JsonNode::Object(_) => arr
+            .iter()
+            .any(|x| matches!(x, JsonNode::Object(_)) && contains(x, e)),
+        JsonNode::Array(_) => arr
+            .iter()
+            .any(|x| matches!(x, JsonNode::Array(_)) && contains(x, e)),
+        scalar => arr.iter().any(|x| x == scalar),
+    }
+}
+
+/// Whether a node is a container (object or array) vs a scalar (null/bool/number/string).
+fn is_container(n: &JsonNode) -> bool {
+    matches!(n, JsonNode::Object(_) | JsonNode::Array(_))
+}
+
+/// `jsonb ? text` — does the document have this top-level key? An object: the key is present; an
+/// array: the key is a string element; a string scalar: it equals the key; otherwise false
+/// (PG semantics, oracle-pinned).
+pub fn has_key(node: &JsonNode, key: &str) -> bool {
+    match node {
+        JsonNode::Object(members) => members.iter().any(|(k, _)| k == key),
+        JsonNode::Array(elems) => elems
+            .iter()
+            .any(|e| matches!(e, JsonNode::String(s) if s == key)),
+        JsonNode::String(s) => s == key,
+        _ => false,
+    }
+}
+
 /// JSON-escape a string the way PG `escape_json` does: quote, escape `"` and `\`, the short
 /// escapes for `\b \f \n \r \t`, other control chars (< 0x20) as `\u00XX`; `/` is NOT escaped
 /// and non-ASCII is emitted as raw UTF-8.

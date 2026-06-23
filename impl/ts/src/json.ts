@@ -684,3 +684,80 @@ export function nodeToText(node: JsonNode): string | null {
   if (node.kind === "string") return node.value;
   return jsonbOut(node);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Containment / existence operators (`@> <@ ? ?| ?&`, spec/design/json-sql-functions.md §1, J5).
+// ---------------------------------------------------------------------------------------------
+
+// nodesEqual is jsonb value equality — two canonical nodes are equal iff they compare equal under
+// the total btree order (jsonNodeCmp == 0; the structural form IS the value, §5).
+function nodesEqual(a: JsonNode, b: JsonNode): boolean {
+  return jsonNodeCmp(a, b) === 0;
+}
+
+// isContainer reports whether a node is a container (object or array) vs a scalar
+// (null/bool/number/string).
+function isContainer(n: JsonNode): boolean {
+  return n.kind === "object" || n.kind === "array";
+}
+
+// contains is `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains`)? The
+// rules, pinned against the postgres:18 oracle:
+//   - object @> object: every member of `b` has a matching key in `a` whose value contains it.
+//   - array @> array: every element of `b` is "contained in" `a` — a SCALAR element must EQUAL a
+//     direct element of `a` (no recursion into `a`'s sub-containers); an OBJECT/ARRAY element must
+//     be contained in some same-kind direct element of `a`.
+//   - array @> scalar: the scalar is a direct element of the array (by value equality).
+//   - scalar @> scalar: value equality.
+//   - any other top-level pairing (object vs array, scalar vs array/object, …) is false.
+export function contains(a: JsonNode, b: JsonNode): boolean {
+  if (a.kind === "object" && b.kind === "object") {
+    return b.members.every((mb) => {
+      const va = getField(a, mb.key);
+      return va !== null && contains(va, mb.value);
+    });
+  }
+  if (a.kind === "array" && b.kind === "array") {
+    return b.elements.every((e) => elementInArray(a.elements, e));
+  }
+  // array @> a scalar: the scalar is a direct element of the array.
+  if (a.kind === "array" && !isContainer(b)) {
+    return a.elements.some((x) => nodesEqual(x, b));
+  }
+  // scalar @> scalar: value equality (a container `a` against a scalar `b` already fell through;
+  // two scalars compare by structural equality).
+  if (!isContainer(a) && !isContainer(b)) {
+    return nodesEqual(a, b);
+  }
+  return false;
+}
+
+// elementInArray reports whether `e` (an element of the right array) is "contained in" the left
+// array `arr`: a scalar element must EQUAL a direct element of `arr`; an object/array element must
+// be contained in some same-kind direct element of `arr`.
+function elementInArray(arr: JsonNode[], e: JsonNode): boolean {
+  if (e.kind === "object") {
+    return arr.some((x) => x.kind === "object" && contains(x, e));
+  }
+  if (e.kind === "array") {
+    return arr.some((x) => x.kind === "array" && contains(x, e));
+  }
+  // scalar
+  return arr.some((x) => nodesEqual(x, e));
+}
+
+// hasKey is `jsonb ? text` — does the document have this top-level key? An object: the key is
+// present; an array: the key is a string element; a string scalar: it equals the key; otherwise
+// false (PG semantics, oracle-pinned).
+export function hasKey(node: JsonNode, key: string): boolean {
+  switch (node.kind) {
+    case "object":
+      return node.members.some((m) => m.key === key);
+    case "array":
+      return node.elements.some((e) => e.kind === "string" && e.value === key);
+    case "string":
+      return node.value === key;
+    default:
+      return false;
+  }
+}

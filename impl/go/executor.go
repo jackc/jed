@@ -13317,6 +13317,14 @@ const (
 	// (`->> #>>`), and is SQL NULL when the access misses (or when base/arg is NULL — the operators are
 	// strict).
 	reJsonGet
+	// reJsonContains is `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5):
+	// does `a` contain `b`. `<@` resolves to this with the operands swapped (`lhs`=a, `rhs`=b).
+	// Boolean; strict (a NULL operand → NULL).
+	reJsonContains
+	// reJsonHasKey is `jsonb ? text` / `?| text[]` / `?& text[]` key-existence
+	// (spec/design/json-sql-functions.md §1, J5). `hasKey` selects one-key / any-key / all-keys;
+	// `lhs` is the jsonb base, `rhs` the text key or text[] of keys. Boolean; strict.
+	reJsonHasKey
 )
 
 // jsonGetOp selects which jsonb accessor operator an reJsonGet node applies
@@ -13328,6 +13336,16 @@ const (
 	jgArrowText                      // `->>` — same access, rendered as text.
 	jgHashArrow                      // `#>` — get at a `text[]` path; result jsonb.
 	jgHashArrowText                  // `#>>` — get at a `text[]` path, rendered as text.
+)
+
+// hasKeyKind selects which jsonb key-existence operator an reJsonHasKey node applies
+// (spec/design/json-sql-functions.md §1, J5).
+type hasKeyKind int
+
+const (
+	hkOne hasKeyKind = iota // `?` — a single key (text) exists.
+	hkAny                   // `?|` — any key of a `text[]` exists.
+	hkAll                   // `?&` — all keys of a `text[]` exist.
 )
 
 // subqueryKind selects which subquery form an reSubquery node is (spec/design/grammar.md §26).
@@ -13581,6 +13599,10 @@ type rExpr struct {
 	// reJsonGet: the jsonb accessor operator (`-> ->> #> #>>`). `lhs` is the jsonb base, `rhs` the
 	// key/index/path argument (spec/design/json-sql-functions.md §1).
 	jgop jsonGetOp
+
+	// reJsonHasKey: which key-existence operator (`?`/`?|`/`?&`) — one-key / any-key / all-keys.
+	// `lhs` is the jsonb base, `rhs` the text key (`?`) or text[] of keys (`?|`/`?&`).
+	hasKey hasKeyKind
 
 	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
 	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
@@ -16866,6 +16888,13 @@ func resolveSetOp(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *para
 		return resolveRangeOp(s, op, lhs, rhs, rl, lt, rr, rt, ag, params)
 	}
 
+	// JSONB axis: only @>/<@ have a jsonb overload (json-sql-functions.md §1, J5). A jsonb operand
+	// (or a string literal adapting to one) routes here; `&&`/the positional operators have no jsonb
+	// overload and fall through to the array branch (42883). A json operand has no @> opclass (42883).
+	if (op == OpContains || op == OpContainedBy) && (lt.kind == rtJsonb || rt.kind == rtJsonb) {
+		return resolveJSONbContains(s, op, lhs, rhs, ag, params)
+	}
+
 	// ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
 	fn, ok := setOpArrayFunc(op)
 	if !ok {
@@ -17199,6 +17228,113 @@ func jsonOpSymbol(op BinaryOp) string {
 	}
 }
 
+// resolveJSONbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
+// J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
+// has no @> operator class (42883). `<@` resolves to `reJsonContains` with the operands swapped
+// (`a <@ b` is `b @> a`). The result is boolean; the operator is strict (a NULL operand → SQL NULL).
+func resolveJSONbContains(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	jsonbHint := Jsonb
+	// Resolve each operand with a jsonb context, so a bare `'{"a":1}'` string literal adapts.
+	resolveJSONb := func(e Expr) (*rExpr, error) {
+		r, t, err := resolve(s, e, &jsonbHint, ag, params)
+		if err != nil {
+			return nil, err
+		}
+		switch t.kind {
+		case rtJsonb, rtNull:
+			return r, nil
+		default:
+			return nil, NewError(UndefinedFunction,
+				fmt.Sprintf("operator does not exist: %s %s jsonb", rtName(t), binaryOpSymbol(op)))
+		}
+	}
+	rl, err := resolveJSONb(lhs)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	rr, err := resolveJSONb(rhs)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// `a @> b` keeps the order; `a <@ b` is `b @> a`.
+	a, b := rl, rr
+	if op == OpContainedBy {
+		a, b = rr, rl
+	}
+	return &rExpr{kind: reJsonContains, lhs: a, rhs: b}, resolvedType{kind: rtBool}, nil
+}
+
+// resolveJSONHasKey resolves a jsonb key-existence operator `?` / `?|` / `?&` (json-sql-functions.md
+// §1, J5). The base must be `jsonb` (a json base is 42883 — no operator). `?` takes a `text` key;
+// `?|`/`?&` take a `text[]` (a bare `'{a,b}'` string literal adapts via array_in). The result is
+// boolean; the operator is strict.
+func resolveJSONHasKey(s *scope, kind hasKeyKind, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	jsonbHint := Jsonb
+	rbase, baseTy, err := resolve(s, lhs, &jsonbHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	switch baseTy.kind {
+	case rtJsonb, rtNull:
+	default:
+		return nil, resolvedType{}, NewError(UndefinedFunction,
+			fmt.Sprintf("operator does not exist: %s %s", rtName(baseTy), hasKeySymbol(kind)))
+	}
+	var rarg *rExpr
+	switch kind {
+	case hkOne:
+		// `?` takes a single text key.
+		textHint := Text
+		r, t, err := resolve(s, rhs, &textHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		switch t.kind {
+		case rtText, rtNull:
+			rarg = r
+		default:
+			return nil, resolvedType{}, NewError(UndefinedFunction,
+				"the ? operator's right argument must be text")
+		}
+	default: // hkAny / hkAll
+		// `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
+		if rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText {
+			val, err := coerceStringToArray(rhs.Literal.Str, ScalarColType(Text))
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			rarg = valueToRExpr(val)
+		} else {
+			r, t, err := resolve(s, rhs, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch {
+			case t.kind == rtArray && t.elem != nil && t.elem.kind == rtText:
+				rarg = r
+			case t.kind == rtNull:
+				rarg = r
+			default:
+				return nil, resolvedType{}, NewError(UndefinedFunction,
+					"the ?| / ?& operator's right argument must be text[]")
+			}
+		}
+	}
+	return &rExpr{kind: reJsonHasKey, hasKey: kind, lhs: rbase, rhs: rarg}, resolvedType{kind: rtBool}, nil
+}
+
+// hasKeySymbol is the display symbol for a key-existence operator, for error messages.
+func hasKeySymbol(kind hasKeyKind) string {
+	switch kind {
+	case hkOne:
+		return "?"
+	case hkAny:
+		return "?|"
+	default: // hkAll
+		return "?&"
+	}
+}
+
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
 // `operator does not exist` message (only the comparison operators reach resolveQuantified).
 func binaryOpSymbol(op BinaryOp) string {
@@ -17253,8 +17389,14 @@ func binaryOpSymbol(op BinaryOp) string {
 		return "->>"
 	case OpJsonGetPath:
 		return "#>"
-	default: // OpJsonGetPathText
+	case OpJsonGetPathText:
 		return "#>>"
+	case OpJsonHasKey:
+		return "?"
+	case OpJsonHasAnyKey:
+		return "?|"
+	default: // OpJsonHasAllKeys
+		return "?&"
 	}
 }
 
@@ -19447,6 +19589,13 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 	// The jsonb accessor operators (spec/design/json-sql-functions.md §1, J4).
 	case OpJsonGet, OpJsonGetText, OpJsonGetPath, OpJsonGetPathText:
 		return resolveJSONAccess(s, b.Op, b.Lhs, b.Rhs, ag, params)
+	// The jsonb key-existence operators (spec/design/json-sql-functions.md §1, J5).
+	case OpJsonHasKey:
+		return resolveJSONHasKey(s, hkOne, b.Lhs, b.Rhs, ag, params)
+	case OpJsonHasAnyKey:
+		return resolveJSONHasKey(s, hkAny, b.Lhs, b.Rhs, ag, params)
+	case OpJsonHasAllKeys:
+		return resolveJSONHasKey(s, hkAll, b.Lhs, b.Rhs, ag, params)
 	default: // OpAnd, OpOr
 		rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 		if err != nil {
@@ -21635,6 +21784,79 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			return NullValue(), nil
 		}
+	case reJsonContains:
+		// `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5). One
+		// operator_eval; STRICT — a NULL operand yields SQL NULL.
+		m.Charge(Costs.OperatorEval)
+		av, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		bv, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		if av.Kind == ValNull || bv.Kind == ValNull {
+			return NullValue(), nil
+		}
+		// resolver guarantees jsonb operands for @> / <@.
+		return BoolValue(jsonContains(av.Json, bv.Json)), nil
+	case reJsonHasKey:
+		// `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (json-sql-functions.md §1, J5).
+		// One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
+		m.Charge(Costs.OperatorEval)
+		bv, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		av, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		if bv.Kind == ValNull || av.Kind == ValNull {
+			return NullValue(), nil
+		}
+		node := bv.Json // resolver guarantees a jsonb base for ? / ?| / ?&
+		var result bool
+		switch e.hasKey {
+		case hkOne:
+			result = jsonHasKey(node, av.Str) // resolver guarantees a text arg for ?
+		default: // hkAny / hkAll — a text[] arg
+			// A NULL element never matches (PG): `?&` over an array with a NULL is false; `?|`
+			// simply skips it.
+			keys := make([]string, 0, len(av.Array.Elements))
+			hasNull := false
+			for _, el := range av.Array.Elements {
+				if el.Kind == ValNull {
+					hasNull = true
+					continue
+				}
+				keys = append(keys, el.Str) // a text[] arg has text/NULL elements
+			}
+			if e.hasKey == hkAny {
+				for _, k := range keys {
+					if jsonHasKey(node, k) {
+						result = true
+						break
+					}
+				}
+			} else { // hkAll
+				result = !hasNull
+				for _, k := range keys {
+					if !jsonHasKey(node, k) {
+						result = false
+						break
+					}
+				}
+			}
+		}
+		return BoolValue(result), nil
 	case reAnd:
 		m.Charge(Costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)

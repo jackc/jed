@@ -3286,6 +3286,12 @@ func (p *Parser) parseConcat() (Expr, error) {
 			op = OpJsonGetPath
 		case TokHashArrowText:
 			op = OpJsonGetPathText
+		case TokQuestion:
+			op = OpJsonHasKey
+		case TokQuestionPipe:
+			op = OpJsonHasAnyKey
+		case TokQuestionAmp:
+			op = OpJsonHasAllKeys
 		default:
 			p.depth = base
 			return lhs, nil
@@ -4419,6 +4425,12 @@ func renderToken(t Token) string {
 		return "#>"
 	case TokHashArrowText:
 		return "#>>"
+	case TokQuestion:
+		return "?"
+	case TokQuestionPipe:
+		return "?|"
+	case TokQuestionAmp:
+		return "?&"
 	case TokTilde:
 		return "~"
 	case TokTildeStar:

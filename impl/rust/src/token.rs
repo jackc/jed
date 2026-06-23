@@ -76,6 +76,12 @@ pub enum Token {
     HashArrow,
     /// The `#>>` jsonb get-at-path-as-text operator (`doc #>> '{a,b}'`). `#` then `>>`, scanned greedily.
     HashArrowText,
+    /// The `?` jsonb key-exists operator (`doc ? 'key'`). See spec/design/json-sql-functions.md §1.
+    Question,
+    /// The `?|` jsonb any-key-exists operator (`doc ?| '{a,b}'`). `?` then `|`, scanned greedily.
+    QuestionPipe,
+    /// The `?&` jsonb all-keys-exist operator (`doc ?& '{a,b}'`). `?` then `&`, scanned greedily.
+    QuestionAmp,
     /// The `@>` array containment operator (`a @> b` — does `a` contain `b`). `@` then `>`, scanned
     /// greedily; a lone `@` is a 42601 syntax error. See spec/design/grammar.md §40, array-functions.md §10.
     Contains,

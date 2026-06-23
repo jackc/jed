@@ -9888,9 +9888,13 @@ impl Database {
                 self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(r, bound, ctes, cost)
             }
-            RExpr::JsonGet { base, arg, .. } => {
+            RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
                 self.fold_uncorrelated_in_rexpr(base, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(arg, bound, ctes, cost)
+            }
+            RExpr::JsonContains { a, b } => {
+                self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(b, bound, ctes, cost)
             }
             RExpr::IsNull { operand, .. } => {
                 self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
@@ -11148,6 +11152,17 @@ enum RSubscript {
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
 /// a row. Arithmetic nodes carry their (promotion-tower) result type so the computed
 /// value can be range-checked against it (the i16+i16 → i16 boundary).
+/// Which jsonb key-existence operator a [`RExpr::JsonHasKey`] applies (json-sql-functions.md §1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HasKeyKind {
+    /// `?` — a single key (text) exists.
+    One,
+    /// `?|` — any key of a `text[]` exists.
+    Any,
+    /// `?&` — all keys of a `text[]` exist.
+    All,
+}
+
 /// Which jsonb accessor operator a [`RExpr::JsonGet`] applies (spec/design/json-sql-functions.md §1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JsonGetOp {
@@ -11266,6 +11281,19 @@ enum RExpr {
     /// text (`->> #>>`), and is SQL NULL when the access misses (or when base/arg is NULL).
     JsonGet {
         op: JsonGetOp,
+        base: Box<RExpr>,
+        arg: Box<RExpr>,
+    },
+    /// `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5) — does `a` contain
+    /// `b`. `<@` resolves to this with the operands swapped. Boolean; strict (a NULL operand → NULL).
+    JsonContains {
+        a: Box<RExpr>,
+        b: Box<RExpr>,
+    },
+    /// `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (spec/design/json-sql-functions.md §1,
+    /// J5). `kind` selects one-key / any-key / all-keys. Boolean; strict.
+    JsonHasKey {
+        kind: HasKeyKind,
         base: Box<RExpr>,
         arg: Box<RExpr>,
     },
@@ -12839,7 +12867,10 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::Regex { lhs, rhs, .. }
         | RExpr::And(lhs, rhs)
         | RExpr::Or(lhs, rhs) => rexpr_is_constant(lhs) && rexpr_is_constant(rhs),
-        RExpr::JsonGet { base, arg, .. } => rexpr_is_constant(base) && rexpr_is_constant(arg),
+        RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
+            rexpr_is_constant(base) && rexpr_is_constant(arg)
+        }
+        RExpr::JsonContains { a, b } => rexpr_is_constant(a) && rexpr_is_constant(b),
         RExpr::IsNull { operand, .. } => rexpr_is_constant(operand),
         RExpr::Case { arms, els, .. } => {
             arms.iter()
@@ -14717,8 +14748,11 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::Regex { lhs, rhs, .. } => {
             rexpr_references_outer(lhs, depth) || rexpr_references_outer(rhs, depth)
         }
-        RExpr::JsonGet { base, arg, .. } => {
+        RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
             rexpr_references_outer(base, depth) || rexpr_references_outer(arg, depth)
+        }
+        RExpr::JsonContains { a, b } => {
+            rexpr_references_outer(a, depth) || rexpr_references_outer(b, depth)
         }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
             rexpr_references_outer(l, depth) || rexpr_references_outer(r, depth)
@@ -14843,9 +14877,13 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched(lhs, depth, touched);
             collect_touched(rhs, depth, touched);
         }
-        RExpr::JsonGet { base, arg, .. } => {
+        RExpr::JsonGet { base, arg, .. } | RExpr::JsonHasKey { base, arg, .. } => {
             collect_touched(base, depth, touched);
             collect_touched(arg, depth, touched);
+        }
+        RExpr::JsonContains { a, b } => {
+            collect_touched(a, depth, touched);
+            collect_touched(b, depth, touched);
         }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
             collect_touched(l, depth, touched);
@@ -19858,6 +19896,14 @@ fn resolve_binary(
         | BinaryOp::JsonGetText
         | BinaryOp::JsonGetPath
         | BinaryOp::JsonGetPathText => resolve_json_access(scope, op, lhs, rhs, agg, params),
+        // The jsonb key-existence operators (spec/design/json-sql-functions.md §1, J5).
+        BinaryOp::JsonHasKey => resolve_json_has_key(scope, HasKeyKind::One, lhs, rhs, agg, params),
+        BinaryOp::JsonHasAnyKey => {
+            resolve_json_has_key(scope, HasKeyKind::Any, lhs, rhs, agg, params)
+        }
+        BinaryOp::JsonHasAllKeys => {
+            resolve_json_has_key(scope, HasKeyKind::All, lhs, rhs, agg, params)
+        }
     }
 }
 
@@ -19995,6 +20041,15 @@ fn resolve_set_op(
         return resolve_range_op(scope, op, lhs, rhs, rl, lt, rr, rt, agg, params);
     }
 
+    // JSONB axis: only @>/<@ have a jsonb overload (json-sql-functions.md §1, J5). A jsonb operand
+    // (or a string literal adapting to one) routes here; `&&`/the positional operators have no jsonb
+    // overload and fall through to the array branch (42883). A json operand has no @> opclass (42883).
+    if (matches!(op, BinaryOp::Contains | BinaryOp::ContainedBy))
+        && (matches!(lt, ResolvedType::Jsonb) || matches!(rt, ResolvedType::Jsonb))
+    {
+        return resolve_jsonb_contains(scope, op, lhs, rhs, agg, params);
+    }
+
     // ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
     let func = match op {
         BinaryOp::Contains => ArrayFunc::Contains,
@@ -20033,6 +20088,129 @@ fn resolve_set_op(
         },
         ResolvedType::Bool,
     ))
+}
+
+/// Resolve a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1, J5). Both operands
+/// must be `jsonb` (a bare string literal adapts via `jsonb_in`); a `json` operand has no @>
+/// operator class (42883). `<@` resolves to `JsonContains` with the operands swapped (`a <@ b` is
+/// `b @> a`). The result is boolean; the operator is strict (a NULL operand yields SQL NULL).
+fn resolve_jsonb_contains(
+    scope: &Scope,
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    // Resolve each operand with a jsonb context, so a bare `'{"a":1}'` string literal adapts.
+    let resolve_jsonb = |e: &Expr, agg: &mut AggCtx, params: &mut ParamTypes| -> Result<RExpr> {
+        let (r, t) = resolve(scope, e, Some(ScalarType::Jsonb), agg, params)?;
+        match t {
+            ResolvedType::Jsonb | ResolvedType::Null => Ok(r),
+            _ => Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!(
+                    "operator does not exist: {} {} {}",
+                    t.type_name(),
+                    binary_op_symbol(op),
+                    "jsonb"
+                ),
+            )),
+        }
+    };
+    let rl = resolve_jsonb(lhs, agg, params)?;
+    let rr = resolve_jsonb(rhs, agg, params)?;
+    // `a @> b` keeps the order; `a <@ b` is `b @> a`.
+    let (a, b) = match op {
+        BinaryOp::Contains => (rl, rr),
+        BinaryOp::ContainedBy => (rr, rl),
+        _ => unreachable!("resolve_jsonb_contains only handles @> / <@"),
+    };
+    Ok((
+        RExpr::JsonContains {
+            a: Box::new(a),
+            b: Box::new(b),
+        },
+        ResolvedType::Bool,
+    ))
+}
+
+/// Resolve a jsonb key-existence operator `?` / `?|` / `?&` (json-sql-functions.md §1, J5). The base
+/// must be `jsonb` (a json base is 42883 — no operator). `?` takes a `text` key; `?|`/`?&` take a
+/// `text[]` (a bare `'{a,b}'` string literal adapts). The result is boolean; the operator is strict.
+fn resolve_json_has_key(
+    scope: &Scope,
+    kind: HasKeyKind,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (rbase, base_ty) = resolve(scope, lhs, Some(ScalarType::Jsonb), agg, params)?;
+    match base_ty {
+        ResolvedType::Jsonb | ResolvedType::Null => {}
+        _ => {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!(
+                    "operator does not exist: {} {}",
+                    base_ty.type_name(),
+                    has_key_symbol(kind)
+                ),
+            ));
+        }
+    }
+    let rarg = match kind {
+        HasKeyKind::One => {
+            // `?` takes a single text key.
+            let (r, t) = resolve(scope, rhs, Some(ScalarType::Text), agg, params)?;
+            match t {
+                ResolvedType::Text | ResolvedType::Null => r,
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedFunction,
+                        "the ? operator's right argument must be text",
+                    ));
+                }
+            }
+        }
+        HasKeyKind::Any | HasKeyKind::All => {
+            // `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
+            if let Expr::Literal(Literal::Text(s)) = rhs {
+                let val = coerce_string_to_array(s, &ColType::Scalar(ScalarType::Text))?;
+                value_to_rexpr(&val)
+            } else {
+                let (r, t) = resolve(scope, rhs, None, agg, params)?;
+                match t {
+                    ResolvedType::Array(elem) if matches!(*elem, ResolvedType::Text) => r,
+                    ResolvedType::Null => r,
+                    _ => {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedFunction,
+                            "the ?| / ?& operator's right argument must be text[]",
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    Ok((
+        RExpr::JsonHasKey {
+            kind,
+            base: Box::new(rbase),
+            arg: Box::new(rarg),
+        },
+        ResolvedType::Bool,
+    ))
+}
+
+/// The display symbol for a key-existence operator, for error messages.
+fn has_key_symbol(kind: HasKeyKind) -> &'static str {
+    match kind {
+        HasKeyKind::One => "?",
+        HasKeyKind::Any => "?|",
+        HasKeyKind::All => "?&",
+    }
 }
 
 /// Map a containment/positional `BinaryOp` to its range-against-range kernel (`RangeOp`).
@@ -20310,6 +20488,9 @@ fn binary_op_symbol(op: BinaryOp) -> &'static str {
         BinaryOp::JsonGetText => "->>",
         BinaryOp::JsonGetPath => "#>",
         BinaryOp::JsonGetPathText => "#>>",
+        BinaryOp::JsonHasKey => "?",
+        BinaryOp::JsonHasAnyKey => "?|",
+        BinaryOp::JsonHasAllKeys => "?&",
     }
 }
 
@@ -23710,6 +23891,62 @@ impl RExpr {
                         Ok(json::node_to_text(n).map_or(Value::Null, Value::Text))
                     }
                 }
+            }
+            RExpr::JsonContains { a, b } => {
+                m.charge(COSTS.operator_eval);
+                let av = a.eval(row, env, m)?;
+                let bv = b.eval(row, env, m)?;
+                m.guard()?;
+                match (&av, &bv) {
+                    (Value::Jsonb(na), Value::Jsonb(nb)) => Ok(Value::Bool(json::contains(na, nb))),
+                    // Strict: a NULL operand yields SQL NULL.
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    _ => unreachable!("resolver guarantees jsonb operands for @> / <@"),
+                }
+            }
+            RExpr::JsonHasKey { kind, base, arg } => {
+                m.charge(COSTS.operator_eval);
+                let bv = base.eval(row, env, m)?;
+                let av = arg.eval(row, env, m)?;
+                m.guard()?;
+                let node = match &bv {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Jsonb(n) => n,
+                    _ => unreachable!("resolver guarantees a jsonb base for ? / ?| / ?&"),
+                };
+                if matches!(av, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let result = match kind {
+                    HasKeyKind::One => match &av {
+                        Value::Text(k) => json::has_key(node, k),
+                        _ => unreachable!("resolver guarantees a text arg for ?"),
+                    },
+                    HasKeyKind::Any | HasKeyKind::All => match &av {
+                        Value::Array(arr) => {
+                            // A NULL element never matches (PG): `?&` over an array with a NULL is
+                            // false; `?|` simply skips it.
+                            let mut keys: Vec<&str> = Vec::with_capacity(arr.elements.len());
+                            let mut has_null = false;
+                            for e in &arr.elements {
+                                match e {
+                                    Value::Text(s) => keys.push(s),
+                                    Value::Null => has_null = true,
+                                    _ => unreachable!("a text[] arg has text/NULL elements"),
+                                }
+                            }
+                            match kind {
+                                HasKeyKind::Any => keys.iter().any(|k| json::has_key(node, k)),
+                                HasKeyKind::All => {
+                                    !has_null && keys.iter().all(|k| json::has_key(node, k))
+                                }
+                                HasKeyKind::One => unreachable!(),
+                            }
+                        }
+                        _ => unreachable!("resolver guarantees a text[] arg for ?| / ?&"),
+                    },
+                };
+                Ok(Value::Bool(result))
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);

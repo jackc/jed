@@ -242,6 +242,20 @@ export function lex(sql: string): Token[] {
       } else {
         throw engineError("syntax_error", "unexpected character '#'");
       }
+    } else if (c === "?") {
+      // `?|` (any-key) / `?&` (all-keys) / `?` (key-exists) are the jsonb key-existence operators
+      // (json-sql-functions.md §1), scanned greedily. A lone `?` is the key-exists operator (jed
+      // binds parameters as `$N`, never `?`).
+      if (i + 1 < n && sql[i + 1] === "|") {
+        tokens.push({ kind: "questionPipe" });
+        i += 2;
+      } else if (i + 1 < n && sql[i + 1] === "&") {
+        tokens.push({ kind: "questionAmp" });
+        i += 2;
+      } else {
+        tokens.push({ kind: "question" });
+        i += 1;
+      }
     } else if (c === "&") {
       // `&&` is the array overlap operator (grammar.md §40); `&<` (not-extend-right) and `&>`
       // (not-extend-left) are the range positional operators (range-functions.md §3). Each

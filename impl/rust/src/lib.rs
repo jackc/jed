@@ -598,6 +598,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "types.json_casts",
     // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
     "func.jsonb_access",
+    // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).
+    "func.jsonb_contains",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

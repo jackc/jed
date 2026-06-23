@@ -888,6 +888,12 @@ const (
 	OpJsonGetText
 	OpJsonGetPath
 	OpJsonGetPathText
+	// OpJsonHasKey/OpJsonHasAnyKey/OpJsonHasAllKeys are the jsonb key-existence operators
+	// `?`/`?|`/`?&` (spec/design/json-sql-functions.md §1, J5): `?` a key exists, `?|` any key of a
+	// text[] exists, `?&` all keys exist. `boolean` result.
+	OpJsonHasKey
+	OpJsonHasAnyKey
+	OpJsonHasAllKeys
 )
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.

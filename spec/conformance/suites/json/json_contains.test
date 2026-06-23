@@ -1,0 +1,93 @@
+# jsonb containment & key-existence operators (J5, spec/design/json-sql-functions.md §1): `@>` deep
+# contains, `<@` contained-by (the reverse), `?` key/element exists, `?|` any key, `?&` all keys.
+# `@>` is PG's deep containment — object @> object recurses on matching keys; array @> array requires
+# every right element contained in the left (a scalar element must equal a left element directly, an
+# object/array element must be contained in a same-kind left element); array @> scalar means the
+# scalar is a direct element; scalar @> scalar is value equality; any other pairing is false. `?`
+# matches an object key, a string array element, or an equal string scalar; `?|`/`?&` take a text[]
+# (a bare '{a,b}' literal adapts). All boolean and strict (NULL operand → SQL NULL). Output matches
+# the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.jsonb, func.jsonb_contains
+
+# @> object / nested / array / scalar containment (the recursion rules).
+query BBBB nosort
+SELECT '{"a":1,"b":2}'::jsonb @> '{"a":1}', '{"a":1}'::jsonb @> '{"a":2}',
+       '{"a":{"x":1,"y":2}}'::jsonb @> '{"a":{"x":1}}', '{"a":[1,2,3]}'::jsonb @> '{"a":[1,3]}'
+----
+true
+false
+true
+true
+
+query BBBB nosort
+SELECT '[1,2,3]'::jsonb @> '[1,3]', '[1,2,3]'::jsonb @> '3', '[1,2,3]'::jsonb @> '[3,3]', '[1,2]'::jsonb @> '[1,2,4]'
+----
+true
+true
+true
+false
+
+# The non-recursive-into-elements rule: a nested array does NOT contain a deep scalar.
+query BBBB nosort
+SELECT '[[1,2,3]]'::jsonb @> '[3]', '[[1,2],[3,4]]'::jsonb @> '[[3,4]]', '[{"a":1,"b":2}]'::jsonb @> '[{"a":1}]', '[1,2,3]'::jsonb @> '[]'
+----
+false
+true
+true
+true
+
+# Type-mismatched pairings are false; scalar @> scalar is value equality; null @> null is true.
+query BBBB nosort
+SELECT '3'::jsonb @> '[3]', '{"a":1}'::jsonb @> '[]', '5'::jsonb @> '5', 'null'::jsonb @> 'null'
+----
+false
+false
+true
+true
+
+# <@ is the reverse of @>.
+query BB nosort
+SELECT '{"a":1}'::jsonb <@ '{"a":1,"b":2}', '{"a":1,"b":2}'::jsonb <@ '{"a":1}'
+----
+true
+false
+
+# ? key/element/scalar existence; ?| any; ?& all.
+query BBBBB nosort
+SELECT '{"a":1,"b":2}'::jsonb ? 'a', '{"a":1}'::jsonb ? 'x', '["a","b"]'::jsonb ? 'a', '"a"'::jsonb ? 'a', '[1,2]'::jsonb ? '1'
+----
+true
+false
+true
+true
+false
+
+query BBBB nosort
+SELECT '{"a":1,"b":2}'::jsonb ?| '{a,x}', '{"a":1}'::jsonb ?| '{x,y}',
+       '{"a":1,"b":2}'::jsonb ?& '{a,b}', '{"a":1}'::jsonb ?& '{a,b}'
+----
+true
+false
+true
+false
+
+# A NULL operand propagates (the operators are strict).
+query BBB nosort
+SELECT (NULL::jsonb) @> '{}', '{"a":1}'::jsonb ? (NULL::text), (NULL::jsonb) ?& '{a}'
+----
+NULL
+NULL
+NULL
+
+# Used as a WHERE filter over a column (the GIN-accelerable predicates, sequential here).
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, b jsonb)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"a":1,"tags":["x","y"]}'), (2, '{"a":2}'), (3, '{"tags":["z"]}')
+
+query I rowsort
+SELECT id FROM docs WHERE b @> '{"a":1}' OR b ? 'tags'
+----
+1
+3

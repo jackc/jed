@@ -264,6 +264,21 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
             }
+            b'?' => {
+                // `?|` (any-key) / `?&` (all-keys) / `?` (key-exists) are the jsonb key-existence
+                // operators (json-sql-functions.md §1), scanned greedily. A lone `?` is the
+                // key-exists operator (jed binds parameters as `$N`, never `?`).
+                if bytes.get(i + 1) == Some(&b'|') {
+                    tokens.push(Token::QuestionPipe);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'&') {
+                    tokens.push(Token::QuestionAmp);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Question);
+                    i += 1;
+                }
+            }
             b'#' => {
                 // `#>>` / `#>` are the jsonb get-at-path operators (json-sql-functions.md §1),
                 // scanned greedily (`#>>` before `#>`). `#-` (delete-at-path) is a J6 follow-on.

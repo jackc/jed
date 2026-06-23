@@ -84,6 +84,12 @@ const (
 	// TokHashArrowText is the "#>>" jsonb get-at-path-as-text operator (doc #>> '{a,b}'). "#" then ">>",
 	// scanned greedily. See spec/design/json-sql-functions.md §1.
 	TokHashArrowText
+	// TokQuestion is the "?" jsonb key-exists operator (doc ? 'key'). See spec/design/json-sql-functions.md §1.
+	TokQuestion
+	// TokQuestionPipe is the "?|" jsonb any-key-exists operator (doc ?| '{a,b}'). "?" then "|", scanned greedily.
+	TokQuestionPipe
+	// TokQuestionAmp is the "?&" jsonb all-keys-exist operator (doc ?& '{a,b}'). "?" then "&", scanned greedily.
+	TokQuestionAmp
 	// TokContains is the "@>" array containment operator (a @> b — does a contain b). "@" then ">"
 	// scanned greedily; a lone "@" is a 42601 syntax error. spec/design/grammar.md §40.
 	TokContains

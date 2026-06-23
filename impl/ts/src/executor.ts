@@ -254,9 +254,11 @@ import {
 } from "./value.ts";
 import {
   type JsonNode,
+  contains as jsonContainsKernel,
   getField,
   getIndex,
   getPath,
+  hasKey as jsonHasKeyKernel,
   jsonNodeCmp,
   jsonbIn,
   jsonbOut,
@@ -8208,8 +8210,13 @@ export class Database {
         e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, ctes, cost);
         return e;
       case "jsonGet":
+      case "jsonHasKey":
         e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
         e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
+        return e;
+      case "jsonContains":
+        e.a = this.foldUncorrelatedInRExpr(e.a, bound, ctes, cost);
+        e.b = this.foldUncorrelatedInRExpr(e.b, bound, ctes, cost);
         return e;
       case "casing":
         e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
@@ -8613,7 +8620,10 @@ function rexprIsConstant(e: RExpr): boolean {
     case "regex":
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
     case "jsonGet":
+    case "jsonHasKey":
       return rexprIsConstant(e.base) && rexprIsConstant(e.arg);
+    case "jsonContains":
+      return rexprIsConstant(e.a) && rexprIsConstant(e.b);
     case "casing":
       return rexprIsConstant(e.arg);
     case "atTimeZone":
@@ -9587,7 +9597,10 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "regex":
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
     case "jsonGet":
+    case "jsonHasKey":
       return rexprReferencesOuter(e.base, depth) || rexprReferencesOuter(e.arg, depth);
+    case "jsonContains":
+      return rexprReferencesOuter(e.a, depth) || rexprReferencesOuter(e.b, depth);
     case "casing":
       return rexprReferencesOuter(e.arg, depth);
     case "atTimeZone":
@@ -9693,8 +9706,13 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       collectTouched(e.rhs, depth, touched);
       return;
     case "jsonGet":
+    case "jsonHasKey":
       collectTouched(e.base, depth, touched);
       collectTouched(e.arg, depth, touched);
+      return;
+    case "jsonContains":
+      collectTouched(e.a, depth, touched);
+      collectTouched(e.b, depth, touched);
       return;
     case "casing":
       collectTouched(e.arg, depth, touched);
@@ -10287,6 +10305,12 @@ type RExpr =
   // the key (text), array index (integer), or path (`text[]`). The result is jsonb (`-> #>`) or
   // text (`->> #>>`), and is SQL NULL when the access misses (or when base/arg is NULL — strict).
   | { kind: "jsonGet"; op: JsonGetOp; base: RExpr; arg: RExpr }
+  // `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5) — does `a` contain
+  // `b`. `<@` resolves to this with the operands swapped. Boolean; strict (a NULL operand → NULL).
+  | { kind: "jsonContains"; a: RExpr; b: RExpr }
+  // `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (spec/design/json-sql-functions.md §1,
+  // J5). `hasKeyKind` selects one-key / any-key / all-keys. Boolean; strict.
+  | { kind: "jsonHasKey"; hasKeyKind: HasKeyKind; base: RExpr; arg: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean; insensitive: boolean }
@@ -10430,6 +10454,11 @@ type SubqueryKind = "scalar" | "exists" | "in" | "quantified";
 // `#>` — get at a `text[]` path, result jsonb; "hashArrowText" `#>>` — get at a `text[]` path,
 // rendered as text.
 type JsonGetOp = "arrow" | "arrowText" | "hashArrow" | "hashArrowText";
+
+// HasKeyKind selects which jsonb key-existence operator a "jsonHasKey" RExpr applies
+// (spec/design/json-sql-functions.md §1, J5): "one" `?` — a single key (text) exists; "any" `?|` —
+// any key of a `text[]` exists; "all" `?&` — all keys of a `text[]` exist.
+type HasKeyKind = "one" | "any" | "all";
 
 // ScalarFuncName is the internal identity of a scalar-function node. abs/round span int/decimal
 // AND float overloads; the rest (ceil…tan) are float-only (spec/design/float.md §8). The
@@ -16404,6 +16433,13 @@ function resolveBinary(
     case "jsonGetPath":
     case "jsonGetPathText":
       return resolveJsonAccess(scope, op, lhs, rhs, ag, params);
+    // The jsonb key-existence operators (spec/design/json-sql-functions.md §1, J5).
+    case "jsonHasKey":
+      return resolveJsonHasKey(scope, "one", lhs, rhs, ag, params);
+    case "jsonHasAnyKey":
+      return resolveJsonHasKey(scope, "any", lhs, rhs, ag, params);
+    case "jsonHasAllKeys":
+      return resolveJsonHasKey(scope, "all", lhs, rhs, ag, params);
     default: {
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
@@ -16509,6 +16545,16 @@ function resolveSetOp(
   // non-range pair they fall through to the array branch below, which rejects them as 42883.)
   if (rl.type.kind === "range" || rr.type.kind === "range") {
     return resolveRangeOp(scope, op, lhs, rhs, rl, rr, ag, params);
+  }
+
+  // JSONB axis: only @>/<@ have a jsonb overload (json-sql-functions.md §1, J5). A jsonb operand
+  // (or a string literal adapting to one) routes here; `&&`/the positional operators have no jsonb
+  // overload and fall through to the array branch (42883). A json operand has no @> opclass (42883).
+  if (
+    (op === "contains" || op === "containedBy") &&
+    (rl.type.kind === "jsonb" || rr.type.kind === "jsonb")
+  ) {
+    return resolveJsonbContains(scope, op, lhs, rhs, ag, params);
   }
 
   // ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
@@ -16640,6 +16686,96 @@ function jsonOpSymbol(op: BinaryOp): string {
       return "#>>";
     default:
       return "?";
+  }
+}
+
+// resolveJsonbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
+// J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
+// has no @> operator class (42883). `<@` resolves to a "jsonContains" node with the operands swapped
+// (`a <@ b` is `b @> a`). The result is boolean; the operator is strict (a NULL operand → SQL NULL).
+function resolveJsonbContains(
+  scope: Scope,
+  op: BinaryOp,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // Resolve each operand with a jsonb context, so a bare `'{"a":1}'` string literal adapts.
+  const resolveJsonb = (e: Expr): RExpr => {
+    const { node, type } = resolve(scope, e, "jsonb", ag, params);
+    if (type.kind === "jsonb" || type.kind === "null") return node;
+    throw engineError(
+      "undefined_function",
+      `operator does not exist: ${rtName(type)} ${binaryOpSymbol(op)} jsonb`,
+    );
+  };
+  const rl = resolveJsonb(lhs);
+  const rr = resolveJsonb(rhs);
+  // `a @> b` keeps the order; `a <@ b` is `b @> a`.
+  const [a, b] = op === "containedBy" ? [rr, rl] : [rl, rr];
+  return { node: { kind: "jsonContains", a, b }, type: { kind: "bool" } };
+}
+
+// resolveJsonHasKey resolves a jsonb key-existence operator `?` / `?|` / `?&` (json-sql-functions.md
+// §1, J5). The base must be `jsonb` (a json base is 42883 — no operator). `?` takes a `text` key;
+// `?|`/`?&` take a `text[]` (a bare `'{a,b}'` string literal adapts via array_in). The result is
+// boolean; the operator is strict.
+function resolveJsonHasKey(
+  scope: Scope,
+  kind: HasKeyKind,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const rbase = resolve(scope, lhs, "jsonb", ag, params);
+  if (rbase.type.kind !== "jsonb" && rbase.type.kind !== "null") {
+    throw engineError(
+      "undefined_function",
+      `operator does not exist: ${rtName(rbase.type)} ${hasKeySymbol(kind)}`,
+    );
+  }
+  let rarg: RExpr;
+  if (kind === "one") {
+    // `?` takes a single text key.
+    const ra = resolve(scope, rhs, "text", ag, params);
+    if (ra.type.kind !== "text" && ra.type.kind !== "null") {
+      throw engineError("undefined_function", "the ? operator's right argument must be text");
+    }
+    rarg = ra.node;
+  } else {
+    // `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
+    if (rhs.kind === "literal" && rhs.literal.kind === "text") {
+      const val = coerceStringToArray(rhs.literal.text, { kind: "scalar", scalar: "text" });
+      rarg = valueToRExpr(val);
+    } else {
+      const ra = resolve(scope, rhs, null, ag, params);
+      const argTy = ra.type;
+      if (!(argTy.kind === "array" && argTy.elem.kind === "text") && argTy.kind !== "null") {
+        throw engineError(
+          "undefined_function",
+          "the ?| / ?& operator's right argument must be text[]",
+        );
+      }
+      rarg = ra.node;
+    }
+  }
+  return {
+    node: { kind: "jsonHasKey", hasKeyKind: kind, base: rbase.node, arg: rarg },
+    type: { kind: "bool" },
+  };
+}
+
+// hasKeySymbol is the display symbol for a key-existence operator, for error messages.
+function hasKeySymbol(kind: HasKeyKind): string {
+  switch (kind) {
+    case "one":
+      return "?";
+    case "any":
+      return "?|";
+    default: // "all"
+      return "?&";
   }
 }
 
@@ -16924,6 +17060,12 @@ function binaryOpSymbol(op: BinaryOp): string {
       return "#>";
     case "jsonGetPathText":
       return "#>>";
+    case "jsonHasKey":
+      return "?";
+    case "jsonHasAnyKey":
+      return "?|";
+    case "jsonHasAllKeys":
+      return "?&";
   }
 }
 
@@ -19441,6 +19583,55 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.op === "arrow" || e.op === "hashArrow") return jsonbValue(accessed);
       const t = nodeToText(accessed);
       return t === null ? nullValue() : textValue(t);
+    }
+    case "jsonContains": {
+      // `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5). One
+      // operator_eval; STRICT — a NULL operand yields SQL NULL.
+      m.charge(COSTS.operatorEval);
+      const av = evalExpr(e.a, row, env, m);
+      const bv = evalExpr(e.b, row, env, m);
+      m.guard();
+      if (av.kind === "null" || bv.kind === "null") return nullValue();
+      if (av.kind !== "jsonb" || bv.kind !== "jsonb")
+        throw new Error("resolver guarantees jsonb operands for @> / <@");
+      return { kind: "bool", value: jsonContainsKernel(av.node, bv.node) };
+    }
+    case "jsonHasKey": {
+      // `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (json-sql-functions.md §1, J5).
+      // One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
+      m.charge(COSTS.operatorEval);
+      const bv = evalExpr(e.base, row, env, m);
+      const av = evalExpr(e.arg, row, env, m);
+      m.guard();
+      if (bv.kind === "null" || av.kind === "null") return nullValue();
+      if (bv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb base for ? / ?| / ?&");
+      const node = bv.node;
+      let result: boolean;
+      if (e.hasKeyKind === "one") {
+        if (av.kind !== "text") throw new Error("resolver guarantees a text arg for ?");
+        result = jsonHasKeyKernel(node, av.text);
+      } else {
+        // `?|` / `?&` — a text[] arg. A NULL element never matches (PG): `?&` over an array with a
+        // NULL is false; `?|` simply skips it.
+        if (av.kind !== "array") throw new Error("resolver guarantees a text[] arg for ?| / ?&");
+        const keys: string[] = [];
+        let hasNull = false;
+        for (const el of av.elements) {
+          if (el.kind === "null") {
+            hasNull = true;
+            continue;
+          }
+          if (el.kind !== "text") throw new Error("a text[] arg has text/NULL elements");
+          keys.push(el.text);
+        }
+        if (e.hasKeyKind === "any") {
+          result = keys.some((k) => jsonHasKeyKernel(node, k));
+        } else {
+          // "all"
+          result = !hasNull && keys.every((k) => jsonHasKeyKernel(node, k));
+        }
+      }
+      return { kind: "bool", value: result };
     }
     case "isNull": {
       m.charge(COSTS.operatorEval);

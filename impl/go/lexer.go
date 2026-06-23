@@ -233,6 +233,20 @@ func Lex(sql string) ([]Token, error) {
 			} else {
 				return nil, NewError(SyntaxError, "unexpected character '#'")
 			}
+		case c == '?':
+			// `?|` (any-key) / `?&` (all-keys) / `?` (key-exists) are the jsonb key-existence
+			// operators (json-sql-functions.md §1), scanned greedily. A lone `?` is the key-exists
+			// operator (jed binds parameters as `$N`, never `?`).
+			if i+1 < len(b) && b[i+1] == '|' {
+				tokens = append(tokens, Token{Kind: TokQuestionPipe})
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '&' {
+				tokens = append(tokens, Token{Kind: TokQuestionAmp})
+				i += 2
+			} else {
+				tokens = append(tokens, Token{Kind: TokQuestion})
+				i++
+			}
 		case c == '&':
 			// `&&` is the array overlap operator (grammar.md §40); `&<` (not-extend-right) and `&>`
 			// (not-extend-left) are the range positional operators (range-functions.md §3). Each

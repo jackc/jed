@@ -333,8 +333,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         non-literal expression (a string literal still coerces at resolve via J0). Same-type identity;
         NULL adapts. A non-text/json/jsonb source → json/jsonb is `42804` (per-core test — PG's 42846
         cannot_coerce isn't registered). All three cores, capability `types.json_casts`, oracle-clean.
-  - [ ] **J4 / J5 / J6** — operators: accessors `-> ->> #> #>>` / containment `@> <@ ? ?| ?&` /
-        mutation `|| - #-`. → json-sql-functions.md §1
+  - [x] **J4** — ✅ accessor operators `-> ->> #> #>>` (jsonb): field/element get, get-as-text,
+        get-at-path, path-as-text; missing/OOB → SQL NULL, JSON null → SQL NULL under `->>`, strict,
+        "any other operator" precedence. New tokens + `RExpr::JsonGet`. `json` overloads deferred
+        `0A000` (verbatim sub-text — json.md §4). Cap `func.jsonb_access`. → json-sql-functions.md §1
+  - [x] **J5** — ✅ containment/existence `@> <@ ? ?| ?&` (jsonb): PG deep `@>` (object recurse /
+        array-element / array-scalar / scalar-equality rules), `<@` reverse, `?`/`?|`/`?&` key
+        existence over text/text[]. Strict; `@>`/`<@` via the shared set-op dispatcher (json operand
+        `42883`); `?` reuses a new token. New `RExpr::JsonContains`/`JsonHasKey`. Cap
+        `func.jsonb_contains`. → json-sql-functions.md §1
+  - [ ] **J6** — mutation operators `||` / `-` / `#-`. → json-sql-functions.md §1
   - [ ] **C0** — shared FROM-clause **column-definition-list** facility + multi-column synthetic
         table (the keystone for record functions, `json[b]_each`, and `JSON_TABLE`). → json-table.md §1
   - [ ] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +

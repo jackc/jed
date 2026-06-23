@@ -782,3 +782,111 @@ func jsonNodeToText(node *JsonNode) (string, bool) {
 		return jsonbOut(node), true
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// Containment / existence operators (`@> <@ ? ?| ?&`, spec/design/json-sql-functions.md §1, J5).
+// ---------------------------------------------------------------------------------------------
+
+// jsonContains is `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains`)?
+// The rules, pinned against the postgres:18 oracle:
+//   - object @> object: every member of `b` has a matching key in `a` whose value contains it.
+//   - array @> array: every element of `b` is "contained in" `a` — a SCALAR element must EQUAL a
+//     direct element of `a` (no recursion into `a`'s sub-containers); an OBJECT/ARRAY element must
+//     be contained in some same-kind direct element of `a`.
+//   - array @> scalar: the scalar is a direct element of the array (by value equality).
+//   - scalar @> scalar: value equality.
+//   - any other top-level pairing (object vs array, scalar vs array/object, …) is false.
+func jsonContains(a, b *JsonNode) bool {
+	switch {
+	case a.Kind == JObject && b.Kind == JObject:
+		for i := range b.Obj {
+			va := jsonGetField(a, b.Obj[i].Key)
+			if va == nil || !jsonContains(va, &b.Obj[i].Val) {
+				return false
+			}
+		}
+		return true
+	case a.Kind == JArray && b.Kind == JArray:
+		for i := range b.Arr {
+			if !jsonElementInArray(a.Arr, &b.Arr[i]) {
+				return false
+			}
+		}
+		return true
+	case a.Kind == JArray && !jsonIsContainer(b):
+		// array @> a scalar: the scalar is a direct element of the array.
+		for i := range a.Arr {
+			if jsonbValueEqual(&a.Arr[i], b) {
+				return true
+			}
+		}
+		return false
+	case !jsonIsContainer(a) && !jsonIsContainer(b):
+		// scalar @> scalar: value equality (a container `a` against a scalar `b` already fell
+		// through; two scalars compare by the structural equality).
+		return jsonbValueEqual(a, b)
+	default:
+		return false
+	}
+}
+
+// jsonElementInArray reports whether `e` (an element of the right array) is "contained in" the left
+// array `arr`: a scalar element must EQUAL a direct element of `arr`; an object/array element must be
+// contained in some same-kind direct element of `arr`.
+func jsonElementInArray(arr []JsonNode, e *JsonNode) bool {
+	switch e.Kind {
+	case JObject:
+		for i := range arr {
+			if arr[i].Kind == JObject && jsonContains(&arr[i], e) {
+				return true
+			}
+		}
+		return false
+	case JArray:
+		for i := range arr {
+			if arr[i].Kind == JArray && jsonContains(&arr[i], e) {
+				return true
+			}
+		}
+		return false
+	default: // scalar
+		for i := range arr {
+			if jsonbValueEqual(&arr[i], e) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// jsonIsContainer reports whether a node is a container (object or array) vs a scalar
+// (null/bool/number/string).
+func jsonIsContainer(n *JsonNode) bool {
+	return n.Kind == JObject || n.Kind == JArray
+}
+
+// jsonHasKey is `jsonb ? text` — does the document have this top-level key? An object: the key is
+// present; an array: the key is a string element; a string scalar: it equals the key; otherwise
+// false (PG semantics, oracle-pinned).
+func jsonHasKey(node *JsonNode, key string) bool {
+	switch node.Kind {
+	case JObject:
+		for i := range node.Obj {
+			if node.Obj[i].Key == key {
+				return true
+			}
+		}
+		return false
+	case JArray:
+		for i := range node.Arr {
+			if node.Arr[i].Kind == JString && node.Arr[i].S == key {
+				return true
+			}
+		}
+		return false
+	case JString:
+		return node.S == key
+	default:
+		return false
+	}
+}

@@ -2495,6 +2495,10 @@ class Parser {
       else if (k === "arrowText") op = "jsonGetText";
       else if (k === "hashArrow") op = "jsonGetPath";
       else if (k === "hashArrowText") op = "jsonGetPathText";
+      // The jsonb key-existence operators (json-sql-functions.md §1, J5) — same precedence level.
+      else if (k === "question") op = "jsonHasKey";
+      else if (k === "questionPipe") op = "jsonHasAnyKey";
+      else if (k === "questionAmp") op = "jsonHasAllKeys";
       else {
         this.depth = base;
         return lhs;
@@ -3320,6 +3324,12 @@ function renderToken(t: Token): string {
       return "#>";
     case "hashArrowText":
       return "#>>";
+    case "question":
+      return "?";
+    case "questionPipe":
+      return "?|";
+    case "questionAmp":
+      return "?&";
     case "tilde":
       return "~";
     case "tildeStar":
