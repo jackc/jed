@@ -32,6 +32,13 @@
   timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE '+05:30'   AS at_plus_530,
   timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE '-08:00'   AS at_minus_8,
   timestamp   '2024-01-15 06:30:00'    AT TIME ZONE '+05:30'   AS back_to_instant;`;
+
+	const convDemo = `SELECT
+  date_trunc('hour', timestamp '2024-03-15 13:47:23.5')   AS truncated,
+  EXTRACT(dow FROM date '2024-03-15')                     AS weekday,
+  EXTRACT(epoch FROM timestamptz '2024-03-15 12:00:00+00') AS epoch,
+  EXTRACT(day FROM interval '40 days 5 hours')            AS interval_days,
+  (timestamp '2024-03-15 13:47:23')::date                 AS as_date;`;
 </script>
 
 <svelte:head>
@@ -110,5 +117,20 @@ Named IANA zones (`America/New_York`, `Europe/Paris`, …) come from a time-zone
 already-loaded zone (an unknown zone raises `22023`). This is the same host-loaded-data model jed
 uses for Unicode collation; see the design notes for the `JTZ` bundle and the `db.loadTimeZoneData`
 host call.
+
+### Truncating, extracting, and converting
+
+`date_trunc(unit, value)` rounds a `timestamp` / `timestamptz` / `interval` **down** to a unit
+(`hour`, `day`, `week`, `month`, `quarter`, `year`, …); `EXTRACT(field FROM value)` pulls a single
+field out as exact `numeric` (`year`, `dow`, `epoch`, `doy`, ISO `week`, …); and the
+`timestamp` / `timestamptz` / `date` types **cast across** each other. For a `timestamptz`, both
+`date_trunc` and `EXTRACT` (and the casts) decompose the instant **in the session time zone** — the
+panel below runs in the default `UTC` session, and `date_trunc(unit, timestamptz, zone)` takes an
+explicit zone:
+
+<LiveSql query={convDemo} rows={1} />
+
+(`date_part` is deferred — it returns `double precision`, and jed has no binary float type — as are
+the `text`↔datetime casts; cast a string with the `timestamp '…'` / `date '…'` literal form instead.)
 
 See the full [type reference](../../reference/types/) for every scalar type and its range.

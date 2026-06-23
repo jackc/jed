@@ -12,7 +12,7 @@
 //!   * a non-datetime / non-literal-text source to a datetime target — jed `0A000` (text→datetime is
 //!     a valid PG cast; int→datetime is PG `42846`) (timezones.md §9.3, casts.toml).
 
-use jed::{execute, Database};
+use jed::{Database, execute};
 
 fn err_code(db: &mut Database, sql: &str) -> String {
     match execute(db, sql) {
@@ -26,7 +26,10 @@ fn err_code(db: &mut Database, sql: &str) -> String {
 fn extract_julian_is_deferred() {
     let mut db = Database::new();
     assert_eq!(
-        err_code(&mut db, "SELECT EXTRACT(julian FROM timestamp '2024-03-15 00:00:00')"),
+        err_code(
+            &mut db,
+            "SELECT EXTRACT(julian FROM timestamp '2024-03-15 00:00:00')"
+        ),
         "0A000"
     );
     assert_eq!(
@@ -40,7 +43,10 @@ fn extract_julian_is_deferred() {
 fn date_part_is_deferred() {
     let mut db = Database::new();
     assert_eq!(
-        err_code(&mut db, "SELECT date_part('hour', timestamp '2024-03-15 13:00:00')"),
+        err_code(
+            &mut db,
+            "SELECT date_part('hour', timestamp '2024-03-15 13:00:00')"
+        ),
         "42883"
     );
 }
@@ -55,7 +61,10 @@ fn extract_from_infinity_traps() {
         "22003"
     );
     assert_eq!(
-        err_code(&mut db, "SELECT EXTRACT(epoch FROM timestamptz '-infinity')"),
+        err_code(
+            &mut db,
+            "SELECT EXTRACT(epoch FROM timestamptz '-infinity')"
+        ),
         "22003"
     );
 }
@@ -67,7 +76,10 @@ fn extract_from_infinity_traps() {
 fn non_datetime_source_to_datetime_is_deferred() {
     let mut db = Database::new();
     // int → timestamp: jed 0A000, PG 42846.
-    assert_eq!(err_code(&mut db, "SELECT CAST(1 + 1 AS timestamp)"), "0A000");
+    assert_eq!(
+        err_code(&mut db, "SELECT CAST(1 + 1 AS timestamp)"),
+        "0A000"
+    );
     // a non-literal text → timestamptz: jed 0A000, PG parses the text.
     assert_eq!(
         err_code(
