@@ -2210,6 +2210,22 @@ class Parser {
       const rhs = this.parseConcat();
       return { kind: "like", lhs, rhs, negated: predNegated, insensitive };
     }
+    // `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
+    // `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
+    // is the prefix-NOT over the whole match, taken a level up). The pattern is one CONCAT expression.
+    const rxKind = this.peek().kind;
+    if (
+      rxKind === "tilde" ||
+      rxKind === "tildeStar" ||
+      rxKind === "bangTilde" ||
+      rxKind === "bangTildeStar"
+    ) {
+      const rxNegated = rxKind === "bangTilde" || rxKind === "bangTildeStar";
+      const rxInsensitive = rxKind === "tildeStar" || rxKind === "bangTildeStar";
+      this.advance();
+      const rhs = this.parseConcat();
+      return { kind: "regex", lhs, rhs, negated: rxNegated, insensitive: rxInsensitive };
+    }
     let op: BinaryOp;
     switch (this.peek().kind) {
       case "eq":
@@ -2902,6 +2918,14 @@ function renderToken(t: Token): string {
       return "&>";
     case "adjacent":
       return "-|-";
+    case "tilde":
+      return "~";
+    case "tildeStar":
+      return "~*";
+    case "bangTilde":
+      return "!~";
+    case "bangTildeStar":
+      return "!~*";
     default: // "eof" — never inside the parentheses
       return "";
   }

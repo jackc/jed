@@ -244,6 +244,7 @@ import {
   rangeUnion,
 } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
+import { compileRegex, type RegexProgram, regexIsMatch, regexNinst } from "./regex.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
 // UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
@@ -7788,6 +7789,7 @@ export class Database {
       case "or":
       case "distinct":
       case "like":
+      case "regex":
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
         e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, ctes, cost);
         return e;
@@ -8141,6 +8143,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "or":
     case "distinct":
     case "like":
+    case "regex":
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
     case "casing":
       return rexprIsConstant(e.arg);
@@ -9101,6 +9104,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "or":
     case "distinct":
     case "like":
+    case "regex":
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
     case "casing":
       return rexprReferencesOuter(e.arg, depth);
@@ -9188,6 +9192,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "or":
     case "distinct":
     case "like":
+    case "regex":
       collectTouched(e.lhs, depth, touched);
       collectTouched(e.rhs, depth, touched);
       return;
@@ -9518,6 +9523,20 @@ type RExpr =
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean; insensitive: boolean }
+  // `lhs ~ rhs` / `~*` / `!~` / `!~*` — regex match (regex.md), matched by the hand-written Pike VM
+  // (regex.ts). `program` is the precompiled NFA for a CONSTANT pattern (compiled once at resolve,
+  // the `col ~ 'literal'` case — regex.md §5); null means the pattern is non-constant (compiled per
+  // row at eval). `compileCharged` is the one-shot flag charging a precompiled program's
+  // regex_compile cost once per statement execution (on first eval), not per row.
+  | {
+      kind: "regex";
+      lhs: RExpr;
+      rhs: RExpr;
+      negated: boolean;
+      insensitive: boolean;
+      program: RegexProgram | null;
+      compileCharged: boolean;
+    }
   // upper(text)/lower(text) — Unicode case folding (collation.md §16). upper selects the direction;
   // folds via the engine-global property table or the ASCII baseline. A NULL operand propagates.
   | { kind: "casing"; upper: boolean; arg: RExpr }
@@ -10246,6 +10265,7 @@ function exprHasAggregate(e: Expr): boolean {
     case "between":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.lo) || exprHasAggregate(e.hi);
     case "like":
+    case "regex":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.rhs);
     case "case":
       return (
@@ -10327,6 +10347,7 @@ function rejectCheckStructure(e: Expr): void {
     case "binary":
     case "isDistinct":
     case "like":
+    case "regex":
       rejectCheckStructure(e.lhs);
       return rejectCheckStructure(e.rhs);
     case "in":
@@ -10406,6 +10427,7 @@ function rejectDefaultStructure(e: Expr): void {
     case "binary":
     case "isDistinct":
     case "like":
+    case "regex":
       rejectDefaultStructure(e.lhs);
       return rejectDefaultStructure(e.rhs);
     case "in":
@@ -10473,6 +10495,7 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
       case "binary":
       case "isDistinct":
       case "like":
+      case "regex":
         walk(e.lhs);
         return walk(e.rhs);
       case "in":
@@ -12103,6 +12126,7 @@ function countSelfRefsExpr(e: Expr, name: string): number {
     case "binary":
     case "isDistinct":
     case "like":
+    case "regex":
       return countSelfRefsExpr(e.lhs, name) + countSelfRefsExpr(e.rhs, name);
     case "in":
       return (
@@ -12739,6 +12763,7 @@ function exprCallsSeqMutator(e: Expr): boolean {
     case "binary":
     case "isDistinct":
     case "like":
+    case "regex":
       return exprCallsSeqMutator(e.lhs) || exprCallsSeqMutator(e.rhs);
     case "in":
       return exprCallsSeqMutator(e.lhs) || e.list.some(exprCallsSeqMutator);
@@ -12987,6 +13012,7 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
     case "binary":
     case "isDistinct":
     case "like":
+    case "regex":
       collectExprPrivs(e.lhs, req, locals);
       collectExprPrivs(e.rhs, req, locals);
       break;
@@ -13068,6 +13094,7 @@ function exprReadsColumns(e: Expr): boolean {
     case "binary":
     case "isDistinct":
     case "like":
+    case "regex":
       return exprReadsColumns(e.lhs) || exprReadsColumns(e.rhs);
     case "in":
       return exprReadsColumns(e.lhs) || e.list.some(exprReadsColumns);
@@ -14054,6 +14081,33 @@ function resolve(
           rhs: p.rr,
           negated: e.negated,
           insensitive: e.insensitive,
+        },
+        type: { kind: "bool" },
+      };
+    }
+    case "regex": {
+      // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand typing as
+      // LIKE: resolve the pair, require both text (or a bare NULL); a non-text operand is 42804.
+      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
+      requireTextOrNull(p.lt);
+      requireTextOrNull(p.rt);
+      // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per row at
+      // eval. For ~* the constant is case-folded before compiling (the ILIKE mechanism). A malformed
+      // pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
+      let program: RegexProgram | null = null;
+      if (p.rr.kind === "constText") {
+        const pat = e.insensitive ? foldLowerSimple(p.rr.value, loadedProperty()) : p.rr.value;
+        program = compileRegex(pat);
+      }
+      return {
+        node: {
+          kind: "regex",
+          lhs: p.rl,
+          rhs: p.rr,
+          negated: e.negated,
+          insensitive: e.insensitive,
+          program,
+          compileCharged: false,
         },
         type: { kind: "bool" },
       };
@@ -17153,6 +17207,42 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       // negated carries NOT LIKE/ILIKE: matched !== negated flips for the NOT form.
       return { kind: "bool", value: likeMatch(sub, pat) !== e.negated };
+    }
+    case "regex": {
+      m.charge(COSTS.operatorEval);
+      const subject = evalExpr(e.lhs, row, env, m);
+      const pattern = evalExpr(e.rhs, row, env, m);
+      // NULL propagates BEFORE the matcher runs (regex.md §1) — a malformed pattern against a NULL
+      // operand is still NULL, never 2201B.
+      if (subject.kind === "null" || pattern.kind === "null") return nullValue();
+      if (subject.kind !== "text" || pattern.kind !== "text") {
+        throw new Error("unreachable: resolver requires text regex operands");
+      }
+      // ~* (insensitive): simple-lowercase the subject under the engine casing regime (collation.md
+      // §16). The constant pattern was folded at resolve; a non-constant pattern is folded below.
+      const prop = e.insensitive ? loadedProperty() : undefined;
+      const sub = e.insensitive ? foldLowerSimple(subject.text, prop) : subject.text;
+      const subjCps = Array.from(sub, (c) => c.codePointAt(0) as number);
+      let matched: boolean;
+      if (e.program !== null) {
+        // Constant precompiled pattern: charge its regex_compile cost ONCE per statement execution
+        // (on first eval), not per row (regex.md §5).
+        if (!e.compileCharged) {
+          e.compileCharged = true;
+          m.charge(COSTS.regexCompile * BigInt(regexNinst(e.program)));
+          m.guard();
+        }
+        matched = regexIsMatch(e.program, subjCps, m);
+      } else {
+        // Non-constant pattern: compile now (charging regex_compile) and run.
+        const pat = e.insensitive ? foldLowerSimple(pattern.text, prop) : pattern.text;
+        const prog = compileRegex(pat);
+        m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
+        m.guard();
+        matched = regexIsMatch(prog, subjCps, m);
+      }
+      // negated carries !~ / !~*: matched !== negated flips for the negated form.
+      return { kind: "bool", value: matched !== e.negated };
     }
     case "casing": {
       m.charge(COSTS.operatorEval);

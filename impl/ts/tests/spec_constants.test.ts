@@ -238,6 +238,10 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.collate;
       case "timezone":
         return COSTS.timezone;
+      case "regex_compile":
+        return COSTS.regexCompile;
+      case "regex_step":
+        return COSTS.regexStep;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

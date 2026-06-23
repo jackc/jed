@@ -45,6 +45,10 @@ export type TokenKind =
   | "notExtendLeft" // &> — the range not-extend-left operator (a &> b). "&" then ">". See range-functions.md §3.
   | "adjacent" // -|- — the range adjacency operator (a -|- b). "-" "|" "-", scanned greedily and
   //              checked BEFORE the "--" line comment. See range-functions.md §3 (RF3).
+  | "tilde" // ~ — the regular-expression match operator (s ~ p). See grammar.md §22b, regex.md.
+  | "tildeStar" // ~* — the case-insensitive regex match operator (s ~* p). "~" then "*", scanned greedily.
+  | "bangTilde" // !~ — the negated regex match operator (s !~ p). "!" then "~", checked before "!="→"ne".
+  | "bangTildeStar" // !~* — the negated case-insensitive regex match operator (s !~* p). "!" "~" "*".
   | "param" // a bind parameter $N — `paramIndex` holds the 1-based index (spec/design/api.md §5)
   | "eof"; // end of input
 

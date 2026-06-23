@@ -186,13 +186,30 @@ export function lex(sql: string): Token[] {
         i++;
       }
     } else if (c === "!") {
-      // `!=` is the PostgreSQL alias for `<>` (grammar.md §4); both fold to the `ne` token. A
-      // lone `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
-      if (i + 1 < n && sql[i + 1] === "=") {
+      // `!~*` / `!~` are the negated regex match operators (grammar.md §22b), checked greedily
+      // BEFORE the `!=`→`ne` alias and the lone-`!` error. `!=` is the PostgreSQL alias for `<>`.
+      // A lone `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
+      if (i + 2 < n && sql[i + 1] === "~" && sql[i + 2] === "*") {
+        tokens.push({ kind: "bangTildeStar" });
+        i += 3;
+      } else if (i + 1 < n && sql[i + 1] === "~") {
+        tokens.push({ kind: "bangTilde" });
+        i += 2;
+      } else if (i + 1 < n && sql[i + 1] === "=") {
         tokens.push({ kind: "ne" });
         i += 2;
       } else {
         throw engineError("syntax_error", "unexpected character '!'");
+      }
+    } else if (c === "~") {
+      // `~*` is the case-insensitive regex match operator (grammar.md §22b), scanned greedily as
+      // one token (never `~` `star`); a bare `~` is the case-sensitive form.
+      if (i + 1 < n && sql[i + 1] === "*") {
+        tokens.push({ kind: "tildeStar" });
+        i += 2;
+      } else {
+        tokens.push({ kind: "tilde" });
+        i += 1;
       }
     } else if (c === "@") {
       // `@>` is the array containment operator (grammar.md §40), scanned greedily as one token;

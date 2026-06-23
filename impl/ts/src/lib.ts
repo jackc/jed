@@ -362,6 +362,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "expr.between",
   "expr.like",
   "expr.ilike",
+  "expr.regex_match",
+  "expr.regex_imatch",
   "expr.case",
   // Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
   // accrued cost via the `# cost:` directive (CLAUDE.md §13).
@@ -384,6 +386,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // loaded catalog that exceeds it is XX001, keeping every derived recursive walk (codec,
   // comparator, record_out/in, resolveColType) stack-safe (CLAUDE.md §13; cost.md §7b).
   "resource.composite_depth_limit",
+  // Regex compiled-program size cap (MAX_REGEX_PROGRAM = 32768) — a well-formed but too-large
+  // pattern aborts 54001 at compile, projectively, protecting the unlimited handle where the
+  // regex_compile cost ceiling cannot (CLAUDE.md §13; cost.md §7c, regex.md §6).
+  "resource.regex_program_limit",
   // Pure built-in surface — no function/operator or statement reaches the host (filesystem,
   // network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
   // calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
