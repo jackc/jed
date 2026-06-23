@@ -3718,3 +3718,37 @@ pub const SET_RETURNING: &[SetReturningDesc] = &[
         errors: &[],
     },
 ];
+
+/// One window function's metadata, mirroring a `[[window]]` entry in catalog.toml. A window
+/// function is per-row AND a fold over a frame (spec/design/window.md); `args` is the argument
+/// shape (none | one | value_offset_default | value_n), `result` a scalar id or "same_as_input",
+/// `frame_sensitive` whether it reads the per-row frame, `requires_order` whether a window
+/// ORDER BY is mandatory (42P20). The catalog aggregates are ALSO window functions (with OVER);
+/// they are not duplicated here. Uniqueness key is `name`.
+pub struct WindowDesc {
+    pub name: &'static str,
+    pub surface: &'static str,
+    pub args: &'static str,
+    pub arg_families: &'static [&'static str],
+    pub result: &'static str,
+    pub frame_sensitive: bool,
+    pub requires_order: bool,
+    pub null: &'static str,
+    pub errors: &'static [&'static str],
+}
+
+/// Every window-exclusive function in the catalog, in catalog order.
+#[rustfmt::skip]
+pub const WINDOWS: &[WindowDesc] = &[
+    WindowDesc {
+        name: "row_number",
+        surface: "ROW_NUMBER",
+        args: "none",
+        arg_families: &[],
+        result: "i64",
+        frame_sensitive: false,
+        requires_order: false,
+        null: "never",
+        errors: &[],
+    },
+];

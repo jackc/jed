@@ -23,6 +23,8 @@ pub struct CostSchedule {
     pub timezone: i64,
     pub regex_compile: i64,
     pub regex_step: i64,
+    pub window_result: i64,
+    pub window_frame_step: i64,
 }
 
 /// The canonical cost schedule — weights accrued per unit during query execution.
@@ -43,4 +45,6 @@ pub const COSTS: CostSchedule = CostSchedule {
     timezone: 1,
     regex_compile: 1,
     regex_step: 1,
+    window_result: 1,
+    window_frame_step: 1,
 };

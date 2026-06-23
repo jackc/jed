@@ -242,6 +242,10 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.regexCompile;
       case "regex_step":
         return COSTS.regexStep;
+      case "window_result":
+        return COSTS.windowResult;
+      case "window_frame_step":
+        return COSTS.windowFrameStep;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

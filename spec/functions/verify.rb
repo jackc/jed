@@ -98,6 +98,14 @@ RESERVED_SRF_RESULTS = %w[set_of_promoted set_of_element].to_set
 SRF_NULL_BEHAVIORS   = %w[empty_on_null].to_set
 SRF_REQUIRED_FIELDS  = %w[name kind surface arity arg_families arg_resolution result column null errors].freeze
 
+# Window functions (kind = "window") use a distinct field set and validation branch — per-row
+# AND a fold over a frame (window.md). `result` accepts a scalar id or "same_as_input"; `args` is
+# the argument shape; `null` one of the window NULL disciplines; uniqueness key is `name`.
+WIN_ARGS             = %w[none one value_offset_default value_n].to_set
+WIN_NULL_BEHAVIORS   = %w[never offset frame aggregate].to_set
+RESERVED_WIN_RESULTS = %w[same_as_input].to_set
+WIN_REQUIRED_FIELDS  = %w[name kind surface args result frame_sensitive requires_order null errors].freeze
+
 def fail!(msg)
   warn "FAIL: #{msg}"
   exit 1
@@ -355,7 +363,50 @@ def main
     fail!("duplicate set_returning (name, arity): #{dup_srfs.map { |n, a| "#{n}/arity-#{a}" }.join(', ')}")
   end
 
-  puts "OK: #{operators.length} operators, #{aggregates.length} aggregates, #{set_returning.length} set-returning — catalog coherent"
+  # (13) window functions (kind = "window") — a separate array + field set. Window functions are
+  # neither operators, aggregates, nor SRFs, so they skip every check above. The catalog aggregates
+  # double as window functions (with OVER) and are NOT re-listed here; this array is window-only.
+  windows = catalog["window"] || []
+  win_names = []
+  windows.each do |w|
+    id = w["name"] || "(unnamed)"
+
+    WIN_REQUIRED_FIELDS.each do |f|
+      fail!("window #{id}: missing field `#{f}`") unless w.key?(f)
+    end
+    fail!("window #{id}: kind must be \"window\"") unless w["kind"] == "window"
+    fail!("window #{id}: surface must be a non-empty string") unless w["surface"].is_a?(String) && !w["surface"].empty?
+
+    args = w["args"]
+    fail!("window #{id}: args #{args.inspect} not in (#{WIN_ARGS.to_a.join('|')})") unless WIN_ARGS.include?(args)
+    # args = "none" takes no arg_families; the others may constrain their argument(s).
+    fams = w["arg_families"] || []
+    fail!("window #{id}: arg_families must be an array") unless fams.is_a?(Array)
+    fail!("window #{id}: args=none takes no arg_families") if args == "none" && !fams.empty?
+    fams.each do |fam|
+      next if fam == "any"
+      fail!("window #{id}: arg family #{fam.inspect} is not a family in scalars.toml") unless families.include?(fam)
+    end
+
+    result = w["result"]
+    unless scalar_ids.include?(result) || RESERVED_WIN_RESULTS.include?(result)
+      fail!("window #{id}: result #{result.inspect} is neither a scalar id nor a reserved window result (#{RESERVED_WIN_RESULTS.to_a.join('|')})")
+    end
+
+    fail!("window #{id}: frame_sensitive must be a boolean") unless [true, false].include?(w["frame_sensitive"])
+    fail!("window #{id}: requires_order must be a boolean") unless [true, false].include?(w["requires_order"])
+    fail!("window #{id}: null #{w['null'].inspect} not in (#{WIN_NULL_BEHAVIORS.to_a.join('|')})") unless WIN_NULL_BEHAVIORS.include?(w["null"])
+
+    (w["errors"] || []).each do |code|
+      fail!("window #{id}: error code #{code.inspect} is not in registry.toml") unless error_codes.include?(code)
+    end
+
+    win_names << w["name"]
+  end
+  dup_wins = win_names.tally.select { |_, n| n > 1 }.keys
+  fail!("duplicate window name: #{dup_wins.join(', ')}") unless dup_wins.empty?
+
+  puts "OK: #{operators.length} operators, #{aggregates.length} aggregates, #{set_returning.length} set-returning, #{windows.length} window — catalog coherent"
 end
 
 main

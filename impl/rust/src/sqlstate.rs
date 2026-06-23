@@ -92,6 +92,8 @@ pub enum SqlState {
     InvalidRecursion,
     /// 42P02 — there is no parameter ${index}
     UndefinedParameter,
+    /// 42P20 — {detail}
+    WindowingError,
     /// 42P21 — collation mismatch between explicit collations {left} and {right}
     CollationMismatch,
     /// 42P22 — could not determine which collation to use for string comparison
@@ -176,6 +178,7 @@ impl SqlState {
             SqlState::IndeterminateDatatype => "42P18",
             SqlState::InvalidRecursion => "42P19",
             SqlState::UndefinedParameter => "42P02",
+            SqlState::WindowingError => "42P20",
             SqlState::CollationMismatch => "42P21",
             SqlState::IndeterminateCollation => "42P22",
             SqlState::DuplicateObject => "42710",
@@ -251,6 +254,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "42P18", name: "indeterminate_datatype", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P19", name: "invalid_recursion", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P02", name: "undefined_parameter", class: "syntax error or access rule violation" },
+    ErrorDesc { code: "42P20", name: "windowing_error", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P21", name: "collation_mismatch", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P22", name: "indeterminate_collation", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42710", name: "duplicate_object", class: "syntax error or access rule violation" },

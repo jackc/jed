@@ -155,6 +155,11 @@ export type Expr =
       argNames: (string | null)[];
       star: boolean;
       variadic: boolean;
+      // Set when the call carries a trailing `OVER (...)` window clause (a WINDOW-function call —
+      // spec/design/window.md). null/undefined for an ordinary scalar/aggregate/SRF call. A
+      // window-only function (row_number/…) with no `over` is 42809; an aggregate with `over` set
+      // is a window aggregate (S3).
+      over?: WindowDef | null;
     }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
@@ -240,6 +245,15 @@ export type OrderKey = {
   collation: string | null;
   descending: boolean;
   nullsFirst: boolean;
+};
+
+// WindowDef is the body of an `OVER (...)` clause (spec/design/window.md §3). S0 carries
+// `PARTITION BY` columns and an `ORDER BY`; the frame clause and a base-window name are deferred
+// (S4/S5). `partition` is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing — general
+// expressions are a follow-on); `order` reuses the query ORDER BY sort keys.
+export type WindowDef = {
+  partition: Expr[];
+  order: OrderKey[];
 };
 
 // ColumnDef is a column definition in a CREATE TABLE. typeName is kept as written and

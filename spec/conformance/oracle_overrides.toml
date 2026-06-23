@@ -984,3 +984,18 @@ reason = "jed: a non-text operand to the `~` regex operator is a 42804 datatype 
 file = "expr/date_trunc.test"
 sql = "SELECT date_trunc('day', date '2024-03-15')"
 reason = "jed: date_trunc has no (text, date) overload — jed has no implicit date->timestamp cast (timezones.md §9.1), so this is 42883 (no such function). PostgreSQL implicitly casts date->timestamptz and date_trunc('day', date) succeeds. A deliberate, documented narrowing; cast the argument explicitly (::timestamp) to use date_trunc on a date."
+
+# --- Window functions S0 (spec/design/window.md): jed defers two shapes PostgreSQL accepts.
+# A window function combined with an aggregate / GROUP BY is 0A000 in S0 (the window stage does not
+# yet layer over the aggregate synthetic row — lifted in S3). PostgreSQL runs the query.
+[[override]]
+file = "window/row_number.test"
+sql = "SELECT g, row_number() OVER (ORDER BY g), SUM(v) FROM t GROUP BY g"
+reason = "jed: a window function combined with aggregates / GROUP BY is 0A000 this slice (window.md §1 — the S0 narrowing; the window stage layers over the aggregate synthetic row in S3). PostgreSQL evaluates the window over the grouped rows and the query succeeds. A deliberate, documented narrowing, lifted in S3."
+
+# A named window (OVER name) is deferred to S5; jed's parser rejects it 0A000 before PG's
+# "window \"w\" does not exist" (42704). Both reject (there is no WINDOW clause defining w).
+[[override]]
+file = "window/row_number.test"
+sql = "SELECT id, row_number() OVER w FROM t"
+reason = "jed: a named window (OVER name / the WINDOW clause) is 0A000 this slice (window.md §1 — deferred to S5), rejected at parse. PostgreSQL parses OVER w and then reports 42704 (window \"w\" does not exist, since no WINDOW clause defines it). Both reject; a documented divergence until S5."

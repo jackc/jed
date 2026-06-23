@@ -3707,7 +3707,110 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	if err := p.expect(TokRParen); err != nil {
 		return Expr{}, err
 	}
+	// A trailing OVER (...) turns the call into a window-function call (spec/design/window.md,
+	// grammar.ebnf `over_clause`). S0 parses only the inline OVER ( [PARTITION BY cols]
+	// [ORDER BY ...] ) form; a named window OVER name (the WINDOW clause) is deferred to S5.
+	if p.peekKeyword() == "over" {
+		p.advance()
+		if p.peek().Kind != TokLParen {
+			return Expr{}, NewError(FeatureNotSupported, "named windows (OVER name) are not supported yet")
+		}
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		// PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
+		var partition []Expr
+		if p.peekKeyword() == "partition" {
+			p.advance()
+			if err := p.expectKeyword("by"); err != nil {
+				return Expr{}, err
+			}
+			for {
+				qualifier, col, err := p.parseColumnRef()
+				if err != nil {
+					return Expr{}, err
+				}
+				if qualifier != "" {
+					partition = append(partition, Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col})
+				} else {
+					partition = append(partition, Expr{Kind: ExprColumn, Column: col})
+				}
+				if p.peek().Kind != TokComma {
+					break
+				}
+				p.advance()
+			}
+		}
+		// ORDER BY <sort_key> (, ...) — optional (empty if absent), consuming ORDER BY.
+		order, err := p.parseWindowOrderBy()
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		fc.Over = &WindowDef{Partition: partition, Order: order}
+	}
 	return Expr{Kind: ExprFuncCall, FuncCall: fc}, nil
+}
+
+// parseWindowOrderBy parses an OVER clause's optional `ORDER BY <key> ("," <key>)*` and returns
+// the keys (nil when absent). It mirrors parseOrderBy's per-key handling (COLLATE, ASC/DESC,
+// NULLS FIRST|LAST resolution) but returns the keys directly rather than writing them onto a
+// *Select (the query ORDER BY's container). spec/design/window.md §3.
+func (p *Parser) parseWindowOrderBy() ([]OrderKey, error) {
+	if p.peekKeyword() != "order" {
+		return nil, nil
+	}
+	p.advance()
+	if err := p.expectKeyword("by"); err != nil {
+		return nil, err
+	}
+	var order []OrderKey
+	for {
+		qualifier, col, err := p.parseColumnRef()
+		if err != nil {
+			return nil, err
+		}
+		collation := ""
+		if p.peekKeyword() == "collate" {
+			p.advance()
+			collation, err = p.expectCollationName()
+			if err != nil {
+				return nil, err
+			}
+		}
+		descending := false
+		switch p.peekKeyword() {
+		case "asc":
+			p.advance()
+		case "desc":
+			p.advance()
+			descending = true
+		}
+		// Default follows direction (grammar.md §10): NULL is the largest value (PostgreSQL model),
+		// so ASC → NULLS LAST, DESC → NULLS FIRST.
+		nullsFirst := descending
+		if p.peekKeyword() == "nulls" {
+			p.advance()
+			switch p.peekKeyword() {
+			case "first":
+				p.advance()
+				nullsFirst = true
+			case "last":
+				p.advance()
+				nullsFirst = false
+			default:
+				return nil, NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
+			}
+		}
+		order = append(order, OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
+		if p.peek().Kind != TokComma {
+			break
+		}
+		p.advance()
+	}
+	return order, nil
 }
 
 // parseColumnRef parses `column_ref ::= identifier ("." identifier)?` — a bare column name, or

@@ -873,6 +873,11 @@ pub enum Expr {
         /// passed directly to a variadic parameter rather than spreading individual arguments.
         /// `false` for every ordinary call (the all-positional/spread fast path).
         variadic: bool,
+        /// `Some` when the call carries a trailing `OVER (...)` window clause (a WINDOW-function
+        /// call — spec/design/window.md). `None` for an ordinary scalar/aggregate/SRF call. A
+        /// window-only function (row_number/…) with `over = None` is 42P20; an aggregate with
+        /// `over = Some` is a window aggregate (S3).
+        over: Option<Box<WindowDef>>,
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`
     /// plans it once against the scope chain; an uncorrelated one is then folded to a constant,
@@ -977,6 +982,16 @@ pub struct OrderKey {
     pub collation: Option<String>,
     pub descending: bool,
     pub nulls_first: bool,
+}
+
+/// A window definition — the body of an `OVER (...)` clause (spec/design/window.md §3). S0 carries
+/// `PARTITION BY` columns and an `ORDER BY`; the frame clause and a base-window name are deferred
+/// (S4/S5). `partition` is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing — general
+/// expressions are a follow-on); `order` reuses the query ORDER BY sort keys.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WindowDef {
+    pub partition: Vec<Expr>,
+    pub order: Vec<OrderKey>,
 }
 
 /// A literal value as written in SQL.

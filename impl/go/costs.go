@@ -25,6 +25,8 @@ type CostSchedule struct {
 	Timezone            int64
 	RegexCompile        int64
 	RegexStep           int64
+	WindowResult        int64
+	WindowFrameStep     int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -45,4 +47,6 @@ var Costs = CostSchedule{
 	Timezone:            1,
 	RegexCompile:        1,
 	RegexStep:           1,
+	WindowResult:        1,
+	WindowFrameStep:     1,
 }

@@ -284,6 +284,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // HAVING: a boolean filter over grouped rows, after aggregation, before ORDER BY
     // (spec/design/aggregates.md §8, grammar.md §19).
     "query.having",
+    // Window functions — OVER (PARTITION BY / ORDER BY), the window stage, row_number() (S0,
+    // spec/design/window.md).
+    "query.window",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",

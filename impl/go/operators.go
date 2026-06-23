@@ -3717,3 +3717,36 @@ var SetReturning = []SetReturningDesc{
 		Errors:        []string{},
 	},
 }
+
+// WindowDesc is one window function's metadata, mirroring a [[window]] entry in catalog.toml.
+// A window function is per-row AND a fold over a frame (spec/design/window.md); Args is the
+// argument shape (none | one | value_offset_default | value_n), Result a scalar id or
+// "same_as_input", FrameSensitive whether it reads the per-row frame, RequiresOrder whether a
+// window ORDER BY is mandatory (42P20). The catalog aggregates are ALSO window functions (with
+// OVER); they are not duplicated here. Uniqueness key is Name.
+type WindowDesc struct {
+	Name           string
+	Surface        string
+	Args           string
+	ArgFamilies    []string
+	Result         string
+	FrameSensitive bool
+	RequiresOrder  bool
+	Null           string
+	Errors         []string
+}
+
+// Windows lists every window-exclusive function in the catalog, in catalog order.
+var Windows = []WindowDesc{
+	{
+		Name:           "row_number",
+		Surface:        "ROW_NUMBER",
+		Args:           "none",
+		ArgFamilies:    []string{},
+		Result:         "i64",
+		FrameSensitive: false,
+		RequiresOrder:  false,
+		Null:           "never",
+		Errors:         []string{},
+	},
+}

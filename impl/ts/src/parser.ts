@@ -39,6 +39,7 @@ import type {
   TypeFieldDef,
   TypeMod,
   Update,
+  WindowDef,
 } from "./ast.ts";
 import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
@@ -2766,7 +2767,44 @@ class Parser {
     this.expect("rparen");
     // Keep argNames empty unless a name appeared (the all-positional sentinel — §8).
     const argNames = anyNamed ? names : [];
-    return { kind: "funcCall", name, args, argNames, star, variadic };
+    // A trailing `OVER (...)` turns the call into a window-function call (spec/design/window.md,
+    // grammar.ebnf `over_clause`). S0 parses only the inline `OVER ( [PARTITION BY cols]
+    // [ORDER BY ...] )` form; a named window `OVER name` (the WINDOW clause) is deferred to S5.
+    let over: WindowDef | null = null;
+    if (this.peekKeyword() === "over") {
+      this.advance();
+      if (this.peek().kind !== "lparen") {
+        throw engineError(
+          "feature_not_supported",
+          "named windows (OVER name) are not supported yet",
+        );
+      }
+      this.expect("lparen");
+      // PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
+      const partition: Expr[] = [];
+      if (this.peekKeyword() === "partition") {
+        this.advance();
+        this.expectKeyword("by");
+        for (;;) {
+          const [qualifier, name] = this.parseColumnRef();
+          partition.push(
+            qualifier !== null
+              ? { kind: "qualifiedColumn", qualifier, name }
+              : { kind: "column", name },
+          );
+          if (this.peek().kind === "comma") {
+            this.advance();
+          } else {
+            break;
+          }
+        }
+      }
+      // ORDER BY <sort_key> (, ...) — self-guards (empty if absent), consumes ORDER BY.
+      const order = this.parseOrderBy();
+      this.expect("rparen");
+      over = { partition, order };
+    }
+    return { kind: "funcCall", name, args, argNames, star, variadic, over };
   }
 
   // --- cursor helpers ---

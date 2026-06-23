@@ -3611,3 +3611,36 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     errors: [],
   },
 ];
+
+// One window function's metadata, mirroring a [[window]] entry in catalog.toml. A window
+// function is per-row AND a fold over a frame (spec/design/window.md); `args` is the argument
+// shape (none | one | value_offset_default | value_n), `result` a scalar id or "same_as_input",
+// `frameSensitive` whether it reads the per-row frame, `requiresOrder` whether a window ORDER BY
+// is mandatory (42P20). The catalog aggregates are ALSO window functions (with OVER); they are
+// not duplicated here. Uniqueness key is `name`.
+export interface WindowDesc {
+  name: string;
+  surface: string;
+  args: string;
+  argFamilies: readonly string[];
+  result: string;
+  frameSensitive: boolean;
+  requiresOrder: boolean;
+  null: string;
+  errors: readonly string[];
+}
+
+// Every window-exclusive function in the catalog, in catalog order.
+export const WINDOWS: readonly WindowDesc[] = [
+  {
+    name: "row_number",
+    surface: "ROW_NUMBER",
+    args: "none",
+    argFamilies: [],
+    result: "i64",
+    frameSensitive: false,
+    requiresOrder: false,
+    null: "never",
+    errors: [],
+  },
+];

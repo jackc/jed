@@ -9,7 +9,7 @@ use crate::ast::{
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
     DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinKind, Literal, OnConflict,
     OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind,
-    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithExpr, WithQuery,
+    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -24,7 +24,7 @@ use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::{encode_bool, encode_int, encode_terminated};
 use crate::error::{EngineError, Result, SqlState};
 use crate::interval::{self, Interval, parse_interval};
-use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc};
+use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc, WINDOWS};
 use crate::pmap::KeyBound;
 use crate::privileges::{Privilege, PrivilegeSet};
 use crate::storage::{Row, TableStore};
@@ -8006,9 +8006,25 @@ impl Database {
         // aggregate query (HAVING alone groups the whole table — grammar.md §19).
         let is_agg =
             !group_keys.is_empty() || items_have_aggregate(&sel.items) || sel.having.is_some();
+        // A window query (a select-list `OVER` call) resolves its projection in Window mode, where
+        // bare columns read the real row and window calls collect into synthetic slots
+        // (spec/design/window.md §5.1). S0 narrows a window function combined with a GROUP BY /
+        // aggregate to 0A000 (lifted in S3), so the two modes are mutually exclusive here.
+        let has_window_syntax = items_have_window(&sel.items);
+        if has_window_syntax && is_agg {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "window functions with aggregates or GROUP BY are not supported yet",
+            ));
+        }
         let mut agg_ctx = if is_agg {
             AggCtx::Collect {
                 group_keys: group_keys.clone(),
+                specs: Vec::new(),
+            }
+        } else if has_window_syntax {
+            AggCtx::Window {
+                base: scope.width(),
                 specs: Vec::new(),
             }
         } else {
@@ -8030,10 +8046,14 @@ impl Database {
             }
             None => None,
         };
-        let agg_specs: Vec<AggSpec> = match agg_ctx {
-            AggCtx::Collect { specs, .. } => specs,
-            AggCtx::Forbidden => Vec::new(),
+        // Extract the collected aggregate specs and/or window specs from the resolution context
+        // (one is always empty — a query is aggregate XOR window in S0). spec/design/window.md §5.1.
+        let (agg_specs, window_specs): (Vec<AggSpec>, Vec<WindowSpec>) = match agg_ctx {
+            AggCtx::Collect { specs, .. } => (specs, Vec::new()),
+            AggCtx::Window { specs, .. } => (Vec::new(), specs),
+            AggCtx::Forbidden => (Vec::new(), Vec::new()),
         };
+        let has_window = !window_specs.is_empty();
         // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
         if is_agg && sel.distinct {
             return Err(EngineError::new(
@@ -8233,6 +8253,16 @@ impl Database {
             for (slot, ..) in &order {
                 touched[*slot] = true;
             }
+            // A window query also reads each window function's PARTITION BY + ORDER BY key columns
+            // (real input columns), beyond what the projection's window-result slots reference.
+            for spec in &window_specs {
+                for &pk in &spec.partition {
+                    touched[pk] = true;
+                }
+                for (slot, ..) in &spec.order {
+                    touched[*slot] = true;
+                }
+            }
         }
         let rel_masks: Vec<Vec<bool>> = rels
             .iter()
@@ -8260,6 +8290,8 @@ impl Database {
             is_agg,
             group_keys,
             agg_specs,
+            has_window,
+            window_specs,
             having,
             order,
             projections,
@@ -8888,6 +8920,7 @@ impl Database {
         if plan.rels.len() == 1
             && plan.joins.is_empty()
             && !plan.is_agg
+            && !plan.has_window
             && !plan.distinct
             && (plan.pk_ordered || (plan.order.is_empty() && plan.limit.is_some()))
             // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
@@ -8920,6 +8953,7 @@ impl Database {
             && plan.rels.len() == 1
             && plan.joins.is_empty()
             && !plan.is_agg
+            && !plan.has_window
             && !plan.distinct
             && !matches!(
                 plan.rel_bounds[0],
@@ -9064,6 +9098,15 @@ impl Database {
             if keep {
                 rows.push(row);
             }
+        }
+
+        // WINDOW stage (spec/design/window.md §5.2): a blocking operator over the post-WHERE rows,
+        // running BEFORE the query ORDER BY / DISTINCT / LIMIT. Each window function's per-row
+        // result is APPENDED to its row (so the projection reads result `i` at flat slot
+        // `input_width + i`); the rows keep their scan order, and the query ORDER BY below re-sorts
+        // the extended rows. A window query never enters the streaming fast-paths above.
+        if plan.has_window {
+            apply_window_stage(&mut rows, &plan.window_specs, &mut meter)?;
         }
 
         // ORDER BY: a stable sort applying each key left to right — the first non-equal key
@@ -10269,6 +10312,13 @@ impl<'a> Scope<'a> {
             }
         }
         unreachable!("a resolved flat column index is always in range")
+    }
+
+    /// The flat column count of this scope (the input-row width). The window base offset: a window
+    /// query appends each window function's result after the input columns (spec/design/window.md
+    /// §5.1), so window slot = `width() + window_index`.
+    fn width(&self) -> usize {
+        self.rels.iter().map(|r| r.table.columns.len()).sum()
     }
 
     /// The ancestor scope `level` hops outward (1 = immediate parent).
@@ -11824,6 +11874,14 @@ struct SelectPlan {
     is_agg: bool,
     group_keys: Vec<usize>,
     agg_specs: Vec<AggSpec>,
+    /// `true` when the select list has a window function — the query runs the blocking WINDOW
+    /// stage (after WHERE, before ORDER BY/LIMIT) and takes the eager path (never streaming).
+    /// Mutually exclusive with `is_agg` in S0 (spec/design/window.md §5.2).
+    has_window: bool,
+    /// One resolved window function per select-list `OVER` call (empty unless `has_window`). The
+    /// window stage appends each spec's per-row result after the input columns, so the projection
+    /// references result `i` as flat slot `input_width + i` (spec/design/window.md §5.1).
+    window_specs: Vec<WindowSpec>,
     having: Option<RExpr>,
     /// (flat slot, descending, nulls_first) per ORDER BY key.
     order: Vec<crate::spill::SortKey>,
@@ -12997,6 +13055,30 @@ enum AggCtx {
         group_keys: Vec<usize>,
         specs: Vec<AggSpec>,
     },
+    /// A non-aggregate WINDOW query's projection (spec/design/window.md §5.1). Bare columns
+    /// resolve to the real input row (like Forbidden); a `FuncCall` carrying an `OVER` clause
+    /// collects into `specs` and resolves to the synthetic slot `base + window_index`, where
+    /// `base` is the input row's flat width — the window stage appends each function's result
+    /// after the input columns. S0 narrows window + aggregate/GROUP BY to 0A000 (the two are not
+    /// combined yet), so an aggregate cannot reach this context.
+    Window { base: usize, specs: Vec<WindowSpec> },
+}
+
+/// One resolved window function (spec/design/window.md §5.1): its plan, the resolved PARTITION BY
+/// key column slots (flat input-row indices), and the resolved within-partition ORDER BY (sort
+/// keys over the input row, PK tie-break applied by the stable sort over the PK-ordered scan).
+struct WindowSpec {
+    plan: WindowPlan,
+    partition: Vec<usize>,
+    order: Vec<crate::spill::SortKey>,
+}
+
+/// The runtime plan for one window function (spec/design/window.md §4). S0: `row_number` only;
+/// ranking / offset / aggregate-window / frame plans land in S1–S4.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowPlan {
+    /// `ROW_NUMBER()` — the 1-based sequence position within the partition (frame-insensitive).
+    RowNumber,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
@@ -13316,6 +13398,70 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         }
         // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
         // an aggregate query (the outer reference, if any, is just a constant to the subquery).
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => false,
+    }
+}
+
+/// Whether any select item contains a window-function call (a `FuncCall` carrying `OVER`). A
+/// window query resolves its projection in `AggCtx::Window` mode (spec/design/window.md §5.1).
+fn items_have_window(items: &SelectItems) -> bool {
+    match items {
+        SelectItems::All => false,
+        SelectItems::Items(items) => items.iter().any(|it| expr_has_window(&it.expr)),
+    }
+}
+
+/// Whether an expression tree contains a window-function call anywhere (a `FuncCall` whose `over`
+/// is set). An ordinary call may CONTAIN one in its arguments (`abs(row_number() OVER ())`), so the
+/// arguments are walked; a window call's own PARTITION BY / ORDER BY may not contain a window
+/// function (that is rejected at resolve, 42P20), so they are not walked here.
+fn expr_has_window(e: &Expr) -> bool {
+    match e {
+        Expr::FuncCall { over, args, .. } => over.is_some() || args.iter().any(expr_has_window),
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::Param(_) => false,
+        Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_window(inner),
+        Expr::Collate { inner, .. } => expr_has_window(inner),
+        Expr::Unary { operand, .. } => expr_has_window(operand),
+        Expr::IsNull { operand, .. } => expr_has_window(operand),
+        Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+            expr_has_window(lhs) || expr_has_window(rhs)
+        }
+        Expr::In { lhs, list, .. } => expr_has_window(lhs) || list.iter().any(expr_has_window),
+        Expr::Quantified { lhs, array, .. } => expr_has_window(lhs) || expr_has_window(array),
+        Expr::Between { lhs, lo, hi, .. } => {
+            expr_has_window(lhs) || expr_has_window(lo) || expr_has_window(hi)
+        }
+        Expr::Like { lhs, rhs, .. } | Expr::Regex { lhs, rhs, .. } => {
+            expr_has_window(lhs) || expr_has_window(rhs)
+        }
+        Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_window),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_window(base),
+        Expr::Subscript { base, subscripts } => {
+            expr_has_window(base)
+                || subscripts
+                    .iter()
+                    .flat_map(subscript_spec_exprs)
+                    .any(expr_has_window)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().is_some_and(expr_has_window)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_has_window(c) || expr_has_window(r))
+                || els.as_deref().is_some_and(expr_has_window)
+        }
+        // A subquery is an independent query: a window function inside it is the subquery's own.
         Expr::ScalarSubquery(_)
         | Expr::Exists(_)
         | Expr::InSubquery { .. }
@@ -13812,7 +13958,10 @@ fn subscript_bounds(s: &RSubscript) -> Vec<&RExpr> {
 fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
     match e {
         RExpr::Column(i) => {
-            if depth == 0 {
+            // A `Column` index beyond the real columns is a SYNTHETIC slot (an aggregate or window
+            // result, spec/design/window.md §5.1), not a table column — it touches no stored data,
+            // so the bound check skips it rather than panicking.
+            if depth == 0 && *i < touched.len() {
                 touched[*i] = true;
             }
         }
@@ -14713,7 +14862,9 @@ fn resolve_aggregate(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    if matches!(agg, AggCtx::Forbidden) {
+    if !matches!(agg, AggCtx::Collect { .. }) {
+        // Forbidden (WHERE/JOIN ON/plain projection) and Window (a window query's projection, where
+        // window + aggregate is 0A000 in S0) both reject a bare aggregate here — 42803.
         return Err(EngineError::new(
             SqlState::GroupingError,
             "aggregate functions are not allowed here",
@@ -14763,7 +14914,9 @@ fn collect_column(
 ) -> Result<(RExpr, ResolvedType)> {
     let ty = resolved_type_of_col(&scope.column_at(idx).ty, scope.catalog);
     match agg {
-        AggCtx::Forbidden => Ok((RExpr::Column(idx), ty)),
+        // Forbidden and Window both read the real input row by flat index (a window query's bare
+        // columns are not grouped — spec/design/window.md §5.1).
+        AggCtx::Forbidden | AggCtx::Window { .. } => Ok((RExpr::Column(idx), ty)),
         AggCtx::Collect { group_keys, .. } => match group_keys.iter().position(|&gk| gk == idx) {
             Some(pos) => Ok((RExpr::Column(pos), ty)),
             None => Err(grouping_error_column(name)),
@@ -14797,6 +14950,148 @@ fn is_aggregate_name(name: &str) -> bool {
     AGGREGATES
         .iter()
         .any(|a| a.surface.eq_ignore_ascii_case(name))
+}
+
+/// Whether `name` is a registered WINDOW-only function surface (row_number/rank/…). Data-driven
+/// over the catalog (`WINDOWS`). Such a function REQUIRES an `OVER` clause — used without one it is
+/// 42P20 (spec/design/window.md §7). The catalog aggregates double as window functions but are not
+/// in `WINDOWS`, so they are still valid without `OVER`.
+fn is_window_only_name(name: &str) -> bool {
+    WINDOWS.iter().any(|w| w.surface.eq_ignore_ascii_case(name))
+}
+
+/// Resolve a window-function call `f(args) OVER (window_definition)` (spec/design/window.md §5.1).
+/// Valid only in a window query's projection (`AggCtx::Window`); anywhere else (WHERE / JOIN ON /
+/// HAVING / an aggregate query) it is 42P20. The call collects into a `WindowSpec` and resolves to
+/// the synthetic slot `base + window_index`. S0: only `row_number()`.
+fn resolve_window_call(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    star: bool,
+    wd: &WindowDef,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let lname = name.to_ascii_lowercase();
+    // The plan + result type from the function name. S0: only row_number(); an aggregate name with
+    // OVER (a window aggregate) is deferred to S3; any other name is 42883.
+    let (plan, result) = if lname == "row_number" {
+        if star || !args.is_empty() {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                "row_number takes no arguments",
+            ));
+        }
+        (WindowPlan::RowNumber, ResolvedType::Int(ScalarType::Int64))
+    } else if is_aggregate_name(&lname) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "aggregate window functions are not supported yet",
+        ));
+    } else {
+        return Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            format!("{lname} is not a window function"),
+        ));
+    };
+    // Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys) — all
+    // against the input scope, never recursing into `agg`. Done before borrowing `specs`.
+    let (partition, order) = resolve_window_def(scope, wd, params)?;
+    // A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
+    // HAVING / an aggregate query the context is Forbidden or Collect → 42P20 (window.md §7).
+    let (base, specs) = match agg {
+        AggCtx::Window { base, specs } => (*base, specs),
+        _ => {
+            return Err(EngineError::new(
+                SqlState::WindowingError,
+                "window functions are not allowed here",
+            ));
+        }
+    };
+    let slot = base + specs.len();
+    specs.push(WindowSpec {
+        plan,
+        partition,
+        order,
+    });
+    Ok((RExpr::Column(slot), result))
+}
+
+/// Resolve the PARTITION BY column list (→ flat input-row slots) and the within-partition ORDER BY
+/// (→ sort keys) of an `OVER (...)` clause, against the (non-aggregate) input scope. Mirrors the
+/// query ORDER BY resolution (the collation / direction / NULLS handling). S0: partition keys are
+/// columns only. A window function in a partition/order key, or an outer reference, is rejected.
+fn resolve_window_def(
+    scope: &Scope,
+    wd: &WindowDef,
+    _params: &mut ParamTypes,
+) -> Result<(Vec<usize>, Vec<crate::spill::SortKey>)> {
+    let mut partition = Vec::with_capacity(wd.partition.len());
+    for key in &wd.partition {
+        let r = match key {
+            Expr::Column(name) => scope.resolve_bare(name.as_str())?,
+            Expr::QualifiedColumn { qualifier, name } => {
+                scope.resolve_qualified(qualifier.as_str(), name.as_str())?
+            }
+            _ => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "PARTITION BY supports only column references",
+                ));
+            }
+        };
+        match r {
+            Resolved::Local(i) => partition.push(i),
+            Resolved::Outer { .. } => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "PARTITION BY may not reference an outer query column",
+                ));
+            }
+        }
+    }
+    let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(wd.order.len());
+    for key in &wd.order {
+        let r = match &key.qualifier {
+            Some(q) => scope.resolve_qualified(q, &key.column)?,
+            None => scope.resolve_bare(&key.column)?,
+        };
+        let idx = match r {
+            Resolved::Local(i) => i,
+            Resolved::Outer { .. } => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "window ORDER BY may not reference an outer query column",
+                ));
+            }
+        };
+        let coll = match &key.collation {
+            Some(cn) => {
+                if !scope.column_of(r).ty.is_text() {
+                    return Err(type_error(format!(
+                        "collations are not supported by type {}",
+                        scope.column_of(r).ty.canonical_name()
+                    )));
+                }
+                resolve_collation_name(scope.catalog, cn)?
+            }
+            None => match &scope.column_of(r).collation {
+                Some(cn) => resolve_collation_name(scope.catalog, cn)?,
+                None => None,
+            },
+        };
+        // A non-`C` collated window ORDER BY is deferred in S0 (the window stage's per-partition
+        // sort is the plain comparator) — 0A000, a documented narrowing (spec/design/window.md §11).
+        if coll.is_some() {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "collated window ORDER BY is not supported yet",
+            ));
+        }
+        order.push((idx, key.descending, key.nulls_first, coll));
+    }
+    Ok((partition, order))
 }
 
 /// A scalar function over argument types it has no overload for (e.g. abs(text), round(int,
@@ -16671,7 +16966,24 @@ fn resolve(
             arg_names,
             star,
             variadic,
+            over,
         } => {
+            // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
+            if let Some(wd) = over {
+                return resolve_window_call(scope, name, args, *star, wd, agg, params);
+            }
+            // A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's
+            // wrong_object_type, not the windowing_error 42P20 it uses for a window in WHERE —
+            // window.md §7, oracle-verified).
+            if is_window_only_name(name) {
+                return Err(EngineError::new(
+                    SqlState::WrongObjectType,
+                    format!(
+                        "window function {} requires an OVER clause",
+                        name.to_ascii_lowercase()
+                    ),
+                ));
+            }
             let names = arg_names.as_deref().map(Vec::as_slice);
             resolve_func_call(scope, name, args, names, *star, *variadic, agg, params)
         }
@@ -22859,6 +23171,62 @@ fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()>
         return sort_rows_collated(rows, order);
     }
     rows.sort_by(|a, b| cmp_rows_by_order(a, b, order));
+    Ok(())
+}
+
+/// The WINDOW stage (spec/design/window.md §5.2): for each window function, partition the rows,
+/// sort each partition by the window ORDER BY (stable → PK tie-break, as `rows` arrives in PK scan
+/// order), compute the per-row result, and APPEND it to every row (so window result `i` lands at
+/// flat slot `input_width + i`, where the projection reads it). The partition + sort are unmetered
+/// (like ORDER BY / GROUP BY); each computed result charges `window_result` and guards the ceiling.
+/// S0: `row_number()` only; partitions bucket value-canonically via an insertion-ordered list, so
+/// no hash-map iteration order leaks (CLAUDE.md §8/§10).
+fn apply_window_stage(rows: &mut [Row], specs: &[WindowSpec], meter: &mut Meter) -> Result<()> {
+    let n = rows.len();
+    if n == 0 {
+        return Ok(());
+    }
+    for spec in specs {
+        // Partition the row indices by the partition-key values. The map is an index only (never
+        // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
+        let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+        let mut partitions: Vec<Vec<usize>> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let key: Vec<Value> = spec.partition.iter().map(|&p| row[p].clone()).collect();
+            let pi = match index.get(&key) {
+                Some(&p) => p,
+                None => {
+                    let p = partitions.len();
+                    index.insert(key, p);
+                    partitions.push(Vec::new());
+                    p
+                }
+            };
+            partitions[pi].push(i);
+        }
+        // Compute each row's result into a per-row slot, then append in input order.
+        let mut results: Vec<Value> = vec![Value::Null; n];
+        for part in &partitions {
+            // Sort the partition's row indices by the window ORDER BY. `slice::sort_by` is stable,
+            // so a full tie keeps ascending original index = PK scan order (the §3 PK tie-break).
+            let mut ordered = part.clone();
+            if !spec.order.is_empty() {
+                ordered.sort_by(|&a, &b| cmp_rows_by_order(&rows[a], &rows[b], &spec.order));
+            }
+            match spec.plan {
+                WindowPlan::RowNumber => {
+                    for (pos, &ri) in ordered.iter().enumerate() {
+                        meter.guard()?; // enforce the cost ceiling per result (CLAUDE.md §13)
+                        meter.charge(COSTS.window_result);
+                        results[ri] = Value::Int(pos as i64 + 1);
+                    }
+                }
+            }
+        }
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.push(std::mem::replace(&mut results[i], Value::Null));
+        }
+    }
     Ok(())
 }
 

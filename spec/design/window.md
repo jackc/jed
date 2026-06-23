@@ -258,8 +258,10 @@ before it or per input row — PostgreSQL's SQLSTATE `42P20` (`windowing_error`)
   without) the window stage.
 - **Nested in another window function**, or in another window's `PARTITION BY`/`ORDER BY`/frame
   bound.
-- **A window-only function used without `OVER`** — `row_number()` with no `OVER` is `42P20`
-  ("requires an OVER clause"); an *aggregate* without `OVER` is simply an ordinary aggregate.
+- **A window-only function used without `OVER`** — `row_number()` with no `OVER` is **`42809`**
+  (`wrong_object_type`, "window function row_number requires an OVER clause" — PG's code here,
+  oracle-verified, *not* the `42P20` PG uses for a window function in WHERE/HAVING); an *aggregate*
+  without `OVER` is simply an ordinary aggregate.
 - **`OVER w` naming a non-window** (a `WINDOW` name that doesn't exist) — `42704`; `OVER` on a
   scalar/SRF function — `42P20`.
 

@@ -3198,6 +3198,63 @@ result       = "same_as_input"
 null         = "aggregate"
 errors       = []
 
+# === window functions ========================================================
+# A WINDOW function computes a per-row value over a related set of rows (its frame) WITHOUT
+# collapsing them (../design/window.md). It is neither an operator (one value from infix
+# operands) nor an aggregate (one value from a whole group) — it is per-row AND a fold at once,
+# evaluated in a dedicated WINDOW stage after GROUP BY/HAVING and before ORDER BY/LIMIT. So the
+# window-ONLY functions live in their OWN array with kind = "window" and their own field set
+# (verify.rb validates them on a separate branch; gen_catalog.rb emits a separate WINDOWS
+# descriptor table cross-checked per core). The catalog AGGREGATES (count/sum/min/max/avg) are
+# ALSO usable as window functions with an OVER clause (S3) — they are NOT duplicated here; the
+# resolver dispatches an aggregate name carrying OVER through the same AggPlan/Acc kernels folded
+# over a frame. This array holds only the window-EXCLUSIVE functions. The resolve dispatch is
+# hand-written per core (like the aggregate/scalar/SRF dispatch); these rows are the shared
+# registry data (CLAUDE.md §5). Lands across slices S0–S4 (../design/window.md §1).
+#
+# field doc (window) ----------------------------------------------------------
+# name           internal identity + AST/resolver WindowPlan selector. Uniqueness key is `name`
+#                (no overloading this slice — each window function has one signature).
+# kind           always "window".
+# surface        SQL spelling, uppercase canonical (resolved case-insensitively — window names are
+#                not reserved, grammar.md §3).
+# args           argument shape: "none" (row_number/rank/dense_rank/percent_rank/cume_dist —
+#                no argument), "one" (ntile(n)/first_value(e)/last_value(e) — one argument),
+#                "value_offset_default" (lag/lead — a value expr + optional integer offset +
+#                optional default), "value_n" (nth_value(e, n) — a value expr + an integer
+#                position). Interpreted by the hand-written resolver.
+# arg_families   required family of the constrained argument(s), by position; "any" =
+#                unconstrained. Omitted for args = "none". ntile's n is "integer"; the
+#                value-expression of lag/lead/first_value/… is "any".
+# result         a scalar id (i64, decimal) OR the reserved "same_as_input" id (the value
+#                functions return their value-expression's type, like MIN/MAX). Ranking counters
+#                → i64; percent_rank/cume_dist → decimal (NOT PG's float8 — divergence D2,
+#                ../design/window.md §10).
+# frame_sensitive whether the function reads the per-row FRAME (true) or ignores it and sees the
+#                whole partition / a positional offset (false). row_number/rank/dense_rank/
+#                percent_rank/cume_dist/ntile/lag/lead are frame-INSENSITIVE; the aggregate
+#                windows + first_value/last_value/nth_value are frame-SENSITIVE.
+# requires_order whether the function REQUIRES a window ORDER BY (42P20 if absent). All current
+#                window functions tolerate no ORDER BY (then every row is one peer group; the
+#                within-partition order is PK order — the fully-resolved-order rule, window.md §3).
+# null           "never" (ranking counters never NULL), "offset" (lag/lead → NULL when the offset
+#                leaves the partition and no default is given), "frame" (first/last/nth_value →
+#                NULL when the frame is empty / has < n rows).
+# errors         SQLSTATE codes the function may raise; ntile/nth_value carry 22023 (argument < 1),
+#                the rest [].
+# -----------------------------------------------------------------------------
+
+[[window]]
+name           = "row_number"
+kind           = "window"
+surface        = "ROW_NUMBER"
+args           = "none"
+result         = "i64"
+frame_sensitive = false
+requires_order = false
+null           = "never"
+errors         = []
+
 # === set-returning functions =================================================
 # A set-returning function (SRF) EXPANDS its arguments into a ROW SET — it fits neither the
 # operator mold (one value from infix operands) nor the aggregate mold (one value from a group):

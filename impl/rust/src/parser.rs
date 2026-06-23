@@ -11,7 +11,7 @@ use crate::ast::{
     Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict, OrderKey,
     Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
     SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
-    Update, WithExpr, WithQuery,
+    Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -2628,6 +2628,7 @@ impl Parser {
                 arg_names: None,
                 star: false,
                 variadic: false,
+                over: None,
             };
         }
         self.depth = base;
@@ -3035,6 +3036,7 @@ impl Parser {
                     arg_names: None,
                     star: false,
                     variadic: false,
+                    over: None,
                 })
             }
             Token::Str(_) => {
@@ -3147,12 +3149,53 @@ impl Parser {
         } else {
             None
         };
+        // A trailing `OVER (...)` turns the call into a window-function call (spec/design/window.md,
+        // grammar.ebnf `over_clause`). S0 parses only the inline `OVER ( [PARTITION BY cols]
+        // [ORDER BY ...] )` form; a named window `OVER name` (the WINDOW clause) is deferred to S5.
+        let over = if self.peek_keyword().as_deref() == Some("over") {
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "named windows (OVER name) are not supported yet",
+                ));
+            }
+            self.expect(&Token::LParen)?;
+            // PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
+            let mut partition = Vec::new();
+            if self.peek_keyword().as_deref() == Some("partition") {
+                self.advance();
+                self.expect_keyword("by")?;
+                loop {
+                    let (q, c) = self.parse_column_ref()?;
+                    partition.push(match q {
+                        Some(q) => Expr::QualifiedColumn {
+                            qualifier: q,
+                            name: c,
+                        },
+                        None => Expr::Column(c),
+                    });
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            // ORDER BY <sort_key> (, ...) — self-guards (empty if absent), consumes ORDER BY.
+            let order = self.parse_order_by()?;
+            self.expect(&Token::RParen)?;
+            Some(Box::new(WindowDef { partition, order }))
+        } else {
+            None
+        };
         Ok(Expr::FuncCall {
             name,
             args,
             arg_names,
             star,
             variadic,
+            over,
         })
     }
 

@@ -24,6 +24,8 @@ export interface CostSchedule {
   timezone: bigint;
   regexCompile: bigint;
   regexStep: bigint;
+  windowResult: bigint;
+  windowFrameStep: bigint;
 }
 
 // The canonical cost schedule — weights accrued per unit during query execution.
@@ -44,4 +46,6 @@ export const COSTS: CostSchedule = {
   timezone: 1n,
   regexCompile: 1n,
   regexStep: 1n,
+  windowResult: 1n,
+  windowFrameStep: 1n,
 };

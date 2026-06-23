@@ -9226,7 +9226,25 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an aggregate
 	// query (HAVING alone groups the whole table — grammar.md §19).
 	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items) || sel.Having != nil
+	// A window query (a select-list OVER call) resolves its projection in window mode, where bare
+	// columns read the real row and window calls collect into synthetic slots (spec/design/window.md
+	// §5.1). S0 narrows a window function combined with a GROUP BY / aggregate to 0A000 (lifted in
+	// S3), so the two modes are mutually exclusive here.
+	hasWindowSyntax := itemsHaveWindow(sel.Items)
+	if hasWindowSyntax && isAgg {
+		return nil, NewError(FeatureNotSupported, "window functions with aggregates or GROUP BY are not supported yet")
+	}
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
+	if hasWindowSyntax {
+		// scope width = the input row's flat column count; the window stage appends each function's
+		// result after the input columns, so window slot = width + window_index (window.md §5.1).
+		width := 0
+		for _, rel := range s.rels {
+			width += len(rel.table.Columns)
+		}
+		projAgg.windowing = true
+		projAgg.windowBase = width
+	}
 	projections, columnNames, columnTypes, err := resolveProjections(s, sel.Items, projAgg, ptypes)
 	if err != nil {
 		return nil, err
@@ -9247,6 +9265,8 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		having = node
 	}
 	aggSpecs := projAgg.specs
+	windowSpecs := projAgg.windowSpecs
+	hasWindow := len(windowSpecs) > 0
 	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
 	if isAgg && sel.Distinct {
 		return nil, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
@@ -9413,6 +9433,16 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		for _, o := range order {
 			touched[o.idx] = true
 		}
+		// A window query also reads each window function's PARTITION BY + ORDER BY key columns
+		// (real input columns), beyond what the projection's window-result slots reference.
+		for _, spec := range windowSpecs {
+			for _, pk := range spec.partition {
+				touched[pk] = true
+			}
+			for _, o := range spec.order {
+				touched[o.idx] = true
+			}
+		}
 	}
 	relMasks := make([][]bool, len(planRels))
 	for i, rel := range planRels {
@@ -9428,7 +9458,8 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
-		aggSpecs: aggSpecs, having: having, order: order, projections: projections,
+		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, having: having,
+		order: order, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
 		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, relBounds: relBounds, relMasks: relMasks,
 	}, nil
@@ -11127,7 +11158,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// A set-returning relation is generated, not scanned — it takes the eager path
 	// (functions.md §10); the streaming reader assumes a table store.
 	if len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.distinct &&
+		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
 		(plan.pkOrdered || (len(plan.order) == 0 && plan.limit != nil)) &&
 		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
 		plan.rels[0].srf == nil &&
@@ -11147,7 +11178,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// short-circuit). Results + cost are identical to the eager sort (the sort is unmetered —
 	// cost.md §3; spill.md §6).
 	if len(plan.order) > 0 && !plan.pkOrdered && len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.distinct &&
+		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
 		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference takes the eager path (cte.md §5).
@@ -11302,6 +11333,17 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		}
 		if keep {
 			rows = append(rows, row)
+		}
+	}
+
+	// WINDOW stage (spec/design/window.md §5.2): a blocking operator over the post-WHERE rows,
+	// running BEFORE the query ORDER BY / DISTINCT / LIMIT. Each window function's per-row result is
+	// APPENDED to its row (so the projection reads result i at flat slot input_width+i); the rows
+	// keep their scan order, and the query ORDER BY below re-sorts the extended rows. A window query
+	// never enters the streaming fast-paths above.
+	if plan.hasWindow {
+		if err := applyWindowStage(rows, plan.windowSpecs, meter); err != nil {
+			return selectResult{}, err
 		}
 	}
 
@@ -11808,7 +11850,10 @@ func collectTouched(e *rExpr, depth int, touched []bool) {
 	}
 	switch e.kind {
 	case reColumn:
-		if depth == 0 {
+		// A reColumn index beyond the real columns is a SYNTHETIC slot (an aggregate or window
+		// result, spec/design/window.md §5.1), not a table column — it touches no stored data, so
+		// the bound check skips it rather than panicking.
+		if depth == 0 && e.index < len(touched) {
 			touched[e.index] = true
 		}
 		return
@@ -13131,12 +13176,20 @@ type orderSlot struct {
 // selectPlan is a resolved SELECT, executable against an outer-row environment (the execute half
 // of the old runSelect, lifted to a value so a correlated subquery can re-run it per outer row).
 type selectPlan struct {
-	rels        []planRel
-	joins       []planJoin
-	filter      *rExpr
-	isAgg       bool
-	groupKeys   []int
-	aggSpecs    []aggSpec
+	rels      []planRel
+	joins     []planJoin
+	filter    *rExpr
+	isAgg     bool
+	groupKeys []int
+	aggSpecs  []aggSpec
+	// hasWindow is true when the select list has a window function — the query runs the blocking
+	// WINDOW stage (after WHERE, before ORDER BY/LIMIT) and takes the eager path (never streaming).
+	// Mutually exclusive with isAgg in S0 (spec/design/window.md §5.2).
+	hasWindow bool
+	// windowSpecs is one resolved window function per select-list OVER call (empty unless hasWindow).
+	// The window stage appends each spec's per-row result after the input columns, so the projection
+	// references result i as flat slot input_width+i (spec/design/window.md §5.1).
+	windowSpecs []windowSpec
 	having      *rExpr
 	order       []orderSlot
 	projections []*rExpr
@@ -13229,7 +13282,35 @@ type aggCtx struct {
 	collecting bool
 	groupKeys  []int
 	specs      []aggSpec
+	// windowing marks a non-aggregate WINDOW query's projection (spec/design/window.md §5.1):
+	// bare columns resolve to the real input row (like the Forbidden mode), and a FuncCall carrying
+	// an OVER clause collects into windowSpecs and resolves to the synthetic slot
+	// windowBase+window_index — the window stage appends each function's result after the input
+	// columns. S0 narrows window + aggregate/GROUP BY to 0A000, so collecting and windowing are
+	// never both set.
+	windowing   bool
+	windowBase  int
+	windowSpecs []windowSpec
 }
+
+// windowSpec is one resolved window function (spec/design/window.md §5.1): its plan, the resolved
+// PARTITION BY key column slots (flat input-row indices), and the resolved within-partition ORDER
+// BY (sort keys over the input row, PK tie-break applied by the stable sort over the PK-ordered
+// scan).
+type windowSpec struct {
+	plan      windowPlan
+	partition []int
+	order     []orderSlot
+}
+
+// windowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
+// row_number only; ranking / offset / aggregate-window / frame plans land in S1–S4.
+type windowPlan int
+
+const (
+	// planRowNumber — ROW_NUMBER(): the 1-based sequence position within the partition.
+	planRowNumber windowPlan = iota
+)
 
 // aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
 // type (the PG widening — spec/design/aggregates.md §3).
@@ -13443,6 +13524,20 @@ func isAggregateName(name string) bool {
 	return false
 }
 
+// isWindowOnlyName reports whether name is a registered WINDOW-only function surface
+// (row_number/…). Data-driven over the catalog (Windows). Such a function REQUIRES an OVER clause —
+// used without one it is 42809 (spec/design/window.md §7). The catalog aggregates double as window
+// functions but are not in Windows, so they are still valid without OVER.
+func isWindowOnlyName(name string) bool {
+	lname := toLowerASCII(name)
+	for i := range Windows {
+		if toLowerASCII(Windows[i].Surface) == lname {
+			return true
+		}
+	}
+	return false
+}
+
 // subscriptSpecExprs returns the sub-expressions of one AST subscript spec (an index, or a slice's
 // present bounds) — for the Expr tree walkers (spec/design/array.md §6).
 func subscriptSpecExprs(s SubscriptSpec) []*Expr {
@@ -13541,6 +13636,105 @@ func exprHasAggregate(e Expr) bool {
 		return false
 	case ExprQuantified:
 		return exprHasAggregate(e.Quantified.Lhs) || exprHasAggregate(e.Quantified.Array)
+	default:
+		return false
+	}
+}
+
+// itemsHaveWindow reports whether any select item contains a window-function call (a FuncCall
+// carrying OVER). A window query resolves its projection in window mode (spec/design/window.md §5.1).
+func itemsHaveWindow(items SelectItems) bool {
+	if items.All {
+		return false
+	}
+	for _, it := range items.Items {
+		if exprHasWindow(it.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// exprHasWindow reports whether an expression tree contains a window-function call anywhere (a
+// FuncCall whose Over is set). An ordinary call may CONTAIN one in its arguments
+// (abs(row_number() OVER ())), so the arguments are walked; a window call's own PARTITION BY /
+// ORDER BY may not contain a window function (rejected at resolve, 42P20), so they are not walked
+// here. A subquery is an independent query: a window function inside it is the subquery's own.
+func exprHasWindow(e Expr) bool {
+	switch e.Kind {
+	case ExprFuncCall:
+		if e.FuncCall.Over != nil {
+			return true
+		}
+		for _, a := range e.FuncCall.Args {
+			if exprHasWindow(*a) {
+				return true
+			}
+		}
+		return false
+	case ExprCast:
+		return exprHasWindow(e.Cast.Inner)
+	case ExprExtract:
+		return exprHasWindow(e.Extract.Source)
+	case ExprCollate:
+		return exprHasWindow(e.Collate.Inner)
+	case ExprUnary:
+		return exprHasWindow(e.Unary.Operand)
+	case ExprIsNull:
+		return exprHasWindow(e.IsNullOf.Operand)
+	case ExprBinary:
+		return exprHasWindow(e.Binary.Lhs) || exprHasWindow(e.Binary.Rhs)
+	case ExprIsDistinct:
+		return exprHasWindow(e.IsDistinct.Lhs) || exprHasWindow(e.IsDistinct.Rhs)
+	case ExprIn:
+		if exprHasWindow(e.In.Lhs) {
+			return true
+		}
+		for _, elem := range e.In.List {
+			if exprHasWindow(elem) {
+				return true
+			}
+		}
+		return false
+	case ExprBetween:
+		return exprHasWindow(e.Between.Lhs) || exprHasWindow(e.Between.Lo) || exprHasWindow(e.Between.Hi)
+	case ExprLike:
+		return exprHasWindow(e.Like.Lhs) || exprHasWindow(e.Like.Rhs)
+	case ExprRegex:
+		return exprHasWindow(e.Regex.Lhs) || exprHasWindow(e.Regex.Rhs)
+	case ExprCase:
+		if e.Case.Operand != nil && exprHasWindow(*e.Case.Operand) {
+			return true
+		}
+		for _, w := range e.Case.Whens {
+			if exprHasWindow(w.Cond) || exprHasWindow(w.Result) {
+				return true
+			}
+		}
+		return e.Case.Els != nil && exprHasWindow(*e.Case.Els)
+	case ExprFieldAccess, ExprFieldStar:
+		return exprHasWindow(*e.Base)
+	case ExprSubscript:
+		if exprHasWindow(*e.Base) {
+			return true
+		}
+		for _, s := range e.Subscripts {
+			for _, x := range subscriptSpecExprs(s) {
+				if exprHasWindow(*x) {
+					return true
+				}
+			}
+		}
+		return false
+	case ExprRow, ExprArray:
+		for _, it := range e.RowItems {
+			if exprHasWindow(it) {
+				return true
+			}
+		}
+		return false
+	case ExprQuantified:
+		return exprHasWindow(e.Quantified.Lhs) || exprHasWindow(e.Quantified.Array)
 	default:
 		return false
 	}
@@ -13911,6 +14105,116 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	slot := len(ag.groupKeys) + len(ag.specs)
 	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// resolveWindowCall resolves a window-function call `f(args) OVER (window_definition)`
+// (spec/design/window.md §5.1). Valid only in a window query's projection (ag.windowing); anywhere
+// else (WHERE / JOIN ON / HAVING / an aggregate query) it is 42P20. The call collects into a
+// windowSpec and resolves to the synthetic slot windowBase+window_index. S0: only row_number().
+func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	name := toLowerASCII(fc.Name)
+	// The plan + result type from the function name. S0: only row_number(); an aggregate name with
+	// OVER (a window aggregate) is deferred to S3; any other name is 42883.
+	var (
+		plan   windowPlan
+		result resolvedType
+	)
+	switch {
+	case name == "row_number":
+		if fc.Star || len(fc.Args) != 0 {
+			return nil, resolvedType{}, NewError(UndefinedFunction, "row_number takes no arguments")
+		}
+		plan = planRowNumber
+		result = resolvedType{kind: rtInt, intTy: Int64}
+	case isAggregateName(name):
+		return nil, resolvedType{}, NewError(FeatureNotSupported, "aggregate window functions are not supported yet")
+	default:
+		return nil, resolvedType{}, NewError(UndefinedFunction, name+" is not a window function")
+	}
+	// Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys) — all
+	// against the input scope, never recursing into ag. Done before collecting the spec.
+	partition, order, err := resolveWindowDef(s, fc.Over)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
+	// HAVING / an aggregate query ag is not windowing → 42P20 (window.md §7).
+	if !ag.windowing {
+		return nil, resolvedType{}, NewError(WindowingError, "window functions are not allowed here")
+	}
+	slot := ag.windowBase + len(ag.windowSpecs)
+	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order})
+	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// resolveWindowDef resolves the PARTITION BY column list (→ flat input-row slots) and the
+// within-partition ORDER BY (→ sort keys) of an OVER (...) clause, against the (non-aggregate)
+// input scope. Mirrors the query ORDER BY resolution (the collation / direction / NULLS handling).
+// S0: partition keys are columns only. A window function in a partition/order key, or an outer
+// reference, is rejected.
+func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, error) {
+	partition := make([]int, 0, len(wd.Partition))
+	for _, key := range wd.Partition {
+		var (
+			r   resolved
+			err error
+		)
+		switch key.Kind {
+		case ExprColumn:
+			r, err = s.resolveBare(key.Column)
+		case ExprQualifiedColumn:
+			r, err = s.resolveQualified(key.Qualifier, key.Column)
+		default:
+			return nil, nil, NewError(FeatureNotSupported, "PARTITION BY supports only column references")
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if r.level != 0 {
+			return nil, nil, NewError(FeatureNotSupported, "PARTITION BY may not reference an outer query column")
+		}
+		partition = append(partition, r.index)
+	}
+	order := make([]orderSlot, 0, len(wd.Order))
+	for _, key := range wd.Order {
+		var (
+			r   resolved
+			err error
+		)
+		if key.Qualifier != "" {
+			r, err = s.resolveQualified(key.Qualifier, key.Column)
+		} else {
+			r, err = s.resolveBare(key.Column)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if r.level != 0 {
+			return nil, nil, NewError(FeatureNotSupported, "window ORDER BY may not reference an outer query column")
+		}
+		var coll *Collation
+		if key.Collation != "" {
+			if !s.columnOf(r).Type.IsText() {
+				return nil, nil, typeError(fmt.Sprintf(
+					"collations are not supported by type %s", s.columnOf(r).Type.CanonicalName(),
+				))
+			}
+			if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+				return nil, nil, err
+			}
+		} else if cn := s.columnOf(r).Collation; cn != "" {
+			if coll, err = resolveCollationName(s.catalog, cn); err != nil {
+				return nil, nil, err
+			}
+		}
+		// A non-C collated window ORDER BY is deferred in S0 (the window stage's per-partition sort
+		// is the plain comparator) — 0A000, a documented narrowing (spec/design/window.md §11).
+		if coll != nil {
+			return nil, nil, NewError(FeatureNotSupported, "collated window ORDER BY is not supported yet")
+		}
+		order = append(order, orderSlot{idx: r.index, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
+	}
+	return partition, order, nil
 }
 
 // aggArg returns the single argument of a non-star aggregate call. Each aggregate takes
@@ -16379,6 +16683,16 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &common}, nil
 	case ExprFuncCall:
+		// A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
+		if e.FuncCall.Over != nil {
+			return resolveWindowCall(s, e.FuncCall, ag, params)
+		}
+		// A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's wrong_object_type,
+		// not the windowing_error 42P20 it uses for a window in WHERE — window.md §7, oracle-verified).
+		if isWindowOnlyName(e.FuncCall.Name) {
+			return nil, resolvedType{}, NewError(WrongObjectType,
+				fmt.Sprintf("window function %s requires an OVER clause", toLowerASCII(e.FuncCall.Name)))
+		}
 		return resolveFuncCall(s, e.FuncCall, ag, params)
 	case ExprLiteral:
 		switch e.Literal.Kind {
@@ -20403,6 +20717,71 @@ func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
 		}
 	}
 	sort.SliceStable(rows, func(a, b int) bool { return cmpRowsByOrder(rows[a], rows[b], order) < 0 })
+	return nil
+}
+
+// applyWindowStage runs the WINDOW stage (spec/design/window.md §5.2): for each window function,
+// partition the rows, sort each partition by the window ORDER BY (stable → PK tie-break, as rows
+// arrive in PK scan order), compute the per-row result, and APPEND it to every row (so window
+// result i lands at flat slot input_width+i, where the projection reads it). The partition + sort
+// are unmetered (like ORDER BY / GROUP BY); each computed result charges window_result and guards
+// the ceiling. S0: row_number() only; partitions bucket value-canonically via an insertion-ordered
+// list, so no map iteration order leaks (CLAUDE.md §8/§10).
+func applyWindowStage(rows []Row, specs []windowSpec, meter *Meter) error {
+	n := len(rows)
+	if n == 0 {
+		return nil
+	}
+	for _, spec := range specs {
+		// Partition the row indices by the partition-key values. The map is an index only (never
+		// iterated); output comes from the insertion-ordered `partitions` (no map-order leak). The
+		// key is the value-canonical distinctRowKey (collapses 1.5/1.50, groups NULL with NULL).
+		index := make(map[string]int)
+		var partitions [][]int
+		for i := range rows {
+			key := make([]Value, len(spec.partition))
+			for j, p := range spec.partition {
+				key[j] = rows[i][p]
+			}
+			k := distinctRowKey(key)
+			pi, ok := index[k]
+			if !ok {
+				pi = len(partitions)
+				index[k] = pi
+				partitions = append(partitions, nil)
+			}
+			partitions[pi] = append(partitions[pi], i)
+		}
+		// Compute each row's result into a per-row slot, then append in input order.
+		results := make([]Value, n)
+		for i := range results {
+			results[i] = NullValue()
+		}
+		for _, part := range partitions {
+			// Sort the partition's row indices by the window ORDER BY. SliceStable keeps a full tie
+			// at ascending original index = PK scan order (the §3 PK tie-break).
+			ordered := part
+			if len(spec.order) > 0 {
+				ordered = append([]int(nil), part...)
+				sort.SliceStable(ordered, func(a, b int) bool {
+					return cmpRowsByOrder(rows[ordered[a]], rows[ordered[b]], spec.order) < 0
+				})
+			}
+			switch spec.plan {
+			case planRowNumber:
+				for pos, ri := range ordered {
+					if err := meter.Guard(); err != nil { // enforce the cost ceiling per result (CLAUDE.md §13)
+						return err
+					}
+					meter.Charge(Costs.WindowResult)
+					results[ri] = IntValue(int64(pos) + 1)
+				}
+			}
+		}
+		for i := range rows {
+			rows[i] = append(rows[i], results[i])
+		}
+	}
 	return nil
 }
 

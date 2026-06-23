@@ -248,3 +248,28 @@ event  = "one Pike-VM thread-step taken while matching a regular expression"
 # leaves unmetered (../design/cost.md §3 "regex compile/step"; LIKE is linear in input alone, regex in
 # program * input). Charged at the identical per-step point in every core (../regex/match_vectors.toml),
 # so the accrued cost and the abort point are cross-core identical (§8/§13).
+
+[[unit]]
+id     = "window_result"
+weight = 1
+event  = "one (input row x window function) result computed in the window stage"
+# Landed with window functions (../design/window.md §8, ../design/cost.md §3). The window-stage
+# analog of aggregate_accumulate: fires once per (input row x window function) whose value is
+# materialized into the synthetic row. The partition bucketing and per-partition sort are
+# UNMETERED (like the ORDER BY sort and the DISTINCT dedup — their input cardinality is already
+# bounded by the upstream storage_row_read / row_produced). So a row_number()-only query over N
+# rows accrues N storage_row_read + N window_result + N row_produced (+ page_read). Charged at the
+# identical per-(row x function) point in every core, so cost is cross-core identical (§8/§13).
+
+[[unit]]
+id     = "window_frame_step"
+weight = 1
+event  = "one frame row folded into a frame-sensitive window function's accumulator"
+# Landed with window functions (../design/window.md §8). A frame-sensitive window function
+# (an aggregate-over-OVER, first_value/last_value/nth_value — S3+) folds over its per-row frame;
+# this unit fires once per frame row folded, bounding the per-frame work a naive O(partition^2)
+# frame scan can drive so a max_cost ceiling aborts an untrusted running-window query
+# deterministically (54P01, §13). The S5 sliding-window optimization only LOWERS this count; it
+# never changes correctness or the result. Charged at the identical per-frame-row point in every
+# core (§8/§13). Defined now; fires only once frame-sensitive functions land (S3) — row_number
+# (S0) is frame-insensitive and never charges it.

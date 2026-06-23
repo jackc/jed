@@ -414,6 +414,10 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.RegexCompile
 		case "regex_step":
 			return Costs.RegexStep
+		case "window_result":
+			return Costs.WindowResult
+		case "window_frame_step":
+			return Costs.WindowFrameStep
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0

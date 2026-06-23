@@ -50,6 +50,7 @@ export type SqlState =
   | "indeterminate_datatype" // 42P18 — could not determine data type of parameter ${index}
   | "invalid_recursion" // 42P19 — {detail}
   | "undefined_parameter" // 42P02 — there is no parameter ${index}
+  | "windowing_error" // 42P20 — {detail}
   | "collation_mismatch" // 42P21 — collation mismatch between explicit collations {left} and {right}
   | "indeterminate_collation" // 42P22 — could not determine which collation to use for string comparison
   | "duplicate_object" // 42710 — constraint {name} for relation {table} already exists
@@ -111,6 +112,7 @@ const CODES: Record<SqlState, string> = {
   indeterminate_datatype: "42P18",
   invalid_recursion: "42P19",
   undefined_parameter: "42P02",
+  windowing_error: "42P20",
   collation_mismatch: "42P21",
   indeterminate_collation: "42P22",
   duplicate_object: "42710",
@@ -188,6 +190,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "42P18", name: "indeterminate_datatype", class: "syntax error or access rule violation" },
   { code: "42P19", name: "invalid_recursion", class: "syntax error or access rule violation" },
   { code: "42P02", name: "undefined_parameter", class: "syntax error or access rule violation" },
+  { code: "42P20", name: "windowing_error", class: "syntax error or access rule violation" },
   { code: "42P21", name: "collation_mismatch", class: "syntax error or access rule violation" },
   { code: "42P22", name: "indeterminate_collation", class: "syntax error or access rule violation" },
   { code: "42710", name: "duplicate_object", class: "syntax error or access rule violation" },

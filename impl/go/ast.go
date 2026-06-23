@@ -971,6 +971,11 @@ type FuncCallExpr struct {
 	ArgNames []*string
 	Star     bool
 	Variadic bool
+	// Over is set when the call carries a trailing OVER (...) window clause (a WINDOW-function
+	// call — spec/design/window.md). nil for an ordinary scalar/aggregate/SRF call. A window-only
+	// function (row_number/…) with Over == nil is 42809; an aggregate with Over set is a window
+	// aggregate (S3, deferred).
+	Over *WindowDef
 }
 
 // InExpr is `Lhs IN (List)` / `Lhs NOT IN (List)` — membership over a non-empty value list
@@ -1053,6 +1058,15 @@ type OrderKey struct {
 	Collation  string
 	Descending bool
 	NullsFirst bool
+}
+
+// WindowDef is a window definition — the body of an OVER (...) clause (spec/design/window.md §3).
+// S0 carries PARTITION BY columns and an ORDER BY; the frame clause and a base-window name are
+// deferred (S4/S5). Partition is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing —
+// general expressions are a follow-on); Order reuses the query ORDER BY sort keys.
+type WindowDef struct {
+	Partition []Expr
+	Order     []OrderKey
 }
 
 // LiteralKind distinguishes the literal forms.

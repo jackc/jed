@@ -307,6 +307,18 @@ class = "syntax error or access rule violation"
 template = "there is no parameter ${index}"
 
 [[error]]
+code = "42P20"
+name = "windowing_error"
+class = "syntax error or access rule violation"
+# A window function (a call carrying an OVER clause — spec/design/window.md §7) used where it
+# cannot run: in WHERE / a JOIN ON / GROUP BY / HAVING / a CHECK or DEFAULT / a frame bound (all
+# run BEFORE the window stage); nested inside another window function's argument or its
+# PARTITION BY / ORDER BY / frame; a window-only function (row_number/rank/…) used WITHOUT OVER;
+# or OVER on a scalar/SRF function. The windowing analog of the aggregate's 42803. Matches
+# PostgreSQL (code only — the message detail is site-specific).
+template = "{detail}"
+
+[[error]]
 code = "42P21"
 name = "collation_mismatch"
 class = "syntax error or access rule violation"
