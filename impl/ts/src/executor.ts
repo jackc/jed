@@ -12940,7 +12940,7 @@ function countCteRefsDml(body: CteBody, name: string): number {
         ? countSelfRefsSelect(body.source.select, name)
         : // VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice).
           0;
-    if (body.onConflict !== null && body.onConflict.doUpdate) {
+    if (body.onConflict?.doUpdate) {
       for (const a of body.onConflict.assignments) n += countSelfRefsExpr(a.value, name);
       if (body.onConflict.filter !== null) n += countSelfRefsExpr(body.onConflict.filter, name);
     }
@@ -13612,9 +13612,9 @@ function selectCallsSeqMutator(s: Select): boolean {
 
 function tableRefCallsSeqMutator(t: TableRef): boolean {
   return (
-    (t.args !== null && t.args.some(exprCallsSeqMutator)) ||
+    t.args?.some(exprCallsSeqMutator) ||
     (t.subquery !== undefined && queryCallsSeqMutator(t.subquery)) ||
-    (t.values !== undefined && t.values.some((row) => row.some(exprCallsSeqMutator)))
+    (t.values?.some((row) => row.some(exprCallsSeqMutator)) ?? false)
   );
 }
 
@@ -13755,7 +13755,7 @@ function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): voi
   if (ins.source.kind === "select") {
     collectSelectPrivs(ins.source.select, req, locals);
   }
-  if (ins.onConflict !== null && ins.onConflict.doUpdate) {
+  if (ins.onConflict?.doUpdate) {
     for (const a of ins.onConflict.assignments) collectExprPrivs(a.value, req, locals);
     if (ins.onConflict.filter !== null) collectExprPrivs(ins.onConflict.filter, req, locals);
   }

@@ -221,7 +221,7 @@ export class WriteHandle {
   commit(): void {
     if (this.done) return;
     this.done = true;
-    const failed = this.db.session.tx !== null && this.db.session.tx.failed;
+    const failed = this.db.session.tx?.failed ?? false;
     this.db.commitTx(); // inner in-memory swap: committed := working, shared-temp adopted (or no-op if failed)
     if (!failed) {
       const snap = this.db.committed;
