@@ -129,8 +129,8 @@ statement error 42804
 SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 12345
 
 # ============================================================================================
-# Cost: each conversion charges the `timezone` unit at the evaluation site (cost.md, §10).
-# The exact value is pinned cross-core (rebaselined by the Rust harness).
+# Cost metering — each conversion charges the `timezone` unit at the evaluation site (cost.md,
+# timezones.md §10). The exact value is pinned cross-core (rebaselined by the Rust harness).
 # ============================================================================================
 
 # cost: 3

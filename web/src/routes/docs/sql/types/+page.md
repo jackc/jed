@@ -26,6 +26,12 @@
   int4range(1, 10) + int4range(8, 20)             AS unioned,
   int4range(1, 10) * int4range(8, 20)             AS intersected,
   range_merge(int4range(1,5), int4range(20,30))   AS merged;`;
+
+	const tzDemo = `SELECT
+  timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'UTC'      AS at_utc,
+  timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE '+05:30'   AS at_plus_530,
+  timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE '-08:00'   AS at_minus_8,
+  timestamp   '2024-01-15 06:30:00'    AT TIME ZONE '+05:30'   AS back_to_instant;`;
 </script>
 
 <svelte:head>
@@ -87,5 +93,22 @@ adjacent), and combine ranges with the set operators — `+` (union), `*` (inter
 the gap instead:
 
 <LiveSql query={rangeDemo} rows={3} />
+
+## Time zones
+
+`timestamptz` stores a UTC instant; a time zone is an I/O-time interpretation, never part of the
+stored value or its order (PostgreSQL's model). The `AT TIME ZONE` operator converts both ways —
+`timestamptz AT TIME ZONE zone` renders the instant as the local wall clock in `zone`, and
+`timestamp AT TIME ZONE zone` interprets a wall clock as being in `zone` and gives back the UTC
+instant. `UTC` and fixed offsets like `+05:30` are built in (note the **POSIX sign**: `'+05:30'`
+means UTC−5:30, matching PostgreSQL):
+
+<LiveSql query={tzDemo} rows={1} />
+
+Named IANA zones (`America/New_York`, `Europe/Paris`, …) come from a time-zone database the host
+**loads** as bytes — the engine ships none by itself, so a query can only ever *use* an
+already-loaded zone (an unknown zone raises `22023`). This is the same host-loaded-data model jed
+uses for Unicode collation; see the design notes for the `JTZ` bundle and the `db.loadTimeZoneData`
+host call.
 
 See the full [type reference](../../reference/types/) for every scalar type and its range.
