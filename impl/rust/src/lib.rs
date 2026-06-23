@@ -230,6 +230,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.comparison_order",
     "query.point_lookup",
     "query.limit_short_circuit",
+    "query.order_by_pk_scan",
     "query.correlated_pushdown",
     "query.join_pushdown",
     // GIN-bounded scan — `col @> const` / `col && const` over a GIN-indexed array column narrows

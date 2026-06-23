@@ -287,6 +287,16 @@ resolved at parse time to `explicit ? … : descending` and applied independentl
 **unmetered**, like `LIMIT`/`OFFSET` slicing ([cost.md](cost.md) §3); only the scanned and
 produced rows accrue cost.
 
+**The sort is elided when the scan already produces the order.** When the `ORDER BY` keys are an
+`ASC` prefix of the single base table's **primary key** (sorting by each column's stored key
+order), the table scan already delivers rows in that order, so the engine skips the sort entirely
+and streams scan→filter→project — and with a `LIMIT` short-circuits a top-N
+([cost.md](cost.md) §3 "ORDER BY satisfied by primary-key order"). The result is identical (the
+PK scan order *is* the requested order, tie-break included); only the cost drops for the `LIMIT`
+case. A collated PK is stored in collation order, so a collated `ORDER BY` is satisfied for free.
+`DESC` (a reverse scan), secondary-index order, `DISTINCT`, and joins keep the blocking sort —
+each a relaxable follow-on.
+
 ## 11. `DISTINCT`
 
 `SELECT DISTINCT` removes duplicate rows from the result by **deduplicating the projected

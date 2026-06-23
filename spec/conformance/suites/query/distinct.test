@@ -14,7 +14,7 @@
 # column in the select list (or the list is `*`), else 42P10 — once duplicates collapse, a
 # key not in the output has no single value per row. (NULL ordering also follows PostgreSQL,
 # §10 — NULL is the largest value, so ASC defaults to NULLS LAST.)
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, query.order_by_pk_scan, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -247,11 +247,13 @@ INSERT INTO t3 VALUES (3, 4)
 statement error 22012
 SELECT DISTINCT 1 / c FROM t3 LIMIT 1
 
-# The un-DISTINCT counterpart: windowing before projection means only the first row (c=2,
-# 1/2 = 0) is evaluated, so there is no division-by-zero. 3 scanned + 1 projection
-# operator_eval + 1 produced = 5.
+# The un-DISTINCT counterpart: `ORDER BY id` is satisfied by the primary-key scan order
+# (cost.md §3 "ORDER BY satisfied by primary-key order"), so LIMIT 1 short-circuits the scan after
+# the first row (c=2, 1/2 = 0) — neither the c=0 row nor any later row is scanned, so there is no
+# division-by-zero AND only one row is read. 1 page + 1 scanned + 1 projection operator_eval +
+# 1 produced = 4.
 # names: ?column?
-# cost: 6
+# cost: 4
 query I nosort
 SELECT 1 / c FROM t3 ORDER BY id LIMIT 1
 ----

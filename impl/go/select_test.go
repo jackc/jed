@@ -57,10 +57,13 @@ func limitDB(t *testing.T) *Database {
 }
 
 func TestLimitOffsetWindowReducesProducedCost(t *testing.T) {
-	// The slice runs before projection, so only windowed rows charge row_produced:
-	// 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8 (spec/design/cost.md §3).
+	// ORDER BY on a NON-primary-key column (`v`) is a blocking sort the scan does not satisfy, so it
+	// reads every row before windowing; the slice runs before projection, so only windowed rows
+	// charge row_produced: 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8
+	// (spec/design/cost.md §3). (Ordering by the PK instead short-circuits — pinned cross-core in
+	// query/limit_offset.test, cost 5.)
 	db := limitDB(t)
-	out, err := Execute(db, "SELECT id FROM t ORDER BY id LIMIT 2")
+	out, err := Execute(db, "SELECT id FROM t ORDER BY v LIMIT 2")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -495,10 +495,13 @@ capability.
   accrual model across all scans; the row reads are where the early-out shows. (Tightening
   `page_read` to the leaves actually faulted is a possible later refinement; it would only matter
   for a very large multi-leaf table.)
-- **An `ORDER BY` (or any blocking operator) keeps the full scan.** Those must materialize every row
-  before windowing, so they charge `storage_row_read` for all of them — the rule at the top of this
-  section. This is why every `LIMIT`-with-`ORDER BY` cost in `query/limit_offset.test` scans all
-  rows, while the `LIMIT`-without-`ORDER BY` cases short-circuit.
+- **A *blocking* `ORDER BY` (or any blocking operator) keeps the full scan.** A sort the scan does
+  **not** already satisfy — a non-PK key, or `DESC` (a reverse scan is a follow-on) — must
+  materialize every row before windowing, so it charges `storage_row_read` for all of them (the rule
+  at the top of this section). But an `ORDER BY` the scan **does** satisfy is *not* blocking: see
+  "ORDER BY satisfied by primary-key order" below, which short-circuits exactly like the no-`ORDER
+  BY` case. `query/limit_offset.test` pins both sides — `ORDER BY id` (the PK) short-circuits while
+  `ORDER BY val` (a non-PK) scans all rows.
 - **Composes with the PK bound.** A `WHERE pk <range> ... LIMIT n` first bounds the scan to the key
   range (above), then short-circuits within it once `n` rows are produced. (An **index** bound does
   **not** stream — an index-bounded scan with a LIMIT takes the eager path; see the index-bounded
@@ -509,6 +512,53 @@ capability.
 
 `query/limit_offset.test` pins these costs cross-core (a uniform-value table makes the no-`ORDER BY`
 subset deterministic so a specific result can be asserted alongside the `# cost:`).
+
+### ORDER BY satisfied by primary-key order — eliding the sort
+
+An `ORDER BY` is normally a **blocking** operator: the engine must read every row, sort, then window
+(the rule at the top of this section). But when the requested order is *already* the order the scan
+produces, the sort is a no-op and is **elided** — the scan streams rows straight to the window, and
+(with a `LIMIT`) short-circuits exactly like the no-`ORDER BY` case above. Gated by the
+`query.order_by_pk_scan` capability.
+
+The base-table scan walks the table tree forward in **storage-key (primary-key) order**, so an
+`ORDER BY` is satisfied by the scan when it is a single-table, non-aggregate, non-`DISTINCT` `SELECT`
+whose `ORDER BY` keys are a **prefix of the PRIMARY KEY columns** (in key order), each:
+
+- **`ASC`** — the forward scan is ascending; `DESC` (a reverse traversal) is a follow-on, and keeps
+  the blocking sort.
+- sorting by the **same order the stored key realizes** — for a collated key, the column's frozen
+  collation (the tree stores the UCA sort key, so its byte order *is* the collation order —
+  [encoding.md §2.12](encoding.md), [collation.md §8](collation.md)); a mismatching explicit
+  `COLLATE` keeps the blocking sort. A **version-skewed** collated key (collation.md §12) is never
+  used for order — the stored keys are at the file's pinned version, so the scan order would be wrong
+  for the loaded one; it keeps the blocking sort, which recomputes against the loaded collation.
+
+The PK columns are `NOT NULL`, so a key's `NULLS FIRST|LAST` is a no-op (no NULLs to place). Two
+coverage shapes both qualify: an `ORDER BY` **shorter** than the PK is a prefix — ties are broken by
+the remaining PK columns, which is exactly the canonical PK tie-break the eager stable sort produces;
+an `ORDER BY` that runs **past** the full PK matches the whole (unique) key, so its extra keys are
+redundant (no ties remain).
+
+- **Cost — no `LIMIT`.** The scan reads every row either way, and the sort is unmetered (below), so
+  eliding it does **not** move the cost. The observable contract is the **row order** (the scan
+  already delivers it). `query/order_by_pk_scan.test` pins the composite-key order.
+- **Cost — with `LIMIT`.** The deliberate change: the scan short-circuits once the window is filled,
+  so `storage_row_read` (and the filter `operator_eval`s) drop to the rows actually read — a top-N
+  early-out, the same drop as the no-`ORDER BY` `LIMIT` short-circuit. `query/limit_offset.test` pins
+  `ORDER BY id LIMIT 2` at the short-circuited cost (and the non-PK `ORDER BY val LIMIT 2` at the
+  full-scan cost, the contrast).
+- **The collation payoff.** A collated PK (or any collated key the scan walks) is stored in collation
+  order, so a collated `ORDER BY` is satisfied **without** the in-memory collated decorate-sort (and
+  with **no** `collate` units — there is no ordering *comparison*, just the scan emitting in stored
+  order). `collation/collated_pushdown.test` pins `ORDER BY name LIMIT 2` over a `unicode` PK.
+- **Composes with the PK bound** the same way the `LIMIT` short-circuit does: a `WHERE pk <range>`
+  forward range walk is already PK order, so the bound narrows *which* rows are scanned and the
+  `ORDER BY` still streams within it.
+
+Narrowings (each a follow-on optimization slice): `DESC` (reverse scan), **secondary-index** order
+(walk the index tree + point-lookup — the general non-PK collation payoff), `DISTINCT`, and multi-
+table joins all keep the blocking sort / eager path.
 
 ### `SELECT DISTINCT` — the projection-vs-produce asymmetry
 

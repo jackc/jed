@@ -8196,6 +8196,20 @@ impl Database {
             .map(|r| touched[r.offset..r.offset + r.col_count].to_vec())
             .collect();
 
+        // ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base
+        // table, non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the
+        // relation's PRIMARY KEY columns — each ASC, collation-matching the column's stored key
+        // form — needs no sort, since the table scan already yields rows in that order. The
+        // streaming scan then elides the sort (and, with a LIMIT, short-circuits a top-N).
+        let pk_ordered = !is_agg
+            && !sel.distinct
+            && !order.is_empty()
+            && rels.len() == 1
+            && rels[0].srf.is_none()
+            && rels[0].cte.is_none()
+            && rels[0].derived.is_none()
+            && order_satisfied_by_pk(scope.rels[0].table, rels[0].offset, &order, self);
+
         Ok(SelectPlan {
             rels,
             joins,
@@ -8211,6 +8225,7 @@ impl Database {
             distinct: sel.distinct,
             limit: sel.limit,
             offset: sel.offset,
+            pk_ordered,
             rel_bounds,
             rel_masks,
         })
@@ -8405,14 +8420,19 @@ impl Database {
         Ok(out)
     }
 
-    /// The LIMIT short-circuit path (spec/design/cost.md §3): a single-table, no-blocking-operator
-    /// query with a LIMIT streams scan→filter→project and stops the scan the instant the LIMIT/OFFSET
-    /// window is filled, charging storage_row_read only for the rows actually read. Cost-equivalent to
-    /// the eager path EXCEPT that it reads (and filters) fewer rows — the deliberate cost change.
-    /// page_read is the full block (the bound's node count); only the row reads short-circuit. Rows
-    /// match the eager path exactly: the offset..offset+limit slice of the primary-key-ordered
-    /// filtered rows.
-    fn exec_streaming_limit(
+    /// The streaming primary-key-ordered scan path (spec/design/cost.md §3): a single-table,
+    /// no-blocking-operator query whose output order is already the table's primary-key scan order
+    /// — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
+    /// (`plan.pk_ordered`, set by `order_satisfied_by_pk`) — streams scan→filter→project with NO
+    /// sort, and (when there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is
+    /// filled, charging storage_row_read only for the rows actually read. With no LIMIT it emits
+    /// every survivor after OFFSET (the sort is simply elided — same rows, same cost as the eager/
+    /// sort path). Cost-equivalent to the eager path EXCEPT that a LIMIT reads (and filters) fewer
+    /// rows — the deliberate cost change. page_read is the full block (the bound's node count); only
+    /// the row reads short-circuit. Rows match the eager path exactly: the offset..offset+limit
+    /// slice of the primary-key-ordered filtered rows (which, for a `pk_ordered` query, is exactly
+    /// the ORDER BY's result — the stored PK order IS the requested order).
+    fn exec_streaming_scan(
         &self,
         plan: &SelectPlan,
         env: &EvalEnv,
@@ -8442,10 +8462,12 @@ impl Database {
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
 
-        let limit = plan.limit.expect("streaming path is gated on a LIMIT");
+        // `limit` is optional here: a `pk_ordered` query may have no LIMIT (it streams every
+        // survivor in order, eliding the sort), while the LIMIT short-circuit always has one.
+        let limit = plan.limit;
         let offset = plan.offset.unwrap_or(0);
         let mut out: Vec<Vec<Value>> = Vec::new();
-        if !empty && limit > 0 {
+        if !empty && limit != Some(0) {
             let mut passed: i64 = 0;
             store.scan_range(&bound, &mut |_key, row| {
                 meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -8479,7 +8501,12 @@ impl Database {
                     projected.push(p.eval(row, env, meter)?);
                 }
                 out.push(projected);
-                Ok((out.len() as i64) < limit) // stop once the window is filled
+                // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
+                // survivor after OFFSET, in primary-key order).
+                Ok(match limit {
+                    Some(l) => (out.len() as i64) < l,
+                    None => true,
+                })
             })?;
         }
         Ok(SelectResult {
@@ -8807,17 +8834,19 @@ impl Database {
         };
         let mut meter = self.session.new_meter();
 
-        // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no
-        // blocking operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project
-        // and STOPS the scan once the window is filled, so storage_row_read counts only the rows
-        // actually read. (ORDER BY/DISTINCT/aggregate must see every row, so they keep the eager path
-        // below.) page_read stays the full block; only row reads short-circuit.
-        if plan.limit.is_some()
-            && plan.rels.len() == 1
+        // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
+        // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with
+        // a LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key
+        // scan order (`plan.pk_ordered`) — streams scan→filter→project with NO sort, and with a
+        // LIMIT STOPS the scan once the window is filled (so storage_row_read counts only the rows
+        // actually read). A non-PK-ordered ORDER BY, DISTINCT, aggregate, or join must see every row
+        // (sort/dedup/group/combine), so it keeps the sort/eager path below. page_read stays the
+        // full block; only the row reads short-circuit.
+        if plan.rels.len() == 1
             && plan.joins.is_empty()
             && !plan.is_agg
             && !plan.distinct
-            && plan.order.is_empty()
+            && (plan.pk_ordered || (plan.order.is_empty() && plan.limit.is_some()))
             // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
             // gin.md §6): it reads the full admitted set via the eager path below.
             && !matches!(
@@ -8833,16 +8862,18 @@ impl Database {
             // A derived table is a computed source too (grammar.md §42) — eager path.
             && plan.rels[0].derived.is_none()
         {
-            return self.exec_streaming_limit(plan, &env, &mut meter, params);
+            return self.exec_streaming_scan(plan, &env, &mut meter, params);
         }
 
         // Streaming external sort (spec/design/spill.md §5): a single-table, no-join,
-        // non-aggregate, non-DISTINCT query with an ORDER BY streams scan→filter→Sorter, so the
-        // input is never materialized in the executor heap and the sort spills sorted runs to disk
-        // under work_mem (file-backed databases). DISTINCT/aggregate/join take the eager path below,
-        // and an index bound does not stream (like the LIMIT short-circuit). Results + cost are
-        // identical to the eager sort (the sort is unmetered — cost.md §3; spill.md §6).
+        // non-aggregate, non-DISTINCT query with an ORDER BY the scan does NOT already satisfy
+        // (`!plan.pk_ordered` — caught above) streams scan→filter→Sorter, so the input is never
+        // materialized in the executor heap and the sort spills sorted runs to disk under work_mem
+        // (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an index
+        // bound does not stream (like the LIMIT short-circuit). Results + cost are identical to the
+        // eager sort (the sort is unmetered — cost.md §3; spill.md §6).
         if !plan.order.is_empty()
+            && !plan.pk_ordered
             && plan.rels.len() == 1
             && plan.joins.is_empty()
             && !plan.is_agg
@@ -11718,6 +11749,13 @@ struct SelectPlan {
     distinct: bool,
     limit: Option<i64>,
     offset: Option<i64>,
+    /// `ORDER BY` is satisfied by the single base relation's **primary-key scan order** — the
+    /// table tree already yields rows in this order, so the sort is elided (and with a `LIMIT`
+    /// the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
+    /// non-`DISTINCT` `SELECT` whose `ORDER BY` keys are a prefix of the PK columns, each `ASC`
+    /// with the column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by
+    /// primary-key order"). `DESC` (reverse scan) and secondary-index order are follow-ons.
+    pk_ordered: bool,
     /// Scan-bound pushdown, **one entry per relation** in `rels`: the WHERE conjuncts that
     /// bound that relation's scan — a primary-key range, or (when no PK bound applies) a
     /// secondary-index equality (cost.md §3 "bounded scan" / "index-bounded scan"). `None` ⇒
@@ -11971,6 +12009,55 @@ fn key_collation_ctx(
             }
         }
     }
+}
+
+/// Whether a single base relation's `ORDER BY` is satisfied **by its primary-key scan order**
+/// (spec/design/cost.md §3 "ORDER BY satisfied by primary-key order") — i.e. the table tree, walked
+/// forward in storage-key order, already delivers rows in the requested order, so the sort is a
+/// no-op. True iff the `ORDER BY` keys are a **prefix of the PK columns** (in key order), each
+/// `ASC` (a `DESC` reverse scan is a follow-on) and sorting by the **same order the stored PK key
+/// realizes** (collation.md §8/§12). The PK columns are NOT NULL, so a key's `NULLS FIRST|LAST` is
+/// a no-op (no NULLs to place) and is ignored. Two coverage shapes both qualify: an `ORDER BY`
+/// shorter than the PK is a prefix (ties are broken by the remaining PK columns — the canonical PK
+/// tie-break, matching the eager stable sort); an `ORDER BY` longer than the PK matches the whole
+/// PK and its extra keys are redundant (the PK is unique, so there are no ties left to break).
+fn order_satisfied_by_pk(
+    table: &Table,
+    offset: usize,
+    order: &[crate::spill::SortKey],
+    catalog: &Database,
+) -> bool {
+    let pk = table.pk_indices();
+    if pk.is_empty() {
+        return false; // no PK (synthetic rowid order is not a user-visible column)
+    }
+    let m = order.len().min(pk.len());
+    for (i, (slot, descending, _nulls_first, coll)) in order.iter().take(m).enumerate() {
+        if *descending {
+            return false; // ASC only this slice (a DESC reverse scan is a follow-on)
+        }
+        if *slot != offset + pk[i] {
+            return false; // must be the i-th PK column, in key order
+        }
+        // The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
+        // (`C`/non-text) key matches a key with no collation; a `Full`-collated key matches the
+        // SAME collation; a `Skewed`/unresolvable collation never matches (the stored keys are at
+        // the file's pinned version, so the scan order would be wrong for the loaded one — the
+        // read-safety rule §12; recompute via the eager/streaming sort instead).
+        match key_collation_ctx(catalog, &table.columns[pk[i]]) {
+            None => return false,
+            Some(None) => {
+                if coll.is_some() {
+                    return false;
+                }
+            }
+            Some(Some(c)) => match coll {
+                Some(c2) if c2.name == c.name => {}
+                _ => return false,
+            },
+        }
+    }
+    true
 }
 
 /// Detect a GIN-bounded scan over `columns`/`indexes` (gin.md §6): the lowest-named GIN index

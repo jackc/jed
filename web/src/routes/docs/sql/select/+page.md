@@ -348,3 +348,11 @@ a time keeps only the date part, so `'2024-01-15 09:30:00'` stores `2024-01-15`.
 Cost is shown with every result. Each query accrues a deterministic cost, and a caller can set a
 ceiling so an expensive query aborts with `54P01` rather than running away — which is what makes it
 safe to run untrusted SQL.
+
+When an `ORDER BY` already matches the order the data is stored in — an ascending prefix of the
+table's `PRIMARY KEY` — jed skips the sort and reads rows straight from the table in order. Paired
+with a `LIMIT`, this becomes a **top-N**: the scan stops as soon as the window is full, so
+`SELECT … ORDER BY <pk> LIMIT 100` over a million-row table reads ~100 rows, not a million. A
+collated primary key is stored in its collation's order, so a collated `ORDER BY` is satisfied the
+same way, with no in-memory re-sort. (Ordering by a non-key column, or `DESC`, still does a full
+sort for now.)

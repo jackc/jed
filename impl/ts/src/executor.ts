@@ -6912,6 +6912,20 @@ export class Database {
       for (const o of order) touched[o.idx] = true;
     }
     const relMasks = planRels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
+    // ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
+    // non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the relation's PRIMARY
+    // KEY columns — each ASC, collation-matching the column's stored key form — needs no sort, since
+    // the table scan already yields rows in that order. The streaming scan then elides the sort (and,
+    // with a LIMIT, short-circuits a top-N).
+    const pkOrdered =
+      !isAgg &&
+      !sel.distinct &&
+      order.length > 0 &&
+      planRels.length === 1 &&
+      planRels[0]!.srf === undefined &&
+      planRels[0]!.cte === undefined &&
+      planRels[0]!.derived === undefined &&
+      orderSatisfiedByPK(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order);
     return {
       kind: "select",
       rels: planRels,
@@ -6928,6 +6942,7 @@ export class Database {
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
+      pkOrdered,
       relBounds,
       relMasks,
     };
@@ -7079,14 +7094,18 @@ export class Database {
   // of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
   // + project. The per-row evaluator gets an EvalEnv carrying the outer rows + a runSubquery
   // callback, so a correlated subquery in any clause re-executes against them (grammar.md §26).
-  // execStreamingLimit executes the LIMIT short-circuit path (spec/design/cost.md §3): a single-table,
-  // no-blocking-operator query with a LIMIT streams scan→filter→project and stops the scan the instant
-  // the LIMIT/OFFSET window is filled, charging storageRowRead only for the rows actually read.
-  // Cost-equivalent to the eager path EXCEPT that it reads (and filters) fewer rows — the deliberate
-  // cost change. pageRead is the full block (the bound's node count); only the row reads short-circuit.
-  // Rows match the eager path exactly: the offset..offset+limit slice of the primary-key-ordered
-  // filtered rows.
-  private execStreamingLimit(
+  // execStreamingScan executes the streaming primary-key-ordered scan path (spec/design/cost.md §3):
+  // a single-table, no-blocking-operator query whose output order is already the table's primary-key
+  // scan order — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
+  // (plan.pkOrdered, set by orderSatisfiedByPK) — streams scan→filter→project with NO sort, and (when
+  // there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is filled, charging
+  // storageRowRead only for the rows actually read. With no LIMIT it emits every survivor after
+  // OFFSET (the sort is simply elided — same rows, same cost as the eager/sort path).
+  // Cost-equivalent to the eager path EXCEPT that a LIMIT reads (and filters) fewer rows — the
+  // deliberate cost change. pageRead is the full block (the bound's node count); only the row reads
+  // short-circuit. Rows match the eager path exactly: the offset..offset+limit slice of the
+  // primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's result).
+  private execStreamingScan(
     plan: SelectPlan,
     env: EvalEnv,
     meter: Meter,
@@ -7112,10 +7131,13 @@ export class Database {
     const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
     meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
-    const limit = plan.limit!;
+    // limit is optional here: a pkOrdered query may have no LIMIT (it streams every survivor in
+    // order, eliding the sort), while the LIMIT short-circuit always has one.
+    const limit = plan.limit;
     const offset = plan.offset ?? 0n;
     const out: Value[][] = [];
-    if (!empty && limit > 0n) {
+    // Skip the scan entirely for LIMIT 0 (no window to fill).
+    if (!empty && limit !== 0n) {
       let passed = 0n;
       store.scanRange(bound, (_key, rawRow) => {
         meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -7130,7 +7152,9 @@ export class Database {
         if (passed <= offset) return true;
         meter.charge(COSTS.rowProduced);
         out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
-        return BigInt(out.length) < limit; // stop once the window is filled
+        // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every survivor
+        // after OFFSET, in primary-key order).
+        return limit === null ? true : BigInt(out.length) < limit;
       });
     }
     return {
@@ -7416,18 +7440,19 @@ export class Database {
     };
     const meter = this.session.newMeter();
 
-    // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
-    // operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
-    // scan once the window is filled, so storageRowRead counts only the rows actually read. (ORDER BY/
-    // DISTINCT/aggregate must see every row, so they keep the eager path below.) pageRead stays the
-    // full block; only row reads short-circuit.
+    // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
+    // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
+    // LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
+    // (plan.pkOrdered) — streams scan→filter→project with NO sort, and with a LIMIT STOPS the scan
+    // once the window is filled, so storageRowRead counts only the rows actually read. A non-PK-ordered
+    // ORDER BY, DISTINCT, aggregate, or join must see every row, so it keeps the sort/eager path below.
+    // pageRead stays the full block; only row reads short-circuit.
     if (
-      plan.limit !== null &&
       plan.rels.length === 1 &&
       plan.joins.length === 0 &&
       !plan.isAgg &&
       !plan.distinct &&
-      plan.order.length === 0 &&
+      (plan.pkOrdered || (plan.order.length === 0 && plan.limit !== null)) &&
       // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
       // gin.md §6): it reads the full admitted set via the eager path below.
       plan.relBounds[0]?.kind !== "index" &&
@@ -7441,17 +7466,19 @@ export class Database {
       // A derived table is a computed source too (grammar.md §42) — eager path.
       plan.rels[0]!.derived === undefined
     ) {
-      return this.execStreamingLimit(plan, env, meter, params);
+      return this.execStreamingScan(plan, env, meter, params);
     }
 
     // Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
-    // non-DISTINCT query with an ORDER BY streams scan→filter→sorter, so the input is never
-    // materialized in the executor heap and the sort spills sorted runs to disk under workMem
-    // (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an index bound
-    // does not stream (like the LIMIT short-circuit). Results + cost are identical to the eager sort
-    // (the sort is unmetered — cost.md §3; spill.md §6).
+    // non-DISTINCT query with an ORDER BY the scan does NOT already satisfy (!plan.pkOrdered — caught
+    // above) streams scan→filter→sorter, so the input is never materialized in the executor heap and
+    // the sort spills sorted runs to disk under workMem (file-backed databases). DISTINCT/aggregate/
+    // join take the eager path below, and an index bound does not stream (like the LIMIT
+    // short-circuit). Results + cost are identical to the eager sort (the sort is unmetered —
+    // cost.md §3; spill.md §6).
     if (
       plan.order.length > 0 &&
+      !plan.pkOrdered &&
       plan.rels.length === 1 &&
       plan.joins.length === 0 &&
       !plan.isAgg &&
@@ -8032,6 +8059,43 @@ function keyCollationCtx(snap: Snapshot, col: Column): { coll: Collation | null 
   if (snap.collationSkew(col.collation) !== undefined) return null;
   const c = snap.resolveCollation(col.collation);
   return c !== undefined ? { coll: c } : null;
+}
+
+// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied BY ITS
+// PRIMARY-KEY scan order (spec/design/cost.md §3 "ORDER BY satisfied by primary-key order") — the
+// table tree, walked forward in storage-key order, already delivers rows in the requested order, so
+// the sort is a no-op. True iff the ORDER BY keys are a PREFIX of the PK columns (in key order),
+// each ASC (a DESC reverse scan is a follow-on) and sorting by the SAME order the stored PK key
+// realizes (collation.md §8/§12). The PK columns are NOT NULL, so a key's NULLS FIRST|LAST is a
+// no-op (no NULLs to place) and is ignored. An ORDER BY shorter than the PK is a prefix (ties broken
+// by the remaining PK columns — the canonical tie-break the eager stable sort produces); an ORDER BY
+// longer than the PK matches the whole PK and its extra keys are redundant (the PK is unique).
+function orderSatisfiedByPK(
+  snap: Snapshot,
+  table: Table,
+  offset: number,
+  order: OrderSlot[],
+): boolean {
+  const pk = pkIndices(table);
+  if (pk.length === 0) return false; // no PK (synthetic rowid order is not a user-visible column)
+  const m = Math.min(order.length, pk.length);
+  for (let i = 0; i < m; i++) {
+    const o = order[i]!;
+    if (o.descending) return false; // ASC only this slice (a DESC reverse scan is a follow-on)
+    if (o.idx !== offset + pk[i]!) return false; // must be the i-th PK column, in key order
+    // The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
+    // (C/non-text) key matches a key with no collation; a Full-collated key matches the SAME
+    // collation; a Skewed/unresolvable collation never matches (its stored keys are at the file's
+    // pinned version, so the scan order would be wrong for the loaded one — §12).
+    const ctx = keyCollationCtx(snap, table.columns[pk[i]!]!);
+    if (ctx === null) return false; // Skewed / unresolvable
+    if (ctx.coll === null) {
+      if (o.collation !== null) return false; // raw-byte key, but the ORDER BY key carries a collation
+    } else if (o.collation === null || o.collation.name !== ctx.coll.name) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named GIN
@@ -9885,6 +9949,13 @@ type SelectPlan = {
   distinct: boolean;
   limit: bigint | null;
   offset: bigint | null;
+  // pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
+  // order — the table tree already yields rows in this order, so the sort is elided (and with a
+  // LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
+  // non-DISTINCT SELECT whose ORDER BY keys are a prefix of the PK columns, each ASC with the
+  // column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by primary-key
+  // order"). DESC (reverse scan) and secondary-index order are follow-ons.
+  pkOrdered: boolean;
   // Primary-key predicate pushdown, ONE entry per relation in rels: the WHERE conjuncts that bound
   // that relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
   // (cost.md §3 "bounded scan"). null ⇒ a full scan of that relation. In a JOIN each base table is

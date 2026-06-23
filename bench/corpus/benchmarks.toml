@@ -59,6 +59,17 @@ seed = 4204
 expect_rows_per_iter = 100
 
 [[bench]]
+name = "order_by_pk_limit"
+description = "Top-100 by the PRIMARY KEY over 1M rows — ORDER BY satisfied by the PK scan order (cost.md §3), so the scan short-circuits the top-N instead of full-sorting 1M rows"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders ORDER BY id LIMIT 100"
+warmup = 2
+iterations = 10
+seed = 4214
+expect_rows_per_iter = 100
+
+[[bench]]
 name = "insert_rollback"
 description = "Insert throughput: 1000 bound inserts per transaction, rolled back"
 dataset = "small"

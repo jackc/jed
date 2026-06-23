@@ -90,6 +90,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Richer `ORDER BY`** — multiple keys, per-key `ASC`/`DESC`, `NULLS FIRST|LAST` (PG
       NULL-largest default). → [grammar.md §10](spec/design/grammar.md)
   - [ ] _follow-on:_ ordinal / expression / alias sort keys.
+- [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,
+      non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK columns (sorting by each
+      column's stored key order) elides the sort and streams the scan; with a `LIMIT` it
+      short-circuits a top-N (`storage_row_read` drops to the rows read). Composes with a PK range
+      bound; a collated PK is stored in collation order, so a collated `ORDER BY` is satisfied with
+      no in-memory re-sort and no `collate` units. Capability `query.order_by_pk_scan`.
+      → [cost.md §3](spec/design/cost.md), [grammar.md §10](spec/design/grammar.md)
+  - [ ] _follow-on (each its own slice + NoREC obligation):_ `DESC` (reverse scan); **secondary-index
+        order** (walk the index tree + point-lookup — the general non-PK collated-`ORDER BY` payoff,
+        needs a variable-width key-suffix skip); `DISTINCT`; multi-table joins.
 - [x] **`DISTINCT`** — NULL-safe dedup of projected rows, after ORDER BY before LIMIT; PG
       restriction on ORDER BY keys (`42P10`). → [grammar.md §11](spec/design/grammar.md)
 - [x] **FROM-less `SELECT`** — `SELECT 1` over one virtual zero-column row.

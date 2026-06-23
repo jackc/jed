@@ -1,0 +1,129 @@
+# ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3 "ORDER BY satisfied by
+# primary-key order"). A single-table, non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are
+# a PREFIX of the table's PRIMARY KEY columns — each ASC, sorting by the column's stored key order —
+# needs no sort: the table tree, walked forward in storage-key order, already delivers rows in that
+# order. The engine elides the sort and STREAMS the scan; with a LIMIT it stops once the window is
+# filled (a top-N early-out). The cost-visible win is the LIMIT case: storage_row_read drops to the
+# rows actually read. A query with no LIMIT reads every row either way (the sort is unmetered —
+# cost.md §3 — so eliding it does not move the cost; the contract there is the ROW ORDER).
+#
+# This file pins the COMPOSITE-PK behavior + the contrasts the single-column query/limit_offset.test
+# does not: a STRICT PREFIX of a composite key satisfies the order, an ORDER BY that runs PAST the
+# full (unique) key (the extra keys are redundant), and the cases that do NOT qualify (DESC — a
+# reverse scan is a follow-on; a non-PK leading key) which keep the full scan + sort. Every ORDER BY
+# here is a TOTAL order (the leading column `a` and the non-key `c` are both unique), so the rows are
+# unambiguous and agree with the PostgreSQL oracle — jed's deliberate PK tie-break beyond SQL
+# (CLAUDE.md §8) is exercised by the existing query/order_by.test, not re-pinned here. All units
+# weigh 1, so for every record:
+#   cost = page_read (visited nodes) + storage_row_read (rows read) + filter operator_evals
+#          (per scanned row) + row_produced + projection operator_evals.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.order_by_pk_scan, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (a i32, b i32, c i32, PRIMARY KEY (a, b))
+
+# Composite-key order is (a, b): every row has a distinct `a` (so `ORDER BY a` is already a total
+# order), and `c` is a non-key column de-correlated from `a`.
+statement ok
+INSERT INTO t VALUES (1, 10, 300), (2, 20, 100), (3, 30, 500), (4, 40, 200), (5, 50, 400)
+
+# Full composite key, ASC: `ORDER BY a, b` IS the scan order, so LIMIT 2 short-circuits after the
+# first two rows — (3,30) and beyond are never scanned. 1 page + 2 scanned + 2 produced = 5.
+# cost: 5
+query II nosort
+SELECT a, b FROM t ORDER BY a, b LIMIT 2
+----
+1
+10
+2
+20
+
+# STRICT PREFIX of the composite key: `ORDER BY a` alone (the FIRST of the two PK columns) is still
+# satisfied by the (a, b) scan order, so LIMIT 2 short-circuits the same way. This exercises the
+# prefix-acceptance path (the ORDER BY is shorter than the PK). 1 page + 2 scanned + 2 produced = 5.
+# cost: 5
+query II nosort
+SELECT a, b FROM t ORDER BY a LIMIT 2
+----
+1
+10
+2
+20
+
+# ORDER BY runs PAST the full key: `a, b` is the whole (unique) PK, so the trailing `c` is
+# redundant — no two rows share (a, b), so there are no ties left for `c` to break. Still satisfied
+# by the scan; LIMIT 2 short-circuits. 1 page + 2 scanned + 2 produced = 5.
+# cost: 5
+query II nosort
+SELECT a, b FROM t ORDER BY a, b, c LIMIT 2
+----
+1
+10
+2
+20
+
+# A residual WHERE composes with the streaming scan: `a >= 2` filters per scanned row, and the LIMIT
+# still short-circuits (a composite PK has no single-column bound, so this is a full ordered scan +
+# residual filter). The scan reads (1,*) [filtered out], then (2,*),(3,*) [produced], and stops.
+# 1 page + 3 scanned + 3 filter + 2 produced = 9.
+# cost: 9
+query II nosort
+SELECT a, b FROM t WHERE a >= 2 ORDER BY a LIMIT 2
+----
+2
+20
+3
+30
+
+# No LIMIT: every row is read either way, so the cost is the full-scan cost (the sort is elided but
+# unmetered — cost.md §3); the contract here is the ROW ORDER (the composite-key walk). 1 page +
+# 5 scanned + 5 produced = 11.
+# cost: 11
+query II nosort
+SELECT a, b FROM t ORDER BY a, b
+----
+1
+10
+2
+20
+3
+30
+4
+40
+5
+50
+
+# CONTRAST — DESC is a reverse traversal the forward scan does not satisfy (a reverse-scan
+# optimization is a follow-on), so `ORDER BY a DESC LIMIT 2` keeps the full scan + sort. 1 page +
+# 5 scanned + 2 produced = 8 — higher than the cost-5 ASC cases, the proof the short-circuit is
+# forward-ASC-only.
+# cost: 8
+query II nosort
+SELECT a, b FROM t ORDER BY a DESC LIMIT 2
+----
+5
+50
+4
+40
+
+# CONTRAST — a NON-PK leading key (`c`) is a blocking sort the scan does not satisfy, so it reads
+# every row before windowing. `c` ascending is 100,200,… → rows (2,20),(4,40). 1 page + 5 scanned +
+# 2 produced = 8.
+# cost: 8
+query II nosort
+SELECT a, b FROM t ORDER BY c LIMIT 2
+----
+2
+20
+4
+40
+
+# Empty table: a PK-ordered LIMIT over zero rows reads nothing — the streaming scan never starts.
+# cost: 0
+statement ok
+CREATE TABLE e (id i32 PRIMARY KEY)
+
+# cost: 0
+query I nosort
+SELECT id FROM e ORDER BY id LIMIT 5
+----

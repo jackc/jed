@@ -9372,12 +9372,67 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	for i, rel := range planRels {
 		relMasks[i] = touched[rel.offset : rel.offset+rel.colCount]
 	}
+	// ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
+	// non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the relation's PRIMARY
+	// KEY columns — each ASC, collation-matching the column's stored key form — needs no sort, since
+	// the table scan already yields rows in that order. The streaming scan then elides the sort (and,
+	// with a LIMIT, short-circuits a top-N).
+	pkOrdered := !isAgg && !sel.Distinct && len(order) > 0 && len(planRels) == 1 &&
+		planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil &&
+		db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		aggSpecs: aggSpecs, having: having, order: order, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, relBounds: relBounds, relMasks: relMasks,
+		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, relBounds: relBounds, relMasks: relMasks,
 	}, nil
+}
+
+// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied BY ITS
+// PRIMARY-KEY scan order (spec/design/cost.md §3 "ORDER BY satisfied by primary-key order") — the
+// table tree, walked forward in storage-key order, already delivers rows in the requested order, so
+// the sort is a no-op. True iff the ORDER BY keys are a PREFIX of the PK columns (in key order),
+// each ASC (a DESC reverse scan is a follow-on) and sorting by the SAME order the stored PK key
+// realizes (collation.md §8/§12). The PK columns are NOT NULL, so a key's NULLS FIRST|LAST is a
+// no-op (no NULLs to place) and is ignored. An ORDER BY shorter than the PK is a prefix (ties broken
+// by the remaining PK columns — the canonical tie-break the eager stable sort produces); an ORDER BY
+// longer than the PK matches the whole PK and its extra keys are redundant (the PK is unique).
+func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSlot) bool {
+	pk := table.PKIndices()
+	if len(pk) == 0 {
+		return false // no PK (synthetic rowid order is not a user-visible column)
+	}
+	m := len(order)
+	if len(pk) < m {
+		m = len(pk)
+	}
+	for i := 0; i < m; i++ {
+		o := order[i]
+		if o.descending {
+			return false // ASC only this slice (a DESC reverse scan is a follow-on)
+		}
+		if o.idx != offset+pk[i] {
+			return false // must be the i-th PK column, in key order
+		}
+		// The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
+		// (C/non-text) key matches a key with no collation; a Full-collated key matches the SAME
+		// collation; a Skewed/unresolvable collation never matches (its stored keys are at the
+		// file's pinned version, so the scan order would be wrong for the loaded one — §12).
+		coll, push := db.keyCollationCtx(table.Columns[pk[i]])
+		if !push {
+			return false // Skewed / unresolvable
+		}
+		if coll == nil {
+			if o.collation != nil {
+				return false // raw-byte key, but the ORDER BY key carries a collation
+			}
+		} else {
+			if o.collation == nil || o.collation.Name != coll.Name {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // resolveSRF resolves a FROM-clause set-returning function call (generate_series(...)) into a
@@ -10570,14 +10625,19 @@ func boundEmpty(b keyBound) bool {
 // of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
 // + project. The per-row evaluator gets an evalEnv carrying the engine + outer rows, so a
 // correlated subquery in any clause re-executes against them (grammar.md §26).
-// execStreamingLimit executes the LIMIT short-circuit path (spec/design/cost.md §3): a single-table,
-// no-blocking-operator query with a LIMIT streams scan→filter→project and stops the scan the instant
-// the LIMIT/OFFSET window is filled, charging storage_row_read only for the rows actually read. It is
-// cost-equivalent to the eager path EXCEPT that it reads (and filters) fewer rows, which is the
+// execStreamingScan executes the streaming primary-key-ordered scan path (spec/design/cost.md §3):
+// a single-table, no-blocking-operator query whose output order is already the table's primary-key
+// scan order — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
+// (plan.pkOrdered, set by orderSatisfiedByPK) — streams scan→filter→project with NO sort, and (when
+// there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is filled, charging
+// storage_row_read only for the rows actually read. With no LIMIT it emits every survivor after
+// OFFSET (the sort is simply elided — same rows, same cost as the eager/sort path). It is
+// cost-equivalent to the eager path EXCEPT that a LIMIT reads (and filters) fewer rows, which is the
 // deliberate cost change. page_read is the full block (the bound's node count) — it does not
 // short-circuit; only the row reads do. Rows match the eager path exactly: the offset..offset+limit
-// slice of the primary-key-ordered filtered rows.
-func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
+// slice of the primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's
+// result — the stored PK order is the requested order).
+func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
@@ -10599,13 +10659,15 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	}
 	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
 
-	limit := *plan.limit
+	// limit is optional here: a pkOrdered query may have no LIMIT (it streams every survivor in
+	// order, eliding the sort), while the LIMIT short-circuit always has one.
 	var offset int64
 	if plan.offset != nil {
 		offset = *plan.offset
 	}
 	out := make([][]Value, 0)
-	if !empty && limit > 0 {
+	// Skip the scan entirely for LIMIT 0 (no window to fill).
+	if !empty && (plan.limit == nil || *plan.limit > 0) {
 		var passed int64
 		err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -10641,7 +10703,12 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 				projected[i] = v
 			}
 			out = append(out, projected)
-			return int64(len(out)) < limit, nil // stop once the window is filled
+			// Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
+			// survivor after OFFSET, in primary-key order).
+			if plan.limit != nil {
+				return int64(len(out)) < *plan.limit, nil
+			}
+			return true, nil
 		})
 		if err != nil {
 			return selectResult{}, err
@@ -11001,18 +11068,21 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
 	meter := db.session.newMeter()
 
-	// LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
-	// operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
-	// scan once the window is filled, so storage_row_read counts only the rows actually read — a
-	// genuine early-out, not a post-hoc truncation. (ORDER BY/DISTINCT/aggregate must see every row, so
-	// they keep the eager path below.) page_read stays the full block (the bound's node count); only
-	// row reads short-circuit.
+	// Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
+	// blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
+	// LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
+	// (plan.pkOrdered) — streams scan→filter→project with NO sort, and with a LIMIT STOPS the scan
+	// once the window is filled, so storage_row_read counts only the rows actually read (a genuine
+	// early-out, not a post-hoc truncation). A non-PK-ordered ORDER BY, DISTINCT, aggregate, or join
+	// must see every row, so it keeps the sort/eager path below. page_read stays the full block (the
+	// bound's node count); only row reads short-circuit.
 	// An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it reads
 	// the full admitted set via the eager path below.
 	// A set-returning relation is generated, not scanned — it takes the eager path
 	// (functions.md §10); the streaming reader assumes a table store.
-	if plan.limit != nil && len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.distinct && len(plan.order) == 0 &&
+	if len(plan.rels) == 1 && len(plan.joins) == 0 &&
+		!plan.isAgg && !plan.distinct &&
+		(plan.pkOrdered || (len(plan.order) == 0 && plan.limit != nil)) &&
 		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference is a computed/buffered source, not a table store — the eager path
@@ -11020,16 +11090,17 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		plan.rels[0].cte == nil &&
 		// A derived table is a computed source too (grammar.md §42) — eager path.
 		plan.rels[0].derived == nil {
-		return db.execStreamingLimit(plan, env, meter, params)
+		return db.execStreamingScan(plan, env, meter, params)
 	}
 
 	// Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
-	// non-DISTINCT query with an ORDER BY streams scan→filter→sorter, so the input is never
-	// materialized in the executor heap and the sort spills sorted runs to disk under workMem
-	// (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an index bound
-	// does not stream (like the LIMIT short-circuit). Results + cost are identical to the eager sort
-	// (the sort is unmetered — cost.md §3; spill.md §6).
-	if len(plan.order) > 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
+	// non-DISTINCT query with an ORDER BY the scan does NOT already satisfy (!plan.pkOrdered — caught
+	// above) streams scan→filter→sorter, so the input is never materialized in the executor heap and
+	// the sort spills sorted runs to disk under workMem (file-backed databases). DISTINCT/aggregate/
+	// join take the eager path below, and an index bound does not stream (like the LIMIT
+	// short-circuit). Results + cost are identical to the eager sort (the sort is unmetered —
+	// cost.md §3; spill.md §6).
+	if len(plan.order) > 0 && !plan.pkOrdered && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.distinct &&
 		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
 		plan.rels[0].srf == nil &&
@@ -13016,6 +13087,13 @@ type selectPlan struct {
 	distinct    bool
 	limit       *int64
 	offset      *int64
+	// pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
+	// order — the table tree already yields rows in this order, so the sort is elided (and with a
+	// LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
+	// non-DISTINCT SELECT whose ORDER BY keys are a prefix of the PK columns, each ASC with the
+	// column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by primary-key
+	// order"). DESC (reverse scan) and secondary-index order are follow-ons.
+	pkOrdered bool
 	// relBounds is the scan-bound pushdown, ONE entry per relation in rels: the WHERE
 	// conjuncts that bound that relation's storage key, so its scan seeks/ranges instead of walking
 	// the whole B-tree (spec/design/cost.md §3 "bounded scan"). nil ⇒ a full scan of that relation.

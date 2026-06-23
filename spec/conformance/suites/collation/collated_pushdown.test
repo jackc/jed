@@ -20,7 +20,7 @@
 # charge no collate (deterministic-collation equality is byte-identity, §7). The drop is the
 # CROSS-CORE contract (Rust == Go == TS) — a full scan of each query would cost strictly more.
 #
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.point_lookup, expr.collate, ddl.collate_column, ddl.secondary_index, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.point_lookup, query.limit, query.order_by_pk_scan, expr.collate, ddl.collate_column, ddl.secondary_index, types.i32, types.text, resource.cost_metering
 
 # load-collation: unicode = collation/17.0.0/root.allkeys
 
@@ -87,3 +87,31 @@ SELECT id FROM ci WHERE name = 'A'
 query I nosort
 SELECT id FROM ci WHERE name = 'q'
 ----
+
+# --- Collated ORDER BY satisfied by the collated PK scan order (the collation payoff) -----------
+#
+# `cp.name` is a `unicode`-collated PRIMARY KEY, so the table tree is stored in unicode sort-key
+# order (encoding.md §2.12) — which IS the collation order. So `ORDER BY name` (inheriting the
+# column's unicode collation) is satisfied by the PK scan order (cost.md §3 "ORDER BY satisfied by
+# primary-key order"): no in-memory collated re-sort, and LIMIT 2 short-circuits after two rows.
+# Crucially this charges NO collate units — there is no ordering COMPARISON, just the scan emitting
+# in stored order. 1 page + 2 scanned + 2 produced = 5. Unicode order is a < A, so the first two
+# are a, A.
+# cost: 5
+query T nosort
+SELECT name FROM cp ORDER BY name LIMIT 2
+----
+a
+A
+
+# CONTRAST — an explicit `COLLATE "C"` orders by RAW BYTES, which disagrees with the column's
+# unicode key order, so the scan order does NOT satisfy it: a blocking byte-order sort over the full
+# table (no short-circuit). Byte order is 'A'(0x41) < 'a'(0x61), the OPPOSITE of unicode, and the
+# cost is higher. 1 page + 4 scanned + 2 produced = 7 — the proof the collation-match gate (not a
+# blanket "any ORDER BY on the PK") is what admits the skip-sort.
+# cost: 7
+query T nosort
+SELECT name FROM cp ORDER BY name COLLATE "C" LIMIT 2
+----
+A
+a
