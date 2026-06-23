@@ -17,8 +17,9 @@ function affected(db: Database, sql: string): number | null {
   return out.kind === "statement" ? out.rowsAffected : null;
 }
 
-// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is 0A000 — the standing
-// UPDATE narrowing (the storage key never changes). PostgreSQL allows it.
+// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is still 0A000 — a
+// deferred follow-on. The standalone UPDATE re-keying has landed (§11 step 6); extending it to
+// the upsert conflict path is separate. PostgreSQL allows it.
 test("ON CONFLICT DO UPDATE assigning a PK column is 0A000", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 10)"]);
   assert.equal(

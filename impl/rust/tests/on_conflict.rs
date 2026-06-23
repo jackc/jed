@@ -30,8 +30,9 @@ fn affected(db: &mut Database, sql: &str) -> Option<i64> {
     }
 }
 
-/// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is `0A000` — the standing
-/// UPDATE narrowing (the storage key never changes). PostgreSQL allows it (probed: `SET id =
+/// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is still `0A000` — a
+/// deferred follow-on. The standalone UPDATE re-keying has landed (§11 step 6), but extending it
+/// to the upsert conflict path is separate. PostgreSQL allows it (probed: `SET id =
 /// excluded.id + 100` re-keys the row).
 #[test]
 fn do_update_pk_column_assignment_is_unsupported() {

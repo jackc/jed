@@ -5290,6 +5290,9 @@ func (db *Database) resolveOnConflict(table *Table, oc *OnConflict, ptypes *para
 			return nil, NewError(GeneratedAlways,
 				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
 		}
+		// Assigning a PRIMARY KEY member in DO UPDATE remains deferred (0A000, upsert.md §5/§9):
+		// the standalone UPDATE re-keying has landed (§11 step 6), but extending it to the upsert
+		// conflict path is a separate follow-on.
 		if slices.Contains(pkMembers, idx) {
 			return nil, NewError(FeatureNotSupported, "updating a primary key column is not supported")
 		}
@@ -6892,9 +6895,9 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	s.ctes = ctx.bindings
 	ptypes := &paramTypes{}
 
-	// Resolve assignments up front (fail fast, deterministic). The 0A000 guard covers
-	// EVERY key member — for a composite PRIMARY KEY, assigning any member would change
-	// the storage key (constraints.md §3).
+	// Resolve assignments up front (fail fast, deterministic). Assigning a key member is
+	// allowed and re-keys the row — the storage key is derived from the PK (constraints.md §3),
+	// so a new key is recomputed and the row is moved in phase 2.
 	pkMembers := table.PKIndices()
 	plans := make([]assignPlan, 0, len(upd.Assignments))
 	for _, a := range upd.Assignments {
@@ -6908,10 +6911,6 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 		if c := table.Columns[idx].Identity; c != nil && *c == IdentityAlways {
 			return Outcome{}, NewError(GeneratedAlways,
 				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
-		}
-		if slices.Contains(pkMembers, idx) {
-			return Outcome{}, NewError(FeatureNotSupported,
-				"updating a primary key column is not supported")
 		}
 		for _, p := range plans {
 			if p.idx == idx {
@@ -6941,6 +6940,12 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, notNull: col.NotNull, source: src,
 		})
 	}
+	// A re-keying UPDATE assigns at least one key member: each matched row's storage key is
+	// recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key member
+	// keeps every storage key in place — the in-place fast path (writeStore.Replace).
+	pkChanged := len(pkMembers) > 0 && slices.ContainsFunc(plans, func(p assignPlan) bool {
+		return slices.Contains(pkMembers, p.idx)
+	})
 
 	var filter *rExpr
 	if upd.Filter != nil {
@@ -7007,9 +7012,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	// readSnap == working for an ordinary UPDATE, so this is unchanged there.
 	store := db.lkpStore(upd.Table)
 	writeStore := db.writeStore(upd.Table)
-	// Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
+	// Each entry is (old key, new key, new row, OLD row) — the old row feeds the index
+	// maintenance and the new key the re-keying; for a non-PK UPDATE the new key equals the old.
 	type pending struct {
 		key    []byte
+		newKey []byte
 		row    Row
 		oldRow Row
 	}
@@ -7122,7 +7129,44 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 		if err := evalChecks(checks, table.Name, newRow, env, meter); err != nil {
 			return Outcome{}, err
 		}
-		updates = append(updates, pending{key: e.Key, row: newRow, oldRow: row})
+		// The row's NEW storage key: recomputed from the post-assignment row when a key member
+		// was assigned (re-keying), else the unchanged old key.
+		newKey := e.Key
+		if pkChanged {
+			if newKey, err = encodePkKey(table, pkMembers, colls, newRow); err != nil {
+				return Outcome{}, err
+			}
+		}
+		updates = append(updates, pending{key: e.Key, newKey: newKey, row: newRow, oldRow: row})
+	}
+
+	// PRIMARY KEY end-state validation for a re-keying UPDATE (the storage key changed): like
+	// UNIQUE (indexes.md §8) this is an END-STATE check — the new keys must be distinct from each
+	// other (in-batch) and from every NON-rewritten stored key (a rewritten row's old key is
+	// vacated by this statement, so a row landing on it is fine). A collision traps 23505 on the
+	// PK's derived <table>_pkey name, reported BEFORE the secondary UNIQUE probes (PG reports the
+	// PK first). Unmetered, phase 1.
+	if pkChanged {
+		rewritten := make(map[string]struct{}, len(updates))
+		for _, u := range updates {
+			rewritten[string(u.key)] = struct{}{}
+		}
+		batch := make(map[string]struct{}, len(updates))
+		for _, u := range updates {
+			collides := false
+			if _, dup := batch[string(u.newKey)]; dup {
+				collides = true
+			} else if _, exists, gerr := store.Get(u.newKey); gerr != nil {
+				return Outcome{}, gerr
+			} else if _, own := rewritten[string(u.newKey)]; exists && !own {
+				collides = true
+			}
+			if collides {
+				return Outcome{}, NewError(UniqueViolation,
+					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
+			}
+			batch[string(u.newKey)] = struct{}{}
+		}
 	}
 
 	// UNIQUE validation against the statement's END STATE (indexes.md §8 — a documented
@@ -7239,12 +7283,13 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	}
 
 	// FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not strand
-	// a child. A referenced PRIMARY KEY column cannot change (PK assignment is 0A000), so only a
-	// referenced UNIQUE column is at risk. For each inbound FK, a referenced tuple DISAPPEARS when
-	// an updated row's old value is absent from the statement's new end state (old − new over the
-	// updated rows); if a child still references a disappearing tuple → 23503. Unmetered, phase 1.
-	// A self-reference's child IS this table, whose end state excludes the rows being updated
-	// (their new values are validated child-side above).
+	// a child. A referenced column — PRIMARY KEY (now re-keyable) or UNIQUE — may change. For each
+	// inbound FK, a referenced tuple DISAPPEARS when an updated row's old value is absent from the
+	// statement's new end state (old − new over the updated rows); if a child still references a
+	// disappearing tuple → 23503. Unmetered, phase 1. A self-reference's child IS this table: the
+	// committed scan excludes the rows being updated (their NEW references are checked separately,
+	// newChildRefs, since a re-key can leave an updated row pointing at its own now-vacated value —
+	// the child-side probe reads the pre-update parent, so it cannot see that).
 	referencers := db.fkReferencers(upd.Table)
 	if len(referencers) > 0 {
 		parent, _ := db.Table(upd.Table)
@@ -7255,6 +7300,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 		empty := map[string]struct{}{}
 		for ri := range referencers {
 			r := &referencers[ri]
+			selfRef := strings.EqualFold(r.childTable, upd.Table)
 			// parent is the update target itself, so its key columns use colls (§2.12).
 			// The referenced tuples the updated rows now supply (so a swap re-supplies one).
 			newPresent := make(map[string]struct{})
@@ -7267,8 +7313,22 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 					newPresent[string(probe.bytes)] = struct{}{}
 				}
 			}
+			// For a self-reference, the FK tuples the updated rows now POINT AT (their new
+			// local-column values): an updated row referencing a disappearing tuple dangles.
+			newChildRefs := make(map[string]struct{})
+			if selfRef {
+				for _, u := range updates {
+					probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.Columns)
+					if err != nil {
+						return Outcome{}, err
+					}
+					if ok {
+						newChildRefs[string(probe.bytes)] = struct{}{}
+					}
+				}
+			}
 			exclude := empty
-			if strings.EqualFold(r.childTable, upd.Table) {
+			if selfRef {
 				exclude = updatedKeys
 			}
 			for _, u := range updates {
@@ -7293,11 +7353,13 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 				if _, present := newPresent[string(oldProbe.bytes)]; present {
 					continue
 				}
+				// Stranded if a committed (non-updated) child OR an updated row's NEW reference
+				// still points at the disappearing tuple.
 				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, exclude)
 				if err != nil {
 					return Outcome{}, err
 				}
-				if referenced {
+				if _, dangles := newChildRefs[string(oldProbe.bytes)]; referenced || dangles {
 					return Outcome{}, NewError(ForeignKeyViolation,
 						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
 				}
@@ -7310,7 +7372,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	// writes anything, preserving all-or-nothing.
 	var cunits int64
 	for _, u := range updates {
-		cunits += int64(store.WriteCompressUnits(u.key, u.row))
+		cunits += int64(store.WriteCompressUnits(u.newKey, u.row))
 	}
 	meter.Charge(Costs.ValueCompress * cunits)
 	if err := meter.Guard(); err != nil {
@@ -7337,8 +7399,9 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	// Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
 	// old/new keys leave the index tree untouched (part of the contract: it keeps the
 	// copy-on-write dirty set, and so the commit's written pages, byte-identical across
-	// cores). The storage key cannot change (PK assignment is rejected), so the suffix is
-	// stable.
+	// cores). An entry key is `indexed-cols || storage-key`, so a re-keyed row moves EVERY
+	// one of its entries (the suffix changed); a non-PK UPDATE keeps the suffix and moves
+	// only entries whose indexed columns changed.
 	type indexMove struct{ removals, insertions [][]byte }
 	indexMoves := make([][]indexMove, len(table.Indexes))
 	for _, u := range updates {
@@ -7350,7 +7413,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 			if err != nil {
 				return Outcome{}, err
 			}
-			newEks, err := indexEntryKeys(table.Columns, colls, def, u.key, u.row)
+			newEks, err := indexEntryKeys(table.Columns, colls, def, u.newKey, u.row)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -7362,29 +7425,77 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 		}
 	}
 
-	// Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
-	// changed index entries (unmetered write work; cannot fail). Writes land in working (writeStore),
-	// even when the scan above read the pin.
-	for _, u := range updates {
-		if err := writeStore.Replace(u.key, u.row); err != nil {
-			return Outcome{}, err
+	// Phase 2: write the validated rows, then move the changed index entries (unmetered write
+	// work). Writes land in working (writeStore), even when the scan above read the pin. A non-PK
+	// UPDATE replaces each row in place (the fast path). A re-keying UPDATE vacates every OLD key
+	// first and then places each row at its NEW key — a two-pass so a chain or swap of keys among
+	// the updated rows never transiently collides (the end state is collision-free, validated
+	// above). The index entries move the same way (all removals across rows, then all insertions),
+	// since a moved row's new entry can equal another moved row's not-yet-removed old entry.
+	if pkChanged {
+		for _, u := range updates {
+			if _, err := writeStore.Remove(u.key); err != nil {
+				return Outcome{}, err
+			}
 		}
-	}
-	for k, def := range table.Indexes {
-		istore := db.writeIndexStore(strings.ToLower(def.Name))
-		for _, mv := range indexMoves[k] {
-			for _, oldEk := range mv.removals {
-				if _, err := istore.Remove(oldEk); err != nil {
-					return Outcome{}, err
+		for _, u := range updates {
+			inserted, err := writeStore.Insert(u.newKey, u.row)
+			if err != nil {
+				return Outcome{}, err
+			}
+			if !inserted {
+				// Reachable only under the writable-CTE read pin (writable-cte.md §7): an earlier
+				// sub-statement staged this key, unseen by phase 1. Aborts all-or-nothing, matching
+				// INSERT. For a single statement, phase 1's end-state check caught every duplicate.
+				return Outcome{}, NewError(UniqueViolation,
+					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
+			}
+		}
+		for k, def := range table.Indexes {
+			istore := db.writeIndexStore(strings.ToLower(def.Name))
+			for _, mv := range indexMoves[k] {
+				for _, oldEk := range mv.removals {
+					if _, err := istore.Remove(oldEk); err != nil {
+						return Outcome{}, err
+					}
 				}
 			}
-			for _, newEk := range mv.insertions {
-				inserted, err := istore.Insert(newEk, nil)
-				if err != nil {
-					return Outcome{}, err
+			for _, mv := range indexMoves[k] {
+				for _, newEk := range mv.insertions {
+					inserted, err := istore.Insert(newEk, nil)
+					if err != nil {
+						return Outcome{}, err
+					}
+					if !inserted {
+						// A cross-sub-statement collision under the read pin (as above).
+						return Outcome{}, NewError(UniqueViolation,
+							"duplicate key value violates unique constraint: "+def.Name)
+					}
 				}
-				if !inserted {
-					panic("index entry keys are unique (storage-key suffix)")
+			}
+		}
+	} else {
+		for _, u := range updates {
+			if err := writeStore.Replace(u.key, u.row); err != nil {
+				return Outcome{}, err
+			}
+		}
+		for k, def := range table.Indexes {
+			istore := db.writeIndexStore(strings.ToLower(def.Name))
+			for _, mv := range indexMoves[k] {
+				for _, oldEk := range mv.removals {
+					if _, err := istore.Remove(oldEk); err != nil {
+						return Outcome{}, err
+					}
+				}
+				for _, newEk := range mv.insertions {
+					inserted, err := istore.Insert(newEk, nil)
+					if err != nil {
+						return Outcome{}, err
+					}
+					if !inserted {
+						panic("index entry keys are unique (storage-key suffix)")
+					}
 				}
 			}
 		}

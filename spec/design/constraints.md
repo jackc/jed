@@ -180,9 +180,10 @@ oracle-checked).
 **Every member is a key column.** Each member is implicitly `NOT NULL` (§1) and must be of a
 key-encodable type — the same per-column rule as the column-level form: the integer types,
 `uuid`, `timestamp`, `timestamptz`; a `text`/`decimal`/`bytea`/`boolean` member is the same
-documented `0A000` narrowing ([types.md](types.md) §9/§11/§12/§13). The UPDATE narrowing
-extends naturally: assigning **any** member column traps `0A000` (CLAUDE.md §11 step 6 — the
-storage key never changes).
+documented `0A000` narrowing ([types.md](types.md) §9/§11/§12/§13). Assigning a member column
+in an UPDATE is allowed and **re-keys** the row (CLAUDE.md §11 step 6, §6.5 below — the
+storage key is recomputed from the post-assignment members and the row moves; a resulting key
+collision traps `23505`, like an INSERT).
 
 **The key bytes are the concatenation** of the members' bare encodings, in **key order**
 ([encoding.md](encoding.md) §2.3 — now exercised). Every keyable type is fixed-width, so the
@@ -548,15 +549,17 @@ A parent mutation must not leave a child pointing at a key that no longer exists
   update or delete on table <table> violates foreign key constraint <name>
   ```
 
-- **UPDATE.** A referenced **primary-key** column cannot change (assigning a PK column is `0A000`,
-  §11 step 6 / CLAUDE.md), so a PK-referencing FK is **never** disturbed by a parent UPDATE. A
-  referenced **UNIQUE** column *can* change. jed computes the set of referenced tuples that were
-  present in the updated rows' **old** values but are **absent from the statement's end state**
-  (`old_tuples − new_tuples`, over the updated rows; untouched rows keep their values and, by
-  uniqueness, cannot hold a disappearing tuple). For each such **disappearing** tuple, if a child
-  references it → **`23503`**. A referenced-value **swap** therefore succeeds (the end state still
-  contains every referenced tuple) where PostgreSQL's per-row check fails on the transient — the
-  same end-state divergence `UNIQUE` carries (§6.7, [indexes.md §7](indexes.md)).
+- **UPDATE.** A referenced column — **primary-key** (now re-keyable, §11 step 6 / CLAUDE.md) or
+  **UNIQUE** — may change. jed computes the set of referenced tuples that were present in the
+  updated rows' **old** values but are **absent from the statement's end state** (`old_tuples −
+  new_tuples`, over the updated rows; untouched rows keep their values and, by uniqueness, cannot
+  hold a disappearing tuple). For each such **disappearing** tuple, if a child references it →
+  **`23503`**. For a **self-referencing** FK the child *is* this table, so "references it" includes
+  an updated row's **own new** local-column value: re-keying a row away from an id it still points
+  at strands itself (`23503`), since the committed child-scan reads the pre-update parent and
+  cannot see the row's new key. A referenced-value **swap** (or a key cascade) therefore succeeds
+  (the end state still contains every referenced tuple) where PostgreSQL's per-row check fails on
+  the transient — the same end-state divergence `UNIQUE` carries (§6.7, [indexes.md §7](indexes.md)).
 
 Finding the children is the **reverse** of the child-side probe and is **not** index-accelerated:
 the child's FK columns are not necessarily indexed (PostgreSQL does not auto-index them either), so

@@ -4715,6 +4715,9 @@ export class Database {
       if (table.columns[idx]!.identity === "always") {
         throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
       }
+      // Assigning a PRIMARY KEY member in DO UPDATE remains deferred (0A000, upsert.md §5/§9):
+      // the standalone UPDATE re-keying has landed (§11 step 6), but extending it to the upsert
+      // conflict path is a separate follow-on.
       if (pkMembers.includes(idx)) {
         throw engineError(
           "feature_not_supported",
@@ -5471,8 +5474,10 @@ export class Database {
   // executeUpdate is two-phase / all-or-nothing: phase 1 builds and type-checks every
   // matching row's new values (assignments evaluate against the OLD row, so
   // `SET a = b, b = a` swaps); a 22003/23502 aborts with no writes. Phase 2 applies.
-  // Assigning a PRIMARY KEY column traps 0A000 (the storage key must not change this
-  // slice); a duplicate target column traps 42701. No WHERE updates every row.
+  // Assigning a PRIMARY KEY column RE-KEYS the row (its storage key is recomputed and the
+  // row moves, §11 step 6); the new keys are validated against the statement's end state —
+  // a collision with another row's key traps 23505 (<table>_pkey). A duplicate target
+  // column traps 42701. No WHERE updates every row.
   private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
     const table = this.lkpTable(upd.table); // temp-first (temp-tables.md §3)
     if (!table) {
@@ -5493,9 +5498,9 @@ export class Database {
     scope.ctes = ctx.bindings;
     const ptypes = new ParamTypes();
 
-    // Resolve assignments up front (fail fast, deterministic).
-    // The 0A000 guard covers EVERY key member — for a composite PRIMARY KEY, assigning
-    // any member would change the storage key (constraints.md §3).
+    // Resolve assignments up front (fail fast, deterministic). Assigning a key member is
+    // allowed and re-keys the row — the storage key is derived from the PK (constraints.md §3),
+    // so a new key is recomputed and the row is moved in phase 2.
     const pkMembers = pkIndices(table);
     const plans: AssignPlan[] = [];
     for (const a of upd.assignments) {
@@ -5508,12 +5513,6 @@ export class Database {
       // 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
       if (table.columns[idx]!.identity === "always") {
         throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
-      }
-      if (pkMembers.includes(idx)) {
-        throw engineError(
-          "feature_not_supported",
-          "updating a primary key column is not supported",
-        );
       }
       for (const p of plans) {
         if (p.idx === idx) {
@@ -5564,6 +5563,10 @@ export class Database {
         source: node,
       });
     }
+    // A re-keying UPDATE assigns at least one key member: each matched row's storage key is
+    // recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key member
+    // keeps every storage key in place — the in-place fast path (writeStore.replace).
+    const pkChanged = pkMembers.length > 0 && plans.some((p) => pkMembers.includes(p.idx));
 
     let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
     // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
@@ -5607,8 +5610,9 @@ export class Database {
     // data-modifying WITH — writable-cte.md §2; else working == read-your-writes); the phase-2 REPLACE
     // writes the transaction's working set.
     const store = this.lkpStore(upd.table);
-    // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
-    const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
+    // Each entry is (old key, new key, new row, OLD row) — the old row feeds the index
+    // maintenance and the new key the re-keying; for a non-PK UPDATE the new key equals the old.
+    const updates: { key: Uint8Array; newKey: Uint8Array; row: Row; oldRow: Row }[] = [];
     // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's, and
     // the RETURNING items' MINUS the assigned columns — an assigned column's returned value is
     // the freshly computed one, not a storage read. The rewrite re-stores an untouched spilled
@@ -5682,7 +5686,32 @@ export class Database {
       // columns); TRUE and NULL pass, the first FALSE aborts the statement (phase 1 —
       // nothing has been written).
       evalChecks(checks, table.name, resident, env, meter);
-      updates.push({ key: e.key, row: resident, oldRow: row });
+      // The row's NEW storage key: recomputed from the post-assignment row when a key member
+      // was assigned (re-keying), else the unchanged old key.
+      const newKey = pkChanged ? encodePkKey(table, pkMembers, colls, resident) : e.key;
+      updates.push({ key: e.key, newKey, row: resident, oldRow: row });
+    }
+
+    // PRIMARY KEY end-state validation for a re-keying UPDATE (the storage key changed): like
+    // UNIQUE (indexes.md §8) this is an END-STATE check — the new keys must be distinct from each
+    // other (in-batch) and from every NON-rewritten stored key (a rewritten row's old key is
+    // vacated by this statement, so a row landing on it is fine). A collision traps 23505 on the
+    // PK's derived <table>_pkey name, reported BEFORE the secondary UNIQUE probes (PG reports the
+    // PK first). Unmetered, phase 1.
+    if (pkChanged) {
+      const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
+      const batch = new Set<string>();
+      for (const u of updates) {
+        const nk = u.newKey.join(",");
+        const collides = batch.has(nk) || (store.get(u.newKey) !== undefined && !rewritten.has(nk));
+        if (collides) {
+          throw engineError(
+            "unique_violation",
+            "duplicate key value violates unique constraint: " + table.name.toLowerCase() + "_pkey",
+          );
+        }
+        batch.add(nk);
+      }
     }
 
     // UNIQUE validation against the statement's END STATE (indexes.md §8 — a documented
@@ -5754,18 +5783,20 @@ export class Database {
     }
 
     // FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not strand
-    // a child. A referenced PRIMARY KEY column cannot change (PK assignment is 0A000), so only a
-    // referenced UNIQUE column is at risk. For each inbound FK, a referenced tuple DISAPPEARS when
-    // an updated row's old value is absent from the statement's new end state (old − new over the
-    // updated rows); if a child still references a disappearing tuple → 23503. Unmetered, phase 1.
-    // A self-reference's child IS this table, whose end state excludes the rows being updated
-    // (their new values are validated child-side above).
+    // a child. A referenced column — PRIMARY KEY (now re-keyable) or UNIQUE — may change. For each
+    // inbound FK, a referenced tuple DISAPPEARS when an updated row's old value is absent from the
+    // statement's new end state (old − new over the updated rows); if a child still references a
+    // disappearing tuple → 23503. Unmetered, phase 1. A self-reference's child IS this table: the
+    // committed scan excludes the rows being updated (their NEW references are checked separately,
+    // newChildRefs, since a re-key can leave an updated row pointing at its own now-vacated value —
+    // the child-side probe reads the pre-update parent, so it cannot see that).
     const updReferencers = this.fkReferencers(upd.table);
     if (updReferencers.length > 0) {
       const parent = this.table(upd.table)!;
       const updatedKeys = new Set<string>(updates.map((u) => u.key.join(",")));
       const empty = new Set<string>();
       for (const { childTable, fk } of updReferencers) {
+        const selfRef = childTable.toLowerCase() === upd.table.toLowerCase();
         // The referenced tuples the updated rows now supply (so a swap re-supplies one).
         // parent is the update target itself, so its key columns use colls (§2.12).
         const newPresent = new Set<string>();
@@ -5773,7 +5804,16 @@ export class Database {
           const p = fkProbe(fk, parent, colls, u.row, fk.refColumns);
           if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
         }
-        const exclude = childTable.toLowerCase() === upd.table.toLowerCase() ? updatedKeys : empty;
+        // For a self-reference, the FK tuples the updated rows now POINT AT (their new
+        // local-column values): an updated row referencing a disappearing tuple dangles.
+        const newChildRefs = new Set<string>();
+        if (selfRef) {
+          for (const u of updates) {
+            const p = fkProbe(fk, parent, colls, u.row, fk.columns);
+            if (p !== null) newChildRefs.add(fkProbeBytes(p).join(","));
+          }
+        }
+        const exclude = selfRef ? updatedKeys : empty;
         for (const u of updates) {
           const oldProbe = fkProbe(fk, parent, colls, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue; // a NULL old referenced value was referenced by nothing
@@ -5783,7 +5823,12 @@ export class Database {
             continue;
           // Re-supplied by another updated row (e.g. a value swap) → not disappearing.
           if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
-          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), exclude)) {
+          // Stranded if a committed (non-updated) child OR an updated row's NEW reference
+          // still points at the disappearing tuple.
+          if (
+            this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), exclude) ||
+            newChildRefs.has(fkProbeBytes(oldProbe).join(","))
+          ) {
             throw engineError(
               "foreign_key_violation",
               "update or delete on table " +
@@ -5802,7 +5847,7 @@ export class Database {
     // — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
     // writes anything, preserving all-or-nothing.
     let cunits = 0n;
-    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.key, u.row));
+    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.newKey, u.row));
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
@@ -5825,8 +5870,9 @@ export class Database {
     // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
     // old/new keys leave the index tree untouched (part of the contract: it keeps the
     // copy-on-write dirty set, and so the commit's written pages, byte-identical across
-    // cores). The storage key cannot change (PK assignment is rejected), so the suffix is
-    // stable.
+    // cores). An entry key is `indexed-cols || storage-key`, so a re-keyed row moves EVERY
+    // one of its entries (the suffix changed); a non-PK UPDATE keeps the suffix and moves
+    // only entries whose indexed columns changed.
     const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
       () => [],
     );
@@ -5837,7 +5883,7 @@ export class Database {
         // gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched, keeping the
         // copy-on-write dirty set byte-identical across cores.
         const oldEks = indexEntryKeys(table.columns, colls, def, u.key, u.oldRow);
-        const newEks = indexEntryKeys(table.columns, colls, def, u.key, u.row);
+        const newEks = indexEntryKeys(table.columns, colls, def, u.newKey, u.row);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0) {
@@ -5846,17 +5892,51 @@ export class Database {
       }
     }
 
-    // Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
-    // changed index entries (unmetered write work; cannot fail). The REPLACE targets the working set.
+    // Phase 2: write the validated rows, then move the changed index entries (unmetered write
+    // work). Writes target the working set. A non-PK UPDATE replaces each row in place (the fast
+    // path). A re-keying UPDATE vacates every OLD key first and then places each row at its NEW
+    // key — a two-pass so a chain or swap of keys among the updated rows never transiently collides
+    // (the end state is collision-free, validated above). The index entries move the same way (all
+    // removals across rows, then all insertions), since a moved row's new entry can equal another
+    // moved row's not-yet-removed old entry.
     const writeStore = this.writeStore(upd.table);
-    for (const u of updates) writeStore.replace(u.key, u.row);
-    for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.writeIndexStore(table.indexes[k]!.name.toLowerCase());
-      for (const mv of indexMoves[k]!) {
-        for (const oldEk of mv.removals) istore.remove(oldEk);
-        for (const newEk of mv.insertions) {
-          if (!istore.insert(newEk, [])) {
-            throw new Error("index entry keys are unique (storage-key suffix)");
+    if (pkChanged) {
+      for (const u of updates) writeStore.remove(u.key);
+      for (const u of updates) {
+        if (!writeStore.insert(u.newKey, u.row)) {
+          // Reachable only under the writable-CTE read pin (writable-cte.md §7): an earlier
+          // sub-statement staged this key, unseen by phase 1. Aborts all-or-nothing, matching
+          // INSERT. For a single statement, phase 1's end-state check caught every duplicate.
+          throw engineError(
+            "unique_violation",
+            "duplicate key value violates unique constraint: " + table.name.toLowerCase() + "_pkey",
+          );
+        }
+      }
+      for (let k = 0; k < table.indexes.length; k++) {
+        const istore = this.writeIndexStore(table.indexes[k]!.name.toLowerCase());
+        for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) istore.remove(oldEk);
+        for (const mv of indexMoves[k]!)
+          for (const newEk of mv.insertions) {
+            if (!istore.insert(newEk, [])) {
+              // A cross-sub-statement collision under the read pin (as above).
+              throw engineError(
+                "unique_violation",
+                "duplicate key value violates unique constraint: " + table.indexes[k]!.name,
+              );
+            }
+          }
+      }
+    } else {
+      for (const u of updates) writeStore.replace(u.key, u.row);
+      for (let k = 0; k < table.indexes.length; k++) {
+        const istore = this.writeIndexStore(table.indexes[k]!.name.toLowerCase());
+        for (const mv of indexMoves[k]!) {
+          for (const oldEk of mv.removals) istore.remove(oldEk);
+          for (const newEk of mv.insertions) {
+            if (!istore.insert(newEk, [])) {
+              throw new Error("index entry keys are unique (storage-key suffix)");
+            }
           }
         }
       }

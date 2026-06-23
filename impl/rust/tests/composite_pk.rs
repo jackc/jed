@@ -146,10 +146,11 @@ fn ddl_errors_match_postgres_and_narrowings() {
     assert!(t.columns[0].not_null);
 }
 
-/// Every member is a key column: NULL into any member traps 23502, and UPDATE may assign
-/// no member (0A000 — the storage key never changes), while non-member columns update fine.
+/// Every member is a key column: NULL into any member traps 23502. Assigning a member now
+/// re-keys the row (§11 step 6 — the narrowing is lifted) instead of trapping 0A000; a
+/// non-member updates in place.
 #[test]
-fn members_are_not_null_and_update_guarded() {
+fn members_are_not_null_and_rekey() {
     let mut db = db_with(&[
         "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
         "INSERT INTO t VALUES (1, 1, 10)",
@@ -162,9 +163,16 @@ fn members_are_not_null_and_update_guarded() {
         err_code(&mut db, "INSERT INTO t (a, v) VALUES (2, 5)"),
         "23502"
     );
-    assert_eq!(err_code(&mut db, "UPDATE t SET a = 9"), "0A000");
-    assert_eq!(err_code(&mut db, "UPDATE t SET b = 9"), "0A000");
+    // Assigning a key member re-keys the row: (1,1) → (9,1) → (9,9); a non-member is in place.
+    execute(&mut db, "UPDATE t SET a = 9").unwrap();
+    execute(&mut db, "UPDATE t SET b = 9").unwrap();
     execute(&mut db, "UPDATE t SET v = 11").unwrap();
+    let rows = db.rows_in_key_order("t").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(
+        (&rows[0][0], &rows[0][1], &rows[0][2]),
+        (Value::Int(9), Value::Int(9), Value::Int(11))
+    ));
 }
 
 /// Mixed fixed-width components (uuid first, i32 second) concatenate per encoding.md

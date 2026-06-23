@@ -682,8 +682,8 @@ export type Select = {
   windows: [string, WindowDef][];
 };
 
-// Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column is
-// rejected this slice (the storage key must not change — see the executor). The WHERE
+// Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column re-keys
+// the row — the storage key is recomputed and the row moves (see the executor). The WHERE
 // expression must resolve to boolean.
 export type Update = {
   kind: "update";

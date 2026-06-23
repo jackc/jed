@@ -409,10 +409,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ `DO UPDATE SET col = DEFAULT` (with the `UPDATE` `SET = DEFAULT` follow-on);
         `INSERT INTO t AS alias` (the existing row is referenced by the table name today); the
         partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing
-        the DO UPDATE PK-column assignment (`0A000`) with the UPDATE re-keying follow-on. → [upsert.md §10](spec/design/upsert.md)
-- [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
-      `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).
-      _(size: M; deps: transactions for clean re-keying)_
+        the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed,
+        but the conflict-path re-key (the existing row moves) is still deferred. → [upsert.md §10](spec/design/upsert.md)
+- [x] **Relax the UPDATE narrowings** — assigning a `PRIMARY KEY` column now **re-keys** the row:
+      its storage key is recomputed and the row moves (secondary-index entries follow). The new
+      keys are validated against the statement's end state, so a collision traps `23505` and a
+      re-key that strands a child (incl. a self-reference) traps `23503`; an end-state-valid
+      swap/cascade succeeds where PG fails the per-row transient (the `UNIQUE` end-state
+      divergence, constraints.md §6.5). Two-pass phase 2 (vacate old keys, then place at new) so a
+      key chain/swap never transiently collides. All three cores; no `format_version` bump; the DO
+      UPDATE conflict-path equivalent remains a deferred `0A000` follow-on (above). (§11 step 6.)
 - [ ] **Temporary tables** — `CREATE [SHARED] [TEMP|TEMPORARY] TABLE` (+ `DROP`): relations that make
       **zero writes to the database file** (held outside the serialized `Snapshot`, so no
       `format_version` bump), bounded by a deterministic storage budget so they keep the

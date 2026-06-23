@@ -156,8 +156,9 @@ then validated like any `UPDATE` row: every `CHECK` (`23514`), end-state uniquen
 non-arbiter unique indexes (`23505`), and the FK child-side (`23503`).
 
 **Narrowings on `SET` (each relaxable, §9):** assigning a **primary-key column** is
-**`0A000`** (the standing `UPDATE` narrowing — the storage key never changes, CLAUDE.md §11
-step 6); assigning a **`GENERATED ALWAYS AS IDENTITY`** column is **`428C9`** (the standing
+**`0A000`** — a deferred follow-on (the standalone `UPDATE` re-keying has landed, CLAUDE.md §11
+step 6, but extending it to the conflict path is separate); assigning a
+**`GENERATED ALWAYS AS IDENTITY`** column is **`428C9`** (the standing
 `UPDATE` rule, sequences.md §13); `SET col = DEFAULT` is not supported (the `UPDATE`
 `SET = DEFAULT` follow-on is deferred too — the RHS is a general expression, and `DEFAULT` is
 not reserved (grammar.md §3), so a bare `DEFAULT` there resolves as a column reference →
@@ -202,7 +203,9 @@ an `ON CONFLICT`-specific message needs no registry edit. The codes:
 ## 9. Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
 - **`DO UPDATE` cannot assign a primary-key column** (`0A000`); PostgreSQL allows it. The
-  standing `UPDATE` PK-immutability narrowing (CLAUDE.md §11 step 6) — relaxable with it.
+  standalone `UPDATE` re-keying has landed (CLAUDE.md §11 step 6), but extending it to the
+  conflict path (the existing row would move, with its own arbiter/secondary-index re-probe)
+  is a separate deferred follow-on (§10).
 - **End-state, not per-row transient, uniqueness** for planned updates and the overlay-based
   conflict probe — the same divergence `UNIQUE`/`UPDATE` carry (indexes.md §7), from the
   two-phase / all-or-nothing model. A value *swap* under `DO UPDATE` succeeds where PG's

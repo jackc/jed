@@ -143,9 +143,10 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	}
 }
 
-// Every member is a key column: NULL into any member traps 23502, and UPDATE may assign
-// no member (0A000 — the storage key never changes), while non-member columns update fine.
-func TestCompositeMembersNotNullAndUpdateGuarded(t *testing.T) {
+// Every member is a key column: NULL into any member traps 23502. Assigning a member now
+// re-keys the row (§11 step 6 — the narrowing is lifted) instead of trapping 0A000; a
+// non-member updates in place.
+func TestCompositeMembersNotNullAndRekey(t *testing.T) {
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
@@ -157,14 +158,15 @@ func TestCompositeMembersNotNullAndUpdateGuarded(t *testing.T) {
 	if code := compositeErrCode(t, db, "INSERT INTO t (a, v) VALUES (2, 5)"); code != "23502" {
 		t.Fatalf("omitted member: got %s, want 23502", code)
 	}
-	if code := compositeErrCode(t, db, "UPDATE t SET a = 9"); code != "0A000" {
-		t.Fatalf("assign first member: got %s, want 0A000", code)
+	// Assigning a key member re-keys the row: (1,1) → (9,1) → (9,9); a non-member is in place.
+	for _, stmt := range []string{"UPDATE t SET a = 9", "UPDATE t SET b = 9", "UPDATE t SET v = 11"} {
+		if _, err := Execute(db, stmt); err != nil {
+			t.Fatalf("%q: %v", stmt, err)
+		}
 	}
-	if code := compositeErrCode(t, db, "UPDATE t SET b = 9"); code != "0A000" {
-		t.Fatalf("assign second member: got %s, want 0A000", code)
-	}
-	if _, err := Execute(db, "UPDATE t SET v = 11"); err != nil {
-		t.Fatalf("non-member update: %v", err)
+	rows := db.RowsInKeyOrder("t")
+	if len(rows) != 1 || rows[0][0].Int != 9 || rows[0][1].Int != 9 || rows[0][2].Int != 11 {
+		t.Fatalf("after re-key: got %v, want one row (9,9,11)", rows)
 	}
 }
 

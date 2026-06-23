@@ -1,7 +1,9 @@
-# UPDATE — in-place value replacement (two-phase / all-or-nothing). Assignments
-# evaluate against the pre-update row, so `SET a = b, b = a` swaps. Assigning a
-# PRIMARY KEY column is rejected this slice (0A000); a duplicate target column is
-# rejected (42701); an out-of-range value traps 22003 and leaves the table unchanged.
+# UPDATE — value replacement (two-phase / all-or-nothing). Assignments evaluate against
+# the pre-update row, so `SET a = b, b = a` swaps. Assigning a PRIMARY KEY column RE-KEYS
+# the row — its storage key is recomputed and it moves; the new keys are validated against
+# the statement's end state, so a collision traps 23505 (§11 step 6). A duplicate target
+# column is rejected (42701); an out-of-range value traps 22003 and leaves the table
+# unchanged.
 # Format + the `requires` directive: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.update, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, error.overflow_trap
 
@@ -65,10 +67,6 @@ SELECT a FROM t WHERE id = 3
 ----
 NULL
 
-# assigning a PRIMARY KEY column is not supported yet (the storage key must not change)
-statement error 0A000
-UPDATE t SET id = 5 WHERE id = 2
-
 # the same column assigned twice in one statement is rejected
 statement error 42701
 UPDATE t SET a = 1, a = 2 WHERE id = 2
@@ -124,3 +122,110 @@ SELECT id, n FROM m ORDER BY id
 2
 3
 3
+
+# --- re-keying: assigning a PRIMARY KEY column moves the row to a new storage key ------
+# (§11 step 6 — the narrowing is lifted). The new keys are validated against the
+# statement's END STATE, so a collision traps 23505 like an INSERT; an undisturbed move
+# succeeds and the row is found at its new key. (The PG-divergent end-state cases — a key
+# swap, a key increment that transiently collides — live in the per-core update tests,
+# the same divergence UNIQUE carries: indexes.md §8.)
+
+statement ok
+CREATE TABLE rk (id i32 PRIMARY KEY, v i16)
+
+statement ok
+INSERT INTO rk VALUES (1, 10), (2, 20), (3, 30)
+
+# move a row to a free key — re-keyed and re-found at the new id
+statement ok
+UPDATE rk SET id = 5 WHERE id = 2
+
+query II nosort
+SELECT id, v FROM rk ORDER BY id
+----
+1
+10
+3
+30
+5
+20
+
+# the old key is gone
+query I nosort
+SELECT count(*) FROM rk WHERE id = 2
+----
+0
+
+# moving onto another (non-updated) row's key collides — 23505, nothing changes
+statement error 23505
+UPDATE rk SET id = 1 WHERE id = 3
+
+query II nosort
+SELECT id, v FROM rk ORDER BY id
+----
+1
+10
+3
+30
+5
+20
+
+# re-keying can change the value in the same statement
+statement ok
+UPDATE rk SET id = 2, v = 99 WHERE id = 5
+
+query II nosort
+SELECT id, v FROM rk ORDER BY id
+----
+1
+10
+2
+99
+3
+30
+
+# RETURNING projects the NEW (post-assignment) key
+query II nosort
+UPDATE rk SET id = id + 100 WHERE id = 1 RETURNING id, v
+----
+101
+10
+
+# two matched rows re-keyed to the SAME new key collide in-batch — 23505 (all-or-nothing)
+statement ok
+CREATE TABLE rk2 (id i32 PRIMARY KEY, g i32, v i16)
+
+statement ok
+INSERT INTO rk2 VALUES (1, 7, 10), (2, 7, 20)
+
+statement error 23505
+UPDATE rk2 SET id = 9 WHERE g = 7
+
+query II nosort
+SELECT id, v FROM rk2 ORDER BY id
+----
+1
+10
+2
+20
+
+# re-keying maintains secondary indexes — the moved row is found through the index
+statement ok
+CREATE TABLE rki (id i32 PRIMARY KEY, tag i32)
+
+statement ok
+CREATE INDEX rki_tag ON rki (tag)
+
+statement ok
+INSERT INTO rki VALUES (1, 100), (2, 200), (3, 100)
+
+statement ok
+UPDATE rki SET id = 50 WHERE id = 1
+
+query II nosort
+SELECT id, tag FROM rki WHERE tag = 100 ORDER BY id
+----
+3
+100
+50
+100

@@ -109,7 +109,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   assert.ok(t.columns[0]!.notNull);
 });
 
-test("members are NOT NULL and UPDATE may not assign one", () => {
+test("members are NOT NULL and assigning one re-keys the row", () => {
   const db = dbWith([
     "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
     "INSERT INTO t VALUES (1, 1, 10)",
@@ -122,15 +122,18 @@ test("members are NOT NULL and UPDATE may not assign one", () => {
     errCode(() => execute(db, "INSERT INTO t (a, v) VALUES (2, 5)")),
     "23502",
   );
-  assert.equal(
-    errCode(() => execute(db, "UPDATE t SET a = 9")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => execute(db, "UPDATE t SET b = 9")),
-    "0A000",
-  );
-  execute(db, "UPDATE t SET v = 11"); // non-member updates fine
+  // Assigning a key member re-keys the row (§11 step 6): (1,1) → (9,1) → (9,9); a non-member
+  // updates in place. No longer 0A000.
+  execute(db, "UPDATE t SET a = 9");
+  execute(db, "UPDATE t SET b = 9");
+  execute(db, "UPDATE t SET v = 11");
+  const rows = db.rowsInKeyOrder("t");
+  assert.equal(rows.length, 1);
+  const vals = rows[0]!.map((c) => {
+    if (c.kind !== "int") throw new Error("expected int");
+    return c.int;
+  });
+  assert.deepEqual(vals, [9n, 9n, 11n]);
 });
 
 test("mixed uuid + int components order correctly", () => {

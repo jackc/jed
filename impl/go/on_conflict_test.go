@@ -40,8 +40,9 @@ func ocAffected(t *testing.T, db *Database, sql string) (int64, bool) {
 	return out.RowsAffected, out.HasRowsAffected
 }
 
-// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is 0A000 — the standing
-// UPDATE narrowing (the storage key never changes). PostgreSQL allows it.
+// DIVERGENCE (upsert.md §9): assigning a PRIMARY KEY column in DO UPDATE is still 0A000 — a
+// deferred follow-on. The standalone UPDATE re-keying has landed (§11 step 6); extending it to
+// the upsert conflict path is separate. PostgreSQL allows it.
 func TestOnConflictDoUpdatePKColumnUnsupported(t *testing.T) {
 	db := ocDB(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 10)")
 	if got := ocErr(t, db, "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100"); got != "0A000" {

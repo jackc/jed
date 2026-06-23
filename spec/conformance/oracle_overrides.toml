@@ -119,11 +119,6 @@ reason = "jed: a full scan iterates the range PRIMARY KEY in key (= range_total_
 
 [[override]]
 file = "ddl/composite_pk.test"
-sql = "UPDATE t SET b = 9 WHERE a = 1"
-reason = "jed: assigning any primary-key member is the documented 0A000 narrowing (the storage key never changes — constraints.md §3, CLAUDE.md §11 step 6). PG allows PK updates (and here would instead trap 23505 on the resulting duplicate tuple)."
-
-[[override]]
-file = "ddl/composite_pk.test"
 sql = "SELECT a, s FROM e6"
 reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascending, then the text member s in C/byte (code-point) order within each a (encoding.md §2.3/§2.4), so (1,'a'),(1,'aa'),(1,'b'),(2,'a'). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical."
 
@@ -800,12 +795,7 @@ file = "joins/errors.test"
 sql = "SELECT p.id FROM p, q"
 reason = "jed: comma-separated FROM (the old implicit cross join) is not supported — 42601; use CROSS JOIN (grammar.md). PostgreSQL accepts the comma cross join and returns the product. A documented surface narrowing."
 
-# --- mutation/update.test: PK-column assignment narrowing, and double-assignment code.
-[[override]]
-file = "mutation/update.test"
-sql = "UPDATE t SET id = 5 WHERE id = 2"
-reason = "jed: assigning a primary-key column is the documented 0A000 narrowing (the storage key never changes — constraints.md §3, CLAUDE.md §11 step 6). PostgreSQL allows PK updates and performs it. (The ddl/composite_pk.test precedent.)"
-
+# --- mutation/update.test: the same-column-twice double-assignment code.
 [[override]]
 file = "mutation/update.test"
 sql = "UPDATE t SET a = 1, a = 2 WHERE id = 2"

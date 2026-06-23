@@ -420,8 +420,8 @@ pub enum InsertValue {
 
 /// `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each assignment's
 /// right-hand side is evaluated against the *pre-update* row (so `SET a = b, b = a`
-/// swaps). Assigning a PRIMARY KEY column is rejected this slice (the storage key must
-/// not change — see the executor). The WHERE expression must resolve to boolean.
+/// swaps). Assigning a PRIMARY KEY column re-keys the row — the storage key is recomputed
+/// and the row moves (see the executor). The WHERE expression must resolve to boolean.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Update {
     pub table: String,

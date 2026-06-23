@@ -57,10 +57,11 @@ big-endian bytes.
    ([spec/fileformat/verify.rb](spec/fileformat/verify.rb)) pinning the goldens. Whole-image
    form for now; incremental commit deferred.
 6. ✅ **Row mutation — `UPDATE` / `DELETE`** — integer columns, both cores, against a
-   `mutation` conformance profile. `UPDATE` is in-place and two-phase (all-or-nothing:
-   every matching row is type-checked before any write); assigning a `PRIMARY KEY` column
-   is rejected (`0A000`) so the storage key never changes. No-PK rows use a monotonic
-   rowid (reconstructed on load), so `DELETE` then `INSERT` never collides.
+   `mutation` conformance profile. `UPDATE` is two-phase (all-or-nothing: every matching row
+   is type-checked before any write); assigning a `PRIMARY KEY` column **re-keys** the row
+   (its storage key is recomputed and it moves), validated against the statement's end state,
+   so a collision traps `23505`. No-PK rows use a monotonic rowid (reconstructed on load), so
+   `DELETE` then `INSERT` never collides.
 
 ### Beyond the first six steps
 

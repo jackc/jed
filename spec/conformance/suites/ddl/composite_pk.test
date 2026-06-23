@@ -57,9 +57,10 @@ INSERT INTO t VALUES (4, NULL, 1)
 statement error 23502
 INSERT INTO t (a, v) VALUES (4, 1)
 
-# assigning any key member is the documented 0A000 narrowing (the storage key never
-# changes — constraints.md §3); PG allows PK updates, a recorded divergence
-statement error 0A000
+# assigning a key member re-keys the row (§11 step 6 — the narrowing is lifted); here both
+# matched rows (1,1) and (1,2) would become (1,9), an in-batch key collision → 23505
+# (all-or-nothing, the table is unchanged)
+statement error 23505
 UPDATE t SET b = 9 WHERE a = 1
 
 # non-member columns update fine

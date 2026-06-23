@@ -5326,8 +5326,9 @@ impl Database {
                             format!("column {} can only be updated to DEFAULT", a.column),
                         ));
                     }
-                    // Assigning a PRIMARY KEY member is the standing UPDATE narrowing (0A000 — the
-                    // storage key never changes, upsert.md §5/§9).
+                    // Assigning a PRIMARY KEY member in DO UPDATE remains deferred (0A000,
+                    // upsert.md §5/§9): the standalone UPDATE re-keying has landed (§11 step 6),
+                    // but extending it to the upsert conflict path is a separate follow-on.
                     if pk_members.contains(&idx) {
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
@@ -6327,9 +6328,11 @@ impl Database {
     /// Analyze and run an UPDATE. Two-phase / all-or-nothing: phase 1 builds and
     /// type-checks every matching row's new values (assignments evaluate against the
     /// *old* row, so `SET a = b, b = a` swaps); a `22003`/`23502` aborts with no
-    /// writes. Phase 2 applies. Assigning a PRIMARY KEY column traps `0A000` (the
-    /// storage key must not change this slice); a duplicate target column traps
-    /// `42701`. No WHERE updates every row.
+    /// writes. Phase 2 applies. Assigning a PRIMARY KEY column **re-keys** the row (its
+    /// storage key is recomputed and the row moves, §11 step 6); the new keys are
+    /// validated against the statement's end state — a collision with another row's key
+    /// traps `23505` (`<table>_pkey`). A duplicate target column traps `42701`. No WHERE
+    /// updates every row.
     fn execute_update(&mut self, upd: Update, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
         let table = self.table(&upd.table).ok_or_else(|| {
             EngineError::new(
@@ -6347,10 +6350,17 @@ impl Database {
         let mut scope = Scope::single(self, table);
         scope.ctes = ctx.bindings;
 
-        // Resolve assignments up front (fail fast, deterministic). The 0A000 guard covers
-        // EVERY key member — for a composite PRIMARY KEY, assigning any member would change
-        // the storage key (constraints.md §3).
+        // Resolve assignments up front (fail fast, deterministic). Assigning a key member is
+        // allowed and re-keys the row — the storage key is derived from the PK (constraints.md
+        // §3), so a new key is recomputed and the row is moved in phase 2.
         let pk_members = table.pk_indices();
+        // The PK members as (index, type) in key order, captured by value before the `table`
+        // borrow ends (the mutate path takes `&mut self`), so a re-keying UPDATE can re-encode
+        // each row's new storage key (`encode_pk_key`); empty for a no-PK (rowid) table.
+        let pk_typed: Vec<(usize, Type)> = pk_members
+            .iter()
+            .map(|&i| (i, table.columns[i].ty.clone()))
+            .collect();
         // Capture the PK (index, type) by value for the primary-key pushdown (detected after the
         // `table` borrow ends, since the mutate path takes `&mut self`). Pushdown recognizes
         // single-column keys only (`primary_key_index`); a composite-PK table full-scans.
@@ -6382,12 +6392,6 @@ impl Database {
                 return Err(EngineError::new(
                     SqlState::GeneratedAlways,
                     format!("column {} can only be updated to DEFAULT", a.column),
-                ));
-            }
-            if pk_members.contains(&idx) {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "updating a primary key column is not supported",
                 ));
             }
             if plans.iter().any(|p| p.idx == idx) {
@@ -6430,6 +6434,11 @@ impl Database {
                 source,
             });
         }
+        // A re-keying UPDATE assigns at least one key member: each matched row's storage key is
+        // recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key
+        // member keeps every storage key in place — the in-place fast path (`store.replace`).
+        let pk_changed =
+            !pk_members.is_empty() && plans.iter().any(|p| pk_members.contains(&p.idx));
 
         let mut filter = match &upd.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
@@ -6476,8 +6485,9 @@ impl Database {
         // Phase 1: build + validate every matching row's new values; no writes yet. Each
         // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
         // do not — they evaluate nothing; spec/design/cost.md §3). Each entry is
-        // (key, new row, OLD row) — the old row feeds the index maintenance.
-        let mut updates: Vec<(Vec<u8>, Row, Row)> = Vec::new();
+        // (old key, NEW key, new row, OLD row) — the old row feeds the index maintenance and
+        // the new key the re-keying; for a non-PK UPDATE the new key equals the old key.
+        let mut updates: Vec<(Vec<u8>, Vec<u8>, Row, Row)> = Vec::new();
         // A correlated subquery (in an RHS or the WHERE) re-runs per row: the eval environment
         // pushes the current (old) row, so `target.col` (an `OuterColumn`) reads it. `outer`
         // starts empty (UPDATE is the top-level statement — no enclosing query).
@@ -6595,7 +6605,40 @@ impl Database {
                     ));
                 }
             }
-            updates.push((key, new_row, row));
+            // The row's NEW storage key: recomputed from the post-assignment row when a key
+            // member was assigned (re-keying), else the unchanged old key.
+            let new_key = if pk_changed {
+                encode_pk_key(&pk_typed, &colls, &new_row)?
+            } else {
+                key.clone()
+            };
+            updates.push((key, new_key, new_row, row));
+        }
+
+        // PRIMARY KEY end-state validation for a re-keying UPDATE (the storage key changed):
+        // like UNIQUE (indexes.md §8) this is an END-STATE check — the new keys must be
+        // distinct from each other (in-batch) and from every NON-rewritten stored key (a
+        // rewritten row's old key is vacated by this statement, so a row landing on it is
+        // fine). A collision traps 23505 on the PK's derived `<table>_pkey` name, reported
+        // BEFORE the secondary UNIQUE probes (PG reports the PK first). Unmetered, phase 1.
+        if pk_changed {
+            let rewritten: HashSet<&[u8]> =
+                updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
+            let store = self.store(&upd.table);
+            let mut batch: HashSet<&[u8]> = HashSet::new();
+            for (_, new_key, _, _) in &updates {
+                let collides = !batch.insert(new_key.as_slice())
+                    || (store.get(new_key)?.is_some() && !rewritten.contains(new_key.as_slice()));
+                if collides {
+                    return Err(EngineError::new(
+                        SqlState::UniqueViolation,
+                        format!(
+                            "duplicate key value violates unique constraint: {}_pkey",
+                            relation.to_ascii_lowercase()
+                        ),
+                    ));
+                }
+            }
         }
 
         // UNIQUE validation against the statement's END STATE (indexes.md §8 — a
@@ -6606,11 +6649,12 @@ impl Database {
         // existing entry whose suffix is NOT a rewritten row's key (a rewritten row's old
         // entry is being replaced, so it cannot conflict). Unmetered validation, phase 1.
         if indexes.iter().any(|d| d.unique) && !updates.is_empty() {
-            let rewritten: HashSet<&[u8]> = updates.iter().map(|(k, _, _)| k.as_slice()).collect();
+            let rewritten: HashSet<&[u8]> =
+                updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
             for def in indexes.iter().filter(|d| d.unique) {
                 let istore = self.index_store(&def.name.to_ascii_lowercase());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
-                for (_, new_row, _) in &updates {
+                for (_, _, new_row, _) in &updates {
                     let Some(prefix) = index_prefix_key(&tcolumns, &colls, def, new_row)? else {
                         continue;
                     };
@@ -6654,7 +6698,7 @@ impl Database {
             let parent_colls = self.column_collations(&parent.columns);
             let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
                 let mut s = HashSet::new();
-                for (_, new_row, _) in &updates {
+                for (_, _, new_row, _) in &updates {
                     if let Some(p) = fk_probe(fk, parent, &parent_colls, new_row, &fk.ref_columns)?
                     {
                         s.insert(p.bytes().to_vec());
@@ -6664,7 +6708,7 @@ impl Database {
             } else {
                 HashSet::new()
             };
-            for (_, new_row, _) in &updates {
+            for (_, _, new_row, _) in &updates {
                 let Some(probe) = fk_probe(fk, parent, &parent_colls, new_row, &fk.columns)? else {
                     continue; // a NULL local column → exempt (MATCH SIMPLE)
                 };
@@ -6684,12 +6728,14 @@ impl Database {
         }
 
         // FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not
-        // strand a child. A referenced PRIMARY KEY column cannot change (PK assignment is 0A000),
-        // so only a referenced UNIQUE column is at risk. For each inbound FK, a referenced tuple
-        // DISAPPEARS when an updated row's old value is absent from the statement's new end state
-        // (`old − new` over the updated rows); if a child still references a disappearing tuple →
-        // 23503. Unmetered, phase 1. A self-reference's child IS this table, whose end state
-        // excludes the rows being updated (their new values are validated child-side above).
+        // strand a child. A referenced column — PRIMARY KEY (now re-keyable) or UNIQUE — may
+        // change. For each inbound FK, a referenced tuple DISAPPEARS when an updated row's old
+        // value is absent from the statement's new end state (`old − new` over the updated rows);
+        // if a child still references a disappearing tuple → 23503. Unmetered, phase 1. A
+        // self-reference's child IS this table: the committed scan excludes the rows being updated
+        // (their NEW references are checked separately, `new_child_refs`, since a re-key can leave
+        // an updated row pointing at its own now-vacated value — the child-side probe reads the
+        // pre-update parent, so it cannot see that).
         let referencers = self.fk_referencers(&upd.table);
         if !referencers.is_empty() {
             let parent = self
@@ -6697,23 +6743,33 @@ impl Database {
                 .expect("update target exists")
                 .clone();
             let updated_keys: HashSet<Vec<u8>> =
-                updates.iter().map(|(k, _, _)| k.clone()).collect();
+                updates.iter().map(|(k, _, _, _)| k.clone()).collect();
             let empty: HashSet<Vec<u8>> = HashSet::new();
             for (child_table, fk) in &referencers {
+                let self_ref = child_table.eq_ignore_ascii_case(&upd.table);
                 // `parent` is the update target itself, so its key columns use `colls` (§2.12).
                 // The referenced tuples the updated rows now supply (so a swap re-supplies one).
                 let mut new_present: HashSet<Vec<u8>> = HashSet::new();
-                for (_, new_row, _) in &updates {
+                for (_, _, new_row, _) in &updates {
                     if let Some(p) = fk_probe(fk, &parent, &colls, new_row, &fk.ref_columns)? {
                         new_present.insert(p.bytes().to_vec());
                     }
                 }
-                let exclude = if child_table.eq_ignore_ascii_case(&upd.table) {
-                    &updated_keys
+                // For a self-reference, the FK tuples the updated rows now POINT AT (their new
+                // local-column values): an updated row referencing a disappearing tuple dangles.
+                let new_child_refs: HashSet<Vec<u8>> = if self_ref {
+                    let mut s = HashSet::new();
+                    for (_, _, new_row, _) in &updates {
+                        if let Some(p) = fk_probe(fk, &parent, &colls, new_row, &fk.columns)? {
+                            s.insert(p.bytes().to_vec());
+                        }
+                    }
+                    s
                 } else {
-                    &empty
+                    HashSet::new()
                 };
-                for (_, new_row, old_row) in &updates {
+                let exclude = if self_ref { &updated_keys } else { &empty };
+                for (_, _, new_row, old_row) in &updates {
                     let Some(old_probe) = fk_probe(fk, &parent, &colls, old_row, &fk.ref_columns)?
                     else {
                         continue; // a NULL old referenced value was referenced by nothing
@@ -6730,13 +6786,16 @@ impl Database {
                     if new_present.contains(old_probe.bytes()) {
                         continue;
                     }
+                    // Stranded if a committed (non-updated) child OR an updated row's NEW
+                    // reference still points at the disappearing tuple.
                     if self.fk_child_references(
                         child_table,
                         fk,
                         &parent,
                         old_probe.bytes(),
                         exclude,
-                    )? {
+                    )? || new_child_refs.contains(old_probe.bytes())
+                    {
                         return Err(EngineError::new(
                             SqlState::ForeignKeyViolation,
                             format!(
@@ -6754,8 +6813,8 @@ impl Database {
         // ceiling BEFORE phase 2 writes anything, preserving all-or-nothing.
         let store = self.store(&upd.table);
         let mut cunits: i64 = 0;
-        for (key, row, _) in &updates {
-            cunits += store.write_compress_units(key, row) as i64;
+        for (_, new_key, row, _) in &updates {
+            cunits += store.write_compress_units(new_key, row) as i64;
         }
         meter.charge(COSTS.value_compress * cunits);
         meter.guard()?;
@@ -6766,8 +6825,8 @@ impl Database {
         // and a 54P01 here writes nothing (all-or-nothing).
         let returned = match &ret {
             Some((nodes, _, _)) => {
-                let prows: Vec<&Row> = updates.iter().map(|(_, new_row, _)| new_row).collect();
-                let olds: Vec<&Row> = updates.iter().map(|(_, _, old_row)| old_row).collect();
+                let prows: Vec<&Row> = updates.iter().map(|(_, _, new_row, _)| new_row).collect();
+                let olds: Vec<&Row> = updates.iter().map(|(_, _, _, old_row)| old_row).collect();
                 Some(self.project_returning(nodes, &prows, Some(&olds), &bound, ctx, &mut meter)?)
             }
             None => None,
@@ -6776,18 +6835,20 @@ impl Database {
         // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED —
         // equal old/new keys leave the index tree untouched (part of the contract: it keeps
         // the copy-on-write dirty set, and so the commit's written pages, byte-identical
-        // across cores). The storage key cannot change (PK assignment is rejected), so the
-        // suffix is stable. Computed before the rewrite consumes the rows.
+        // across cores). An entry key is `indexed-cols || storage-key`, so a re-keyed row
+        // moves EVERY one of its entries (the suffix changed); a non-PK UPDATE keeps the
+        // suffix and moves only entries whose indexed columns changed. Computed before the
+        // rewrite consumes the rows.
         let mut index_moves: Vec<Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> =
             vec![Vec::new(); indexes.len()];
-        for (key, new_row, old_row) in &updates {
+        for (old_key, new_key, new_row, old_row) in &updates {
             for (k, def) in indexes.iter().enumerate() {
                 // The row's old and new entry SETS (one entry for an ordered index, one per term
                 // for GIN — gin.md §5). Remove old−new, insert new−old: a shared entry (an ordered
                 // key that did not change, or a GIN term present in both) is left untouched,
                 // keeping the copy-on-write dirty set byte-identical across cores.
-                let old_eks = index_entry_keys(&tcolumns, &colls, def, key, old_row)?;
-                let new_eks = index_entry_keys(&tcolumns, &colls, def, key, new_row)?;
+                let old_eks = index_entry_keys(&tcolumns, &colls, def, old_key, old_row)?;
+                let new_eks = index_entry_keys(&tcolumns, &colls, def, new_key, new_row)?;
                 let removals: Vec<Vec<u8>> = old_eks
                     .iter()
                     .filter(|e| !new_eks.contains(*e))
@@ -6804,24 +6865,72 @@ impl Database {
             }
         }
 
-        // Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
-        // changed index entries (unmetered write work; cannot fail).
+        // Phase 2: write the validated rows, then move the changed index entries (unmetered
+        // write work). A non-PK UPDATE replaces each row in place (the fast path). A re-keying
+        // UPDATE vacates every OLD key first and then places each row at its NEW key — a two-pass
+        // so a chain or swap of keys among the updated rows never transiently collides (the end
+        // state is collision-free, validated above). The index entries move the same way (all
+        // removals across rows, then all insertions), since a moved row's new entry can equal
+        // another moved row's not-yet-removed old entry.
         let updated = updates.len() as i64;
         let store = self.store_mut(&upd.table);
-        for (key, row, _) in updates {
-            store.replace(&key, row)?;
-        }
-        for (k, def) in indexes.iter().enumerate() {
-            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
-            for (removals, insertions) in index_moves[k].drain(..) {
-                for old_ek in removals {
-                    istore.remove(&old_ek)?;
+        if pk_changed {
+            let relation_lc = relation.to_ascii_lowercase();
+            for (old_key, _, _, _) in &updates {
+                store.remove(old_key)?;
+            }
+            for (_, new_key, row, _) in updates {
+                if !store.insert(new_key, row)? {
+                    // Reachable only under the writable-CTE read pin (writable-cte.md §7): an
+                    // earlier sub-statement staged this key, unseen by phase 1. Aborts
+                    // all-or-nothing, matching INSERT. For a single statement, phase 1's
+                    // end-state check already caught every duplicate.
+                    return Err(EngineError::new(
+                        SqlState::UniqueViolation,
+                        format!(
+                            "duplicate key value violates unique constraint: {relation_lc}_pkey"
+                        ),
+                    ));
                 }
-                for new_ek in insertions {
-                    assert!(
-                        istore.insert(new_ek, Vec::new())?,
-                        "index entry keys are unique (storage-key suffix)"
-                    );
+            }
+            for (k, def) in indexes.iter().enumerate() {
+                let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+                for (removals, _) in &index_moves[k] {
+                    for old_ek in removals {
+                        istore.remove(old_ek)?;
+                    }
+                }
+                for (_, insertions) in &index_moves[k] {
+                    for new_ek in insertions {
+                        if !istore.insert(new_ek.clone(), Vec::new())? {
+                            // A cross-sub-statement collision under the read pin (as above).
+                            return Err(EngineError::new(
+                                SqlState::UniqueViolation,
+                                format!(
+                                    "duplicate key value violates unique constraint: {}",
+                                    def.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            for (key, _, row, _) in updates {
+                store.replace(&key, row)?;
+            }
+            for (k, def) in indexes.iter().enumerate() {
+                let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+                for (removals, insertions) in index_moves[k].drain(..) {
+                    for old_ek in removals {
+                        istore.remove(&old_ek)?;
+                    }
+                    for new_ek in insertions {
+                        assert!(
+                            istore.insert(new_ek, Vec::new())?,
+                            "index entry keys are unique (storage-key suffix)"
+                        );
+                    }
                 }
             }
         }
