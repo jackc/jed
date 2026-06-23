@@ -213,6 +213,29 @@ fn large_json_spills_verbatim() {
     assert_eq!(rows[0][0], verbatim); // verbatim bytes, whitespace preserved
 }
 
+/// A NULL element inside the `jsonb_set` / `jsonb_insert` path array propagates a SQL NULL result —
+/// a documented divergence from PostgreSQL, which raises `22004` ("path element at position N is
+/// null"). jed treats the path strictly, like the `#-` delete-path operator's text[] handling. The
+/// agreeing behavior (set/insert/no-op/22023/22P02) is oracle-clean in suites/json/json_set.test.
+#[test]
+fn jsonb_set_null_path_element_propagates_null() {
+    let mut db = Database::new();
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT jsonb_set('{\"a\":1}', ARRAY['a', NULL], '99')"
+        )[0][0],
+        "NULL"
+    );
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT jsonb_insert('{\"a\":1}', ARRAY[NULL], '99')"
+        )[0][0],
+        "NULL"
+    );
+}
+
 /// The `json` two-column SRFs `json_each` / `json_each_text` are a deferred `0A000` follow-on (they
 /// would have to preserve the verbatim member sub-text — json.md §4); the jsonb variants are
 /// oracle-clean in suites/json/json_each.test. PostgreSQL supports the json variants, so this is a

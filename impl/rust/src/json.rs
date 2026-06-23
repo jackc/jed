@@ -846,6 +846,132 @@ pub fn delete_path(node: &JsonNode, path: &[String]) -> Result<JsonNode> {
     }
 }
 
+/// Whether a path mutation REPLACES at the final step (`jsonb_set`) or INSERTS a new element
+/// (`jsonb_insert`). For Insert, `flag` is `insert_after` (place after the array index, not before);
+/// for Set, `flag` is `create_if_missing` (add a missing final key / out-of-range index).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PathSetMode {
+    Set,
+    Insert,
+}
+
+/// `jsonb_set(target, path, value[, create_if_missing])` (json-sql-functions.md §2): set the value at
+/// `path` (a text[] of object keys / array indices). A non-final missing key/index is a no-op (the
+/// target is returned unchanged); at the final step an existing element is REPLACED, a missing one is
+/// added only when `create`. A scalar at any step → `22023`; a non-integer step into an array →
+/// `22P02`. Negative array indices count from the end; an out-of-range create appends (≥len) or
+/// prepends (<0).
+pub fn set_path(
+    node: &JsonNode,
+    path: &[String],
+    value: &JsonNode,
+    create: bool,
+) -> Result<JsonNode> {
+    set_insert_path(node, path, value, create, PathSetMode::Set, 0)
+}
+
+/// `jsonb_insert(target, path, value[, insert_after])` (json-sql-functions.md §2): like `set_path` but
+/// the final step INSERTS rather than replaces — an existing object key → `22023` ("cannot replace
+/// existing key"); an array index inserts before the index (or after, when `insert_after`).
+pub fn insert_path(
+    node: &JsonNode,
+    path: &[String],
+    value: &JsonNode,
+    insert_after: bool,
+) -> Result<JsonNode> {
+    set_insert_path(node, path, value, insert_after, PathSetMode::Insert, 0)
+}
+
+fn set_insert_path(
+    node: &JsonNode,
+    path: &[String],
+    value: &JsonNode,
+    flag: bool, // create_if_missing (Set) | insert_after (Insert)
+    mode: PathSetMode,
+    pos: usize, // 0-based path position, for the 22P02 message
+) -> Result<JsonNode> {
+    if path.is_empty() {
+        return Ok(node.clone()); // an empty path returns the target unchanged (PG)
+    }
+    let (step, rest) = (&path[0], &path[1..]);
+    let is_final = rest.is_empty();
+    match node {
+        JsonNode::Object(m) => {
+            let mut out = m.clone();
+            let found = out.iter().position(|(k, _)| k == step);
+            if is_final {
+                match found {
+                    Some(p) => {
+                        if mode == PathSetMode::Insert {
+                            return Err(cannot_delete("cannot replace existing key"));
+                        }
+                        out[p].1 = value.clone();
+                    }
+                    None => {
+                        // A missing final key: Set adds it only with create; Insert always adds it.
+                        if mode == PathSetMode::Insert || flag {
+                            out.push((step.clone(), value.clone()));
+                        }
+                    }
+                }
+            } else if let Some(p) = found {
+                out[p].1 = set_insert_path(&out[p].1, rest, value, flag, mode, pos + 1)?;
+            }
+            // (a missing non-final key is a no-op). Re-canonicalize: a replaced value keeps the
+            // canonical order; an added key is sorted into place.
+            Ok(JsonNode::Object(canonicalize_object(out)))
+        }
+        JsonNode::Array(e) => {
+            let idx: i64 = step.trim().parse().map_err(|_| {
+                malformed(&format!(
+                    "path element at position {} is not an integer: \"{}\"",
+                    pos + 1,
+                    step
+                ))
+            })?;
+            let len = e.len() as i64;
+            let mut out = e.clone();
+            if is_final {
+                if mode == PathSetMode::Insert {
+                    // Insertion index: normalize a negative index from the end, clamp to [0,len],
+                    // then `insert_after` shifts one past.
+                    let mut i = if idx < 0 { len + idx } else { idx };
+                    if i < 0 {
+                        i = 0;
+                    }
+                    if flag {
+                        i += 1;
+                    }
+                    if i > len {
+                        i = len;
+                    }
+                    out.insert(i as usize, value.clone());
+                } else {
+                    let i = if idx < 0 { len + idx } else { idx };
+                    if i >= 0 && i < len {
+                        out[i as usize] = value.clone();
+                    } else if flag {
+                        // out of range + create: append (≥len) or prepend (<0).
+                        if idx < 0 {
+                            out.insert(0, value.clone());
+                        } else {
+                            out.push(value.clone());
+                        }
+                    }
+                }
+            } else {
+                let i = if idx < 0 { len + idx } else { idx };
+                if i >= 0 && i < len {
+                    out[i as usize] =
+                        set_insert_path(&out[i as usize], rest, value, flag, mode, pos + 1)?;
+                }
+            }
+            Ok(JsonNode::Array(out))
+        }
+        _ => Err(cannot_delete("cannot set path in scalar")),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Processing / introspection functions (B1, spec/design/json-sql-functions.md §2).
 // ---------------------------------------------------------------------------------------------

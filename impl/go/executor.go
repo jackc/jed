@@ -13465,6 +13465,11 @@ const (
 	// operand is spread; a NULL whole-array → NULL). Argument nodes reuse `sargs`. The result type
 	// (json/jsonb) is fixed at resolve from the catalog.
 	reJsonBuild
+	// reJsonSetInsert is `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): a jsonb path
+	// mutation. `sargs` is `[target jsonb, path text[], value jsonb, flag boolean]` — STRICT (any
+	// NULL → SQL NULL, including a NULL path element). `psMode` selects replace-or-create (Set) vs
+	// insert (Insert); the boolean flag is create_if_missing (Set) / insert_after (Insert).
+	reJsonSetInsert
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
 	reOuterColumn
@@ -13825,6 +13830,10 @@ type rExpr struct {
 	// nodes reuse `sargs`; `variadicArray` (above) records the VARIADIC-array call shape.
 	jbKind jsonBuildKind
 	jbJson bool
+
+	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert). Argument nodes are in
+	// `sargs` = [target, path, value, flag] (json-sql-functions.md §2).
+	psMode pathSetMode
 
 	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
 	// arrays, stacked into one higher dimension — spec/design/array.md §4).
@@ -17890,6 +17899,53 @@ func resolveTextArrayArg(s *scope, rhs Expr, sym string, ag *aggCtx, params *par
 	}
 }
 
+// resolveJSONSetInsert resolves jsonb_set / jsonb_insert (json-sql-functions.md §2): `(target jsonb,
+// path text[], value jsonb [, flag boolean])` → jsonb. A bare `'{a,b}'` path literal adapts to text[]
+// and a bare string `value` literal adapts to jsonb. STRICT (the eval propagates any NULL). The
+// optional flag defaults to `true` for jsonb_set (create_if_missing) / `false` for jsonb_insert
+// (insert_after).
+func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if len(fc.Args) != 3 && len(fc.Args) != 4 {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	jsonbHint := Jsonb
+	target, t0, err := resolve(s, *fc.Args[0], &jsonbHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if t0.kind != rtJsonb && t0.kind != rtNull {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	path, err := resolveTextArrayArg(s, *fc.Args[1], name, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	value, t2, err := resolve(s, *fc.Args[2], &jsonbHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if t2.kind != rtJsonb && t2.kind != rtNull {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	var flag *rExpr
+	if len(fc.Args) == 4 {
+		boolHint := Bool
+		f, tf, err := resolve(s, *fc.Args[3], &boolHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if tf.kind != rtBool && tf.kind != rtNull {
+			return nil, resolvedType{}, noFuncOverload(name)
+		}
+		flag = f
+	} else {
+		// Default: jsonb_set create_if_missing = true; jsonb_insert insert_after = false.
+		flag = valueToRExpr(BoolValue(mode == psSet))
+	}
+	return &rExpr{kind: reJsonSetInsert, psMode: mode, sargs: []*rExpr{target, path, value, flag}},
+		resolvedType{kind: rtJsonb}, nil
+}
+
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
 // `operator does not exist` message (only the comparison operators reach resolveQuantified).
 func binaryOpSymbol(op BinaryOp) string {
@@ -18108,6 +18164,23 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		return resolveGrouping(s, fc, ag)
+	}
+	// jsonb_set / jsonb_insert (json-sql-functions.md §2) take a jsonb target, a text[] path (a bare
+	// `'{a,b}'` literal adapts, like `#>`), a jsonb new value, and an optional boolean flag.
+	// Hand-resolved (like the accessor operators) — the text[] + adapting-literal + optional-flag
+	// signature is outside the catalog family mold.
+	if name == "jsonb_set" || name == "jsonb_insert" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		mode := psSet
+		if name == "jsonb_insert" {
+			mode = psInsert
+		}
+		return resolveJSONSetInsert(s, name, mode, fc, ag, params)
 	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -23354,6 +23427,56 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			return JsonbValue(makeObject(members)), nil
 		}
+	case reJsonSetInsert:
+		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
+		// (or a NULL path element) → SQL NULL. One operator_eval; the args charge their own.
+		m.Charge(Costs.OperatorEval)
+		target, err := e.sargs[0].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		pathV, err := e.sargs[1].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		valueV, err := e.sargs[2].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		flagV, err := e.sargs[3].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		if target.Kind == ValNull || pathV.Kind == ValNull || valueV.Kind == ValNull || flagV.Kind == ValNull {
+			return NullValue(), nil
+		}
+		// Extract the text[] path (a NULL element propagates a SQL NULL, like the `#-` path).
+		if pathV.Kind != ValArray {
+			return NullValue(), nil
+		}
+		path := make([]string, 0, len(pathV.Array.Elements))
+		for _, el := range pathV.Array.Elements {
+			if el.Kind != ValText {
+				return NullValue(), nil // a NULL path element propagates
+			}
+			path = append(path, el.Str)
+		}
+		node := *target.Json // resolver guarantees a jsonb target
+		valueNode := *valueV.Json
+		flag := flagV.Kind == ValBool && flagV.Bool
+		var out JsonNode
+		if e.psMode == psSet {
+			out, err = setPath(&node, path, &valueNode, flag)
+		} else {
+			out, err = insertPath(&node, path, &valueNode, flag)
+		}
+		if err != nil {
+			return Value{}, err
+		}
+		return JsonbValue(out), nil
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

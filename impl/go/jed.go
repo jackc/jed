@@ -526,6 +526,8 @@ var SupportedCapabilities = []string{
 	// json/jsonb construction builders (B1) — to_json / json[b]_build_array / json[b]_build_object
 	// (json-sql-functions.md §2).
 	"func.json_builders",
+	// jsonb_set / jsonb_insert (B1) — the jsonb path-mutation builders (json-sql-functions.md §2).
+	"func.json_set",
 	// json/jsonb array aggregates (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §2).
 	"func.json_agg",
 }

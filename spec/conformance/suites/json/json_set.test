@@ -1,0 +1,79 @@
+# jsonb_set / jsonb_insert — the jsonb path-mutation builders (B1, spec/design/json-sql-functions.md
+# §2). jsonb_set replaces (or creates, default) the value at a text[] path; jsonb_insert inserts a new
+# element. A non-final missing key/index → no-op; an empty path → unchanged; a scalar at a step →
+# 22023; a non-integer array step → 22P02; negative indices count from the end. STRICT. Output matches
+# the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, func.json_set
+
+# jsonb_set replaces an existing object member, descends a nested path, and (default) creates a
+# missing final key.
+query TTT nosort
+SELECT jsonb_set('{"a": 1, "b": 2}', '{a}', '99'), jsonb_set('{"a": {"x": 1}}', '{a,x}', '99'), jsonb_set('{"a": 1}', '{c}', '99')
+----
+{"a": 99, "b": 2}
+{"a": {"x": 99}}
+{"a": 1, "c": 99}
+
+# create_if_missing = false leaves a missing final key untouched.
+query T nosort
+SELECT jsonb_set('{"a": 1}', '{c}', '99', false)
+----
+{"a": 1}
+
+# Array indices: positive, negative-from-end, and an out-of-range positive create (append).
+query TTT nosort
+SELECT jsonb_set('[0,1,2]', '{1}', '99'), jsonb_set('[0,1,2]', '{-1}', '99'), jsonb_set('[0,1,2]', '{5}', '99')
+----
+[0, 99, 2]
+[0, 1, 99]
+[0, 1, 2, 99]
+
+# An empty path and a missing non-final key are both no-ops (the target is returned unchanged).
+query TT nosort
+SELECT jsonb_set('{"a": 1}', '{}', '99'), jsonb_set('{"a": 1}', '{b,c}', '99')
+----
+{"a": 1}
+{"a": 1}
+
+# jsonb_insert adds a new object key, and inserts an array element BEFORE the index (or AFTER with
+# insert_after = true).
+query TTT nosort
+SELECT jsonb_insert('{"a": 1}', '{b}', '99'), jsonb_insert('[0,1,2]', '{1}', '99'), jsonb_insert('[0,1,2]', '{1}', '99', true)
+----
+{"a": 1, "b": 99}
+[0, 99, 1, 2]
+[0, 1, 99, 2]
+
+# STRICT: any NULL argument → SQL NULL.
+query TT nosort
+SELECT jsonb_set(NULL::jsonb, '{a}', '1'), jsonb_set('{"a": 1}', '{a}', NULL::jsonb)
+----
+NULL
+NULL
+
+# jsonb_insert cannot replace an existing object key.
+statement error 22023
+SELECT jsonb_insert('{"a": 1}', '{a}', '99')
+
+# A scalar target at a path step → 22023.
+statement error 22023
+SELECT jsonb_set('5'::jsonb, '{a}', '1')
+
+# A non-integer step into an array → 22P02.
+statement error 22P02
+SELECT jsonb_set('[1,2]', '{x}', '9')
+
+# Over a stored column: update a nested member per row.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '{"n": 1, "tags": []}'), (2, '{"n": 2, "tags": ["x"]}')
+
+query IT nosort
+SELECT id, jsonb_set(doc, '{n}', '0') FROM t ORDER BY id
+----
+1
+{"n": 0, "tags": []}
+2
+{"n": 0, "tags": ["x"]}

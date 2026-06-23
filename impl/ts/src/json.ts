@@ -950,6 +950,118 @@ export function deletePath(node: JsonNode, path: string[]): JsonNode {
   }
 }
 
+// PathSetMode selects whether a path mutation REPLACES at the final step (`jsonb_set`) or INSERTS a
+// new element (`jsonb_insert`). For Insert, the flag is `insert_after` (place after the array index,
+// not before); for Set, the flag is `create_if_missing` (add a missing final key / out-of-range
+// index).
+export type PathSetMode = "set" | "insert";
+
+// setPath is `jsonb_set(target, path, value[, create_if_missing])` (json-sql-functions.md §2): set
+// the value at `path` (a text[] of object keys / array indices). A non-final missing key/index is a
+// no-op (the target is returned unchanged); at the final step an existing element is REPLACED, a
+// missing one is added only when `create`. A scalar at any step → `22023`; a non-integer step into an
+// array → `22P02`. Negative array indices count from the end; an out-of-range create appends (≥len)
+// or prepends (<0).
+export function setPath(
+  node: JsonNode,
+  path: string[],
+  value: JsonNode,
+  create: boolean,
+): JsonNode {
+  return setInsertPath(node, path, value, create, "set", 0);
+}
+
+// insertPath is `jsonb_insert(target, path, value[, insert_after])` (json-sql-functions.md §2): like
+// setPath but the final step INSERTS rather than replaces — an existing object key → `22023` ("cannot
+// replace existing key"); an array index inserts before the index (or after, when `insert_after`).
+export function insertPath(
+  node: JsonNode,
+  path: string[],
+  value: JsonNode,
+  insertAfter: boolean,
+): JsonNode {
+  return setInsertPath(node, path, value, insertAfter, "insert", 0);
+}
+
+// setInsertPath is the shared recursion for setPath/insertPath (mirrors deletePath's structure).
+// `flag` is create_if_missing (Set) | insert_after (Insert); `pos` is the 0-based path position, for
+// the 22P02 message.
+function setInsertPath(
+  node: JsonNode,
+  path: string[],
+  value: JsonNode,
+  flag: boolean,
+  mode: PathSetMode,
+  pos: number,
+): JsonNode {
+  if (path.length === 0) return node; // an empty path returns the target unchanged (PG)
+  const step = path[0]!;
+  const rest = path.slice(1);
+  const isFinal = rest.length === 0;
+  switch (node.kind) {
+    case "object": {
+      const out: JsonMember[] = node.members.map((m) => ({ key: m.key, value: m.value }));
+      const found = out.findIndex((m) => m.key === step);
+      if (isFinal) {
+        if (found >= 0) {
+          if (mode === "insert") throw cannotDelete("cannot replace existing key");
+          out[found]!.value = value;
+        } else if (mode === "insert" || flag) {
+          // A missing final key: Set adds it only with create; Insert always adds it.
+          out.push({ key: step, value });
+        }
+      } else if (found >= 0) {
+        out[found]!.value = setInsertPath(out[found]!.value, rest, value, flag, mode, pos + 1);
+      }
+      // (a missing non-final key is a no-op). Re-canonicalize: a replaced value keeps the canonical
+      // order; an added key is sorted into place.
+      return { kind: "object", members: canonicalizeObject(out) };
+    }
+    case "array": {
+      // The step must parse as a base-10 i64 (trimmed); a non-integer OR an out-of-i64-range value →
+      // 22P02 (1-based position), matching Rust `step.trim().parse::<i64>()` (which errors on both).
+      const trimmed = step.trim();
+      const bad = (): never => {
+        throw malformed(`path element at position ${pos + 1} is not an integer: "${step}"`);
+      };
+      if (!/^[+-]?\d+$/.test(trimmed)) bad();
+      const idx64 = BigInt(trimmed);
+      if (idx64 < -(2n ** 63n) || idx64 > 2n ** 63n - 1n) bad();
+      const idx = Number(idx64);
+      const len = node.elements.length;
+      const out = node.elements.slice();
+      if (isFinal) {
+        if (mode === "insert") {
+          // Insertion index: normalize a negative index from the end, clamp to [0,len], then
+          // `insert_after` shifts one past.
+          let i = idx < 0 ? len + idx : idx;
+          if (i < 0) i = 0;
+          if (flag) i += 1;
+          if (i > len) i = len;
+          out.splice(i, 0, value);
+        } else {
+          const i = idx < 0 ? len + idx : idx;
+          if (i >= 0 && i < len) {
+            out[i] = value;
+          } else if (flag) {
+            // out of range + create: append (≥len) or prepend (<0).
+            if (idx < 0) out.unshift(value);
+            else out.push(value);
+          }
+        }
+      } else {
+        const i = idx < 0 ? len + idx : idx;
+        if (i >= 0 && i < len) {
+          out[i] = setInsertPath(out[i]!, rest, value, flag, mode, pos + 1);
+        }
+      }
+      return { kind: "array", elements: out };
+    }
+    default:
+      throw cannotDelete("cannot set path in scalar");
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Processing / introspection functions (B1, spec/design/json-sql-functions.md §2).
 // ---------------------------------------------------------------------------------------------

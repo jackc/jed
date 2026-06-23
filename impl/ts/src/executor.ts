@@ -255,6 +255,7 @@ import {
 import {
   type JsonMember,
   type JsonNode,
+  type PathSetMode,
   arrayLength as jsonArrayLength,
   concat as jsonConcatKernel,
   contains as jsonContainsKernel,
@@ -266,6 +267,7 @@ import {
   getIndex,
   getPath,
   hasKey as jsonHasKeyKernel,
+  insertPath as jsonInsertPathKernel,
   jsonCompactOut,
   jsonNodeCmp,
   jsonbIn,
@@ -274,6 +276,7 @@ import {
   nodeToText,
   parsePreservingJson,
   pretty as jsonPretty,
+  setPath as jsonSetPathKernel,
   stripNulls as jsonStripNulls,
   typeofName as jsonTypeofName,
   validateJson,
@@ -8481,6 +8484,7 @@ export class Database {
       case "rangeSetOp":
       case "variadic":
       case "jsonBuild":
+      case "jsonSetInsert":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
         return e;
       case "row":
@@ -8884,6 +8888,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "rangeSetOp":
     case "variadic":
     case "jsonBuild":
+    case "jsonSetInsert":
       return e.args.every(rexprIsConstant);
     case "inValues":
       return rexprIsConstant(e.lhs);
@@ -9865,6 +9870,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "rangeSetOp":
     case "variadic":
     case "jsonBuild":
+    case "jsonSetInsert":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
@@ -9986,6 +9992,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "rangeSetOp":
     case "variadic":
     case "jsonBuild":
+    case "jsonSetInsert":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
     case "row":
@@ -10673,6 +10680,15 @@ type RExpr =
       json: boolean;
       args: RExpr[];
       arrayForm: boolean;
+    }
+  // `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): a jsonb path mutation. `args` is
+  // `[target jsonb, path text[], value jsonb, flag boolean]` — STRICT (any NULL → SQL NULL). `mode`
+  // selects replace-or-create ("set") vs insert ("insert"); the boolean flag is create_if_missing
+  // (set) / insert_after (insert), defaulting to true / false respectively (supplied at resolve).
+  | {
+      kind: "jsonSetInsert";
+      mode: PathSetMode;
+      args: RExpr[];
     }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
@@ -12979,6 +12995,16 @@ function resolveFuncCall(
   if (lname === "grouping") {
     rejectNamed(lname, e.argNames);
     return resolveGrouping(scope, e, ag);
+  }
+  // jsonb_set / jsonb_insert (json-sql-functions.md §2) take a jsonb target, a text[] path (a bare
+  // `'{a,b}'` literal adapts, like `#>`), a jsonb new value, and an optional boolean flag.
+  // Hand-resolved (like the accessor operators) — the text[] + adapting-literal + optional-flag
+  // signature is outside the catalog family mold.
+  if (lname === "jsonb_set" || lname === "jsonb_insert") {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    const mode: PathSetMode = lname === "jsonb_set" ? "set" : "insert";
+    return resolveJsonbSetInsert(scope, lname, mode, e.args, ag, params);
   }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -17432,6 +17458,40 @@ function resolveTextArrayArg(
   throw engineError("undefined_function", `the ${sym} operator's right argument must be text[]`);
 }
 
+// resolveJsonbSetInsert resolves jsonb_set / jsonb_insert (json-sql-functions.md §2): `(target jsonb,
+// path text[], value jsonb [, flag boolean])` → jsonb. A bare `'{a,b}'` path literal adapts to text[]
+// and a bare string `value` literal adapts to jsonb (the `Some(ScalarType::Jsonb)` hint). STRICT (the
+// eval propagates any NULL). The optional flag defaults to `true` for jsonb_set (create_if_missing) /
+// `false` for jsonb_insert (insert_after).
+function resolveJsonbSetInsert(
+  scope: Scope,
+  name: string,
+  mode: PathSetMode,
+  args: Expr[],
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (args.length !== 3 && args.length !== 4) throw noFuncOverload(name);
+  const target = resolve(scope, args[0]!, "jsonb", ag, params);
+  if (target.type.kind !== "jsonb" && target.type.kind !== "null") throw noFuncOverload(name);
+  const path = resolveTextArrayArg(scope, args[1]!, name, ag, params);
+  const value = resolve(scope, args[2]!, "jsonb", ag, params);
+  if (value.type.kind !== "jsonb" && value.type.kind !== "null") throw noFuncOverload(name);
+  let flag: RExpr;
+  if (args.length === 4) {
+    const f = resolve(scope, args[3]!, "boolean", ag, params);
+    if (f.type.kind !== "bool" && f.type.kind !== "null") throw noFuncOverload(name);
+    flag = f.node;
+  } else {
+    // Default: jsonb_set create_if_missing = true; jsonb_insert insert_after = false.
+    flag = { kind: "constBool", value: mode === "set" };
+  }
+  return {
+    node: { kind: "jsonSetInsert", mode, args: [target.node, path, value.node, flag] },
+    type: { kind: "jsonb" },
+  };
+}
+
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).
 function rangeOpFor(op: BinaryOp): RangeOpName {
   switch (op) {
@@ -20880,6 +20940,39 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         members.push({ key, value: valueToNode(vals[i + 1]!) });
       }
       return jsonbValue(jsonMakeObject(members));
+    }
+    case "jsonSetInsert": {
+      // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
+      // (or a NULL path element) → SQL NULL.
+      m.charge(COSTS.operatorEval);
+      const target = evalExpr(e.args[0]!, row, env, m);
+      const pathV = evalExpr(e.args[1]!, row, env, m);
+      const valueV = evalExpr(e.args[2]!, row, env, m);
+      const flagV = evalExpr(e.args[3]!, row, env, m);
+      m.guard();
+      if (
+        target.kind === "null" ||
+        pathV.kind === "null" ||
+        valueV.kind === "null" ||
+        flagV.kind === "null"
+      ) {
+        return nullValue();
+      }
+      // Extract the text[] path (a NULL element propagates a SQL NULL result, like the `#-` path).
+      if (pathV.kind !== "array") throw new Error("resolver guarantees a text[] path");
+      const path: string[] = [];
+      for (const el of pathV.elements) {
+        if (el.kind !== "text") return nullValue(); // a NULL path element propagates
+        path.push(el.text);
+      }
+      const node = jsonArgNode(target);
+      const valueNode = jsonArgNode(valueV);
+      const flag = flagV.kind === "bool" && flagV.value;
+      const out =
+        e.mode === "set"
+          ? jsonSetPathKernel(node, path, valueNode, flag)
+          : jsonInsertPathKernel(node, path, valueNode, flag);
+      return jsonbValue(out);
     }
     case "subquery": {
       // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push

@@ -1124,6 +1124,138 @@ func jsonDeletePath(node *JsonNode, path []string) (JsonNode, error) {
 	}
 }
 
+// pathSetMode selects whether a path mutation REPLACES at the final step (`jsonb_set`) or INSERTS a
+// new element (`jsonb_insert`). For Insert, the flag is `insert_after` (place after the array index,
+// not before); for Set, the flag is `create_if_missing` (add a missing final key / out-of-range
+// index).
+type pathSetMode int
+
+const (
+	psSet pathSetMode = iota
+	psInsert
+)
+
+// setPath is `jsonb_set(target, path, value[, create_if_missing])` (json-sql-functions.md §2): set
+// the value at `path` (a text[] of object keys / array indices). A non-final missing key/index is a
+// no-op (the target is returned unchanged); at the final step an existing element is REPLACED, a
+// missing one is added only when `create`. A scalar at any step → 22023; a non-integer step into an
+// array → 22P02. Negative array indices count from the end; an out-of-range create appends (≥len) or
+// prepends (<0).
+func setPath(node *JsonNode, path []string, value *JsonNode, create bool) (JsonNode, error) {
+	return setInsertPath(node, path, value, create, psSet, 0)
+}
+
+// insertPath is `jsonb_insert(target, path, value[, insert_after])` (json-sql-functions.md §2): like
+// setPath but the final step INSERTS rather than replaces — an existing object key → 22023 ("cannot
+// replace existing key"); an array index inserts before the index (or after, when `insert_after`).
+func insertPath(node *JsonNode, path []string, value *JsonNode, insertAfter bool) (JsonNode, error) {
+	return setInsertPath(node, path, value, insertAfter, psInsert, 0)
+}
+
+// setInsertPath is the shared kernel for setPath / insertPath. `flag` is create_if_missing (Set) /
+// insert_after (Insert); `pos` is the 0-based path position (for the 22P02 message).
+func setInsertPath(node *JsonNode, path []string, value *JsonNode, flag bool, mode pathSetMode, pos int) (JsonNode, error) {
+	if len(path) == 0 {
+		return *node, nil // an empty path returns the target unchanged (PG)
+	}
+	step, rest := path[0], path[1:]
+	isFinal := len(rest) == 0
+	switch node.Kind {
+	case JObject:
+		out := make([]JsonMember, len(node.Obj))
+		copy(out, node.Obj)
+		found := -1
+		for i := range out {
+			if out[i].Key == step {
+				found = i
+				break
+			}
+		}
+		if isFinal {
+			if found >= 0 {
+				if mode == psInsert {
+					return JsonNode{}, cannotDelete("cannot replace existing key")
+				}
+				out[found].Val = *value
+			} else if mode == psInsert || flag {
+				// A missing final key: Set adds it only with create; Insert always adds it.
+				out = append(out, JsonMember{Key: step, Val: *value})
+			}
+		} else if found >= 0 {
+			child, err := setInsertPath(&out[found].Val, rest, value, flag, mode, pos+1)
+			if err != nil {
+				return JsonNode{}, err
+			}
+			out[found].Val = child
+		}
+		// (a missing non-final key is a no-op). Re-canonicalize: a replaced value keeps the
+		// canonical order; an added key is sorted into place.
+		return JsonNode{Kind: JObject, Obj: canonicalizeObject(out)}, nil
+	case JArray:
+		idx, err := strconv.ParseInt(strings.TrimSpace(step), 10, 64)
+		if err != nil {
+			return JsonNode{}, jsonMalformed(
+				"path element at position " + strconv.Itoa(pos+1) + " is not an integer: \"" + step + "\"",
+			)
+		}
+		length := int64(len(node.Arr))
+		out := make([]JsonNode, len(node.Arr))
+		copy(out, node.Arr)
+		if isFinal {
+			if mode == psInsert {
+				// Insertion index: normalize a negative index from the end, clamp to [0,len], then
+				// `insert_after` shifts one past.
+				i := idx
+				if i < 0 {
+					i = length + i
+				}
+				if i < 0 {
+					i = 0
+				}
+				if flag {
+					i++
+				}
+				if i > length {
+					i = length
+				}
+				out = append(out, JsonNode{})
+				copy(out[i+1:], out[i:])
+				out[i] = *value
+			} else {
+				i := idx
+				if i < 0 {
+					i = length + i
+				}
+				if i >= 0 && i < length {
+					out[i] = *value
+				} else if flag {
+					// out of range + create: append (≥len) or prepend (<0).
+					if idx < 0 {
+						out = append([]JsonNode{*value}, out...)
+					} else {
+						out = append(out, *value)
+					}
+				}
+			}
+		} else {
+			i := idx
+			if i < 0 {
+				i = length + i
+			}
+			if i >= 0 && i < length {
+				child, err := setInsertPath(&out[i], rest, value, flag, mode, pos+1)
+				if err != nil {
+					return JsonNode{}, err
+				}
+				out[i] = child
+			}
+		}
+		return JsonNode{Kind: JArray, Arr: out}, nil
+	default:
+		return JsonNode{}, cannotDelete("cannot set path in scalar")
+	}
+}
+
 // ---------------------------------------------------------------------------------------------
 // Processing / introspection functions (B1, spec/design/json-sql-functions.md §2).
 // ---------------------------------------------------------------------------------------------

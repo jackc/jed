@@ -327,3 +327,18 @@ func TestJsonAggCanonicalizesJsonElements(t *testing.T) {
 		t.Errorf("json_agg(json) = %q, want %q", got, want)
 	}
 }
+
+// TestJsonbSetNullPathElementPropagatesNull: a NULL element inside the jsonb_set / jsonb_insert path
+// array propagates a SQL NULL result — a documented divergence from PostgreSQL, which raises 22004
+// ("path element at position N is null"). jed treats the path strictly, like the `#-` delete-path
+// operator's text[] handling. The agreeing behavior (set/insert/no-op/22023/22P02) is oracle-clean in
+// suites/json/json_set.test. Mirrors impl/rust/tests/json.rs jsonb_set_null_path_element_propagates_null.
+func TestJsonbSetNullPathElementPropagatesNull(t *testing.T) {
+	db := NewDatabase()
+	if got := queryRendered(t, db, "SELECT jsonb_set('{\"a\":1}', ARRAY['a', NULL], '99')")[0][0]; got != "NULL" {
+		t.Errorf("jsonb_set(NULL path element) = %q, want NULL", got)
+	}
+	if got := queryRendered(t, db, "SELECT jsonb_insert('{\"a\":1}', ARRAY[NULL], '99')")[0][0]; got != "NULL" {
+		t.Errorf("jsonb_insert(NULL path element) = %q, want NULL", got)
+	}
+}

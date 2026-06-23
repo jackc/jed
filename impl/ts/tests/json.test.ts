@@ -215,3 +215,14 @@ test("json_agg canonicalizes json elements", () => {
   // jed canonicalizes the element; PG would render the verbatim `[{ "a" : 1 }]`.
   assert.deepEqual(query(db, "SELECT json_agg(doc) FROM j"), [['[{"a": 1}]']]);
 });
+
+// A NULL element inside the `jsonb_set` / `jsonb_insert` path array propagates a SQL NULL result — a
+// documented divergence from PostgreSQL, which raises `22004` ("path element at position N is null").
+// jed treats the path strictly, like the `#-` delete-path operator's text[] handling. The agreeing
+// behavior (set/insert/no-op/22023/22P02) is oracle-clean in suites/json/json_set.test. Mirrors
+// impl/rust/tests/json.rs jsonb_set_null_path_element_propagates_null and impl/go/json_test.go.
+test("jsonb_set null path element propagates null", () => {
+  const db = dbWith([]);
+  assert.deepEqual(query(db, `SELECT jsonb_set('{"a":1}', ARRAY['a', NULL], '99')`), [["NULL"]]);
+  assert.deepEqual(query(db, `SELECT jsonb_insert('{"a":1}', ARRAY[NULL], '99')`), [["NULL"]]);
+});

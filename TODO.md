@@ -371,6 +371,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           exact, text/bool, json/jsonb canonicalize, 1-D array recursive incl. NULL→json null); STRICT;
           `value_to_node` kernel (reused by B4). Float / composite / datetime / uuid / bytea / interval /
           multidim-array sources deferred `0A000`. All 3 cores, cap `func.to_jsonb`, oracle-clean.
+    - [x] **B1 builders — path-mutation subset** — ✅ `jsonb_set(target, path text[], new_value [,
+          create_if_missing])` / `jsonb_insert(target, path, new_value [, insert_after])`. Path walk over
+          object keys / array indices (negative-from-end); non-final missing key/index + empty path →
+          no-op; scalar step → `22023`; non-integer array step → `22P02`; jsonb_insert on an existing key
+          → `22023`; out-of-range jsonb_set create appends/prepends. STRICT (a NULL path element → SQL
+          NULL, a divergence from PG's `22004`). `set_path`/`insert_path` kernels + `RExpr::JsonSetInsert`,
+          hand-resolved (text[] + adapting-literal + optional flag). All 3 cores, cap `func.json_set`,
+          oracle-clean. _follow-on:_ `jsonb_set_lax` (null_value_treatment).
     - [x] **B1 builders — construction subset** — ✅ `to_json(anyelement)` (the to_jsonb image as
           `json`: jsonb input → canonical-spaced, json input → verbatim, else compact) + `json[b]_build_array`
           / `json[b]_build_object` (VARIADIC "any"): zero-arg `[]`/`{}`, VARIADIC-array spread (NULL array →

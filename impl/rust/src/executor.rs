@@ -10147,7 +10147,8 @@ impl Database {
             | RExpr::RangeOp { args, .. }
             | RExpr::RangeSetOp { args, .. }
             | RExpr::Variadic { args, .. }
-            | RExpr::JsonBuild { args, .. } => {
+            | RExpr::JsonBuild { args, .. }
+            | RExpr::JsonSetInsert { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 }
@@ -11585,6 +11586,14 @@ enum RExpr {
         kind: DeleteKind,
         base: Box<RExpr>,
         arg: Box<RExpr>,
+    },
+    /// `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): a jsonb path mutation. `args` is
+    /// `[target jsonb, path text[], value jsonb, (flag boolean)]` — STRICT (any NULL → SQL NULL).
+    /// `mode` selects replace-or-create (Set) vs insert (Insert); the optional flag is
+    /// create_if_missing (Set) / insert_after (Insert), defaulting to true / false respectively.
+    JsonSetInsert {
+        mode: json::PathSetMode,
+        args: Vec<RExpr>,
     },
     IsNull {
         operand: Box<RExpr>,
@@ -13236,7 +13245,8 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. }
-        | RExpr::JsonBuild { args, .. } => args.iter().all(rexpr_is_constant),
+        | RExpr::JsonBuild { args, .. }
+        | RExpr::JsonSetInsert { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
     }
@@ -15191,7 +15201,10 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. }
-        | RExpr::JsonBuild { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
+        | RExpr::JsonBuild { args, .. }
+        | RExpr::JsonSetInsert { args, .. } => {
+            args.iter().any(|a| rexpr_references_outer(a, depth))
+        }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
         }
@@ -15328,7 +15341,8 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. }
-        | RExpr::JsonBuild { args, .. } => {
+        | RExpr::JsonBuild { args, .. }
+        | RExpr::JsonSetInsert { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
             }
@@ -17230,6 +17244,25 @@ fn resolve_func_call(
     if lname == "grouping" {
         reject_named(&lname, arg_names)?;
         return resolve_grouping(scope, args, star, agg, params);
+    }
+    // `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2) take a jsonb target, a text[] path (a
+    // bare `'{a,b}'` literal adapts, like `#>`), a jsonb new value, and an optional boolean flag.
+    // Hand-resolved (like the accessor operators) — the text[] + adapting-literal + optional-flag
+    // signature is outside the catalog family mold.
+    if lname == "jsonb_set" || lname == "jsonb_insert" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        let mode = if lname == "jsonb_set" {
+            json::PathSetMode::Set
+        } else {
+            json::PathSetMode::Insert
+        };
+        return resolve_jsonb_set_insert(scope, &lname, mode, args, agg, params);
     }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -20950,6 +20983,67 @@ fn resolve_text_array_arg(
             SqlState::UndefinedFunction,
             format!("the {sym} operator's right argument must be text[]"),
         )),
+    }
+}
+
+/// Resolve `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): `(target jsonb, path text[],
+/// value jsonb [, flag boolean])` → jsonb. A bare `'{a,b}'` path literal adapts to text[] and a bare
+/// string `value` literal adapts to jsonb. STRICT (the eval propagates any NULL). The optional flag
+/// defaults to `true` for jsonb_set (create_if_missing) / `false` for jsonb_insert (insert_after).
+fn resolve_jsonb_set_insert(
+    scope: &Scope,
+    name: &str,
+    mode: json::PathSetMode,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if args.len() != 3 && args.len() != 4 {
+        return Err(no_func_overload(name));
+    }
+    let (target, t0) = resolve(scope, &args[0], Some(ScalarType::Jsonb), agg, params)?;
+    if !matches!(t0, ResolvedType::Jsonb | ResolvedType::Null) {
+        return Err(no_func_overload(name));
+    }
+    let path = resolve_text_array_arg(scope, &args[1], name, agg, params)?;
+    let (value, t2) = resolve(scope, &args[2], Some(ScalarType::Jsonb), agg, params)?;
+    if !matches!(t2, ResolvedType::Jsonb | ResolvedType::Null) {
+        return Err(no_func_overload(name));
+    }
+    let flag = if args.len() == 4 {
+        let (f, tf) = resolve(scope, &args[3], Some(ScalarType::Bool), agg, params)?;
+        if !matches!(tf, ResolvedType::Bool | ResolvedType::Null) {
+            return Err(no_func_overload(name));
+        }
+        f
+    } else {
+        // Default: jsonb_set create_if_missing = true; jsonb_insert insert_after = false.
+        value_to_rexpr(&Value::Bool(mode == json::PathSetMode::Set))
+    };
+    Ok((
+        RExpr::JsonSetInsert {
+            mode,
+            args: vec![target, path, value, flag],
+        },
+        ResolvedType::Jsonb,
+    ))
+}
+
+/// Extract a `text[]` value into a path of strings — `None` if it is not an array or has a NULL
+/// element (which propagates a SQL NULL through `jsonb_set`/`jsonb_insert`, like the `#-` path).
+fn value_to_text_path(v: &Value) -> Option<Vec<String>> {
+    match v {
+        Value::Array(arr) => {
+            let mut path = Vec::with_capacity(arr.elements.len());
+            for e in &arr.elements {
+                match e {
+                    Value::Text(s) => path.push(s.clone()),
+                    _ => return None,
+                }
+            }
+            Some(path)
+        }
+        _ => None,
     }
 }
 
@@ -24752,6 +24846,36 @@ impl RExpr {
                     },
                 };
                 Ok(Value::Jsonb(result))
+            }
+            // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL
+            // argument (or a NULL path element) → SQL NULL.
+            RExpr::JsonSetInsert { mode, args } => {
+                m.charge(COSTS.operator_eval);
+                let target = args[0].eval(row, env, m)?;
+                let path_v = args[1].eval(row, env, m)?;
+                let value_v = args[2].eval(row, env, m)?;
+                let flag_v = args[3].eval(row, env, m)?;
+                if matches!(target, Value::Null)
+                    || matches!(path_v, Value::Null)
+                    || matches!(value_v, Value::Null)
+                    || matches!(flag_v, Value::Null)
+                {
+                    return Ok(Value::Null);
+                }
+                let path = match value_to_text_path(&path_v) {
+                    Some(p) => p,
+                    None => return Ok(Value::Null), // a NULL path element propagates
+                };
+                let node = json_arg_node(&target)?;
+                let value_node = json_arg_node(&value_v)?;
+                let flag = matches!(flag_v, Value::Bool(true));
+                let out = match mode {
+                    json::PathSetMode::Set => json::set_path(&node, &path, &value_node, flag)?,
+                    json::PathSetMode::Insert => {
+                        json::insert_path(&node, &path, &value_node, flag)?
+                    }
+                };
+                Ok(Value::Jsonb(out))
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);
