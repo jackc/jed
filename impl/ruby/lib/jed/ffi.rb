@@ -69,7 +69,8 @@ module Jed
     OPEN_MEMORY    = fn(:jed_open_memory, [], VOIDP)
     CREATE         = fn(:jed_create, [VOIDP], VOIDP)
     OPEN           = fn(:jed_open, [VOIDP, CHAR], VOIDP)
-    EXECUTE        = fn(:jed_execute, [VOIDP, VOIDP], VOIDP)
+    # (db, sql, params_buf, params_len) — the param buffer is the ruby.md §3a encoding (null/0 = none).
+    EXECUTE        = fn(:jed_execute, [VOIDP, VOIDP, VOIDP, UINT], VOIDP)
     COMMIT         = fn(:jed_commit, [VOIDP], VOIDP)
     CLOSE          = fn(:jed_close, [VOIDP], VOID)
     FREE           = fn(:jed_free, [VOIDP], VOID)

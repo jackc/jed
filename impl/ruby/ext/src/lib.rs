@@ -25,6 +25,25 @@
 //! `lstr` = u32 length prefix + that many UTF-8 bytes. A query cell's text is exactly
 //! `Value::render()` (the conformance text contract, ruby.md §3) so the gem renders byte-identical
 //! to the Rust conformance harness; a SQL NULL is the `is_null` flag, never the string `"NULL"`.
+//!
+//! ## Bind parameters (ruby.md §3a)
+//!
+//! [`jed_execute`] takes an optional **param buffer** (`*const u8` + length, null/0 for none)
+//! encoding the `$N` values, little-endian:
+//!
+//! ```text
+//! u32 nparams ; nparams×( u8 tag ; payload )
+//!   tag 0 NULL  : (no payload)
+//!   tag 1 INT   : i64
+//!   tag 2 FLOAT : f64
+//!   tag 3 BOOL  : u8 (0/1)
+//!   tag 4 TEXT  : u32 len + utf8 bytes
+//! ```
+//!
+//! Each decodes to a `Value` (`Int`/`Float64`/`Bool`/`Text`/`Null`); the engine then **context-
+//! types** every `$N` against its use site and coerces/range-checks the bound value two-phase
+//! before any row is touched (api.md §5) — e.g. an integer bound to an `i16` column that overflows
+//! traps `22003` at bind. Richer typed binds (decimal/timestamp/array) are a follow-on (ruby.md §6).
 
 // Every `extern "C"` export below dereferences caller-supplied raw pointers — the nature of an FFI
 // boundary. Clippy's `not_unsafe_ptr_arg_deref` would have us mark them `unsafe fn`, but a
@@ -40,7 +59,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// The ABI version. The Ruby side checks this against its own constant on load and refuses a
 /// mismatch (ruby.md §5), so a stale cdylib next to a newer gem fails loudly, never silently.
-const ABI_VERSION: u32 = 1;
+/// Bumped to 2 when [`jed_execute`] grew its bind-parameter arguments.
+const ABI_VERSION: u32 = 2;
 
 const TAG_ERROR: u8 = 0;
 const TAG_STATEMENT: u8 = 1;
@@ -201,6 +221,74 @@ fn cstr<'a>(p: *const c_char) -> Result<&'a str, *mut u8> {
         .map_err(|_| err_buf("XX000", "argument is not valid UTF-8"))
 }
 
+/// An `XX000` ERROR buffer for a malformed bind-parameter buffer (the Ruby encoder produces a
+/// well-formed one, so this is a corrupted-input backstop, never a normal path).
+fn malformed_params() -> *mut u8 {
+    err_buf("XX000", "malformed bind-parameter buffer")
+}
+
+/// A bounds-checked little-endian cursor over the param buffer.
+struct ParamReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl ParamReader<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let s = self.bytes.get(self.pos..self.pos.checked_add(n)?)?;
+        self.pos += n;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|s| s[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        self.take(4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn i64(&mut self) -> Option<i64> {
+        self.take(8)
+            .map(|s| i64::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn f64(&mut self) -> Option<f64> {
+        self.take(8)
+            .map(|s| f64::from_le_bytes(s.try_into().unwrap()))
+    }
+}
+
+/// Decode the bind-parameter buffer (ruby.md §3a) into `Vec<Value>`. A null pointer or zero length
+/// is the no-parameter case. On a malformed buffer (impossible from the gem's own encoder) returns
+/// an ERROR buffer so a corrupted input aborts cleanly rather than reading out of bounds.
+fn decode_params(ptr: *const u8, len: u32) -> Result<Vec<Value>, *mut u8> {
+    if ptr.is_null() || len == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: the gem passes a pointer to a contiguous byte buffer of exactly `len` bytes, valid for
+    // the call's duration; the cursor below never reads past `len`.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let mut r = ParamReader { bytes, pos: 0 };
+    let nparams = r.u32().ok_or_else(malformed_params)?;
+    let mut out = Vec::with_capacity(nparams as usize);
+    for _ in 0..nparams {
+        let value = match r.u8().ok_or_else(malformed_params)? {
+            0 => Value::Null,
+            1 => Value::Int(r.i64().ok_or_else(malformed_params)?),
+            2 => Value::Float64(r.f64().ok_or_else(malformed_params)?),
+            3 => Value::Bool(r.u8().ok_or_else(malformed_params)? != 0),
+            4 => {
+                let n = r.u32().ok_or_else(malformed_params)? as usize;
+                let s = r.take(n).ok_or_else(malformed_params)?;
+                let text = std::str::from_utf8(s)
+                    .map_err(|_| err_buf("XX000", "bind text parameter is not valid UTF-8"))?;
+                Value::Text(text.to_string())
+            }
+            _ => return Err(err_buf("XX000", "unknown bind-parameter type tag")),
+        };
+        out.push(value);
+    }
+    Ok(out)
+}
+
 /// The ABI version this library implements (ruby.md §5).
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_abi_version() -> u32 {
@@ -253,11 +341,16 @@ pub extern "C" fn jed_open(path: *const c_char, read_only: u8) -> *mut u8 {
     })
 }
 
-/// Execute one SQL statement against `db`. Returns a QUERY buffer for a `SELECT`, a STATEMENT buffer
-/// for DDL/DML, or an ERROR buffer. Bind parameters are not yet supported (literal SQL only; the
-/// `$N` follow-on, ruby.md §6). Free the buffer with [`jed_free`].
+/// Execute one SQL statement against `db`, binding `$N` parameters from `params` (a buffer of
+/// `params_len` bytes in the ruby.md §3a encoding; null/0 for none). Returns a QUERY buffer for a
+/// `SELECT`, a STATEMENT buffer for DDL/DML, or an ERROR buffer. Free the buffer with [`jed_free`].
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_execute(db: *mut Database, sql: *const c_char) -> *mut u8 {
+pub extern "C" fn jed_execute(
+    db: *mut Database,
+    sql: *const c_char,
+    params: *const u8,
+    params_len: u32,
+) -> *mut u8 {
     guard(|| {
         if db.is_null() {
             return err_buf("XX000", "null database handle");
@@ -269,7 +362,11 @@ pub extern "C" fn jed_execute(db: *mut Database, sql: *const c_char) -> *mut u8 
             Ok(s) => s,
             Err(b) => return b,
         };
-        match db.execute(sql, &[]) {
+        let params = match decode_params(params, params_len) {
+            Ok(v) => v,
+            Err(b) => return b,
+        };
+        match db.execute(sql, &params) {
             Ok(outcome) => ok_outcome(&outcome),
             Err(e) => err_buf(e.code(), &e.message),
         }

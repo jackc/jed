@@ -42,9 +42,11 @@ Jed.memory do |db|                                  # also: Jed.create(path), Je
 end
 ```
 
-- **`Database#execute(sql)`** → a `Jed::Result` for a query, or `{ rows_affected:, cost: }` for
-  DDL/DML. **`#query(sql)`** always returns a `Jed::Result` (raises if the statement produces no
-  rows). **`#commit`** publishes an explicit transaction (a no-op success under autocommit).
+- **`Database#execute(sql, *params)`** → a `Jed::Result` for a query, or `{ rows_affected:, cost: }`
+  for DDL/DML. **`#query(sql, *params)`** always returns a `Jed::Result` (raises if the statement
+  produces no rows). `$N` placeholders bind to the positional `params` (`$1` ⇒ the first); pass an
+  array with the splat (`db.execute(sql, *vals)`). **`#commit`** publishes an explicit transaction
+  (a no-op success under autocommit).
   **`#close`** releases the handle (rolls back an open block; never commits implicitly — api.md
   §2.3). The block forms close automatically.
 - **Autocommit** is the default (CLAUDE.md §3): each `execute` is durable on its own. An explicit
@@ -88,6 +90,27 @@ buffer is self-describing, little-endian, single-allocation:
 and parses it ([codec.rb](../../impl/ruby/lib/jed/codec.rb)), so no native allocation outlives a
 call.
 
+### 3a. Bind parameters
+
+`jed_execute` also takes an optional **param buffer** (`*const u8` + length, null/0 for none)
+encoding the `$N` values, little-endian:
+
+```
+u32 nparams ; nparams×( u8 tag ; payload )
+  0 NULL  : (no payload)        2 FLOAT : f64           4 TEXT : u32 len + utf8 bytes
+  1 INT   : i64                 3 BOOL  : u8 (0/1)
+```
+
+The gem encodes one Ruby scalar per param ([params.rb](../../impl/ruby/lib/jed/params.rb)) —
+`nil`→NULL, `Integer`→INT, `Float`→FLOAT, `true`/`false`→BOOL, `String`→TEXT — and the native side
+decodes each to a `Value`. The engine then **context-types** every `$N` against its use site and
+coerces/range-checks the bound value two-phase before any row is touched (api.md §5): an `Integer`
+binds equally to an `i16`/`i32`/`i64`/`decimal` site, an out-of-range value traps `22003` at bind,
+a NULL into a `NOT NULL` column `23502`, an undetermined type `42P18`. Two gem-side guards raise an
+`ArgumentError` *before* the call (a programming error, not a SQL one): an unsupported Ruby type, or
+an `Integer` outside the i64 range (`Array#pack("q<")` would silently *wrap* it, so the range is
+checked explicitly). Richer typed binds (`BigDecimal`/`Time`/array/…) are a follow-on (§6).
+
 **The value-rendering contract.** A query cell's text is exactly **`Value::render()`** — the
 same canonical rendering the Rust conformance harness emits — so the gem prints byte-identical
 to the corpus. A SQL **NULL is the `is_null` flag**, never the string `"NULL"`, so the gem can
@@ -129,11 +152,12 @@ beside a newer gem fails loudly, never as a silent wire misparse.
   the CLI. Per CLAUDE.md §10 those tests cover only what the corpus cannot — the binding seam
   itself (marshalling, value coercion, NULL handling, handle lifecycle, error mapping,
   persistence). SQL semantics stay in the shared corpus, inherited by construction.
-- **Follow-ons** (this slice ships create/open/execute/commit/close over literal SQL):
-  - **Bind parameters (`$N`)** — typed `Value` marshalling across the ABI (the core's
-    `execute(sql, params)` already supports it; the corpus stays literal-only, api.md).
+- **Landed:** create/open/execute/commit/close over literal SQL (slice 1); **`$N` bind
+  parameters** (slice 2 — §3a, ABI v2).
+- **Follow-ons:**
   - **Richer typed values** — optional `BigDecimal` / `Time` / `Date` coercion for the
-    String-today types, behind an explicit opt-in.
+    String-today types, both on read (the coerce table) and as bind params (beyond the slice-2
+    `nil`/`Integer`/`Float`/bool/`String` set), behind an explicit opt-in.
   - **Host-loaded bundles** — expose `load_unicode_data` / `load_time_zone_data` so the gem can
     run collation / time-zone features (collation.md, timezones.md).
   - **Distributable packaging** — a `gem install`-able native gem via **`rb-sys` + precompiled
@@ -149,7 +173,7 @@ impl/ruby/
   jed.gemspec            # the gem (lib + ext sources)
   README.md              # user-facing quickstart
   lib/jed.rb             # entry point
-  lib/jed/{version,error,ffi,codec,coerce,result,database}.rb
+  lib/jed/{version,error,ffi,codec,coerce,params,result,database}.rb
   ext/Cargo.toml         # standalone cdylib crate, jed = { path = "../../rust" }
   ext/src/lib.rs         # the C ABI (the only unsafe in the product path)
   test/database_test.rb  # minitest seam tests

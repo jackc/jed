@@ -36,6 +36,24 @@ Jed.open("data.jed", read_only: true) do |db|
 end
 ```
 
+### Bind parameters (`$N`)
+
+Pass values positionally for `$1`, `$2`, …; the engine type-checks each against its use site
+before touching any row:
+
+```ruby
+db.execute("INSERT INTO t VALUES ($1, $2, $3)", 1, "alice", 9.5)
+db.query("SELECT * FROM t WHERE id = $1 AND name = $2", 1, "alice")
+db.execute("UPDATE t SET score = $1 WHERE id = $2", 10.0, 1)
+
+vals = [2, "bob"]
+db.query("SELECT * FROM t WHERE id = $1 AND name = $2", *vals)   # splat an array
+```
+
+Params are `nil` / `Integer` / `Float` / `true` / `false` / `String` (richer typed binds are a
+follow-on). The usual SQL errors raise `Jed::Error` (e.g. an integer overflowing an `i16` column →
+`22003`); a value the gem can't encode raises `ArgumentError`.
+
 ### Errors
 
 A structured engine error raises `Jed::Error`, carrying the 5-char SQLSTATE:

@@ -727,9 +727,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `boolean`. `rake ruby:build`/`ruby:test` (minitest **seam** tests — marshalling/lifecycle/
         coercion/errors/persistence, what the corpus can't express §10), folded into `rake test`.
         → [ruby.md](spec/design/ruby.md)
-  - [ ] _follow-on (each its own slice):_ **bind params `$N`** (typed `Value` marshalling — the
-        core's `execute(sql, params)` already supports it); **richer typed values** (opt-in
-        `BigDecimal`/`Time`/`Date` for the String-today types); **host-loaded bundles**
+  - [x] **Slice 2 — `$N` bind parameters.** `execute(sql, *params)`/`query(sql, *params)` marshal
+        Ruby scalars (`nil`/`Integer`/`Float`/`true`/`false`/`String`) into a length-delimited param
+        buffer (ABI v2; ruby.md §3a) decoded to `Value`s; the engine context-types + coerces each
+        `$N` two-phase (an `i16` overflow `22003`, NULL-into-`NOT NULL` `23502`, indeterminate
+        `42P18` all surface as `Jed::Error`). Gem-side `ArgumentError` guards for an unsupported type
+        or an out-of-i64 `Integer` (`pack("q<")` silently wraps, so the range is checked). Corpus
+        stays literal-only (params are host-API; api.md §5). → [ruby.md §3a](spec/design/ruby.md)
+  - [ ] _follow-on (each its own slice):_ **richer typed values** (opt-in
+        `BigDecimal`/`Time`/`Date` for the String-today types — on read and as bind params beyond
+        the slice-2 scalar set); **host-loaded bundles**
         (`load_unicode_data`/`load_time_zone_data` for collation/tz); **distributable packaging**
         — a `gem install`-able native gem via **`rb-sys` + precompiled platform gems** (or
         `magnus` for richer Rust ergonomics), replacing the in-repo `rake ruby:build` step (a

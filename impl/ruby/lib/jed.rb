@@ -5,6 +5,7 @@ require_relative "jed/error"
 require_relative "jed/ffi"
 require_relative "jed/codec"
 require_relative "jed/coerce"
+require_relative "jed/params"
 require_relative "jed/result"
 require_relative "jed/database"
 

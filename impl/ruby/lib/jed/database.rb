@@ -61,12 +61,21 @@ module Jed
       ObjectSpace.define_finalizer(self, self.class.send(:finalizer, @addr))
     end
 
-    # Execute one SQL statement (literal SQL only — `$N` bind params are a follow-on, ruby.md §6).
-    # Returns a {Jed::Result} for a query, or a Hash `{rows_affected:, cost:}` for a non-query
-    # statement (DDL/DML). Raises {Jed::Error} on a structured engine error.
-    def execute(sql)
+    # Execute one SQL statement, binding any `$N` placeholders to `params` (positional, 1-based:
+    # `$1` ⇒ the first). Returns a {Jed::Result} for a query, or a Hash `{rows_affected:, cost:}`
+    # for a non-query statement (DDL/DML). Raises {Jed::Error} on a structured engine error.
+    #
+    #   db.execute("INSERT INTO t VALUES ($1, $2)", 7, "alice")
+    #   db.execute("UPDATE t SET v = $1 WHERE id = $2", 10, 7)
+    #
+    # Each param is `nil`/`Integer`/`Float`/`true`/`false`/`String`; the engine context-types every
+    # `$N` and coerces it (ruby.md §3a). Pass an array of values with the splat: `db.execute(sql, *vals)`.
+    def execute(sql, *params)
       check_open
-      result = Jed::Codec.take(Jed::FFI::EXECUTE.call(@handle, sql.to_s))
+      buf = Jed::Params.encode(params)
+      ptr = buf || Fiddle::NULL
+      len = buf ? buf.bytesize : 0
+      result = Jed::Codec.take(Jed::FFI::EXECUTE.call(@handle, sql.to_s, ptr, len))
       case result[:kind]
       when :error then raise Jed::Error.new(result[:sqlstate], result[:message])
       when :query then build_result(result)
@@ -75,10 +84,10 @@ module Jed
       end
     end
 
-    # Execute a query and return a {Jed::Result}. Raises if the statement produces no rows (use
-    # {#execute} for DDL/DML).
-    def query(sql)
-      result = execute(sql)
+    # Execute a query, binding `$N` params, and return a {Jed::Result}. Raises if the statement
+    # produces no rows (use {#execute} for DDL/DML).
+    def query(sql, *params)
+      result = execute(sql, *params)
       return result if result.is_a?(Jed::Result)
 
       raise Jed::Error.new("42601",
