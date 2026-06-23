@@ -370,7 +370,17 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   frames coincide — and the moving `COUNT(*)`/`SUM` forms (the un-fold / partial-rebuild paths)
   match the by-construction rows; **tlp** —
   ternary-logic partitioning (above), an independent oracle for 3-valued NULL logic rather than an
-  optimization pair.
+  optimization pair. Three further relations are **algebraic-equivalence oracles** — like `tlp`, they
+  assert that equivalent *spellings* agree rather than an optimized-vs-unoptimized pair: **predicate**
+  — one predicate written many logically-equivalent ways (AND/OR commutativity, Kleene De Morgan,
+  double negation, `IN`↔OR-chain, `BETWEEN`↔`>= AND <=`) must return identical rows under 3VL,
+  exercising distinct parse/eval paths (desugaring, connective precedence) for the §8 boolean-connective
+  hotspot; **setop_logic** — the connective ↔ set-operation identities over a unique key (`WHERE p OR
+  q` ≡ `(WHERE p) UNION (WHERE q)`, `WHERE p AND q` ≡ `(WHERE p) INTERSECT (WHERE q)`), plus UNION /
+  INTERSECT / DISTINCT idempotence and a NULL-group DISTINCT collapse, driving the set-op dedup path
+  against the same logic; **join_comm** — INNER-JOIN commutativity (`a JOIN b` ≡ `b JOIN a`) and the
+  CROSS-JOIN-plus-filter equivalence (`a JOIN b ON a.k=b.k` ≡ `a CROSS JOIN b WHERE a.k=b.k`), the
+  same projected pairs through different execution shapes.
 - **NOT yet covered (needs a new relation):** any future index *range* / multi-column-prefix
   bound, DISTINCT / aggregate pushdown, or other optimization added later; on the TLP side,
   `SUM`/`MIN`/`MAX`/`AVG` aggregate partitioning (blocked on `COALESCE`/`LEAST`/`GREATEST`) and a
