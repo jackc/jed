@@ -177,13 +177,30 @@ func Lex(sql string) ([]Token, error) {
 				i++
 			}
 		case c == '!':
-			// `!=` is the PostgreSQL alias for `<>` (grammar.md §4); both fold to TokNe. A lone
-			// `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
-			if i+1 < len(b) && b[i+1] == '=' {
+			// `!~*` / `!~` are the negated regex match operators (grammar.md §22b), checked greedily
+			// BEFORE the `!=`→TokNe alias and the lone-`!` error. `!=` is the PostgreSQL alias for
+			// `<>`. A lone `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
+			if i+2 < len(b) && b[i+1] == '~' && b[i+2] == '*' {
+				tokens = append(tokens, Token{Kind: TokBangTildeStar})
+				i += 3
+			} else if i+1 < len(b) && b[i+1] == '~' {
+				tokens = append(tokens, Token{Kind: TokBangTilde})
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '=' {
 				tokens = append(tokens, Token{Kind: TokNe})
 				i += 2
 			} else {
 				return nil, NewError(SyntaxError, "unexpected character '!'")
+			}
+		case c == '~':
+			// `~*` is the case-insensitive regex match operator (grammar.md §22b), scanned greedily
+			// as one token (never `~` TokStar); a bare `~` is the case-sensitive form.
+			if i+1 < len(b) && b[i+1] == '*' {
+				tokens = append(tokens, Token{Kind: TokTildeStar})
+				i += 2
+			} else {
+				tokens = append(tokens, Token{Kind: TokTilde})
+				i++
 			}
 		case c == '@':
 			// `@>` is the array containment operator (grammar.md §40), scanned greedily as one

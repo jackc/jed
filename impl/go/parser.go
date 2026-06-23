@@ -2948,6 +2948,30 @@ func (p *Parser) parseComparison() (Expr, error) {
 		}
 		return Expr{Kind: ExprLike, Like: &LikeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}}, nil
 	}
+	// `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
+	// `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
+	// is the prefix-NOT over the whole match, taken a level up). The pattern is one CONCAT expression.
+	var rxNegated, rxInsensitive bool
+	rxMatch := true
+	switch p.peek().Kind {
+	case TokTilde:
+	case TokTildeStar:
+		rxInsensitive = true
+	case TokBangTilde:
+		rxNegated = true
+	case TokBangTildeStar:
+		rxNegated, rxInsensitive = true, true
+	default:
+		rxMatch = false
+	}
+	if rxMatch {
+		p.advance()
+		rhs, err := p.parseConcat()
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprRegex, Regex: &RegexExpr{Lhs: lhs, Rhs: rhs, Negated: rxNegated, Insensitive: rxInsensitive}}, nil
+	}
 	var op BinaryOp
 	switch p.peek().Kind {
 	case TokEq:
@@ -3915,6 +3939,14 @@ func renderToken(t Token) string {
 		return "&>"
 	case TokAdjacent:
 		return "-|-"
+	case TokTilde:
+		return "~"
+	case TokTildeStar:
+		return "~*"
+	case TokBangTilde:
+		return "!~"
+	case TokBangTildeStar:
+		return "!~*"
 	default: // TokEof — never inside the parentheses
 		return ""
 	}

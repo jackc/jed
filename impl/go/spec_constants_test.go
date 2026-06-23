@@ -410,6 +410,10 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.Collate
 		case "timezone":
 			return Costs.Timezone
+		case "regex_compile":
+			return Costs.RegexCompile
+		case "regex_step":
+			return Costs.RegexStep
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0

@@ -694,6 +694,9 @@ const (
 	// ExprLike is `lhs LIKE rhs` / `lhs NOT LIKE rhs` — a text pattern match with a dedicated
 	// matcher (spec/design/grammar.md §22).
 	ExprLike
+	// ExprRegex is `lhs ~ rhs` / `~*` / `!~` / `!~*` — a regular-expression match with a hand-written
+	// Pike VM (spec/design/grammar.md §22b, regex.md).
+	ExprRegex
 	// ExprCase is a CASE expression (searched or simple form), lazily evaluated
 	// (spec/design/grammar.md §23).
 	ExprCase
@@ -837,6 +840,7 @@ type Expr struct {
 	In          *InExpr         // ExprIn
 	Between     *BetweenExpr    // ExprBetween
 	Like        *LikeExpr       // ExprLike
+	Regex       *RegexExpr      // ExprRegex
 	Case        *CaseExpr       // ExprCase
 	Subquery    *QueryExpr      // ExprScalarSubquery, ExprExists (the inner query)
 	InSubquery  *InSubqueryExpr // ExprInSubquery
@@ -986,6 +990,18 @@ type BetweenExpr struct {
 // matcher. Negated carries the NOT keyword; Insensitive carries ILIKE (case-insensitive matching,
 // both sides simple-lowercased under the casing regime — collation.md §16).
 type LikeExpr struct {
+	Lhs         Expr
+	Rhs         Expr
+	Negated     bool
+	Insensitive bool
+}
+
+// RegexExpr is `Lhs ~ Rhs` / `~*` / `!~` / `!~*` — a regular-expression match (grammar.md §22b,
+// regex.md). jed's own RE2-able flavor (not PostgreSQL-compatible), matched by a hand-written
+// linear-time Pike VM. UNANCHORED (matches a substring). Both operands must be text; NULL
+// propagates. Negated carries `!~`/`!~*`; Insensitive carries `~*`/`!~*` (case-insensitive, both
+// sides simple-lowercased like ILIKE — collation.md §16).
+type RegexExpr struct {
 	Lhs         Expr
 	Rhs         Expr
 	Negated     bool

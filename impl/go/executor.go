@@ -2562,6 +2562,8 @@ func exprCallsSeqMutator(e *Expr) bool {
 		return exprCallsSeqMutator(&e.IsDistinct.Lhs) || exprCallsSeqMutator(&e.IsDistinct.Rhs)
 	case ExprLike:
 		return exprCallsSeqMutator(&e.Like.Lhs) || exprCallsSeqMutator(&e.Like.Rhs)
+	case ExprRegex:
+		return exprCallsSeqMutator(&e.Regex.Lhs) || exprCallsSeqMutator(&e.Regex.Rhs)
 	case ExprIn:
 		if exprCallsSeqMutator(&e.In.Lhs) {
 			return true
@@ -2992,6 +2994,9 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 	case ExprLike:
 		collectExprPrivs(&e.Like.Lhs, req, locals)
 		collectExprPrivs(&e.Like.Rhs, req, locals)
+	case ExprRegex:
+		collectExprPrivs(&e.Regex.Lhs, req, locals)
+		collectExprPrivs(&e.Regex.Rhs, req, locals)
 	case ExprIn:
 		collectExprPrivs(&e.In.Lhs, req, locals)
 		for i := range e.In.List {
@@ -3084,6 +3089,8 @@ func exprReadsColumns(e *Expr) bool {
 		return exprReadsColumns(&e.IsDistinct.Lhs) || exprReadsColumns(&e.IsDistinct.Rhs)
 	case ExprLike:
 		return exprReadsColumns(&e.Like.Lhs) || exprReadsColumns(&e.Like.Rhs)
+	case ExprRegex:
+		return exprReadsColumns(&e.Regex.Lhs) || exprReadsColumns(&e.Regex.Rhs)
 	case ExprIn:
 		if exprReadsColumns(&e.In.Lhs) {
 			return true
@@ -8030,6 +8037,8 @@ func countSelfRefsExpr(e Expr, name string) int {
 		return countSelfRefsExpr(e.Between.Lhs, name) + countSelfRefsExpr(e.Between.Lo, name) + countSelfRefsExpr(e.Between.Hi, name)
 	case ExprLike:
 		return countSelfRefsExpr(e.Like.Lhs, name) + countSelfRefsExpr(e.Like.Rhs, name)
+	case ExprRegex:
+		return countSelfRefsExpr(e.Regex.Lhs, name) + countSelfRefsExpr(e.Regex.Rhs, name)
 	case ExprCase:
 		n := 0
 		if e.Case.Operand != nil {
@@ -12409,6 +12418,10 @@ const (
 	reIsNull
 	reDistinct
 	reLike
+	// reRegex is `lhs ~ rhs` / `~*` / `!~` / `!~*` — a regular-expression match (regex.md). Matched
+	// by the hand-written Pike VM (regex.go); negated carries `!~`/`!~*`, insensitive carries
+	// `~*`/`!~*` (both sides simple-lowercased like ILIKE). A constant pattern is precompiled once.
+	reRegex
 	// reCasing is upper(text)/lower(text) — Unicode case folding (collation.md §16). casingUpper
 	// selects the direction; folds via the engine-global property table or the ASCII baseline.
 	reCasing
@@ -12670,13 +12683,19 @@ type rExpr struct {
 	rhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
 	operand *rExpr         // reCast, reNeg, reNot, reIsNull, reCasing
 	negated bool           // reIsNull, reDistinct
-	// insensitive carries ILIKE (reLike); casingUpper selects upper vs lower (reCasing) — both
-	// collation.md §16.
+	// insensitive carries ILIKE (reLike) / ~* (reRegex); casingUpper selects upper vs lower
+	// (reCasing) — both collation.md §16.
 	insensitive bool
 	casingUpper bool
 	// atTzToTimestamptz selects the AT TIME ZONE direction (reAtTimeZone): false is timestamptz→
 	// timestamp, true is timestamp→timestamptz (timezones.md §6).
 	atTzToTimestamptz bool
+	// reRegex: rxProgram is the precompiled NFA for a CONSTANT pattern (compiled once at resolve,
+	// the `col ~ 'literal'` case — regex.md §5); nil means the pattern is non-constant (compiled per
+	// row at eval). rxCompileCharged is the one-shot flag charging a precompiled program's
+	// regex_compile cost once per statement execution (on first eval), not per row.
+	rxProgram        *regexProgram
+	rxCompileCharged bool
 	// collation is the derived collation of a reCompare (spec/design/collation.md §7). nil is the
 	// C / default byte order (the unchanged fast path); non-nil is a loaded collation that orders the
 	// ORDERING comparisons (< <= > >=) by its UCA sort key. =/<> stay byte-equality regardless
@@ -13330,6 +13349,8 @@ func exprHasAggregate(e Expr) bool {
 		return exprHasAggregate(e.Between.Lhs) || exprHasAggregate(e.Between.Lo) || exprHasAggregate(e.Between.Hi)
 	case ExprLike:
 		return exprHasAggregate(e.Like.Lhs) || exprHasAggregate(e.Like.Rhs)
+	case ExprRegex:
+		return exprHasAggregate(e.Regex.Lhs) || exprHasAggregate(e.Regex.Rhs)
 	case ExprCase:
 		if e.Case.Operand != nil && exprHasAggregate(*e.Case.Operand) {
 			return true
@@ -13418,6 +13439,11 @@ func rejectCheckStructure(e Expr) error {
 			return err
 		}
 		return rejectCheckStructure(e.Like.Rhs)
+	case ExprRegex:
+		if err := rejectCheckStructure(e.Regex.Lhs); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.Regex.Rhs)
 	case ExprIn:
 		if err := rejectCheckStructure(e.In.Lhs); err != nil {
 			return err
@@ -13529,6 +13555,11 @@ func rejectDefaultStructure(e Expr) error {
 			return err
 		}
 		return rejectDefaultStructure(e.Like.Rhs)
+	case ExprRegex:
+		if err := rejectDefaultStructure(e.Regex.Lhs); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.Regex.Rhs)
 	case ExprIn:
 		if err := rejectDefaultStructure(e.In.Lhs); err != nil {
 			return err
@@ -13630,6 +13661,9 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 		case ExprLike:
 			walk(e.Like.Lhs)
 			walk(e.Like.Rhs)
+		case ExprRegex:
+			walk(e.Regex.Lhs)
+			walk(e.Regex.Rhs)
 		case ExprIn:
 			walk(e.In.Lhs)
 			for _, elem := range e.In.List {
@@ -16547,6 +16581,35 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reLike, lhs: rl, rhs: rr, negated: e.Like.Negated, insensitive: e.Like.Insensitive},
 			resolvedType{kind: rtBool}, nil
+	case ExprRegex:
+		// ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand typing
+		// as LIKE: resolve the pair, require both text (or a bare NULL); a non-text operand is 42804.
+		rl, lt, rr, rt, err := resolveOperandPair(s, e.Regex.Lhs, e.Regex.Rhs, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireTextOrNull(lt); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireTextOrNull(rt); err != nil {
+			return nil, resolvedType{}, err
+		}
+		// Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per row at
+		// eval. For ~* the constant is case-folded before compiling (the ILIKE mechanism). A malformed
+		// pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
+		var prog *regexProgram
+		if rr.kind == reConstText {
+			pat := rr.cText
+			if e.Regex.Insensitive {
+				pat = FoldLowerSimple(pat, LoadedProperty())
+			}
+			prog, err = compileRegex(pat)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+		return &rExpr{kind: reRegex, lhs: rl, rhs: rr, negated: e.Regex.Negated, insensitive: e.Regex.Insensitive, rxProgram: prog},
+			resolvedType{kind: rtBool}, nil
 	case ExprCase:
 		// Resolve each branch's condition: searched form requires a boolean WHEN (42804
 		// otherwise); simple form desugars to `operand = value` (reusing the `=` operand pairing
@@ -18926,6 +18989,67 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return Value{}, err
 		}
 		// negated carries NOT LIKE/ILIKE: matched != negated flips for the NOT form.
+		return BoolValue(matched != e.negated), nil
+	case reRegex:
+		m.Charge(Costs.OperatorEval)
+		subject, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		pattern, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		// NULL propagates BEFORE the matcher runs (regex.md §1) — a malformed pattern against a NULL
+		// operand is still NULL, never 2201B.
+		if subject.Kind == ValNull || pattern.Kind == ValNull {
+			return NullValue(), nil
+		}
+		sub := subject.Str
+		var prop *PropertyTable
+		if e.insensitive {
+			// ~* (insensitive): simple-lowercase the subject under the engine casing regime
+			// (collation.md §16). The constant pattern was folded at resolve; a non-constant pattern
+			// is folded below before compiling.
+			prop = LoadedProperty()
+			sub = FoldLowerSimple(sub, prop)
+		}
+		subjRunes := []rune(sub)
+		var matched bool
+		if e.rxProgram != nil {
+			// Constant precompiled pattern: charge its regex_compile cost ONCE per statement
+			// execution (on first eval), not per row (regex.md §5).
+			if !e.rxCompileCharged {
+				e.rxCompileCharged = true
+				m.Charge(Costs.RegexCompile * int64(e.rxProgram.ninst()))
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+			}
+			matched, err = e.rxProgram.isMatch(subjRunes, m)
+			if err != nil {
+				return Value{}, err
+			}
+		} else {
+			// Non-constant pattern: compile now (charging regex_compile) and run.
+			pat := pattern.Str
+			if e.insensitive {
+				pat = FoldLowerSimple(pat, prop)
+			}
+			prog, err := compileRegex(pat)
+			if err != nil {
+				return Value{}, err
+			}
+			m.Charge(Costs.RegexCompile * int64(prog.ninst()))
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+			matched, err = prog.isMatch(subjRunes, m)
+			if err != nil {
+				return Value{}, err
+			}
+		}
+		// negated carries !~ / !~*: matched != negated flips for the negated form.
 		return BoolValue(matched != e.negated), nil
 	case reCasing:
 		m.Charge(Costs.OperatorEval)

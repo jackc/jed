@@ -92,6 +92,17 @@ const (
 	// TokAdjacent is the "-|-" range adjacency operator (a -|- b). "-" "|" "-", scanned greedily and
 	// checked BEFORE the "--" line comment. range-functions.md §3 (RF3).
 	TokAdjacent
+	// TokTilde is the "~" regular-expression match operator (s ~ p). grammar.md §22b, regex.md.
+	TokTilde
+	// TokTildeStar is the "~*" case-insensitive regex match operator (s ~* p). "~" then "*", scanned
+	// greedily (so "~*" is one token, never "~" TokStar). grammar.md §22b.
+	TokTildeStar
+	// TokBangTilde is the "!~" negated regex match operator (s !~ p). "!" then "~", checked in the
+	// "!" arm BEFORE "!="→TokNe and the lone-"!" error. grammar.md §22b.
+	TokBangTilde
+	// TokBangTildeStar is the "!~*" negated case-insensitive regex match operator (s !~* p). "!" "~"
+	// "*", scanned greedily. grammar.md §22b.
+	TokBangTildeStar
 	// TokParam is a bind parameter $N — Int holds the 1-based index. The lexer rejects $0, a
 	// leading zero ($01), and $ with no following digit (42601). Bound by the host API, not the
 	// corpus (spec/design/api.md, grammar.md §5).
