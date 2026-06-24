@@ -96,18 +96,19 @@ class DatabaseTest < Minitest::Test
     end
   end
 
-  # Non-coerced types come back as their canonical render String, losslessly (ruby.md §3/§6).
+  # Types with no clean native Ruby counterpart come back as their canonical render String,
+  # losslessly (ruby.md §3). (decimal/date/timestamp coercion lives in rich_types_test.rb.)
   def test_non_coerced_types_render_as_string
     Jed.memory do |db|
       row = db.query(<<~SQL).first
         SELECT
-          1.50::decimal           AS d,
-          DATE '2020-01-02'       AS dt,
-          '\\xdeadbeef'::bytea     AS by
+          '\\xdeadbeef'::bytea                              AS by,
+          '12345678-1234-1234-1234-123456789abc'::uuid    AS u,
+          INTERVAL '1 day'                                AS iv
       SQL
-      assert_equal "1.50", row[:d]
-      assert_equal "2020-01-02", row[:dt]
       assert_equal "\\xdeadbeef", row[:by]
+      assert_equal "12345678-1234-1234-1234-123456789abc", row[:u]
+      assert_equal "1 day", row[:iv]
     end
   end
 

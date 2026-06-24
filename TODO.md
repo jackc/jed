@@ -734,9 +734,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `42P18` all surface as `Jed::Error`). Gem-side `ArgumentError` guards for an unsupported type
         or an out-of-i64 `Integer` (`pack("q<")` silently wraps, so the range is checked). Corpus
         stays literal-only (params are host-API; api.md §5). → [ruby.md §3a](spec/design/ruby.md)
-  - [ ] _follow-on (each its own slice):_ **richer typed values** (opt-in
-        `BigDecimal`/`Time`/`Date` for the String-today types — on read and as bind params beyond
-        the slice-2 scalar set); **host-loaded bundles**
+  - [x] **Slice 3 — richer typed values (AR-style, always-on).** `decimal`⇄`BigDecimal`,
+        `date`⇄`Date`, `timestamp`/`timestamptz`⇄`Time` (UTC), both read and bind (ABI v3, tags
+        DECIMAL/DATE/TSTZ). Mirrors ActiveRecord's PostgreSQL adapter, incl. **`±infinity` →
+        `±Float::INFINITY`** (which `Date`/`Time` can't hold — so a date/timestamp column is
+        `Date|Float` / `Time|Float`) and BC via astronomical years. Always-on, not opt-in: the rule
+        is **totality** — coerce iff Ruby has a faithful total type (jed `decimal` is finite-only ⇒
+        `BigDecimal` is total; the ±infinity sentinel is the one gap, handled AR's way). Adds the
+        **`bigdecimal`** gemspec dependency (a Ruby *bundled* stdlib gem — the `pg` gem declares it
+        too; `date` stays a default gem). → [ruby.md §3](spec/design/ruby.md)
+  - [ ] _follow-on (each its own slice):_ **`interval`/`uuid`/`bytea` typed coercion** (left as
+        String — no single obvious native target); **host-loaded bundles**
         (`load_unicode_data`/`load_time_zone_data` for collation/tz); **distributable packaging**
         — a `gem install`-able native gem via **`rb-sys` + precompiled platform gems** (or
         `magnus` for richer Rust ergonomics), replacing the in-repo `rake ruby:build` step (a

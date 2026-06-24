@@ -69,16 +69,25 @@ end
 
 ### Values
 
-Cells come back coerced to native Ruby for the unambiguous scalars and as their canonical
-String otherwise (lossless), with SQL `NULL` always `nil`:
+Cells come back coerced to native Ruby (mirroring ActiveRecord's PostgreSQL adapter), with SQL
+`NULL` always `nil` and anything without a faithful native type left as its canonical String:
 
-| jed type            | Ruby value                                   |
-| ------------------- | -------------------------------------------- |
-| `i16` `i32` `i64`   | `Integer`                                    |
-| `f32` `f64`         | `Float` (incl. `Infinity`/`-Infinity`/`NaN`) |
-| `boolean`           | `true` / `false`                             |
-| NULL                | `nil`                                        |
-| everything else     | `String` (the engine's canonical rendering)  |
+| jed type                     | Ruby value                                          |
+| ---------------------------- | --------------------------------------------------- |
+| `i16` `i32` `i64`            | `Integer`                                           |
+| `f32` `f64`                  | `Float` (incl. `Infinity`/`-Infinity`/`NaN`)        |
+| `boolean`                    | `true` / `false`                                    |
+| `decimal`                    | `BigDecimal` (exact)                                |
+| `date`                       | `Date`, or `±Float::INFINITY` for `±infinity`       |
+| `timestamp` `timestamptz`    | `Time` (UTC), or `±Float::INFINITY` for `±infinity` |
+| NULL                         | `nil`                                               |
+| `interval` `uuid` `bytea` …  | `String` (the engine's canonical rendering)         |
+
+Bind params accept the same set in reverse — `nil`, `Integer`, `Float`, `true`/`false`, `String`,
+`BigDecimal`, `Date`, and `Time`/`DateTime` — and the engine type-checks each against its column.
+Like ActiveRecord, an infinite `date`/`timestamp` reads back as `±Float::INFINITY` (so those
+columns are `Date|Float` / `Time|Float`); a zoneless `timestamp` and a `timestamptz` both read as a
+UTC `Time`.
 
 ## Build & test (in-repo)
 

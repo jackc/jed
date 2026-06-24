@@ -97,29 +97,52 @@ encoding the `$N` values, little-endian:
 
 ```
 u32 nparams ; nparams×( u8 tag ; payload )
-  0 NULL  : (no payload)        2 FLOAT : f64           4 TEXT : u32 len + utf8 bytes
-  1 INT   : i64                 3 BOOL  : u8 (0/1)
+  0 NULL  : (no payload)        2 FLOAT : f64           4 TEXT    : u32 len + utf8 bytes
+  1 INT   : i64                 3 BOOL  : u8 (0/1)       5 DECIMAL : u8 neg ; u32 len + ascii digits ; u32 scale
+                                                         6 DATE    : i32 days since 1970-01-01
+                                                         7 TSTZ    : i64 µs since the 1970-01-01 UTC epoch
 ```
 
-The gem encodes one Ruby scalar per param ([params.rb](../../impl/ruby/lib/jed/params.rb)) —
-`nil`→NULL, `Integer`→INT, `Float`→FLOAT, `true`/`false`→BOOL, `String`→TEXT — and the native side
-decodes each to a `Value`. The engine then **context-types** every `$N` against its use site and
-coerces/range-checks the bound value two-phase before any row is touched (api.md §5): an `Integer`
-binds equally to an `i16`/`i32`/`i64`/`decimal` site, an out-of-range value traps `22003` at bind,
-a NULL into a `NOT NULL` column `23502`, an undetermined type `42P18`. Two gem-side guards raise an
-`ArgumentError` *before* the call (a programming error, not a SQL one): an unsupported Ruby type, or
-an `Integer` outside the i64 range (`Array#pack("q<")` would silently *wrap* it, so the range is
-checked explicitly). Richer typed binds (`BigDecimal`/`Time`/array/…) are a follow-on (§6).
+The gem encodes one Ruby value per param ([params.rb](../../impl/ruby/lib/jed/params.rb)) —
+`nil`→NULL, `Integer`→INT, `Float`→FLOAT, `true`/`false`→BOOL, `String`→TEXT, `BigDecimal`→DECIMAL
+(decomposed via `BigDecimal#split` into sign/digits/scale and rebuilt with `Decimal::from_digits_scale`),
+`Date`→DATE (days via `Date` arithmetic, BC-correct), `Time`/`DateTime`→TSTZ (an instant in µs) — and
+the native side decodes each to a `Value`. The engine then **context-types** every `$N` against its
+use site and coerces/range-checks the bound value two-phase before any row is touched (api.md §5): an
+`Integer` binds equally to an `i16`/`i32`/`i64`/`decimal` site, an out-of-range value traps `22003`
+at bind, a NULL into a `NOT NULL` column `23502`, an undetermined type `42P18`, a `BigDecimal` into an
+integer column a clean type error. Gem-side guards raise an `ArgumentError` *before* the call (a
+programming error, not a SQL one): an unsupported Ruby type, an `Integer` outside the i64 range
+(`Array#pack("q<")` would silently *wrap* it, so the range is checked explicitly), a non-finite
+`BigDecimal` (jed decimal is finite-only), or a `Date`/`Time` outside jed's representable range.
 
 **The value-rendering contract.** A query cell's text is exactly **`Value::render()`** — the
-same canonical rendering the Rust conformance harness emits — so the gem prints byte-identical
-to the corpus. A SQL **NULL is the `is_null` flag**, never the string `"NULL"`, so the gem can
-distinguish a NULL from a `text` value that happens to render as `"NULL"`. The gem then
-**coerces** the unambiguous scalars to native Ruby — `i16`/`i32`/`i64` → `Integer`, `f32`/`f64`
-→ `Float` (with `Infinity`/`-Infinity`/`NaN`), `boolean` → `true`/`false`, NULL → `nil` — and
-leaves everything else (`decimal`, `timestamp`/`tz`, `date`, `interval`, `uuid`, `bytea`,
-`range`, `array`, composite) as its **canonical String**: lossless and surprise-free
-([coerce.rb](../../impl/ruby/lib/jed/coerce.rb)).
+same canonical rendering the Rust conformance harness emits — so the gem reads byte-identical to
+the corpus. A SQL **NULL is the `is_null` flag**, never the string `"NULL"`, so the gem can
+distinguish a NULL from a `text` value that happens to render as `"NULL"`. The gem then **coerces**
+to native Ruby ([coerce.rb](../../impl/ruby/lib/jed/coerce.rb)), **mirroring ActiveRecord's
+PostgreSQL adapter** — coerce wherever Ruby has a faithful type, leave the rest as the canonical
+String:
+
+| jed type | Ruby |
+|---|---|
+| `i16`/`i32`/`i64` | `Integer` |
+| `f32`/`f64` | `Float` (incl. `±Infinity`/`NaN`) |
+| `boolean` | `true`/`false` |
+| `decimal` | `BigDecimal` (finite-only → always clean) |
+| `date` | `Date`, or `±Float::INFINITY` for `±infinity` |
+| `timestamp`/`timestamptz` | `Time` (UTC), or `±Float::INFINITY` for `±infinity` |
+| NULL | `nil` |
+| `interval`/`uuid`/`bytea`/`range`/`array`/composite | canonical `String` |
+
+The principle is **totality**: coerce iff Ruby's type is a faithful, total target for jed's value
+space. `Integer`/`Float`/`BigDecimal` are total (no jed value escapes them — jed `decimal` is
+finite-only). `date`/`timestamp` carry a first-class **`±infinity`** that `Date`/`Time` cannot hold,
+so — exactly as AR does — those values become **`±Float::INFINITY`** (the column's Ruby type is then
+`Date|Float` / `Time|Float`). A zoneless `timestamp` and a `timestamptz` both decode to a **UTC**
+`Time` (AR's `default_timezone = :utc` convention); BC dates use astronomical year numbering, which
+`Date`/`Time` share. A render shape the parser doesn't recognize degrades to the String rather than
+raising.
 
 ## 4. Memory safety & untrusted queries
 
@@ -153,11 +176,13 @@ beside a newer gem fails loudly, never as a silent wire misparse.
   itself (marshalling, value coercion, NULL handling, handle lifecycle, error mapping,
   persistence). SQL semantics stay in the shared corpus, inherited by construction.
 - **Landed:** create/open/execute/commit/close over literal SQL (slice 1); **`$N` bind
-  parameters** (slice 2 — §3a, ABI v2).
+  parameters** (slice 2 — §3a, ABI v2); **richer typed values** — `BigDecimal`/`Date`/`Time`
+  coercion both directions, AR-style, always-on (slice 3 — §3, ABI v3; adds the `bigdecimal`
+  gemspec dependency, a bundled stdlib gem).
 - **Follow-ons:**
-  - **Richer typed values** — optional `BigDecimal` / `Time` / `Date` coercion for the
-    String-today types, both on read (the coerce table) and as bind params (beyond the slice-2
-    `nil`/`Integer`/`Float`/bool/`String` set), behind an explicit opt-in.
+  - **`interval` / `uuid` / `bytea`** typed coercion — the remaining String-today scalars
+    (`ActiveSupport::Duration` / a `uuid` wrapper / an ASCII-8BIT `String`), if the demand appears.
+    Left as String for now (no single obvious native target, unlike decimal/date/time).
   - **Host-loaded bundles** — expose `load_unicode_data` / `load_time_zone_data` so the gem can
     run collation / time-zone features (collation.md, timezones.md).
   - **Distributable packaging** — a `gem install`-able native gem via **`rb-sys` + precompiled

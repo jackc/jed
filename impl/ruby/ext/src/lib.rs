@@ -33,17 +33,20 @@
 //!
 //! ```text
 //! u32 nparams ; nparams×( u8 tag ; payload )
-//!   tag 0 NULL  : (no payload)
-//!   tag 1 INT   : i64
-//!   tag 2 FLOAT : f64
-//!   tag 3 BOOL  : u8 (0/1)
-//!   tag 4 TEXT  : u32 len + utf8 bytes
+//!   tag 0 NULL        : (no payload)
+//!   tag 1 INT         : i64
+//!   tag 2 FLOAT       : f64
+//!   tag 3 BOOL        : u8 (0/1)
+//!   tag 4 TEXT        : u32 len + utf8 bytes
+//!   tag 5 DECIMAL     : u8 neg ; u32 len + ascii digits ; u32 scale   (BigDecimal)
+//!   tag 6 DATE        : i32 days since 1970-01-01                     (Date)
+//!   tag 7 TIMESTAMPTZ : i64 µs since the 1970-01-01 UTC epoch         (Time)
 //! ```
 //!
-//! Each decodes to a `Value` (`Int`/`Float64`/`Bool`/`Text`/`Null`); the engine then **context-
-//! types** every `$N` against its use site and coerces/range-checks the bound value two-phase
-//! before any row is touched (api.md §5) — e.g. an integer bound to an `i16` column that overflows
-//! traps `22003` at bind. Richer typed binds (decimal/timestamp/array) are a follow-on (ruby.md §6).
+//! Each decodes to a `Value` (`Int`/`Float64`/`Bool`/`Text`/`Decimal`/`Date`/`Timestamptz`/`Null`);
+//! the engine then **context-types** every `$N` against its use site and coerces/range-checks the
+//! bound value two-phase before any row is touched (api.md §5) — e.g. an integer bound to an `i16`
+//! column that overflows traps `22003` at bind.
 
 // Every `extern "C"` export below dereferences caller-supplied raw pointers — the nature of an FFI
 // boundary. Clippy's `not_unsafe_ptr_arg_deref` would have us mark them `unsafe fn`, but a
@@ -59,8 +62,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// The ABI version. The Ruby side checks this against its own constant on load and refuses a
 /// mismatch (ruby.md §5), so a stale cdylib next to a newer gem fails loudly, never silently.
-/// Bumped to 2 when [`jed_execute`] grew its bind-parameter arguments.
-const ABI_VERSION: u32 = 2;
+/// Bumped to 2 when [`jed_execute`] grew its bind-parameter arguments, to 3 for the decimal/date/
+/// timestamp param tags.
+const ABI_VERSION: u32 = 3;
 
 const TAG_ERROR: u8 = 0;
 const TAG_STATEMENT: u8 = 1;
@@ -246,6 +250,10 @@ impl ParamReader<'_> {
         self.take(4)
             .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
     }
+    fn i32(&mut self) -> Option<i32> {
+        self.take(4)
+            .map(|s| i32::from_le_bytes(s.try_into().unwrap()))
+    }
     fn i64(&mut self) -> Option<i64> {
         self.take(8)
             .map(|s| i64::from_le_bytes(s.try_into().unwrap()))
@@ -282,6 +290,23 @@ fn decode_params(ptr: *const u8, len: u32) -> Result<Vec<Value>, *mut u8> {
                     .map_err(|_| err_buf("XX000", "bind text parameter is not valid UTF-8"))?;
                 Value::Text(text.to_string())
             }
+            // DECIMAL: (u8 neg, u32 len + ascii digit string, u32 scale) — the gem decomposes a
+            // Ruby BigDecimal into its sign/unscaled-coefficient/scale; we rebuild the exact value.
+            5 => {
+                let neg = r.u8().ok_or_else(malformed_params)? != 0;
+                let n = r.u32().ok_or_else(malformed_params)? as usize;
+                let digits = std::str::from_utf8(r.take(n).ok_or_else(malformed_params)?)
+                    .map_err(|_| malformed_params())?
+                    .to_string();
+                let scale = r.u32().ok_or_else(malformed_params)?;
+                Value::Decimal(jed::decimal::Decimal::from_digits_scale(
+                    neg, &digits, scale,
+                ))
+            }
+            // DATE: i32 days since 1970-01-01 (the gem computes it via Date arithmetic, BC-correct).
+            6 => Value::Date(r.i32().ok_or_else(malformed_params)?),
+            // TIMESTAMPTZ: i64 µs since the 1970-01-01 UTC epoch (a Ruby Time is an instant).
+            7 => Value::Timestamptz(r.i64().ok_or_else(malformed_params)?),
             _ => return Err(err_buf("XX000", "unknown bind-parameter type tag")),
         };
         out.push(value);

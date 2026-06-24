@@ -27,6 +27,12 @@ Gem::Specification.new do |spec|
     %w[README.md]
   spec.require_paths = ["lib"]
 
+  # bigdecimal is a Ruby BUNDLED gem (no longer default), so a gem that requires it must declare it
+  # — otherwise a consumer under Bundler hits the bundled_gems load guard (the `pg` gem declares it
+  # for the same reason). It backs the always-on `numeric → BigDecimal` mapping (ruby.md §3). `date`
+  # is still a default gem, so it needs no declaration.
+  spec.add_dependency "bigdecimal"
+
   spec.metadata = {
     "rubygems_mfa_required" => "true",
   }
