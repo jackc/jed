@@ -15148,22 +15148,23 @@ enum AggCtx {
 
 /// The placeholder base a window query's window results carry until `rebase_placeholder_cols` rewrites
 /// them to `input_width + window_keys.len() + w` (spec/design/window.md §5.1). Far above any real
-/// column/synthetic-slot count, and below 2⁵³ so it is exact in the TS core's `number`.
-const WINDOW_RESULT_BASE: usize = 1 << 40;
+/// column/synthetic-slot count, and below 2³¹ so it is valid on a 32-bit `usize` (the wasm32 build)
+/// as well as f64-exact in the TS core's `number`. Kept identical across the three cores.
+const WINDOW_RESULT_BASE: usize = 1 << 28;
 
 /// The placeholder base a materialized window-key expression (a non-column PARTITION BY / ORDER BY
 /// key — `PARTITION BY a + b`) carries until the rebase pass rewrites it to its real synthetic slot
 /// `input_width + k` (spec/design/window.md §5.1). Disjoint from `WINDOW_RESULT_BASE`'s range, and
-/// below 2⁵³ for the TS core. A bare-column key is NOT materialized — it keeps its real row slot.
-const WINDOW_KEY_BASE: usize = 1 << 41;
+/// below 2³¹ (32-bit-`usize` / wasm32 safe). A bare-column key is NOT materialized — it keeps its real row slot.
+const WINDOW_KEY_BASE: usize = 1 << 29;
 
 /// The placeholder base a `GROUPING(...)` call carries until the rebase pass rewrites it to its real
 /// trailing synthetic slot `group_keys.len() + agg_specs.len() + grouping_index` (the GROUPING
 /// results follow the master columns + aggregate results in the grouped row —
-/// spec/design/aggregates.md §12). Disjoint from the window bases, below 2⁵³ for the TS core.
+/// spec/design/aggregates.md §12). Disjoint from the window bases, below 2³¹ (32-bit-`usize` / wasm32 safe).
 /// GROUPING is mutually exclusive with window functions, so its placeholders never coexist with the
 /// window ones in a projection.
-const GROUPING_GS_BASE: usize = 1 << 42;
+const GROUPING_GS_BASE: usize = 1 << 30;
 
 /// The maximum number of grouping sets a `GROUP BY` may expand to (`CUBE` of n columns alone is
 /// 2ⁿ). Beyond this the statement is aborted `54001` (statement_too_complex) — jed's structural-

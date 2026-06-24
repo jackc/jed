@@ -10468,23 +10468,24 @@ function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]):
 
 // WINDOW_RESULT_BASE is the placeholder base a grouped+window query's window results carry until
 // rebaseWindowResults rewrites them to groupKeys.length+aggSpecs.length+w (spec/design/window.md
-// §5.1). Far above any real column/synthetic-slot count, and below 2^53 so it stays an exact number.
-// (Written as 2**40, not 1<<40 — JS bitwise operators are 32-bit and would wrap.)
-const WINDOW_RESULT_BASE = 2 ** 40;
+// §5.1). Far above any real column/synthetic-slot count, and below 2^31 so it is valid on a 32-bit
+// usize (the Rust wasm32 build) as well as an exact number here. Kept identical across the three cores.
+// (Written as 2**28, not 1<<28, to match the WINDOW_KEY/GROUPING bases below where a 1<<N would risk wrap.)
+const WINDOW_RESULT_BASE = 2 ** 28;
 
 // WINDOW_KEY_BASE is the placeholder base a materialized window-key expression (a non-column
 // PARTITION BY / ORDER BY key — `PARTITION BY a + b`) carries until the rebase pass rewrites it to
 // its real synthetic slot inputWidth+k (spec/design/window.md §5.1). Disjoint from
-// WINDOW_RESULT_BASE's range, below 2**53 for exactness. A bare-column key is NOT materialized — it
-// keeps its real row slot. (2 ** 41, NOT 1 << 41 — JS bitwise is 32-bit.)
-const WINDOW_KEY_BASE = 2 ** 41;
+// WINDOW_RESULT_BASE's range, below 2**31 (32-bit-usize / wasm32 safe). A bare-column key is NOT
+// materialized — it keeps its real row slot. (2 ** 29.)
+const WINDOW_KEY_BASE = 2 ** 29;
 
 // GROUPING_GS_BASE is the placeholder base a GROUPING(...) call carries until the rebase pass rewrites
 // it to its real trailing synthetic slot groupKeys.length+aggSpecs.length+g (the GROUPING results
 // follow the master columns + aggregate results — spec/design/aggregates.md §12). Disjoint from the
-// window bases, below 2**53 for exactness. GROUPING is mutually exclusive with window functions, so
-// its placeholders never coexist with the window ones in a projection. (2 ** 42, NOT 1 << 42.)
-const GROUPING_GS_BASE = 2 ** 42;
+// window bases, below 2**31 (32-bit-usize / wasm32 safe). GROUPING is mutually exclusive with window
+// functions, so its placeholders never coexist with the window ones in a projection. (2 ** 30.)
+const GROUPING_GS_BASE = 2 ** 30;
 
 // MAX_GROUPING_SETS bounds a GROUP BY's total expansion (CUBE of n columns alone is 2^n). Beyond this
 // the statement is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (a

@@ -13243,22 +13243,22 @@ func collectTouched(e *rExpr, depth int, touched []bool) {
 
 // windowResultBase is the placeholder base a window query's window results carry until
 // rebaseWindowResults rewrites them to inputWidth+len(windowKeys)+w (spec/design/window.md §5.1).
-// Far above any real column/synthetic-slot count, and below 2^53 so it is exact in the TS core's
-// number.
-const windowResultBase = 1 << 40
+// Far above any real column/synthetic-slot count, and below 2^31 so it is valid on a 32-bit usize
+// (the Rust wasm32 build) as well as f64-exact in the TS core. Kept identical across the three cores.
+const windowResultBase = 1 << 28
 
 // windowKeyBase is the placeholder base a materialized window-key expression (a non-column PARTITION
 // BY / ORDER BY key — `PARTITION BY a + b`) carries until the rebase pass rewrites it to its real
 // synthetic slot inputWidth+k (spec/design/window.md §5.1). Disjoint from windowResultBase's range,
-// below 2^53 for the TS core. A bare-column key is NOT materialized — it keeps its real row slot.
-const windowKeyBase = 1 << 41
+// below 2^31 (32-bit-usize / wasm32 safe). A bare-column key is NOT materialized — it keeps its real row slot.
+const windowKeyBase = 1 << 29
 
 // groupingGsBase is the placeholder base a GROUPING(...) call carries until the rebase pass rewrites
 // it to its real trailing synthetic slot len(groupKeys)+len(aggSpecs)+g (the GROUPING results follow
 // the master columns + aggregate results — spec/design/aggregates.md §12). Disjoint from the window
-// bases, below 2^53 for the TS core. GROUPING is mutually exclusive with window functions, so its
+// bases, below 2^31 (32-bit-usize / wasm32 safe). GROUPING is mutually exclusive with window functions, so its
 // placeholders never coexist with the window ones in a projection.
-const groupingGsBase = 1 << 42
+const groupingGsBase = 1 << 30
 
 // maxGroupingSets bounds a GROUP BY's total expansion (CUBE of n columns alone is 2^n). Beyond this
 // the statement is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (a
