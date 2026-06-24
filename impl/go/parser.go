@@ -976,6 +976,18 @@ func (p *Parser) parseCreateType() (*CreateType, error) {
 	if err := p.expect(TokLParen); err != nil {
 		return nil, err
 	}
+	fields, err := p.parseFieldDefList()
+	if err != nil {
+		return nil, err
+	}
+	return &CreateType{Name: name, Fields: fields}, nil
+}
+
+// parseFieldDefList parses a `( field type [numeric(p,s)] [[]] [NOT NULL] [, …] )` field-definition
+// list — the body shared by `CREATE TYPE … AS (…)` (composite.md) and a FROM-clause **column-
+// definition list** `AS t(col type, …)` (C0, json-table.md §1). The caller has consumed the opening
+// `(`; this consumes through the matching `)`.
+func (p *Parser) parseFieldDefList() ([]TypeFieldDef, error) {
 	var fields []TypeFieldDef
 	for {
 		fname, err := p.expectIdentifier()
@@ -1017,7 +1029,7 @@ func (p *Parser) parseCreateType() (*CreateType, error) {
 		}
 		return nil, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
-	return &CreateType{Name: name, Fields: fields}, nil
+	return fields, nil
 }
 
 // parseDropType parses `DROP TYPE [IF EXISTS] <name> [RESTRICT | CASCADE]`
@@ -2336,14 +2348,28 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 		p.advance()
 		alias = &a
 	}
-	// The column-alias-list form `... AS g(n)` is a deferred narrowing (grammar.md §35): a `(`
-	// after the alias is unambiguous (a base table never has one there) and rejected.
+	// A `(` after the alias is a FROM-clause list on a table function (a base table never has one
+	// there). The TYPED column-definition list `AS t(col type, …)` (C0, json-table.md §1) — for the
+	// record-returning functions — is parsed here; the rename-only form `AS g(col)` (no type) stays a
+	// deferred narrowing (grammar.md §35).
+	var columnDefs []TypeFieldDef
 	if alias != nil && p.peek().Kind == TokLParen {
-		return TableRef{}, NewError(FeatureNotSupported,
-			"column alias list on a table function is not supported yet")
+		// Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. With the
+		// cursor still on `(`, the first column name is at offset 1, so a `Word` at offset 2 means a
+		// type follows (col-def list).
+		if p.peekKindAt(2) != TokWord {
+			return TableRef{}, NewError(FeatureNotSupported,
+				"column alias list on a table function is not supported yet")
+		}
+		p.advance() // (
+		defs, err := p.parseFieldDefList()
+		if err != nil {
+			return TableRef{}, err
+		}
+		columnDefs = defs
 	}
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
-	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args, Lateral: lateral}, nil
+	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args, ColumnDefs: columnDefs, Lateral: lateral}, nil
 }
 
 // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).

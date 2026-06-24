@@ -9268,7 +9268,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			if lateralEligible {
 				srfParent = lateralParent
 			}
-			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, srfParent, ctes, ptypes)
+			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, tref.ColumnDefs, srfParent, ctes, ptypes)
 			if serr != nil {
 				return nil, serr
 			}
@@ -9833,17 +9833,31 @@ func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSl
 // type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows PostgreSQL's
 // single-column function-alias rule: the table alias when one is given (generate_series(1,5) AS g
 // ⇒ column g), else the function name generate_series.
-func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Database) resolveSRF(name string, args []*Expr, alias *string, columnDefs []TypeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
 	// inherited so an arg subquery can reference a CTE (cte.md §2).
 	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+	lname := strings.ToLower(name)
+	// Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
+	// json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
+	// `AS t(col type, …)`. Dispatched first, before the col-def-list guard below.
+	switch lname {
+	case "json_to_record", "jsonb_to_record", "json_to_recordset", "jsonb_to_recordset":
+		jsonb := strings.HasPrefix(lname, "jsonb")
+		set := strings.HasSuffix(lname, "set")
+		return db.resolveJSONRecord(lname, jsonb, set, args, alias, columnDefs, argScope, ptypes)
+	}
+	// A column-definition list is valid ONLY on a record-returning function (PG).
+	if columnDefs != nil {
+		return nil, nil, NewError(SyntaxError,
+			"a column definition list is only allowed for a record-returning function, not "+name)
+	}
 	switch {
 	case strings.EqualFold(name, "generate_series"):
 		return db.resolveGenerateSeries(args, alias, argScope, ptypes)
 	case strings.EqualFold(name, "unnest"):
 		return db.resolveUnnest(args, alias, argScope, ptypes)
 	}
-	lname := strings.ToLower(name)
 	// json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
 	// jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
 	// json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
@@ -9915,6 +9929,57 @@ func (db *Database) resolveJSONEach(name string, kind srfKind, valueTy Type, arg
 	}
 	table := srfTableCols(name, alias, []srfCol{{"key", ScalarT(Text)}, {"value", valueTy}})
 	return table, &srfPlan{kind: kind, args: []*rExpr{r}}, nil
+}
+
+// resolveJSONRecord resolves a json/jsonb RECORD-returning SRF (R1 — json[b]_to_record /
+// json[b]_to_recordset, json-table.md §2): the one argument is a json/jsonb document; the output
+// columns come from the C0 col-def list `AS t(col type, …)` (required — else 42601). The synthetic
+// table's columns are the declared types (a composite/array column type is a deferred 0A000), and
+// the srfPlan carries them as recordCols so the row generator can map members → columns by name.
+func (db *Database) resolveJSONRecord(name string, jsonb, set bool, args []*Expr, alias *string, columnDefs []TypeFieldDef, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	if len(args) != 1 {
+		return nil, nil, noFuncOverload(name)
+	}
+	want := Json
+	if jsonb {
+		want = Jsonb
+	}
+	forbidden := &aggCtx{}
+	r, t, err := resolve(argScope, *args[0], &want, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	ok := t.kind == rtNull || (jsonb && t.kind == rtJsonb) || (!jsonb && t.kind == rtJson)
+	if !ok {
+		return nil, nil, noFuncOverload(name)
+	}
+	if columnDefs == nil {
+		return nil, nil, NewError(SyntaxError,
+			"a column definition list is required for function "+name)
+	}
+	columns := make([]Column, 0, len(columnDefs))
+	for _, d := range columnDefs {
+		// A composite/array column type in the col-def list is a deferred 0A000 follow-on.
+		if strings.HasSuffix(d.TypeName, "[]") || db.CompositeType(d.TypeName) != nil {
+			return nil, nil, NewError(FeatureNotSupported,
+				"a composite/array column in a record column-definition list is not supported yet")
+		}
+		st, decimal, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod)
+		if err != nil {
+			return nil, nil, err
+		}
+		columns = append(columns, Column{Name: d.Name, Type: ScalarT(st), Decimal: decimal})
+	}
+	tname := name
+	if alias != nil {
+		tname = *alias
+	}
+	table := &Table{Name: tname, Columns: columns}
+	kind := srfJSONRecord
+	if set {
+		kind = srfJSONRecordset
+	}
+	return table, &srfPlan{kind: kind, args: []*rExpr{r}, recordCols: columns}, nil
 }
 
 // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
@@ -10180,10 +10245,96 @@ func (db *Database) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, err
 			}
 			out = append(out, Row{TextValue(node.Obj[i].Key), value})
 		}
+	case srfJSONRecord:
+		// json[b]_to_record (R1): one record row, mapping members → the col-def columns by name.
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(Costs.GeneratedRow)
+		row, err := jsonRecordRow(&node, sp.recordCols, env, m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	case srfJSONRecordset:
+		// json[b]_to_recordset (R1): one record row per element of a top-level array (preserving
+		// order); a non-array document → 22023.
+		if node.Kind != JArray {
+			return nil, NewError(InvalidParameterValue, "cannot call json_to_recordset on a non-array")
+		}
+		for i := range node.Arr {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(Costs.GeneratedRow)
+			row, err := jsonRecordRow(&node.Arr[i], sp.recordCols, env, m)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, row)
+		}
 	default:
 		panic("jsonSrfRows only handles the json SRF kinds")
 	}
 	return out, nil
+}
+
+// jsonRecordRow builds one output row for json[b]_to_record(set) (R1): map each declared column to
+// the JSON object's member of that name, coercing it to the column type. A missing member or a JSON
+// null → SQL NULL; a non-object node → 22023. (json-table.md §2)
+func jsonRecordRow(node *JsonNode, cols []Column, env *evalEnv, m *Meter) (Row, error) {
+	if node.Kind != JObject {
+		return nil, NewError(InvalidParameterValue, "argument of json_to_record must be a JSON object")
+	}
+	row := make(Row, 0, len(cols))
+	for ci := range cols {
+		col := &cols[ci]
+		var member *JsonNode
+		for mi := range node.Obj {
+			if node.Obj[mi].Key == col.Name {
+				member = &node.Obj[mi].Val
+				break
+			}
+		}
+		// A missing member or a JSON null member → SQL NULL.
+		if member == nil || member.Kind == JNull {
+			row = append(row, NullValue())
+			continue
+		}
+		v, err := coerceJSONMember(member, col.Type, col.Decimal, env, m)
+		if err != nil {
+			return nil, err
+		}
+		row = append(row, v)
+	}
+	return row, nil
+}
+
+// coerceJSONMember coerces a JSON member node to a record column's type (R1, the JSON_VALUE scalar
+// path): a `jsonb` column embeds the node, a `json` column its canonical text, every other scalar
+// coerces the node's `->>`-style text through the cast machinery (so `"42"` / `42` → an `int`
+// column, etc.). A composite/array column type is a deferred 0A000.
+func coerceJSONMember(node *JsonNode, colTy Type, decimal *DecimalTypmod, env *evalEnv, m *Meter) (Value, error) {
+	if colTy.IsComposite() {
+		return Value{}, NewError(FeatureNotSupported, "a composite/array record column is not supported yet")
+	}
+	st := colTy.ScalarTy()
+	switch {
+	case st == Jsonb:
+		return JsonbValue(*node), nil
+	case st == Json:
+		return JsonValue(jsonbOut(node)), nil
+	default:
+		text, ok := jsonNodeToText(node)
+		if !ok {
+			return NullValue(), nil
+		}
+		rexpr, _, err := coerceStringLiteral(text, st, decimal)
+		if err != nil {
+			return Value{}, err
+		}
+		return rexpr.eval(nil, env, m)
+	}
 }
 
 // unnestRows generates the rows of an unnest(anyarray) FROM-clause source (spec/design/array-functions.md
@@ -11517,7 +11668,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 			return db.generateSeriesRows(rel.srf, env, meter)
 		case srfUnnest:
 			return db.unnestRows(rel.srf, env, meter)
-		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText:
+		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText, srfJSONRecord, srfJSONRecordset:
 			return db.jsonSrfRows(rel.srf, env, meter)
 		}
 		return nil, nil
@@ -14128,6 +14279,12 @@ const (
 	// srfJsonbEachText is jsonb_each_text(jsonb) — one `(key text, value text)` row per member (the
 	// `->>`-style value).
 	srfJsonbEachText
+	// srfJSONRecord is json[b]_to_record(doc) (R1, json-table.md §2) — ONE record row: map the JSON
+	// object's members to the C0 col-def-list columns by name, coercing each to its declared type.
+	srfJSONRecord
+	// srfJSONRecordset is json[b]_to_recordset(doc) (R1) — setof record: one record row per element
+	// of a top-level JSON array (a non-array → 22023).
+	srfJSONRecordset
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
@@ -14138,6 +14295,9 @@ const (
 type srfPlan struct {
 	kind srfKind
 	args []*rExpr
+	// recordCols is the declared output columns for a record-returning SRF (srfJSONRecord[set]) — the
+	// C0 col-def list, used to map JSON members to columns by name + coerce. nil for every other kind.
+	recordCols []Column
 }
 
 // planJoin is one join in a SELECT plan: its kind and resolved ON predicate (nil for CROSS). The

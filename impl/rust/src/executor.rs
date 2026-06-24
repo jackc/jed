@@ -9,8 +9,8 @@ use crate::ast::{
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
     DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind,
     JsonPredicateKind, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select,
-    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp,
-    Update, WindowDef, WithExpr, WithQuery,
+    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
+    TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -7979,6 +7979,7 @@ impl Database {
                         &tref.name,
                         args,
                         tref.alias.as_deref(),
+                        tref.column_defs.as_deref(),
                         Some(&prefix),
                         ctes,
                         ptypes,
@@ -7988,6 +7989,7 @@ impl Database {
                         &tref.name,
                         args,
                         tref.alias.as_deref(),
+                        tref.column_defs.as_deref(),
                         parent,
                         ctes,
                         ptypes,
@@ -8513,7 +8515,22 @@ impl Database {
         // so the plan outlives the scope and a correlated subquery can re-execute it per row).
         let mut srf_plans: Vec<Option<SrfPlan>> = srf_meta
             .into_iter()
-            .map(|m| m.map(|(_, args, kind)| SrfPlan { kind, args }))
+            .map(|m| {
+                m.map(|(si, args, kind)| {
+                    // A record-returning SRF carries its declared columns (the C0 col-def list, held
+                    // on the synthetic table) so the row generator can map members → columns.
+                    let record_cols = if matches!(kind, SrfKind::JsonRecord { .. }) {
+                        synthetic[si].columns.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    SrfPlan {
+                        kind,
+                        args,
+                        record_cols,
+                    }
+                })
+            })
             .collect();
         let rels: Vec<PlanRel> = scope
             .rels
@@ -8638,11 +8655,13 @@ impl Database {
     /// does not (42703/42P01). The produced column's NAME follows PostgreSQL's single-column
     /// function-alias rule: the table alias when one is given (`unnest(xs) AS g` ⇒ column `g`),
     /// else the function name. Returns `(synthetic table, resolved args, kind)`.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_srf<'a>(
         &'a self,
         name: &str,
         args: &[Expr],
         alias: Option<&str>,
+        column_defs: Option<&[TypeFieldDef]>,
         parent: Option<&Scope<'a>>,
         ctes: &'a [CteBinding],
         ptypes: &mut ParamTypes,
@@ -8656,6 +8675,36 @@ impl Database {
             allow_subquery: true,
             ctes,
         };
+        // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
+        // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
+        // `AS t(col type, …)`. Dispatched first, before the col-def-list guard below.
+        let lc = name.to_ascii_lowercase();
+        if matches!(
+            lc.as_str(),
+            "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
+        ) {
+            let jsonb = lc.starts_with("jsonb");
+            let set = lc.ends_with("set");
+            return self.resolve_json_record(
+                &lc,
+                jsonb,
+                set,
+                args,
+                alias,
+                column_defs,
+                &arg_scope,
+                ptypes,
+            );
+        }
+        // A column-definition list is valid ONLY on a record-returning function (PG).
+        if column_defs.is_some() {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                format!(
+                    "a column definition list is only allowed for a record-returning function, not {name}"
+                ),
+            ));
+        }
         if name.eq_ignore_ascii_case("generate_series") {
             return self.resolve_generate_series(args, alias, &arg_scope, ptypes);
         }
@@ -8815,6 +8864,83 @@ impl Database {
             vec![("key", Type::Scalar(ScalarType::Text)), ("value", value_ty)],
         );
         Ok((table, vec![rarg], kind))
+    }
+
+    /// Resolve a json/jsonb RECORD-returning SRF (R1 — `json[b]_to_record` / `json[b]_to_recordset`,
+    /// json-table.md §2): the one argument is a json/jsonb document; the output columns come from the
+    /// C0 col-def list `AS t(col type, …)` (required — else 42601). The synthetic table's columns are
+    /// the declared types (a composite/array column type is a deferred `0A000`).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_json_record(
+        &self,
+        name: &str,
+        jsonb: bool,
+        set: bool,
+        args: &[Expr],
+        alias: Option<&str>,
+        column_defs: Option<&[TypeFieldDef]>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        if args.len() != 1 {
+            return Err(no_func_overload(name));
+        }
+        let want = if jsonb {
+            ScalarType::Jsonb
+        } else {
+            ScalarType::Json
+        };
+        let (rarg, t) = resolve(
+            arg_scope,
+            &args[0],
+            Some(want),
+            &mut AggCtx::Forbidden,
+            ptypes,
+        )?;
+        let ok = matches!(
+            (&t, jsonb),
+            (ResolvedType::Jsonb, true) | (ResolvedType::Json, false) | (ResolvedType::Null, _)
+        );
+        if !ok {
+            return Err(no_func_overload(name));
+        }
+        let defs = column_defs.ok_or_else(|| {
+            EngineError::new(
+                SqlState::SyntaxError,
+                format!("a column definition list is required for function {name}"),
+            )
+        })?;
+        let mut columns = Vec::with_capacity(defs.len());
+        for d in defs {
+            // A composite/array column type in the col-def list is a deferred 0A000 follow-on.
+            if d.type_name.ends_with("[]") || self.composite_type(&d.type_name).is_some() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a composite/array column in a record column-definition list is not supported yet",
+                ));
+            }
+            let (st, decimal) = resolve_type_and_typmod(&d.type_name, &d.type_mod)?;
+            columns.push(Column {
+                name: d.name.clone(),
+                ty: Type::Scalar(st),
+                decimal,
+                primary_key: false,
+                not_null: false,
+                default: None,
+                default_expr: None,
+                identity: None,
+                collation: None,
+            });
+        }
+        let table = Box::new(Table {
+            name: alias.unwrap_or(name).to_string(),
+            columns,
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        });
+        Ok((table, vec![rarg], SrfKind::JsonRecord { jsonb, set }))
     }
 
     /// Resolve `generate_series(start, stop[, step])` (spec/design/functions.md §10): 2 or 3
@@ -9020,6 +9146,29 @@ impl Database {
                         Value::Jsonb(v.clone())
                     };
                     out.push(vec![Value::Text(k.clone()), value]);
+                }
+            }
+            // json[b]_to_record / _recordset (R1): map members → the col-def columns by name.
+            SrfKind::JsonRecord { set, .. } => {
+                if set {
+                    let elems = match &node {
+                        JsonNode::Array(e) => e,
+                        _ => {
+                            return Err(EngineError::new(
+                                SqlState::InvalidParameterValue,
+                                "cannot call json_to_recordset on a non-array",
+                            ));
+                        }
+                    };
+                    for e in elems {
+                        meter.guard()?;
+                        meter.charge(COSTS.generated_row);
+                        out.push(json_record_row(e, &srf.record_cols, env, meter)?);
+                    }
+                } else {
+                    meter.guard()?;
+                    meter.charge(COSTS.generated_row);
+                    out.push(json_record_row(&node, &srf.record_cols, env, meter)?);
                 }
             }
             _ => unreachable!("json_srf_rows only handles the json SRF kinds"),
@@ -9348,7 +9497,8 @@ impl Database {
                 | SrfKind::JsonbObjectKeys
                 | SrfKind::JsonObjectKeys
                 | SrfKind::JsonbEach
-                | SrfKind::JsonbEachText => self.json_srf_rows(srf, &env, meter),
+                | SrfKind::JsonbEachText
+                | SrfKind::JsonRecord { .. } => self.json_srf_rows(srf, &env, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -12623,6 +12773,10 @@ enum SrfKind {
     JsonbEach,
     /// `jsonb_each_text(jsonb)` — one `(key text, value text)` row per member (the `->>`-style value).
     JsonbEachText,
+    /// `json[b]_to_record` / `json[b]_to_recordset` (R1, json-table.md §2): map a JSON object's members
+    /// to the C0 col-def-list columns by name, coercing each to its declared type. `set` = the
+    /// recordset form (one row per array element); else one record row. `jsonb` selects the input type.
+    JsonRecord { jsonb: bool, set: bool },
 }
 
 /// A resolved set-returning-function row source (spec/design/functions.md §10, array-functions.md
@@ -12634,6 +12788,9 @@ enum SrfKind {
 struct SrfPlan {
     kind: SrfKind,
     args: Vec<RExpr>,
+    /// The declared output columns for a record-returning SRF (`JsonRecord`) — the C0 col-def list,
+    /// used to map JSON members to columns by name + coerce. Empty for every other SRF kind.
+    record_cols: Vec<Column>,
 }
 
 /// Build a set-returning function's **synthetic one-column relation** (spec/design/functions.md
@@ -12691,6 +12848,64 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
     })
+}
+
+/// Build one output row for `json[b]_to_record(set)` (R1): map each declared column to the JSON
+/// object's member of that name, coercing it to the column type. A missing member or a JSON null →
+/// SQL NULL; a non-object node → `22023`. (json-table.md §2)
+fn json_record_row(
+    node: &JsonNode,
+    cols: &[Column],
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Row> {
+    let members = match node {
+        JsonNode::Object(m) => m,
+        _ => {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                "argument of json_to_record must be a JSON object",
+            ));
+        }
+    };
+    let mut row = Vec::with_capacity(cols.len());
+    for col in cols {
+        let member = members.iter().find(|(k, _)| k == &col.name).map(|(_, v)| v);
+        let val = match member {
+            None | Some(JsonNode::Null) => Value::Null, // missing / JSON null → SQL NULL
+            Some(v) => coerce_json_member(v, &col.ty, col.decimal.clone(), env, meter)?,
+        };
+        row.push(val);
+    }
+    Ok(row)
+}
+
+/// Coerce a JSON member node to a record column's type (R1, the JSON_VALUE scalar path): a `jsonb`
+/// column embeds the node, a `json` column its canonical text, every other scalar coerces the node's
+/// `->>`-style text through the cast machinery (so `"42"` / `42` → an `int` column, etc.). A
+/// composite/array column type is a deferred `0A000`.
+fn coerce_json_member(
+    node: &JsonNode,
+    col_ty: &Type,
+    decimal: Option<DecimalTypmod>,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Value> {
+    match col_ty {
+        Type::Scalar(ScalarType::Jsonb) => Ok(Value::Jsonb(node.clone())),
+        Type::Scalar(ScalarType::Json) => Ok(Value::Json(json::jsonb_out(node))),
+        Type::Scalar(st) => match json::node_to_text(node) {
+            None => Ok(Value::Null),
+            Some(text) => {
+                let (rexpr, _) = coerce_string_literal(&text, *st, decimal)?;
+                rexpr.eval(&[], env, meter)
+            }
+        },
+        _ => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "a composite/array record column is not supported yet",
+        )),
+    }
 }
 
 /// The catalog name of a json two-column SRF, for its non-object error message.

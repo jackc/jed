@@ -335,6 +335,44 @@ fn json_agg_deferred_element_source_is_0a000() {
     assert_eq!(err(&mut db, "SELECT json_agg(x) FROM f"), "0A000");
 }
 
+/// A composite or array COLUMN in a record function's column-definition list is a deferred `0A000`
+/// (only scalar / json / jsonb columns coerce this slice). PostgreSQL supports them, so this is a
+/// documented divergence; the scalar columns are oracle-clean in suites/json/json_record.test.
+#[test]
+fn json_record_composite_array_column_is_0a000() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM jsonb_to_record('{\"a\":1}') AS t(a addr)"
+        ),
+        "0A000"
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM jsonb_to_record('{\"a\":1}') AS t(a i32[])"
+        ),
+        "0A000"
+    );
+}
+
+/// A rename-only column-alias list `AS g(col)` (no types) on a table function is a deferred `0A000`
+/// (only the TYPED column-definition list `AS t(col type, …)` — C0 — is parsed). PostgreSQL accepts a
+/// rename list on an SRF, so this is a documented divergence.
+#[test]
+fn srf_rename_only_column_list_is_deferred() {
+    let mut db = Database::new();
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM jsonb_to_recordset('[{\"a\":1}]') AS t(a, b)"
+        ),
+        "0A000"
+    );
+}
+
 /// `json[b]_object_agg` over a deferred-source VALUE (float, like to_jsonb) is `0A000` — the value
 /// conversion reuses the to_jsonb element kernel. PG supports it, so this is a documented divergence;
 /// the supported value types are oracle-clean in suites/json/json_object_agg.test.

@@ -474,7 +474,11 @@ type TableRef struct {
 	Subquery      *QueryExpr
 	Values        [][]*Expr
 	ColumnAliases []string
-	Lateral       bool
+	// ColumnDefs is a FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md
+	// §1): the typed columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually
+	// exclusive with ColumnAliases (a rename-only list). Nil for an ordinary table / SRF.
+	ColumnDefs []TypeFieldDef
+	Lateral    bool
 }
 
 // JoinKind is the kind of a join. Inner and Cross execute this slice; the Left/Right/Full

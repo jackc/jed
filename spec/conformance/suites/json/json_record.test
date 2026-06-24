@@ -1,0 +1,89 @@
+# json[b]_to_record / _recordset — the record-returning functions (R1, spec/design/json-table.md §2)
+# over the C0 column-definition list AS t(col type, …). Each declared column takes the JSON object
+# member of its name, coerced to the declared type; a missing member / JSON null → SQL NULL. _record →
+# one row, _recordset → one row per array element. A non-object/non-array → 22023; a col-def list is
+# required (else 42601). Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.aggregates, query.cross_join, types.jsonb, types.json, func.coldeflist, func.json_record
+
+# jsonb_to_record: members → columns by name, coerced to the declared types.
+query ITB nosort
+SELECT * FROM jsonb_to_record('{"a": 1, "b": "x", "c": true}') AS t(a i32, b text, c boolean)
+----
+1
+x
+true
+
+# A column with no matching member → SQL NULL; a JSON null member → SQL NULL.
+query IT nosort
+SELECT * FROM jsonb_to_record('{"a": null}') AS t(a i32, b text)
+----
+NULL
+NULL
+
+# Coercions: a json string "42" → an int, a json number → numeric, an object/array → a jsonb column.
+query IDT nosort
+SELECT * FROM jsonb_to_record('{"n": "42", "d": 1.5, "j": {"k": 1}}') AS t(n i32, d numeric, j jsonb)
+----
+42
+1.5
+{"k": 1}
+
+# json_to_record (json input) works the same — the result is typed columns, no verbatim concern.
+query IT nosort
+SELECT * FROM json_to_record('{"a": 7, "b": "hi"}') AS t(a i32, b text)
+----
+7
+hi
+
+# _recordset: one row per array element, in array order.
+query IT nosort
+SELECT * FROM jsonb_to_recordset('[{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]') AS t(a i32, b text)
+----
+1
+x
+2
+y
+
+# The recordset composes with aggregation.
+query I nosort
+SELECT sum(a)::i32 FROM jsonb_to_recordset('[{"a": 1}, {"a": 2}, {"a": 3}]') AS t(a i32)
+----
+6
+
+# A NULL document → zero rows.
+query I nosort
+SELECT count(*)::i32 FROM jsonb_to_recordset(NULL::jsonb) AS t(a i32)
+----
+0
+
+# A non-object (to_record) / non-array (to_recordset) document → 22023.
+statement error 22023
+SELECT * FROM jsonb_to_record('[1,2]') AS t(a i32)
+
+statement error 22023
+SELECT * FROM jsonb_to_recordset('{"a":1}') AS t(a i32)
+
+# A record-returning function REQUIRES a column-definition list (else 42601).
+statement error 42601
+SELECT * FROM jsonb_to_record('{"a":1}')
+
+# A column-definition list is valid ONLY on a record-returning function (else 42601).
+statement error 42601
+SELECT * FROM generate_series(1, 3) AS t(x i32)
+
+# Lateral over a stored jsonb column: expand each row's document into typed columns (CROSS JOIN).
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, j jsonb)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"n": 10, "label": "a"}'), (2, '{"n": 20, "label": "b"}')
+
+query IIT nosort
+SELECT d.id, r.n, r.label FROM docs d CROSS JOIN jsonb_to_record(d.j) AS r(n i32, label text) ORDER BY d.id
+----
+1
+10
+a
+2
+20
+b

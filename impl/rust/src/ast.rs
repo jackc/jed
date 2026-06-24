@@ -488,6 +488,10 @@ pub struct TableRef {
     pub subquery: Option<Box<QueryExpr>>,
     pub values: Option<Vec<Vec<Expr>>>,
     pub column_aliases: Option<Vec<String>>,
+    /// A FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md §1): the typed
+    /// columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually exclusive
+    /// with `column_aliases` (a rename-only list). `None` for an ordinary table / SRF.
+    pub column_defs: Option<Vec<TypeFieldDef>>,
     pub lateral: bool,
 }
 

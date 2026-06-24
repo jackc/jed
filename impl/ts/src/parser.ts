@@ -775,6 +775,15 @@ class Parser {
     const name = this.expectIdentifier();
     this.expectKeyword("as");
     this.expect("lparen");
+    const fields = this.parseFieldDefList();
+    return { kind: "createType", name, fields };
+  }
+
+  // parseFieldDefList parses a `( field type [numeric(p,s)] [[]] [NOT NULL] [, …] )`
+  // field-definition list — the body shared by `CREATE TYPE … AS (…)` (composite.md) and a
+  // FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md §1). The caller
+  // has consumed the opening `(`; this consumes through the matching `)`.
+  private parseFieldDefList(): TypeFieldDef[] {
     const fields: TypeFieldDef[] = [];
     for (;;) {
       const fname = this.expectIdentifier();
@@ -795,7 +804,7 @@ class Parser {
       if (tok.kind === "rparen") break;
       throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
-    return { kind: "createType", name, fields };
+    return fields;
   }
 
   // parseDropType parses `DROP TYPE [IF EXISTS] <name> [RESTRICT | CASCADE]`
@@ -1935,16 +1944,26 @@ class Parser {
         this.advance();
       }
     }
-    // The column-alias-list form `... AS g(n)` is a deferred narrowing (grammar.md §35): a `(`
-    // after the alias is unambiguous (a base table never has one there) and rejected.
+    // A `(` after the alias is a FROM-clause list on a table function (a base table never has one
+    // there). The TYPED column-definition list `AS t(col type, …)` (C0, json-table.md §1) — for the
+    // record-returning functions — is parsed here; the rename-only form `AS g(col)` (no type) stays
+    // a deferred narrowing (grammar.md §35).
+    let columnDefs: TypeFieldDef[] | undefined;
     if (alias !== null && this.peek().kind === "lparen") {
-      throw engineError(
-        "feature_not_supported",
-        "column alias list on a table function is not supported yet",
-      );
+      this.advance(); // (
+      // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. After the
+      // opening `(`, the current token is the first column name, so a `word` in the NEXT slot means a
+      // type follows (col-def list).
+      if (this.peekKindAt(1) !== "word") {
+        throw engineError(
+          "feature_not_supported",
+          "column alias list on a table function is not supported yet",
+        );
+      }
+      columnDefs = this.parseFieldDefList();
     }
     // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
-    return { name, alias, args, lateral };
+    return { name, alias, args, columnDefs, lateral };
   }
 
   // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).

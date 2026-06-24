@@ -287,3 +287,31 @@ test("JSON_SCALAR of deferred types is 0A000", () => {
     "0A000",
   );
 });
+
+// A composite or array COLUMN in a record function's column-definition list (R1) is a deferred 0A000
+// (only scalar / json / jsonb columns coerce this slice). PostgreSQL supports them, so this is a
+// documented divergence; the scalar columns are oracle-clean in suites/json/json_record.test.
+// Mirrors impl/rust/tests/json.rs json_record_composite_array_column_is_0a000.
+test("json_to_record composite/array column is 0A000", () => {
+  const db = dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a addr)`)),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a i32[])`)),
+    "0A000",
+  );
+});
+
+// A rename-only column-alias list `AS g(col)` (no types) on a table function is a deferred 0A000
+// (only the TYPED column-definition list `AS t(col type, …)` — C0 — is parsed). PostgreSQL accepts a
+// rename list on an SRF, so this is a documented divergence. Mirrors
+// impl/rust/tests/json.rs srf_rename_only_column_list_is_deferred.
+test("srf rename-only column list is deferred", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)`)),
+    "0A000",
+  );
+});

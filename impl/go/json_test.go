@@ -397,3 +397,30 @@ func TestJsonScalarDeferredTypesAre0A000(t *testing.T) {
 		t.Errorf("JSON_SCALAR(f64): got %s, want 0A000", got)
 	}
 }
+
+// TestJsonRecordCompositeArrayColumnIs0A000: a composite or array COLUMN in a record function's
+// column-definition list is a deferred 0A000 (only scalar / json / jsonb columns coerce this slice).
+// PostgreSQL supports them, so this is a documented divergence; the scalar columns are oracle-clean
+// in suites/json/json_record.test. Mirrors impl/rust/tests/json.rs
+// json_record_composite_array_column_is_0a000.
+func TestJsonRecordCompositeArrayColumnIs0A000(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
+	if got := errJSON(t, db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a addr)`); got != "0A000" {
+		t.Errorf("composite record column: got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a i32[])`); got != "0A000" {
+		t.Errorf("array record column: got %s, want 0A000", got)
+	}
+}
+
+// TestSrfRenameOnlyColumnListIsDeferred: a rename-only column-alias list AS g(col) (no types) on a
+// table function is a deferred 0A000 (only the TYPED column-definition list AS t(col type, …) — C0 —
+// is parsed). PostgreSQL accepts a rename list on an SRF, so this is a documented divergence. Mirrors
+// impl/rust/tests/json.rs srf_rename_only_column_list_is_deferred.
+func TestSrfRenameOnlyColumnListIsDeferred(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, `SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)`); got != "0A000" {
+		t.Errorf("rename-only column list: got %s, want 0A000", got)
+	}
+}

@@ -792,6 +792,15 @@ impl Parser {
         let name = self.expect_identifier()?;
         self.expect_keyword("as")?;
         self.expect(&Token::LParen)?;
+        let fields = self.parse_field_def_list()?;
+        Ok(CreateType { name, fields })
+    }
+
+    /// Parse a `( field type [NOT NULL] [, …] )` field-definition list — the body shared by
+    /// `CREATE TYPE … AS (…)` (composite.md) and a FROM-clause **column-definition list**
+    /// `AS t(col type, …)` (C0, json-table.md §1). The caller has consumed the opening `(`; this
+    /// consumes through the matching `)`. Each field is `name type [numeric(p,s)] [[]] [NOT NULL]`.
+    fn parse_field_def_list(&mut self) -> Result<Vec<TypeFieldDef>> {
         let mut fields = Vec::new();
         loop {
             let fname = self.expect_identifier()?;
@@ -822,7 +831,7 @@ impl Parser {
                 other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
             }
         }
-        Ok(CreateType { name, fields })
+        Ok(fields)
     }
 
     /// `DROP TYPE [IF EXISTS] <name> [RESTRICT | CASCADE]` (spec/design/composite.md §7).
@@ -2064,14 +2073,26 @@ impl Parser {
                 _ => None,
             }
         };
-        // The column-alias-list form `... AS g(n)` is a deferred narrowing (grammar.md §35): a
-        // `(` after the alias is unambiguous (a base table never has one there) and rejected.
-        if alias.is_some() && matches!(self.peek(), Token::LParen) {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "column alias list on a table function is not supported yet",
-            ));
-        }
+        // A `(` after the alias is a FROM-clause list on a table function (a base table never has
+        // one there). The TYPED column-definition list `AS t(col type, …)` (C0, json-table.md §1) —
+        // for the record-returning functions — is parsed here; the rename-only form `AS g(col)` (no
+        // type) stays a deferred narrowing (grammar.md §35).
+        let column_defs = if alias.is_some() && matches!(self.peek(), Token::LParen) {
+            self.advance(); // (
+            // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`.
+            // After the opening `(`, the current token is the first column name, so a `Word` in the
+            // NEXT slot means a type follows (col-def list).
+            let typed = matches!(self.peek_at(1), Token::Word(_));
+            if !typed {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "column alias list on a table function is not supported yet",
+                ));
+            }
+            Some(self.parse_field_def_list()?)
+        } else {
+            None
+        };
         Ok(TableRef {
             name,
             alias,
@@ -2079,6 +2100,7 @@ impl Parser {
             subquery: None,
             values: None,
             column_aliases: None,
+            column_defs,
             // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
             lateral,
         })
@@ -2150,6 +2172,7 @@ impl Parser {
             subquery,
             values,
             column_aliases,
+            column_defs: None,
             // The caller (`parse_table_ref`) sets `lateral` from a leading `LATERAL` keyword.
             lateral: false,
         })

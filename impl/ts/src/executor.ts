@@ -39,6 +39,7 @@ import type {
   Statement,
   SubscriptSpec,
   TableRef,
+  TypeFieldDef,
   TypeMod,
   Update,
   WindowDef,
@@ -6847,7 +6848,15 @@ export class Database {
         // scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query /
         // params), unchanged (functions.md §10).
         const srfParent = lateralEligible ? lateralParent : parent;
-        const r = this.resolveSRF(tref.name, tref.args, tref.alias, srfParent, ctes, ptypes);
+        const r = this.resolveSRF(
+          tref.name,
+          tref.args,
+          tref.alias,
+          tref.columnDefs ?? null,
+          srfParent,
+          ctes,
+          ptypes,
+        );
         t = r.table;
         srf = r.srf;
         lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
@@ -7293,6 +7302,7 @@ export class Database {
     name: string,
     args: Expr[],
     alias: string | null,
+    columnDefs: TypeFieldDef[] | null,
     parent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
@@ -7301,6 +7311,26 @@ export class Database {
     // inherited so an arg subquery can reference a CTE (cte.md §2).
     const argScope = new Scope([], this, parent, true, ctes);
     const lname = name.toLowerCase();
+    // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
+    // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
+    // `AS t(col type, …)`. Dispatched FIRST, before the col-def-list guard below.
+    if (
+      lname === "json_to_record" ||
+      lname === "jsonb_to_record" ||
+      lname === "json_to_recordset" ||
+      lname === "jsonb_to_recordset"
+    ) {
+      const jsonb = lname.startsWith("jsonb");
+      const set = lname.endsWith("set");
+      return this.resolveJsonRecord(lname, jsonb, set, args, alias, columnDefs, argScope, ptypes);
+    }
+    // A column-definition list is valid ONLY on a record-returning function (PG).
+    if (columnDefs !== null) {
+      throw engineError(
+        "syntax_error",
+        "a column definition list is only allowed for a record-returning function, not " + name,
+      );
+    }
     if (lname === "generate_series")
       return this.resolveGenerateSeries(args, alias, argScope, ptypes);
     if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
@@ -7438,6 +7468,69 @@ export class Database {
       ["value", valueTy],
     ]);
     return { table, srf: { kind, args: [node] } };
+  }
+
+  // resolveJsonRecord resolves a json/jsonb RECORD-returning SRF (R1 — `json[b]_to_record` /
+  // `json[b]_to_recordset`, json-table.md §2): the one argument is a json/jsonb document; the output
+  // columns come from the C0 col-def list `AS t(col type, …)` (required — else 42601). The synthetic
+  // table's columns are the declared types (a composite/array column type is a deferred 0A000).
+  private resolveJsonRecord(
+    name: string,
+    jsonb: boolean,
+    set: boolean,
+    args: Expr[],
+    alias: string | null,
+    columnDefs: TypeFieldDef[] | null,
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
+    if (args.length !== 1) throw noFuncOverload(name);
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const { node, type } = resolve(argScope, args[0]!, jsonb ? "jsonb" : "json", forbidden, ptypes);
+    const ok =
+      type.kind === "null" || (jsonb && type.kind === "jsonb") || (!jsonb && type.kind === "json");
+    if (!ok) throw noFuncOverload(name);
+    if (columnDefs === null) {
+      throw engineError(
+        "syntax_error",
+        "a column definition list is required for function " + name,
+      );
+    }
+    const columns: Column[] = [];
+    for (const d of columnDefs) {
+      // A composite/array column type in the col-def list is a deferred 0A000 follow-on.
+      if (d.typeName.endsWith("[]") || this.compositeType(d.typeName) !== undefined) {
+        throw engineError(
+          "feature_not_supported",
+          "a composite/array column in a record column-definition list is not supported yet",
+        );
+      }
+      const [st, decimal] = resolveTypeAndTypmod(d.typeName, d.typeMod);
+      columns.push({
+        name: d.name,
+        type: scalarT(st),
+        decimal,
+        primaryKey: false,
+        notNull: false,
+        default: null,
+        defaultExpr: null,
+        identity: null,
+        collation: null,
+      });
+    }
+    const table: Table = {
+      name: alias ?? name,
+      columns,
+      pk: [],
+      checks: [],
+      indexes: [],
+      fks: [],
+    };
+    // The declared columns ride on the plan so the row generator can map members → columns by name.
+    return {
+      table,
+      srf: { kind: "json_record", args: [node], recordSet: set, recordCols: columns },
+    };
   }
 
   // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
@@ -7613,6 +7706,27 @@ export class Database {
             value = jsonbValue(m.value);
           }
           out.push([textValue(m.key), value]);
+        }
+        break;
+      }
+      // json[b]_to_record / _recordset (R1): map members → the col-def columns by name.
+      case "json_record": {
+        const cols = srf.recordCols ?? [];
+        if (srf.recordSet === true) {
+          if (node.kind !== "array")
+            throw engineError(
+              "invalid_parameter_value",
+              "cannot call json_to_recordset on a non-array",
+            );
+          for (const e of node.elements) {
+            meter.guard();
+            meter.charge(COSTS.generatedRow);
+            out.push(jsonRecordRow(e, cols, env, meter));
+          }
+        } else {
+          meter.guard();
+          meter.charge(COSTS.generatedRow);
+          out.push(jsonRecordRow(node, cols, env, meter));
         }
         break;
       }
@@ -7865,6 +7979,7 @@ export class Database {
         case "json_object_keys":
         case "jsonb_each":
         case "jsonb_each_text":
+        case "json_record":
           return this.jsonSrfRows(rel.srf, env, meter);
       }
     }
@@ -10977,6 +11092,10 @@ type PlanRel = {
 //   "json_object_keys"          — one `text` row per object key, in INPUT order (duplicates kept).
 //   "jsonb_each"                — one `(key text, value jsonb)` row per object member, canonical order.
 //   "jsonb_each_text"           — one `(key text, value text)` row per member (the `->>`-style value).
+//   "json_record"               — json[b]_to_record / _recordset (R1, json-table.md §2): map a JSON
+//                                 object's members to the C0 col-def-list columns by name + coerce.
+//                                 The `recordSet`/`recordCols` fields on the plan carry the form +
+//                                 declared columns.
 type SrfKind =
   | "generate_series"
   | "unnest"
@@ -10985,14 +11104,23 @@ type SrfKind =
   | "jsonb_object_keys"
   | "json_object_keys"
   | "jsonb_each"
-  | "jsonb_each_text";
+  | "jsonb_each_text"
+  | "json_record";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
 // 2 or 3 integers) or unnest(anyarray) (args = the single array expression). Non-LATERAL, so each
 // arg evaluates against the params/outer environment with no local row. The produced column's type
 // lives on the synthetic relation (built in resolveSRF).
-type SrfPlan = { kind: SrfKind; args: RExpr[] };
+// recordSet/recordCols apply only to the `json_record` kind (R1, json-table.md §2): recordSet
+// selects the recordset form (one row per array element) vs. the single record row, and recordCols
+// is the declared C0 col-def-list columns used to map JSON members → columns by name + coerce.
+type SrfPlan = {
+  kind: SrfKind;
+  args: RExpr[];
+  recordSet?: boolean;
+  recordCols?: Column[];
+};
 
 // srfTable builds a set-returning function's SYNTHETIC one-column relation (spec/design/functions.md
 // §10). The table's name is the function name (the un-aliased label fallback); the lone column's
@@ -11045,6 +11173,54 @@ function srfTableCols(funcName: string, alias: string | null, cols: [string, Typ
     indexes: [],
     fks: [],
   };
+}
+
+// jsonRecordRow builds one output row for `json[b]_to_record(set)` (R1): map each declared column to
+// the JSON object's member of that name, coercing it to the column type. A missing member or a JSON
+// null → SQL NULL; a non-object node → 22023. (json-table.md §2)
+function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, meter: Meter): Row {
+  if (node.kind !== "object") {
+    throw engineError(
+      "invalid_parameter_value",
+      "argument of json_to_record must be a JSON object",
+    );
+  }
+  const row: Value[] = [];
+  for (const col of cols) {
+    const member = node.members.find((m) => m.key === col.name)?.value;
+    if (member === undefined || member.kind === "null") {
+      row.push(nullValue()); // missing / JSON null → SQL NULL
+    } else {
+      row.push(coerceJsonMember(member, col.type, col.decimal, env, meter));
+    }
+  }
+  return row;
+}
+
+// coerceJsonMember coerces a JSON member node to a record column's type (R1, the JSON_VALUE scalar
+// path): a `jsonb` column embeds the node, a `json` column its canonical text, every other scalar
+// coerces the node's `->>`-style text through the cast machinery (so `"42"` / `42` → an `int`
+// column, etc.). A composite/array column type is a deferred 0A000.
+function coerceJsonMember(
+  node: JsonNode,
+  colTy: Type,
+  decimal: DecimalTypmod | null,
+  env: EvalEnv,
+  meter: Meter,
+): Value {
+  if (colTy.kind !== "scalar") {
+    throw engineError(
+      "feature_not_supported",
+      "a composite/array record column is not supported yet",
+    );
+  }
+  const st = colTy.scalar;
+  if (st === "jsonb") return jsonbValue(node);
+  if (st === "json") return jsonValue(jsonbOut(node));
+  const text = nodeToText(node);
+  if (text === null) return nullValue();
+  const { node: rexpr } = coerceStringLiteral(text, st, decimal);
+  return evalExpr(rexpr, [], env, meter);
 }
 
 // PlanJoin is one join in a SELECT plan: its kind and resolved ON predicate (null for CROSS). The

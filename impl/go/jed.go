@@ -544,6 +544,13 @@ var SupportedCapabilities = []string{
 	// SQL/JSON constructors (S1) — JSON(text) / JSON_SCALAR(anyelement) / JSON_SERIALIZE(json|jsonb)
 	// (json-sql-functions.md §5).
 	"func.json_ctor",
+	// FROM-clause column-definition list (C0) — a record-returning table function followed by
+	// AS t(col type, …) declaring its typed output columns (json-table.md §1). Valid only on a
+	// record-returning function (else 42601); the rename-only AS g(col) form stays 0A000.
+	"func.coldeflist",
+	// json/jsonb record-returning functions (R1) — json[b]_to_record → one record row,
+	// json[b]_to_recordset → setof record, over the C0 col-def list (json-table.md §2).
+	"func.json_record",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

@@ -349,12 +349,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `#-` a new token. A bare `'{a,c}'` is a single text KEY for `-` (verbatim, like PG) but a
         text[] PATH for `#-`. New `RExpr::JsonConcat`/`JsonDelete`. Cap `func.jsonb_mutate`.
         → json-sql-functions.md §1
-  - [~] **C0** — shared FROM-clause facility for record-shaped SRFs (json-table.md §1). The
-        **multi-column synthetic table** half has ✅ landed (with B3 below — `srf_table_cols`, an
-        N-named/typed-column synthetic relation; the FROM alias renames the relation, the columns keep
-        their fixed names). The **column-definition-list** half (`AS t(col type, …)` grammar +
-        resolution) is the remaining piece, landing with the R-series record functions. Cap
-        `func.coldeflist` (pending).
+  - [x] **C0** — ✅ shared FROM-clause facility for record-shaped SRFs (json-table.md §1). Both halves
+        landed: the **multi-column synthetic table** (with B3 — `srf_table_cols`) and the
+        **column-definition list** `AS t(col type, …)` (a `parse_field_def_list` factored from CREATE
+        TYPE + a `column_defs` field on `TableRef`, disambiguated from the deferred rename-only list by
+        the token after the first column name; valid only on a record-returning function, else `42601`).
+        All 3 cores, cap `func.coldeflist`. **★ C0 COMPLETE.**
+  - [x] **R1** — ✅ `json[b]_to_record` (one row) / `json[b]_to_recordset` (setof) over the C0 col-def
+        list: map members → columns by name, coercing each to the declared type (jsonb embeds, json its
+        canonical text, every other scalar via `node_to_text` → the cast machinery; missing/JSON-null →
+        NULL). Non-object/non-array → `22023`; required col-def list (else `42601`); NULL arg → 0 rows; a
+        composite/array column type / a rename-only list → `0A000`. `SrfKind::JsonRecord` + `record_cols`
+        on the SrfPlan + `json_record_row`/`coerce_json_member`. All 3 cores, cap `func.json_record`,
+        oracle-clean. _R2 follow-on:_ `json[b]_populate_record(set)` (shape from a composite-type base arg).
   - [ ] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +
         `like_regex`→Pike-VM (`i`/`q` flags; `s`/`m`/`x`→`0A000`) + the `2203x` error class. → jsonpath.md
   - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
@@ -425,7 +432,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     - [x] **B4 (object aggregates)** — ✅ `jsonb_object_agg` / `json_object_agg` / the `_unique` variants:
           aggregate a group's (key, value) pairs into a JSON object. jsonb canonicalizes (last-wins
           dedup); json keeps row order + dups + PG's `{ … }` brace-padded spacing. Key coerced to text
-          (NULL key → `23023`→actually `22023` "field name must not be null"); `_unique` dup → `22030`;
+          (NULL key → `22023` "field name must not be null"); `_unique` dup → `22030`;
           empty group → NULL. 2-argument aggregates, hand-resolved (the single-operand catalog can't
           express a pair) — carried as a `Row` operand through the agg framework. All 3 cores, cap
           `func.json_object_agg`, oracle-clean. **★ B4 COMPLETE.**

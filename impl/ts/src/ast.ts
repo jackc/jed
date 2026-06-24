@@ -705,6 +705,9 @@ export type InsertValue =
 // appear BEFORE this one (a dependent / correlated join). It is meaningful only for a derived table
 // or table function; a table function is implicitly lateral, so the planner correlates an SRF's args
 // to the earlier siblings whether or not this flag is set.
+// `columnDefs` is a FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md
+// §1): the typed columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually
+// exclusive with `columnAliases` (a rename-only list). Absent for an ordinary table / SRF.
 export type TableRef = {
   name: string;
   alias: string | null;
@@ -712,6 +715,7 @@ export type TableRef = {
   subquery?: QueryExpr;
   values?: Expr[][];
   columnAliases?: string[];
+  columnDefs?: TypeFieldDef[];
   lateral?: boolean;
 };
 
