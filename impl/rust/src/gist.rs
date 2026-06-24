@@ -686,7 +686,10 @@ mod tests {
         let loaded = load_tree(&elem, root, &fetcher(pages.clone())).unwrap();
         let (pages2, root2) = serialize_tree(&loaded, &elem, &mut contig(7));
         assert_eq!(root, root2);
-        assert_eq!(pages, pages2, "serialize is not deterministic across round-trip");
+        assert_eq!(
+            pages, pages2,
+            "serialize is not deterministic across round-trip"
+        );
         assert_eq!(loaded.len(), t.len());
         // The loaded tree answers searches identically to the original / brute force.
         for &(qlo, qhi) in &[(0, 1), (10, 14), (40, 60), (200, 300)] {
@@ -714,9 +717,11 @@ mod tests {
         nums.sort();
         assert_eq!(nums, (0..pages.len() as u32).collect::<Vec<_>>());
         // Only GiST page types appear.
-        assert!(pages
-            .iter()
-            .all(|p| p.page_type == PAGE_GIST_LEAF || p.page_type == PAGE_GIST_INTERIOR));
+        assert!(
+            pages
+                .iter()
+                .all(|p| p.page_type == PAGE_GIST_LEAF || p.page_type == PAGE_GIST_INTERIOR)
+        );
         assert_eq!(
             pages.iter().find(|p| p.page_no == root).unwrap().page_type,
             PAGE_GIST_INTERIOR
@@ -739,8 +744,13 @@ mod tests {
         // The persisted tree is built from the leaf SET in canonical order, so two different
         // insertion orders of the same rows produce byte-identical trees (content-determinism).
         let elem = i32_range_elem();
-        let rows: Vec<(i32, i32, u32)> = (0..25).map(|i| (i * 3 % 17, i * 3 % 17 + 4, i as u32)).collect();
-        let keys_fwd: Vec<Vec<u8>> = rows.iter().map(|&(lo, hi, id)| encode_leaf_key(&elem, &r(lo, hi), &skey(id))).collect();
+        let rows: Vec<(i32, i32, u32)> = (0..25)
+            .map(|i| (i * 3 % 17, i * 3 % 17 + 4, i as u32))
+            .collect();
+        let keys_fwd: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|&(lo, hi, id)| encode_leaf_key(&elem, &r(lo, hi), &skey(id)))
+            .collect();
         let mut keys_rev = keys_fwd.clone();
         keys_rev.reverse();
 

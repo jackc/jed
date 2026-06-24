@@ -89,6 +89,11 @@ pub enum IndexKind {
     /// A GIN inverted index: one entry per term extracted from the (array) column
     /// (spec/design/gin.md §4). This slice: a single integer-element array column (`array_ops`).
     Gin = 1,
+    /// A GiST index — a bounding-predicate R-tree (spec/design/gist.md). GX1: the `range_ops`
+    /// opclass over a single `range` column. The in-memory store holds one leaf-key entry per row
+    /// (`encode_range_body(bound) ‖ storage_key`, gist.rs); the on-disk form is the persisted
+    /// R-tree (page types 5/6, `format_version` 20 — GX1b). Never `unique`.
+    Gist = 2,
 }
 
 /// One secondary index of a table (spec/design/indexes.md): its (relation-namespace) name

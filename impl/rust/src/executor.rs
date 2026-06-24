@@ -4047,6 +4047,7 @@ impl Database {
         let kind = match ci.using.as_deref().map(str::to_ascii_lowercase).as_deref() {
             None | Some("btree") => IndexKind::Btree,
             Some("gin") => IndexKind::Gin,
+            Some("gist") => IndexKind::Gist,
             Some(other) => {
                 return Err(EngineError::new(
                     SqlState::UndefinedObject,
@@ -4114,6 +4115,20 @@ impl Database {
                         Some(_) => {}
                     }
                 }
+                IndexKind::Gist => {
+                    // GiST's `range_ops` opclass needs a range column; any other type has no
+                    // default operator class for access method gist — 42704 (PG's wording;
+                    // spec/design/gist.md §5, the GIN-no-opclass precedent).
+                    if !ty.is_range() {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedObject,
+                            format!(
+                                "data type {} has no default operator class for access method gist",
+                                ty.canonical_name()
+                            ),
+                        ));
+                    }
+                }
             }
             // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
             cols.push(idx);
@@ -4131,6 +4146,31 @@ impl Database {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "a multi-column gin index is not supported yet".to_string(),
+                ));
+            }
+        }
+        // GiST narrowings (spec/design/gist.md §1/§5): no uniqueness (a bounding tree has no unique
+        // key — express it as EXCLUDE (… WITH =), GX3) and a single column only (multi-column GiST
+        // is GX2/GX3). And — GX1a — file persistence (the page-5/6 R-tree + format_version 20) is
+        // GX1b, so a GiST index is in-memory-only for now; a file-backed one is 0A000 rather than a
+        // silent XX001 on reopen.
+        if kind == IndexKind::Gist {
+            if ci.unique {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "access method gist does not support unique indexes".to_string(),
+                ));
+            }
+            if cols.len() != 1 {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a multi-column gist index is not supported yet".to_string(),
+                ));
+            }
+            if self.path.is_some() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a gist index on a file-backed database is not supported yet".to_string(),
                 ));
             }
         }
@@ -14503,7 +14543,29 @@ fn index_entry_keys(
     Ok(match def.kind {
         IndexKind::Btree => vec![index_entry_key(columns, colls, def, storage_key, row)?],
         IndexKind::Gin => gin_entries(columns, def, storage_key, row),
+        IndexKind::Gist => gist_entries(columns, def, storage_key, row),
     })
+}
+
+/// A GiST index's entry keys for one row (spec/design/gist.md §4.1): exactly one leaf key,
+/// `encode_range_body(bound) ‖ storage_key` ([`gist::encode_leaf_key`]) — the GIN `term ‖ skey`
+/// pattern, so all existing index maintenance (insert/update/delete) reuses it unchanged. A NULL
+/// range value is not indexed (the §7 exclusion NULL rule / GIN's NULL skip); the empty range is a
+/// real value and IS indexed.
+fn gist_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<Vec<u8>> {
+    let ci = def.columns[0];
+    let elem = crate::catalog::ColType::Scalar(
+        columns[ci]
+            .ty
+            .range_element()
+            .expect("a GiST index column is a range (CREATE INDEX gate)")
+            .scalar(),
+    );
+    match &row[ci] {
+        Value::Range(rv) => vec![crate::gist::encode_leaf_key(&elem, rv, storage_key)],
+        Value::Null => Vec::new(),
+        _ => unreachable!("a GiST index column holds a range or NULL"),
+    }
 }
 
 /// Is `elem` an element type a GIN (`array_ops`) index admits? The integers, `boolean`, `uuid`,
