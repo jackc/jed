@@ -317,6 +317,13 @@ import {
   rangeTotalCmp,
   rangeUnion,
 } from "./range.ts";
+import {
+  buildGistFromLeafKeys,
+  encodeGistLeafKey,
+  type GistStrategy,
+  type GistTree,
+  gistSearch,
+} from "./gist.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 import {
   compileRegex,
@@ -474,6 +481,12 @@ export class Snapshot {
   // An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
   // on that collation's entry_kind = 3 reference entry, restored on load.
   defaultCollation: string | null;
+  // gistTrees holds each GiST index's resident R-tree (spec/design/gist.md §4.1), keyed by lowercased
+  // index name. The leaf-key store (indexStores) stays the maintained source of truth; this tree is
+  // the acceleration structure the planner descends. Rebuilt CANONICALLY (buildGistFromLeafKeys —
+  // content-deterministic, gist.md §3) at every mutating statement and on load. Never mutated in
+  // place (replaced wholesale on rebuild), so clone shallow-copies it.
+  gistTrees: Map<string, GistTree> = new Map();
 
   constructor(
     txid: bigint = 0n,
@@ -499,7 +512,7 @@ export class Snapshot {
   // SequenceDef / Collation objects are never mutated in place — only added/removed) and each store
   // is an O(1) persistent-map clone (pmap.ts).
   clone(): Snapshot {
-    return new Snapshot(
+    const c = new Snapshot(
       this.txid,
       new Map(this.tables),
       cloneStores(this.stores),
@@ -509,6 +522,41 @@ export class Snapshot {
       new Map(this.collations),
       this.defaultCollation,
     );
+    // GiST trees are never mutated in place — only replaced wholesale — so a shallow Map copy is safe.
+    c.gistTrees = new Map(this.gistTrees);
+    return c;
+  }
+
+  // gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or undefined if
+  // the index is not GiST / not present (spec/design/gist.md §4.1).
+  gistTreeFor(nameKey: string): GistTree | undefined {
+    return this.gistTrees.get(nameKey);
+  }
+
+  // rebuildGistTrees rebuilds EVERY GiST index's resident R-tree from its leaf-key store
+  // (spec/design/gist.md §3/§4.1). Called after any statement that may have changed a GiST index's
+  // leaf set (the mutating-statement hook) and on load, so the working snapshot always carries a fresh
+  // tree a subsequent read descends. Each tree is built CANONICALLY (buildGistFromLeafKeys), making it
+  // a pure function of the leaf SET — content-deterministic, cross-core identical, and identical to the
+  // on-disk persisted R-tree. Trees whose index has been dropped are removed.
+  rebuildGistTrees(): void {
+    const specs: { nameKey: string; elem: ColType }[] = [];
+    for (const t of this.tables.values()) {
+      for (const idx of t.indexes) {
+        if (idx.kind !== "gist") continue;
+        specs.push({
+          nameKey: idx.name.toLowerCase(),
+          elem: gistElemColType(t.columns[idx.columns[0]!]!.type),
+        });
+      }
+    }
+    const live = new Set(specs.map((s) => s.nameKey));
+    for (const k of [...this.gistTrees.keys()]) if (!live.has(k)) this.gistTrees.delete(k);
+    for (const sp of specs) {
+      const store = this.indexStores.get(sp.nameKey);
+      const keys = store ? store.entriesInKeyOrder().map((e) => e.key) : [];
+      this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.elem, keys));
+    }
   }
 
   // resolveCollation resolves a collation name for USE — query resolution and key encoding
@@ -2611,6 +2659,18 @@ export class Database {
     // physical access-mode gate (25006) is checked earlier in executeStmtParams, so it wins when both
     // apply.
     this.checkPrivileges(stmt);
+    const out = this.dispatchStmtBody(stmt, params);
+    // Keep each GiST index's resident R-tree current: after a statement that mutated the main image,
+    // rebuild it from the (now-updated) leaf store so the next read descends a fresh tree (gist.md
+    // §3/§4.1). A no-op for reads / temp-only writes (mainDirty unset), preserving the
+    // temp-no-file-write invariant. GiST on a temp table is 0A000, so only the main snapshot is
+    // refreshed.
+    const tx = this.session.tx;
+    if (tx !== null && tx.mainDirty) tx.working.rebuildGistTrees();
+    return out;
+  }
+
+  private dispatchStmtBody(stmt: Statement, params: Value[]): Outcome {
     switch (stmt.kind) {
       case "createTable":
         rejectParamsForDDL(params);
@@ -3660,9 +3720,10 @@ export class Database {
     // B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
     // parser) so the error is the resolve-time undefined_object, after the table-exists check.
     const method = (ci.using ?? "btree").toLowerCase();
-    let kind: "btree" | "gin";
+    let kind: "btree" | "gin" | "gist";
     if (method === "btree") kind = "btree";
     else if (method === "gin") kind = "gin";
+    else if (method === "gist") kind = "gist";
     else throw engineError("undefined_object", "access method does not exist: " + ci.using);
     const cols: number[] = [];
     for (const name of ci.columns) {
@@ -3689,6 +3750,17 @@ export class Database {
           throw engineError(
             "feature_not_supported",
             "a gin index on " + typeCanonicalName(ty) + " is not supported yet",
+          );
+        }
+      } else if (kind === "gist") {
+        // GiST's range_ops opclass applies only to a range column; any other type has no default
+        // operator class for access method gist — 42704 (gist.md §5, the GIN-no-opclass precedent).
+        if (!typeIsRange(ty)) {
+          throw engineError(
+            "undefined_object",
+            "data type " +
+              typeCanonicalName(ty) +
+              " has no default operator class for access method gist",
           );
         }
       } else if (
@@ -3723,6 +3795,29 @@ export class Database {
       }
       if (cols.length !== 1) {
         throw engineError("feature_not_supported", "a multi-column gin index is not supported yet");
+      }
+    }
+    // GiST narrowings (gist.md §1/§5/§11): no uniqueness (express it as EXCLUDE … WITH =, GX3) and a
+    // single column only (multi-column GiST is GX2/GX3). A GiST index on a TEMP table is 0A000 (its
+    // resident R-tree would live on the temp snapshot — deferred). File persistence landed in GX1b.
+    if (kind === "gist") {
+      if (ci.unique) {
+        throw engineError(
+          "feature_not_supported",
+          "access method gist does not support unique indexes",
+        );
+      }
+      if (cols.length !== 1) {
+        throw engineError(
+          "feature_not_supported",
+          "a multi-column gist index is not supported yet",
+        );
+      }
+      if (this.isTempTable(ci.table) || this.isSharedTempTable(ci.table)) {
+        throw engineError(
+          "feature_not_supported",
+          "a gist index on a temporary table is not supported yet",
+        );
       }
     }
     let name: string;
@@ -4234,6 +4329,67 @@ export class Database {
       pages += u.pages;
       slabs += u.slabs;
       if (u.row === undefined) throw new Error("a GIN entry references a stored row");
+      entries.push({ key, row: u.row });
+    }
+    return { entries, pages, slabs };
+  }
+
+  // gistBoundRows gathers a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the
+  // constant query operand, then DESCENDS the index's resident R-tree visiting only children
+  // consistent with the query, collecting candidate storage keys at the leaves; each candidate row is
+  // point-looked-up in storage-key order. The original &&/@> predicate stays the residual WHERE filter
+  // (always-recheck), so the result is exactly the full-scan result — the bound only narrows which
+  // rows are fetched. Returns the candidate (key, row) entries + the up-front (pages, slabs) block;
+  // gist_descent (per interior node) is charged on meter directly. Degenerate constant queries (gist.md
+  // §5): a NULL Q and an empty && query match nothing; an empty @> query (col @> 'empty') matches every
+  // row → full-scan fallback (the empty bound is invisible to the overlap-descend).
+  gistBoundRows(
+    tableName: string,
+    gb: GistBound,
+    query: RExpr | null,
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+  ): { entries: Entry[]; pages: number; slabs: number } {
+    const store = this.lkpStore(tableName);
+    if (query === null) return { entries: [], pages: 0, slabs: 0 };
+    // The query operand is a constant; evaluating it (extract query) is a planning step, NOT metered.
+    const qv = evalExpr(query, [], env, new Meter());
+    if (qv.kind !== "range") return { entries: [], pages: 0, slabs: 0 }; // a NULL/non-range Q never TRUE
+    if (qv.empty) {
+      if (gb.strategy === "contains") {
+        // col @> 'empty' is TRUE for every row, but an empty bound is absorbed by the union, so it is
+        // invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall back to the full
+        // scan; the residual @> keeps every row.
+        const u = store.scanWithUnits(mask);
+        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
+      }
+      return { entries: [], pages: 0, slabs: 0 }; // col && 'empty' overlaps nothing
+    }
+    // Descend the resident R-tree (rebuilt at each mutating statement, gist.md §3/§4.1) — no per-query
+    // build. page_read per node touched + gist_descent per interior node.
+    let pages = 0;
+    let skeys: Uint8Array[] = [];
+    const tree = this.readSnap().gistTreeFor(gb.nameKey);
+    if (tree !== undefined) {
+      const r = gistSearch(tree, qv, gb.strategy);
+      skeys = r.keys;
+      pages += r.nodes;
+      meter.charge(COSTS.gistDescent * BigInt(r.interior));
+    }
+    // Point-look-up each candidate in storage-key order (the candidates ARE storage keys).
+    skeys.sort(cmpBytes);
+    const deduped: Uint8Array[] = [];
+    for (const k of skeys) {
+      if (deduped.length === 0 || cmpBytes(deduped[deduped.length - 1]!, k) !== 0) deduped.push(k);
+    }
+    let slabs = 0;
+    const entries: Entry[] = [];
+    for (const key of deduped) {
+      const u = store.getWithUnits(key, mask);
+      pages += u.pages;
+      slabs += u.slabs;
+      if (u.row === undefined) throw new Error("a GiST entry references a stored row");
       entries.push({ key, row: u.row });
     }
     return { entries, pages, slabs };
@@ -5445,9 +5601,18 @@ export class Database {
       // ordered-index bound stays SELECT-only). readSnap()==working() during a mutation (tx open), so
       // this reads the read-your-writes state. ginEntry charged inside; the block below.
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
+      const gtb = gb === null ? detectGistBound(filter, table.indexes, table.columns, 0) : null;
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
         const r = this.ginBoundRows(del.table, gb, m?.query ?? null, env, meter, mask);
+        entries = r.entries;
+        overlap = r.pages;
+        slabs = r.slabs;
+      } else if (gtb !== null) {
+        // GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree; the
+        // &&/@> predicate stays the residual filter re-applied per candidate below.
+        const m = filter !== null ? gistMatch(filter, gtb.colGlobal) : null;
+        const r = this.gistBoundRows(del.table, gtb, m?.query ?? null, env, meter, mask);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -5715,9 +5880,18 @@ export class Database {
       // update's target-row scan through the index over the PRE-update state (PK-then-GIN-then-full;
       // the ordered-index bound stays SELECT-only). ginEntry charged inside; the block below.
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
+      const gtb = gb === null ? detectGistBound(filter, table.indexes, table.columns, 0) : null;
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
         const r = this.ginBoundRows(upd.table, gb, m?.query ?? null, env, meter, mask);
+        entries = r.entries;
+        overlap = r.pages;
+        slabs = r.slabs;
+      } else if (gtb !== null) {
+        // GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree over
+        // the PRE-update state; the &&/@> predicate stays the residual filter re-applied per candidate.
+        const m = filter !== null ? gistMatch(filter, gtb.colGlobal) : null;
+        const r = this.gistBoundRows(upd.table, gtb, m?.query ?? null, env, meter, mask);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -8063,7 +8237,7 @@ export class Database {
     let empty = false;
     const sb = plan.relBounds[0]!;
     if (sb !== null) {
-      if (sb.kind === "index" || sb.kind === "gin")
+      if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
         throw new Error("the streaming path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer);
       if (b === null) empty = true;
@@ -8128,7 +8302,7 @@ export class Database {
     let empty = false;
     const sb = plan.relBounds[0]!;
     if (sb !== null) {
-      if (sb.kind === "index" || sb.kind === "gin")
+      if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
         throw new Error("the streaming sort path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer);
       if (b === null) empty = true;
@@ -8346,7 +8520,22 @@ export class Database {
       rows = r.entries.map((e) => e.row);
       nodeCount = r.pages;
       slabs = r.slabs;
-    } else if (relBound !== null) {
+    } else if (relBound !== null && relBound.kind === "gist") {
+      // Re-find the constant query Q (the conjunct plan-time gistMatch chose — gist.md §5); the &&/@>
+      // predicate also stays the residual filter downstream (always-recheck).
+      const m = plan.filter !== null ? gistMatch(plan.filter, relBound.gist.colGlobal) : null;
+      const r = this.gistBoundRows(
+        rel.tableName,
+        relBound.gist,
+        m?.query ?? null,
+        env,
+        meter,
+        plan.relMasks[ri]!,
+      );
+      rows = r.entries.map((e) => e.row);
+      nodeCount = r.pages;
+      slabs = r.slabs;
+    } else if (relBound !== null && relBound.kind === "pk") {
       const b = buildKeyBound(relBound.pk, params, outer);
       if (b === null) {
         rows = [];
@@ -8413,6 +8602,7 @@ export class Database {
       // gin.md §6): it reads the full admitted set via the eager path below.
       plan.relBounds[0]?.kind !== "index" &&
       plan.relBounds[0]?.kind !== "gin" &&
+      plan.relBounds[0]?.kind !== "gist" &&
       // A set-returning relation is generated, not scanned — it takes the eager path
       // (functions.md §10); the streaming reader assumes a table store.
       plan.rels[0]!.srf === undefined &&
@@ -8442,6 +8632,7 @@ export class Database {
       !plan.distinct &&
       plan.relBounds[0]?.kind !== "index" &&
       plan.relBounds[0]?.kind !== "gin" &&
+      plan.relBounds[0]?.kind !== "gist" &&
       // A set-returning relation takes the eager path (functions.md §10).
       plan.rels[0]!.srf === undefined &&
       // A CTE reference takes the eager path (cte.md §5).
@@ -8984,7 +9175,19 @@ function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Ro
 type ScanBound =
   | { kind: "pk"; pk: PkBound }
   | { kind: "index"; index: IndexBound }
-  | { kind: "gin"; gin: GinBound };
+  | { kind: "gin"; gin: GinBound }
+  | { kind: "gist"; gist: GistBound };
+
+// GistBound is the plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST index
+// (lowest lowercased name whose range column has a `col && const` / `col @> const` conjunct), the
+// descent strategy, and the column's global scope index. Like GinBound, the constant query operand is
+// NOT stored (re-found in plan.filter at exec time by gistMatch). No element type — the gather
+// descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
+type GistBound = {
+  nameKey: string;
+  strategy: GistStrategy;
+  colGlobal: number;
+};
 
 // GinStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
 // (contains, mode ALL → posting-list intersection), && (overlaps, mode ANY → union), = ANY
@@ -9089,6 +9292,10 @@ function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBoun
       };
     }
   }
+  // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered loop
+  // above already skipped the GiST index (its leading column is a non-scalar range).
+  const gtb = detectGistBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
+  if (gtb !== null) return { kind: "gist", gist: gtb };
   // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
   const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
   return gb !== null ? { kind: "gin", gin: gb } : null;
@@ -9231,6 +9438,57 @@ function ginMatch(
     rexprIsConstant(filter.lhs)
   ) {
     return { strategy: "member", query: filter.lhs };
+  }
+  return null;
+}
+
+// detectGistBound detects a GiST-bounded scan over columns/indexes (spec/design/gist.md §5): the
+// lowest-named GiST index whose range column at offset+ci has a `col && const` / `col @> const`
+// conjunct. Factored out so the SELECT planner (detectScanBound) and the UPDATE/DELETE scan share the
+// identical detection (the GIN precedent) — the mutations pass their indexes/columns at offset 0.
+function detectGistBound(
+  filter: RExpr | null,
+  indexes: IndexDef[],
+  columns: Column[],
+  offset: number,
+): GistBound | null {
+  if (filter === null) return null;
+  for (const idx of indexes) {
+    if (idx.kind !== "gist") continue;
+    const ci = idx.columns[0]!;
+    if (columns[ci]!.type.kind !== "range") continue; // a GiST column is always a range (the gate)
+    const colGlobal = offset + ci;
+    const m = gistMatch(filter, colGlobal);
+    if (m !== null) {
+      return { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal };
+    }
+  }
+  return null;
+}
+
+// gistMatch finds the first WHERE AND-chain conjunct a GiST range_ops index on colGlobal accelerates
+// (spec/design/gist.md §5): `col && Q` (overlap — symmetric) or `col @> Q` (contains — asymmetric,
+// the column must be the LEFT operand; `Q @> col` is the non-accelerated <@). Q must be a constant.
+// The other range operators stay full-scan this slice. Returns the strategy and the constant query
+// operand — used at plan time (strategy) and exec time (recover from plan.filter).
+function gistMatch(
+  filter: RExpr,
+  colGlobal: number,
+): { strategy: GistStrategy; query: RExpr } | null {
+  if (filter.kind === "and") {
+    return gistMatch(filter.lhs, colGlobal) ?? gistMatch(filter.rhs, colGlobal);
+  }
+  if (filter.kind === "rangeOp" && filter.args.length === 2) {
+    const a = filter.args[0]!;
+    const b = filter.args[1]!;
+    if (filter.op === "overlaps") {
+      // && — symmetric in its operands.
+      if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "overlaps", query: b };
+      if (isColumnRef(b, colGlobal) && rexprIsConstant(a)) return { strategy: "overlaps", query: a };
+    } else if (filter.op === "contains") {
+      // @> — the indexed column must be the container (LEFT).
+      if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "contains", query: b };
+    }
   }
   return null;
 }
@@ -9388,7 +9646,33 @@ function indexEntryKeys(
   row: Row,
 ): Uint8Array[] {
   if (def.kind === "gin") return ginEntries(columns, def, storageKey, row);
+  if (def.kind === "gist") return gistEntries(columns, def, storageKey, row);
   return [indexEntryKey(columns, colls, def, storageKey, row)];
+}
+
+// gistElemColType is a GiST range column's element (sub)type as a ColType — the codec/comparator key
+// for the R-tree bounds (spec/design/gist.md §4.1). Computed consistently in gistEntries, the
+// resident-tree rebuild, and the serializer, so the bytes match across cores.
+function gistElemColType(colType: Type): ColType {
+  if (colType.kind !== "range") throw new Error("a GiST index column is a range (CREATE INDEX gate)");
+  return { kind: "scalar", scalar: typeScalar(colType.elem) };
+}
+
+// gistEntries builds a GiST index's entry keys for one row (spec/design/gist.md §4.1): exactly one
+// leaf key, encodeRangeBody(bound) ‖ storage_key (the GIN term ‖ skey pattern), so all existing index
+// maintenance (insert/update/delete) reuses it unchanged. A NULL range value is not indexed; the
+// empty range is a real value and IS indexed.
+function gistEntries(
+  columns: Column[],
+  def: IndexDef,
+  storageKey: Uint8Array,
+  row: Row,
+): Uint8Array[] {
+  const ci = def.columns[0]!;
+  const elem = gistElemColType(columns[ci]!.type);
+  const v = row[ci]!;
+  if (v.kind !== "range") return []; // a NULL range yields no entry
+  return [encodeGistLeafKey(elem, v, storageKey)];
 }
 
 // ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per

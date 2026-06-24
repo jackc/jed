@@ -234,6 +234,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.sequenceAdvance;
       case "gin_entry":
         return COSTS.ginEntry;
+      case "gist_descent":
+        return COSTS.gistDescent;
       case "collate":
         return COSTS.collate;
       case "timezone":

@@ -112,9 +112,10 @@ export type IndexDef = {
   name: string;
   columns: number[];
   unique: boolean;
-  // kind selects an ordered B-tree (the default) or a GIN inverted index (spec/design/gin.md).
-  // Persisted as the v12 per-index index_kind byte; a GIN index is never unique.
-  kind: "btree" | "gin";
+  // kind selects an ordered B-tree (the default), a GIN inverted index (spec/design/gin.md), or a
+  // GiST R-tree (spec/design/gist.md). Persisted as the per-index index_kind byte (v13 GIN, v20
+  // GiST); a GIN/GiST index is never unique.
+  kind: "btree" | "gin" | "gist";
 };
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its

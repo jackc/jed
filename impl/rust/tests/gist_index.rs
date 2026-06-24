@@ -190,7 +190,10 @@ fn gist_file_backed_round_trip() {
         run(&mut db, "INSERT INTO t VALUES (6, NULL)");
         // Accelerated query before close.
         assert_eq!(
-            ids(&mut db, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"),
+            ids(
+                &mut db,
+                "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"
+            ),
             vec![1, 3]
         );
     }
@@ -198,17 +201,26 @@ fn gist_file_backed_round_trip() {
     {
         let mut db = Database::open(&path).unwrap();
         assert_eq!(
-            ids(&mut db, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"),
+            ids(
+                &mut db,
+                "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"
+            ),
             vec![1, 3]
         );
         assert_eq!(
-            ids(&mut db, "SELECT id FROM t WHERE r @> i32range(4,5) ORDER BY id"),
+            ids(
+                &mut db,
+                "SELECT id FROM t WHERE r @> i32range(4,5) ORDER BY id"
+            ),
             vec![1, 3]
         );
         // Maintenance after reopen: a fresh INSERT updates the (loaded) index, the next query sees it.
         run(&mut db, "INSERT INTO t VALUES (7, '[5,7)')");
         assert_eq!(
-            ids(&mut db, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"),
+            ids(
+                &mut db,
+                "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"
+            ),
             vec![3, 7]
         );
     }
@@ -216,7 +228,10 @@ fn gist_file_backed_round_trip() {
     {
         let mut db = Database::open(&path).unwrap();
         assert_eq!(
-            ids(&mut db, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"),
+            ids(
+                &mut db,
+                "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"
+            ),
             vec![3, 7]
         );
     }

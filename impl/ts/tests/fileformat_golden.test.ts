@@ -227,6 +227,21 @@ function ginArrayTableDB(): Database {
   return db;
 }
 
+// gistRangeTableDB has a GiST index over an i32range column (kind 2, v20 — spec/design/gist.md GX1):
+// pins the index_kind = 2 byte and the persisted R-tree (page types 5/6). 6 bounded [) ranges + one
+// empty range force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels (an interior
+// root over two leaves). Row 8's NULL range is not indexed. Mirrors the Ruby reference GIST_RANGE_TABLE.
+function gistRangeTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), (5, '[50,60)'), (6, '[15,25)'), (7, 'empty'), (8, NULL)",
+  );
+  run(db, "CREATE INDEX t_r_gist ON t USING gist (r)");
+  return db;
+}
+
 // ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
 // golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
@@ -798,6 +813,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "array_table.jed", build: arrayTableDB },
     { name: "range_table.jed", build: rangeTableDB },
     { name: "range_pk_table.jed", build: rangePkTableDB },
+    { name: "gist_range_table.jed", build: gistRangeTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
     { name: "json_table.jed", build: jsonTableDB },
@@ -859,6 +875,7 @@ test("read goldens reproduces rows", () => {
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "range_table.jed", build: rangeTableDB, table: "t" },
     { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },
+    { name: "gist_range_table.jed", build: gistRangeTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
     { name: "json_table.jed", build: jsonTableDB, table: "t" },

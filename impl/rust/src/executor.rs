@@ -854,7 +854,10 @@ impl Snapshot {
 
     /// The resident GiST R-tree of the named index (lowercased key), or `None` if the index is not
     /// GiST / not present (spec/design/gist.md §4.1). The planner descends it for a `&&`/`@>` bound.
-    pub(crate) fn gist_tree(&self, name_key: &str) -> Option<&std::sync::Arc<crate::gist::GistTree>> {
+    pub(crate) fn gist_tree(
+        &self,
+        name_key: &str,
+    ) -> Option<&std::sync::Arc<crate::gist::GistTree>> {
         self.gist_trees.get(name_key)
     }
 
@@ -888,8 +891,7 @@ impl Snapshot {
                 specs.push((idx.name.to_ascii_lowercase(), elem));
             }
         }
-        let live: std::collections::HashSet<&str> =
-            specs.iter().map(|(k, _)| k.as_str()).collect();
+        let live: std::collections::HashSet<&str> = specs.iter().map(|(k, _)| k.as_str()).collect();
         self.gist_trees.retain(|k, _| live.contains(k.as_str()));
         for (name_key, elem) in &specs {
             let keys: Vec<Vec<u8>> = match self.index_stores.get(name_key) {
@@ -14453,7 +14455,8 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Database) -> Opti
     }
     // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered
     // loop above already skipped the GiST index (its leading column is a non-scalar range).
-    if let Some(gb) = detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset) {
+    if let Some(gb) = detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
+    {
         return Some(ScanBound::Gist(gb));
     }
     // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.

@@ -123,7 +123,14 @@ impl GistTree {
         let mut out = Vec::new();
         let mut nodes = 0usize;
         let mut interior = 0usize;
-        search_node(&self.root, query, strat, &mut out, &mut nodes, &mut interior);
+        search_node(
+            &self.root,
+            query,
+            strat,
+            &mut out,
+            &mut nodes,
+            &mut interior,
+        );
         (out, nodes, interior)
     }
 }
