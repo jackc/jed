@@ -245,13 +245,15 @@ func SeqDataTypeForScalar(s ScalarType) (SeqDataType, bool) {
 	}
 }
 
-// IndexKind selects an ordered B-tree (the default) or a GIN inverted index
-// (spec/design/gin.md). Persisted as the v13 per-index index_kind byte.
+// IndexKind selects an ordered B-tree (the default), a GIN inverted index (spec/design/gin.md),
+// or a GiST R-tree (spec/design/gist.md). Persisted as the per-index index_kind byte (v13: GIN;
+// v20: GiST).
 type IndexKind byte
 
 const (
 	IndexBtree IndexKind = 0
 	IndexGin   IndexKind = 1
+	IndexGist  IndexKind = 2
 )
 
 // CompositeType is a user-defined composite (row) type (spec/design/composite.md): a named,

@@ -129,6 +129,13 @@ type Snapshot struct {
 	// An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
 	// on that collation's entry_kind = 3 reference entry, restored on load.
 	defaultCollation string
+	// gistTrees holds each GiST index's resident R-tree (spec/design/gist.md §4.1), keyed by the
+	// lowercased index name. The leaf-key store (indexStores) stays the maintained source of truth;
+	// this tree is the acceleration structure the planner descends. Rebuilt CANONICALLY
+	// (buildGistFromLeafKeys — content-deterministic, gist.md §3) at every mutating statement and on
+	// load, so a committed snapshot always carries a fresh, cross-core-identical tree a SELECT can
+	// descend. Never mutated in place (replaced wholesale on rebuild), so clone shallow-copies it.
+	gistTrees map[string]*gistTree
 }
 
 // newSnapshot builds an empty snapshot.
@@ -140,6 +147,7 @@ func newSnapshot() *Snapshot {
 		indexStores: make(map[string]*TableStore),
 		sequences:   make(map[string]*SequenceDef),
 		collations:  make(map[string]*Collation),
+		gistTrees:   make(map[string]*gistTree),
 	}
 }
 
@@ -176,7 +184,13 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.collations {
 		collations[k] = v
 	}
-	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation}
+	// GiST trees are never mutated in place — only replaced wholesale on rebuild — so the map copy is
+	// shallow (spec/design/gist.md §4.1).
+	gistTrees := make(map[string]*gistTree, len(s.gistTrees))
+	for k, v := range s.gistTrees {
+		gistTrees[k] = v
+	}
+	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees}
 }
 
 // resolveCollation resolves a collation name for USE — query resolution and key encoding
@@ -749,6 +763,65 @@ func (s *Snapshot) setColumnDefaultExpr(tableKey string, column int, de *Default
 // so only the store is registered here.
 func (s *Snapshot) putIndexStore(nameKey string, store *TableStore) {
 	s.indexStores[nameKey] = store
+}
+
+// gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or nil if the
+// index is not GiST / not present (spec/design/gist.md §4.1). The planner descends it for a &&/@>
+// bound.
+func (s *Snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[nameKey] }
+
+// rebuildGistTrees rebuilds EVERY GiST index's resident R-tree from its leaf-key store
+// (spec/design/gist.md §3/§4.1). Called after any statement that may have changed a GiST index's
+// leaf set (the mutating-statement hook) and on load, so the working snapshot always carries a fresh
+// tree a subsequent read descends. Each tree is built CANONICALLY (buildGistFromLeafKeys), making it
+// a pure function of the leaf SET — content-deterministic, cross-core identical, and identical to the
+// on-disk persisted R-tree. Trees whose index has been dropped are removed. A whole-tree rewrite (the
+// §4.1(b) narrowing extended to in-memory writes); the O(rows)-per-mutation cost is unmetered
+// structure maintenance on the (trusted) write path — the untrusted surface is SELECT-only.
+func (s *Snapshot) rebuildGistTrees() error {
+	type spec struct {
+		nameKey string
+		elem    ColType
+	}
+	var specs []spec
+	for _, t := range s.tables {
+		for i := range t.Indexes {
+			idx := &t.Indexes[i]
+			if idx.Kind != IndexGist {
+				continue
+			}
+			rt, _ := t.Columns[idx.Columns[0]].Type.RangeElement()
+			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), elem: ScalarColType(rt.Scalar)})
+		}
+	}
+	live := make(map[string]bool, len(specs))
+	for _, sp := range specs {
+		live[sp.nameKey] = true
+	}
+	for k := range s.gistTrees {
+		if !live[k] {
+			delete(s.gistTrees, k)
+		}
+	}
+	for _, sp := range specs {
+		var keys [][]byte
+		if store := s.indexStores[sp.nameKey]; store != nil {
+			entries, err := store.EntriesInKeyOrder()
+			if err != nil {
+				return err
+			}
+			keys = make([][]byte, len(entries))
+			for i, e := range entries {
+				keys[i] = e.Key
+			}
+		}
+		tree, err := buildGistFromLeafKeys(sp.elem, keys)
+		if err != nil {
+			return err
+		}
+		s.gistTrees[sp.nameKey] = tree
+	}
+	return nil
 }
 
 // removeIndex removes one secondary index (DROP INDEX): its definition from the owning
@@ -3260,6 +3333,31 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 	if err := db.checkPrivileges(stmt); err != nil {
 		return Outcome{}, err
 	}
+	out, err := db.dispatchStmtBody(stmt, params)
+	// Keep each GiST index's resident R-tree current: after a statement that mutated the main image,
+	// rebuild it from the (now-updated) leaf store so the next read descends a fresh tree (gist.md
+	// §3/§4.1). A no-op for reads / temp-only writes (mainDirty unset).
+	if err == nil {
+		if herr := db.rebuildMainGistTreesIfDirty(); herr != nil {
+			return Outcome{}, herr
+		}
+	}
+	return out, err
+}
+
+// rebuildMainGistTreesIfDirty refreshes the main working snapshot's resident GiST trees iff the
+// current statement mutated the main image (gist.md §3/§4.1). Gated on mainDirty (set by the
+// statement's own working() writes): a read or a temp-only write leaves it unset, so this is a no-op
+// and never forces a spurious main-image persist (the temp-no-file-write invariant). GiST on a temp
+// table is 0A000 this slice, so only the main working snapshot is refreshed.
+func (db *Database) rebuildMainGistTreesIfDirty() error {
+	if db.session.tx != nil && db.session.tx.mainDirty {
+		return db.session.tx.working.rebuildGistTrees()
+	}
+	return nil
+}
+
+func (db *Database) dispatchStmtBody(stmt Statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
@@ -4555,6 +4653,8 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		kind = IndexBtree
 	case "gin":
 		kind = IndexGin
+	case "gist":
+		kind = IndexGist
 	default:
 		return Outcome{}, NewError(UndefinedObject, "access method does not exist: "+ci.Using)
 	}
@@ -4585,6 +4685,14 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a gin index on "+ty.CanonicalName()+" is not supported yet")
 			}
+		case IndexGist:
+			// GiST's range_ops opclass applies only to a range column; any other type has no
+			// default operator class for access method gist — 42704 (gist.md §5, the GIN-no-opclass
+			// precedent, PG's wording).
+			if !ty.IsRange() {
+				return Outcome{}, NewError(UndefinedObject,
+					"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
+			}
 		}
 		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
 		cols = append(cols, idx)
@@ -4597,6 +4705,21 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		}
 		if len(cols) != 1 {
 			return Outcome{}, NewError(FeatureNotSupported, "a multi-column gin index is not supported yet")
+		}
+	}
+	// GiST narrowings (gist.md §1/§5/§11): no uniqueness (express it as EXCLUDE … WITH =, GX3) and a
+	// single column only (multi-column GiST is GX2/GX3). A GiST index on a TEMP table is 0A000 (its
+	// resident R-tree would live on the temp snapshot — deferred, gist.md §11). File persistence
+	// landed in GX1b, so a file-backed GiST index is supported.
+	if kind == IndexGist {
+		if ci.Unique {
+			return Outcome{}, NewError(FeatureNotSupported, "access method gist does not support unique indexes")
+		}
+		if len(cols) != 1 {
+			return Outcome{}, NewError(FeatureNotSupported, "a multi-column gist index is not supported yet")
+		}
+		if db.isTempTable(ci.Table) || db.isSharedTempTable(ci.Table) {
+			return Outcome{}, NewError(FeatureNotSupported, "a gist index on a temporary table is not supported yet")
 		}
 	}
 	name := ci.Name
@@ -5020,11 +5143,29 @@ func indexEntryKeys(columns []Column, colls []*Collation, def IndexDef, storageK
 	if def.Kind == IndexGin {
 		return ginEntries(columns, def, storageKey, row), nil
 	}
+	if def.Kind == IndexGist {
+		return gistEntries(columns, def, storageKey, row), nil
+	}
 	ek, err := indexEntryKey(columns, colls, def, storageKey, row)
 	if err != nil {
 		return nil, err
 	}
 	return [][]byte{ek}, nil
+}
+
+// gistEntries builds a GiST index's entry keys for one row (spec/design/gist.md §4.1): exactly one
+// leaf key, encodeRangeBody(bound) ‖ storage_key (the GIN term ‖ skey pattern), so all existing
+// index maintenance (insert/update/delete) reuses it unchanged. A NULL range value is not indexed;
+// the empty range is a real value and IS indexed.
+func gistEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
+	ci := def.Columns[0]
+	rt, _ := columns[ci].Type.RangeElement()
+	elem := ScalarColType(rt.Scalar)
+	v := row[ci]
+	if v.Kind != ValRange {
+		return nil // a NULL range yields no entry
+	}
+	return [][]byte{encodeGistLeafKey(elem, v.Range, storageKey)}
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
@@ -6806,6 +6947,16 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 		if entries, overlap, slabs, err = db.ginBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
 			return Outcome{}, err
 		}
+	} else if gb := detectGistBound(filter, table.Indexes, table.Columns, 0); gb != nil {
+		// GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree; the
+		// &&/@> predicate stays the residual filter re-applied per candidate below.
+		var query *rExpr
+		if _, q, ok := gistMatch(filter, gb.colGlobal); ok {
+			query = q
+		}
+		if entries, overlap, slabs, err = db.gistBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
+			return Outcome{}, err
+		}
 	} else {
 		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
 			return Outcome{}, err
@@ -7120,6 +7271,16 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 			query = q
 		}
 		if entries, overlap, slabs, err = db.ginBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
+			return Outcome{}, err
+		}
+	} else if gb := detectGistBound(filter, table.Indexes, table.Columns, 0); gb != nil {
+		// GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree over
+		// the PRE-update state; the &&/@> predicate stays the residual filter re-applied per candidate.
+		var query *rExpr
+		if _, q, ok := gistMatch(filter, gb.colGlobal); ok {
+			query = q
+		}
+		if entries, overlap, slabs, err = db.gistBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
 			return Outcome{}, err
 		}
 	} else {
@@ -11080,6 +11241,18 @@ type scanBound struct {
 	pk    *pkBoundPlan
 	index *indexBoundPlan
 	gin   *ginBoundPlan
+	gist  *gistBoundPlan
+}
+
+// gistBoundPlan is the plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST
+// index (lowest lowercased name whose range column has a `col && const` / `col @> const` conjunct),
+// the descent strategy, and the column's global scope index. Like ginBoundPlan, the constant query
+// operand is NOT stored (re-found in plan.filter at exec time by gistMatch). No element type is
+// carried — the gather descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
+type gistBoundPlan struct {
+	nameKey   string
+	strategy  gistStrategy
+	colGlobal int
 }
 
 // ginStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
@@ -11210,6 +11383,11 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *Database) *scanBound {
 			}}
 		}
 	}
+	// GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered
+	// loop above already skipped the GiST index (its leading column is a non-scalar range).
+	if gb := detectGistBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
+		return &scanBound{gist: gb}
+	}
 	// GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
 	if gb := detectGinBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
 		return &scanBound{gin: gb}
@@ -11324,6 +11502,61 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 	if filter.kind == reQuantified && filter.op == OpEq && !filter.quantAll &&
 		isColumn(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs) {
 		return ginMember, filter.lhs, true
+	}
+	return 0, nil, false
+}
+
+// detectGistBound detects a GiST-bounded scan over columns/indexes (spec/design/gist.md §5): the
+// lowest-named GiST index whose range column at offset+ci has a `col && const` / `col @> const`
+// conjunct. Factored out so the SELECT planner (detectScanBound) and the UPDATE/DELETE scan share
+// the identical detection (the GIN precedent) — the mutations pass their indexes/columns at offset 0.
+func detectGistBound(filter *rExpr, indexes []IndexDef, columns []Column, offset int) *gistBoundPlan {
+	for _, idx := range indexes {
+		if idx.Kind != IndexGist {
+			continue
+		}
+		ci := idx.Columns[0]
+		if !columns[ci].Type.IsRange() {
+			continue // a GiST column is always a range (the CREATE INDEX gate); defensive
+		}
+		colGlobal := offset + ci
+		if s, _, ok := gistMatch(filter, colGlobal); ok {
+			return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}
+		}
+	}
+	return nil
+}
+
+// gistMatch finds the first WHERE AND-chain conjunct a GiST range_ops index on colGlobal accelerates
+// (spec/design/gist.md §5): `col && Q` (overlap — symmetric) or `col @> Q` (contains — asymmetric,
+// the column must be the LEFT operand; `Q @> col` is the non-accelerated <@). Q must be a constant.
+// The other range operators stay full-scan this slice. Returns the strategy and the constant query
+// operand — used at plan time (strategy) and exec time (recover from plan.filter).
+func gistMatch(filter *rExpr, colGlobal int) (gistStrategy, *rExpr, bool) {
+	if filter == nil {
+		return 0, nil, false
+	}
+	if filter.kind == reAnd {
+		if s, q, ok := gistMatch(filter.lhs, colGlobal); ok {
+			return s, q, true
+		}
+		return gistMatch(filter.rhs, colGlobal)
+	}
+	if filter.kind == reRangeOp && len(filter.sargs) == 2 {
+		a, b := filter.sargs[0], filter.sargs[1]
+		switch filter.rop {
+		case roOverlaps: // && — symmetric in its operands
+			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+				return gistOverlaps, b, true
+			}
+			if isColumn(b, colGlobal) && rexprIsConstant(a) {
+				return gistOverlaps, a, true
+			}
+		case roContains: // @> — the indexed column must be the container (LEFT)
+			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+				return gistContains, b, true
+			}
+		}
 	}
 	return 0, nil, false
 }
@@ -11589,6 +11822,69 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 		slabs += sl
 		if !ok {
 			panic("a GIN entry references a stored row")
+		}
+		out = append(out, Entry{Key: key, Row: row})
+	}
+	return out, pages, slabs, nil
+}
+
+// gistBoundRows gathers a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the
+// constant query operand, then DESCENDS the index's resident R-tree visiting only children
+// consistent with the query, collecting candidate storage keys at the leaves; each candidate row is
+// point-looked-up in storage-key order. The original &&/@> predicate stays the residual WHERE filter
+// (always-recheck), so the result is exactly the full-scan result — the bound only narrows which rows
+// are fetched. Returns the candidate (key, row) Entry pairs + the up-front (page_read, value_decompress)
+// block (tree nodes visited + each candidate's lookup); gist_descent (per interior) is charged on meter
+// directly. Degenerate constant queries (gist.md §5): a NULL Q and an empty && query match nothing; an
+// empty @> query (col @> 'empty') matches every row → full-scan fallback (the empty bound is invisible
+// to the overlap-descend).
+func (db *Database) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
+	store := db.lkpStore(tableName)
+	if query == nil {
+		return nil, 0, 0, nil
+	}
+	// The query operand is a constant; evaluating it (extract query) is a planning step, NOT metered.
+	qv, err := query.eval(nil, env, &Meter{})
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if qv.Kind != ValRange {
+		return nil, 0, 0, nil // a NULL (or non-range) query is never TRUE (both && and @>)
+	}
+	qr := qv.Range
+	if qr.Empty {
+		switch gb.strategy {
+		case gistContains:
+			// col @> 'empty' is TRUE for every row, but an empty bound is absorbed by the union, so it
+			// is invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall back to the
+			// full scan; the residual @> keeps every row.
+			entries, p, sl, e := store.ScanWithUnits(mask)
+			return entries, p, sl, e
+		case gistOverlaps:
+			return nil, 0, 0, nil // col && 'empty' overlaps nothing
+		}
+	}
+	// Descend the resident R-tree (rebuilt at each mutating statement, gist.md §3/§4.1) — no per-query
+	// build. page_read per node touched + gist_descent per interior node.
+	var skeys [][]byte
+	if tree := db.readSnap().gistTreeFor(gb.nameKey); tree != nil {
+		nodes, interior := 0, 0
+		skeys, nodes, interior = tree.search(qr, gb.strategy)
+		pages += nodes
+		meter.Charge(Costs.GistDescent * int64(interior))
+	}
+	// Point-look-up each candidate in storage-key order (the candidates ARE storage keys).
+	slices.SortFunc(skeys, bytes.Compare)
+	skeys = slices.CompactFunc(skeys, bytes.Equal)
+	for _, key := range skeys {
+		row, ok, n, sl, e := store.GetWithUnits(key, mask)
+		if e != nil {
+			return nil, 0, 0, e
+		}
+		pages += n
+		slabs += sl
+		if !ok {
+			panic("a GiST entry references a stored row")
 		}
 		out = append(out, Entry{Key: key, Row: row})
 	}
@@ -12372,7 +12668,25 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 			rows[i] = entries[i].Row
 		}
 		nodeCount, slabs = pages, sl
-	} else if sb != nil {
+	} else if sb != nil && sb.gist != nil {
+		// Re-find the constant query Q (the conjunct plan-time gistMatch chose — gist.md §5); the
+		// &&/@> predicate also stays the residual filter downstream (always-recheck).
+		var query *rExpr
+		if plan.filter != nil {
+			if _, q, ok := gistMatch(plan.filter, sb.gist.colGlobal); ok {
+				query = q
+			}
+		}
+		entries, pages, sl, err := db.gistBoundRows(rel.tableName, sb.gist, query, env, meter, plan.relMasks[ri])
+		if err != nil {
+			return nil, err
+		}
+		rows = make([]Row, len(entries))
+		for i := range entries {
+			rows[i] = entries[i].Row
+		}
+		nodeCount, slabs = pages, sl
+	} else if sb != nil && sb.pk != nil {
 		b, empty := db.buildKeyBound(sb.pk, params, outer)
 		if !empty {
 			entries, pages, sl, err := store.RangeScanWithUnits(b, plan.relMasks[ri])
@@ -12439,7 +12753,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	if len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
 		(plan.pkOrdered || (len(plan.order) == 0 && plan.limit != nil)) &&
-		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
+		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil && plan.relBounds[0].gist == nil)) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference is a computed/buffered source, not a table store — the eager path
 		// (cte.md §5) delivers its rows; the streaming reader assumes a store.
@@ -12458,7 +12772,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// cost.md §3; spill.md §6).
 	if len(plan.order) > 0 && !plan.pkOrdered && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
-		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
+		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil && plan.relBounds[0].gist == nil)) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference takes the eager path (cte.md §5).
 		plan.rels[0].cte == nil &&

@@ -238,6 +238,19 @@ func ginArrayTableDB(t *testing.T) *Database {
 	return db
 }
 
+// gistRangeTableDB has a GiST index over an i32range column (kind 2, v20 — spec/design/gist.md GX1):
+// pins the index_kind = 2 byte and the persisted R-tree (page types 5/6). 6 bounded [) ranges + one
+// empty range force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels (an interior
+// root over two leaves). Row 8's NULL range is not indexed. Mirrors the Ruby reference GIST_RANGE_TABLE.
+func gistRangeTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)")
+	run(t, db, "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), "+
+		"(5, '[50,60)'), (6, '[15,25)'), (7, 'empty'), (8, NULL)")
+	run(t, db, "CREATE INDEX t_r_gist ON t USING gist (r)")
+	return db
+}
+
 // ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
 // golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
@@ -794,6 +807,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"array_table.jed", arrayTableDB},
 		{"range_table.jed", rangeTableDB},
 		{"range_pk_table.jed", rangePKTableDB},
+		{"gist_range_table.jed", gistRangeTableDB},
 		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
 		{"sequence_table.jed", sequenceTableDB},
@@ -860,6 +874,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"array_table.jed", arrayTableDB, "t"},
 		{"range_table.jed", rangeTableDB, "t"},
 		{"range_pk_table.jed", rangePKTableDB, "t"},
+		{"gist_range_table.jed", gistRangeTableDB, "t"},
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
 		{"sequence_table.jed", sequenceTableDB, "t"},

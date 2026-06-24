@@ -23,7 +23,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 19    // on-disk format version (19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 20    // on-disk format version (20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -797,7 +797,18 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		// (spec/fileformat/format.md "From-scratch image").
 		for _, idx := range s.tables[k].Indexes {
 			var r uint32
-			if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
+			if idx.Kind == IndexGist {
+				// GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md
+				// §4.1). Serialize the canonical tree, allocating from the same counter.
+				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, func() uint32 { p := nextIndex; nextIndex++; return p })
+				if err != nil {
+					return nil, err
+				}
+				for _, p := range gpages {
+					body = append(body, bodyPage{index: p.pageNo, pageType: p.pageType, itemCount: p.itemCount, nextPage: 0, payload: p.payload})
+				}
+				r = root
+			} else if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
 				rp, np, err := serializeNode(root, indexColTypes, capacity, nextIndex, &body)
 				if err != nil {
 					return nil, err
@@ -881,6 +892,38 @@ type bodyPage struct {
 	itemCount uint32
 	nextPage  uint32
 	payload   []byte
+}
+
+// serializeGistIndex builds a GiST index's canonical R-tree from its leaf-key store and serializes it
+// to node pages (spec/design/gist.md §3/§4.1). The on-disk form of a GiST index is the R-tree (page
+// types 5/6), NOT the flat leaf-key B-tree the in-memory index store holds — so the index store is
+// never serialized for a GiST index; this is. The tree is rebuilt CANONICALLY from the leaf set, so
+// its bytes are a pure function of the set — content-deterministic and cross-core identical (§3).
+// alloc hands out page numbers (a counter for the whole image, the free-list allocator for an
+// incremental commit). Returns the node pages + the root; an empty index returns no pages and root 0.
+func serializeGistIndex(s *Snapshot, table *Table, idx IndexDef, alloc func() uint32) ([]gistPage, uint32, error) {
+	rt, _ := table.Columns[idx.Columns[0]].Type.RangeElement()
+	elem := ScalarColType(rt.Scalar)
+	var keys [][]byte
+	if istore := s.indexStores[strings.ToLower(idx.Name)]; istore != nil {
+		entries, err := istore.EntriesInKeyOrder()
+		if err != nil {
+			return nil, 0, err
+		}
+		keys = make([][]byte, len(entries))
+		for i, e := range entries {
+			keys[i] = e.Key
+		}
+	}
+	if len(keys) == 0 {
+		return nil, 0, nil
+	}
+	tree, err := buildGistFromLeafKeys(elem, keys)
+	if err != nil {
+		return nil, 0, err
+	}
+	pages, root := serializeGistTree(tree, elem, alloc)
+	return pages, root, nil
 }
 
 // serializeNode serializes one node and its subtree post-order, appending each to *body, and returns
@@ -1010,7 +1053,18 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 		// "Allocation & incremental commit").
 		for _, idx := range s.tables[k].Indexes {
 			var r uint32
-			if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
+			if idx.Kind == IndexGist {
+				// GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from the
+				// allocator (free-list first), the old tree's pages reclaimed on the next open.
+				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, alloc.take)
+				if err != nil {
+					return incrementalWrite{}, err
+				}
+				for _, p := range gpages {
+					pages = append(pages, dirtyPage{index: p.pageNo, bytes: makePage(ps, p.pageType, p.itemCount, 0, p.payload)})
+				}
+				r = root
+			} else if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
 				rp, err := serializeDirty(root, indexColTypes, capacity, ps, alloc, &pages, paging)
 				if err != nil {
 					return incrementalWrite{}, err
@@ -1275,11 +1329,33 @@ func LoadDatabase(image []byte) (*Database, error) {
 			for k, idx := range table.Indexes {
 				istore := NewTableStore(pageSize-pageHeader, nil)
 				if indexRoots[k] != 0 {
-					root, length, err := readTree(image, pageSize, indexRoots[k], nil, reached)
-					if err != nil {
-						return nil, err
+					if idx.Kind == IndexGist {
+						// GiST: parse the persisted R-tree (pages 5/6), marking its pages reached, and
+						// recover its leaf keys to repopulate the flat leaf store. The resident R-tree is
+						// rebuilt canonically below (rebuildGistTrees).
+						var keys [][]byte
+						read := func(p uint32) (byte, uint32, []byte, error) {
+							pg, err := readPage(image, pageSize, p)
+							if err != nil {
+								return 0, 0, nil, err
+							}
+							return pg.pageType, pg.itemCount, pg.payload, nil
+						}
+						if err := readGistLeafKeys(read, indexRoots[k], reached, &keys); err != nil {
+							return nil, err
+						}
+						for _, key := range keys {
+							if _, err := istore.Insert(key, nil); err != nil {
+								return nil, err
+							}
+						}
+					} else {
+						root, length, err := readTree(image, pageSize, indexRoots[k], nil, reached)
+						if err != nil {
+							return nil, err
+						}
+						istore.setTree(root, length)
 					}
-					istore.setTree(root, length)
 				}
 				snap.putIndexStore(strings.ToLower(idx.Name), istore)
 			}
@@ -1289,6 +1365,10 @@ func LoadDatabase(image []byte) (*Database, error) {
 	// Two-pass: validate the composite-type catalog (existence + acyclicity) now that every type
 	// entry has been read (spec/design/composite.md §3); a bad reference is XX001.
 	if err := snap.validateCompositeTypes(); err != nil {
+		return nil, err
+	}
+	// Build each GiST index's resident R-tree from its now-loaded leaf store (gist.md §4.1).
+	if err := snap.rebuildGistTrees(); err != nil {
 		return nil, err
 	}
 	db := NewDatabase()
@@ -1442,13 +1522,38 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 			// is ever needed.
 			for k, idx := range table.Indexes {
 				istore := NewTableStore(pageSize-pageHeader, nil)
-				istore.attachPaging(paging)
-				if indexRoots[k] != 0 {
-					root, length, err := readSkeleton(paging, indexRoots[k], nil, reached)
-					if err != nil {
+				if indexRoots[k] != 0 && idx.Kind == IndexGist {
+					// GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the whole R-tree
+					// (marking pages reached), recover its leaf keys into a fully-resident leaf store.
+					var keys [][]byte
+					read := func(p uint32) (byte, uint32, []byte, error) {
+						block, err := paging.readBlock(p)
+						if err != nil {
+							return 0, 0, nil, err
+						}
+						pg, err := parsePage(block)
+						if err != nil {
+							return 0, 0, nil, err
+						}
+						return pg.pageType, pg.itemCount, pg.payload, nil
+					}
+					if err := readGistLeafKeys(read, indexRoots[k], reached, &keys); err != nil {
 						return nil, err
 					}
-					istore.setTree(root, length)
+					for _, key := range keys {
+						if _, err := istore.Insert(key, nil); err != nil {
+							return nil, err
+						}
+					}
+				} else {
+					istore.attachPaging(paging)
+					if indexRoots[k] != 0 {
+						root, length, err := readSkeleton(paging, indexRoots[k], nil, reached)
+						if err != nil {
+							return nil, err
+						}
+						istore.setTree(root, length)
+					}
 				}
 				snap.putIndexStore(strings.ToLower(idx.Name), istore)
 			}
@@ -1459,6 +1564,10 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 	// Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
 	// reference (spec/design/composite.md §3).
 	if err := snap.validateCompositeTypes(); err != nil {
+		return nil, err
+	}
+	// Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
+	if err := snap.rebuildGistTrees(); err != nil {
 		return nil, err
 	}
 	db := NewDatabase()
@@ -3022,11 +3131,11 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		if iflags&^uint8(0b01) != 0 {
 			return nil, 0, nil, NewError(DataCorrupted, "reserved index flag set")
 		}
-		ikind, err := readU8(buf, pos) // v12: index_kind byte (0 = btree, 1 = GIN)
+		ikind, err := readU8(buf, pos) // v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		if ikind > 1 {
+		if ikind > 2 {
 			return nil, 0, nil, NewError(DataCorrupted, "unsupported index kind")
 		}
 		iroot, err := readU32(buf, pos)

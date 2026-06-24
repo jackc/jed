@@ -406,6 +406,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.SequenceAdvance
 		case "gin_entry":
 			return Costs.GinEntry
+		case "gist_descent":
+			return Costs.GistDescent
 		case "collate":
 			return Costs.Collate
 		case "timezone":
