@@ -30,6 +30,22 @@ test("jsonpath P1b constructs are 0A000", () => {
   }
 });
 
+// A jsonpath query function (P2) over a path that uses a P1b construct (a filter / item method) is
+// 0A000 — the path fails to compile (P1b structural subset). PostgreSQL evaluates these, so this is a
+// documented divergence; the structural query behavior is oracle-clean in
+// suites/json/jsonpath_query.test.
+test("jsonpath query function with a P1b path is 0A000", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM jsonb_path_query('[1,2,3]', '$[*] ? (@ > 1)')")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')")),
+    "0A000",
+  );
+});
+
 // A `jsonpath` value is NOT comparable — every comparison / ORDER BY is 42883 (PG ships no opclass).
 // A documented contract (jsonpath.md §1); only IS [NOT] NULL applies.
 test("jsonpath is not comparable", () => {

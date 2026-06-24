@@ -371,8 +371,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           Hand-written recursive-descent parser per core (new `jsonpath.{rs,go,ts}` module). P1a parses the
           STRUCTURAL-accessor subset; a valid-PG filter/method/arithmetic/`like_regex`/`$name` is a deferred
           `0A000` (P1b), a malformed path `42601`. All 3 cores, cap `types.jsonpath`, oracle-clean, NO format
-          bump (literal-only). _P1b follow-on (with P2):_ the lax/strict eval engine + item methods + filters
-          + `like_regex` + the `2203x` error class — the eval needs a consumer (the P2 query functions) to test.
+          bump (literal-only).
+    - [x] **P1b-core + P2-core — the lax/strict evaluator + the query functions** — ✅ the ordered jsonb
+          sequence evaluator over the structural-accessor AST (lax auto-unwrap §4.1 + structural-error
+          suppression §4.2; strict raises `2203A` missing member / `22033` subscript), and the query
+          functions `jsonb_path_exists` / `jsonb_path_query` (SRF, `SrfKind::JsonbPathQuery`) /
+          `jsonb_path_query_first` / `jsonb_path_query_array`. The `2203x` SQL/JSON error class registered.
+          A bare string adapts (ctx→jsonb, path→compiled jsonpath). All 3 cores, cap `func.jsonb_path`,
+          oracle-clean. _P1b/P2 follow-on:_ the filter / item-method / arithmetic / `like_regex` path
+          constructs (still `0A000` at compile — a per-core divergence test), `jsonb_path_match`, `@?`/`@@`
+          operators, the `_tz` variants (P3), and the `vars`/`silent` arguments.
   - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
         + `@?`/`@@` + `vars`/`silent`; then the `_tz` variants. → jsonpath.md §5
   - [~] **S1 ✅ / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅; then S2

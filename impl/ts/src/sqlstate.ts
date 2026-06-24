@@ -28,6 +28,15 @@ export type SqlState =
   | "invalid_regular_expression" // 2201B — invalid regular expression: {detail}
   | "array_subscript_error" // 2202E — {detail}
   | "duplicate_json_object_key_value" // 22030 — duplicate JSON object key value
+  | "sql_json_item_cannot_be_cast_to_target_type" // 2203A — {detail}
+  | "sql_json_object_not_found" // 2203C — {detail}
+  | "sql_json_member_not_found" // 2203F — {detail}
+  | "invalid_argument_for_sql_json_datetime_function" // 22031 — {detail}
+  | "invalid_sql_json_subscript" // 22033 — {detail}
+  | "more_than_one_sql_json_item" // 22034 — {detail}
+  | "no_sql_json_item" // 22035 — {detail}
+  | "non_numeric_sql_json_item" // 22036 — {detail}
+  | "singleton_sql_json_item_required" // 22038 — {detail}
   | "invalid_text_representation" // 22P02 — invalid input syntax for type {type}: {detail}
   | "not_null_violation" // 23502 — null value in column {name} violates not-null constraint
   | "unique_violation" // 23505 — duplicate key value violates unique constraint: {name}
@@ -94,6 +103,15 @@ const CODES: Record<SqlState, string> = {
   invalid_regular_expression: "2201B",
   array_subscript_error: "2202E",
   duplicate_json_object_key_value: "22030",
+  sql_json_item_cannot_be_cast_to_target_type: "2203A",
+  sql_json_object_not_found: "2203C",
+  sql_json_member_not_found: "2203F",
+  invalid_argument_for_sql_json_datetime_function: "22031",
+  invalid_sql_json_subscript: "22033",
+  more_than_one_sql_json_item: "22034",
+  no_sql_json_item: "22035",
+  non_numeric_sql_json_item: "22036",
+  singleton_sql_json_item_required: "22038",
   invalid_text_representation: "22P02",
   not_null_violation: "23502",
   unique_violation: "23505",
@@ -176,6 +194,15 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
   { code: "2202E", name: "array_subscript_error", class: "data exception" },
   { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },
+  { code: "2203A", name: "sql_json_item_cannot_be_cast_to_target_type", class: "data exception" },
+  { code: "2203C", name: "sql_json_object_not_found", class: "data exception" },
+  { code: "2203F", name: "sql_json_member_not_found", class: "data exception" },
+  { code: "22031", name: "invalid_argument_for_sql_json_datetime_function", class: "data exception" },
+  { code: "22033", name: "invalid_sql_json_subscript", class: "data exception" },
+  { code: "22034", name: "more_than_one_sql_json_item", class: "data exception" },
+  { code: "22035", name: "no_sql_json_item", class: "data exception" },
+  { code: "22036", name: "non_numeric_sql_json_item", class: "data exception" },
+  { code: "22038", name: "singleton_sql_json_item_required", class: "data exception" },
   { code: "22P02", name: "invalid_text_representation", class: "data exception" },
   { code: "23502", name: "not_null_violation", class: "integrity constraint violation" },
   { code: "23505", name: "unique_violation", class: "integrity constraint violation" },

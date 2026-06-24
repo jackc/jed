@@ -1,0 +1,68 @@
+# The jsonpath query functions (P2, spec/design/jsonpath.md §5) over the P1b structural-accessor
+# evaluator: jsonb_path_exists / jsonb_path_query (SRF) / jsonb_path_query_first / jsonb_path_query_array.
+# The path evaluates to an ordered jsonb sequence; lax (default) auto-unwraps arrays + suppresses
+# navigation failures, strict raises (2203A missing member, 22033 subscript). STRICT in the args.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: query.select, query.aggregates, types.jsonpath, func.jsonb_path
+
+# jsonb_path_exists: the sequence is non-empty (a missing member → false in lax).
+query BB nosort
+SELECT jsonb_path_exists('{"a": 1}', '$.a'), jsonb_path_exists('{"a": 1}', '$.b')
+----
+true
+false
+
+# Lax auto-unwraps an array for a member accessor: $.a over [{"a":1},{"a":2}] → 1, 2 (non-empty).
+query B nosort
+SELECT jsonb_path_exists('[{"a": 1}, {"a": 2}]', '$.a')
+----
+true
+
+# jsonb_path_query_first → the first item; an empty sequence → SQL NULL.
+query TT nosort
+SELECT jsonb_path_query_first('{"a": [10, 20, 30]}', '$.a[*]'), jsonb_path_query_first('{"a": 1}', '$.b')
+----
+10
+NULL
+
+# jsonb_path_query_array wraps the sequence in a JSON array.
+query TT nosort
+SELECT jsonb_path_query_array('{"a": [1, 2, 3]}', '$.a[*]'), jsonb_path_query_array('{"a": 1}', '$.b')
+----
+[1, 2, 3]
+[]
+
+# A NULL context → SQL NULL.
+query TB nosort
+SELECT jsonb_path_query_first(NULL::jsonb, '$.a'), jsonb_path_exists(NULL::jsonb, '$.a')
+----
+NULL
+NULL
+
+# Strict mode raises on a missing member (2203A) and an out-of-range subscript (22033).
+statement error 2203A
+SELECT jsonb_path_query_array('{"a": 1}', 'strict $.b')
+
+statement error 22033
+SELECT jsonb_path_query_array('[1, 2]', 'strict $[5]')
+
+# jsonb_path_query as a FROM-clause SRF — one row per sequence item, in order.
+query T nosort
+SELECT * FROM jsonb_path_query('{"a": [1, 2, 3]}', '$.a[*]')
+----
+1
+2
+3
+
+# Nested navigation + a slice yields the selected elements as jsonb rows, in order.
+query T nosort
+SELECT * FROM jsonb_path_query('{"xs": [10, 20, 30, 40]}', '$.xs[1 to 2]')
+----
+20
+30
+
+# A NULL document → zero rows.
+query I nosort
+SELECT count(*)::i32 FROM jsonb_path_query(NULL::jsonb, '$.a[*]')
+----
+0

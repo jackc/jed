@@ -10,6 +10,7 @@
 //! the conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
 
 use crate::error::{EngineError, Result};
+use crate::json::JsonNode;
 use crate::sqlstate::SqlState;
 
 /// A compiled jsonpath (the structural-accessor subset, P1a).
@@ -175,6 +176,165 @@ impl JsonPath {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Evaluation (jsonpath.md §3-4) — the lax/strict ordered jsonb-item sequence (P1b structural subset).
+// ---------------------------------------------------------------------------------------------
+
+/// Evaluate a compiled path over a jsonb context item → the ordered SQL/JSON sequence
+/// (jsonpath.md §3). Each accessor is a `seq → seq` map applied left to right. `lax` (default)
+/// auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); `strict` raises.
+/// The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
+/// compile).
+pub fn eval(path: &JsonPath, ctx: &JsonNode) -> Result<Vec<JsonNode>> {
+    let mut seq = vec![ctx.clone()];
+    for step in &path.steps {
+        let mut next = Vec::new();
+        for item in &seq {
+            apply_step(step, item, path.strict, &mut next)?;
+        }
+        seq = next;
+    }
+    Ok(seq)
+}
+
+fn apply_step(step: &Step, item: &JsonNode, strict: bool, out: &mut Vec<JsonNode>) -> Result<()> {
+    match step {
+        Step::Member(key) => {
+            // lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
+            if !strict && let JsonNode::Array(elems) = item {
+                for e in elems {
+                    member_access(e, key, strict, out)?;
+                }
+                return Ok(());
+            }
+            member_access(item, key, strict, out)
+        }
+        Step::WildcardMember => {
+            if !strict && let JsonNode::Array(elems) = item {
+                for e in elems {
+                    wildcard_member(e, strict, out)?;
+                }
+                return Ok(());
+            }
+            wildcard_member(item, strict, out)
+        }
+        Step::Subscripts(subs) => {
+            // [i] on a non-array: lax treats the item as a singleton array (§4.1.2); strict raises.
+            let singleton;
+            let elems: &[JsonNode] = match item {
+                JsonNode::Array(e) => e,
+                _ if !strict => {
+                    singleton = [item.clone()];
+                    &singleton
+                }
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::InvalidSqlJsonSubscript,
+                        "jsonpath array accessor can only be applied to an array",
+                    ));
+                }
+            };
+            for sub in subs {
+                subscript(elems, sub, strict, out)?;
+            }
+            Ok(())
+        }
+        Step::WildcardElement => {
+            // [*] on a non-array: lax → the singleton item; strict raises.
+            match item {
+                JsonNode::Array(e) => {
+                    out.extend(e.iter().cloned());
+                    Ok(())
+                }
+                _ if !strict => {
+                    out.push(item.clone());
+                    Ok(())
+                }
+                _ => Err(EngineError::new(
+                    SqlState::InvalidSqlJsonSubscript,
+                    "jsonpath wildcard array accessor can only be applied to an array",
+                )),
+            }
+        }
+    }
+}
+
+fn member_access(item: &JsonNode, key: &str, strict: bool, out: &mut Vec<JsonNode>) -> Result<()> {
+    match item {
+        JsonNode::Object(m) => {
+            if let Some((_, v)) = m.iter().find(|(k, _)| k == key) {
+                out.push(v.clone());
+            } else if strict {
+                return Err(EngineError::new(
+                    SqlState::SqlJsonItemCannotBeCastToTargetType,
+                    format!("JSON object does not contain key \"{key}\""),
+                ));
+            }
+            // lax: a missing member contributes no item (§4.2 rule 5).
+            Ok(())
+        }
+        _ if strict => Err(EngineError::new(
+            SqlState::SqlJsonObjectNotFound,
+            "jsonpath member accessor can only be applied to an object",
+        )),
+        // lax: a member accessor on a non-object/non-array contributes no item.
+        _ => Ok(()),
+    }
+}
+
+fn wildcard_member(item: &JsonNode, strict: bool, out: &mut Vec<JsonNode>) -> Result<()> {
+    match item {
+        JsonNode::Object(m) => {
+            out.extend(m.iter().map(|(_, v)| v.clone()));
+            Ok(())
+        }
+        _ if strict => Err(EngineError::new(
+            SqlState::SqlJsonObjectNotFound,
+            "jsonpath wildcard member accessor can only be applied to an object",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn subscript(
+    elems: &[JsonNode],
+    sub: &Subscript,
+    strict: bool,
+    out: &mut Vec<JsonNode>,
+) -> Result<()> {
+    let len = elems.len() as i64;
+    let resolve = |i: &Index| -> i64 {
+        match i {
+            Index::Number(n) => *n,
+            Index::Last => len - 1,
+        }
+    };
+    match sub {
+        Subscript::Index(idx) => {
+            let i = resolve(idx);
+            if i >= 0 && i < len {
+                out.push(elems[i as usize].clone());
+            } else if strict {
+                return Err(EngineError::new(
+                    SqlState::InvalidSqlJsonSubscript,
+                    "jsonpath array subscript is out of bounds",
+                ));
+            }
+            // lax: an out-of-range subscript contributes no item.
+        }
+        Subscript::Slice(a, b) => {
+            let from = resolve(a).max(0);
+            let to = resolve(b).min(len - 1);
+            let mut i = from;
+            while i <= to {
+                out.push(elems[i as usize].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_index(i: &Index, out: &mut String) {

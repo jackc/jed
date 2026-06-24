@@ -59,6 +59,29 @@ fn jsonpath_column_is_unsupported() {
     assert_eq!(err(&mut db, "CREATE TABLE t (p jsonpath)"), "0A000");
 }
 
+/// A jsonpath query function over a path that uses a P1b construct (a filter / item method) is
+/// `0A000` — the path fails to compile (P1b structural subset). PostgreSQL evaluates these, so this
+/// is a documented divergence; the structural query behavior is oracle-clean in
+/// suites/json/jsonpath_query.test.
+#[test]
+fn jsonpath_query_with_filter_is_0a000() {
+    let mut db = Database::new();
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM jsonb_path_query('[1,2,3]', '$[*] ? (@ > 1)')"
+        ),
+        "0A000"
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')"
+        ),
+        "0A000"
+    );
+}
+
 /// A malformed jsonpath literal is `42601` (PG's syntax-error class), distinct from the `0A000` of a
 /// valid-but-unsupported construct. (The agreeing 42601 cases live in the corpus; this pins the
 /// distinction against the 0A000 ones above.)

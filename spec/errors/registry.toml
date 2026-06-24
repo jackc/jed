@@ -144,6 +144,61 @@ name = "duplicate_json_object_key_value"
 class = "data exception"
 template = "duplicate JSON object key value"
 
+# --- SQL/JSON path + standard-function errors (class 22, ../design/jsonpath.md §8) -----------
+[[error]]
+code = "2203A"
+name = "sql_json_item_cannot_be_cast_to_target_type"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "2203C"
+name = "sql_json_object_not_found"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "2203F"
+name = "sql_json_member_not_found"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "22031"
+name = "invalid_argument_for_sql_json_datetime_function"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "22033"
+name = "invalid_sql_json_subscript"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "22034"
+name = "more_than_one_sql_json_item"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "22035"
+name = "no_sql_json_item"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "22036"
+name = "non_numeric_sql_json_item"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
+code = "22038"
+name = "singleton_sql_json_item_required"
+class = "data exception"
+template = "{detail}"
+
 [[error]]
 code = "22P02"
 name = "invalid_text_representation"

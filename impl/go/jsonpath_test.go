@@ -57,6 +57,20 @@ func TestJsonpathColumnIsUnsupported(t *testing.T) {
 	}
 }
 
+// A jsonpath query function (P2) over a path that uses a P1b construct (a filter / item method) is
+// 0A000 — the path fails to compile (P1b structural subset). PostgreSQL evaluates these, so this is
+// a documented divergence; the structural query behavior is oracle-clean in
+// suites/json/jsonpath_query.test.
+func TestJsonpathQueryWithFilterIs0A000(t *testing.T) {
+	db := NewDatabase()
+	if got := jpErr(t, db, "SELECT * FROM jsonb_path_query('[1,2,3]', '$[*] ? (@ > 1)')"); got != "0A000" {
+		t.Errorf("jsonb_path_query with a filter should be 0A000, got %s", got)
+	}
+	if got := jpErr(t, db, "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')"); got != "0A000" {
+		t.Errorf("jsonb_path_query_array with an item method should be 0A000, got %s", got)
+	}
+}
+
 // A malformed jsonpath literal is 42601 (PG's syntax-error class), distinct from the 0A000 of a
 // valid-but-unsupported construct. (The agreeing 42601 cases live in the corpus; this pins the
 // distinction against the 0A000 ones above.)

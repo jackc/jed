@@ -626,6 +626,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_object",
     // the jsonpath scalar type (P1a) — literal + compile + canonical render (jsonpath.md).
     "types.jsonpath",
+    // the jsonpath query functions (P2) — jsonb_path_exists/query/query_first/query_array (jsonpath.md §5).
+    "func.jsonb_path",
     // the IS JSON predicate (S1) — well-formedness + kind + unique-keys (json-sql-functions.md §5).
     "expr.is_json",
     // the SQL/JSON constructors (S1) — JSON() / JSON_SCALAR / JSON_SERIALIZE (json-sql-functions.md §5).

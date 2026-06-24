@@ -188,6 +188,159 @@ func (jp JsonPath) Render() string {
 	return out.String()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Evaluation (jsonpath.md §3-4) — the lax/strict ordered jsonb-item sequence (P1b structural subset).
+// ---------------------------------------------------------------------------------------------
+
+// Eval evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
+// (jsonpath.md §3). Each accessor is a `seq → seq` map applied left to right. lax (the default)
+// auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); strict raises.
+// The P1b structural subset (no filters / item methods / arithmetic — those are still 0A000 at
+// compile).
+func (jp JsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
+	seq := []JsonNode{ctx}
+	for i := range jp.Steps {
+		var next []JsonNode
+		for j := range seq {
+			var err error
+			next, err = applyStep(&jp.Steps[i], &seq[j], jp.Strict, next)
+			if err != nil {
+				return nil, err
+			}
+		}
+		seq = next
+	}
+	return seq, nil
+}
+
+func applyStep(step *jpStep, item *JsonNode, strict bool, out []JsonNode) ([]JsonNode, error) {
+	switch step.kind {
+	case jpMember:
+		// lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
+		if !strict && item.Kind == JArray {
+			for k := range item.Arr {
+				var err error
+				out, err = memberAccess(&item.Arr[k], step.key, strict, out)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		}
+		return memberAccess(item, step.key, strict, out)
+	case jpWildcardMember:
+		if !strict && item.Kind == JArray {
+			for k := range item.Arr {
+				var err error
+				out, err = wildcardMember(&item.Arr[k], strict, out)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		}
+		return wildcardMember(item, strict, out)
+	case jpSubscripts:
+		// [i] on a non-array: lax treats the item as a singleton array (§4.1.2); strict raises.
+		var elems []JsonNode
+		if item.Kind == JArray {
+			elems = item.Arr
+		} else if !strict {
+			elems = []JsonNode{*item}
+		} else {
+			return nil, NewError(InvalidSqlJsonSubscript,
+				"jsonpath array accessor can only be applied to an array")
+		}
+		for i := range step.subs {
+			var err error
+			out, err = subscript(elems, &step.subs[i], strict, out)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	default: // jpWildcardElement
+		// [*] on a non-array: lax → the singleton item; strict raises.
+		if item.Kind == JArray {
+			return append(out, item.Arr...), nil
+		}
+		if !strict {
+			return append(out, *item), nil
+		}
+		return nil, NewError(InvalidSqlJsonSubscript,
+			"jsonpath wildcard array accessor can only be applied to an array")
+	}
+}
+
+func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode) ([]JsonNode, error) {
+	if item.Kind == JObject {
+		for i := range item.Obj {
+			if item.Obj[i].Key == key {
+				return append(out, item.Obj[i].Val), nil
+			}
+		}
+		if strict {
+			return nil, NewError(SqlJsonItemCannotBeCastToTargetType,
+				"JSON object does not contain key \""+key+"\"")
+		}
+		// lax: a missing member contributes no item (§4.2 rule 5).
+		return out, nil
+	}
+	if strict {
+		return nil, NewError(SqlJsonObjectNotFound,
+			"jsonpath member accessor can only be applied to an object")
+	}
+	// lax: a member accessor on a non-object/non-array contributes no item.
+	return out, nil
+}
+
+func wildcardMember(item *JsonNode, strict bool, out []JsonNode) ([]JsonNode, error) {
+	if item.Kind == JObject {
+		for i := range item.Obj {
+			out = append(out, item.Obj[i].Val)
+		}
+		return out, nil
+	}
+	if strict {
+		return nil, NewError(SqlJsonObjectNotFound,
+			"jsonpath wildcard member accessor can only be applied to an object")
+	}
+	return out, nil
+}
+
+func subscript(elems []JsonNode, sub *jpSubscript, strict bool, out []JsonNode) ([]JsonNode, error) {
+	length := int64(len(elems))
+	resolve := func(idx jpIndex) int64 {
+		if idx.last {
+			return length - 1
+		}
+		return idx.number
+	}
+	if sub.slice {
+		from := resolve(sub.a)
+		if from < 0 {
+			from = 0
+		}
+		to := resolve(sub.b)
+		if to > length-1 {
+			to = length - 1
+		}
+		for i := from; i <= to; i++ {
+			out = append(out, elems[i])
+		}
+		return out, nil
+	}
+	i := resolve(sub.a)
+	if i >= 0 && i < length {
+		out = append(out, elems[i])
+	} else if strict {
+		return nil, NewError(InvalidSqlJsonSubscript,
+			"jsonpath array subscript is out of bounds")
+	}
+	// lax: an out-of-range subscript contributes no item.
+	return out, nil
+}
+
 func writeIndex(i jpIndex, out *strings.Builder) {
 	if i.last {
 		out.WriteString("last")

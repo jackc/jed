@@ -15,6 +15,7 @@
 // member-key JSON-string escaping all match the Rust version.
 
 import { engineError, type EngineError } from "./errors.ts";
+import type { JsonNode } from "./json.ts";
 
 // A subscript index: a non-negative integer literal or the `last` sentinel.
 export type Index = { kind: "number"; value: number } | { kind: "last" };
@@ -343,6 +344,150 @@ class Parser {
 // valid-PG but unsupported construct → `0A000`.
 export function compile(src: string): JsonPath {
   return new Parser(src).compile();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Evaluation (jsonpath.md §3-4) — the lax/strict ordered jsonb-item sequence (P1b structural subset).
+// ---------------------------------------------------------------------------------------------
+
+// eval evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
+// (jsonpath.md §3). Each accessor is a `seq → seq` map applied left to right. `lax` (default)
+// auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); `strict` raises.
+// The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
+// compile). Port of impl/rust/src/jsonpath.rs `eval`.
+export function evalPath(path: JsonPath, ctx: JsonNode): JsonNode[] {
+  let seq: JsonNode[] = [ctx];
+  for (const step of path.steps) {
+    const next: JsonNode[] = [];
+    for (const item of seq) {
+      applyStep(step, item, path.strict, next);
+    }
+    seq = next;
+  }
+  return seq;
+}
+
+function applyStep(step: Step, item: JsonNode, strict: boolean, out: JsonNode[]): void {
+  switch (step.kind) {
+    case "member": {
+      // lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
+      if (!strict && item.kind === "array") {
+        for (const e of item.elements) {
+          memberAccess(e, step.key, strict, out);
+        }
+        return;
+      }
+      memberAccess(item, step.key, strict, out);
+      return;
+    }
+    case "wildcardMember": {
+      if (!strict && item.kind === "array") {
+        for (const e of item.elements) {
+          wildcardMember(e, strict, out);
+        }
+        return;
+      }
+      wildcardMember(item, strict, out);
+      return;
+    }
+    case "subscripts": {
+      // [i] on a non-array: lax treats the item as a singleton array (§4.1.2); strict raises.
+      let elems: JsonNode[];
+      if (item.kind === "array") {
+        elems = item.elements;
+      } else if (!strict) {
+        elems = [item];
+      } else {
+        throw engineError(
+          "invalid_sql_json_subscript",
+          "jsonpath array accessor can only be applied to an array",
+        );
+      }
+      for (const sub of step.subs) {
+        subscript(elems, sub, strict, out);
+      }
+      return;
+    }
+    case "wildcardElement": {
+      // [*] on a non-array: lax → the singleton item; strict raises.
+      if (item.kind === "array") {
+        for (const e of item.elements) {
+          out.push(e);
+        }
+        return;
+      }
+      if (!strict) {
+        out.push(item);
+        return;
+      }
+      throw engineError(
+        "invalid_sql_json_subscript",
+        "jsonpath wildcard array accessor can only be applied to an array",
+      );
+    }
+  }
+}
+
+function memberAccess(item: JsonNode, key: string, strict: boolean, out: JsonNode[]): void {
+  if (item.kind === "object") {
+    const member = item.members.find((m) => m.key === key);
+    if (member !== undefined) {
+      out.push(member.value);
+    } else if (strict) {
+      throw engineError(
+        "sql_json_item_cannot_be_cast_to_target_type",
+        `JSON object does not contain key "${key}"`,
+      );
+    }
+    // lax: a missing member contributes no item (§4.2 rule 5).
+    return;
+  }
+  if (strict) {
+    throw engineError(
+      "sql_json_object_not_found",
+      "jsonpath member accessor can only be applied to an object",
+    );
+  }
+  // lax: a member accessor on a non-object/non-array contributes no item.
+}
+
+function wildcardMember(item: JsonNode, strict: boolean, out: JsonNode[]): void {
+  if (item.kind === "object") {
+    for (const m of item.members) {
+      out.push(m.value);
+    }
+    return;
+  }
+  if (strict) {
+    throw engineError(
+      "sql_json_object_not_found",
+      "jsonpath wildcard member accessor can only be applied to an object",
+    );
+  }
+}
+
+function resolveIndex(i: Index, len: number): number {
+  return i.kind === "number" ? i.value : len - 1;
+}
+
+function subscript(elems: JsonNode[], sub: Subscript, strict: boolean, out: JsonNode[]): void {
+  const len = elems.length;
+  if (sub.kind === "index") {
+    const i = resolveIndex(sub.index, len);
+    if (i >= 0 && i < len) {
+      out.push(elems[i]!);
+    } else if (strict) {
+      throw engineError("invalid_sql_json_subscript", "jsonpath array subscript is out of bounds");
+    }
+    // lax: an out-of-range subscript contributes no item.
+    return;
+  }
+  // A slice `i to j` → the clamped inclusive range (no error).
+  const from = Math.max(resolveIndex(sub.from, len), 0);
+  const to = Math.min(resolveIndex(sub.to, len), len - 1);
+  for (let i = from; i <= to; i++) {
+    out.push(elems[i]!);
+  }
 }
 
 function writeIndex(i: Index): string {

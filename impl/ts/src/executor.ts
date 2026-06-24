@@ -256,7 +256,11 @@ import {
   jsonbValue,
   jsonPathValue,
 } from "./value.ts";
-import { compile as jsonPathCompile, render as jsonPathRender } from "./jsonpath.ts";
+import {
+  compile as jsonPathCompile,
+  evalPath as jsonPathEval,
+  render as jsonPathRender,
+} from "./jsonpath.ts";
 import {
   type JsonMember,
   type JsonNode,
@@ -7373,6 +7377,14 @@ export class Database {
           lname + " is not supported yet; use the jsonb variant",
         );
     }
+    // jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): the SRF form — one `jsonb` row per
+    // item of the path's evaluation sequence over the context document. A bare string literal adapts.
+    if (lname === "jsonb_path_query") {
+      const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+      const [ctx, path] = resolveJsonpathArgs(argScope, lname, args, forbidden, ptypes);
+      const table = srfTable(lname, alias, scalarT("jsonb"));
+      return { table, srf: { kind: "jsonb_path_query", args: [ctx, path] } };
+    }
     // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
     // variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
     // the json accessor operators; the jsonb variants + `json_object_keys` ship here.
@@ -7738,6 +7750,22 @@ export class Database {
         }
         break;
       }
+      // jsonb_path_query (P2): one jsonb row per path-evaluation-sequence item. The context node
+      // (`node`) is already parsed above; evaluate the path (a NULL path → zero rows).
+      case "jsonb_path_query": {
+        const path = evalExpr(srf.args[1]!, [], env, meter);
+        if (path.kind === "null") return out;
+        if (path.kind !== "jsonpath") {
+          throw new Error("resolver restricts the path argument to jsonpath");
+        }
+        const compiled = jsonPathCompile(path.text);
+        for (const item of jsonPathEval(compiled, node)) {
+          meter.guard();
+          meter.charge(COSTS.generatedRow);
+          out.push([jsonbValue(item)]);
+        }
+        break;
+      }
       default:
         throw new Error("jsonSrfRows only handles the json SRF kinds");
     }
@@ -7988,6 +8016,7 @@ export class Database {
         case "jsonb_each":
         case "jsonb_each_text":
         case "json_record":
+        case "jsonb_path_query":
           return this.jsonSrfRows(rel.srf, env, meter);
       }
     }
@@ -8619,6 +8648,7 @@ export class Database {
       case "jsonBuild":
       case "jsonSetInsert":
       case "jsonObjectFromArrays":
+      case "jsonPathFn":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
         return e;
       case "row":
@@ -9026,6 +9056,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "jsonPathFn":
       return e.args.every(rexprIsConstant);
     case "inValues":
       return rexprIsConstant(e.lhs);
@@ -10011,6 +10042,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "jsonPathFn":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
@@ -10136,6 +10168,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "jsonPathFn":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
     case "row":
@@ -10868,6 +10901,14 @@ type RExpr =
       json: boolean;
       args: RExpr[];
     }
+  // A scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists / jsonb_path_query_first
+  // / jsonb_path_query_array. `args` = `[ctx jsonb, path jsonpath]`; STRICT (any NULL → SQL NULL).
+  // The path is recompiled from its canonical text at eval.
+  | {
+      kind: "jsonPathFn";
+      pathFnKind: JsonPathFnKind;
+      args: RExpr[];
+    }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
   | { kind: "outerColumn"; level: number; index: number }
@@ -11064,6 +11105,12 @@ type VariadicFuncName = "num_nulls" | "num_nonnulls";
 // "object" — json[b]_build_object, alternating key/value arguments (odd count / NULL key → 22023).
 type JsonBuildKind = "array" | "object";
 
+// JsonPathFnKind selects which scalar jsonpath query function a "jsonPathFn" RExpr node is
+// (jsonpath.md §5): "exists" — jsonb_path_exists → boolean (the sequence is non-empty);
+// "queryFirst" — jsonb_path_query_first → the first sequence item, or NULL if empty;
+// "queryArray" — jsonb_path_query_array → the sequence wrapped in a JSON array.
+type JsonPathFnKind = "exists" | "queryFirst" | "queryArray";
+
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
 // subquery is re-run once per outer row). planQuery (the resolve half of the old runSelect)
@@ -11124,7 +11171,10 @@ type SrfKind =
   | "json_object_keys"
   | "jsonb_each"
   | "jsonb_each_text"
-  | "json_record";
+  | "json_record"
+  // jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
+  // evaluation sequence over the context document. `args` is `[ctx, path]`.
+  | "jsonb_path_query";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -13375,6 +13425,23 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     return resolveJsonObject(scope, lname, lname === "json_object", e.args, ag, params);
+  }
+  // The scalar jsonpath query functions (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. Hand-
+  // resolved (the jsonpath arg + adapting-literal are outside the catalog family mold).
+  {
+    const pathFnKind: JsonPathFnKind | null =
+      lname === "jsonb_path_exists"
+        ? "exists"
+        : lname === "jsonb_path_query_first"
+          ? "queryFirst"
+          : lname === "jsonb_path_query_array"
+            ? "queryArray"
+            : null;
+    if (pathFnKind !== null) {
+      rejectNamed(lname, e.argNames);
+      if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+      return resolveJsonpathFn(scope, lname, pathFnKind, e.args, ag, params);
+    }
   }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -16373,6 +16440,17 @@ function resolve(
               type: { kind: "jsonb" },
             };
           }
+          if (ctx !== null && isJsonPath(ctx)) {
+            // A string adapts to a jsonpath context (a jsonpath function argument) — it is compiled
+            // to a path at resolve (jsonpath.md §1); malformed → 42601 / unsupported → 0A000.
+            return {
+              node: {
+                kind: "constJsonPath",
+                value: jsonPathRender(jsonPathCompile(e.literal.text)),
+              },
+              type: { kind: "jsonpath" },
+            };
+          }
           return {
             node: { kind: "constText", value: e.literal.text },
             type: { kind: "text" },
@@ -17630,6 +17708,18 @@ function jsonArgNode(v: Value): JsonNode {
   throw new Error("jsonArgNode: a json/jsonb function argument must be json/jsonb");
 }
 
+// evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb` context
+// value (the shared kernel of the jsonpath query functions). A NULL context or path yields `null`
+// (→ SQL NULL / zero rows). Port of impl/rust/src/executor.rs `eval_jsonpath`.
+function evalJsonpath(ctx: Value, path: Value): JsonNode[] | null {
+  if (ctx.kind === "null" || path.kind === "null") return null;
+  const node = jsonArgNode(ctx);
+  if (path.kind !== "jsonpath") {
+    throw new Error("resolver restricts a jsonpath argument to jsonpath");
+  }
+  return jsonPathEval(jsonPathCompile(path.text), node);
+}
+
 // jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's kind
 // (json-sql-functions.md §5).
 function jsonPredKindMatches(node: JsonNode, kind: JsonPredicateKind): boolean {
@@ -17981,6 +18071,41 @@ function resolveJsonObject(
     node: { kind: "jsonObjectFromArrays", json, args: rargs },
     type: { kind: json ? "json" : "jsonb" },
   };
+}
+
+// resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb, path
+// jsonpath)`. A bare string literal adapts (the context to jsonb, the path to a compiled jsonpath).
+// STRICT.
+function resolveJsonpathFn(
+  scope: Scope,
+  name: string,
+  kind: JsonPathFnKind,
+  args: Expr[],
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const [ctx, path] = resolveJsonpathArgs(scope, name, args, ag, params);
+  const type: ResolvedType = kind === "exists" ? { kind: "bool" } : { kind: "jsonb" };
+  return { node: { kind: "jsonPathFn", pathFnKind: kind, args: [ctx, path] }, type };
+}
+
+// resolveJsonpathArgs resolves the `(context jsonb, path jsonpath)` argument pair shared by the
+// jsonpath query functions (the SRF and the scalar forms). A bare string literal adapts: the context
+// to jsonb, the path to a compiled `jsonpath`. Exactly two args this slice (the optional `vars` /
+// `silent` are a follow-on).
+function resolveJsonpathArgs(
+  scope: Scope,
+  name: string,
+  args: Expr[],
+  ag: AggCtx,
+  params: ParamTypes,
+): [RExpr, RExpr] {
+  if (args.length !== 2) throw noFuncOverload(name);
+  const ctx = resolve(scope, args[0]!, "jsonb", ag, params);
+  if (ctx.type.kind !== "jsonb" && ctx.type.kind !== "null") throw noFuncOverload(name);
+  const path = resolve(scope, args[1]!, "jsonpath", ag, params);
+  if (path.type.kind !== "jsonpath" && path.type.kind !== "null") throw noFuncOverload(name);
+  return [ctx.node, path.node];
 }
 
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).
@@ -21627,6 +21752,26 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         });
       }
       return jsonbValue(jsonMakeObject(members));
+    }
+    case "jsonPathFn": {
+      // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
+      m.charge(COSTS.operatorEval);
+      const ctx = evalExpr(e.args[0]!, row, env, m);
+      const path = evalExpr(e.args[1]!, row, env, m);
+      const seq = evalJsonpath(ctx, path);
+      if (seq === null) return nullValue();
+      // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
+      m.charge(COSTS.operatorEval * BigInt(seq.length));
+      m.guard();
+      switch (e.pathFnKind) {
+        case "exists":
+          return boolValue(seq.length > 0);
+        case "queryFirst":
+          return seq.length > 0 ? jsonbValue(seq[0]!) : nullValue();
+        case "queryArray":
+          return jsonbValue({ kind: "array", elements: seq });
+      }
+      break;
     }
     case "subquery": {
       // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push

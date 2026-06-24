@@ -556,6 +556,11 @@ var SupportedCapabilities = []string{
 	// subset only (filters/methods/arithmetic → 0A000); non-comparable (42883); literal-only (a
 	// jsonpath column → 0A000); malformed → 42601 (spec/design/jsonpath.md).
 	"types.jsonpath",
+	// The jsonpath query functions (P1b/P2) over the structural-accessor evaluator: jsonb_path_exists
+	// / jsonb_path_query (SRF) / jsonb_path_query_first / jsonb_path_query_array, each `(jsonb,
+	// jsonpath)`; lax auto-unwraps arrays + suppresses navigation failures, strict raises (2203A
+	// missing member / 22033 subscript); a filter / item-method path is still 0A000 (jsonpath.md §5).
+	"func.jsonb_path",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

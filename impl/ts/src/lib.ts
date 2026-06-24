@@ -90,6 +90,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // NOT comparable → 42883). A valid-PG filter / item method / arithmetic / $name is a deferred
   // 0A000 (P1b); a malformed path literal is 42601.
   "types.jsonpath",
+  // The jsonpath query functions (P2) — jsonb_path_exists / jsonb_path_query / jsonb_path_query_first
+  // / jsonb_path_query_array (jsonpath.md §5).
+  "func.jsonb_path",
   // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
   "func.jsonb_access",
   // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).

@@ -9892,6 +9892,17 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, columnD
 	case "json_array_elements", "json_array_elements_text":
 		return nil, nil, NewError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
 	}
+	// jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
+	// evaluation sequence over the context document. A bare string literal adapts (the ctx to jsonb,
+	// the path to a compiled jsonpath). STRICT in the args; a NULL ctx/path → zero rows at exec.
+	if lname == "jsonb_path_query" {
+		forbidden := &aggCtx{}
+		ctx, path, err := resolveJsonpathArgs(argScope, lname, args, forbidden, ptypes)
+		if err != nil {
+			return nil, nil, err
+		}
+		return srfTable(lname, alias, ScalarT(Jsonb)), &srfPlan{kind: srfJsonbPathQuery, args: []*rExpr{ctx, path}}, nil
+	}
 	return nil, nil, NewError(UndefinedFunction, "function does not exist: "+name)
 }
 
@@ -10280,6 +10291,32 @@ func (db *Database) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, err
 				return nil, err
 			}
 			out = append(out, row)
+		}
+	case srfJsonbPathQuery:
+		// jsonb_path_query (P2, jsonpath.md §5.2): one jsonb row per path-evaluation-sequence item.
+		// The context node is already parsed above (`node`); evaluate the path (a NULL path → zero
+		// rows). The resolver restricts the path argument to jsonpath (its canonical text in Str).
+		path, err := sp.args[1].eval(nil, env, m)
+		if err != nil {
+			return nil, err
+		}
+		if path.Kind == ValNull {
+			return nil, nil
+		}
+		compiled, err := Compile(path.Str)
+		if err != nil {
+			return nil, err
+		}
+		seq, err := compiled.Eval(node)
+		if err != nil {
+			return nil, err
+		}
+		for i := range seq {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(Costs.GeneratedRow)
+			out = append(out, Row{JsonbValue(seq[i])})
 		}
 	default:
 		panic("jsonSrfRows only handles the json SRF kinds")
@@ -11676,7 +11713,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 			return db.generateSeriesRows(rel.srf, env, meter)
 		case srfUnnest:
 			return db.unnestRows(rel.srf, env, meter)
-		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText, srfJSONRecord, srfJSONRecordset:
+		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText, srfJSONRecord, srfJSONRecordset, srfJsonbPathQuery:
 			return db.jsonSrfRows(rel.srf, env, meter)
 		}
 		return nil, nil
@@ -13674,6 +13711,11 @@ const (
 	// NULL array → SQL NULL). `jbJson` true ⇒ the json result (insertion order + dups + " : "
 	// spacing); false ⇒ the jsonb result (canonical: last-wins dedup + sorted keys).
 	reJsonObject
+	// reJsonPathFn is a scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists /
+	// jsonb_path_query_first / jsonb_path_query_array. `sargs` = [ctx jsonb, path jsonpath]; STRICT
+	// (any NULL → SQL NULL). `jpFnKind` selects which function. The path is recompiled from its
+	// canonical text at eval.
+	reJsonPathFn
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
 	reOuterColumn
@@ -13960,6 +14002,18 @@ const (
 	jbObject                      // json[b]_build_object — alternating key/value args (odd count / NULL key → 22023)
 )
 
+// jsonPathFnKind selects which scalar jsonpath query function an reJsonPathFn node is (jsonpath.md §5).
+type jsonPathFnKind int
+
+const (
+	// jpfExists is jsonb_path_exists → boolean (the sequence is non-empty).
+	jpfExists jsonPathFnKind = iota
+	// jpfQueryFirst is jsonb_path_query_first → the first sequence item, or NULL if empty.
+	jpfQueryFirst
+	// jpfQueryArray is jsonb_path_query_array → the sequence wrapped in a JSON array.
+	jpfQueryArray
+)
+
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
 // row. Arithmetic/neg nodes carry their (promotion-tower) result type in `result` so the
 // computed value can be range-checked against it.
@@ -14040,6 +14094,10 @@ type rExpr struct {
 	// nodes reuse `sargs`; `variadicArray` (above) records the VARIADIC-array call shape.
 	jbKind jsonBuildKind
 	jbJson bool
+
+	// reJsonPathFn: which scalar jsonpath query function (jsonb_path_exists / _query_first /
+	// _query_array). Argument nodes are in `sargs` = [ctx jsonb, path jsonpath] (jsonpath.md §5).
+	jpFnKind jsonPathFnKind
 
 	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert). Argument nodes are in
 	// `sargs` = [target, path, value, flag] (json-sql-functions.md §2).
@@ -14306,6 +14364,9 @@ const (
 	// srfJSONRecordset is json[b]_to_recordset(doc) (R1) — setof record: one record row per element
 	// of a top-level JSON array (a non-array → 22023).
 	srfJSONRecordset
+	// srfJsonbPathQuery is jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2) — one `jsonb` row
+	// per item of the path's evaluation sequence over the context document. `args` is `[ctx, path]`.
+	srfJsonbPathQuery
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
@@ -18322,6 +18383,71 @@ func resolveTextArrayArg(s *scope, rhs Expr, sym string, ag *aggCtx, params *par
 	}
 }
 
+// resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb,
+// path jsonpath)`. A bare string literal adapts (the context to jsonb, the path to a compiled
+// jsonpath). STRICT (any NULL → SQL NULL).
+func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	ctx, path, err := resolveJsonpathArgs(s, name, fc.Args, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	result := resolvedType{kind: rtJsonb}
+	if kind == jpfExists {
+		result = resolvedType{kind: rtBool}
+	}
+	return &rExpr{kind: reJsonPathFn, jpFnKind: kind, sargs: []*rExpr{ctx, path}}, result, nil
+}
+
+// resolveJsonpathArgs resolves the `(context jsonb, path jsonpath)` argument pair shared by the
+// jsonpath query functions (the SRF and the scalar forms). A bare string literal adapts: the context
+// to jsonb, the path to a compiled `jsonpath`. Exactly two args this slice (the optional vars /
+// silent are a follow-on).
+func resolveJsonpathArgs(s *scope, name string, args []*Expr, ag *aggCtx, params *paramTypes) (*rExpr, *rExpr, error) {
+	if len(args) != 2 {
+		return nil, nil, noFuncOverload(name)
+	}
+	jsonbHint := Jsonb
+	ctx, ct, err := resolve(s, *args[0], &jsonbHint, ag, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ct.kind != rtJsonb && ct.kind != rtNull {
+		return nil, nil, noFuncOverload(name)
+	}
+	pathHint := JsonPathType
+	path, pt, err := resolve(s, *args[1], &pathHint, ag, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pt.kind != rtJsonPath && pt.kind != rtNull {
+		return nil, nil, noFuncOverload(name)
+	}
+	return ctx, path, nil
+}
+
+// evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb`
+// context value (the shared kernel of the jsonpath query functions). A NULL context or path yields
+// ok=false (→ SQL NULL / zero rows).
+func evalJsonpath(ctx, path Value) ([]JsonNode, bool, error) {
+	if ctx.Kind == ValNull || path.Kind == ValNull {
+		return nil, false, nil
+	}
+	node, err := jsonArgNode(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
+	compiled, err := Compile(path.Str)
+	if err != nil {
+		return nil, false, err
+	}
+	seq, err := compiled.Eval(node)
+	if err != nil {
+		return nil, false, err
+	}
+	return seq, true, nil
+}
+
 // resolveJSONSetInsert resolves jsonb_set / jsonb_insert (json-sql-functions.md §2): `(target jsonb,
 // path text[], value jsonb [, flag boolean])` → jsonb. A bare `'{a,b}'` path literal adapts to text[]
 // and a bare string `value` literal adapts to jsonb. STRICT (the eval propagates any NULL). The
@@ -18656,6 +18782,26 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		return resolveJSONObject(s, name, name == "json_object", fc, ag, params)
+	}
+	// The scalar jsonpath query functions (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. Hand-
+	// resolved (the jsonpath arg + adapting-literal are outside the catalog family mold).
+	if name == "jsonb_path_exists" || name == "jsonb_path_query_first" || name == "jsonb_path_query_array" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		var kind jsonPathFnKind
+		switch name {
+		case "jsonb_path_exists":
+			kind = jpfExists
+		case "jsonb_path_query_first":
+			kind = jpfQueryFirst
+		default: // jsonb_path_query_array
+			kind = jpfQueryArray
+		}
+		return resolveJsonpathFn(s, name, kind, fc, ag, params)
 	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -19835,6 +19981,14 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstJsonb, cJsonb: &node}, resolvedType{kind: rtJsonb}, nil
+			case ctx != nil && ctx.IsJsonPath():
+				// A string literal adapts to a jsonpath context (a jsonpath function argument) — it
+				// is compiled to a path at resolve (jsonpath.md §1); malformed → 42601.
+				jp, err := Compile(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstJsonPath, cText: jp.Render()}, resolvedType{kind: rtJsonPath}, nil
 			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
@@ -24164,6 +24318,40 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return Value{}, err
 		}
 		return JsonbValue(out), nil
+	case reJsonPathFn:
+		// A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
+		m.Charge(Costs.OperatorEval)
+		ctx, err := e.sargs[0].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		path, err := e.sargs[1].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		seq, ok, err := evalJsonpath(ctx, path)
+		if err != nil {
+			return Value{}, err
+		}
+		if !ok {
+			return NullValue(), nil
+		}
+		// Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
+		m.Charge(Costs.OperatorEval * int64(len(seq)))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		switch e.jpFnKind {
+		case jpfExists:
+			return BoolValue(len(seq) > 0), nil
+		case jpfQueryFirst:
+			if len(seq) == 0 {
+				return NullValue(), nil
+			}
+			return JsonbValue(seq[0]), nil
+		default: // jpfQueryArray
+			return JsonbValue(JsonNode{Kind: JArray, Arr: seq}), nil
+		}
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

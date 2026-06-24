@@ -8753,6 +8753,17 @@ impl Database {
                     format!("{lname} is not supported yet; use the jsonb variant"),
                 ));
             }
+            "jsonb_path_query" => {
+                let (ctx, path) = resolve_jsonpath_args(
+                    &arg_scope,
+                    &lname,
+                    args,
+                    &mut AggCtx::Forbidden,
+                    ptypes,
+                )?;
+                let table = srf_table(&lname, alias, Type::Scalar(ScalarType::Jsonb));
+                return Ok((table, vec![ctx, path], SrfKind::JsonbPathQuery));
+            }
             _ => {}
         }
         // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
@@ -9157,6 +9168,22 @@ impl Database {
                     out.push(vec![Value::Text(k.clone()), value]);
                 }
             }
+            // jsonb_path_query (P2): one jsonb row per path-evaluation-sequence item. The context node
+            // is already parsed above (`node`); evaluate the path (a NULL path → zero rows).
+            SrfKind::JsonbPathQuery => {
+                let path = srf.args[1].eval(&[], env, meter)?;
+                let text = match &path {
+                    Value::Null => return Ok(out),
+                    Value::JsonPath(s) => s,
+                    _ => unreachable!("resolver restricts the path argument to jsonpath"),
+                };
+                let compiled = crate::jsonpath::JsonPath::compile(text)?;
+                for item in crate::jsonpath::eval(&compiled, &node)? {
+                    meter.guard()?;
+                    meter.charge(COSTS.generated_row);
+                    out.push(vec![Value::Jsonb(item)]);
+                }
+            }
             // json[b]_to_record / _recordset (R1): map members → the col-def columns by name.
             SrfKind::JsonRecord { set, .. } => {
                 if set {
@@ -9507,7 +9534,8 @@ impl Database {
                 | SrfKind::JsonObjectKeys
                 | SrfKind::JsonbEach
                 | SrfKind::JsonbEachText
-                | SrfKind::JsonRecord { .. } => self.json_srf_rows(srf, &env, meter),
+                | SrfKind::JsonRecord { .. }
+                | SrfKind::JsonbPathQuery => self.json_srf_rows(srf, &env, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -10310,7 +10338,8 @@ impl Database {
             | RExpr::Variadic { args, .. }
             | RExpr::JsonBuild { args, .. }
             | RExpr::JsonSetInsert { args, .. }
-            | RExpr::JsonObjectFromArrays { args, .. } => {
+            | RExpr::JsonObjectFromArrays { args, .. }
+            | RExpr::JsonPathFn { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 }
@@ -11567,6 +11596,17 @@ enum VariadicFunc {
     NumNonnulls,
 }
 
+/// Which scalar jsonpath query function an [`RExpr::JsonPathFn`] node is (jsonpath.md §5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JsonPathFnKind {
+    /// `jsonb_path_exists` → boolean (the sequence is non-empty).
+    Exists,
+    /// `jsonb_path_query_first` → the first sequence item, or NULL if empty.
+    QueryFirst,
+    /// `jsonb_path_query_array` → the sequence wrapped in a JSON array.
+    QueryArray,
+}
+
 /// Which json/jsonb builder an [`RExpr::JsonBuild`] node is (json-sql-functions.md §2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JsonBuildKind {
@@ -11780,6 +11820,13 @@ enum RExpr {
     /// (canonical) result.
     JsonObjectFromArrays {
         json: bool,
+        args: Vec<RExpr>,
+    },
+    /// A scalar jsonpath query function (P2, jsonpath.md §5): `jsonb_path_exists` /
+    /// `jsonb_path_query_first` / `jsonb_path_query_array`. `args` = `[ctx jsonb, path jsonpath]`;
+    /// STRICT (any NULL → SQL NULL). The path is recompiled from its canonical text at eval.
+    JsonPathFn {
+        kind: JsonPathFnKind,
         args: Vec<RExpr>,
     },
     IsNull {
@@ -12795,6 +12842,9 @@ enum SrfKind {
     /// to the C0 col-def-list columns by name, coercing each to its declared type. `set` = the
     /// recordset form (one row per array element); else one record row. `jsonb` selects the input type.
     JsonRecord { jsonb: bool, set: bool },
+    /// `jsonb_path_query(jsonb, jsonpath)` (P2, jsonpath.md §5.2): one `jsonb` row per item of the
+    /// path's evaluation sequence over the context document. `args` is `[ctx, path]`.
+    JsonbPathQuery,
 }
 
 /// A resolved set-returning-function row source (spec/design/functions.md §10, array-functions.md
@@ -13522,7 +13572,8 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::Variadic { args, .. }
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
-        | RExpr::JsonObjectFromArrays { args, .. } => args.iter().all(rexpr_is_constant),
+        | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::JsonPathFn { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
     }
@@ -15577,9 +15628,8 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::Variadic { args, .. }
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
-        | RExpr::JsonObjectFromArrays { args, .. } => {
-            args.iter().any(|a| rexpr_references_outer(a, depth))
-        }
+        | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::JsonPathFn { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
         }
@@ -15721,7 +15771,8 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::Variadic { args, .. }
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
-        | RExpr::JsonObjectFromArrays { args, .. } => {
+        | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::JsonPathFn { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
             }
@@ -17701,6 +17752,23 @@ fn resolve_func_call(
         }
         return resolve_json_object(scope, &lname, lname == "json_object", args, agg, params);
     }
+    // The scalar jsonpath query functions (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. Hand-
+    // resolved (the jsonpath arg + adapting-literal are outside the catalog family mold).
+    if let Some(kind) = match lname.as_str() {
+        "jsonb_path_exists" => Some(JsonPathFnKind::Exists),
+        "jsonb_path_query_first" => Some(JsonPathFnKind::QueryFirst),
+        "jsonb_path_query_array" => Some(JsonPathFnKind::QueryArray),
+        _ => None,
+    } {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_jsonpath_fn(scope, &lname, kind, args, agg, params);
+    }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
     if is_aggregate_name(&lname) {
@@ -19667,6 +19735,12 @@ fn resolve(
                     RExpr::ConstJsonb(Box::new(json::jsonb_in(s)?)),
                     ResolvedType::Jsonb,
                 )),
+                // A string literal adapts to a jsonpath context (a jsonpath function argument) — it is
+                // compiled to a path at resolve (jsonpath.md §1); malformed → 42601.
+                Some(ScalarType::JsonPath) => Ok((
+                    RExpr::ConstJsonPath(crate::jsonpath::JsonPath::compile(s)?.render()),
+                    ResolvedType::JsonPath,
+                )),
                 _ => Ok((RExpr::ConstText(s.clone()), ResolvedType::Text)),
             }
         }
@@ -21579,6 +21653,70 @@ fn resolve_json_object(
         ResolvedType::Jsonb
     };
     Ok((RExpr::JsonObjectFromArrays { json, args: rargs }, result))
+}
+
+/// Resolve a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. A
+/// bare string literal adapts (the context to jsonb, the path to a compiled jsonpath). STRICT.
+fn resolve_jsonpath_fn(
+    scope: &Scope,
+    name: &str,
+    kind: JsonPathFnKind,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (ctx, path) = resolve_jsonpath_args(scope, name, args, agg, params)?;
+    let result = match kind {
+        JsonPathFnKind::Exists => ResolvedType::Bool,
+        JsonPathFnKind::QueryFirst | JsonPathFnKind::QueryArray => ResolvedType::Jsonb,
+    };
+    Ok((
+        RExpr::JsonPathFn {
+            kind,
+            args: vec![ctx, path],
+        },
+        result,
+    ))
+}
+
+/// Resolve the `(context jsonb, path jsonpath)` argument pair shared by the jsonpath query functions
+/// (the SRF and the scalar forms). A bare string literal adapts: the context to jsonb, the path to a
+/// compiled `jsonpath`. Exactly two args this slice (the optional `vars` / `silent` are a follow-on).
+fn resolve_jsonpath_args(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, RExpr)> {
+    if args.len() != 2 {
+        return Err(no_func_overload(name));
+    }
+    let (ctx, ct) = resolve(scope, &args[0], Some(ScalarType::Jsonb), agg, params)?;
+    if !matches!(ct, ResolvedType::Jsonb | ResolvedType::Null) {
+        return Err(no_func_overload(name));
+    }
+    let (path, pt) = resolve(scope, &args[1], Some(ScalarType::JsonPath), agg, params)?;
+    if !matches!(pt, ResolvedType::JsonPath | ResolvedType::Null) {
+        return Err(no_func_overload(name));
+    }
+    Ok((ctx, path))
+}
+
+/// Recompile a `jsonpath` value's canonical text and evaluate it over a `jsonb` context value (the
+/// shared kernel of the jsonpath query functions). A NULL context or path yields `None` (→ SQL NULL).
+fn eval_jsonpath(ctx: &Value, path: &Value) -> Result<Option<Vec<JsonNode>>> {
+    let node = match ctx {
+        Value::Null => return Ok(None),
+        _ => json_arg_node(ctx)?,
+    };
+    let text = match path {
+        Value::Null => return Ok(None),
+        Value::JsonPath(s) => s,
+        _ => unreachable!("resolver restricts a jsonpath argument to jsonpath"),
+    };
+    let compiled = crate::jsonpath::JsonPath::compile(text)?;
+    Ok(Some(crate::jsonpath::eval(&compiled, &node)?))
 }
 
 /// Extract a `text[]` value into `Vec<Option<String>>`, preserving NULL elements — `None` if the
@@ -25547,6 +25685,26 @@ impl RExpr {
                         members.push((key, node));
                     }
                     Ok(Value::Jsonb(json::make_object(members)))
+                }
+            }
+            // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
+            RExpr::JsonPathFn { kind, args } => {
+                m.charge(COSTS.operator_eval);
+                let ctx = args[0].eval(row, env, m)?;
+                let path = args[1].eval(row, env, m)?;
+                let seq = match eval_jsonpath(&ctx, &path)? {
+                    None => return Ok(Value::Null),
+                    Some(s) => s,
+                };
+                // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
+                m.charge(COSTS.operator_eval * seq.len() as i64);
+                m.guard()?;
+                match kind {
+                    JsonPathFnKind::Exists => Ok(Value::Bool(!seq.is_empty())),
+                    JsonPathFnKind::QueryFirst => {
+                        Ok(seq.into_iter().next().map_or(Value::Null, Value::Jsonb))
+                    }
+                    JsonPathFnKind::QueryArray => Ok(Value::Jsonb(JsonNode::Array(seq))),
                 }
             }
             RExpr::And(l, r) => {
