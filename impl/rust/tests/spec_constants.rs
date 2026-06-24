@@ -473,6 +473,7 @@ fn cost_schedule_matches_spec() {
             "cte_scan_row" => COSTS.cte_scan_row,
             "sequence_advance" => COSTS.sequence_advance,
             "gin_entry" => COSTS.gin_entry,
+            "gist_descent" => COSTS.gist_descent,
             "collate" => COSTS.collate,
             "timezone" => COSTS.timezone,
             "regex_compile" => COSTS.regex_compile,

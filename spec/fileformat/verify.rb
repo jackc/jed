@@ -14,7 +14,14 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 19 # format_version 19: storable json/jsonb columns (spec/design/json.md, J1/J1b) — a
+VERSION = 20 # format_version 20: GiST indexes (spec/design/gist.md, GX1) — a per-index index_kind = 2
+# selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-
+# predicate nodes (page types 5 = GiST leaf, 6 = GiST interior, §4.1). A leaf entry is
+# bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is
+# bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). Entries are ordered canonically
+# (range_total_cmp, ties by storage key / subtree-min key); pages allocated post-order. The catalog
+# index entry is unchanged (index_root_page points at the R-tree root, 0 for empty). A file with no
+# GiST index still moves to v20 only by its version byte. format_version 19: storable json/jsonb (below) — a
 # column type can be json (type_code 18) or jsonb (type_code 19), both plain scalar catalog entries
 # with NO extra descriptor (like text/uuid). A json value's body is the verbatim text, length-prefixed
 # like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128
@@ -67,6 +74,9 @@ PAGE_CATALOG = 1
 PAGE_LEAF = 2
 PAGE_INTERIOR = 3
 PAGE_OVERFLOW = 4 # an out-of-line value slab, chained by next_page (large-values.md §12)
+PAGE_GIST_LEAF = 5     # v20: a GiST R-tree leaf (spec/design/gist.md §4.1)
+PAGE_GIST_INTERIOR = 6 # v20: a GiST R-tree interior (one bound per child, not N separators / N+1 children)
+GIST_FANOUT = 4 # v20: max entries per GiST node; the (N+1)-th triggers a median picksplit (gist.md §4.1)
 
 # Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md §12/§13;
 # format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len), 0x03
@@ -718,6 +728,27 @@ GIN_UUID_TABLE = {
          [5, ["00000000-0000-0000-0000-0000000000aa", nil, "00000000-0000-0000-0000-0000000000ee"], 5]]
 }.freeze
 
+# A table with a GiST index over an i32range column (v20 — spec/design/gist.md GX1). Pins the
+# per-index index_kind = 2 byte AND a persisted R-tree (page types 5 = GiST leaf, 6 = GiST interior):
+# 6 bounded canonical [) ranges + one empty range (7 leaf entries) force one median split at
+# GIST_FANOUT = 4, so the tree is two levels (an interior root over two leaves) — exercising BOTH
+# page types, the leaf entry layout (bound_len ‖ encode_range_body ‖ skey_len ‖ skey), the interior
+# entry layout (union bound ‖ child_page), least-enlargement choose-subtree (the 6th/7th inserts), and
+# post-order page allocation. Row 8's NULL range is NOT indexed (no leaf entry). The cores build this
+# via
+#   CREATE TABLE t (id i32 PRIMARY KEY, r i32range)
+#   INSERT (1,'[1,5)'); (2,'[10,20)'); (3,'[3,8)'); (4,'[100,200)'); (5,'[50,60)'); (6,'[15,25)');
+#          (7,'empty'); (8,NULL)
+#   CREATE INDEX t_r_gist ON t USING gist (r)
+def rng(lo, hi) = { lower: lo, upper: hi, lower_inc: true, upper_inc: false }
+GIST_RANGE_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("r", "i32range")],
+  indexes: [{ name: "t_r_gist", cols: [1], kind: "gist" }],
+  rows: [[1, rng(1, 5)], [2, rng(10, 20)], [3, rng(3, 8)], [4, rng(100, 200)],
+         [5, rng(50, 60)], [6, rng(15, 25)], [7, :empty], [8, nil]]
+}.freeze
+
 # A composite type used as an ARRAY ELEMENT type (v10 — array-of-composite, spec/design/array.md §12
 # AC1): pins the catalog array-column entry with a COMPOSITE element descriptor (type_code 15, then
 # the element descriptor element_type_code 14 + name "addr", §3) AND the recursive value body — an
@@ -977,6 +1008,7 @@ FIXTURES = [
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
   { file: "range_pk_table.jed", page_size: 256, tables: [RANGE_PK_TABLE] },
+  { file: "gist_range_table.jed", page_size: 256, tables: [GIST_RANGE_TABLE] },
   { file: "json_table.jed", page_size: 256, tables: [JSON_TABLE] },
   { file: "jsonb_table.jed", page_size: 256, tables: [JSONB_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
@@ -1532,7 +1564,8 @@ def table_entry_bytes(table, root_data_page, index_roots)
     out << u16(ix[:cols].size)
     ix[:cols].each { |i| out << u16(i) }
     out << [ix[:unique] ? 1 : 0].pack("C")
-    out << [ix[:kind] == "gin" ? 1 : 0].pack("C") # v13: index_kind byte (0 = btree, 1 = GIN)
+    # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
+    out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
     out << u32(index_roots[k])
   end
   # Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS table,
@@ -1702,6 +1735,209 @@ def gin_index_entries(table, ix)
     end
   end
   pairs.sort_by { |key, _| key }
+end
+
+# --- GiST R-tree (spec/design/gist.md §3/§4.1) -------------------------------
+#
+# The on-disk form of a GiST index is a persisted R-tree (page types 5/6), NOT the flat leaf-key
+# B-tree. The reference builds it exactly as the cores do: from the leaf SET in CANONICAL order —
+# range_total_cmp, here the order-preserving range-bounds KEY bytes (encode_range_key, which is
+# order-preserving for that total order by construction, encoding.md §2.11), ties by storage key —
+# inserting each via least-enlargement choose-subtree + a deterministic median split at GIST_FANOUT.
+# So the tree (and its bytes) are a pure function of the leaf set (content-deterministic), identical
+# across every core. A node is { leaf: true, entries: [[bound, skey], ...] } or
+# { leaf: false, children: [[union_bound, child_node], ...] }; `bound`/`union_bound` are range values
+# (:empty or a {lower:,upper:,lower_inc:,upper_inc:} hash) and `skey` is a binary storage key.
+
+# range_union (range.rs, strict = false) — the convex hull. `empty` contributes nothing; otherwise
+# lower = the lesser lower bound, upper = the greater upper bound. GX1's range elements are the six
+# discrete/continuous subtypes; this reference's GiST golden uses only FINITE, canonical `[)` i32
+# ranges (so the bound comparison reduces to value min/max with the canonical inclusivity), matching
+# the cores for that set. An infinite bound is not exercised by the golden (a defensive raise).
+def gist_union(a, b)
+  return b if a == :empty
+  return a if b == :empty
+  if [a[:lower], a[:upper], b[:lower], b[:upper]].any?(&:nil?) ||
+     !(a[:lower_inc] && b[:lower_inc]) || a[:upper_inc] || b[:upper_inc]
+    raise "GiST golden expects finite canonical [) ranges"
+  end
+  { lower: [a[:lower], b[:lower]].min, upper: [a[:upper], b[:upper]].max,
+    lower_inc: true, upper_inc: false }
+end
+
+def gist_node_union(elem, node)
+  bounds = node[:leaf] ? node[:entries].map { |b, _| b } : node[:children].map { |u, _| u }
+  bounds.reduce { |acc, b| gist_union(acc, b) }
+end
+
+def gist_subtree_min_skey(node)
+  if node[:leaf]
+    node[:entries].map { |_, s| s }.min
+  else
+    node[:children].map { |_, c| gist_subtree_min_skey(c) }.min
+  end
+end
+
+# Canonical leaf order: (range_total_cmp(bound), skey) = (encode_range_key bytes, skey).
+def gist_sort_leaf!(elem, entries)
+  entries.sort_by! { |b, s| [encode_range_key(elem, b), s] }
+end
+
+# Canonical child order: (range_total_cmp(union), subtree_min_skey).
+def gist_sort_children!(elem, children)
+  children.sort_by! { |u, c| [encode_range_key(elem, u), gist_subtree_min_skey(c)] }
+end
+
+# choose-subtree (penalty): the child whose union, MERGED with the new entry, has the
+# lexicographically-smallest value-codec bytes; ties keep the lower slot (gist.md §3).
+def gist_choose_child(elem, children, bound)
+  best = 0
+  best_key = nil
+  children.each_with_index do |(u, _), i|
+    key = encode_range_body(elem, gist_union(u, bound))
+    if best_key.nil? || key < best_key
+      best = i
+      best_key = key
+    end
+  end
+  best
+end
+
+# Insert (bound, skey) into `node` (mutated in place); returns nil or a new right-sibling child
+# [union_bound, node] when the node split.
+def gist_insert_node(elem, node, bound, skey)
+  if node[:leaf]
+    node[:entries] << [bound, skey]
+    gist_sort_leaf!(elem, node[:entries])
+  else
+    i = gist_choose_child(elem, node[:children], bound)
+    sib = gist_insert_node(elem, node[:children][i][1], bound, skey)
+    node[:children][i][0] = gist_node_union(elem, node[:children][i][1])
+    node[:children] << sib if sib
+    gist_sort_children!(elem, node[:children])
+  end
+  gist_split_if_overflow(elem, node)
+end
+
+# Split an over-FANOUT node at the median (ceil(n/2)); return the new right sibling [union, node].
+def gist_split_if_overflow(elem, node)
+  key = node[:leaf] ? :entries : :children
+  return nil if node[key].size <= GIST_FANOUT
+
+  mid = (node[key].size + 1) / 2 # ceil(n/2) = div_ceil
+  right_items = node[key].slice!(mid..)
+  right = node[:leaf] ? { leaf: true, entries: right_items } : { leaf: false, children: right_items }
+  [gist_node_union(elem, right), right]
+end
+
+# Build the canonical R-tree from leaf entries [[bound, skey], ...].
+def gist_build(elem, entries)
+  root = { leaf: true, entries: [] }
+  entries.sort_by { |b, s| [encode_range_key(elem, b), s] }.each do |bound, skey|
+    sib = gist_insert_node(elem, root, bound, skey)
+    next unless sib
+
+    children = [[gist_node_union(elem, root), root], sib]
+    gist_sort_children!(elem, children)
+    root = { leaf: false, children: children }
+  end
+  root
+end
+
+# Serialize the R-tree post-order into `pages` (children before parent, root last); returns
+# [root_index, next_index]. Leaf entry: bound_len(u16) ‖ bound ‖ skey_len(u16) ‖ skey.
+# Interior entry: bound_len(u16) ‖ union_bound ‖ child_page(u32). (gist.md §4.1)
+def gist_serialize(elem, node, next_index, pages)
+  if node[:leaf]
+    payload = +"".b
+    node[:entries].each do |bound, skey|
+      b = encode_range_body(elem, bound)
+      payload << u16(b.bytesize) << b << u16(skey.bytesize) << skey
+    end
+    index = next_index
+    next_index += 1
+    pages[index] = [PAGE_GIST_LEAF, node[:entries].size, payload, 0]
+    [index, next_index]
+  else
+    child_indices = node[:children].map do |_, c|
+      ci, next_index = gist_serialize(elem, c, next_index, pages)
+      ci
+    end
+    payload = +"".b
+    node[:children].each_with_index do |(u, _), i|
+      b = encode_range_body(elem, u)
+      payload << u16(b.bytesize) << b << u32(child_indices[i])
+    end
+    index = next_index
+    next_index += 1
+    pages[index] = [PAGE_GIST_INTERIOR, node[:children].size, payload, 0]
+    [index, next_index]
+  end
+end
+
+# Build + serialize a GiST index's R-tree from a table's rows; returns [root_index, next_index].
+# One leaf entry per NON-NULL range row (a NULL range is not indexed — gist.md §4.1). An empty
+# index serializes nothing and returns root 0 (the empty-index convention).
+def serialize_gist_index(table, ix, next_index, pages)
+  elem = range_elem(table[:columns][ix[:cols][0]][:type])
+  raise "a GiST index column must be a range" unless elem
+
+  entries = []
+  table_entries(table).each do |storage_key, row|
+    rv = row[ix[:cols][0]]
+    entries << [rv, storage_key] unless rv.nil?
+  end
+  return [0, next_index] if entries.empty?
+
+  gist_serialize(elem, gist_build(elem, entries), next_index, pages)
+end
+
+# A GiST index's leaf keys (encode_range_body(bound) ‖ skey), one per non-NULL range row, sorted
+# bytewise — the SET a round-trip read must reproduce (order-independent: the comparison sorts).
+def gist_leaf_keys_sorted(table, ix)
+  elem = range_elem(table[:columns][ix[:cols][0]][:type])
+  keys = []
+  table_entries(table).each do |storage_key, row|
+    rv = row[ix[:cols][0]]
+    keys << (encode_range_body(elem, rv) + storage_key).b unless rv.nil?
+  end
+  keys.sort
+end
+
+# Walk a persisted GiST R-tree (page types 5/6), returning its leaf keys (bound ‖ skey) — the
+# inverse of serialize_gist_index for the round-trip read.
+def read_gist_keys(image, ps, root_page)
+  keys = []
+  walk = lambda do |idx|
+    return if idx.zero?
+
+    pg = read_page(image, ps, idx)
+    case pg[:type]
+    when PAGE_GIST_LEAF
+      pos = 0
+      pg[:item_count].times do
+        bl, pos = take(pg[:payload], pos, 2)
+        bound, pos = take(pg[:payload], pos, bl.unpack1("n"))
+        sl, pos = take(pg[:payload], pos, 2)
+        skey, pos = take(pg[:payload], pos, sl.unpack1("n"))
+        keys << (bound + skey).b
+      end
+    when PAGE_GIST_INTERIOR
+      children = []
+      pos = 0
+      pg[:item_count].times do
+        bl, pos = take(pg[:payload], pos, 2)
+        _bound, pos = take(pg[:payload], pos, bl.unpack1("n"))
+        cp, pos = take(pg[:payload], pos, 4)
+        children << cp.unpack1("N")
+      end
+      children.each { |cp| walk.call(cp) }
+    else
+      raise "expected a GiST node page, got type #{pg[:type]}"
+    end
+  end
+  walk.call(root_page)
+  keys
 end
 
 # --- out-of-line large values (large-values.md §12) -------------------------
@@ -2000,8 +2236,14 @@ def build_image(types, sequences, tables, page_size, collations = [])
     # The table's index trees follow its data tree, in catalog (name) order (format.md
     # "Allocation & incremental commit" / "From-scratch image").
     (t[:indexes] || []).each do |ix|
-      entries = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
-      r, next_index = serialize_tree(build_tree(entries, cap), next_index, cap, data_pages)
+      r, next_index =
+        if ix[:kind] == "gist"
+          # The on-disk form is the R-tree (pages 5/6), not the flat leaf B-tree (gist.md §4.1).
+          serialize_gist_index(t, ix, next_index, data_pages)
+        else
+          entries = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
+          serialize_tree(build_tree(entries, cap), next_index, cap, data_pages)
+        end
       index_roots[ti] << r
     end
   end
@@ -2264,11 +2506,12 @@ def decode_table_entry(buf, pos)
     end
     fb, pos = take(buf, pos, 1)
     raise "reserved index flag set (only bit0 unique is defined — v6)" if (fb.getbyte(0) & ~0b01) != 0
-    kb, pos = take(buf, pos, 1) # v12: index_kind byte (0 = btree, 1 = GIN)
-    raise "reserved index kind (only 0=btree, 1=gin defined — v12)" if kb.getbyte(0) > 1
+    kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
+    raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
     rb, pos = take(buf, pos, 4)
     indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0,
-                 kind: kb.getbyte(0) == 1 ? "gin" : "btree", root_page: rb.unpack1("N") }
+                 kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
+                 root_page: rb.unpack1("N") }
   end
   # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
   # actions byte, in name order. An FK owns no B-tree (no root page).
@@ -2722,8 +2965,12 @@ def decode_image(image)
       entry, pos = decode_table_entry(pg[:payload], pos)
       rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
       indexes = entry[:indexes].map do |ix|
-        { name: ix[:name], cols: ix[:cols],
-          entries: read_tree_keys(image, ps, ix[:root_page]).map { |k| k.unpack1("H*") } }
+        raw = if ix[:kind] == "gist"
+                read_gist_keys(image, ps, ix[:root_page]).sort
+              else
+                read_tree_keys(image, ps, ix[:root_page])
+              end
+        { name: ix[:name], cols: ix[:cols], entries: raw.map { |k| k.unpack1("H*") } }
       end
       tables << { name: entry[:name], columns: entry[:columns], pk: entry[:pk],
                   checks: entry[:checks], indexes: indexes, rows: rows }
@@ -2796,9 +3043,14 @@ def expected_tables(fx)
       pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },
       indexes: (t[:indexes] || []).map do |ix|
-        ent = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
-        { name: ix[:name], cols: ix[:cols],
-          entries: ent.map { |key, _| key.unpack1("H*") } }
+        if ix[:kind] == "gist"
+          { name: ix[:name], cols: ix[:cols],
+            entries: gist_leaf_keys_sorted(t, ix).map { |k| k.unpack1("H*") } }
+        else
+          ent = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
+          { name: ix[:name], cols: ix[:cols],
+            entries: ent.map { |key, _| key.unpack1("H*") } }
+        end
       end,
       rows: table_entries(t).map { |_key, row| row } }
   end
