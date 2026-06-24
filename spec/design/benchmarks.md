@@ -329,6 +329,29 @@ re-parses the SQL each call (the core's `prepare` parses once) — that per-call
 in the measured delta; a gem prepared-statement API would isolate the pure FFI tax. The harness also
 prints **allocations/op** to stderr (deterministic, unlike wall-clock) as a complementary metric.
 
+### 7.2 The WebAssembly variant (`jed/wasm/wrap`)
+
+`bench/ts/src/bench-wasm.ts` runs the **same corpus** through the Rust core compiled to
+**`wasm32-wasip1`** (`impl/wasm`), driven from Node over `WebAssembly` + the `node:wasi` host
+(`engine=jed, lang=wasm, variant=wrap`). It reuses the TS harness's param stream + FNV-1a checksum
+(`bench/ts/src/lib.ts`), and its answer checksum must match the native cores' — the cross-engine
+checksum gate in `scripts/bench_report.rb` doubles as a **conformance check on the wasm build**. It
+needs Node's preview1 WASI: `node --experimental-wasi-unstable-preview1` (the Rakefile passes it);
+the `.jed` data files open through a WASI preopen of `bench/data`. **No new dependency** — the wasm
+artifact is loaded by Node's built-in `WebAssembly`/`node:wasi`. Two deltas are interesting:
+
+- `jed/wasm/wrap − jed/ts/core` — the **wasm-vs-native-JS** comparison (the same Rust algorithms in
+  a wasm sandbox vs. the hand-written TypeScript core). For cheap queries the per-call marshalling
+  round-trip (param encode + result-buffer decode across linear memory) dominates and wasm can be
+  *slower*; for scan/sort/aggregate-heavy queries the compiled-Rust execution dominates and wasm
+  pulls ahead.
+- `jed/wasm/wrap − jed/rust/core` — the **wasm sandbox + marshalling tax** over native Rust.
+
+Unlike the Ruby gem wrap (§7.1), the wasm ABI exposes `jed_prepare`/`jed_stmt_query`, so the bench
+mirrors the native cores' "parse once, run many" — the delta isolates execution, not parse overhead.
+The artifact is an optimized release build (`opt-level=3`, full LTO, stripped); a size-first build
+(`opt-level="z"`) trades speed for a smaller module.
+
 ## 8. Write benchmarks and the scratch database
 
 Two write kinds:

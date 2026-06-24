@@ -9,6 +9,8 @@
 /cli/target/
 # Ruby gem's native-extension (cdylib) build artifacts; ext/Cargo.lock IS committed.
 /impl/ruby/ext/target/
+# WASM (wasm32-wasip1) wrap's build artifacts; impl/wasm/Cargo.lock IS committed.
+/impl/wasm/target/
 # Built gem packages.
 /impl/ruby/*.gem
 

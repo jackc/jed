@@ -176,6 +176,9 @@ RUST_MANIFEST = File.join(__dir__, "impl/rust/Cargo.toml")
 CLI_MANIFEST  = File.join(__dir__, "cli/Cargo.toml")
 RUBY_GEM_DIR  = File.join(__dir__, "impl/ruby")               # the jed Ruby gem (host artifact; spec/design/ruby.md)
 RUBY_EXT_MANIFEST = File.join(RUBY_GEM_DIR, "ext/Cargo.toml") # its native-extension cdylib crate
+WASM_MANIFEST = File.join(__dir__, "impl/wasm/Cargo.toml")    # the wasm32-wasip1 wrap of the core (host artifact)
+WASM_TARGET   = "wasm32-wasip1"
+WASM_ARTIFACT = File.join(__dir__, "impl/wasm/target", WASM_TARGET, "release/jed_wasm.wasm")
 GO_DIR        = File.join(__dir__, "impl/go")
 TS_DIR        = File.join(__dir__, "impl/ts")
 TS_CORE_DIRS  = %w[impl/ts bench/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
@@ -224,6 +227,11 @@ namespace :fmt do
       failures << "ruby-ext"
     end
 
+    puts "wasm: cargo fmt --check (the wasm32-wasip1 wrap)"
+    unless system("cargo", "fmt", "--check", "--manifest-path", WASM_MANIFEST)
+      failures << "wasm"
+    end
+
     puts "go:   gofumpt -l impl/go"
     unformatted = gofumpt_unformatted
     unless unformatted.empty?
@@ -247,6 +255,7 @@ namespace :fmt do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "cargo", "fmt", "--manifest-path", RUBY_EXT_MANIFEST
+    sh "cargo", "fmt", "--manifest-path", WASM_MANIFEST
     sh "gofumpt", "-w", GO_DIR
     sh "biome", "format", "--write", *TS_CORE_DIRS
     npm_ci_if_stale(WEB_DIR)
@@ -423,6 +432,9 @@ namespace :bench do
     npm_ci_if_stale("bench/ts")
     # The Ruby gem bench (bench/ruby) drives the gem, so it needs the gem's native extension built.
     sh "cargo", "build", "--release", "--quiet", "--manifest-path", RUBY_EXT_MANIFEST
+    # The wasm bench (bench/ts/src/bench-wasm.ts) drives the core compiled to wasm32-wasip1. Build
+    # the artifact here (needs `rustup target add wasm32-wasip1` once; cargo errors clearly if absent).
+    sh "cargo", "build", "--release", "--quiet", "--target", WASM_TARGET, "--manifest-path", WASM_MANIFEST
   end
 
   desc "Generate/refresh the benchmark databases (fingerprint-gated; [force] to override)"
@@ -455,6 +467,11 @@ namespace :bench do
     Bundler.with_unbundled_env do
       sh RbConfig.ruby, "bench/ruby/bench_jed.rb", "bench/corpus", "bench/data", File.join(dir, "ruby-bench-jed.jsonl"), *filter
     end
+    # The wasm wrap (jed/wasm/wrap) — the Rust core compiled to wasm32-wasip1, driven from Node over
+    # WebAssembly + node:wasi (the --experimental flag enables the preview1 host). Its delta vs
+    # jed/ts/core is the wasm-vs-native-JS comparison; vs jed/rust/core, the wasm sandbox tax.
+    sh "node", "--experimental-wasi-unstable-preview1", "bench/ts/src/bench-wasm.ts",
+       "bench/corpus", "bench/data", File.join(dir, "wasm-bench-jed.jsonl"), *filter
     Rake::Task["bench:report"].invoke(dir)
     Rake::Task["bench:html"].invoke(dir)
   end

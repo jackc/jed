@@ -319,6 +319,14 @@ ship WASM only, no native TS — is legitimate, but it means the browser target 
 **This is the decision reserved for the maintainer**; everything else in this doc follows
 from the §1 principle.
 
+A **first concrete Rust→WASM artifact now exists** — `impl/wasm`, a `wasm32-wasip1` `cdylib`
+wrapping the safe Rust core via a small C ABI (the same host-artifact shape as the Ruby gem's
+extension, `impl/ruby/ext`). It is **not** a conformance voice (§1 — it *is* the Rust core), and it
+does not pre-empt the decision above; it exists today as a **benchmark engine**
+(`jed/wasm/wrap`, `spec/design/benchmarks.md` §7.2, driven from Node over `node:wasi`) and a proof
+that the wrap path works end-to-end. Its answer checksums are cross-checked against the native cores
+by the benchmark harness, so it is correct-by-construction in practice as well as in principle.
+
 ## 6. Current recommendation / status
 
 The differential core set is **in place**: Rust + Go + the native TS core run in lockstep,

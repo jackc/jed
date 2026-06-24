@@ -1,0 +1,38 @@
+# A WASM (wasm32-wasip1) build of the safe Rust core via a C ABI — a HOST ARTIFACT, not a core
+# (CLAUDE.md §2; cores.md). It is the same shape as the Ruby gem's native extension
+# (impl/ruby/ext): a standalone `cdylib` that WRAPS the safe Rust core (`jed`), confines its FFI
+# `unsafe` to pointer marshalling at the boundary, and pulls in NO third-party dependency (the
+# JS side loads it through the WebAssembly + node:wasi stdlib), so CLAUDE.md §14 needs no new
+# dependency approval — the path-dep on the core is the only edge. It conforms by construction
+# (it IS the Rust core, recompiled to wasm).
+#
+# Deliberately NOT in a Cargo workspace with impl/rust (the cli/ + ruby-ext precedent): the engine
+# crate stays hermetic and its FFI/wasm concerns never leak into it.
+#
+# Targets wasm32-wasip1 (NOT wasm32-unknown-unknown): WASI gives the core std::fs (open a .jed
+# file through a Node preopen) and getrandom a working backend (WASI random_get) with no Cargo
+# feature, and Node has a built-in WASI host. Build: see Rakefile `wasm:build`.
+
+[package]
+name = "jed-wasm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "C ABI over the safe Rust core, compiled to wasm32-wasip1 (CLAUDE.md §2; the Rust→WASM wrap)."
+
+[lib]
+name = "jed_wasm"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+jed = { path = "../rust" }
+
+# A realistic optimized production wasm build (the fair size/speed comparison to the TS core's
+# production bundle): full LTO, one codegen unit, symbols stripped. opt-level 3 favors speed; a
+# size-first build would use "z" (smaller, slower) — noted in the bench report.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
