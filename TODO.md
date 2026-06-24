@@ -750,8 +750,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         ILIKE/case-folding and named zones (`AT TIME ZONE 'America/New_York'`, `date_trunc(…, zone)`).
         Malformed bundle → `Jed::Error` (`XX001`). The ABI check moved ahead of symbol binding so a
         stale cdylib gives a clear version error. → [ruby.md §5a](spec/design/ruby.md)
-  - [ ] _follow-on (each its own slice):_ **`interval`/`uuid`/`bytea` typed coercion** (left as
-        String — no single obvious native target); **distributable packaging**
+  - [x] **Binding-overhead benchmark** (`bench/ruby`, `jed/ruby/wrap`) — runs the shared corpus
+        through the gem; its `ns_per_op` delta vs `jed/rust/core` (same engine) is the wrapper tax
+        (FFI + marshalling + coercion + per-call parse). Reuses the splitmix64 PRNG + FNV-1a
+        checksum (cross-engine checksum = correctness gate; pinned vectors); also reports
+        allocations/op. No new dep. Caveat: includes per-call parse (no gem prepared-stmt API yet).
+        → [benchmarks.md §7.1](spec/design/benchmarks.md)
+  - [ ] _follow-on (each its own slice):_ **gem prepared-statement API** (isolates the pure FFI tax
+        from the per-call parse the overhead bench currently includes); **`interval`/`uuid`/`bytea`
+        typed coercion** (left as String — no single obvious native target); **distributable packaging**
         — a `gem install`-able native gem via **`rb-sys` + precompiled platform gems** (or
         `magnus` for richer Rust ergonomics), replacing the in-repo `rake ruby:build` step (a
         wrapper-module dep, the `bench/`/`web/` precedent §14, needs the §14 confirmation before

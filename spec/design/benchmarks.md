@@ -303,12 +303,31 @@ by the independent Ruby reference, like the PRNG vectors).
 | | `postgres` (porsager) | PG client; raw `$N` via `sql.unsafe` |
 | | `node:sqlite` | built-in (Node ≥ 22), zero dep |
 | | `smol-toml` | corpus parsing (Node has no built-in TOML) |
+| `bench/ruby` | jed via the **gem** (`require "jed"` ← `impl/ruby/lib`) | the wrapped core under test |
+| | `toml-rb` | corpus parsing — **already a project dev dep** (root Gemfile), no new dep |
+| | `bigdecimal` | transitively via the gem |
 
 These are **harness dependencies, not engine dependencies** (CLAUDE.md §14): the bench
 modules are separate packages and the cores' manifests are untouched. The Go core's
 pure-Go/no-cgo rule binds the *core*; `bench-sqlite-cgo` exists precisely to get the
 C-SQLite baseline and its cgo never leaks past `bench/go`. New bench dependencies still
 require explicit human confirmation, like any dependency.
+
+### 7.1 The Ruby-gem overhead variant (`jed/ruby/wrap`)
+
+`bench/ruby/bench_jed.rb` runs the **same corpus** through the jed **Ruby gem**
+(`engine=jed, lang=ruby, variant=wrap`), reusing the splitmix64 param stream + FNV-1a answer
+checksum (ported in `bench/ruby/lib/bench.rb`, pinned to the shared vectors in
+`bench/ruby/test/vectors_test.rb`). Its purpose is **not** engine comparison — it is the **gem's
+binding overhead**: because `jed/ruby/wrap` and `jed/rust/core` drive the *identical* Rust engine
+on the same data, the per-bench `ns_per_op` **delta** is the wrapper tax (FFI round-trip + result
+marshalling + value coercion + Ruby object allocation). The answer checksum must match the core's,
+which doubles as a correctness gate on the gem. It pulls in **no new dependency** (`toml-rb` is
+already in the root Gemfile); it is spawned under `Bundler.with_unbundled_env` so the gem's
+`bigdecimal` require resolves. **Caveat:** the gem has no prepared-statement API, so the bench
+re-parses the SQL each call (the core's `prepare` parses once) — that per-call parse is *included*
+in the measured delta; a gem prepared-statement API would isolate the pure FFI tax. The harness also
+prints **allocations/op** to stderr (deterministic, unlike wall-clock) as a complementary metric.
 
 ## 8. Write benchmarks and the scratch database
 

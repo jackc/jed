@@ -17,6 +17,10 @@ rake bench:diff      # machine-readable JSONL diff of two runs (newest vs previo
 - `go/`, `rust/`, `ts/` — per-language harnesses; **separate modules** with their own
   dependency manifests (PG/SQLite drivers live here, never in `impl/*`). One binary per
   engine/driver variant, all emitting identical JSONL.
+- `ruby/` — the **Ruby-gem overhead** harness (`jed/ruby/wrap`): the same corpus through the
+  gem, so its delta vs `jed/rust/core` is the binding tax (FFI + marshalling + coercion). Reuses
+  the shared PRNG + checksum; no new dependency. See [benchmarks.md §7.1](../spec/design/benchmarks.md)
+  and [ruby/README.md](ruby/README.md).
 - `data/`, `results/` — generated; gitignored.
 
 Wall-clock numbers are environment-relative and deliberately **not** part of `rake ci`

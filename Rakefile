@@ -421,6 +421,8 @@ namespace :bench do
     sh({ "CGO_ENABLED" => "1" }, "go", "build", "-o", "bin/", "./cmd/bench-sqlite-cgo", chdir: "bench/go")
     sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Cargo.toml"
     npm_ci_if_stale("bench/ts")
+    # The Ruby gem bench (bench/ruby) drives the gem, so it needs the gem's native extension built.
+    sh "cargo", "build", "--release", "--quiet", "--manifest-path", RUBY_EXT_MANIFEST
   end
 
   desc "Generate/refresh the benchmark databases (fingerprint-gated; [force] to override)"
@@ -445,6 +447,13 @@ namespace :bench do
     end
     BENCH_TS_BINS.each do |bin|
       sh "node", "bench/ts/src/#{bin}.ts", "bench/corpus", "bench/data", File.join(dir, "ts-#{bin}.jsonl"), *filter
+    end
+    # The Ruby gem bench (jed/ruby/wrap) — its delta vs jed/rust/core is the binding overhead
+    # (benchmarks.md §7). Spawned under `with_unbundled_env` because the Rakefile loads
+    # `bundler/setup`, which would otherwise restrict the child to the root Gemfile and block the
+    # gem's `bigdecimal` require (the bundled-gem trap, same as ruby:test).
+    Bundler.with_unbundled_env do
+      sh RbConfig.ruby, "bench/ruby/bench_jed.rb", "bench/corpus", "bench/data", File.join(dir, "ruby-bench-jed.jsonl"), *filter
     end
     Rake::Task["bench:report"].invoke(dir)
     Rake::Task["bench:html"].invoke(dir)
