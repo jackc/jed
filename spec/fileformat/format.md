@@ -422,7 +422,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key column: |
 | &nbsp;&nbsp;`key_ordinal` ×`key_col_count` | u16 each — column ordinals in **index-key order**; each must be `< col_count` (duplicates allowed — indexes.md §1; else `XX001`) |
 | &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
-| &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2…` reserved (a value > 1 is `XX001`). A GIN index always has `index_flags` bit0 (`unique`) clear |
+| &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**reserved** — named at GX0, claimed by a future `format_version`, [../design/gist.md](../design/gist.md)); `3…` reserved. At v19 a value `> 1` is `XX001`. A GIN index always has `index_flags` bit0 (`unique`) clear |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | `fk_count` | u16 — the table's `FOREIGN KEY` constraints (**new in v11**; `0` for a table with none) |
 | per foreign key (×`fk_count`): | |

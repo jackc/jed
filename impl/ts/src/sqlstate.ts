@@ -42,6 +42,7 @@ export type SqlState =
   | "unique_violation" // 23505 — duplicate key value violates unique constraint: {name}
   | "check_violation" // 23514 — new row for relation {table} violates check constraint {name}
   | "foreign_key_violation" // 23503 — insert or update on table {table} violates foreign key constraint {name}
+  | "exclusion_violation" // 23P01 — conflicting key value violates exclusion constraint: {name}
   | "active_sql_transaction" // 25001 — there is already a transaction in progress
   | "read_only_sql_transaction" // 25006 — cannot execute {statement} in a read-only transaction
   | "in_failed_sql_transaction" // 25P02 — current transaction is aborted, commands ignored until end of transaction block
@@ -117,6 +118,7 @@ const CODES: Record<SqlState, string> = {
   unique_violation: "23505",
   check_violation: "23514",
   foreign_key_violation: "23503",
+  exclusion_violation: "23P01",
   active_sql_transaction: "25001",
   read_only_sql_transaction: "25006",
   in_failed_sql_transaction: "25P02",
@@ -208,6 +210,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "23505", name: "unique_violation", class: "integrity constraint violation" },
   { code: "23514", name: "check_violation", class: "integrity constraint violation" },
   { code: "23503", name: "foreign_key_violation", class: "integrity constraint violation" },
+  { code: "23P01", name: "exclusion_violation", class: "integrity constraint violation" },
   { code: "25001", name: "active_sql_transaction", class: "invalid transaction state" },
   { code: "25006", name: "read_only_sql_transaction", class: "invalid transaction state" },
   { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },

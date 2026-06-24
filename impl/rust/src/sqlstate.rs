@@ -76,6 +76,8 @@ pub enum SqlState {
     CheckViolation,
     /// 23503 — insert or update on table {table} violates foreign key constraint {name}
     ForeignKeyViolation,
+    /// 23P01 — conflicting key value violates exclusion constraint: {name}
+    ExclusionViolation,
     /// 25001 — there is already a transaction in progress
     ActiveSqlTransaction,
     /// 25006 — cannot execute {statement} in a read-only transaction
@@ -196,6 +198,7 @@ impl SqlState {
             SqlState::UniqueViolation => "23505",
             SqlState::CheckViolation => "23514",
             SqlState::ForeignKeyViolation => "23503",
+            SqlState::ExclusionViolation => "23P01",
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::ReadOnlySqlTransaction => "25006",
             SqlState::InFailedSqlTransaction => "25P02",
@@ -285,6 +288,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "23505", name: "unique_violation", class: "integrity constraint violation" },
     ErrorDesc { code: "23514", name: "check_violation", class: "integrity constraint violation" },
     ErrorDesc { code: "23503", name: "foreign_key_violation", class: "integrity constraint violation" },
+    ErrorDesc { code: "23P01", name: "exclusion_violation", class: "integrity constraint violation" },
     ErrorDesc { code: "25001", name: "active_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25006", name: "read_only_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },

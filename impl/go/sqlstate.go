@@ -79,6 +79,8 @@ const (
 	CheckViolation
 	// ForeignKeyViolation is 23503 — insert or update on table {table} violates foreign key constraint {name}.
 	ForeignKeyViolation
+	// ExclusionViolation is 23P01 — conflicting key value violates exclusion constraint: {name}.
+	ExclusionViolation
 	// ActiveSqlTransaction is 25001 — there is already a transaction in progress.
 	ActiveSqlTransaction
 	// ReadOnlySqlTransaction is 25006 — cannot execute {statement} in a read-only transaction.
@@ -230,6 +232,8 @@ func (s SqlState) Code() string {
 		return "23514"
 	case ForeignKeyViolation:
 		return "23503"
+	case ExclusionViolation:
+		return "23P01"
 	case ActiveSqlTransaction:
 		return "25001"
 	case ReadOnlySqlTransaction:
@@ -360,6 +364,7 @@ var Errors = []ErrorDesc{
 	{Code: "23505", Name: "unique_violation", Class: "integrity constraint violation"},
 	{Code: "23514", Name: "check_violation", Class: "integrity constraint violation"},
 	{Code: "23503", Name: "foreign_key_violation", Class: "integrity constraint violation"},
+	{Code: "23P01", Name: "exclusion_violation", Class: "integrity constraint violation"},
 	{Code: "25001", Name: "active_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25006", Name: "read_only_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25P02", Name: "in_failed_sql_transaction", Class: "invalid transaction state"},

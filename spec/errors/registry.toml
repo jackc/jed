@@ -240,6 +240,17 @@ class = "integrity constraint violation"
 # jed carries no separate DETAIL line — house style, codes match.)
 template = "insert or update on table {table} violates foreign key constraint {name}"
 
+[[error]]
+code = "23P01"
+name = "exclusion_violation"
+class = "integrity constraint violation"
+# Raised by an EXCLUDE constraint (spec/design/gist.md §7): an INSERT/UPDATE produces a row that,
+# under the constraint's WITH operators, conflicts with an existing row (every element comparison
+# TRUE). A NULL in any excluded expression exempts the row (PG-matched). {name} is the constraint's
+# backing GiST index name. (Unlike PostgreSQL, jed carries no separate DETAIL line — house style,
+# code matches.) Reserved at GX0; first raised when GX3 lands.
+template = "conflicting key value violates exclusion constraint: {name}"
+
 # --- invalid transaction state (class 25) -----------------------------------
 # Raised by the transaction-control surface (spec/design/transactions.md §4/§6):
 # BEGIN/COMMIT/ROLLBACK, the read-only access mode, and the failed-transaction
