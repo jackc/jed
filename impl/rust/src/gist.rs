@@ -116,13 +116,15 @@ impl GistTree {
 
     /// Consistent-descent search: every storage key whose row satisfies `query OP col` under
     /// `strat`. The interior descend predicate is conservative (no false negatives); the exact
-    /// operator is applied at the leaf. Returns `(storage keys, nodes_visited)` — the second is the
-    /// `gist_descent` cost (interior + leaf nodes touched).
-    pub fn search(&self, query: &RangeVal, strat: GistStrategy) -> (Vec<Vec<u8>>, usize) {
+    /// operator is applied at the leaf. Returns `(storage keys, nodes_visited, interior_visited)` —
+    /// `nodes_visited` (interior + leaf) is the `page_read` charge, `interior_visited` the
+    /// `gist_descent` charge (spec/design/gist.md §9).
+    pub fn search(&self, query: &RangeVal, strat: GistStrategy) -> (Vec<Vec<u8>>, usize, usize) {
         let mut out = Vec::new();
-        let mut visited = 0usize;
-        search_node(&self.root, query, strat, &mut out, &mut visited);
-        (out, visited)
+        let mut nodes = 0usize;
+        let mut interior = 0usize;
+        search_node(&self.root, query, strat, &mut out, &mut nodes, &mut interior);
+        (out, nodes, interior)
     }
 }
 
@@ -267,9 +269,10 @@ fn search_node(
     query: &RangeVal,
     strat: GistStrategy,
     out: &mut Vec<Vec<u8>>,
-    visited: &mut usize,
+    nodes: &mut usize,
+    interior: &mut usize,
 ) {
-    *visited += 1;
+    *nodes += 1;
     match node {
         GistNode::Leaf(entries) => {
             for e in entries {
@@ -279,9 +282,10 @@ fn search_node(
             }
         }
         GistNode::Interior(children) => {
+            *interior += 1;
             for c in children {
                 if descend(&c.bound, query, strat) {
-                    search_node(&c.node, query, strat, out, visited);
+                    search_node(&c.node, query, strat, out, nodes, interior);
                 }
             }
         }
@@ -624,7 +628,7 @@ mod tests {
     #[test]
     fn empty_tree_searches_to_nothing() {
         let t = GistTree::new();
-        let (hits, _) = t.search(&r(1, 5), GistStrategy::Overlaps);
+        let (hits, _, _) = t.search(&r(1, 5), GistStrategy::Overlaps);
         assert!(hits.is_empty());
         assert!(t.is_empty());
     }
@@ -671,7 +675,7 @@ mod tests {
         let mut t = build(&[(1, 5, 1), (10, 20, 2)]);
         t.insert(&elem, RangeVal::empty(), skey(99)); // an empty-range row
         let q = r(0, 100);
-        let (hits, _) = t.search(&q, GistStrategy::Overlaps);
+        let (hits, _, _) = t.search(&q, GistStrategy::Overlaps);
         assert!(!sorted(hits).contains(&skey(99)));
     }
 

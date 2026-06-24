@@ -227,6 +227,16 @@ pub struct Snapshot {
     /// (`db.set_default_collation`); persisted as the `is_default` flag bit on that collation's
     /// `entry_kind = 3` snapshot, restored on load. `C` ⇒ no snapshot carries the bit.
     default_collation: Option<String>,
+    /// Each GiST index's **resident R-tree** (spec/design/gist.md §4.1), keyed by the lowercased
+    /// index name. The leaf-key store (`index_stores`) stays the maintained source of truth (so all
+    /// insert/update/delete index maintenance is reused, gist.md §4.1); this tree is the acceleration
+    /// structure the planner descends. Rebuilt **canonically** (`build_from_leaf_keys` — content-
+    /// deterministic, a pure function of the leaf SET, gist.md §3) at every mutating statement and on
+    /// load, so a committed snapshot always carries a fresh, cross-core-identical tree a SELECT can
+    /// descend lock-free (the immutable-snapshot read path, §3). `Arc` so a snapshot clone stays O(1)
+    /// (the tree is replaced wholesale on rebuild, never mutated in place). The on-disk form is the
+    /// persisted R-tree (page types 5/6); this in-memory tree is rebuilt from the loaded leaf store.
+    gist_trees: HashMap<String, std::sync::Arc<crate::gist::GistTree>>,
 }
 
 impl Snapshot {
@@ -840,6 +850,57 @@ impl Snapshot {
     /// the store is registered here.
     pub(crate) fn put_index_store(&mut self, name_key: String, store: TableStore) {
         self.index_stores.insert(name_key, store);
+    }
+
+    /// The resident GiST R-tree of the named index (lowercased key), or `None` if the index is not
+    /// GiST / not present (spec/design/gist.md §4.1). The planner descends it for a `&&`/`@>` bound.
+    pub(crate) fn gist_tree(&self, name_key: &str) -> Option<&std::sync::Arc<crate::gist::GistTree>> {
+        self.gist_trees.get(name_key)
+    }
+
+    /// Rebuild **every** GiST index's resident R-tree from its leaf-key store (spec/design/gist.md
+    /// §3/§4.1). Called after any statement that may have changed a GiST index's leaf set (the
+    /// mutating-statement hook), so the working snapshot always carries a fresh tree a subsequent
+    /// read descends — and after publish, the committed snapshot does too. Each tree is built in
+    /// **canonical** order (`build_from_leaf_keys`: `range_total_cmp`, ties by storage key), making
+    /// it a pure function of the leaf SET — content-deterministic, cross-core identical, and
+    /// identical to the on-disk persisted R-tree. Trees whose index has been dropped are removed.
+    /// A whole-tree rewrite, the §4.1(b) commit-rewrite narrowing extended to in-memory writes; the
+    /// O(rows)-per-mutation cost is unmetered structure maintenance on the (trusted) write path —
+    /// the untrusted surface is SELECT-only and never triggers it (gist.md §9, CLAUDE.md §13).
+    pub(crate) fn rebuild_gist_trees(&mut self) -> Result<()> {
+        // Collect (index name key, range-element type) for every GiST index, dropping the borrow on
+        // `self.tables` before mutating `self.gist_trees`.
+        let mut specs: Vec<(String, ColType)> = Vec::new();
+        for table in self.tables.values() {
+            for idx in &table.indexes {
+                if idx.kind != IndexKind::Gist {
+                    continue;
+                }
+                let ci = idx.columns[0];
+                let elem = ColType::Scalar(
+                    table.columns[ci]
+                        .ty
+                        .range_element()
+                        .expect("a GiST index column is a range (CREATE INDEX gate)")
+                        .scalar(),
+                );
+                specs.push((idx.name.to_ascii_lowercase(), elem));
+            }
+        }
+        let live: std::collections::HashSet<&str> =
+            specs.iter().map(|(k, _)| k.as_str()).collect();
+        self.gist_trees.retain(|k, _| live.contains(k.as_str()));
+        for (name_key, elem) in &specs {
+            let keys: Vec<Vec<u8>> = match self.index_stores.get(name_key) {
+                Some(store) => store.iter_entries()?.into_iter().map(|(k, _)| k).collect(),
+                None => Vec::new(),
+            };
+            let tree = crate::gist::build_from_leaf_keys(elem, keys.iter().map(|k| k.as_slice()))?;
+            self.gist_trees
+                .insert(name_key.clone(), std::sync::Arc::new(tree));
+        }
+        Ok(())
     }
 
     /// Remove one secondary index (DROP INDEX): its definition from the owning table and
@@ -1567,6 +1628,23 @@ impl Database {
                     ),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Refresh the main working snapshot's resident GiST trees **iff** the current statement mutated
+    /// the main image (spec/design/gist.md §3/§4.1). Run after a statement so a subsequent read —
+    /// within the same transaction or, after publish, against the committed snapshot — descends a
+    /// fresh, canonically-rebuilt tree. Gated on `main_dirty` (set by the statement's own
+    /// `working_mut` writes): a read or a temp-only write leaves it unset, so this is a no-op and
+    /// never forces a spurious main-image persist (the temp-no-file-write invariant, temp-tables.md
+    /// §2). Trees on temp/shared-temp snapshots are out of scope this slice (GiST on a temp table is
+    /// `0A000`, gist.md §11), so only the main working snapshot is refreshed.
+    fn rebuild_main_gist_trees_if_dirty(&mut self) -> Result<()> {
+        if let Some(tx) = self.session.tx.as_mut()
+            && tx.main_dirty
+        {
+            tx.working.rebuild_gist_trees()?;
         }
         Ok(())
     }
@@ -2861,7 +2939,7 @@ impl Database {
         // common path pays nothing. The physical access-mode gate (`25006`) is checked earlier in
         // `execute_stmt_params`, so it wins when both apply.
         self.check_privileges(&stmt)?;
-        match stmt {
+        let out = match stmt {
             Statement::CreateTable(ct) => {
                 reject_params_for_ddl(params)?;
                 self.execute_create_table(ct)
@@ -2908,7 +2986,14 @@ impl Database {
             Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {
                 unreachable!("transaction control is handled before dispatch")
             }
+        };
+        // Keep each GiST index's resident R-tree current: after a statement that mutated the main
+        // image, rebuild it from the (now-updated) leaf store so the next read descends a fresh tree
+        // (spec/design/gist.md §3/§4.1). A no-op for reads / temp-only writes (main_dirty unset).
+        if out.is_ok() {
+            self.rebuild_main_gist_trees_if_dirty()?;
         }
+        out
     }
 
     /// Analyze and run a CREATE TABLE: resolve each column's type name, enforce a
@@ -4149,11 +4234,12 @@ impl Database {
                 ));
             }
         }
-        // GiST narrowings (spec/design/gist.md §1/§5): no uniqueness (a bounding tree has no unique
-        // key — express it as EXCLUDE (… WITH =), GX3) and a single column only (multi-column GiST
-        // is GX2/GX3). And — GX1a — file persistence (the page-5/6 R-tree + format_version 20) is
-        // GX1b, so a GiST index is in-memory-only for now; a file-backed one is 0A000 rather than a
-        // silent XX001 on reopen.
+        // GiST narrowings (spec/design/gist.md §1/§5/§11): no uniqueness (a bounding tree has no
+        // unique key — express it as EXCLUDE (… WITH =), GX3) and a single column only (multi-column
+        // GiST is GX2/GX3). File persistence (the page-5/6 R-tree + format_version 20) landed in
+        // GX1b, so a file-backed GiST index is now supported; only a GiST index on a TEMP table is
+        // still 0A000 (its resident R-tree would live on the temp/shared-temp snapshot — deferred,
+        // gist.md §11), failing closed rather than silently dropping the acceleration.
         if kind == IndexKind::Gist {
             if ci.unique {
                 return Err(EngineError::new(
@@ -4167,10 +4253,10 @@ impl Database {
                     "a multi-column gist index is not supported yet".to_string(),
                 ));
             }
-            if self.path.is_some() {
+            if self.is_temp_table(&ci.table) || self.is_shared_temp_table(&ci.table) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
-                    "a gist index on a file-backed database is not supported yet".to_string(),
+                    "a gist index on a temporary table is not supported yet".to_string(),
                 ));
             }
         }
@@ -6245,6 +6331,12 @@ impl Database {
             (Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
+        // GiST bound (gist.md §5): when neither a PK nor a GIN bound applies, a `&&`/`@>` conjunct
+        // over a GiST-indexed range column bounds the delete's target scan via the resident R-tree.
+        let gist_bound = match (&filter, &pk_bound, &gin_bound) {
+            (Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
+            _ => None,
+        };
         // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
         // OLD-side references — a returned old value is a logical read of the dropped row,
         // while a `new.col` is the constant NULL row and reads nothing. The RETURNING mask
@@ -6263,9 +6355,9 @@ impl Database {
                 *m |= ret_mask[i];
             }
         }
-        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound) {
+        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _) => match build_key_bound(bp, &bound, &[]) {
+            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&del.table).range_scan_with_units(&b, &mask)?;
@@ -6276,13 +6368,21 @@ impl Database {
             // GIN-bounded delete (gin.md §6): gather the candidate `(key, row)` pairs through the
             // index; the predicate stays the residual filter, re-applied per candidate in the loop
             // below. `gin_entry` is charged inside; the block (page_read/value_decompress) below.
-            (None, Some(gb)) => {
+            (None, Some(gb), _) => {
                 let query = filter
                     .as_ref()
                     .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
                 self.gin_bound_rows(&del.table, gb, query, &env, &mut meter, &mask)?
             }
-            (None, None) => {
+            // GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree;
+            // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
+            (None, None, Some(gb)) => {
+                let query = filter
+                    .as_ref()
+                    .and_then(|f| gist_match(f, gb.col_global).map(|(_, q)| q));
+                self.gist_bound_rows(&del.table, gb, query, &env, &mut meter, &mask)?
+            }
+            (None, None, None) => {
                 let (entries, pages, slabs) = self.store(&del.table).scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
@@ -6575,6 +6675,14 @@ impl Database {
             (Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
+        // GiST bound (gist.md §5): when neither a PK nor a GIN bound applies, a `&&`/`@>` conjunct
+        // over a GiST-indexed range column bounds the update's target scan via the resident R-tree
+        // (over the pre-update index state — the WHERE reads the old row, so it admits exactly the
+        // rows the full scan would match).
+        let gist_bound = match (&filter, &pk_bound, &gin_bound) {
+            (Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
+            _ => None,
+        };
         // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
         // and the RETURNING items' — the NEW side minus the assigned columns (an assigned
         // column's returned value is the freshly computed one, not a storage read), plus the
@@ -6599,9 +6707,9 @@ impl Database {
                 *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
         }
-        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound) {
+        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _) => match build_key_bound(bp, &bound, &[]) {
+            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&upd.table).range_scan_with_units(&b, &mask)?;
@@ -6612,13 +6720,21 @@ impl Database {
             // GIN-bounded update (gin.md §6): gather the candidate `(key, row)` pairs through the
             // index; the predicate stays the residual filter (re-applied per candidate in the loop
             // below). `gin_entry` charged inside; the page_read/value_decompress block below.
-            (None, Some(gb)) => {
+            (None, Some(gb), _) => {
                 let query = filter
                     .as_ref()
                     .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
                 self.gin_bound_rows(&upd.table, gb, query, &env, &mut meter, &mask)?
             }
-            (None, None) => {
+            // GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree;
+            // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
+            (None, None, Some(gb)) => {
+                let query = filter
+                    .as_ref()
+                    .and_then(|f| gist_match(f, gb.col_global).map(|(_, q)| q));
+                self.gist_bound_rows(&upd.table, gb, query, &env, &mut meter, &mask)?
+            }
+            (None, None, None) => {
                 let (entries, pages, slabs) = self.store(&upd.table).scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
@@ -9631,7 +9747,7 @@ impl Database {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) => {
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)) => {
                 unreachable!("the streaming path is gated to PK/full scans")
             }
             None => (KeyBound::unbounded(), false),
@@ -9723,7 +9839,7 @@ impl Database {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) => {
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)) => {
                 unreachable!("the streaming sort path is gated to PK/full scans")
             }
             None => (KeyBound::unbounded(), false),
@@ -9982,6 +10098,25 @@ impl Database {
                 // SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
                 (pairs.into_iter().map(|(_, v)| v).collect(), units)
             }
+            Some(ScanBound::Gist(gb)) => {
+                // Re-find the constant query `Q` in the WHERE filter (the conjunct plan-time
+                // `gist_match` chose — gist.md §5); the `&&`/`@>` predicate also stays as the
+                // residual filter applied to these rows downstream (always-recheck).
+                let query = plan
+                    .filter
+                    .as_ref()
+                    .and_then(|f| gist_match(f, gb.col_global).map(|(_, q)| q));
+                let (pairs, units) = self.gist_bound_rows(
+                    &rel.table_name,
+                    gb,
+                    query,
+                    &env,
+                    meter,
+                    &plan.rel_masks[ri],
+                )?;
+                // SELECT discards the storage keys (UPDATE/DELETE keep them — gist.md §5).
+                (pairs.into_iter().map(|(_, v)| v).collect(), units)
+            }
             None => {
                 let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
                 let rows = entries.into_iter().map(|(_, v)| v).collect();
@@ -10042,7 +10177,7 @@ impl Database {
             // gin.md §6): it reads the full admitted set via the eager path below.
             && !matches!(
                 plan.rel_bounds[0],
-                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_))
+                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
             )
             // A set-returning relation is generated, not scanned — it takes the eager path
             // (functions.md §10); the streaming reader assumes a table store.
@@ -10072,7 +10207,7 @@ impl Database {
             && !plan.distinct
             && !matches!(
                 plan.rel_bounds[0],
-                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_))
+                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
             )
             // A set-returning relation takes the eager path (functions.md §10).
             && plan.rels[0].srf.is_none()
@@ -10820,6 +10955,13 @@ impl Database {
         self.read_snap().index_store(name_key)
     }
 
+    /// The resident GiST R-tree of the named index, for the planner gather (spec/design/gist.md
+    /// §5). GiST on a temp table is `0A000` this slice (gist.md §11), so only the main snapshot
+    /// carries trees — read straight from `read_snap`.
+    fn gist_tree(&self, name_key: &str) -> Option<&std::sync::Arc<crate::gist::GistTree>> {
+        self.read_snap().gist_tree(name_key)
+    }
+
     /// Mutable access to a secondary index's store; routes a temp table's index to the matching
     /// working temp snapshot (session-local → shared → main).
     fn index_store_mut(&mut self, name_key: &str) -> &mut TableStore {
@@ -11171,6 +11313,78 @@ impl Database {
             pages += n;
             slabs += s;
             rows.push((key, row.expect("a GIN entry references a stored row")));
+        }
+        Ok((rows, (pages, slabs)))
+    }
+
+    /// Gather a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the constant
+    /// query operand, then **descends the index's resident R-tree** visiting only children
+    /// `consistent` with the query, collecting candidate storage keys at the leaves; each candidate
+    /// row is point-looked-up in storage-key order. The original `&&`/`@>` predicate stays the
+    /// residual WHERE filter (always-recheck, re-applied downstream), so the result is exactly the
+    /// full-scan result — the bound only narrows which rows are fetched. Returns the candidate
+    /// `(storage_key, row)` pairs + the up-front `(page_read, value_decompress)` block (tree nodes
+    /// visited + each candidate's point-lookup); `gist_descent` (per interior node) is charged on
+    /// `meter` directly here. Degenerate constant queries (gist.md §5): a NULL `Q` and an empty
+    /// `&&` query match nothing (read nothing); an empty `@>` query (`col @> 'empty'`) matches every
+    /// row and falls back to the full scan (the empty bound is invisible to the overlap-descend).
+    fn gist_bound_rows(
+        &self,
+        table_name: &str,
+        gb: &GistBound,
+        query: Option<&RExpr>,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        mask: &[bool],
+    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
+        use crate::gist::GistStrategy;
+        let store = self.store(table_name);
+        // The query operand is a constant; evaluating it (the opclass "extract query") is a planning
+        // step, NOT metered (cost.md §3) — a scratch meter over the empty row.
+        let qv = match query {
+            Some(q) => q.eval(&[], env, &mut Meter::new())?,
+            None => return Ok((Vec::new(), (0, 0))),
+        };
+        let qrange = match qv {
+            Value::Range(rv) => rv,
+            // A NULL query is 3VL-unknown for every row → never TRUE (both `&&` and `@>`).
+            Value::Null => return Ok((Vec::new(), (0, 0))),
+            _ => return Ok((Vec::new(), (0, 0))), // not a range (impossible post-resolve)
+        };
+        if qrange.empty {
+            return match gb.strategy {
+                // `col @> 'empty'` is TRUE for every row (the empty range is contained in every
+                // range), but an empty bound is absorbed by `range_merge`, so it is invisible to the
+                // overlap-descend (a false-negative trap, gist.md §5). Fall back to the full scan;
+                // the residual `@>` keeps every row.
+                GistStrategy::Contains => {
+                    let (entries, pages, slabs) = store.scan_with_units(mask)?;
+                    Ok((entries, (pages, slabs)))
+                }
+                // `col && 'empty'` overlaps nothing.
+                GistStrategy::Overlaps => Ok((Vec::new(), (0, 0))),
+            };
+        }
+        // Descend the resident R-tree (rebuilt at each mutating statement, gist.md §3/§4.1), so the
+        // gather visits only consistent nodes — no per-query build. An index with no tree yet (never
+        // populated) yields no candidates. `page_read` per node touched + `gist_descent` per interior.
+        let (mut skeys, nodes, interior) = match self.gist_tree(&gb.name_key) {
+            Some(tree) => tree.search(&qrange, gb.strategy),
+            None => (Vec::new(), 0, 0),
+        };
+        meter.charge(COSTS.gist_descent * interior as i64);
+        let mut pages = nodes;
+        // Point-look-up each candidate in storage-key order (the candidates ARE storage keys), so
+        // the lookups and emitted rows follow storage order exactly as a full scan would.
+        skeys.sort_unstable();
+        skeys.dedup();
+        let mut slabs = 0usize;
+        let mut rows = Vec::with_capacity(skeys.len());
+        for key in skeys {
+            let (row, n, s) = store.get_with_units(&key, mask)?;
+            pages += n;
+            slabs += s;
+            rows.push((key, row.expect("a GiST entry references a stored row")));
         }
         Ok((rows, (pages, slabs)))
     }
@@ -14080,6 +14294,20 @@ enum ScanBound {
     Pk(PkBound),
     Index(IndexBound),
     Gin(GinBound),
+    Gist(GistBound),
+}
+
+/// The plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST index (lowest
+/// lowercased name whose range column has a `col && const` / `col @> const` conjunct), the operator
+/// strategy, and the column's global scope index. Like [`GinBound`], the constant query operand is
+/// NOT stored (re-found in `plan.filter` at exec time by `gist_match`). No element type is carried:
+/// the gather descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
+struct GistBound {
+    /// The index store's key — the lowercased index name (its resident R-tree lives under this key).
+    name_key: String,
+    strategy: crate::gist::GistStrategy,
+    /// The GiST-indexed column's global scope index (`rel.offset + ci`).
+    col_global: usize,
 }
 
 /// Which array operator a GIN bound accelerates (spec/design/gin.md §6): `@>` (contains, mode
@@ -14223,6 +14451,11 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Database) -> Opti
             }));
         }
     }
+    // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered
+    // loop above already skipped the GiST index (its leading column is a non-scalar range).
+    if let Some(gb) = detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset) {
+        return Some(ScanBound::Gist(gb));
+    }
     // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
     detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset).map(ScanBound::Gin)
 }
@@ -14337,6 +14570,74 @@ fn detect_gin_bound(
         }
     }
     None
+}
+
+/// Detect a GiST-bounded scan over `columns`/`indexes` (spec/design/gist.md §5): the lowest-named
+/// GiST index whose range column at `offset + ci` has a GiST-accelerable conjunct (`col && const`
+/// or `col @> const`). Factored out so the SELECT planner (`detect_scan_bound`) and the
+/// UPDATE/DELETE scan share the identical detection (the GIN precedent) — the mutations pass their
+/// own table's indexes/columns at `offset = 0`.
+fn detect_gist_bound(
+    filter: &RExpr,
+    indexes: &[IndexDef],
+    columns: &[Column],
+    offset: usize,
+) -> Option<GistBound> {
+    for idx in indexes {
+        if idx.kind != IndexKind::Gist {
+            continue;
+        }
+        let ci = idx.columns[0];
+        let col_global = offset + ci;
+        if columns[ci].ty.range_element().is_none() {
+            continue; // a GiST column is always a range (the CREATE INDEX gate); defensive
+        }
+        if let Some((strategy, _)) = gist_match(filter, col_global) {
+            return Some(GistBound {
+                name_key: idx.name.to_ascii_lowercase(),
+                strategy,
+                col_global,
+            });
+        }
+    }
+    None
+}
+
+/// Find the first WHERE AND-chain conjunct that a GiST `range_ops` index on `col_global`
+/// accelerates (spec/design/gist.md §5): `col && Q` (overlap — symmetric, the column may be either
+/// operand) or `col @> Q` (contains — asymmetric, the column must be the LEFT operand; `Q @> col`
+/// is the non-accelerated `<@`, gist.md §5). `Q` must be a **constant** (re-evaluable per scan, not
+/// per row). The other range operators (`<@`/`<<`/`>>`/`&<`/`&>`/`-|-`/`=`) stay full-scan this
+/// slice (gist.md §5). Returns the descent strategy and a reference to the constant query operand —
+/// used at plan time (the strategy) and exec time (recover the operand from `plan.filter`), so the
+/// two agree on the same conjunct by construction.
+fn gist_match(filter: &RExpr, col_global: usize) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    use crate::gist::GistStrategy;
+    match filter {
+        RExpr::And(l, r) => gist_match(l, col_global).or_else(|| gist_match(r, col_global)),
+        // `col && Q` — overlap is symmetric in its operands.
+        RExpr::RangeOp {
+            op: RangeOp::Overlaps,
+            args,
+            ..
+        } if args.len() == 2 => {
+            if is_column(&args[0], col_global) && rexpr_is_constant(&args[1]) {
+                Some((GistStrategy::Overlaps, &args[1]))
+            } else if is_column(&args[1], col_global) && rexpr_is_constant(&args[0]) {
+                Some((GistStrategy::Overlaps, &args[0]))
+            } else {
+                None
+            }
+        }
+        // `col @> Q` — containment is asymmetric: the indexed column must be the container (LEFT).
+        RExpr::RangeOp {
+            op: RangeOp::Contains,
+            args,
+            ..
+        } if args.len() == 2 => (is_column(&args[0], col_global) && rexpr_is_constant(&args[1]))
+            .then_some((GistStrategy::Contains, &args[1])),
+        _ => None,
+    }
 }
 
 /// Find the first WHERE AND-chain conjunct that a GIN index on `col_global` accelerates

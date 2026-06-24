@@ -1,8 +1,8 @@
-//! GiST indexes (spec/design/gist.md) — GX1a: in-memory `CREATE INDEX … USING gist` over a range
-//! column, its maintenance, and the DDL validation surface. Covers what the corpus cannot yet (the
-//! deliberate GX1a narrowings — file-backed persistence is GX1b, and the planner gather is a
-//! follow-on, so a query is correct by full scan + residual filter here). Mirrored in Go/TS when
-//! those cores land the feature.
+//! GiST indexes (spec/design/gist.md) — GX1: `CREATE INDEX … USING gist` over a range column, its
+//! maintenance, the planner `&&`/`@>` gather (descending the resident R-tree), and file persistence
+//! (the page-5/6 R-tree, format_version 20, the close/reopen round-trip). Covers what the corpus
+//! cannot: the deliberate divergences (UNIQUE/multi-column/temp → 0A000), introspection (DROP), and
+//! the on-disk round-trip. Mirrored in Go/TS by the shared conformance corpus + each core's harness.
 
 use std::path::PathBuf;
 
@@ -150,17 +150,74 @@ fn gist_unknown_access_method_is_42704() {
     );
 }
 
-/// GX1a narrowing: a GiST index on a file-backed database is 0A000 (persistence is GX1b — the
-/// page-5/6 R-tree + format_version 20). In-memory works; a file DB fails closed and discoverably
-/// rather than writing an index_kind it cannot read back.
+/// GX1 narrowing (gist.md §11): a GiST index on a TEMP table is 0A000 — its resident R-tree would
+/// live on the temp/shared-temp snapshot (deferred). It fails closed rather than silently dropping
+/// the acceleration. (File persistence, by contrast, landed in GX1b — see the round-trip below.)
 #[test]
-fn gist_on_file_backed_db_is_0a000() {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_file_gate.jed");
-    let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
+fn gist_on_temp_table_is_0a000() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TEMP TABLE t (id i32 PRIMARY KEY, r i32range)",
+    );
     assert_eq!(
         err_code(&mut db, "CREATE INDEX ON t USING gist (r)"),
         "0A000"
     );
+}
+
+/// GX1b: a GiST index persists to the page-5/6 R-tree (format_version 20) and reloads correctly —
+/// the index survives a close/reopen and still accelerates `&&`/`@>` to the same rows. Exercises the
+/// serialize path (commit), the demand-paged load path (`open` → `open_paged`'s eager GiST load),
+/// and the resident-tree rebuild on open. Maintenance after reopen is also covered.
+#[test]
+fn gist_file_backed_round_trip() {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_round_trip.jed");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+        run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
+        run(&mut db, "CREATE INDEX t_r_gist ON t USING gist (r)");
+        for (id, lit) in [
+            (1, "'[1,5)'"),
+            (2, "'[10,20)'"),
+            (3, "'[3,8)'"),
+            (4, "'[100,200)'"),
+            (5, "'empty'"),
+        ] {
+            run(&mut db, &format!("INSERT INTO t VALUES ({id}, {lit})"));
+        }
+        run(&mut db, "INSERT INTO t VALUES (6, NULL)");
+        // Accelerated query before close.
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"),
+            vec![1, 3]
+        );
+    }
+    // Reopen: the persisted R-tree loads, the resident tree is rebuilt, the query still works.
+    {
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"),
+            vec![1, 3]
+        );
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE r @> i32range(4,5) ORDER BY id"),
+            vec![1, 3]
+        );
+        // Maintenance after reopen: a fresh INSERT updates the (loaded) index, the next query sees it.
+        run(&mut db, "INSERT INTO t VALUES (7, '[5,7)')");
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"),
+            vec![3, 7]
+        );
+    }
+    // And once more, after the maintenance commit, to prove the rewritten tree persists.
+    {
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"),
+            vec![3, 7]
+        );
+    }
 }

@@ -66,7 +66,15 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal
 /// body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no
 /// json/jsonb column still moves to v19 only by its version byte.
-const FORMAT_VERSION: u16 = 19;
+///
+/// v20 = **GiST indexes** (spec/design/gist.md, slice GX1): a per-index `index_kind = 2` selects the
+/// GiST access method, and the index's on-disk form is a persisted **R-tree** of bounding-predicate
+/// nodes — two new `page_type`s `5` (GiST leaf) / `6` (GiST interior) (§4.1). A leaf entry is
+/// `bound_len u16 ‖ encode_range_body(bound) ‖ skey_len u16 ‖ skey`; an interior entry is
+/// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
+/// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
+/// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
+const FORMAT_VERSION: u16 = 20;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -1064,10 +1072,27 @@ impl Snapshot {
             // (spec/fileformat/format.md "From-scratch image"). Index records are the key alone —
             // no value columns, so they encode against an empty `col_types`.
             for idx in &table.indexes {
-                let istore = self.index_store(&idx.name.to_ascii_lowercase());
-                let r = match istore.tree_root() {
-                    Some(root) => serialize_node(root, &[], cap, &mut next_index, &mut body)?,
-                    None => 0,
+                let r = if idx.kind == IndexKind::Gist {
+                    // GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store
+                    // (gist.md §4.1). Serialize the canonical tree, allocating from the same counter.
+                    let (gpages, root) = {
+                        let mut alloc = || {
+                            let p = next_index;
+                            next_index += 1;
+                            p
+                        };
+                        serialize_gist_index(self, table, idx, &mut alloc)?
+                    };
+                    for p in gpages {
+                        body.push((p.page_no, p.page_type, p.item_count, 0, p.payload));
+                    }
+                    root
+                } else {
+                    let istore = self.index_store(&idx.name.to_ascii_lowercase());
+                    match istore.tree_root() {
+                        Some(root) => serialize_node(root, &[], cap, &mut next_index, &mut body)?,
+                        None => 0,
+                    }
                 };
                 index_roots[ti].push(r);
             }
@@ -1338,12 +1363,28 @@ impl Snapshot {
             // "Allocation & incremental commit"). Index records carry no value columns (empty
             // `col_types`).
             for idx in &table.indexes {
-                let istore = self.index_store(&idx.name.to_ascii_lowercase());
-                let r = match istore.tree_root() {
-                    Some(root) => {
-                        serialize_dirty(root, &[], cap, ps, &mut alloc, &mut pages, paging)?
+                let r = if idx.kind == IndexKind::Gist {
+                    // GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from
+                    // the allocator (free-list first), the old tree's pages reclaimed on the next open.
+                    let (gpages, root) = {
+                        let mut a = || alloc.take();
+                        serialize_gist_index(self, table, idx, &mut a)?
+                    };
+                    for p in gpages {
+                        pages.push((
+                            p.page_no,
+                            make_page(ps, p.page_type, p.item_count, 0, &p.payload),
+                        ));
                     }
-                    None => 0,
+                    root
+                } else {
+                    let istore = self.index_store(&idx.name.to_ascii_lowercase());
+                    match istore.tree_root() {
+                        Some(root) => {
+                            serialize_dirty(root, &[], cap, ps, &mut alloc, &mut pages, paging)?
+                        }
+                        None => 0,
+                    }
                 };
                 index_roots[ti].push(r);
             }
@@ -1589,8 +1630,28 @@ impl Database {
                     let cap = page_size - PAGE_HEADER;
                     let mut istore = TableStore::new(cap, Vec::new());
                     if iroot != 0 {
-                        let (root, len) = read_tree(image, page_size, iroot, &[], &mut reached)?;
-                        istore.set_tree(Some(root), len);
+                        if idx.kind == IndexKind::Gist {
+                            // GiST: parse the persisted R-tree (pages 5/6), marking its pages
+                            // reached, and recover its leaf keys to repopulate the flat leaf store.
+                            // The resident R-tree is rebuilt canonically below (rebuild_gist_trees).
+                            let mut keys = Vec::new();
+                            read_gist_leaf_keys(
+                                &|p| {
+                                    let pg = read_page(image, page_size, p)?;
+                                    Ok((pg.page_type, pg.item_count, pg.payload.to_vec()))
+                                },
+                                iroot,
+                                &mut reached,
+                                &mut keys,
+                            )?;
+                            for k in keys {
+                                istore.insert(k, Vec::new())?;
+                            }
+                        } else {
+                            let (root, len) =
+                                read_tree(image, page_size, iroot, &[], &mut reached)?;
+                            istore.set_tree(Some(root), len);
+                        }
                     }
                     snap.put_index_store(idx.name.to_ascii_lowercase(), istore);
                 }
@@ -1600,6 +1661,8 @@ impl Database {
         // Two-pass: validate the composite-type catalog (existence + acyclicity) now that every
         // type entry has been read (spec/design/composite.md §3); a bad reference is XX001.
         snap.validate_composite_types()?;
+        // Build each GiST index's resident R-tree from its now-loaded leaf store (gist.md §4.1).
+        snap.rebuild_gist_trees()?;
         let mut db = Database::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count; // the on-disk high-water for the next incremental commit
@@ -1730,10 +1793,32 @@ impl Database {
                 for (idx, &iroot) in indexes.iter().zip(&index_roots) {
                     let cap = page_size - PAGE_HEADER;
                     let mut istore = TableStore::new(cap, Vec::new());
-                    istore.attach_paging(paging.clone());
                     if iroot != 0 {
-                        let (root, len) = read_skeleton(&paging, iroot, &[], &mut reached)?;
-                        istore.set_tree(Some(root), len);
+                        if idx.kind == IndexKind::Gist {
+                            // GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the
+                            // whole R-tree (marking pages reached), recover its leaf keys into a
+                            // fully-resident leaf store. The resident R-tree is rebuilt below.
+                            let mut keys = Vec::new();
+                            read_gist_leaf_keys(
+                                &|p| {
+                                    let block = paging.pager().read_block(p)?;
+                                    let pg = parse_page(&block)?;
+                                    Ok((pg.page_type, pg.item_count, pg.payload.to_vec()))
+                                },
+                                iroot,
+                                &mut reached,
+                                &mut keys,
+                            )?;
+                            for k in keys {
+                                istore.insert(k, Vec::new())?;
+                            }
+                        } else {
+                            istore.attach_paging(paging.clone());
+                            let (root, len) = read_skeleton(&paging, iroot, &[], &mut reached)?;
+                            istore.set_tree(Some(root), len);
+                        }
+                    } else {
+                        istore.attach_paging(paging.clone());
                     }
                     snap.put_index_store(idx.name.to_ascii_lowercase(), istore);
                 }
@@ -1744,6 +1829,8 @@ impl Database {
         // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
         // reference (spec/design/composite.md §3).
         snap.validate_composite_types()?;
+        // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
+        snap.rebuild_gist_trees()?;
         let mut db = Database::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count;
@@ -1931,6 +2018,98 @@ fn read_tree(
         }
         _ => Err(corrupt("expected a B-tree node page")),
     }
+}
+
+/// Build a GiST index's canonical R-tree from its leaf-key store and serialize it to node pages
+/// (spec/design/gist.md §3/§4.1). The on-disk form of a GiST index is the R-tree (page types 5/6),
+/// NOT the flat leaf-key B-tree the in-memory index store holds — so the index store is never
+/// serialized for a GiST index; this is. The tree is rebuilt **canonically** (`build_from_leaf_keys`)
+/// from the leaf set, so its bytes are a pure function of the set — content-deterministic and
+/// cross-core identical (§3); the whole tree is rewritten every commit (§4.1(b)). `alloc` hands out
+/// page numbers (a counter for the whole image, the free-list allocator for an incremental commit).
+/// Returns the node pages + the root page; an empty index returns no pages and root `0` (the
+/// empty-index convention shared with ordinary indexes).
+fn serialize_gist_index<A: FnMut() -> u32>(
+    snap: &Snapshot,
+    table: &Table,
+    idx: &IndexDef,
+    alloc: &mut A,
+) -> Result<(Vec<crate::gist::GistPage>, u32)> {
+    let elem = ColType::Scalar(
+        table.columns[idx.columns[0]]
+            .ty
+            .range_element()
+            .expect("a GiST index column is a range (CREATE INDEX gate)")
+            .scalar(),
+    );
+    let istore = snap.index_store(&idx.name.to_ascii_lowercase());
+    let keys: Vec<Vec<u8>> = istore.iter_entries()?.into_iter().map(|(k, _)| k).collect();
+    if keys.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let tree = crate::gist::build_from_leaf_keys(&elem, keys.iter().map(|k| k.as_slice()))?;
+    Ok(crate::gist::serialize_tree(&tree, &elem, alloc))
+}
+
+/// Walk a persisted GiST R-tree (rooted at `root`, page types 5/6 — spec/design/gist.md §4.1),
+/// marking every node page in `reached` (so the free-list keeps the live tree) and collecting each
+/// leaf's **leaf key** (`encode_range_body(bound) ‖ skey` — the bound bytes concatenated with the
+/// storage key, recovered by re-joining the two length-prefixed fields). The leaf keys repopulate
+/// the in-memory leaf-key store (the maintenance source of truth); the resident R-tree the planner
+/// descends is rebuilt canonically from them afterward (`Snapshot::rebuild_gist_trees`). Pure byte
+/// walk — no element type needed (the bound bytes are copied verbatim). `read` returns one page's
+/// `(page_type, item_count, payload)`, reading from the whole image or through the pager.
+fn read_gist_leaf_keys<F>(
+    read: &F,
+    page_no: u32,
+    reached: &mut HashSet<u32>,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()>
+where
+    F: Fn(u32) -> Result<(u8, u32, Vec<u8>)>,
+{
+    reached.insert(page_no);
+    let (page_type, n, payload) = read(page_no)?;
+    let mut pos = 0usize;
+    match page_type {
+        t if t == crate::gist::PAGE_GIST_LEAF => {
+            for _ in 0..n {
+                let blen = read_u16(&payload, &mut pos)? as usize;
+                let bound = take_bytes(&payload, &mut pos, blen)?;
+                let slen = read_u16(&payload, &mut pos)? as usize;
+                let skey = take_bytes(&payload, &mut pos, slen)?;
+                let mut key = bound;
+                key.extend_from_slice(&skey);
+                out.push(key);
+            }
+            Ok(())
+        }
+        t if t == crate::gist::PAGE_GIST_INTERIOR => {
+            // Collect child pages first (the payload borrow ends before recursing).
+            let mut children = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let blen = read_u16(&payload, &mut pos)? as usize;
+                let _ = take_bytes(&payload, &mut pos, blen)?; // skip the union bound
+                children.push(read_u32(&payload, &mut pos)?);
+            }
+            for cp in children {
+                read_gist_leaf_keys(read, cp, reached, out)?;
+            }
+            Ok(())
+        }
+        _ => Err(corrupt("expected a GiST node page")),
+    }
+}
+
+/// Copy `n` bytes from `buf` at `*pos`, advancing it (bounds-checked) — the byte-slice analogue of
+/// `read_u16`/`read_u32` used by the GiST node walk.
+fn take_bytes(buf: &[u8], pos: &mut usize, n: usize) -> Result<Vec<u8>> {
+    if *pos + n > buf.len() {
+        return Err(corrupt("truncated GiST node payload"));
+    }
+    let v = buf[*pos..*pos + n].to_vec();
+    *pos += n;
+    Ok(v)
 }
 
 /// One record's bytes: `key_len(u16) | key | payload(each column value)`.
@@ -2854,10 +3033,12 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         if iflags & !0b01 != 0 {
             return Err(corrupt("reserved index flag set"));
         }
-        // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
+        // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7);
+        // v20: 2 = GiST (spec/design/gist.md §8).
         let kind = match read_u8(buf, pos)? {
             0 => IndexKind::Btree,
             1 => IndexKind::Gin,
+            2 => IndexKind::Gist,
             _ => return Err(corrupt("unsupported index kind")),
         };
         index_roots.push(read_u32(buf, pos)?);

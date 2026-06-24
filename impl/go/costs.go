@@ -21,6 +21,7 @@ type CostSchedule struct {
 	GeneratedRow        int64
 	SequenceAdvance     int64
 	GinEntry            int64
+	GistDescent         int64
 	Collate             int64
 	Timezone            int64
 	RegexCompile        int64
@@ -44,6 +45,7 @@ var Costs = CostSchedule{
 	GeneratedRow:        1,
 	SequenceAdvance:     1,
 	GinEntry:            1,
+	GistDescent:         1,
 	Collate:             1,
 	Timezone:            1,
 	RegexCompile:        1,

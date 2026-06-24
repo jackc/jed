@@ -20,6 +20,7 @@ export interface CostSchedule {
   generatedRow: bigint;
   sequenceAdvance: bigint;
   ginEntry: bigint;
+  gistDescent: bigint;
   collate: bigint;
   timezone: bigint;
   regexCompile: bigint;
@@ -43,6 +44,7 @@ export const COSTS: CostSchedule = {
   generatedRow: 1n,
   sequenceAdvance: 1n,
   ginEntry: 1n,
+  gistDescent: 1n,
   collate: 1n,
   timezone: 1n,
   regexCompile: 1n,

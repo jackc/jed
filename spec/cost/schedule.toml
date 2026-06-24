@@ -187,6 +187,24 @@ event  = "one GIN posting-list entry visited during a GIN-bounded scan's term ga
 # tree NODE count). Charged at the identical per-entry point in every core (CLAUDE.md §8/§13).
 
 [[unit]]
+id     = "gist_descent"
+weight = 1
+event  = "one GiST interior node visited during a consistent-descent of a GiST-bounded scan"
+# Landed with GiST indexes (../design/gist.md §9, ../design/cost.md §3 "GiST-bounded scan").
+# A `col && const` / `col @> const` scan over a GiST-indexed range column descends the index's
+# resident R-tree, visiting only the children whose bounding key is `consistent` with the query
+# (../design/gist.md §5); this unit fires once per INTERIOR node so visited, BESIDE the `page_read`
+# charged per node touched (interior + leaf). It meters the per-node descent work `page_read`
+# (a per-node count) leaves implicit — so a low-selectivity predicate an untrusted query can drive
+# stays cost-proportional and a max_cost ceiling aborts it (54P01). The descent visits a tree that
+# is a pure function of the indexed row SET (the resident tree is rebuilt canonically from the leaf
+# set — content-deterministic, ../design/gist.md §3), so the node count, the gist_descent charge,
+# and the abort point are cross-core identical (CLAUDE.md §8/§13). DISTINCT from `storage_row_read`
+# (charged only per CANDIDATE row fetched after the descent) and from the residual `operator_eval`
+# (the always-recheck of `&&`/`@>` on each candidate, ../design/gist.md §5). Charged at the
+# identical per-interior-node point in every core.
+
+[[unit]]
 id     = "collate"
 weight = 1
 event  = "one code point processed while building a collation sort key for a collated comparison"
