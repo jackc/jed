@@ -10637,6 +10637,8 @@ function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
     case "neg":
     case "not":
     case "isNull":
+    case "isJson":
+    case "jsonCtor":
       rebasePlaceholderCols(e.operand, from, target);
       return;
     case "arith":
@@ -10682,7 +10684,23 @@ function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
     case "rangeOp":
     case "rangeSetOp":
     case "variadic":
+    case "jsonBuild":
+    case "jsonSetInsert":
+    case "jsonObjectFromArrays":
+    case "jsonPathFn":
+    case "jsonSqlFn":
       for (const a of e.args) rebasePlaceholderCols(a, from, target);
+      return;
+    case "jsonGet":
+    case "jsonHasKey":
+    case "jsonDelete":
+      rebasePlaceholderCols(e.base, from, target);
+      rebasePlaceholderCols(e.arg, from, target);
+      return;
+    case "jsonContains":
+    case "jsonConcat":
+      rebasePlaceholderCols(e.a, from, target);
+      rebasePlaceholderCols(e.b, from, target);
       return;
     case "row":
       for (const f of e.fields) rebasePlaceholderCols(f, from, target);

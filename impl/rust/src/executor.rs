@@ -16859,7 +16859,11 @@ fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize) {
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
-        | RExpr::Variadic { args, .. } => {
+        | RExpr::Variadic { args, .. }
+        | RExpr::JsonSetInsert { args, .. }
+        | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::JsonPathFn { args, .. }
+        | RExpr::JsonBuild { args, .. } => {
             for a in args {
                 rebase_placeholder_cols(a, from, target);
             }
@@ -16888,6 +16892,23 @@ fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize) {
                 }
             }
         }
+        RExpr::JsonGet { base, arg, .. }
+        | RExpr::JsonHasKey { base, arg, .. }
+        | RExpr::JsonDelete { base, arg, .. } => {
+            rebase_placeholder_cols(base, from, target);
+            rebase_placeholder_cols(arg, from, target);
+        }
+        RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
+            rebase_placeholder_cols(a, from, target);
+            rebase_placeholder_cols(b, from, target);
+        }
+        RExpr::JsonSqlFn { ctx, path, .. } => {
+            rebase_placeholder_cols(ctx, from, target);
+            rebase_placeholder_cols(path, from, target);
+        }
+        RExpr::IsJson { operand, .. } | RExpr::JsonCtor { operand, .. } => {
+            rebase_placeholder_cols(operand, from, target)
+        }
         RExpr::OuterColumn { .. }
         | RExpr::Param(_)
         | RExpr::ConstInt(_)
@@ -16898,6 +16919,9 @@ fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize) {
         | RExpr::ConstFloat64(_)
         | RExpr::ConstBytea(_)
         | RExpr::ConstUuid(_)
+        | RExpr::ConstJson(_)
+        | RExpr::ConstJsonb(_)
+        | RExpr::ConstJsonPath(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
         | RExpr::ConstDate(_)
@@ -17782,15 +17806,39 @@ fn resolve_aggregate(
         } else {
             ResolvedType::Jsonb
         };
-        if let AggCtx::Collect { group_keys, specs } = agg {
-            let slot = group_keys.len() + specs.len();
-            specs.push(AggSpec {
-                plan,
-                operand: Some(operand),
-            });
-            return Ok((RExpr::Column(slot), result));
-        }
-        unreachable!("an aggregate in a non-Collect context is handled above");
+        // object_agg never carries DISTINCT/FILTER (the 2-arg key/value shape predates them and the
+        // surface does not wire them — B4); both default off, matching Go's zero-valued aggSpec. It
+        // collects into `Collect` or `GroupedWindow` (a grouped query that also windows), exactly like
+        // any aggregate (spec/design/window.md §5.1).
+        return match agg {
+            AggCtx::Collect {
+                group_keys, specs, ..
+            } => {
+                let slot = group_keys.len() + specs.len();
+                specs.push(AggSpec {
+                    plan,
+                    operand: Some(operand),
+                    distinct: false,
+                    filter: None,
+                });
+                Ok((RExpr::Column(slot), result))
+            }
+            AggCtx::GroupedWindow {
+                group_keys,
+                agg_specs,
+                ..
+            } => {
+                let slot = group_keys.len() + agg_specs.len();
+                agg_specs.push(AggSpec {
+                    plan,
+                    operand: Some(operand),
+                    distinct: false,
+                    filter: None,
+                });
+                Ok((RExpr::Column(slot), result))
+            }
+            _ => unreachable!("an aggregate in a non-collecting context is handled above"),
+        };
     }
     let (plan, operand, result) = if star {
         // Only COUNT has a star overload (aggregates.md §3); `SUM(*)` etc. is a syntax error.
