@@ -22,6 +22,7 @@ pub mod error;
 pub mod executor;
 pub mod file;
 pub mod format;
+pub mod gist;
 pub mod interval;
 pub mod json;
 pub mod jsonpath;

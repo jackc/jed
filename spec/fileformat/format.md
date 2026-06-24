@@ -336,7 +336,7 @@ slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `d
 
 | offset | size | field |
 |---|---|---|
-| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow |
+| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior** (**reserved** — named at GX0, claimed by a future `format_version`, [../design/gist.md §4.1](../design/gist.md)) |
 | 1 | 1 | reserved (0) |
 | 2 | 2 | reserved (0) |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |

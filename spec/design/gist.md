@@ -93,15 +93,18 @@ TS.
 
 - **`union`, `consistent`, `penalty`, `picksplit`, `same`, and node entry ordering are pure
   deterministic functions** of their inputs (§2). Concretely:
-  - **`penalty`** (choose-subtree): descend into the child whose bounding key needs the **least
-    enlargement** to cover the new entry; ties broken by the **smaller resulting bounding-key
-    bytes**, then by **lower child slot index** — a *total* order, never a coin-flip.
-  - **`picksplit`**: when a node overflows, **sort its entries by their bounding-key bytes** (the
-    order-preserving encoding §4 gives a total byte order) and split at the **median**; recompute
-    each half's `union`. A deterministic linear split — *not* PG's quadratic heuristic. Index
-    *quality* (fan-out balance) is a cost concern, never a correctness one (§9).
-  - **node entry order** within a page is the sorted bounding-key-byte order, so a node's bytes are
-    a pure function of its entry *set*.
+  - **`penalty`** (choose-subtree): descend into the child whose union, **merged** with the new
+    entry (`range_merge` = `range_union(strict = false)`, the convex hull, [ranges.md](ranges.md)),
+    has the lexicographically-smallest **value-codec bytes** (§4.1); ties broken by **lower child
+    slot index** — a *total* order, never a coin-flip. (A child that already covers the entry merges
+    to itself, so its bytes are unchanged — naturally the least "enlargement.")
+  - **`picksplit`**: when a node exceeds the fan-out (§4.1), **sort its entries by `range_total_cmp`**
+    (the canonical range total order, [ranges.md §6](ranges.md) — a pure deterministic function) and
+    split at the **median** (first ⌈n/2⌉ ‖ the rest); recompute each half's `union`. A deterministic
+    median split — *not* PG's quadratic heuristic. Fan-out balance is a cost concern, never a
+    correctness one (§9).
+  - **node entry order** on disk is `range_total_cmp` order (ties by storage-key for leaves / child
+    page for interiors), so a node's bytes are a pure function of its entry *set*.
 - **Cross-core byte-identity then holds by construction.** Every core replays the **identical
   mutation sequence** (the corpus / a program issues the same statements in the same order), and
   each tree operation is a pure function of `(current tree, the entry)`, so all three cores walk
@@ -138,12 +141,50 @@ exactly as a table or ordered-index tree ([indexes.md §6](indexes.md), [storage
 - an **interior entry** = `union(child entries) ‖ child_page` (the bounding key covering the
   subtree).
 
-Bounding keys reuse the engine's existing **order-preserving key encodings** — no new on-disk
-primitive. `range_ops`' bounding key is the `range-bounds` encoding ([encoding.md §2.11](encoding.md))
-covering `[min lower bound, max upper bound]` with the empty / ±∞ / inclusivity framing of the §6
-range total order; a scalar opclass' bounding key is `[min, max]` over the value's existing scalar
-key encoding (§6). Because the bounding key is just bytes with a total order, `picksplit`'s
-median-sort and `penalty`'s tie-breaks are well-defined for *every* opclass uniformly (§3).
+A bound is stored as the range's **decodable value codec** — the same `encode_range_body` /
+`read_range_body` a range *column* uses ([format.md](../fileformat/format.md)) — **not** the one-way
+order-preserving key encoding ([encoding.md §2.11](encoding.md)): a persisted GiST node must
+reconstruct each bound as a `RangeVal` to evaluate `consistent` / `union` on read, which the
+order-preserving key encoding (lossy for some elements) cannot guarantee. `range_ops`' leaf bound is
+`encode_range_body(elem, row_range)`; an interior bound is `encode_range_body(elem, union)` where the
+union is the convex hull `range_merge` covering the subtree. The **canonical order** the §3 split and
+node layout sort by is `range_total_cmp` (the range total order, [ranges.md §6](ranges.md)) — a pure
+deterministic function — not the raw codec bytes. (A scalar opclass, §6, stores `[min, max]` over the
+value codec and orders by the scalar's comparator; the tree core is identical.)
+
+### 4.1 The on-disk node format (GX1, `format_version` 20)
+
+GiST nodes are page-backed like any tree node ([format.md](../fileformat/format.md) *Page header*):
+the standard 16-byte header (per-page CRC included), payload from offset 16, with **two new
+`page_type`s** — `5` = GiST leaf, `6` = GiST interior. `item_count` is the node's entry count *N*;
+`next_page` is 0. The element (sub)type needed to decode a bound comes from the indexed range
+column's catalog type.
+
+- **Leaf node (`page_type 5`)** — *N* entries, each
+  `bound_len u16 ‖ bound (bound_len B) ‖ skey_len u16 ‖ skey (skey_len B)`, where `bound =
+  encode_range_body(elem, row_range)` and `skey` is the row's storage key (so a match resolves to a
+  row). Ordered by `(range_total_cmp(bound), skey)`.
+- **Interior node (`page_type 6`)** — *N* entries, each
+  `bound_len u16 ‖ bound (bound_len B) ‖ child_page u32`, where `bound = encode_range_body(elem,
+  subtree_union)`. Ordered by `(range_total_cmp(bound), child_page)`. Unlike a B-tree interior (N+1
+  children separated by N keys), a GiST interior carries **N bounds for N children** — this count
+  difference is exactly why GiST needs its own page types, not a reuse of `3`.
+
+**Fan-out & split.** A node holds at most `GIST_FANOUT` entries (a pinned spec constant); inserting
+an (N+1)-th triggers a `picksplit` (§3) and propagates upward, growing a new root when the old root
+splits. Every GX1 element bound is fixed-width or small, so a node always fits its page and the byte
+budget never binds before the fan-out; a bound that would exceed the page payload is `XX001`
+(unreachable at GX1's element set).
+
+**Serialization order (page allocation).** The tree serializes in a canonical **post-order** walk —
+each node's children in entry order before the node itself, the root last — so page numbers are a
+deterministic function of the tree, identical cross-core.
+
+**GX1 simplifications (documented narrowings, none foreclosed — §11).** (a) The tree is **eagerly
+loaded** on open, not demand-paged (the pager seam stays open, [pager.md](pager.md); fine for the
+RAM-sized target, CLAUDE.md §9). (b) A commit **rewrites the whole GiST tree** (fresh pages for all
+nodes, the old pages reclaimed by the free-list) rather than writing only dirty nodes — the pre-P6.1
+whole-image flavor, scoped to GiST. Incremental GiST COW and demand-paging are follow-ons.
 
 ## 5. `range_ops` — the first opclass (GX1)
 
@@ -167,7 +208,18 @@ consistent-descent gather**: descend from the root, visiting only children whose
 `consistent` with the query, collecting candidate storage keys at the leaves; then **always
 recheck** the residual operator on each candidate row (the GIN always-recheck posture, [gin.md §2](gin.md)
 — unobservable in results, only adds the already-metered `operator_eval`). Same rows as the
-full-scan residual, lower cost. Accelerates `&&`/`@>`/`<@`/`<<`/`>>`/`&<`/`&>`/`-|-`/`=` for SELECT
+full-scan residual, lower cost.
+
+**GX1 acceleration scope.** GX1 accelerates **`&&` (overlaps) and `@>` (contains)** — the two whose
+conservative descend predicate is exactly `range_overlaps(node_union, query)` (a matching row must
+overlap the query, and every row lies in its subtree's union, so a non-overlapping union holds no
+match — pruning is sound). This mirrors GIN shipping `@>`/`&&` first. The remaining operators stay
+**full-scan** this slice and are follow-ons (§11): `<<`/`>>`/`&<`/`&>`/`-|-` need bespoke
+positional descend predicates; `<@` and `=` interact with **empty-range rows** (`empty <@ Q` and
+`empty = empty` match, but an empty bound is absorbed by `range_merge` and so is invisible to the
+union — a false-negative trap), as does an **empty query** (`col @> 'empty'` matches every row); all
+are deferred rather than risk an unsound prune — the GIN-`<@` precedent. Empty-range *rows* are
+indexed and correct under `&&`/`@>` (they simply never match a non-empty query). Applies to SELECT
 and GiST-bounded UPDATE/DELETE.
 
 ## 6. Scalar `=` opclasses — the in-core `btree_gist` equivalent (GX2)

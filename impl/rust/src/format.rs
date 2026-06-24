@@ -318,7 +318,7 @@ fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
 /// upper bound (`!UB_INF`) each contribute the element's value-codec body **minus the presence
 /// tag** (the same tag-byte+body split array/composite use). The stored value is canonical (§4) —
 /// canonicalization happens at parse/cast, not here.
-fn encode_range_body(elem: &ColType, rv: &RangeVal) -> Vec<u8> {
+pub(crate) fn encode_range_body(elem: &ColType, rv: &RangeVal) -> Vec<u8> {
     if rv.empty {
         return vec![0x01]; // RANGE_EMPTY
     }
@@ -3007,7 +3007,7 @@ fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> 
 /// element's value-codec body (no presence tag). A reserved flag bit set is `XX001`. Note: an
 /// infinite bound's inclusivity bit is canonically 0, but the body that produced the bytes already
 /// enforced that — read whatever bits are present and rebuild the `RangeVal` faithfully.
-fn read_range_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+pub(crate) fn read_range_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     let flags = read_u8(buf, pos)?;
     if flags & !0x1f != 0 {
         return Err(corrupt("range flags has a reserved bit set"));
