@@ -90,6 +90,9 @@ pub enum Token {
     /// The `@?` jsonpath-exists operator (`jsonb @? jsonpath` = `jsonb_path_exists`). `@` then `?`,
     /// scanned greedily. See spec/design/jsonpath.md §6.
     JsonPathExists,
+    /// The `@@` jsonpath-match operator (`jsonb @@ jsonpath` = `jsonb_path_match`). `@` then `@`,
+    /// scanned greedily. See spec/design/jsonpath.md §6.
+    JsonPathMatch,
     /// The `<@` array contained-by operator (`a <@ b` — is `a` contained by `b`). `<` then `@`. See
     /// spec/design/grammar.md §40, array-functions.md §10.
     ContainedBy,

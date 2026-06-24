@@ -90,7 +90,10 @@ export type BinaryOp =
   | "jsonDeletePath"
   // jsonPathExists is the `@?` jsonpath-exists operator (`jsonb @? jsonpath` = `jsonb_path_exists`)
   // — spec/design/jsonpath.md §6. Reuses the path-exists kernel.
-  | "jsonPathExists";
+  | "jsonPathExists"
+  // jsonPathMatch is the `@@` jsonpath-match operator (`jsonb @@ jsonpath` = `jsonb_path_match`)
+  // — spec/design/jsonpath.md §6. Reuses the path-match kernel.
+  | "jsonPathMatch";
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
 // The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A

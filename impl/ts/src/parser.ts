@@ -2540,6 +2540,8 @@ class Parser {
       else if (k === "contains") op = "contains";
       // The `@?` jsonpath-exists operator (jsonpath.md §6) — same precedence level as `@>`.
       else if (k === "jsonPathExists") op = "jsonPathExists";
+      // The `@@` jsonpath-match operator (jsonpath.md §6) — same precedence level as `@>`.
+      else if (k === "jsonPathMatch") op = "jsonPathMatch";
       else if (k === "containedBy") op = "containedBy";
       else if (k === "overlaps") op = "overlaps";
       else if (k === "strictlyLeft") op = "strictlyLeft";
@@ -3384,6 +3386,8 @@ function renderToken(t: Token): string {
       return "@>";
     case "jsonPathExists":
       return "@?";
+    case "jsonPathMatch":
+      return "@@";
     case "containedBy":
       return "<@";
     case "overlaps":

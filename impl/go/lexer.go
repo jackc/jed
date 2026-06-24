@@ -212,14 +212,16 @@ func Lex(sql string) ([]Token, error) {
 				i++
 			}
 		case c == '@':
-			// `@>` array containment (grammar.md §40); `@?` is the jsonpath-exists operator
-			// (jsonpath.md §6). Scanned greedily; a lone `@` is not jed's surface — 42601. (`@@`, the
-			// path-match operator, lands with top-level predicates.)
+			// `@>` array containment (grammar.md §40); `@?` / `@@` are the jsonpath exists / match
+			// operators (jsonpath.md §6). Scanned greedily; a lone `@` is not jed's surface — 42601.
 			if i+1 < len(b) && b[i+1] == '>' {
 				tokens = append(tokens, Token{Kind: TokContains})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '?' {
 				tokens = append(tokens, Token{Kind: TokJsonPathExists})
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '@' {
+				tokens = append(tokens, Token{Kind: TokJsonPathMatch})
 				i += 2
 			} else {
 				return nil, NewError(SyntaxError, "unexpected character '@'")

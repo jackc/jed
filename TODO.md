@@ -390,11 +390,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           (true if SOME pair compares true) with 3-valued (Kleene) connectives, an item kept only on definite
           TRUE; filter operands never raise (even in strict). The `@?` operator (`jsonb @? jsonpath` =
           `jsonb_path_exists`, new `@?` lexer token at the `@>` precedence). Canonical render (`$[*]?(@ > 2)`,
-          spaced `&&`/`||`, `!(…)`). All 3 cores byte-identical, cap `expr.jsonpath_filter`, oracle-clean, NO
-          format bump. _Still `0A000`:_ item methods, arithmetic, **top-level predicates** (the `@@` /
-          `jsonb_path_match` body), `like_regex` / `starts with` / `exists` / `is unknown`, `$name` variables.
-  - [~] **P2 / P3** — remaining: `jsonb_path_match` + `@@` (needs **top-level predicate** bodies),
-        `like_regex` → Pike VM, `vars`/`silent`; then the `_tz` variants (P3). → jsonpath.md §5
+          spaced `&&`/`||`, `!(…)`). All 3 cores byte-identical, cap `expr.jsonpath_filter`, oracle-clean.
+    - [x] **P1b-match + P2 `@@` — top-level predicates + jsonb_path_match + the match operator** — ✅ a
+          jsonpath body may be a TOP-LEVEL boolean predicate (`$.a == 1`, `$.a > 1 && $.b < 2`) — same
+          predicate grammar, rooted at the document; the compiled `JsonPath` body is `Path | Predicate`.
+          `jsonb_path_match(ctx,path)` / `ctx @@ path` requires EXACTLY one boolean item (else `22038`); a
+          top-level predicate always yields one (unknown→`false`). Queried, a predicate body yields the
+          boolean as one item. Renders parenthesized (`($."a" == 1)`), round-trips through compile. New `@@`
+          lexer token at the `@>` precedence. All 3 cores byte-identical, cap `expr.jsonpath_match`,
+          oracle-clean, NO format bump. _Still `0A000`:_ item methods, arithmetic, `like_regex` / `starts
+          with` / `is unknown`, `$name` variables.
+  - [~] **P2 / P3** — remaining: `like_regex` → Pike VM (§4.3), item methods (`.type()`/`.size()`/
+        `.double()`/…), arithmetic, `vars`/`silent` args; then the `_tz` variants (P3). → jsonpath.md §5
   - [~] **S1 ✅ / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅; then S2
         `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY, needs P1). → json-sql-functions.md §5
     - [x] **S1a — the `IS JSON` predicate** — ✅ `expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]

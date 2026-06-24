@@ -17,18 +17,20 @@ func jpErr(t *testing.T, db *Database, sql string) string {
 	return err.(*EngineError).Code()
 }
 
-// The still-deferred path-expression constructs — item methods .m(), arithmetic, top-level
-// predicates, $name variables — are a deferred 0A000 at compile (P1b added filters ?(comparison) but
-// not these). PostgreSQL compiles them, so each is a documented divergence; the supported subset is
-// oracle-clean in suites/json/jsonpath_literal.test and jsonpath_query.test.
+// The still-deferred path-expression constructs — item methods .m(), arithmetic, like_regex /
+// starts-with top-level predicates, $name variables, non-literal subscripts — are a deferred 0A000
+// at compile (P1b added filters ?(comparison) and top-level comparison predicates, but not these).
+// PostgreSQL compiles them, so each is a documented divergence; the supported subset is oracle-clean
+// in suites/json/jsonpath_literal.test and jsonpath_query.test.
 func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
 	db := NewDatabase()
 	for _, path := range []string{
-		"$.a.size()", // item method
-		"$.a + 2",    // arithmetic
-		"$.a == 1",   // a top-level predicate (jsonb_path_match / @@ surface)
-		"$[$x]",      // a non-literal subscript expression
-		"$x",         // a path variable
+		"$.a.size()",          // item method
+		"$.a + 2",             // arithmetic
+		`$.a like_regex "x"`,  // a like_regex top-level predicate
+		`$.a starts with "x"`, // a starts-with top-level predicate
+		"$[$x]",               // a non-literal subscript expression
+		"$x",                  // a path variable
 	} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "0A000" {
 			t.Errorf("path %q should defer 0A000, got %s", path, got)
@@ -57,24 +59,24 @@ func TestJsonpathColumnIsUnsupported(t *testing.T) {
 	}
 }
 
-// A jsonpath using a STILL-deferred construct (an item method, a top-level predicate, like_regex,
-// arithmetic) is 0A000 — it fails to compile. Filters ?(comparison) now compile (P1b), but item
-// methods / top-level predicates (for jsonb_path_match / @@) / like_regex are a follow-on.
-// PostgreSQL evaluates all of these, so each is a documented divergence; the supported filter +
-// query behavior is oracle-clean in suites/json/jsonpath_query.test.
+// A jsonpath using a STILL-deferred construct (an item method, like_regex in a filter, like_regex as
+// a top-level predicate) is 0A000 — it fails to compile. Filters ?(comparison) and top-level
+// comparison predicates ($.a == 1, for jsonb_path_match / @@) now compile (P1b), but item methods /
+// like_regex are a follow-on. PostgreSQL evaluates all of these, so each is a documented divergence;
+// the supported filter + query + match behavior is oracle-clean in suites/json/jsonpath_query.test.
 func TestJsonpathDeferredConstructsAre0A000(t *testing.T) {
 	db := NewDatabase()
 	// An item method.
 	if got := jpErr(t, db, "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')"); got != "0A000" {
 		t.Errorf("jsonb_path_query_array with an item method should be 0A000, got %s", got)
 	}
-	// A top-level predicate (the jsonb_path_match / @@ surface).
-	if got := jpErr(t, db, "SELECT jsonb_path_exists('{\"a\":1}', '$.a == 1')"); got != "0A000" {
-		t.Errorf("a top-level predicate should be 0A000, got %s", got)
-	}
 	// like_regex inside a filter (a non-comparison predicate).
 	if got := jpErr(t, db, "SELECT jsonb_path_exists('[\"x\"]', '$[*] ? (@ like_regex \"x\")')"); got != "0A000" {
 		t.Errorf("like_regex inside a filter should be 0A000, got %s", got)
+	}
+	// like_regex as a top-level predicate.
+	if got := jpErr(t, db, "SELECT jsonb_path_match('[\"x\"]', '$ like_regex \"x\"')"); got != "0A000" {
+		t.Errorf("a like_regex top-level predicate should be 0A000, got %s", got)
 	}
 }
 

@@ -11701,6 +11701,9 @@ enum JsonPathFnKind {
     QueryFirst,
     /// `jsonb_path_query_array` → the sequence wrapped in a JSON array.
     QueryArray,
+    /// `jsonb_path_match` → the single boolean the path/predicate produces (22038 if not exactly one
+    /// boolean item). Also the `@@` operator.
+    Match,
 }
 
 /// Which json/jsonb builder an [`RExpr::JsonBuild`] node is (json-sql-functions.md §2).
@@ -17854,6 +17857,7 @@ fn resolve_func_call(
         "jsonb_path_exists" => Some(JsonPathFnKind::Exists),
         "jsonb_path_query_first" => Some(JsonPathFnKind::QueryFirst),
         "jsonb_path_query_array" => Some(JsonPathFnKind::QueryArray),
+        "jsonb_path_match" => Some(JsonPathFnKind::Match),
         _ => None,
     } {
         reject_named(&lname, arg_names)?;
@@ -21128,25 +21132,31 @@ fn resolve_binary(
             }
             resolve_jsonb_delete(scope, true, lhs, rhs, rbase, agg, params)
         }
-        // `jsonb @? jsonpath` = jsonb_path_exists (jsonpath.md §6). Reuses the path-exists kernel.
-        BinaryOp::JsonPathExists => {
+        // `jsonb @? jsonpath` = jsonb_path_exists, `jsonb @@ jsonpath` = jsonb_path_match
+        // (jsonpath.md §6). Both reuse the jsonpath kernels.
+        BinaryOp::JsonPathExists | BinaryOp::JsonPathMatch => {
+            let (sym, kind) = if matches!(op, BinaryOp::JsonPathExists) {
+                ("@?", JsonPathFnKind::Exists)
+            } else {
+                ("@@", JsonPathFnKind::Match)
+            };
             let (ctx, ct) = resolve(scope, lhs, Some(ScalarType::Jsonb), agg, params)?;
             if !matches!(ct, ResolvedType::Jsonb | ResolvedType::Null) {
                 return Err(EngineError::new(
                     SqlState::UndefinedFunction,
-                    format!("operator does not exist: {} @? jsonpath", ct.type_name()),
+                    format!("operator does not exist: {} {sym} jsonpath", ct.type_name()),
                 ));
             }
             let (path, pt) = resolve(scope, rhs, Some(ScalarType::JsonPath), agg, params)?;
             if !matches!(pt, ResolvedType::JsonPath | ResolvedType::Null) {
                 return Err(EngineError::new(
                     SqlState::UndefinedFunction,
-                    "operator does not exist: jsonb @? (a non-jsonpath)",
+                    format!("operator does not exist: jsonb {sym} (a non-jsonpath)"),
                 ));
             }
             Ok((
                 RExpr::JsonPathFn {
-                    kind: JsonPathFnKind::Exists,
+                    kind,
                     args: vec![ctx, path],
                 },
                 ResolvedType::Bool,
@@ -21787,7 +21797,7 @@ fn resolve_jsonpath_fn(
 ) -> Result<(RExpr, ResolvedType)> {
     let (ctx, path) = resolve_jsonpath_args(scope, name, args, agg, params)?;
     let result = match kind {
-        JsonPathFnKind::Exists => ResolvedType::Bool,
+        JsonPathFnKind::Exists | JsonPathFnKind::Match => ResolvedType::Bool,
         JsonPathFnKind::QueryFirst | JsonPathFnKind::QueryArray => ResolvedType::Jsonb,
     };
     Ok((
@@ -22154,6 +22164,7 @@ fn binary_op_symbol(op: BinaryOp) -> &'static str {
         BinaryOp::JsonHasAllKeys => "?&",
         BinaryOp::JsonDeletePath => "#-",
         BinaryOp::JsonPathExists => "@?",
+        BinaryOp::JsonPathMatch => "@@",
     }
 }
 
@@ -25826,6 +25837,14 @@ impl RExpr {
                         Ok(seq.into_iter().next().map_or(Value::Null, Value::Jsonb))
                     }
                     JsonPathFnKind::QueryArray => Ok(Value::Jsonb(JsonNode::Array(seq))),
+                    // jsonb_path_match / @@: the path must produce EXACTLY one boolean item.
+                    JsonPathFnKind::Match => match seq.as_slice() {
+                        [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
+                        _ => Err(EngineError::new(
+                            SqlState::SingletonSqlJsonItemRequired,
+                            "single boolean result is expected",
+                        )),
+                    },
                 }
             }
             RExpr::And(l, r) => {

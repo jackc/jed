@@ -51,8 +51,16 @@ export type FiltExpr =
 // A jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
 export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
-// A compiled jsonpath (the structural-accessor subset, P1a).
-export type JsonPath = { strict: boolean; steps: Step[] };
+// A jsonpath body: an accessor path (produces a sequence) or a top-level boolean predicate
+// (`$.a == 1`, for `jsonb_path_match` / `@@`; jsonpath.md §6). Port of the Rust `PathBody` enum.
+export type PathBody =
+  // An accessor path → an ordered jsonb-item sequence.
+  | { kind: "path"; steps: Step[] }
+  // A top-level predicate → a single boolean item (TRUE iff the predicate is definitely true).
+  | { kind: "predicate"; pred: Pred };
+
+// A compiled jsonpath: a mode flag + a body that is EITHER an accessor path OR a top-level predicate.
+export type JsonPath = { strict: boolean; body: PathBody };
 
 // A jsonpath construct that is valid in PostgreSQL but not yet supported by jed (a deferred P1b
 // follow-on): `0A000`, a documented divergence.
@@ -148,6 +156,19 @@ class Parser {
       strict = false;
     }
     this.skipWs();
+    // A parenthesized top-level predicate — `($.a == 1)`, which is also the canonical render of a
+    // top-level predicate, so this round-trips render → compile.
+    if (this.peek() === "(") {
+      const pred = this.parsePred();
+      this.skipWs();
+      if (this.peek() !== undefined) {
+        throw malformed("unexpected trailing input in predicate");
+      }
+      return { strict, body: { kind: "predicate", pred } };
+    }
+    // Remember the body start: if the accessor path turns out to be the LHS of a TOP-LEVEL
+    // predicate (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
+    const bodyStart = this.i;
     if (!this.eat("$")) {
       // `@`, a variable, or a bare literal as a top-level path expression — the filter / scalar
       // path-expression surface (a P1b follow-on).
@@ -161,33 +182,48 @@ class Parser {
     }
     const steps = this.parseSteps();
     this.skipWs();
-    // After the accessor path, anything left is a TOP-LEVEL predicate operator (`$.a == 1`, for
-    // jsonb_path_match / @@) or arithmetic — both a P1b follow-on this slice.
+    // After the accessor path: a comparison / logical operator makes the whole thing a top-level
+    // predicate (re-parse from the body start as a predicate); arithmetic is a P1b follow-on.
     const trailing = this.peek();
-    if (trailing !== undefined) {
-      if (
-        trailing === "=" ||
-        trailing === "<" ||
-        trailing === ">" ||
-        trailing === "!" ||
-        trailing === "&" ||
-        trailing === "|"
-      ) {
-        throw unsupported("top-level predicate expressions");
+    if (trailing === undefined) {
+      // (an empty `steps` is `$` alone — the valid root document.)
+      return { strict, body: { kind: "path", steps } };
+    }
+    if (
+      trailing === "=" ||
+      trailing === "<" ||
+      trailing === ">" ||
+      trailing === "!" ||
+      trailing === "&" ||
+      trailing === "|"
+    ) {
+      this.i = bodyStart;
+      const pred = this.parsePred();
+      this.skipWs();
+      if (this.peek() !== undefined) {
+        throw malformed("unexpected trailing input in predicate");
       }
-      if (
-        trailing === "+" ||
-        trailing === "-" ||
-        trailing === "*" ||
-        trailing === "/" ||
-        trailing === "%"
-      ) {
-        throw unsupported("path arithmetic");
+      return { strict, body: { kind: "predicate", pred } };
+    }
+    if (
+      trailing === "+" ||
+      trailing === "-" ||
+      trailing === "*" ||
+      trailing === "/" ||
+      trailing === "%"
+    ) {
+      throw unsupported("path arithmetic");
+    }
+    // A trailing WORD predicate operator (`like_regex`, `starts with`, `is unknown`) is a top-level
+    // predicate too — deferred `0A000` (not malformed). Any other word is malformed.
+    if ((trailing >= "a" && trailing <= "z") || (trailing >= "A" && trailing <= "Z")) {
+      const rest = this.s.slice(this.i);
+      if (rest.startsWith("like_regex") || rest.startsWith("starts") || rest.startsWith("is")) {
+        throw unsupported("top-level predicate expressions");
       }
       throw malformed("unexpected trailing input in path");
     }
-    // (an empty `steps` is `$` alone — the valid root document.)
-    return { strict, steps };
+    throw malformed("unexpected trailing input in path");
   }
 
   // Parse a sequence of accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, `?(filter)`), stopping
@@ -559,7 +595,13 @@ export function compile(src: string): JsonPath {
 // The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
 // compile). Port of impl/rust/src/jsonpath.rs `eval`.
 export function evalPath(path: JsonPath, ctx: JsonNode): JsonNode[] {
-  return evalSteps(path.steps, ctx, ctx, path.strict);
+  if (path.body.kind === "path") {
+    return evalSteps(path.body.steps, ctx, ctx, path.strict);
+  }
+  // A top-level predicate → a single boolean item: TRUE iff the predicate is definitely true
+  // (unknown / false both render as `false`, matching PG's jsonb_path_query).
+  const truth = evalPred(path.body.pred, ctx, ctx, path.strict) === true;
+  return [{ kind: "bool", value: truth }];
 }
 
 // evalSteps evaluates an accessor-step sequence over a seed item, with `root` as the document `$`
@@ -855,8 +897,16 @@ function writeQuoted(k: string): string {
 // keys quoted; `[*]`, `[i]`, `[i to j]` subscripts; `?(predicate)` filters; matches PostgreSQL's
 // `jsonpath_out`.
 export function render(jp: JsonPath): string {
-  let out = jp.strict ? "strict $" : "$";
-  out += writeSteps(jp.steps);
+  let out = jp.strict ? "strict " : "";
+  if (jp.body.kind === "path") {
+    out += "$";
+    out += writeSteps(jp.body.steps);
+  } else {
+    // A top-level predicate renders parenthesized (PG's `jsonpath_out`): `($."a" == 1)`.
+    out += "(";
+    out += writePred(jp.body.pred);
+    out += ")";
+  }
   return out;
 }
 

@@ -3323,6 +3323,8 @@ func (p *Parser) parseConcat() (Expr, error) {
 			op = OpContains
 		case TokJsonPathExists:
 			op = OpJsonPathExists
+		case TokJsonPathMatch:
+			op = OpJsonPathMatch
 		case TokContainedBy:
 			op = OpContainedBy
 		case TokOverlaps:
@@ -4492,6 +4494,8 @@ func renderToken(t Token) string {
 		return "@>"
 	case TokJsonPathExists:
 		return "@?"
+	case TokJsonPathMatch:
+		return "@@"
 	case TokContainedBy:
 		return "<@"
 	case TokOverlaps:

@@ -225,14 +225,17 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 }
             }
             b'@' => {
-                // `@>` array containment (grammar.md §40); `@?` is the jsonpath-exists operator
-                // (jsonpath.md §6). Scanned greedily; a lone `@` is not jed's surface — 42601. (`@@`,
-                // the path-match operator, lands with top-level predicates.)
+                // `@>` array containment (grammar.md §40); `@?` / `@@` are the jsonpath
+                // exists / match operators (jsonpath.md §6). Scanned greedily; a lone `@` is not
+                // jed's surface — 42601.
                 if bytes.get(i + 1) == Some(&b'>') {
                     tokens.push(Token::Contains);
                     i += 2;
                 } else if bytes.get(i + 1) == Some(&b'?') {
                     tokens.push(Token::JsonPathExists);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'@') {
+                    tokens.push(Token::JsonPathMatch);
                     i += 2;
                 } else {
                     return Err(syntax("unexpected character '@'".to_string()));

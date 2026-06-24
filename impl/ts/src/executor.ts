@@ -11189,8 +11189,10 @@ type JsonBuildKind = "array" | "object";
 // JsonPathFnKind selects which scalar jsonpath query function a "jsonPathFn" RExpr node is
 // (jsonpath.md §5): "exists" — jsonb_path_exists → boolean (the sequence is non-empty);
 // "queryFirst" — jsonb_path_query_first → the first sequence item, or NULL if empty;
-// "queryArray" — jsonb_path_query_array → the sequence wrapped in a JSON array.
-type JsonPathFnKind = "exists" | "queryFirst" | "queryArray";
+// "queryArray" — jsonb_path_query_array → the sequence wrapped in a JSON array;
+// "match" — jsonb_path_match (and the `@@` operator) → the single boolean the path/predicate
+// produces (22038 if not exactly one boolean item).
+type JsonPathFnKind = "exists" | "queryFirst" | "queryArray" | "match";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -13517,7 +13519,9 @@ function resolveFuncCall(
           ? "queryFirst"
           : lname === "jsonb_path_query_array"
             ? "queryArray"
-            : null;
+            : lname === "jsonb_path_match"
+              ? "match"
+              : null;
     if (pathFnKind !== null) {
       rejectNamed(lname, e.argNames);
       if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
@@ -17527,24 +17531,28 @@ function resolveBinary(
       }
       return resolveJsonbDelete(scope, true, rhs, rbase.node, ag, params);
     }
-    // `jsonb @? jsonpath` = jsonb_path_exists (jsonpath.md §6). Reuses the path-exists kernel.
-    case "jsonPathExists": {
+    // `jsonb @? jsonpath` = jsonb_path_exists, `jsonb @@ jsonpath` = jsonb_path_match
+    // (jsonpath.md §6). Both reuse the jsonpath kernels.
+    case "jsonPathExists":
+    case "jsonPathMatch": {
+      const [sym, kind]: [string, JsonPathFnKind] =
+        op === "jsonPathExists" ? ["@?", "exists"] : ["@@", "match"];
       const ctx = resolve(scope, lhs, "jsonb", ag, params);
       if (ctx.type.kind !== "jsonb" && ctx.type.kind !== "null") {
         throw engineError(
           "undefined_function",
-          `operator does not exist: ${rtName(ctx.type)} @? jsonpath`,
+          `operator does not exist: ${rtName(ctx.type)} ${sym} jsonpath`,
         );
       }
       const path = resolve(scope, rhs, "jsonpath", ag, params);
       if (path.type.kind !== "jsonpath" && path.type.kind !== "null") {
         throw engineError(
           "undefined_function",
-          "operator does not exist: jsonb @? (a non-jsonpath)",
+          `operator does not exist: jsonb ${sym} (a non-jsonpath)`,
         );
       }
       return {
-        node: { kind: "jsonPathFn", pathFnKind: "exists", args: [ctx.node, path.node] },
+        node: { kind: "jsonPathFn", pathFnKind: kind, args: [ctx.node, path.node] },
         type: { kind: "bool" },
       };
     }
@@ -18187,7 +18195,8 @@ function resolveJsonpathFn(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   const [ctx, path] = resolveJsonpathArgs(scope, name, args, ag, params);
-  const type: ResolvedType = kind === "exists" ? { kind: "bool" } : { kind: "jsonb" };
+  const type: ResolvedType =
+    kind === "exists" || kind === "match" ? { kind: "bool" } : { kind: "jsonb" };
   return { node: { kind: "jsonPathFn", pathFnKind: kind, args: [ctx, path] }, type };
 }
 
@@ -18501,6 +18510,8 @@ function binaryOpSymbol(op: BinaryOp): string {
       return "#-";
     case "jsonPathExists":
       return "@?";
+    case "jsonPathMatch":
+      return "@@";
   }
 }
 
@@ -21874,6 +21885,16 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return seq.length > 0 ? jsonbValue(seq[0]!) : nullValue();
         case "queryArray":
           return jsonbValue({ kind: "array", elements: seq });
+        case "match": {
+          // jsonb_path_match / @@: the path must produce EXACTLY one boolean item.
+          if (seq.length === 1 && seq[0]!.kind === "bool") {
+            return boolValue(seq[0]!.value);
+          }
+          throw engineError(
+            "singleton_sql_json_item_required",
+            "single boolean result is expected",
+          );
+        }
       }
       break;
     }

@@ -51,6 +51,8 @@ export type TokenKind =
   //              scanned greedily, a lone "@" is a 42601 syntax error (spec/design/grammar.md §40)
   | "jsonPathExists" // @? — the jsonpath-exists operator (jsonb @? jsonpath = jsonb_path_exists);
   //              "@" then "?", scanned greedily (spec/design/jsonpath.md §6)
+  | "jsonPathMatch" // @@ — the jsonpath-match operator (jsonb @@ jsonpath = jsonb_path_match);
+  //              "@" then "@", scanned greedily (spec/design/jsonpath.md §6)
   | "containedBy" // <@ — the array contained-by operator (a <@ b — is a contained by b) (grammar.md §40)
   | "overlaps" // && — the array overlap operator (a && b — do a and b share an element); two "&"
   //              scanned greedily, a lone "&" is a 42601 syntax error (spec/design/grammar.md §40)

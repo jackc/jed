@@ -98,6 +98,9 @@ const (
 	// TokJsonPathExists is the "@?" jsonpath-exists operator (jsonb @? jsonpath = jsonb_path_exists).
 	// "@" then "?", scanned greedily. spec/design/jsonpath.md §6.
 	TokJsonPathExists
+	// TokJsonPathMatch is the "@@" jsonpath-match operator (jsonb @@ jsonpath = jsonb_path_match).
+	// "@" then "@", scanned greedily. spec/design/jsonpath.md §6.
+	TokJsonPathMatch
 	// TokContainedBy is the "<@" array contained-by operator (a <@ b — is a contained by b). "<"
 	// then "@". spec/design/grammar.md §40.
 	TokContainedBy

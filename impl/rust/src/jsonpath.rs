@@ -13,11 +13,21 @@ use crate::error::{EngineError, Result};
 use crate::json::JsonNode;
 use crate::sqlstate::SqlState;
 
-/// A compiled jsonpath (the structural-accessor subset, P1a).
+/// A compiled jsonpath.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct JsonPath {
     pub strict: bool,
-    pub steps: Vec<Step>,
+    pub body: PathBody,
+}
+
+/// A jsonpath body: an accessor path (produces a sequence) or a top-level boolean predicate
+/// (`$.a == 1`, for `jsonb_path_match` / `@@`; jsonpath.md §6).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PathBody {
+    /// An accessor path → an ordered jsonb-item sequence.
+    Path(Vec<Step>),
+    /// A top-level predicate → a single boolean item (TRUE iff the predicate is definitely true).
+    Predicate(Box<Pred>),
 }
 
 /// One accessor step.
@@ -112,6 +122,22 @@ impl JsonPath {
             false
         };
         p.skip_ws();
+        // A parenthesized top-level predicate — `($.a == 1)`, which is also the canonical render of a
+        // top-level predicate, so this round-trips render → compile.
+        if p.peek() == Some(b'(') {
+            let pred = p.parse_pred()?;
+            p.skip_ws();
+            if p.peek().is_some() {
+                return Err(malformed("unexpected trailing input in predicate"));
+            }
+            return Ok(JsonPath {
+                strict,
+                body: PathBody::Predicate(Box::new(pred)),
+            });
+        }
+        // Remember the body start: if the accessor path turns out to be the LHS of a TOP-LEVEL
+        // predicate (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
+        let body_start = p.i;
         if !p.eat(b'$') {
             // `@`, a variable, or a bare literal as a top-level path expression — the filter / scalar
             // path-expression surface (a P1b follow-on).
@@ -126,20 +152,41 @@ impl JsonPath {
         }
         let steps = p.parse_steps()?;
         p.skip_ws();
-        // After the accessor path, anything left is a TOP-LEVEL predicate operator (`$.a == 1`,
-        // for jsonb_path_match / @@) or arithmetic — both a P1b follow-on this slice.
+        // After the accessor path: a comparison / logical operator makes the whole thing a top-level
+        // predicate (re-parse from the body start as a predicate); arithmetic is a P1b follow-on.
         match p.peek() {
-            None => {}
+            None => Ok(JsonPath {
+                strict,
+                body: PathBody::Path(steps),
+            }),
             Some(b'=' | b'<' | b'>' | b'!' | b'&' | b'|') => {
-                return Err(unsupported("top-level predicate expressions"));
+                p.i = body_start;
+                let pred = p.parse_pred()?;
+                p.skip_ws();
+                if p.peek().is_some() {
+                    return Err(malformed("unexpected trailing input in predicate"));
+                }
+                Ok(JsonPath {
+                    strict,
+                    body: PathBody::Predicate(Box::new(pred)),
+                })
             }
-            Some(b'+' | b'-' | b'*' | b'/' | b'%') => {
-                return Err(unsupported("path arithmetic"));
+            Some(b'+' | b'-' | b'*' | b'/' | b'%') => Err(unsupported("path arithmetic")),
+            // A trailing WORD predicate operator (`like_regex`, `starts with`, `is unknown`) is a
+            // top-level predicate too — deferred `0A000` (not malformed). Any other word is malformed.
+            Some(c) if c.is_ascii_alphabetic() => {
+                let rest = &p.s[p.i..];
+                if rest.starts_with(b"like_regex")
+                    || rest.starts_with(b"starts")
+                    || rest.starts_with(b"is")
+                {
+                    Err(unsupported("top-level predicate expressions"))
+                } else {
+                    Err(malformed("unexpected trailing input in path"))
+                }
             }
-            Some(_) => return Err(malformed("unexpected trailing input in path")),
+            Some(_) => Err(malformed("unexpected trailing input in path")),
         }
-        // (an empty `steps` is `$` alone — the valid root document.)
-        Ok(JsonPath { strict, steps })
     }
 
     /// The canonical render (spec/design/jsonpath.md §2): `strict` kept / `lax` omitted; member keys
@@ -149,8 +196,18 @@ impl JsonPath {
         if self.strict {
             out.push_str("strict ");
         }
-        out.push('$');
-        write_steps(&self.steps, &mut out);
+        match &self.body {
+            PathBody::Path(steps) => {
+                out.push('$');
+                write_steps(steps, &mut out);
+            }
+            // A top-level predicate renders parenthesized (PG's `jsonpath_out`): `($."a" == 1)`.
+            PathBody::Predicate(pred) => {
+                out.push('(');
+                write_pred(pred, &mut out);
+                out.push(')');
+            }
+        }
         out
     }
 }
@@ -246,7 +303,15 @@ fn write_filt_expr(e: &FiltExpr, out: &mut String) {
 /// The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
 /// compile).
 pub fn eval(path: &JsonPath, ctx: &JsonNode) -> Result<Vec<JsonNode>> {
-    eval_steps(&path.steps, ctx, ctx, path.strict)
+    match &path.body {
+        PathBody::Path(steps) => eval_steps(steps, ctx, ctx, path.strict),
+        // A top-level predicate → a single boolean item: TRUE iff the predicate is definitely true
+        // (unknown / false both render as `false`, matching PG's jsonb_path_query).
+        PathBody::Predicate(pred) => {
+            let truth = eval_pred(pred, ctx, ctx, path.strict)? == Some(true);
+            Ok(vec![JsonNode::Bool(truth)])
+        }
+    }
 }
 
 /// Evaluate an accessor-step sequence over a seed item, with `root` as the document `$` (for a

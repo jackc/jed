@@ -914,6 +914,9 @@ const (
 	// OpJsonPathExists is the `@?` jsonpath-exists operator (`jsonb @? jsonpath` = `jsonb_path_exists`)
 	// — jsonpath.md §6.
 	OpJsonPathExists
+	// OpJsonPathMatch is the `@@` jsonpath-match operator (`jsonb @@ jsonpath` = `jsonb_path_match`)
+	// — jsonpath.md §6.
+	OpJsonPathMatch
 )
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.

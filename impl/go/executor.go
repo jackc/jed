@@ -14077,6 +14077,9 @@ const (
 	jpfQueryFirst
 	// jpfQueryArray is jsonb_path_query_array → the sequence wrapped in a JSON array.
 	jpfQueryArray
+	// jpfMatch is jsonb_path_match (and the `@@` operator) → the single boolean the path/predicate
+	// produces (22038 if not exactly one boolean item).
+	jpfMatch
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -18457,7 +18460,7 @@ func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *FuncCallE
 		return nil, resolvedType{}, err
 	}
 	result := resolvedType{kind: rtJsonb}
-	if kind == jpfExists {
+	if kind == jpfExists || kind == jpfMatch {
 		result = resolvedType{kind: rtBool}
 	}
 	return &rExpr{kind: reJsonPathFn, jpFnKind: kind, sargs: []*rExpr{ctx, path}}, result, nil
@@ -18664,8 +18667,10 @@ func binaryOpSymbol(op BinaryOp) string {
 		return "?&"
 	case OpJsonDeletePath:
 		return "#-"
-	default: // OpJsonPathExists
+	case OpJsonPathExists:
 		return "@?"
+	default: // OpJsonPathMatch
+		return "@@"
 	}
 }
 
@@ -18852,7 +18857,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 	}
 	// The scalar jsonpath query functions (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. Hand-
 	// resolved (the jsonpath arg + adapting-literal are outside the catalog family mold).
-	if name == "jsonb_path_exists" || name == "jsonb_path_query_first" || name == "jsonb_path_query_array" {
+	if name == "jsonb_path_exists" || name == "jsonb_path_query_first" || name == "jsonb_path_query_array" || name == "jsonb_path_match" {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -18865,6 +18870,8 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			kind = jpfExists
 		case "jsonb_path_query_first":
 			kind = jpfQueryFirst
+		case "jsonb_path_match":
+			kind = jpfMatch
 		default: // jsonb_path_query_array
 			kind = jpfQueryArray
 		}
@@ -21008,8 +21015,13 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		return resolveJSONHasKey(s, hkAny, b.Lhs, b.Rhs, ag, params)
 	case OpJsonHasAllKeys:
 		return resolveJSONHasKey(s, hkAll, b.Lhs, b.Rhs, ag, params)
-	// `jsonb @? jsonpath` = jsonb_path_exists (jsonpath.md §6). Reuses the path-exists kernel.
-	case OpJsonPathExists:
+	// `jsonb @? jsonpath` = jsonb_path_exists, `jsonb @@ jsonpath` = jsonb_path_match
+	// (jsonpath.md §6). Both reuse the jsonpath kernels.
+	case OpJsonPathExists, OpJsonPathMatch:
+		sym, fnKind := "@?", jpfExists
+		if b.Op == OpJsonPathMatch {
+			sym, fnKind = "@@", jpfMatch
+		}
 		jsonbHint := Jsonb
 		ctx, ct, err := resolve(s, b.Lhs, &jsonbHint, ag, params)
 		if err != nil {
@@ -21017,7 +21029,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		}
 		if ct.kind != rtJsonb && ct.kind != rtNull {
 			return nil, resolvedType{}, NewError(UndefinedFunction,
-				fmt.Sprintf("operator does not exist: %s @? jsonpath", rtName(ct)))
+				fmt.Sprintf("operator does not exist: %s %s jsonpath", rtName(ct), sym))
 		}
 		pathHint := JsonPathType
 		path, pt, err := resolve(s, b.Rhs, &pathHint, ag, params)
@@ -21026,9 +21038,9 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		}
 		if pt.kind != rtJsonPath && pt.kind != rtNull {
 			return nil, resolvedType{}, NewError(UndefinedFunction,
-				"operator does not exist: jsonb @? (a non-jsonpath)")
+				fmt.Sprintf("operator does not exist: jsonb %s (a non-jsonpath)", sym))
 		}
-		return &rExpr{kind: reJsonPathFn, jpFnKind: jpfExists, sargs: []*rExpr{ctx, path}},
+		return &rExpr{kind: reJsonPathFn, jpFnKind: fnKind, sargs: []*rExpr{ctx, path}},
 			resolvedType{kind: rtBool}, nil
 	// The jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1, J6). `||` and
 	// `-` (delete) are dispatched by operand type in resolveConcat / the arithmetic arm.
@@ -24438,6 +24450,12 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return NullValue(), nil
 			}
 			return JsonbValue(seq[0]), nil
+		case jpfMatch:
+			// jsonb_path_match / @@: the path must produce EXACTLY one boolean item.
+			if len(seq) == 1 && seq[0].Kind == JBool {
+				return BoolValue(seq[0].B), nil
+			}
+			return Value{}, NewError(SingletonSqlJsonItemRequired, "single boolean result is expected")
 		default: // jpfQueryArray
 			return JsonbValue(JsonNode{Kind: JArray, Arr: seq}), nil
 		}

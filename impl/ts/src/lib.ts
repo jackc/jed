@@ -95,9 +95,13 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.jsonb_path",
   // jsonpath filter expressions `?(predicate)` + the `@?` exists operator (P1b, jsonpath.md §4/§6):
   // a filter step keeps items whose predicate is definitely TRUE (3-valued Kleene connectives,
-  // existential comparison); `jsonb @? jsonpath` is jsonb_path_exists. Item methods / top-level
-  // predicates / like_regex / arithmetic stay deferred 0A000.
+  // existential comparison); `jsonb @? jsonpath` is jsonb_path_exists. Item methods / like_regex /
+  // arithmetic stay deferred 0A000.
   "expr.jsonpath_filter",
+  // jsonpath top-level predicates + jsonb_path_match + the `@@` operator (P1b/P2, jsonpath.md §6):
+  // a jsonpath body can be a boolean predicate (`$.a == 1`) producing a single boolean item;
+  // `jsonb_path_match` / `jsonb @@ jsonpath` returns it (22038 if not exactly one boolean item).
+  "expr.jsonpath_match",
   // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
   "func.jsonb_access",
   // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).

@@ -3,7 +3,7 @@
 # The path evaluates to an ordered jsonb sequence; lax (default) auto-unwraps arrays + suppresses
 # navigation failures, strict raises (2203A missing member, 22033 subscript). STRICT in the args.
 # Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
-# requires: query.select, query.aggregates, types.jsonpath, func.jsonb_path, expr.jsonpath_filter
+# requires: query.select, query.aggregates, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.jsonpath_match
 
 # jsonb_path_exists: the sequence is non-empty (a missing member → false in lax).
 query BB nosort
@@ -102,3 +102,37 @@ SELECT '$[*] ? (@ > 2)'::jsonpath, '$ ? (@.a == 1 || @.b == 2)'::jsonpath
 ----
 $[*]?(@ > 2)
 $?(@."a" == 1 || @."b" == 2)
+
+# A TOP-LEVEL predicate ($.a == 1) is a boolean-valued path: jsonb_path_match returns the boolean.
+query BB nosort
+SELECT jsonb_path_match('{"a": 1}', '$.a == 1'), jsonb_path_match('{"a": 1}', '$.a == 2')
+----
+true
+false
+
+# A missing member makes the comparison unknown → jsonb_path_match returns false.
+query B nosort
+SELECT jsonb_path_match('{}', '$.a == 1')
+----
+false
+
+# The @@ operator is jsonb_path_match, with && / || and an existential element comparison.
+query BBB nosort
+SELECT '{"a": 1}'::jsonb @@ '$.a == 1', '{"a": 1}'::jsonb @@ '$.a > 5', '{"a": [1, 2, 3]}'::jsonb @@ '$.a[*] == 2'
+----
+true
+false
+true
+
+# A top-level predicate, queried, yields the boolean as a single jsonb item.
+query T nosort
+SELECT * FROM jsonb_path_query('{"a": 1}', '$.a == 1')
+----
+true
+
+# A top-level predicate renders parenthesized (PG jsonpath_out); it round-trips through compile.
+query TT nosort
+SELECT '$.a == 1'::jsonpath, '$.a > 1 && $.b < 2'::jsonpath
+----
+($."a" == 1)
+($."a" > 1 && $."b" < 2)

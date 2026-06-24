@@ -567,6 +567,8 @@ var SupportedCapabilities = []string{
 	"func.jsonb_path",
 	// jsonpath filter expressions `?(predicate)` + the `@?` exists operator (P1b, jsonpath.md §4/§6).
 	"expr.jsonpath_filter",
+	// Top-level jsonpath predicates (`$.a == 1`) + jsonb_path_match + the `@@` operator (jsonpath.md §6).
+	"expr.jsonpath_match",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

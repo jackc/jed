@@ -313,10 +313,17 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     `||` / `!(…)` and parens, with existential comparison + 3-valued (Kleene) connectives (an
     item is kept only on a definite TRUE; filter operands never raise). `jsonb @? jsonpath`
     binds at the `@>` precedence and routes to `jsonb_path_exists`. Capability
-    `expr.jsonpath_filter`. **Still deferred (`0A000`):** item methods, arithmetic, top-level
-    predicates (the `jsonb_path_match` / `@@` surface), `like_regex` / `starts with` /
-    `exists` / `is unknown`, and `$name` variables — the §4.3 Pike-VM `like_regex` and the
-    `@@` / `jsonb_path_match` top-level-predicate body remain the open P2 follow-ons.
+    `expr.jsonpath_filter`.
+  - **P1b/P2-match** ✅ — TOP-LEVEL predicates + `jsonb_path_match` + the `@@` operator (§6)
+    have landed. A jsonpath body may be a top-level boolean predicate (`$.a == 1`,
+    `$.a > 1 && $.b < 2`) — the same predicate grammar as a filter, rooted at the document.
+    `jsonb_path_match(ctx, path)` / `ctx @@ path` requires the path to produce **exactly one
+    boolean** item (else `22038`); a top-level predicate always does, with an unknown result
+    rendering as `false`. A top-level predicate, queried, yields the boolean as a single item;
+    it renders parenthesized (`($."a" == 1)`), which round-trips through compile. Capability
+    `expr.jsonpath_match`. **Still deferred (`0A000`):** item methods, arithmetic, the §4.3
+    Pike-VM `like_regex` / `starts with` / `is unknown` predicates, and `$name` variables —
+    the remaining open P2 follow-ons.
 - **P3** — the `_tz` variants (§5.1): route `.datetime()` through the clock/tz seam,
   `stable` volatility. Small follow-on to P2.
 

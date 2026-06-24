@@ -1070,6 +1070,8 @@ pub enum BinaryOp {
     JsonDeletePath,
     /// The `@?` jsonpath-exists operator (`jsonb @? jsonpath` = `jsonb_path_exists`) — jsonpath.md §6.
     JsonPathExists,
+    /// The `@@` jsonpath-match operator (`jsonb @@ jsonpath` = `jsonb_path_match`) — jsonpath.md §6.
+    JsonPathMatch,
 }
 
 /// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL

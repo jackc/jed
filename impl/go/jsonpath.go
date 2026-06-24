@@ -17,10 +17,14 @@ import (
 // 42601. The compiled program is a pure function of the source — kept byte-identical cross-core
 // by the conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
 
-// JsonPath is a compiled jsonpath (the structural-accessor subset, P1a).
+// JsonPath is a compiled jsonpath. The body is EITHER an accessor path (produces a sequence) or a
+// top-level boolean predicate (`$.a == 1`, for jsonb_path_match / @@; jsonpath.md §6).
 type JsonPath struct {
 	Strict bool
-	Steps  []jpStep
+	// Path holds the accessor steps when Pred == nil; Pred holds a top-level predicate otherwise.
+	// Exactly one is meaningful (Go has no sum types): Pred == nil ⇒ an accessor-path body.
+	Path []jpStep
+	Pred *jpPred
 }
 
 // jpStepKind tags an accessor step.
@@ -148,6 +152,22 @@ func Compile(src string) (JsonPath, error) {
 		p.eatKeyword("lax")
 	}
 	p.skipWs()
+	// A parenthesized top-level predicate — `($.a == 1)`, which is also the canonical render of a
+	// top-level predicate, so this round-trips render → compile.
+	if c, ok := p.peek(); ok && c == '(' {
+		pred, err := p.parsePred()
+		if err != nil {
+			return JsonPath{}, err
+		}
+		p.skipWs()
+		if _, ok := p.peek(); ok {
+			return JsonPath{}, jpMalformed("unexpected trailing input in predicate")
+		}
+		return JsonPath{Strict: strict, Pred: pred}, nil
+	}
+	// Remember the body start: if the accessor path turns out to be the LHS of a TOP-LEVEL
+	// predicate (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
+	bodyStart := p.i
 	if !p.eat('$') {
 		// @, a variable, or a bare literal as a top-level path expression — the filter / scalar
 		// path-expression surface (a P1b follow-on).
@@ -163,20 +183,39 @@ func Compile(src string) (JsonPath, error) {
 		return JsonPath{}, err
 	}
 	p.skipWs()
-	// After the accessor path, anything left is a TOP-LEVEL predicate operator (`$.a == 1`, for
-	// jsonb_path_match / @@) or arithmetic — both a P1b follow-on this slice.
-	if c, ok := p.peek(); ok {
-		switch c {
-		case '=', '<', '>', '!', '&', '|':
-			return JsonPath{}, jpUnsupported("top-level predicate expressions")
-		case '+', '-', '*', '/', '%':
-			return JsonPath{}, jpUnsupported("path arithmetic")
-		default:
+	// After the accessor path: a comparison / logical operator makes the whole thing a top-level
+	// predicate (re-parse from the body start as a predicate); arithmetic is a P1b follow-on.
+	c, ok := p.peek()
+	if !ok {
+		// `$` alone is valid (the root document) — steps is empty in that case.
+		return JsonPath{Strict: strict, Path: steps}, nil
+	}
+	switch c {
+	case '=', '<', '>', '!', '&', '|':
+		p.i = bodyStart
+		pred, err := p.parsePred()
+		if err != nil {
+			return JsonPath{}, err
+		}
+		p.skipWs()
+		if _, ok := p.peek(); ok {
+			return JsonPath{}, jpMalformed("unexpected trailing input in predicate")
+		}
+		return JsonPath{Strict: strict, Pred: pred}, nil
+	case '+', '-', '*', '/', '%':
+		return JsonPath{}, jpUnsupported("path arithmetic")
+	default:
+		// A trailing WORD predicate operator (`like_regex`, `starts with`, `is unknown`) is a
+		// top-level predicate too — deferred 0A000 (not malformed). Any other word is malformed.
+		if isAsciiAlpha(c) {
+			rest := string(p.s[p.i:])
+			if strings.HasPrefix(rest, "like_regex") || strings.HasPrefix(rest, "starts") || strings.HasPrefix(rest, "is") {
+				return JsonPath{}, jpUnsupported("top-level predicate expressions")
+			}
 			return JsonPath{}, jpMalformed("unexpected trailing input in path")
 		}
+		return JsonPath{}, jpMalformed("unexpected trailing input in path")
 	}
-	// `$` alone is valid (the root document) — steps is empty in that case.
-	return JsonPath{Strict: strict, Steps: steps}, nil
 }
 
 // Render is the canonical render (spec/design/jsonpath.md §2): strict kept / lax omitted; member
@@ -186,8 +225,15 @@ func (jp JsonPath) Render() string {
 	if jp.Strict {
 		out.WriteString("strict ")
 	}
+	if jp.Pred != nil {
+		// A top-level predicate renders parenthesized (PG's jsonpath_out): `($."a" == 1)`.
+		out.WriteByte('(')
+		writePred(jp.Pred, &out)
+		out.WriteByte(')')
+		return out.String()
+	}
 	out.WriteByte('$')
-	writeSteps(jp.Steps, &out)
+	writeSteps(jp.Path, &out)
 	return out.String()
 }
 
@@ -286,7 +332,16 @@ func writeFiltExpr(e *jpFiltExpr, out *strings.Builder) {
 // The P1b structural subset (no filters / item methods / arithmetic — those are still 0A000 at
 // compile).
 func (jp JsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
-	return evalSteps(jp.Steps, &ctx, &ctx, jp.Strict)
+	if jp.Pred != nil {
+		// A top-level predicate → a single boolean item: TRUE iff the predicate is definitely true
+		// (unknown / false both render as `false`, matching PG's jsonb_path_query).
+		v, err := evalPred(jp.Pred, &ctx, &ctx, jp.Strict)
+		if err != nil {
+			return nil, err
+		}
+		return []JsonNode{{Kind: JBool, B: isTrue(v)}}, nil
+	}
+	return evalSteps(jp.Path, &ctx, &ctx, jp.Strict)
 }
 
 // evalSteps evaluates an accessor-step sequence over a seed item, with root as the document `$` (for
