@@ -95,6 +95,9 @@ const (
 	// TokContains is the "@>" array containment operator (a @> b — does a contain b). "@" then ">"
 	// scanned greedily; a lone "@" is a 42601 syntax error. spec/design/grammar.md §40.
 	TokContains
+	// TokJsonPathExists is the "@?" jsonpath-exists operator (jsonb @? jsonpath = jsonb_path_exists).
+	// "@" then "?", scanned greedily. spec/design/jsonpath.md §6.
+	TokJsonPathExists
 	// TokContainedBy is the "<@" array contained-by operator (a <@ b — is a contained by b). "<"
 	// then "@". spec/design/grammar.md §40.
 	TokContainedBy

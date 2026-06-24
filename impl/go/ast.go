@@ -911,6 +911,9 @@ const (
 	// §1, J6). (The `||` concat reuses OpConcat, and `-` delete reuses OpSub — both dispatched by
 	// operand type.)
 	OpJsonDeletePath
+	// OpJsonPathExists is the `@?` jsonpath-exists operator (`jsonb @? jsonpath` = `jsonb_path_exists`)
+	// — jsonpath.md §6.
+	OpJsonPathExists
 )
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.

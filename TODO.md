@@ -383,11 +383,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           functions `jsonb_path_exists` / `jsonb_path_query` (SRF, `SrfKind::JsonbPathQuery`) /
           `jsonb_path_query_first` / `jsonb_path_query_array`. The `2203x` SQL/JSON error class registered.
           A bare string adapts (ctx→jsonb, path→compiled jsonpath). All 3 cores, cap `func.jsonb_path`,
-          oracle-clean. _P1b/P2 follow-on:_ the filter / item-method / arithmetic / `like_regex` path
-          constructs (still `0A000` at compile — a per-core divergence test), `jsonb_path_match`, `@?`/`@@`
-          operators, the `_tz` variants (P3), and the `vars`/`silent` arguments.
-  - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
-        + `@?`/`@@` + `vars`/`silent`; then the `_tz` variants. → jsonpath.md §5
+          oracle-clean.
+    - [x] **P1b-filters + P2 `@?` — filter expressions + the exists operator** — ✅ filter steps
+          `?(predicate)` (jsonpath.md §4) over the comparison subset: `== != <> < <= > >=` over `@`/`$`-rooted
+          accessor paths + scalar literals, combined with `&& || !(…)` and parens; existential comparison
+          (true if SOME pair compares true) with 3-valued (Kleene) connectives, an item kept only on definite
+          TRUE; filter operands never raise (even in strict). The `@?` operator (`jsonb @? jsonpath` =
+          `jsonb_path_exists`, new `@?` lexer token at the `@>` precedence). Canonical render (`$[*]?(@ > 2)`,
+          spaced `&&`/`||`, `!(…)`). All 3 cores byte-identical, cap `expr.jsonpath_filter`, oracle-clean, NO
+          format bump. _Still `0A000`:_ item methods, arithmetic, **top-level predicates** (the `@@` /
+          `jsonb_path_match` body), `like_regex` / `starts with` / `exists` / `is unknown`, `$name` variables.
+  - [~] **P2 / P3** — remaining: `jsonb_path_match` + `@@` (needs **top-level predicate** bodies),
+        `like_regex` → Pike VM, `vars`/`silent`; then the `_tz` variants (P3). → jsonpath.md §5
   - [~] **S1 ✅ / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅; then S2
         `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY, needs P1). → json-sql-functions.md §5
     - [x] **S1a — the `IS JSON` predicate** — ✅ `expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]

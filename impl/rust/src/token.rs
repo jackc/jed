@@ -87,6 +87,9 @@ pub enum Token {
     /// The `@>` array containment operator (`a @> b` — does `a` contain `b`). `@` then `>`, scanned
     /// greedily; a lone `@` is a 42601 syntax error. See spec/design/grammar.md §40, array-functions.md §10.
     Contains,
+    /// The `@?` jsonpath-exists operator (`jsonb @? jsonpath` = `jsonb_path_exists`). `@` then `?`,
+    /// scanned greedily. See spec/design/jsonpath.md §6.
+    JsonPathExists,
     /// The `<@` array contained-by operator (`a <@ b` — is `a` contained by `b`). `<` then `@`. See
     /// spec/design/grammar.md §40, array-functions.md §10.
     ContainedBy,

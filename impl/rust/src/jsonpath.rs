@@ -31,6 +31,40 @@ pub enum Step {
     Subscripts(Vec<Subscript>),
     /// `[*]` — the wildcard element accessor.
     WildcardElement,
+    /// `?(predicate)` — a filter: keep only the items for which the predicate is TRUE (§4).
+    Filter(Box<Pred>),
+}
+
+/// A filter predicate (jsonpath.md §4, the P1b comparison subset). 3-valued — `Not`/`And`/`Or`
+/// follow SQL/JSON's Kleene logic, but a filter keeps an item only when the predicate is definitely
+/// TRUE.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Pred {
+    Or(Box<Pred>, Box<Pred>),
+    And(Box<Pred>, Box<Pred>),
+    Not(Box<Pred>),
+    /// `lhs cmp rhs` — an existential comparison (true if SOME pair of items compares true).
+    Compare(FiltExpr, CmpOp, FiltExpr),
+}
+
+/// A comparison operand inside a filter: a `@`/`$`-rooted accessor path, or a scalar literal.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FiltExpr {
+    /// `@`-rooted (`from_root = false`) or `$`-rooted (`true`) accessor path.
+    Path { from_root: bool, steps: Vec<Step> },
+    /// A scalar literal — a JSON number / string / boolean / null.
+    Lit(JsonNode),
+}
+
+/// A jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// One subscript: a single index or an `i to j` slice.
@@ -90,50 +124,19 @@ impl JsonPath {
         if p.peek().is_some_and(|c| is_member_start(c) || c == b'"') {
             return Err(unsupported("path variables `$name`"));
         }
-        let mut steps = Vec::new();
-        loop {
-            p.skip_ws();
-            match p.peek() {
-                None => break,
-                Some(b'.') => {
-                    p.i += 1;
-                    if p.eat(b'*') {
-                        steps.push(Step::WildcardMember);
-                    } else if p.peek().is_some_and(|c| c == b'"' || is_member_start(c)) {
-                        let m = p.parse_member()?;
-                        // `.identifier(` is an item-method call (a P1b follow-on); a bare identifier
-                        // is a member accessor.
-                        if p.peek() == Some(b'(') {
-                            return Err(unsupported("item methods"));
-                        }
-                        steps.push(Step::Member(m));
-                    } else {
-                        // `$.` with nothing (or a non-member) after it is malformed.
-                        return Err(malformed("expected a member name after `.`"));
-                    }
-                }
-                Some(b'[') => {
-                    p.i += 1;
-                    p.skip_ws();
-                    if p.eat(b'*') {
-                        p.skip_ws();
-                        if !p.eat(b']') {
-                            return Err(malformed("expected `]` after `[*`"));
-                        }
-                        steps.push(Step::WildcardElement);
-                    } else {
-                        steps.push(Step::Subscripts(p.parse_subscripts()?));
-                    }
-                }
-                Some(b'?') => return Err(unsupported("filter expressions `?(…)`")),
-                // Arithmetic / comparison operators on a path expression are a P1b follow-on.
-                Some(
-                    b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'!' | b'&' | b'|',
-                ) => {
-                    return Err(unsupported("path arithmetic / predicate operators"));
-                }
-                Some(_) => return Err(malformed("unexpected character in path")),
+        let steps = p.parse_steps()?;
+        p.skip_ws();
+        // After the accessor path, anything left is a TOP-LEVEL predicate operator (`$.a == 1`,
+        // for jsonb_path_match / @@) or arithmetic — both a P1b follow-on this slice.
+        match p.peek() {
+            None => {}
+            Some(b'=' | b'<' | b'>' | b'!' | b'&' | b'|') => {
+                return Err(unsupported("top-level predicate expressions"));
             }
+            Some(b'+' | b'-' | b'*' | b'/' | b'%') => {
+                return Err(unsupported("path arithmetic"));
+            }
+            Some(_) => return Err(malformed("unexpected trailing input in path")),
         }
         // (an empty `steps` is `$` alone — the valid root document.)
         Ok(JsonPath { strict, steps })
@@ -147,34 +150,89 @@ impl JsonPath {
             out.push_str("strict ");
         }
         out.push('$');
-        for step in &self.steps {
-            match step {
-                Step::Member(k) => {
-                    out.push('.');
-                    write_quoted(k, &mut out);
-                }
-                Step::WildcardMember => out.push_str(".*"),
-                Step::WildcardElement => out.push_str("[*]"),
-                Step::Subscripts(subs) => {
-                    out.push('[');
-                    for (n, s) in subs.iter().enumerate() {
-                        if n > 0 {
-                            out.push(',');
-                        }
-                        match s {
-                            Subscript::Index(i) => write_index(i, &mut out),
-                            Subscript::Slice(a, b) => {
-                                write_index(a, &mut out);
-                                out.push_str(" to ");
-                                write_index(b, &mut out);
-                            }
+        write_steps(&self.steps, &mut out);
+        out
+    }
+}
+
+/// Render an accessor-step sequence (shared by the path render and a filter's `@`/`$` operand).
+fn write_steps(steps: &[Step], out: &mut String) {
+    for step in steps {
+        match step {
+            Step::Member(k) => {
+                out.push('.');
+                write_quoted(k, out);
+            }
+            Step::WildcardMember => out.push_str(".*"),
+            Step::WildcardElement => out.push_str("[*]"),
+            Step::Subscripts(subs) => {
+                out.push('[');
+                for (n, s) in subs.iter().enumerate() {
+                    if n > 0 {
+                        out.push(',');
+                    }
+                    match s {
+                        Subscript::Index(i) => write_index(i, out),
+                        Subscript::Slice(a, b) => {
+                            write_index(a, out);
+                            out.push_str(" to ");
+                            write_index(b, out);
                         }
                     }
-                    out.push(']');
                 }
+                out.push(']');
+            }
+            Step::Filter(pred) => {
+                out.push_str("?(");
+                write_pred(pred, out);
+                out.push(')');
             }
         }
-        out
+    }
+}
+
+/// Render a filter predicate (PG's `?(…)` form: `&&`/`||` spaced, `!(…)`, `a op b` spaced).
+fn write_pred(pred: &Pred, out: &mut String) {
+    match pred {
+        Pred::Or(a, b) => {
+            write_pred(a, out);
+            out.push_str(" || ");
+            write_pred(b, out);
+        }
+        Pred::And(a, b) => {
+            write_pred(a, out);
+            out.push_str(" && ");
+            write_pred(b, out);
+        }
+        Pred::Not(p) => {
+            out.push_str("!(");
+            write_pred(p, out);
+            out.push(')');
+        }
+        Pred::Compare(l, op, r) => {
+            write_filt_expr(l, out);
+            out.push(' ');
+            out.push_str(match op {
+                CmpOp::Eq => "==",
+                CmpOp::Ne => "!=",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
+            });
+            out.push(' ');
+            write_filt_expr(r, out);
+        }
+    }
+}
+
+fn write_filt_expr(e: &FiltExpr, out: &mut String) {
+    match e {
+        FiltExpr::Path { from_root, steps } => {
+            out.push(if *from_root { '$' } else { '@' });
+            write_steps(steps, out);
+        }
+        FiltExpr::Lit(n) => out.push_str(&crate::json::json_compact_out(n)),
     }
 }
 
@@ -188,18 +246,35 @@ impl JsonPath {
 /// The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
 /// compile).
 pub fn eval(path: &JsonPath, ctx: &JsonNode) -> Result<Vec<JsonNode>> {
-    let mut seq = vec![ctx.clone()];
-    for step in &path.steps {
+    eval_steps(&path.steps, ctx, ctx, path.strict)
+}
+
+/// Evaluate an accessor-step sequence over a seed item, with `root` as the document `$` (for a
+/// filter's `$`-rooted operand).
+fn eval_steps(
+    steps: &[Step],
+    seed: &JsonNode,
+    root: &JsonNode,
+    strict: bool,
+) -> Result<Vec<JsonNode>> {
+    let mut seq = vec![seed.clone()];
+    for step in steps {
         let mut next = Vec::new();
         for item in &seq {
-            apply_step(step, item, path.strict, &mut next)?;
+            apply_step(step, item, strict, root, &mut next)?;
         }
         seq = next;
     }
     Ok(seq)
 }
 
-fn apply_step(step: &Step, item: &JsonNode, strict: bool, out: &mut Vec<JsonNode>) -> Result<()> {
+fn apply_step(
+    step: &Step,
+    item: &JsonNode,
+    strict: bool,
+    root: &JsonNode,
+    out: &mut Vec<JsonNode>,
+) -> Result<()> {
     match step {
         Step::Member(key) => {
             // lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
@@ -258,7 +333,120 @@ fn apply_step(step: &Step, item: &JsonNode, strict: bool, out: &mut Vec<JsonNode
                 )),
             }
         }
+        // `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
+        // predicate's `@` is the item, `$` is the document root.
+        Step::Filter(pred) => {
+            if eval_pred(pred, item, root, strict)? == Some(true) {
+                out.push(item.clone());
+            }
+            Ok(())
+        }
     }
+}
+
+/// Evaluate a filter predicate to a Kleene truth value (`Some(true)`/`Some(false)`/`None` = unknown).
+fn eval_pred(
+    pred: &Pred,
+    current: &JsonNode,
+    root: &JsonNode,
+    strict: bool,
+) -> Result<Option<bool>> {
+    Ok(match pred {
+        Pred::Or(a, b) => {
+            let (x, y) = (
+                eval_pred(a, current, root, strict)?,
+                eval_pred(b, current, root, strict)?,
+            );
+            match (x, y) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }
+        }
+        Pred::And(a, b) => {
+            let (x, y) = (
+                eval_pred(a, current, root, strict)?,
+                eval_pred(b, current, root, strict)?,
+            );
+            match (x, y) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            }
+        }
+        Pred::Not(p) => eval_pred(p, current, root, strict)?.map(|b| !b),
+        Pred::Compare(l, op, r) => eval_compare(l, *op, r, current, root, strict)?,
+    })
+}
+
+/// Existential comparison (§4): true if SOME pair `(a in lhs-seq, b in rhs-seq)` compares true. An
+/// empty operand or all-incomparable pairs → `None` (unknown); else `Some(false)`.
+fn eval_compare(
+    l: &FiltExpr,
+    op: CmpOp,
+    r: &FiltExpr,
+    current: &JsonNode,
+    root: &JsonNode,
+    strict: bool,
+) -> Result<Option<bool>> {
+    let ls = eval_filt_expr(l, current, root, strict)?;
+    let rs = eval_filt_expr(r, current, root, strict)?;
+    if ls.is_empty() || rs.is_empty() {
+        return Ok(None);
+    }
+    let mut any_unknown = false;
+    for a in &ls {
+        for b in &rs {
+            match compare_nodes(a, op, b) {
+                Some(true) => return Ok(Some(true)),
+                Some(false) => {}
+                None => any_unknown = true,
+            }
+        }
+    }
+    Ok(if any_unknown { None } else { Some(false) })
+}
+
+/// Evaluate a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton literal.
+fn eval_filt_expr(
+    e: &FiltExpr,
+    current: &JsonNode,
+    root: &JsonNode,
+    strict: bool,
+) -> Result<Vec<JsonNode>> {
+    match e {
+        FiltExpr::Path { from_root, steps } => {
+            let seed = if *from_root { root } else { current };
+            // A navigation error inside a filter operand → no items (the comparison is just unknown),
+            // never propagated (§4.2: filter operands never raise, even in strict).
+            Ok(eval_steps(steps, seed, root, strict).unwrap_or_default())
+        }
+        FiltExpr::Lit(n) => Ok(vec![n.clone()]),
+    }
+}
+
+/// Compare two jsonb scalars under a jsonpath operator. Only same-type number/string compare by
+/// order; booleans / nulls compare only by `==`/`!=`; any other (mixed-type) pair is `None` (unknown).
+fn compare_nodes(a: &JsonNode, op: CmpOp, b: &JsonNode) -> Option<bool> {
+    use std::cmp::Ordering;
+    let ord: Ordering = match (a, b) {
+        (JsonNode::Number(x), JsonNode::Number(y)) => x.cmp_value(y),
+        (JsonNode::String(x), JsonNode::String(y)) => x.cmp(y),
+        (JsonNode::Bool(x), JsonNode::Bool(y)) => x.cmp(y),
+        (JsonNode::Null, JsonNode::Null) => Ordering::Equal,
+        _ => return None, // mixed types are not comparable
+    };
+    // Booleans / nulls support only equality; ordering on them is unknown.
+    let order_ok = matches!((a, b), (JsonNode::Number(_), _) | (JsonNode::String(_), _));
+    Some(match op {
+        CmpOp::Eq => ord == Ordering::Equal,
+        CmpOp::Ne => ord != Ordering::Equal,
+        CmpOp::Lt if order_ok => ord == Ordering::Less,
+        CmpOp::Le if order_ok => ord != Ordering::Greater,
+        CmpOp::Gt if order_ok => ord == Ordering::Greater,
+        CmpOp::Ge if order_ok => ord != Ordering::Less,
+        _ => return None, // an order comparison on bool/null is unknown
+    })
 }
 
 fn member_access(item: &JsonNode, key: &str, strict: bool, out: &mut Vec<JsonNode>) -> Result<()> {
@@ -534,6 +722,206 @@ impl Parser<'_> {
             .and_then(|t| t.parse().ok())
             .ok_or_else(|| malformed("subscript out of range"))?;
         Ok(Index::Number(n))
+    }
+
+    /// Parse a sequence of accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, `?(filter)`),
+    /// stopping at the first non-accessor byte (EOF, a comparison/logical operator, `)`, etc).
+    fn parse_steps(&mut self) -> Result<Vec<Step>> {
+        let mut steps = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'.') => {
+                    self.i += 1;
+                    if self.eat(b'*') {
+                        steps.push(Step::WildcardMember);
+                    } else if self.peek().is_some_and(|c| c == b'"' || is_member_start(c)) {
+                        let m = self.parse_member()?;
+                        // `.identifier(` is an item-method call (a P1b follow-on).
+                        if self.peek() == Some(b'(') {
+                            return Err(unsupported("item methods"));
+                        }
+                        steps.push(Step::Member(m));
+                    } else {
+                        return Err(malformed("expected a member name after `.`"));
+                    }
+                }
+                Some(b'[') => {
+                    self.i += 1;
+                    self.skip_ws();
+                    if self.eat(b'*') {
+                        self.skip_ws();
+                        if !self.eat(b']') {
+                            return Err(malformed("expected `]` after `[*`"));
+                        }
+                        steps.push(Step::WildcardElement);
+                    } else {
+                        steps.push(Step::Subscripts(self.parse_subscripts()?));
+                    }
+                }
+                Some(b'?') => {
+                    self.i += 1;
+                    self.skip_ws();
+                    if !self.eat(b'(') {
+                        return Err(malformed("expected `(` after `?`"));
+                    }
+                    let pred = self.parse_pred()?;
+                    self.skip_ws();
+                    if !self.eat(b')') {
+                        return Err(malformed("expected `)` after a filter predicate"));
+                    }
+                    steps.push(Step::Filter(Box::new(pred)));
+                }
+                _ => break,
+            }
+        }
+        Ok(steps)
+    }
+
+    /// Parse a filter predicate (P1b comparison subset): `||` over `&&` over `!` / `(…)` / comparison.
+    fn parse_pred(&mut self) -> Result<Pred> {
+        let mut left = self.parse_and()?;
+        loop {
+            self.skip_ws();
+            if self.eat_op(b"||") {
+                let right = self.parse_and()?;
+                left = Pred::Or(Box::new(left), Box::new(right));
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_and(&mut self) -> Result<Pred> {
+        let mut left = self.parse_not()?;
+        loop {
+            self.skip_ws();
+            if self.eat_op(b"&&") {
+                let right = self.parse_not()?;
+                left = Pred::And(Box::new(left), Box::new(right));
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_not(&mut self) -> Result<Pred> {
+        self.skip_ws();
+        if self.eat(b'!') {
+            self.skip_ws();
+            if !self.eat(b'(') {
+                return Err(malformed("expected `(` after `!`"));
+            }
+            let inner = self.parse_pred()?;
+            self.skip_ws();
+            if !self.eat(b')') {
+                return Err(malformed("expected `)` after `!(`"));
+            }
+            return Ok(Pred::Not(Box::new(inner)));
+        }
+        if self.peek() == Some(b'(') {
+            self.i += 1;
+            let inner = self.parse_pred()?;
+            self.skip_ws();
+            if !self.eat(b')') {
+                return Err(malformed("expected `)` in predicate"));
+            }
+            return Ok(inner);
+        }
+        self.parse_comparison()
+    }
+
+    /// `filter_expr cmp filter_expr` — the only leaf predicate this slice (`exists` / `like_regex` /
+    /// `starts with` / `is unknown` are a follow-on).
+    fn parse_comparison(&mut self) -> Result<Pred> {
+        let left = self.parse_filter_expr()?;
+        self.skip_ws();
+        let op = if self.eat_op(b"==") {
+            CmpOp::Eq
+        } else if self.eat_op(b"!=") || self.eat_op(b"<>") {
+            CmpOp::Ne
+        } else if self.eat_op(b"<=") {
+            CmpOp::Le
+        } else if self.eat_op(b">=") {
+            CmpOp::Ge
+        } else if self.eat(b'<') {
+            CmpOp::Lt
+        } else if self.eat(b'>') {
+            CmpOp::Gt
+        } else {
+            return Err(unsupported(
+                "filter predicates other than a comparison (exists / like_regex / starts with)",
+            ));
+        };
+        let right = self.parse_filter_expr()?;
+        Ok(Pred::Compare(left, op, right))
+    }
+
+    /// A comparison operand: a `@`/`$`-rooted accessor path, or a scalar literal.
+    fn parse_filter_expr(&mut self) -> Result<FiltExpr> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'@') => {
+                self.i += 1;
+                Ok(FiltExpr::Path {
+                    from_root: false,
+                    steps: self.parse_steps()?,
+                })
+            }
+            Some(b'$') => {
+                self.i += 1;
+                if self.peek().is_some_and(|c| is_member_start(c) || c == b'"') {
+                    return Err(unsupported("path variables `$name`"));
+                }
+                Ok(FiltExpr::Path {
+                    from_root: true,
+                    steps: self.parse_steps()?,
+                })
+            }
+            Some(b'"') => Ok(FiltExpr::Lit(JsonNode::String(self.parse_quoted()?))),
+            Some(c) if c.is_ascii_digit() || c == b'-' => Ok(FiltExpr::Lit(self.parse_number()?)),
+            _ => {
+                if self.eat_keyword("true") {
+                    Ok(FiltExpr::Lit(JsonNode::Bool(true)))
+                } else if self.eat_keyword("false") {
+                    Ok(FiltExpr::Lit(JsonNode::Bool(false)))
+                } else if self.eat_keyword("null") {
+                    Ok(FiltExpr::Lit(JsonNode::Null))
+                } else {
+                    Err(malformed("expected a comparison operand"))
+                }
+            }
+        }
+    }
+
+    /// Parse a JSON number literal in a filter (integer or decimal) → a `Number` node.
+    fn parse_number(&mut self) -> Result<JsonNode> {
+        let start = self.i;
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        while self.peek().is_some_and(|c| {
+            c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E' || c == b'+' || c == b'-'
+        }) {
+            self.i += 1;
+        }
+        let text =
+            std::str::from_utf8(&self.s[start..self.i]).map_err(|_| malformed("bad number"))?;
+        // Reuse the json number parser (a bare number is valid JSON) → a `Number` node.
+        match crate::json::jsonb_in(text) {
+            Ok(n @ JsonNode::Number(_)) => Ok(n),
+            _ => Err(malformed("invalid number literal")),
+        }
+    }
+
+    /// Consume a multi-byte operator token if it appears at the cursor.
+    fn eat_op(&mut self, op: &[u8]) -> bool {
+        if self.s[self.i..].starts_with(op) {
+            self.i += op.len();
+            true
+        } else {
+            false
+        }
     }
 }
 

@@ -2818,6 +2818,7 @@ impl Parser {
             let op = match self.peek() {
                 Token::Concat => BinaryOp::Concat,
                 Token::Contains => BinaryOp::Contains,
+                Token::JsonPathExists => BinaryOp::JsonPathExists,
                 Token::ContainedBy => BinaryOp::ContainedBy,
                 Token::Overlaps => BinaryOp::Overlaps,
                 Token::StrictlyLeft => BinaryOp::StrictlyLeft,
@@ -3803,6 +3804,7 @@ fn render_token(t: &Token) -> String {
         Token::FatArrow => "=>".into(),
         Token::Concat => "||".into(),
         Token::Contains => "@>".into(),
+        Token::JsonPathExists => "@?".into(),
         Token::ContainedBy => "<@".into(),
         Token::Overlaps => "&&".into(),
         Token::StrictlyLeft => "<<".into(),

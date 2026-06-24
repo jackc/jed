@@ -87,7 +87,10 @@ export type BinaryOp =
   // jsonDeletePath is the jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1,
   // J6). (The `||` concat reuses "concat", and `-` delete reuses "sub" — both dispatched by operand
   // type.)
-  | "jsonDeletePath";
+  | "jsonDeletePath"
+  // jsonPathExists is the `@?` jsonpath-exists operator (`jsonb @? jsonpath` = `jsonb_path_exists`)
+  // — spec/design/jsonpath.md §6. Reuses the path-exists kernel.
+  | "jsonPathExists";
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
 // The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A

@@ -14,19 +14,19 @@ fn err(db: &mut Database, sql: &str) -> String {
         .to_string()
 }
 
-/// The P1b path-expression constructs — filters `?(…)`, item methods `.m()`, arithmetic, `like_regex`,
-/// and the `@`/`$name` filter-context primaries — are a deferred `0A000` at compile (P1a parses only
-/// the structural-accessor subset). PostgreSQL compiles them, so each is a documented divergence; the
-/// supported subset is oracle-clean in suites/json/jsonpath_literal.test.
+/// The still-deferred path-expression constructs — item methods `.m()`, arithmetic, top-level
+/// predicates, `$name` variables — are a `0A000` at compile (P1b added filters `?(comparison)` but
+/// not these). PostgreSQL compiles them, so each is a documented divergence; the supported subset is
+/// oracle-clean in suites/json/jsonpath_literal.test and jsonpath_query.test.
 #[test]
 fn jsonpath_p1b_constructs_are_0a000() {
     let mut db = Database::new();
     for path in [
-        "$.a ? (@ > 1)", // filter
-        "$.a.size()",    // item method
-        "$.a + 2",       // arithmetic
-        "$[$x]",         // a non-literal subscript expression
-        "$x",            // a path variable
+        "$.a.size()", // item method
+        "$.a + 2",    // arithmetic
+        "$.a == 1",   // a top-level predicate (jsonb_path_match / @@ surface)
+        "$[$x]",      // a non-literal subscript expression
+        "$x",         // a path variable
     ] {
         assert_eq!(
             err(&mut db, &format!("SELECT '{path}'::jsonpath")),
@@ -59,24 +59,32 @@ fn jsonpath_column_is_unsupported() {
     assert_eq!(err(&mut db, "CREATE TABLE t (p jsonpath)"), "0A000");
 }
 
-/// A jsonpath query function over a path that uses a P1b construct (a filter / item method) is
-/// `0A000` — the path fails to compile (P1b structural subset). PostgreSQL evaluates these, so this
-/// is a documented divergence; the structural query behavior is oracle-clean in
-/// suites/json/jsonpath_query.test.
+/// A jsonpath using a STILL-deferred construct (an item method, a top-level predicate, `like_regex`,
+/// arithmetic) is `0A000` — it fails to compile. Filters `?(comparison)` now compile (P1b), but item
+/// methods / top-level predicates (for jsonb_path_match / @@) / like_regex are a follow-on.
+/// PostgreSQL evaluates all of these, so each is a documented divergence; the supported filter +
+/// query behavior is oracle-clean in suites/json/jsonpath_query.test.
 #[test]
-fn jsonpath_query_with_filter_is_0a000() {
+fn jsonpath_deferred_constructs_are_0a000() {
     let mut db = Database::new();
-    assert_eq!(
-        err(
-            &mut db,
-            "SELECT * FROM jsonb_path_query('[1,2,3]', '$[*] ? (@ > 1)')"
-        ),
-        "0A000"
-    );
+    // An item method.
     assert_eq!(
         err(
             &mut db,
             "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')"
+        ),
+        "0A000"
+    );
+    // A top-level predicate (the jsonb_path_match / @@ surface).
+    assert_eq!(
+        err(&mut db, "SELECT jsonb_path_exists('{\"a\":1}', '$.a == 1')"),
+        "0A000"
+    );
+    // like_regex inside a filter (a non-comparison predicate).
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT jsonb_path_exists('[\"x\"]', '$[*] ? (@ like_regex \"x\")')"
         ),
         "0A000"
     );

@@ -2538,6 +2538,8 @@ class Parser {
       const k = this.peek().kind;
       if (k === "concat") op = "concat";
       else if (k === "contains") op = "contains";
+      // The `@?` jsonpath-exists operator (jsonpath.md §6) — same precedence level as `@>`.
+      else if (k === "jsonPathExists") op = "jsonPathExists";
       else if (k === "containedBy") op = "containedBy";
       else if (k === "overlaps") op = "overlaps";
       else if (k === "strictlyLeft") op = "strictlyLeft";
@@ -3380,6 +3382,8 @@ function renderToken(t: Token): string {
       return "||";
     case "contains":
       return "@>";
+    case "jsonPathExists":
+      return "@?";
     case "containedBy":
       return "<@";
     case "overlaps":

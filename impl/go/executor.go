@@ -18662,8 +18662,10 @@ func binaryOpSymbol(op BinaryOp) string {
 		return "?|"
 	case OpJsonHasAllKeys:
 		return "?&"
-	default: // OpJsonDeletePath
+	case OpJsonDeletePath:
 		return "#-"
+	default: // OpJsonPathExists
+		return "@?"
 	}
 }
 
@@ -21006,6 +21008,28 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		return resolveJSONHasKey(s, hkAny, b.Lhs, b.Rhs, ag, params)
 	case OpJsonHasAllKeys:
 		return resolveJSONHasKey(s, hkAll, b.Lhs, b.Rhs, ag, params)
+	// `jsonb @? jsonpath` = jsonb_path_exists (jsonpath.md §6). Reuses the path-exists kernel.
+	case OpJsonPathExists:
+		jsonbHint := Jsonb
+		ctx, ct, err := resolve(s, b.Lhs, &jsonbHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if ct.kind != rtJsonb && ct.kind != rtNull {
+			return nil, resolvedType{}, NewError(UndefinedFunction,
+				fmt.Sprintf("operator does not exist: %s @? jsonpath", rtName(ct)))
+		}
+		pathHint := JsonPathType
+		path, pt, err := resolve(s, b.Rhs, &pathHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if pt.kind != rtJsonPath && pt.kind != rtNull {
+			return nil, resolvedType{}, NewError(UndefinedFunction,
+				"operator does not exist: jsonb @? (a non-jsonpath)")
+		}
+		return &rExpr{kind: reJsonPathFn, jpFnKind: jpfExists, sargs: []*rExpr{ctx, path}},
+			resolvedType{kind: rtBool}, nil
 	// The jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1, J6). `||` and
 	// `-` (delete) are dispatched by operand type in resolveConcat / the arithmetic arm.
 	case OpJsonDeletePath:

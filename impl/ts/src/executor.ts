@@ -17527,6 +17527,27 @@ function resolveBinary(
       }
       return resolveJsonbDelete(scope, true, rhs, rbase.node, ag, params);
     }
+    // `jsonb @? jsonpath` = jsonb_path_exists (jsonpath.md §6). Reuses the path-exists kernel.
+    case "jsonPathExists": {
+      const ctx = resolve(scope, lhs, "jsonb", ag, params);
+      if (ctx.type.kind !== "jsonb" && ctx.type.kind !== "null") {
+        throw engineError(
+          "undefined_function",
+          `operator does not exist: ${rtName(ctx.type)} @? jsonpath`,
+        );
+      }
+      const path = resolve(scope, rhs, "jsonpath", ag, params);
+      if (path.type.kind !== "jsonpath" && path.type.kind !== "null") {
+        throw engineError(
+          "undefined_function",
+          "operator does not exist: jsonb @? (a non-jsonpath)",
+        );
+      }
+      return {
+        node: { kind: "jsonPathFn", pathFnKind: "exists", args: [ctx.node, path.node] },
+        type: { kind: "bool" },
+      };
+    }
     default: {
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
@@ -18478,6 +18499,8 @@ function binaryOpSymbol(op: BinaryOp): string {
       return "?&";
     case "jsonDeletePath":
       return "#-";
+    case "jsonPathExists":
+      return "@?";
   }
 }
 

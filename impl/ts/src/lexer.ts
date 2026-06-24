@@ -221,10 +221,14 @@ export function lex(sql: string): Token[] {
         i += 1;
       }
     } else if (c === "@") {
-      // `@>` is the array containment operator (grammar.md §40), scanned greedily as one token;
-      // a lone `@` is not part of jed's surface — 42601.
+      // `@>` array containment (grammar.md §40); `@?` the jsonpath-exists operator (jsonpath.md §6).
+      // Scanned greedily; a lone `@` is not part of jed's surface — 42601. (`@@`, the path-match
+      // operator, lands with top-level predicates.)
       if (i + 1 < n && sql[i + 1] === ">") {
         tokens.push({ kind: "contains" });
+        i += 2;
+      } else if (i + 1 < n && sql[i + 1] === "?") {
+        tokens.push({ kind: "jsonPathExists" });
         i += 2;
       } else {
         throw engineError("syntax_error", "unexpected character '@'");

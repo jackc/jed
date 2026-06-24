@@ -565,6 +565,8 @@ var SupportedCapabilities = []string{
 	// jsonpath)`; lax auto-unwraps arrays + suppresses navigation failures, strict raises (2203A
 	// missing member / 22033 subscript); a filter / item-method path is still 0A000 (jsonpath.md §5).
 	"func.jsonb_path",
+	// jsonpath filter expressions `?(predicate)` + the `@?` exists operator (P1b, jsonpath.md §4/§6).
+	"expr.jsonpath_filter",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

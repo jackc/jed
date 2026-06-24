@@ -630,6 +630,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "types.jsonpath",
     // the jsonpath query functions (P2) — jsonb_path_exists/query/query_first/query_array (jsonpath.md §5).
     "func.jsonb_path",
+    // jsonpath filter expressions `?(predicate)` + the `@?` exists operator (P1b, jsonpath.md §4/§6).
+    "expr.jsonpath_filter",
     // the IS JSON predicate (S1) — well-formedness + kind + unique-keys (json-sql-functions.md §5).
     "expr.is_json",
     // the SQL/JSON constructors (S1) — JSON() / JSON_SCALAR / JSON_SERIALIZE (json-sql-functions.md §5).

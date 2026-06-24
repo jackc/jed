@@ -9,16 +9,16 @@ import { test } from "node:test";
 import { execute } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
-// The P1b path-expression constructs — filters ?(…), item methods .m(), arithmetic, like_regex,
-// and the @/$name filter-context primaries — are a deferred 0A000 at compile (P1a parses only the
-// structural-accessor subset). PostgreSQL compiles them, so each is a documented divergence; the
-// supported subset is oracle-clean in suites/json/jsonpath_literal.test.
+// The still-deferred path-expression constructs — item methods .m(), arithmetic, top-level
+// predicates, $name variables — are a 0A000 at compile (P1b added filters ?(comparison) but not
+// these). PostgreSQL compiles them, so each is a documented divergence; the supported subset is
+// oracle-clean in suites/json/jsonpath_literal.test and jsonpath_query.test.
 test("jsonpath P1b constructs are 0A000", () => {
   const db = dbWith([]);
   for (const path of [
-    "$.a ? (@ > 1)", // filter
     "$.a.size()", // item method
     "$.a + 2", // arithmetic
+    "$.a == 1", // a top-level predicate (jsonb_path_match / @@ surface)
     "$[$x]", // a non-literal subscript expression
     "$x", // a path variable
   ]) {
@@ -30,18 +30,26 @@ test("jsonpath P1b constructs are 0A000", () => {
   }
 });
 
-// A jsonpath query function (P2) over a path that uses a P1b construct (a filter / item method) is
-// 0A000 — the path fails to compile (P1b structural subset). PostgreSQL evaluates these, so this is a
-// documented divergence; the structural query behavior is oracle-clean in
-// suites/json/jsonpath_query.test.
-test("jsonpath query function with a P1b path is 0A000", () => {
+// A jsonpath using a STILL-deferred construct (an item method, a top-level predicate, like_regex,
+// arithmetic) is 0A000 — it fails to compile. Filters ?(comparison) now compile (P1b), but item
+// methods / top-level predicates (for jsonb_path_match / @@) / like_regex are a follow-on.
+// PostgreSQL evaluates all of these, so each is a documented divergence; the supported filter +
+// query behavior is oracle-clean in suites/json/jsonpath_query.test.
+test("jsonpath deferred constructs are 0A000", () => {
   const db = dbWith([]);
-  assert.equal(
-    errCode(() => execute(db, "SELECT * FROM jsonb_path_query('[1,2,3]', '$[*] ? (@ > 1)')")),
-    "0A000",
-  );
+  // An item method.
   assert.equal(
     errCode(() => execute(db, "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')")),
+    "0A000",
+  );
+  // A top-level predicate (the jsonb_path_match / @@ surface).
+  assert.equal(
+    errCode(() => execute(db, `SELECT jsonb_path_exists('{"a":1}', '$.a == 1')`)),
+    "0A000",
+  );
+  // like_regex inside a filter (a non-comparison predicate).
+  assert.equal(
+    errCode(() => execute(db, `SELECT jsonb_path_exists('["x"]', '$[*] ? (@ like_regex "x")')`)),
     "0A000",
   );
 });

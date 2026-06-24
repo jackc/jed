@@ -35,6 +35,8 @@ const (
 	jpSubscripts
 	// jpWildcardElement is `[*]` — the wildcard element accessor.
 	jpWildcardElement
+	// jpFilter is `?(predicate)` — keep only items for which the predicate is TRUE (§4).
+	jpFilter
 )
 
 // jpStep is one accessor step.
@@ -44,7 +46,68 @@ type jpStep struct {
 	key string
 	// subs holds the subscript list when kind == jpSubscripts.
 	subs []jpSubscript
+	// pred holds the filter predicate when kind == jpFilter.
+	pred *jpPred
 }
+
+// jpPredKind tags a filter predicate (jsonpath.md §4, the P1b comparison subset). 3-valued —
+// Not/And/Or follow SQL/JSON's Kleene logic, but a filter keeps an item only when the predicate is
+// definitely TRUE.
+type jpPredKind int
+
+const (
+	// jpPredOr is `a || b`.
+	jpPredOr jpPredKind = iota
+	// jpPredAnd is `a && b`.
+	jpPredAnd
+	// jpPredNot is `!(a)`.
+	jpPredNot
+	// jpPredCompare is `lhs cmp rhs` — an existential comparison (true if SOME pair compares true).
+	jpPredCompare
+)
+
+// jpPred is a filter predicate. kind selects which fields are meaningful (Go has no sum types).
+type jpPred struct {
+	kind jpPredKind
+	// left/right hold operand predicates for Or/And; left holds the inner predicate for Not.
+	left, right *jpPred
+	// cmpLeft/cmpRight/cmpOp hold the comparison operands and operator when kind == jpPredCompare.
+	cmpLeft, cmpRight jpFiltExpr
+	cmpOp             jpCmpOp
+}
+
+// jpFiltExprKind tags a comparison operand inside a filter: a `@`/`$`-rooted accessor path, or a
+// scalar literal.
+type jpFiltExprKind int
+
+const (
+	// jpFiltPath is a `@`-rooted (fromRoot == false) or `$`-rooted (true) accessor path.
+	jpFiltPath jpFiltExprKind = iota
+	// jpFiltLit is a scalar literal — a JSON number / string / boolean / null.
+	jpFiltLit
+)
+
+// jpFiltExpr is a comparison operand inside a filter.
+type jpFiltExpr struct {
+	kind jpFiltExprKind
+	// fromRoot/steps hold the accessor path when kind == jpFiltPath.
+	fromRoot bool
+	steps    []jpStep
+	// lit holds the literal node when kind == jpFiltLit.
+	lit JsonNode
+}
+
+// jpCmpOp is a jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
+type jpCmpOp int
+
+const (
+	jpCmpEq jpCmpOp = iota
+	jpCmpNe
+	jpCmpLt
+	jpCmpLe
+	jpCmpGt
+	jpCmpGe
+)
 
 // jpSubscript is one subscript: a single index or an `i to j` slice. slice == false ⇒ a single
 // index (only a is meaningful); slice == true ⇒ the `a to b` form.
@@ -95,56 +158,21 @@ func Compile(src string) (JsonPath, error) {
 	if c, ok := p.peek(); ok && (isMemberStart(c) || c == '"') {
 		return JsonPath{}, jpUnsupported("path variables `$name`")
 	}
-	var steps []jpStep
-	for {
-		p.skipWs()
-		c, ok := p.peek()
-		if !ok {
-			break
-		}
+	steps, err := p.parseSteps()
+	if err != nil {
+		return JsonPath{}, err
+	}
+	p.skipWs()
+	// After the accessor path, anything left is a TOP-LEVEL predicate operator (`$.a == 1`, for
+	// jsonb_path_match / @@) or arithmetic — both a P1b follow-on this slice.
+	if c, ok := p.peek(); ok {
 		switch c {
-		case '.':
-			p.i++
-			if p.eat('*') {
-				steps = append(steps, jpStep{kind: jpWildcardMember})
-			} else if nc, ok := p.peek(); ok && (nc == '"' || isMemberStart(nc)) {
-				m, err := p.parseMember()
-				if err != nil {
-					return JsonPath{}, err
-				}
-				// `.identifier(` is an item-method call (a P1b follow-on); a bare identifier
-				// is a member accessor.
-				if pc, ok := p.peek(); ok && pc == '(' {
-					return JsonPath{}, jpUnsupported("item methods")
-				}
-				steps = append(steps, jpStep{kind: jpMember, key: m})
-			} else {
-				// `$.` with nothing (or a non-member) after it is malformed.
-				return JsonPath{}, jpMalformed("expected a member name after `.`")
-			}
-		case '[':
-			p.i++
-			p.skipWs()
-			if p.eat('*') {
-				p.skipWs()
-				if !p.eat(']') {
-					return JsonPath{}, jpMalformed("expected `]` after `[*`")
-				}
-				steps = append(steps, jpStep{kind: jpWildcardElement})
-			} else {
-				subs, err := p.parseSubscripts()
-				if err != nil {
-					return JsonPath{}, err
-				}
-				steps = append(steps, jpStep{kind: jpSubscripts, subs: subs})
-			}
-		case '?':
-			return JsonPath{}, jpUnsupported("filter expressions `?(…)`")
-		case '+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|':
-			// Arithmetic / comparison operators on a path expression are a P1b follow-on.
-			return JsonPath{}, jpUnsupported("path arithmetic / predicate operators")
+		case '=', '<', '>', '!', '&', '|':
+			return JsonPath{}, jpUnsupported("top-level predicate expressions")
+		case '+', '-', '*', '/', '%':
+			return JsonPath{}, jpUnsupported("path arithmetic")
 		default:
-			return JsonPath{}, jpMalformed("unexpected character in path")
+			return JsonPath{}, jpMalformed("unexpected trailing input in path")
 		}
 	}
 	// `$` alone is valid (the root document) — steps is empty in that case.
@@ -159,11 +187,18 @@ func (jp JsonPath) Render() string {
 		out.WriteString("strict ")
 	}
 	out.WriteByte('$')
-	for _, step := range jp.Steps {
+	writeSteps(jp.Steps, &out)
+	return out.String()
+}
+
+// writeSteps renders an accessor-step sequence (shared by the path render and a filter's `@`/`$`
+// operand).
+func writeSteps(steps []jpStep, out *strings.Builder) {
+	for _, step := range steps {
 		switch step.kind {
 		case jpMember:
 			out.WriteByte('.')
-			writeQuoted(step.key, &out)
+			writeQuoted(step.key, out)
 		case jpWildcardMember:
 			out.WriteString(".*")
 		case jpWildcardElement:
@@ -175,17 +210,70 @@ func (jp JsonPath) Render() string {
 					out.WriteByte(',')
 				}
 				if s.slice {
-					writeIndex(s.a, &out)
+					writeIndex(s.a, out)
 					out.WriteString(" to ")
-					writeIndex(s.b, &out)
+					writeIndex(s.b, out)
 				} else {
-					writeIndex(s.a, &out)
+					writeIndex(s.a, out)
 				}
 			}
 			out.WriteByte(']')
+		case jpFilter:
+			out.WriteString("?(")
+			writePred(step.pred, out)
+			out.WriteByte(')')
 		}
 	}
-	return out.String()
+}
+
+// writePred renders a filter predicate (PG's `?(…)` form: `&&`/`||` spaced, `!(…)`, `a op b` spaced).
+func writePred(pred *jpPred, out *strings.Builder) {
+	switch pred.kind {
+	case jpPredOr:
+		writePred(pred.left, out)
+		out.WriteString(" || ")
+		writePred(pred.right, out)
+	case jpPredAnd:
+		writePred(pred.left, out)
+		out.WriteString(" && ")
+		writePred(pred.right, out)
+	case jpPredNot:
+		out.WriteString("!(")
+		writePred(pred.left, out)
+		out.WriteByte(')')
+	default: // jpPredCompare
+		writeFiltExpr(&pred.cmpLeft, out)
+		out.WriteByte(' ')
+		switch pred.cmpOp {
+		case jpCmpEq:
+			out.WriteString("==")
+		case jpCmpNe:
+			out.WriteString("!=")
+		case jpCmpLt:
+			out.WriteString("<")
+		case jpCmpLe:
+			out.WriteString("<=")
+		case jpCmpGt:
+			out.WriteString(">")
+		case jpCmpGe:
+			out.WriteString(">=")
+		}
+		out.WriteByte(' ')
+		writeFiltExpr(&pred.cmpRight, out)
+	}
+}
+
+func writeFiltExpr(e *jpFiltExpr, out *strings.Builder) {
+	if e.kind == jpFiltPath {
+		if e.fromRoot {
+			out.WriteByte('$')
+		} else {
+			out.WriteByte('@')
+		}
+		writeSteps(e.steps, out)
+		return
+	}
+	out.WriteString(jsonCompactOut(&e.lit))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -198,12 +286,18 @@ func (jp JsonPath) Render() string {
 // The P1b structural subset (no filters / item methods / arithmetic — those are still 0A000 at
 // compile).
 func (jp JsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
-	seq := []JsonNode{ctx}
-	for i := range jp.Steps {
+	return evalSteps(jp.Steps, &ctx, &ctx, jp.Strict)
+}
+
+// evalSteps evaluates an accessor-step sequence over a seed item, with root as the document `$` (for
+// a filter's `$`-rooted operand).
+func evalSteps(steps []jpStep, seed, root *JsonNode, strict bool) ([]JsonNode, error) {
+	seq := []JsonNode{*seed}
+	for i := range steps {
 		var next []JsonNode
 		for j := range seq {
 			var err error
-			next, err = applyStep(&jp.Steps[i], &seq[j], jp.Strict, next)
+			next, err = applyStep(&steps[i], &seq[j], strict, root, next)
 			if err != nil {
 				return nil, err
 			}
@@ -213,7 +307,7 @@ func (jp JsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
 	return seq, nil
 }
 
-func applyStep(step *jpStep, item *JsonNode, strict bool, out []JsonNode) ([]JsonNode, error) {
+func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []JsonNode) ([]JsonNode, error) {
 	switch step.kind {
 	case jpMember:
 		// lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
@@ -259,7 +353,7 @@ func applyStep(step *jpStep, item *JsonNode, strict bool, out []JsonNode) ([]Jso
 			}
 		}
 		return out, nil
-	default: // jpWildcardElement
+	case jpWildcardElement:
 		// [*] on a non-array: lax → the singleton item; strict raises.
 		if item.Kind == JArray {
 			return append(out, item.Arr...), nil
@@ -269,7 +363,164 @@ func applyStep(step *jpStep, item *JsonNode, strict bool, out []JsonNode) ([]Jso
 		}
 		return nil, NewError(InvalidSqlJsonSubscript,
 			"jsonpath wildcard array accessor can only be applied to an array")
+	default: // jpFilter
+		// `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
+		// predicate's `@` is the item, `$` is the document root.
+		ok, err := evalPred(step.pred, item, root, strict)
+		if err != nil {
+			return nil, err
+		}
+		if ok != nil && *ok {
+			return append(out, *item), nil
+		}
+		return out, nil
 	}
+}
+
+// evalPred evaluates a filter predicate to a Kleene truth value (a *bool: &true / &false / nil =
+// unknown — mirroring the Rust Option<bool>).
+func evalPred(pred *jpPred, current, root *JsonNode, strict bool) (*bool, error) {
+	switch pred.kind {
+	case jpPredOr:
+		x, err := evalPred(pred.left, current, root, strict)
+		if err != nil {
+			return nil, err
+		}
+		y, err := evalPred(pred.right, current, root, strict)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case isTrue(x) || isTrue(y):
+			return boolPtr(true), nil
+		case isFalse(x) && isFalse(y):
+			return boolPtr(false), nil
+		default:
+			return nil, nil
+		}
+	case jpPredAnd:
+		x, err := evalPred(pred.left, current, root, strict)
+		if err != nil {
+			return nil, err
+		}
+		y, err := evalPred(pred.right, current, root, strict)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case isFalse(x) || isFalse(y):
+			return boolPtr(false), nil
+		case isTrue(x) && isTrue(y):
+			return boolPtr(true), nil
+		default:
+			return nil, nil
+		}
+	case jpPredNot:
+		v, err := evalPred(pred.left, current, root, strict)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			return nil, nil
+		}
+		return boolPtr(!*v), nil
+	default: // jpPredCompare
+		return evalCompare(&pred.cmpLeft, pred.cmpOp, &pred.cmpRight, current, root, strict)
+	}
+}
+
+func isTrue(b *bool) bool  { return b != nil && *b }
+func isFalse(b *bool) bool { return b != nil && !*b }
+
+func boolPtr(b bool) *bool { return &b }
+
+// evalCompare is the existential comparison (§4): true if SOME pair (a in lhs-seq, b in rhs-seq)
+// compares true. An empty operand or all-incomparable pairs → nil (unknown); else &false.
+func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNode, strict bool) (*bool, error) {
+	ls := evalFiltExpr(l, current, root, strict)
+	rs := evalFiltExpr(r, current, root, strict)
+	if len(ls) == 0 || len(rs) == 0 {
+		return nil, nil
+	}
+	anyUnknown := false
+	for i := range ls {
+		for j := range rs {
+			c := compareNodes(&ls[i], op, &rs[j])
+			switch {
+			case c == nil:
+				anyUnknown = true
+			case *c:
+				return boolPtr(true), nil
+			}
+		}
+	}
+	if anyUnknown {
+		return nil, nil
+	}
+	return boolPtr(false), nil
+}
+
+// evalFiltExpr evaluates a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton
+// literal.
+func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool) []JsonNode {
+	if e.kind == jpFiltLit {
+		return []JsonNode{e.lit}
+	}
+	seed := current
+	if e.fromRoot {
+		seed = root
+	}
+	// A navigation error inside a filter operand → no items (the comparison is just unknown),
+	// never propagated (§4.2: filter operands never raise, even in strict).
+	seq, err := evalSteps(e.steps, seed, root, strict)
+	if err != nil {
+		return nil
+	}
+	return seq
+}
+
+// compareNodes compares two jsonb scalars under a jsonpath operator (a *bool: &v / nil = unknown).
+// Only same-type number/string compare by order; booleans/nulls compare only by `==`/`!=`; any other
+// (mixed-type) pair is nil (unknown).
+func compareNodes(a *JsonNode, op jpCmpOp, b *JsonNode) *bool {
+	var ord int
+	switch {
+	case a.Kind == JNumber && b.Kind == JNumber:
+		ord = a.Num.CmpValue(b.Num)
+	case a.Kind == JString && b.Kind == JString:
+		ord = strings.Compare(a.S, b.S)
+	case a.Kind == JBool && b.Kind == JBool:
+		ord = cmpInt(boolRank(a.B), boolRank(b.B))
+	case a.Kind == JNull && b.Kind == JNull:
+		ord = 0
+	default:
+		return nil // mixed types are not comparable
+	}
+	// Booleans / nulls support only equality; ordering on them is unknown.
+	orderOK := a.Kind == JNumber || a.Kind == JString
+	switch op {
+	case jpCmpEq:
+		return boolPtr(ord == 0)
+	case jpCmpNe:
+		return boolPtr(ord != 0)
+	case jpCmpLt:
+		if orderOK {
+			return boolPtr(ord < 0)
+		}
+	case jpCmpLe:
+		if orderOK {
+			return boolPtr(ord <= 0)
+		}
+	case jpCmpGt:
+		if orderOK {
+			return boolPtr(ord > 0)
+		}
+	case jpCmpGe:
+		if orderOK {
+			return boolPtr(ord >= 0)
+		}
+	}
+	return nil // an order comparison on bool/null is unknown
 }
 
 func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode) ([]JsonNode, error) {
@@ -563,6 +814,265 @@ func (p *jpParser) parseSubscripts() ([]jpSubscript, error) {
 			return nil, jpMalformed("expected `,` or `]` in subscript")
 		}
 	}
+}
+
+// parseSteps parses a sequence of accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, `?(filter)`),
+// stopping at the first non-accessor byte (EOF, a comparison/logical operator, `)`, etc).
+func (p *jpParser) parseSteps() ([]jpStep, error) {
+	var steps []jpStep
+	for {
+		p.skipWs()
+		c, ok := p.peek()
+		if !ok {
+			break
+		}
+		switch c {
+		case '.':
+			p.i++
+			if p.eat('*') {
+				steps = append(steps, jpStep{kind: jpWildcardMember})
+			} else if nc, ok := p.peek(); ok && (nc == '"' || isMemberStart(nc)) {
+				m, err := p.parseMember()
+				if err != nil {
+					return nil, err
+				}
+				// `.identifier(` is an item-method call (a P1b follow-on); a bare identifier
+				// is a member accessor.
+				if pc, ok := p.peek(); ok && pc == '(' {
+					return nil, jpUnsupported("item methods")
+				}
+				steps = append(steps, jpStep{kind: jpMember, key: m})
+			} else {
+				return nil, jpMalformed("expected a member name after `.`")
+			}
+		case '[':
+			p.i++
+			p.skipWs()
+			if p.eat('*') {
+				p.skipWs()
+				if !p.eat(']') {
+					return nil, jpMalformed("expected `]` after `[*`")
+				}
+				steps = append(steps, jpStep{kind: jpWildcardElement})
+			} else {
+				subs, err := p.parseSubscripts()
+				if err != nil {
+					return nil, err
+				}
+				steps = append(steps, jpStep{kind: jpSubscripts, subs: subs})
+			}
+		case '?':
+			p.i++
+			p.skipWs()
+			if !p.eat('(') {
+				return nil, jpMalformed("expected `(` after `?`")
+			}
+			pred, err := p.parsePred()
+			if err != nil {
+				return nil, err
+			}
+			p.skipWs()
+			if !p.eat(')') {
+				return nil, jpMalformed("expected `)` after a filter predicate")
+			}
+			steps = append(steps, jpStep{kind: jpFilter, pred: pred})
+		default:
+			return steps, nil
+		}
+	}
+	return steps, nil
+}
+
+// parsePred parses a filter predicate (P1b comparison subset): `||` over `&&` over `!` / `(…)` /
+// comparison.
+func (p *jpParser) parsePred() (*jpPred, error) {
+	left, err := p.parseAnd()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		p.skipWs()
+		if p.eatOp("||") {
+			right, err := p.parseAnd()
+			if err != nil {
+				return nil, err
+			}
+			left = &jpPred{kind: jpPredOr, left: left, right: right}
+		} else {
+			return left, nil
+		}
+	}
+}
+
+func (p *jpParser) parseAnd() (*jpPred, error) {
+	left, err := p.parseNot()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		p.skipWs()
+		if p.eatOp("&&") {
+			right, err := p.parseNot()
+			if err != nil {
+				return nil, err
+			}
+			left = &jpPred{kind: jpPredAnd, left: left, right: right}
+		} else {
+			return left, nil
+		}
+	}
+}
+
+func (p *jpParser) parseNot() (*jpPred, error) {
+	p.skipWs()
+	if p.eat('!') {
+		p.skipWs()
+		if !p.eat('(') {
+			return nil, jpMalformed("expected `(` after `!`")
+		}
+		inner, err := p.parsePred()
+		if err != nil {
+			return nil, err
+		}
+		p.skipWs()
+		if !p.eat(')') {
+			return nil, jpMalformed("expected `)` after `!(`")
+		}
+		return &jpPred{kind: jpPredNot, left: inner}, nil
+	}
+	if c, ok := p.peek(); ok && c == '(' {
+		p.i++
+		inner, err := p.parsePred()
+		if err != nil {
+			return nil, err
+		}
+		p.skipWs()
+		if !p.eat(')') {
+			return nil, jpMalformed("expected `)` in predicate")
+		}
+		return inner, nil
+	}
+	return p.parseComparison()
+}
+
+// parseComparison parses `filter_expr cmp filter_expr` — the only leaf predicate this slice (`exists`
+// / `like_regex` / `starts with` / `is unknown` are a follow-on).
+func (p *jpParser) parseComparison() (*jpPred, error) {
+	left, err := p.parseFilterExpr()
+	if err != nil {
+		return nil, err
+	}
+	p.skipWs()
+	var op jpCmpOp
+	switch {
+	case p.eatOp("=="):
+		op = jpCmpEq
+	case p.eatOp("!=") || p.eatOp("<>"):
+		op = jpCmpNe
+	case p.eatOp("<="):
+		op = jpCmpLe
+	case p.eatOp(">="):
+		op = jpCmpGe
+	case p.eat('<'):
+		op = jpCmpLt
+	case p.eat('>'):
+		op = jpCmpGt
+	default:
+		return nil, jpUnsupported(
+			"filter predicates other than a comparison (exists / like_regex / starts with)",
+		)
+	}
+	right, err := p.parseFilterExpr()
+	if err != nil {
+		return nil, err
+	}
+	return &jpPred{kind: jpPredCompare, cmpLeft: left, cmpOp: op, cmpRight: right}, nil
+}
+
+// parseFilterExpr parses a comparison operand: a `@`/`$`-rooted accessor path, or a scalar literal.
+func (p *jpParser) parseFilterExpr() (jpFiltExpr, error) {
+	p.skipWs()
+	c, ok := p.peek()
+	if !ok {
+		return jpFiltExpr{}, jpMalformed("expected a comparison operand")
+	}
+	switch {
+	case c == '@':
+		p.i++
+		steps, err := p.parseSteps()
+		if err != nil {
+			return jpFiltExpr{}, err
+		}
+		return jpFiltExpr{kind: jpFiltPath, fromRoot: false, steps: steps}, nil
+	case c == '$':
+		p.i++
+		if nc, ok := p.peek(); ok && (isMemberStart(nc) || nc == '"') {
+			return jpFiltExpr{}, jpUnsupported("path variables `$name`")
+		}
+		steps, err := p.parseSteps()
+		if err != nil {
+			return jpFiltExpr{}, err
+		}
+		return jpFiltExpr{kind: jpFiltPath, fromRoot: true, steps: steps}, nil
+	case c == '"':
+		s, err := p.parseQuoted()
+		if err != nil {
+			return jpFiltExpr{}, err
+		}
+		return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JString, S: s}}, nil
+	case (c >= '0' && c <= '9') || c == '-':
+		n, err := p.parseNumber()
+		if err != nil {
+			return jpFiltExpr{}, err
+		}
+		return jpFiltExpr{kind: jpFiltLit, lit: n}, nil
+	default:
+		switch {
+		case p.eatKeyword("true"):
+			return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JBool, B: true}}, nil
+		case p.eatKeyword("false"):
+			return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JBool, B: false}}, nil
+		case p.eatKeyword("null"):
+			return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JNull}}, nil
+		default:
+			return jpFiltExpr{}, jpMalformed("expected a comparison operand")
+		}
+	}
+}
+
+// parseNumber parses a JSON number literal in a filter (integer or decimal) → a Number node. Reuses
+// the json number parser (a bare number is valid JSON).
+func (p *jpParser) parseNumber() (JsonNode, error) {
+	start := p.i
+	if c, ok := p.peek(); ok && c == '-' {
+		p.i++
+	}
+	for {
+		c, ok := p.peek()
+		if !ok {
+			break
+		}
+		if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
+			p.i++
+		} else {
+			break
+		}
+	}
+	text := string(p.s[start:p.i])
+	n, err := jsonbIn(text)
+	if err != nil || n.Kind != JNumber {
+		return JsonNode{}, jpMalformed("invalid number literal")
+	}
+	return n, nil
+}
+
+// eatOp consumes a multi-byte operator token if it appears at the cursor.
+func (p *jpParser) eatOp(op string) bool {
+	if p.i+len(op) <= len(p.s) && string(p.s[p.i:p.i+len(op)]) == op {
+		p.i += len(op)
+		return true
+	}
+	return false
 }
 
 func (p *jpParser) parseIndex() (jpIndex, error) {

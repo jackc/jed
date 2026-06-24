@@ -307,6 +307,16 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
   after `JSON_TABLE`** — a whole sub-language and evaluator. Capability `types.jsonpath`.
 - **P2** — the path query functions + `@?`/`@@` + the `jsonb_path_query` SRF + `vars`/
   `silent` (§5–§6). Depends on P1. Capability `func.jsonb_path`.
+  - **P1b/P2-filters** ✅ — filter expressions `?(predicate)` (§4) + the `@?` exists operator
+    (§6) have landed. The predicate subset is the comparison core: `==` `!=`/`<>` `<` `<=`
+    `>` `>=` over `@`/`$`-rooted accessor paths and scalar literals, combined with `&&` /
+    `||` / `!(…)` and parens, with existential comparison + 3-valued (Kleene) connectives (an
+    item is kept only on a definite TRUE; filter operands never raise). `jsonb @? jsonpath`
+    binds at the `@>` precedence and routes to `jsonb_path_exists`. Capability
+    `expr.jsonpath_filter`. **Still deferred (`0A000`):** item methods, arithmetic, top-level
+    predicates (the `jsonb_path_match` / `@@` surface), `like_regex` / `starts with` /
+    `exists` / `is unknown`, and `$name` variables — the §4.3 Pike-VM `like_regex` and the
+    `@@` / `jsonb_path_match` top-level-predicate body remain the open P2 follow-ons.
 - **P3** — the `_tz` variants (§5.1): route `.datetime()` through the clock/tz seam,
   `stable` volatility. Small follow-on to P2.
 

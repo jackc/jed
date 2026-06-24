@@ -3,7 +3,7 @@
 # The path evaluates to an ordered jsonb sequence; lax (default) auto-unwraps arrays + suppresses
 # navigation failures, strict raises (2203A missing member, 22033 subscript). STRICT in the args.
 # Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
-# requires: query.select, query.aggregates, types.jsonpath, func.jsonb_path
+# requires: query.select, query.aggregates, types.jsonpath, func.jsonb_path, expr.jsonpath_filter
 
 # jsonb_path_exists: the sequence is non-empty (a missing member → false in lax).
 query BB nosort
@@ -66,3 +66,39 @@ query I nosort
 SELECT count(*)::i32 FROM jsonb_path_query(NULL::jsonb, '$.a[*]')
 ----
 0
+
+# A filter ?(comparison) keeps only the items for which the predicate is true.
+query T nosort
+SELECT * FROM jsonb_path_query('[1, 2, 3, 4]', '$[*] ? (@ > 2)')
+----
+3
+4
+
+# A filter over object members, with a nested member comparison.
+query T nosort
+SELECT * FROM jsonb_path_query('[{"a": 1}, {"a": 5}]', '$[*] ? (@.a >= 5)')
+----
+{"a": 5}
+
+# Boolean connectives && / || / ! and a string comparison.
+query TTT nosort
+SELECT jsonb_path_query_array('[1,2,3]', '$[*] ? (@ > 1 && @ < 3)'), jsonb_path_query_array('[1,2,3]', '$[*] ? (@ == 1 || @ == 3)'), jsonb_path_query_array('["x","y"]', '$[*] ? (@ == "y")')
+----
+[2]
+[1, 3]
+["y"]
+
+# The @? operator is jsonb_path_exists.
+query BBB nosort
+SELECT '{"a": 1}'::jsonb @? '$.a', '{"a": 1}'::jsonb @? '$.b', '[1,2,3]'::jsonb @? '$[*] ? (@ > 2)'
+----
+true
+false
+true
+
+# A filter renders canonically (lax omitted; the comparison spaced).
+query TT nosort
+SELECT '$[*] ? (@ > 2)'::jsonpath, '$ ? (@.a == 1 || @.b == 2)'::jsonpath
+----
+$[*]?(@ > 2)
+$?(@."a" == 1 || @."b" == 2)

@@ -15,7 +15,7 @@
 // member-key JSON-string escaping all match the Rust version.
 
 import { engineError, type EngineError } from "./errors.ts";
-import type { JsonNode } from "./json.ts";
+import { jsonbIn, jsonCompactOut, jsonNodeCmp, type JsonNode } from "./json.ts";
 
 // A subscript index: a non-negative integer literal or the `last` sentinel.
 export type Index = { kind: "number"; value: number } | { kind: "last" };
@@ -28,7 +28,28 @@ export type Step =
   | { kind: "member"; key: string } // `.key` — a member accessor (the key, unescaped).
   | { kind: "wildcardMember" } // `.*` — the wildcard member accessor.
   | { kind: "subscripts"; subs: Subscript[] } // `[s, …]` — one or more subscripts.
-  | { kind: "wildcardElement" }; // `[*]` — the wildcard element accessor.
+  | { kind: "wildcardElement" } // `[*]` — the wildcard element accessor.
+  | { kind: "filter"; pred: Pred }; // `?(predicate)` — a filter (§4).
+
+// A filter predicate (jsonpath.md §4, the P1b comparison subset). 3-valued — `not`/`and`/`or`
+// follow SQL/JSON's Kleene logic, but a filter keeps an item only when the predicate is definitely
+// TRUE.
+export type Pred =
+  | { kind: "or"; a: Pred; b: Pred }
+  | { kind: "and"; a: Pred; b: Pred }
+  | { kind: "not"; p: Pred }
+  // `lhs cmp rhs` — an existential comparison (true if SOME pair of items compares true).
+  | { kind: "compare"; lhs: FiltExpr; op: CmpOp; rhs: FiltExpr };
+
+// A comparison operand inside a filter: a `@`/`$`-rooted accessor path, or a scalar literal.
+export type FiltExpr =
+  // `@`-rooted (`fromRoot = false`) or `$`-rooted (`true`) accessor path.
+  | { kind: "path"; fromRoot: boolean; steps: Step[] }
+  // A scalar literal — a JSON number / string / boolean / null.
+  | { kind: "lit"; node: JsonNode };
+
+// A jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
+export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
 // A compiled jsonpath (the structural-accessor subset, P1a).
 export type JsonPath = { strict: boolean; steps: Step[] };
@@ -138,11 +159,44 @@ class Parser {
     if (after$ !== undefined && (isMemberStart(after$) || after$ === '"')) {
       throw unsupported("path variables `$name`");
     }
+    const steps = this.parseSteps();
+    this.skipWs();
+    // After the accessor path, anything left is a TOP-LEVEL predicate operator (`$.a == 1`, for
+    // jsonb_path_match / @@) or arithmetic — both a P1b follow-on this slice.
+    const trailing = this.peek();
+    if (trailing !== undefined) {
+      if (
+        trailing === "=" ||
+        trailing === "<" ||
+        trailing === ">" ||
+        trailing === "!" ||
+        trailing === "&" ||
+        trailing === "|"
+      ) {
+        throw unsupported("top-level predicate expressions");
+      }
+      if (
+        trailing === "+" ||
+        trailing === "-" ||
+        trailing === "*" ||
+        trailing === "/" ||
+        trailing === "%"
+      ) {
+        throw unsupported("path arithmetic");
+      }
+      throw malformed("unexpected trailing input in path");
+    }
+    // (an empty `steps` is `$` alone — the valid root document.)
+    return { strict, steps };
+  }
+
+  // Parse a sequence of accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, `?(filter)`), stopping
+  // at the first non-accessor character (EOF, a comparison/logical operator, `)`, etc).
+  private parseSteps(): Step[] {
     const steps: Step[] = [];
     for (;;) {
       this.skipWs();
       const c = this.peek();
-      if (c === undefined) break;
       if (c === ".") {
         this.i += 1;
         if (this.eat("*")) {
@@ -175,27 +229,176 @@ class Parser {
           steps.push({ kind: "subscripts", subs: this.parseSubscripts() });
         }
       } else if (c === "?") {
-        throw unsupported("filter expressions `?(…)`");
-      } else if (
-        // Arithmetic / comparison operators on a path expression are a P1b follow-on.
-        c === "+" ||
-        c === "-" ||
-        c === "*" ||
-        c === "/" ||
-        c === "%" ||
-        c === "=" ||
-        c === "<" ||
-        c === ">" ||
-        c === "!" ||
-        c === "&" ||
-        c === "|"
-      ) {
-        throw unsupported("path arithmetic / predicate operators");
+        this.i += 1;
+        this.skipWs();
+        if (!this.eat("(")) {
+          throw malformed("expected `(` after `?`");
+        }
+        const pred = this.parsePred();
+        this.skipWs();
+        if (!this.eat(")")) {
+          throw malformed("expected `)` after a filter predicate");
+        }
+        steps.push({ kind: "filter", pred });
       } else {
-        throw malformed("unexpected character in path");
+        break;
       }
     }
-    return { strict, steps };
+    return steps;
+  }
+
+  // Parse a filter predicate (P1b comparison subset): `||` over `&&` over `!` / `(…)` / comparison.
+  private parsePred(): Pred {
+    let left = this.parseAnd();
+    for (;;) {
+      this.skipWs();
+      if (this.eatOp("||")) {
+        const right = this.parseAnd();
+        left = { kind: "or", a: left, b: right };
+      } else {
+        return left;
+      }
+    }
+  }
+
+  private parseAnd(): Pred {
+    let left = this.parseNot();
+    for (;;) {
+      this.skipWs();
+      if (this.eatOp("&&")) {
+        const right = this.parseNot();
+        left = { kind: "and", a: left, b: right };
+      } else {
+        return left;
+      }
+    }
+  }
+
+  private parseNot(): Pred {
+    this.skipWs();
+    if (this.eat("!")) {
+      this.skipWs();
+      if (!this.eat("(")) {
+        throw malformed("expected `(` after `!`");
+      }
+      const inner = this.parsePred();
+      this.skipWs();
+      if (!this.eat(")")) {
+        throw malformed("expected `)` after `!(`");
+      }
+      return { kind: "not", p: inner };
+    }
+    if (this.peek() === "(") {
+      this.i += 1;
+      const inner = this.parsePred();
+      this.skipWs();
+      if (!this.eat(")")) {
+        throw malformed("expected `)` in predicate");
+      }
+      return inner;
+    }
+    return this.parseComparison();
+  }
+
+  // `filter_expr cmp filter_expr` — the only leaf predicate this slice (`exists` / `like_regex` /
+  // `starts with` / `is unknown` are a follow-on).
+  private parseComparison(): Pred {
+    const lhs = this.parseFilterExpr();
+    this.skipWs();
+    let op: CmpOp;
+    if (this.eatOp("==")) {
+      op = "eq";
+    } else if (this.eatOp("!=") || this.eatOp("<>")) {
+      op = "ne";
+    } else if (this.eatOp("<=")) {
+      op = "le";
+    } else if (this.eatOp(">=")) {
+      op = "ge";
+    } else if (this.eat("<")) {
+      op = "lt";
+    } else if (this.eat(">")) {
+      op = "gt";
+    } else {
+      throw unsupported(
+        "filter predicates other than a comparison (exists / like_regex / starts with)",
+      );
+    }
+    const rhs = this.parseFilterExpr();
+    return { kind: "compare", lhs, op, rhs };
+  }
+
+  // A comparison operand: a `@`/`$`-rooted accessor path, or a scalar literal.
+  private parseFilterExpr(): FiltExpr {
+    this.skipWs();
+    const c = this.peek();
+    if (c === "@") {
+      this.i += 1;
+      return { kind: "path", fromRoot: false, steps: this.parseSteps() };
+    }
+    if (c === "$") {
+      this.i += 1;
+      const next = this.peek();
+      if (next !== undefined && (isMemberStart(next) || next === '"')) {
+        throw unsupported("path variables `$name`");
+      }
+      return { kind: "path", fromRoot: true, steps: this.parseSteps() };
+    }
+    if (c === '"') {
+      return { kind: "lit", node: { kind: "string", value: this.parseQuoted() } };
+    }
+    if (c !== undefined && (isAsciiDigit(c) || c === "-")) {
+      return { kind: "lit", node: this.parseNumber() };
+    }
+    if (this.eatKeyword("true")) {
+      return { kind: "lit", node: { kind: "bool", value: true } };
+    }
+    if (this.eatKeyword("false")) {
+      return { kind: "lit", node: { kind: "bool", value: false } };
+    }
+    if (this.eatKeyword("null")) {
+      return { kind: "lit", node: { kind: "null" } };
+    }
+    throw malformed("expected a comparison operand");
+  }
+
+  // Parse a JSON number literal in a filter (integer or decimal) → a `number` node. Reuses the json
+  // number parser (a bare number is valid JSON).
+  private parseNumber(): JsonNode {
+    const start = this.i;
+    if (this.peek() === "-") {
+      this.i += 1;
+    }
+    for (;;) {
+      const ch = this.peek();
+      if (
+        ch !== undefined &&
+        (isAsciiDigit(ch) || ch === "." || ch === "e" || ch === "E" || ch === "+" || ch === "-")
+      ) {
+        this.i += 1;
+      } else {
+        break;
+      }
+    }
+    const text = this.s.slice(start, this.i);
+    let node: JsonNode;
+    try {
+      node = jsonbIn(text);
+    } catch {
+      throw malformed("invalid number literal");
+    }
+    if (node.kind !== "number") {
+      throw malformed("invalid number literal");
+    }
+    return node;
+  }
+
+  // Consume a multi-character operator token if it appears at the cursor.
+  private eatOp(op: string): boolean {
+    if (this.s.startsWith(op, this.i)) {
+      this.i += op.length;
+      return true;
+    }
+    return false;
   }
 
   // Parse a member key after `.`: a bare identifier or a `"…"` quoted string.
@@ -356,18 +559,30 @@ export function compile(src: string): JsonPath {
 // The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
 // compile). Port of impl/rust/src/jsonpath.rs `eval`.
 export function evalPath(path: JsonPath, ctx: JsonNode): JsonNode[] {
-  let seq: JsonNode[] = [ctx];
-  for (const step of path.steps) {
+  return evalSteps(path.steps, ctx, ctx, path.strict);
+}
+
+// evalSteps evaluates an accessor-step sequence over a seed item, with `root` as the document `$`
+// (for a filter's `$`-rooted operand). Port of impl/rust/src/jsonpath.rs `eval_steps`.
+function evalSteps(steps: Step[], seed: JsonNode, root: JsonNode, strict: boolean): JsonNode[] {
+  let seq: JsonNode[] = [seed];
+  for (const step of steps) {
     const next: JsonNode[] = [];
     for (const item of seq) {
-      applyStep(step, item, path.strict, next);
+      applyStep(step, item, strict, root, next);
     }
     seq = next;
   }
   return seq;
 }
 
-function applyStep(step: Step, item: JsonNode, strict: boolean, out: JsonNode[]): void {
+function applyStep(
+  step: Step,
+  item: JsonNode,
+  strict: boolean,
+  root: JsonNode,
+  out: JsonNode[],
+): void {
   switch (step.kind) {
     case "member": {
       // lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
@@ -425,6 +640,122 @@ function applyStep(step: Step, item: JsonNode, strict: boolean, out: JsonNode[])
         "jsonpath wildcard array accessor can only be applied to an array",
       );
     }
+    case "filter": {
+      // `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
+      // predicate's `@` is the item, `$` is the document root.
+      if (evalPred(step.pred, item, root, strict) === true) {
+        out.push(item);
+      }
+      return;
+    }
+  }
+}
+
+// evalPred evaluates a filter predicate to a Kleene truth value (`true`/`false`/`null` = unknown).
+// Port of impl/rust/src/jsonpath.rs `eval_pred` (the Rust `Option<bool>`: Some(true)/Some(false)/None
+// → true/false/null here).
+function evalPred(pred: Pred, current: JsonNode, root: JsonNode, strict: boolean): boolean | null {
+  switch (pred.kind) {
+    case "or": {
+      const x = evalPred(pred.a, current, root, strict);
+      const y = evalPred(pred.b, current, root, strict);
+      if (x === true || y === true) return true;
+      if (x === false && y === false) return false;
+      return null;
+    }
+    case "and": {
+      const x = evalPred(pred.a, current, root, strict);
+      const y = evalPred(pred.b, current, root, strict);
+      if (x === false || y === false) return false;
+      if (x === true && y === true) return true;
+      return null;
+    }
+    case "not": {
+      const x = evalPred(pred.p, current, root, strict);
+      return x === null ? null : !x;
+    }
+    case "compare":
+      return evalCompare(pred.lhs, pred.op, pred.rhs, current, root, strict);
+  }
+}
+
+// evalCompare is the existential comparison (§4): true if SOME pair `(a in lhs-seq, b in rhs-seq)`
+// compares true. An empty operand or all-incomparable pairs → null (unknown); else false.
+function evalCompare(
+  lhs: FiltExpr,
+  op: CmpOp,
+  rhs: FiltExpr,
+  current: JsonNode,
+  root: JsonNode,
+  strict: boolean,
+): boolean | null {
+  const ls = evalFiltExpr(lhs, current, root, strict);
+  const rs = evalFiltExpr(rhs, current, root, strict);
+  if (ls.length === 0 || rs.length === 0) {
+    return null;
+  }
+  let anyUnknown = false;
+  for (const a of ls) {
+    for (const b of rs) {
+      const r = compareNodes(a, op, b);
+      if (r === true) return true;
+      if (r === null) anyUnknown = true;
+    }
+  }
+  return anyUnknown ? null : false;
+}
+
+// evalFiltExpr evaluates a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton
+// literal. A navigation error inside a filter operand → no items (the comparison is just unknown),
+// never propagated (§4.2: filter operands never raise, even in strict).
+function evalFiltExpr(e: FiltExpr, current: JsonNode, root: JsonNode, strict: boolean): JsonNode[] {
+  if (e.kind === "lit") {
+    return [e.node];
+  }
+  const seed = e.fromRoot ? root : current;
+  try {
+    return evalSteps(e.steps, seed, root, strict);
+  } catch {
+    return [];
+  }
+}
+
+// compareNodes compares two jsonb scalars under a jsonpath operator. Only same-type number/string
+// compare by order; booleans / nulls compare only by `==`/`!=`; any other (mixed-type) pair is null
+// (unknown). Number comparison reuses the json comparator (jsonNodeCmp); string is its UTF-8 byte
+// order — both via jsonNodeCmp on same-type operands.
+function compareNodes(a: JsonNode, op: CmpOp, b: JsonNode): boolean | null {
+  // Same-type only; mixed types are not comparable.
+  let ord: number;
+  let orderOk: boolean;
+  if (a.kind === "number" && b.kind === "number") {
+    ord = jsonNodeCmp(a, b);
+    orderOk = true;
+  } else if (a.kind === "string" && b.kind === "string") {
+    ord = jsonNodeCmp(a, b);
+    orderOk = true;
+  } else if (a.kind === "bool" && b.kind === "bool") {
+    ord = jsonNodeCmp(a, b);
+    orderOk = false; // booleans support only equality
+  } else if (a.kind === "null" && b.kind === "null") {
+    ord = 0;
+    orderOk = false; // nulls support only equality
+  } else {
+    return null; // mixed types are not comparable
+  }
+  switch (op) {
+    case "eq":
+      return ord === 0;
+    case "ne":
+      return ord !== 0;
+    case "lt":
+      return orderOk ? ord < 0 : null;
+    case "le":
+      return orderOk ? ord <= 0 : null;
+    case "gt":
+      return orderOk ? ord > 0 : null;
+    case "ge":
+      return orderOk ? ord >= 0 : null;
   }
 }
 
@@ -521,14 +852,19 @@ function writeQuoted(k: string): string {
 }
 
 // render is the canonical render (spec/design/jsonpath.md §2): `strict` kept / `lax` omitted; member
-// keys quoted; `[*]`, `[i]`, `[i to j]` subscripts; matches PostgreSQL's `jsonpath_out`.
+// keys quoted; `[*]`, `[i]`, `[i to j]` subscripts; `?(predicate)` filters; matches PostgreSQL's
+// `jsonpath_out`.
 export function render(jp: JsonPath): string {
+  let out = jp.strict ? "strict $" : "$";
+  out += writeSteps(jp.steps);
+  return out;
+}
+
+// writeSteps renders an accessor-step sequence (shared by the path render and a filter's `@`/`$`
+// operand). Port of impl/rust/src/jsonpath.rs `write_steps`.
+function writeSteps(steps: Step[]): string {
   let out = "";
-  if (jp.strict) {
-    out += "strict ";
-  }
-  out += "$";
-  for (const step of jp.steps) {
+  for (const step of steps) {
     switch (step.kind) {
       case "member":
         out += ".";
@@ -558,7 +894,51 @@ export function render(jp: JsonPath): string {
         out += "]";
         break;
       }
+      case "filter":
+        out += "?(";
+        out += writePred(step.pred);
+        out += ")";
+        break;
     }
   }
   return out;
+}
+
+// writePred renders a filter predicate (PG's `?(…)` form: `&&`/`||` spaced, `!(…)`, `a op b`
+// spaced). Port of impl/rust/src/jsonpath.rs `write_pred`.
+function writePred(pred: Pred): string {
+  switch (pred.kind) {
+    case "or":
+      return writePred(pred.a) + " || " + writePred(pred.b);
+    case "and":
+      return writePred(pred.a) + " && " + writePred(pred.b);
+    case "not":
+      return "!(" + writePred(pred.p) + ")";
+    case "compare":
+      return writeFiltExpr(pred.lhs) + " " + cmpOpSymbol(pred.op) + " " + writeFiltExpr(pred.rhs);
+  }
+}
+
+function cmpOpSymbol(op: CmpOp): string {
+  switch (op) {
+    case "eq":
+      return "==";
+    case "ne":
+      return "!=";
+    case "lt":
+      return "<";
+    case "le":
+      return "<=";
+    case "gt":
+      return ">";
+    case "ge":
+      return ">=";
+  }
+}
+
+function writeFiltExpr(e: FiltExpr): string {
+  if (e.kind === "lit") {
+    return jsonCompactOut(e.node);
+  }
+  return (e.fromRoot ? "$" : "@") + writeSteps(e.steps);
 }

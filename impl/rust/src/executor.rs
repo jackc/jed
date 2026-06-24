@@ -21128,6 +21128,30 @@ fn resolve_binary(
             }
             resolve_jsonb_delete(scope, true, lhs, rhs, rbase, agg, params)
         }
+        // `jsonb @? jsonpath` = jsonb_path_exists (jsonpath.md §6). Reuses the path-exists kernel.
+        BinaryOp::JsonPathExists => {
+            let (ctx, ct) = resolve(scope, lhs, Some(ScalarType::Jsonb), agg, params)?;
+            if !matches!(ct, ResolvedType::Jsonb | ResolvedType::Null) {
+                return Err(EngineError::new(
+                    SqlState::UndefinedFunction,
+                    format!("operator does not exist: {} @? jsonpath", ct.type_name()),
+                ));
+            }
+            let (path, pt) = resolve(scope, rhs, Some(ScalarType::JsonPath), agg, params)?;
+            if !matches!(pt, ResolvedType::JsonPath | ResolvedType::Null) {
+                return Err(EngineError::new(
+                    SqlState::UndefinedFunction,
+                    "operator does not exist: jsonb @? (a non-jsonpath)",
+                ));
+            }
+            Ok((
+                RExpr::JsonPathFn {
+                    kind: JsonPathFnKind::Exists,
+                    args: vec![ctx, path],
+                },
+                ResolvedType::Bool,
+            ))
+        }
     }
 }
 
@@ -22129,6 +22153,7 @@ fn binary_op_symbol(op: BinaryOp) -> &'static str {
         BinaryOp::JsonHasAnyKey => "?|",
         BinaryOp::JsonHasAllKeys => "?&",
         BinaryOp::JsonDeletePath => "#-",
+        BinaryOp::JsonPathExists => "@?",
     }
 }
 
