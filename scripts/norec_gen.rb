@@ -130,6 +130,9 @@ GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_e
 GIN_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_mutation query.gin_any_eq
                  dml.insert dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                  query.order_by types.i32 types.array func.array_containment func.array_quantified].freeze
+GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
+              dml.insert_multi_row query.select query.order_by types.i32 types.range
+              func.range_constructors func.range_operators].freeze
 PREDICATE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                    query.comparison_order query.order_by query.logical_connectives expr.between
                    expr.in_list expr.comparison_value types.i32 null.three_valued].freeze
@@ -448,6 +451,58 @@ def gen_gin(seed)
   gpair.call("@> {#{present}} (present)", [present], matches.call([present]))
   gpair.call("@> {#{absent}} (absent -> empty)", [absent], matches.call([absent]))
   gpair.call("@> {#{present},#{k2}} (intersection)", [present, k2], matches.call([present, k2]))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GiST-bounded range containment (r @> Q via the GiST index vs Q <@ r full scan) -----
+# `r @> Q` over a GiST-indexed range column descends the resident R-tree to candidate rows
+# (spec/design/gist.md §5; query.gist_scan); the SEMANTICALLY IDENTICAL `Q <@ r` (contained-by, the
+# constant on the LEFT) is NOT GiST-accelerated (gistMatch only detects `&&` and `col @> const`) and
+# full scans. So the metamorphic pair is `r @> Q` vs `Q <@ r` — both mean "r contains Q", the bound
+# taken on one side and not the other; both must return identical rows. Expected rows are known by
+# construction (r contains a non-empty `[qlo,qhi)` iff r is a non-empty range with r.lo <= qlo and
+# qhi <= r.hi; a NULL/empty r never contains a non-empty Q), so no oracle is consulted — this catches
+# a GiST consistent-descent bug ALL cores might share, which differential testing alone cannot.
+def gen_gist(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, r): a canonical [lo, hi) i32 range from a small domain (so @> admits several rows); one row
+  # is NULL and some are empty. r is [lo, hi] (hi exclusive), :empty, or nil.
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+    next [id, :empty] if rng.rand(0..5).zero?
+
+    lo = rng.rand(0..8)
+    [id, [lo, lo + rng.rand(1..6)]]
+  end
+  # The by-construction @> oracle for a NON-empty query [qlo, qhi): r contains it iff r is a non-empty
+  # range with r.lo <= qlo and qhi <= r.hi (a NULL/empty r never contains a non-empty range).
+  matches = lambda do |qlo, qhi|
+    rows.select { |_id, r| r.is_a?(Array) && r[0] <= qlo && qhi <= r[1] }.map { |id, _| id.to_s }
+  end
+
+  lit = ->(r) { r.nil? ? "NULL" : r == :empty ? "'empty'" : "'[#{r[0]},#{r[1]})'" }
+  qr = ->(qlo, qhi) { "int4range(#{qlo}, #{qhi})" }
+
+  out = header(seed, GIST_REQ, "GiST-bounded scan (@> via the GiST index vs <@ full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, r int4range)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, r| "(#{id}, #{lit.call(r)})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_r_gist ON t USING gist (r)")
+
+  gpair = lambda do |title, qlo, qhi|
+    exp = matches.call(qlo, qhi)
+    out << "# #{title}"
+    out << "# GiST bound (r @> const -> consistent-descent gather)"
+    q(out, "I", "SELECT id FROM t WHERE r @> #{qr.call(qlo, qhi)} ORDER BY id", exp)
+    out << "# full scan (const <@ r is the same predicate, not GiST-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE #{qr.call(qlo, qhi)} <@ r ORDER BY id", exp)
+  end
+
+  gpair.call("@> a mid singleton {3}=[3,4)", 3, 4)
+  gpair.call("@> a small span [2,5)", 2, 5)
+  gpair.call("@> a high span [50,60) (likely absent)", 50, 60)
 
   out.join("\n") + "\n"
 end
@@ -996,6 +1051,7 @@ SCENARIOS = {
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),
   "gin_mut" => method(:gen_gin_mutation),
+  "gist" => method(:gen_gist),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
   "window" => method(:gen_window_frame),
