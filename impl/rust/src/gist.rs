@@ -290,13 +290,16 @@ fn search_node(
 
 // ---- on-disk node codec (gist.md §4.1) -------------------------------------------------------
 
-/// One serialized GiST node page: its page number, type (leaf 5 / interior 6), and the payload
-/// bytes that follow the standard 16-byte page header. Page allocation is post-order (children
-/// before parent, the root last) so page numbers are a deterministic function of the tree.
+/// One serialized GiST node page: its page number, type (leaf 5 / interior 6), the entry count
+/// (the page header's `item_count`), and the payload bytes that follow the standard 16-byte page
+/// header. Page allocation is post-order (children before parent, the root last) so page numbers
+/// are a deterministic function of the tree. `item_count` is load-bearing: a file page is padded to
+/// `page_size`, so the loader parses exactly `item_count` entries rather than to the buffer end.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GistPage {
     pub page_no: u32,
     pub page_type: u8,
+    pub item_count: u32,
     pub payload: Vec<u8>,
 }
 
@@ -330,6 +333,7 @@ fn serialize_node(
             pages.push(GistPage {
                 page_no,
                 page_type: PAGE_GIST_LEAF,
+                item_count: entries.len() as u32,
                 payload,
             });
             page_no
@@ -352,6 +356,7 @@ fn serialize_node(
             pages.push(GistPage {
                 page_no,
                 page_type: PAGE_GIST_INTERIOR,
+                item_count: children.len() as u32,
                 payload,
             });
             page_no
@@ -359,14 +364,15 @@ fn serialize_node(
     }
 }
 
-/// Rebuild a tree from its node pages (keyed by page number), starting at `root_page`. `elem` is the
-/// range element (sub)type for decoding bounds.
-pub fn load_tree(
-    elem: &ColType,
-    pages: &std::collections::HashMap<u32, GistPage>,
-    root_page: u32,
-) -> Result<GistTree> {
-    let root = load_node(elem, pages, root_page)?;
+/// Rebuild a tree from its node pages, starting at `root_page`. `fetch` returns the [`GistPage`] for
+/// a page number — the format layer reads it on demand from the pager (header `page_type` +
+/// `item_count`, payload after the 16-byte header), so the tree need not be materialized as a map.
+/// `elem` is the range element (sub)type for decoding bounds.
+pub fn load_tree<F>(elem: &ColType, root_page: u32, fetch: &F) -> Result<GistTree>
+where
+    F: Fn(u32) -> Result<GistPage>,
+{
+    let root = load_node(elem, root_page, fetch)?;
     let len = count_rows(&root);
     Ok(GistTree { root, len })
 }
@@ -378,20 +384,17 @@ fn count_rows(node: &GistNode) -> usize {
     }
 }
 
-fn load_node(
-    elem: &ColType,
-    pages: &std::collections::HashMap<u32, GistPage>,
-    page_no: u32,
-) -> Result<GistNode> {
-    let p = pages
-        .get(&page_no)
-        .ok_or_else(|| corrupt(&format!("gist: missing page {page_no}")))?;
+fn load_node<F>(elem: &ColType, page_no: u32, fetch: &F) -> Result<GistNode>
+where
+    F: Fn(u32) -> Result<GistPage>,
+{
+    let p = fetch(page_no)?;
     let buf = &p.payload;
     let mut pos = 0usize;
     match p.page_type {
         PAGE_GIST_LEAF => {
-            let mut entries = Vec::new();
-            while pos < buf.len() {
+            let mut entries = Vec::with_capacity(p.item_count as usize);
+            for _ in 0..p.item_count {
                 let bound = read_bound(elem, buf, &mut pos)?;
                 let slen = rd_u16(buf, &mut pos)? as usize;
                 let skey = rd_bytes(buf, &mut pos, slen)?;
@@ -400,17 +403,61 @@ fn load_node(
             Ok(GistNode::Leaf(entries))
         }
         PAGE_GIST_INTERIOR => {
-            let mut children = Vec::new();
-            while pos < buf.len() {
+            let mut children = Vec::with_capacity(p.item_count as usize);
+            for _ in 0..p.item_count {
                 let bound = read_bound(elem, buf, &mut pos)?;
                 let child_page = rd_u32(buf, &mut pos)?;
-                let node = Box::new(load_node(elem, pages, child_page)?);
+                let node = Box::new(load_node(elem, child_page, fetch)?);
                 children.push(ChildEntry { bound, node });
             }
             Ok(GistNode::Interior(children))
         }
         other => Err(corrupt(&format!("gist: bad page_type {other}"))),
     }
+}
+
+// ---- the leaf-key codec + canonical-order build (the executor/serializer API) -----------------
+
+/// The index store holds one entry per row, keyed by `encode_range_body(bound) ‖ storage_key`
+/// (the GIN `term ‖ skey` pattern — a range column yields exactly one entry per row; the storage
+/// key makes it unique). `encode_range_body` is self-delimiting, so [`decode_leaf_key`] recovers
+/// `(bound, skey)`. This is what `index_entry_keys` produces for an `IndexKind::Gist` index, so all
+/// existing insert/update/delete index maintenance is reused unchanged.
+pub fn encode_leaf_key(elem: &ColType, bound: &RangeVal, skey: &[u8]) -> Vec<u8> {
+    let mut k = encode_range_body(elem, bound);
+    k.extend_from_slice(skey);
+    k
+}
+
+/// Split a leaf key back into `(bound, storage_key)` — the inverse of [`encode_leaf_key`].
+pub fn decode_leaf_key(elem: &ColType, key: &[u8]) -> Result<(RangeVal, Vec<u8>)> {
+    let mut pos = 0usize;
+    let rv = match read_range_body(elem, key, &mut pos)? {
+        Value::Range(rv) => rv,
+        _ => return Err(corrupt("gist: leaf key is not a range")),
+    };
+    Ok((rv, key[pos..].to_vec()))
+}
+
+/// Build the persisted R-tree from the index store's leaf keys. The keys are decoded and inserted
+/// in **canonical order** (`range_total_cmp`, ties by storage key), so the tree is a pure function
+/// of the leaf *set* — content-deterministic, independent of the original mutation order (gist.md
+/// §3; stronger than the operation-determinism the design floor requires, and what makes the
+/// commit-time rebuild and the golden round-trip reproducible).
+pub fn build_from_leaf_keys<'a, I>(elem: &ColType, keys: I) -> Result<GistTree>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut entries: Vec<(RangeVal, Vec<u8>)> = Vec::new();
+    for k in keys {
+        entries.push(decode_leaf_key(elem, k)?);
+    }
+    entries.sort_by(|a, b| range_total_cmp(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut tree = GistTree::new();
+    for (bound, skey) in entries {
+        tree.insert(elem, bound, skey);
+    }
+    Ok(tree)
 }
 
 /// Read one length-prefixed bound (`bound_len u16 ‖ encode_range_body`) into a `RangeVal`.
@@ -518,8 +565,21 @@ mod tests {
         v
     }
 
-    fn pagemap(pages: Vec<GistPage>) -> HashMap<u32, GistPage> {
-        pages.into_iter().map(|p| (p.page_no, p)).collect()
+    /// A `fetch` closure over an in-memory page map (mirrors the format layer reading pages on
+    /// demand). Pages are padded to a page size to exercise the parse-exactly-`item_count` path.
+    fn fetcher(pages: Vec<GistPage>) -> impl Fn(u32) -> Result<GistPage> {
+        let map: HashMap<u32, GistPage> = pages
+            .into_iter()
+            .map(|mut p| {
+                p.payload.resize(256, 0); // pad like a real page body
+                (p.page_no, p)
+            })
+            .collect();
+        move |page_no| {
+            map.get(&page_no)
+                .cloned()
+                .ok_or_else(|| corrupt(&format!("gist: missing page {page_no}")))
+        }
     }
 
     #[test]
@@ -582,11 +642,13 @@ mod tests {
         let t = build(&rows);
         let elem = i32_range_elem();
         let (pages, root) = serialize_tree(&t, &elem, 7);
-        // Re-serializing the loaded tree yields identical pages (deterministic codec).
-        let loaded = load_tree(&elem, &pagemap(pages.clone()), root).unwrap();
+        // Re-serializing the loaded tree yields identical pages (deterministic codec) — even though
+        // load reads padded pages and parses exactly `item_count` entries.
+        let loaded = load_tree(&elem, root, &fetcher(pages.clone())).unwrap();
         let (pages2, root2) = serialize_tree(&loaded, &elem, 7);
         assert_eq!(root, root2);
         assert_eq!(pages, pages2, "serialize is not deterministic across round-trip");
+        assert_eq!(loaded.len(), t.len());
         // The loaded tree answers searches identically to the original / brute force.
         for &(qlo, qhi) in &[(0, 1), (10, 14), (40, 60), (200, 300)] {
             let q = r(qlo, qhi);
@@ -620,5 +682,41 @@ mod tests {
             pages.iter().find(|p| p.page_no == root).unwrap().page_type,
             PAGE_GIST_INTERIOR
         );
+    }
+
+    #[test]
+    fn leaf_key_round_trips() {
+        let elem = i32_range_elem();
+        for (b, id) in [(r(1, 5), 1u32), (r(-3, 100), 7), (RangeVal::empty(), 9)] {
+            let k = encode_leaf_key(&elem, &b, &skey(id));
+            let (b2, sk2) = decode_leaf_key(&elem, &k).unwrap();
+            assert_eq!(b2, b);
+            assert_eq!(sk2, skey(id));
+        }
+    }
+
+    #[test]
+    fn build_from_leaf_keys_is_order_independent_and_correct() {
+        // The persisted tree is built from the leaf SET in canonical order, so two different
+        // insertion orders of the same rows produce byte-identical trees (content-determinism).
+        let elem = i32_range_elem();
+        let rows: Vec<(i32, i32, u32)> = (0..25).map(|i| (i * 3 % 17, i * 3 % 17 + 4, i as u32)).collect();
+        let keys_fwd: Vec<Vec<u8>> = rows.iter().map(|&(lo, hi, id)| encode_leaf_key(&elem, &r(lo, hi), &skey(id))).collect();
+        let mut keys_rev = keys_fwd.clone();
+        keys_rev.reverse();
+
+        let t1 = build_from_leaf_keys(&elem, keys_fwd.iter().map(|k| k.as_slice())).unwrap();
+        let t2 = build_from_leaf_keys(&elem, keys_rev.iter().map(|k| k.as_slice())).unwrap();
+        let (p1, r1) = serialize_tree(&t1, &elem, 0);
+        let (p2, r2) = serialize_tree(&t2, &elem, 0);
+        assert_eq!((r1, &p1), (r2, &p2), "build is not order-independent");
+
+        // And it answers searches exactly like brute force.
+        for &(qlo, qhi) in &[(0, 2), (5, 9), (14, 20), (100, 200)] {
+            let q = r(qlo, qhi);
+            for strat in [GistStrategy::Overlaps, GistStrategy::Contains] {
+                assert_eq!(sorted(t1.search(&q, strat).0), brute(&rows, &q, strat));
+            }
+        }
     }
 }

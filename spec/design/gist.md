@@ -124,6 +124,13 @@ a different order yields a *different* (still valid, still byte-identical-cross-
 correct) tree. This is acceptable and documented; the determinism that the agent loop and §8
 depend on — a fixed `(statement sequence) → bytes` function — is fully preserved.
 
+**GX1 in fact clears the stronger bar.** GX1 rebuilds the persisted tree at commit from the index
+store's leaf *set* in **canonical** order (`range_total_cmp`, ties by storage key — §4.1), not in
+mutation order, so its tree is a pure function of the row *set* — **content-deterministic**, like the
+ordered B-tree and GIN (insertion order cannot change the bytes). Operation-determinism above is the
+design *floor* (what a future incremental-COW GiST mutating the tree in place would still satisfy);
+GX1 exceeds it. Either way the bytes are cross-core identical.
+
 **This is a structural divergence from PostgreSQL, not a behavioral one.** *Which rows match* a
 query, and *which writes a constraint rejects*, are identical to PG (behavior tracks PG, §1). Only
 the tree *shape*, the plan/cost, and the on-disk bytes are jed's own — ledgered in §10, **not** a
