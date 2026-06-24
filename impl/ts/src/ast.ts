@@ -270,6 +270,13 @@ export type Expr =
       // definition (into `over`) before resolution; exactly one of `over`/`overName` is set on a
       // window call. null/undefined for an inline `OVER (...)` or a non-window call.
       overName?: string | null;
+      // Set to the WITHIN GROUP (ORDER BY …) order keys when the call is an ordered-set aggregate
+      // (mode/percentile_cont/percentile_disc — spec/design/aggregates.md §13); null/undefined for
+      // an ordinary call. The parenthesized args are the per-group direct argument (the percentile
+      // fraction; empty for mode); these keys are the aggregated argument, the value sorted over.
+      // Column-only, like the query ORDER BY (the parser keeps the whole list so the resolver can
+      // reject a second key, 42883).
+      withinGroup?: OrderKey[] | null;
     }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a

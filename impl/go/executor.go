@@ -12692,7 +12692,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		newAccs := func() []*acc {
 			a := make([]*acc, len(plan.aggSpecs))
 			for i, spec := range plan.aggSpecs {
-				a[i] = newAcc(spec.plan)
+				a[i] = newAccFromSpec(spec)
 			}
 			return a
 		}
@@ -15340,6 +15340,11 @@ const (
 	planJsonObjectAgg        // json_object_agg(k, v) — row order + dups, '{ … }' brace-padded spacing
 	planJsonbObjectAggUnique // jsonb_object_agg_unique(k, v) — as jsonb, but 22030 on a duplicate key
 	planJsonObjectAggUnique  // json_object_agg_unique(k, v) — as json, but 22030 on a duplicate key
+	// Ordered-set aggregates (spec/design/aggregates.md §13). The WITHIN GROUP direction +
+	// percentile fraction live on the aggSpec/acc, not the plan.
+	planMode           // mode() — the most frequent value (tie → first in sort order)
+	planPercentileDisc // percentile_disc(f) — the discrete percentile (an actual input value)
+	planPercentileCont // percentile_cont(f) — the continuous (interpolated) percentile, f64
 )
 
 // aggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
@@ -15355,6 +15360,12 @@ type aggSpec struct {
 	// aggregates.md §11); nil for an unfiltered aggregate. The fold loop evaluates it per input row
 	// and folds only the rows for which it is TRUE (so the filter applies before the DISTINCT dedup).
 	filter *rExpr
+	// osaDesc / osaFrac are the ordered-set aggregate parameters (mode/percentile_* —
+	// aggregates.md §13), set only for the planMode/planPercentile* plans: the WITHIN GROUP sort
+	// direction and the constant percentile fraction (nil = a NULL fraction → NULL result; unused
+	// for mode).
+	osaDesc bool
+	osaFrac *float64
 }
 
 // acc is a running aggregate accumulator (one per aggSpec), folded per input row then finalized.
@@ -15381,6 +15392,13 @@ type acc struct {
 	objPairs  []objAggPair
 	objAgg    bool
 	objUnique bool
+	// Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
+	// fraction, plus the collected non-NULL values (percentile_cont widens to f64 into osaFloats;
+	// mode/percentile_disc keep the Value in osaVals). Sorted + computed at finalize.
+	osaDesc   bool
+	osaFrac   *float64
+	osaVals   []Value
+	osaFloats []float64
 }
 
 // objAggPair is one (key, value) pair accumulated by json[b]_object_agg (the key already coerced to
@@ -15419,6 +15437,20 @@ func newAcc(plan aggPlan) *acc {
 	return a
 }
 
+// newAccFromSpec builds the accumulator for one resolved aggregate. Ordered-set aggregates
+// (mode/percentile_* — aggregates.md §13) need their WITHIN GROUP direction + fraction (carried on
+// the spec, not the plan); every other plan delegates to newAcc. Only the aggregation stage builds
+// ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
+// ordered-set aggregate with OVER is 0A000, rejected at resolve).
+func newAccFromSpec(s aggSpec) *acc {
+	switch s.plan {
+	case planMode, planPercentileDisc, planPercentileCont:
+		return &acc{plan: s.plan, osaDesc: s.osaDesc, osaFrac: s.osaFrac}
+	default:
+		return newAcc(s.plan)
+	}
+}
+
 // clone returns an independent snapshot of the running accumulator, so the window stage can
 // finalize a peer-group's cumulative value without consuming the still-running acc (Rust's
 // `acc.clone().finalize()`). The acc struct copies by value, but floatSum is a POINTER whose
@@ -15441,6 +15473,14 @@ func (a *acc) clone() *acc {
 		// Deep-copy the (key, value) pairs slice (as jsonNodes above) so a cloned-finalize over a
 		// window peer-group doesn't alias the still-running acc.
 		c.objPairs = append([]objAggPair(nil), a.objPairs...)
+	}
+	// Ordered-set accumulators are never windowed (clone is the window-stage snapshot), but deep-copy
+	// the collected slices anyway so a clone never aliases the original.
+	if a.osaVals != nil {
+		c.osaVals = append([]Value(nil), a.osaVals...)
+	}
+	if a.osaFloats != nil {
+		c.osaFloats = append([]float64(nil), a.osaFloats...)
 	}
 	return &c
 }
@@ -15560,6 +15600,21 @@ func (a *acc) fold(v Value, m *Meter) error {
 			}
 		}
 		a.objPairs = append(a.objPairs, objAggPair{key: key, val: vv})
+	case planMode, planPercentileDisc, planPercentileCont:
+		// Collect the non-NULL aggregated argument (the WITHIN GROUP order key, evaluated per row).
+		// percentile_cont widens each numeric value to f64 up front (the correctly-rounded cast,
+		// matching PG's numeric→float8); mode/percentile_disc keep the Value.
+		if !v.IsNull() {
+			if a.plan == planPercentileCont {
+				f, err := percentileInputF64(v)
+				if err != nil {
+					return err
+				}
+				a.osaFloats = append(a.osaFloats, f)
+			} else {
+				a.osaVals = append(a.osaVals, v)
+			}
+		}
 	}
 	return nil
 }
@@ -15685,11 +15740,137 @@ func (a *acc) finalize() (Value, error) {
 			members = append(members, JsonMember{Key: p.key, Val: node})
 		}
 		return JsonbValue(makeObject(members)), nil
+	case planMode, planPercentileDisc, planPercentileCont:
+		return a.finalizeOrderedSet()
 	default: // planMin, planMax
 		if a.hasCur {
 			return a.cur, nil
 		}
 		return NullValue(), nil
+	}
+}
+
+// finalizeOrderedSet computes an ordered-set aggregate's value over its collected group
+// (spec/design/aggregates.md §13). mode → the most frequent value (tie → first in WITHIN GROUP sort
+// order); percentile_disc → an actual value at 1-based row ceil(p·N); percentile_cont → the
+// interpolated f64. The fraction range check (22003) fires here, after the NULL-fraction check and
+// before the empty-group check — matching PG.
+func (a *acc) finalizeOrderedSet() (Value, error) {
+	desc := a.osaDesc
+	switch a.plan {
+	case planMode:
+		vals := a.osaVals
+		if len(vals) == 0 {
+			return NullValue(), nil
+		}
+		sort.SliceStable(vals, func(i, j int) bool {
+			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
+		})
+		// The first value of the longest run of equal values — the most frequent, ties broken by
+		// sort order (the first such run).
+		bestIdx, bestCount, runStart := 0, 1, 0
+		for i := 1; i < len(vals); i++ {
+			if valueCmp(vals[i], vals[runStart]) == 0 {
+				if runLen := i - runStart + 1; runLen > bestCount {
+					bestCount, bestIdx = runLen, runStart
+				}
+			} else {
+				runStart = i
+			}
+		}
+		return vals[bestIdx], nil
+	case planPercentileDisc:
+		if a.osaFrac == nil {
+			return NullValue(), nil // a NULL fraction → NULL (before the range check)
+		}
+		p := *a.osaFrac
+		if err := checkPercentileFraction(p); err != nil {
+			return NullValue(), err
+		}
+		vals := a.osaVals
+		if len(vals) == 0 {
+			return NullValue(), nil
+		}
+		sort.SliceStable(vals, func(i, j int) bool {
+			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
+		})
+		n := len(vals)
+		// PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
+		rownum := int(math.Ceil(p * float64(n)))
+		idx := 0
+		if rownum >= 1 {
+			idx = rownum - 1
+		}
+		if idx > n-1 {
+			idx = n - 1
+		}
+		return vals[idx], nil
+	case planPercentileCont:
+		if a.osaFrac == nil {
+			return NullValue(), nil
+		}
+		p := *a.osaFrac
+		if err := checkPercentileFraction(p); err != nil {
+			return NullValue(), err
+		}
+		fs := a.osaFloats
+		if len(fs) == 0 {
+			return NullValue(), nil
+		}
+		sort.SliceStable(fs, func(i, j int) bool {
+			return dirCmp(floatTotalCmp(fs[i], fs[j]), desc) < 0
+		})
+		n := len(fs)
+		// PG percentile_cont (orderedsetaggs.c): interpolate between the bracketing rows, in f64
+		// with PG's exact operation order — bit-identical across cores and to PG.
+		pos := p * float64(n-1)
+		first := int(math.Floor(pos))
+		second := int(math.Ceil(pos))
+		var result float64
+		if first == second {
+			result = fs[first]
+		} else {
+			lo, hi := fs[first], fs[second]
+			proportion := pos - float64(first)
+			result = lo + (proportion * (hi - lo))
+		}
+		return Float64Value(result), nil
+	default:
+		panic("finalizeOrderedSet called for a non-ordered-set plan")
+	}
+}
+
+// dirCmp applies a WITHIN GROUP sort direction to a comparison result (DESC reverses).
+func dirCmp(c int, desc bool) int {
+	if desc {
+		return -c
+	}
+	return c
+}
+
+// checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
+// NaN is 22003 (numeric_value_out_of_range), matching PG's "percentile value … is not between 0 and
+// 1". Called per group at finalize, after the NULL-fraction check.
+func checkPercentileFraction(p float64) error {
+	if math.IsNaN(p) || p < 0 || p > 1 {
+		return NewError(NumericValueOutOfRange, fmt.Sprintf("percentile value %v is not between 0 and 1", p))
+	}
+	return nil
+}
+
+// percentileInputF64 widens a numeric value to f64 for percentile_cont (aggregates.md §13):
+// integers via the IEEE cast, decimals via the correctly-rounded decimal→f64 cast (matching PG's
+// numeric→float8), floats unchanged. The resolver restricts the operand to a numeric family.
+func percentileInputF64(v Value) (float64, error) {
+	switch v.Kind {
+	case ValInt:
+		return float64(v.Int), nil
+	case ValFloat32, ValFloat64:
+		return v.asF64(), nil
+	case ValDecimal:
+		return decimalToFloat64(*v.Dec)
+	default:
+		panic("resolver restricts percentile_cont to a numeric operand")
 	}
 }
 
@@ -15749,6 +15930,20 @@ func isAggregateName(name string) bool {
 		}
 	}
 	if _, ok := objectAggClassify(name); ok {
+		return true
+	}
+	// The ordered-set aggregates are aggregates for these purposes too (they fold a set of rows)
+	// but are not catalog rows (their result/arg mold is special, like GROUPING()).
+	return isOrderedSetAggregateName(name)
+}
+
+// isOrderedSetAggregateName reports whether name is an ordered-set aggregate surface (mode /
+// percentile_cont / percentile_disc — spec/design/aggregates.md §13). These take a WITHIN GROUP
+// (ORDER BY …) clause and are resolved by resolveOrderedSetAggregate, intercepted before the generic
+// aggregate/scalar dispatch.
+func isOrderedSetAggregateName(name string) bool {
+	switch toLowerASCII(name) {
+	case "mode", "percentile_cont", "percentile_disc":
 		return true
 	}
 	return false
@@ -16891,6 +17086,140 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	slot := len(ag.groupKeys) + len(ag.specs)
 	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// resolveOrderedSetAggregate resolves agg(direct_args) WITHIN GROUP (ORDER BY key) — mode,
+// percentile_cont, percentile_disc (spec/design/aggregates.md §13). Like resolveAggregate it is
+// valid only in collect mode (else 42803) and folds into the same aggSpec list, returning a
+// synthetic-row reference. The WITHIN GROUP key is the aggregate's operand (resolved with aggregates
+// forbidden — a nested aggregate is 42803); the parenthesized Args are the per-group direct argument
+// (the percentile fraction; empty for mode).
+func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if !ag.collecting {
+		return nil, resolvedType{}, NewError(GroupingError, "aggregate functions are not allowed here")
+	}
+	// DISTINCT cannot decorate an ordered-set aggregate (PG: a 42601 syntax error).
+	if fc.Distinct {
+		return nil, resolvedType{}, NewError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
+	}
+	name := toLowerASCII(fc.Name)
+	// Exactly one WITHIN GROUP sort key (PG models a second as a missing overload → 42883).
+	if len(fc.WithinGroup) != 1 {
+		return nil, resolvedType{}, noAggOverload(name)
+	}
+	key := fc.WithinGroup[0]
+	// An explicit COLLATE on the WITHIN GROUP key is deferred (the sort uses the value's default
+	// order); reject it rather than silently ignore the requested collation.
+	if key.Collation != "" {
+		return nil, resolvedType{}, NewError(FeatureNotSupported, "COLLATE in a WITHIN GROUP ORDER BY is not supported")
+	}
+	// The aggregated argument: the sort-key column, resolved per row with aggregates FORBIDDEN (a
+	// nested aggregate in the order key is 42803, matching PG).
+	var keyExpr Expr
+	if key.Qualifier != "" {
+		keyExpr = Expr{Kind: ExprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
+	} else {
+		keyExpr = Expr{Kind: ExprColumn, Column: key.Column}
+	}
+	sub := &aggCtx{collecting: false}
+	operand, optype, err := resolve(s, keyExpr, nil, sub, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	var (
+		plan   aggPlan
+		frac   *float64
+		result resolvedType
+	)
+	switch name {
+	case "mode":
+		// mode() takes no direct argument; mode(x) matches no overload (42883).
+		if len(fc.Args) != 0 {
+			return nil, resolvedType{}, noAggOverload(name)
+		}
+		plan, frac, result = planMode, nil, optype
+	case "percentile_disc":
+		f, err := resolveOsaFraction(s, name, fc.Args, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		plan, frac, result = planPercentileDisc, f, optype
+	case "percentile_cont":
+		// percentile_cont interpolates, so the aggregated input must be numeric (interval is a
+		// deferred follow-on); a non-numeric WITHIN GROUP column matches no overload (42883).
+		switch optype.kind {
+		case rtInt, rtDecimal, rtFloat32, rtFloat64:
+		default:
+			return nil, resolvedType{}, noAggOverload(name)
+		}
+		f, err := resolveOsaFraction(s, name, fc.Args, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		plan, frac, result = planPercentileCont, f, resolvedType{kind: rtFloat64}
+	default:
+		panic("isOrderedSetAggregateName gates the three names above")
+	}
+	// FILTER (WHERE cond): resolved per input row with aggregates forbidden, exactly as for an
+	// ordinary aggregate (aggregates.md §11) — a non-boolean cond is 42804, a nested aggregate 42803.
+	var filter *rExpr
+	if fc.Filter != nil {
+		fsub := &aggCtx{collecting: false}
+		rf, ft, err := resolve(s, *fc.Filter, nil, fsub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if ft.kind != rtBool && ft.kind != rtNull {
+			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
+		}
+		filter = rf
+	}
+	slot := len(ag.groupKeys) + len(ag.specs)
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: false, filter: filter, osaDesc: key.Descending, osaFrac: frac})
+	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// resolveOsaFraction resolves an ordered-set aggregate's direct argument — the percentile fraction
+// (aggregates.md §13). It must be a numeric constant (a column reference / param / non-folded
+// expression is the deferred non-constant form, 0A000); resolved with a float context so a numeric
+// literal folds to an f64. Returns nil for a NULL fraction (→ NULL result). A non-numeric fraction
+// or a wrong argument count matches no overload (42883).
+func resolveOsaFraction(s *scope, name string, args []*Expr, params *paramTypes) (*float64, error) {
+	if len(args) != 1 {
+		return nil, noAggOverload(name) // wrong argument count
+	}
+	if exprReadsColumns(args[0]) {
+		return nil, NewError(FeatureNotSupported, "the fraction argument of an ordered-set aggregate must be a constant")
+	}
+	fl := Float64
+	sub := &aggCtx{collecting: false}
+	rarg, rtype, err := resolve(s, *args[0], &fl, sub, params)
+	if err != nil {
+		return nil, err
+	}
+	switch rtype.kind {
+	case rtNull:
+		return nil, nil
+	case rtFloat32, rtFloat64, rtInt, rtDecimal:
+		switch rarg.kind {
+		case reConstFloat64, reConstFloat32:
+			f := rarg.cFloat
+			return &f, nil
+		case reConstInt:
+			f := float64(rarg.cInt)
+			return &f, nil
+		case reConstDecimal:
+			f, err := decimalToFloat64(rarg.cDec)
+			if err != nil {
+				return nil, err
+			}
+			return &f, nil
+		default:
+			return nil, NewError(FeatureNotSupported, "the fraction argument of an ordered-set aggregate must be a constant")
+		}
+	default:
+		return nil, noAggOverload(name) // a non-numeric fraction matches no overload
+	}
 }
 
 // resolveGrouping resolves GROUPING(c1, …, ck) (spec/design/aggregates.md §12) — the grouping-sets
@@ -20729,6 +21058,25 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &common}, nil
 	case ExprFuncCall:
+		// An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13)
+		// carries WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself does
+		// not support an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP it is
+		// 42883 (PG: "function mode() does not exist").
+		if isOrderedSetAggregateName(e.FuncCall.Name) {
+			if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					fmt.Sprintf("OVER is not supported for ordered-set aggregate %s", toLowerASCII(e.FuncCall.Name)))
+			}
+			if e.FuncCall.WithinGroup == nil {
+				return nil, resolvedType{}, noAggOverload(toLowerASCII(e.FuncCall.Name))
+			}
+			return resolveOrderedSetAggregate(s, e.FuncCall, ag, params)
+		}
+		// WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function) is
+		// 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
+		if e.FuncCall.WithinGroup != nil {
+			return nil, resolvedType{}, noAggOverload(toLowerASCII(e.FuncCall.Name))
+		}
 		// A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
 		if e.FuncCall.Over != nil {
 			if strings.EqualFold(e.FuncCall.Name, "grouping") {

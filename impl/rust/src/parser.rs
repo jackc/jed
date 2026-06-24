@@ -3259,6 +3259,7 @@ impl Parser {
                 variadic: false,
                 over: None,
                 over_name: None,
+                within_group: None,
             };
         }
         self.depth = base;
@@ -3758,6 +3759,7 @@ impl Parser {
                     variadic: false,
                     over: None,
                     over_name: None,
+                    within_group: None,
                 })
             }
             Token::Str(_) => {
@@ -3883,6 +3885,25 @@ impl Parser {
         } else {
             None
         };
+        // A trailing `WITHIN GROUP (ORDER BY <key>)` marks an ordered-set aggregate (mode /
+        // percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list
+        // and any FILTER / OVER (PG order). `WITHIN`/`GROUP` are not reserved; right after the call's
+        // `)` they are always the clause. The order key reuses the column-only query `ORDER BY`
+        // (parse_order_by consumes the `ORDER BY` keywords); the resolver enforces exactly one key
+        // (42883) and the per-name rules.
+        let within_group = if self.peek_keyword().as_deref() == Some("within") {
+            self.advance();
+            self.expect_keyword("group")?;
+            self.expect(&Token::LParen)?;
+            if self.peek_keyword().as_deref() != Some("order") {
+                return Err(syntax("WITHIN GROUP requires an ORDER BY clause"));
+            }
+            let keys = self.parse_order_by()?;
+            self.expect(&Token::RParen)?;
+            Some(Box::new(keys))
+        } else {
+            None
+        };
         // A trailing `FILTER (WHERE cond)` restricts which input rows feed THIS aggregate
         // (aggregates.md §11). PG syntax: `agg(args) FILTER (WHERE cond) [OVER (...)]` — FILTER binds
         // to the aggregate and precedes any OVER. FILTER is not a reserved word, but right after the
@@ -3923,6 +3944,7 @@ impl Parser {
                     variadic,
                     over: None,
                     over_name,
+                    within_group,
                 });
             }
             self.expect(&Token::LParen)?;
@@ -3944,6 +3966,7 @@ impl Parser {
             variadic,
             over,
             over_name,
+            within_group,
         })
     }
 

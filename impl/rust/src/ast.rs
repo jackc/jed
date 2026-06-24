@@ -1033,6 +1033,14 @@ pub enum Expr {
         /// definition (into `over`) before resolution; exactly one of `over`/`over_name` is set on
         /// a window call. `None` for an inline `OVER (...)` or a non-window call.
         over_name: Option<String>,
+        /// `Some(order_keys)` when the call carries a trailing `WITHIN GROUP (ORDER BY …)` clause —
+        /// an **ordered-set aggregate** (`mode`/`percentile_cont`/`percentile_disc`,
+        /// spec/design/aggregates.md §13). The parenthesized `args` are the per-group **direct**
+        /// argument (the percentile fraction; empty for `mode`); these keys are the **aggregated**
+        /// argument, the value sorted over. Column-only, like the query `ORDER BY` (the parser keeps
+        /// the whole list so the resolver can reject a second key, 42883). `None` for every ordinary
+        /// call. Boxed so a plain call does not grow `Expr`.
+        within_group: Option<Box<Vec<OrderKey>>>,
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`
     /// plans it once against the scope chain; an uncorrelated one is then folded to a constant,

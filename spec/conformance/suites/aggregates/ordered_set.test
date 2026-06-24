@@ -1,0 +1,211 @@
+# Ordered-set aggregates: mode() / percentile_cont(f) / percentile_disc(f) WITHIN GROUP (ORDER BY
+# col) (spec/design/aggregates.md §13). The result is defined by the rows sorted by the WITHIN GROUP
+# order key (one bare/qualified column, ASC/DESC/NULLS — the column-only query-ORDER-BY narrowing).
+# mode() -> the most frequent value (tie broken by sort order), result the input type.
+# percentile_cont(f) -> the continuous (interpolated) percentile, ALWAYS f64, numeric input only:
+# pos = f*(N-1); result = val[floor(pos)] + (pos-floor(pos))*(val[ceil(pos)]-val[floor(pos)]) in f64,
+# bit-identical to PostgreSQL. percentile_disc(f) -> the discrete percentile, an actual input value at
+# 1-based row ceil(f*N) (any sortable type, input-type result). The fraction is a per-group constant
+# f64 (NULL -> NULL); out of [0,1] or NaN -> 22003 per group (after the NULL check, before the empty
+# check). NULL aggregated values skipped; empty/all-NULL group -> NULL. Composes with GROUP BY /
+# HAVING / FILTER. DISTINCT -> 42601; OVER -> 0A000 (PG matches); a second order key, WITHIN GROUP on
+# a non-ordered-set function, or an ordered-set aggregate with no WITHIN GROUP -> 42883.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.ordered_set_aggregate, query.aggregate_filter, types.i32, types.decimal, types.text, types.f64, resource.cost_metering
+
+statement ok
+CREATE TABLE osa (id i32 PRIMARY KEY, g i32, v decimal, t text)
+
+statement ok
+INSERT INTO osa VALUES (1,1,10,'a'),(2,1,20,'b'),(3,1,30,'a'),(4,1,40,'b'),(5,2,10,'x'),(6,2,NULL,'x'),(7,2,30,'y'),(8,3,5,'m'),(9,3,5,'n'),(10,3,7,'p'),(11,4,NULL,'q')
+
+# --- percentile_cont over numeric -> f64 (g=1: sorted 10,20,30,40) ---
+# 0 -> 10, 0.25 -> 17.5, 0.5 -> 25, 0.75 -> 32.5, 1 -> 40
+# names: p0, p25, p50, p75, p100
+query RRRRR nosort
+SELECT percentile_cont(0.0) WITHIN GROUP (ORDER BY v) AS p0,
+       percentile_cont(0.25) WITHIN GROUP (ORDER BY v) AS p25,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS p50,
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY v) AS p75,
+       percentile_cont(1.0) WITHIN GROUP (ORDER BY v) AS p100
+FROM osa WHERE g = 1
+----
+10
+17.5
+25
+32.5
+40
+
+# --- percentile_disc over numeric -> the input type (g=1: 10,20,30,40) ---
+# 0 -> 10, 0.25 -> 10, 0.5 -> 20, 0.75 -> 30, 1 -> 40
+# names: p0, p25, p50, p75, p100
+query DDDDD nosort
+SELECT percentile_disc(0.0) WITHIN GROUP (ORDER BY v) AS p0,
+       percentile_disc(0.25) WITHIN GROUP (ORDER BY v) AS p25,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY v) AS p50,
+       percentile_disc(0.75) WITHIN GROUP (ORDER BY v) AS p75,
+       percentile_disc(1.0) WITHIN GROUP (ORDER BY v) AS p100
+FROM osa WHERE g = 1
+----
+10
+10
+20
+30
+40
+
+# --- percentile_disc honors DESC (sorted 40,30,20,10): 0.25 -> 40 ---
+# names: pdesc
+query D nosort
+SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY v DESC) AS pdesc FROM osa WHERE g = 1
+----
+40
+
+# --- percentile_cont honors DESC (sorted 40,30,20,10): 0.25 -> 32.5 ---
+# names: pdesc
+query R nosort
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v DESC) AS pdesc FROM osa WHERE g = 1
+----
+32.5
+
+# --- percentile_cont skips NULL (g=2 non-NULL: 10,30) -> 0.5 = 20 ---
+# names: percentile_cont
+query R nosort
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM osa WHERE g = 2
+----
+20
+
+# --- percentile_cont over an integer column widens to f64 (g sorted 1,1,1,1 over g=1) ---
+# Over distinct ints id=1..4 (g=1): 0.5 -> 2.5
+# names: percentile_cont
+query R nosort
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id) FROM osa WHERE g = 1
+----
+2.5
+
+# --- mode(): most frequent value, tie broken by sort order ---
+# g=3 v = {5,5,7} -> 5 (clear winner)
+# names: mode
+query D nosort
+SELECT mode() WITHIN GROUP (ORDER BY v) FROM osa WHERE g = 3
+----
+5
+
+# --- mode() over text, all distinct in g=3 ('m','n','p') -> 'm' (smallest) ---
+# names: mode
+query T nosort
+SELECT mode() WITHIN GROUP (ORDER BY t) FROM osa WHERE g = 3
+----
+m
+
+# --- mode() tie over text (g=1 t = a,b,a,b -> tie, smallest in sort order = 'a') ---
+# names: mode
+query T nosort
+SELECT mode() WITHIN GROUP (ORDER BY t) FROM osa WHERE g = 1
+----
+a
+
+# --- GROUP BY g (g=1,2,3): one ordered-set value per group ---
+# g=1: mode 10 (all distinct -> smallest), cont(0.5) 25, disc(0.5) 20
+# g=2: mode 10 (10,30 tie -> smallest), cont(0.5) 20, disc(0.5) 10
+# g=3: mode 5,                          cont(0.5) 5,  disc(0.5) 5
+# names: g, mode, pc, pd
+query IDRD nosort
+SELECT g,
+       mode() WITHIN GROUP (ORDER BY v) AS mode,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS pc,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY v) AS pd
+FROM osa WHERE g < 4 GROUP BY g ORDER BY g
+----
+1
+10
+25
+20
+2
+10
+20
+10
+3
+5
+5
+5
+
+# --- single non-NULL row: percentile_cont returns that value ---
+# names: percentile_cont
+query R nosort
+SELECT percentile_cont(0.7) WITHIN GROUP (ORDER BY v) FROM osa WHERE id = 8
+----
+5
+
+# --- empty input -> NULL (all three) ---
+# names: m, pc, pd
+query TRD nosort
+SELECT mode() WITHIN GROUP (ORDER BY t) AS m,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS pc,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY v) AS pd
+FROM osa WHERE id < 0
+----
+NULL
+NULL
+NULL
+
+# --- all-NULL aggregated input (g=4 v is NULL) -> NULL ---
+# names: m, pc
+query DR nosort
+SELECT mode() WITHIN GROUP (ORDER BY v) AS m,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS pc
+FROM osa WHERE g = 4
+----
+NULL
+NULL
+
+# --- a NULL fraction yields NULL (checked before the range check) ---
+# names: percentile_cont
+query R nosort
+SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY v) FROM osa WHERE g = 1
+----
+NULL
+
+# --- composes with FILTER (restricts the collected rows first) ---
+# g=1 keep v > 15 -> {20,30,40}, disc(0.5): ceil(0.5*3)=2 -> idx1 -> 30
+# names: percentile_disc
+query D nosort
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE v > 15) FROM osa WHERE g = 1
+----
+30
+
+# --- cost pin: one ordered-set aggregate over all 11 whole-table rows ---
+# 11 storage_row_read + 11 aggregate_accumulate + 1 row_produced (+ the aggregate-query constant).
+# Same cost shape as an ordinary aggregate — the per-group sort + finalize are unmetered.
+# cost: 24
+query D nosort
+SELECT mode() WITHIN GROUP (ORDER BY v) FROM osa
+----
+5
+
+# === error cases (all match PostgreSQL) =====================================
+
+# A fraction outside [0,1] is 22003 (per group at finalize, before the empty check).
+statement error 22003
+SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY v) FROM osa
+
+statement error 22003
+SELECT percentile_disc(-0.5) WITHIN GROUP (ORDER BY v) FROM osa
+
+# WITHIN GROUP on an ordinary aggregate is 42883 (PG models it as a missing sum(...) overload).
+statement error 42883
+SELECT sum(v) WITHIN GROUP (ORDER BY v) FROM osa
+
+# An ordered-set aggregate with NO WITHIN GROUP is 42883.
+statement error 42883
+SELECT mode() FROM osa
+
+# mode() takes no direct argument.
+statement error 42883
+SELECT mode(v) WITHIN GROUP (ORDER BY v) FROM osa
+
+# Exactly one WITHIN GROUP order key (a second matches no overload).
+statement error 42883
+SELECT mode() WITHIN GROUP (ORDER BY v, t) FROM osa
+
+# OVER on an ordered-set aggregate is 0A000 (PostgreSQL matches).
+statement error 0A000
+SELECT mode() WITHIN GROUP (ORDER BY v) OVER () FROM osa

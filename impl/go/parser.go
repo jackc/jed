@@ -4490,6 +4490,48 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	if err := p.expect(TokRParen); err != nil {
 		return Expr{}, err
 	}
+	// A trailing WITHIN GROUP (ORDER BY <key>) marks an ordered-set aggregate (mode /
+	// percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list and
+	// any FILTER / OVER (PG order). WITHIN/GROUP are not reserved; right after the call's `)` they are
+	// always the clause. The order key reuses the column-only query ORDER BY; the resolver enforces
+	// exactly one key (42883) and the per-name rules.
+	if p.peekKeyword() == "within" {
+		p.advance()
+		if err := p.expectKeyword("group"); err != nil {
+			return Expr{}, err
+		}
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		if p.peekKeyword() != "order" {
+			return Expr{}, NewError(SyntaxError, "WITHIN GROUP requires an ORDER BY clause")
+		}
+		p.advance()
+		if err := p.expectKeyword("by"); err != nil {
+			return Expr{}, err
+		}
+		keys := []OrderKey{}
+		for {
+			qualifier, col, err := p.parseColumnRef()
+			if err != nil {
+				return Expr{}, err
+			}
+			collation, descending, nullsFirst, err := p.parseSortSuffix()
+			if err != nil {
+				return Expr{}, err
+			}
+			keys = append(keys, OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
+			if p.peek().Kind == TokComma {
+				p.advance()
+				continue
+			}
+			break
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		fc.WithinGroup = keys
+	}
 	// A trailing FILTER (WHERE cond) restricts which input rows feed THIS aggregate
 	// (aggregates.md §11). PG syntax: `agg(args) FILTER (WHERE cond) [OVER (...)]` — FILTER binds to
 	// the aggregate and precedes any OVER. FILTER is not reserved, but right after the call's `)` it

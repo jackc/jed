@@ -8579,16 +8579,7 @@ export class Database {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] =>
-        plan.aggSpecs.map((s) =>
-          newAcc(
-            s.plan,
-            s.floatWidth ?? "f64",
-            s.jsonAsJson ?? false,
-            s.jsonStrict ?? false,
-            s.jsonUnique ?? false,
-          ),
-        );
+      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s));
       // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
       // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
       // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
@@ -12229,7 +12220,12 @@ type AggPlan =
   // `jsonAsJson` flag selects the json (insertion order + dups + " : " spacing, brace-padded) vs jsonb
   // (canonical, last-wins) render; `jsonUnique` errors 22030 on a duplicate key. An empty group → NULL
   // (the `seen` flag). Hand-resolved (the single-operand aggregate catalog can't express a pair).
-  | "jsonObjectAgg";
+  | "jsonObjectAgg"
+  // Ordered-set aggregates (spec/design/aggregates.md §13). The WITHIN GROUP direction + percentile
+  // fraction ride on the AggSpec/Acc, not the plan.
+  | "mode" // mode() — the most frequent value (tie → first in sort order)
+  | "percentileDisc" // percentile_disc(f) — the discrete percentile (an actual input value)
+  | "percentileCont"; // percentile_cont(f) — the continuous (interpolated) percentile, f64
 
 // AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
 // row against the real row). operand is null for COUNT(*). distinct (COUNT(DISTINCT x),
@@ -12252,6 +12248,11 @@ type AggSpec = {
   // For the "jsonObjectAgg" plan (B4): unique → error 22030 on a duplicate key. asJson rides on
   // jsonAsJson above (json vs jsonb render). Fixed at resolve.
   jsonUnique?: boolean;
+  // Ordered-set aggregate parameters (mode/percentile_* — aggregates.md §13), set only for the
+  // mode/percentileDisc/percentileCont plans: the WITHIN GROUP sort direction and the constant
+  // percentile fraction (null = a NULL fraction → NULL result; unused for mode).
+  osaDesc?: boolean;
+  osaFrac?: number | null;
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -12383,6 +12384,13 @@ type Acc = {
   // finalize; `seen` (above) distinguishes a zero-row group (→ NULL) from a non-empty one.
   jsonPairs: [string, Value][];
   jsonUnique: boolean;
+  // Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
+  // fraction, plus the collected non-NULL values (percentileCont widens to f64 into osaFloats;
+  // mode/percentileDisc keep the Value in osaVals). Sorted + computed at finalize.
+  osaDesc?: boolean;
+  osaFrac?: number | null;
+  osaVals?: Value[];
+  osaFloats?: number[];
 };
 
 function newAcc(
@@ -12409,16 +12417,44 @@ function newAcc(
   };
 }
 
+// newAccFromSpec builds the accumulator for one resolved aggregate. Ordered-set aggregates
+// (mode/percentile_* — aggregates.md §13) need their WITHIN GROUP direction + fraction (carried on
+// the spec, not the plan); every other plan delegates to newAcc. Only the aggregation stage builds
+// ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
+// ordered-set aggregate with OVER is 0A000, rejected at resolve).
+function newAccFromSpec(s: AggSpec): Acc {
+  if (s.plan === "mode" || s.plan === "percentileDisc" || s.plan === "percentileCont") {
+    const a = newAcc(s.plan);
+    a.osaDesc = s.osaDesc;
+    a.osaFrac = s.osaFrac;
+    a.osaVals = [];
+    a.osaFloats = [];
+    return a;
+  }
+  // Pass the json[b]_agg / object_agg flags through (the json plans ride them on the Acc, B4).
+  return newAcc(
+    s.plan,
+    s.floatWidth ?? "f64",
+    s.jsonAsJson ?? false,
+    s.jsonStrict ?? false,
+    s.jsonUnique ?? false,
+  );
+}
+
 // cloneAcc deep-copies a running accumulator so the window stage can SNAPSHOT it at each peer-group
 // boundary and finalize the snapshot without consuming the running fold (spec/design/window.md §6;
 // the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values), so only the
 // float-fold buffer needs a real copy; `cur` is a Value (treated immutably by foldAcc/finalizeAcc).
 function cloneAcc(a: Acc): Acc {
+  // Ordered-set accumulators are never windowed (clone is the window-stage snapshot), but copy the
+  // collected slices anyway so a clone never aliases the original.
   return {
     ...a,
     floats: a.floats.slice(),
     jsonNodes: a.jsonNodes.slice(),
     jsonPairs: a.jsonPairs.slice(),
+    osaVals: a.osaVals ? a.osaVals.slice() : undefined,
+    osaFloats: a.osaFloats ? a.osaFloats.slice() : undefined,
   };
 }
 
@@ -12525,6 +12561,17 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
       a.jsonPairs.push([key, vv]);
       break;
     }
+    case "mode":
+    case "percentileDisc":
+    case "percentileCont":
+      // Collect the non-NULL aggregated argument (the WITHIN GROUP order key, evaluated per row).
+      // percentileCont widens each numeric value to f64 up front (the correctly-rounded cast,
+      // matching PG's numeric→float8); mode/percentileDisc keep the Value.
+      if (v.kind !== "null") {
+        if (a.plan === "percentileCont") a.osaFloats!.push(percentileInputF64(v));
+        else a.osaVals!.push(v);
+      }
+      break;
   }
 }
 
@@ -12608,6 +12655,109 @@ function finalizeAcc(a: Acc): Value {
       }));
       return jsonbValue(jsonMakeObject(members));
     }
+    case "mode":
+    case "percentileDisc":
+    case "percentileCont":
+      return finalizeOrderedSet(a);
+  }
+}
+
+// finalizeOrderedSet computes an ordered-set aggregate's value over its collected group
+// (spec/design/aggregates.md §13). mode → the most frequent value (tie → first in WITHIN GROUP sort
+// order); percentileDisc → an actual value at 1-based row ceil(p·N); percentileCont → the
+// interpolated f64. The fraction range check (22003) fires here, after the NULL-fraction check and
+// before the empty-group check — matching PG.
+function finalizeOrderedSet(a: Acc): Value {
+  const desc = a.osaDesc === true;
+  if (a.plan === "mode") {
+    const vals = a.osaVals!;
+    if (vals.length === 0) return nullValue();
+    vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
+    // The first value of the longest run of equal values — the most frequent, ties broken by sort
+    // order (the first such run).
+    let bestIdx = 0;
+    let bestCount = 1;
+    let runStart = 0;
+    for (let i = 1; i < vals.length; i++) {
+      if (valueCmp(vals[i]!, vals[runStart]!) === 0) {
+        const runLen = i - runStart + 1;
+        if (runLen > bestCount) {
+          bestCount = runLen;
+          bestIdx = runStart;
+        }
+      } else {
+        runStart = i;
+      }
+    }
+    return vals[bestIdx]!;
+  }
+  if (a.plan === "percentileDisc") {
+    if (a.osaFrac === null || a.osaFrac === undefined) return nullValue(); // NULL fraction → NULL
+    const p = a.osaFrac;
+    checkPercentileFraction(p);
+    const vals = a.osaVals!;
+    if (vals.length === 0) return nullValue();
+    vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
+    const n = vals.length;
+    // PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
+    const rownum = Math.ceil(p * n);
+    let idx = rownum >= 1 ? rownum - 1 : 0;
+    if (idx > n - 1) idx = n - 1;
+    return vals[idx]!;
+  }
+  // percentileCont
+  if (a.osaFrac === null || a.osaFrac === undefined) return nullValue();
+  const p = a.osaFrac;
+  checkPercentileFraction(p);
+  const fs = a.osaFloats!;
+  if (fs.length === 0) return nullValue();
+  fs.sort((x, y) => dirCmp(floatTotalCmp(x, y), desc));
+  const n = fs.length;
+  // PG percentile_cont (orderedsetaggs.c): interpolate between the bracketing rows, in f64 with PG's
+  // exact operation order — bit-identical across cores and to PG.
+  const pos = p * (n - 1);
+  const first = Math.floor(pos);
+  const second = Math.ceil(pos);
+  let result: number;
+  if (first === second) {
+    result = fs[first]!;
+  } else {
+    const lo = fs[first]!;
+    const hi = fs[second]!;
+    const proportion = pos - first;
+    result = lo + proportion * (hi - lo);
+  }
+  return float64Value(result);
+}
+
+// dirCmp applies a WITHIN GROUP sort direction to a comparison result (DESC reverses).
+function dirCmp(c: number, desc: boolean): number {
+  return desc ? -c : c;
+}
+
+// checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
+// NaN is 22003 (numeric_value_out_of_range), matching PG's "percentile value … is not between 0 and
+// 1". Called per group at finalize, after the NULL-fraction check.
+function checkPercentileFraction(p: number): void {
+  if (Number.isNaN(p) || p < 0 || p > 1) {
+    throw engineError("numeric_value_out_of_range", `percentile value ${p} is not between 0 and 1`);
+  }
+}
+
+// percentileInputF64 widens a numeric value to f64 for percentile_cont (aggregates.md §13): integers
+// via Number(), decimals via the correctly-rounded Number(render()) cast (matching PG's
+// numeric→float8), floats unchanged. The resolver restricts the operand to a numeric family.
+function percentileInputF64(v: Value): number {
+  switch (v.kind) {
+    case "int":
+      return Number(v.int);
+    case "f32":
+    case "f64":
+      return v.value;
+    case "decimal":
+      return Number(v.dec.render());
+    default:
+      throw new Error("resolver restricts percentile_cont to a numeric operand");
   }
 }
 
@@ -12670,12 +12820,15 @@ function windowsHaveAggregate(windows: [string, WindowDef][]): boolean {
   return windows.some(([, wd]) => windowDefHasAggregate(wd));
 }
 
-// isAggregateName reports whether name (case-insensitive) is a catalog aggregate or one of the
-// hand-resolved json[b]_object_agg[_unique] aggregates (which carry no catalog row, B4).
+// isAggregateName reports whether name (case-insensitive) is a catalog aggregate, one of the
+// hand-resolved json[b]_object_agg[_unique] aggregates (no catalog row, B4), or an ordered-set
+// aggregate (mode/percentile_*, §13 — also not catalog rows, their result/arg mold is special).
 function isAggregateName(name: string): boolean {
   const lname = name.toLowerCase();
   return (
-    AGGREGATES.some((a) => a.surface.toLowerCase() === lname) || objectAggClassify(name) !== null
+    AGGREGATES.some((a) => a.surface.toLowerCase() === lname) ||
+    objectAggClassify(name) !== null ||
+    isOrderedSetAggregateName(name)
   );
 }
 
@@ -12695,6 +12848,15 @@ function objectAggClassify(name: string): { asJson: boolean; unique: boolean } |
     default:
       return null;
   }
+}
+
+// isOrderedSetAggregateName reports whether name (case-insensitive) is an ordered-set aggregate
+// surface (mode / percentile_cont / percentile_disc — spec/design/aggregates.md §13). These take a
+// WITHIN GROUP (ORDER BY …) clause and are resolved by resolveOrderedSetAggregate, intercepted before
+// the generic aggregate/scalar dispatch.
+function isOrderedSetAggregateName(name: string): boolean {
+  const lname = name.toLowerCase();
+  return lname === "mode" || lname === "percentile_cont" || lname === "percentile_disc";
 }
 
 // astSubscriptExprs is the sub-expressions of a list of AST subscript specs (each index, or a
@@ -13377,6 +13539,130 @@ function resolveAggregate(
     jsonStrict: jsonFlags?.strict,
   });
   return { node: { kind: "column", index: slot }, type: result };
+}
+
+// resolveOrderedSetAggregate resolves agg(direct_args) WITHIN GROUP (ORDER BY key) — mode,
+// percentile_cont, percentile_disc (spec/design/aggregates.md §13). Like resolveAggregate it is valid
+// only in collect mode (else 42803) and folds into the same AggSpec list, returning a synthetic-row
+// reference. The WITHIN GROUP key is the aggregate's operand (resolved with aggregates forbidden — a
+// nested aggregate is 42803); the parenthesized args are the per-group direct argument (the
+// percentile fraction; empty for mode).
+function resolveOrderedSetAggregate(
+  scope: Scope,
+  e: {
+    name: string;
+    args: Expr[];
+    distinct: boolean;
+    filter?: Expr | null;
+    withinGroup?: OrderKey[] | null;
+  },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (!ag.collecting) {
+    throw engineError("grouping_error", "aggregate functions are not allowed here");
+  }
+  // DISTINCT cannot decorate an ordered-set aggregate (PG: a 42601 syntax error).
+  if (e.distinct) {
+    throw engineError("syntax_error", "DISTINCT is not allowed with ordered-set aggregates");
+  }
+  const name = e.name.toLowerCase();
+  const keys = e.withinGroup ?? [];
+  // Exactly one WITHIN GROUP sort key (PG models a second as a missing overload → 42883).
+  if (keys.length !== 1) throw noAggOverload(name);
+  const key = keys[0]!;
+  // An explicit COLLATE on the WITHIN GROUP key is deferred (the sort uses the value's default
+  // order); reject it rather than silently ignore the requested collation.
+  if (key.collation !== null && key.collation !== undefined && key.collation !== "") {
+    throw engineError(
+      "feature_not_supported",
+      "COLLATE in a WITHIN GROUP ORDER BY is not supported",
+    );
+  }
+  // The aggregated argument: the sort-key column, resolved per row with aggregates FORBIDDEN (a
+  // nested aggregate in the order key is 42803, matching PG).
+  const keyExpr: Expr =
+    key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
+      ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column }
+      : { kind: "column", name: key.column };
+  const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  const r = resolve(scope, keyExpr, null, sub, params);
+  const operand = r.node;
+  const optype = r.type;
+
+  let plan: AggPlan;
+  let frac: number | null;
+  let result: ResolvedType;
+  if (name === "mode") {
+    // mode() takes no direct argument; mode(x) matches no overload (42883).
+    if (e.args.length !== 0) throw noAggOverload(name);
+    plan = "mode";
+    frac = null;
+    result = optype;
+  } else if (name === "percentile_disc") {
+    frac = resolveOsaFraction(scope, name, e.args, params);
+    plan = "percentileDisc";
+    result = optype;
+  } else {
+    // percentile_cont interpolates, so the aggregated input must be numeric (interval is a deferred
+    // follow-on); a non-numeric WITHIN GROUP column matches no overload (42883).
+    if (optype.kind !== "int" && optype.kind !== "decimal" && optype.kind !== "float") {
+      throw noAggOverload(name);
+    }
+    frac = resolveOsaFraction(scope, name, e.args, params);
+    plan = "percentileCont";
+    result = { kind: "float", ty: "f64" };
+  }
+
+  // FILTER (WHERE cond): resolved per input row with aggregates forbidden, exactly as for an ordinary
+  // aggregate (aggregates.md §11) — a non-boolean cond is 42804, a nested aggregate 42803.
+  let filter: RExpr | null = null;
+  if (e.filter !== undefined && e.filter !== null) {
+    const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const rf = resolve(scope, e.filter, null, fsub, params);
+    if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
+      throw typeError("argument of FILTER must be type boolean");
+    }
+    filter = rf.node;
+  }
+
+  const slot = ag.groupKeys.length + ag.specs.length;
+  ag.specs.push({ plan, operand, distinct: false, filter, osaDesc: key.descending, osaFrac: frac });
+  return { node: { kind: "column", index: slot }, type: result };
+}
+
+// resolveOsaFraction resolves an ordered-set aggregate's direct argument — the percentile fraction
+// (aggregates.md §13). It must be a numeric constant (a column reference / param / non-folded
+// expression is the deferred non-constant form, 0A000); resolved with a float context so a numeric
+// literal folds to an f64. Returns null for a NULL fraction (→ NULL result). A non-numeric fraction
+// or a wrong argument count matches no overload (42883).
+function resolveOsaFraction(
+  scope: Scope,
+  name: string,
+  args: Expr[],
+  params: ParamTypes,
+): number | null {
+  if (args.length !== 1) throw noAggOverload(name); // wrong argument count
+  if (exprReadsColumns(args[0]!)) {
+    throw engineError(
+      "feature_not_supported",
+      "the fraction argument of an ordered-set aggregate must be a constant",
+    );
+  }
+  const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  const r = resolve(scope, args[0]!, "f64", sub, params);
+  if (r.type.kind === "null") return null;
+  if (r.type.kind === "float" || r.type.kind === "int" || r.type.kind === "decimal") {
+    const node = r.node;
+    if (node.kind === "constFloat") return node.value;
+    if (node.kind === "constInt") return Number(node.value);
+    if (node.kind === "constDecimal") return Number(node.value.render());
+    throw engineError(
+      "feature_not_supported",
+      "the fraction argument of an ordered-set aggregate must be a constant",
+    );
+  }
+  throw noAggOverload(name); // a non-numeric fraction matches no overload
 }
 
 // resolveGrouping resolves GROUPING(c1, …, ck) (spec/design/aggregates.md §12) — the grouping-sets
@@ -17046,6 +17332,30 @@ function resolve(
       return { node: { kind: "param", index: idx0 }, type };
     }
     case "funcCall": {
+      // An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13) carries
+      // WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself does not support
+      // an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP it is 42883 (PG:
+      // "function mode() does not exist").
+      if (isOrderedSetAggregateName(e.name)) {
+        if (
+          (e.over !== undefined && e.over !== null) ||
+          (e.overName !== undefined && e.overName !== null)
+        ) {
+          throw engineError(
+            "feature_not_supported",
+            `OVER is not supported for ordered-set aggregate ${e.name.toLowerCase()}`,
+          );
+        }
+        if (e.withinGroup === undefined || e.withinGroup === null) {
+          throw noAggOverload(e.name.toLowerCase());
+        }
+        return resolveOrderedSetAggregate(scope, e, ag, params);
+      }
+      // WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function) is
+      // 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
+      if (e.withinGroup !== undefined && e.withinGroup !== null) {
+        throw noAggOverload(e.name.toLowerCase());
+      }
       // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
       if (e.over !== undefined && e.over !== null) {
         // GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in PostgreSQL

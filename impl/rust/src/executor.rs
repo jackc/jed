@@ -10236,8 +10236,7 @@ impl Database {
             // DISTINCT aggregate (`None` for a plain aggregate — `COUNT(DISTINCT x)`,
             // aggregates.md §5). The set is value-canonical (`Value`'s own Eq/Hash, so `1.5`/`1.50`
             // and `-0`/`+0` collapse, identical to the group-key bucketing).
-            let new_accs =
-                || -> Vec<Acc> { plan.agg_specs.iter().map(|s| Acc::new(s.plan)).collect() };
+            let new_accs = || -> Vec<Acc> { plan.agg_specs.iter().map(Acc::from_spec).collect() };
             let new_seen = || -> Vec<Option<HashSet<Value>>> {
                 plan.agg_specs
                     .iter()
@@ -15279,6 +15278,26 @@ enum AggPlan {
         json: bool,
         unique: bool,
     },
+    /// `mode() WITHIN GROUP (ORDER BY x)` — the most frequent value (tie → first in sort order),
+    /// result the input type (spec/design/aggregates.md §13). The direction + buffered values live
+    /// on the `Acc`; this is just the kernel id (kept f64-free so AggPlan stays `Copy`/`Eq`).
+    OrderedSetMode,
+    /// `percentile_disc(f) WITHIN GROUP (ORDER BY x)` — the discrete percentile, an actual input
+    /// value at row `ceil(f·N)`; result the input type. Direction + fraction live on the `Acc`.
+    OrderedSetDisc,
+    /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)` — the continuous (interpolated) percentile;
+    /// numeric input widened to f64, result f64. Direction + fraction live on the `Acc`.
+    OrderedSetCont,
+}
+
+/// The resolve-time parameters of an ordered-set aggregate (spec/design/aggregates.md §13), kept
+/// off `AggPlan` (which is `Copy`/`Eq` and so cannot hold an `f64`). `desc` is the `WITHIN GROUP`
+/// sort direction; `frac` is the constant percentile fraction (`None` = a NULL fraction → NULL
+/// result; unused for `mode`).
+#[derive(Clone, Copy)]
+struct OsaParams {
+    desc: bool,
+    frac: Option<f64>,
 }
 
 /// One resolved aggregate: its plan and its resolved argument expression (evaluated per
@@ -15294,6 +15313,9 @@ struct AggSpec {
     operand: Option<RExpr>,
     distinct: bool,
     filter: Option<RExpr>,
+    /// `Some` for an ordered-set aggregate (`mode`/`percentile_*` — aggregates.md §13): the
+    /// `WITHIN GROUP` sort direction + the constant fraction. `None` for every ordinary aggregate.
+    osa: Option<OsaParams>,
 }
 
 /// A running aggregate accumulator (one per AggSpec), folded per input row then finalized.
@@ -15350,9 +15372,42 @@ enum Acc {
         unique: bool,
         seen: bool,
     },
+    /// An ordered-set aggregate (`mode`/`percentile_disc`/`percentile_cont` — aggregates.md §13):
+    /// buffer every non-NULL operand value, then sort + compute at finalize. `kind` selects the
+    /// computation, `desc` the `WITHIN GROUP` direction, `frac` the constant fraction. For
+    /// `percentile_cont` the inputs are widened to f64 into `floats`; `mode`/`percentile_disc`
+    /// buffer the original `Value`s into `vals`.
+    OrderedSet {
+        kind: AggPlan,
+        desc: bool,
+        frac: Option<f64>,
+        vals: Vec<Value>,
+        floats: Vec<f64>,
+    },
 }
 
 impl Acc {
+    /// Build the accumulator for one resolved aggregate. Ordered-set aggregates need their
+    /// `WITHIN GROUP` direction + fraction (carried on the spec, not the `Copy` plan), so they go
+    /// through here; every other plan delegates to [`Acc::new`]. Only the aggregation stage builds
+    /// ordered-set accumulators — the window stage (which calls [`Acc::new`] directly) never sees
+    /// one (an ordered-set aggregate with `OVER` is 0A000, rejected at resolve).
+    fn from_spec(s: &AggSpec) -> Acc {
+        match s.plan {
+            AggPlan::OrderedSetMode | AggPlan::OrderedSetDisc | AggPlan::OrderedSetCont => {
+                let osa = s.osa.expect("an ordered-set plan carries its OSA params");
+                Acc::OrderedSet {
+                    kind: s.plan,
+                    desc: osa.desc,
+                    frac: osa.frac,
+                    vals: Vec::new(),
+                    floats: Vec::new(),
+                }
+            }
+            _ => Acc::new(s.plan),
+        }
+    }
+
     fn new(plan: AggPlan) -> Acc {
         match plan {
             AggPlan::CountStar => Acc::CountStar(0),
@@ -15407,6 +15462,11 @@ impl Acc {
                 unique,
                 seen: false,
             },
+            AggPlan::OrderedSetMode | AggPlan::OrderedSetDisc | AggPlan::OrderedSetCont => {
+                unreachable!(
+                    "ordered-set accumulators are built via Acc::from_spec, never the window stage"
+                )
+            }
         }
     }
 
@@ -15554,6 +15614,20 @@ impl Acc {
                 }
                 pairs.push((key, vv));
             }
+            Acc::OrderedSet {
+                kind, vals, floats, ..
+            } => {
+                // Collect the non-NULL aggregated argument (the WITHIN GROUP order key, evaluated per
+                // row). percentile_cont widens each numeric value to f64 up front (the correctly-
+                // rounded cast, matching PG's numeric→float8); mode/percentile_disc keep the Value.
+                if !matches!(value, Value::Null) {
+                    if matches!(kind, AggPlan::OrderedSetCont) {
+                        floats.push(percentile_input_f64(&value)?);
+                    } else {
+                        vals.push(value);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -15671,8 +15745,131 @@ impl Acc {
                     Value::Jsonb(json::make_object(members))
                 }
             }
+            Acc::OrderedSet {
+                kind,
+                desc,
+                frac,
+                vals,
+                floats,
+            } => finalize_ordered_set(kind, desc, frac, vals, floats)?,
         })
     }
+}
+
+/// Compute an ordered-set aggregate's value over its collected group (spec/design/aggregates.md
+/// §13). `mode` returns the most frequent value (tie → first in `WITHIN GROUP` sort order);
+/// `percentile_disc` an actual value at row `ceil(p·N)`; `percentile_cont` the interpolated f64.
+/// The fraction range check (`22003`) fires here, after the NULL-fraction check and before the
+/// empty-group check — matching PG.
+fn finalize_ordered_set(
+    kind: AggPlan,
+    desc: bool,
+    frac: Option<f64>,
+    mut vals: Vec<Value>,
+    mut floats: Vec<f64>,
+) -> Result<Value> {
+    match kind {
+        AggPlan::OrderedSetMode => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            // Sort by the WITHIN GROUP order, then take the first value of the longest run of
+            // equal values — the most frequent, ties broken by sort order (the first such run).
+            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            let mut best_idx = 0usize;
+            let mut best_count = 1usize;
+            let mut run_start = 0usize;
+            for i in 1..vals.len() {
+                if value_cmp(&vals[i], &vals[run_start]) == std::cmp::Ordering::Equal {
+                    let run_len = i - run_start + 1;
+                    if run_len > best_count {
+                        best_count = run_len;
+                        best_idx = run_start;
+                    }
+                } else {
+                    run_start = i;
+                }
+            }
+            Ok(vals.swap_remove(best_idx))
+        }
+        AggPlan::OrderedSetDisc => {
+            let Some(p) = frac else {
+                return Ok(Value::Null); // a NULL fraction → NULL (checked before the range check)
+            };
+            check_percentile_fraction(p)?;
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            let n = vals.len();
+            // PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
+            let rownum = (p * n as f64).ceil() as i64;
+            let idx = if rownum < 1 { 0 } else { (rownum - 1) as usize };
+            let idx = idx.min(n - 1);
+            Ok(vals.swap_remove(idx))
+        }
+        AggPlan::OrderedSetCont => {
+            let Some(p) = frac else {
+                return Ok(Value::Null);
+            };
+            check_percentile_fraction(p)?;
+            if floats.is_empty() {
+                return Ok(Value::Null);
+            }
+            floats.sort_by(|a, b| dir_cmp(crate::value::total_cmp_f64(*a, *b), desc));
+            let n = floats.len();
+            // PG percentile_cont (orderedsetaggs.c): interpolate between the bracketing rows, in
+            // f64 with PG's exact operation order — bit-identical across cores and to PG.
+            let pos = p * ((n - 1) as f64);
+            let first = pos.floor() as usize;
+            let second = pos.ceil() as usize;
+            let result = if first == second {
+                floats[first]
+            } else {
+                let lo = floats[first];
+                let hi = floats[second];
+                let proportion = pos - first as f64;
+                lo + (proportion * (hi - lo))
+            };
+            Ok(Value::Float64(result))
+        }
+        _ => unreachable!("finalize_ordered_set is only called for the ordered-set plans"),
+    }
+}
+
+/// Apply a `WITHIN GROUP` sort direction to a comparison result (DESC reverses).
+fn dir_cmp(ord: std::cmp::Ordering, desc: bool) -> std::cmp::Ordering {
+    if desc { ord.reverse() } else { ord }
+}
+
+/// The percentile fraction range gate (spec/design/aggregates.md §13): `< 0`, `> 1`, or NaN is
+/// `22003` (`numeric_value_out_of_range`), matching PG's "percentile value … is not between 0
+/// and 1". Called per group at finalize, after the NULL-fraction check.
+fn check_percentile_fraction(p: f64) -> Result<()> {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) {
+        return Err(EngineError::new(
+            SqlState::NumericValueOutOfRange,
+            format!("percentile value {p} is not between 0 and 1"),
+        ));
+    }
+    Ok(())
+}
+
+/// Widen a numeric value to f64 for `percentile_cont` (spec/design/aggregates.md §13): integers via
+/// the IEEE cast, decimals via the correctly-rounded `decimal→f64` cast (matching PG's
+/// `numeric→float8`), floats unchanged (f32 widened to its exact f64). The resolver restricts the
+/// operand to a numeric family, so no other variant reaches here.
+fn percentile_input_f64(v: &Value) -> Result<f64> {
+    Ok(match v {
+        Value::Int(i) => *i as f64,
+        Value::Float32(f) => *f as f64,
+        Value::Float64(f) => *f,
+        Value::Decimal(d) => match decimal_to_float(d, ScalarType::Float64)? {
+            Value::Float64(f) => f,
+            _ => unreachable!("decimal_to_float(_, Float64) yields a Float64"),
+        },
+        _ => unreachable!("resolver restricts percentile_cont to a numeric operand"),
+    })
 }
 
 /// Whether any select item contains an aggregate call — i.e. this is an aggregate query.
@@ -17820,6 +18017,7 @@ fn resolve_aggregate(
                     operand: Some(operand),
                     distinct: false,
                     filter: None,
+                    osa: None,
                 });
                 Ok((RExpr::Column(slot), result))
             }
@@ -17834,6 +18032,7 @@ fn resolve_aggregate(
                     operand: Some(operand),
                     distinct: false,
                     filter: None,
+                    osa: None,
                 });
                 Ok((RExpr::Column(slot), result))
             }
@@ -17904,6 +18103,7 @@ fn resolve_aggregate(
                 operand,
                 distinct,
                 filter: rfilter,
+                osa: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -17918,10 +18118,195 @@ fn resolve_aggregate(
                 operand,
                 distinct,
                 filter: rfilter,
+                osa: None,
             });
             Ok((RExpr::Column(slot), result))
         }
         _ => unreachable!("an aggregate in a non-collecting context is handled above"),
+    }
+}
+
+/// Resolve an ordered-set aggregate `agg(direct_args) WITHIN GROUP (ORDER BY key)` — `mode`,
+/// `percentile_cont`, `percentile_disc` (spec/design/aggregates.md §13). Like `resolve_aggregate`
+/// it is valid only in a collecting context (else 42803) and folds into the same `AggSpec` list,
+/// returning a synthetic-row reference. The `WITHIN GROUP` key is the aggregate's operand
+/// (resolved with aggregates forbidden — a nested aggregate is 42803); the parenthesized `args`
+/// are the per-group direct argument (the percentile fraction; empty for `mode`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_ordered_set_aggregate(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    keys: &[OrderKey],
+    distinct: bool,
+    filter: Option<&Expr>,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if !matches!(agg, AggCtx::Collect { .. } | AggCtx::GroupedWindow { .. }) {
+        return Err(EngineError::new(
+            SqlState::GroupingError,
+            "aggregate functions are not allowed here",
+        ));
+    }
+    // DISTINCT cannot decorate an ordered-set aggregate (PG: a 42601 syntax error).
+    if distinct {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "DISTINCT is not allowed with ordered-set aggregates",
+        ));
+    }
+    // Exactly one WITHIN GROUP sort key (PG models a second as a missing overload → 42883).
+    let [key] = keys else {
+        return Err(no_agg_overload(name));
+    };
+    // An explicit COLLATE on the WITHIN GROUP key is deferred (the sort uses the value's default
+    // order); reject it rather than silently ignore the requested collation.
+    if key.collation.is_some() {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "COLLATE in a WITHIN GROUP ORDER BY is not supported",
+        ));
+    }
+    // The aggregated argument: the sort-key column, resolved per row with aggregates FORBIDDEN
+    // (a nested aggregate in the order key is 42803, matching PG).
+    let key_expr = match &key.qualifier {
+        Some(q) => Expr::QualifiedColumn {
+            qualifier: q.clone(),
+            name: key.column.clone(),
+        },
+        None => Expr::Column(key.column.clone()),
+    };
+    let mut sub = AggCtx::Forbidden;
+    let (operand, optype) = resolve(scope, &key_expr, None, &mut sub, params)?;
+
+    let lname = name.to_ascii_lowercase();
+    let (plan, frac, result) = match lname.as_str() {
+        "mode" => {
+            // mode() takes no direct argument; mode(x) matches no overload (42883).
+            if !args.is_empty() {
+                return Err(no_agg_overload(&lname));
+            }
+            (AggPlan::OrderedSetMode, None, optype.clone())
+        }
+        "percentile_disc" => {
+            let frac = resolve_osa_fraction(scope, &lname, args, params)?;
+            (AggPlan::OrderedSetDisc, frac, optype.clone())
+        }
+        "percentile_cont" => {
+            // percentile_cont interpolates, so the aggregated input must be numeric (interval is a
+            // deferred follow-on); a non-numeric WITHIN GROUP column matches no overload (42883).
+            if !matches!(
+                optype,
+                ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Float(_)
+            ) {
+                return Err(no_agg_overload(&lname));
+            }
+            let frac = resolve_osa_fraction(scope, &lname, args, params)?;
+            (
+                AggPlan::OrderedSetCont,
+                frac,
+                ResolvedType::Float(ScalarType::Float64),
+            )
+        }
+        _ => unreachable!("is_ordered_set_aggregate_name gates the three names above"),
+    };
+
+    // FILTER (WHERE cond): resolved per input row with aggregates forbidden, exactly as for an
+    // ordinary aggregate (aggregates.md §11) — a non-boolean cond is 42804, a nested aggregate
+    // 42803. Composes with the ordered-set fold (the filter restricts the collected rows first).
+    let rfilter = match filter {
+        Some(f) => {
+            let mut fsub = AggCtx::Forbidden;
+            let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
+            match ft {
+                ResolvedType::Bool | ResolvedType::Null => Some(rf),
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::DatatypeMismatch,
+                        "argument of FILTER must be type boolean",
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
+    let osa = OsaParams {
+        desc: key.descending,
+        frac,
+    };
+    match agg {
+        AggCtx::Collect {
+            group_keys, specs, ..
+        } => {
+            let slot = group_keys.len() + specs.len();
+            specs.push(AggSpec {
+                plan,
+                operand: Some(operand),
+                distinct: false,
+                filter: rfilter,
+                osa: Some(osa),
+            });
+            Ok((RExpr::Column(slot), result))
+        }
+        AggCtx::GroupedWindow {
+            group_keys,
+            agg_specs,
+            ..
+        } => {
+            let slot = group_keys.len() + agg_specs.len();
+            agg_specs.push(AggSpec {
+                plan,
+                operand: Some(operand),
+                distinct: false,
+                filter: rfilter,
+                osa: Some(osa),
+            });
+            Ok((RExpr::Column(slot), result))
+        }
+        _ => unreachable!("the non-collecting context is rejected above"),
+    }
+}
+
+/// Resolve an ordered-set aggregate's direct argument — the percentile fraction (aggregates.md
+/// §13). It must be a numeric **constant** (a column reference / param / non-folded expression is
+/// the deferred non-constant form, 0A000); resolved with a float context so a numeric literal
+/// folds to an `f64`. Returns `None` for a NULL fraction (→ NULL result). A non-numeric fraction
+/// or a wrong argument count matches no overload (42883).
+fn resolve_osa_fraction(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    params: &mut ParamTypes,
+) -> Result<Option<f64>> {
+    let [arg] = args else {
+        return Err(no_agg_overload(name)); // wrong argument count
+    };
+    if expr_reads_columns(arg) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "the fraction argument of an ordered-set aggregate must be a constant",
+        ));
+    }
+    let mut sub = AggCtx::Forbidden;
+    let (rarg, rtype) = resolve(scope, arg, Some(ScalarType::Float64), &mut sub, params)?;
+    match rtype {
+        ResolvedType::Null => Ok(None),
+        ResolvedType::Float(_) | ResolvedType::Int(_) | ResolvedType::Decimal => match rarg {
+            RExpr::ConstFloat64(f) => Ok(Some(f)),
+            RExpr::ConstFloat32(f) => Ok(Some(f as f64)),
+            RExpr::ConstInt(n) => Ok(Some(n as f64)),
+            RExpr::ConstDecimal(d) => match decimal_to_float(&d, ScalarType::Float64)? {
+                Value::Float64(f) => Ok(Some(f)),
+                _ => unreachable!("decimal_to_float(_, Float64) yields a Float64"),
+            },
+            _ => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "the fraction argument of an ordered-set aggregate must be a constant",
+            )),
+        },
+        _ => Err(no_agg_overload(name)), // a non-numeric fraction matches no overload
     }
 }
 
@@ -18041,11 +18426,15 @@ fn no_agg_overload(func: &str) -> EngineError {
 
 /// Whether `name` (case-insensitive) is a registered aggregate surface (COUNT/SUM/MIN/MAX/AVG).
 /// Data-driven over the catalog (`AGGREGATES`); consulted by the grouping + CHECK-structure walks.
+/// The ordered-set aggregates (`is_ordered_set_aggregate_name`) are aggregates for these purposes
+/// too — they fold a set of rows — but are not catalog rows (their result/arg mold is special,
+/// like `GROUPING()`), so they are OR'd in here rather than carried in `AGGREGATES`.
 fn is_aggregate_name(name: &str) -> bool {
     AGGREGATES
         .iter()
         .any(|a| a.surface.eq_ignore_ascii_case(name))
         || object_agg_classify(name).is_some()
+        || is_ordered_set_aggregate_name(name)
 }
 
 /// Classify a `json[b]_object_agg[_unique]` name → (is-json, is-unique). `None` otherwise. These
@@ -18059,6 +18448,16 @@ fn object_agg_classify(name: &str) -> Option<(bool, bool)> {
         "json_object_agg_unique" => Some((true, true)),
         _ => None,
     }
+}
+
+/// Whether `name` is an ordered-set aggregate surface (`mode`/`percentile_cont`/`percentile_disc` —
+/// spec/design/aggregates.md §13). These take a `WITHIN GROUP (ORDER BY …)` clause and are resolved
+/// by `resolve_ordered_set_aggregate`, intercepted before the generic aggregate/scalar dispatch.
+fn is_ordered_set_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "mode" | "percentile_cont" | "percentile_disc"
+    )
 }
 
 /// Whether `name` is a registered WINDOW-only function surface (row_number/rank/…). Data-driven
@@ -20560,7 +20959,41 @@ fn resolve(
             variadic,
             over,
             over_name: _, // desugared to `over` before resolution (window.md §5)
+            within_group,
         } => {
+            // An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13)
+            // carries WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself
+            // does not support an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP
+            // it is 42883 (PG: "function mode() does not exist").
+            if is_ordered_set_aggregate_name(name) {
+                if over.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "OVER is not supported for ordered-set aggregate {}",
+                            name.to_ascii_lowercase()
+                        ),
+                    ));
+                }
+                let Some(keys) = within_group.as_deref() else {
+                    return Err(no_agg_overload(&name.to_ascii_lowercase()));
+                };
+                return resolve_ordered_set_aggregate(
+                    scope,
+                    name,
+                    args,
+                    keys,
+                    *distinct,
+                    filter.as_deref(),
+                    agg,
+                    params,
+                );
+            }
+            // WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function)
+            // is 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
+            if within_group.is_some() {
+                return Err(no_agg_overload(&name.to_ascii_lowercase()));
+            }
             // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
             if let Some(wd) = over {
                 // GROUPING is not a window function — `GROUPING(a) OVER ()` is a syntax error in

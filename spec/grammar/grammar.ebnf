@@ -948,10 +948,19 @@ extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
  * not reserved but is always the modifier right after the call's ")". FILTER on a non-aggregate is
  * 42809, on a window function 0A000, an aggregate inside cond is 42803, a non-boolean cond 42804
  * (the resolver rejects). */
-function_call  ::= identifier "(" "DISTINCT"? ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" filter_clause? over_clause?
+function_call  ::= identifier "(" "DISTINCT"? ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" within_group_clause? filter_clause? over_clause?
 function_arg   ::= ( identifier "=>" )? expr
 variadic_arg   ::= "VARIADIC" expr
 filter_clause  ::= "FILTER" "(" "WHERE" expr ")"
+
+/* An ordered-set aggregate (mode / percentile_cont / percentile_disc — ../design/aggregates.md
+ * §13) attaches its sort key as a WITHIN GROUP ( ORDER BY … ) clause, between the argument list
+ * and any FILTER / OVER. The parenthesized argument list is the per-group DIRECT argument (the
+ * percentile fraction; empty for mode), the WITHIN GROUP order key is the AGGREGATED argument
+ * (the sorted input). Exactly one sort key (a second column is 42883); column-only, like the
+ * query order_by (§ order_by). WITHIN GROUP on a non-ordered-set function — or its absence on an
+ * ordered-set aggregate — is 42883; OVER on an ordered-set aggregate is 0A000. */
+within_group_clause ::= "WITHIN" "GROUP" "(" "ORDER" "BY" sort_key ")"
 
 /* A trailing OVER clause turns a call into a WINDOW-function call (../design/window.md). The
  * window-ONLY functions (row_number/rank/dense_rank/percent_rank/cume_dist/ntile/lag/lead/

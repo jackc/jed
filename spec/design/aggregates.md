@@ -236,11 +236,15 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   to a follow-on, a documented divergence.
 - **`GROUPING SETS` / `ROLLUP` / `CUBE`** (landed) — one `GROUP BY` computes several grouping sets
   at once, and the `GROUPING()` function reports which columns a row was grouped by (§12).
+- **Ordered-set aggregates** (landed) — `mode`, `percentile_cont`, `percentile_disc`, computed over
+  the rows sorted by a `WITHIN GROUP (ORDER BY …)` clause (§13).
 - **Deferred / out of scope**: `GROUP BY` by expression / ordinal / output alias; the PG
   **functional-dependency**
   relaxation of the grouping rule (a column functionally dependent on a grouped PK); **`FILTER` on
-  a window aggregate**; **`GROUPING SETS` combined with window functions**; and ordered-set
-  aggregates (`percentile_cont`). Each is an additive later feature ([../../TODO.md](../../TODO.md)).
+  a window aggregate**; **`GROUPING SETS` combined with window functions**; **hypothetical-set
+  aggregates** (`rank`/`dense_rank`/`percent_rank`/`cume_dist` `WITHIN GROUP`); and the
+  **array-valued** `percentile_cont`/`percentile_disc` fraction form. Each is an additive later
+  feature ([../../TODO.md](../../TODO.md)).
 
 ## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
 
@@ -335,3 +339,95 @@ define); jed bounds the uniform total (`CUBE(12)` = 4096 is fine, `CUBE(13)` = 8
 **Window functions** combined with `GROUPING SETS` / `GROUPING()` are **deferred** (`0A000`) — both
 want the grouped row's trailing synthetic slots; a single-grouping-set `GROUP BY` with a window
 function is unaffected (§10).
+
+## 13. Ordered-set aggregates (`WITHIN GROUP (ORDER BY …)`)
+
+The five aggregates of §1–§9 are **order-independent** — `SUM`/`COUNT`/`AVG` fold commutatively and
+`MIN`/`MAX` track an extreme — so a row's *position in a sort* never enters the result. An
+**ordered-set aggregate** is the opposite: its result is *defined by* the sorted order of its input,
+so the sort key is written explicitly as a `WITHIN GROUP (ORDER BY …)` clause attached to the call
+(SQL-standard / PostgreSQL). jed ships PostgreSQL's three built-ins:
+
+| Aggregate | Direct arg | `WITHIN GROUP` input | Result type | What it computes |
+|---|---|---|---|---|
+| `mode()` | (none) | any sortable | the input type | the most frequent input value |
+| `percentile_cont(fraction)` | `f64` fraction | **numeric** | **`f64`** | the **continuous** percentile (interpolated) |
+| `percentile_disc(fraction)` | `f64` fraction | any sortable | the input type | the **discrete** percentile (an actual input value) |
+
+**Syntax** ([grammar.md](grammar.md) §17). `agg ( direct_args ) WITHIN GROUP ( ORDER BY sort_key )`,
+where `sort_key` is a single bare/qualified **column** with the ordinary `ASC`/`DESC` /
+`NULLS FIRST|LAST` suffix (the same column-only narrowing as the query `ORDER BY`, §10 — a general
+expression sort key is the deferred follow-on). The `WITHIN GROUP` clause comes between the argument
+list and any `FILTER (WHERE …)` / `OVER (…)`. **Exactly one** sort key is allowed for all three (PG:
+a second key produces *"function mode(…, …) does not exist"*); a second column → **`42883`**.
+
+**The direct argument vs. the aggregated argument.** A `percentile_*` call has **two** argument
+lists. The parenthesized **direct argument** (the fraction) is a per-group **constant**, evaluated
+**once** — jed resolves it in an empty (no-column) scope and folds it to an `f64` at plan time (a
+column reference in the direct argument is the deferred non-constant form). The **aggregated
+argument** is the `WITHIN GROUP` `ORDER BY` column, evaluated **per row** (it is the aggregate's
+operand). `mode()` has no direct argument.
+
+**NULL handling.** NULL aggregated values are **skipped**, exactly as for the §7 aggregates: a group
+whose every input is NULL (or that is empty) yields **`NULL`** for all three. A **NULL fraction**
+yields `NULL` (checked before the range check). Over a non-empty group the aggregated input is the
+sorted multiset of non-NULL values; let `N` be its size.
+
+**`mode()`** returns the value that occurs most often; a tie is broken by the **sort order** (the
+first such value under the `WITHIN GROUP` ordering, so `ORDER BY x DESC` flips which tie wins). The
+result is the input column's own type — `mode()` over `text` is `text`, over `i32` is `i32`.
+
+**`percentile_disc(p)`** returns an **actual stored value** — no interpolation, so it works for any
+sortable type and returns that type. Over the `1`-based sorted values it returns the value at row
+`K = ceil(p · N)` (and row `1` when `p = 0`), i.e. the smallest `K` with `K/N ≥ p` (PostgreSQL
+`orderedsetaggs.c`). Zero-based: `idx = max(0, ceil(p·N) − 1)`.
+
+**`percentile_cont(p)`** **interpolates** between the two bracketing values and always returns
+**`f64`** (PostgreSQL `float8`). The aggregated input must be **numeric** — `i16`/`i32`/`i64`/
+`decimal`/`f32`/`f64` — each value widened to `f64` (the correctly-rounded `decimal→f64` cast,
+[decimal.md](decimal.md); matching PG's implicit `numeric→float8`) **before** the sort; a non-numeric
+input column is **`42883`** (no overload), matching PG (interval input is the deferred follow-on).
+The formula is PostgreSQL's exactly, computed in `f64` so it is **bit-identical** to PG (the same
+in-contract determinism exception the window `percent_rank`/`cume_dist` ratios use —
+[float.md](float.md) §7, [determinism.md](determinism.md), the `R` render tag):
+
+```
+pos    = p · (N − 1)
+first  = floor(pos)          second = ceil(pos)
+result = (first == second) ? val[first]
+                           : val[first] + ((pos − first) · (val[second] − val[first]))
+```
+
+The lerp keeps PG's operation order (`lo + (proportion · (hi − lo))`); since each IEEE operation is
+individually correctly-rounded and the cores share the operation sequence, the `f64` result is
+byte-identical across cores and to PG. `percentile_cont` over a **single** row returns that row's
+value; `p = 0`/`p = 1` return the min/max.
+
+**Out-of-range fraction.** `p < 0`, `p > 1`, or `NaN` raises **`22003`** (`numeric_value_out_of_range`,
+*"percentile value … is not between 0 and 1"*). Matching PG, the range check fires **per group at
+finalize**, *after* the NULL-fraction check but *before* the empty-group check — so a whole-table
+`percentile_cont(1.5) FROM empty` (one group) raises `22003`, while `… GROUP BY g` over an empty
+table (zero groups) raises nothing.
+
+**Composition.** Ordered-set aggregates compose with `GROUP BY`/`HAVING` (the sort + percentile is
+per group) and with `FILTER (WHERE cond)` (the filter restricts the collected rows first, PG —
+§11). `DISTINCT` inside the call is rejected (`42601`, PG). **`OVER (…)` is `0A000`** — PostgreSQL
+itself does not support an ordered-set aggregate as a window function (*"OVER is not supported for
+ordered-set aggregate …"*), so this **matches** PG, not a divergence. An aggregate inside the
+`WITHIN GROUP` `ORDER BY` is **`42803`** (*"aggregate function calls cannot be nested"*, PG). A
+`WITHIN GROUP` clause on a **non**-ordered-set function — an ordinary aggregate (`sum`) or a scalar
+function — is **`42883`** (PG models it as a missing `sum(…, …)` overload), as is an ordered-set
+aggregate used **without** `WITHIN GROUP` (PG: *"function mode() does not exist"*).
+
+**Cost** (the cross-core contract, §8). The aggregated argument is evaluated **per row**
+(`operator_eval`s) and `aggregate_accumulate` is charged per `(passing input row × aggregate)` — the
+identical shape as an ordinary aggregate (a single ordered-set aggregate over `N` whole-table rows is
+`N` `storage_row_read` + `N` `aggregate_accumulate` + `1` `row_produced`). The per-group **sort**, the
+mode/percentile **finalize**, and the constant fraction evaluation are **unmetered**, like the
+`ORDER BY` sort, the `DISTINCT` dedup, and `AVG`'s division (§8).
+
+**Determinism.** The collected values are sorted by the same total order `ORDER BY`/`MIN`/`MAX` use
+([../types/compare.toml](../types/compare.toml); `percentile_cont` sorts in PG's `float8` total
+order), so the sorted multiset — and therefore mode's tie-break, the discrete index, and the
+continuous interpolation — is byte-identical across cores. No hash-map iteration order enters the
+result. Result `f64`s are the in-contract correctly-rounded exception (above).

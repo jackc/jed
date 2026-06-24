@@ -143,9 +143,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `query.grouping_sets`; scan once, accumulate per (set×row×agg); total sets capped at 4096
         (`54001`, divergence from PG's per-construct 54011); window-combined deferred `0A000`. →
         aggregates.md §12
+  - [x] **Ordered-set aggregates** — `mode()` / `percentile_cont(f)` / `percentile_disc(f)`
+        `WITHIN GROUP (ORDER BY col)`: the result is defined by the rows sorted by the WITHIN GROUP
+        key (one bare/qualified column, ASC/DESC/NULLS — the column-only query-ORDER-BY narrowing).
+        `mode` → the most frequent value (tie → sort order), input-type result; `percentile_cont` →
+        the interpolated **f64** percentile (numeric input, PG's `orderedsetaggs.c` formula,
+        bit-identical to PG); `percentile_disc` → an actual value at row `ceil(f·N)`, input-type
+        result. Fraction is a per-group constant f64 (NULL → NULL; out of `[0,1]`/NaN → `22003`).
+        Composes with GROUP BY/HAVING/FILTER. `DISTINCT` → `42601`; `OVER` → `0A000` (PG matches); a
+        second key / `WITHIN GROUP` on a non-ordered-set fn / no `WITHIN GROUP` → `42883`. New
+        capability `query.ordered_set_aggregate`; cost = an ordinary aggregate's (sort + finalize
+        unmetered). → aggregates.md §13
   - [ ] _follow-on:_ `SELECT DISTINCT` in an aggregate query, GROUP BY by
-        expression/ordinal/alias, functional-dependency grouping, ordered-set aggregates,
-        `GROUPING SETS` combined with window functions, and `FILTER` on a **window** aggregate.
+        expression/ordinal/alias, functional-dependency grouping,
+        `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate, and the
+        ordered-set follow-ons (hypothetical-set aggregates `rank`/`dense_rank`/`percent_rank`/
+        `cume_dist` `WITHIN GROUP`, the array-valued `percentile_*` fraction, interval input to
+        `percentile_cont`, a general-expression / collated `WITHIN GROUP` key, a non-constant
+        fraction).
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
       optimization.** Per-row values folded over a related row set in a dedicated **window stage**
       (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/

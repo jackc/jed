@@ -295,6 +295,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // HAVING: a boolean filter over grouped rows, after aggregation, before ORDER BY
     // (spec/design/aggregates.md §8, grammar.md §19).
     "query.having",
+    // Ordered-set aggregates mode() / percentile_cont(f) / percentile_disc(f) WITHIN GROUP
+    // (ORDER BY col) (spec/design/aggregates.md §13, grammar.md §17).
+    "query.ordered_set_aggregate",
     // Window functions — OVER (PARTITION BY / ORDER BY), the window stage, row_number() (S0,
     // spec/design/window.md).
     "query.window",

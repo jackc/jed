@@ -1261,6 +1261,13 @@ type FuncCallExpr struct {
 	// desugaring pass replaces it with the named definition (into Over) before resolution; exactly
 	// one of Over/OverName is set on a window call.
 	OverName string
+	// WithinGroup is the WITHIN GROUP (ORDER BY …) order keys when the call is an ordered-set
+	// aggregate (mode/percentile_cont/percentile_disc — spec/design/aggregates.md §13); nil for an
+	// ordinary call. The parenthesized Args are the per-group direct argument (the percentile
+	// fraction; empty for mode); these keys are the aggregated argument, the value sorted over.
+	// Column-only, like the query ORDER BY (the parser keeps the whole list so the resolver can
+	// reject a second key, 42883).
+	WithinGroup []OrderKey
 }
 
 // InExpr is `Lhs IN (List)` / `Lhs NOT IN (List)` — membership over a non-empty value list

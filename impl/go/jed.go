@@ -219,6 +219,9 @@ var SupportedCapabilities = []string{
 	// HAVING: a boolean filter over grouped rows, after aggregation, before ORDER BY
 	// (spec/design/aggregates.md §8, grammar.md §19).
 	"query.having",
+	// Ordered-set aggregates mode() / percentile_cont(f) / percentile_disc(f) WITHIN GROUP
+	// (ORDER BY col) (spec/design/aggregates.md §13, grammar.md §17).
+	"query.ordered_set_aggregate",
 	// Window functions (OVER) — the window stage + row_number() (spec/design/window.md, S0). A
 	// window-only function without OVER is 42809; a window function in WHERE/HAVING is 42P20.
 	"query.window",

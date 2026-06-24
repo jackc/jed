@@ -3240,6 +3240,22 @@ class Parser {
     this.expect("rparen");
     // Keep argNames empty unless a name appeared (the all-positional sentinel — §8).
     const argNames = anyNamed ? names : [];
+    // A trailing `WITHIN GROUP (ORDER BY <key>)` marks an ordered-set aggregate (mode /
+    // percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list and
+    // any FILTER / OVER (PG order). WITHIN/GROUP are not reserved; right after the call's `)` they are
+    // always the clause. The order key reuses the column-only query ORDER BY (parseOrderBy consumes
+    // the ORDER BY keywords); the resolver enforces exactly one key (42883) and the per-name rules.
+    let withinGroup: OrderKey[] | null = null;
+    if (this.peekKeyword() === "within") {
+      this.advance();
+      this.expectKeyword("group");
+      this.expect("lparen");
+      if (this.peekKeyword() !== "order") {
+        throw engineError("syntax_error", "WITHIN GROUP requires an ORDER BY clause");
+      }
+      withinGroup = this.parseOrderBy();
+      this.expect("rparen");
+    }
     // A trailing `FILTER (WHERE cond)` restricts which input rows feed THIS aggregate
     // (aggregates.md §11). PG syntax: `agg(args) FILTER (WHERE cond) [OVER (...)]` — FILTER binds to
     // the aggregate and precedes any OVER. FILTER is not reserved, but right after the call's `)` it
@@ -3280,6 +3296,7 @@ class Parser {
           variadic,
           over: null,
           overName,
+          withinGroup,
         };
       }
       this.expect("lparen");
@@ -3299,6 +3316,7 @@ class Parser {
       variadic,
       over,
       overName,
+      withinGroup,
     };
   }
 

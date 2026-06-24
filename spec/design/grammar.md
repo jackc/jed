@@ -727,6 +727,26 @@ across the three cores:
    too-short spread (`42883`) are resolve-time concerns driven by the catalog's `variadic` flag —
    see [array-functions.md](array-functions.md) §12.
 
+**The `WITHIN GROUP (ORDER BY …)` clause (ordered-set aggregates).** An **ordered-set aggregate**
+— `mode`, `percentile_cont`, `percentile_disc` ([aggregates.md](aggregates.md) §13) — attaches a
+`within_group_clause ::= "WITHIN" "GROUP" "(" "ORDER" "BY" sort_key ")"` between the argument list
+and any `FILTER` / `OVER`. The parenthesized argument list is the per-group **direct** argument
+(the percentile fraction; empty for `mode`); the `WITHIN GROUP` order key is the **aggregated**
+argument (the value sorted over). Parser rules, byte-identical across the three cores:
+
+1. **One column-only sort key.** `WITHIN GROUP`'s `sort_key` is a single bare/qualified
+   `column_ref` with the ordinary `ASC`/`DESC` / `NULLS FIRST|LAST` suffix — the same column-only
+   narrowing as the query `ORDER BY` (§10). The clause carries a `Some(sort_key)` onto the
+   `FuncCall` node (an ordinary call carries `None` and parses byte-identically to before); the
+   one-key restriction, the per-name validity, and every error below are resolve-time concerns
+   driven by [aggregates.md](aggregates.md) §13. `WITHIN`/`GROUP` are recognized positionally,
+   right after the call's `)`, so they stay non-reserved.
+2. **Resolve-time meaning.** A second sort key, `WITHIN GROUP` on a non-ordered-set function, and
+   an ordered-set aggregate **without** `WITHIN GROUP` are all **`42883`**; `OVER` on an
+   ordered-set aggregate is **`0A000`**; an out-of-range percentile fraction is **`22003`**; an
+   aggregate inside the `WITHIN GROUP` order key is **`42803`** — see [aggregates.md](aggregates.md)
+   §13.
+
 ## 18. `GROUP BY`
 
 `group_by ::= "GROUP" "BY" group_item ("," group_item)*` slots between `WHERE` and

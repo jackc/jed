@@ -154,7 +154,9 @@ Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).
 `GROUP BY` also takes `GROUPING SETS`, `ROLLUP`, and `CUBE` to compute several groupings at once,
-with the `GROUPING(col)` function to tell subtotal rows apart.
+with the `GROUPING(col)` function to tell subtotal rows apart. The ordered-set aggregates `mode`,
+`percentile_cont`, and `percentile_disc` are written with a `WITHIN GROUP (ORDER BY …)` clause
+(for example, `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` for the median).
 
 Grouping and aggregation:
 
