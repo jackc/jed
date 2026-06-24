@@ -24,7 +24,9 @@ import type {
   JoinKind,
   JsonOnBehavior,
   JsonPredicateKind,
+  JsonTable,
   JsonWrapper,
+  JtColumn,
   Literal,
   OnConflict,
   OrderKey,
@@ -1923,6 +1925,11 @@ class Parser {
       tr.lateral = lateral;
       return tr;
     }
+    // `JSON_TABLE(ctx, path [AS n] COLUMNS (…))` — a table source (json-table.md §3, T1), recognized
+    // by the keyword followed by `(`.
+    if (this.peekKeyword() === "json_table" && this.peekKindAt(1) === "lparen") {
+      return this.parseJsonTable();
+    }
     const name = this.expectIdentifier();
     // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
     let args: Expr[] | null = null;
@@ -2053,6 +2060,127 @@ class Parser {
       this.advance();
     }
     return rows;
+  }
+
+  // parseJsonTable parses `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md
+  // §3, T1). The caller has verified the JSON_TABLE keyword + `(`.
+  private parseJsonTable(): TableRef {
+    this.advance(); // JSON_TABLE
+    this.advance(); // (
+    const ctx = this.parseExpr();
+    this.skipFormatJson();
+    this.expect("comma");
+    const path = this.parseExpr();
+    // An optional `AS name` for the root path (the path-name) is accepted and ignored (it only
+    // matters with an explicit PLAN clause, the deferred T2).
+    if (this.peekKeyword() === "as") {
+      this.advance();
+      this.expectIdentifier();
+    }
+    if (this.peekKeyword() === "passing") {
+      throw engineError("feature_not_supported", "JSON_TABLE PASSING clause is not supported yet");
+    }
+    this.expectKeyword("columns");
+    const columns = this.parseJtColumns();
+    // An explicit PLAN clause is the deferred T2 slice.
+    if (this.peekKeyword() === "plan") {
+      throw engineError(
+        "feature_not_supported",
+        "JSON_TABLE explicit PLAN clause is not supported yet",
+      );
+    }
+    this.expect("rparen");
+    let alias: string | null = null;
+    if (this.peekKeyword() === "as") {
+      this.advance();
+      alias = this.expectIdentifier();
+    } else {
+      const t = this.peek();
+      if (t.kind === "word" && !isTableRefStopKeyword(lower(t.word!))) {
+        alias = t.word!;
+        this.advance();
+      }
+    }
+    const jsonTable: JsonTable = { ctx, path, columns };
+    return { name: alias ?? "json_table", alias, args: null, jsonTable, lateral: false };
+  }
+
+  // parseJtColumns parses a parenthesized JSON_TABLE COLUMNS list — `"(" jt_column ("," jt_column)*
+  // ")"`.
+  private parseJtColumns(): JtColumn[] {
+    this.expect("lparen");
+    const cols: JtColumn[] = [this.parseJtColumn()];
+    while (this.peek().kind === "comma") {
+      this.advance();
+      cols.push(this.parseJtColumn());
+    }
+    this.expect("rparen");
+    return cols;
+  }
+
+  // parseJtColumn parses one JSON_TABLE column: `NESTED [PATH] p [AS n] COLUMNS (…)`, `name FOR
+  // ORDINALITY`, `name type EXISTS [PATH p] [ON ERROR]`, or a regular `name type [PATH p] [wrapper]
+  // [quotes] [ON …]` column (json-table.md §3.3).
+  private parseJtColumn(): JtColumn {
+    if (this.peekKeyword() === "nested") {
+      this.advance(); // NESTED
+      if (this.peekKeyword() === "path") {
+        this.advance();
+      }
+      const t = this.advance();
+      if (t.kind !== "str") {
+        throw engineError("syntax_error", "expected a string path after NESTED PATH");
+      }
+      const path = t.str!;
+      if (this.peekKeyword() === "as") {
+        this.advance();
+        this.expectIdentifier();
+      }
+      this.expectKeyword("columns");
+      const columns = this.parseJtColumns();
+      return { kind: "nested", path, columns };
+    }
+    const name = this.expectIdentifier();
+    // `name FOR ORDINALITY`.
+    if (this.peekKeyword() === "for") {
+      this.advance();
+      this.expectKeyword("ordinality");
+      return { kind: "ordinality", name };
+    }
+    // `name type …` — parse the type name + optional `[]`.
+    const typeName = this.expectIdentifier();
+    let array = false;
+    if (this.peek().kind === "lbracket") {
+      this.advance();
+      this.expect("rbracket");
+      array = true;
+    }
+    // `EXISTS` column.
+    if (this.peekKeyword() === "exists") {
+      this.advance();
+      const path = this.parseJtPathClause();
+      const onError = this.parseJsonOnErrorOnly();
+      return { kind: "exists", name, typeName, path, onError };
+    }
+    // A regular column.
+    this.skipFormatJson();
+    const path = this.parseJtPathClause();
+    const [wrapper, keepQuotes] = this.parseJsonWrapperQuotes();
+    const [onEmpty, onError] = this.parseJsonOnClauses();
+    return { kind: "regular", name, typeName, array, path, wrapper, keepQuotes, onEmpty, onError };
+  }
+
+  // parseJtPathClause parses an optional `PATH '<string>'` clause on a JSON_TABLE column.
+  private parseJtPathClause(): string | null {
+    if (this.peekKeyword() === "path") {
+      this.advance();
+      const t = this.advance();
+      if (t.kind !== "str") {
+        throw engineError("syntax_error", "expected a string after PATH");
+      }
+      return t.str!;
+    }
+    return null;
   }
 
   // parseJoinClause parses one join_clause if a join keyword begins here (returns null to end

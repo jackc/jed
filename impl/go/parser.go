@@ -2494,6 +2494,11 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 		tr.Lateral = lateral
 		return tr, nil
 	}
+	// `JSON_TABLE(ctx, path [AS n] COLUMNS (…))` — a table source (json-table.md §3, T1), recognized
+	// by the keyword followed by `(`.
+	if p.peekKeyword() == "json_table" && p.peekKindAt(1) == TokLParen {
+		return p.parseJsonTable()
+	}
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return TableRef{}, err
@@ -2554,6 +2559,206 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 	}
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
 	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args, ColumnDefs: columnDefs, Lateral: lateral}, nil
+}
+
+// parseJsonTable parses `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md §3,
+// T1). The caller has verified the `JSON_TABLE` keyword + `(`. An explicit PLAN clause and a PASSING
+// clause are the deferred T2 (0A000).
+func (p *Parser) parseJsonTable() (TableRef, error) {
+	p.advance() // JSON_TABLE
+	p.advance() // (
+	ctx, err := p.parseExpr()
+	if err != nil {
+		return TableRef{}, err
+	}
+	p.skipFormatJSON()
+	if err := p.expect(TokComma); err != nil {
+		return TableRef{}, err
+	}
+	path, err := p.parseExpr()
+	if err != nil {
+		return TableRef{}, err
+	}
+	// An optional `AS name` for the root path (the path-name) is accepted and ignored (it only matters
+	// with an explicit PLAN clause, the deferred T2).
+	if p.peekKeyword() == "as" {
+		p.advance()
+		if _, err := p.expectIdentifier(); err != nil {
+			return TableRef{}, err
+		}
+	}
+	if p.peekKeyword() == "passing" {
+		return TableRef{}, NewError(FeatureNotSupported, "JSON_TABLE PASSING clause is not supported yet")
+	}
+	if err := p.expectKeyword("columns"); err != nil {
+		return TableRef{}, err
+	}
+	columns, err := p.parseJtColumns()
+	if err != nil {
+		return TableRef{}, err
+	}
+	// An explicit PLAN clause is the deferred T2 slice.
+	if p.peekKeyword() == "plan" {
+		return TableRef{}, NewError(FeatureNotSupported, "JSON_TABLE explicit PLAN clause is not supported yet")
+	}
+	if err := p.expect(TokRParen); err != nil {
+		return TableRef{}, err
+	}
+	var alias *string
+	if p.peekKeyword() == "as" {
+		p.advance()
+		a, err := p.expectIdentifier()
+		if err != nil {
+			return TableRef{}, err
+		}
+		alias = &a
+	} else if t := p.peek(); t.Kind == TokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+		a := t.Word
+		p.advance()
+		alias = &a
+	}
+	name := "json_table"
+	if alias != nil {
+		name = *alias
+	}
+	return TableRef{
+		Name:      name,
+		Alias:     alias,
+		JsonTable: &JsonTable{Ctx: &ctx, Path: &path, Columns: columns},
+	}, nil
+}
+
+// parseJtColumns parses a parenthesized `JSON_TABLE` `COLUMNS` list — `"(" jt_column ("," jt_column)*
+// ")"`.
+func (p *Parser) parseJtColumns() ([]JtColumn, error) {
+	if err := p.expect(TokLParen); err != nil {
+		return nil, err
+	}
+	first, err := p.parseJtColumn()
+	if err != nil {
+		return nil, err
+	}
+	cols := []JtColumn{first}
+	for p.peek().Kind == TokComma {
+		p.advance()
+		c, err := p.parseJtColumn()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	if err := p.expect(TokRParen); err != nil {
+		return nil, err
+	}
+	return cols, nil
+}
+
+// parseJtColumn parses one `JSON_TABLE` column: `NESTED [PATH] p [AS n] COLUMNS (…)`, `name FOR
+// ORDINALITY`, `name type EXISTS [PATH p] [ON ERROR]`, or a regular `name type [PATH p] [wrapper]
+// [quotes] [ON …]` column (json-table.md §3.3).
+func (p *Parser) parseJtColumn() (JtColumn, error) {
+	if p.peekKeyword() == "nested" {
+		p.advance() // NESTED
+		if p.peekKeyword() == "path" {
+			p.advance()
+		}
+		tok := p.advance()
+		if tok.Kind != TokStr {
+			return nil, NewError(SyntaxError, "expected a string path after NESTED PATH")
+		}
+		path := tok.Word
+		if p.peekKeyword() == "as" {
+			p.advance()
+			if _, err := p.expectIdentifier(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKeyword("columns"); err != nil {
+			return nil, err
+		}
+		columns, err := p.parseJtColumns()
+		if err != nil {
+			return nil, err
+		}
+		return &JtColumnNested{Path: path, Columns: columns}, nil
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	// `name FOR ORDINALITY`.
+	if p.peekKeyword() == "for" {
+		p.advance()
+		if err := p.expectKeyword("ordinality"); err != nil {
+			return nil, err
+		}
+		return &JtColumnOrdinality{Name: name}, nil
+	}
+	// `name type …` — parse the type name + optional `[]`.
+	typeName, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	array := false
+	if p.peek().Kind == TokLBracket {
+		p.advance()
+		if err := p.expect(TokRBracket); err != nil {
+			return nil, err
+		}
+		array = true
+	}
+	// `EXISTS` column.
+	if p.peekKeyword() == "exists" {
+		p.advance()
+		path, err := p.parseJtPathClause()
+		if err != nil {
+			return nil, err
+		}
+		onError, err := p.parseJSONOnErrorOnly()
+		if err != nil {
+			return nil, err
+		}
+		return &JtColumnExists{Name: name, TypeName: typeName, Path: path, OnError: onError}, nil
+	}
+	// A regular column.
+	p.skipFormatJSON()
+	path, err := p.parseJtPathClause()
+	if err != nil {
+		return nil, err
+	}
+	wrapper, keepQuotes, err := p.parseJSONWrapperQuotes()
+	if err != nil {
+		return nil, err
+	}
+	onEmpty, onError, err := p.parseJSONOnClauses()
+	if err != nil {
+		return nil, err
+	}
+	return &JtColumnRegular{
+		Name:       name,
+		TypeName:   typeName,
+		Array:      array,
+		Path:       path,
+		Wrapper:    wrapper,
+		KeepQuotes: keepQuotes,
+		OnEmpty:    onEmpty,
+		OnError:    onError,
+	}, nil
+}
+
+// parseJtPathClause parses an optional `PATH '<string>'` clause on a JSON_TABLE column → the literal
+// path string, or nil when absent (the column then defaults to `$.<name>`).
+func (p *Parser) parseJtPathClause() (*string, error) {
+	if p.peekKeyword() != "path" {
+		return nil, nil
+	}
+	p.advance()
+	tok := p.advance()
+	if tok.Kind != TokStr {
+		return nil, NewError(SyntaxError, "expected a string after PATH")
+	}
+	s := tok.Word
+	return &s, nil
 }
 
 // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).

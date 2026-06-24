@@ -9,9 +9,10 @@ use crate::ast::{
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
     Delete, DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, GroupItem,
     IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior,
-    JsonPredicateKind, JsonWrapper, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction,
-    Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec,
-    TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
+    QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef,
+    WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -2231,6 +2232,13 @@ impl Parser {
             tr.lateral = lateral;
             return Ok(tr);
         }
+        // `JSON_TABLE(ctx, path [AS n] COLUMNS (…))` — a table source (json-table.md §3, T1),
+        // recognized by the keyword followed by `(`.
+        if self.peek_keyword().as_deref() == Some("json_table")
+            && matches!(self.peek_at(1), Token::LParen)
+        {
+            return self.parse_json_table();
+        }
         let name = self.expect_identifier()?;
         // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT` — those
         // are aggregate/star forms, not an SRF argument list).
@@ -2287,6 +2295,7 @@ impl Parser {
             values: None,
             column_aliases: None,
             column_defs,
+            json_table: None,
             // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
             lateral,
         })
@@ -2359,9 +2368,162 @@ impl Parser {
             values,
             column_aliases,
             column_defs: None,
+            json_table: None,
             // The caller (`parse_table_ref`) sets `lateral` from a leading `LATERAL` keyword.
             lateral: false,
         })
+    }
+
+    /// Parse `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md §3, T1). The
+    /// caller has verified the `JSON_TABLE` keyword + `(`.
+    fn parse_json_table(&mut self) -> Result<TableRef> {
+        self.advance(); // JSON_TABLE
+        self.advance(); // (
+        let ctx = self.parse_expr()?;
+        self.skip_format_json();
+        self.expect(&Token::Comma)?;
+        let path = self.parse_expr()?;
+        // An optional `AS name` for the root path (the path-name) is accepted and ignored (it only
+        // matters with an explicit PLAN clause, the deferred T2).
+        if self.peek_keyword().as_deref() == Some("as") {
+            self.advance();
+            self.expect_identifier()?;
+        }
+        if self.peek_keyword().as_deref() == Some("passing") {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "JSON_TABLE PASSING clause is not supported yet",
+            ));
+        }
+        self.expect_keyword("columns")?;
+        let columns = self.parse_jt_columns()?;
+        // An explicit PLAN clause is the deferred T2 slice.
+        if self.peek_keyword().as_deref() == Some("plan") {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "JSON_TABLE explicit PLAN clause is not supported yet",
+            ));
+        }
+        self.expect(&Token::RParen)?;
+        let alias = if self.peek_keyword().as_deref() == Some("as") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            match self.peek() {
+                Token::Word(w) if !is_table_ref_stop_keyword(&w.to_ascii_lowercase()) => {
+                    let a = w.clone();
+                    self.advance();
+                    Some(a)
+                }
+                _ => None,
+            }
+        };
+        Ok(TableRef {
+            name: alias.clone().unwrap_or_else(|| "json_table".to_string()),
+            alias,
+            args: None,
+            subquery: None,
+            values: None,
+            column_aliases: None,
+            column_defs: None,
+            json_table: Some(Box::new(JsonTable {
+                ctx: Box::new(ctx),
+                path: Box::new(path),
+                columns,
+            })),
+            lateral: false,
+        })
+    }
+
+    /// Parse a parenthesized `JSON_TABLE` `COLUMNS` list — `"(" jt_column ("," jt_column)* ")"`.
+    fn parse_jt_columns(&mut self) -> Result<Vec<JtColumn>> {
+        self.expect(&Token::LParen)?;
+        let mut cols = vec![self.parse_jt_column()?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            cols.push(self.parse_jt_column()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(cols)
+    }
+
+    /// Parse one `JSON_TABLE` column: `NESTED [PATH] p [AS n] COLUMNS (…)`, `name FOR ORDINALITY`,
+    /// `name type EXISTS [PATH p] [ON ERROR]`, or a regular `name type [PATH p] [wrapper] [quotes]
+    /// [ON …]` column (json-table.md §3.3).
+    fn parse_jt_column(&mut self) -> Result<JtColumn> {
+        if self.peek_keyword().as_deref() == Some("nested") {
+            self.advance(); // NESTED
+            if self.peek_keyword().as_deref() == Some("path") {
+                self.advance();
+            }
+            let path = match self.advance() {
+                Token::Str(s) => s,
+                _ => return Err(syntax("expected a string path after NESTED PATH")),
+            };
+            if self.peek_keyword().as_deref() == Some("as") {
+                self.advance();
+                self.expect_identifier()?;
+            }
+            self.expect_keyword("columns")?;
+            let columns = self.parse_jt_columns()?;
+            return Ok(JtColumn::Nested { path, columns });
+        }
+        let name = self.expect_identifier()?;
+        // `name FOR ORDINALITY`.
+        if self.peek_keyword().as_deref() == Some("for") {
+            self.advance();
+            self.expect_keyword("ordinality")?;
+            return Ok(JtColumn::Ordinality { name });
+        }
+        // `name type …` — parse the type name + optional `[]`.
+        let type_name = self.expect_identifier()?;
+        let array = if matches!(self.peek(), Token::LBracket) {
+            self.advance();
+            self.expect(&Token::RBracket)?;
+            true
+        } else {
+            false
+        };
+        // `EXISTS` column.
+        if self.peek_keyword().as_deref() == Some("exists") {
+            self.advance();
+            let path = self.parse_jt_path_clause()?;
+            let on_error = self.parse_json_on_error_only()?;
+            return Ok(JtColumn::Exists {
+                name,
+                type_name,
+                path,
+                on_error,
+            });
+        }
+        // A regular column.
+        self.skip_format_json();
+        let path = self.parse_jt_path_clause()?;
+        let (wrapper, keep_quotes) = self.parse_json_wrapper_quotes()?;
+        let (on_empty, on_error) = self.parse_json_on_clauses()?;
+        Ok(JtColumn::Regular {
+            name,
+            type_name,
+            array,
+            path,
+            wrapper,
+            keep_quotes,
+            on_empty,
+            on_error,
+        })
+    }
+
+    /// Parse an optional `PATH '<string>'` clause on a JSON_TABLE column.
+    fn parse_jt_path_clause(&mut self) -> Result<Option<String>> {
+        if self.peek_keyword().as_deref() == Some("path") {
+            self.advance();
+            match self.advance() {
+                Token::Str(s) => Ok(Some(s)),
+                _ => Err(syntax("expected a string after PATH")),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Parse a VALUES-body's rows — `VALUES "(" expr ("," expr)* ")" ("," …)*` (grammar.md §42),

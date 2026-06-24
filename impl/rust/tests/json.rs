@@ -451,6 +451,31 @@ fn json_query_fn_deferred_clauses_are_0a000() {
     }
 }
 
+/// The deferred T1 sub-features of JSON_TABLE are `0A000` — an explicit PLAN, PASSING, an array
+/// column, a WRAPPER on a scalar column, OMIT QUOTES; an unknown column type is `42704`. PostgreSQL
+/// supports the first set, so each is a documented divergence; the supported subset is oracle-clean
+/// in suites/json/json_table.test.
+#[test]
+fn json_table_deferred_features_are_0a000() {
+    let mut db = Database::new();
+    for sql in [
+        "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))",
+        "SELECT * FROM JSON_TABLE('{}', '$' PASSING 1 AS y COLUMNS (x i32 PATH '$.x'))",
+        "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32[] PATH '$.x'))",
+        "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' WITH WRAPPER))",
+        "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' OMIT QUOTES))",
+    ] {
+        assert_eq!(err(&mut db, sql), "0A000", "{sql} should defer 0A000");
+    }
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x nosuchtype PATH '$.x'))"
+        ),
+        "42704"
+    );
+}
+
 #[test]
 fn jsonb_all_node_kinds_round_trip() {
     let mut db = Database::with_page_size(4096);

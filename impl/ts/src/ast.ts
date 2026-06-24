@@ -762,6 +762,9 @@ export type InsertValue =
 // `columnDefs` is a FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md
 // §1): the typed columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually
 // exclusive with `columnAliases` (a rename-only list). Absent for an ordinary table / SRF.
+// `jsonTable` is a `JSON_TABLE(...)` table source (json-table.md §3, T1) — projects a JSON
+// document into a relation via the COLUMNS clause. When present, the other source fields
+// (`name`/`args`/…) are unused. Implicitly lateral (its `ctx` may reference earlier FROM siblings).
 export type TableRef = {
   name: string;
   alias: string | null;
@@ -770,8 +773,49 @@ export type TableRef = {
   values?: Expr[][];
   columnAliases?: string[];
   columnDefs?: TypeFieldDef[];
+  jsonTable?: JsonTable;
   lateral?: boolean;
 };
+
+// JsonTable is a `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3,
+// T1). The root `path` is evaluated over `ctx` to a sequence of row items; the COLUMNS tree projects
+// each item (and, via NESTED PATH, child items) into relational columns under the default plan
+// (parent→child LEFT OUTER, sibling NESTED paths UNIONed).
+export type JsonTable = {
+  ctx: Expr;
+  path: Expr;
+  columns: JtColumn[];
+};
+
+// JtColumn is one `JSON_TABLE` COLUMNS entry (json-table.md §3.3), a discriminated union over the
+// four column kinds.
+export type JtColumn =
+  // `name FOR ORDINALITY` — a per-level 1-based row counter (`integer`).
+  | { kind: "ordinality"; name: string }
+  // `name type [PATH p] [wrapper] [quotes] [ON EMPTY] [ON ERROR]` — a regular column: evaluate `p`
+  // (default `$.name`) over the current row item and coerce to `type` like JSON_VALUE (scalar) or
+  // JSON_QUERY (json/jsonb).
+  | {
+      kind: "regular";
+      name: string;
+      typeName: string;
+      array: boolean;
+      path: string | null;
+      wrapper: JsonWrapper;
+      keepQuotes: boolean;
+      onEmpty: JsonOnBehavior | null;
+      onError: JsonOnBehavior | null;
+    }
+  // `name type EXISTS [PATH p] [behavior ON ERROR]` — JSON_EXISTS of `p`, coerced to `type`.
+  | {
+      kind: "exists";
+      name: string;
+      typeName: string;
+      path: string | null;
+      onError: JsonOnBehavior | null;
+    }
+  // `NESTED [PATH] p [AS n] COLUMNS (…)` — recursively expand a child path over the row item.
+  | { kind: "nested"; path: string; columns: JtColumn[] };
 
 // JoinKind is the kind of a join. "inner"/"cross" execute this slice; the "left"/"right"/"full"
 // outer kinds parse and are carried in the AST but executing one is a documented 0A000

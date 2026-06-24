@@ -11,10 +11,12 @@
 > semantics (§3.3) are subtle and oracle-pinned. Grammar is data in
 > [../grammar/grammar.ebnf](../grammar/grammar.ebnf).
 
-> **Status: SPEC-FIRST (design ratified, implementation pending).** Implemented by the
-> C0 / R-series / T-series slices (§5). This is the **highest-risk** corner of the JSON
-> feature; `JSON_TABLE` with the default plan is T1, the explicit `PLAN` clause is the
-> deferred T2.
+> **Status: C0 / R1 / R2 / T1 LANDED** (all three cores, oracle-clean). The shared col-def-list
+> facility (C0), the record-returning functions (R1/R2), and **`JSON_TABLE` with the default plan
+> (T1)** — regular / `FOR ORDINALITY` / `EXISTS` columns and recursive `NESTED PATH` with the
+> default LEFT-OUTER / sibling-UNION expansion — are implemented (capability `func.json_table`).
+> The explicit `PLAN` clause is the deferred **T2** (`0A000`). This was the **highest-risk** corner
+> of the JSON feature.
 
 ---
 

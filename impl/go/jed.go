@@ -574,6 +574,8 @@ var SupportedCapabilities = []string{
 	// / ON EMPTY / ON ERROR). PASSING vars, DEFAULT-expr behaviors, JSON_QUERY OMIT QUOTES, and a
 	// JSON_QUERY non-json RETURNING are deferred 0A000 (json-sql-functions.md §5).
 	"expr.json_query_fns",
+	// JSON_TABLE with the default plan (T1, json-table.md §3): COLUMNS, FOR ORDINALITY, EXISTS, NESTED.
+	"func.json_table",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

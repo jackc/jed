@@ -478,8 +478,66 @@ type TableRef struct {
 	// §1): the typed columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually
 	// exclusive with ColumnAliases (a rename-only list). Nil for an ordinary table / SRF.
 	ColumnDefs []TypeFieldDef
-	Lateral    bool
+	// JsonTable is a `JSON_TABLE(...)` table source (json-table.md §3, T1) — projects a JSON document
+	// into a relation via the `COLUMNS` clause. When non-nil, the other source fields (`Name`/`Args`/…)
+	// are unused. Implicitly lateral (its `Ctx` may reference earlier FROM siblings).
+	JsonTable *JsonTable
+	Lateral   bool
 }
+
+// JsonTable is a `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3,
+// T1). The root `path` is evaluated over `ctx` to a sequence of row items; the `COLUMNS` tree
+// projects each item (and, via `NESTED PATH`, child items) into relational columns under the default
+// plan (parent→child LEFT OUTER, sibling NESTED paths UNIONed).
+type JsonTable struct {
+	Ctx     *Expr
+	Path    *Expr
+	Columns []JtColumn
+}
+
+// JtColumn is one `JSON_TABLE` `COLUMNS` entry (json-table.md §3.3): an ordinality, a regular, an
+// EXISTS, or a NESTED column. Modeled as a tagged union (one struct per kind, marker method).
+type JtColumn interface{ isJtColumn() }
+
+// JtColumnOrdinality is `name FOR ORDINALITY` — a per-level 1-based row counter (`integer`).
+type JtColumnOrdinality struct {
+	Name string
+}
+
+// JtColumnRegular is `name type [PATH p] [wrapper] [quotes] [ON EMPTY] [ON ERROR]` — a regular
+// column: evaluate `p` (default `$.name`) over the current row item and coerce to `type` like
+// JSON_VALUE (scalar) or JSON_QUERY (json/jsonb).
+type JtColumnRegular struct {
+	Name       string
+	TypeName   string
+	Array      bool
+	Path       *string
+	Wrapper    JsonWrapper
+	KeepQuotes bool
+	OnEmpty    *JsonOnBehavior
+	OnError    *JsonOnBehavior
+}
+
+// JtColumnExists is `name type EXISTS [PATH p] [behavior ON ERROR]` — JSON_EXISTS of `p`, coerced
+// to `type`.
+type JtColumnExists struct {
+	Name     string
+	TypeName string
+	Path     *string
+	OnError  *JsonOnBehavior
+}
+
+// JtColumnNested is `NESTED [PATH] p [AS n] COLUMNS (…)` — recursively expand a child path over the
+// row item.
+type JtColumnNested struct {
+	Path    string
+	Columns []JtColumn
+}
+
+func (*JtColumnOrdinality) isJtColumn() {}
+func (*JtColumnRegular) isJtColumn()    {}
+func (*JtColumnExists) isJtColumn()     {}
+func (*JtColumnNested) isJtColumn()     {}
 
 // JoinKind is the kind of a join. Inner and Cross execute this slice; the Left/Right/Full
 // outer kinds parse and are carried in the AST but executing one is a documented 0A000

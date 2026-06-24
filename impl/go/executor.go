@@ -9254,7 +9254,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		// body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
 		// item (i == 0) has no earlier sibling, so it is never lateral; an SRF there resolves against
 		// `parent` (the enclosing query) exactly as before.
-		lateralEligible := i > 0 && ((isDerived && tref.Lateral) || tref.IsFunc)
+		lateralEligible := i > 0 && ((isDerived && tref.Lateral) || tref.IsFunc || tref.JsonTable != nil)
 		// The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
 		// enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
 		// deeper). nil when not lateral-eligible.
@@ -9306,6 +9306,28 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, tref.ColumnDefs, srfParent, ctes, ptypes)
 			if serr != nil {
 				return nil, serr
+			}
+			t = tbl
+			srfPlans[i] = sp
+			if lateralEligible {
+				for _, a := range sp.args {
+					if rexprReferencesOuter(a, 0) {
+						lateralFlags[i] = true
+						break
+					}
+				}
+			}
+		} else if tref.JsonTable != nil {
+			// A JSON_TABLE source (T1, json-table.md §3) — implicitly lateral like an SRF; its ctx
+			// resolves against the prefix scope (so `JSON_TABLE(sibling.doc, …)` works), or `parent` at
+			// i==0.
+			jtParent := parent
+			if lateralEligible {
+				jtParent = lateralParent
+			}
+			tbl, sp, jerr := db.resolveJSONTable(tref.JsonTable, tref.Alias, jtParent, ctes, ptypes)
+			if jerr != nil {
+				return nil, jerr
 			}
 			t = tbl
 			srfPlans[i] = sp
@@ -10091,6 +10113,131 @@ func (db *Database) resolveJSONPopulate(name string, jsonb, set bool, args []*Ex
 	return table, &srfPlan{kind: kind, args: []*rExpr{r}, recordCols: columns}, nil
 }
 
+// resolveJSONTable resolves a JSON_TABLE(ctx, path COLUMNS (…)) source (T1, json-table.md §3) → its
+// synthetic relation (the flattened columns), the `[ctx]` arg, and the resolved jtPlan. The ctx /
+// root path see only params + the lateral prefix (never sibling columns of THIS relation) — an
+// empty-local-rels scope chained to `parent`, exactly like an SRF (grammar.md §44).
+func (db *Database) resolveJSONTable(jt *JsonTable, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+	forbidden := &aggCtx{}
+	// The context item (json / jsonb / text, coerced to a jsonb document at eval).
+	jsonbHint := Jsonb
+	rctx, ctxTy, err := resolve(argScope, *jt.Ctx, &jsonbHint, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch ctxTy.kind {
+	case rtJsonb, rtJson, rtText, rtNull:
+		// ok
+	default:
+		return nil, nil, NewError(DatatypeMismatch,
+			fmt.Sprintf("the context item of JSON_TABLE must be json/jsonb/text, not %s", rtName(ctxTy)))
+	}
+	// The root path — a constant jsonpath (a string literal compiles to a reConstJsonPath node).
+	pathHint := JsonPathType
+	rpath, pathTy, err := resolve(argScope, *jt.Path, &pathHint, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pathTy.kind != rtJsonPath {
+		return nil, nil, NewError(DatatypeMismatch, "the path of JSON_TABLE must be a constant jsonpath")
+	}
+	if rpath.kind != reConstJsonPath {
+		return nil, nil, NewError(FeatureNotSupported, "a non-constant JSON_TABLE path is not supported")
+	}
+	rootPath := rpath.cText
+	var outColumns []Column
+	columns, err := db.resolveJtColumns(jt.Columns, &outColumns)
+	if err != nil {
+		return nil, nil, err
+	}
+	tname := "json_table"
+	if alias != nil {
+		tname = *alias
+	}
+	table := &Table{Name: tname, Columns: outColumns}
+	return table, &srfPlan{
+		kind:      srfJsonTable,
+		args:      []*rExpr{rctx},
+		jsonTable: &jtPlan{rootPath: rootPath, width: len(outColumns), columns: columns},
+	}, nil
+}
+
+// resolveJtColumns recursively resolves a JSON_TABLE COLUMNS tree, flattening the leaf columns into
+// `outColumns` (pre-order, declaration order) and assigning each its flat output index.
+func (db *Database) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]jtCol, error) {
+	resolved := make([]jtCol, 0, len(cols))
+	for _, col := range cols {
+		switch c := col.(type) {
+		case *JtColumnOrdinality:
+			idx := len(*outColumns)
+			*outColumns = append(*outColumns, jtColumn(c.Name, Int32, nil))
+			resolved = append(resolved, &jtColOrdinality{idx: idx})
+		case *JtColumnRegular:
+			if c.Array {
+				return nil, NewError(FeatureNotSupported, "an array JSON_TABLE column is not supported yet")
+			}
+			st, decimal, err := jtScalarType(db, c.TypeName)
+			if err != nil {
+				return nil, err
+			}
+			if !c.KeepQuotes {
+				return nil, NewError(FeatureNotSupported, "JSON_TABLE OMIT QUOTES is not supported yet")
+			}
+			query := st == Json || st == Jsonb
+			if !query && c.Wrapper != JWWithout {
+				return nil, NewError(FeatureNotSupported, "a WRAPPER on a scalar JSON_TABLE column is not supported yet")
+			}
+			compiled, err := jtCompilePath(c.Path, c.Name)
+			if err != nil {
+				return nil, err
+			}
+			idx := len(*outColumns)
+			*outColumns = append(*outColumns, jtColumn(c.Name, st, decimal))
+			resolved = append(resolved, &jtColRegular{
+				idx:       idx,
+				returning: st,
+				decimal:   decimal,
+				path:      compiled,
+				query:     query,
+				wrapper:   c.Wrapper,
+				onEmpty:   jtBehavior(c.OnEmpty, JOBNull),
+				onError:   jtBehavior(c.OnError, JOBNull),
+			})
+		case *JtColumnExists:
+			st, _, err := jtScalarType(db, c.TypeName)
+			if err != nil {
+				return nil, err
+			}
+			compiled, err := jtCompilePath(c.Path, c.Name)
+			if err != nil {
+				return nil, err
+			}
+			idx := len(*outColumns)
+			*outColumns = append(*outColumns, jtColumn(c.Name, st, nil))
+			resolved = append(resolved, &jtColExists{
+				idx:       idx,
+				returning: st,
+				path:      compiled,
+				onError:   jtBehavior(c.OnError, JOBFalse),
+			})
+		case *JtColumnNested:
+			compiled, err := Compile(c.Path)
+			if err != nil {
+				return nil, err
+			}
+			nested, err := db.resolveJtColumns(c.Columns, outColumns)
+			if err != nil {
+				return nil, err
+			}
+			resolved = append(resolved, &jtColNested{path: compiled.Render(), columns: nested})
+		default:
+			panic("resolveJtColumns: unknown JtColumn kind")
+		}
+	}
+	return resolved, nil
+}
+
 // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
 // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
 // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
@@ -10566,6 +10713,255 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning ScalarType, w
 			node = seq[0]
 		}
 		return jsonNodeAsReturning(node, returning, env, m)
+	}
+}
+
+// ----------------------------------------------------------------------------------------------
+// JSON_TABLE (T1, json-table.md §3)
+// ----------------------------------------------------------------------------------------------
+
+// jtAssign is a sparse assignment of a JSON_TABLE row — `(flat column index, value)` pairs;
+// unassigned columns are NULL (the LEFT-OUTER / sibling-UNION fill).
+type jtAssign struct {
+	idx int
+	v   Value
+}
+
+// jsonTableRows generates the rows of a JSON_TABLE SRF (T1, json-table.md §3) — the default-plan
+// recursive expansion (parent→child LEFT OUTER, sibling NESTED paths UNIONed). A NULL ctx → zero
+// rows; a structural error evaluating the root path → zero rows.
+func (db *Database) jsonTableRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+	plan := sp.jsonTable
+	ctx, err := sp.args[0].eval(nil, env, m)
+	if err != nil {
+		return nil, err
+	}
+	if ctx.Kind == ValNull {
+		return nil, nil
+	}
+	node, err := jsonArgNode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The root path → the sequence of row items (a structural error here yields no rows).
+	root, err := Compile(plan.rootPath)
+	if err != nil {
+		return nil, err
+	}
+	items, err := root.Eval(node)
+	if err != nil {
+		if isSQLJSONError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	// Expand the column tree over the root sequence → sparse rows, then materialize.
+	sparse, err := expandJtLevel(plan.columns, items, env, m)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Row, 0, len(sparse))
+	for _, assignment := range sparse {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(Costs.GeneratedRow)
+		row := make(Row, plan.width)
+		for i := range row {
+			row[i] = NullValue()
+		}
+		for _, a := range assignment {
+			row[a.idx] = a.v
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// jtColumn builds a synthetic JSON_TABLE output column.
+func jtColumn(name string, ty ScalarType, decimal *DecimalTypmod) Column {
+	return Column{Name: name, Type: ScalarT(ty), Decimal: decimal}
+}
+
+// jtBehavior resolves an optional ON EMPTY / ON ERROR behavior to its value, falling back to def.
+func jtBehavior(b *JsonOnBehavior, def JsonOnBehavior) JsonOnBehavior {
+	if b != nil {
+		return *b
+	}
+	return def
+}
+
+// jtScalarType resolves a JSON_TABLE column type name → its scalar type + decimal typmod (a composite
+// → 0A000, an unknown name → 42704).
+func jtScalarType(db *Database, typeName string) (ScalarType, *DecimalTypmod, error) {
+	if st, ok := ScalarTypeFromName(typeName); ok {
+		return st, nil, nil
+	}
+	if db.CompositeType(typeName) != nil {
+		return 0, nil, NewError(FeatureNotSupported, "a composite JSON_TABLE column is not supported yet")
+	}
+	return 0, nil, NewError(UndefinedObject, fmt.Sprintf("type \"%s\" does not exist", typeName))
+}
+
+// jtCompilePath compiles a JSON_TABLE column path — the explicit `PATH p`, or the default
+// `$.<column_name>` — to its canonical rendered form (validating; malformed → 42601).
+func jtCompilePath(path *string, name string) (string, error) {
+	src := "$." + name
+	if path != nil {
+		src = *path
+	}
+	compiled, err := Compile(src)
+	if err != nil {
+		return "", err
+	}
+	return compiled.Render(), nil
+}
+
+// expandJtLevel expands a JSON_TABLE COLUMNS level over a sequence of row items → the sparse rows
+// (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3).
+func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *Meter) ([][]jtAssign, error) {
+	var rows [][]jtAssign
+	for i := range items {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		ord := int64(i + 1)
+		item := &items[i]
+		// This level's non-nested columns (regular / exists / ordinality).
+		var local []jtAssign
+		for _, col := range cols {
+			switch c := col.(type) {
+			case *jtColOrdinality:
+				local = append(local, jtAssign{idx: c.idx, v: IntValue(ord)})
+			case *jtColRegular:
+				v, err := evalJtRegular(item, c, env, m)
+				if err != nil {
+					return nil, err
+				}
+				local = append(local, jtAssign{idx: c.idx, v: v})
+			case *jtColExists:
+				v, err := evalJtExists(item, c)
+				if err != nil {
+					return nil, err
+				}
+				local = append(local, jtAssign{idx: c.idx, v: v})
+			case *jtColNested:
+				// handled below
+			}
+		}
+		// The NESTED siblings, expanded over this item (UNIONed + LEFT OUTER fill).
+		var nested []*jtColNested
+		for _, col := range cols {
+			if n, ok := col.(*jtColNested); ok {
+				nested = append(nested, n)
+			}
+		}
+		nestedRows, err := expandJtNested(nested, item, env, m)
+		if err != nil {
+			return nil, err
+		}
+		for _, nr := range nestedRows {
+			row := make([]jtAssign, 0, len(local)+len(nr))
+			row = append(row, local...)
+			row = append(row, nr...)
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
+}
+
+// expandJtNested expands the NESTED siblings of a level over one parent item — the default-plan
+// UNION of the siblings (each row fills only its own subtree), with the parent→child LEFT OUTER fill
+// (no child rows at all → one all-NULL nested row).
+func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *Meter) ([][]jtAssign, error) {
+	if len(children) == 0 {
+		return [][]jtAssign{nil}, nil
+	}
+	var union [][]jtAssign
+	for _, child := range children {
+		p, err := Compile(child.path)
+		if err != nil {
+			return nil, err
+		}
+		childSeq, err := p.Eval(*item)
+		if err != nil {
+			if isSQLJSONError(err) {
+				childSeq = nil
+			} else {
+				return nil, err
+			}
+		}
+		rows, err := expandJtLevel(child.columns, childSeq, env, m)
+		if err != nil {
+			return nil, err
+		}
+		union = append(union, rows...)
+	}
+	if len(union) == 0 {
+		union = append(union, nil)
+	}
+	return union, nil
+}
+
+// evalJtRegular evaluates a regular JSON_TABLE column over a row item — JSON_VALUE (scalar) /
+// JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
+func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *Meter) (Value, error) {
+	p, err := Compile(c.path)
+	if err != nil {
+		return Value{}, err
+	}
+	seq, err := p.Eval(*item)
+	if err != nil {
+		if isSQLJSONError(err) {
+			return applyJSONBehavior(c.onError, err, c.returning, env, m)
+		}
+		return Value{}, err
+	}
+	kind := jsValue
+	if c.query {
+		kind = jsQuery
+	}
+	return evalJSONSqlResult(kind, seq, c.returning, c.wrapper, c.onEmpty, c.onError, env, m)
+}
+
+// evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the
+// column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
+func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
+	p, err := Compile(c.path)
+	if err != nil {
+		return Value{}, err
+	}
+	var exists bool
+	seq, err := p.Eval(*item)
+	if err != nil {
+		if isSQLJSONError(err) {
+			switch c.onError {
+			case JOBError:
+				return Value{}, err
+			case JOBTrue:
+				exists = true
+			case JOBUnknown:
+				return NullValue(), nil
+			default:
+				exists = false
+			}
+		} else {
+			return Value{}, err
+		}
+	} else {
+		exists = len(seq) > 0
+	}
+	// Coerce the boolean to the column type (a `boolean` column → bool; an integer column → 1/0).
+	switch {
+	case c.returning.IsBool():
+		return BoolValue(exists), nil
+	case c.returning.IsInteger():
+		if exists {
+			return IntValue(1), nil
+		}
+		return IntValue(0), nil
+	default:
+		return Value{}, NewError(FeatureNotSupported, "an EXISTS JSON_TABLE column must be boolean or integer this slice")
 	}
 }
 
@@ -11902,6 +12298,8 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 			return db.unnestRows(rel.srf, env, meter)
 		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText, srfJSONRecord, srfJSONRecordset, srfJsonbPathQuery:
 			return db.jsonSrfRows(rel.srf, env, meter)
+		case srfJsonTable:
+			return db.jsonTableRows(rel.srf, env, meter)
 		}
 		return nil, nil
 	}
@@ -14584,6 +14982,10 @@ const (
 	// srfJsonbPathQuery is jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2) — one `jsonb` row
 	// per item of the path's evaluation sequence over the context document. `args` is `[ctx, path]`.
 	srfJsonbPathQuery
+	// srfJsonTable is JSON_TABLE(ctx, path COLUMNS (…)) (T1, json-table.md §3) — a multi-column
+	// relation produced by the recursive default-plan expansion. `args` is `[ctx]`; the resolved column
+	// tree is the srfPlan's `jsonTable` field.
+	srfJsonTable
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
@@ -14597,7 +14999,64 @@ type srfPlan struct {
 	// recordCols is the declared output columns for a record-returning SRF (srfJSONRecord[set]) — the
 	// C0 col-def list, used to map JSON members to columns by name + coerce. nil for every other kind.
 	recordCols []Column
+	// jsonTable is the resolved column tree for a JSON_TABLE SRF (srfJsonTable), else nil.
+	jsonTable *jtPlan
 }
+
+// jtPlan is a resolved JSON_TABLE plan (T1, json-table.md §3) — the compiled root path + the column
+// tree + the total flattened width.
+type jtPlan struct {
+	// rootPath is the compiled root jsonpath (its evaluation over `ctx` yields the row items).
+	rootPath string
+	// width is the total number of flattened output columns.
+	width int
+	// columns is the top-level column tree.
+	columns []jtCol
+}
+
+// jtCol is one resolved JSON_TABLE column (json-table.md §3.3). Leaf columns carry their flat output
+// index; a nested column carries its child subtree. Modeled as a tagged union (one struct per kind).
+type jtCol interface{ isJtCol() }
+
+// jtColOrdinality is `FOR ORDINALITY` — the level's 1-based row counter, written to flat index `idx`.
+type jtColOrdinality struct {
+	idx int
+}
+
+// jtColRegular is a regular column: evaluate `path` over the row item, apply JSON_VALUE (scalar) or
+// JSON_QUERY (json/jsonb) semantics, coerce to `returning`, and write it to flat index `idx`.
+type jtColRegular struct {
+	idx       int
+	returning ScalarType
+	decimal   *DecimalTypmod
+	path      string
+	// query selects JSON_QUERY semantics (json/jsonb returning) vs JSON_VALUE (scalar).
+	query   bool
+	wrapper JsonWrapper
+	onEmpty JsonOnBehavior
+	onError JsonOnBehavior
+}
+
+// jtColExists is an EXISTS column: JSON_EXISTS of `path`, coerced to `returning` (bool/int), written
+// to flat index `idx`.
+type jtColExists struct {
+	idx       int
+	returning ScalarType
+	path      string
+	onError   JsonOnBehavior
+}
+
+// jtColNested is a NESTED PATH subtree: expanded over the row item (the default-plan LEFT OUTER /
+// sibling UNION).
+type jtColNested struct {
+	path    string
+	columns []jtCol
+}
+
+func (*jtColOrdinality) isJtCol() {}
+func (*jtColRegular) isJtCol()    {}
+func (*jtColExists) isJtCol()     {}
+func (*jtColNested) isJtCol()     {}
 
 // planJoin is one join in a SELECT plan: its kind and resolved ON predicate (nil for CROSS). The
 // right relation is rels[k+1].

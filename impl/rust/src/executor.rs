@@ -8,9 +8,10 @@ use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
     DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind,
-    JsonOnBehavior, JsonPredicateKind, JsonWrapper, Literal, OnConflict, OrderKey, Overriding,
-    QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
+    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind,
+    Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef,
+    WithExpr, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -7919,8 +7920,9 @@ impl Database {
             .chain(sel.joins.iter().map(|j| &j.table))
             .collect();
         let mut synthetic: Vec<Box<Table>> = Vec::new();
-        // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind))` = an SRF.
-        let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, SrfKind)>> =
+        // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind, jt))` = an
+        // SRF (`jt` is the JSON_TABLE plan for a `JsonTable` kind, else `None`).
+        let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, SrfKind, Option<Box<JtPlan>>)>> =
             Vec::with_capacity(from_items.len());
         // Per FROM item: the planned body of a DERIVED TABLE (grammar.md §42), else `None`.
         let mut derived_plans: Vec<Option<QueryPlan>> = Vec::with_capacity(from_items.len());
@@ -7941,7 +7943,10 @@ impl Database {
             // VALUES body explicitly marked `LATERAL`, or ANY table function (implicitly lateral —
             // §44). The first item (i == 0) has no earlier sibling, so it is never lateral; an SRF
             // there resolves against `parent` (the enclosing query) exactly as before.
-            let lateral_eligible = i > 0 && ((is_derived && tref.lateral) || tref.args.is_some());
+            let lateral_eligible = i > 0
+                && ((is_derived && tref.lateral)
+                    || tref.args.is_some()
+                    || tref.json_table.is_some());
             let src: RelSrc;
             if is_derived {
                 // Plan the body. LATERAL → `parent` is the prefix scope (earlier siblings chained to
@@ -8008,7 +8013,34 @@ impl Database {
                     .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
                 synthetic.push(table);
                 let si = synthetic.len() - 1;
-                srf_meta.push(Some((si, rargs, kind)));
+                srf_meta.push(Some((si, rargs, kind, None)));
+                derived_meta.push(None);
+                derived_plans.push(None);
+                src = RelSrc::Synthetic(si);
+            } else if let Some(jt) = &tref.json_table {
+                // A JSON_TABLE source (T1, json-table.md §3) — implicitly lateral like an SRF; its
+                // `ctx` resolves against the prefix scope (so `JSON_TABLE(sibling.doc, …)` works).
+                let scope_parent;
+                let prefix;
+                let resolve_against = if lateral_eligible {
+                    prefix = build_prefix_scope(&finalized, &synthetic, parent, self, ctes);
+                    Some(&prefix)
+                } else {
+                    scope_parent = parent;
+                    scope_parent
+                };
+                let (table, rargs, plan) = self.resolve_json_table(
+                    jt,
+                    tref.alias.as_deref(),
+                    resolve_against,
+                    ctes,
+                    ptypes,
+                )?;
+                lateral_flags
+                    .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
+                synthetic.push(table);
+                let si = synthetic.len() - 1;
+                srf_meta.push(Some((si, rargs, SrfKind::JsonTable, Some(Box::new(plan)))));
                 derived_meta.push(None);
                 derived_plans.push(None);
                 src = RelSrc::Synthetic(si);
@@ -8525,7 +8557,7 @@ impl Database {
         let mut srf_plans: Vec<Option<SrfPlan>> = srf_meta
             .into_iter()
             .map(|m| {
-                m.map(|(si, args, kind)| {
+                m.map(|(si, args, kind, json_table)| {
                     // A record-returning SRF carries its declared columns (the C0 col-def list, held
                     // on the synthetic table) so the row generator can map members → columns.
                     let record_cols = if matches!(kind, SrfKind::JsonRecord { .. }) {
@@ -8537,6 +8569,7 @@ impl Database {
                         kind,
                         args,
                         record_cols,
+                        json_table,
                     }
                 })
             })
@@ -9057,6 +9090,209 @@ impl Database {
         });
         // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
         Ok((table, vec![doc], SrfKind::JsonRecord { jsonb, set }))
+    }
+
+    /// Resolve a `JSON_TABLE(ctx, path COLUMNS (…))` source (T1, json-table.md §3) → its synthetic
+    /// relation (the flattened columns), the `[ctx]` arg, and the resolved [`JtPlan`].
+    fn resolve_json_table<'a>(
+        &'a self,
+        jt: &JsonTable,
+        alias: Option<&str>,
+        parent: Option<&Scope<'a>>,
+        ctes: &'a [CteBinding],
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, JtPlan)> {
+        // The ctx / root path see only params + the lateral prefix (never sibling columns of THIS
+        // relation) — an empty-local-rels scope chained to `parent`, exactly like an SRF (§44).
+        let arg_scope = Scope {
+            rels: Vec::new(),
+            parent,
+            catalog: self,
+            allow_subquery: true,
+            ctes,
+        };
+        // The context item (json / jsonb / text, coerced to a jsonb document at eval).
+        let (rctx, ctx_ty) = resolve(
+            &arg_scope,
+            &jt.ctx,
+            Some(ScalarType::Jsonb),
+            &mut AggCtx::Forbidden,
+            ptypes,
+        )?;
+        if !matches!(
+            ctx_ty,
+            ResolvedType::Jsonb | ResolvedType::Json | ResolvedType::Text | ResolvedType::Null
+        ) {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "the context item of JSON_TABLE must be json/jsonb/text, not {}",
+                    ctx_ty.type_name()
+                ),
+            ));
+        }
+        // The root path — a constant jsonpath (a string literal compiles).
+        let (rpath, pt) = resolve(
+            &arg_scope,
+            &jt.path,
+            Some(ScalarType::JsonPath),
+            &mut AggCtx::Forbidden,
+            ptypes,
+        )?;
+        if !matches!(pt, ResolvedType::JsonPath) {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                "the path of JSON_TABLE must be a constant jsonpath",
+            ));
+        }
+        let root_path = match &rpath {
+            RExpr::ConstJsonPath(s) => s.clone(),
+            _ => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a non-constant JSON_TABLE path is not supported",
+                ));
+            }
+        };
+        let mut out_columns: Vec<Column> = Vec::new();
+        let columns = self.resolve_jt_columns(&jt.columns, &mut out_columns)?;
+        let width = out_columns.len();
+        let table = Box::new(Table {
+            name: alias.unwrap_or("json_table").to_string(),
+            columns: out_columns,
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        });
+        Ok((
+            table,
+            vec![rctx],
+            JtPlan {
+                root_path,
+                width,
+                columns,
+            },
+        ))
+    }
+
+    /// Recursively resolve a `JSON_TABLE` `COLUMNS` tree, flattening the leaf columns into
+    /// `out_columns` (pre-order, declaration order) and assigning each its flat output index.
+    fn resolve_jt_columns(
+        &self,
+        cols: &[JtColumn],
+        out_columns: &mut Vec<Column>,
+    ) -> Result<Vec<JtCol>> {
+        let mut resolved = Vec::with_capacity(cols.len());
+        for col in cols {
+            match col {
+                JtColumn::Ordinality { name } => {
+                    let idx = out_columns.len();
+                    out_columns.push(jt_column(name, ScalarType::Int32, None));
+                    resolved.push(JtCol::Ordinality { idx });
+                }
+                JtColumn::Regular {
+                    name,
+                    type_name,
+                    array,
+                    path,
+                    wrapper,
+                    keep_quotes,
+                    on_empty,
+                    on_error,
+                } => {
+                    if *array {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "an array JSON_TABLE column is not supported yet",
+                        ));
+                    }
+                    let st = jt_scalar_type(self, type_name)?;
+                    if !*keep_quotes {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "JSON_TABLE OMIT QUOTES is not supported yet",
+                        ));
+                    }
+                    let query = matches!(st, ScalarType::Json | ScalarType::Jsonb);
+                    if !query && !matches!(wrapper, JsonWrapper::Without) {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "a WRAPPER on a scalar JSON_TABLE column is not supported yet",
+                        ));
+                    }
+                    let compiled = jt_compile_path(path.as_deref(), name)?;
+                    let idx = out_columns.len();
+                    out_columns.push(jt_column(name, st, None));
+                    resolved.push(JtCol::Regular {
+                        idx,
+                        returning: st,
+                        decimal: None,
+                        path: compiled,
+                        query,
+                        wrapper: *wrapper,
+                        on_empty: on_empty.unwrap_or(JsonOnBehavior::Null),
+                        on_error: on_error.unwrap_or(JsonOnBehavior::Null),
+                    });
+                }
+                JtColumn::Exists {
+                    name,
+                    type_name,
+                    path,
+                    on_error,
+                } => {
+                    let st = jt_scalar_type(self, type_name)?;
+                    let compiled = jt_compile_path(path.as_deref(), name)?;
+                    let idx = out_columns.len();
+                    out_columns.push(jt_column(name, st, None));
+                    resolved.push(JtCol::Exists {
+                        idx,
+                        returning: st,
+                        path: compiled,
+                        on_error: on_error.unwrap_or(JsonOnBehavior::False),
+                    });
+                }
+                JtColumn::Nested { path, columns } => {
+                    let compiled = crate::jsonpath::JsonPath::compile(path)?.render();
+                    let nested = self.resolve_jt_columns(columns, out_columns)?;
+                    resolved.push(JtCol::Nested {
+                        path: compiled,
+                        columns: nested,
+                    });
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Generate the rows of a `JSON_TABLE` SRF (T1, json-table.md §3) — the default-plan recursive
+    /// expansion (parent→child LEFT OUTER, sibling NESTED paths UNIONed).
+    fn json_table_rows(&self, srf: &SrfPlan, env: &EvalEnv, meter: &mut Meter) -> Result<Vec<Row>> {
+        let plan = srf
+            .json_table
+            .as_ref()
+            .expect("a JsonTable SRF carries its plan");
+        let ctx = srf.args[0].eval(&[], env, meter)?;
+        if matches!(ctx, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let node = json_arg_node(&ctx)?;
+        // The root path → the sequence of row items (a structural error here yields no rows).
+        let root = crate::jsonpath::JsonPath::compile(&plan.root_path)?;
+        let items = crate::jsonpath::eval(&root, &node).unwrap_or_default();
+        // Expand the column tree over the root sequence → sparse rows, then materialize.
+        let sparse = expand_jt_level(&plan.columns, &items, env, meter)?;
+        let mut out = Vec::with_capacity(sparse.len());
+        for assignment in sparse {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            let mut row = vec![Value::Null; plan.width];
+            for (idx, v) in assignment {
+                row[idx] = v;
+            }
+            out.push(row);
+        }
+        Ok(out)
     }
 
     /// Resolve `generate_series(start, stop[, step])` (spec/design/functions.md §10): 2 or 3
@@ -9632,6 +9868,7 @@ impl Database {
                 | SrfKind::JsonbEachText
                 | SrfKind::JsonRecord { .. }
                 | SrfKind::JsonbPathQuery => self.json_srf_rows(srf, &env, meter),
+                SrfKind::JsonTable => self.json_table_rows(srf, &env, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -11956,7 +12193,6 @@ enum RExpr {
         returning: ScalarType,
         decimal: Option<DecimalTypmod>,
         wrapper: JsonWrapper,
-        keep_quotes: bool,
         on_empty: JsonOnBehavior,
         on_error: JsonOnBehavior,
     },
@@ -12979,6 +13215,50 @@ enum SrfKind {
     /// `jsonb_path_query(jsonb, jsonpath)` (P2, jsonpath.md §5.2): one `jsonb` row per item of the
     /// path's evaluation sequence over the context document. `args` is `[ctx, path]`.
     JsonbPathQuery,
+    /// `JSON_TABLE(ctx, path COLUMNS (…))` (T1, json-table.md §3): a multi-column relation produced by
+    /// the recursive default-plan expansion. `args` is `[ctx]`; the resolved column tree is the
+    /// SrfPlan's `json_table` field.
+    JsonTable,
+}
+
+/// A resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the column tree.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct JtPlan {
+    /// The compiled root jsonpath (its evaluation over `ctx` yields the row items).
+    root_path: String,
+    /// The total number of flattened output columns.
+    width: usize,
+    /// The top-level column tree.
+    columns: Vec<JtCol>,
+}
+
+/// One resolved `JSON_TABLE` column (json-table.md §3.3). Leaf columns carry their flat output index.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum JtCol {
+    /// `FOR ORDINALITY` — the level's 1-based row counter.
+    Ordinality { idx: usize },
+    /// A regular column: evaluate `path` over the row item, apply JSON_VALUE (scalar) or JSON_QUERY
+    /// (json/jsonb) semantics, coerce to `returning`.
+    Regular {
+        idx: usize,
+        returning: ScalarType,
+        decimal: Option<DecimalTypmod>,
+        path: String,
+        /// JSON_QUERY semantics (json/jsonb returning) vs JSON_VALUE (scalar).
+        query: bool,
+        wrapper: JsonWrapper,
+        on_empty: JsonOnBehavior,
+        on_error: JsonOnBehavior,
+    },
+    /// An `EXISTS` column: JSON_EXISTS of `path`, coerced to `returning` (bool/int).
+    Exists {
+        idx: usize,
+        returning: ScalarType,
+        path: String,
+        on_error: JsonOnBehavior,
+    },
+    /// A `NESTED PATH` subtree: expanded over the row item (the default-plan LEFT OUTER / sibling UNION).
+    Nested { path: String, columns: Vec<JtCol> },
 }
 
 /// A resolved set-returning-function row source (spec/design/functions.md §10, array-functions.md
@@ -12993,6 +13273,8 @@ struct SrfPlan {
     /// The declared output columns for a record-returning SRF (`JsonRecord`) — the C0 col-def list,
     /// used to map JSON members to columns by name + coerce. Empty for every other SRF kind.
     record_cols: Vec<Column>,
+    /// The resolved column tree for a `JSON_TABLE` SRF (`JsonTable`), else `None`.
+    json_table: Option<Box<JtPlan>>,
 }
 
 /// Build a set-returning function's **synthetic one-column relation** (spec/design/functions.md
@@ -13167,7 +13449,6 @@ fn resolve_json_sql_fn(
             returning: returning_st,
             decimal: None,
             wrapper,
-            keep_quotes,
             on_empty,
             on_error,
         },
@@ -13339,6 +13620,208 @@ fn coerce_json_member(
             SqlState::FeatureNotSupported,
             "a composite/array record column is not supported yet",
         )),
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// JSON_TABLE helpers (T1, json-table.md §3)
+// ----------------------------------------------------------------------------------------------
+
+/// A sparse assignment of a `JSON_TABLE` row — `(flat column index, value)` pairs; unassigned
+/// columns are NULL (the LEFT-OUTER / sibling-UNION fill).
+type JtAssign = Vec<(usize, Value)>;
+
+/// Build a synthetic `JSON_TABLE` output column.
+fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmod>) -> Column {
+    Column {
+        name: name.to_string(),
+        ty: Type::Scalar(ty),
+        decimal,
+        primary_key: false,
+        not_null: false,
+        default: None,
+        default_expr: None,
+        identity: None,
+        collation: None,
+    }
+}
+
+/// Resolve a `JSON_TABLE` column type name → its scalar type (a composite → `0A000`, an unknown
+/// name → `42704`).
+fn jt_scalar_type(db: &Database, type_name: &str) -> Result<ScalarType> {
+    if let Some(st) = ScalarType::from_name(type_name) {
+        Ok(st)
+    } else if db.composite_type(type_name).is_some() {
+        Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "a composite JSON_TABLE column is not supported yet",
+        ))
+    } else {
+        Err(EngineError::new(
+            SqlState::UndefinedObject,
+            format!("type \"{type_name}\" does not exist"),
+        ))
+    }
+}
+
+/// Compile a `JSON_TABLE` column path — the explicit `PATH p`, or the default `$.<column_name>` —
+/// to its canonical rendered form (validating; malformed → 42601).
+fn jt_compile_path(path: Option<&str>, name: &str) -> Result<String> {
+    let src = match path {
+        Some(p) => p.to_string(),
+        None => format!("$.{name}"),
+    };
+    Ok(crate::jsonpath::JsonPath::compile(&src)?.render())
+}
+
+/// Expand a `JSON_TABLE` COLUMNS level over a sequence of row items → the sparse rows (the
+/// parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3).
+fn expand_jt_level(
+    cols: &[JtCol],
+    items: &[JsonNode],
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Vec<JtAssign>> {
+    let mut rows: Vec<JtAssign> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        meter.guard()?;
+        let ord = (i + 1) as i64;
+        // This level's non-nested columns (regular / exists / ordinality).
+        let mut local: JtAssign = Vec::new();
+        for col in cols {
+            match col {
+                JtCol::Ordinality { idx } => local.push((*idx, Value::Int(ord))),
+                JtCol::Regular {
+                    idx,
+                    returning,
+                    decimal,
+                    path,
+                    query,
+                    wrapper,
+                    on_empty,
+                    on_error,
+                } => {
+                    let v = eval_jt_regular(
+                        item, path, *query, *returning, *decimal, *wrapper, *on_empty, *on_error,
+                        env, meter,
+                    )?;
+                    local.push((*idx, v));
+                }
+                JtCol::Exists {
+                    idx,
+                    returning,
+                    path,
+                    on_error,
+                } => {
+                    let v = eval_jt_exists(item, path, *returning, *on_error)?;
+                    local.push((*idx, v));
+                }
+                JtCol::Nested { .. } => {}
+            }
+        }
+        // The NESTED siblings, expanded over this item (UNIONed + LEFT OUTER fill).
+        let nested: Vec<&JtCol> = cols
+            .iter()
+            .filter(|c| matches!(c, JtCol::Nested { .. }))
+            .collect();
+        let nested_rows = expand_jt_nested(&nested, item, env, meter)?;
+        for nr in nested_rows {
+            let mut row = local.clone();
+            row.extend(nr);
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Expand the NESTED siblings of a level over one parent item — the default-plan **UNION** of the
+/// siblings (each row fills only its own subtree), with the parent→child **LEFT OUTER** fill (no
+/// child rows at all → one all-NULL nested row).
+fn expand_jt_nested(
+    children: &[&JtCol],
+    item: &JsonNode,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Vec<JtAssign>> {
+    if children.is_empty() {
+        return Ok(vec![Vec::new()]);
+    }
+    let mut union: Vec<JtAssign> = Vec::new();
+    for child in children {
+        if let JtCol::Nested { path, columns } = child {
+            let p = crate::jsonpath::JsonPath::compile(path)?;
+            let child_seq = crate::jsonpath::eval(&p, item).unwrap_or_default();
+            union.extend(expand_jt_level(columns, &child_seq, env, meter)?);
+        }
+    }
+    if union.is_empty() {
+        union.push(Vec::new());
+    }
+    Ok(union)
+}
+
+/// Evaluate a regular `JSON_TABLE` column over a row item — JSON_VALUE (scalar) / JSON_QUERY
+/// (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
+#[allow(clippy::too_many_arguments)]
+fn eval_jt_regular(
+    item: &JsonNode,
+    path: &str,
+    query: bool,
+    returning: ScalarType,
+    decimal: Option<DecimalTypmod>,
+    wrapper: JsonWrapper,
+    on_empty: JsonOnBehavior,
+    on_error: JsonOnBehavior,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Value> {
+    let p = crate::jsonpath::JsonPath::compile(path)?;
+    let seq = match crate::jsonpath::eval(&p, item) {
+        Ok(s) => s,
+        Err(e) if is_sqljson_error(&e) => {
+            return apply_json_behavior(on_error, e, returning, env, meter);
+        }
+        Err(e) => return Err(e),
+    };
+    let kind = if query {
+        JsonSqlKind::Query
+    } else {
+        JsonSqlKind::Value
+    };
+    eval_json_sql_result(
+        kind, seq, returning, decimal, wrapper, on_empty, on_error, env, meter,
+    )
+}
+
+/// Evaluate an `EXISTS` `JSON_TABLE` column over a row item — JSON_EXISTS, coerced to the column
+/// type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
+fn eval_jt_exists(
+    item: &JsonNode,
+    path: &str,
+    returning: ScalarType,
+    on_error: JsonOnBehavior,
+) -> Result<Value> {
+    let p = crate::jsonpath::JsonPath::compile(path)?;
+    let exists = match crate::jsonpath::eval(&p, item) {
+        Ok(seq) => !seq.is_empty(),
+        Err(e) if is_sqljson_error(&e) => match on_error {
+            JsonOnBehavior::Error => return Err(e),
+            JsonOnBehavior::True => true,
+            JsonOnBehavior::Unknown => return Ok(Value::Null),
+            _ => false,
+        },
+        Err(e) => return Err(e),
+    };
+    // Coerce the boolean to the column type (a `boolean` column → bool; an integer column → 1/0).
+    if returning.is_bool() {
+        Ok(Value::Bool(exists))
+    } else if returning.is_integer() {
+        Ok(Value::Int(i64::from(exists)))
+    } else {
+        Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "an EXISTS JSON_TABLE column must be boolean or integer this slice",
+        ))
     }
 }
 
@@ -26232,7 +26715,6 @@ impl RExpr {
                 returning,
                 decimal,
                 wrapper,
-                keep_quotes: _,
                 on_empty,
                 on_error,
             } => {

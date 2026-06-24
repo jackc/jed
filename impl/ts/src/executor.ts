@@ -26,7 +26,9 @@ import type {
   JoinKind,
   JsonOnBehavior,
   JsonPredicateKind,
+  JsonTable,
   JsonWrapper,
+  JtColumn,
   Literal,
   OnConflict,
   OrderKey,
@@ -6839,7 +6841,11 @@ export class Database {
       // body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
       // item (i === 0) has no earlier sibling, so it is never lateral; an SRF there resolves against
       // `parent` (the enclosing query) exactly as before.
-      const lateralEligible = i > 0 && ((isDerived && tref.lateral === true) || tref.args !== null);
+      const lateralEligible =
+        i > 0 &&
+        ((isDerived && tref.lateral === true) ||
+          tref.args !== null ||
+          tref.jsonTable !== undefined);
       // The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
       // enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
       // deeper). null when not lateral-eligible.
@@ -6871,6 +6877,14 @@ export class Database {
           ctes,
           ptypes,
         );
+        t = r.table;
+        srf = r.srf;
+        lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
+      } else if (tref.jsonTable !== undefined) {
+        // A JSON_TABLE source (T1, json-table.md §3) — implicitly lateral like an SRF; its `ctx`
+        // resolves against the prefix scope (so `JSON_TABLE(sibling.doc, …)` works).
+        const jtParent = lateralEligible ? lateralParent : parent;
+        const r = this.resolveJsonTable(tref.jsonTable, tref.alias, jtParent, ctes, ptypes);
         t = r.table;
         srf = r.srf;
         lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
@@ -7636,6 +7650,167 @@ export class Database {
     };
   }
 
+  // resolveJsonTable resolves a `JSON_TABLE(ctx, path COLUMNS (…))` source (T1, json-table.md §3) →
+  // its synthetic relation (the flattened columns), the `[ctx]` arg, and the resolved JtPlan. Port of
+  // impl/rust/src/executor.rs `resolve_json_table`.
+  private resolveJsonTable(
+    jt: JsonTable,
+    alias: string | null,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
+    // The ctx / root path see only params + the lateral prefix (never sibling columns of THIS
+    // relation) — an empty-local-rels scope chained to `parent`, exactly like an SRF (§44).
+    const argScope = new Scope([], this, parent, true, ctes);
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    // The context item (json / jsonb / text, coerced to a jsonb document at eval).
+    const rctx = resolve(argScope, jt.ctx, "jsonb", forbidden, ptypes);
+    switch (rctx.type.kind) {
+      case "jsonb":
+      case "json":
+      case "text":
+      case "null":
+        break;
+      default:
+        throw engineError(
+          "datatype_mismatch",
+          "the context item of JSON_TABLE must be json/jsonb/text, not " + rtName(rctx.type),
+        );
+    }
+    // The root path — a constant jsonpath (a string literal compiles).
+    const rpath = resolve(argScope, jt.path, "jsonpath", forbidden, ptypes);
+    if (rpath.type.kind !== "jsonpath") {
+      throw engineError("datatype_mismatch", "the path of JSON_TABLE must be a constant jsonpath");
+    }
+    if (rpath.node.kind !== "constJsonPath") {
+      throw engineError("feature_not_supported", "a non-constant JSON_TABLE path is not supported");
+    }
+    const rootPath = rpath.node.value;
+    const outColumns: Column[] = [];
+    const columns = this.resolveJtColumns(jt.columns, outColumns);
+    const width = outColumns.length;
+    const table: Table = {
+      name: alias ?? "json_table",
+      columns: outColumns,
+      pk: [],
+      checks: [],
+      indexes: [],
+      fks: [],
+    };
+    return {
+      table,
+      srf: { kind: "json_table", args: [rctx.node], jtPlan: { rootPath, width, columns } },
+    };
+  }
+
+  // resolveJtColumns recursively resolves a `JSON_TABLE` COLUMNS tree, flattening the leaf columns
+  // into `outColumns` (pre-order, declaration order) and assigning each its flat output index. Port
+  // of impl/rust/src/executor.rs `resolve_jt_columns`.
+  private resolveJtColumns(cols: JtColumn[], outColumns: Column[]): JtCol[] {
+    const resolved: JtCol[] = [];
+    for (const col of cols) {
+      switch (col.kind) {
+        case "ordinality": {
+          const idx = outColumns.length;
+          outColumns.push(jtColumn(col.name, "i32", null));
+          resolved.push({ kind: "ordinality", idx });
+          break;
+        }
+        case "regular": {
+          if (col.array) {
+            throw engineError(
+              "feature_not_supported",
+              "an array JSON_TABLE column is not supported yet",
+            );
+          }
+          const st = jtScalarType(this, col.typeName);
+          if (!col.keepQuotes) {
+            throw engineError(
+              "feature_not_supported",
+              "JSON_TABLE OMIT QUOTES is not supported yet",
+            );
+          }
+          const query = st === "json" || st === "jsonb";
+          if (!query && col.wrapper !== "without") {
+            throw engineError(
+              "feature_not_supported",
+              "a WRAPPER on a scalar JSON_TABLE column is not supported yet",
+            );
+          }
+          const compiled = jtCompilePath(col.path, col.name);
+          const idx = outColumns.length;
+          outColumns.push(jtColumn(col.name, st, null));
+          resolved.push({
+            kind: "regular",
+            idx,
+            returning: st,
+            decimal: null,
+            path: compiled,
+            query,
+            wrapper: col.wrapper,
+            onEmpty: col.onEmpty ?? "null",
+            onError: col.onError ?? "null",
+          });
+          break;
+        }
+        case "exists": {
+          const st = jtScalarType(this, col.typeName);
+          const compiled = jtCompilePath(col.path, col.name);
+          const idx = outColumns.length;
+          outColumns.push(jtColumn(col.name, st, null));
+          resolved.push({
+            kind: "exists",
+            idx,
+            returning: st,
+            path: compiled,
+            onError: col.onError ?? "false",
+          });
+          break;
+        }
+        case "nested": {
+          const compiled = jsonPathRender(jsonPathCompile(col.path));
+          const nested = this.resolveJtColumns(col.columns, outColumns);
+          resolved.push({ kind: "nested", path: compiled, columns: nested });
+          break;
+        }
+      }
+    }
+    return resolved;
+  }
+
+  // jsonTableRows generates the rows of a `JSON_TABLE` SRF (T1, json-table.md §3) — the default-plan
+  // recursive expansion (parent→child LEFT OUTER, sibling NESTED paths UNIONed). Port of
+  // impl/rust/src/executor.rs `json_table_rows`.
+  private jsonTableRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+    const plan = srf.jtPlan;
+    if (plan === undefined) throw new Error("a json_table SRF carries its plan");
+    const ctx = evalExpr(srf.args[0]!, [], env, meter);
+    if (ctx.kind === "null") return [];
+    const node = jsonArgNode(ctx);
+    // The root path → the sequence of row items (a structural error here yields no rows).
+    const root = jsonPathCompile(plan.rootPath);
+    let items: JsonNode[];
+    try {
+      items = jsonPathEval(root, node);
+    } catch {
+      items = [];
+    }
+    // Expand the column tree over the root sequence → sparse rows, then materialize.
+    const sparse = expandJtLevel(plan.columns, items, env, meter);
+    const out: Row[] = [];
+    for (const assignment of sparse) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      const row: Value[] = new Array(plan.width).fill(nullValue());
+      for (const [idx, v] of assignment) {
+        row[idx] = v;
+      }
+      out.push(row);
+    }
+    return out;
+  }
+
   // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
   // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
   // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
@@ -8101,6 +8276,8 @@ export class Database {
         case "json_record":
         case "jsonb_path_query":
           return this.jsonSrfRows(rel.srf, env, meter);
+        case "json_table":
+          return this.jsonTableRows(rel.srf, env, meter);
       }
     }
     // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
@@ -11286,7 +11463,11 @@ type SrfKind =
   | "json_record"
   // jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
   // evaluation sequence over the context document. `args` is `[ctx, path]`.
-  | "jsonb_path_query";
+  | "jsonb_path_query"
+  // JSON_TABLE(ctx, path COLUMNS (…)) (T1, json-table.md §3): a multi-column relation produced by the
+  // recursive default-plan expansion. `args` is `[ctx]`; the resolved column tree is the SrfPlan's
+  // `jtPlan` field.
+  | "json_table";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -11301,7 +11482,45 @@ type SrfPlan = {
   args: RExpr[];
   recordSet?: boolean;
   recordCols?: Column[];
+  // The resolved column tree for a `JSON_TABLE` SRF (the `json_table` kind, T1, json-table.md §3),
+  // else absent.
+  jtPlan?: JtPlan;
 };
+
+// JtPlan is a resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the
+// column tree. `width` is the total flattened output-column count.
+type JtPlan = {
+  // The compiled root jsonpath (its evaluation over `ctx` yields the row items).
+  rootPath: string;
+  // The total number of flattened output columns.
+  width: number;
+  // The top-level column tree.
+  columns: JtCol[];
+};
+
+// JtCol is one resolved `JSON_TABLE` column (json-table.md §3.3), a discriminated union. Leaf
+// columns carry their flat output index `idx`.
+type JtCol =
+  // `FOR ORDINALITY` — the level's 1-based row counter.
+  | { kind: "ordinality"; idx: number }
+  // A regular column: evaluate `path` over the row item, apply JSON_VALUE (scalar) or JSON_QUERY
+  // (json/jsonb) semantics, coerce to `returning`.
+  | {
+      kind: "regular";
+      idx: number;
+      returning: ScalarType;
+      decimal: DecimalTypmod | null;
+      path: string;
+      // JSON_QUERY semantics (json/jsonb returning) vs JSON_VALUE (scalar).
+      query: boolean;
+      wrapper: JsonWrapper;
+      onEmpty: JsonOnBehavior;
+      onError: JsonOnBehavior;
+    }
+  // An `EXISTS` column: JSON_EXISTS of `path`, coerced to `returning` (bool/int).
+  | { kind: "exists"; idx: number; returning: ScalarType; path: string; onError: JsonOnBehavior }
+  // A `NESTED PATH` subtree: expanded over the row item (the default-plan LEFT OUTER / sibling UNION).
+  | { kind: "nested"; path: string; columns: JtCol[] };
 
 // srfTable builds a set-returning function's SYNTHETIC one-column relation (spec/design/functions.md
 // §10). The table's name is the function name (the un-aliased label fallback); the lone column's
@@ -11553,6 +11772,202 @@ function evalJsonSqlResult(
       return jsonNodeAsReturning(node, returning, env, meter);
     }
   }
+}
+
+// ----------------------------------------------------------------------------------------------
+// JSON_TABLE helpers (T1, json-table.md §3)
+// ----------------------------------------------------------------------------------------------
+
+// JtAssign is a sparse assignment of a `JSON_TABLE` row — `[flat column index, value]` pairs;
+// unassigned columns are NULL (the LEFT-OUTER / sibling-UNION fill).
+type JtAssign = [number, Value][];
+
+// jtColumn builds a synthetic `JSON_TABLE` output column. Port of impl/rust/src/executor.rs
+// `jt_column`.
+function jtColumn(name: string, ty: ScalarType, decimal: DecimalTypmod | null): Column {
+  return {
+    name,
+    type: scalarT(ty),
+    decimal,
+    primaryKey: false,
+    notNull: false,
+    default: null,
+    defaultExpr: null,
+    identity: null,
+    collation: null,
+  };
+}
+
+// jtScalarType resolves a `JSON_TABLE` column type name → its scalar type (a composite → 0A000, an
+// unknown name → 42704). Port of impl/rust/src/executor.rs `jt_scalar_type`.
+function jtScalarType(db: Database, typeName: string): ScalarType {
+  const st = scalarTypeFromName(typeName);
+  if (st !== undefined) return st;
+  if (db.compositeType(typeName) !== undefined) {
+    throw engineError(
+      "feature_not_supported",
+      "a composite JSON_TABLE column is not supported yet",
+    );
+  }
+  throw engineError("undefined_object", `type "${typeName}" does not exist`);
+}
+
+// jtCompilePath compiles a `JSON_TABLE` column path — the explicit `PATH p`, or the default
+// `$.<column_name>` — to its canonical rendered form (validating; malformed → 42601). Port of
+// impl/rust/src/executor.rs `jt_compile_path`.
+function jtCompilePath(path: string | null, name: string): string {
+  const src = path ?? `$.${name}`;
+  return jsonPathRender(jsonPathCompile(src));
+}
+
+// expandJtLevel expands a `JSON_TABLE` COLUMNS level over a sequence of row items → the sparse rows
+// (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Port
+// of impl/rust/src/executor.rs `expand_jt_level`.
+function expandJtLevel(cols: JtCol[], items: JsonNode[], env: EvalEnv, meter: Meter): JtAssign[] {
+  const rows: JtAssign[] = [];
+  for (let i = 0; i < items.length; i++) {
+    meter.guard();
+    const item = items[i]!;
+    const ord = BigInt(i + 1);
+    // This level's non-nested columns (regular / exists / ordinality).
+    const local: JtAssign = [];
+    for (const col of cols) {
+      switch (col.kind) {
+        case "ordinality":
+          local.push([col.idx, intValue(ord)]);
+          break;
+        case "regular": {
+          const v = evalJtRegular(
+            item,
+            col.path,
+            col.query,
+            col.returning,
+            col.decimal,
+            col.wrapper,
+            col.onEmpty,
+            col.onError,
+            env,
+            meter,
+          );
+          local.push([col.idx, v]);
+          break;
+        }
+        case "exists": {
+          const v = evalJtExists(item, col.path, col.returning, col.onError);
+          local.push([col.idx, v]);
+          break;
+        }
+        case "nested":
+          break;
+      }
+    }
+    // The NESTED siblings, expanded over this item (UNIONed + LEFT OUTER fill).
+    const nested = cols.filter((c): c is JtCol & { kind: "nested" } => c.kind === "nested");
+    const nestedRows = expandJtNested(nested, item, env, meter);
+    for (const nr of nestedRows) {
+      rows.push([...local, ...nr]);
+    }
+  }
+  return rows;
+}
+
+// expandJtNested expands the NESTED siblings of a level over one parent item — the default-plan
+// UNION of the siblings (each row fills only its own subtree), with the parent→child LEFT OUTER fill
+// (no child rows at all → one all-NULL nested row). Port of impl/rust/src/executor.rs
+// `expand_jt_nested`.
+function expandJtNested(
+  children: (JtCol & { kind: "nested" })[],
+  item: JsonNode,
+  env: EvalEnv,
+  meter: Meter,
+): JtAssign[] {
+  if (children.length === 0) return [[]];
+  const union: JtAssign[] = [];
+  for (const child of children) {
+    const p = jsonPathCompile(child.path);
+    let childSeq: JsonNode[];
+    try {
+      childSeq = jsonPathEval(p, item);
+    } catch {
+      childSeq = [];
+    }
+    union.push(...expandJtLevel(child.columns, childSeq, env, meter));
+  }
+  if (union.length === 0) union.push([]);
+  return union;
+}
+
+// evalJtRegular evaluates a regular `JSON_TABLE` column over a row item — JSON_VALUE (scalar) /
+// JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR. Port of
+// impl/rust/src/executor.rs `eval_jt_regular`.
+function evalJtRegular(
+  item: JsonNode,
+  path: string,
+  query: boolean,
+  returning: ScalarType,
+  decimal: DecimalTypmod | null,
+  wrapper: JsonWrapper,
+  onEmpty: JsonOnBehavior,
+  onError: JsonOnBehavior,
+  env: EvalEnv,
+  meter: Meter,
+): Value {
+  const p = jsonPathCompile(path);
+  let seq: JsonNode[];
+  try {
+    seq = jsonPathEval(p, item);
+  } catch (e) {
+    if (isSqljsonError(e)) {
+      return applyJsonBehavior(onError, e, returning, env, meter);
+    }
+    throw e;
+  }
+  const kind: JsonSqlKind = query ? "query" : "value";
+  return evalJsonSqlResult(kind, seq, returning, decimal, wrapper, onEmpty, onError, env, meter);
+}
+
+// evalJtExists evaluates an `EXISTS` `JSON_TABLE` column over a row item — JSON_EXISTS, coerced to
+// the column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
+// Port of impl/rust/src/executor.rs `eval_jt_exists`.
+function evalJtExists(
+  item: JsonNode,
+  path: string,
+  returning: ScalarType,
+  onError: JsonOnBehavior,
+): Value {
+  const p = jsonPathCompile(path);
+  let exists: boolean;
+  try {
+    exists = jsonPathEval(p, item).length > 0;
+  } catch (e) {
+    if (isSqljsonError(e)) {
+      switch (onError) {
+        case "error":
+          throw e;
+        case "true":
+          exists = true;
+          break;
+        case "unknown":
+          return nullValue();
+        default:
+          exists = false;
+          break;
+      }
+    } else {
+      throw e;
+    }
+  }
+  // Coerce the boolean to the column type (a `boolean` column → bool; an integer column → 1/0).
+  if (isBool(returning)) {
+    return boolValue(exists);
+  }
+  if (isInteger(returning)) {
+    return intValue(BigInt(exists ? 1 : 0));
+  }
+  throw engineError(
+    "feature_not_supported",
+    "an EXISTS JSON_TABLE column must be boolean or integer this slice",
+  );
 }
 
 // PlanJoin is one join in a SELECT plan: its kind and resolved ON predicate (null for CROSS). The

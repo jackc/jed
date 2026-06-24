@@ -461,3 +461,26 @@ func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
 		}
 	}
 }
+
+// TestJSONTableDeferredFeaturesAre0A000: the deferred T1 sub-features of JSON_TABLE are 0A000 — an
+// explicit PLAN, PASSING, an array column, a WRAPPER on a scalar column, OMIT QUOTES; an unknown
+// column type is 42704. PostgreSQL supports the first set, so each is a documented divergence; the
+// supported subset is oracle-clean in suites/json/json_table.test. Mirrors impl/rust/tests/json.rs
+// json_table_deferred_features_are_0a000.
+func TestJSONTableDeferredFeaturesAre0A000(t *testing.T) {
+	db := NewDatabase()
+	for _, sql := range []string{
+		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))`,
+		`SELECT * FROM JSON_TABLE('{}', '$' PASSING 1 AS y COLUMNS (x i32 PATH '$.x'))`,
+		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32[] PATH '$.x'))`,
+		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' WITH WRAPPER))`,
+		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' OMIT QUOTES))`,
+	} {
+		if got := errJSON(t, db, sql); got != "0A000" {
+			t.Errorf("%s: got %s, want 0A000", sql, got)
+		}
+	}
+	if got := errJSON(t, db, `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x nosuchtype PATH '$.x'))`); got != "42704" {
+		t.Errorf("unknown column type: got %s, want 42704", got)
+	}
+}

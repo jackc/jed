@@ -1,0 +1,102 @@
+# JSON_TABLE with the default plan (T1, spec/design/json-table.md §3) — projecting a JSON document
+# into a relation via the COLUMNS clause: regular / FOR ORDINALITY / EXISTS columns, NESTED PATH with
+# the default LEFT-OUTER / sibling-UNION expansion. (A qualified `jt.*` star is not in jed's surface,
+# so these use `SELECT *`.) Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: query.select, query.order_by, query.aggregates, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns, func.json_table
+
+# A regular column + FOR ORDINALITY + a NESTED PATH: each parent row joins each child (LEFT OUTER).
+query IITI nosort
+SELECT * FROM JSON_TABLE('{"id": 7, "items": [{"sku": "a", "qty": 2}, {"sku": "b", "qty": 5}]}', '$' COLUMNS (id i32 PATH '$.id', n FOR ORDINALITY, NESTED PATH '$.items[*]' COLUMNS (sku text PATH '$.sku', qty i32 PATH '$.qty'))) AS jt
+----
+7
+1
+a
+2
+7
+1
+b
+5
+
+# An empty nested path → ONE parent row with the nested columns NULL (LEFT OUTER).
+query IT nosort
+SELECT * FROM JSON_TABLE('{"id": 7, "items": []}', '$' COLUMNS (id i32 PATH '$.id', NESTED PATH '$.items[*]' COLUMNS (sku text PATH '$.sku'))) AS jt
+----
+7
+NULL
+
+# Sibling NESTED paths are UNIONed: each sibling's rows carry the other's columns NULL.
+query II nosort
+SELECT * FROM JSON_TABLE('{"a": [1, 2], "b": [10, 20]}', '$' COLUMNS (NESTED PATH '$.a[*]' COLUMNS (x i32 PATH '$'), NESTED PATH '$.b[*]' COLUMNS (y i32 PATH '$'))) AS jt ORDER BY x NULLS LAST, y
+----
+1
+NULL
+2
+NULL
+NULL
+10
+NULL
+20
+
+# A root array (multiple row items), default column paths ($.<name>), an EXISTS column, ordinality.
+query ITII nosort
+SELECT * FROM JSON_TABLE('[{"a": 1, "b": "x"}, {"a": 2}]', '$[*]' COLUMNS (a i32, b text, hasb i32 EXISTS PATH '$.b', n FOR ORDINALITY)) AS jt ORDER BY n
+----
+1
+x
+1
+1
+2
+NULL
+0
+2
+
+# Two-level NESTED with per-level ordinality (the inner counter resets per parent item).
+query IIT nosort
+SELECT * FROM JSON_TABLE('{"items": [{"t": ["p", "q"]}, {"t": ["r"]}]}', '$' COLUMNS (NESTED PATH '$.items[*]' COLUMNS (i FOR ORDINALITY, NESTED PATH '$.t[*]' COLUMNS (j FOR ORDINALITY, v text PATH '$')))) AS jt ORDER BY i, j
+----
+1
+1
+p
+1
+2
+q
+2
+1
+r
+
+# A regular column whose scalar coercion fails → NULL (default NULL ON ERROR); a jsonb column is
+# structural (JSON_QUERY); an EXISTS boolean column.
+query ITB nosort
+SELECT * FROM JSON_TABLE('{"a": "notnum", "arr": [1, 2, 3]}', '$' COLUMNS (a i32 PATH '$.a', arr jsonb PATH '$.arr', e boolean EXISTS PATH '$.missing')) AS jt
+----
+NULL
+[1, 2, 3]
+false
+
+# A NULL context and an empty root sequence each yield zero rows.
+query I nosort
+SELECT count(*)::i32 FROM JSON_TABLE(NULL::jsonb, '$[*]' COLUMNS (x i32 PATH '$')) AS a
+----
+0
+
+query I nosort
+SELECT count(*)::i32 FROM JSON_TABLE('{"a": 1}', '$.nope[*]' COLUMNS (x i32 PATH '$')) AS a
+----
+0
+
+# JSON_TABLE is implicitly lateral — its context may reference an earlier FROM sibling.
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, j jsonb)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"tags": ["red", "blue"]}'), (2, '{"tags": ["green"]}')
+
+query IT nosort
+SELECT d.id, jt.tag FROM docs d CROSS JOIN JSON_TABLE(d.j, '$.tags[*]' COLUMNS (tag text PATH '$')) AS jt ORDER BY d.id, jt.tag
+----
+1
+blue
+1
+red
+2
+green

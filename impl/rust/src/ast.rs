@@ -492,7 +492,54 @@ pub struct TableRef {
     /// columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually exclusive
     /// with `column_aliases` (a rename-only list). `None` for an ordinary table / SRF.
     pub column_defs: Option<Vec<TypeFieldDef>>,
+    /// A `JSON_TABLE(...)` table source (json-table.md §3, T1) — projects a JSON document into a
+    /// relation via the `COLUMNS` clause. When `Some`, the other source fields (`name`/`args`/…) are
+    /// unused. Implicitly lateral (its `ctx` may reference earlier FROM siblings).
+    pub json_table: Option<Box<JsonTable>>,
     pub lateral: bool,
+}
+
+/// A `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3, T1). The
+/// root `path` is evaluated over `ctx` to a sequence of row items; the `COLUMNS` tree projects each
+/// item (and, via `NESTED PATH`, child items) into relational columns under the default plan
+/// (parent→child LEFT OUTER, sibling NESTED paths UNIONed).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JsonTable {
+    pub ctx: Box<Expr>,
+    pub path: Box<Expr>,
+    pub columns: Vec<JtColumn>,
+}
+
+/// One `JSON_TABLE` `COLUMNS` entry (json-table.md §3.3).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum JtColumn {
+    /// `name FOR ORDINALITY` — a per-level 1-based row counter (`integer`).
+    Ordinality { name: String },
+    /// `name type [PATH p] [wrapper] [quotes] [ON EMPTY] [ON ERROR]` — a regular column: evaluate `p`
+    /// (default `$.name`) over the current row item and coerce to `type` like JSON_VALUE (scalar) or
+    /// JSON_QUERY (json/jsonb).
+    Regular {
+        name: String,
+        type_name: String,
+        array: bool,
+        path: Option<String>,
+        wrapper: JsonWrapper,
+        keep_quotes: bool,
+        on_empty: Option<JsonOnBehavior>,
+        on_error: Option<JsonOnBehavior>,
+    },
+    /// `name type EXISTS [PATH p] [behavior ON ERROR]` — JSON_EXISTS of `p`, coerced to `type`.
+    Exists {
+        name: String,
+        type_name: String,
+        path: Option<String>,
+        on_error: Option<JsonOnBehavior>,
+    },
+    /// `NESTED [PATH] p [AS n] COLUMNS (…)` — recursively expand a child path over the row item.
+    Nested {
+        path: String,
+        columns: Vec<JtColumn>,
+    },
 }
 
 /// The kind of a join. `Inner` and `Cross` execute this slice; the `Left`/`Right`/`Full`

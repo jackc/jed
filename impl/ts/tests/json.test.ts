@@ -358,3 +358,30 @@ test("json query function deferred clauses are 0A000", () => {
     );
   }
 });
+
+// The deferred T1 sub-features of JSON_TABLE are 0A000 — an explicit PLAN, PASSING, an array column,
+// a WRAPPER on a scalar column, OMIT QUOTES; an unknown column type is 42704. PostgreSQL supports the
+// first set, so each is a documented divergence; the supported subset is oracle-clean in
+// suites/json/json_table.test. Mirrors impl/rust/tests/json.rs json_table_deferred_features_are_0a000.
+test("json_table deferred features are 0A000", () => {
+  const db = dbWith([]);
+  for (const sql of [
+    `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))`,
+    `SELECT * FROM JSON_TABLE('{}', '$' PASSING 1 AS y COLUMNS (x i32 PATH '$.x'))`,
+    `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32[] PATH '$.x'))`,
+    `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' WITH WRAPPER))`,
+    `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' OMIT QUOTES))`,
+  ]) {
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "0A000",
+      `${sql} should defer 0A000`,
+    );
+  }
+  assert.equal(
+    errCode(() =>
+      execute(db, `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x nosuchtype PATH '$.x'))`),
+    ),
+    "42704",
+  );
+});

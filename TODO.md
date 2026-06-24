@@ -402,6 +402,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           with` / `is unknown`, `$name` variables.
   - [~] **P2 / P3** — remaining: `like_regex` → Pike VM (§4.3), item methods (`.type()`/`.size()`/
         `.double()`/…), arithmetic, `vars`/`silent` args; then the `_tz` variants (P3). → jsonpath.md §5
+  - [x] **T1 ✅ — JSON_TABLE (default plan)** — ✅ `JSON_TABLE(ctx, path [AS n] COLUMNS (…))` as a
+        FROM-clause table source (json-table.md §3): regular columns (JSON_VALUE/QUERY semantics over
+        the row item, default path `$.<name>`), `FOR ORDINALITY` (per-level 1-based `i32` counter),
+        `EXISTS` columns (JSON_EXISTS → bool/int), and recursive `NESTED PATH` with the default plan
+        (parent→child LEFT OUTER, sibling NESTED paths UNIONed). A new `SrfKind::JsonTable` row source
+        (a `JtPlan`/`JtCol` tree + the sparse-row recursive expansion), implicitly lateral. Reuses the
+        S2 column machinery + C0 synthetic table. Deferred `0A000`: explicit PLAN (T2), PASSING, array/
+        composite columns, scalar WRAPPER, OMIT QUOTES (unknown type `42704`). All 3 cores byte-identical,
+        cap `func.json_table`, oracle-clean, NO format bump. **★ The highest-risk JSON slice — DONE.**
   - [x] **S1 ✅ / S2 ✅** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅ + S2
         `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` ✅. → json-sql-functions.md §5
     - [x] **S1a — the `IS JSON` predicate** — ✅ `expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]
