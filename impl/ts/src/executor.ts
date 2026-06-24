@@ -8169,7 +8169,13 @@ export class Database {
       // unmetered (cost.md §3).
       const newAccs = (): Acc[] =>
         plan.aggSpecs.map((s) =>
-          newAcc(s.plan, s.floatWidth ?? "f64", s.jsonAsJson ?? false, s.jsonStrict ?? false),
+          newAcc(
+            s.plan,
+            s.floatWidth ?? "f64",
+            s.jsonAsJson ?? false,
+            s.jsonStrict ?? false,
+            s.jsonUnique ?? false,
+          ),
         );
       // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
       // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
@@ -11276,7 +11282,13 @@ type AggPlan =
   // `strict` skips a NULL-valued row (the non-strict variants keep it as JSON null). An empty/zero-row
   // group → SQL NULL, but a group whose rows were all dropped by the strict filter → an empty array []
   // (the `seen` flag distinguishes the two).
-  | "jsonAgg";
+  | "jsonAgg"
+  // json_object_agg / jsonb_object_agg (and the `_unique` variants, B4) — aggregate a group's (key,
+  // value) pairs (carried as a Row operand) into one JSON object (json-sql-functions.md §4). The
+  // `jsonAsJson` flag selects the json (insertion order + dups + " : " spacing, brace-padded) vs jsonb
+  // (canonical, last-wins) render; `jsonUnique` errors 22030 on a duplicate key. An empty group → NULL
+  // (the `seen` flag). Hand-resolved (the single-operand aggregate catalog can't express a pair).
+  | "jsonObjectAgg";
 
 // AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
 // row against the real row). operand is null for COUNT(*). distinct (COUNT(DISTINCT x),
@@ -11296,6 +11308,9 @@ type AggSpec = {
   // NULL-valued row. Both ride on the Acc, fixed at resolve.
   jsonAsJson?: boolean;
   jsonStrict?: boolean;
+  // For the "jsonObjectAgg" plan (B4): unique → error 22030 on a duplicate key. asJson rides on
+  // jsonAsJson above (json vs jsonb render). Fixed at resolve.
+  jsonUnique?: boolean;
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -11422,6 +11437,11 @@ type Acc = {
   jsonNodes: JsonNode[];
   jsonAsJson: boolean;
   jsonStrict: boolean;
+  // For the "jsonObjectAgg" plan (B4): the (key, value) pairs in row order (the key already coerced
+  // to text). `jsonUnique` errors 22030 on a duplicate key; `jsonAsJson` (above) selects json vs jsonb
+  // finalize; `seen` (above) distinguishes a zero-row group (→ NULL) from a non-empty one.
+  jsonPairs: [string, Value][];
+  jsonUnique: boolean;
 };
 
 function newAcc(
@@ -11429,6 +11449,7 @@ function newAcc(
   floatWidth: ScalarType = "f64",
   jsonAsJson = false,
   jsonStrict = false,
+  jsonUnique = false,
 ): Acc {
   return {
     plan,
@@ -11442,6 +11463,8 @@ function newAcc(
     jsonNodes: [],
     jsonAsJson,
     jsonStrict,
+    jsonPairs: [],
+    jsonUnique,
   };
 }
 
@@ -11450,7 +11473,12 @@ function newAcc(
 // the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values), so only the
 // float-fold buffer needs a real copy; `cur` is a Value (treated immutably by foldAcc/finalizeAcc).
 function cloneAcc(a: Acc): Acc {
-  return { ...a, floats: a.floats.slice(), jsonNodes: a.jsonNodes.slice() };
+  return {
+    ...a,
+    floats: a.floats.slice(),
+    jsonNodes: a.jsonNodes.slice(),
+    jsonPairs: a.jsonPairs.slice(),
+  };
 }
 
 // foldAcc folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
@@ -11531,6 +11559,31 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
         a.jsonNodes.push(valueToNode(v));
       }
       break;
+    case "jsonObjectAgg": {
+      // Called once per group row. `seen` marks the group non-empty (so an empty group → NULL at
+      // finalize). The operand is a Row(key, value) composite; split it back out, coerce the key to
+      // text (NULL → 22023 "field name must not be null"), then push (key, value) in row order. The
+      // _unique variant errors 22030 on a key already accumulated. Charges one generatedRow per pair.
+      a.seen = true;
+      m.charge(COSTS.generatedRow);
+      m.guard();
+      if (v.kind !== "composite" || v.fields.length !== 2) {
+        throw new Error("BUG: object_agg operand is a 2-field Row");
+      }
+      const kv = v.fields[0]!;
+      const vv = v.fields[1]!;
+      // The key is coerced to text (text/integer/decimal/boolean); a NULL key → 22023 (a DIFFERENT
+      // message from build_object's "key must not be null"), so it is handled before objectKeyText.
+      if (kv.kind === "null") {
+        throw engineError("invalid_parameter_value", "field name must not be null");
+      }
+      const key = objectKeyText(kv, 1);
+      if (a.jsonUnique && a.jsonPairs.some(([k]) => k === key)) {
+        throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
+      }
+      a.jsonPairs.push([key, vv]);
+      break;
+    }
   }
 }
 
@@ -11596,6 +11649,24 @@ function finalizeAcc(a: Acc): Value {
       if (a.jsonAsJson) return jsonValue(jsonbOut(arr));
       return jsonbValue(arr);
     }
+    case "jsonObjectAgg": {
+      // Zero-row group → SQL NULL; else the JSON object. json keeps insertion order + dups with PG's
+      // idiosyncratic " : " spacing and PADDED braces (`{ … }` — distinct from json_build_object,
+      // which does NOT pad); jsonb canonicalizes last-wins (makeObject).
+      if (!a.seen) return nullValue();
+      if (a.jsonAsJson) {
+        const parts = a.jsonPairs.map(
+          ([k, v]) => `${jsonCompactOut({ kind: "string", value: k })} : ${elemJsonText(v)}`,
+        );
+        // PG's json_object_agg PADS the braces (`{ … }`).
+        return jsonValue(`{ ${parts.join(", ")} }`);
+      }
+      const members: JsonMember[] = a.jsonPairs.map(([k, v]) => ({
+        key: k,
+        value: valueToNode(v),
+      }));
+      return jsonbValue(jsonMakeObject(members));
+    }
   }
 }
 
@@ -11658,10 +11729,31 @@ function windowsHaveAggregate(windows: [string, WindowDef][]): boolean {
   return windows.some(([, wd]) => windowDefHasAggregate(wd));
 }
 
-// isAggregateName reports whether name (case-insensitive) is one of the five aggregates.
+// isAggregateName reports whether name (case-insensitive) is a catalog aggregate or one of the
+// hand-resolved json[b]_object_agg[_unique] aggregates (which carry no catalog row, B4).
 function isAggregateName(name: string): boolean {
   const lname = name.toLowerCase();
-  return AGGREGATES.some((a) => a.surface.toLowerCase() === lname);
+  return (
+    AGGREGATES.some((a) => a.surface.toLowerCase() === lname) || objectAggClassify(name) !== null
+  );
+}
+
+// objectAggClassify classifies a json[b]_object_agg[_unique] name → { asJson, unique }, else null.
+// These 2-argument aggregates are hand-resolved (the single-operand aggregate catalog can't express a
+// key/value pair), like jsonb_set among the scalar functions (json-sql-functions.md §4).
+function objectAggClassify(name: string): { asJson: boolean; unique: boolean } | null {
+  switch (name.toLowerCase()) {
+    case "jsonb_object_agg":
+      return { asJson: false, unique: false };
+    case "json_object_agg":
+      return { asJson: true, unique: false };
+    case "jsonb_object_agg_unique":
+      return { asJson: false, unique: true };
+    case "json_object_agg_unique":
+      return { asJson: true, unique: true };
+    default:
+      return null;
+  }
 }
 
 // astSubscriptExprs is the sub-expressions of a list of AST subscript specs (each index, or a
@@ -12231,6 +12323,24 @@ function resolveAggregate(
   }
   const name = e.name.toLowerCase();
   const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  // json[b]_object_agg[_unique] take TWO operands (key, value) — resolve both and encode as a Row
+  // operand for the single-operand aggregate framework (the fold splits the composite back out, B4).
+  const objAgg = objectAggClassify(name);
+  if (objAgg !== null) {
+    if (e.star || e.args.length !== 2) throw noAggOverload(name);
+    const rk = resolve(scope, e.args[0]!, null, sub, params);
+    const rv = resolve(scope, e.args[1]!, null, sub, params);
+    const operandRow: RExpr = { kind: "row", fields: [rk.node, rv.node] };
+    const result: ResolvedType = objAgg.asJson ? { kind: "json" } : { kind: "jsonb" };
+    const slot = ag.groupKeys.length + ag.specs.length;
+    ag.specs.push({
+      plan: "jsonObjectAgg",
+      operand: operandRow,
+      jsonAsJson: objAgg.asJson,
+      jsonUnique: objAgg.unique,
+    });
+    return { node: { kind: "column", index: slot }, type: result };
+  }
   let plan: AggPlan;
   let operand: RExpr | null;
   let result: ResolvedType;

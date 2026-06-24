@@ -281,6 +281,23 @@ func TestJsonAggDeferredElementSourceIs0A000(t *testing.T) {
 	}
 }
 
+// TestJsonObjectAggDeferredValueSourceIs0A000: json[b]_object_agg over a deferred-source VALUE
+// (float, like to_jsonb) is 0A000 — the value conversion reuses the to_jsonb element kernel
+// (valueToNode). PG supports it, so this is a documented divergence; the supported value types are
+// oracle-clean in suites/json/json_object_agg.test. Mirrors impl/rust/tests/json.rs
+// json_object_agg_deferred_value_source_is_0a000.
+func TestJsonObjectAggDeferredValueSourceIs0A000(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE f (id i32 PRIMARY KEY, k text, x f64)")
+	run(t, db, "INSERT INTO f VALUES (1, 'a', 1.5)")
+	if got := errJSON(t, db, "SELECT jsonb_object_agg(k, x) FROM f"); got != "0A000" {
+		t.Errorf("jsonb_object_agg(text, f64): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT json_object_agg(k, x) FROM f"); got != "0A000" {
+		t.Errorf("json_object_agg(text, f64): got %s, want 0A000", got)
+	}
+}
+
 // TestJsonBuildersDeferredElementSourceIs0A000: the json/jsonb construction builders (to_json,
 // json[b]_build_array, json[b]_build_object) reuse the to_jsonb element kernel (valueToNode /
 // elemJsonText), so a deferred element source (float, like to_jsonb) propagates the 0A000 deferral

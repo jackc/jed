@@ -1,0 +1,58 @@
+# json[b]_object_agg[_unique] — the JSON-object aggregate builders (B4,
+# spec/design/json-sql-functions.md §4). Aggregate a group's (key, value) pairs into one JSON object.
+# jsonb canonicalizes (last-wins dedup); json keeps row order + dups + the '{ … }' brace-padded
+# spacing. A key coerces to text; a NULL key → 22023; _unique on a duplicate → 22030. An empty group
+# → SQL NULL. The pairs follow the group's row order, deterministic under ORDER BY of the source.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.group_by, query.derived_table, types.jsonb, types.json, func.json_object_agg
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, grp i32, k text, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 'a', 10), (2, 1, 'b', 20), (3, 2, 'c', 30), (4, 2, 'd', 40)
+
+# Whole-table jsonb object (distinct keys, so order-independent); the json variant keeps row order +
+# the brace-padded spacing.
+query T nosort
+SELECT jsonb_object_agg(k, v) FROM t
+----
+{"a": 10, "b": 20, "c": 30, "d": 40}
+
+query T nosort
+SELECT json_object_agg(k, v) FROM (SELECT * FROM t ORDER BY id) s
+----
+{ "a" : 10, "b" : 20, "c" : 30, "d" : 40 }
+
+# Grouped: one object per group, keys canonical in the jsonb result.
+query IT nosort
+SELECT grp, jsonb_object_agg(k, v) FROM t GROUP BY grp ORDER BY grp
+----
+1
+{"a": 10, "b": 20}
+2
+{"c": 30, "d": 40}
+
+# An empty group → SQL NULL, not an empty object.
+query T nosort
+SELECT jsonb_object_agg(k, v) FROM t WHERE v > 100
+----
+NULL
+
+# A non-text key coerces to text.
+query T nosort
+SELECT jsonb_object_agg(id, v) FROM (SELECT * FROM t ORDER BY id) s
+----
+{"1": 10, "2": 20, "3": 30, "4": 40}
+
+# The aggregate result is a first-class jsonb — composes with the scalar functions.
+query T nosort
+SELECT jsonb_typeof(jsonb_object_agg(k, v)) FROM t
+----
+object
+
+# _unique succeeds when the keys are distinct.
+query T nosort
+SELECT jsonb_object_agg_unique(k, v) FROM t
+----
+{"a": 10, "b": 20, "c": 30, "d": 40}

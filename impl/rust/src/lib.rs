@@ -625,6 +625,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_ctor",
     // json/jsonb aggregate builders (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §4).
     "func.json_agg",
+    // json/jsonb object aggregates (B4) — json[b]_object_agg[_unique] (json-sql-functions.md §4).
+    "func.json_object_agg",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

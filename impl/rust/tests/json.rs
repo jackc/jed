@@ -335,6 +335,24 @@ fn json_agg_deferred_element_source_is_0a000() {
     assert_eq!(err(&mut db, "SELECT json_agg(x) FROM f"), "0A000");
 }
 
+/// `json[b]_object_agg` over a deferred-source VALUE (float, like to_jsonb) is `0A000` — the value
+/// conversion reuses the to_jsonb element kernel. PG supports it, so this is a documented divergence;
+/// the supported value types are oracle-clean in suites/json/json_object_agg.test.
+#[test]
+fn json_object_agg_deferred_value_source_is_0a000() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE f (id i32 PRIMARY KEY, k text, x f64)",
+    );
+    run(&mut db, "INSERT INTO f VALUES (1, 'a', 1.5)");
+    assert_eq!(
+        err(&mut db, "SELECT jsonb_object_agg(k, x) FROM f"),
+        "0A000"
+    );
+    assert_eq!(err(&mut db, "SELECT json_object_agg(k, x) FROM f"), "0A000");
+}
+
 /// `json_agg` over a `json` element CANONICALIZES it (the element conversion runs through the
 /// jsonb node tree), dropping the input whitespace — a documented divergence from PostgreSQL, which
 /// preserves the verbatim sub-text (`[{ "a" : 1 }]`). This is the same verbatim divergence the json

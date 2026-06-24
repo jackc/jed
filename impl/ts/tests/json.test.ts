@@ -202,6 +202,27 @@ test("json_agg deferred element source is 0A000", () => {
   );
 });
 
+// `json[b]_object_agg` over a deferred-source VALUE (float, like to_jsonb) is `0A000` — the value
+// conversion reuses the to_jsonb element kernel, so the same float/datetime/composite/uuid/bytea/
+// interval sources propagate the deferral (json-sql-functions.md §4, B4). PG supports it, so this is
+// a documented divergence; the supported value types are oracle-clean in
+// suites/json/json_object_agg.test. Mirrors impl/rust/tests/json.rs
+// json_object_agg_deferred_value_source_is_0a000 and impl/go/json_test.go.
+test("json_object_agg deferred value source is 0A000", () => {
+  const db = dbWith([
+    "CREATE TABLE f (id i32 PRIMARY KEY, k text, x f64)",
+    "INSERT INTO f VALUES (1, 'a', 1.5)",
+  ]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT jsonb_object_agg(k, x) FROM f")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT json_object_agg(k, x) FROM f")),
+    "0A000",
+  );
+});
+
 // `json_agg` over a `json` element CANONICALIZES it (the element conversion runs through the jsonb
 // node tree), dropping the input whitespace — a documented divergence from PostgreSQL, which
 // preserves the verbatim sub-text (`[{ "a" : 1 }]`). This is the same verbatim divergence the json

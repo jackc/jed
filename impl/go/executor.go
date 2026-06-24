@@ -14415,6 +14415,13 @@ const (
 	planJsonAgg        // json_agg(x) — same array, typed json (spaced canonical render)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
 	planJsonAggStrict  // json_agg_strict(x) — skip NULL-valued rows; json array
+	// json[b]_object_agg[_unique] (B4) — aggregate (key, value) pairs (a Row operand) into a JSON
+	// object (json-sql-functions.md §4). The plan encodes the json-vs-jsonb render and the _unique
+	// flag; the operand is a 2-field Row(key, value) the fold splits back out.
+	planJsonbObjectAgg       // jsonb_object_agg(k, v) — canonical (last-wins dedup, key sort, spaced)
+	planJsonObjectAgg        // json_object_agg(k, v) — row order + dups, '{ … }' brace-padded spacing
+	planJsonbObjectAggUnique // jsonb_object_agg_unique(k, v) — as jsonb, but 22030 on a duplicate key
+	planJsonObjectAggUnique  // json_object_agg_unique(k, v) — as json, but 22030 on a duplicate key
 )
 
 // aggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
@@ -14449,6 +14456,20 @@ type acc struct {
 	jsonNodes  []JsonNode
 	jsonAsJSON bool
 	jsonStrict bool
+	// json[b]_object_agg[_unique] accumulator (B4): the (key, value) pairs in row order. objAgg is
+	// true for the object-agg plans; objUnique errors 22030 on a duplicate key. jsonAsJSON selects
+	// the json (brace-padded, row order, dups) vs jsonb (canonical, last-wins) finalize render, and
+	// `seen` distinguishes a zero-row group (→ NULL) from a non-empty one (→ an object).
+	objPairs  []objAggPair
+	objAgg    bool
+	objUnique bool
+}
+
+// objAggPair is one (key, value) pair accumulated by json[b]_object_agg (the key already coerced to
+// text, the value its raw Value carried to finalize where it becomes its to_jsonb / json image).
+type objAggPair struct {
+	key string
+	val Value
 }
 
 func newAcc(plan aggPlan) *acc {
@@ -14468,6 +14489,14 @@ func newAcc(plan aggPlan) *acc {
 		a.jsonStrict = true
 	case planJsonAggStrict:
 		a.jsonAsJSON, a.jsonStrict = true, true
+	case planJsonbObjectAgg:
+		a.objAgg = true
+	case planJsonObjectAgg:
+		a.objAgg, a.jsonAsJSON = true, true
+	case planJsonbObjectAggUnique:
+		a.objAgg, a.objUnique = true, true
+	case planJsonObjectAggUnique:
+		a.objAgg, a.jsonAsJSON, a.objUnique = true, true, true
 	}
 	return a
 }
@@ -14489,6 +14518,11 @@ func (a *acc) clone() *acc {
 		// Deep-copy the node slice so a window peer-group's finalize doesn't consume the running
 		// acc's nodes (mirrors the floatSum slice clone above).
 		c.jsonNodes = append([]JsonNode(nil), a.jsonNodes...)
+	}
+	if a.objPairs != nil {
+		// Deep-copy the (key, value) pairs slice (as jsonNodes above) so a cloned-finalize over a
+		// window peer-group doesn't alias the still-running acc.
+		c.objPairs = append([]objAggPair(nil), a.objPairs...)
 	}
 	return &c
 }
@@ -14577,6 +14611,37 @@ func (a *acc) fold(v Value, m *Meter) error {
 			}
 			a.jsonNodes = append(a.jsonNodes, node)
 		}
+	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
+		// The operand is a Row(key, value) composite; mark the group non-empty (an empty group → NULL,
+		// not `{}`) and split the two fields back out.
+		a.seen = true
+		m.Charge(Costs.GeneratedRow)
+		if err := m.Guard(); err != nil {
+			return err
+		}
+		if v.Kind != ValComposite || v.Comp == nil || len(*v.Comp) != 2 {
+			panic("BUG: object_agg operand is a 2-field Row")
+		}
+		fields := *v.Comp
+		kv, vv := fields[0], fields[1]
+		// The key coerces to text (text/integer/decimal/boolean); a NULL key → 22023, but with a
+		// DIFFERENT message from build_object's "key must not be null" (NULL handled here, before
+		// objectKeyText, so the non-NULL coercion + the non-scalar 0A000 still reuse it).
+		if kv.Kind == ValNull {
+			return NewError(InvalidParameterValue, "field name must not be null")
+		}
+		key, err := objectKeyText(kv, 1)
+		if err != nil {
+			return err
+		}
+		if a.objUnique {
+			for i := range a.objPairs {
+				if a.objPairs[i].key == key {
+					return NewError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+				}
+			}
+		}
+		a.objPairs = append(a.objPairs, objAggPair{key: key, val: vv})
 	}
 	return nil
 }
@@ -14670,6 +14735,38 @@ func (a *acc) finalize() (Value, error) {
 			return JsonValue(jsonbOut(&arr)), nil
 		}
 		return JsonbValue(arr), nil
+	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
+		// json[b]_object_agg: NULL over an empty (zero-row) group; else the JSON object. json keeps
+		// the group's row order + duplicate keys and PG's '{ … }' brace-padded ', ' / ' : ' spacing;
+		// jsonb canonicalizes (last-wins dedup + canonical key sort) via makeObject.
+		if !a.seen {
+			return NullValue(), nil
+		}
+		if a.jsonAsJSON {
+			parts := make([]string, 0, len(a.objPairs))
+			for _, p := range a.objPairs {
+				// The key's json-quoted form (jsonCompactOut of a JSON string node), then ` : `, then
+				// the value's json image (json verbatim / jsonb canonical-spaced / else compact).
+				img, err := elemJsonText(p.val)
+				if err != nil {
+					return NullValue(), err
+				}
+				keyNode := JsonNode{Kind: JString, S: p.key}
+				parts = append(parts, jsonCompactOut(&keyNode)+" : "+img)
+			}
+			// PG's json_object_agg PADS the braces (`{ … }`) — distinct from json_build_object, which
+			// does NOT pad.
+			return JsonValue("{ " + strings.Join(parts, ", ") + " }"), nil
+		}
+		members := make([]JsonMember, 0, len(a.objPairs))
+		for _, p := range a.objPairs {
+			node, err := valueToNode(p.val)
+			if err != nil {
+				return NullValue(), err
+			}
+			members = append(members, JsonMember{Key: p.key, Val: node})
+		}
+		return JsonbValue(makeObject(members)), nil
 	default: // planMin, planMax
 		if a.hasCur {
 			return a.cur, nil
@@ -14733,7 +14830,28 @@ func isAggregateName(name string) bool {
 			return true
 		}
 	}
+	if _, ok := objectAggClassify(name); ok {
+		return true
+	}
 	return false
+}
+
+// objectAggClassify classifies a json[b]_object_agg[_unique] name → (plan, ok). These 2-argument
+// aggregates are hand-resolved (the single-operand aggregate catalog can't express a key/value
+// pair), like jsonb_set among the scalar functions (json-sql-functions.md §4).
+func objectAggClassify(name string) (aggPlan, bool) {
+	switch toLowerASCII(name) {
+	case "jsonb_object_agg":
+		return planJsonbObjectAgg, true
+	case "json_object_agg":
+		return planJsonObjectAgg, true
+	case "jsonb_object_agg_unique":
+		return planJsonbObjectAggUnique, true
+	case "json_object_agg_unique":
+		return planJsonObjectAggUnique, true
+	default:
+		return 0, false
+	}
 }
 
 // isWindowOnlyName reports whether name is a registered WINDOW-only function surface
@@ -15686,6 +15804,29 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		operand *rExpr
 		result  resolvedType
 	)
+	// json[b]_object_agg[_unique] take TWO operands (key, value) — resolve both and encode as a Row
+	// operand for the single-operand aggregate framework (the fold splits the composite back out).
+	if objPlan, ok := objectAggClassify(name); ok {
+		if fc.Star || len(fc.Args) != 2 {
+			return nil, resolvedType{}, noAggOverload(name)
+		}
+		rk, _, err := resolve(s, *fc.Args[0], nil, sub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rv, _, err := resolve(s, *fc.Args[1], nil, sub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		operand := &rExpr{kind: reRow, sargs: []*rExpr{rk, rv}}
+		result := resolvedType{kind: rtJsonb}
+		if objPlan == planJsonObjectAgg || objPlan == planJsonObjectAggUnique {
+			result = resolvedType{kind: rtJson}
+		}
+		slot := len(ag.groupKeys) + len(ag.specs)
+		ag.specs = append(ag.specs, aggSpec{plan: objPlan, operand: operand})
+		return &rExpr{kind: reColumn, index: slot}, result, nil
+	}
 	if fc.Star {
 		// Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
 		if !aggregateHasStar(name) {

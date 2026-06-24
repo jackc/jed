@@ -534,6 +534,10 @@ var SupportedCapabilities = []string{
 	"func.json_object",
 	// json/jsonb array aggregates (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §2).
 	"func.json_agg",
+	// json/jsonb object aggregates (B4) — json[b]_object_agg[_unique](key, value) aggregate a group's
+	// (key, value) pairs into one JSON object; _unique errors 22030 on a duplicate key
+	// (json-sql-functions.md §4).
+	"func.json_object_agg",
 	// IS JSON predicate (S1) — expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT)
 	// UNIQUE [KEYS]] well-formedness test over a string/json/jsonb operand (json-sql-functions.md §5).
 	"expr.is_json",

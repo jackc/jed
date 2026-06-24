@@ -14136,6 +14136,14 @@ enum AggPlan {
         compact: bool,
         strict: bool,
     },
+    /// json_object_agg / jsonb_object_agg (and the `_unique` variants) — aggregate (key, value) pairs
+    /// (a `Row` operand) into a JSON object (json-sql-functions.md §4). `json` selects the json
+    /// (insertion order + dups + " : " spacing) vs jsonb (canonical, last-wins) render; `unique`
+    /// errors `22030` on a duplicate key.
+    JsonObjectAgg {
+        json: bool,
+        unique: bool,
+    },
 }
 
 /// One resolved aggregate: its plan and its resolved argument expression (evaluated per
@@ -14198,6 +14206,15 @@ enum Acc {
         strict: bool,
         seen: bool,
     },
+    /// json_object_agg / jsonb_object_agg accumulator (B4): the (key, value) pairs in row order.
+    /// `json` selects the json vs jsonb finalize render; `unique` errors `22030` on a duplicate key.
+    /// `seen` distinguishes a zero-row group (→ NULL) from a non-empty one (→ an object, maybe `{}`).
+    JsonObjectAgg {
+        pairs: Vec<(String, Value)>,
+        json: bool,
+        unique: bool,
+        seen: bool,
+    },
 }
 
 impl Acc {
@@ -14247,6 +14264,12 @@ impl Acc {
                 nodes: Vec::new(),
                 compact,
                 strict,
+                seen: false,
+            },
+            AggPlan::JsonObjectAgg { json, unique } => Acc::JsonObjectAgg {
+                pairs: Vec::new(),
+                json,
+                unique,
                 seen: false,
             },
         }
@@ -14360,6 +14383,42 @@ impl Acc {
                     nodes.push(value_to_node(&value)?);
                 }
             }
+            Acc::JsonObjectAgg {
+                pairs,
+                unique,
+                seen,
+                ..
+            } => {
+                *seen = true;
+                m.charge(COSTS.generated_row);
+                m.guard()?;
+                // The operand is a Row(key, value); split it back out.
+                let (kv, vv) = match value {
+                    Value::Composite(mut fields) if fields.len() == 2 => {
+                        let v = fields.pop().unwrap();
+                        let k = fields.pop().unwrap();
+                        (k, v)
+                    }
+                    _ => unreachable!("object_agg operand is a 2-field Row"),
+                };
+                // The key is coerced to text (text/integer/decimal/boolean); a NULL key → 22023.
+                let key = match &kv {
+                    Value::Null => {
+                        return Err(EngineError::new(
+                            SqlState::InvalidParameterValue,
+                            "field name must not be null",
+                        ));
+                    }
+                    _ => object_key_text(&kv, 1)?,
+                };
+                if *unique && pairs.iter().any(|(k, _)| k == &key) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateJsonObjectKeyValue,
+                        "duplicate JSON object key value",
+                    ));
+                }
+                pairs.push((key, vv));
+            }
         }
         Ok(())
     }
@@ -14449,6 +14508,32 @@ impl Acc {
                     } else {
                         Value::Jsonb(arr)
                     }
+                }
+            }
+            // json_object_agg/jsonb_object_agg: NULL over an empty group; else the JSON object (json
+            // keeps insertion order + dups + " : " spacing, jsonb canonicalizes last-wins).
+            Acc::JsonObjectAgg {
+                pairs, json, seen, ..
+            } => {
+                if !seen {
+                    Value::Null
+                } else if json {
+                    let mut parts = Vec::with_capacity(pairs.len());
+                    for (k, v) in &pairs {
+                        parts.push(format!(
+                            "{} : {}",
+                            json::json_compact_out(&JsonNode::String(k.clone())),
+                            elem_json_text(v)?
+                        ));
+                    }
+                    // PG's json_object_agg PADS the braces (`{ … }`) — distinct from json_build_object.
+                    Value::Json(format!("{{ {} }}", parts.join(", ")))
+                } else {
+                    let mut members = Vec::with_capacity(pairs.len());
+                    for (k, v) in pairs {
+                        members.push((k, value_to_node(&v)?));
+                    }
+                    Value::Jsonb(json::make_object(members))
                 }
             }
         })
@@ -16505,6 +16590,31 @@ fn resolve_aggregate(
         ));
     }
     let mut sub = AggCtx::Forbidden;
+    // json[b]_object_agg[_unique] take TWO operands (key, value) — resolve both and encode as a Row
+    // operand for the single-operand aggregate framework (the fold splits the composite back out).
+    if let Some((json, unique)) = object_agg_classify(name) {
+        if star || args.len() != 2 {
+            return Err(no_agg_overload(name));
+        }
+        let (rk, _kt) = resolve(scope, &args[0], None, &mut sub, params)?;
+        let (rv, _vt) = resolve(scope, &args[1], None, &mut sub, params)?;
+        let operand = RExpr::Row(vec![rk, rv]);
+        let plan = AggPlan::JsonObjectAgg { json, unique };
+        let result = if json {
+            ResolvedType::Json
+        } else {
+            ResolvedType::Jsonb
+        };
+        if let AggCtx::Collect { group_keys, specs } = agg {
+            let slot = group_keys.len() + specs.len();
+            specs.push(AggSpec {
+                plan,
+                operand: Some(operand),
+            });
+            return Ok((RExpr::Column(slot), result));
+        }
+        unreachable!("an aggregate in a non-Collect context is handled above");
+    }
     let (plan, operand, result) = if star {
         // Only COUNT has a star overload (aggregates.md §3); `SUM(*)` etc. is a syntax error.
         if !aggregate_has_star(name) {
@@ -16710,6 +16820,20 @@ fn is_aggregate_name(name: &str) -> bool {
     AGGREGATES
         .iter()
         .any(|a| a.surface.eq_ignore_ascii_case(name))
+        || object_agg_classify(name).is_some()
+}
+
+/// Classify a `json[b]_object_agg[_unique]` name → (is-json, is-unique). `None` otherwise. These
+/// 2-argument aggregates are hand-resolved (the single-operand aggregate catalog can't express a
+/// key/value pair), like `jsonb_set` among the scalar functions. (json-sql-functions.md §4)
+fn object_agg_classify(name: &str) -> Option<(bool, bool)> {
+    match name.to_ascii_lowercase().as_str() {
+        "jsonb_object_agg" => Some((false, false)),
+        "json_object_agg" => Some((true, false)),
+        "jsonb_object_agg_unique" => Some((false, true)),
+        "json_object_agg_unique" => Some((true, true)),
+        _ => None,
+    }
 }
 
 /// Whether `name` is a registered WINDOW-only function surface (row_number/rank/…). Data-driven

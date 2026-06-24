@@ -422,6 +422,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           NULL → 0 rows; FROM-clause only, implicitly lateral (CROSS JOIN over a stored column). The
           first consumer of the C0 multi-column synthetic table (`srf_table_cols`). The json_each[_text]
           verbatim variants are a deferred `0A000`. All 3 cores, cap `func.json_each`, oracle-clean.
+    - [x] **B4 (object aggregates)** — ✅ `jsonb_object_agg` / `json_object_agg` / the `_unique` variants:
+          aggregate a group's (key, value) pairs into a JSON object. jsonb canonicalizes (last-wins
+          dedup); json keeps row order + dups + PG's `{ … }` brace-padded spacing. Key coerced to text
+          (NULL key → `23023`→actually `22023` "field name must not be null"); `_unique` dup → `22030`;
+          empty group → NULL. 2-argument aggregates, hand-resolved (the single-operand catalog can't
+          express a pair) — carried as a `Row` operand through the agg framework. All 3 cores, cap
+          `func.json_object_agg`, oracle-clean. **★ B4 COMPLETE.**
     - [x] **B4 (array-aggregate subset)** — ✅ `jsonb_agg` / `json_agg` / `jsonb_agg_strict` /
           `json_agg_strict`: aggregate a group into a JSON array (scan/GROUP-BY order); both render the
           spaced canonical form (json variant typed `json`); `_strict` skips NULL inputs (kept as JSON
