@@ -39,3 +39,4 @@
 # Personal, machine-local mise overrides (mise.toml IS committed/shared). Git has
 # no knowledge of mise's conventions, so this must be ignored explicitly.
 /mise.local.toml
+/spec/conformance/suites/_reduce_tmp/
