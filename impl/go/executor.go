@@ -2516,7 +2516,13 @@ func selectCallsSeqMutator(s *Select) bool {
 		return true
 	}
 	for i := range s.GroupBy {
-		if exprCallsSeqMutator(&s.GroupBy[i]) {
+		found := false
+		s.GroupBy[i].forEachExpr(func(e *Expr) {
+			if exprCallsSeqMutator(e) {
+				found = true
+			}
+		})
+		if found {
 			return true
 		}
 	}
@@ -2946,7 +2952,9 @@ func collectSelectPrivs(s *Select, req *privReq, locals map[string]bool) {
 		collectExprPrivs(s.Filter, req, locals)
 	}
 	for i := range s.GroupBy {
-		collectExprPrivs(&s.GroupBy[i], req, locals)
+		s.GroupBy[i].forEachExpr(func(e *Expr) {
+			collectExprPrivs(e, req, locals)
+		})
 	}
 	if s.Having != nil {
 		collectExprPrivs(s.Having, req, locals)
@@ -8436,7 +8444,11 @@ func selectExprs(s *Select) []Expr {
 	if s.Filter != nil {
 		v = append(v, *s.Filter)
 	}
-	v = append(v, s.GroupBy...)
+	for i := range s.GroupBy {
+		s.GroupBy[i].forEachExpr(func(e *Expr) {
+			v = append(v, *e)
+		})
+	}
 	if s.Having != nil {
 		v = append(v, *s.Having)
 	}
@@ -9311,23 +9323,47 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column — grammar.md
 	// §18). An unknown column is 42703, an ambiguous bare key 42702.
 	var err error
-	groupKeys := make([]int, 0, len(sel.GroupBy))
-	for _, key := range sel.GroupBy {
-		var r resolved
-		if key.Kind == ExprQualifiedColumn {
-			r, err = s.resolveQualified(key.Qualifier, key.Column)
-		} else {
-			r, err = s.resolveBare(key.Column)
+	// Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets, resolve
+	// each set's columns to flat row indices, and build the master grouping-column list (groupKeys) —
+	// the ordered union of every set's columns, i.e. the columns groupable in at least one set
+	// (spec/design/aggregates.md §12). A plain GROUP BY a, b expands to a single set [a, b]; no GROUP
+	// BY expands to a single empty set (the whole-table grand total). An unknown column is 42703.
+	expanded, err := expandGroupBy(sel.GroupBy)
+	if err != nil {
+		return nil, err
+	}
+	groupKeys := make([]int, 0)
+	resolvedSets := make([][]int, 0, len(expanded))
+	for _, set := range expanded {
+		idxs := make([]int, 0, len(set))
+		for _, key := range set {
+			var r resolved
+			if key.Kind == ExprQualifiedColumn {
+				r, err = s.resolveQualified(key.Qualifier, key.Column)
+			} else {
+				r, err = s.resolveBare(key.Column)
+			}
+			if err != nil {
+				return nil, err
+			}
+			// Grouping by an enclosing-query column (a per-outer-row constant) is degenerate and
+			// unsupported this slice — the key machinery is flat local indices (§26).
+			if r.level != 0 {
+				return nil, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+			}
+			found := false
+			for _, gk := range groupKeys {
+				if gk == r.index {
+					found = true
+					break
+				}
+			}
+			if !found {
+				groupKeys = append(groupKeys, r.index)
+			}
+			idxs = append(idxs, r.index)
 		}
-		if err != nil {
-			return nil, err
-		}
-		// Grouping by an enclosing-query column (a per-outer-row constant) is degenerate and
-		// unsupported this slice — the key machinery is flat local indices (§26).
-		if r.level != 0 {
-			return nil, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
-		}
-		groupKeys = append(groupKeys, r.index)
+		resolvedSets = append(resolvedSets, idxs)
 	}
 
 	// An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
@@ -9338,7 +9374,9 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// query (HAVING alone groups the whole table — grammar.md §19). An aggregate inside a window
 	// definition's keys also does — inline (`OVER (ORDER BY sum(x))`, caught by itemsHaveAggregate)
 	// or in a WINDOW-clause entry (`WINDOW w AS (ORDER BY sum(x))`, scanned here before the desugar).
-	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items) || sel.Having != nil ||
+	// Note len(sel.GroupBy) (not groupKeys): GROUP BY GROUPING SETS (()) has an empty master list yet
+	// is still an aggregate query (the whole-table grand total).
+	isAgg := len(sel.GroupBy) > 0 || itemsHaveAggregate(sel.Items) || sel.Having != nil ||
 		windowsHaveAggregate(sel.Windows)
 	// A window query (a select-list OVER call) resolves its projection in window mode, where bare
 	// columns read the input/grouped row and window calls collect into synthetic slots
@@ -9385,14 +9423,15 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	aggSpecs := projAgg.specs
 	windowSpecs := projAgg.windowSpecs
 	windowKeys := projAgg.windowKeys
+	groupingSpecs := projAgg.groupingSpecs
 	hasWindow := len(windowSpecs) > 0
 	// HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
-	// window stage, window.md §7), continuing the aggregate specs so its aggregates slot after the
-	// projection's. It must be boolean (42804). A HAVING aggregate, like a projection one, is part of
-	// the grouped row, so the window slots that follow are rebased over the final aggregate count.
+	// window stage, window.md §7), continuing the aggregate specs (and GROUPING() calls) so they slot
+	// after the projection's. It must be boolean (42804). A HAVING aggregate, like a projection one, is
+	// part of the grouped row, so the window slots that follow are rebased over the final aggregate count.
 	var having *rExpr
 	if sel.Having != nil {
-		hctx := &aggCtx{collecting: true, groupKeys: groupKeys, specs: aggSpecs}
+		hctx := &aggCtx{collecting: true, groupKeys: groupKeys, specs: aggSpecs, groupingSpecs: groupingSpecs}
 		node, ty, herr := resolve(s, *sel.Having, nil, hctx, ptypes)
 		if herr != nil {
 			return nil, herr
@@ -9402,6 +9441,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		}
 		having = node
 		aggSpecs = hctx.specs
+		groupingSpecs = hctx.groupingSpecs
 	}
 	// Rebase the window placeholder slots now that the row layout is final (window.md §5.1). The
 	// window stage's row is [input… , materialized window keys… , window results…], where inputWidth
@@ -9434,7 +9474,55 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			}
 		}
 		for _, p := range projections {
-			rebaseWindowResults(p, resultBase)
+			rebasePlaceholderCols(p, windowResultBase, resultBase)
+		}
+	}
+	// Build the grouping sets (spec/design/aggregates.md §12). For an aggregate query with no GROUP BY
+	// this is the single empty (whole-table) set; otherwise one entry per resolved set, each recording
+	// its bucket key columns, the per-master-slot value source (or -1 = NULL), and the GROUPING() mask.
+	var groupSets []groupSetPlan
+	if isAgg {
+		groupSets = make([]groupSetPlan, 0, len(resolvedSets))
+		for _, set := range resolvedSets {
+			slotSrc := make([]int, len(groupKeys))
+			for p := range slotSrc {
+				slotSrc[p] = -1
+			}
+			for j, fidx := range set {
+				for p, gk := range groupKeys {
+					if gk == fidx {
+						slotSrc[p] = j
+						break
+					}
+				}
+			}
+			var mask int64
+			for p, src := range slotSrc {
+				if src < 0 {
+					mask |= int64(1) << uint(p)
+				}
+			}
+			keyCols := make([]int, len(set))
+			copy(keyCols, set)
+			groupSets = append(groupSets, groupSetPlan{keyCols: keyCols, slotSrc: slotSrc, mask: mask})
+		}
+	}
+	// GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
+	// (spec/design/aggregates.md §12) — both want the grouped-row trailing slots, and the combination
+	// is deferred. A pure single-set GROUP BY + window stays on the existing path.
+	if hasWindow && (len(groupSets) > 1 || len(groupingSpecs) > 0) {
+		return nil, NewError(FeatureNotSupported, "GROUPING SETS / GROUPING() with window functions is not supported")
+	}
+	// Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
+	// len(groupKeys)+len(aggSpecs)+g (the GROUPING results follow the master columns and aggregate
+	// results — §12). GROUPING never coexists with window functions (guarded above).
+	if len(groupingSpecs) > 0 {
+		gbase := len(groupKeys) + len(aggSpecs)
+		for _, p := range projections {
+			rebasePlaceholderCols(p, groupingGsBase, gbase)
+		}
+		if having != nil {
+			rebasePlaceholderCols(having, groupingGsBase, gbase)
 		}
 	}
 	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
@@ -9639,6 +9727,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
+		groupSets: groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
@@ -11598,83 +11687,107 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 			}
 			return a
 		}
-		index := make(map[string]int)
-		var groups []group
-		if len(plan.groupKeys) == 0 {
-			groups = append(groups, group{keys: nil, accs: newAccs(), seen: newSeen()})
-			index[""] = 0
-		}
-		for _, row := range rows {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per folded row (CLAUDE.md §13)
-				return selectResult{}, err
+		// One grouping set per plan.groupSets (spec/design/aggregates.md §12): a plain GROUP BY /
+		// whole-table aggregate has exactly one; ROLLUP / CUBE / GROUPING SETS have several. Each set is
+		// bucketed independently over the SAME post-WHERE rows and its groups projected into the shared
+		// synthetic row [master_columns…, aggregate_results…, GROUPING_results…]: a column not grouped
+		// in this set is NULL, and each GROUPING() value comes from this set's mask. The scan
+		// (storage_row_read) is upstream and counted once; aggregate_accumulate + operand evals accrue
+		// per (set × row × passing aggregate). The per-set bucket index is never iterated — output order
+		// comes from the insertion-ordered groups then the set order (no map-order leak — §8/§10).
+		var groupRows []Row
+		for gsi := range plan.groupSets {
+			gset := &plan.groupSets[gsi]
+			index := make(map[string]int)
+			var groups []group
+			// An empty grouping set (the () / whole-table grand total) is one pre-created group, so it
+			// emits ONE row even over zero input; a non-empty set over empty input emits nothing.
+			if len(gset.keyCols) == 0 {
+				groups = append(groups, group{keys: nil, accs: newAccs(), seen: newSeen()})
+				index[""] = 0
 			}
-			keys := make([]Value, len(plan.groupKeys))
-			for i, gk := range plan.groupKeys {
-				keys[i] = row[gk]
+			for _, row := range rows {
+				if err := meter.Guard(); err != nil { // enforce the cost ceiling per folded row (CLAUDE.md §13)
+					return selectResult{}, err
+				}
+				keys := make([]Value, len(gset.keyCols))
+				for i, gk := range gset.keyCols {
+					keys[i] = row[gk]
+				}
+				k := distinctRowKey(keys)
+				gi, ok := index[k]
+				if !ok {
+					gi = len(groups)
+					index[k] = gi
+					groups = append(groups, group{keys: keys, accs: newAccs(), seen: newSeen()})
+				}
+				for i, spec := range plan.aggSpecs {
+					// FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
+					// contributes nothing to THIS aggregate — its operand is not evaluated and it is not
+					// accumulated (aggregates.md §11). The filter's own operator_evals are charged (it is
+					// evaluated per row, like the operand); aggregate_accumulate is charged only for a row
+					// that passes. The pass/fold decision is deterministic (scan order is cross-core
+					// identical), so the metered cost is identical across cores.
+					if spec.filter != nil {
+						fv, ferr := spec.filter.eval(row, env, meter)
+						if ferr != nil {
+							return selectResult{}, ferr
+						}
+						if !fv.IsTrue() {
+							continue
+						}
+					}
+					meter.Charge(Costs.AggregateAccumulate)
+					v := NullValue() // COUNT(*) ignores the value
+					if spec.operand != nil {
+						var verr error
+						if v, verr = spec.operand.eval(row, env, meter); verr != nil {
+							return selectResult{}, verr
+						}
+					}
+					// DISTINCT: skip a NULL (never folded by any aggregate) and any value already
+					// folded into this group — the FIRST occurrence in scan order wins, so the set of
+					// folded values (and the decimal_work fold charges) is order-deterministic and
+					// cross-core identical.
+					if seen := groups[gi].seen[i]; seen != nil {
+						if v.IsNull() {
+							continue
+						}
+						dk := distinctRowKey([]Value{v})
+						if seen[dk] {
+							continue
+						}
+						seen[dk] = true
+					}
+					if ferr := groups[gi].accs[i].fold(v, meter); ferr != nil {
+						return selectResult{}, ferr
+					}
+				}
 			}
-			k := distinctRowKey(keys)
-			gi, ok := index[k]
-			if !ok {
-				gi = len(groups)
-				index[k] = gi
-				groups = append(groups, group{keys: keys, accs: newAccs(), seen: newSeen()})
-			}
-			for i, spec := range plan.aggSpecs {
-				// FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
-				// contributes nothing to THIS aggregate — its operand is not evaluated and it is not
-				// accumulated (aggregates.md §11). The filter's own operator_evals are charged (it is
-				// evaluated per row, like the operand); aggregate_accumulate is charged only for a row
-				// that passes. The pass/fold decision is deterministic (scan order is cross-core
-				// identical), so the metered cost is identical across cores.
-				if spec.filter != nil {
-					fv, ferr := spec.filter.eval(row, env, meter)
+			// Build one synthetic row per group of this set: each master grouping column's value (NULL
+			// where this set doesn't group it), then the aggregate results, then each GROUPING() value
+			// (computed from this set's mask — spec/design/aggregates.md §12).
+			for _, g := range groups {
+				srow := make([]Value, 0, len(plan.groupKeys)+len(plan.aggSpecs)+len(plan.groupingSpecs))
+				for _, src := range gset.slotSrc {
+					if src < 0 {
+						srow = append(srow, NullValue())
+					} else {
+						srow = append(srow, g.keys[src])
+					}
+				}
+				for _, a := range g.accs {
+					v, ferr := a.finalize()
 					if ferr != nil {
 						return selectResult{}, ferr
 					}
-					if !fv.IsTrue() {
-						continue
-					}
+					srow = append(srow, v)
 				}
-				meter.Charge(Costs.AggregateAccumulate)
-				v := NullValue() // COUNT(*) ignores the value
-				if spec.operand != nil {
-					var verr error
-					if v, verr = spec.operand.eval(row, env, meter); verr != nil {
-						return selectResult{}, verr
-					}
+				for _, positions := range plan.groupingSpecs {
+					srow = append(srow, IntValue(groupingValue(positions, gset.mask)))
 				}
-				// DISTINCT: skip a NULL (never folded by any aggregate) and any value already
-				// folded into this group — the FIRST occurrence in scan order wins, so the set of
-				// folded values (and the decimal_work fold charges) is order-deterministic and
-				// cross-core identical.
-				if seen := groups[gi].seen[i]; seen != nil {
-					if v.IsNull() {
-						continue
-					}
-					dk := distinctRowKey([]Value{v})
-					if seen[dk] {
-						continue
-					}
-					seen[dk] = true
-				}
-				if ferr := groups[gi].accs[i].fold(v, meter); ferr != nil {
-					return selectResult{}, ferr
-				}
+				groupRows = append(groupRows, srow)
 			}
-		}
-		// Build one synthetic row per group: [group_key_values..., aggregate_results...].
-		groupRows := make([]Row, 0, len(groups))
-		for _, g := range groups {
-			srow := make([]Value, 0, len(g.keys)+len(g.accs))
-			srow = append(srow, g.keys...)
-			for _, a := range g.accs {
-				v, ferr := a.finalize()
-				if ferr != nil {
-					return selectResult{}, ferr
-				}
-				srow = append(srow, v)
-			}
-			groupRows = append(groupRows, srow)
 		}
 		// HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
 		// evaluated against each group's synthetic row (charging its operator_evals per group);
@@ -12131,46 +12244,192 @@ const windowResultBase = 1 << 40
 // below 2^53 for the TS core. A bare-column key is NOT materialized — it keeps its real row slot.
 const windowKeyBase = 1 << 41
 
+// groupingGsBase is the placeholder base a GROUPING(...) call carries until the rebase pass rewrites
+// it to its real trailing synthetic slot len(groupKeys)+len(aggSpecs)+g (the GROUPING results follow
+// the master columns + aggregate results — spec/design/aggregates.md §12). Disjoint from the window
+// bases, below 2^53 for the TS core. GROUPING is mutually exclusive with window functions, so its
+// placeholders never coexist with the window ones in a projection.
+const groupingGsBase = 1 << 42
+
+// maxGroupingSets bounds a GROUP BY's total expansion (CUBE of n columns alone is 2^n). Beyond this
+// the statement is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (a
+// deliberate divergence from PostgreSQL's per-construct "CUBE is limited to 12 elements" / 54011;
+// jed bounds the total expansion instead). spec/design/aggregates.md §12.
+const maxGroupingSets = 4096
+
+// groupSetPlan is one resolved grouping set of a GROUP BY (spec/design/aggregates.md §12). A plain
+// GROUP BY has exactly one; ROLLUP/CUBE/GROUPING SETS produce several. Each is bucketed independently
+// over the post-WHERE rows and its groups projected into the shared synthetic row, whose first
+// len(groupKeys) slots are the master grouping columns (the ordered union of all sets' columns).
+type groupSetPlan struct {
+	// keyCols are the flat input-row indices this set buckets on (its key, in key order). Empty = one
+	// grand-total group (always emits one row, even over an empty input — the () / whole-table case).
+	keyCols []int
+	// slotSrc is per master grouping-column slot (length len(groupKeys)): >= 0 if this set includes
+	// that column (its synthetic value is the bucket key's slotSrc[p]-th component), else -1, meaning
+	// the column is not grouped in this set and its synthetic value is NULL.
+	slotSrc []int
+	// mask is the GROUPING() bitmask for rows from this set: bit p is set iff master slot p is NOT in
+	// this set.
+	mask int64
+}
+
+// groupItemSetCount is the number of grouping sets a single GROUP BY term expands to, saturating well
+// below the int max so a huge CUBE cannot overflow the product before the maxGroupingSets check.
+func groupItemSetCount(item *GroupItem) int {
+	switch item.Kind {
+	case GroupSet:
+		return 1
+	case GroupRollup:
+		return len(item.Groups) + 1
+	case GroupCube:
+		if len(item.Groups) >= 20 {
+			return maxGroupingSets + 1
+		}
+		return 1 << len(item.Groups)
+	case GroupGroupingSets:
+		total := 0
+		for i := range item.Elems {
+			total += groupItemSetCount(&item.Elems[i])
+			if total > maxGroupingSets {
+				return maxGroupingSets + 1
+			}
+		}
+		return total
+	}
+	return 1
+}
+
+// expandGroupItem expands a single GROUP BY term into its grouping sets, each a list of column Exprs
+// (ROLLUP/CUBE/GROUPING SETS and nesting — spec/design/aggregates.md §12). The per-set column order
+// is textual; the set order is deterministic and identical across cores (tests compare with rowsort).
+func expandGroupItem(item *GroupItem) [][]*Expr {
+	switch item.Kind {
+	case GroupSet:
+		set := make([]*Expr, len(item.Cols))
+		for i := range item.Cols {
+			set[i] = &item.Cols[i]
+		}
+		return [][]*Expr{set}
+	case GroupRollup:
+		// The prefixes longest-first down to the empty set — n+1 sets.
+		out := make([][]*Expr, 0, len(item.Groups)+1)
+		for k := len(item.Groups); k >= 0; k-- {
+			var set []*Expr
+			for i := 0; i < k; i++ {
+				for j := range item.Groups[i] {
+					set = append(set, &item.Groups[i][j])
+				}
+			}
+			out = append(out, set)
+		}
+		return out
+	case GroupCube:
+		// Every subset of the column groups — 2^n sets (bit i = include group i).
+		n := len(item.Groups)
+		out := make([][]*Expr, 0, 1<<n)
+		for mask := 0; mask < (1 << n); mask++ {
+			var set []*Expr
+			for i := 0; i < n; i++ {
+				if mask&(1<<i) != 0 {
+					for j := range item.Groups[i] {
+						set = append(set, &item.Groups[i][j])
+					}
+				}
+			}
+			out = append(out, set)
+		}
+		return out
+	case GroupGroupingSets:
+		var out [][]*Expr
+		for i := range item.Elems {
+			out = append(out, expandGroupItem(&item.Elems[i])...)
+		}
+		return out
+	}
+	return nil
+}
+
+// expandGroupBy expands a whole GROUP BY clause into its grouping sets: the cross-product of the
+// top-level terms' expansions. An empty clause yields one empty set (the whole-table grand total).
+// Aborts 54001 if the expansion exceeds maxGroupingSets (spec/design/aggregates.md §12).
+func expandGroupBy(items []GroupItem) ([][]*Expr, error) {
+	total := 1
+	for i := range items {
+		total *= groupItemSetCount(&items[i])
+		if total > maxGroupingSets {
+			return nil, NewError(StatementTooComplex, fmt.Sprintf("too many grouping sets (the limit is %d)", maxGroupingSets))
+		}
+	}
+	acc := [][]*Expr{{}}
+	for i := range items {
+		exp := expandGroupItem(&items[i])
+		next := make([][]*Expr, 0, len(acc)*len(exp))
+		for _, a := range acc {
+			for _, s := range exp {
+				combined := make([]*Expr, 0, len(a)+len(s))
+				combined = append(combined, a...)
+				combined = append(combined, s...)
+				next = append(next, combined)
+			}
+		}
+		acc = next
+	}
+	return acc, nil
+}
+
+// groupingValue computes a GROUPING(args) result for a group from the grouping set whose mask is
+// given: bit (k-1-j) of the result is bit positions[j] of mask (spec/design/aggregates.md §12).
+func groupingValue(positions []int, mask int64) int64 {
+	k := len(positions)
+	var r int64
+	for j, p := range positions {
+		bit := (mask >> uint(p)) & 1
+		r |= bit << uint(k-1-j)
+	}
+	return r
+}
+
 // rebaseWindowResults rewrites a grouped+window projection's window-result placeholder slots to their
 // real grouped-row slot (spec/design/window.md §5.1). During resolution a window result of index w is
 // assigned the placeholder windowResultBase+w, because its real slot len(groupKeys)+len(aggSpecs)+w is
 // unknown until every aggregate (including any nested in a later window argument or HAVING) has been
 // collected. It descends into a subquery's lhs (current row space) but NOT its plan (those columns
 // index the subquery's own rows; a nested grouped+window plan was already rebased when it was built).
-func rebaseWindowResults(e *rExpr, wbase int) {
+func rebasePlaceholderCols(e *rExpr, from, target int) {
 	if e == nil {
 		return
 	}
 	switch e.kind {
 	case reColumn:
-		if e.index >= windowResultBase {
-			e.index = wbase + (e.index - windowResultBase)
+		if e.index >= from {
+			e.index = target + (e.index - from)
 		}
 		return
 	case reOuterColumn:
 		return
 	case reSubquery:
-		rebaseWindowResults(e.lhs, wbase) // current row space only; not subPlan
+		rebasePlaceholderCols(e.lhs, from, target) // current row space only; not subPlan
 		return
 	case reInValues:
-		rebaseWindowResults(e.lhs, wbase)
+		rebasePlaceholderCols(e.lhs, from, target)
 		return
 	}
-	rebaseWindowResults(e.operand, wbase)
-	rebaseWindowResults(e.lhs, wbase)
-	rebaseWindowResults(e.rhs, wbase)
+	rebasePlaceholderCols(e.operand, from, target)
+	rebasePlaceholderCols(e.lhs, from, target)
+	rebasePlaceholderCols(e.rhs, from, target)
 	for _, arm := range e.caseArms {
-		rebaseWindowResults(arm.cond, wbase)
-		rebaseWindowResults(arm.result, wbase)
+		rebasePlaceholderCols(arm.cond, from, target)
+		rebasePlaceholderCols(arm.result, from, target)
 	}
-	rebaseWindowResults(e.caseEls, wbase)
+	rebasePlaceholderCols(e.caseEls, from, target)
 	for _, a := range e.sargs {
-		rebaseWindowResults(a, wbase)
+		rebasePlaceholderCols(a, from, target)
 	}
 	for _, sub := range e.subs {
-		rebaseWindowResults(sub.index, wbase)
-		rebaseWindowResults(sub.lower, wbase)
-		rebaseWindowResults(sub.upper, wbase)
+		rebasePlaceholderCols(sub.index, from, target)
+		rebasePlaceholderCols(sub.lower, from, target)
+		rebasePlaceholderCols(sub.upper, from, target)
 	}
 }
 
@@ -13472,7 +13731,14 @@ type selectPlan struct {
 	filter    *rExpr
 	isAgg     bool
 	groupKeys []int
-	aggSpecs  []aggSpec
+	// groupSets are the grouping sets to compute (spec/design/aggregates.md §12). A plain GROUP BY
+	// (and the whole-table aggregate) is a single set; ROLLUP/CUBE/GROUPING SETS produce several.
+	groupSets []groupSetPlan
+	// groupingSpecs has one entry per GROUPING() call in the projection / HAVING, in synthetic-slot
+	// order: the master-grouping-column positions of its arguments. Each call's value per group row is
+	// computed from the row's grouping-set mask and appended after the aggregate results.
+	groupingSpecs [][]int
+	aggSpecs      []aggSpec
 	// hasWindow is true when the select list has a window function — the query runs the blocking
 	// WINDOW stage (after WHERE, before ORDER BY/LIMIT) and takes the eager path (never streaming).
 	// Mutually exclusive with isAgg in S0 (spec/design/window.md §5.2).
@@ -13593,6 +13859,11 @@ type aggCtx struct {
 	// windowKeyBase+k. A bare column or a bare aggregate (`ORDER BY sum(x)`) resolves to its real row
 	// slot and is NOT materialized (spec/design/window.md §5.1).
 	windowKeys []*rExpr
+	// groupingSpecs collects one entry per GROUPING(c1,…,ck) call from the projection / HAVING — the
+	// master-grouping-column POSITIONS (indices into groupKeys) of its arguments. Each call resolves
+	// to the placeholder slot groupingGsBase+index, rebased after resolution to its real trailing
+	// synthetic slot (spec/design/aggregates.md §12).
+	groupingSpecs [][]int
 }
 
 // windowSpec is one resolved window function (spec/design/window.md §5.1): its plan, the resolved
@@ -14935,6 +15206,67 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	slot := len(ag.groupKeys) + len(ag.specs)
 	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// resolveGrouping resolves GROUPING(c1, …, ck) (spec/design/aggregates.md §12) — the grouping-sets
+// membership function. Valid only in a grouped query's projection / HAVING (collecting); each
+// argument must be one of the master grouping columns, else 42803 (matching PostgreSQL). Returns an
+// integer (i32) whose bit (k-1-j) is 1 iff c_j is grouped away in the row's grouping set. The value
+// is computed per group row at execution from the grouping set's mask, so the call resolves to the
+// placeholder slot groupingGsBase+index (rebased to its real trailing synthetic slot afterwards).
+func resolveGrouping(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		// GROUPING(*) — PG raises a syntax error; mirror the COUNT-only `*` message (42601).
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	if len(fc.Args) == 0 {
+		// GROUPING() with no arguments — PG raises a syntax error (42601).
+		return nil, resolvedType{}, NewError(SyntaxError, "GROUPING requires at least one argument")
+	}
+	groupingArgErr := func() error {
+		return NewError(GroupingError, "arguments to GROUPING must be grouping expressions of the associated query level")
+	}
+	// GROUPING is meaningful only in a grouped query; outside one its arguments cannot be grouping
+	// expressions. (GROUPING with window functions is rejected 0A000 earlier in resolveSelectPlan.)
+	if !ag.collecting {
+		return nil, resolvedType{}, groupingArgErr()
+	}
+	positions := make([]int, 0, len(fc.Args))
+	for _, arg := range fc.Args {
+		var (
+			r   resolved
+			err error
+		)
+		switch arg.Kind {
+		case ExprColumn:
+			r, err = s.resolveBare(arg.Column)
+		case ExprQualifiedColumn:
+			r, err = s.resolveQualified(arg.Qualifier, arg.Column)
+		default:
+			// A non-column argument is never a grouping column (jed groups by columns only).
+			return nil, resolvedType{}, groupingArgErr()
+		}
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if r.level != 0 {
+			return nil, resolvedType{}, groupingArgErr()
+		}
+		pos := -1
+		for p, gk := range ag.groupKeys {
+			if gk == r.index {
+				pos = p
+				break
+			}
+		}
+		if pos < 0 {
+			return nil, resolvedType{}, groupingArgErr()
+		}
+		positions = append(positions, pos)
+	}
+	slot := groupingGsBase + len(ag.groupingSpecs)
+	ag.groupingSpecs = append(ag.groupingSpecs, positions)
+	return &rExpr{kind: reColumn, index: slot}, resolvedType{kind: rtInt, intTy: Int32}, nil
 }
 
 // resolveWindowCall resolves a window-function call `f(args) OVER (window_definition)`
@@ -16856,6 +17188,15 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveDateTrunc(s, fc, ag, params)
 	}
+	// GROUPING(c1, …, ck) — the grouping-sets membership function (spec/design/aggregates.md §12). It
+	// is not an aggregate (no DISTINCT/FILTER — those already errored 42809 above) and only resolves
+	// inside a grouped query, so it is intercepted before the by-name dispatch.
+	if name == "grouping" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveGrouping(s, fc, ag)
+	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
 	if isAggregateName(name) {
@@ -17901,6 +18242,11 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 	case ExprFuncCall:
 		// A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
 		if e.FuncCall.Over != nil {
+			if strings.EqualFold(e.FuncCall.Name, "grouping") {
+				// GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in
+				// PostgreSQL (42601); match it rather than treating GROUPING as an unknown window fn.
+				return nil, resolvedType{}, NewError(SyntaxError, "OVER is not supported for GROUPING")
+			}
 			// DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5):
 			// a window aggregate folds over a frame, where per-frame de-duplication is undefined.
 			if e.FuncCall.Distinct {

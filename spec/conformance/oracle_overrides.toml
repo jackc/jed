@@ -58,6 +58,16 @@ sql = "SELECT SUM(b) FILTER (WHERE a = 1) OVER () FROM t"
 reason = "jed: FILTER on a window AGGREGATE is deferred 0A000 (aggregates.md §11/§10). PostgreSQL allows it and returns rows. FILTER on aggregates landed for the non-window paths (whole-table / GROUP BY / HAVING); the window-aggregate frame fold is a deferred follow-on (the window subsystem already defers FILTER). A pure non-aggregate window function with FILTER is PG's own 0A000 (no override needed for that case). A documented narrowing, not a semantic disagreement on the supported surface."
 
 [[override]]
+file = "aggregates/grouping_sets.test"
+sql = "SELECT a, COUNT(*), row_number() OVER () FROM gt GROUP BY GROUPING SETS ((a), (b))"
+reason = "jed: GROUPING SETS / GROUPING() combined with a window function is deferred 0A000 (aggregates.md §12) — both want the grouped row's trailing synthetic slots, and the combination is a follow-on. PostgreSQL runs the window stage over the unioned grouping-set rows and returns rows. A documented narrowing, not a semantic disagreement on the supported surface; a single-grouping-set GROUP BY + window works."
+
+[[override]]
+file = "aggregates/grouping_sets.test"
+sql = "SELECT a FROM gt GROUP BY CUBE (a, a, a, a, a, a, a, a, a, a, a, a, a)"
+reason = "jed: a GROUP BY whose grouping sets exceed jed's MAX_GROUPING_SETS (4096) is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (aggregates.md §12, cost.md §7). PostgreSQL caps each construct instead ('CUBE is limited to 12 elements', 54011, a code jed's registry does not define). jed bounds the total expansion uniformly (CUBE(12)=4096 ok, CUBE(13)=8192 over), the deterministic resource bound the untrusted-query guarantee needs (CLAUDE.md §13). A documented divergence on the limit's code, not the supported surface."
+
+[[override]]
 file = "types/decimal.test"
 sql = "SELECT id FROM c WHERE d = '2.5'"
 reason = "jed: decimal vs text is not comparable (42804). PG implicitly coerces the text literal to numeric and returns a row. The strict type system (§4) rejects the cross-family comparison."

@@ -287,6 +287,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // GROUP BY: one row per grouping-key combination + the grouping-error rule + ORDER BY over
     // grouping keys (spec/design/aggregates.md §5-6, grammar.md §18).
     "query.group_by",
+    // GROUPING SETS / ROLLUP / CUBE and the GROUPING() function — multiple grouping sets in one
+    // GROUP BY (spec/design/aggregates.md §12, grammar.md §18).
+    "query.grouping_sets",
     // HAVING: a boolean filter over grouped rows, after aggregation, before ORDER BY
     // (spec/design/aggregates.md §8, grammar.md §19).
     "query.having",

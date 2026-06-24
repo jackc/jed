@@ -30,7 +30,8 @@ vertical slices** (CLAUDE.md §10/§11), each a commit across all three cores �
 Locked scope decisions: **PostgreSQL widening** for `SUM`/`AVG` (§3); **`DISTINCT` inside an
 aggregate** (`COUNT(DISTINCT x)`) has **landed** (§5) — the aggregate folds only the distinct
 non-NULL argument values; **`FILTER (WHERE cond)`** has **landed** (§11) — the aggregate folds
-only the input rows for which `cond` is TRUE.
+only the input rows for which `cond` is TRUE; **`GROUPING SETS` / `ROLLUP` / `CUBE`** and the
+**`GROUPING()`** function have **landed** (§12) — one `GROUP BY` names several grouping sets at once.
 
 ## 2. What an aggregate computes
 
@@ -233,11 +234,13 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   **window** aggregate it is deferred (`0A000`): a pure non-aggregate window function with `FILTER`
   matches PG's own `0A000`, and a window aggregate with `FILTER` (which PG allows) is deferred here
   to a follow-on, a documented divergence.
+- **`GROUPING SETS` / `ROLLUP` / `CUBE`** (landed) — one `GROUP BY` computes several grouping sets
+  at once, and the `GROUPING()` function reports which columns a row was grouped by (§12).
 - **Deferred / out of scope**: `GROUP BY` by expression / ordinal / output alias; the PG
   **functional-dependency**
-  relaxation of the grouping rule (a column functionally dependent on a grouped PK); and
-  `GROUPING SETS`/`ROLLUP`/`CUBE`, **`FILTER` on a window aggregate**, and ordered-set aggregates
-  (`percentile_cont`). Each is an additive later feature ([../../TODO.md](../../TODO.md)).
+  relaxation of the grouping rule (a column functionally dependent on a grouped PK); **`FILTER` on
+  a window aggregate**; **`GROUPING SETS` combined with window functions**; and ordered-set
+  aggregates (`percentile_cont`). Each is an additive later feature ([../../TODO.md](../../TODO.md)).
 
 ## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
 
@@ -273,3 +276,62 @@ operand's own evaluation are charged **only for a row that passes** the filter (
 contributes nothing, so it accrues no accumulate — contrast `DISTINCT`, where every row accumulates
 and only duplicates skip the fold, §5). Because the pass/fold decision is deterministic (scan order
 is cross-core identical), the metered cost is deterministic and identical across cores.
+
+## 12. `GROUPING SETS` / `ROLLUP` / `CUBE` and `GROUPING()` — multiple grouping sets
+
+A plain `GROUP BY` partitions the rows by **one** set of columns. `GROUP BY GROUPING SETS (...)`
+names **several** at once: each *grouping set* is grouped independently and the results are unioned
+(PostgreSQL / SQL-standard). `ROLLUP` and `CUBE` are sugar for common families of sets:
+
+- `GROUP BY GROUPING SETS ((a), (b), ())` → the per-`a` groups, the per-`b` groups, and the
+  whole-table grand total, in one result.
+- `GROUP BY ROLLUP (a, b)` ≡ `GROUPING SETS ((a, b), (a), ())` — the hierarchical subtotals: the
+  prefixes of the column list, longest first down to the empty set (n+1 sets).
+- `GROUP BY CUBE (a, b)` ≡ `GROUPING SETS ((a, b), (a), (b), ())` — **every** subset of the columns
+  (2ⁿ sets).
+- A plain term **cross-products** with the grouping-set forms: `GROUP BY a, GROUPING SETS ((b), (c))`
+  ≡ `GROUPING SETS ((a, b), (a, c))`, and several grouping-set clauses multiply. `ROLLUP`/`CUBE` may
+  also nest inside `GROUPING SETS`. Each element is a **column group** — a bare column, a
+  parenthesized `(a, b)`, or the empty `()` — never an expression/ordinal/alias (the same narrowing
+  as plain `GROUP BY`, §10).
+
+**The master grouping columns.** The resolver expands the clause to a flat list of grouping sets and
+takes the **ordered union** of every set's columns — a column is *groupable* if it appears in **at
+least one** set. A non-aggregated select-list / `ORDER BY` / `HAVING` column must be one of these
+master columns, else `42803` (the §6 grouping-error rule, widened to the union). In a row produced by
+a grouping set that does **not** include a given master column, that column projects as **NULL** (it
+was grouped away, not an actual data NULL — that ambiguity is what `GROUPING()` resolves).
+
+**Empty input / empty set.** An **empty grouping set** `()` always emits **one** row (the grand
+total — `COUNT` 0, others NULL, like whole-table aggregation §4), *even over an empty table*; a
+**non-empty** set over an empty input emits **nothing**. **Duplicate** grouping sets are **kept**
+(`GROUPING SETS ((a), (a))` emits each group twice — PG). With no `ORDER BY` the row order is
+unspecified (the corpus uses `rowsort` or an explicit `ORDER BY` over the master columns); the result
+**multiset** is deterministic and byte-identical across cores (sets iterated in expansion order, groups
+in first-occurrence order — CLAUDE.md §8/§10).
+
+**`GROUPING(c1, …, ck)`** returns an `integer` bitmask reporting, for the grouping set a row came
+from, which of its arguments were **grouped away**: bit `(k − 1 − j)` is `1` iff `c_j` is **not** in
+that set (so it is NULL by grouping, not by data), `0` if actually grouped. `GROUPING(a)` is `0`/`1`;
+`GROUPING(a, b)` is `2·GROUPING(a) + GROUPING(b)`. Each argument must be one of the master grouping
+columns, else `42803`. `GROUPING(*)` and `GROUPING()` (no args) are syntax errors (`42601`), and
+`GROUPING(...)` does not take `OVER` (`42601`) — it is not a window function. Internally each
+`GROUPING()` call is a synthetic trailing column of the grouped row, its value computed per set from
+the set's membership mask (no new evaluator node).
+
+**Cost** (the cross-core contract, §8): the post-`WHERE` rows are scanned **once**
+(`storage_row_read` unchanged); each row is then folded into **every** grouping set it belongs to, so
+`aggregate_accumulate` and the operand `operator_eval`s accrue per `(grouping set × row ×
+aggregate)`. `row_produced` is charged per emitted group row across all sets. The `GROUPING()`
+finalize is unmetered (like the other finalize steps). Deterministic and identical across cores.
+
+**Bounded expansion.** `CUBE (a, b, …)` of n columns is 2ⁿ grouping sets — an exponential blow-up
+from tiny input. The total expansion is capped at **`MAX_GROUPING_SETS` = 4096**; beyond it the
+statement aborts `54001` (`statement_too_complex`), jed's structural-complexity gate (the untrusted-
+query resource bound, CLAUDE.md §13). This is a **deliberate divergence** from PostgreSQL, which caps
+each construct instead (`CUBE is limited to 12 elements`, `54011`, a code jed's registry does not
+define); jed bounds the uniform total (`CUBE(12)` = 4096 is fine, `CUBE(13)` = 8192 trips it).
+
+**Window functions** combined with `GROUPING SETS` / `GROUPING()` are **deferred** (`0A000`) — both
+want the grouped row's trailing synthetic slots; a single-grouping-set `GROUP BY` with a window
+function is unaffected (§10).

@@ -273,6 +273,10 @@ id = "query.group_by"
 description = "GROUP BY <column,...>: one result row per distinct grouping-key combination; NULL is its own group; decimal keys bucket value-canonically; first-occurrence group order (ORDER BY over a grouping column overrides); a non-aggregated SELECT/ORDER BY column not in GROUP BY is 42803; GROUP BY over an empty table yields zero rows (spec/design/aggregates.md §5-6, grammar.md §18)"
 
 [[capability]]
+id = "query.grouping_sets"
+description = "GROUP BY GROUPING SETS / ROLLUP / CUBE and the GROUPING() function: several grouping sets in one GROUP BY (ROLLUP(a,b)={(a,b),(a),()}, CUBE(a,b)=every subset; a plain term cross-products with these); a column not grouped in a row's set projects NULL; a select column must be in the union of all sets else 42803; GROUPING(c1,...,ck) -> integer bitmask (1 = grouped away), its args must be grouping columns else 42803; columns only; combined with window functions or over MAX_GROUPING_SETS is deferred/limited (54001) (spec/design/aggregates.md §12, grammar.md §18)"
+
+[[capability]]
 id = "query.having"
 description = "HAVING <predicate>: boolean filter over grouped rows, after aggregation and before ORDER BY; may reference aggregates (even ones not projected) and grouping keys; a non-grouped column is 42803, non-boolean is 42804; HAVING alone makes a query an aggregate query; HAVING with no GROUP BY filters the single whole-table group (spec/design/aggregates.md §8, grammar.md §19)"
 

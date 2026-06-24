@@ -685,6 +685,33 @@ export type JoinKind = "inner" | "cross" | "left" | "right" | "full";
 // which require an ON). See spec/design/grammar.md §15.
 export type JoinClause = { kind: JoinKind; table: TableRef; on: Expr | null };
 
+// GroupItem is one GROUP BY grouping term (spec/design/aggregates.md §12). Most queries use only
+// "set" with one column each (plain `GROUP BY a, b` → two "set" items); the ROLLUP/CUBE/GROUPING SETS
+// forms produce several grouping sets the resolver expands and cross-products. Each Expr is a
+// bare/qualified column (the parser enforces it). A "set" with no cols is the empty set `()`.
+export type GroupItem =
+  | { kind: "set"; cols: Expr[] }
+  | { kind: "rollup"; groups: Expr[][] }
+  | { kind: "cube"; groups: Expr[][] }
+  | { kind: "groupingSets"; elems: GroupItem[] };
+
+// forEachGroupExpr visits every column Expr in a grouping term — used by the analysis walks that
+// scan a SELECT's expressions (privilege collection, sublink / sequence-mutator detection).
+export function forEachGroupExpr(item: GroupItem, f: (e: Expr) => void): void {
+  switch (item.kind) {
+    case "set":
+      for (const e of item.cols) f(e);
+      break;
+    case "rollup":
+    case "cube":
+      for (const g of item.groups) for (const e of g) f(e);
+      break;
+    case "groupingSets":
+      for (const el of item.elems) forEachGroupExpr(el, f);
+      break;
+  }
+}
+
 // Select is a SELECT. The FROM clause is a left-deep chain: `from` followed by zero or more
 // `joins` (empty = single-table). limit caps the result at `limit` rows; offset skips the
 // first `offset` rows. Both are non-negative counts, applied after ORDER BY, before projection
@@ -702,10 +729,10 @@ export type Select = {
   // `from` is null — joins exist only inside a FROM clause). grammar.md §15.
   joins: JoinClause[];
   filter: Expr | null;
-  // GROUP BY keys — bare or qualified table columns (never expressions/aliases/ordinals);
-  // empty means no GROUP BY. Each is a "column" or "qualifiedColumn" (the parser restricts it
-  // to column_ref). With keys present the query groups (spec/design/grammar.md §18).
-  groupBy: Expr[];
+  // GROUP BY grouping terms — a GroupItem per comma-separated term: a plain column set, or the
+  // ROLLUP/CUBE/GROUPING SETS forms that expand to multiple grouping sets (spec/design/aggregates.md
+  // §12). Empty means no GROUP BY. Every grouping column is a "column"/"qualifiedColumn".
+  groupBy: GroupItem[];
   // The HAVING predicate (a boolean filter over the grouped rows), or null. May reference
   // aggregates and grouping keys; evaluated after aggregation, before ORDER BY. HAVING makes a
   // query an aggregate query even with no GROUP BY (spec/design/grammar.md §19).

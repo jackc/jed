@@ -134,9 +134,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         non-aggregate case matches PG; window-aggregate FILTER is a deferred follow-on). New
         capability `query.aggregate_filter`; the filter is metered per row, accumulate only for
         passing rows. → aggregates.md §11
+  - [x] **`GROUPING SETS` / `ROLLUP` / `CUBE` + `GROUPING()`** — one GROUP BY names several grouping
+        sets at once: `GROUPING SETS ((a),(b),())`, `ROLLUP(a,b)`={(a,b),(a),()}, `CUBE(a,b)`=every
+        subset; a plain term cross-products, nesting allowed. A column not in a row's set projects
+        NULL; a select column must be in the union of all sets else `42803`. `GROUPING(c1,…,ck)` →
+        integer bitmask (1 = grouped away), args must be grouping columns else `42803`; `GROUPING(*)`/
+        `GROUPING()`/`GROUPING()…OVER` are `42601`. Columns only. New capability
+        `query.grouping_sets`; scan once, accumulate per (set×row×agg); total sets capped at 4096
+        (`54001`, divergence from PG's per-construct 54011); window-combined deferred `0A000`. →
+        aggregates.md §12
   - [ ] _follow-on:_ `SELECT DISTINCT` in an aggregate query, GROUP BY by
-        expression/ordinal/alias, functional-dependency grouping, `GROUPING SETS`/ordered-set, and
-        `FILTER` on a **window** aggregate.
+        expression/ordinal/alias, functional-dependency grouping, ordered-set aggregates,
+        `GROUPING SETS` combined with window functions, and `FILTER` on a **window** aggregate.
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
       optimization.** Per-row values folded over a related row set in a dedicated **window stage**
       (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/

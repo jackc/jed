@@ -539,7 +539,18 @@ having_clause  ::= "HAVING" expr
  * three-valued); decimal keys bucket by VALUE-canonical form so 1.5 and 1.50 share one group
  * (../design/decimal.md §5). Output group order with no ORDER BY is first-occurrence over the
  * source scan (the DISTINCT mechanism — grammar.md §11). */
-group_by       ::= "GROUP" "BY" column_ref ("," column_ref)*
+/* GROUP BY names one or more grouping terms. A term is an ordinary column group, or the
+ * ROLLUP/CUBE/GROUPING SETS forms that each expand to several grouping sets (aggregates.md §12);
+ * the whole clause's sets are the cross-product of the terms'. A group_set is a parenthesized
+ * column list (or empty `()`) or a bare column. The grouping columns are columns only (the ORDER
+ * BY / plain-GROUP-BY narrowing). The GROUPING() function (which reports a row's grouping set) is
+ * an ordinary function_call. */
+group_by       ::= "GROUP" "BY" group_item ("," group_item)*
+group_item     ::= "ROLLUP" "(" group_set ("," group_set)* ")"
+                 | "CUBE" "(" group_set ("," group_set)* ")"
+                 | "GROUPING" "SETS" "(" group_item ("," group_item)* ")"
+                 | group_set
+group_set      ::= "(" (column_ref ("," column_ref)*)? ")" | column_ref
 
 /* The FROM clause is a left-deep chain: a first table_ref followed by zero or more
  * join_clauses. With no join_clause it is the single-table SELECT the rest of the

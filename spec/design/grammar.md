@@ -729,11 +729,18 @@ across the three cores:
 
 ## 18. `GROUP BY`
 
-`group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` slots between `WHERE` and
+`group_by ::= "GROUP" "BY" group_item ("," group_item)*` slots between `WHERE` and
 `ORDER BY`. It partitions the post-`WHERE` rows into groups sharing a value on every grouping
 key and produces **one result row per group**; the select list then projects the grouping
 keys and aggregates over each group. Semantics live in [aggregates.md](aggregates.md) §5–§6;
 this section is the syntax + the two narrowings.
+
+**Grouping sets.** A `group_item` is an ordinary column group, or `ROLLUP (...)` / `CUBE (...)` /
+`GROUPING SETS (...)` — the forms that name **several** grouping sets in one `GROUP BY`
+([aggregates.md](aggregates.md) §12). `ROLLUP`/`CUBE` are sugar (subtotal prefixes / every subset);
+a plain term cross-products with them. The `GROUPING(col, …)` function (which reports a row's
+grouping set as a bitmask) is an ordinary `function_call`, valid only in a grouped query. The
+no-grouping-sets case below is the single-set special case.
 
 **Keys are bare/qualified columns only.** A grouping key is a `column_ref` (`g` or `t.g`) —
 **not** a general expression (`GROUP BY a + 1`), an output alias, or an ordinal

@@ -7,9 +7,9 @@
 use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
-    Delete, DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, IdentitySpec,
-    Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict, OrderKey,
-    Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
+    Delete, DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, GroupItem,
+    IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict,
+    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
     SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
     Update, WindowDef, WithExpr, WithQuery,
 };
@@ -1892,30 +1892,105 @@ impl Parser {
         Ok(Some(self.parse_expr()?))
     }
 
-    /// `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md §18). Parsed after
-    /// WHERE, before ORDER BY. Empty when absent. Each key is a bare/qualified column (never an
-    /// expression/alias/ordinal — the same narrowing ORDER BY makes). `GROUP` is not reserved,
-    /// so it is a clause only when immediately followed by `BY`.
-    fn parse_group_by(&mut self) -> Result<Vec<Expr>> {
+    /// `group_by ::= "GROUP" "BY" group_item ("," group_item)*` (grammar.md §18). Parsed after
+    /// WHERE, before ORDER BY. Empty when absent. Each term is an ordinary column, a parenthesized
+    /// column group, or `ROLLUP`/`CUBE`/`GROUPING SETS` (spec/design/aggregates.md §12); every
+    /// grouping column is a bare/qualified column (the same narrowing ORDER BY makes — never an
+    /// expression/alias/ordinal). `GROUP` is not reserved, so it is a clause only when immediately
+    /// followed by `BY`.
+    fn parse_group_by(&mut self) -> Result<Vec<GroupItem>> {
         if self.peek_keyword().as_deref() != Some("group") {
             return Ok(Vec::new());
         }
         self.advance(); // GROUP
         self.expect_keyword("by")?;
-        let mut keys = Vec::new();
+        let mut items = Vec::new();
         loop {
-            let (qualifier, name) = self.parse_column_ref()?;
-            keys.push(match qualifier {
-                Some(qualifier) => Expr::QualifiedColumn { qualifier, name },
-                None => Expr::Column(name),
-            });
+            items.push(self.parse_group_item()?);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;
             }
             break;
         }
-        Ok(keys)
+        Ok(items)
+    }
+
+    /// One GROUP BY grouping term — a `ROLLUP`/`CUBE`/`GROUPING SETS` construct, or an ordinary
+    /// column group (a bare column, a parenthesized `(a, b)`, or the empty set `()`). Also used for
+    /// the elements of a `GROUPING SETS (...)` list (which may themselves nest these forms).
+    /// `ROLLUP`/`CUBE`/`GROUPING`/`SETS` are unreserved, recognized by lookahead only (a column
+    /// literally named one of them must be quoted).
+    fn parse_group_item(&mut self) -> Result<GroupItem> {
+        match self.peek_keyword().as_deref() {
+            Some("rollup") => {
+                self.advance();
+                Ok(GroupItem::Rollup(self.parse_group_set_list()?))
+            }
+            Some("cube") => {
+                self.advance();
+                Ok(GroupItem::Cube(self.parse_group_set_list()?))
+            }
+            Some("grouping") if self.peek_keyword_at(1).as_deref() == Some("sets") => {
+                self.advance(); // GROUPING
+                self.advance(); // SETS
+                self.expect(&Token::LParen)?;
+                let mut elems = Vec::new();
+                loop {
+                    elems.push(self.parse_group_item()?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(&Token::RParen)?;
+                Ok(GroupItem::GroupingSets(elems))
+            }
+            _ => Ok(GroupItem::Set(self.parse_group_set()?)),
+        }
+    }
+
+    /// The parenthesized `( group_set ("," group_set)* )` argument list of `ROLLUP` / `CUBE`,
+    /// where each element is a column group (`spec/design/aggregates.md` §12).
+    fn parse_group_set_list(&mut self) -> Result<Vec<Vec<Expr>>> {
+        self.expect(&Token::LParen)?;
+        let mut sets = Vec::new();
+        loop {
+            sets.push(self.parse_group_set()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen)?;
+        Ok(sets)
+    }
+
+    /// A single grouping "column group": a parenthesized `( col, ... )` / empty `()`, or a bare
+    /// column. Every member is a bare/qualified column reference.
+    fn parse_group_set(&mut self) -> Result<Vec<Expr>> {
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut cols = Vec::new();
+            if !matches!(self.peek(), Token::RParen) {
+                loop {
+                    let (q, n) = self.parse_column_ref()?;
+                    cols.push(column_ref_expr(q, n));
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+            Ok(cols)
+        } else {
+            let (q, n) = self.parse_column_ref()?;
+            Ok(vec![column_ref_expr(q, n)])
+        }
     }
 
     /// `from_clause ::= table_ref join_clause*` (spec/grammar/grammar.ebnf, grammar.md §15).
@@ -3638,6 +3713,15 @@ fn render_token(t: &Token) -> String {
 
 fn syntax(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::SyntaxError, msg.into())
+}
+
+/// Build a bare or qualified column-reference `Expr` from a parsed `column_ref` (the GROUP BY
+/// grouping terms are columns only — spec/design/aggregates.md §12).
+fn column_ref_expr(qualifier: Option<String>, name: String) -> Expr {
+    match qualifier {
+        Some(qualifier) => Expr::QualifiedColumn { qualifier, name },
+        None => Expr::Column(name),
+    }
 }
 
 /// Whether `kw` (already lower-cased) is a keyword that may legally follow a `table_ref`,

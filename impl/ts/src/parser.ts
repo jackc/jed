@@ -15,6 +15,7 @@ import type {
   ColumnDef,
   Delete,
   Expr,
+  GroupItem,
   IdentitySpec,
   ConflictTarget,
   Insert,
@@ -1768,29 +1769,106 @@ class Parser {
     return this.parseExpr();
   }
 
-  // parseGroupBy parses `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md
-  // §18), after WHERE and before ORDER BY. Each key is a bare/qualified column (never an
-  // expression/alias/ordinal). `GROUP` is not reserved, so it is a clause only when immediately
-  // followed by `BY`.
-  private parseGroupBy(): Expr[] {
+  // parseGroupBy parses `group_by ::= "GROUP" "BY" group_item ("," group_item)*` (grammar.md §18),
+  // after WHERE and before ORDER BY. Each term is an ordinary column, a parenthesized column group, or
+  // ROLLUP/CUBE/GROUPING SETS (spec/design/aggregates.md §12); every grouping column is a
+  // bare/qualified column. `GROUP` is not reserved, so it is a clause only when followed by `BY`.
+  private parseGroupBy(): GroupItem[] {
     if (this.peekKeyword() !== "group") return [];
     this.advance(); // GROUP
     this.expectKeyword("by");
-    const keys: Expr[] = [];
+    const items: GroupItem[] = [];
     for (;;) {
-      const [qualifier, name] = this.parseColumnRef();
-      keys.push(
-        qualifier !== null
-          ? { kind: "qualifiedColumn", qualifier, name }
-          : { kind: "column", name },
-      );
+      items.push(this.parseGroupItem());
       if (this.peek().kind === "comma") {
         this.advance();
         continue;
       }
       break;
     }
-    return keys;
+    return items;
+  }
+
+  // parseGroupItem parses one GROUP BY grouping term — a ROLLUP/CUBE/GROUPING SETS construct, or an
+  // ordinary column group (a bare column, a parenthesized `(a, b)`, or the empty set `()`). Also used
+  // for the elements of a GROUPING SETS list (which may nest these forms). ROLLUP/CUBE/GROUPING/SETS
+  // are unreserved, recognized by lookahead only.
+  private parseGroupItem(): GroupItem {
+    switch (this.peekKeyword()) {
+      case "rollup":
+        this.advance();
+        return { kind: "rollup", groups: this.parseGroupSetList() };
+      case "cube":
+        this.advance();
+        return { kind: "cube", groups: this.parseGroupSetList() };
+      case "grouping":
+        if (this.peekKeywordAt(1) === "sets") {
+          this.advance(); // GROUPING
+          this.advance(); // SETS
+          this.expect("lparen");
+          const elems: GroupItem[] = [];
+          for (;;) {
+            elems.push(this.parseGroupItem());
+            if (this.peek().kind === "comma") {
+              this.advance();
+              continue;
+            }
+            break;
+          }
+          this.expect("rparen");
+          return { kind: "groupingSets", elems };
+        }
+        break;
+    }
+    return { kind: "set", cols: this.parseGroupSet() };
+  }
+
+  // parseGroupSetList parses the parenthesized `( group_set ("," group_set)* )` argument list of
+  // ROLLUP / CUBE, where each element is a column group (spec/design/aggregates.md §12).
+  private parseGroupSetList(): Expr[][] {
+    this.expect("lparen");
+    const sets: Expr[][] = [];
+    for (;;) {
+      sets.push(this.parseGroupSet());
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      break;
+    }
+    this.expect("rparen");
+    return sets;
+  }
+
+  // parseGroupSet parses a single grouping "column group": a parenthesized `( col, ... )` / empty
+  // `()`, or a bare column. Every member is a bare/qualified column reference.
+  private parseGroupSet(): Expr[] {
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      const cols: Expr[] = [];
+      if (this.peek().kind !== "rparen") {
+        for (;;) {
+          cols.push(this.columnRefExpr());
+          if (this.peek().kind === "comma") {
+            this.advance();
+            continue;
+          }
+          break;
+        }
+      }
+      this.expect("rparen");
+      return cols;
+    }
+    return [this.columnRefExpr()];
+  }
+
+  // columnRefExpr parses a column_ref into a bare or qualified column-reference Expr (the GROUP BY
+  // grouping terms are columns only — spec/design/aggregates.md §12).
+  private columnRefExpr(): Expr {
+    const [qualifier, name] = this.parseColumnRef();
+    return qualifier !== null
+      ? { kind: "qualifiedColumn", qualifier, name }
+      : { kind: "column", name };
   }
 
   // parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first

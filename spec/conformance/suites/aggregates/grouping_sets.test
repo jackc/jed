@@ -1,0 +1,260 @@
+# GROUPING SETS / ROLLUP / CUBE and the GROUPING() function (spec/design/aggregates.md §12).
+# `GROUP BY` may name several grouping sets at once: GROUPING SETS ((a),(b),()) computes each set's
+# grouping independently and unions the results; ROLLUP(a,b) is sugar for the prefixes
+# {(a,b),(a),()}; CUBE(a,b) for every subset {(a,b),(a),(b),()}; a plain term mixed with these
+# cross-products (GROUP BY a, GROUPING SETS((b),()) = {(a,b),(a)}). A column not grouped in the set a
+# row came from projects as NULL. GROUPING(c1,...,ck) returns an integer bitmask: bit (k-1-j) is 1
+# iff c_j was grouped away (NULL because not in this set), 0 if actually grouped. Columns only (the
+# same narrowing as plain GROUP BY); GROUPING() args must be grouping columns (else 42803).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.grouping_sets, query.window, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE gt (id i32 PRIMARY KEY, a i32, b i32, v i32)
+
+statement ok
+INSERT INTO gt VALUES (1,1,1,10),(2,1,2,20),(3,2,1,30),(4,2,2,40),(5,1,1,50)
+
+# ROLLUP(a,b) = grouping sets {(a,b),(a),()}: the (a,b) groups, then the per-a subtotals (b NULL),
+# then the grand total (a,b both NULL). v = {10,20,30,40,50}.
+# names: a, b, count, sum
+query IIII nosort
+SELECT a, b, COUNT(*), SUM(v) FROM gt GROUP BY ROLLUP(a, b) ORDER BY a, b
+----
+1
+1
+2
+60
+1
+2
+1
+20
+1
+NULL
+3
+80
+2
+1
+1
+30
+2
+2
+1
+40
+2
+NULL
+2
+70
+NULL
+NULL
+5
+150
+
+# CUBE(a,b) = {(a,b),(a),(b),()}: ROLLUP's sets plus the per-b subtotals (a NULL).
+# names: a, b, count, sum
+query IIII nosort
+SELECT a, b, COUNT(*), SUM(v) FROM gt GROUP BY CUBE(a, b) ORDER BY a, b
+----
+1
+1
+2
+60
+1
+2
+1
+20
+1
+NULL
+3
+80
+2
+1
+1
+30
+2
+2
+1
+40
+2
+NULL
+2
+70
+NULL
+1
+3
+90
+NULL
+2
+2
+60
+NULL
+NULL
+5
+150
+
+# GROUPING SETS ((a),(b),()) with the GROUPING() function. For the (a) sets b is grouped away so
+# GROUPING(b)=1; for (b) sets GROUPING(a)=1; for () both are 1 (GROUPING(a,b)=3). GROUPING(a,b) is
+# the 2-bit value 2*GROUPING(a)+GROUPING(b).
+# names: a, b, grouping, grouping, grouping, count
+query IIIIII nosort
+SELECT a, b, GROUPING(a), GROUPING(b), GROUPING(a, b), COUNT(*)
+FROM gt GROUP BY GROUPING SETS ((a), (b), ()) ORDER BY a, b
+----
+1
+NULL
+0
+1
+1
+3
+2
+NULL
+0
+1
+1
+2
+NULL
+1
+1
+0
+2
+3
+NULL
+2
+1
+0
+2
+2
+NULL
+NULL
+1
+1
+3
+5
+
+# A plain term mixed with GROUPING SETS cross-products: GROUP BY a, GROUPING SETS((b),()) = {(a,b),(a)}.
+# cost pins the cross-core contract: 5 storage_row_read + 2 sets x 5 rows x 1 aggregate accumulate
+# (COUNT(*), no operand) + 8 row_produced (4 (a,b) groups + 2 (a) groups = 6... see below) — pinned
+# to jed's metered value.
+# names: a, b, count
+query III nosort
+SELECT a, b, COUNT(*) FROM gt GROUP BY a, GROUPING SETS ((b), ()) ORDER BY a, b
+----
+1
+1
+2
+1
+2
+1
+1
+NULL
+3
+2
+1
+1
+2
+2
+1
+2
+NULL
+2
+
+# GROUP BY () alone is the whole-table grand total (one row), like no GROUP BY.
+# names: count, sum
+query II nosort
+SELECT COUNT(*), SUM(v) FROM gt GROUP BY ()
+----
+5
+150
+
+# Duplicate grouping sets are KEPT — each produces its own rows (GROUPING SETS ((a),(a))).
+# names: a, count
+query II rowsort
+SELECT a, COUNT(*) FROM gt GROUP BY GROUPING SETS ((a), (a))
+----
+1
+3
+1
+3
+2
+2
+2
+2
+
+# HAVING filters the grouped rows of every set (here keep groups of >= 2 rows).
+# names: a, b, count
+query III nosort
+SELECT a, b, COUNT(*) FROM gt GROUP BY ROLLUP(a, b) HAVING COUNT(*) >= 2 ORDER BY a, b
+----
+1
+1
+2
+1
+NULL
+3
+2
+NULL
+2
+NULL
+NULL
+5
+
+# Over an empty table only the empty grouping set () emits a row (COUNT 0); the non-empty sets emit
+# nothing (spec/design/aggregates.md §12).
+statement ok
+CREATE TABLE ge (id i32 PRIMARY KEY, a i32, b i32)
+
+# names: a, b, count
+query III nosort
+SELECT a, b, COUNT(*) FROM ge GROUP BY GROUPING SETS ((a), (b), ()) ORDER BY a, b
+----
+NULL
+NULL
+0
+
+# Cost pin: ROLLUP(a) = {(a),()} over 5 rows, one COUNT(*) aggregate. 5 storage_row_read +
+# 2 sets x 5 rows accumulate (10) + 3 row_produced (a=1, a=2, grand total) + the aggregate-query
+# constant.
+# names: a, count
+# cost: 19
+query II nosort
+SELECT a, COUNT(*) FROM gt GROUP BY ROLLUP(a) ORDER BY a
+----
+1
+3
+2
+2
+NULL
+5
+
+# --- error cases ----------------------------------------------------------------------------
+
+# GROUPING of a non-grouping column is 42803 (v is not a grouping expression here).
+statement error 42803
+SELECT a, GROUPING(v) FROM gt GROUP BY ROLLUP(a)
+
+# GROUPING outside a grouped query (no GROUP BY) is 42803.
+statement error 42803
+SELECT GROUPING(a) FROM gt
+
+# A select-list column not in ANY grouping set is the ordinary grouping error 42803.
+statement error 42803
+SELECT a, b, COUNT(*) FROM gt GROUP BY GROUPING SETS ((a), ())
+
+# GROUPING(*) is a syntax error (42601) — * is only valid as the argument of COUNT.
+statement error 42601
+SELECT GROUPING(*) FROM gt GROUP BY a
+
+# GROUPING with no arguments is a syntax error (42601).
+statement error 42601
+SELECT GROUPING() FROM gt GROUP BY a
+
+# GROUPING is not a window function — OVER is a syntax error (42601).
+statement error 42601
+SELECT GROUPING(a) OVER () FROM gt GROUP BY a
+
+# GROUPING SETS combined with a window function is deferred (0A000).
+statement error 0A000
+SELECT a, COUNT(*), row_number() OVER () FROM gt GROUP BY GROUPING SETS ((a), (b))
+
+# A GROUP BY whose grouping sets exceed the limit (CUBE of 13 columns = 8192 > 4096) is 54001.
+statement error 54001
+SELECT a FROM gt GROUP BY CUBE (a, a, a, a, a, a, a, a, a, a, a, a, a)

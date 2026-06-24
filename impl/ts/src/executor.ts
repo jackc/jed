@@ -20,6 +20,7 @@ import type {
   DropTable,
   DropType,
   Expr,
+  GroupItem,
   Insert,
   InsertValue,
   JoinKind,
@@ -47,7 +48,12 @@ import type {
   WithExpr,
   WithQuery,
 } from "./ast.ts";
-import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions } from "./ast.ts";
+import {
+  cteBodyAsQuery,
+  cteBodyIsDataModifying,
+  emptySeqOptions,
+  forEachGroupExpr,
+} from "./ast.ts";
 import {
   type CheckConstraint,
   type ColField,
@@ -6858,22 +6864,30 @@ export class Database {
     }
     const scope = new Scope(rels, this, parent, true, ctes);
 
-    // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column — grammar.md
-    // §18). An unknown column is 42703, an ambiguous bare key 42702. An outer (correlated) key —
-    // grouping by an enclosing-query constant — is degenerate and 0A000 (§26).
-    const groupKeys: number[] = sel.groupBy.map((key) => {
-      const r =
-        key.kind === "qualifiedColumn"
-          ? scope.resolveQualified(key.qualifier, key.name)
-          : scope.resolveBare((key as { name: string }).name);
-      if (r.level !== 0) {
-        throw engineError(
-          "feature_not_supported",
-          "GROUP BY may not reference an outer query column",
-        );
-      }
-      return r.index;
-    });
+    // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets, resolve
+    // each set's columns to flat row indices, and build the master grouping-column list (groupKeys) —
+    // the ordered union of every set's columns, i.e. the columns groupable in at least one set
+    // (spec/design/aggregates.md §12). A plain GROUP BY a, b expands to a single set [a, b]; no GROUP
+    // BY expands to a single empty set (the whole-table grand total). An unknown column is 42703, an
+    // outer (correlated) key is degenerate and 0A000 (§26).
+    const expanded = expandGroupBy(sel.groupBy);
+    const groupKeys: number[] = [];
+    const resolvedSets: number[][] = expanded.map((set) =>
+      set.map((key) => {
+        const r =
+          key.kind === "qualifiedColumn"
+            ? scope.resolveQualified(key.qualifier, key.name)
+            : scope.resolveBare((key as { name: string }).name);
+        if (r.level !== 0) {
+          throw engineError(
+            "feature_not_supported",
+            "GROUP BY may not reference an outer query column",
+          );
+        }
+        if (!groupKeys.includes(r.index)) groupKeys.push(r.index);
+        return r.index;
+      }),
+    );
 
     // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
     // resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
@@ -6884,8 +6898,10 @@ export class Database {
     // An aggregate inside a window definition's keys also makes the query an aggregate query —
     // inline (`OVER (ORDER BY sum(x))`, caught by itemsHaveAggregate) or in a WINDOW-clause entry
     // (`WINDOW w AS (ORDER BY sum(x))`, scanned here before the desugar). spec/design/window.md §5.1.
+    // Note sel.groupBy.length (not groupKeys): GROUP BY GROUPING SETS (()) has an empty master list
+    // yet is still an aggregate query (the whole-table grand total).
     const isAgg =
-      groupKeys.length > 0 ||
+      sel.groupBy.length > 0 ||
       itemsHaveAggregate(sel.items) ||
       sel.having !== null ||
       windowsHaveAggregate(sel.windows);
@@ -6904,9 +6920,10 @@ export class Database {
           collecting: isAgg,
           groupKeys,
           specs: [],
+          groupingSpecs: [],
           window: { base: WINDOW_RESULT_BASE, windowSpecs: [], windowKeys: [] },
         }
-      : { collecting: isAgg, groupKeys, specs: [] };
+      : { collecting: isAgg, groupKeys, specs: [], groupingSpecs: [] };
     // Resolve the WINDOW clause: an entry may extend an earlier entry (`w2 AS (w ORDER BY …)` —
     // window.md §5), so each is merged against the already-resolved earlier entries (a missing/
     // forward/self base is 42704; PARTITION/ORDER overrides and a framed base are 42P20). Every
@@ -6928,6 +6945,7 @@ export class Database {
       types: columnTypes,
     } = resolveProjections(scope, itemsRef, projAgg, ptypes);
     let aggSpecs = projAgg.specs;
+    let groupingSpecs: number[][] = projAgg.groupingSpecs ?? [];
     // The collected window specs + materialized window-key expressions (empty unless a window query).
     // spec/design/window.md §5.1.
     const windowSpecs: WindowSpec[] = projAgg.window?.windowSpecs ?? [];
@@ -6939,13 +6957,14 @@ export class Database {
     // the grouped row, so the window slots that follow are rebased over the final aggregate count.
     let having: RExpr | null = null;
     if (sel.having !== null) {
-      const hctx: AggCtx = { collecting: true, groupKeys, specs: aggSpecs };
+      const hctx: AggCtx = { collecting: true, groupKeys, specs: aggSpecs, groupingSpecs };
       const { node, type } = resolve(scope, sel.having, null, hctx, ptypes);
       if (type.kind !== "bool" && type.kind !== "null") {
         throw typeError("argument of HAVING must be boolean");
       }
       having = node;
       aggSpecs = hctx.specs;
+      groupingSpecs = hctx.groupingSpecs ?? groupingSpecs;
     }
     // Rebase the window placeholder slots now that the row layout is final (window.md §5.1). The
     // window stage's row is [input… , materialized window keys… , window results…], where inputWidth
@@ -6968,7 +6987,40 @@ export class Database {
           if (o.idx >= WINDOW_KEY_BASE) o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
         }
       }
-      for (const p of projections) rebaseWindowResults(p, resultBase);
+      for (const p of projections) rebasePlaceholderCols(p, WINDOW_RESULT_BASE, resultBase);
+    }
+    // Build the grouping sets (spec/design/aggregates.md §12). For an aggregate query with no GROUP BY
+    // this is the single empty (whole-table) set; otherwise one entry per resolved set, each recording
+    // its bucket key columns, the per-master-slot value source (or -1 = NULL), and the GROUPING() mask.
+    const groupSets: GroupSet[] = isAgg
+      ? resolvedSets.map((set) => {
+          const slotSrc = new Array<number>(groupKeys.length).fill(-1);
+          set.forEach((fidx, j) => {
+            const p = groupKeys.indexOf(fidx);
+            slotSrc[p] = j;
+          });
+          // bigint to match Rust/Go i64 exactly for >31 master columns (JS `<<` is 32-bit).
+          let mask = 0n;
+          for (let p = 0; p < slotSrc.length; p++) if (slotSrc[p] < 0) mask |= 1n << BigInt(p);
+          return { keyCols: set.slice(), slotSrc, mask };
+        })
+      : [];
+    // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
+    // (spec/design/aggregates.md §12) — both want the grouped-row trailing slots, and the combination
+    // is deferred. A pure single-set GROUP BY + window stays on the existing path.
+    if (hasWindow && (groupSets.length > 1 || groupingSpecs.length > 0)) {
+      throw engineError(
+        "feature_not_supported",
+        "GROUPING SETS / GROUPING() with window functions is not supported",
+      );
+    }
+    // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
+    // groupKeys.length+aggSpecs.length+g (the GROUPING results follow the master columns and aggregate
+    // results — §12). GROUPING never coexists with window functions (guarded above).
+    if (groupingSpecs.length > 0) {
+      const gbase = groupKeys.length + aggSpecs.length;
+      for (const p of projections) rebasePlaceholderCols(p, GROUPING_GS_BASE, gbase);
+      if (having !== null) rebasePlaceholderCols(having, GROUPING_GS_BASE, gbase);
     }
     // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
     if (isAgg && sel.distinct) {
@@ -7144,6 +7196,8 @@ export class Database {
       filter,
       isAgg,
       groupKeys,
+      groupSets,
+      groupingSpecs,
       aggSpecs,
       hasWindow,
       windowSpecs,
@@ -7844,50 +7898,73 @@ export class Database {
       // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
       const newSeen = (): (Set<string> | null)[] =>
         plan.aggSpecs.map((s) => (s.distinct ? new Set<string>() : null));
-      const index = new Map<string, number>();
-      const groups: { keys: Value[]; accs: Acc[]; seen: (Set<string> | null)[] }[] = [];
-      if (plan.groupKeys.length === 0) {
-        groups.push({ keys: [], accs: newAccs(), seen: newSeen() });
-        index.set("", 0);
-      }
-      for (const row of rows) {
-        meter.guard(); // enforce the cost ceiling per folded row (CLAUDE.md §13)
-        const keys = plan.groupKeys.map((gk) => row[gk]!);
-        const k = distinctRowKey(keys);
-        let gi = index.get(k);
-        if (gi === undefined) {
-          gi = groups.length;
-          index.set(k, gi);
-          groups.push({ keys, accs: newAccs(), seen: newSeen() });
+      // One grouping set per plan.groupSets (spec/design/aggregates.md §12): a plain GROUP BY /
+      // whole-table aggregate has exactly one; ROLLUP / CUBE / GROUPING SETS have several. Each set is
+      // bucketed independently over the SAME post-WHERE rows and its groups projected into the shared
+      // synthetic row [master_columns…, aggregate_results…, GROUPING_results…]: a column not grouped
+      // in this set is NULL, and each GROUPING() value comes from this set's mask. The scan
+      // (storageRowRead) is upstream and counted once; aggregateAccumulate + operand evals accrue per
+      // (set × row × passing aggregate). The per-set index Map is never iterated — output order comes
+      // from the insertion-ordered groups then the set order (no Map-order leak — §8/§10).
+      let groupRows: Value[][] = [];
+      for (const gset of plan.groupSets) {
+        const index = new Map<string, number>();
+        const groups: { keys: Value[]; accs: Acc[]; seen: (Set<string> | null)[] }[] = [];
+        // An empty grouping set (the () / whole-table grand total) is one pre-created group, so it
+        // emits ONE row even over zero input; a non-empty set over empty input emits nothing.
+        if (gset.keyCols.length === 0) {
+          groups.push({ keys: [], accs: newAccs(), seen: newSeen() });
+          index.set("", 0);
         }
-        const accs = groups[gi]!.accs;
-        const seen = groups[gi]!.seen;
-        plan.aggSpecs.forEach((spec, i) => {
-          // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL) contributes
-          // nothing to THIS aggregate — its operand is not evaluated and it is not accumulated
-          // (aggregates.md §11). The filter's own operatorEvals are charged (it is evaluated per row,
-          // like the operand); aggregateAccumulate is charged only for a row that passes. The
-          // pass/fold decision is deterministic (scan order is cross-core identical).
-          if (spec.filter !== undefined && spec.filter !== null) {
-            if (!isTrue(evalExpr(spec.filter, row, env, meter))) return;
+        for (const row of rows) {
+          meter.guard(); // enforce the cost ceiling per folded row (CLAUDE.md §13)
+          const keys = gset.keyCols.map((gk) => row[gk]!);
+          const k = distinctRowKey(keys);
+          let gi = index.get(k);
+          if (gi === undefined) {
+            gi = groups.length;
+            index.set(k, gi);
+            groups.push({ keys, accs: newAccs(), seen: newSeen() });
           }
-          meter.charge(COSTS.aggregateAccumulate);
-          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
-          // DISTINCT: skip a NULL (never folded by any aggregate) and any value already folded into
-          // this group — the FIRST occurrence in scan order wins, so the set of folded values (and
-          // the decimalWork fold charges) is order-deterministic and cross-core identical.
-          const dedup = seen[i];
-          if (dedup) {
-            if (v.kind === "null") return;
-            const dk = distinctRowKey([v]);
-            if (dedup.has(dk)) return;
-            dedup.add(dk);
+          const accs = groups[gi]!.accs;
+          const seen = groups[gi]!.seen;
+          plan.aggSpecs.forEach((spec, i) => {
+            // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL) contributes
+            // nothing to THIS aggregate — its operand is not evaluated and it is not accumulated
+            // (aggregates.md §11). The filter's own operatorEvals are charged (it is evaluated per row,
+            // like the operand); aggregateAccumulate is charged only for a row that passes. The
+            // pass/fold decision is deterministic (scan order is cross-core identical).
+            if (spec.filter !== undefined && spec.filter !== null) {
+              if (!isTrue(evalExpr(spec.filter, row, env, meter))) return;
+            }
+            meter.charge(COSTS.aggregateAccumulate);
+            const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
+            // DISTINCT: skip a NULL (never folded by any aggregate) and any value already folded into
+            // this group — the FIRST occurrence in scan order wins, so the set of folded values (and
+            // the decimalWork fold charges) is order-deterministic and cross-core identical.
+            const dedup = seen[i];
+            if (dedup) {
+              if (v.kind === "null") return;
+              const dk = distinctRowKey([v]);
+              if (dedup.has(dk)) return;
+              dedup.add(dk);
+            }
+            foldAcc(accs[i]!, v, meter);
+          });
+        }
+        // Build one synthetic row per group of this set: each master grouping column's value (NULL
+        // where this set doesn't group it), then the aggregate results, then each GROUPING() value
+        // (computed from this set's mask — spec/design/aggregates.md §12).
+        for (const g of groups) {
+          const srow: Value[] = [];
+          for (const src of gset.slotSrc) srow.push(src < 0 ? nullValue() : g.keys[src]!);
+          for (const a of g.accs) srow.push(finalizeAcc(a));
+          for (const positions of plan.groupingSpecs) {
+            srow.push(intValue(groupingValue(positions, gset.mask)));
           }
-          foldAcc(accs[i]!, v, meter);
-        });
+          groupRows.push(srow);
+        }
       }
-      // Build one synthetic row per group: [group_key_values..., aggregate_results...].
-      let groupRows = groups.map((g) => [...g.keys, ...g.accs.map((a) => finalizeAcc(a))]);
       // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
       // evaluated against each group's synthetic row (charging its operatorEvals per group);
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
@@ -9651,6 +9728,127 @@ const WINDOW_RESULT_BASE = 2 ** 40;
 // keeps its real row slot. (2 ** 41, NOT 1 << 41 — JS bitwise is 32-bit.)
 const WINDOW_KEY_BASE = 2 ** 41;
 
+// GROUPING_GS_BASE is the placeholder base a GROUPING(...) call carries until the rebase pass rewrites
+// it to its real trailing synthetic slot groupKeys.length+aggSpecs.length+g (the GROUPING results
+// follow the master columns + aggregate results — spec/design/aggregates.md §12). Disjoint from the
+// window bases, below 2**53 for exactness. GROUPING is mutually exclusive with window functions, so
+// its placeholders never coexist with the window ones in a projection. (2 ** 42, NOT 1 << 42.)
+const GROUPING_GS_BASE = 2 ** 42;
+
+// MAX_GROUPING_SETS bounds a GROUP BY's total expansion (CUBE of n columns alone is 2^n). Beyond this
+// the statement is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (a
+// deliberate divergence from PostgreSQL's per-construct "CUBE is limited to 12 elements" / 54011; jed
+// bounds the total expansion instead). spec/design/aggregates.md §12.
+const MAX_GROUPING_SETS = 4096;
+
+// GroupSet is one resolved grouping set of a GROUP BY (spec/design/aggregates.md §12). A plain GROUP
+// BY has exactly one; ROLLUP/CUBE/GROUPING SETS produce several. Each is bucketed independently over
+// the post-WHERE rows and its groups projected into the shared synthetic row, whose first
+// groupKeys.length slots are the master grouping columns (the ordered union of all sets' columns).
+type GroupSet = {
+  // keyCols: the flat input-row indices this set buckets on (its key, in key order). Empty = one
+  // grand-total group (always emits one row, even over an empty input — the () / whole-table case).
+  keyCols: number[];
+  // slotSrc: per master grouping-column slot (length groupKeys.length): >= 0 if this set includes
+  // that column (its synthetic value is the bucket key's slotSrc[p]-th component), else -1 (NULL).
+  slotSrc: number[];
+  // mask: the GROUPING() bitmask for rows from this set — bit p set iff master slot p is NOT in it.
+  mask: bigint;
+};
+
+// groupItemSetCount is the number of grouping sets a single GROUP BY term expands to, saturating well
+// below MAX_GROUPING_SETS+1 so a huge CUBE cannot overflow the product before the limit check.
+function groupItemSetCount(item: GroupItem): number {
+  switch (item.kind) {
+    case "set":
+      return 1;
+    case "rollup":
+      return item.groups.length + 1;
+    case "cube":
+      return item.groups.length >= 20 ? MAX_GROUPING_SETS + 1 : 2 ** item.groups.length;
+    case "groupingSets": {
+      let total = 0;
+      for (const el of item.elems) {
+        total += groupItemSetCount(el);
+        if (total > MAX_GROUPING_SETS) return MAX_GROUPING_SETS + 1;
+      }
+      return total;
+    }
+  }
+}
+
+// expandGroupItem expands a single GROUP BY term into its grouping sets, each a list of column Exprs
+// (ROLLUP/CUBE/GROUPING SETS and nesting — spec/design/aggregates.md §12). The per-set column order
+// is textual; the set order is deterministic and identical across cores (tests compare with rowsort).
+function expandGroupItem(item: GroupItem): Expr[][] {
+  switch (item.kind) {
+    case "set":
+      return [item.cols.slice()];
+    case "rollup": {
+      // The prefixes longest-first down to the empty set — n+1 sets.
+      const out: Expr[][] = [];
+      for (let k = item.groups.length; k >= 0; k--) {
+        const set: Expr[] = [];
+        for (let i = 0; i < k; i++) set.push(...item.groups[i]!);
+        out.push(set);
+      }
+      return out;
+    }
+    case "cube": {
+      // Every subset of the column groups — 2^n sets (bit i = include group i).
+      const n = item.groups.length;
+      const out: Expr[][] = [];
+      for (let mask = 0; mask < 2 ** n; mask++) {
+        const set: Expr[] = [];
+        for (let i = 0; i < n; i++) if (mask & (1 << i)) set.push(...item.groups[i]!);
+        out.push(set);
+      }
+      return out;
+    }
+    case "groupingSets": {
+      const out: Expr[][] = [];
+      for (const el of item.elems) out.push(...expandGroupItem(el));
+      return out;
+    }
+  }
+}
+
+// expandGroupBy expands a whole GROUP BY clause into its grouping sets: the cross-product of the
+// top-level terms' expansions. An empty clause yields one empty set (the whole-table grand total).
+// Aborts 54001 if the expansion exceeds MAX_GROUPING_SETS (spec/design/aggregates.md §12).
+function expandGroupBy(items: GroupItem[]): Expr[][] {
+  let total = 1;
+  for (const it of items) {
+    total *= groupItemSetCount(it);
+    if (total > MAX_GROUPING_SETS) {
+      throw engineError(
+        "statement_too_complex",
+        `too many grouping sets (the limit is ${MAX_GROUPING_SETS})`,
+      );
+    }
+  }
+  let acc: Expr[][] = [[]];
+  for (const it of items) {
+    const exp = expandGroupItem(it);
+    const next: Expr[][] = [];
+    for (const a of acc) for (const s of exp) next.push([...a, ...s]);
+    acc = next;
+  }
+  return acc;
+}
+
+// groupingValue computes a GROUPING(args) result for a group from the grouping set whose mask is
+// given: bit (k-1-j) of the result is bit positions[j] of mask (spec/design/aggregates.md §12).
+function groupingValue(positions: number[], mask: bigint): bigint {
+  const k = positions.length;
+  let r = 0n;
+  for (let j = 0; j < k; j++) {
+    const bit = (mask >> BigInt(positions[j]!)) & 1n;
+    r |= bit << BigInt(k - 1 - j);
+  }
+  return r;
+}
+
 // rebaseWindowResults rewrites a grouped+window projection's window-result placeholder slots to their
 // real grouped-row slot (spec/design/window.md §5.1). During resolution a window result of index w is
 // assigned the placeholder WINDOW_RESULT_BASE+w, because its real slot
@@ -9658,28 +9856,28 @@ const WINDOW_KEY_BASE = 2 ** 41;
 // window argument or HAVING) has been collected. It descends into a subquery's lhs (current row space)
 // but NOT its plan (those columns index the subquery's own rows; a nested grouped+window plan was
 // already rebased when it was built). Mirrors collectTouched's variant coverage.
-function rebaseWindowResults(e: RExpr, wbase: number): void {
+function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
   switch (e.kind) {
     case "column":
-      if (e.index >= WINDOW_RESULT_BASE) e.index = wbase + (e.index - WINDOW_RESULT_BASE);
+      if (e.index >= from) e.index = target + (e.index - from);
       return;
     case "outerColumn":
       return;
     case "subquery":
-      if (e.lhs !== null) rebaseWindowResults(e.lhs, wbase); // current row space only; not the plan
+      if (e.lhs !== null) rebasePlaceholderCols(e.lhs, from, target); // current row space only; not the plan
       return;
     case "inValues":
-      rebaseWindowResults(e.lhs, wbase);
+      rebasePlaceholderCols(e.lhs, from, target);
       return;
     case "quantified":
-      rebaseWindowResults(e.lhs, wbase);
-      rebaseWindowResults(e.array, wbase);
+      rebasePlaceholderCols(e.lhs, from, target);
+      rebasePlaceholderCols(e.array, from, target);
       return;
     case "cast":
     case "neg":
     case "not":
     case "isNull":
-      rebaseWindowResults(e.operand, wbase);
+      rebasePlaceholderCols(e.operand, from, target);
       return;
     case "arith":
     case "compare":
@@ -9688,33 +9886,33 @@ function rebaseWindowResults(e: RExpr, wbase: number): void {
     case "distinct":
     case "like":
     case "regex":
-      rebaseWindowResults(e.lhs, wbase);
-      rebaseWindowResults(e.rhs, wbase);
+      rebasePlaceholderCols(e.lhs, from, target);
+      rebasePlaceholderCols(e.rhs, from, target);
       return;
     case "casing":
-      rebaseWindowResults(e.arg, wbase);
+      rebasePlaceholderCols(e.arg, from, target);
       return;
     case "atTimeZone":
-      rebaseWindowResults(e.zone, wbase);
-      rebaseWindowResults(e.value, wbase);
+      rebasePlaceholderCols(e.zone, from, target);
+      rebasePlaceholderCols(e.value, from, target);
       return;
     case "dateTrunc":
-      rebaseWindowResults(e.unit, wbase);
-      rebaseWindowResults(e.value, wbase);
-      if (e.zone !== null) rebaseWindowResults(e.zone, wbase);
+      rebasePlaceholderCols(e.unit, from, target);
+      rebasePlaceholderCols(e.value, from, target);
+      if (e.zone !== null) rebasePlaceholderCols(e.zone, from, target);
       return;
     case "extract":
-      rebaseWindowResults(e.value, wbase);
+      rebasePlaceholderCols(e.value, from, target);
       return;
     case "dateConvert":
-      rebaseWindowResults(e.inner, wbase);
+      rebasePlaceholderCols(e.inner, from, target);
       return;
     case "case":
       for (const arm of e.arms) {
-        rebaseWindowResults(arm.cond, wbase);
-        rebaseWindowResults(arm.result, wbase);
+        rebasePlaceholderCols(arm.cond, from, target);
+        rebasePlaceholderCols(arm.result, from, target);
       }
-      rebaseWindowResults(e.els, wbase);
+      rebasePlaceholderCols(e.els, from, target);
       return;
     case "scalarFunc":
     case "arrayFunc":
@@ -9724,20 +9922,20 @@ function rebaseWindowResults(e: RExpr, wbase: number): void {
     case "rangeOp":
     case "rangeSetOp":
     case "variadic":
-      for (const a of e.args) rebaseWindowResults(a, wbase);
+      for (const a of e.args) rebasePlaceholderCols(a, from, target);
       return;
     case "row":
-      for (const f of e.fields) rebaseWindowResults(f, wbase);
+      for (const f of e.fields) rebasePlaceholderCols(f, from, target);
       return;
     case "array":
-      for (const el of e.elements) rebaseWindowResults(el, wbase);
+      for (const el of e.elements) rebasePlaceholderCols(el, from, target);
       return;
     case "field":
-      rebaseWindowResults(e.base, wbase);
+      rebasePlaceholderCols(e.base, from, target);
       return;
     case "subscript":
-      rebaseWindowResults(e.base, wbase);
-      for (const b of rSubscriptBounds(e.subscripts)) rebaseWindowResults(b, wbase);
+      rebasePlaceholderCols(e.base, from, target);
+      for (const b of rSubscriptBounds(e.subscripts)) rebasePlaceholderCols(b, from, target);
       return;
     default: // leaves: param, const*
   }
@@ -10359,6 +10557,13 @@ type SelectPlan = {
   filter: RExpr | null;
   isAgg: boolean;
   groupKeys: number[];
+  // groupSets are the grouping sets to compute (spec/design/aggregates.md §12). A plain GROUP BY
+  // (and the whole-table aggregate) is a single set; ROLLUP/CUBE/GROUPING SETS produce several.
+  groupSets: GroupSet[];
+  // groupingSpecs has one entry per GROUPING() call in the projection / HAVING, in synthetic-slot
+  // order: the master-grouping-column positions of its arguments. Each call's value per group row is
+  // computed from the row's grouping-set mask and appended after the aggregate results.
+  groupingSpecs: number[][];
   aggSpecs: AggSpec[];
   // hasWindow is true when the select list has a window function — the query runs the blocking
   // WINDOW stage (after WHERE, before ORDER BY/LIMIT) and takes the eager path (never streaming).
@@ -10595,6 +10800,11 @@ type AggCtx = {
   // carries the placeholder slot base WINDOW_RESULT_BASE+w; a materialized window key carries
   // WINDOW_KEY_BASE+k — both rebased once the row layout is final (spec/design/window.md §5.1).
   window?: { base: number; windowSpecs: WindowSpec[]; windowKeys: RExpr[] };
+  // groupingSpecs collects one entry per GROUPING(c1,…,ck) call from the projection / HAVING — the
+  // master-grouping-column POSITIONS (indices into groupKeys) of its arguments. Each call resolves to
+  // the placeholder slot GROUPING_GS_BASE+index, rebased after resolution to its real trailing
+  // synthetic slot (spec/design/aggregates.md §12).
+  groupingSpecs?: number[][];
 };
 
 // WindowSpec is one resolved window function (spec/design/window.md §5.1): its plan, the resolved
@@ -11505,6 +11715,51 @@ function resolveAggregate(
   return { node: { kind: "column", index: slot }, type: result };
 }
 
+// resolveGrouping resolves GROUPING(c1, …, ck) (spec/design/aggregates.md §12) — the grouping-sets
+// membership function. Valid only in a grouped query's projection / HAVING (collecting); each
+// argument must be one of the master grouping columns, else 42803 (matching PostgreSQL). Returns an
+// integer (i32) whose bit (k-1-j) is 1 iff c_j is grouped away in the row's grouping set. The value
+// is computed per group row at execution from the grouping set's mask, so the call resolves to the
+// placeholder slot GROUPING_GS_BASE+index (rebased to its real trailing synthetic slot afterwards).
+function resolveGrouping(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) {
+    // GROUPING(*) — PG raises a syntax error; mirror the COUNT-only `*` message (42601).
+    throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  }
+  if (e.args.length === 0) {
+    // GROUPING() with no arguments — PG raises a syntax error (42601).
+    throw engineError("syntax_error", "GROUPING requires at least one argument");
+  }
+  const groupingArgErr = () =>
+    engineError(
+      "grouping_error",
+      "arguments to GROUPING must be grouping expressions of the associated query level",
+    );
+  // GROUPING is meaningful only in a grouped query; outside one its arguments cannot be grouping
+  // expressions. (GROUPING with window functions is rejected 0A000 earlier in resolveSelectPlan.)
+  if (!ag.collecting) throw groupingArgErr();
+  const positions: number[] = [];
+  for (const arg of e.args) {
+    let r: { level: number; index: number };
+    if (arg.kind === "column") r = scope.resolveBare(arg.name);
+    else if (arg.kind === "qualifiedColumn") r = scope.resolveQualified(arg.qualifier, arg.name);
+    // A non-column argument is never a grouping column (jed groups by columns only).
+    else throw groupingArgErr();
+    if (r.level !== 0) throw groupingArgErr();
+    const pos = ag.groupKeys.indexOf(r.index);
+    if (pos < 0) throw groupingArgErr();
+    positions.push(pos);
+  }
+  if (ag.groupingSpecs === undefined) ag.groupingSpecs = [];
+  const slot = GROUPING_GS_BASE + ag.groupingSpecs.length;
+  ag.groupingSpecs.push(positions);
+  return { node: { kind: "column", index: slot }, type: { kind: "int", ty: "i32" } };
+}
+
 // collectColumn resolves a column reference (already at real flat index `idx`) under an
 // aggregate context. In Forbidden mode (and Window mode — a window query's bare columns are not
 // grouped, spec/design/window.md §5.1) it reads the real input row directly; in collect mode it
@@ -12185,6 +12440,13 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     return resolveDateTrunc(scope, e, ag, params);
+  }
+  // GROUPING(c1, …, ck) — the grouping-sets membership function (spec/design/aggregates.md §12). It
+  // is not an aggregate (no DISTINCT/FILTER — those already errored 42809 above) and only resolves
+  // inside a grouped query, so it is intercepted before the by-name dispatch.
+  if (lname === "grouping") {
+    rejectNamed(lname, e.argNames);
+    return resolveGrouping(scope, e, ag);
   }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -13711,7 +13973,7 @@ function selectExprs(s: Select): Expr[] {
   const v: Expr[] = [];
   if (s.items.kind === "list") for (const it of s.items.items) v.push(it.expr);
   if (s.filter !== null) v.push(s.filter);
-  for (const g of s.groupBy) v.push(g);
+  for (const g of s.groupBy) forEachGroupExpr(g, (e) => v.push(e));
   if (s.having !== null) v.push(s.having);
   for (const j of s.joins) if (j.on !== null) v.push(j.on);
   return v;
@@ -14170,7 +14432,13 @@ function selectCallsSeqMutator(s: Select): boolean {
       (j) => tableRefCallsSeqMutator(j.table) || (j.on !== null && exprCallsSeqMutator(j.on)),
     ) ||
     (s.filter !== null && exprCallsSeqMutator(s.filter)) ||
-    s.groupBy.some(exprCallsSeqMutator) ||
+    s.groupBy.some((g) => {
+      let found = false;
+      forEachGroupExpr(g, (e) => {
+        if (exprCallsSeqMutator(e)) found = true;
+      });
+      return found;
+    }) ||
     (s.having !== null && exprCallsSeqMutator(s.having))
   );
 }
@@ -14404,7 +14672,7 @@ function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void 
     for (const it of s.items.items) collectExprPrivs(it.expr, req, locals);
   }
   if (s.filter !== null) collectExprPrivs(s.filter, req, locals);
-  for (const g of s.groupBy) collectExprPrivs(g, req, locals);
+  for (const g of s.groupBy) forEachGroupExpr(g, (e) => collectExprPrivs(e, req, locals));
   if (s.having !== null) collectExprPrivs(s.having, req, locals);
 }
 
@@ -14965,6 +15233,11 @@ function resolve(
     case "funcCall": {
       // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
       if (e.over !== undefined && e.over !== null) {
+        // GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in PostgreSQL
+        // (42601); match it rather than treating GROUPING as an unknown window function.
+        if (e.name.toLowerCase() === "grouping") {
+          throw engineError("syntax_error", "OVER is not supported for GROUPING");
+        }
         // DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5): a window
         // aggregate folds over a frame, where per-frame de-duplication is undefined.
         if (e.distinct) {

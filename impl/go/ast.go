@@ -518,10 +518,11 @@ type Select struct {
 	// empty when From is nil — joins exist only inside a FROM clause).
 	Joins  []JoinClause
 	Filter *Expr
-	// GroupBy holds the GROUP BY keys — bare or qualified table columns (never expressions /
-	// aliases / ordinals); nil/empty means no GROUP BY. Each is an ExprColumn or
-	// ExprQualifiedColumn (the parser restricts it to column_ref). spec/design/grammar.md §18.
-	GroupBy []Expr
+	// GroupBy holds the GROUP BY grouping terms — GroupSet for plain keys (`GROUP BY a, b` →
+	// two GroupSet items) plus the ROLLUP/CUBE/GROUPING SETS forms that expand to multiple
+	// grouping sets (spec/design/aggregates.md §12). nil/empty means no GROUP BY. Every grouping
+	// column is an ExprColumn or ExprQualifiedColumn (the parser restricts each to column_ref).
+	GroupBy []GroupItem
 	// Having is the HAVING predicate (a boolean filter over the grouped rows), if any. May
 	// reference aggregates and grouping keys; evaluated after aggregation, before ORDER BY.
 	// HAVING makes a query an aggregate query even with no GROUP BY (spec/design/grammar.md §19).
@@ -545,6 +546,54 @@ type Select struct {
 type NamedWindow struct {
 	Name string
 	Def  WindowDef
+}
+
+// GroupItemKind tags a GroupItem (spec/design/aggregates.md §12).
+type GroupItemKind int
+
+const (
+	// GroupSet is a single grouping set's column list: a bare column `a` (Cols=[a]), a
+	// parenthesized group `(a, b)` (Cols=[a,b]), or the empty set `()` (Cols=[]).
+	GroupSet GroupItemKind = iota
+	// GroupRollup is `ROLLUP (g1, …, gn)` — n+1 grouping sets (the prefixes of the column groups,
+	// longest first down to empty). Groups holds the column groups.
+	GroupRollup
+	// GroupCube is `CUBE (g1, …, gn)` — 2^n grouping sets (every subset of the column groups).
+	GroupCube
+	// GroupGroupingSets is `GROUPING SETS (e1, …, en)` — the concatenation of each element's
+	// expansion; an element may itself be any GroupItem (Elems holds them).
+	GroupGroupingSets
+)
+
+// GroupItem is one GROUP BY grouping term (spec/design/aggregates.md §12). Most queries use only
+// GroupSet with one column each (plain `GROUP BY a, b`); the ROLLUP/CUBE/GROUPING SETS forms produce
+// several grouping sets the resolver expands and cross-products. Each Expr is a bare/qualified column.
+type GroupItem struct {
+	Kind   GroupItemKind
+	Cols   []Expr      // GroupSet
+	Groups [][]Expr    // GroupRollup / GroupCube
+	Elems  []GroupItem // GroupGroupingSets
+}
+
+// forEachExpr visits every column Expr in this grouping term — used by the analysis walks that scan
+// a SELECT's expressions (privilege collection, sublink / sequence-mutator detection).
+func (g *GroupItem) forEachExpr(f func(*Expr)) {
+	switch g.Kind {
+	case GroupSet:
+		for i := range g.Cols {
+			f(&g.Cols[i])
+		}
+	case GroupRollup, GroupCube:
+		for i := range g.Groups {
+			for j := range g.Groups[i] {
+				f(&g.Groups[i][j])
+			}
+		}
+	case GroupGroupingSets:
+		for i := range g.Elems {
+			g.Elems[i].forEachExpr(f)
+		}
+	}
 }
 
 // QueryExpr is the operand of a set operation (spec/design/grammar.md §25): a single SELECT core, a

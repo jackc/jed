@@ -529,10 +529,11 @@ pub struct Select {
     pub joins: Vec<JoinClause>,
     /// The WHERE expression (must resolve to boolean), if any.
     pub filter: Option<Expr>,
-    /// GROUP BY keys — bare or qualified table columns (never expressions/aliases/ordinals);
-    /// empty means no GROUP BY. Each is a `Column` or `QualifiedColumn` (the parser restricts
-    /// it to `column_ref`). With keys present the query groups (spec/design/grammar.md §18).
-    pub group_by: Vec<Expr>,
+    /// GROUP BY grouping terms — `GroupItem::Set` for plain keys (`GROUP BY a, b` →
+    /// `[Set([a]), Set([b])]`) plus the `ROLLUP`/`CUBE`/`GROUPING SETS` forms that expand to
+    /// *multiple* grouping sets (spec/design/aggregates.md §12). Empty means no GROUP BY. Every
+    /// grouping column is a bare/qualified `Column` (the parser restricts each to `column_ref`).
+    pub group_by: Vec<GroupItem>,
     /// The HAVING predicate (a boolean filter over the grouped rows), if any. May reference
     /// aggregates and grouping keys; evaluated after aggregation, before ORDER BY. HAVING makes
     /// a query an aggregate query even with no GROUP BY (spec/design/grammar.md §19).
@@ -669,6 +670,39 @@ pub enum SelectItems {
     All,
     /// Projected expressions, one per output column.
     Items(Vec<SelectItem>),
+}
+
+/// A `GROUP BY` grouping term (grammar.md §18, spec/design/aggregates.md §12). Most queries use
+/// only `Set` with one column each (plain `GROUP BY a, b` parses as `[Set([a]), Set([b])]`); the
+/// `ROLLUP`/`CUBE`/`GROUPING SETS` forms produce *multiple* grouping sets the resolver expands and
+/// cross-products. Each `Expr` inside is a bare/qualified `Column` (the parser enforces it).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GroupItem {
+    /// A single grouping set's column list: a bare column `a` (`Set([a])`), a parenthesized group
+    /// `(a, b)` (`Set([a, b])`), or the empty set `()` (`Set([])`).
+    Set(Vec<Expr>),
+    /// `ROLLUP (g1, …, gn)` — n+1 grouping sets: the prefixes of the column groups, longest first
+    /// down to the empty set. Each `gi` is a column group (one or more columns).
+    Rollup(Vec<Vec<Expr>>),
+    /// `CUBE (g1, …, gn)` — 2^n grouping sets: every subset of the column groups.
+    Cube(Vec<Vec<Expr>>),
+    /// `GROUPING SETS (e1, …, en)` — the concatenation of each element's expansion; an element may
+    /// itself be a `Set`/`Rollup`/`Cube`/nested `GroupingSets`.
+    GroupingSets(Vec<GroupItem>),
+}
+
+impl GroupItem {
+    /// Visit every column `Expr` contained anywhere in this grouping term — used by the analysis
+    /// walks that scan a SELECT's expressions (privilege collection, sublink/sequence detection).
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        match self {
+            GroupItem::Set(cols) => cols.iter().for_each(|e| f(e)),
+            GroupItem::Rollup(groups) | GroupItem::Cube(groups) => {
+                groups.iter().flatten().for_each(|e| f(e));
+            }
+            GroupItem::GroupingSets(elems) => elems.iter().for_each(|e| e.for_each_expr(f)),
+        }
+    }
 }
 
 /// One select-list expression with its optional output-name alias (`expr AS name`).

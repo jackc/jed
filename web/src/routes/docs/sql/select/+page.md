@@ -153,6 +153,8 @@ ORDER BY on_day;`;
 Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).
+`GROUP BY` also takes `GROUPING SETS`, `ROLLUP`, and `CUBE` to compute several groupings at once,
+with the `GROUPING(col)` function to tell subtotal rows apart.
 
 Grouping and aggregation:
 

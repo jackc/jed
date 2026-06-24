@@ -7,9 +7,10 @@
 use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
-    DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinKind, Literal, OnConflict,
-    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind,
-    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind, Literal,
+    OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp,
+    SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WindowDef, WithExpr,
+    WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -8083,28 +8084,42 @@ impl Database {
             ctes,
         };
 
-        // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column —
-        // grammar.md §18). An unknown column is 42703, an ambiguous bare key 42702.
-        let mut group_keys: Vec<usize> = Vec::with_capacity(sel.group_by.len());
-        for key in &sel.group_by {
-            let r = match key {
-                Expr::Column(name) => scope.resolve_bare(name)?,
-                Expr::QualifiedColumn { qualifier, name } => {
-                    scope.resolve_qualified(qualifier, name)?
+        // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,
+        // resolve each set's columns to flat row indices, and build the *master* grouping-column list
+        // (`group_keys`) — the ordered union of every set's columns, i.e. the columns groupable in at
+        // least one set (spec/design/aggregates.md §12). A plain `GROUP BY a, b` expands to a single
+        // set `[a, b]`; no GROUP BY expands to a single empty set (the whole-table grand total). An
+        // unknown column is 42703, an ambiguous bare key 42702. Each key is a bare/qualified column.
+        let expanded = expand_group_by(&sel.group_by)?;
+        let mut group_keys: Vec<usize> = Vec::new();
+        let mut resolved_sets: Vec<Vec<usize>> = Vec::with_capacity(expanded.len());
+        for set in &expanded {
+            let mut idxs: Vec<usize> = Vec::with_capacity(set.len());
+            for key in set {
+                let r = match key {
+                    Expr::Column(name) => scope.resolve_bare(name)?,
+                    Expr::QualifiedColumn { qualifier, name } => {
+                        scope.resolve_qualified(qualifier, name)?
+                    }
+                    _ => unreachable!("the parser restricts GROUP BY keys to column references"),
+                };
+                let idx = match r {
+                    Resolved::Local(idx) => idx,
+                    // Grouping by an enclosing-query column (a per-outer-row constant) is degenerate
+                    // and unsupported this slice — the key machinery is flat local indices (§26).
+                    Resolved::Outer { .. } => {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "GROUP BY may not reference an outer query column",
+                        ));
+                    }
+                };
+                if !group_keys.contains(&idx) {
+                    group_keys.push(idx);
                 }
-                _ => unreachable!("the parser restricts GROUP BY keys to column references"),
-            };
-            match r {
-                Resolved::Local(idx) => group_keys.push(idx),
-                // Grouping by an enclosing-query column (a per-outer-row constant) is degenerate
-                // and unsupported this slice — the key machinery is flat local indices (§26).
-                Resolved::Outer { .. } => {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "GROUP BY may not reference an outer query column",
-                    ));
-                }
+                idxs.push(idx);
             }
+            resolved_sets.push(idxs);
         }
 
         // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
@@ -8116,7 +8131,9 @@ impl Database {
         // An aggregate also makes the query an aggregate query when it appears inside a window
         // definition's keys — inline (`OVER (ORDER BY sum(x))`, caught by `items_have_aggregate`) or in
         // a WINDOW-clause entry (`WINDOW w AS (ORDER BY sum(x))`, scanned here before the desugar).
-        let is_agg = !group_keys.is_empty()
+        // Note `!sel.group_by.is_empty()` (not `group_keys`): `GROUP BY GROUPING SETS (())` has an
+        // empty master list yet is still an aggregate query (the whole-table grand total).
+        let is_agg = !sel.group_by.is_empty()
             || items_have_aggregate(&sel.items)
             || sel.having.is_some()
             || windows_have_aggregate(&sel.windows);
@@ -8136,6 +8153,7 @@ impl Database {
             AggCtx::Collect {
                 group_keys: group_keys.clone(),
                 specs: Vec::new(),
+                grouping_specs: Vec::new(),
             }
         } else if has_window_syntax {
             AggCtx::Window {
@@ -8174,12 +8192,22 @@ impl Database {
         // Pull the collected aggregate + window specs (and materialized window-key expressions) out of
         // the projection context. A grouped+window query (`GroupedWindow`) carries all; a plain
         // aggregate/window query carries one (the rest empty). spec/design/window.md §5.1.
+        // `grouping_specs` (the GROUPING() calls — only ever collected in `Collect`) is pulled out
+        // alongside the aggregate/window specs (spec/design/aggregates.md §12).
+        let mut grouping_specs: Vec<Vec<usize>> = Vec::new();
         let (mut agg_specs, mut window_specs, window_keys): (
             Vec<AggSpec>,
             Vec<WindowSpec>,
             Vec<RExpr>,
         ) = match agg_ctx {
-            AggCtx::Collect { specs, .. } => (specs, Vec::new(), Vec::new()),
+            AggCtx::Collect {
+                specs,
+                grouping_specs: gs,
+                ..
+            } => {
+                grouping_specs = gs;
+                (specs, Vec::new(), Vec::new())
+            }
             AggCtx::Window {
                 specs, window_keys, ..
             } => (Vec::new(), specs, window_keys),
@@ -8202,10 +8230,17 @@ impl Database {
                 let mut hctx = AggCtx::Collect {
                     group_keys: group_keys.clone(),
                     specs: std::mem::take(&mut agg_specs),
+                    grouping_specs: std::mem::take(&mut grouping_specs),
                 };
                 let (node, ty) = resolve(&scope, h, None, &mut hctx, ptypes)?;
-                if let AggCtx::Collect { specs, .. } = hctx {
+                if let AggCtx::Collect {
+                    specs,
+                    grouping_specs: gs,
+                    ..
+                } = hctx
+                {
                     agg_specs = specs;
+                    grouping_specs = gs;
                 }
                 match ty {
                     ResolvedType::Bool | ResolvedType::Null => Some(node),
@@ -8244,7 +8279,59 @@ impl Database {
                 }
             }
             for p in &mut projections {
-                rebase_window_results(p, result_base);
+                rebase_placeholder_cols(p, WINDOW_RESULT_BASE, result_base);
+            }
+        }
+        // Build the grouping sets (spec/design/aggregates.md §12). For an aggregate query with no
+        // GROUP BY this is the single empty (whole-table) set; otherwise one entry per resolved set,
+        // each recording its bucket key columns, the per-master-slot value source (or NULL), and the
+        // GROUPING() bitmask. A non-aggregate query carries none (the field is unused).
+        let group_sets: Vec<GroupSetPlan> = if is_agg {
+            resolved_sets
+                .iter()
+                .map(|set| {
+                    let mut slot_src: Vec<Option<usize>> = vec![None; group_keys.len()];
+                    for (j, &fidx) in set.iter().enumerate() {
+                        let p = group_keys.iter().position(|&g| g == fidx).unwrap();
+                        slot_src[p] = Some(j);
+                    }
+                    let mut mask: i64 = 0;
+                    for (p, src) in slot_src.iter().enumerate() {
+                        if src.is_none() {
+                            mask |= 1i64 << p;
+                        }
+                    }
+                    GroupSetPlan {
+                        key_cols: set.clone(),
+                        slot_src,
+                        mask,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one
+        // query (spec/design/aggregates.md §12) — both want the grouped-row trailing slots, and the
+        // combination is deferred. A pure single-set GROUP BY + window stays on the existing path.
+        if has_window && (group_sets.len() > 1 || !grouping_specs.is_empty()) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "GROUPING SETS / GROUPING() with window functions is not supported",
+            ));
+        }
+        // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
+        // `group_keys.len() + agg_specs.len() + g` (the GROUPING results follow the master columns and
+        // aggregate results — §12). GROUPING never coexists with window functions (guarded above), so
+        // these are the only placeholders left in the projection / HAVING.
+        let mut having = having;
+        if !grouping_specs.is_empty() {
+            let gbase = group_keys.len() + agg_specs.len();
+            for p in &mut projections {
+                rebase_placeholder_cols(p, GROUPING_GS_BASE, gbase);
+            }
+            if let Some(h) = &mut having {
+                rebase_placeholder_cols(h, GROUPING_GS_BASE, gbase);
             }
         }
         // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
@@ -8494,6 +8581,8 @@ impl Database {
             filter,
             is_agg,
             group_keys,
+            group_sets,
+            grouping_specs,
             agg_specs,
             has_window,
             window_specs,
@@ -9376,61 +9465,89 @@ impl Database {
                     .map(|s| s.distinct.then(HashSet::new))
                     .collect()
             };
-            let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
-            let mut groups: Vec<(Vec<Value>, Vec<Acc>, Vec<Option<HashSet<Value>>>)> = Vec::new();
-            if plan.group_keys.is_empty() {
-                groups.push((Vec::new(), new_accs(), new_seen()));
-                index.insert(Vec::new(), 0);
-            }
-            for row in &rows {
-                meter.guard()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
-                let key: Vec<Value> = plan.group_keys.iter().map(|&gk| row[gk].clone()).collect();
-                let gi = match index.get(&key) {
-                    Some(&i) => i,
-                    None => {
-                        let i = groups.len();
-                        index.insert(key.clone(), i);
-                        groups.push((key, new_accs(), new_seen()));
-                        i
-                    }
-                };
-                for (si, spec) in plan.agg_specs.iter().enumerate() {
-                    // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
-                    // contributes nothing to THIS aggregate — its operand is not evaluated and it is
-                    // not accumulated (aggregates.md §11). The filter's own operator_evals are charged
-                    // (it is evaluated per row, like the operand); aggregate_accumulate is charged only
-                    // for a row that passes. The pass/fold decision is deterministic (scan order is
-                    // cross-core identical), so the metered cost is identical across cores.
-                    if let Some(f) = &spec.filter
-                        && !f.eval(row, &env, &mut meter)?.is_true()
-                    {
-                        continue;
-                    }
-                    meter.charge(COSTS.aggregate_accumulate);
-                    let v = match &spec.operand {
-                        Some(op) => op.eval(row, &env, &mut meter)?,
-                        None => Value::Null, // COUNT(*) ignores the value
+            // One grouping set per `plan.group_sets` (spec/design/aggregates.md §12): a plain GROUP BY
+            // / whole-table aggregate has exactly one; ROLLUP / CUBE / GROUPING SETS have several. Each
+            // set is bucketed independently over the SAME post-WHERE rows and its groups projected into
+            // the shared synthetic row `[master_columns…, aggregate_results…, GROUPING_results…]`: a
+            // column not grouped in this set is NULL, and each GROUPING() call's value comes from this
+            // set's mask. The scan (storage_row_read) is upstream and counted once; aggregate_accumulate
+            // + operand evals accrue per (set × row × passing aggregate). The per-set bucket index is
+            // never iterated — output order comes from the insertion-ordered `groups` then the set order
+            // (no hashmap-order leak — CLAUDE.md §8/§10).
+            let mut group_rows: Vec<Vec<Value>> = Vec::new();
+            for gset in &plan.group_sets {
+                let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+                let mut groups: Vec<(Vec<Value>, Vec<Acc>, Vec<Option<HashSet<Value>>>)> =
+                    Vec::new();
+                // An empty grouping set (the `()` / whole-table grand total) is one pre-created group,
+                // so it emits ONE row even over zero input; a non-empty set over an empty input emits
+                // nothing (spec/design/aggregates.md §4/§12).
+                if gset.key_cols.is_empty() {
+                    groups.push((Vec::new(), new_accs(), new_seen()));
+                    index.insert(Vec::new(), 0);
+                }
+                for row in &rows {
+                    meter.guard()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
+                    let key: Vec<Value> = gset.key_cols.iter().map(|&gk| row[gk].clone()).collect();
+                    let gi = match index.get(&key) {
+                        Some(&i) => i,
+                        None => {
+                            let i = groups.len();
+                            index.insert(key.clone(), i);
+                            groups.push((key, new_accs(), new_seen()));
+                            i
+                        }
                     };
-                    // DISTINCT: skip a NULL (never folded by any aggregate) and any value already
-                    // folded into this group — the FIRST occurrence in scan order wins, so the set
-                    // of folded values (and the decimal_work fold charges) is order-deterministic
-                    // and cross-core identical. `insert` returns false when the value is a repeat.
-                    if let Some(seen) = &mut groups[gi].2[si]
-                        && (matches!(v, Value::Null) || !seen.insert(v.clone()))
-                    {
-                        continue;
+                    for (si, spec) in plan.agg_specs.iter().enumerate() {
+                        // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
+                        // contributes nothing to THIS aggregate — its operand is not evaluated and it
+                        // is not accumulated (aggregates.md §11). The filter's own operator_evals are
+                        // charged (it is evaluated per row, like the operand); aggregate_accumulate is
+                        // charged only for a row that passes. The pass/fold decision is deterministic
+                        // (scan order is cross-core identical), so the metered cost is identical.
+                        if let Some(f) = &spec.filter
+                            && !f.eval(row, &env, &mut meter)?.is_true()
+                        {
+                            continue;
+                        }
+                        meter.charge(COSTS.aggregate_accumulate);
+                        let v = match &spec.operand {
+                            Some(op) => op.eval(row, &env, &mut meter)?,
+                            None => Value::Null, // COUNT(*) ignores the value
+                        };
+                        // DISTINCT: skip a NULL (never folded by any aggregate) and any value already
+                        // folded into this group — the FIRST occurrence in scan order wins, so the set
+                        // of folded values (and the decimal_work fold charges) is order-deterministic
+                        // and cross-core identical. `insert` returns false when the value is a repeat.
+                        if let Some(seen) = &mut groups[gi].2[si]
+                            && (matches!(v, Value::Null) || !seen.insert(v.clone()))
+                        {
+                            continue;
+                        }
+                        groups[gi].1[si].fold(v, &mut meter)?;
                     }
-                    groups[gi].1[si].fold(v, &mut meter)?;
                 }
-            }
-            // Build one synthetic row per group: [group_key_values..., aggregate_results...].
-            let mut group_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-            for (key, accs, _seen) in groups {
-                let mut srow = key;
-                for acc in accs {
-                    srow.push(acc.finalize()?);
+                // Build one synthetic row per group of this set: each master grouping column's value
+                // (NULL where this set doesn't group it), then the aggregate results, then each
+                // GROUPING() value (computed from this set's mask — spec/design/aggregates.md §12).
+                for (key, accs, _seen) in groups {
+                    let mut srow: Vec<Value> = Vec::with_capacity(
+                        plan.group_keys.len() + plan.agg_specs.len() + plan.grouping_specs.len(),
+                    );
+                    for src in &gset.slot_src {
+                        srow.push(match src {
+                            Some(j) => key[*j].clone(),
+                            None => Value::Null,
+                        });
+                    }
+                    for acc in accs {
+                        srow.push(acc.finalize()?);
+                    }
+                    for positions in &plan.grouping_specs {
+                        srow.push(Value::Int(grouping_value(positions, gset.mask)));
+                    }
+                    group_rows.push(srow);
                 }
-                group_rows.push(srow);
             }
             // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The
             // predicate is evaluated against each group's synthetic row (charging its
@@ -11835,7 +11952,9 @@ fn select_exprs(s: &Select) -> Vec<&Expr> {
         v.extend(items.iter().map(|it| &it.expr));
     }
     v.extend(s.filter.iter());
-    v.extend(s.group_by.iter());
+    for item in &s.group_by {
+        item.for_each_expr(&mut |e| v.push(e));
+    }
     v.extend(s.having.iter());
     v.extend(s.joins.iter().filter_map(|j| j.on.as_ref()));
     v
@@ -12121,12 +12240,37 @@ struct PlanJoin {
 
 /// A resolved SELECT, executable against an outer-row environment (the execute half of the old
 /// `run_select`, lifted to a value so a correlated subquery can re-run it per outer row).
+/// One resolved grouping set of a `GROUP BY` (spec/design/aggregates.md §12). For a plain `GROUP BY`
+/// there is exactly one of these; `ROLLUP`/`CUBE`/`GROUPING SETS` produce several. Each is bucketed
+/// independently over the post-`WHERE` rows and its groups projected into the shared synthetic row,
+/// whose first `group_keys.len()` slots are the *master* grouping columns (the ordered union of all
+/// sets' columns).
+struct GroupSetPlan {
+    /// The flat input-row indices this set buckets on (its key, in key order). Empty = one grand-total
+    /// group (always emits one row, even over an empty input — the `()` / whole-table case).
+    key_cols: Vec<usize>,
+    /// Per master-grouping-column slot (length `group_keys.len()`): `Some(j)` if this set includes
+    /// that column — its synthetic value is the bucket key's `j`-th component — else `None`, meaning
+    /// the column is not grouped in this set and its synthetic value is `NULL`.
+    slot_src: Vec<Option<usize>>,
+    /// The `GROUPING()` bitmask for rows from this set: bit `p` is set iff master slot `p` is NOT in
+    /// this set (so `GROUPING(col)` returns 1 for a column grouped away in this set).
+    mask: i64,
+}
+
 struct SelectPlan {
     rels: Vec<PlanRel>,
     joins: Vec<PlanJoin>,
     filter: Option<RExpr>,
     is_agg: bool,
     group_keys: Vec<usize>,
+    /// The grouping sets to compute (spec/design/aggregates.md §12). A plain `GROUP BY` (and the
+    /// whole-table aggregate) is a single set; `ROLLUP`/`CUBE`/`GROUPING SETS` produce several.
+    group_sets: Vec<GroupSetPlan>,
+    /// One entry per `GROUPING(...)` call in the projection / HAVING, in synthetic-slot order: the
+    /// master-grouping-column positions of its arguments. Each call's value per group row is computed
+    /// from the row's grouping-set `mask` and appended after the aggregate results.
+    grouping_specs: Vec<Vec<usize>>,
     agg_specs: Vec<AggSpec>,
     /// `true` when the select list has a window function — the query runs the blocking WINDOW
     /// stage (after WHERE, before ORDER BY/LIMIT) and takes the eager path (never streaming).
@@ -13315,6 +13459,11 @@ enum AggCtx {
     Collect {
         group_keys: Vec<usize>,
         specs: Vec<AggSpec>,
+        /// One entry per `GROUPING(c1, …, ck)` call collected from the projection / HAVING — each is
+        /// the list of master-grouping-column POSITIONS (indices into `group_keys`) of its arguments.
+        /// The call resolves to the placeholder slot `GROUPING_GS_BASE + index`, rebased after
+        /// resolution to its real trailing synthetic slot (spec/design/aggregates.md §12).
+        grouping_specs: Vec<Vec<usize>>,
     },
     /// A non-aggregate WINDOW query's projection (spec/design/window.md §5.1). Bare columns
     /// resolve to the real input row (like Forbidden); a `FuncCall` carrying an `OVER` clause
@@ -13338,7 +13487,7 @@ enum AggCtx {
     /// slot (`group_keys.len() + agg_specs.len() + w`) is not known until EVERY aggregate has been
     /// collected (one may be nested in a later window argument or the HAVING clause), a window
     /// result is resolved to the PLACEHOLDER slot `WINDOW_RESULT_BASE + w` and rewritten to its real
-    /// slot by `rebase_window_results` after resolution finishes.
+    /// slot by `rebase_placeholder_cols` after resolution finishes.
     GroupedWindow {
         group_keys: Vec<usize>,
         agg_specs: Vec<AggSpec>,
@@ -13351,7 +13500,7 @@ enum AggCtx {
     },
 }
 
-/// The placeholder base a window query's window results carry until `rebase_window_results` rewrites
+/// The placeholder base a window query's window results carry until `rebase_placeholder_cols` rewrites
 /// them to `input_width + window_keys.len() + w` (spec/design/window.md §5.1). Far above any real
 /// column/synthetic-slot count, and below 2⁵³ so it is exact in the TS core's `number`.
 const WINDOW_RESULT_BASE: usize = 1 << 40;
@@ -13361,6 +13510,20 @@ const WINDOW_RESULT_BASE: usize = 1 << 40;
 /// `input_width + k` (spec/design/window.md §5.1). Disjoint from `WINDOW_RESULT_BASE`'s range, and
 /// below 2⁵³ for the TS core. A bare-column key is NOT materialized — it keeps its real row slot.
 const WINDOW_KEY_BASE: usize = 1 << 41;
+
+/// The placeholder base a `GROUPING(...)` call carries until the rebase pass rewrites it to its real
+/// trailing synthetic slot `group_keys.len() + agg_specs.len() + grouping_index` (the GROUPING
+/// results follow the master columns + aggregate results in the grouped row —
+/// spec/design/aggregates.md §12). Disjoint from the window bases, below 2⁵³ for the TS core.
+/// GROUPING is mutually exclusive with window functions, so its placeholders never coexist with the
+/// window ones in a projection.
+const GROUPING_GS_BASE: usize = 1 << 42;
+
+/// The maximum number of grouping sets a `GROUP BY` may expand to (`CUBE` of n columns alone is
+/// 2ⁿ). Beyond this the statement is aborted `54001` (statement_too_complex) — jed's structural-
+/// complexity gate (a deliberate divergence from PostgreSQL's per-construct "CUBE is limited to 12
+/// elements" / 54011; jed bounds the total expansion instead). spec/design/aggregates.md §12.
+const MAX_GROUPING_SETS: usize = 4096;
 
 /// One resolved window function (spec/design/window.md §5.1): its plan, the resolved PARTITION BY
 /// key column slots (flat input-row indices), and the resolved within-partition ORDER BY (sort
@@ -14653,67 +14816,157 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
     }
 }
 
-/// Rewrite a grouped+window projection's window-result placeholder slots to their real grouped-row
-/// slot (spec/design/window.md §5.1). During resolution a window result of index `w` is assigned the
-/// placeholder `WINDOW_RESULT_BASE + w`, because its real slot `group_keys.len() + agg_specs.len() +
-/// w` is unknown until every aggregate (including any nested in a later window argument or the
-/// HAVING clause) has been collected. Once it is, this rewrites `Column(WINDOW_RESULT_BASE + w)` to
-/// `Column(wbase + w)`. It descends into a subquery's `lhs` (current row space) but NOT its plan
-/// (those columns index the subquery's own rows; a nested grouped+window plan was already rebased
-/// when it was built). Mirrors `collect_touched`'s variant coverage.
-fn rebase_window_results(e: &mut RExpr, wbase: usize) {
+/// The number of grouping sets a single GROUP BY term expands to, saturating well below `usize::MAX`
+/// so a huge `CUBE` cannot overflow the product before the `MAX_GROUPING_SETS` limit check.
+fn group_item_set_count(item: &GroupItem) -> usize {
+    match item {
+        GroupItem::Set(_) => 1,
+        GroupItem::Rollup(groups) => groups.len() + 1,
+        // CUBE of n column groups is 2ⁿ; clamp the exponent so the shift can't overflow.
+        GroupItem::Cube(groups) => {
+            if groups.len() >= 20 {
+                usize::MAX >> 1
+            } else {
+                1usize << groups.len()
+            }
+        }
+        GroupItem::GroupingSets(elems) => elems
+            .iter()
+            .map(group_item_set_count)
+            .fold(0usize, |a, c| a.saturating_add(c)),
+    }
+}
+
+/// Expand a single GROUP BY term into its list of grouping sets, each a list of column `Expr`s
+/// (`ROLLUP`/`CUBE`/`GROUPING SETS` and nesting — spec/design/aggregates.md §12). The per-set column
+/// order is the textual order; the set order is deterministic and identical across cores (tests
+/// compare the row multiset with `rowsort`).
+fn expand_group_item(item: &GroupItem) -> Vec<Vec<&Expr>> {
+    match item {
+        GroupItem::Set(cols) => vec![cols.iter().collect()],
+        // ROLLUP(g1..gn): the prefixes longest-first down to the empty set — n+1 sets.
+        GroupItem::Rollup(groups) => (0..=groups.len())
+            .rev()
+            .map(|k| groups[..k].iter().flatten().collect())
+            .collect(),
+        // CUBE(g1..gn): every subset of the column groups — 2ⁿ sets (bit i = include group i).
+        GroupItem::Cube(groups) => (0..(1usize << groups.len()))
+            .map(|mask| {
+                let mut s: Vec<&Expr> = Vec::new();
+                for (i, g) in groups.iter().enumerate() {
+                    if mask & (1usize << i) != 0 {
+                        s.extend(g.iter());
+                    }
+                }
+                s
+            })
+            .collect(),
+        // GROUPING SETS(e1..en): the concatenation of each element's expansion.
+        GroupItem::GroupingSets(elems) => elems.iter().flat_map(expand_group_item).collect(),
+    }
+}
+
+/// Expand a whole GROUP BY clause into its grouping sets: the cross-product of the top-level terms'
+/// expansions (`GROUP BY a, ROLLUP(b,c)` → `{(a,b,c),(a,b),(a)}`). An empty clause yields one empty
+/// set (the whole-table grand total). Aborts `54001` if the expansion exceeds `MAX_GROUPING_SETS`.
+fn expand_group_by(items: &[GroupItem]) -> Result<Vec<Vec<&Expr>>> {
+    let mut total: usize = 1;
+    for it in items {
+        total = total.saturating_mul(group_item_set_count(it));
+    }
+    if total > MAX_GROUPING_SETS {
+        return Err(EngineError::new(
+            SqlState::StatementTooComplex,
+            format!("too many grouping sets (the limit is {MAX_GROUPING_SETS})"),
+        ));
+    }
+    let mut acc: Vec<Vec<&Expr>> = vec![Vec::new()];
+    for it in items {
+        let exp = expand_group_item(it);
+        let mut next: Vec<Vec<&Expr>> = Vec::with_capacity(acc.len() * exp.len().max(1));
+        for a in &acc {
+            for s in &exp {
+                let mut combined = a.clone();
+                combined.extend(s.iter().copied());
+                next.push(combined);
+            }
+        }
+        acc = next;
+    }
+    Ok(acc)
+}
+
+/// Compute a `GROUPING(args)` result for a group from the grouping set whose `mask` is given: bit
+/// `(k-1-j)` of the result is bit `positions[j]` of `mask` (1 iff that column is grouped away in this
+/// set). spec/design/aggregates.md §12.
+fn grouping_value(positions: &[usize], mask: i64) -> i64 {
+    let k = positions.len();
+    let mut r: i64 = 0;
+    for (j, &p) in positions.iter().enumerate() {
+        let bit = (mask >> p) & 1;
+        r |= bit << (k - 1 - j);
+    }
+    r
+}
+
+/// Rewrite placeholder column slots `>= base` (a window-result `WINDOW_RESULT_BASE + w` or a
+/// `GROUPING(...)` `GROUPING_GS_BASE + g`) to their real synthetic slot `target + (slot - base)`,
+/// once the grouped/windowed row layout is final (spec/design/window.md §5.1, aggregates.md §12).
+/// Window functions and GROUPING are mutually exclusive in a projection, so only one base's
+/// placeholders ever appear.
+fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize) {
     match e {
         RExpr::Column(i) => {
-            if *i >= WINDOW_RESULT_BASE {
-                *i = wbase + (*i - WINDOW_RESULT_BASE);
+            if *i >= from {
+                *i = target + (*i - from);
             }
         }
         RExpr::Subquery { lhs, .. } => {
             if let Some(l) = lhs {
-                rebase_window_results(l, wbase);
+                rebase_placeholder_cols(l, from, target);
             }
         }
-        RExpr::InValues { lhs, .. } => rebase_window_results(lhs, wbase),
+        RExpr::InValues { lhs, .. } => rebase_placeholder_cols(lhs, from, target),
         RExpr::Quantified { lhs, array, .. } => {
-            rebase_window_results(lhs, wbase);
-            rebase_window_results(array, wbase);
+            rebase_placeholder_cols(lhs, from, target);
+            rebase_placeholder_cols(array, from, target);
         }
-        RExpr::Cast { inner, .. } => rebase_window_results(inner, wbase),
-        RExpr::Neg { operand, .. } => rebase_window_results(operand, wbase),
-        RExpr::Not(x) => rebase_window_results(x, wbase),
-        RExpr::Casing { arg, .. } => rebase_window_results(arg, wbase),
+        RExpr::Cast { inner, .. } => rebase_placeholder_cols(inner, from, target),
+        RExpr::Neg { operand, .. } => rebase_placeholder_cols(operand, from, target),
+        RExpr::Not(x) => rebase_placeholder_cols(x, from, target),
+        RExpr::Casing { arg, .. } => rebase_placeholder_cols(arg, from, target),
         RExpr::AtTimeZone { zone, value, .. } => {
-            rebase_window_results(zone, wbase);
-            rebase_window_results(value, wbase);
+            rebase_placeholder_cols(zone, from, target);
+            rebase_placeholder_cols(value, from, target);
         }
         RExpr::DateTrunc { unit, value, zone } => {
-            rebase_window_results(unit, wbase);
-            rebase_window_results(value, wbase);
+            rebase_placeholder_cols(unit, from, target);
+            rebase_placeholder_cols(value, from, target);
             if let Some(z) = zone {
-                rebase_window_results(z, wbase);
+                rebase_placeholder_cols(z, from, target);
             }
         }
-        RExpr::Extract { value, .. } => rebase_window_results(value, wbase),
-        RExpr::DateConvert { inner, .. } => rebase_window_results(inner, wbase),
+        RExpr::Extract { value, .. } => rebase_placeholder_cols(value, from, target),
+        RExpr::DateConvert { inner, .. } => rebase_placeholder_cols(inner, from, target),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
         | RExpr::Like { lhs, rhs, .. }
         | RExpr::Regex { lhs, rhs, .. } => {
-            rebase_window_results(lhs, wbase);
-            rebase_window_results(rhs, wbase);
+            rebase_placeholder_cols(lhs, from, target);
+            rebase_placeholder_cols(rhs, from, target);
         }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
-            rebase_window_results(l, wbase);
-            rebase_window_results(r, wbase);
+            rebase_placeholder_cols(l, from, target);
+            rebase_placeholder_cols(r, from, target);
         }
-        RExpr::IsNull { operand, .. } => rebase_window_results(operand, wbase),
+        RExpr::IsNull { operand, .. } => rebase_placeholder_cols(operand, from, target),
         RExpr::Case { arms, els, .. } => {
             for (c, r) in arms {
-                rebase_window_results(c, wbase);
-                rebase_window_results(r, wbase);
+                rebase_placeholder_cols(c, from, target);
+                rebase_placeholder_cols(r, from, target);
             }
-            rebase_window_results(els, wbase);
+            rebase_placeholder_cols(els, from, target);
         }
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
@@ -14724,28 +14977,28 @@ fn rebase_window_results(e: &mut RExpr, wbase: usize) {
         | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. } => {
             for a in args {
-                rebase_window_results(a, wbase);
+                rebase_placeholder_cols(a, from, target);
             }
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             for f in fields {
-                rebase_window_results(f, wbase);
+                rebase_placeholder_cols(f, from, target);
             }
         }
-        RExpr::Field { base, .. } => rebase_window_results(base, wbase),
+        RExpr::Field { base, .. } => rebase_placeholder_cols(base, from, target),
         RExpr::Subscript {
             base, subscripts, ..
         } => {
-            rebase_window_results(base, wbase);
+            rebase_placeholder_cols(base, from, target);
             for s in subscripts.iter_mut() {
                 match s {
-                    RSubscript::Index(i) => rebase_window_results(i, wbase),
+                    RSubscript::Index(i) => rebase_placeholder_cols(i, from, target),
                     RSubscript::Slice { lower, upper } => {
                         if let Some(l) = lower {
-                            rebase_window_results(l, wbase);
+                            rebase_placeholder_cols(l, from, target);
                         }
                         if let Some(u) = upper {
-                            rebase_window_results(u, wbase);
+                            rebase_placeholder_cols(u, from, target);
                         }
                     }
                 }
@@ -15636,7 +15889,9 @@ fn resolve_aggregate(
     // (`GroupedWindow`) collects into the SAME `agg_specs` (its window results are slotted after
     // every aggregate — spec/design/window.md §5.1).
     match agg {
-        AggCtx::Collect { group_keys, specs } => {
+        AggCtx::Collect {
+            group_keys, specs, ..
+        } => {
             let slot = group_keys.len() + specs.len();
             specs.push(AggSpec {
                 plan,
@@ -15662,6 +15917,76 @@ fn resolve_aggregate(
         }
         _ => unreachable!("an aggregate in a non-collecting context is handled above"),
     }
+}
+
+/// Resolve `GROUPING(c1, …, ck)` (spec/design/aggregates.md §12) — the grouping-sets membership
+/// function. Valid only in a grouped query's projection / HAVING (`Collect`); each argument must be
+/// one of the master grouping columns, else 42803 (matching PostgreSQL). Returns an `integer` (i32)
+/// whose bit `(k-1-j)` is 1 iff `c_j` is grouped away in the row's grouping set. The value is computed
+/// per group row at execution from the grouping set's mask, so the call resolves to the placeholder
+/// slot `GROUPING_GS_BASE + index` (rebased to its real trailing synthetic slot after resolution).
+fn resolve_grouping(
+    scope: &Scope,
+    args: &[Expr],
+    star: bool,
+    agg: &mut AggCtx,
+    _params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if star {
+        // GROUPING(*) — PG raises a syntax error; mirror the COUNT-only `*` message (42601).
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "* is only valid as the argument of COUNT",
+        ));
+    }
+    if args.is_empty() {
+        // GROUPING() with no arguments — PG raises a syntax error (42601).
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "GROUPING requires at least one argument",
+        ));
+    }
+    let grouping_arg_err = || {
+        EngineError::new(
+            SqlState::GroupingError,
+            "arguments to GROUPING must be grouping expressions of the associated query level",
+        )
+    };
+    // GROUPING is meaningful only in a grouped query; outside one (Forbidden / Window) — or, this
+    // slice, with window functions (GroupedWindow) — its arguments cannot be grouping expressions.
+    let group_keys: Vec<usize> = match agg {
+        AggCtx::Collect { group_keys, .. } => group_keys.clone(),
+        _ => return Err(grouping_arg_err()),
+    };
+    // Map each argument (a grouping column) to its master-grouping-column position.
+    let mut positions: Vec<usize> = Vec::with_capacity(args.len());
+    for arg in args {
+        let r = match arg {
+            Expr::Column(name) => scope.resolve_bare(name)?,
+            Expr::QualifiedColumn { qualifier, name } => {
+                scope.resolve_qualified(qualifier, name)?
+            }
+            // A non-column argument is never a grouping column (jed groups by columns only).
+            _ => return Err(grouping_arg_err()),
+        };
+        let idx = match r {
+            Resolved::Local(idx) => idx,
+            Resolved::Outer { .. } => return Err(grouping_arg_err()),
+        };
+        match group_keys.iter().position(|&g| g == idx) {
+            Some(p) => positions.push(p),
+            None => return Err(grouping_arg_err()),
+        }
+    }
+    let slot = match agg {
+        AggCtx::Collect { grouping_specs, .. } => {
+            let s = GROUPING_GS_BASE + grouping_specs.len();
+            grouping_specs.push(positions);
+            s
+        }
+        _ => unreachable!("Collect verified above"),
+    };
+    Ok((RExpr::Column(slot), ResolvedType::Int(ScalarType::Int32)))
 }
 
 /// Resolve a column reference (already at real flat index `idx`) under an aggregate context.
@@ -15756,6 +16081,7 @@ fn resolve_window_call(
             AggCtx::Collect {
                 group_keys: group_keys.clone(),
                 specs: std::mem::take(agg_specs),
+                grouping_specs: Vec::new(),
             },
             std::mem::take(window_keys),
         ),
@@ -16301,6 +16627,13 @@ fn resolve_func_call(
             ));
         }
         return resolve_date_trunc(scope, args, agg, params);
+    }
+    // GROUPING(c1, …, ck) — the grouping-sets membership function (spec/design/aggregates.md §12).
+    // It is not an aggregate (no DISTINCT/FILTER — those already errored 42809 above) and only
+    // resolves inside a grouped query, so it is intercepted before the by-name dispatch.
+    if lname == "grouping" {
+        reject_named(&lname, arg_names)?;
+        return resolve_grouping(scope, args, star, agg, params);
     }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -17307,7 +17640,11 @@ fn select_calls_seq_mutator(s: &Select) -> bool {
             .iter()
             .any(|j| table_ref_calls(&j.table) || j.on.as_ref().is_some_and(expr_calls_seq_mutator))
         || s.filter.as_ref().is_some_and(expr_calls_seq_mutator)
-        || s.group_by.iter().any(expr_calls_seq_mutator)
+        || s.group_by.iter().any(|item| {
+            let mut found = false;
+            item.for_each_expr(&mut |e| found |= expr_calls_seq_mutator(e));
+            found
+        })
         || s.having.as_ref().is_some_and(expr_calls_seq_mutator)
 }
 
@@ -17570,8 +17907,8 @@ fn collect_select_privs(s: &Select, req: &mut PrivReq, locals: &HashSet<String>)
     if let Some(f) = &s.filter {
         collect_expr_privs(f, req, locals);
     }
-    for g in &s.group_by {
-        collect_expr_privs(g, req, locals);
+    for item in &s.group_by {
+        item.for_each_expr(&mut |g| collect_expr_privs(g, req, locals));
     }
     if let Some(h) = &s.having {
         collect_expr_privs(h, req, locals);
@@ -18099,6 +18436,14 @@ fn resolve(
         } => {
             // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
             if let Some(wd) = over {
+                // GROUPING is not a window function — `GROUPING(a) OVER ()` is a syntax error in
+                // PostgreSQL (42601); match it rather than treating GROUPING as an unknown window fn.
+                if name.eq_ignore_ascii_case("grouping") {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "OVER is not supported for GROUPING",
+                    ));
+                }
                 // DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5):
                 // a window aggregate folds over a frame, where per-frame de-duplication is undefined.
                 if *distinct {

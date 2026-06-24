@@ -2556,10 +2556,11 @@ func isTableRefStopKeyword(kw string) bool {
 // sel. NullsFirst is resolved here: explicit if given, else the direction default (ASC ->
 // last, DESC -> first). A bare NULLS not followed by FIRST/LAST is a syntax error (42601).
 // Leaves sel.OrderBy nil when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
-// parseGroupBy parses `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md
-// §18), after WHERE and before ORDER BY. Each key is a bare/qualified column (never an
-// expression/alias/ordinal). `GROUP` is not reserved, so it is a clause only when immediately
-// followed by `BY`.
+// parseGroupBy parses `group_by ::= "GROUP" "BY" group_item ("," group_item)*` (grammar.md §18),
+// after WHERE and before ORDER BY. Each term is an ordinary column, a parenthesized column group, or
+// ROLLUP/CUBE/GROUPING SETS (spec/design/aggregates.md §12); every grouping column is a
+// bare/qualified column (the same narrowing ORDER BY makes). `GROUP` is not reserved, so it is a
+// clause only when immediately followed by `BY`.
 func (p *Parser) parseGroupBy(sel *Select) error {
 	if p.peekKeyword() != "group" {
 		return nil
@@ -2569,17 +2570,11 @@ func (p *Parser) parseGroupBy(sel *Select) error {
 		return err
 	}
 	for {
-		qualifier, col, err := p.parseColumnRef()
+		item, err := p.parseGroupItem()
 		if err != nil {
 			return err
 		}
-		var key Expr
-		if qualifier != "" {
-			key = Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col}
-		} else {
-			key = Expr{Kind: ExprColumn, Column: col}
-		}
-		sel.GroupBy = append(sel.GroupBy, key)
+		sel.GroupBy = append(sel.GroupBy, item)
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue
@@ -2587,6 +2582,116 @@ func (p *Parser) parseGroupBy(sel *Select) error {
 		break
 	}
 	return nil
+}
+
+// parseGroupItem parses one GROUP BY grouping term — a ROLLUP/CUBE/GROUPING SETS construct, or an
+// ordinary column group (a bare column, a parenthesized `(a, b)`, or the empty set `()`). Also used
+// for the elements of a GROUPING SETS list (which may nest these forms). ROLLUP/CUBE/GROUPING/SETS
+// are unreserved, recognized by lookahead only.
+func (p *Parser) parseGroupItem() (GroupItem, error) {
+	switch p.peekKeyword() {
+	case "rollup":
+		p.advance()
+		groups, err := p.parseGroupSetList()
+		return GroupItem{Kind: GroupRollup, Groups: groups}, err
+	case "cube":
+		p.advance()
+		groups, err := p.parseGroupSetList()
+		return GroupItem{Kind: GroupCube, Groups: groups}, err
+	case "grouping":
+		if p.peekKeywordAt(1) == "sets" {
+			p.advance() // GROUPING
+			p.advance() // SETS
+			if err := p.expect(TokLParen); err != nil {
+				return GroupItem{}, err
+			}
+			var elems []GroupItem
+			for {
+				elem, err := p.parseGroupItem()
+				if err != nil {
+					return GroupItem{}, err
+				}
+				elems = append(elems, elem)
+				if p.peek().Kind == TokComma {
+					p.advance()
+					continue
+				}
+				break
+			}
+			if err := p.expect(TokRParen); err != nil {
+				return GroupItem{}, err
+			}
+			return GroupItem{Kind: GroupGroupingSets, Elems: elems}, nil
+		}
+	}
+	cols, err := p.parseGroupSet()
+	return GroupItem{Kind: GroupSet, Cols: cols}, err
+}
+
+// parseGroupSetList parses the parenthesized `( group_set ("," group_set)* )` argument list of
+// ROLLUP / CUBE, where each element is a column group (spec/design/aggregates.md §12).
+func (p *Parser) parseGroupSetList() ([][]Expr, error) {
+	if err := p.expect(TokLParen); err != nil {
+		return nil, err
+	}
+	var sets [][]Expr
+	for {
+		set, err := p.parseGroupSet()
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, set)
+		if p.peek().Kind == TokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	if err := p.expect(TokRParen); err != nil {
+		return nil, err
+	}
+	return sets, nil
+}
+
+// parseGroupSet parses a single grouping "column group": a parenthesized `( col, ... )` / empty `()`,
+// or a bare column. Every member is a bare/qualified column reference.
+func (p *Parser) parseGroupSet() ([]Expr, error) {
+	if p.peek().Kind == TokLParen {
+		p.advance()
+		cols := []Expr{}
+		if p.peek().Kind != TokRParen {
+			for {
+				qualifier, col, err := p.parseColumnRef()
+				if err != nil {
+					return nil, err
+				}
+				cols = append(cols, columnRefExpr(qualifier, col))
+				if p.peek().Kind == TokComma {
+					p.advance()
+					continue
+				}
+				break
+			}
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return nil, err
+		}
+		return cols, nil
+	}
+	qualifier, col, err := p.parseColumnRef()
+	if err != nil {
+		return nil, err
+	}
+	return []Expr{columnRefExpr(qualifier, col)}, nil
+}
+
+// columnRefExpr builds a bare or qualified column-reference Expr from a parsed column_ref (the GROUP
+// BY grouping terms are columns only — spec/design/aggregates.md §12).
+func columnRefExpr(qualifier, col string) Expr {
+	if qualifier != "" {
+		return Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col}
+	}
+	return Expr{Kind: ExprColumn, Column: col}
 }
 
 // parseHaving parses `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and
