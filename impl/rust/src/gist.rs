@@ -303,21 +303,28 @@ pub struct GistPage {
     pub payload: Vec<u8>,
 }
 
-/// Serialize the whole tree to its node pages, numbering from `base_page` in canonical post-order.
-/// Returns the pages and the root page number.
-pub fn serialize_tree(tree: &GistTree, elem: &ColType, base_page: u32) -> (Vec<GistPage>, u32) {
+/// Serialize the whole tree to its node pages in canonical post-order (children before parent, the
+/// root last). `alloc` hands out the next page number — a contiguous counter for the from-scratch
+/// image, or the free-list allocator for an incremental commit — so GiST pages interleave with the
+/// rest of the file's pages. Returns the pages (each with its allocated number) and the root page.
+pub fn serialize_tree<A>(tree: &GistTree, elem: &ColType, alloc: &mut A) -> (Vec<GistPage>, u32)
+where
+    A: FnMut() -> u32,
+{
     let mut pages = Vec::new();
-    let mut next = base_page;
-    let root = serialize_node(&tree.root, elem, &mut pages, &mut next);
+    let root = serialize_node(&tree.root, elem, &mut pages, alloc);
     (pages, root)
 }
 
-fn serialize_node(
+fn serialize_node<A>(
     node: &GistNode,
     elem: &ColType,
     pages: &mut Vec<GistPage>,
-    next: &mut u32,
-) -> u32 {
+    alloc: &mut A,
+) -> u32
+where
+    A: FnMut() -> u32,
+{
     match node {
         GistNode::Leaf(entries) => {
             let mut payload = Vec::new();
@@ -328,8 +335,7 @@ fn serialize_node(
                 payload.extend_from_slice(&(e.skey.len() as u16).to_be_bytes());
                 payload.extend_from_slice(&e.skey);
             }
-            let page_no = *next;
-            *next += 1;
+            let page_no = alloc();
             pages.push(GistPage {
                 page_no,
                 page_type: PAGE_GIST_LEAF,
@@ -342,7 +348,7 @@ fn serialize_node(
             // Children first (post-order), in the node's canonical entry order.
             let child_pages: Vec<u32> = children
                 .iter()
-                .map(|c| serialize_node(&c.node, elem, pages, next))
+                .map(|c| serialize_node(&c.node, elem, pages, alloc))
                 .collect();
             let mut payload = Vec::new();
             for (c, cp) in children.iter().zip(child_pages.iter()) {
@@ -351,8 +357,7 @@ fn serialize_node(
                 payload.extend_from_slice(&b);
                 payload.extend_from_slice(&cp.to_be_bytes());
             }
-            let page_no = *next;
-            *next += 1;
+            let page_no = alloc();
             pages.push(GistPage {
                 page_no,
                 page_type: PAGE_GIST_INTERIOR,
@@ -460,6 +465,30 @@ where
     Ok(tree)
 }
 
+/// Flatten a tree back to its leaf keys (`encode_leaf_key` per row) — used on load to rebuild the
+/// index store from the persisted R-tree (the in-memory store is the leaf-key PMap; the R-tree is
+/// the on-disk form, gist.md §4.1). Order is irrelevant (the store re-sorts).
+pub fn leaf_keys(tree: &GistTree, elem: &ColType) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(tree.len);
+    collect_leaf_keys(&tree.root, elem, &mut out);
+    out
+}
+
+fn collect_leaf_keys(node: &GistNode, elem: &ColType, out: &mut Vec<Vec<u8>>) {
+    match node {
+        GistNode::Leaf(entries) => {
+            for e in entries {
+                out.push(encode_leaf_key(elem, &e.bound, &e.skey));
+            }
+        }
+        GistNode::Interior(children) => {
+            for c in children {
+                collect_leaf_keys(&c.node, elem, out);
+            }
+        }
+    }
+}
+
 /// Read one length-prefixed bound (`bound_len u16 ‖ encode_range_body`) into a `RangeVal`.
 fn read_bound(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<RangeVal> {
     let blen = rd_u16(buf, pos)? as usize;
@@ -565,6 +594,16 @@ mod tests {
         v
     }
 
+    /// A contiguous page allocator from `base` (mirrors the from-scratch image's counter).
+    fn contig(base: u32) -> impl FnMut() -> u32 {
+        let mut n = base;
+        move || {
+            let i = n;
+            n += 1;
+            i
+        }
+    }
+
     /// A `fetch` closure over an in-memory page map (mirrors the format layer reading pages on
     /// demand). Pages are padded to a page size to exercise the parse-exactly-`item_count` path.
     fn fetcher(pages: Vec<GistPage>) -> impl Fn(u32) -> Result<GistPage> {
@@ -641,11 +680,11 @@ mod tests {
         let rows: Vec<(i32, i32, u32)> = (0..30).map(|i| (i * 2, i * 2 + 5, i as u32)).collect();
         let t = build(&rows);
         let elem = i32_range_elem();
-        let (pages, root) = serialize_tree(&t, &elem, 7);
+        let (pages, root) = serialize_tree(&t, &elem, &mut contig(7));
         // Re-serializing the loaded tree yields identical pages (deterministic codec) — even though
         // load reads padded pages and parses exactly `item_count` entries.
         let loaded = load_tree(&elem, root, &fetcher(pages.clone())).unwrap();
-        let (pages2, root2) = serialize_tree(&loaded, &elem, 7);
+        let (pages2, root2) = serialize_tree(&loaded, &elem, &mut contig(7));
         assert_eq!(root, root2);
         assert_eq!(pages, pages2, "serialize is not deterministic across round-trip");
         assert_eq!(loaded.len(), t.len());
@@ -667,7 +706,7 @@ mod tests {
         let rows: Vec<(i32, i32, u32)> = (0..12).map(|i| (i, i + 2, i as u32)).collect();
         let t = build(&rows);
         let elem = i32_range_elem();
-        let (pages, root) = serialize_tree(&t, &elem, 0);
+        let (pages, root) = serialize_tree(&t, &elem, &mut contig(0));
         // Post-order: the root is allocated last (highest page number).
         assert_eq!(root, pages.iter().map(|p| p.page_no).max().unwrap());
         // Page numbers are a contiguous 0..n.
@@ -707,8 +746,8 @@ mod tests {
 
         let t1 = build_from_leaf_keys(&elem, keys_fwd.iter().map(|k| k.as_slice())).unwrap();
         let t2 = build_from_leaf_keys(&elem, keys_rev.iter().map(|k| k.as_slice())).unwrap();
-        let (p1, r1) = serialize_tree(&t1, &elem, 0);
-        let (p2, r2) = serialize_tree(&t2, &elem, 0);
+        let (p1, r1) = serialize_tree(&t1, &elem, &mut contig(0));
+        let (p2, r2) = serialize_tree(&t2, &elem, &mut contig(0));
         assert_eq!((r1, &p1), (r2, &p2), "build is not order-independent");
 
         // And it answers searches exactly like brute force.
