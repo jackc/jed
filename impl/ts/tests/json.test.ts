@@ -337,3 +337,24 @@ test("srf rename-only column list is deferred", () => {
     "0A000",
   );
 });
+
+// The deferred S2 sub-clauses of the SQL/JSON query functions are 0A000 — PASSING (path vars), ON
+// ERROR/EMPTY DEFAULT expr, JSON_QUERY OMIT QUOTES, and JSON_QUERY RETURNING a non-json type.
+// PostgreSQL supports all of these, so each is a documented divergence; the supported subset is
+// oracle-clean in suites/json/json_query_fns.test. Mirrors impl/rust/tests/json.rs
+// json_query_fn_deferred_clauses_are_0a000.
+test("json query function deferred clauses are 0A000", () => {
+  const db = dbWith([]);
+  for (const sql of [
+    `SELECT JSON_VALUE('{"a":1}', '$.a' PASSING 1 AS x)`,
+    `SELECT JSON_VALUE('{"a":1}', '$.b' DEFAULT 'z' ON EMPTY)`,
+    `SELECT JSON_QUERY('{"a":1}', '$.a' OMIT QUOTES)`,
+    `SELECT JSON_QUERY('{"a":1}', '$.a' RETURNING int)`,
+  ]) {
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "0A000",
+      `${sql} should defer 0A000`,
+    );
+  }
+});

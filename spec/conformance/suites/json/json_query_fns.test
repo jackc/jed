@@ -1,0 +1,91 @@
+# The SQL/JSON standard query functions JSON_EXISTS / JSON_VALUE / JSON_QUERY (S2,
+# spec/design/json-sql-functions.md §5) over the jsonpath evaluator. Keyword-led primaries with
+# sub-clauses (RETURNING, WRAPPER, constant ON EMPTY / ON ERROR). Output matches the postgres:18
+# oracle. Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns
+
+# JSON_EXISTS — non-empty sequence → true; a missing member (lax) → false.
+query BB nosort
+SELECT JSON_EXISTS('{"a": 1}', '$.a'), JSON_EXISTS('{"a": 1}', '$.b')
+----
+true
+false
+
+# A filter inside the path.
+query B nosort
+SELECT JSON_EXISTS('{"a": 1}', '$.a ? (@ > 5)')
+----
+false
+
+# A strict structural error defaults to FALSE ON ERROR; TRUE ON ERROR overrides.
+query BB nosort
+SELECT JSON_EXISTS('[1, 2]', 'strict $[5]'), JSON_EXISTS('[1, 2]', 'strict $[5]' TRUE ON ERROR)
+----
+false
+true
+
+# JSON_VALUE — extract a single scalar (default RETURNING text).
+query TT nosort
+SELECT JSON_VALUE('{"a": 42}', '$.a'), JSON_VALUE('{"a": "x"}', '$.a')
+----
+42
+x
+
+# RETURNING coerces the scalar to the declared type — here usable in arithmetic.
+query I nosort
+SELECT JSON_VALUE('{"a": 42}', '$.a' RETURNING int) + 1
+----
+43
+
+# A missing member → ON EMPTY (default NULL); a JSON null → SQL NULL.
+query TT nosort
+SELECT JSON_VALUE('{"a": 1}', '$.b'), JSON_VALUE('{"a": null}', '$.a')
+----
+NULL
+NULL
+
+# A non-scalar item / a coercion failure / >1 item → ON ERROR (default NULL).
+query TIT nosort
+SELECT JSON_VALUE('{"a": [1, 2]}', '$.a'), JSON_VALUE('{"a": "abc"}', '$.a' RETURNING int), JSON_VALUE('[1, 2]', 'strict $[*]' NULL ON ERROR)
+----
+NULL
+NULL
+NULL
+
+# JSON_QUERY — extract a json value (default jsonb); an object value comes back whole.
+query T nosort
+SELECT JSON_QUERY('{"a": [1, 2, 3]}', '$.a')
+----
+[1, 2, 3]
+
+# WITH WRAPPER wraps the sequence in an array; CONDITIONAL wraps only when not a singleton.
+query TT nosort
+SELECT JSON_QUERY('{"a": 1}', '$.a' WITH WRAPPER), JSON_QUERY('{"a": 1}', '$.a' WITH CONDITIONAL WRAPPER)
+----
+[1]
+1
+
+# WITHOUT WRAPPER on a >1-item sequence is an error → ON ERROR (default NULL); EMPTY ARRAY overrides.
+query TT nosort
+SELECT JSON_QUERY('[1, 2, 3]', '$[*]'), JSON_QUERY('[1, 2, 3]', '$[*]' EMPTY ARRAY ON ERROR)
+----
+NULL
+[]
+
+# A NULL context → NULL.
+query TB nosort
+SELECT JSON_VALUE(NULL::jsonb, '$.a'), JSON_EXISTS(NULL::jsonb, '$.a')
+----
+NULL
+NULL
+
+# ERROR ON ERROR raises the underlying SQL/JSON error: a non-scalar JSON_VALUE → 2203F.
+statement error 2203F
+SELECT JSON_VALUE('{"a": [1, 2]}', '$.a' ERROR ON ERROR)
+
+# >1 item (JSON_VALUE) or >1 item without a wrapper (JSON_QUERY) → 22034.
+statement error 22034
+SELECT JSON_VALUE('[1, 2]', 'strict $[*]' ERROR ON ERROR)
+
+statement error 22034
+SELECT JSON_QUERY('[1, 2, 3]', '$[*]' ERROR ON ERROR)

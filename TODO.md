@@ -402,8 +402,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           with` / `is unknown`, `$name` variables.
   - [~] **P2 / P3** — remaining: `like_regex` → Pike VM (§4.3), item methods (`.type()`/`.size()`/
         `.double()`/…), arithmetic, `vars`/`silent` args; then the `_tz` variants (P3). → jsonpath.md §5
-  - [~] **S1 ✅ / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅; then S2
-        `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY, needs P1). → json-sql-functions.md §5
+  - [x] **S1 ✅ / S2 ✅** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅ + S2
+        `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` ✅. → json-sql-functions.md §5
     - [x] **S1a — the `IS JSON` predicate** — ✅ `expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]
           [(WITH|WITHOUT) UNIQUE [KEYS]]`: well-formedness + kind + recursive unique-keys over a
           string/json/jsonb operand; malformed → false; NULL → NULL; non-string/json operand → `42804`;

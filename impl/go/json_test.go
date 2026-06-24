@@ -442,3 +442,22 @@ func TestSrfRenameOnlyColumnListIsDeferred(t *testing.T) {
 		t.Errorf("rename-only column list: got %s, want 0A000", got)
 	}
 }
+
+// TestJSONQueryFnDeferredClausesAre0A000: the SQL/JSON query functions' deferred sub-clauses (S2,
+// json-sql-functions.md §5) each resolve to 0A000 — PASSING path vars, a DEFAULT-expr behavior,
+// JSON_QUERY OMIT QUOTES, and a JSON_QUERY non-json RETURNING. A per-core test (the oracle corpus is
+// PG-clean, so a jed-defers case cannot live there). Mirrors impl/rust/tests/json.rs
+// json_query_fn_deferred_clauses_are_0a000.
+func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
+	db := NewDatabase()
+	for _, sql := range []string{
+		`SELECT JSON_VALUE('{"a":1}', '$.a' PASSING 1 AS x)`,
+		`SELECT JSON_VALUE('{"a":1}', '$.b' DEFAULT 'z' ON EMPTY)`,
+		`SELECT JSON_QUERY('{"a":1}', '$.a' OMIT QUOTES)`,
+		`SELECT JSON_QUERY('{"a":1}', '$.a' RETURNING int)`,
+	} {
+		if got := errJSON(t, db, sql); got != "0A000" {
+			t.Errorf("%s: got %s, want 0A000", sql, got)
+		}
+	}
+}

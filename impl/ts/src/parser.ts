@@ -22,7 +22,9 @@ import type {
   InsertValue,
   JoinClause,
   JoinKind,
+  JsonOnBehavior,
   JsonPredicateKind,
+  JsonWrapper,
   Literal,
   OnConflict,
   OrderKey,
@@ -2855,6 +2857,48 @@ class Parser {
       const t = this.advance();
       return { kind: "typedLiteral", typeName: nameTok.word!, text: t.str! };
     }
+    // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
+    // (json-sql-functions.md §5, S2) — keyword-led primaries with sub-clauses, recognized when the
+    // keyword is immediately followed by `(` (so the words stay usable as identifiers otherwise).
+    {
+      const kw = this.peekKeyword();
+      if (
+        (kw === "json_exists" || kw === "json_value" || kw === "json_query") &&
+        this.peekKindAt(1) === "lparen"
+      ) {
+        this.advance(); // the function keyword
+        this.advance(); // (
+        const ctx = this.parseExpr();
+        // `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb context
+        // is coerced to jsonb regardless).
+        this.skipFormatJson();
+        this.expect("comma");
+        const path = this.parseExpr();
+        // `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
+        if (this.peekKeyword() === "passing") {
+          throw engineError(
+            "feature_not_supported",
+            "JSON query function PASSING clause is not supported yet",
+          );
+        }
+        let expr: Expr;
+        if (kw === "json_exists") {
+          const onError = this.parseJsonOnErrorOnly();
+          expr = { kind: "jsonExists", ctx, path, onError };
+        } else if (kw === "json_value") {
+          const returning = this.parseJsonReturning();
+          const [onEmpty, onError] = this.parseJsonOnClauses();
+          expr = { kind: "jsonValue", ctx, path, returning, onEmpty, onError };
+        } else {
+          const returning = this.parseJsonReturning();
+          const [wrapper, keepQuotes] = this.parseJsonWrapperQuotes();
+          const [onEmpty, onError] = this.parseJsonOnClauses();
+          expr = { kind: "jsonQuery", ctx, path, returning, wrapper, keepQuotes, onEmpty, onError };
+        }
+        this.expect("rparen");
+        return expr;
+      }
+    }
     // `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
     // (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled above, a
     // string follows) and a generic call by being the JSON keyword immediately followed by `(`.
@@ -3233,6 +3277,190 @@ class Parser {
   }
 
   // --- cursor helpers ---
+
+  // skipFormatJson skips an optional `FORMAT JSON [ENCODING …]` clause after a SQL/JSON context item
+  // (json-sql-functions.md §5). The clause is accepted and ignored — a text/json/jsonb context is
+  // coerced to jsonb regardless.
+  private skipFormatJson(): void {
+    if (this.peekKeyword() === "format" && this.peekKeywordAt(1) === "json") {
+      this.advance(); // FORMAT
+      this.advance(); // JSON
+    }
+  }
+
+  // parseJsonReturning parses an optional `RETURNING <type> [FORMAT JSON]` clause → the type name
+  // (resolved later).
+  private parseJsonReturning(): string | null {
+    if (this.peekKeyword() !== "returning") return null;
+    this.advance(); // RETURNING
+    const ty = this.expectIdentifier();
+    this.skipFormatJson();
+    return ty;
+  }
+
+  // parseJsonBehavior parses one constant SQL/JSON behavior word (`ERROR` / `NULL` / `TRUE` / `FALSE`
+  // / `UNKNOWN` / `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is the deferred S3 follow-on (0A000).
+  private parseJsonBehavior(): JsonOnBehavior {
+    switch (this.peekKeyword()) {
+      case "error":
+        this.advance();
+        return "error";
+      case "null":
+        this.advance();
+        return "null";
+      case "true":
+        this.advance();
+        return "true";
+      case "false":
+        this.advance();
+        return "false";
+      case "unknown":
+        this.advance();
+        return "unknown";
+      case "empty": {
+        this.advance();
+        switch (this.peekKeyword()) {
+          case "object":
+            this.advance();
+            return "emptyObject";
+          case "array":
+            this.advance();
+            return "emptyArray";
+          // bare `EMPTY` defaults to `EMPTY ARRAY` (PostgreSQL).
+          default:
+            return "emptyArray";
+        }
+      }
+      case "default":
+        throw engineError(
+          "feature_not_supported",
+          "ON ERROR / ON EMPTY DEFAULT expr is not supported yet",
+        );
+      default:
+        throw engineError("syntax_error", "expected a SQL/JSON ON ERROR/EMPTY behavior");
+    }
+  }
+
+  // parseJsonOnErrorOnly parses JSON_EXISTS's single optional `<behavior> ON ERROR` clause.
+  private parseJsonOnErrorOnly(): JsonOnBehavior | null {
+    if (this.isJsonBehaviorStart() && this.peekOnClauseIs("error")) {
+      const b = this.parseJsonBehavior();
+      this.advance(); // ON
+      this.advance(); // ERROR
+      return b;
+    }
+    return null;
+  }
+
+  // parseJsonOnClauses parses the optional `<behavior> ON EMPTY` then `<behavior> ON ERROR` clauses
+  // (in that order).
+  private parseJsonOnClauses(): [JsonOnBehavior | null, JsonOnBehavior | null] {
+    let onEmpty: JsonOnBehavior | null = null;
+    let onError: JsonOnBehavior | null = null;
+    if (this.isJsonBehaviorStart() && this.peekOnClauseIs("empty")) {
+      const b = this.parseJsonBehavior();
+      this.advance(); // ON
+      this.advance(); // EMPTY
+      onEmpty = b;
+    }
+    if (this.isJsonBehaviorStart() && this.peekOnClauseIs("error")) {
+      const b = this.parseJsonBehavior();
+      this.advance(); // ON
+      this.advance(); // ERROR
+      onError = b;
+    }
+    return [onEmpty, onError];
+  }
+
+  // parseJsonWrapperQuotes parses JSON_QUERY's optional
+  // `[WITH [COND|UNCOND] [ARRAY] WRAPPER | WITHOUT [ARRAY] WRAPPER]` and
+  // `[KEEP|OMIT QUOTES [ON SCALAR STRING]]` clauses.
+  private parseJsonWrapperQuotes(): [JsonWrapper, boolean] {
+    let wrapper: JsonWrapper = "without";
+    switch (this.peekKeyword()) {
+      case "with": {
+        this.advance(); // WITH
+        switch (this.peekKeyword()) {
+          case "conditional":
+            this.advance();
+            wrapper = "conditional";
+            break;
+          case "unconditional":
+            this.advance();
+            wrapper = "unconditional";
+            break;
+          default:
+            wrapper = "unconditional";
+            break;
+        }
+        if (this.peekKeyword() === "array") this.advance();
+        this.expectKeyword("wrapper");
+        break;
+      }
+      case "without": {
+        this.advance(); // WITHOUT
+        if (this.peekKeyword() === "array") this.advance();
+        this.expectKeyword("wrapper");
+        break;
+      }
+      default:
+        break;
+    }
+    let keepQuotes = true;
+    switch (this.peekKeyword()) {
+      case "keep":
+        this.advance();
+        this.expectKeyword("quotes");
+        this.skipOnScalarString();
+        break;
+      case "omit":
+        this.advance();
+        this.expectKeyword("quotes");
+        this.skipOnScalarString();
+        keepQuotes = false;
+        break;
+      default:
+        break;
+    }
+    return [wrapper, keepQuotes];
+  }
+
+  // skipOnScalarString skips an optional `ON SCALAR STRING` after a QUOTES clause.
+  private skipOnScalarString(): void {
+    if (this.peekKeyword() === "on" && this.peekKeywordAt(1) === "scalar") {
+      this.advance(); // ON
+      this.advance(); // SCALAR
+      if (this.peekKeyword() === "string") this.advance();
+    }
+  }
+
+  // isJsonBehaviorStart reports whether the cursor is at a SQL/JSON behavior word
+  // (ERROR/NULL/TRUE/FALSE/UNKNOWN/EMPTY/DEFAULT).
+  private isJsonBehaviorStart(): boolean {
+    switch (this.peekKeyword()) {
+      case "error":
+      case "null":
+      case "true":
+      case "false":
+      case "unknown":
+      case "empty":
+      case "default":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // peekOnClauseIs reports whether the upcoming clause is `… ON <which>` (a one-or-two-token
+  // lookahead past the behavior — the behavior is 1 token, or 2 for EMPTY ARRAY/OBJECT).
+  private peekOnClauseIs(which: string): boolean {
+    for (const skip of [1, 2]) {
+      if (this.peekKeywordAt(skip) === "on" && this.peekKeywordAt(skip + 1) === which) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   private peek(): Token {
     return this.tokens[this.pos]!;

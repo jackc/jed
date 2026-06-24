@@ -634,6 +634,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.jsonpath_filter",
     // jsonpath top-level predicates + jsonb_path_match + the `@@` operator (P1b/P2, jsonpath.md §6).
     "expr.jsonpath_match",
+    // the SQL/JSON query functions JSON_EXISTS / JSON_VALUE / JSON_QUERY (S2, json-sql-functions.md §5).
+    "expr.json_query_fns",
     // the IS JSON predicate (S1) — well-formedness + kind + unique-keys (json-sql-functions.md §5).
     "expr.is_json",
     // the SQL/JSON constructors (S1) — JSON() / JSON_SCALAR / JSON_SERIALIZE (json-sql-functions.md §5).

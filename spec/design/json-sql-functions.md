@@ -182,13 +182,27 @@ jsonb-number → `decimal` path; a failed coercion under `ERROR ON ERROR` is `22
 
 ### 5.3 What is hard (and what defers)
 
+**Status: S2 has landed** — `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` ship (capability
+`expr.json_query_fns`, all three cores, oracle-clean). The **constant** behaviors
+(`ERROR`/`NULL`/`TRUE`/`FALSE`/`UNKNOWN`/`EMPTY ARRAY|OBJECT`), `RETURNING type`, and
+`JSON_QUERY`'s `WITH/WITHOUT [COND|UNCOND] ARRAY WRAPPER` + `KEEP QUOTES` are implemented.
+The result type is fixed at resolve (`RExpr::JsonSqlFn`); a SQL/JSON (class-`22`) evaluation
+error honors `ON ERROR`, while a resource/cost abort propagates. The exact PG codes match on
+`ERROR ON ERROR` (`2203F` non-scalar, `22034` >1 item).
+
+Still **deferred** (each `0A000`, a documented divergence):
+
 - **`ON ERROR / ON EMPTY DEFAULT expr`** makes the function partly non-constant and requires
   a **guarded sub-evaluation** (try the kernel; on a SQL/JSON error substitute the default
   expression without unwinding the statement) — a genuinely new evaluator capability. **It is
-  deferred to slice S3**; the first pass ships only the **constant** behaviors
-  (`ERROR`/`NULL`/`TRUE`/`FALSE`/`UNKNOWN`/`EMPTY ARRAY|OBJECT`).
-- **`PASSING … AS name`** reuses the `vars` substitution from [jsonpath.md §5](jsonpath.md).
-- **`IS JSON … WITH UNIQUE KEYS`** uses the shared duplicate-key kernel (§6.2).
+  deferred to slice S3**.
+- **`PASSING … AS name`** reuses the `vars` substitution from [jsonpath.md §5](jsonpath.md)
+  (the path-variable surface, itself a jsonpath follow-on).
+- **`JSON_QUERY OMIT QUOTES`** — PG returns the de-quoted scalar string still typed `jsonb`
+  (an invalid-`jsonb` quirk that fits jed's strict static typing poorly); deferred.
+- **`JSON_QUERY RETURNING` a non-json type** — the wrapper/quotes result is a JSON value;
+  coercing it to an arbitrary scalar is a follow-on.
+- **`IS JSON … WITH UNIQUE KEYS`** (S1) uses the shared duplicate-key kernel (§6.2).
 
 ---
 

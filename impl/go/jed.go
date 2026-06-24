@@ -569,6 +569,11 @@ var SupportedCapabilities = []string{
 	"expr.jsonpath_filter",
 	// Top-level jsonpath predicates (`$.a == 1`) + jsonb_path_match + the `@@` operator (jsonpath.md §6).
 	"expr.jsonpath_match",
+	// The SQL/JSON query functions (S2) — JSON_EXISTS / JSON_VALUE / JSON_QUERY: compile a jsonpath,
+	// evaluate it over a context item, and apply per-function semantics (RETURNING / wrapper / quotes
+	// / ON EMPTY / ON ERROR). PASSING vars, DEFAULT-expr behaviors, JSON_QUERY OMIT QUOTES, and a
+	// JSON_QUERY non-json RETURNING are deferred 0A000 (json-sql-functions.md §5).
+	"expr.json_query_fns",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

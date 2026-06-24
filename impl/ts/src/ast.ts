@@ -35,6 +35,26 @@ export type UnaryOp = "neg" | "not";
 // a JSON object.
 export type JsonPredicateKind = "value" | "scalar" | "array" | "object";
 
+// JsonOnBehavior: a constant `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions
+// (spec/design/json-sql-functions.md §5.2). "null" — substitute SQL NULL; "error" — raise the
+// underlying SQL/JSON error; "true"/"false"/"unknown" — only valid for JSON_EXISTS's `ON ERROR`;
+// "emptyArray"/"emptyObject" — substitute an empty JSON array / object (JSON_QUERY). `DEFAULT expr`
+// is the deferred S3 follow-on (§5.3).
+export type JsonOnBehavior =
+  | "null"
+  | "error"
+  | "true"
+  | "false"
+  | "unknown"
+  | "emptyArray"
+  | "emptyObject";
+
+// JsonWrapper: JSON_QUERY's array-wrapper mode (spec/design/json-sql-functions.md §5.2). "without"
+// (`WITHOUT [ARRAY] WRAPPER`, default) — the sequence must be a singleton; "unconditional"
+// (`WITH [UNCONDITIONAL] [ARRAY] WRAPPER`) — always wrap the sequence in an array; "conditional"
+// (`WITH CONDITIONAL [ARRAY] WRAPPER`) — wrap only when the sequence is not a single item.
+export type JsonWrapper = "without" | "unconditional" | "conditional";
+
 // BinaryOp: arithmetic (integer→promoted), comparison (integer→boolean), or logical
 // (boolean→boolean, Kleene).
 export type BinaryOp =
@@ -144,6 +164,34 @@ export type Expr =
   // (spec/design/json-sql-functions.md §5): parse a character string to a `json` value (verbatim).
   // Malformed → 22P02; `WITH UNIQUE KEYS` on a duplicate object key → 22030. STRICT.
   | { kind: "jsonCtor"; operand: Expr; uniqueKeys: boolean }
+  // `JSON_EXISTS(ctx, path [behavior ON ERROR])` — the SQL/JSON existence predicate
+  // (json-sql-functions.md §5, S2). The path is evaluated over the context item; a non-empty
+  // sequence → true. The default `ON ERROR` behavior is `FALSE`. `PASSING` (vars) is deferred.
+  | { kind: "jsonExists"; ctx: Expr; path: Expr; onError: JsonOnBehavior | null }
+  // `JSON_VALUE(ctx, path [RETURNING type] [ON EMPTY] [ON ERROR])` — extract a single SCALAR item,
+  // coerced to the RETURNING type (default `text`). Empty → ON EMPTY (default NULL); a non-scalar /
+  // >1 item / coercion failure → ON ERROR (default NULL). (json-sql-functions.md §5.)
+  | {
+      kind: "jsonValue";
+      ctx: Expr;
+      path: Expr;
+      returning: string | null;
+      onEmpty: JsonOnBehavior | null;
+      onError: JsonOnBehavior | null;
+    }
+  // `JSON_QUERY(ctx, path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])` — extract a
+  // JSON value (default `jsonb`). `wrapper` controls array-wrapping; `keepQuotes` controls scalar-
+  // string de-quoting (`KEEP QUOTES` true default / `OMIT QUOTES` false). (json-sql-functions.md §5.)
+  | {
+      kind: "jsonQuery";
+      ctx: Expr;
+      path: Expr;
+      returning: string | null;
+      wrapper: JsonWrapper;
+      keepQuotes: boolean;
+      onEmpty: JsonOnBehavior | null;
+      onError: JsonOnBehavior | null;
+    }
   // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
   // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).

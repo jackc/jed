@@ -24,7 +24,9 @@ import type {
   Insert,
   InsertValue,
   JoinKind,
+  JsonOnBehavior,
   JsonPredicateKind,
+  JsonWrapper,
   Literal,
   OnConflict,
   OrderKey,
@@ -125,7 +127,7 @@ import {
   workMul,
 } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
-import { type EngineError, engineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
 import { type Privilege, type PrivilegeSet, Privileges } from "./privileges.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -8730,6 +8732,7 @@ export class Database {
       case "jsonSetInsert":
       case "jsonObjectFromArrays":
       case "jsonPathFn":
+      case "jsonSqlFn":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
         return e;
       case "row":
@@ -9138,6 +9141,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
     case "jsonPathFn":
+    case "jsonSqlFn":
       return e.args.every(rexprIsConstant);
     case "inValues":
       return rexprIsConstant(e.lhs);
@@ -10124,6 +10128,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
     case "jsonPathFn":
+    case "jsonSqlFn":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
@@ -10250,6 +10255,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
     case "jsonPathFn":
+    case "jsonSqlFn":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
     case "row":
@@ -10990,6 +10996,23 @@ type RExpr =
       pathFnKind: JsonPathFnKind;
       args: RExpr[];
     }
+  // A SQL/JSON query function `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md §5,
+  // S2). `args` = `[ctx, path]` (the SRF-style arg list, so the generic RExpr walks recurse for
+  // free): `ctx` produces the context jsonb (or json/text, coerced), `path` the jsonpath; the
+  // behaviors / wrapper / quotes drive the result. The result type is fixed at resolve.
+  | {
+      kind: "jsonSqlFn";
+      sqlKind: JsonSqlKind;
+      args: RExpr[];
+      // The RETURNING scalar type ("boolean" for JSON_EXISTS; the JSON_VALUE scalar target;
+      // "jsonb"/"json" for JSON_QUERY) — drives the result coercion.
+      returning: ScalarType;
+      decimal: DecimalTypmod | null;
+      wrapper: JsonWrapper;
+      keepQuotes: boolean;
+      onEmpty: JsonOnBehavior;
+      onError: JsonOnBehavior;
+    }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
   | { kind: "outerColumn"; level: number; index: number }
@@ -11194,6 +11217,12 @@ type JsonBuildKind = "array" | "object";
 // produces (22038 if not exactly one boolean item).
 type JsonPathFnKind = "exists" | "queryFirst" | "queryArray" | "match";
 
+// JsonSqlKind selects which SQL/JSON query function a "jsonSqlFn" RExpr node is
+// (json-sql-functions.md §5, S2): "exists" — JSON_EXISTS → boolean (non-empty sequence); errors
+// honor ON ERROR (default FALSE); "value" — JSON_VALUE → a single scalar coerced to the RETURNING
+// type (default text); "query" — JSON_QUERY → a json/jsonb value (wrapper / quotes controlled).
+type JsonSqlKind = "exists" | "value" | "query";
+
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
 // subquery is re-run once per outer row). planQuery (the resolve half of the old runSelect)
@@ -11373,6 +11402,157 @@ function coerceJsonMember(
   if (text === null) return nullValue();
   const { node: rexpr } = coerceStringLiteral(text, st, decimal);
   return evalExpr(rexpr, [], env, meter);
+}
+
+// isSqljsonError reports whether an error is a SQL/JSON error the query functions' `ON ERROR` clause
+// catches: a data exception (class `22`). Resource / cost aborts (class `53`/`54`) propagate
+// unconditionally. Port of impl/rust/src/executor.rs `is_sqljson_error`.
+function isSqljsonError(e: unknown): e is EngineError {
+  return e instanceof EngineError && e.code().startsWith("22");
+}
+
+// applyJsonBehavior applies a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING
+// type. `underlying` is the SQL/JSON error this behavior replaces (rethrown verbatim by `error`).
+// Port of impl/rust/src/executor.rs `apply_json_behavior`.
+function applyJsonBehavior(
+  behavior: JsonOnBehavior,
+  underlying: EngineError,
+  returning: ScalarType,
+  env: EvalEnv,
+  meter: Meter,
+): Value {
+  switch (behavior) {
+    case "error":
+      throw underlying;
+    case "null":
+      return nullValue();
+    case "true":
+      return boolValue(true);
+    case "false":
+      return boolValue(false);
+    case "unknown":
+      return nullValue();
+    case "emptyArray":
+      return jsonNodeAsReturning({ kind: "array", elements: [] }, returning, env, meter);
+    case "emptyObject":
+      return jsonNodeAsReturning({ kind: "object", members: [] }, returning, env, meter);
+  }
+}
+
+// jsonNodeAsReturning renders a json result node as the RETURNING type: `jsonb` embeds, `json` its
+// canonical text, any other scalar coerces the node's `->>`-style text through the cast machinery.
+// Port of impl/rust/src/executor.rs `json_node_as_returning`.
+function jsonNodeAsReturning(
+  node: JsonNode,
+  returning: ScalarType,
+  env: EvalEnv,
+  meter: Meter,
+): Value {
+  return coerceJsonMember(node, scalarT(returning), null, env, meter);
+}
+
+// evalJsonSqlResult applies the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an
+// evaluated sequence. (JSON_EXISTS is handled inline — non-empty → true.) Port of
+// impl/rust/src/executor.rs `eval_json_sql_result`.
+function evalJsonSqlResult(
+  kind: JsonSqlKind,
+  seq: JsonNode[],
+  returning: ScalarType,
+  decimal: DecimalTypmod | null,
+  wrapper: JsonWrapper,
+  onEmpty: JsonOnBehavior,
+  onError: JsonOnBehavior,
+  env: EvalEnv,
+  meter: Meter,
+): Value {
+  switch (kind) {
+    case "exists":
+      return boolValue(seq.length > 0);
+    case "value": {
+      if (seq.length === 0) {
+        return applyJsonBehavior(
+          onEmpty,
+          engineError("no_sql_json_item", "no SQL/JSON item"),
+          returning,
+          env,
+          meter,
+        );
+      }
+      if (seq.length > 1) {
+        return applyJsonBehavior(
+          onError,
+          engineError(
+            "more_than_one_sql_json_item",
+            "JSON path expression in JSON_VALUE should return singleton scalar item",
+          ),
+          returning,
+          env,
+          meter,
+        );
+      }
+      const item = seq[0]!;
+      // JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
+      if (item.kind === "array" || item.kind === "object") {
+        return applyJsonBehavior(
+          onError,
+          engineError(
+            "sql_json_member_not_found",
+            "JSON path expression in JSON_VALUE should return singleton scalar item",
+          ),
+          returning,
+          env,
+          meter,
+        );
+      }
+      // Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
+      // SQL/JSON error honored by ON ERROR.
+      try {
+        return coerceJsonMember(item, scalarT(returning), decimal, env, meter);
+      } catch (e) {
+        if (isSqljsonError(e)) {
+          return applyJsonBehavior(onError, e, returning, env, meter);
+        }
+        throw e;
+      }
+    }
+    case "query": {
+      let node: JsonNode;
+      switch (wrapper) {
+        case "unconditional":
+          node = { kind: "array", elements: seq };
+          break;
+        case "conditional":
+          node = seq.length === 1 ? seq[0]! : { kind: "array", elements: seq };
+          break;
+        case "without": {
+          if (seq.length === 0) {
+            return applyJsonBehavior(
+              onEmpty,
+              engineError("no_sql_json_item", "no SQL/JSON item"),
+              returning,
+              env,
+              meter,
+            );
+          }
+          if (seq.length > 1) {
+            return applyJsonBehavior(
+              onError,
+              engineError(
+                "more_than_one_sql_json_item",
+                "JSON path expression in JSON_QUERY should return singleton item without wrapper",
+              ),
+              returning,
+              env,
+              meter,
+            );
+          }
+          node = seq[0]!;
+          break;
+        }
+      }
+      return jsonNodeAsReturning(node, returning, env, meter);
+    }
+  }
 }
 
 // PlanJoin is one join in a SELECT plan: its kind and resolved ON predicate (null for CROSS). The
@@ -12126,6 +12306,10 @@ function exprHasAggregate(e: Expr): boolean {
     case "isJson":
     case "jsonCtor":
       return exprHasAggregate(e.operand);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return exprHasAggregate(e.ctx) || exprHasAggregate(e.path);
     case "binary":
     case "isDistinct":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.rhs);
@@ -12186,6 +12370,10 @@ function exprHasWindow(e: Expr): boolean {
     case "isJson":
     case "jsonCtor":
       return exprHasWindow(e.operand);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return exprHasWindow(e.ctx) || exprHasWindow(e.path);
     case "binary":
     case "isDistinct":
       return exprHasWindow(e.lhs) || exprHasWindow(e.rhs);
@@ -12325,6 +12513,12 @@ function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
     case "jsonCtor":
       desugarNamedWindows(e.operand, windows);
       return;
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      desugarNamedWindows(e.ctx, windows);
+      desugarNamedWindows(e.path, windows);
+      return;
     case "binary":
     case "isDistinct":
       desugarNamedWindows(e.lhs, windows);
@@ -12431,6 +12625,12 @@ function rejectCheckStructure(e: Expr): void {
     case "isJson":
     case "jsonCtor":
       return rejectCheckStructure(e.operand);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      rejectCheckStructure(e.ctx);
+      rejectCheckStructure(e.path);
+      return;
     case "binary":
     case "isDistinct":
     case "like":
@@ -12515,6 +12715,12 @@ function rejectDefaultStructure(e: Expr): void {
     case "isJson":
     case "jsonCtor":
       return rejectDefaultStructure(e.operand);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      rejectDefaultStructure(e.ctx);
+      rejectDefaultStructure(e.path);
+      return;
     case "binary":
     case "isDistinct":
     case "like":
@@ -12587,6 +12793,12 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
       case "isJson":
       case "jsonCtor":
         return walk(e.operand);
+      case "jsonExists":
+      case "jsonValue":
+      case "jsonQuery":
+        walk(e.ctx);
+        walk(e.path);
+        return;
       case "binary":
       case "isDistinct":
       case "like":
@@ -14986,6 +15198,10 @@ function countSelfRefsExpr(e: Expr, name: string): number {
     case "isJson":
     case "jsonCtor":
       return countSelfRefsExpr(e.operand, name);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return countSelfRefsExpr(e.ctx, name) + countSelfRefsExpr(e.path, name);
     case "binary":
     case "isDistinct":
     case "like":
@@ -15639,6 +15855,10 @@ function exprCallsSeqMutator(e: Expr): boolean {
     case "isJson":
     case "jsonCtor":
       return exprCallsSeqMutator(e.operand);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return exprCallsSeqMutator(e.ctx) || exprCallsSeqMutator(e.path);
     case "binary":
     case "isDistinct":
     case "like":
@@ -15893,6 +16113,12 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
     case "jsonCtor":
       collectExprPrivs(e.operand, req, locals);
       break;
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      collectExprPrivs(e.ctx, req, locals);
+      collectExprPrivs(e.path, req, locals);
+      break;
     case "binary":
     case "isDistinct":
     case "like":
@@ -15977,6 +16203,10 @@ function exprReadsColumns(e: Expr): boolean {
     case "isJson":
     case "jsonCtor":
       return exprReadsColumns(e.operand);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return exprReadsColumns(e.ctx) || exprReadsColumns(e.path);
     case "funcCall":
       return e.args.some(exprReadsColumns);
     case "binary":
@@ -17106,6 +17336,52 @@ function resolve(
         type: { kind: "json" },
       };
     }
+    // The SQL/JSON query functions JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
+    // S2). Each compiles a jsonpath, evaluates it over a context item, and applies per-function
+    // semantics (the existence predicate / a single scalar / a json value). resolveJsonSqlFn does the
+    // shared context/path resolution + the RETURNING/behavior bookkeeping.
+    case "jsonExists":
+      return resolveJsonSqlFn(
+        scope,
+        "exists",
+        e.ctx,
+        e.path,
+        null,
+        "without",
+        true,
+        null,
+        e.onError,
+        ag,
+        params,
+      );
+    case "jsonValue":
+      return resolveJsonSqlFn(
+        scope,
+        "value",
+        e.ctx,
+        e.path,
+        e.returning,
+        "without",
+        true,
+        e.onEmpty,
+        e.onError,
+        ag,
+        params,
+      );
+    case "jsonQuery":
+      return resolveJsonSqlFn(
+        scope,
+        "query",
+        e.ctx,
+        e.path,
+        e.returning,
+        e.wrapper,
+        e.keepQuotes,
+        e.onEmpty,
+        e.onError,
+        ag,
+        params,
+      );
     case "isDistinct": {
       // NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a literal
       // adapts to its sibling; a text literal stays text), then require the operands be
@@ -18217,6 +18493,89 @@ function resolveJsonpathArgs(
   const path = resolve(scope, args[1]!, "jsonpath", ag, params);
   if (path.type.kind !== "jsonpath" && path.type.kind !== "null") throw noFuncOverload(name);
   return [ctx.node, path.node];
+}
+
+// resolveJsonSqlFn resolves a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY
+// (json-sql-functions.md §5, S2) → a "jsonSqlFn" RExpr + its fixed result type. Port of
+// impl/rust/src/executor.rs `resolve_json_sql_fn`.
+function resolveJsonSqlFn(
+  scope: Scope,
+  kind: JsonSqlKind,
+  ctx: Expr,
+  path: Expr,
+  returning: string | null,
+  wrapper: JsonWrapper,
+  keepQuotes: boolean,
+  onEmpty: JsonOnBehavior | null,
+  onError: JsonOnBehavior | null,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // The context item — json / jsonb / text, coerced to a jsonb document at eval; a bare string
+  // literal adapts to jsonb.
+  const rctx = resolve(scope, ctx, "jsonb", ag, params);
+  switch (rctx.type.kind) {
+    case "jsonb":
+    case "json":
+    case "text":
+    case "null":
+      break;
+    default:
+      throw engineError(
+        "datatype_mismatch",
+        "the context item of a SQL/JSON query function must be json/jsonb/text, not " +
+          rtName(rctx.type),
+      );
+  }
+  // The path — a jsonpath; a bare string literal compiles.
+  const rpath = resolve(scope, path, "jsonpath", ag, params);
+  if (rpath.type.kind !== "jsonpath" && rpath.type.kind !== "null") {
+    throw engineError(
+      "datatype_mismatch",
+      "the path of a SQL/JSON query function must be a jsonpath",
+    );
+  }
+  // OMIT QUOTES is the deferred S2 follow-on (the jsonb-of-bare-text result quirk).
+  if (!keepQuotes) {
+    throw engineError("feature_not_supported", "JSON_QUERY OMIT QUOTES is not supported yet");
+  }
+  // The fixed RETURNING scalar type.
+  let returningSt: ScalarType;
+  if (kind === "exists") {
+    returningSt = "boolean";
+  } else if (returning === null) {
+    returningSt = kind === "value" ? "text" : "jsonb";
+  } else {
+    const st = scalarTypeFromName(returning);
+    if (st === undefined) {
+      throw engineError("undefined_object", `type "${returning}" does not exist`);
+    }
+    returningSt = st;
+  }
+  // JSON_QUERY's result must be a JSON type (json/jsonb); JSON_VALUE's must be a scalar — a
+  // composite/array RETURNING is a deferred 0A000 (it cannot hold an extracted scalar).
+  if (kind === "query" && returningSt !== "json" && returningSt !== "jsonb") {
+    throw engineError(
+      "feature_not_supported",
+      "JSON_QUERY RETURNING a non-json type is not supported yet",
+    );
+  }
+  const onEmptyB: JsonOnBehavior = onEmpty ?? "null";
+  const onErrorB: JsonOnBehavior = onError ?? (kind === "exists" ? "false" : "null");
+  return {
+    node: {
+      kind: "jsonSqlFn",
+      sqlKind: kind,
+      args: [rctx.node, rpath.node],
+      returning: returningSt,
+      decimal: null,
+      wrapper,
+      keepQuotes,
+      onEmpty: onEmptyB,
+      onError: onErrorB,
+    },
+    type: resolvedTypeOf(returningSt),
+  };
 }
 
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).
@@ -21897,6 +22256,40 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
       }
       break;
+    }
+    case "jsonSqlFn": {
+      // A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
+      // S2). A NULL context / path → NULL; a SQL/JSON (class-22) error honors ON ERROR.
+      m.charge(COSTS.operatorEval);
+      const cv = evalExpr(e.args[0]!, row, env, m);
+      const pv = evalExpr(e.args[1]!, row, env, m);
+      if (cv.kind === "null" || pv.kind === "null") return nullValue();
+      let seq: JsonNode[] | null;
+      try {
+        seq = evalJsonpath(cv, pv);
+      } catch (err) {
+        // A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost abort,
+        // etc.) propagates.
+        if (isSqljsonError(err)) {
+          return applyJsonBehavior(e.onError, err, e.returning, env, m);
+        }
+        throw err;
+      }
+      // A NULL ctx/path already returned above; evalJsonpath can still report no match as null.
+      if (seq === null) return nullValue();
+      m.charge(COSTS.operatorEval * BigInt(seq.length));
+      m.guard();
+      return evalJsonSqlResult(
+        e.sqlKind,
+        seq,
+        e.returning,
+        e.decimal,
+        e.wrapper,
+        e.onEmpty,
+        e.onError,
+        env,
+        m,
+      );
     }
     case "subquery": {
       // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push

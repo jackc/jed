@@ -8,10 +8,10 @@ use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
     Delete, DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, GroupItem,
-    IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonPredicateKind,
-    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
-    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
-    TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior,
+    JsonPredicateKind, JsonWrapper, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction,
+    Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec,
+    TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -800,6 +800,192 @@ impl Parser {
     /// `CREATE TYPE … AS (…)` (composite.md) and a FROM-clause **column-definition list**
     /// `AS t(col type, …)` (C0, json-table.md §1). The caller has consumed the opening `(`; this
     /// consumes through the matching `)`. Each field is `name type [numeric(p,s)] [[]] [NOT NULL]`.
+    /// Skip an optional `FORMAT JSON [ENCODING …]` clause after a SQL/JSON context item.
+    fn skip_format_json(&mut self) {
+        if self.peek_keyword().as_deref() == Some("format")
+            && self.peek_keyword_at(1).as_deref() == Some("json")
+        {
+            self.advance(); // FORMAT
+            self.advance(); // JSON
+        }
+    }
+
+    /// Parse an optional `RETURNING <type> [FORMAT JSON]` clause → the type name (resolved later).
+    fn parse_json_returning(&mut self) -> Result<Option<String>> {
+        if self.peek_keyword().as_deref() != Some("returning") {
+            return Ok(None);
+        }
+        self.advance(); // RETURNING
+        let ty = self.expect_identifier()?;
+        self.skip_format_json();
+        Ok(Some(ty))
+    }
+
+    /// Parse one constant SQL/JSON behavior word (`ERROR` / `NULL` / `TRUE` / `FALSE` / `UNKNOWN` /
+    /// `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is the deferred S3 follow-on (0A000).
+    fn parse_json_behavior(&mut self) -> Result<JsonOnBehavior> {
+        match self.peek_keyword().as_deref() {
+            Some("error") => {
+                self.advance();
+                Ok(JsonOnBehavior::Error)
+            }
+            Some("null") => {
+                self.advance();
+                Ok(JsonOnBehavior::Null)
+            }
+            Some("true") => {
+                self.advance();
+                Ok(JsonOnBehavior::True)
+            }
+            Some("false") => {
+                self.advance();
+                Ok(JsonOnBehavior::False)
+            }
+            Some("unknown") => {
+                self.advance();
+                Ok(JsonOnBehavior::Unknown)
+            }
+            Some("empty") => {
+                self.advance();
+                match self.peek_keyword().as_deref() {
+                    Some("object") => {
+                        self.advance();
+                        Ok(JsonOnBehavior::EmptyObject)
+                    }
+                    Some("array") => {
+                        self.advance();
+                        Ok(JsonOnBehavior::EmptyArray)
+                    }
+                    // bare `EMPTY` defaults to `EMPTY ARRAY` (PostgreSQL).
+                    _ => Ok(JsonOnBehavior::EmptyArray),
+                }
+            }
+            Some("default") => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "ON ERROR / ON EMPTY DEFAULT expr is not supported yet",
+            )),
+            _ => Err(syntax("expected a SQL/JSON ON ERROR/EMPTY behavior")),
+        }
+    }
+
+    /// Parse JSON_EXISTS's single optional `<behavior> ON ERROR` clause.
+    fn parse_json_on_error_only(&mut self) -> Result<Option<JsonOnBehavior>> {
+        // A behavior word followed by `ON ERROR`.
+        if self.is_json_behavior_start() && self.peek_on_clause_is("error") {
+            let b = self.parse_json_behavior()?;
+            self.advance(); // ON
+            self.advance(); // ERROR
+            Ok(Some(b))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Parse the optional `<behavior> ON EMPTY` then `<behavior> ON ERROR` clauses (in that order).
+    fn parse_json_on_clauses(
+        &mut self,
+    ) -> Result<(Option<JsonOnBehavior>, Option<JsonOnBehavior>)> {
+        let mut on_empty = None;
+        let mut on_error = None;
+        if self.is_json_behavior_start() && self.peek_on_clause_is("empty") {
+            let b = self.parse_json_behavior()?;
+            self.advance(); // ON
+            self.advance(); // EMPTY
+            on_empty = Some(b);
+        }
+        if self.is_json_behavior_start() && self.peek_on_clause_is("error") {
+            let b = self.parse_json_behavior()?;
+            self.advance(); // ON
+            self.advance(); // ERROR
+            on_error = Some(b);
+        }
+        Ok((on_empty, on_error))
+    }
+
+    /// Parse JSON_QUERY's optional `[WITH [COND|UNCOND] [ARRAY] WRAPPER | WITHOUT [ARRAY] WRAPPER]`
+    /// and `[KEEP|OMIT QUOTES [ON SCALAR STRING]]` clauses.
+    fn parse_json_wrapper_quotes(&mut self) -> Result<(JsonWrapper, bool)> {
+        let mut wrapper = JsonWrapper::Without;
+        match self.peek_keyword().as_deref() {
+            Some("with") => {
+                self.advance(); // WITH
+                wrapper = match self.peek_keyword().as_deref() {
+                    Some("conditional") => {
+                        self.advance();
+                        JsonWrapper::Conditional
+                    }
+                    Some("unconditional") => {
+                        self.advance();
+                        JsonWrapper::Unconditional
+                    }
+                    _ => JsonWrapper::Unconditional,
+                };
+                if self.peek_keyword().as_deref() == Some("array") {
+                    self.advance();
+                }
+                self.expect_keyword("wrapper")?;
+            }
+            Some("without") => {
+                self.advance(); // WITHOUT
+                if self.peek_keyword().as_deref() == Some("array") {
+                    self.advance();
+                }
+                self.expect_keyword("wrapper")?;
+            }
+            _ => {}
+        }
+        let mut keep_quotes = true;
+        match self.peek_keyword().as_deref() {
+            Some("keep") => {
+                self.advance();
+                self.expect_keyword("quotes")?;
+                self.skip_on_scalar_string();
+            }
+            Some("omit") => {
+                self.advance();
+                self.expect_keyword("quotes")?;
+                self.skip_on_scalar_string();
+                keep_quotes = false;
+            }
+            _ => {}
+        }
+        Ok((wrapper, keep_quotes))
+    }
+
+    /// Skip an optional `ON SCALAR STRING` after a QUOTES clause.
+    fn skip_on_scalar_string(&mut self) {
+        if self.peek_keyword().as_deref() == Some("on")
+            && self.peek_keyword_at(1).as_deref() == Some("scalar")
+        {
+            self.advance(); // ON
+            self.advance(); // SCALAR
+            if self.peek_keyword().as_deref() == Some("string") {
+                self.advance();
+            }
+        }
+    }
+
+    /// True if the cursor is at a SQL/JSON behavior word (ERROR/NULL/TRUE/FALSE/UNKNOWN/EMPTY/DEFAULT).
+    fn is_json_behavior_start(&self) -> bool {
+        matches!(
+            self.peek_keyword().as_deref(),
+            Some("error" | "null" | "true" | "false" | "unknown" | "empty" | "default")
+        )
+    }
+
+    /// True if the upcoming clause is `… ON <which>` (a one-or-two-token lookahead past the behavior).
+    fn peek_on_clause_is(&self, which: &str) -> bool {
+        // The behavior is 1 token (ERROR/NULL/…) or 2 (EMPTY ARRAY/OBJECT); scan to the `ON`.
+        for skip in [1usize, 2] {
+            if self.peek_keyword_at(skip).as_deref() == Some("on")
+                && self.peek_keyword_at(skip + 1).as_deref() == Some(which)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn parse_field_def_list(&mut self) -> Result<Vec<TypeFieldDef>> {
         let mut fields = Vec::new();
         loop {
@@ -3265,6 +3451,66 @@ impl Parser {
                 operand: Box::new(operand),
                 unique_keys,
             });
+        }
+        // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
+        // (json-sql-functions.md §5, S2) — keyword-led primaries with sub-clauses.
+        if let Some(kw @ ("json_exists" | "json_value" | "json_query")) =
+            self.peek_keyword().as_deref()
+            && matches!(self.peek_at(1), Token::LParen)
+        {
+            let kw = kw.to_string();
+            self.advance(); // the function keyword
+            self.advance(); // (
+            let ctx = self.parse_expr()?;
+            // `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb
+            // context is coerced to jsonb regardless).
+            self.skip_format_json();
+            self.expect(&Token::Comma)?;
+            let path = self.parse_expr()?;
+            // `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
+            if self.peek_keyword().as_deref() == Some("passing") {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "JSON query function PASSING clause is not supported yet",
+                ));
+            }
+            let expr = match kw.as_str() {
+                "json_exists" => {
+                    let on_error = self.parse_json_on_error_only()?;
+                    Expr::JsonExists {
+                        ctx: Box::new(ctx),
+                        path: Box::new(path),
+                        on_error,
+                    }
+                }
+                "json_value" => {
+                    let returning = self.parse_json_returning()?;
+                    let (on_empty, on_error) = self.parse_json_on_clauses()?;
+                    Expr::JsonValue {
+                        ctx: Box::new(ctx),
+                        path: Box::new(path),
+                        returning,
+                        on_empty,
+                        on_error,
+                    }
+                }
+                _ => {
+                    let returning = self.parse_json_returning()?;
+                    let (wrapper, keep_quotes) = self.parse_json_wrapper_quotes()?;
+                    let (on_empty, on_error) = self.parse_json_on_clauses()?;
+                    Expr::JsonQuery {
+                        ctx: Box::new(ctx),
+                        path: Box::new(path),
+                        returning,
+                        wrapper,
+                        keep_quotes,
+                        on_empty,
+                        on_error,
+                    }
+                }
+            };
+            self.expect(&Token::RParen)?;
+            return Ok(expr);
         }
         if self.peek_keyword().as_deref() == Some("case") {
             self.advance();

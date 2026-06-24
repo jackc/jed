@@ -983,6 +983,190 @@ func (p *Parser) parseCreateType() (*CreateType, error) {
 	return &CreateType{Name: name, Fields: fields}, nil
 }
 
+// skipFormatJSON skips an optional `FORMAT JSON [ENCODING …]` clause after a SQL/JSON context item.
+func (p *Parser) skipFormatJSON() {
+	if p.peekKeyword() == "format" && p.peekKeywordAt(1) == "json" {
+		p.advance() // FORMAT
+		p.advance() // JSON
+	}
+}
+
+// parseJSONReturning parses an optional `RETURNING <type> [FORMAT JSON]` clause → the type name
+// (resolved later). nil when absent.
+func (p *Parser) parseJSONReturning() (*string, error) {
+	if p.peekKeyword() != "returning" {
+		return nil, nil
+	}
+	p.advance() // RETURNING
+	ty, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	p.skipFormatJSON()
+	return &ty, nil
+}
+
+// parseJSONBehavior parses one constant SQL/JSON behavior word (`ERROR` / `NULL` / `TRUE` / `FALSE` /
+// `UNKNOWN` / `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is the deferred S3 follow-on (0A000).
+func (p *Parser) parseJSONBehavior() (JsonOnBehavior, error) {
+	switch p.peekKeyword() {
+	case "error":
+		p.advance()
+		return JOBError, nil
+	case "null":
+		p.advance()
+		return JOBNull, nil
+	case "true":
+		p.advance()
+		return JOBTrue, nil
+	case "false":
+		p.advance()
+		return JOBFalse, nil
+	case "unknown":
+		p.advance()
+		return JOBUnknown, nil
+	case "empty":
+		p.advance()
+		switch p.peekKeyword() {
+		case "object":
+			p.advance()
+			return JOBEmptyObject, nil
+		case "array":
+			p.advance()
+			return JOBEmptyArray, nil
+		default:
+			// bare `EMPTY` defaults to `EMPTY ARRAY` (PostgreSQL).
+			return JOBEmptyArray, nil
+		}
+	case "default":
+		return 0, NewError(FeatureNotSupported, "ON ERROR / ON EMPTY DEFAULT expr is not supported yet")
+	default:
+		return 0, NewError(SyntaxError, "expected a SQL/JSON ON ERROR/EMPTY behavior")
+	}
+}
+
+// parseJSONOnErrorOnly parses JSON_EXISTS's single optional `<behavior> ON ERROR` clause.
+func (p *Parser) parseJSONOnErrorOnly() (*JsonOnBehavior, error) {
+	if p.isJSONBehaviorStart() && p.peekOnClauseIs("error") {
+		b, err := p.parseJSONBehavior()
+		if err != nil {
+			return nil, err
+		}
+		p.advance() // ON
+		p.advance() // ERROR
+		return &b, nil
+	}
+	return nil, nil
+}
+
+// parseJSONOnClauses parses the optional `<behavior> ON EMPTY` then `<behavior> ON ERROR` clauses (in
+// that order).
+func (p *Parser) parseJSONOnClauses() (onEmpty, onError *JsonOnBehavior, err error) {
+	if p.isJSONBehaviorStart() && p.peekOnClauseIs("empty") {
+		b, e := p.parseJSONBehavior()
+		if e != nil {
+			return nil, nil, e
+		}
+		p.advance() // ON
+		p.advance() // EMPTY
+		onEmpty = &b
+	}
+	if p.isJSONBehaviorStart() && p.peekOnClauseIs("error") {
+		b, e := p.parseJSONBehavior()
+		if e != nil {
+			return nil, nil, e
+		}
+		p.advance() // ON
+		p.advance() // ERROR
+		onError = &b
+	}
+	return onEmpty, onError, nil
+}
+
+// parseJSONWrapperQuotes parses JSON_QUERY's optional `[WITH [COND|UNCOND] [ARRAY] WRAPPER | WITHOUT
+// [ARRAY] WRAPPER]` and `[KEEP|OMIT QUOTES [ON SCALAR STRING]]` clauses. Returns the wrapper mode and
+// the keep-quotes flag (true = KEEP, the default).
+func (p *Parser) parseJSONWrapperQuotes() (JsonWrapper, bool, error) {
+	wrapper := JWWithout
+	switch p.peekKeyword() {
+	case "with":
+		p.advance() // WITH
+		switch p.peekKeyword() {
+		case "conditional":
+			p.advance()
+			wrapper = JWConditional
+		case "unconditional":
+			p.advance()
+			wrapper = JWUnconditional
+		default:
+			wrapper = JWUnconditional
+		}
+		if p.peekKeyword() == "array" {
+			p.advance()
+		}
+		if err := p.expectKeyword("wrapper"); err != nil {
+			return 0, false, err
+		}
+	case "without":
+		p.advance() // WITHOUT
+		if p.peekKeyword() == "array" {
+			p.advance()
+		}
+		if err := p.expectKeyword("wrapper"); err != nil {
+			return 0, false, err
+		}
+	}
+	keepQuotes := true
+	switch p.peekKeyword() {
+	case "keep":
+		p.advance()
+		if err := p.expectKeyword("quotes"); err != nil {
+			return 0, false, err
+		}
+		p.skipOnScalarString()
+	case "omit":
+		p.advance()
+		if err := p.expectKeyword("quotes"); err != nil {
+			return 0, false, err
+		}
+		p.skipOnScalarString()
+		keepQuotes = false
+	}
+	return wrapper, keepQuotes, nil
+}
+
+// skipOnScalarString skips an optional `ON SCALAR STRING` after a QUOTES clause.
+func (p *Parser) skipOnScalarString() {
+	if p.peekKeyword() == "on" && p.peekKeywordAt(1) == "scalar" {
+		p.advance() // ON
+		p.advance() // SCALAR
+		if p.peekKeyword() == "string" {
+			p.advance()
+		}
+	}
+}
+
+// isJSONBehaviorStart reports whether the cursor is at a SQL/JSON behavior word
+// (ERROR/NULL/TRUE/FALSE/UNKNOWN/EMPTY/DEFAULT).
+func (p *Parser) isJSONBehaviorStart() bool {
+	switch p.peekKeyword() {
+	case "error", "null", "true", "false", "unknown", "empty", "default":
+		return true
+	}
+	return false
+}
+
+// peekOnClauseIs reports whether the upcoming clause is `… ON <which>` (a one-or-two-token lookahead
+// past the behavior — EMPTY may be `EMPTY ARRAY`/`EMPTY OBJECT`, so scan to the `ON`).
+func (p *Parser) peekOnClauseIs(which string) bool {
+	for _, skip := range []int{1, 2} {
+		if p.peekKeywordAt(skip) == "on" && p.peekKeywordAt(skip+1) == which {
+			return true
+		}
+	}
+	return false
+}
+
 // parseFieldDefList parses a `( field type [numeric(p,s)] [[]] [NOT NULL] [, …] )` field-definition
 // list — the body shared by `CREATE TYPE … AS (…)` (composite.md) and a FROM-clause **column-
 // definition list** `AS t(col type, …)` (C0, json-table.md §1). The caller has consumed the opening
@@ -3814,6 +3998,68 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		name := p.advance().Word // the named type (original case; ScalarFromName lowercases)
 		t := p.advance()
 		return Expr{Kind: ExprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
+	}
+	// The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md
+	// §5, S2) — keyword-led primaries with sub-clauses. Recognized by the function keyword immediately
+	// followed by `(`.
+	if kw := p.peekKeyword(); (kw == "json_exists" || kw == "json_value" || kw == "json_query") && p.peekKindAt(1) == TokLParen {
+		p.advance() // the function keyword
+		p.advance() // (
+		ctx, err := p.parseExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		// `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb context is
+		// coerced to jsonb regardless).
+		p.skipFormatJSON()
+		if err := p.expect(TokComma); err != nil {
+			return Expr{}, err
+		}
+		path, err := p.parseExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		// `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
+		if p.peekKeyword() == "passing" {
+			return Expr{}, NewError(FeatureNotSupported, "JSON query function PASSING clause is not supported yet")
+		}
+		var expr Expr
+		switch kw {
+		case "json_exists":
+			onError, err := p.parseJSONOnErrorOnly()
+			if err != nil {
+				return Expr{}, err
+			}
+			expr = Expr{Kind: ExprJsonExists, JsonExists: &JsonExistsExpr{Ctx: ctx, Path: path, OnError: onError}}
+		case "json_value":
+			returning, err := p.parseJSONReturning()
+			if err != nil {
+				return Expr{}, err
+			}
+			onEmpty, onError, err := p.parseJSONOnClauses()
+			if err != nil {
+				return Expr{}, err
+			}
+			expr = Expr{Kind: ExprJsonValue, JsonValue: &JsonValueExpr{Ctx: ctx, Path: path, Returning: returning, OnEmpty: onEmpty, OnError: onError}}
+		default: // json_query
+			returning, err := p.parseJSONReturning()
+			if err != nil {
+				return Expr{}, err
+			}
+			wrapper, keepQuotes, err := p.parseJSONWrapperQuotes()
+			if err != nil {
+				return Expr{}, err
+			}
+			onEmpty, onError, err := p.parseJSONOnClauses()
+			if err != nil {
+				return Expr{}, err
+			}
+			expr = Expr{Kind: ExprJsonQuery, JsonQuery: &JsonQueryExpr{Ctx: ctx, Path: path, Returning: returning, Wrapper: wrapper, KeepQuotes: keepQuotes, OnEmpty: onEmpty, OnError: onError}}
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return expr, nil
 	}
 	// `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
 	// (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled above, a

@@ -2606,6 +2606,12 @@ func exprCallsSeqMutator(e *Expr) bool {
 		return exprCallsSeqMutator(&e.IsJsonOf.Operand)
 	case ExprJsonCtor:
 		return exprCallsSeqMutator(&e.JsonCtorOf.Operand)
+	case ExprJsonExists:
+		return exprCallsSeqMutator(&e.JsonExists.Ctx) || exprCallsSeqMutator(&e.JsonExists.Path)
+	case ExprJsonValue:
+		return exprCallsSeqMutator(&e.JsonValue.Ctx) || exprCallsSeqMutator(&e.JsonValue.Path)
+	case ExprJsonQuery:
+		return exprCallsSeqMutator(&e.JsonQuery.Ctx) || exprCallsSeqMutator(&e.JsonQuery.Path)
 	case ExprBinary:
 		return exprCallsSeqMutator(&e.Binary.Lhs) || exprCallsSeqMutator(&e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -3043,6 +3049,15 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 		collectExprPrivs(&e.IsJsonOf.Operand, req, locals)
 	case ExprJsonCtor:
 		collectExprPrivs(&e.JsonCtorOf.Operand, req, locals)
+	case ExprJsonExists:
+		collectExprPrivs(&e.JsonExists.Ctx, req, locals)
+		collectExprPrivs(&e.JsonExists.Path, req, locals)
+	case ExprJsonValue:
+		collectExprPrivs(&e.JsonValue.Ctx, req, locals)
+		collectExprPrivs(&e.JsonValue.Path, req, locals)
+	case ExprJsonQuery:
+		collectExprPrivs(&e.JsonQuery.Ctx, req, locals)
+		collectExprPrivs(&e.JsonQuery.Path, req, locals)
 	case ExprBinary:
 		collectExprPrivs(&e.Binary.Lhs, req, locals)
 		collectExprPrivs(&e.Binary.Rhs, req, locals)
@@ -3140,6 +3155,12 @@ func exprReadsColumns(e *Expr) bool {
 		return exprReadsColumns(&e.IsJsonOf.Operand)
 	case ExprJsonCtor:
 		return exprReadsColumns(&e.JsonCtorOf.Operand)
+	case ExprJsonExists:
+		return exprReadsColumns(&e.JsonExists.Ctx) || exprReadsColumns(&e.JsonExists.Path)
+	case ExprJsonValue:
+		return exprReadsColumns(&e.JsonValue.Ctx) || exprReadsColumns(&e.JsonValue.Path)
+	case ExprJsonQuery:
+		return exprReadsColumns(&e.JsonQuery.Ctx) || exprReadsColumns(&e.JsonQuery.Path)
 	case ExprFuncCall:
 		for _, a := range e.FuncCall.Args {
 			if exprReadsColumns(a) {
@@ -8209,6 +8230,12 @@ func countSelfRefsExpr(e Expr, name string) int {
 		return countSelfRefsExpr(e.IsJsonOf.Operand, name)
 	case ExprJsonCtor:
 		return countSelfRefsExpr(e.JsonCtorOf.Operand, name)
+	case ExprJsonExists:
+		return countSelfRefsExpr(e.JsonExists.Ctx, name) + countSelfRefsExpr(e.JsonExists.Path, name)
+	case ExprJsonValue:
+		return countSelfRefsExpr(e.JsonValue.Ctx, name) + countSelfRefsExpr(e.JsonValue.Path, name)
+	case ExprJsonQuery:
+		return countSelfRefsExpr(e.JsonQuery.Ctx, name) + countSelfRefsExpr(e.JsonQuery.Path, name)
 	case ExprBinary:
 		return countSelfRefsExpr(e.Binary.Lhs, name) + countSelfRefsExpr(e.Binary.Rhs, name)
 	case ExprIsDistinct:
@@ -10444,6 +10471,101 @@ func coerceJSONMember(node *JsonNode, colTy Type, decimal *DecimalTypmod, env *e
 			return Value{}, err
 		}
 		return rexpr.eval(nil, env, m)
+	}
+}
+
+// isSQLJSONError reports whether an error is a SQL/JSON error caught by a query function's `ON ERROR`
+// clause: a data exception (class `22`). Resource / cost aborts (class `53`/`54`) propagate
+// unconditionally.
+func isSQLJSONError(err error) bool {
+	if ee, ok := err.(*EngineError); ok {
+		return strings.HasPrefix(ee.Code(), "22")
+	}
+	return false
+}
+
+// applyJSONBehavior applies a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING
+// type. underlying is the SQL/JSON error this behavior replaces (raised verbatim by `ERROR`).
+func applyJSONBehavior(behavior JsonOnBehavior, underlying error, returning ScalarType, env *evalEnv, m *Meter) (Value, error) {
+	switch behavior {
+	case JOBError:
+		return Value{}, underlying
+	case JOBNull:
+		return NullValue(), nil
+	case JOBTrue:
+		return BoolValue(true), nil
+	case JOBFalse:
+		return BoolValue(false), nil
+	case JOBUnknown:
+		return NullValue(), nil
+	case JOBEmptyArray:
+		return jsonNodeAsReturning(JsonNode{Kind: JArray}, returning, env, m)
+	default: // JOBEmptyObject
+		return jsonNodeAsReturning(JsonNode{Kind: JObject}, returning, env, m)
+	}
+}
+
+// jsonNodeAsReturning renders a json result node as the RETURNING type: `jsonb` embeds, `json` its
+// canonical text, any other scalar coerces the node's `->>`-style text through the cast machinery.
+func jsonNodeAsReturning(node JsonNode, returning ScalarType, env *evalEnv, m *Meter) (Value, error) {
+	return coerceJSONMember(&node, ScalarT(returning), nil, env, m)
+}
+
+// evalJSONSqlResult applies the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an
+// evaluated sequence. (JSON_EXISTS is handled inline — non-empty → true.)
+func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning ScalarType, wrapper JsonWrapper, onEmpty, onError JsonOnBehavior, env *evalEnv, m *Meter) (Value, error) {
+	switch kind {
+	case jsExists:
+		return BoolValue(len(seq) > 0), nil
+	case jsValue:
+		if len(seq) == 0 {
+			return applyJSONBehavior(onEmpty, NewError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+		}
+		if len(seq) > 1 {
+			return applyJSONBehavior(onError,
+				NewError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_VALUE should return singleton scalar item"),
+				returning, env, m)
+		}
+		item := seq[0]
+		// JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
+		if item.Kind == JArray || item.Kind == JObject {
+			return applyJSONBehavior(onError,
+				NewError(SqlJsonMemberNotFound, "JSON path expression in JSON_VALUE should return singleton scalar item"),
+				returning, env, m)
+		}
+		// Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
+		// SQL/JSON error honored by ON ERROR.
+		v, err := coerceJSONMember(&item, ScalarT(returning), nil, env, m)
+		if err != nil {
+			if isSQLJSONError(err) {
+				return applyJSONBehavior(onError, err, returning, env, m)
+			}
+			return Value{}, err
+		}
+		return v, nil
+	default: // jsQuery
+		var node JsonNode
+		switch wrapper {
+		case JWUnconditional:
+			node = JsonNode{Kind: JArray, Arr: seq}
+		case JWConditional:
+			if len(seq) == 1 {
+				node = seq[0]
+			} else {
+				node = JsonNode{Kind: JArray, Arr: seq}
+			}
+		default: // JWWithout
+			if len(seq) == 0 {
+				return applyJSONBehavior(onEmpty, NewError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+			}
+			if len(seq) > 1 {
+				return applyJSONBehavior(onError,
+					NewError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_QUERY should return singleton item without wrapper"),
+					returning, env, m)
+			}
+			node = seq[0]
+		}
+		return jsonNodeAsReturning(node, returning, env, m)
 	}
 }
 
@@ -13781,6 +13903,12 @@ const (
 	// (any NULL → SQL NULL). `jpFnKind` selects which function. The path is recompiled from its
 	// canonical text at eval.
 	reJsonPathFn
+	// reJsonSqlFn is a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md
+	// §5, S2). `sargs` = [ctx, path]: ctx produces the context jsonb (or json/text, coerced), path the
+	// jsonpath; a NULL ctx/path → SQL NULL. `jsKind` selects which function; `result`/`typmod` the
+	// RETURNING type; `jsWrapper`/`jsKeepQuotes`/`jsOnEmpty`/`jsOnError` drive the result. A SQL/JSON
+	// (class-22) error honors ON ERROR; anything else propagates.
+	reJsonSqlFn
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
 	reOuterColumn
@@ -14067,6 +14195,18 @@ const (
 	jbObject                      // json[b]_build_object — alternating key/value args (odd count / NULL key → 22023)
 )
 
+// jsonSqlKind selects which SQL/JSON query function an reJsonSqlFn node is (json-sql-functions.md §5).
+type jsonSqlKind int
+
+const (
+	// jsExists is JSON_EXISTS → boolean (non-empty sequence); errors honor ON ERROR (default FALSE).
+	jsExists jsonSqlKind = iota
+	// jsValue is JSON_VALUE → a single scalar coerced to the RETURNING type (default text).
+	jsValue
+	// jsQuery is JSON_QUERY → a json/jsonb value (wrapper / quotes controlled).
+	jsQuery
+)
+
 // jsonPathFnKind selects which scalar jsonpath query function an reJsonPathFn node is (jsonpath.md §5).
 type jsonPathFnKind int
 
@@ -14166,6 +14306,15 @@ type rExpr struct {
 	// reJsonPathFn: which scalar jsonpath query function (jsonb_path_exists / _query_first /
 	// _query_array). Argument nodes are in `sargs` = [ctx jsonb, path jsonpath] (jsonpath.md §5).
 	jpFnKind jsonPathFnKind
+
+	// reJsonSqlFn: a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md
+	// §5, S2). `sargs` = [ctx, path]; `result`/`typmod` hold the RETURNING scalar type + decimal typmod.
+	// jsKind selects the function; jsWrapper/jsKeepQuotes/jsOnEmpty/jsOnError drive the result.
+	jsKind       jsonSqlKind
+	jsWrapper    JsonWrapper
+	jsKeepQuotes bool
+	jsOnEmpty    JsonOnBehavior
+	jsOnError    JsonOnBehavior
 
 	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert). Argument nodes are in
 	// `sargs` = [target, path, value, flag] (json-sql-functions.md §2).
@@ -15233,6 +15382,12 @@ func exprHasAggregate(e Expr) bool {
 		return exprHasAggregate(e.IsJsonOf.Operand)
 	case ExprJsonCtor:
 		return exprHasAggregate(e.JsonCtorOf.Operand)
+	case ExprJsonExists:
+		return exprHasAggregate(e.JsonExists.Ctx) || exprHasAggregate(e.JsonExists.Path)
+	case ExprJsonValue:
+		return exprHasAggregate(e.JsonValue.Ctx) || exprHasAggregate(e.JsonValue.Path)
+	case ExprJsonQuery:
+		return exprHasAggregate(e.JsonQuery.Ctx) || exprHasAggregate(e.JsonQuery.Path)
 	case ExprBinary:
 		return exprHasAggregate(e.Binary.Lhs) || exprHasAggregate(e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -15340,6 +15495,12 @@ func exprHasWindow(e Expr) bool {
 		return exprHasWindow(e.IsJsonOf.Operand)
 	case ExprJsonCtor:
 		return exprHasWindow(e.JsonCtorOf.Operand)
+	case ExprJsonExists:
+		return exprHasWindow(e.JsonExists.Ctx) || exprHasWindow(e.JsonExists.Path)
+	case ExprJsonValue:
+		return exprHasWindow(e.JsonValue.Ctx) || exprHasWindow(e.JsonValue.Path)
+	case ExprJsonQuery:
+		return exprHasWindow(e.JsonQuery.Ctx) || exprHasWindow(e.JsonQuery.Path)
 	case ExprBinary:
 		return exprHasWindow(e.Binary.Lhs) || exprHasWindow(e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -15594,6 +15755,51 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.JsonCtorOf = &ni
 		return ne, nil
+	case ExprJsonExists:
+		ctx, err := desugarNamedWindows(e.JsonExists.Ctx, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		path, err := desugarNamedWindows(e.JsonExists.Path, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nj := *e.JsonExists
+		nj.Ctx = ctx
+		nj.Path = path
+		ne := e
+		ne.JsonExists = &nj
+		return ne, nil
+	case ExprJsonValue:
+		ctx, err := desugarNamedWindows(e.JsonValue.Ctx, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		path, err := desugarNamedWindows(e.JsonValue.Path, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nj := *e.JsonValue
+		nj.Ctx = ctx
+		nj.Path = path
+		ne := e
+		ne.JsonValue = &nj
+		return ne, nil
+	case ExprJsonQuery:
+		ctx, err := desugarNamedWindows(e.JsonQuery.Ctx, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		path, err := desugarNamedWindows(e.JsonQuery.Path, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nj := *e.JsonQuery
+		nj.Ctx = ctx
+		nj.Path = path
+		ne := e
+		ne.JsonQuery = &nj
+		return ne, nil
 	case ExprBinary:
 		lhs, err := desugarNamedWindows(e.Binary.Lhs, windows)
 		if err != nil {
@@ -15803,6 +16009,21 @@ func rejectCheckStructure(e Expr) error {
 		return rejectCheckStructure(e.IsJsonOf.Operand)
 	case ExprJsonCtor:
 		return rejectCheckStructure(e.JsonCtorOf.Operand)
+	case ExprJsonExists:
+		if err := rejectCheckStructure(e.JsonExists.Ctx); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.JsonExists.Path)
+	case ExprJsonValue:
+		if err := rejectCheckStructure(e.JsonValue.Ctx); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.JsonValue.Path)
+	case ExprJsonQuery:
+		if err := rejectCheckStructure(e.JsonQuery.Ctx); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.JsonQuery.Path)
 	case ExprBinary:
 		if err := rejectCheckStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -15925,6 +16146,21 @@ func rejectDefaultStructure(e Expr) error {
 		return rejectDefaultStructure(e.IsJsonOf.Operand)
 	case ExprJsonCtor:
 		return rejectDefaultStructure(e.JsonCtorOf.Operand)
+	case ExprJsonExists:
+		if err := rejectDefaultStructure(e.JsonExists.Ctx); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.JsonExists.Path)
+	case ExprJsonValue:
+		if err := rejectDefaultStructure(e.JsonValue.Ctx); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.JsonValue.Path)
+	case ExprJsonQuery:
+		if err := rejectDefaultStructure(e.JsonQuery.Ctx); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.JsonQuery.Path)
 	case ExprBinary:
 		if err := rejectDefaultStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -16043,6 +16279,15 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			walk(e.IsJsonOf.Operand)
 		case ExprJsonCtor:
 			walk(e.JsonCtorOf.Operand)
+		case ExprJsonExists:
+			walk(e.JsonExists.Ctx)
+			walk(e.JsonExists.Path)
+		case ExprJsonValue:
+			walk(e.JsonValue.Ctx)
+			walk(e.JsonValue.Path)
+		case ExprJsonQuery:
+			walk(e.JsonQuery.Ctx)
+			walk(e.JsonQuery.Path)
 		case ExprBinary:
 			walk(e.Binary.Lhs)
 			walk(e.Binary.Rhs)
@@ -18466,6 +18711,80 @@ func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *FuncCallE
 	return &rExpr{kind: reJsonPathFn, jpFnKind: kind, sargs: []*rExpr{ctx, path}}, result, nil
 }
 
+// resolveJSONSqlFn resolves a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY
+// (json-sql-functions.md §5, S2) → an reJsonSqlFn node + its fixed result type. ctx is json/jsonb/
+// text (coerced to a jsonb document at eval); path is a jsonpath (a bare string literal compiles).
+func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path Expr, returning *string, wrapper JsonWrapper, keepQuotes bool, onEmpty, onError *JsonOnBehavior, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	// The context item — json / jsonb / text, coerced to a jsonb document at eval; a bare string
+	// literal adapts to jsonb.
+	jsonbHint := Jsonb
+	rctx, ctxTy, err := resolve(s, ctx, &jsonbHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	switch ctxTy.kind {
+	case rtJsonb, rtJson, rtText, rtNull:
+		// ok
+	default:
+		return nil, resolvedType{}, NewError(DatatypeMismatch,
+			fmt.Sprintf("the context item of a SQL/JSON query function must be json/jsonb/text, not %s", rtName(ctxTy)))
+	}
+	// The path — a jsonpath; a bare string literal compiles.
+	pathHint := JsonPathType
+	rpath, pathTy, err := resolve(s, path, &pathHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if pathTy.kind != rtJsonPath && pathTy.kind != rtNull {
+		return nil, resolvedType{}, NewError(DatatypeMismatch, "the path of a SQL/JSON query function must be a jsonpath")
+	}
+	// OMIT QUOTES is the deferred S2 follow-on (the jsonb-of-bare-text result quirk).
+	if !keepQuotes {
+		return nil, resolvedType{}, NewError(FeatureNotSupported, "JSON_QUERY OMIT QUOTES is not supported yet")
+	}
+	// The fixed RETURNING scalar type.
+	var returningST ScalarType
+	switch {
+	case kind == jsExists:
+		returningST = Bool
+	case returning == nil && kind == jsValue:
+		returningST = Text
+	case returning == nil: // jsQuery
+		returningST = Jsonb
+	default:
+		st, ok := ScalarTypeFromName(*returning)
+		if !ok {
+			return nil, resolvedType{}, NewError(UndefinedObject, fmt.Sprintf("type \"%s\" does not exist", *returning))
+		}
+		returningST = st
+	}
+	// JSON_QUERY's result must be a JSON type (json/jsonb); JSON_VALUE's must be a scalar — a
+	// composite/array RETURNING is a deferred 0A000 (it cannot hold an extracted scalar).
+	if kind == jsQuery && returningST != Json && returningST != Jsonb {
+		return nil, resolvedType{}, NewError(FeatureNotSupported, "JSON_QUERY RETURNING a non-json type is not supported yet")
+	}
+	onEmptyB := JOBNull
+	if onEmpty != nil {
+		onEmptyB = *onEmpty
+	}
+	onErrorB := JOBNull
+	if onError != nil {
+		onErrorB = *onError
+	} else if kind == jsExists {
+		onErrorB = JOBFalse
+	}
+	return &rExpr{
+		kind:         reJsonSqlFn,
+		jsKind:       kind,
+		sargs:        []*rExpr{rctx, rpath},
+		result:       returningST,
+		jsWrapper:    wrapper,
+		jsKeepQuotes: keepQuotes,
+		jsOnEmpty:    onEmptyB,
+		jsOnError:    onErrorB,
+	}, resolvedTypeOf(returningST), nil
+}
+
 // resolveJsonpathArgs resolves the `(context jsonb, path jsonpath)` argument pair shared by the
 // jsonpath query functions (the SRF and the scalar forms). A bare string literal adapts: the context
 // to jsonb, the path to a compiled `jsonpath`. Exactly two args this slice (the optional vars /
@@ -20574,6 +20893,15 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				kind: reJsonCtor, operand: rop, jpUnique: e.JsonCtorOf.UniqueKeys,
 			},
 			resolvedType{kind: rtJson}, nil
+	case ExprJsonExists:
+		return resolveJSONSqlFn(s, jsExists, e.JsonExists.Ctx, e.JsonExists.Path, nil,
+			JWWithout, true, nil, e.JsonExists.OnError, ag, params)
+	case ExprJsonValue:
+		return resolveJSONSqlFn(s, jsValue, e.JsonValue.Ctx, e.JsonValue.Path, e.JsonValue.Returning,
+			JWWithout, true, e.JsonValue.OnEmpty, e.JsonValue.OnError, ag, params)
+	case ExprJsonQuery:
+		return resolveJSONSqlFn(s, jsQuery, e.JsonQuery.Ctx, e.JsonQuery.Path, e.JsonQuery.Returning,
+			e.JsonQuery.Wrapper, e.JsonQuery.KeepQuotes, e.JsonQuery.OnEmpty, e.JsonQuery.OnError, ag, params)
 	case ExprIsDistinct:
 		// NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a
 		// literal adapts to its sibling; a text literal stays text), then require the
@@ -24459,6 +24787,39 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		default: // jpfQueryArray
 			return JsonbValue(JsonNode{Kind: JArray, Arr: seq}), nil
 		}
+	case reJsonSqlFn:
+		// A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
+		// S2). A NULL context / path → NULL; a SQL/JSON (class-22) error honors ON ERROR.
+		m.Charge(Costs.OperatorEval)
+		cv, err := e.sargs[0].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		pv, err := e.sargs[1].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if cv.Kind == ValNull || pv.Kind == ValNull {
+			return NullValue(), nil
+		}
+		seq, ok, err := evalJsonpath(cv, pv)
+		if err != nil {
+			// A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost abort,
+			// etc.) propagates.
+			if isSQLJSONError(err) {
+				return applyJSONBehavior(e.jsOnError, err, e.result, env, m)
+			}
+			return Value{}, err
+		}
+		if !ok {
+			return NullValue(), nil
+		}
+		// Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
+		m.Charge(Costs.OperatorEval * int64(len(seq)))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		return evalJSONSqlResult(e.jsKind, seq, e.result, e.jsWrapper, e.jsOnEmpty, e.jsOnError, env, m)
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

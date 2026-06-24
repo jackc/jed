@@ -8,9 +8,9 @@ use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
     DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind,
-    JsonPredicateKind, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select,
-    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
-    TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    JsonOnBehavior, JsonPredicateKind, JsonWrapper, Literal, OnConflict, OrderKey, Overriding,
+    QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -10441,6 +10441,11 @@ impl Database {
                 }
                 Ok(())
             }
+            RExpr::JsonSqlFn { ctx, path, .. } => {
+                self.fold_uncorrelated_in_rexpr(ctx, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(path, bound, ctes, cost)?;
+                Ok(())
+            }
             RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
                 for f in fields {
                     self.fold_uncorrelated_in_rexpr(f, bound, ctes, cost)?;
@@ -11706,6 +11711,17 @@ enum JsonPathFnKind {
     Match,
 }
 
+/// Which SQL/JSON query function an [`RExpr::JsonSqlFn`] node is (json-sql-functions.md §5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JsonSqlKind {
+    /// `JSON_EXISTS` → boolean (non-empty sequence); errors honor ON ERROR (default FALSE).
+    Exists,
+    /// `JSON_VALUE` → a single scalar coerced to the RETURNING type (default text).
+    Value,
+    /// `JSON_QUERY` → a json/jsonb value (wrapper / quotes controlled).
+    Query,
+}
+
 /// Which json/jsonb builder an [`RExpr::JsonBuild`] node is (json-sql-functions.md §2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JsonBuildKind {
@@ -11927,6 +11943,22 @@ enum RExpr {
     JsonPathFn {
         kind: JsonPathFnKind,
         args: Vec<RExpr>,
+    },
+    /// A SQL/JSON query function `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md
+    /// §5, S2). `ctx` produces the context jsonb (or json/text, coerced), `path` the jsonpath; the
+    /// behaviors / wrapper / quotes drive the result. The result type is fixed at resolve.
+    JsonSqlFn {
+        kind: JsonSqlKind,
+        ctx: Box<RExpr>,
+        path: Box<RExpr>,
+        /// The RETURNING scalar type (`Bool` for JSON_EXISTS; the JSON_VALUE scalar target;
+        /// `Jsonb`/`Json` for JSON_QUERY) — drives the result coercion.
+        returning: ScalarType,
+        decimal: Option<DecimalTypmod>,
+        wrapper: JsonWrapper,
+        keep_quotes: bool,
+        on_empty: JsonOnBehavior,
+        on_error: JsonOnBehavior,
     },
     IsNull {
         operand: Box<RExpr>,
@@ -12520,6 +12552,9 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         | Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => sub(operand),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => sub(ctx) + sub(path),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -13051,6 +13086,238 @@ fn json_record_row(
 /// column embeds the node, a `json` column its canonical text, every other scalar coerces the node's
 /// `->>`-style text through the cast machinery (so `"42"` / `42` → an `int` column, etc.). A
 /// composite/array column type is a deferred `0A000`.
+/// Resolve a SQL/JSON query function `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
+/// (json-sql-functions.md §5, S2) → an [`RExpr::JsonSqlFn`] + its fixed result type.
+#[allow(clippy::too_many_arguments)]
+fn resolve_json_sql_fn(
+    scope: &Scope,
+    kind: JsonSqlKind,
+    ctx: &Expr,
+    path: &Expr,
+    returning: &Option<String>,
+    wrapper: JsonWrapper,
+    keep_quotes: bool,
+    on_empty: &Option<JsonOnBehavior>,
+    on_error: &Option<JsonOnBehavior>,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    // The context item — json / jsonb / text, coerced to a jsonb document at eval; a bare string
+    // literal adapts to jsonb.
+    let (rctx, ctx_ty) = resolve(scope, ctx, Some(ScalarType::Jsonb), agg, params)?;
+    if !matches!(
+        ctx_ty,
+        ResolvedType::Jsonb | ResolvedType::Json | ResolvedType::Text | ResolvedType::Null
+    ) {
+        return Err(EngineError::new(
+            SqlState::DatatypeMismatch,
+            format!(
+                "the context item of a SQL/JSON query function must be json/jsonb/text, not {}",
+                ctx_ty.type_name()
+            ),
+        ));
+    }
+    // The path — a jsonpath; a bare string literal compiles.
+    let (rpath, path_ty) = resolve(scope, path, Some(ScalarType::JsonPath), agg, params)?;
+    if !matches!(path_ty, ResolvedType::JsonPath | ResolvedType::Null) {
+        return Err(EngineError::new(
+            SqlState::DatatypeMismatch,
+            "the path of a SQL/JSON query function must be a jsonpath",
+        ));
+    }
+    // OMIT QUOTES is the deferred S2 follow-on (the jsonb-of-bare-text result quirk).
+    if !keep_quotes {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "JSON_QUERY OMIT QUOTES is not supported yet",
+        ));
+    }
+    // The fixed RETURNING scalar type.
+    let returning_st = match (kind, returning) {
+        (JsonSqlKind::Exists, _) => ScalarType::Bool,
+        (JsonSqlKind::Value, None) => ScalarType::Text,
+        (JsonSqlKind::Query, None) => ScalarType::Jsonb,
+        (_, Some(name)) => ScalarType::from_name(name).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedObject,
+                format!("type \"{name}\" does not exist"),
+            )
+        })?,
+    };
+    // JSON_QUERY's result must be a JSON type (json/jsonb); JSON_VALUE's must be a scalar — a
+    // composite/array RETURNING is a deferred 0A000 (it cannot hold an extracted scalar).
+    if matches!(kind, JsonSqlKind::Query)
+        && !matches!(returning_st, ScalarType::Json | ScalarType::Jsonb)
+    {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "JSON_QUERY RETURNING a non-json type is not supported yet",
+        ));
+    }
+    let on_empty = on_empty.unwrap_or(JsonOnBehavior::Null);
+    let on_error = on_error.unwrap_or(match kind {
+        JsonSqlKind::Exists => JsonOnBehavior::False,
+        _ => JsonOnBehavior::Null,
+    });
+    Ok((
+        RExpr::JsonSqlFn {
+            kind,
+            ctx: Box::new(rctx),
+            path: Box::new(rpath),
+            returning: returning_st,
+            decimal: None,
+            wrapper,
+            keep_quotes,
+            on_empty,
+            on_error,
+        },
+        resolved_type_of(returning_st),
+    ))
+}
+
+/// A SQL/JSON error that the query functions' `ON ERROR` clause catches: a data exception (class
+/// `22`). Resource / cost aborts (class `53`/`54`) propagate unconditionally.
+fn is_sqljson_error(e: &EngineError) -> bool {
+    e.code().starts_with("22")
+}
+
+/// Apply a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING type. `underlying`
+/// is the SQL/JSON error this behavior replaces (raised verbatim by `ERROR`).
+fn apply_json_behavior(
+    behavior: JsonOnBehavior,
+    underlying: EngineError,
+    returning: ScalarType,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Value> {
+    match behavior {
+        JsonOnBehavior::Error => Err(underlying),
+        JsonOnBehavior::Null => Ok(Value::Null),
+        JsonOnBehavior::True => Ok(Value::Bool(true)),
+        JsonOnBehavior::False => Ok(Value::Bool(false)),
+        JsonOnBehavior::Unknown => Ok(Value::Null),
+        JsonOnBehavior::EmptyArray => {
+            json_node_as_returning(JsonNode::Array(Vec::new()), returning, env, meter)
+        }
+        JsonOnBehavior::EmptyObject => {
+            json_node_as_returning(JsonNode::Object(Vec::new()), returning, env, meter)
+        }
+    }
+}
+
+/// Render a json result node as the RETURNING type: `jsonb` embeds, `json` its canonical text, any
+/// other scalar coerces the node's `->>`-style text through the cast machinery.
+fn json_node_as_returning(
+    node: JsonNode,
+    returning: ScalarType,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Value> {
+    coerce_json_member(&node, &Type::Scalar(returning), None, env, meter)
+}
+
+/// Apply the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an evaluated sequence.
+/// (JSON_EXISTS is handled inline — non-empty → true.)
+#[allow(clippy::too_many_arguments)]
+fn eval_json_sql_result(
+    kind: JsonSqlKind,
+    seq: Vec<JsonNode>,
+    returning: ScalarType,
+    decimal: Option<DecimalTypmod>,
+    wrapper: JsonWrapper,
+    on_empty: JsonOnBehavior,
+    on_error: JsonOnBehavior,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Value> {
+    match kind {
+        JsonSqlKind::Exists => Ok(Value::Bool(!seq.is_empty())),
+        JsonSqlKind::Value => {
+            if seq.is_empty() {
+                return apply_json_behavior(
+                    on_empty,
+                    EngineError::new(SqlState::NoSqlJsonItem, "no SQL/JSON item"),
+                    returning,
+                    env,
+                    meter,
+                );
+            }
+            if seq.len() > 1 {
+                return apply_json_behavior(
+                    on_error,
+                    EngineError::new(
+                        SqlState::MoreThanOneSqlJsonItem,
+                        "JSON path expression in JSON_VALUE should return singleton scalar item",
+                    ),
+                    returning,
+                    env,
+                    meter,
+                );
+            }
+            let item = &seq[0];
+            // JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
+            if matches!(item, JsonNode::Array(_) | JsonNode::Object(_)) {
+                return apply_json_behavior(
+                    on_error,
+                    EngineError::new(
+                        SqlState::SqlJsonMemberNotFound,
+                        "JSON path expression in JSON_VALUE should return singleton scalar item",
+                    ),
+                    returning,
+                    env,
+                    meter,
+                );
+            }
+            // Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is
+            // a SQL/JSON error honored by ON ERROR.
+            match coerce_json_member(item, &Type::Scalar(returning), decimal, env, meter) {
+                Ok(v) => Ok(v),
+                Err(e) if is_sqljson_error(&e) => {
+                    apply_json_behavior(on_error, e, returning, env, meter)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        JsonSqlKind::Query => {
+            let node = match wrapper {
+                JsonWrapper::Unconditional => JsonNode::Array(seq),
+                JsonWrapper::Conditional => {
+                    if seq.len() == 1 {
+                        seq.into_iter().next().unwrap()
+                    } else {
+                        JsonNode::Array(seq)
+                    }
+                }
+                JsonWrapper::Without => {
+                    if seq.is_empty() {
+                        return apply_json_behavior(
+                            on_empty,
+                            EngineError::new(SqlState::NoSqlJsonItem, "no SQL/JSON item"),
+                            returning,
+                            env,
+                            meter,
+                        );
+                    }
+                    if seq.len() > 1 {
+                        return apply_json_behavior(
+                            on_error,
+                            EngineError::new(
+                                SqlState::MoreThanOneSqlJsonItem,
+                                "JSON path expression in JSON_QUERY should return singleton item without wrapper",
+                            ),
+                            returning,
+                            env,
+                            meter,
+                        );
+                    }
+                    seq.into_iter().next().unwrap()
+                }
+            };
+            json_node_as_returning(node, returning, env, meter)
+        }
+    }
+}
+
 fn coerce_json_member(
     node: &JsonNode,
     col_ty: &Type,
@@ -13673,6 +13940,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().all(rexpr_is_constant),
+        RExpr::JsonSqlFn { ctx, path, .. } => rexpr_is_constant(ctx) && rexpr_is_constant(path),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
     }
@@ -14990,6 +15258,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_has_aggregate(operand),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => expr_has_aggregate(ctx) || expr_has_aggregate(path),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_aggregate(lhs) || expr_has_aggregate(rhs)
         }
@@ -15064,6 +15335,9 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_has_window(operand),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => expr_has_window(ctx) || expr_has_window(path),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_window(lhs) || expr_has_window(rhs)
         }
@@ -15223,6 +15497,12 @@ fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)]) -> Resul
         | Expr::JsonCtor { operand, .. } => {
             desugar_named_windows(operand, windows)?;
         }
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            desugar_named_windows(ctx, windows)?;
+            desugar_named_windows(path, windows)?;
+        }
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             desugar_named_windows(lhs, windows)?;
             desugar_named_windows(rhs, windows)?;
@@ -15314,6 +15594,12 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         | Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => reject_check_structure(operand),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            reject_check_structure(ctx)?;
+            reject_check_structure(path)
+        }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -15404,6 +15690,12 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
         | Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => reject_default_structure(operand),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            reject_default_structure(ctx)?;
+            reject_default_structure(path)
+        }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -15481,6 +15773,12 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
             | Expr::IsNull { operand, .. }
             | Expr::IsJson { operand, .. }
             | Expr::JsonCtor { operand, .. } => walk(operand, columns, out),
+            Expr::JsonExists { ctx, path, .. }
+            | Expr::JsonValue { ctx, path, .. }
+            | Expr::JsonQuery { ctx, path, .. } => {
+                walk(ctx, columns, out);
+                walk(path, columns, out);
+            }
             Expr::Binary { lhs, rhs, .. }
             | Expr::IsDistinctFrom { lhs, rhs, .. }
             | Expr::Like { lhs, rhs, .. }
@@ -15729,6 +16027,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
+        RExpr::JsonSqlFn { ctx, path, .. } => {
+            rexpr_references_outer(ctx, depth) || rexpr_references_outer(path, depth)
+        }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
         }
@@ -15875,6 +16176,10 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             for a in args {
                 collect_touched(a, depth, touched);
             }
+        }
+        RExpr::JsonSqlFn { ctx, path, .. } => {
+            collect_touched(ctx, depth, touched);
+            collect_touched(path, depth, touched);
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             for f in fields {
@@ -18960,6 +19265,11 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_calls_seq_mutator(operand),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            expr_calls_seq_mutator(ctx) || expr_calls_seq_mutator(path)
+        }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -19257,6 +19567,12 @@ fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => collect_expr_privs(operand, req, locals),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            collect_expr_privs(ctx, req, locals);
+            collect_expr_privs(path, req, locals);
+        }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -19331,6 +19647,9 @@ fn expr_reads_columns(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_reads_columns(operand),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => expr_reads_columns(ctx) || expr_reads_columns(path),
         Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -20535,6 +20854,63 @@ fn resolve(
                 ResolvedType::Json,
             ))
         }
+        Expr::JsonExists {
+            ctx,
+            path,
+            on_error,
+        } => resolve_json_sql_fn(
+            scope,
+            JsonSqlKind::Exists,
+            ctx,
+            path,
+            &None,
+            JsonWrapper::Without,
+            true,
+            &None,
+            on_error,
+            agg,
+            params,
+        ),
+        Expr::JsonValue {
+            ctx,
+            path,
+            returning,
+            on_empty,
+            on_error,
+        } => resolve_json_sql_fn(
+            scope,
+            JsonSqlKind::Value,
+            ctx,
+            path,
+            returning,
+            JsonWrapper::Without,
+            true,
+            on_empty,
+            on_error,
+            agg,
+            params,
+        ),
+        Expr::JsonQuery {
+            ctx,
+            path,
+            returning,
+            wrapper,
+            keep_quotes,
+            on_empty,
+            on_error,
+        } => resolve_json_sql_fn(
+            scope,
+            JsonSqlKind::Query,
+            ctx,
+            path,
+            returning,
+            *wrapper,
+            *keep_quotes,
+            on_empty,
+            on_error,
+            agg,
+            params,
+        ),
         Expr::IsDistinctFrom { lhs, rhs, negated } => {
             // NULL-safe equality: the SAME operand contract as `=` — resolve the pair
             // (a literal adapts to its sibling; a text literal stays text), then require
@@ -25846,6 +26222,41 @@ impl RExpr {
                         )),
                     },
                 }
+            }
+            // A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md
+            // §5, S2). A NULL context / path → NULL; a SQL/JSON (class-22) error honors ON ERROR.
+            RExpr::JsonSqlFn {
+                kind,
+                ctx,
+                path,
+                returning,
+                decimal,
+                wrapper,
+                keep_quotes: _,
+                on_empty,
+                on_error,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let cv = ctx.eval(row, env, m)?;
+                let pv = path.eval(row, env, m)?;
+                if matches!(cv, Value::Null) || matches!(pv, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let seq = match eval_jsonpath(&cv, &pv) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => return Ok(Value::Null),
+                    // A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost
+                    // abort, etc.) propagates.
+                    Err(e) if is_sqljson_error(&e) => {
+                        return apply_json_behavior(*on_error, e, *returning, env, m);
+                    }
+                    Err(e) => return Err(e),
+                };
+                m.charge(COSTS.operator_eval * seq.len() as i64);
+                m.guard()?;
+                eval_json_sql_result(
+                    *kind, seq, *returning, *decimal, *wrapper, *on_empty, *on_error, env, m,
+                )
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);

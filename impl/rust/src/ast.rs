@@ -848,6 +848,37 @@ pub enum Expr {
         operand: Box<Expr>,
         unique_keys: bool,
     },
+    /// `JSON_EXISTS(ctx, path [behavior ON ERROR])` — the SQL/JSON existence predicate
+    /// (json-sql-functions.md §5, S2). The path is evaluated over the context item; a non-empty
+    /// sequence → true. The default `ON ERROR` behavior is `FALSE`. `PASSING` (vars) is deferred.
+    JsonExists {
+        ctx: Box<Expr>,
+        path: Box<Expr>,
+        on_error: Option<JsonOnBehavior>,
+    },
+    /// `JSON_VALUE(ctx, path [RETURNING type] [ON EMPTY] [ON ERROR])` — extract a single SCALAR
+    /// item, coerced to the RETURNING type (default `text`). Empty → ON EMPTY (default NULL); a
+    /// non-scalar / >1 item / coercion failure → ON ERROR (default NULL). (json-sql-functions.md §5.)
+    JsonValue {
+        ctx: Box<Expr>,
+        path: Box<Expr>,
+        returning: Option<String>,
+        on_empty: Option<JsonOnBehavior>,
+        on_error: Option<JsonOnBehavior>,
+    },
+    /// `JSON_QUERY(ctx, path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])` — extract a
+    /// JSON value (default `jsonb`). `wrapper` controls array-wrapping; `quotes` controls scalar-string
+    /// de-quoting. (json-sql-functions.md §5.)
+    JsonQuery {
+        ctx: Box<Expr>,
+        path: Box<Expr>,
+        returning: Option<String>,
+        wrapper: JsonWrapper,
+        /// `KEEP QUOTES` (true, default) / `OMIT QUOTES` (false).
+        keep_quotes: bool,
+        on_empty: Option<JsonOnBehavior>,
+        on_error: Option<JsonOnBehavior>,
+    },
     /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
     /// keyword: `negated = true` is `IS NOT DISTINCT FROM` (NULL-safe `=`); `false` is
     /// `IS DISTINCT FROM` (its negation). Always boolean-valued, never unknown
@@ -993,6 +1024,34 @@ pub enum Expr {
         lhs: Box<Expr>,
         query: Box<QueryExpr>,
     },
+}
+
+/// A constant `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions
+/// (json-sql-functions.md §5.2). `DEFAULT expr` is the deferred S3 follow-on (§5.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JsonOnBehavior {
+    /// `NULL` — substitute SQL NULL.
+    Null,
+    /// `ERROR` — raise the underlying SQL/JSON error.
+    Error,
+    /// `TRUE` / `FALSE` / `UNKNOWN` — only valid for JSON_EXISTS's `ON ERROR`.
+    True,
+    False,
+    Unknown,
+    /// `EMPTY ARRAY` / `EMPTY OBJECT` — substitute an empty JSON array / object (JSON_QUERY).
+    EmptyArray,
+    EmptyObject,
+}
+
+/// `JSON_QUERY`'s array-wrapper mode (json-sql-functions.md §5.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JsonWrapper {
+    /// `WITHOUT [ARRAY] WRAPPER` (default) — the sequence must be a singleton.
+    Without,
+    /// `WITH [UNCONDITIONAL] [ARRAY] WRAPPER` — always wrap the sequence in an array.
+    Unconditional,
+    /// `WITH CONDITIONAL [ARRAY] WRAPPER` — wrap only when the sequence is not a single item.
+    Conditional,
 }
 
 /// The optional kind word of an `IS JSON` predicate (spec/design/json-sql-functions.md §5).

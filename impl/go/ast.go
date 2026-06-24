@@ -822,6 +822,19 @@ const (
 	// scalar index i then means 1:i (PG). An out-of-bounds / NULL subscript yields NULL (PG, not an
 	// error); a non-array base is 42804 at resolve.
 	ExprSubscript
+	// ExprJsonExists is `JSON_EXISTS(ctx, path [behavior ON ERROR])` — the SQL/JSON existence
+	// predicate (json-sql-functions.md §5, S2). The path is evaluated over the context item; a
+	// non-empty sequence → true. The default `ON ERROR` behavior is `FALSE`. `PASSING` (vars) is
+	// deferred.
+	ExprJsonExists
+	// ExprJsonValue is `JSON_VALUE(ctx, path [RETURNING type] [ON EMPTY] [ON ERROR])` — extract a
+	// single SCALAR item, coerced to the RETURNING type (default `text`). Empty → ON EMPTY (default
+	// NULL); a non-scalar / >1 item / coercion failure → ON ERROR (default NULL). (json-sql-functions.md §5.)
+	ExprJsonValue
+	// ExprJsonQuery is `JSON_QUERY(ctx, path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])`
+	// — extract a JSON value (default `jsonb`). The wrapper controls array-wrapping; the quotes clause
+	// controls scalar-string de-quoting. (json-sql-functions.md §5.)
+	ExprJsonQuery
 )
 
 // SubscriptSpec is one subscript spec inside an ExprSubscript (spec/design/array.md §6): an index
@@ -938,6 +951,9 @@ type Expr struct {
 	IsNullOf    *IsNullExpr     // ExprIsNull
 	IsJsonOf    *IsJsonExpr     // ExprIsJson
 	JsonCtorOf  *JsonCtorExpr   // ExprJsonCtor
+	JsonExists  *JsonExistsExpr // ExprJsonExists
+	JsonValue   *JsonValueExpr  // ExprJsonValue
+	JsonQuery   *JsonQueryExpr  // ExprJsonQuery
 	IsDistinct  *IsDistinctExpr // ExprIsDistinct
 	FuncCall    *FuncCallExpr   // ExprFuncCall
 	In          *InExpr         // ExprIn
@@ -1071,6 +1087,67 @@ type IsJsonExpr struct {
 type JsonCtorExpr struct {
 	Operand    Expr
 	UniqueKeys bool
+}
+
+// JsonOnBehavior is a constant `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions
+// (json-sql-functions.md §5.2). `DEFAULT expr` is the deferred S3 follow-on (§5.3).
+type JsonOnBehavior int
+
+const (
+	// JOBNull is `NULL` — substitute SQL NULL.
+	JOBNull JsonOnBehavior = iota
+	// JOBError is `ERROR` — raise the underlying SQL/JSON error.
+	JOBError
+	// JOBTrue / JOBFalse / JOBUnknown — only valid for JSON_EXISTS's `ON ERROR`.
+	JOBTrue
+	JOBFalse
+	JOBUnknown
+	// JOBEmptyArray / JOBEmptyObject — substitute an empty JSON array / object (JSON_QUERY).
+	JOBEmptyArray
+	JOBEmptyObject
+)
+
+// JsonWrapper is JSON_QUERY's array-wrapper mode (json-sql-functions.md §5.2).
+type JsonWrapper int
+
+const (
+	// JWWithout is `WITHOUT [ARRAY] WRAPPER` (default) — the sequence must be a singleton.
+	JWWithout JsonWrapper = iota
+	// JWUnconditional is `WITH [UNCONDITIONAL] [ARRAY] WRAPPER` — always wrap the sequence in an array.
+	JWUnconditional
+	// JWConditional is `WITH CONDITIONAL [ARRAY] WRAPPER` — wrap only when the sequence is not a single item.
+	JWConditional
+)
+
+// JsonExistsExpr is `JSON_EXISTS(Ctx, Path [behavior ON ERROR])` — the SQL/JSON existence predicate
+// (json-sql-functions.md §5, S2). OnError is nil when no `ON ERROR` clause is present (default FALSE).
+type JsonExistsExpr struct {
+	Ctx     Expr
+	Path    Expr
+	OnError *JsonOnBehavior
+}
+
+// JsonValueExpr is `JSON_VALUE(Ctx, Path [RETURNING type] [ON EMPTY] [ON ERROR])` (json-sql-functions.md
+// §5). Returning is nil for the default `text`; OnEmpty/OnError are nil when absent.
+type JsonValueExpr struct {
+	Ctx       Expr
+	Path      Expr
+	Returning *string
+	OnEmpty   *JsonOnBehavior
+	OnError   *JsonOnBehavior
+}
+
+// JsonQueryExpr is `JSON_QUERY(Ctx, Path [RETURNING type] [wrapper] [quotes] [ON EMPTY] [ON ERROR])`
+// (json-sql-functions.md §5). Returning is nil for the default `jsonb`; KeepQuotes is true for `KEEP
+// QUOTES` (default) / false for `OMIT QUOTES`; OnEmpty/OnError are nil when absent.
+type JsonQueryExpr struct {
+	Ctx        Expr
+	Path       Expr
+	Returning  *string
+	Wrapper    JsonWrapper
+	KeepQuotes bool
+	OnEmpty    *JsonOnBehavior
+	OnError    *JsonOnBehavior
 }
 
 // IsDistinctExpr is `Lhs IS [NOT] DISTINCT FROM Rhs` — NULL-safe equality. Negated

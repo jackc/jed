@@ -149,6 +149,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The SQL/JSON constructors (S1) — JSON(text [(WITH|WITHOUT) UNIQUE [KEYS]]), JSON_SCALAR(v),
   // JSON_SERIALIZE(json|jsonb) (json-sql-functions.md §5).
   "func.json_ctor",
+  // The SQL/JSON query functions (S2) — JSON_EXISTS / JSON_VALUE / JSON_QUERY, the keyword-led
+  // primaries that compile a jsonpath, evaluate it over a context item, and apply per-function
+  // semantics (existence / a single scalar / a json value) with RETURNING/wrapper/quotes/ON
+  // EMPTY/ON ERROR sub-clauses (json-sql-functions.md §5).
+  "expr.json_query_fns",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",
