@@ -9854,6 +9854,12 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, columnD
 		jsonb := strings.HasPrefix(lname, "jsonb")
 		set := strings.HasSuffix(lname, "set")
 		return db.resolveJSONRecord(lname, jsonb, set, args, alias, columnDefs, argScope, ptypes)
+	// json[b]_populate_record(set) (R2, json-table.md §2): like json[b]_to_record(set) but the
+	// column shape comes from the COMPOSITE TYPE of the (typically NULL) first argument.
+	case "json_populate_record", "jsonb_populate_record", "json_populate_recordset", "jsonb_populate_recordset":
+		jsonb := strings.HasPrefix(lname, "jsonb")
+		set := strings.HasSuffix(lname, "set")
+		return db.resolveJSONPopulate(lname, jsonb, set, args, alias, argScope, ptypes)
 	}
 	// A column-definition list is valid ONLY on a record-returning function (PG).
 	if columnDefs != nil {
@@ -9998,6 +10004,63 @@ func (db *Database) resolveJSONRecord(name string, jsonb, set bool, args []*Expr
 	if set {
 		kind = srfJSONRecordset
 	}
+	return table, &srfPlan{kind: kind, args: []*rExpr{r}, recordCols: columns}, nil
+}
+
+// resolveJSONPopulate resolves a json/jsonb POPULATE-RECORD SRF (R2 — json[b]_populate_record(set),
+// json-table.md §2): the FIRST argument is a (typically NULL) value whose COMPOSITE TYPE supplies
+// the output column shape; the SECOND is the json/jsonb document. Reuses the R1 row machinery
+// (srfJSONRecord(set)) — only the column source differs (a composite type vs a col-def list). A
+// non-composite first argument → 42804; an anonymous record base → 0A000.
+func (db *Database) resolveJSONPopulate(name string, jsonb, set bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	if len(args) != 2 {
+		return nil, nil, noFuncOverload(name)
+	}
+	forbidden := &aggCtx{}
+	// The base argument's COMPOSITE type fixes the columns (its value is unused — usually NULL).
+	_, bt, err := resolve(argScope, *args[0], nil, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if bt.kind != rtComposite {
+		return nil, nil, NewError(DatatypeMismatch,
+			"the first argument of "+name+" must be a composite type")
+	}
+	// A named composite supplies the columns; an anonymous record base is 0A000.
+	if !bt.comp.named {
+		return nil, nil, NewError(FeatureNotSupported, "an anonymous record base is not supported yet")
+	}
+	ctype := db.CompositeType(bt.comp.name)
+	if ctype == nil {
+		return nil, nil, NewError(UndefinedObject, "composite type no longer exists")
+	}
+	columns := make([]Column, 0, len(ctype.Fields))
+	for _, f := range ctype.Fields {
+		columns = append(columns, Column{Name: f.Name, Type: f.Type, Decimal: f.Decimal})
+	}
+	// The SECOND argument is the json/jsonb document.
+	want := Json
+	if jsonb {
+		want = Jsonb
+	}
+	r, dt, err := resolve(argScope, *args[1], &want, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	ok := dt.kind == rtNull || (jsonb && dt.kind == rtJsonb) || (!jsonb && dt.kind == rtJson)
+	if !ok {
+		return nil, nil, noFuncOverload(name)
+	}
+	tname := name
+	if alias != nil {
+		tname = *alias
+	}
+	table := &Table{Name: tname, Columns: columns}
+	kind := srfJSONRecord
+	if set {
+		kind = srfJSONRecordset
+	}
+	// The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
 	return table, &srfPlan{kind: kind, args: []*rExpr{r}, recordCols: columns}, nil
 }
 
@@ -10360,7 +10423,9 @@ func jsonRecordRow(node *JsonNode, cols []Column, env *evalEnv, m *Meter) (Row, 
 // coerces the node's `->>`-style text through the cast machinery (so `"42"` / `42` → an `int`
 // column, etc.). A composite/array column type is a deferred 0A000.
 func coerceJSONMember(node *JsonNode, colTy Type, decimal *DecimalTypmod, env *evalEnv, m *Meter) (Value, error) {
-	if colTy.IsComposite() {
+	// A composite / array / range field type is a deferred 0A000 (only scalar / json / jsonb coerce
+	// this slice). R1's col-def list rejects these at resolve; R2's composite fields can carry one.
+	if _, ok := colTy.AsScalar(); !ok {
 		return Value{}, NewError(FeatureNotSupported, "a composite/array record column is not supported yet")
 	}
 	st := colTy.ScalarTy()

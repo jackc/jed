@@ -114,6 +114,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json[b]_to_record / json[b]_to_recordset (R1, json-table.md §2) — the record-returning functions
   // that map a JSON object's members to the C0 col-def-list columns by name + coerce.
   "func.json_record",
+  // json[b]_populate_record / json[b]_populate_recordset (R2, json-table.md §2) — like the R1 record
+  // functions but the column shape comes from the COMPOSITE TYPE of the (typically NULL) first argument.
+  "func.json_populate",
   // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
   "func.to_jsonb",
   // to_json + json[b]_build_array / json[b]_build_object (B1, json-sql-functions.md §2) — the

@@ -304,6 +304,28 @@ test("json_to_record composite/array column is 0A000", () => {
   );
 });
 
+// The R2 populate-record divergences the oracle corpus cannot express. A non-composite first argument
+// → 42804 (PG's "first argument must be a composite type"); a composite whose FIELD is an array →
+// 0A000 at row coercion (the same composite/array deferral R1 carries — only scalar / json / jsonb
+// fields coerce this slice). The scalar-field cases are oracle-clean in suites/json/json_populate.test.
+// Mirrors impl/rust/tests/json.rs json_populate_non_composite_and_complex_field_divergences.
+test("json_populate non-composite base and array field divergences", () => {
+  const db = dbWith([
+    "CREATE TYPE addr AS (street text, zip i32)",
+    "CREATE TYPE poly AS (name text, pts i32[])",
+  ]);
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM jsonb_populate_record(NULL::i32, '{"a":1}')`)),
+    "42804",
+  );
+  assert.equal(
+    errCode(() =>
+      execute(db, `SELECT * FROM jsonb_populate_record(NULL::poly, '{"name":"x","pts":[1,2]}')`),
+    ),
+    "0A000",
+  );
+});
+
 // A rename-only column-alias list `AS g(col)` (no types) on a table function is a deferred 0A000
 // (only the TYPED column-definition list `AS t(col type, …)` — C0 — is parsed). PostgreSQL accepts a
 // rename list on an SRF, so this is a documented divergence. Mirrors

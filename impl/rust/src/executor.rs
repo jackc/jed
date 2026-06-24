@@ -8764,6 +8764,17 @@ impl Database {
                 let table = srf_table(&lname, alias, Type::Scalar(ScalarType::Jsonb));
                 return Ok((table, vec![ctx, path], SrfKind::JsonbPathQuery));
             }
+            // json[b]_populate_record(set) (R2, json-table.md §2): like json[b]_to_record(set) but the
+            // column shape comes from the COMPOSITE TYPE of the (typically NULL) first argument.
+            "json_populate_record"
+            | "jsonb_populate_record"
+            | "json_populate_recordset"
+            | "jsonb_populate_recordset" => {
+                let jsonb = lname.starts_with("jsonb");
+                let set = lname.ends_with("set");
+                return self
+                    .resolve_json_populate(&lname, jsonb, set, args, alias, &arg_scope, ptypes);
+            }
             _ => {}
         }
         // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
@@ -8961,6 +8972,91 @@ impl Database {
             foreign_keys: Vec::new(),
         });
         Ok((table, vec![rarg], SrfKind::JsonRecord { jsonb, set }))
+    }
+
+    /// Resolve a json/jsonb POPULATE-RECORD SRF (R2 — `json[b]_populate_record(set)`, json-table.md
+    /// §2): the FIRST argument is a (typically NULL) value whose COMPOSITE TYPE supplies the output
+    /// column shape; the SECOND is the json/jsonb document. Reuses the R1 row machinery
+    /// (`SrfKind::JsonRecord`) — only the column source differs (a composite type vs a col-def list).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_json_populate(
+        &self,
+        name: &str,
+        jsonb: bool,
+        set: bool,
+        args: &[Expr],
+        alias: Option<&str>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        if args.len() != 2 {
+            return Err(no_func_overload(name));
+        }
+        // The base argument's COMPOSITE type fixes the columns (its value is unused — usually NULL).
+        let (_base, bt) = resolve(arg_scope, &args[0], None, &mut AggCtx::Forbidden, ptypes)?;
+        let ctype = match &bt {
+            ResolvedType::Composite(r) => {
+                // A named composite supplies the columns; an anonymous `record` base is `0A000`.
+                let tname = r.name.as_deref().ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "an anonymous record base is not supported yet",
+                    )
+                })?;
+                self.composite_type(tname).ok_or_else(|| {
+                    EngineError::new(SqlState::UndefinedObject, "composite type no longer exists")
+                })?
+            }
+            _ => {
+                return Err(EngineError::new(
+                    SqlState::DatatypeMismatch,
+                    format!("the first argument of {name} must be a composite type"),
+                ));
+            }
+        };
+        let columns: Vec<Column> = ctype
+            .fields
+            .iter()
+            .map(|f| Column {
+                name: f.name.clone(),
+                ty: f.ty.clone(),
+                decimal: f.decimal,
+                primary_key: false,
+                not_null: false,
+                default: None,
+                default_expr: None,
+                identity: None,
+                collation: None,
+            })
+            .collect();
+        let want = if jsonb {
+            ScalarType::Jsonb
+        } else {
+            ScalarType::Json
+        };
+        let (doc, dt) = resolve(
+            arg_scope,
+            &args[1],
+            Some(want),
+            &mut AggCtx::Forbidden,
+            ptypes,
+        )?;
+        if !matches!(
+            (&dt, jsonb),
+            (ResolvedType::Jsonb, true) | (ResolvedType::Json, false) | (ResolvedType::Null, _)
+        ) {
+            return Err(no_func_overload(name));
+        }
+        let table = Box::new(Table {
+            name: alias.unwrap_or(name).to_string(),
+            columns,
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        });
+        // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
+        Ok((table, vec![doc], SrfKind::JsonRecord { jsonb, set }))
     }
 
     /// Resolve `generate_series(start, stop[, step])` (spec/design/functions.md §10): 2 or 3

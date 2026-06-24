@@ -335,6 +335,31 @@ fn json_agg_deferred_element_source_is_0a000() {
     assert_eq!(err(&mut db, "SELECT json_agg(x) FROM f"), "0A000");
 }
 
+/// `json[b]_populate_record` over a NON-composite base argument is `42804` (jed's datatype-mismatch
+/// convention); a composite whose field is an array/nested composite is `0A000` (the same
+/// coerce-to-field deferral as the record functions). PostgreSQL handles both, so these are
+/// documented divergences; the scalar-field behavior is oracle-clean in suites/json/json_populate.test.
+#[test]
+fn json_populate_non_composite_and_complex_field_divergences() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM jsonb_populate_record(NULL::i32, '{\"a\":1}')"
+        ),
+        "42804"
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM jsonb_populate_record(NULL::poly, '{\"name\":\"x\",\"pts\":[1,2]}')"
+        ),
+        "0A000"
+    );
+}
+
 /// A composite or array COLUMN in a record function's column-definition list is a deferred `0A000`
 /// (only scalar / json / jsonb columns coerce this slice). PostgreSQL supports them, so this is a
 /// documented divergence; the scalar columns are oracle-clean in suites/json/json_record.test.

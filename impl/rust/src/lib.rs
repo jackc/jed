@@ -616,6 +616,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // record-returning functions (R1) — json[b]_to_record / _recordset (json-table.md §2).
     "func.coldeflist",
     "func.json_record",
+    // json/jsonb populate-record functions (R2) — shape from the base arg's composite type (json-table.md §2).
+    "func.json_populate",
     // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
     "func.to_jsonb",
     // json/jsonb construction builders (B1) — to_json / json[b]_build_array / _object (§2).

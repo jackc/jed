@@ -551,6 +551,10 @@ var SupportedCapabilities = []string{
 	// json/jsonb record-returning functions (R1) — json[b]_to_record → one record row,
 	// json[b]_to_recordset → setof record, over the C0 col-def list (json-table.md §2).
 	"func.json_record",
+	// json/jsonb populate-record functions (R2) — json[b]_populate_record → one record row,
+	// json[b]_populate_recordset → setof record, with the column shape taken from the COMPOSITE
+	// TYPE of the (typically NULL) first argument (json-table.md §2).
+	"func.json_populate",
 	// The jsonpath scalar type (P1a) — the '…'::jsonpath / jsonpath '…' literal cast compiled at
 	// resolve + the canonical render ($.a → $."a", lax omitted, strict kept); structural-accessor
 	// subset only (filters/methods/arithmetic → 0A000); non-comparable (42883); literal-only (a

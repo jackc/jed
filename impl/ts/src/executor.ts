@@ -7336,6 +7336,18 @@ export class Database {
       const set = lname.endsWith("set");
       return this.resolveJsonRecord(lname, jsonb, set, args, alias, columnDefs, argScope, ptypes);
     }
+    // json[b]_populate_record(set) (R2, json-table.md §2): like json[b]_to_record(set) but the
+    // column shape comes from the COMPOSITE TYPE of the (typically NULL) first argument.
+    if (
+      lname === "json_populate_record" ||
+      lname === "jsonb_populate_record" ||
+      lname === "json_populate_recordset" ||
+      lname === "jsonb_populate_recordset"
+    ) {
+      const jsonb = lname.startsWith("jsonb");
+      const set = lname.endsWith("set");
+      return this.resolveJsonPopulate(lname, jsonb, set, args, alias, argScope, ptypes);
+    }
     // A column-definition list is valid ONLY on a record-returning function (PG).
     if (columnDefs !== null) {
       throw engineError(
@@ -7550,6 +7562,75 @@ export class Database {
     return {
       table,
       srf: { kind: "json_record", args: [node], recordSet: set, recordCols: columns },
+    };
+  }
+
+  // resolveJsonPopulate resolves a json/jsonb POPULATE-RECORD SRF (R2 — `json[b]_populate_record(set)`,
+  // json-table.md §2): the FIRST argument is a (typically NULL) value whose COMPOSITE TYPE supplies
+  // the output column shape; the SECOND is the json/jsonb document. Reuses the R1 row machinery
+  // (the `json_record` kind) — only the column source differs (a composite type vs a col-def list). A
+  // non-composite first argument → 42804; an anonymous record base → 0A000.
+  private resolveJsonPopulate(
+    name: string,
+    jsonb: boolean,
+    set: boolean,
+    args: Expr[],
+    alias: string | null,
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
+    if (args.length !== 2) throw noFuncOverload(name);
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    // The base argument's COMPOSITE type fixes the columns (its value is unused — usually NULL).
+    const { type: bt } = resolve(argScope, args[0]!, null, forbidden, ptypes);
+    if (bt.kind !== "composite") {
+      throw engineError(
+        "datatype_mismatch",
+        "the first argument of " + name + " must be a composite type",
+      );
+    }
+    // A named composite supplies the columns; an anonymous record base is 0A000.
+    if (bt.name === null) {
+      throw engineError("feature_not_supported", "an anonymous record base is not supported yet");
+    }
+    const ctype = this.compositeType(bt.name);
+    if (ctype === undefined) {
+      throw engineError("undefined_object", "composite type no longer exists");
+    }
+    const columns: Column[] = ctype.fields.map((f: CompositeField) => ({
+      name: f.name,
+      type: f.type,
+      decimal: f.decimal,
+      primaryKey: false,
+      notNull: false,
+      default: null,
+      defaultExpr: null,
+      identity: null,
+      collation: null,
+    }));
+    // The SECOND argument is the json/jsonb document.
+    const { node: doc, type } = resolve(
+      argScope,
+      args[1]!,
+      jsonb ? "jsonb" : "json",
+      forbidden,
+      ptypes,
+    );
+    const ok =
+      type.kind === "null" || (jsonb && type.kind === "jsonb") || (!jsonb && type.kind === "json");
+    if (!ok) throw noFuncOverload(name);
+    const table: Table = {
+      name: alias ?? name,
+      columns,
+      pk: [],
+      checks: [],
+      indexes: [],
+      fks: [],
+    };
+    // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
+    return {
+      table,
+      srf: { kind: "json_record", args: [doc], recordSet: set, recordCols: columns },
     };
   }
 

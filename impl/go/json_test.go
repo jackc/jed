@@ -414,6 +414,24 @@ func TestJsonRecordCompositeArrayColumnIs0A000(t *testing.T) {
 	}
 }
 
+// TestJsonPopulateNonCompositeAndComplexFieldDivergences: the R2 populate-record divergences the
+// oracle corpus cannot express. A non-composite first argument → 42804 (PG's "first argument must be
+// a composite type"); a composite whose FIELD is an array → 0A000 at row coercion (the same
+// composite/array deferral R1 carries — only scalar / json / jsonb fields coerce this slice). The
+// scalar-field cases are oracle-clean in suites/json/json_populate.test. Mirrors
+// impl/rust/tests/json.rs json_populate_non_composite_and_complex_field_divergences.
+func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
+	run(t, db, "CREATE TYPE poly AS (name text, pts i32[])")
+	if got := errJSON(t, db, `SELECT * FROM jsonb_populate_record(NULL::i32, '{"a":1}')`); got != "42804" {
+		t.Errorf("non-composite base: got %s, want 42804", got)
+	}
+	if got := errJSON(t, db, `SELECT * FROM jsonb_populate_record(NULL::poly, '{"name":"x","pts":[1,2]}')`); got != "0A000" {
+		t.Errorf("composite with array field: got %s, want 0A000", got)
+	}
+}
+
 // TestSrfRenameOnlyColumnListIsDeferred: a rename-only column-alias list AS g(col) (no types) on a
 // table function is a deferred 0A000 (only the TYPED column-definition list AS t(col type, …) — C0 —
 // is parsed). PostgreSQL accepts a rename list on an SRF, so this is a documented divergence. Mirrors

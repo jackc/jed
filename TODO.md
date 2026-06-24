@@ -361,7 +361,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         NULL). Non-object/non-array → `22023`; required col-def list (else `42601`); NULL arg → 0 rows; a
         composite/array column type / a rename-only list → `0A000`. `SrfKind::JsonRecord` + `record_cols`
         on the SrfPlan + `json_record_row`/`coerce_json_member`. All 3 cores, cap `func.json_record`,
-        oracle-clean. _R2 follow-on:_ `json[b]_populate_record(set)` (shape from a composite-type base arg).
+        oracle-clean.
+  - [x] **R2** — ✅ `json[b]_populate_record` (one row) / `json[b]_populate_recordset` (setof): like R1
+        but the column shape comes from the COMPOSITE TYPE of the (typically NULL) first argument. Reuses
+        the R1 row machinery (`SrfKind::JsonRecord`) — only the column source differs (composite type vs
+        col-def list). A non-composite base → `42804`; an anonymous record / composite-or-array field type
+        → `0A000`. FROM-clause SRF only. All 3 cores, cap `func.json_populate`, oracle-clean. **★ R DONE.**
   - [~] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +
         `like_regex`→Pike-VM (`i`/`q` flags; `s`/`m`/`x`→`0A000`) + the `2203x` error class. → jsonpath.md
     - [x] **P1a — the jsonpath type + literal + compile + canonical render** — ✅ the `jsonpath` scalar
