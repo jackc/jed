@@ -858,7 +858,7 @@ reason = "jed: a full scan iterates the text PRIMARY KEY in C/byte (code-point) 
 [[override]]
 file = "types/text.test"
 sql = "SELECT s FROM astral ORDER BY s"
-reason = "jed: `C`/byte collation = UTF-8 code-point order, so 豈 (U+F900, bytes E8 BF 88) sorts before 😀 (U+1F600, bytes F0 9F 98 80). The oracle's en_US.utf8 collation orders them oppositely. This pins jed's UTF-8-not-UTF-16 ordering rule (types.md §11); a documented collation divergence."
+reason = "jed: `C`/byte collation = UTF-8 code-point order, so 豈 (U+F900, bytes EF A4 80) sorts before 😀 (U+1F600, bytes F0 9F 98 80). The oracle's en_US.utf8 collation orders them oppositely. This pins jed's UTF-8-not-UTF-16 ordering rule (types.md §11); a documented collation divergence."
 
 [[override]]
 file = "types/text.test"
@@ -998,3 +998,13 @@ reason = "jed: a window function combined with aggregates / GROUP BY is 0A000 th
 # in_range_float*_float8) via the in-contract correctly-rounded kernel, so jed is bit-identical to
 # PostgreSQL (window.md §6, float.md §5). window/frame_range.test's float cases are oracle-clean,
 # needing no override here.
+
+[[override]]
+file = "types/utf16_split.test"
+sql = "SELECT s FROM u WHERE s > '�' COLLATE \"C\" UNION SELECT s FROM u WHERE s = '😀' ORDER BY s COLLATE \"C\""
+reason = "jed: a set operation with COLLATE in the trailing ORDER BY -- PostgreSQL cannot describe (prepare) the result columns of this query shape, so the oracle cannot regenerate the rows. jed orders by the C (code-point) sort key; the committed rows are correct by construction (the UTF-8-not-UTF-16 pin, types.md §11) and verified by cross-core differential agreement."
+
+[[override]]
+file = "types/utf16_split.test"
+sql = "SELECT s FROM u WHERE s >= '豈' COLLATE \"C\" INTERSECT SELECT s FROM u WHERE s <= '😀' COLLATE \"C\" ORDER BY s COLLATE \"C\""
+reason = "jed: a set operation with COLLATE in the trailing ORDER BY -- PostgreSQL cannot describe (prepare) the result columns of this query shape, so the oracle cannot regenerate the rows. jed orders by the C (code-point) sort key; the committed rows are correct by construction (the UTF-8-not-UTF-16 pin, types.md §11) and verified by cross-core differential agreement."

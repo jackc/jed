@@ -1,0 +1,223 @@
+# Adversarial UTF-8-vs-UTF-16 text ordering — the cross-core representation split
+# (spec/design/types.md §11, CLAUDE.md §8). Rust/Go compare `text` by UTF-8 BYTES = Unicode
+# CODE-POINT order; the TS core holds strings as UTF-16 and MUST iterate code points / encoded
+# bytes, never raw JS `<` (UTF-16 CODE-UNIT order). The two orders DISAGREE for any astral char
+# (≥ U+10000) versus a high-BMP char in U+E000..U+FFFF: an astral's lead surrogate is in
+# 0xD800..0xDBFF, BELOW 0xE000, so UTF-16 sorts the astral BEFORE the high-BMP char while
+# code points sort it AFTER. types/text.test already pins ONE such pair through the in-memory
+# sort comparator; this file drives the SAME divergence through every OTHER text comparison
+# path — comparison operators, the text PRIMARY-KEY and secondary-index key encoding, range
+# bounds, MIN/MAX, set-op dedup, DESC inversion, LIKE — each an independent place a UTF-16-naive
+# core could diverge. Ordering operations carry an explicit COLLATE "C" (the default collation
+# is already C; the explicit clause keeps the file oracle-clean — PostgreSQL's default en_US
+# agrees only under C). Every expected row is code-point order, known by construction. The
+# 'default collation resolves to C' property is pinned separately by types/text.test.
+#
+# code-point (correct) order: A < é < 中 < 豈 < ﬀ < � < 𝐀 < 😀 < 🚀
+# UTF-16-naive (WRONG) order: A < é < 中 < 𝐀 < 😀 < 🚀 < 豈 < ﬀ < �
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.point_lookup, query.order_by, query.distinct, query.union, query.intersect, query.aggregates, expr.comparison_value, expr.between, expr.like, types.i32, types.text, types.boolean
+
+# --- comparison operators: an astral char is GREATER than any high-BMP char by code point;
+# a UTF-16-naive `<` would call it smaller (astral lead surrogate 0xD8xx < 0xF900/0xFFFD).
+query BBBB nosort
+SELECT '😀' > '豈' COLLATE "C", '😀' < '豈' COLLATE "C", '𝐀' > '�' COLLATE "C", '🚀' >= 'ﬀ' COLLATE "C"
+----
+true
+false
+true
+true
+
+# equality is byte-equality (a different, non-ordering path) — astral = itself, != a high-BMP.
+query BBB nosort
+SELECT '😀' = '😀', '😀' = '豈', '😀' <> '豈'
+----
+true
+false
+true
+
+# an explicit COLLATE "C" resolves to the same code-point order (the C key path).
+query B nosort
+SELECT '😀' > '�' COLLATE "C"
+----
+true
+
+# --- ORDER BY (sort comparator), the full 9-char ladder. id != sort rank, so the result is a
+# non-identity permutation; a UTF-16-naive core interleaves the astrals into the middle.
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO u VALUES (7, 'A'), (3, 'é'), (9, '中'), (1, '豈'), (5, 'ﬀ'), (8, '�'), (2, '𝐀'), (6, '😀'), (4, '🚀')
+
+# ascending: high-BMP (豈ﬀ�) before astrals (𝐀😀🚀)
+query I nosort
+SELECT id FROM u ORDER BY s COLLATE "C"
+----
+7
+3
+9
+1
+5
+8
+2
+6
+4
+
+# the text values themselves, ascending (the T-tag render path)
+query T nosort
+SELECT s FROM u ORDER BY s COLLATE "C"
+----
+A
+é
+中
+豈
+ﬀ
+�
+𝐀
+😀
+🚀
+
+# descending (the whole-component inversion path) — exact reverse of ascending
+query I nosort
+SELECT id FROM u ORDER BY s COLLATE "C" DESC
+----
+4
+6
+2
+8
+5
+1
+9
+3
+7
+
+# --- range predicates. `s > '�'` (U+FFFD) selects EXACTLY the astrals by code point;
+# a UTF-16-naive bound would instead select the high-BMP chars. Ordered by id for a stable check.
+query I nosort
+SELECT id FROM u WHERE s > '�' COLLATE "C" ORDER BY id
+----
+2
+4
+6
+
+# `s < '豈'` (U+F900) selects the three sub-BMP chars (never an astral).
+query I nosort
+SELECT id FROM u WHERE s < '豈' COLLATE "C" ORDER BY id
+----
+3
+7
+9
+
+# BETWEEN a high-BMP and an astral bound spans both ranges: U+F900..U+1F600 inclusive.
+query T nosort
+SELECT s FROM u WHERE s COLLATE "C" BETWEEN '豈' AND '😀' ORDER BY s COLLATE "C"
+----
+豈
+ﬀ
+�
+𝐀
+😀
+
+# --- MIN/MAX use the same code-point order: min is the ASCII 'A', max is the highest astral.
+# A UTF-16-naive MAX would wrongly pick the high-BMP U+FFFD over the astrals.
+query TT nosort
+SELECT MIN(s COLLATE "C"), MAX(s COLLATE "C") FROM u
+----
+A
+🚀
+
+# --- set operations re-derive order/equality through the dedup path. UNION of two astral-
+# selecting arms dedups to the astrals; INTERSECT of a high-and-up arm with an up-to-astral arm
+# yields the U+F900..U+1F600 span. Both end with ORDER BY over astral/high-BMP boundaries.
+query T nosort
+SELECT s FROM u WHERE s > '�' COLLATE "C" UNION SELECT s FROM u WHERE s = '😀' ORDER BY s COLLATE "C"
+----
+𝐀
+😀
+🚀
+
+query T nosort
+SELECT s FROM u WHERE s >= '豈' COLLATE "C" INTERSECT SELECT s FROM u WHERE s <= '😀' COLLATE "C" ORDER BY s COLLATE "C"
+----
+豈
+ﬀ
+�
+𝐀
+😀
+
+# --- text PRIMARY KEY: the order-preserving key encoding (encoding.md §2.4) is the value's
+# UTF-8 bytes, so the B-tree orders by code point. This is a SEPARATE code path from the
+# in-memory comparator above — a UTF-16-naive key encoder would build a mis-ordered tree.
+statement ok
+CREATE TABLE uk (s text PRIMARY KEY, id i32)
+
+statement ok
+INSERT INTO uk VALUES ('A', 7), ('é', 3), ('中', 9), ('豈', 1), ('ﬀ', 5), ('�', 8), ('𝐀', 2), ('😀', 6), ('🚀', 4)
+
+# PK scan order == code-point order
+query I nosort
+SELECT id FROM uk ORDER BY s COLLATE "C"
+----
+7
+3
+9
+1
+5
+8
+2
+6
+4
+
+# point lookups on an astral and a high-BMP key (the key-equality seek)
+query I nosort
+SELECT id FROM uk WHERE s = '😀'
+----
+6
+
+query I nosort
+SELECT id FROM uk WHERE s = '豈'
+----
+1
+
+# a key-range bound: keys above U+FFFD are exactly the astrals (key-bound pushdown stays correct)
+query I nosort
+SELECT id FROM uk WHERE s > '�' COLLATE "C" ORDER BY s COLLATE "C"
+----
+2
+6
+4
+
+# --- secondary index on a text column: the index B-tree key is likewise UTF-8 bytes.
+statement ok
+CREATE TABLE u2 (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO u2 VALUES (7, 'A'), (3, 'é'), (9, '中'), (1, '豈'), (5, 'ﬀ'), (8, '�'), (2, '𝐀'), (6, '😀'), (4, '🚀')
+
+statement ok
+CREATE INDEX u2_s ON u2 (s)
+
+# equality via the index, on an astral key
+query I nosort
+SELECT id FROM u2 WHERE s = '🚀'
+----
+4
+
+# index range: > U+FFFD selects the astrals (ordered)
+query I nosort
+SELECT id FROM u2 WHERE s > '�' COLLATE "C" ORDER BY s COLLATE "C"
+----
+2
+6
+4
+
+# --- LIKE matches by code point: `_` is exactly one code point, so it matches a single astral;
+# a UTF-16-naive matcher would treat an astral as two units and miss.
+query BBBB nosort
+SELECT '😀' LIKE '_', '😀🚀' LIKE '__', '😀' LIKE '😀', '😀' LIKE '_🚀'
+----
+true
+true
+true
+false
+

@@ -184,15 +184,15 @@ SELECT id FROM w WHERE s = 'a'
 statement ok
 CREATE TABLE astral (id i32 PRIMARY KEY, s text)
 
-# U+F900 (豈, a BMP char ≥ U+E000) and U+1F600 (😀, astral). By Unicode code point = UTF-8
-# byte order (the C collation), U+F900 < U+1F600, so 豈 sorts before 😀. A core comparing by
+# U+F900 (豈, a BMP char ≥ U+E000) and U+1F600 (😀, astral). By Unicode code point = UTF-8
+# byte order (the C collation), U+F900 < U+1F600, so 豈 sorts before 😀. A core comparing by
 # UTF-16 code units would order them oppositely (😀's lead surrogate 0xD83D < 0xF900). This
 # pins the rule that text compares by UTF-8 bytes / code points, never UTF-16.
 statement ok
-INSERT INTO astral VALUES (1, '😀'), (2, '豈')
+INSERT INTO astral VALUES (1, '😀'), (2, '豈')
 
 query T nosort
 SELECT s FROM astral ORDER BY s
 ----
-豈
+豈
 😀
