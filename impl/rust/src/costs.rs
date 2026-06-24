@@ -24,6 +24,7 @@ pub struct CostSchedule {
     pub regex_compile: i64,
     pub regex_step: i64,
     pub window_result: i64,
+    pub varlen_compare: i64,
     pub window_frame_step: i64,
 }
 
@@ -46,5 +47,6 @@ pub const COSTS: CostSchedule = CostSchedule {
     regex_compile: 1,
     regex_step: 1,
     window_result: 1,
+    varlen_compare: 1,
     window_frame_step: 1,
 };

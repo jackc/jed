@@ -54,9 +54,13 @@ fn two_tables() -> Database {
         "CREATE TABLE control (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
+    // control row 1 is `plain` (5 chars), not a 4-char `tiny`: it must be at least as long as the
+    // `small` probe value the correlated test compares against, so `probe.body = body` charges the
+    // SAME varlen_compare (min(5, len) = 5) on both tables — keeping the comp−control delta the pure
+    // compression cost, not a length-of-comparison artifact (cost.md §3 "varlen_compare").
     execute(
         &mut db,
-        "INSERT INTO control VALUES (1, 'tiny'), (2, 'small')",
+        "INSERT INTO control VALUES (1, 'plain'), (2, 'small')",
     )
     .unwrap();
     db

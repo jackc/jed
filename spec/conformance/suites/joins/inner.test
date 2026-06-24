@@ -46,9 +46,11 @@ SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
 2
 
 # WHERE applies AFTER the join, to the combined rows. The ON produces 3 matched rows; WHERE
-# `b.label = 'twenty'` evaluates on each (3 operator_eval) and keeps one. 8 + 16 + 3 + 1 = 28.
+# `b.label = 'twenty'` evaluates on each (3 operator_eval) and keeps one — each text compare also
+# charges varlen_compare for min(len) − 1: 'ten'(2) + 'twenty'(5) + 'twentyish'(5) = 12. 8 + 2 page
+# + 16 ON + 3 WHERE + 12 varlen + 1 produced = 42.
 # names: id, k
-# cost: 30
+# cost: 42
 query II nosort
 SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id
 ----

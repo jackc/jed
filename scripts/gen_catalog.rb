@@ -108,6 +108,7 @@ def rust_entry(op)
     "        arg_defaults: #{rust_slice(op['arg_defaults'] || [])},",
     "        volatility: #{rust_str(op['volatility'] || 'immutable')},",
     "        variadic: #{op['variadic'] ? 'true' : 'false'},",
+    "        cost: #{op['cost'] || 0},",
     "    },",
   ].join("\n")
 end
@@ -193,6 +194,10 @@ def rust_file(ops, aggs, srfs, wins)
         /// VARIADIC flag (array-functions.md §12): the last parameter collects a spread of
         /// trailing args, or a single array via the VARIADIC keyword. Default false.
         pub variadic: bool,
+        /// Per-operator evaluation cost base (functions.md §8): the weight this operator charges
+        /// in place of `operator_eval`. 0 = absent ⇒ use the uniform `operator_eval`. Size-scaled
+        /// cost (decimal_work / varlen_compare / …) is separate from this static base.
+        pub cost: i64,
     }
 
     /// Every operator in the catalog, in catalog order.
@@ -330,6 +335,7 @@ def go_entry(op)
     ["ArgDefaults",   go_slice(op["arg_defaults"] || [])],
     ["Volatility",    go_str(op["volatility"] || "immutable")],
     ["Variadic",      variadic_bool(op)],
+    ["Cost",          (op["cost"] || 0).to_s],
   ]
   w = fields.map { |k, _| k.length }.max
   lines = fields.map { |k, v| "\t\t#{k}:#{' ' * (w - k.length + 1)}#{v}," }
@@ -419,6 +425,10 @@ def go_file(ops, aggs, srfs, wins)
     \t// Variadic marks the last parameter VARIADIC (array-functions.md §12): a spread of trailing
     \t// args, or a single array via the VARIADIC keyword. Default false.
     \tVariadic bool
+    \t// Cost is the per-operator evaluation cost base (functions.md §8): the weight this operator
+    \t// charges in place of OperatorEval. 0 = absent ⇒ use the uniform OperatorEval. Size-scaled
+    \t// cost (DecimalWork / VarlenCompare / …) is separate from this static base.
+    \tCost int64
     }
 
     // Operators lists every operator in the catalog, in catalog order.
@@ -554,6 +564,7 @@ def ts_entry(op)
   lines << "    argDefaults: #{ts_arr(op['arg_defaults'] || [])},"
   lines << "    volatility: #{ts_str(op['volatility'] || 'immutable')},"
   lines << "    variadic: #{variadic_bool(op)},"
+  lines << "    cost: #{op['cost'] || 0},"
   lines << "  },"
   lines.join("\n")
 end
@@ -633,6 +644,10 @@ def ts_file(ops, aggs, srfs, wins)
       // VARIADIC flag (array-functions.md §12): the last parameter collects a spread of trailing
       // args, or a single array via the VARIADIC keyword. Default false.
       variadic: boolean;
+      // Per-operator evaluation cost base (functions.md §8): the weight this operator charges in
+      // place of operatorEval. 0 = absent ⇒ use the uniform operatorEval. Size-scaled cost
+      // (decimalWork / varlenCompare / …) is separate from this static base.
+      cost: number;
     }
 
     // Every operator in the catalog, in catalog order.

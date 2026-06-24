@@ -25,6 +25,7 @@ export interface CostSchedule {
   regexCompile: bigint;
   regexStep: bigint;
   windowResult: bigint;
+  varlenCompare: bigint;
   windowFrameStep: bigint;
 }
 
@@ -47,5 +48,6 @@ export const COSTS: CostSchedule = {
   regexCompile: 1n,
   regexStep: 1n,
   windowResult: 1n,
+  varlenCompare: 1n,
   windowFrameStep: 1n,
 };

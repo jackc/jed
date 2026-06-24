@@ -28,6 +28,10 @@ export interface OperatorDesc {
   // VARIADIC flag (array-functions.md §12): the last parameter collects a spread of trailing
   // args, or a single array via the VARIADIC keyword. Default false.
   variadic: boolean;
+  // Per-operator evaluation cost base (functions.md §8): the weight this operator charges in
+  // place of operatorEval. 0 = absent ⇒ use the uniform operatorEval. Size-scaled cost
+  // (decimalWork / varlenCompare / …) is separate from this static base.
+  cost: number;
 }
 
 // Every operator in the catalog, in catalog order.
@@ -46,6 +50,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "and",
@@ -61,6 +66,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "not",
@@ -76,6 +82,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -92,6 +99,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -108,6 +116,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -124,6 +133,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -140,6 +150,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -156,6 +167,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -172,6 +184,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -187,6 +200,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -202,6 +216,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -218,6 +233,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -234,6 +250,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -250,6 +267,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -266,6 +284,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -282,6 +301,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -298,6 +318,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -313,6 +334,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -328,6 +350,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "like",
@@ -343,6 +366,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ilike",
@@ -358,6 +382,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "regex_match",
@@ -374,6 +399,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "regex_imatch",
@@ -390,6 +416,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -406,6 +433,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -422,6 +450,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -438,6 +467,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -454,6 +484,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -470,6 +501,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -486,6 +518,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -501,6 +534,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -516,6 +550,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -532,6 +567,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -548,6 +584,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -564,6 +601,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -580,6 +618,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -596,6 +635,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -612,6 +652,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -627,6 +668,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -642,6 +684,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -658,6 +701,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -674,6 +718,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -690,6 +735,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -706,6 +752,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -722,6 +769,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -738,6 +786,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -753,6 +802,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -768,6 +818,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -784,6 +835,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -800,6 +852,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -816,6 +869,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -832,6 +886,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -848,6 +903,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -864,6 +920,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -879,6 +936,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -894,6 +952,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -910,6 +969,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -926,6 +986,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -942,6 +1003,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -958,6 +1020,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -974,6 +1037,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -990,6 +1054,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -1005,6 +1070,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -1020,6 +1086,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -1036,6 +1103,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -1052,6 +1120,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -1068,6 +1137,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -1084,6 +1154,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -1100,6 +1171,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -1116,6 +1188,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -1131,6 +1204,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -1146,6 +1220,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -1162,6 +1237,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -1178,6 +1254,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -1194,6 +1271,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -1210,6 +1288,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -1226,6 +1305,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -1242,6 +1322,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -1257,6 +1338,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -1272,6 +1354,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "eq",
@@ -1288,6 +1371,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ne",
@@ -1304,6 +1388,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lt",
@@ -1320,6 +1405,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "gt",
@@ -1336,6 +1422,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "le",
@@ -1352,6 +1439,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ge",
@@ -1368,6 +1456,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_distinct_from",
@@ -1383,6 +1472,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_distinct_from",
@@ -1398,6 +1488,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_null",
@@ -1413,6 +1504,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "is_not_null",
@@ -1428,6 +1520,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1444,6 +1537,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1460,6 +1554,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mul",
@@ -1476,6 +1571,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "div",
@@ -1492,6 +1588,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mod",
@@ -1508,6 +1605,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "neg",
@@ -1524,6 +1622,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1540,6 +1639,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1556,6 +1656,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mul",
@@ -1572,6 +1673,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "div",
@@ -1588,6 +1690,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mod",
@@ -1604,6 +1707,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "neg",
@@ -1620,6 +1724,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1636,6 +1741,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1652,6 +1758,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "neg",
@@ -1668,6 +1775,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1684,6 +1792,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1700,6 +1809,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1716,6 +1826,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1732,6 +1843,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1748,6 +1860,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1764,6 +1877,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1780,6 +1894,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1796,6 +1911,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mul",
@@ -1812,6 +1928,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mul",
@@ -1828,6 +1945,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mul",
@@ -1844,6 +1962,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mul",
@@ -1860,6 +1979,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "div",
@@ -1876,6 +1996,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "div",
@@ -1892,6 +2013,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "add",
@@ -1908,6 +2030,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sub",
@@ -1924,6 +2047,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mul",
@@ -1940,6 +2064,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "div",
@@ -1956,6 +2081,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "mod",
@@ -1972,6 +2098,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "neg",
@@ -1988,6 +2115,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "abs",
@@ -2003,6 +2131,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "abs",
@@ -2018,6 +2147,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "round",
@@ -2033,6 +2163,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "round",
@@ -2048,6 +2179,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "round",
@@ -2063,6 +2195,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "round",
@@ -2078,6 +2211,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "abs",
@@ -2093,6 +2227,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ceil",
@@ -2108,6 +2243,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "floor",
@@ -2123,6 +2259,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "trunc",
@@ -2138,6 +2275,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "round",
@@ -2153,6 +2291,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "round",
@@ -2168,6 +2307,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sqrt",
@@ -2183,6 +2323,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "exp",
@@ -2198,6 +2339,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "ln",
@@ -2213,6 +2355,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "log10",
@@ -2228,6 +2371,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "pow",
@@ -2243,6 +2387,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "sin",
@@ -2258,6 +2403,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "cos",
@@ -2273,6 +2419,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "tan",
@@ -2288,6 +2435,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "make_interval",
@@ -2303,6 +2451,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: ["0", "0", "0", "0", "0", "0", "0"],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "uuid_extract_version",
@@ -2318,6 +2467,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "uuid_extract_timestamp",
@@ -2333,6 +2483,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "uuidv4",
@@ -2348,6 +2499,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "uuidv7",
@@ -2363,6 +2515,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "uuidv7",
@@ -2378,6 +2531,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "now",
@@ -2393,6 +2547,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "stable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "clock_timestamp",
@@ -2408,6 +2563,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "nextval",
@@ -2423,6 +2579,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "currval",
@@ -2438,6 +2595,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "setval",
@@ -2453,6 +2611,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "setval",
@@ -2468,6 +2627,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lastval",
@@ -2483,6 +2643,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "volatile",
     variadic: false,
+    cost: 0,
   },
   {
     name: "current_setting",
@@ -2498,6 +2659,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "stable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "current_setting",
@@ -2513,6 +2675,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "stable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "num_nulls",
@@ -2528,6 +2691,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: true,
+    cost: 0,
   },
   {
     name: "num_nonnulls",
@@ -2543,6 +2707,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: true,
+    cost: 0,
   },
   {
     name: "array_ndims",
@@ -2558,6 +2723,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_length",
@@ -2573,6 +2739,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_lower",
@@ -2588,6 +2755,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_upper",
@@ -2603,6 +2771,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "cardinality",
@@ -2618,6 +2787,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_dims",
@@ -2633,6 +2803,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_to_json",
@@ -2648,6 +2819,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_append",
@@ -2663,6 +2835,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_prepend",
@@ -2678,6 +2851,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_cat",
@@ -2693,6 +2867,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_remove",
@@ -2708,6 +2883,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_replace",
@@ -2723,6 +2899,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_position",
@@ -2738,6 +2915,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_position",
@@ -2753,6 +2931,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "array_positions",
@@ -2768,6 +2947,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "concat",
@@ -2784,6 +2964,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "concat",
@@ -2800,6 +2981,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "concat",
@@ -2816,6 +2998,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "contains",
@@ -2832,6 +3015,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "contained_by",
@@ -2848,6 +3032,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "overlaps",
@@ -2864,6 +3049,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "contains",
@@ -2880,6 +3066,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "contains",
@@ -2896,6 +3083,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "contained_by",
@@ -2912,6 +3100,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "contained_by",
@@ -2928,6 +3117,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "overlaps",
@@ -2944,6 +3134,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "strictly_left",
@@ -2960,6 +3151,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "strictly_right",
@@ -2976,6 +3168,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "not_extend_right",
@@ -2992,6 +3185,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "not_extend_left",
@@ -3008,6 +3202,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "adjacent",
@@ -3024,6 +3219,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lower",
@@ -3039,6 +3235,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "upper",
@@ -3054,6 +3251,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lower",
@@ -3069,6 +3267,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "upper",
@@ -3084,6 +3283,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "regexp_replace",
@@ -3099,6 +3299,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "regexp_replace",
@@ -3114,6 +3315,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "regexp_match",
@@ -3129,6 +3331,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "regexp_match",
@@ -3144,6 +3347,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "isempty",
@@ -3159,6 +3363,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lower_inc",
@@ -3174,6 +3379,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "upper_inc",
@@ -3189,6 +3395,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "lower_inf",
@@ -3204,6 +3411,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "upper_inf",
@@ -3219,6 +3427,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "i32range",
@@ -3234,6 +3443,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "i32range",
@@ -3249,6 +3459,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "i64range",
@@ -3264,6 +3475,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "i64range",
@@ -3279,6 +3491,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "numrange",
@@ -3294,6 +3507,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "numrange",
@@ -3309,6 +3523,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "tsrange",
@@ -3324,6 +3539,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "tsrange",
@@ -3339,6 +3555,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "tstzrange",
@@ -3354,6 +3571,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "tstzrange",
@@ -3369,6 +3587,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "daterange",
@@ -3384,6 +3603,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "daterange",
@@ -3399,6 +3619,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "range_union",
@@ -3415,6 +3636,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "range_difference",
@@ -3431,6 +3653,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "range_intersect",
@@ -3447,6 +3670,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "range_merge",
@@ -3462,6 +3686,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "jsonb_typeof",
@@ -3477,6 +3702,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "json_typeof",
@@ -3492,6 +3718,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "jsonb_array_length",
@@ -3507,6 +3734,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "json_array_length",
@@ -3522,6 +3750,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "jsonb_strip_nulls",
@@ -3537,6 +3766,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "json_strip_nulls",
@@ -3552,6 +3782,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "jsonb_pretty",
@@ -3567,6 +3798,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "to_jsonb",
@@ -3582,6 +3814,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "to_json",
@@ -3597,6 +3830,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "json_scalar",
@@ -3612,6 +3846,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "json_serialize",
@@ -3627,6 +3862,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "json_serialize",
@@ -3642,6 +3878,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: false,
+    cost: 0,
   },
   {
     name: "jsonb_build_array",
@@ -3657,6 +3894,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: true,
+    cost: 0,
   },
   {
     name: "json_build_array",
@@ -3672,6 +3910,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: true,
+    cost: 0,
   },
   {
     name: "jsonb_build_object",
@@ -3687,6 +3926,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: true,
+    cost: 0,
   },
   {
     name: "json_build_object",
@@ -3702,6 +3942,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     argDefaults: [],
     volatility: "immutable",
     variadic: true,
+    cost: 0,
   },
 ];
 

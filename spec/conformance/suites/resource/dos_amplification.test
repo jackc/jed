@@ -13,7 +13,7 @@
 #
 # jed-SPECIFIC (PostgreSQL has no execution-cost ceiling — a documented divergence, CLAUDE.md §1/§13),
 # so the 54P01 records are NOT oracle-checked; the `# cost:` baselines are the cross-core contract.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, types.i32, types.decimal, expr.decimal_arithmetic, resource.cost_metering, resource.cost_limit
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, types.i32, types.text, types.decimal, expr.decimal_arithmetic, resource.cost_metering, resource.cost_limit
 
 statement ok
 CREATE TABLE s (id i32 PRIMARY KEY, v i32)
@@ -149,3 +149,42 @@ query R nosort
 SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
 ----
 9999999999999999999999999999999999999999999999999800000000000000000000000000000000000000000000000001
+
+# === 4. Variable-length comparison — text/bytea compare cost scales with LENGTH, not just fan-out ===
+
+statement ok
+CREATE TABLE tx (id i32 PRIMARY KEY, t text)
+
+statement ok
+INSERT INTO tx VALUES (1, 'aaaaaaaaaa'), (2, 'aaaaaaaaaa')
+
+# A self CROSS JOIN comparing a 10-char text column: 2x2 = 4 pairs, each `a.t = b.t` charging
+# operator_eval(1) + varlen_compare(min(10,10)-1 = 9) = 10. True cost = 3 (materialize a: 1 page + 2
+# rows) + 3 (materialize b) + 40 (4 pairs x 10) + 4 produced = 50. A FLAT operator_eval would bill
+# only 4 for the four compares (total 14); the per-comparison LENGTH is the amplification varlen_compare
+# meters — at 1000 rows x 1 KB strings that compare is ~10^9 byte-compares, every one charged.
+# cost: 50
+query I rowsort
+SELECT a.id FROM tx a CROSS JOIN tx b WHERE a.t = b.t
+----
+1
+1
+2
+2
+
+# A ceiling well below the true cost aborts the length×fan-out blowup — the varlen_compare charge is
+# guarded BEFORE each byte scan (cost.md §3), so it stops ahead of the work, like the decimal case.
+# max_cost: 20
+statement error 54P01
+SELECT a.id FROM tx a CROSS JOIN tx b WHERE a.t = b.t
+
+# A ceiling above the true cost completes and returns all four self-matches.
+# max_cost: 60
+# cost: 50
+query I rowsort
+SELECT a.id FROM tx a CROSS JOIN tx b WHERE a.t = b.t
+----
+1
+1
+2
+2

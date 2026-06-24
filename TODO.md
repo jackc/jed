@@ -75,7 +75,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       storage reads, a data-defined unit schedule, the `# cost:` corpus directive asserting
       byte-identical accrued cost cross-core. Ceiling+abort (`54P01`) and a real `page_read` unit
       have since landed. → [cost.md](spec/design/cost.md), [schedule.toml](spec/cost/schedule.toml) _(§13)_
-  - [ ] _follow-on:_ per-operator `cost` weights.
+  - [x] _follow-on:_ per-operator `cost` weights — the optional `cost` field in
+        [catalog.toml](spec/functions/catalog.toml) is codegen'd into `OperatorDesc` and read by the
+        evaluator (`operator_cost`, the arithmetic/comparison/logical arms): an operator charges its
+        own static `cost` base if authored, else the uniform `operator_eval`. Name-level + size-
+        independent (argument-size cost is the size-scaled units). No built-in overrides it, so cost
+        is unchanged; tuning a base is a pure data change. → [functions.md §8](spec/design/functions.md),
+        [cost.md §3](spec/design/cost.md)
+    - [x] **`varlen_compare` unit** — text/bytea comparison work scales with the SHORTER operand's
+          length (code points / bytes), the `decimal_work` analog, so a join/correlated re-scan
+          comparing long values is metered, not flat. Complements `collate`. →
+          [cost.md §3](spec/design/cost.md), [schedule.toml](spec/cost/schedule.toml)
 
 ---
 

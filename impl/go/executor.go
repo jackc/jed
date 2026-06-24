@@ -24146,7 +24146,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return evalCast(v, e.result, e.typmod)
 	case reNeg:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(operatorCost("neg"))
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -24180,14 +24180,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return IntValue(n), nil
 	case reNot:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(operatorCost("not"))
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolNot(v), nil
 	case reArith:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(operatorCost(e.op.catalogName()))
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -24288,7 +24288,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return evalArith(e.op, a.Int, b.Int, e.result)
 	case reCompare:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(operatorCost(e.op.catalogName()))
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -24331,6 +24331,15 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			// Either operand NULL ⇒ Unknown (text comparison is three-valued).
 			return Value{Kind: ValNull}, nil
+		}
+		// Variable-length text/bytea comparison scans up to the shorter operand's length (code
+		// points / bytes); charge varlen_compare × (W − 1) so the per-comparison length work an
+		// untrusted join / correlated re-scan can amplify by fan-out is metered, not flat
+		// (spec/design/cost.md §3 "varlen_compare"). Collated ORDERING already charged collate above
+		// and returned; this covers =/<>, C/default-collation ordering, and all bytea.
+		m.Charge(Costs.VarlenCompare * (varlenCompareWork(a, b) - 1))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
 		}
 		switch e.op {
 		case OpEq:
@@ -24557,7 +24566,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return JsonbValue(result), nil
 	case reAnd:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(operatorCost("and"))
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -24568,7 +24577,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return boolAnd(a, b), nil
 	case reOr:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(operatorCost("or"))
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -26002,6 +26011,93 @@ func decimalCmpWork(a, b Value) int64 {
 		return WorkLinear(DecimalFromInt64(a.Int), *b.Dec)
 	default:
 		return 1
+	}
+}
+
+// varlenCompareWork is the varlen_compare W of a comparison over a variable-length scalar pair —
+// the SHORTER operand's length (code points for text, bytes for bytea), clamped to >= 1. A byte /
+// code-point comparison stops at the first differing position or the end of the shorter operand,
+// so min is a true upper bound on the work (spec/design/cost.md §3 "varlen_compare"). Any other
+// pair — including a NULL side or a non-varlen type — returns 1 (no charge).
+func varlenCompareWork(a, b Value) int64 {
+	var n int
+	switch {
+	case a.Kind == ValText && b.Kind == ValText:
+		n = utf8.RuneCountInString(a.Str)
+		if m := utf8.RuneCountInString(b.Str); m < n {
+			n = m
+		}
+	case a.Kind == ValBytea && b.Kind == ValBytea:
+		n = len(a.Str)
+		if len(b.Str) < n {
+			n = len(b.Str)
+		}
+	default:
+		return 1
+	}
+	if n < 1 {
+		return 1
+	}
+	return int64(n)
+}
+
+// opCostOverrides maps an operator NAME to its per-operator cost base, for the Operators rows
+// whose catalog Cost is non-default (functions.md §8). Empty while every built-in uses the uniform
+// OperatorEval; authoring a Cost in catalog.toml populates it (a pure data change, no code). The
+// Cost == 0 sentinel means "use OperatorEval". Built once at package init from the generated table.
+var opCostOverrides = func() map[string]int64 {
+	m := map[string]int64{}
+	for _, o := range Operators {
+		if o.Cost != 0 {
+			m[o.Name] = o.Cost
+		}
+	}
+	return m
+}()
+
+// operatorCost is the cost an operator's evaluation charges: its catalog Cost base if authored, else
+// the uniform OperatorEval (cost.md §3). The len==0 fast path keeps the common all-default case a
+// single check, so no per-node map lookup happens until a weight is actually tuned.
+func operatorCost(name string) int64 {
+	if len(opCostOverrides) == 0 {
+		return Costs.OperatorEval
+	}
+	if c, ok := opCostOverrides[name]; ok {
+		return c
+	}
+	return Costs.OperatorEval
+}
+
+// catalogName is the catalog operator name (catalog.toml) for an arithmetic or comparison BinaryOp —
+// the key for its per-operator Cost base (functions.md §8, operatorCost).
+func (op BinaryOp) catalogName() string {
+	switch op {
+	case OpAdd:
+		return "add"
+	case OpSub:
+		return "sub"
+	case OpMul:
+		return "mul"
+	case OpDiv:
+		return "div"
+	case OpMod:
+		return "mod"
+	case OpEq:
+		return "eq"
+	case OpNe:
+		return "ne"
+	case OpLt:
+		return "lt"
+	case OpGt:
+		return "gt"
+	case OpLe:
+		return "le"
+	case OpGe:
+		return "ge"
+	default:
+		// Only arithmetic/comparison BinaryOps flow through here (reArith/reCompare); any other
+		// is a non-operator name ⇒ operatorCost falls back to the uniform operator_eval.
+		return ""
 	}
 }
 

@@ -246,6 +246,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.windowResult;
       case "window_frame_step":
         return COSTS.windowFrameStep;
+      case "varlen_compare":
+        return COSTS.varlenCompare;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

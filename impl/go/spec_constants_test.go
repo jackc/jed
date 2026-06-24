@@ -418,6 +418,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.WindowResult
 		case "window_frame_step":
 			return Costs.WindowFrameStep
+		case "varlen_compare":
+			return Costs.VarlenCompare
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0

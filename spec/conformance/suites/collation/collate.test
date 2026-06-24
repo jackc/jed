@@ -274,8 +274,9 @@ SELECT 'aä' < 'az' COLLATE "unicode"
 ----
 true
 
-# a C / un-collated comparison charges NO collate: operator_eval(1) + row_produced(1) = 2
-# cost: 2
+# a C / un-collated comparison charges NO collate, but DOES charge varlen_compare for the byte scan
+# (the collate complement, cost.md §3): operator_eval(1) + varlen_compare (min(2,2)−1 = 1) + produced(1) = 3
+# cost: 3
 query B nosort
 SELECT 'aä' < 'az'
 ----

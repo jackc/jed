@@ -80,10 +80,12 @@ NULL
 
 # Predicate in the ON: an unmatched left row is still PRESERVED (the extra condition only filters
 # which right rows match). `a.k=b.k AND b.label='twenty'` matches only a(2)↔b(20); a(1)/a(3)/a(4)
-# match nothing and NULL-extend. ON has 3 interior nodes (and + two compares), 16 pairs → 48;
-# 8 materialize + 48 ON + 4 produced = 60.
+# match nothing and NULL-extend. ON has 3 interior nodes (and + two compares), 16 pairs → 48; the
+# `b.label='twenty'` text compare also charges varlen_compare per pair — each of the 4 b labels vs
+# 'twenty'(6) over 4 a rows: 4 × ('ten'2 + 'twenty'5 + 'twentyish'5 + 'nullk'4) = 64.
+# 8 materialize + 2 page + 48 ON + 64 varlen + 4 produced = 126.
 # names: id, id
-# cost: 62
+# cost: 126
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.label = 'twenty' ORDER BY a.id, b.id
 ----
@@ -99,9 +101,10 @@ NULL
 # The SAME predicate moved to WHERE turns the LEFT JOIN effectively INNER: the join produces 5
 # combined rows (3 matched + 2 NULL-extended), then `b.label='twenty'` is evaluated on each (5)
 # and a NULL-extended row's b.label is NULL → NULL='twenty' → dropped. Only a(2)↔b(20) survives.
-# 8 materialize + 16 ON + 5 WHERE + 1 produced = 30.
+# The 3 matched text compares charge varlen_compare ('ten'2 + 'twenty'5 + 'twentyish'5 = 12; the two
+# NULL rows charge none). 8 materialize + 2 page + 16 ON + 5 WHERE + 12 varlen + 1 produced = 44.
 # names: id, id
-# cost: 32
+# cost: 44
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id, b.id
 ----

@@ -21957,7 +21957,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return evalCast(v, e.target, e.typmod);
     }
     case "neg": {
-      m.charge(COSTS.operatorEval);
+      m.charge(operatorCost("neg"));
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       if (isInterval(e.result)) {
@@ -21983,11 +21983,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return intValue(n);
     }
     case "not": {
-      m.charge(COSTS.operatorEval);
+      m.charge(operatorCost("not"));
       return boolNot(evalExpr(e.operand, row, env, m));
     }
     case "arith": {
-      m.charge(COSTS.operatorEval);
+      m.charge(operatorCost(e.op));
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
       if (a.kind === "null" || b.kind === "null") return nullValue();
@@ -22055,7 +22055,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return evalArith(e.op, a.int, b.int, e.result);
     }
     case "compare": {
-      m.charge(COSTS.operatorEval);
+      m.charge(operatorCost(e.op));
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
       // A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
@@ -22094,6 +22094,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // Either operand NULL ⇒ Unknown (text comparison is three-valued).
         return { kind: "null" };
       }
+      // Variable-length text/bytea comparison scans up to the shorter operand's length (code points
+      // / bytes); charge varlen_compare × (W − 1) so the per-comparison length work an untrusted
+      // join / correlated re-scan can amplify by fan-out is metered, not flat (spec/design/cost.md
+      // §3 "varlen_compare"). Collated ORDERING already charged collate above and returned; this
+      // covers =/<>, C/default-collation ordering, and all bytea.
+      m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
+      m.guard();
       switch (e.op) {
         case "eq":
           return from3(eq3(a, b));
@@ -22110,13 +22117,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
     }
     case "and": {
-      m.charge(COSTS.operatorEval);
+      m.charge(operatorCost("and"));
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
       return boolAnd(a, b);
     }
     case "or": {
-      m.charge(COSTS.operatorEval);
+      m.charge(operatorCost("or"));
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
       return boolOr(a, b);
@@ -23550,6 +23557,41 @@ function decimalCmpWork(a: Value, b: Value): number {
   if (a.kind === "decimal" && b.kind === "int") return workLinear(a.dec, Decimal.fromBigInt(b.int));
   if (a.kind === "int" && b.kind === "decimal") return workLinear(Decimal.fromBigInt(a.int), b.dec);
   return 1;
+}
+
+// varlenCompareWork is the varlen_compare W of a comparison over a variable-length scalar pair —
+// the SHORTER operand's length (code points for text, bytes for bytea), clamped to >= 1. A byte /
+// code-point comparison stops at the first differing position or the end of the shorter operand,
+// so min is a true upper bound on the work (spec/design/cost.md §3 "varlen_compare"). Any other
+// pair — including a NULL side or a non-varlen type — returns 1 (no charge). [...s] counts code
+// points (NOT s.length — the UTF-16 trap, CLAUDE.md §8).
+function varlenCompareWork(a: Value, b: Value): number {
+  let n: number;
+  if (a.kind === "text" && b.kind === "text") {
+    n = Math.min([...a.text].length, [...b.text].length);
+  } else if (a.kind === "bytea" && b.kind === "bytea") {
+    n = Math.min(a.bytes.length, b.bytes.length);
+  } else {
+    return 1;
+  }
+  return n < 1 ? 1 : n;
+}
+
+// opCostOverrides maps an operator NAME to its per-operator cost base, for the OPERATORS rows whose
+// catalog cost is non-default (functions.md §8). Empty while every built-in uses the uniform
+// operatorEval; authoring a cost in catalog.toml populates it (a pure data change, no code). The
+// cost === 0 sentinel means "use operatorEval". Built once at module load from the generated table.
+const opCostOverrides: Map<string, bigint> = new Map(
+  OPERATORS.filter((o) => o.cost !== 0).map((o) => [o.name, BigInt(o.cost)]),
+);
+
+// operatorCost is the cost an operator's evaluation charges: its catalog cost base if authored, else
+// the uniform operatorEval (cost.md §3). The size===0 fast path keeps the common all-default case a
+// single check, so no per-node map lookup happens until a weight is actually tuned. The arithmetic
+// and comparison op strings ARE the catalog names ("add", "lt", …); neg/not/and/or pass a literal.
+export function operatorCost(name: string): bigint {
+  if (opCostOverrides.size === 0) return COSTS.operatorEval;
+  return opCostOverrides.get(name) ?? COSTS.operatorEval;
 }
 
 // evalDecimalArith evaluates decimal arithmetic with PG's result-scale rules

@@ -187,19 +187,25 @@ trap `22012` on a zero divisor (a defined, deterministic abort, not a wrapped va
 
 ## 8. Deferred fields and the growth rule
 
-One field is designed but **deliberately not authored yet**, so its absence is intentional:
+One optional field rounds out the operator schema — recently moved from reserved to **live**, the
+model for additive, data-only growth:
 
-- `cost` — a **per-operator** evaluation cost. The cost-accounting seam has now landed
-  (CLAUDE.md §13): the whole unit schedule is authored as data in
-  [../cost/schedule.toml](../cost/schedule.toml) — storage row reads, rows produced, and a
-  single **uniform `operator_eval`** weight — with the *why* in
-  [../design/cost.md](../design/cost.md). The per-operator `cost` field **here** stays
-  **reserved** as the additive tuning hook: the evaluator charges the uniform `operator_eval`
-  for every operator this slice, and authoring per-operator weights later (the evaluator
-  preferring an operator's own `cost`, falling back to `operator_eval`) is a pure data-only
-  change. The seam was designed as one coherent schedule, not as a per-operator constant
-  bolted on here — adding a field to a data table later is cheap; designing the seam in
-  fragments is not.
+- `cost` — a **per-operator** evaluation cost base, now **live**. The cost-accounting seam landed
+  first (CLAUDE.md §13): the unit schedule is data in [../cost/schedule.toml](../cost/schedule.toml)
+  with a single **uniform `operator_eval`** weight, the *why* in [../design/cost.md](../design/cost.md).
+  This optional `cost` field is now codegen'd into `OperatorDesc` and **read by the evaluator**: an
+  operator node charges `operator_cost(name)` — the operator's own `cost` if authored, else the
+  uniform `operator_eval` (cost.md §3). It is a **name-level static base** (overloads sharing a name
+  must agree — verify.rb) and **size-independent**: argument-size-dependent cost lives in the
+  size-scaled units (`decimal_work` / `varlen_compare` / `collate` / `regex_step` / …), never here.
+  **No built-in sets a non-default `cost` today** — every weight is the uniform default, so cost is
+  unchanged — but tuning a built-in's base, or giving a host-defined function a static weight
+  (cost.md §6), is now a **pure data-only change**: add the integer in catalog.toml, regenerate, done.
+  (The evaluator reads it at the arithmetic / comparison / logical operator arms; extending it to the
+  remaining operator-bearing nodes — null-test, `IS DISTINCT FROM`, `||`, the scalar functions,
+  json/array/range operators — is the identical one-line pattern per arm, an additive follow-on.)
+  The seam was designed as one coherent schedule, not a per-operator constant bolted on — which is
+  why the field could be made live later with no reshape.
 
 Reserved values and kinds still to be authored spec-first with their own executor slices
 ([../../TODO.md](../../TODO.md)):
@@ -505,10 +511,11 @@ function. Cost is the uniform one `operator_eval` per call.
 re-authoring); the generators are `volatile`; `now()`/`current_timestamp` (the clock seam) is
 `stable` and `clock_timestamp()` is `volatile` (below).
 It marks a call non-foldable for a future constant-folding/CSE pass. It is **advisory today** —
-no such pass exists yet — exactly the posture §8 takes with the reserved `cost` field: the spec
+no such pass exists yet — the same posture §8's `cost` field held before it went live: the spec
 states the truth at the point the function is added, and the optimizer slice that needs the
-data finds it already there. `verify.rb` validates the value set; `gen_catalog.rb` emits it
-(default `immutable`) into the descriptor table each core reads.
+data finds it already there (`cost` has since become live — §8; `volatility` still awaits its
+pass). `verify.rb` validates the value set; `gen_catalog.rb` emits it (default `immutable`) into
+the descriptor table each core reads.
 
 ### Current-time functions — `now()` / `current_timestamp` / `clock_timestamp()`
 

@@ -479,6 +479,7 @@ fn cost_schedule_matches_spec() {
             "regex_step" => COSTS.regex_step,
             "window_result" => COSTS.window_result,
             "window_frame_step" => COSTS.window_frame_step,
+            "varlen_compare" => COSTS.varlen_compare,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };

@@ -352,7 +352,7 @@ cross-core cost-identity (G2 on cost — a wrapped core and a native core must a
 cost for the same call). The design space is already enumerated in [cost.md](cost.md) §6; this doc
 adopts it and extends it from functions to type methods:
 
-- **(a) Declared static weight** — a per-call constant (generalizes the reserved `cost` field in
+- **(a) Declared static weight** — a per-call constant (generalizes the now-live `cost` field in
   [../functions/catalog.toml](../functions/catalog.toml), [functions.md](functions.md) §8). Charged
   once per call like `operator_eval`. Simplest.
 - **(b) Declared cost-as-fn-of-args** — a *pure, deterministic* function of argument values/sizes
@@ -472,7 +472,8 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 - **[../fileformat/format.md](../fileformat/format.md)** — `type_code = 14`, the persisted type
   catalog, the composite body layout, the host-scalar opaque-framed body; bump `format_version`.
 - **[../functions/catalog.toml](../functions/catalog.toml)** — confirm the runtime function registry
-  reuses the entry shape; activate the reserved `cost` field ([functions.md](functions.md) §8).
+  reuses the entry shape; the `cost` field is already live ([functions.md](functions.md) §8) — a host
+  function declares its static weight there.
 - **[../errors/registry.toml](../errors/registry.toml)** — register the new codes proposed here
   (`42723` duplicate_function; `XX002` extension_type_unavailable; reuse `0A000` for not-yet-keyable
   tiers, `22P02` for host text-in failures).

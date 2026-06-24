@@ -73,7 +73,8 @@ schema_version = 2
 #                 varies across statements (a future now()/the clock seam); "volatile" = may
 #                 differ on every call (uuidv4/uuidv7 — the entropy+clock seam, ../design/
 #                 entropy.md). Marks a call non-foldable for a future constant-folding/CSE pass;
-#                 ADVISORY today (no such pass exists yet — the reserved-`cost`-field posture).
+#                 ADVISORY today (no such pass exists yet — the posture the `cost` field held
+#                 before it went live below).
 # variadic        OPTIONAL boolean (scalar functions only — ../design/array-functions.md §12),
 #                 absent ⇒ false. true marks the LAST parameter as VARIADIC (PostgreSQL): the call
 #                 accepts EITHER a SPREAD of trailing arguments — f(a, b, c), each matching the
@@ -83,6 +84,16 @@ schema_version = 2
 #                 the spread is heterogeneous and the VARIADIC array may have any element type
 #                 (num_nulls/num_nonnulls). A VARIADIC keyword on a non-array argument is 42804; a
 #                 spread with fewer than `arity` args has no overload (42883). Hand-written per core.
+# cost            OPTIONAL per-operator evaluation cost weight — a POSITIVE integer, the static base
+#                 an operator's evaluation charges in place of the uniform `operator_eval` unit
+#                 (../design/cost.md §2/§3, functions.md §8). ABSENT ⇒ the uniform `operator_eval`
+#                 weight (the default for every built-in today, so cost is unchanged). It is a
+#                 NAME-LEVEL base: overloads sharing a `name` must agree on `cost` (verify.rb), and
+#                 the evaluator looks it up by name. It is the operator's SIZE-INDEPENDENT base only
+#                 — argument-size-dependent cost is metered by the SIZE-SCALED units (decimal_work /
+#                 varlen_compare / collate / regex_step / …), never this field. Codegen'd into
+#                 OperatorDesc.cost (0 = absent ⇒ use operator_eval); the evaluator prefers it over
+#                 operator_eval, so tuning a built-in's base later is a pure DATA-ONLY change here.
 # -----------------------------------------------------------------------------
 
 # --- logical connectives -----------------------------------------------------

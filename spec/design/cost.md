@@ -53,9 +53,13 @@ The core seam units, all weight `1`:
 the aggregates path, the `value_compress`/`value_decompress` units — §3 "the compression
 units" — in the large-value codec paths, the `decimal_work` unit — §3 "`decimal_work`"
 — in the decimal arithmetic/comparison evaluations, the `gin_entry` unit — §3
-"GIN-bounded scan" — in the GIN index gather, and the `collate` unit — §3 "`collate`" —
-in a collated comparison's sort-key build.) The weights are uniform on purpose — phase 1 proves the seam reads
-cost from **data**; tuning the numbers later is a data-only change touching no executor code.
+"GIN-bounded scan" — in the GIN index gather, the `collate` unit — §3 "`collate`" —
+in a collated comparison's sort-key build, and the `varlen_compare` unit — §3
+"`varlen_compare`" — in a text/bytea comparison's byte scan.) Most weights are uniform on
+purpose — phase 1 proved the seam reads cost from **data**; tuning the numbers later is a
+data-only change touching no executor code. The per-operator `cost` field (functions.md §8) is
+that hook made live: an operator charges its own base if catalog.toml authors one, else the
+uniform `operator_eval` (§3).
 
 ## 3. Accrual rules (the cross-core determinism contract)
 
@@ -429,7 +433,9 @@ cross-core-identical metering point:
   immediately, so a cost ceiling aborts a runaway collated comparison (54P01).
 - **`=`/`<>` charge no `collate`** even under a collation: deterministic-collation equality **is**
   byte-identity (collation.md §7), so they take the plain `eq3` path. A `C` / default comparison
-  (collation `None`) charges nothing here either.
+  (collation `None`) charges nothing here either. (Both of those paths instead charge `varlen_compare`
+  for the byte/code-point scan — the subsection below; `collate` and `varlen_compare` partition the
+  text/bytea comparison surface, never both on one node.)
 - A **NULL** operand charges no `collate` (the comparison is Unknown before any sort key is built).
 - The **`ORDER BY` sort is unmetered**, like every sort ("What is NOT metered" below, spill.md §6):
   a collated `ORDER BY` materializes its survivors and sorts them with a **decorate** sorter that
@@ -438,6 +444,45 @@ cross-core-identical metering point:
   set-operation sort path carries no `Meter` at all, so the comparison evaluator is the one
   consistent, meterable site — collation.md §11.) Pinned cross-core by `# cost:` assertions in
   `spec/conformance/suites/collation/collate.test`.
+
+### `varlen_compare` — a text / bytea comparison's length-scaled byte scan
+
+A comparison node charges **one** `operator_eval` regardless of operand size, but comparing two long
+`text` or `bytea` values is **O(length)** work — and an untrusted query can multiply that length work
+by **fan-out**: a join or correlated re-scan runs the same comparison `|A| × |B|` times, while the
+scan's one-time `value_decompress` / `page_read` paid for each value only **once**. So a flat charge
+lets `SELECT … FROM big a JOIN big b ON a.t = b.t` do length × N² comparison work for an N²-flat cost.
+The **`varlen_compare`** unit (weight 1) closes that gap — the text/bytea analog of `decimal_work`,
+charged at the **comparison-operator evaluation** site (the deterministic, cross-core-identical
+metering point, like `collate`):
+
+- A comparison (`= <> < <= > >=`) over two **non-NULL** `text` or two **non-NULL** `bytea` operands
+  charges `varlen_compare × (W − 1)`, where **W = max(1, min(len(lhs), len(rhs)))** — the **shorter**
+  operand's length, counted in **code points** for `text` (the cross-core count, **not** UTF-16 units
+  or UTF-8 bytes — CLAUDE.md §8) and in **bytes** for `bytea` — *in addition to* the node's one
+  `operator_eval`. The charge is guarded immediately, so a cost ceiling aborts a runaway comparison
+  (54P01) **before** the byte scan.
+- **Why `min`, not the `max` decimal-compare uses.** A byte / code-point comparison stops at the first
+  differing position or the end of the **shorter** operand (equality of unequal lengths is O(1); an
+  ordering compare never reads past the shorter string), so `min` is a true upper bound on the work.
+  Equally important, `min` keeps a legitimate `WHERE body = $short` against one large-`text` row
+  **cheap** (a length mismatch costs ~1), which a `max`-based charge would wrongly inflate to the big
+  value's length. Decimal compare uses `max` because magnitude comparison has no length short-circuit;
+  the divergence is principled, not an inconsistency.
+- **W − 1, like `decimal_work`.** The first unit rides the flat `operator_eval`; operands of ≤ 1 unit
+  (one code point / one byte, or an empty string) have W = 1 and charge **nothing**, so small-string
+  costs predating this unit are unchanged.
+- **It complements `collate`, never doubles with it.** The collated **ORDERING** path (a non-`C`
+  collation, `< <= > >=`) charges `collate` and returns *before* this charge, so `varlen_compare`
+  covers exactly the rest of the text/bytea comparison surface: **`=`/`<>`** (byte-identity under any
+  collation), **`C` / default-collation ordering**, and **all `bytea`** comparison (bytea has no
+  collation). The two units partition the surface.
+- A **NULL** operand, or a non-`text`/`bytea` pair (integers, decimals — `decimal_work` handles those),
+  charges no `varlen_compare`.
+- The **`ORDER BY` sort stays unmetered** like every sort (the `collate` rule above) — the unit lives
+  at the expression-evaluation site, not the sort. Pinned cross-core by `spec/conformance/suites/expr/varlen_compare.test`
+  (and the join `# cost:` baselines in `joins/inner.test` / `joins/left.test`), with the ceiling-abort
+  amplification in `resource/dos_amplification.test`.
 
 **Bounded scan / JOIN — each base table bounded by its own PK predicate.** In a multi-table FROM
 each base table is materialized independently (see "JOIN" below), so each is bounded **on its own**
@@ -946,8 +991,9 @@ It is now built:
   scanned row (the SELECT/JOIN materialization, the DELETE and UPDATE scans, the streaming
   LIMIT walk), once per produced row, once per expression node (the recursive evaluator's
   entry), once per aggregate fold row, and **immediately after each size-scaled
-  `decimal_work` charge** (§3 — so the ceiling aborts *before* the big-decimal limb work
-  runs, not at the next node). These points are **mirrored identically across
+  `decimal_work` (or `varlen_compare`) charge** (§3 — so the ceiling aborts *before* the
+  big-decimal limb work, or the long text/bytea byte scan, runs — not at the next node). These
+  points are **mirrored identically across
   Rust, Go, and TS**, and accrual order is fixed (§3), so the abort is deterministic and
   **cross-core identical**: the same `(query, db, ceiling)` aborts (or completes) in every
   core. A subquery executes through the same path with the same `max_cost`, so a runaway
@@ -998,10 +1044,18 @@ Other items recorded against the seam:
   physical disk fetch, so the future buffer pool / cache for larger-than-RAM files
   (CLAUDE.md §9) cannot perturb the deterministic, cache-independent cost (§13). Accrual
   rules: §3 "`page_read`".
-- **Per-operator `cost` weights.** A uniform `operator_eval` weight now; the per-operator
-  `cost` field in [../functions/catalog.toml](../functions/catalog.toml) stays reserved
-  ([functions.md](functions.md) §8). Authoring it later (evaluator preferring the
-  operator's `cost`, falling back to `operator_eval`) is purely additive.
+- **Per-operator `cost` weights — ✅ live.** The per-operator `cost` field in
+  [../functions/catalog.toml](../functions/catalog.toml) ([functions.md](functions.md) §8) is now
+  codegen'd into `OperatorDesc` and **read by the evaluator**: an operator node charges
+  `operator_cost(name)` — the operator's own `cost` base if authored, else the uniform
+  `operator_eval`. It is a **name-level, size-independent** base — the size-scaled units
+  (`decimal_work` / `varlen_compare` / …) carry argument-dependent cost. **No built-in sets a
+  non-default `cost`**, so every weight is still the uniform `operator_eval` and cost is unchanged;
+  but tuning a built-in's base (or a host function's static weight, below) is now a **pure data
+  change** in catalog.toml. The evaluator reads it at the arithmetic / comparison / logical arms; the
+  override lookup is empty-fast-pathed so the all-default case adds no per-node work. (The per-core
+  unit tests — `operator_cost_reflects_catalog` and the catalog cross-checks — pin the data-driven
+  lookup the uniform-weight corpus cannot observe.)
 - **Host-defined functions must contribute cost (open requirement).** When host-defined
   functions land (CLAUDE.md §2; TODO.md Phase 7/9), they are **opaque to the meter** by
   default — host code does not route through `charge` — which would break both the
@@ -1009,9 +1063,10 @@ Other items recorded against the seam:
   the **cross-core cost identity** §8 demands (a wrapped core and a native core must compute
   the *same* cost for the same call). The host-function registration API must therefore carry
   a cost contract, one of: (a) a **declared static weight** (charged once per call, like
-  `operator_eval` — generalizing the reserved `cost` field, [functions.md](functions.md) §8);
-  (b) a **declared deterministic cost function of the argument values/sizes**, charged up
-  front and guarded *before* the call (the `decimal_work` / `value_compress` model above); or
+  `operator_eval` — the host-function generalization of the now-live per-operator `cost` field,
+  [functions.md](functions.md) §8); (b) a **declared deterministic cost function of the argument
+  values/sizes**, charged up front and guarded *before* the call (the `decimal_work` /
+  `varlen_compare` / `value_compress` model above); or
   (c) a **deterministic metering callback** — a narrow `charge(n)` handle into the `Meter`
   that the host calls as it works, enabling a chunk-boundary **mid-call abort** (the per-chunk
   model). Whichever is chosen, it must be deterministic and cross-core identical — **no

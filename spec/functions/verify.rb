@@ -46,6 +46,11 @@
 #      is overload-independent).
 #  14. OPTIONAL volatility (functions.md §12): if present, one of immutable|stable|volatile.
 #      Absent ⇒ immutable. Marks a call non-foldable for a future constant-folding pass.
+#  15. OPTIONAL variadic (array-functions.md §12): if present, a boolean; true only on a scalar
+#      function with non-empty arg_families and no arg_defaults.
+#  16. OPTIONAL cost (functions.md §8): if present, a positive integer — the per-operator
+#      evaluation base. Absent ⇒ the uniform operator_eval. NAME-level: overloads sharing a name
+#      must agree.
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -135,6 +140,7 @@ def main
   name_sigs = []   # [name, arg_families] — unique per overload
   symbol_sigs = [] # [symbol, kind, arity, arg_families] — unique per overload
   param_pos = {}   # [name, param_name] => position — cross-overload name→slot consistency
+  costs_by_name = Hash.new { |h, k| h[k] = [] } # name => [explicit cost weights] — must agree (16)
 
   operators.each do |op|
     id = op["name"] || "(unnamed)"
@@ -248,11 +254,26 @@ def main
       end
     end
 
+    # (16) optional per-operator cost weight (functions.md §8); absent ⇒ the uniform operator_eval.
+    # A positive integer; NAME-LEVEL, so overloads sharing a name must agree (checked after the loop)
+    # — the evaluator looks the base up by name.
+    if op.key?("cost")
+      c = op["cost"]
+      fail!("operator #{id}: cost #{c.inspect} must be a positive integer") unless c.is_a?(Integer) && c.positive?
+      costs_by_name[op["name"]] << c
+    end
+
     # (9) collect for uniqueness — keyed by operand-family signature, so an operator
     # overloaded across families (one row per arg_families) is allowed; a true
     # duplicate (same name AND same operand families) is still rejected.
     name_sigs << [op["name"], args]
     symbol_sigs << [op["symbol"], kind, op["arity"], args] if op.key?("symbol")
+  end
+
+  # (16) same-named operators must agree on their cost base (it is looked up by name).
+  costs_by_name.each do |name, cs|
+    next if cs.uniq.length <= 1
+    fail!("operator #{name.inspect}: overloads disagree on cost (#{cs.uniq.sort.join(', ')}); the base is name-level")
   end
 
   # (9) uniqueness of overload signatures

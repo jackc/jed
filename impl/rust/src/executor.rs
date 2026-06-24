@@ -37,6 +37,7 @@ use crate::value::{
     ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::LazyLock;
 
 /// The outcome of executing one statement. Both variants carry the deterministic
 /// execution `cost` accrued while running the statement (CLAUDE.md §13) — a DML
@@ -11696,6 +11697,20 @@ enum ArithOp {
     Mod,
 }
 
+impl ArithOp {
+    /// The catalog operator name (catalog.toml) for this arithmetic op — the key for its
+    /// per-operator `cost` base (functions.md §8, `operator_cost`).
+    fn op_name(self) -> &'static str {
+        match self {
+            ArithOp::Add => "add",
+            ArithOp::Sub => "sub",
+            ArithOp::Mul => "mul",
+            ArithOp::Div => "div",
+            ArithOp::Mod => "mod",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CmpOp {
     Eq,
@@ -11704,6 +11719,21 @@ enum CmpOp {
     Gt,
     Le,
     Ge,
+}
+
+impl CmpOp {
+    /// The catalog operator name (catalog.toml) for this comparison — the key for its
+    /// per-operator `cost` base (functions.md §8, `operator_cost`).
+    fn op_name(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "eq",
+            CmpOp::Ne => "ne",
+            CmpOp::Lt => "lt",
+            CmpOp::Gt => "gt",
+            CmpOp::Le => "le",
+            CmpOp::Ge => "ge",
+        }
+    }
 }
 
 /// The scalar functions (kind = "function", spec/design/functions.md §9), parsed from a call
@@ -26689,7 +26719,7 @@ impl RExpr {
                 }
             }
             RExpr::Neg { operand, result } => {
-                m.charge(COSTS.operator_eval);
+                m.charge(operator_cost("neg"));
                 match operand.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) if result.is_decimal() => {
@@ -26736,7 +26766,7 @@ impl RExpr {
                 }
             }
             RExpr::Not(e) => {
-                m.charge(COSTS.operator_eval);
+                m.charge(operator_cost("not"));
                 let v = e.eval(row, env, m)?;
                 Ok(not3(&v))
             }
@@ -26746,7 +26776,7 @@ impl RExpr {
                 rhs,
                 result,
             } => {
-                m.charge(COSTS.operator_eval);
+                m.charge(operator_cost(op.op_name()));
                 let a = lhs.eval(row, env, m)?;
                 let b = rhs.eval(row, env, m)?;
                 if matches!(a, Value::Null) || matches!(b, Value::Null) {
@@ -26845,7 +26875,7 @@ impl RExpr {
                 rhs,
                 collation,
             } => {
-                m.charge(COSTS.operator_eval);
+                m.charge(operator_cost(op.op_name()));
                 let a = lhs.eval(row, env, m)?;
                 let b = rhs.eval(row, env, m)?;
                 // A decimal(-promotable) pair charges size-scaled decimal_work — once per
@@ -26877,6 +26907,14 @@ impl RExpr {
                     // Either operand NULL ⇒ Unknown (text comparison is 3-valued).
                     return Ok(Value::Null);
                 }
+                // Variable-length text/bytea comparison scans up to the shorter operand's length
+                // (code points / bytes); charge `varlen_compare × (W − 1)` so the per-comparison
+                // length work an untrusted join / correlated re-scan can amplify by fan-out is
+                // metered, not flat (cost.md §3 "varlen_compare"). Collated ORDERING already charged
+                // `collate` above and returned; this covers `=`/`<>`, `C`/default-collation
+                // ordering, and all bytea. Charged before the compare runs, then guarded.
+                m.charge(COSTS.varlen_compare * (varlen_compare_work(&a, &b) - 1));
+                m.guard()?;
                 let tv = match op {
                     CmpOp::Eq => a.eq3(&b),
                     CmpOp::Ne => a.eq3(&b).not(),
@@ -27223,13 +27261,13 @@ impl RExpr {
                 )
             }
             RExpr::And(l, r) => {
-                m.charge(COSTS.operator_eval);
+                m.charge(operator_cost("and"));
                 let lv = l.eval(row, env, m)?;
                 let rv = r.eval(row, env, m)?;
                 Ok(and3(&lv, &rv))
             }
             RExpr::Or(l, r) => {
-                m.charge(COSTS.operator_eval);
+                m.charge(operator_cost("or"));
                 let lv = l.eval(row, env, m)?;
                 let rv = r.eval(row, env, m)?;
                 Ok(or3(&lv, &rv))
@@ -28805,6 +28843,45 @@ fn decimal_cmp_work(a: &Value, b: &Value) -> u64 {
     }
 }
 
+/// Per-operator cost-base overrides, keyed by operator name — the `OPERATORS` rows whose catalog
+/// `cost` is non-default (functions.md §8). Empty while every built-in uses the uniform
+/// `operator_eval`; authoring a `cost` in catalog.toml populates it (a pure data change, no code).
+/// The `cost == 0` sentinel means "use operator_eval". Built once from the generated table.
+static OP_COST_OVERRIDES: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
+    OPERATORS
+        .iter()
+        .filter(|o| o.cost != 0)
+        .map(|o| (o.name, o.cost))
+        .collect()
+});
+
+/// The cost an operator's evaluation charges: its catalog `cost` base if authored, else the uniform
+/// `operator_eval` (cost.md §3). The `is_empty` fast path keeps the common all-default case a single
+/// check, so no per-node name hashing happens until a weight is actually tuned.
+fn operator_cost(name: &str) -> i64 {
+    if OP_COST_OVERRIDES.is_empty() {
+        return COSTS.operator_eval;
+    }
+    OP_COST_OVERRIDES
+        .get(name)
+        .copied()
+        .unwrap_or(COSTS.operator_eval)
+}
+
+/// The `varlen_compare` W of a comparison over a variable-length scalar pair — the SHORTER
+/// operand's length (code points for `text`, bytes for `bytea`), clamped to ≥ 1. A byte /
+/// code-point comparison stops at the first differing position or the end of the shorter
+/// operand, so `min` is a true upper bound on the work (cost.md §3 "varlen_compare"). Any
+/// other pair — including a NULL side or a non-varlen type — returns 1 (no charge).
+fn varlen_compare_work(a: &Value, b: &Value) -> i64 {
+    let n = match (a, b) {
+        (Value::Text(x), Value::Text(y)) => x.chars().count().min(y.chars().count()),
+        (Value::Bytea(x), Value::Bytea(y)) => x.len().min(y.len()),
+        _ => return 1,
+    };
+    (n as i64).max(1)
+}
+
 /// Evaluate decimal arithmetic with PG's result-scale rules (spec/design/decimal.md §4),
 /// trapping 22003 at the cap and 22012 on a zero divisor/modulus.
 fn eval_decimal_arith(op: ArithOp, a: Decimal, b: Decimal) -> Result<Value> {
@@ -30073,6 +30150,58 @@ mod registry_tests {
                 let lname = a.surface.to_ascii_lowercase();
                 let _ = aggregate_plan(&lname, found.result, &probe);
             }
+        }
+    }
+
+    /// The evaluator's per-operator cost base (functions.md §8): `operator_cost` returns each
+    /// operator's catalog `cost` if authored, else the uniform `operator_eval`. Cross-checking
+    /// against the generated `OPERATORS` table proves the lookup is data-driven — authoring a
+    /// `cost` in catalog.toml is automatically honored, with no evaluator change. (The corpus
+    /// cannot observe this while every weight is the uniform default — CLAUDE.md §10.)
+    #[test]
+    fn operator_cost_reflects_catalog() {
+        for o in OPERATORS {
+            let want = if o.cost == 0 {
+                COSTS.operator_eval
+            } else {
+                o.cost
+            };
+            assert_eq!(operator_cost(o.name), want, "operator_cost({:?})", o.name);
+        }
+        // An unknown name falls back to the uniform operator_eval.
+        assert_eq!(
+            operator_cost("definitely_not_an_operator"),
+            COSTS.operator_eval
+        );
+    }
+
+    /// Every operator-enum → catalog-name mapping the evaluator charges through must resolve to a
+    /// real catalog operator, so a typo in `op_name` / a wired literal is caught here, not silently
+    /// masked by the uniform-weight fallback.
+    #[test]
+    fn wired_operator_names_exist_in_catalog() {
+        let names = [
+            CmpOp::Eq.op_name(),
+            CmpOp::Ne.op_name(),
+            CmpOp::Lt.op_name(),
+            CmpOp::Gt.op_name(),
+            CmpOp::Le.op_name(),
+            CmpOp::Ge.op_name(),
+            ArithOp::Add.op_name(),
+            ArithOp::Sub.op_name(),
+            ArithOp::Mul.op_name(),
+            ArithOp::Div.op_name(),
+            ArithOp::Mod.op_name(),
+            "neg",
+            "not",
+            "and",
+            "or",
+        ];
+        for name in names {
+            assert!(
+                OPERATORS.iter().any(|o| o.name == name),
+                "wired operator name {name:?} is not in the catalog"
+            );
         }
     }
 }

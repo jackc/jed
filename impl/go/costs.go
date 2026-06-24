@@ -26,6 +26,7 @@ type CostSchedule struct {
 	RegexCompile        int64
 	RegexStep           int64
 	WindowResult        int64
+	VarlenCompare       int64
 	WindowFrameStep     int64
 }
 
@@ -48,5 +49,6 @@ var Costs = CostSchedule{
 	RegexCompile:        1,
 	RegexStep:           1,
 	WindowResult:        1,
+	VarlenCompare:       1,
 	WindowFrameStep:     1,
 }

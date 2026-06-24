@@ -106,9 +106,11 @@ id     = "operator_eval"
 weight = 1
 event  = "one function/operator (interior expression node) evaluation"
 # Charged once per INTERIOR expression node (cast/neg/not/arith/compare/and/or/
-# is_null/distinct); leaf nodes (column/constant) charge nothing. A single uniform
-# weight this slice; the per-operator `cost` field in ../functions/catalog.toml stays
-# reserved as the additive tuning hook (functions.md §8).
+# is_null/distinct); leaf nodes (column/constant) charge nothing. The DEFAULT base for
+# every operator; the per-operator `cost` field in ../functions/catalog.toml (functions.md
+# §8) is now LIVE — an operator's evaluation charges its own `cost` if authored, else this
+# uniform weight (the arithmetic/comparison/logical arms, via operator_cost). No built-in
+# overrides it today, so cost is unchanged; tuning a base is a pure data change.
 
 [[unit]]
 id     = "aggregate_accumulate"
@@ -260,6 +262,26 @@ event  = "one (input row x window function) result computed in the window stage"
 # bounded by the upstream storage_row_read / row_produced). So a row_number()-only query over N
 # rows accrues N storage_row_read + N window_result + N row_produced (+ page_read). Charged at the
 # identical per-(row x function) point in every core, so cost is cross-core identical (§8/§13).
+
+[[unit]]
+id     = "varlen_compare"
+weight = 1
+event  = "one code point (text) or byte (bytea) of variable-length value comparison work beyond the first"
+# Landed with per-operator cost weights (../design/cost.md §3 "varlen_compare"). A comparison
+# (`= <> < <= > >=`) over two non-NULL TEXT or two non-NULL BYTEA operands scans up to the SHORTER
+# operand's length — code points for text (the cross-core count, NOT UTF-16 units, CLAUDE.md §8),
+# bytes for bytea — so it fires W - 1 times where W = max(1, min(len_lhs, len_rhs)). A byte/code-point
+# comparison stops at the first differing position or the end of the shorter operand, so `min` is a
+# true upper bound on the work AND keeps `WHERE body = $1` against one large-text row cheap (a length
+# mismatch is O(1)). It is the text/bytea analog of `decimal_work`, metering the per-comparison length
+# work a join / correlated re-scan can amplify by fan-out (the flat operator_eval charges 1 regardless
+# of length, so a self-join comparing long strings does length×N² work charging only N²). It
+# COMPLEMENTS `collate`, which already meters non-`C` collation ORDERING — so this unit covers `=`/`<>`
+# (byte-equality under any collation), `C`/default-collation ordering, and ALL bytea comparison.
+# Charged BEFORE the comparison runs and immediately guarded (the `decimal_work` discipline), so a
+# max_cost ceiling aborts ahead of the work (54P01). Operands of <= 1 unit (empty / one char / one
+# byte) have W = 1 and charge nothing; NULL or non-varlen pairs charge nothing. Charged at the
+# identical point in every core, so cost stays cross-core identical (§8/§13).
 
 [[unit]]
 id     = "window_frame_step"
