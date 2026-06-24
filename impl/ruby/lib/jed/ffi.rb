@@ -66,6 +66,17 @@ module Jed
     module_function :fn
 
     ABI_VERSION_FN = fn(:jed_abi_version, [], UINT)
+
+    # Check ABI compatibility BEFORE binding the rest: a stale cdylib then fails with a clear
+    # version message rather than an obscure missing-symbol error on a newer binding below
+    # (spec/design/ruby.md §5).
+    loaded_abi = ABI_VERSION_FN.call
+    unless loaded_abi == Jed::ABI_VERSION
+      raise Jed::LoadError,
+        "jed native ABI mismatch: gem expects #{Jed::ABI_VERSION}, library reports #{loaded_abi} " \
+        "(rebuild with `rake ruby:build`)"
+    end
+
     OPEN_MEMORY    = fn(:jed_open_memory, [], VOIDP)
     CREATE         = fn(:jed_create, [VOIDP], VOIDP)
     OPEN           = fn(:jed_open, [VOIDP, CHAR], VOIDP)
@@ -74,15 +85,8 @@ module Jed
     COMMIT         = fn(:jed_commit, [VOIDP], VOIDP)
     CLOSE          = fn(:jed_close, [VOIDP], VOID)
     FREE           = fn(:jed_free, [VOIDP], VOID)
-
-    # Fail loudly if the loaded cdylib was built against a different ABI than this gem expects —
-    # a stale artifact next to a newer gem (or vice versa). Better a clear error than a wire
-    # misparse (spec/design/ruby.md §5).
-    loaded_abi = ABI_VERSION_FN.call
-    unless loaded_abi == Jed::ABI_VERSION
-      raise Jed::LoadError,
-        "jed native ABI mismatch: gem expects #{Jed::ABI_VERSION}, library reports #{loaded_abi} " \
-        "(rebuild with `rake ruby:build`)"
-    end
+    # (bytes, len) → engine-global host-bundle loaders; UNIT on success / ERROR on a bad bundle.
+    LOAD_UNICODE   = fn(:jed_load_unicode_data, [VOIDP, UINT], VOIDP)
+    LOAD_TIMEZONE  = fn(:jed_load_time_zone_data, [VOIDP, UINT], VOIDP)
   end
 end

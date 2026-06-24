@@ -30,5 +30,28 @@ module Jed
 
     # Open an existing file-backed database at `path` (see {Database.open}).
     def open(path, read_only: false, &) = Database.open(path, read_only: read_only, &)
+
+    # Load a Unicode collation bundle (a `JUCD` byte string) into the **engine-global** collation
+    # set (spec/design/collation.md). The bare engine ships `C`-collation only; this adds the
+    # linguistic collations the bundle provides (e.g. `COLLATE "unicode"`, case folding, `ILIKE`).
+    # Process-global (the SQLite model) — affects every open and future database. Raises
+    # {Jed::Error} on a malformed bundle. Typical use: `Jed.load_unicode_data(File.binread(path))`.
+    def load_unicode_data(bytes) = load_bundle(Jed::FFI::LOAD_UNICODE, bytes)
+
+    # Load an IANA time-zone bundle (a `JTZ` byte string) into the **engine-global** zone set
+    # (spec/design/timezones.md). The bare engine ships `UTC` + fixed offsets only; this adds the
+    # named zones the bundle provides (`AT TIME ZONE 'America/New_York'`, `date_trunc(…, zone)`, the
+    # session `time_zone` setting). Process-global. Raises {Jed::Error} on a malformed bundle.
+    def load_time_zone_data(bytes) = load_bundle(Jed::FFI::LOAD_TIMEZONE, bytes)
+
+    private
+
+    def load_bundle(fn, bytes)
+      raw = bytes.to_s.b # a binary copy; Fiddle passes a pointer to its bytes
+      result = Jed::Codec.take(fn.call(raw, raw.bytesize))
+      raise Jed::Error.new(result[:sqlstate], result[:message]) if result[:kind] == :error
+
+      nil
+    end
   end
 end

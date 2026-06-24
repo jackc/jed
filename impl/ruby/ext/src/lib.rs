@@ -63,8 +63,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// The ABI version. The Ruby side checks this against its own constant on load and refuses a
 /// mismatch (ruby.md §5), so a stale cdylib next to a newer gem fails loudly, never silently.
 /// Bumped to 2 when [`jed_execute`] grew its bind-parameter arguments, to 3 for the decimal/date/
-/// timestamp param tags.
-const ABI_VERSION: u32 = 3;
+/// timestamp param tags, to 4 for the [`jed_load_unicode_data`] / [`jed_load_time_zone_data`]
+/// host-bundle loaders.
+const ABI_VERSION: u32 = 4;
 
 const TAG_ERROR: u8 = 0;
 const TAG_STATEMENT: u8 = 1;
@@ -413,6 +414,39 @@ pub extern "C" fn jed_commit(db: *mut Database) -> *mut u8 {
             Err(e) => err_buf(e.code(), &e.message),
         }
     })
+}
+
+/// Load a host bundle (`load` = [`jed::load_unicode_data`] / [`jed::load_time_zone_data`]) from
+/// `len` bytes at `ptr`. Returns a UNIT buffer on success or an ERROR buffer for a malformed bundle.
+fn load_bundle(ptr: *const u8, len: u32, load: fn(&[u8]) -> jed::Result<()>) -> *mut u8 {
+    guard(|| {
+        let bytes: &[u8] = if ptr.is_null() || len == 0 {
+            &[]
+        } else {
+            // SAFETY: the gem passes a pointer to `len` contiguous bytes valid for the call.
+            unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+        };
+        match load(bytes) {
+            Ok(()) => Buf::new(TAG_UNIT).finish(),
+            Err(e) => err_buf(e.code(), &e.message),
+        }
+    })
+}
+
+/// Load a Unicode collation bundle (JUCD) into the **engine-global** collation set
+/// (spec/design/collation.md) — usable by every database in the process (the SQLite model). The
+/// bare binary ships `C`-collation only; this adds the linguistic collations the bundle provides.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_load_unicode_data(ptr: *const u8, len: u32) -> *mut u8 {
+    load_bundle(ptr, len, jed::load_unicode_data)
+}
+
+/// Load an IANA time-zone bundle (JTZ) into the **engine-global** zone set
+/// (spec/design/timezones.md) — usable by every database in the process. The bare binary ships
+/// `UTC` + fixed offsets only; this adds the named zones the bundle provides.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_load_time_zone_data(ptr: *const u8, len: u32) -> *mut u8 {
+    load_bundle(ptr, len, jed::load_time_zone_data)
 }
 
 /// Close a database handle, rolling back any open explicit transaction (it never commits implicitly

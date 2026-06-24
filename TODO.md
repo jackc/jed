@@ -743,9 +743,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `BigDecimal` is total; the ±infinity sentinel is the one gap, handled AR's way). Adds the
         **`bigdecimal`** gemspec dependency (a Ruby *bundled* stdlib gem — the `pg` gem declares it
         too; `date` stays a default gem). → [ruby.md §3](spec/design/ruby.md)
+  - [x] **Slice 4 — host-loaded bundles.** `Jed.load_unicode_data(bytes)` /
+        `Jed.load_time_zone_data(bytes)` over the engine-global `load_unicode_data` /
+        `load_time_zone_data` seams (ABI v4): the bare engine ships `C` + `UTC`/fixed offsets only;
+        loading a JUCD/JTZ byte bundle (process-global, the SQLite model) adds `COLLATE "unicode"`/
+        ILIKE/case-folding and named zones (`AT TIME ZONE 'America/New_York'`, `date_trunc(…, zone)`).
+        Malformed bundle → `Jed::Error` (`XX001`). The ABI check moved ahead of symbol binding so a
+        stale cdylib gives a clear version error. → [ruby.md §5a](spec/design/ruby.md)
   - [ ] _follow-on (each its own slice):_ **`interval`/`uuid`/`bytea` typed coercion** (left as
-        String — no single obvious native target); **host-loaded bundles**
-        (`load_unicode_data`/`load_time_zone_data` for collation/tz); **distributable packaging**
+        String — no single obvious native target); **distributable packaging**
         — a `gem install`-able native gem via **`rb-sys` + precompiled platform gems** (or
         `magnus` for richer Rust ergonomics), replacing the in-repo `rake ruby:build` step (a
         wrapper-module dep, the `bench/`/`web/` precedent §14, needs the §14 confirmation before

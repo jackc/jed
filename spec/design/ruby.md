@@ -165,8 +165,28 @@ The loader ([ffi.rb](../../impl/ruby/lib/jed/ffi.rb)) resolves the platform cdyl
 (`libjed_ruby.{so,dylib}` / `jed_ruby.dll`) from, in order: `JED_RUBY_LIB` (explicit override),
 the in-repo cargo outputs (`ext/target/{release,debug}`), then the gem's own `lib/`. A missing
 library raises a `Jed::LoadError` pointing at `rake ruby:build`. On load the gem checks
-`jed_abi_version()` against its own `Jed::ABI_VERSION` and refuses a mismatch — a stale cdylib
-beside a newer gem fails loudly, never as a silent wire misparse.
+`jed_abi_version()` against its own `Jed::ABI_VERSION` (**before** binding the rest of the surface,
+so a stale cdylib fails with a clear version message rather than a missing-symbol error) and refuses
+a mismatch — never a silent wire misparse.
+
+## 5a. Host-loaded bundles
+
+The bare engine ships only `C` collation and `UTC` + fixed offsets (collation.md, timezones.md). A
+host adds linguistic collations and IANA zones by loading byte **bundles** through two engine seams,
+exposed as module functions over `jed_load_unicode_data` / `jed_load_time_zone_data` (each a
+`(bytes, len) → UNIT|ERROR` call):
+
+```ruby
+Jed.load_unicode_data(File.binread("unicode.jucd"))   # JUCD → COLLATE "unicode", ILIKE, case folding
+Jed.load_time_zone_data(File.binread("tzdata.jtz"))    # JTZ  → AT TIME ZONE 'America/New_York', date_trunc(…, zone)
+```
+
+Both are **engine-global** (the SQLite model) — they load into process-wide state, so one call
+affects every open and future `Database`, and they take the raw bundle bytes (the host reads the
+file). A malformed bundle raises `Jed::Error` (`XX001`). The repo's fixtures
+(`spec/collation/fixtures/unicode.jucd`, `spec/tz/fixtures/tzdata.jtz`) are what the gem's tests
+load; producing/shipping bundles is the host's concern, identical to the other cores'
+`db.LoadUnicodeData` / `db.LoadTimeZoneData`.
 
 ## 6. Build, test, and follow-ons
 
@@ -178,13 +198,12 @@ beside a newer gem fails loudly, never as a silent wire misparse.
 - **Landed:** create/open/execute/commit/close over literal SQL (slice 1); **`$N` bind
   parameters** (slice 2 — §3a, ABI v2); **richer typed values** — `BigDecimal`/`Date`/`Time`
   coercion both directions, AR-style, always-on (slice 3 — §3, ABI v3; adds the `bigdecimal`
-  gemspec dependency, a bundled stdlib gem).
+  gemspec dependency, a bundled stdlib gem); **host-loaded bundles** —
+  `load_unicode_data`/`load_time_zone_data` (slice 4 — §5a, ABI v4).
 - **Follow-ons:**
   - **`interval` / `uuid` / `bytea`** typed coercion — the remaining String-today scalars
     (`ActiveSupport::Duration` / a `uuid` wrapper / an ASCII-8BIT `String`), if the demand appears.
     Left as String for now (no single obvious native target, unlike decimal/date/time).
-  - **Host-loaded bundles** — expose `load_unicode_data` / `load_time_zone_data` so the gem can
-    run collation / time-zone features (collation.md, timezones.md).
   - **Distributable packaging** — a `gem install`-able native gem via **`rb-sys` + precompiled
     platform gems** (or `magnus` for richer Rust ergonomics), replacing the in-repo
     `rake ruby:build` step. The TODO Phase 9 entry names this as the packaging approach.

@@ -89,6 +89,24 @@ Like ActiveRecord, an infinite `date`/`timestamp` reads back as `±Float::INFINI
 columns are `Date|Float` / `Time|Float`); a zoneless `timestamp` and a `timestamptz` both read as a
 UTC `Time`.
 
+### Collation & time zones (host-loaded bundles)
+
+The bare engine ships only `C` collation and `UTC` + fixed offsets. Load a Unicode bundle and/or an
+IANA time-zone bundle to enable linguistic collations and named zones — process-global, so one call
+covers every database:
+
+```ruby
+Jed.load_unicode_data(File.binread("unicode.jucd"))    # → COLLATE "unicode", ILIKE, case folding
+Jed.load_time_zone_data(File.binread("tzdata.jtz"))     # → AT TIME ZONE 'America/New_York', date_trunc(…, zone)
+
+Jed.memory do |db|
+  db.query(%(SELECT 'a' < 'B' COLLATE "unicode"))                      # => true (UCA), vs false under C
+  db.query(%(SELECT now() AT TIME ZONE 'America/New_York'))            # local wall-clock
+end
+```
+
+A malformed bundle raises `Jed::Error`.
+
 ## Build & test (in-repo)
 
 The native extension is a Rust `cdylib`. From the **repo root**:
