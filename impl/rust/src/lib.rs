@@ -118,6 +118,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // built + maintained on every write, persisted (format_version 13). The query-side planner
     // bound is query.gin_scan (spec/design/gin.md).
     "ddl.gin_index",
+    // GiST indexes — CREATE INDEX ... USING gist over a range column (the range_ops opclass); the
+    // on-disk R-tree (pages 5/6, format_version 20) + the maintained leaf store. The query-side
+    // planner bound is query.gist_scan (spec/design/gist.md GX1).
+    "ddl.gist_index",
     // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9). S2: the type
     // is created/dropped/persisted; composite columns/values land later (spec/design/composite.md).
     "types.composite",
@@ -241,6 +245,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // the SELECT scan to candidate rows (term gather → intersect/union → residual filter); the
     // result is identical to the full scan (spec/design/gin.md §6).
     "query.gin_scan",
+    // GiST-bounded scan — a SELECT/UPDATE/DELETE whose WHERE has `range_col && const` /
+    // `range_col @> const` against a GiST-indexed range column descends the resident R-tree to
+    // candidate rows; the predicate stays the residual filter (same rows as the full scan, lower
+    // cost — spec/design/gist.md §5).
+    "query.gist_scan",
     // GIN-bounded `c = ANY(col)` membership — the single-term `@>` reduction over a GIN-indexed
     // array column (spec/design/gin.md §6); same rows as the full scan, lower cost.
     "query.gin_any_eq",

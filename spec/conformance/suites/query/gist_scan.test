@@ -1,0 +1,129 @@
+# GiST-bounded scans — a GiST index narrows a SELECT / UPDATE / DELETE over a range column by the
+# && (overlaps) and @> (contains) operators (spec/design/gist.md §5). With a GiST index present,
+# the planner DESCENDS the index's resident R-tree to candidate rows and re-applies the original
+# predicate as the residual WHERE filter, so the RESULT is identical to the full-scan answer — this
+# file pins that the index is transparent (correct rows, including across INSERT/UPDATE/DELETE
+# maintenance, and the degenerate empty-query cases). The PostgreSQL oracle agrees (the rows do not
+# depend on whether an index is used; PG builds a GiST index over a range column too); the operator
+# semantics themselves are pinned in expr/range_predicate.test.
+#
+# Deliberate jed divergences (UNIQUE/multi-column/temp gist → 0A000, the structural tree-shape /
+# plan / cost differences) are NOT here — they live in each core's per-core gist tests, since the
+# oracle corpus is PG-clean. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gist_index, query.gist_scan, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, types.range, func.range_constructors, func.range_operators
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, r int4range)
+
+statement ok
+CREATE INDEX t_r_gist ON t USING gist (r)
+
+# 6 bounded ranges + an empty range + a NULL range (the NULL row is not indexed)
+statement ok
+INSERT INTO t VALUES
+  (1, '[1,5)'),
+  (2, '[10,20)'),
+  (3, '[3,8)'),
+  (4, '[100,200)'),
+  (5, '[50,60)'),
+  (6, '[15,25)'),
+  (7, 'empty'),
+  (8, NULL)
+
+# --- && overlaps: rows whose range overlaps the query range -----------------------------------
+# [4,6) overlaps [1,5) and [3,8); empty / NULL never overlap a non-empty query. The `# cost:`
+# assertions PIN that the GiST bound (not a full scan) is taken: page_read per R-tree node visited
+# + gist_descent per interior node + per-candidate point lookup (page_read + storage_row_read) +
+# residual operator_eval + row_produced (gist.md §5 / cost.md §3). Cross-core identical (CLAUDE.md §8).
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE r && int4range(4,6) ORDER BY id
+----
+1
+3
+
+# [15,18) overlaps [10,20) and [15,25)
+query I nosort
+SELECT id FROM t WHERE r && int4range(15,18) ORDER BY id
+----
+2
+6
+
+# the high cluster
+query I nosort
+SELECT id FROM t WHERE r && int4range(150,160) ORDER BY id
+----
+4
+
+# no overlap → empty
+query I nosort
+SELECT id FROM t WHERE r && int4range(300,400) ORDER BY id
+----
+
+# --- @> contains: rows whose range contains the query range ------------------------------------
+# {4} = [4,5): contained by [1,5) and [3,8)
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE r @> int4range(4,5) ORDER BY id
+----
+1
+3
+
+# [16,18) ⊆ [10,20) and [15,25)
+query I nosort
+SELECT id FROM t WHERE r @> int4range(16,18) ORDER BY id
+----
+2
+6
+
+# --- degenerate empty query (int4range(5,5) is the empty range) --------------------------------
+# col && 'empty' overlaps nothing
+query I nosort
+SELECT id FROM t WHERE r && int4range(5,5) ORDER BY id
+----
+
+# col @> 'empty' is TRUE for EVERY row (the empty range is contained in every range) — the gather
+# falls back to the full scan; the residual @> keeps every row (NULL-range row 8 excluded by 3VL)
+query I nosort
+SELECT id FROM t WHERE r @> int4range(5,5) ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+7
+
+# --- maintenance: DELETE / INSERT / UPDATE, then re-query (the index stays transparent) --------
+statement ok
+DELETE FROM t WHERE id = 3
+
+query I nosort
+SELECT id FROM t WHERE r && int4range(4,6) ORDER BY id
+----
+1
+
+statement ok
+INSERT INTO t VALUES (9, '[5,7)')
+
+query I nosort
+SELECT id FROM t WHERE r && int4range(6,7) ORDER BY id
+----
+9
+
+# --- GiST-bounded UPDATE / DELETE (the bound narrows the mutation's target scan) ---------------
+statement ok
+DELETE FROM t WHERE r && int4range(190,210)
+
+query I nosort
+SELECT id FROM t WHERE r @> int4range(150,160) ORDER BY id
+----
+
+statement ok
+UPDATE t SET id = id + 100 WHERE r && int4range(52,54)
+
+query I nosort
+SELECT id FROM t WHERE r && int4range(50,60) ORDER BY id
+----
+105
