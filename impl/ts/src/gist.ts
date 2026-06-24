@@ -1,14 +1,18 @@
 // GiST access method — the operation-deterministic R-tree (spec/design/gist.md).
 //
-// GX1 ships the range_ops opclass: a GiST index over a range column, accelerating the overlap (&&)
-// and containment (@>) operators. This module is the self-contained core — the in-memory R-tree
-// (build / penalty / median split), the on-disk node codec (the §4.1 byte layout, page types 5/6),
-// and the consistent-descent search. Catalog/format integration (the "gist" index kind, the grammar,
-// format_version 20, the planner gather) is wired separately and reuses these primitives.
+// Two opclasses share one tree core (gist.md §2 — the type-specific part is the *only* part that
+// differs): range_ops (GX1) over a range column accelerating && and @>, and the scalar `=` opclass
+// (GX2, the in-core btree_gist equivalent) over a fixed-width keyable scalar column accelerating =.
+// A range_ops bound is the row's exact range (leaf) / covering union (interior) via encodeRangeBody;
+// a scalar `=` bound is [min,max] over the ORDER-PRESERVING KEY ENCODING (gist.md §6) — the executor
+// encodes a value to its key bytes and the tree only ever COMPARES those bytes (no decode, no
+// per-type comparator, no collation; the fixed-width set). This module is the self-contained core —
+// the in-memory R-tree (build / penalty / median split), the on-disk node codec (the §4.1 byte
+// layout, page types 5/6), and the consistent-descent search.
 //
 // Determinism (gist.md §3): every operation is a pure function of its inputs, so the identical
 // mutation sequence every core replays builds the byte-identical tree. Within a node, entries are
-// ordered canonically (rangeTotalCmp, ties by storage key / subtree-min key), so a node's bytes are
+// ordered canonically (boundTotalCmp, ties by storage key / subtree-min key), so a node's bytes are
 // a pure function of its entry set; pages are assigned in a canonical post-order walk. This is the
 // lockstep port of impl/rust/src/gist.rs (CLAUDE.md §2) — byte-identical by construction.
 
@@ -26,18 +30,37 @@ export const GIST_FANOUT = 4;
 export const PAGE_GIST_LEAF = 5;
 export const PAGE_GIST_INTERIOR = 6;
 
-// The query operator range_ops serves. GX1 accelerates "overlaps" (&&) and "contains" (@>); the
-// positional operators, <@, =, and the empty-query edge cases stay full-scan this slice.
-export type GistStrategy = "overlaps" | "contains";
+// The query operator a GiST opclass serves. range_ops accelerates "overlaps" (&&) and "contains"
+// (@>); the scalar `=` opclass accelerates "equal" (=).
+export type GistStrategy = "overlaps" | "contains" | "equal";
+
+// The operator class — the only type-specific part (gist.md §2). Range is range_ops over a range
+// column whose element ColType is elem; Scalar is the `=` opclass over a fixed-width keyable scalar
+// (whose bound is opaque key bytes the executor produces — no element type).
+export type GistOpclass = { scalar: false; elem: ColType } | { scalar: true };
+
+export const GIST_SCALAR_OPCLASS: GistOpclass = { scalar: true };
+export function gistRangeOpclass(elem: ColType): GistOpclass {
+  return { scalar: false, elem };
+}
 
 type RangeVal = Value & { kind: "range" };
-type GistLeafEntry = { bound: RangeVal; skey: Uint8Array };
-type GistChildEntry = { bound: RangeVal; node: GistNode };
+
+// A bounding key: a range value (range_ops) or a [min,max] pair over the order-preserving key
+// encoding (scalar `=`). A leaf's scalar bound is the degenerate [v,v]. Narrowed by `"rng" in b`.
+type GistBound = { rng: RangeVal } | { smin: Uint8Array; smax: Uint8Array };
+
+// A search query operand: a range constant (rng) for &&/@>, or a scalar equality constant's
+// order-preserving KEY bytes (skey) for =.
+export type GistQuery = { rng: RangeVal } | { skey: Uint8Array };
+
+type GistLeafEntry = { bound: GistBound; skey: Uint8Array };
+type GistChildEntry = { bound: GistBound; node: GistNode };
 type GistNode =
   | { leaf: true; entries: GistLeafEntry[] }
   | { leaf: false; children: GistChildEntry[] };
 
-// GistTree is an operation-deterministic GiST R-tree over a single range column.
+// GistTree is an operation-deterministic GiST R-tree over a single column (range or scalar opclass).
 export type GistTree = { root: GistNode; len: number };
 
 // GistPage is one serialized GiST node page: page number, type (leaf 5 / interior 6), entry count
@@ -70,10 +93,58 @@ function cmpBytes(a: Uint8Array, b: Uint8Array): number {
   return a.length - b.length;
 }
 
-// insert one row's (range bound, storage key) into the tree. elem is the range's element subtype,
-// used by the value codec and the penalty metric.
-export function gistInsert(tree: GistTree, elem: ColType, bound: RangeVal, skey: Uint8Array): void {
-  const sib = insertNode(tree.root, elem, bound, skey);
+// encodeBound serializes a bounding key to its self-delimiting bytes (no outer length prefix — the
+// node codec adds the bound_len framing; the leaf-store key relies on this being self-delimiting to
+// split off the trailing storage key).
+function encodeBound(op: GistOpclass, b: GistBound): Uint8Array {
+  if (!op.scalar) return encodeRangeBody(op.elem, (b as { rng: RangeVal }).rng);
+  const s = b as { smin: Uint8Array; smax: Uint8Array };
+  return joinBytes([be16(s.smin.length), s.smin, be16(s.smax.length), s.smax]);
+}
+
+// readBound reads one self-delimiting bounding key starting at cur.pos, advancing it past the bound.
+function readBound(op: GistOpclass, buf: Uint8Array, cur: { pos: number }): GistBound {
+  if (!op.scalar) {
+    const v = readRangeBody(op.elem, buf, cur);
+    if (v.kind !== "range") throw engineError("data_corrupted", "gist: bound is not a range");
+    return { rng: v };
+  }
+  const mlen = readU16(buf, cur);
+  const smin = takeBytes(buf, cur, mlen);
+  const xlen = readU16(buf, cur);
+  const smax = takeBytes(buf, cur, xlen);
+  return { smin, smax };
+}
+
+// boundTotalCmp is the canonical total order over bounding keys (gist.md §3): rangeTotalCmp for
+// ranges; the [min,max] key bytes lexicographically for scalars (the order-preserving key encoding
+// makes raw byte order reproduce value order). Dispatched on the bound kind.
+function boundTotalCmp(a: GistBound, b: GistBound): number {
+  if ("rng" in a) return rangeTotalCmp(a.rng, (b as { rng: RangeVal }).rng);
+  const bs = b as { smin: Uint8Array; smax: Uint8Array };
+  const c = cmpBytes(a.smin, bs.smin);
+  return c !== 0 ? c : cmpBytes(a.smax, bs.smax);
+}
+
+// boundUnion is the covering union of two bounding keys — the convex-hull merge for ranges; the
+// componentwise [min(min), max(max)] (byte-wise, the order-preserving key order) for scalars.
+function boundUnion(a: GistBound, b: GistBound): GistBound {
+  if ("rng" in a) return { rng: mustUnion(a.rng, (b as { rng: RangeVal }).rng) };
+  const bs = b as { smin: Uint8Array; smax: Uint8Array };
+  return {
+    smin: cmpBytes(bs.smin, a.smin) < 0 ? bs.smin : a.smin,
+    smax: cmpBytes(bs.smax, a.smax) > 0 ? bs.smax : a.smax,
+  };
+}
+
+// gistInsert one row's (bounding key, storage key) into the tree under op.
+export function gistInsert(
+  tree: GistTree,
+  op: GistOpclass,
+  bound: GistBound,
+  skey: Uint8Array,
+): void {
+  const sib = insertNode(tree.root, op, bound, skey);
   if (sib !== null) {
     // The root split: grow a new interior root over the old root (left) + the sibling.
     const left = tree.root;
@@ -84,13 +155,13 @@ export function gistInsert(tree: GistTree, elem: ColType, bound: RangeVal, skey:
   tree.len++;
 }
 
-// gistSearch is the consistent-descent search: every storage key whose row satisfies `query OP col`
-// under strat. The interior descend predicate is conservative (no false negatives); the exact
-// operator is applied at the leaf. Returns { keys, nodes, interior } — nodes (interior + leaf) is the
-// page_read charge, interior the gist_descent charge (spec/design/gist.md §9).
+// gistSearch is the consistent-descent search: every storage key whose row satisfies the query under
+// strat. The interior descend predicate is conservative (no false negatives); the exact operator is
+// applied at the leaf. Returns { keys, nodes, interior } — nodes (interior + leaf) is the page_read
+// charge, interior the gist_descent charge (spec/design/gist.md §9).
 export function gistSearch(
   tree: GistTree,
-  query: RangeVal,
+  query: GistQuery,
   strat: GistStrategy,
 ): { keys: Uint8Array[]; nodes: number; interior: number } {
   const out: Uint8Array[] = [];
@@ -100,12 +171,12 @@ export function gistSearch(
 }
 
 // chooseChild picks the child to descend on insert: the one whose union, merged with the new entry,
-// has the lexicographically-smallest value-codec bytes; ties keep the lower slot (penalty).
-function chooseChild(children: GistChildEntry[], elem: ColType, bound: RangeVal): number {
+// has the lexicographically-smallest serialized bound bytes; ties keep the lower slot (penalty).
+function chooseChild(children: GistChildEntry[], op: GistOpclass, bound: GistBound): number {
   let best = 0;
   let bestKey: Uint8Array | null = null;
   for (let i = 0; i < children.length; i++) {
-    const key = encodeRangeBody(elem, mustUnion(children[i]!.bound, bound));
+    const key = encodeBound(op, boundUnion(children[i]!.bound, bound));
     if (bestKey === null || cmpBytes(key, bestKey) < 0) {
       best = i;
       bestKey = key;
@@ -117,16 +188,16 @@ function chooseChild(children: GistChildEntry[], elem: ColType, bound: RangeVal)
 // insertNode inserts into node, returning a new right-sibling child when the node split.
 function insertNode(
   node: GistNode,
-  elem: ColType,
-  bound: RangeVal,
+  op: GistOpclass,
+  bound: GistBound,
   skey: Uint8Array,
 ): GistChildEntry | null {
   if (node.leaf) {
     node.entries.push({ bound, skey });
     sortLeaf(node.entries);
   } else {
-    const i = chooseChild(node.children, elem, bound);
-    const sib = insertNode(node.children[i]!.node, elem, bound, skey);
+    const i = chooseChild(node.children, op, bound);
+    const sib = insertNode(node.children[i]!.node, op, bound, skey);
     // The chosen child's union may have shrunk (after a split below) or grown; recompute it.
     node.children[i]!.bound = nodeUnion(node.children[i]!.node);
     if (sib !== null) node.children.push(sib);
@@ -152,14 +223,14 @@ function splitIfOverflow(node: GistNode): GistChildEntry | null {
 
 // nodeUnion is the covering union of a node's entries (the convex-hull merge — never errors). The
 // node must be non-empty (the empty tree's root leaf is never unioned).
-function nodeUnion(node: GistNode): RangeVal {
+function nodeUnion(node: GistNode): GistBound {
   if (node.leaf) {
     let u = node.entries[0]!.bound;
-    for (let i = 1; i < node.entries.length; i++) u = mustUnion(u, node.entries[i]!.bound);
+    for (let i = 1; i < node.entries.length; i++) u = boundUnion(u, node.entries[i]!.bound);
     return u;
   }
   let u = node.children[0]!.bound;
-  for (let i = 1; i < node.children.length; i++) u = mustUnion(u, node.children[i]!.bound);
+  for (let i = 1; i < node.children.length; i++) u = boundUnion(u, node.children[i]!.bound);
   return u;
 }
 
@@ -183,7 +254,7 @@ function subtreeMinSkey(node: GistNode): Uint8Array {
 
 function sortLeaf(entries: GistLeafEntry[]): void {
   entries.sort((a, b) => {
-    const c = rangeTotalCmp(a.bound, b.bound);
+    const c = boundTotalCmp(a.bound, b.bound);
     return c !== 0 ? c : cmpBytes(a.skey, b.skey);
   });
 }
@@ -192,25 +263,40 @@ function sortChildren(children: GistChildEntry[]): void {
   // Recompute the subtree-min tiebreak inside the comparator (fan-out is tiny) so it tracks the live
   // element under sort's swaps.
   children.sort((a, b) => {
-    const c = rangeTotalCmp(a.bound, b.bound);
+    const c = boundTotalCmp(a.bound, b.bound);
     return c !== 0 ? c : cmpBytes(subtreeMinSkey(a.node), subtreeMinSkey(b.node));
   });
 }
 
-// The conservative interior descend predicate (gist.md §5). For && and @>, a matching row must
+// The conservative interior descend predicate (gist.md §5/§6). For && and @>, a matching row must
 // overlap the query, and every row is contained in its subtree's union, so a non-overlapping union
-// holds no match — overlaps prunes safely.
-function descendPred(union: RangeVal, query: RangeVal, _strat: GistStrategy): boolean {
-  return rangeOverlaps(union, query);
+// holds no match — overlaps prunes safely. For =, a matching value must lie within the subtree's
+// [min,max] key interval, so a query key outside it prunes safely.
+function descendPred(union: GistBound, query: GistQuery, strat: GistStrategy): boolean {
+  if (strat === "equal") {
+    const u = union as { smin: Uint8Array; smax: Uint8Array };
+    const q = (query as { skey: Uint8Array }).skey;
+    return cmpBytes(u.smin, q) <= 0 && cmpBytes(q, u.smax) <= 0;
+  }
+  return rangeOverlaps((union as { rng: RangeVal }).rng, (query as { rng: RangeVal }).rng);
 }
 
-function leafMatches(bound: RangeVal, query: RangeVal, strat: GistStrategy): boolean {
-  return strat === "overlaps" ? rangeOverlaps(bound, query) : rangeContains(bound, query);
+// leafMatches is the exact operator, applied at the leaf to keep only true matches. A leaf's scalar
+// bound is the degenerate [v,v], so equality is min == query key.
+function leafMatches(bound: GistBound, query: GistQuery, strat: GistStrategy): boolean {
+  if (strat === "equal") {
+    return (
+      cmpBytes((bound as { smin: Uint8Array }).smin, (query as { skey: Uint8Array }).skey) === 0
+    );
+  }
+  const r = (bound as { rng: RangeVal }).rng;
+  const q = (query as { rng: RangeVal }).rng;
+  return strat === "overlaps" ? rangeOverlaps(r, q) : rangeContains(r, q);
 }
 
 function searchNode(
   node: GistNode,
-  query: RangeVal,
+  query: GistQuery,
   strat: GistStrategy,
   out: Uint8Array[],
   counts: { nodes: number; interior: number },
@@ -253,24 +339,24 @@ function joinBytes(parts: Uint8Array[]): Uint8Array {
 // its allocated number) and the root page.
 export function serializeGistTree(
   tree: GistTree,
-  elem: ColType,
+  op: GistOpclass,
   alloc: () => number,
 ): { pages: GistPage[]; root: number } {
   const pages: GistPage[] = [];
-  const root = serializeNode(tree.root, elem, pages, alloc);
+  const root = serializeNode(tree.root, op, pages, alloc);
   return { pages, root };
 }
 
 function serializeNode(
   node: GistNode,
-  elem: ColType,
+  op: GistOpclass,
   pages: GistPage[],
   alloc: () => number,
 ): number {
   if (node.leaf) {
     const parts: Uint8Array[] = [];
     for (const e of node.entries) {
-      const b = encodeRangeBody(elem, e.bound);
+      const b = encodeBound(op, e.bound);
       parts.push(be16(b.length), b, be16(e.skey.length), e.skey);
     }
     const pageNo = alloc();
@@ -283,10 +369,10 @@ function serializeNode(
     return pageNo;
   }
   // Children first (post-order), in the node's canonical entry order.
-  const childPages = node.children.map((c) => serializeNode(c.node, elem, pages, alloc));
+  const childPages = node.children.map((c) => serializeNode(c.node, op, pages, alloc));
   const parts: Uint8Array[] = [];
   for (let i = 0; i < node.children.length; i++) {
-    const b = encodeRangeBody(elem, node.children[i]!.bound);
+    const b = encodeBound(op, node.children[i]!.bound);
     parts.push(be16(b.length), b, be32(childPages[i]!));
   }
   const pageNo = alloc();
@@ -301,39 +387,53 @@ function serializeNode(
 
 // ---- the leaf-key codec + canonical-order build (the executor/serializer API) -----------------
 
-// encodeGistLeafKey is the index store's per-row key: encodeRangeBody(bound) ‖ storage key (the GIN
-// term ‖ skey pattern). encodeRangeBody is self-delimiting, so decodeGistLeafKey recovers
-// (bound, skey). All existing insert/update/delete index maintenance reuses it unchanged.
-export function encodeGistLeafKey(elem: ColType, bound: RangeVal, skey: Uint8Array): Uint8Array {
-  return joinBytes([encodeRangeBody(elem, bound), skey]);
+// rangeGistLeafKey builds a range_ops leaf-store key for one row (the GIN term ‖ skey pattern): the
+// row range's self-delimiting encodeRangeBody bytes then its storage key.
+export function rangeGistLeafKey(elem: ColType, bound: RangeVal, skey: Uint8Array): Uint8Array {
+  return encodeGistLeafKey(gistRangeOpclass(elem), { rng: bound }, skey);
 }
 
-function decodeGistLeafKey(elem: ColType, key: Uint8Array): { bound: RangeVal; skey: Uint8Array } {
+// scalarGistLeafKey builds a scalar `=` leaf-store key for one row: the value's order-preserving KEY
+// bytes as the degenerate [v,v] bound, then its storage key. valueKey is encodeKeyValue of the row's
+// scalar value — the executor computes it (gist.ts never encodes a value, only compares bytes).
+export function scalarGistLeafKey(valueKey: Uint8Array, skey: Uint8Array): Uint8Array {
+  return encodeGistLeafKey(GIST_SCALAR_OPCLASS, { smin: valueKey, smax: valueKey }, skey);
+}
+
+// encodeGistLeafKey is the leaf-store key = the bound's self-delimiting bytes ‖ the storage key.
+function encodeGistLeafKey(op: GistOpclass, bound: GistBound, skey: Uint8Array): Uint8Array {
+  return joinBytes([encodeBound(op, bound), skey]);
+}
+
+function decodeGistLeafKey(
+  op: GistOpclass,
+  key: Uint8Array,
+): { bound: GistBound; skey: Uint8Array } {
   const cur = { pos: 0 };
-  const v = readRangeBody(elem, key, cur);
-  if (v.kind !== "range") throw engineError("data_corrupted", "gist: leaf key is not a range");
-  return { bound: v, skey: key.subarray(cur.pos) };
+  const bound = readBound(op, key, cur);
+  return { bound, skey: key.subarray(cur.pos) };
 }
 
 // buildGistFromLeafKeys builds the persisted R-tree from the index store's leaf keys. The keys are
-// decoded and inserted in CANONICAL order (rangeTotalCmp, ties by storage key), so the tree is a pure
+// decoded and inserted in CANONICAL order (boundTotalCmp, ties by storage key), so the tree is a pure
 // function of the leaf SET — content-deterministic, independent of the original mutation order
 // (gist.md §3); the cross-core / golden round-trip property the build relies on.
-export function buildGistFromLeafKeys(elem: ColType, keys: Uint8Array[]): GistTree {
-  const entries = keys.map((k) => decodeGistLeafKey(elem, k));
+export function buildGistFromLeafKeys(op: GistOpclass, keys: Uint8Array[]): GistTree {
+  const entries = keys.map((k) => decodeGistLeafKey(op, k));
   entries.sort((a, b) => {
-    const c = rangeTotalCmp(a.bound, b.bound);
+    const c = boundTotalCmp(a.bound, b.bound);
     return c !== 0 ? c : cmpBytes(a.skey, b.skey);
   });
   const tree = newGistTree();
-  for (const e of entries) gistInsert(tree, elem, e.bound, e.skey);
+  for (const e of entries) gistInsert(tree, op, e.bound, e.skey);
   return tree;
 }
 
 // readGistLeafKeys walks a persisted GiST R-tree (rooted at root, page types 5/6), marking every node
-// page in reached (so the free-list keeps the live tree) and collecting each leaf's leaf key
-// (encodeRangeBody(bound) ‖ skey — the bound bytes concatenated with the storage key). Pure byte walk
-// — no element type needed. read returns one page's [pageType, itemCount, payload].
+// page in reached (so the free-list keeps the live tree) and collecting each leaf's leaf key (bound ‖
+// skey — the opclass's self-delimiting bound bytes concatenated with the storage key). OPCLASS-
+// AGNOSTIC: the bound bytes are copied verbatim (range body or [min,max] key blob), so no element type
+// is needed. read returns one page's { pageType, itemCount, payload }.
 export function readGistLeafKeys(
   read: (pageNo: number) => { pageType: number; itemCount: number; payload: Uint8Array },
   pageNo: number,

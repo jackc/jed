@@ -122,6 +122,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // on-disk R-tree (pages 5/6, format_version 20) + the maintained leaf store. The query-side
     // planner bound is query.gist_scan (spec/design/gist.md GX1).
     "ddl.gist_index",
+    // GiST scalar `=` opclass (the in-core btree_gist, spec/design/gist.md GX2): CREATE INDEX …
+    // USING gist over a fixed-width keyable scalar column; bounds are [min,max] over the
+    // order-preserving key encoding. The query-side planner bound is query.gist_scalar_scan.
+    "ddl.gist_scalar_index",
     // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9). S2: the type
     // is created/dropped/persisted; composite columns/values land later (spec/design/composite.md).
     "types.composite",
@@ -250,6 +254,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // candidate rows; the predicate stays the residual filter (same rows as the full scan, lower
     // cost — spec/design/gist.md §5).
     "query.gist_scan",
+    // GiST scalar `=` bounded scan (spec/design/gist.md §6): a `scalar_col = const` against a
+    // GiST-indexed fixed-width scalar column descends the resident R-tree to candidate rows; the
+    // `=` predicate stays the residual filter. The fallback bound — a PK/B-tree column wins.
+    "query.gist_scalar_scan",
     // GIN-bounded `c = ANY(col)` membership — the single-term `@>` reduction over a GIN-indexed
     // array column (spec/design/gin.md §6); same rows as the full scan, lower cost.
     "query.gin_any_eq",

@@ -1,0 +1,125 @@
+# GiST scalar `=` bounded scans — a GiST index over a FIXED-WIDTH scalar column (the scalar `=`
+# opclass, the in-core btree_gist equivalent, spec/design/gist.md §6) narrows a SELECT / UPDATE /
+# DELETE by the `=` operator. With the index present, the planner DESCENDS the index's resident
+# R-tree (whose bounds are `[min,max]` over the order-preserving key encoding) to the candidate rows
+# and re-applies `=` as the residual WHERE filter, so the RESULT is identical to the full-scan answer
+# — this file pins that the index is transparent (correct rows, duplicates and all, across
+# INSERT/UPDATE/DELETE maintenance, including the NULL-constant and no-match degenerate cases).
+#
+# NOT oracle-imported: PostgreSQL needs `CREATE EXTENSION btree_gist` for a scalar GiST index, so the
+# CREATE INDEX DDL itself is a jed divergence (jed ships btree_gist in-core, gist.md §10). The ROWS a
+# `=` scan returns are PG-clean (identical with or without an index); only the index DDL diverges, so
+# the row expectations are hand-authored to the (obvious) `=` semantics rather than oracle-filled.
+#
+# The deliberate jed divergences (deferred keyable → 0A000, no-opclass type → 42704, the fallback-bound
+# precedence) live in each core's per-core gist tests. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gist_scalar_index, query.gist_scalar_scan, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, room i32)
+
+statement ok
+CREATE INDEX t_room_gist ON t USING gist (room)
+
+# 8 rows with duplicate room numbers (> GIST_FANOUT = 4 forces a two-level tree) + a NULL room (not
+# indexed). `room` is non-PK and has only a GiST index, so the GiST `=` gather (not a PK/btree bound)
+# is what fires.
+statement ok
+INSERT INTO t VALUES
+  (1, 10),
+  (2, 20),
+  (3, 10),
+  (4, 30),
+  (5, 20),
+  (6, 40),
+  (7, 10),
+  (8, 50),
+  (9, NULL)
+
+# --- `=` gather: rows whose room equals the query value (duplicates all returned) ----------------
+# The `# cost:` assertions PIN that the GiST bound (not a full scan) is taken: page_read per R-tree
+# node visited + gist_descent per interior node + per-candidate point lookup (page_read +
+# storage_row_read) + residual operator_eval + row_produced (gist.md §6 / cost.md §3). Cross-core
+# identical (CLAUDE.md §8).
+# cost: 15
+query I nosort
+SELECT id FROM t WHERE room = 10 ORDER BY id
+----
+1
+3
+7
+
+# cost: 12
+query I nosort
+SELECT id FROM t WHERE room = 20 ORDER BY id
+----
+2
+5
+
+# a singleton match
+query I nosort
+SELECT id FROM t WHERE room = 50 ORDER BY id
+----
+8
+
+# --- degenerate constants: no match, and `= NULL` (3VL-unknown, never TRUE) ----------------------
+query I nosort
+SELECT id FROM t WHERE room = 99 ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE room = NULL ORDER BY id
+----
+
+# --- maintenance: DELETE / INSERT / UPDATE, then re-query (the index stays transparent) ----------
+statement ok
+DELETE FROM t WHERE id = 3
+
+query I nosort
+SELECT id FROM t WHERE room = 10 ORDER BY id
+----
+1
+7
+
+statement ok
+INSERT INTO t VALUES (10, 10)
+
+query I nosort
+SELECT id FROM t WHERE room = 10 ORDER BY id
+----
+1
+7
+10
+
+# updating the indexed column moves the row between values (the index follows)
+statement ok
+UPDATE t SET room = 20 WHERE id = 1
+
+query I nosort
+SELECT id FROM t WHERE room = 20 ORDER BY id
+----
+1
+2
+5
+
+query I nosort
+SELECT id FROM t WHERE room = 10 ORDER BY id
+----
+7
+10
+
+# --- GiST-bounded UPDATE / DELETE (the `=` bound narrows the mutation's target scan) -------------
+statement ok
+DELETE FROM t WHERE room = 40
+
+query I nosort
+SELECT id FROM t WHERE room = 40 ORDER BY id
+----
+
+statement ok
+UPDATE t SET id = id + 100 WHERE room = 50
+
+query I nosort
+SELECT id FROM t WHERE room = 50 ORDER BY id
+----
+108

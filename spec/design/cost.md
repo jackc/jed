@@ -419,12 +419,14 @@ column's overflow-chain `page_read` / `value_decompress` if its values spilled (
 set is the array column, which **can** be large — unlike the fixed-width ordered build); an empty
 table charges 0, `DROP INDEX` charges 0.
 
-### GiST-bounded scan — an R-tree narrows a range-column scan
+### GiST-bounded scan — an R-tree narrows a range- or scalar-column scan
 
 A `range_col && const` / `range_col @> const` over a **GiST-indexed** range column
-([gist.md §5](gist.md)) bounds the scan: the planner **descends the index's resident R-tree**,
-visiting only the children whose bounding union is `consistent` with the query. In place of the
-full-scan block it accrues:
+([gist.md §5](gist.md)), or a `scalar_col = const` over a **GiST-indexed** fixed-width scalar column
+(the scalar `=` opclass, [gist.md §6](gist.md)), bounds the scan: the planner **descends the index's
+resident R-tree**, visiting only the children whose bounding union is `consistent` with the query (for
+`=`, whose `[min,max]` key-byte interval brackets the query key). In place of the full-scan block it
+accrues:
 
 - **`page_read` × the tree nodes visited** (interior + leaf) — the logical node-touch count, like a
   B-tree scan's per-node `page_read`;
@@ -432,16 +434,19 @@ full-scan block it accrues:
   node count leaves implicit (weight 1, [schedule.toml](../cost/schedule.toml));
 - per **candidate** leaf hit, the table point-lookup's `page_read` + `storage_row_read` (+ its
   touched-column chain/decompress units);
-- the residual `operator_eval` of the always-rechecked `&&`/`@>` per candidate, and `row_produced`
+- the residual `operator_eval` of the always-rechecked `&&`/`@>`/`=` per candidate, and `row_produced`
   per emitted row.
 
 The count is byte-identical across cores: the resident tree is rebuilt **canonically** from the leaf
 set (`build_from_leaf_keys` — content-deterministic, gist.md §3), so the nodes-visited and the
 `gist_descent` charge are a pure function of `(query, row set)`, independent of insertion order or
-medium (in-memory vs reopened file). **Narrowings this slice** (gist.md §5): constant query operand
-only, `&&`/`@>` only; an empty `&&` query is provably empty (charges 0), an empty `@>` query falls
-back to the full scan. A **GiST-bounded `UPDATE`/`DELETE`** accrues this same block in place of its
-full-scan block (PK then GIN then GiST; the phase-2 writes + index maintenance are unmetered). The
+medium (in-memory vs reopened file). **Narrowings** (gist.md §5/§6): constant query operand only;
+`range_ops` accelerates `&&`/`@>` (an empty `&&` query is provably empty → 0, an empty `@>` query falls
+back to the full scan); the scalar `=` opclass accelerates `=` over the **fixed-width** keyables and is
+the **fallback bound** — a `col = const` over a PK or B-tree-indexed column takes the cheaper bound, so
+the GiST `=` block fires only when a GiST index is the column's only index. A **GiST-bounded
+`UPDATE`/`DELETE`** accrues this same block in place of its full-scan block (the scan-bound precedence
+PK → ordered index → GiST → GIN; the phase-2 writes + index maintenance are unmetered). The
 in-memory tree rebuild after each mutating statement is unmetered structure maintenance on the
 (trusted) write path — the untrusted SELECT-only surface never triggers it (gist.md §4.1, CLAUDE.md
 §13). **DDL cost:** `CREATE INDEX … USING gist` charges its build scan (`page_read` × the table node

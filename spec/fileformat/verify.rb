@@ -749,6 +749,22 @@ GIST_RANGE_TABLE = {
          [5, rng(50, 60)], [6, rng(15, 25)], [7, :empty], [8, nil]]
 }.freeze
 
+# A GiST index over a SCALAR i32 column — the scalar `=` opclass (v20 — spec/design/gist.md GX2).
+# Pins the index_kind = 2 byte AND a persisted R-tree whose bounds are `[min,max]` over the
+# order-preserving KEY encoding (NOT a range body — distinguished from GIST_RANGE_TABLE only by the
+# indexed column's catalog type). 8 rows with duplicate room numbers (> GIST_FANOUT = 4) force a
+# median split, so the tree is two levels, exercising both page types + the scalar bound codec. Row
+# 9's NULL room is not indexed. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, room i32)
+#   INSERT INTO t VALUES (1,10),(2,20),(3,10),(4,30),(5,20),(6,40),(7,10),(8,50),(9,NULL)
+#   CREATE INDEX t_room_gist ON t USING gist (room)
+GIST_SCALAR_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("room", "i32")],
+  indexes: [{ name: "t_room_gist", cols: [1], kind: "gist" }],
+  rows: [[1, 10], [2, 20], [3, 10], [4, 30], [5, 20], [6, 40], [7, 10], [8, 50], [9, nil]]
+}.freeze
+
 # A composite type used as an ARRAY ELEMENT type (v10 — array-of-composite, spec/design/array.md §12
 # AC1): pins the catalog array-column entry with a COMPOSITE element descriptor (type_code 15, then
 # the element descriptor element_type_code 14 + name "addr", §3) AND the recursive value body — an
@@ -1009,6 +1025,7 @@ FIXTURES = [
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
   { file: "range_pk_table.jed", page_size: 256, tables: [RANGE_PK_TABLE] },
   { file: "gist_range_table.jed", page_size: 256, tables: [GIST_RANGE_TABLE] },
+  { file: "gist_scalar_table.jed", page_size: 256, tables: [GIST_SCALAR_TABLE] },
   { file: "json_table.jed", page_size: 256, tables: [JSON_TABLE] },
   { file: "jsonb_table.jed", page_size: 256, tables: [JSONB_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
@@ -1749,12 +1766,33 @@ end
 # { leaf: false, children: [[union_bound, child_node], ...] }; `bound`/`union_bound` are range values
 # (:empty or a {lower:,upper:,lower_inc:,upper_inc:} hash) and `skey` is a binary storage key.
 
+# A GiST opclass (gist.md §2/§5/§6): { kind: :range, elem: <subtype> } for `range_ops`, or
+# { kind: :scalar, type: <scalar> } for the scalar `=` opclass (GX2). The opclass is the ONLY
+# type-specific part; the tree machinery below is opclass-agnostic, dispatching on `op[:kind]`.
+def gist_opclass_for(col_type)
+  if (elem = range_elem(col_type))
+    { kind: :range, elem: elem }
+  else
+    { kind: :scalar, type: col_type }
+  end
+end
+
+# The leaf bounding key for one stored value: the range value itself (range opclass), or `[v, v]`
+# over the order-preserving KEY encoding (scalar opclass — a leaf is the degenerate `[v, v]`, the
+# bytes `key_body` produces, byte-comparable, gist.md §6).
+def gist_leaf_bound(op, v)
+  return v if op[:kind] == :range
+
+  k = key_body(op[:type], v).b
+  [k, k]
+end
+
 # range_union (range.rs, strict = false) — the convex hull. `empty` contributes nothing; otherwise
 # lower = the lesser lower bound, upper = the greater upper bound. GX1's range elements are the six
 # discrete/continuous subtypes; this reference's GiST golden uses only FINITE, canonical `[)` i32
 # ranges (so the bound comparison reduces to value min/max with the canonical inclusivity), matching
 # the cores for that set. An infinite bound is not exercised by the golden (a defensive raise).
-def gist_union(a, b)
+def gist_range_union(a, b)
   return b if a == :empty
   return a if b == :empty
   if [a[:lower], a[:upper], b[:lower], b[:upper]].any?(&:nil?) ||
@@ -1765,9 +1803,37 @@ def gist_union(a, b)
     lower_inc: true, upper_inc: false }
 end
 
-def gist_node_union(elem, node)
+# union(a, b): the convex hull for ranges; componentwise [min(min), max(max)] (byte-wise, the
+# order-preserving key order) for scalars.
+def gist_union(op, a, b)
+  return gist_range_union(a, b) if op[:kind] == :range
+
+  amin, amax = a
+  bmin, bmax = b
+  [[amin, bmin].min, [amax, bmax].max]
+end
+
+# Serialize a bounding key to its self-delimiting bytes — the range body for ranges; `[min, max]`
+# each length-prefixed for scalars (gist.md §4.1/§6).
+def gist_encode_bound(op, bound)
+  return encode_range_body(op[:elem], bound) if op[:kind] == :range
+
+  min, max = bound
+  (u16(min.bytesize) + min + u16(max.bytesize) + max).b
+end
+
+# The canonical total-order key for a bound (range_total_cmp for ranges = encode_range_key bytes;
+# the `[min, max]` key bytes lexicographically for scalars). Returned as an Array so `sort_by`
+# appends the storage-key / subtree-min tiebreak uniformly.
+def gist_sortkey(op, bound)
+  return [encode_range_key(op[:elem], bound)] if op[:kind] == :range
+
+  bound # [min, max] — two byte strings, compared lexicographically
+end
+
+def gist_node_union(op, node)
   bounds = node[:leaf] ? node[:entries].map { |b, _| b } : node[:children].map { |u, _| u }
-  bounds.reduce { |acc, b| gist_union(acc, b) }
+  bounds.reduce { |acc, b| gist_union(op, acc, b) }
 end
 
 def gist_subtree_min_skey(node)
@@ -1778,23 +1844,23 @@ def gist_subtree_min_skey(node)
   end
 end
 
-# Canonical leaf order: (range_total_cmp(bound), skey) = (encode_range_key bytes, skey).
-def gist_sort_leaf!(elem, entries)
-  entries.sort_by! { |b, s| [encode_range_key(elem, b), s] }
+# Canonical leaf order: (bound_total_cmp(bound), skey).
+def gist_sort_leaf!(op, entries)
+  entries.sort_by! { |b, s| gist_sortkey(op, b) + [s] }
 end
 
-# Canonical child order: (range_total_cmp(union), subtree_min_skey).
-def gist_sort_children!(elem, children)
-  children.sort_by! { |u, c| [encode_range_key(elem, u), gist_subtree_min_skey(c)] }
+# Canonical child order: (bound_total_cmp(union), subtree_min_skey).
+def gist_sort_children!(op, children)
+  children.sort_by! { |u, c| gist_sortkey(op, u) + [gist_subtree_min_skey(c)] }
 end
 
 # choose-subtree (penalty): the child whose union, MERGED with the new entry, has the
-# lexicographically-smallest value-codec bytes; ties keep the lower slot (gist.md §3).
-def gist_choose_child(elem, children, bound)
+# lexicographically-smallest serialized bound bytes; ties keep the lower slot (gist.md §3).
+def gist_choose_child(op, children, bound)
   best = 0
   best_key = nil
   children.each_with_index do |(u, _), i|
-    key = encode_range_body(elem, gist_union(u, bound))
+    key = gist_encode_bound(op, gist_union(op, u, bound))
     if best_key.nil? || key < best_key
       best = i
       best_key = key
@@ -1805,40 +1871,40 @@ end
 
 # Insert (bound, skey) into `node` (mutated in place); returns nil or a new right-sibling child
 # [union_bound, node] when the node split.
-def gist_insert_node(elem, node, bound, skey)
+def gist_insert_node(op, node, bound, skey)
   if node[:leaf]
     node[:entries] << [bound, skey]
-    gist_sort_leaf!(elem, node[:entries])
+    gist_sort_leaf!(op, node[:entries])
   else
-    i = gist_choose_child(elem, node[:children], bound)
-    sib = gist_insert_node(elem, node[:children][i][1], bound, skey)
-    node[:children][i][0] = gist_node_union(elem, node[:children][i][1])
+    i = gist_choose_child(op, node[:children], bound)
+    sib = gist_insert_node(op, node[:children][i][1], bound, skey)
+    node[:children][i][0] = gist_node_union(op, node[:children][i][1])
     node[:children] << sib if sib
-    gist_sort_children!(elem, node[:children])
+    gist_sort_children!(op, node[:children])
   end
-  gist_split_if_overflow(elem, node)
+  gist_split_if_overflow(op, node)
 end
 
 # Split an over-FANOUT node at the median (ceil(n/2)); return the new right sibling [union, node].
-def gist_split_if_overflow(elem, node)
+def gist_split_if_overflow(op, node)
   key = node[:leaf] ? :entries : :children
   return nil if node[key].size <= GIST_FANOUT
 
   mid = (node[key].size + 1) / 2 # ceil(n/2) = div_ceil
   right_items = node[key].slice!(mid..)
   right = node[:leaf] ? { leaf: true, entries: right_items } : { leaf: false, children: right_items }
-  [gist_node_union(elem, right), right]
+  [gist_node_union(op, right), right]
 end
 
 # Build the canonical R-tree from leaf entries [[bound, skey], ...].
-def gist_build(elem, entries)
+def gist_build(op, entries)
   root = { leaf: true, entries: [] }
-  entries.sort_by { |b, s| [encode_range_key(elem, b), s] }.each do |bound, skey|
-    sib = gist_insert_node(elem, root, bound, skey)
+  entries.sort_by { |b, s| gist_sortkey(op, b) + [s] }.each do |bound, skey|
+    sib = gist_insert_node(op, root, bound, skey)
     next unless sib
 
-    children = [[gist_node_union(elem, root), root], sib]
-    gist_sort_children!(elem, children)
+    children = [[gist_node_union(op, root), root], sib]
+    gist_sort_children!(op, children)
     root = { leaf: false, children: children }
   end
   root
@@ -1847,11 +1913,11 @@ end
 # Serialize the R-tree post-order into `pages` (children before parent, root last); returns
 # [root_index, next_index]. Leaf entry: bound_len(u16) ‖ bound ‖ skey_len(u16) ‖ skey.
 # Interior entry: bound_len(u16) ‖ union_bound ‖ child_page(u32). (gist.md §4.1)
-def gist_serialize(elem, node, next_index, pages)
+def gist_serialize(op, node, next_index, pages)
   if node[:leaf]
     payload = +"".b
     node[:entries].each do |bound, skey|
-      b = encode_range_body(elem, bound)
+      b = gist_encode_bound(op, bound)
       payload << u16(b.bytesize) << b << u16(skey.bytesize) << skey
     end
     index = next_index
@@ -1860,12 +1926,12 @@ def gist_serialize(elem, node, next_index, pages)
     [index, next_index]
   else
     child_indices = node[:children].map do |_, c|
-      ci, next_index = gist_serialize(elem, c, next_index, pages)
+      ci, next_index = gist_serialize(op, c, next_index, pages)
       ci
     end
     payload = +"".b
     node[:children].each_with_index do |(u, _), i|
-      b = encode_range_body(elem, u)
+      b = gist_encode_bound(op, u)
       payload << u16(b.bytesize) << b << u32(child_indices[i])
     end
     index = next_index
@@ -1876,30 +1942,28 @@ def gist_serialize(elem, node, next_index, pages)
 end
 
 # Build + serialize a GiST index's R-tree from a table's rows; returns [root_index, next_index].
-# One leaf entry per NON-NULL range row (a NULL range is not indexed — gist.md §4.1). An empty
+# One leaf entry per NON-NULL indexed row (a NULL value is not indexed — gist.md §4.1). An empty
 # index serializes nothing and returns root 0 (the empty-index convention).
 def serialize_gist_index(table, ix, next_index, pages)
-  elem = range_elem(table[:columns][ix[:cols][0]][:type])
-  raise "a GiST index column must be a range" unless elem
-
+  op = gist_opclass_for(table[:columns][ix[:cols][0]][:type])
   entries = []
   table_entries(table).each do |storage_key, row|
-    rv = row[ix[:cols][0]]
-    entries << [rv, storage_key] unless rv.nil?
+    v = row[ix[:cols][0]]
+    entries << [gist_leaf_bound(op, v), storage_key] unless v.nil?
   end
   return [0, next_index] if entries.empty?
 
-  gist_serialize(elem, gist_build(elem, entries), next_index, pages)
+  gist_serialize(op, gist_build(op, entries), next_index, pages)
 end
 
-# A GiST index's leaf keys (encode_range_body(bound) ‖ skey), one per non-NULL range row, sorted
-# bytewise — the SET a round-trip read must reproduce (order-independent: the comparison sorts).
+# A GiST index's leaf keys (bound ‖ skey), one per non-NULL indexed row, sorted bytewise — the SET a
+# round-trip read must reproduce (order-independent: the comparison sorts).
 def gist_leaf_keys_sorted(table, ix)
-  elem = range_elem(table[:columns][ix[:cols][0]][:type])
+  op = gist_opclass_for(table[:columns][ix[:cols][0]][:type])
   keys = []
   table_entries(table).each do |storage_key, row|
-    rv = row[ix[:cols][0]]
-    keys << (encode_range_body(elem, rv) + storage_key).b unless rv.nil?
+    v = row[ix[:cols][0]]
+    keys << (gist_encode_bound(op, gist_leaf_bound(op, v)) + storage_key).b unless v.nil?
   end
   keys.sort
 end

@@ -872,33 +872,26 @@ impl Snapshot {
     /// O(rows)-per-mutation cost is unmetered structure maintenance on the (trusted) write path —
     /// the untrusted surface is SELECT-only and never triggers it (gist.md §9, CLAUDE.md §13).
     pub(crate) fn rebuild_gist_trees(&mut self) -> Result<()> {
-        // Collect (index name key, range-element type) for every GiST index, dropping the borrow on
+        // Collect (index name key, opclass) for every GiST index, dropping the borrow on
         // `self.tables` before mutating `self.gist_trees`.
-        let mut specs: Vec<(String, ColType)> = Vec::new();
+        let mut specs: Vec<(String, crate::gist::GistOpclass)> = Vec::new();
         for table in self.tables.values() {
             for idx in &table.indexes {
                 if idx.kind != IndexKind::Gist {
                     continue;
                 }
-                let ci = idx.columns[0];
-                let elem = ColType::Scalar(
-                    table.columns[ci]
-                        .ty
-                        .range_element()
-                        .expect("a GiST index column is a range (CREATE INDEX gate)")
-                        .scalar(),
-                );
-                specs.push((idx.name.to_ascii_lowercase(), elem));
+                let op = crate::gist::opclass_for(&table.columns[idx.columns[0]].ty);
+                specs.push((idx.name.to_ascii_lowercase(), op));
             }
         }
         let live: std::collections::HashSet<&str> = specs.iter().map(|(k, _)| k.as_str()).collect();
         self.gist_trees.retain(|k, _| live.contains(k.as_str()));
-        for (name_key, elem) in &specs {
+        for (name_key, op) in &specs {
             let keys: Vec<Vec<u8>> = match self.index_stores.get(name_key) {
                 Some(store) => store.iter_entries()?.into_iter().map(|(k, _)| k).collect(),
                 None => Vec::new(),
             };
-            let tree = crate::gist::build_from_leaf_keys(elem, keys.iter().map(|k| k.as_slice()))?;
+            let tree = crate::gist::build_from_leaf_keys(op, keys.iter().map(|k| k.as_slice()))?;
             self.gist_trees
                 .insert(name_key.clone(), std::sync::Arc::new(tree));
         }
@@ -4203,17 +4196,34 @@ impl Database {
                     }
                 }
                 IndexKind::Gist => {
-                    // GiST's `range_ops` opclass needs a range column; any other type has no
-                    // default operator class for access method gist — 42704 (PG's wording;
-                    // spec/design/gist.md §5, the GIN-no-opclass precedent).
+                    // GiST opclasses (spec/design/gist.md §5/§6): `range_ops` over a range column,
+                    // or the in-core `btree_gist`-equivalent scalar `=` opclass over a FIXED-WIDTH
+                    // keyable scalar (integers / boolean / uuid / date / timestamp / timestamptz —
+                    // its bound is `[min, max]` over that type's order-preserving key encoding, all
+                    // pure byte comparison). A keyable-but-deferred scalar (text / bytea / decimal /
+                    // interval) is 0A000 — we will support it (the GIN element-staging precedent,
+                    // §11); any other type (float / json / array / composite / jsonpath) has no GiST
+                    // opclass at all — 42704 (PG's wording, the GIN-no-opclass precedent).
                     if !ty.is_range() {
-                        return Err(EngineError::new(
-                            SqlState::UndefinedObject,
-                            format!(
-                                "data type {} has no default operator class for access method gist",
-                                ty.canonical_name()
-                            ),
-                        ));
+                        if is_gist_scalar_type(ty) {
+                            // supported scalar `=` opclass — ok
+                        } else if is_gist_deferred_scalar_type(ty) {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                format!(
+                                    "a gist index on {} is not supported yet",
+                                    ty.canonical_name()
+                                ),
+                            ));
+                        } else {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!(
+                                    "data type {} has no default operator class for access method gist",
+                                    ty.canonical_name()
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -6379,9 +6389,7 @@ impl Database {
             // GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree;
             // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
             (None, None, Some(gb)) => {
-                let query = filter
-                    .as_ref()
-                    .and_then(|f| gist_match(f, gb.col_global).map(|(_, q)| q));
+                let query = filter.as_ref().and_then(|f| gist_query_operand(f, gb));
                 self.gist_bound_rows(&del.table, gb, query, &env, &mut meter, &mask)?
             }
             (None, None, None) => {
@@ -6731,9 +6739,7 @@ impl Database {
             // GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree;
             // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
             (None, None, Some(gb)) => {
-                let query = filter
-                    .as_ref()
-                    .and_then(|f| gist_match(f, gb.col_global).map(|(_, q)| q));
+                let query = filter.as_ref().and_then(|f| gist_query_operand(f, gb));
                 self.gist_bound_rows(&upd.table, gb, query, &env, &mut meter, &mask)?
             }
             (None, None, None) => {
@@ -10104,10 +10110,7 @@ impl Database {
                 // Re-find the constant query `Q` in the WHERE filter (the conjunct plan-time
                 // `gist_match` chose — gist.md §5); the `&&`/`@>` predicate also stays as the
                 // residual filter applied to these rows downstream (always-recheck).
-                let query = plan
-                    .filter
-                    .as_ref()
-                    .and_then(|f| gist_match(f, gb.col_global).map(|(_, q)| q));
+                let query = plan.filter.as_ref().and_then(|f| gist_query_operand(f, gb));
                 let (pairs, units) = self.gist_bound_rows(
                     &rel.table_name,
                     gb,
@@ -11339,7 +11342,7 @@ impl Database {
         meter: &mut Meter,
         mask: &[bool],
     ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
-        use crate::gist::GistStrategy;
+        use crate::gist::{GistQuery, GistStrategy};
         let store = self.store(table_name);
         // The query operand is a constant; evaluating it (the opclass "extract query") is a planning
         // step, NOT metered (cost.md §3) — a scratch meter over the empty row.
@@ -11347,31 +11350,51 @@ impl Database {
             Some(q) => q.eval(&[], env, &mut Meter::new())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
-        let qrange = match qv {
-            Value::Range(rv) => rv,
-            // A NULL query is 3VL-unknown for every row → never TRUE (both `&&` and `@>`).
-            Value::Null => return Ok((Vec::new(), (0, 0))),
-            _ => return Ok((Vec::new(), (0, 0))), // not a range (impossible post-resolve)
-        };
-        if qrange.empty {
-            return match gb.strategy {
-                // `col @> 'empty'` is TRUE for every row (the empty range is contained in every
-                // range), but an empty bound is absorbed by `range_merge`, so it is invisible to the
-                // overlap-descend (a false-negative trap, gist.md §5). Fall back to the full scan;
-                // the residual `@>` keeps every row.
-                GistStrategy::Contains => {
-                    let (entries, pages, slabs) = store.scan_with_units(mask)?;
-                    Ok((entries, (pages, slabs)))
+        // Form the resident-tree search query from the constant, handling the strategy-specific
+        // degenerate cases. A NULL query is 3VL-unknown for every row → never TRUE (all strategies).
+        let gquery = match gb.strategy {
+            GistStrategy::Equal => {
+                // scalar `=` (gist.md §6): encode the constant to its order-preserving key bytes.
+                match qv {
+                    Value::Null => return Ok((Vec::new(), (0, 0))),
+                    v => {
+                        let s = gb
+                            .scalar_type
+                            .expect("a scalar GiST bound carries its column scalar type");
+                        let key = encode_key_value(s, &v, None)
+                            .expect("a fixed-width GiST scalar key is infallible (no collation)");
+                        GistQuery::Scalar(key)
+                    }
                 }
-                // `col && 'empty'` overlaps nothing.
-                GistStrategy::Overlaps => Ok((Vec::new(), (0, 0))),
-            };
-        }
+            }
+            GistStrategy::Overlaps | GistStrategy::Contains => {
+                let qrange = match qv {
+                    Value::Range(rv) => rv,
+                    Value::Null => return Ok((Vec::new(), (0, 0))),
+                    _ => return Ok((Vec::new(), (0, 0))), // not a range (impossible post-resolve)
+                };
+                if qrange.empty {
+                    return match gb.strategy {
+                        // `col @> 'empty'` is TRUE for every row (the empty range is contained in
+                        // every range), but an empty bound is absorbed by `range_merge`, so it is
+                        // invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall
+                        // back to the full scan; the residual `@>` keeps every row.
+                        GistStrategy::Contains => {
+                            let (entries, pages, slabs) = store.scan_with_units(mask)?;
+                            Ok((entries, (pages, slabs)))
+                        }
+                        // `col && 'empty'` overlaps nothing.
+                        _ => Ok((Vec::new(), (0, 0))),
+                    };
+                }
+                GistQuery::Range(qrange)
+            }
+        };
         // Descend the resident R-tree (rebuilt at each mutating statement, gist.md §3/§4.1), so the
         // gather visits only consistent nodes — no per-query build. An index with no tree yet (never
         // populated) yields no candidates. `page_read` per node touched + `gist_descent` per interior.
         let (mut skeys, nodes, interior) = match self.gist_tree(&gb.name_key) {
-            Some(tree) => tree.search(&qrange, gb.strategy),
+            Some(tree) => tree.search(&gquery, gb.strategy),
             None => (Vec::new(), 0, 0),
         };
         meter.charge(COSTS.gist_descent * interior as i64);
@@ -14310,6 +14333,10 @@ struct GistBound {
     strategy: crate::gist::GistStrategy,
     /// The GiST-indexed column's global scope index (`rel.offset + ci`).
     col_global: usize,
+    /// `Some(scalar)` for the scalar `=` opclass (GX2): the column's scalar type, so `gist_bound_rows`
+    /// can encode the equality constant to its order-preserving key bytes. `None` for `range_ops`,
+    /// whose `&&`/`@>` query is a range constant the resident R-tree compares directly.
+    scalar_type: Option<ScalarType>,
 }
 
 /// Which array operator a GIN bound accelerates (spec/design/gin.md §6): `@>` (contains, mode
@@ -14395,9 +14422,11 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Database) -> Opti
         return Some(ScanBound::Pk(b));
     }
     for idx in &rel.table.indexes {
-        // A GIN index is not an ordered-equality bound — its column is an array and it is keyed by
-        // terms, not the whole value (handled by the GIN pass below, gin.md §6).
-        if idx.kind == IndexKind::Gin {
+        // Only an ordered B-tree is an ordered-equality bound. A GIN index is keyed by array terms
+        // (gin.md §6); a GiST index is keyed by a bounding `[min, max]` / range, NOT the whole value
+        // — a scalar GiST index's store key is `[v, v]‖skey`, not the ordered-index key form, so it
+        // must NOT be probed here (handled by the GiST pass below, gist.md §5/§6). Both are skipped.
+        if idx.kind != IndexKind::Btree {
             continue;
         }
         let ci = idx.columns[0];
@@ -14592,15 +14621,27 @@ fn detect_gist_bound(
         }
         let ci = idx.columns[0];
         let col_global = offset + ci;
-        if columns[ci].ty.range_element().is_none() {
-            continue; // a GiST column is always a range (the CREATE INDEX gate); defensive
-        }
-        if let Some((strategy, _)) = gist_match(filter, col_global) {
-            return Some(GistBound {
-                name_key: idx.name.to_ascii_lowercase(),
-                strategy,
-                col_global,
-            });
+        let col_ty = &columns[ci].ty;
+        if col_ty.range_element().is_some() {
+            // `range_ops` (GX1): a `col && Q` / `col @> Q` conjunct.
+            if let Some((strategy, _)) = gist_match(filter, col_global) {
+                return Some(GistBound {
+                    name_key: idx.name.to_ascii_lowercase(),
+                    strategy,
+                    col_global,
+                    scalar_type: None,
+                });
+            }
+        } else if is_gist_scalar_type(col_ty) {
+            // scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
+            if gist_scalar_match(filter, col_global).is_some() {
+                return Some(GistBound {
+                    name_key: idx.name.to_ascii_lowercase(),
+                    strategy: crate::gist::GistStrategy::Equal,
+                    col_global,
+                    scalar_type: Some(col_ty.scalar()),
+                });
+            }
         }
     }
     None
@@ -14640,6 +14681,51 @@ fn gist_match(filter: &RExpr, col_global: usize) -> Option<(crate::gist::GistStr
         } if args.len() == 2 => (is_column(&args[0], col_global) && rexpr_is_constant(&args[1]))
             .then_some((GistStrategy::Contains, &args[1])),
         _ => None,
+    }
+}
+
+/// Find the first WHERE AND-chain conjunct that a GiST scalar `=` opclass on `col_global`
+/// accelerates (spec/design/gist.md §6): `col = Q` where `Q` is a **constant** (re-evaluable per
+/// scan, not per row). Equality is commutative — the column may be either operand. `<>` and the
+/// inequalities are not accelerated (a GiST `=` opclass has only the equal strategy). Returns the
+/// `Equal` strategy and a reference to the constant operand (recovered at exec from `plan.filter`,
+/// so plan and exec agree on the same conjunct by construction — the `gist_match` precedent).
+fn gist_scalar_match(
+    filter: &RExpr,
+    col_global: usize,
+) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    use crate::gist::GistStrategy;
+    match filter {
+        RExpr::And(l, r) => {
+            gist_scalar_match(l, col_global).or_else(|| gist_scalar_match(r, col_global))
+        }
+        RExpr::Compare {
+            op: CmpOp::Eq,
+            lhs,
+            rhs,
+            ..
+        } => {
+            if is_column(lhs, col_global) && rexpr_is_constant(rhs) {
+                Some((GistStrategy::Equal, rhs.as_ref()))
+            } else if is_column(rhs, col_global) && rexpr_is_constant(lhs) {
+                Some((GistStrategy::Equal, lhs.as_ref()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Recover a GiST bound's constant query operand from the live filter at exec time — `gist_match`
+/// for `range_ops` (`&&`/`@>`), `gist_scalar_match` for the scalar `=` opclass. Centralizes the
+/// strategy dispatch so every scan site (SELECT / UPDATE / DELETE) recovers the operand uniformly.
+fn gist_query_operand<'a>(filter: &'a RExpr, gb: &GistBound) -> Option<&'a RExpr> {
+    match gb.strategy {
+        crate::gist::GistStrategy::Equal => {
+            gist_scalar_match(filter, gb.col_global).map(|(_, q)| q)
+        }
+        _ => gist_match(filter, gb.col_global).map(|(_, q)| q),
     }
 }
 
@@ -14858,17 +14944,26 @@ fn index_entry_keys(
 /// real value and IS indexed.
 fn gist_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<Vec<u8>> {
     let ci = def.columns[0];
-    let elem = crate::catalog::ColType::Scalar(
-        columns[ci]
-            .ty
-            .range_element()
-            .expect("a GiST index column is a range (CREATE INDEX gate)")
-            .scalar(),
-    );
-    match &row[ci] {
-        Value::Range(rv) => vec![crate::gist::encode_leaf_key(&elem, rv, storage_key)],
-        Value::Null => Vec::new(),
-        _ => unreachable!("a GiST index column holds a range or NULL"),
+    let col = &columns[ci];
+    if let Some(elem) = col.ty.range_element() {
+        // `range_ops`: the row range's value-codec bytes ‖ storage key.
+        match &row[ci] {
+            Value::Range(rv) => vec![crate::gist::range_leaf_key(elem.scalar(), rv, storage_key)],
+            Value::Null => Vec::new(),
+            _ => unreachable!("a GiST range index column holds a range or NULL"),
+        }
+    } else {
+        // scalar `=` opclass: the value's order-preserving KEY bytes as `[v, v]` ‖ storage key
+        // (gist.md §6). The column is a FIXED-WIDTH keyable (the CREATE INDEX gate), so the key
+        // encoding is collation-free and infallible.
+        match &row[ci] {
+            Value::Null => Vec::new(),
+            v => {
+                let k = encode_key_value(col.ty.scalar(), v, None)
+                    .expect("a fixed-width GiST scalar key is infallible (no collation)");
+                vec![crate::gist::scalar_leaf_key(&k, storage_key)]
+            }
+        }
     }
 }
 
@@ -14887,6 +14982,28 @@ fn is_gin_element_type(elem: &Type) -> bool {
         || elem.is_timestamp()
         || elem.is_timestamptz()
         || elem.is_date()
+}
+
+/// Does the scalar `=` GiST opclass admit this column type (spec/design/gist.md §6)? The FIXED-WIDTH
+/// keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is `[min, max]`
+/// over the order-preserving key encoding, compared as raw bytes (no decode, no collation). Exactly
+/// `is_gin_element_type`'s set (both stage on the fixed-width key-encodable scalars), kept a separate
+/// predicate so the two surfaces evolve independently.
+fn is_gist_scalar_type(ty: &Type) -> bool {
+    ty.is_integer()
+        || ty.is_bool()
+        || ty.is_uuid()
+        || ty.is_timestamp()
+        || ty.is_timestamptz()
+        || ty.is_date()
+}
+
+/// A keyable scalar the GiST scalar `=` opclass will eventually admit but defers this slice
+/// (spec/design/gist.md §6/§11): the VARIABLE-width / collation-sensitive keyables — `text`,
+/// `bytea`, `decimal`, `interval`. A column of one of these is `0A000` ("not supported yet"), not
+/// `42704` (it is on the roadmap, like each GIN element type before it).
+fn is_gist_deferred_scalar_type(ty: &Type) -> bool {
+    ty.is_text() || ty.is_bytea() || ty.is_decimal() || ty.is_interval()
 }
 
 /// A GIN index's entry keys for one row (spec/design/gin.md §4): one entry per DISTINCT non-NULL

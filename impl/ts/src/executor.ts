@@ -319,10 +319,15 @@ import {
 } from "./range.ts";
 import {
   buildGistFromLeafKeys,
-  encodeGistLeafKey,
+  GIST_SCALAR_OPCLASS,
+  type GistOpclass,
+  gistRangeOpclass,
+  type GistQuery,
   type GistStrategy,
   type GistTree,
   gistSearch,
+  rangeGistLeafKey,
+  scalarGistLeafKey,
 } from "./gist.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 import {
@@ -540,13 +545,13 @@ export class Snapshot {
   // a pure function of the leaf SET — content-deterministic, cross-core identical, and identical to the
   // on-disk persisted R-tree. Trees whose index has been dropped are removed.
   rebuildGistTrees(): void {
-    const specs: { nameKey: string; elem: ColType }[] = [];
+    const specs: { nameKey: string; op: GistOpclass }[] = [];
     for (const t of this.tables.values()) {
       for (const idx of t.indexes) {
         if (idx.kind !== "gist") continue;
         specs.push({
           nameKey: idx.name.toLowerCase(),
-          elem: gistElemColType(t.columns[idx.columns[0]!]!.type),
+          op: gistOpclassFor(t.columns[idx.columns[0]!]!.type),
         });
       }
     }
@@ -555,7 +560,7 @@ export class Snapshot {
     for (const sp of specs) {
       const store = this.indexStores.get(sp.nameKey);
       const keys = store ? store.entriesInKeyOrder().map((e) => e.key) : [];
-      this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.elem, keys));
+      this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.op, keys));
     }
   }
 
@@ -3753,15 +3758,28 @@ export class Database {
           );
         }
       } else if (kind === "gist") {
-        // GiST's range_ops opclass applies only to a range column; any other type has no default
-        // operator class for access method gist — 42704 (gist.md §5, the GIN-no-opclass precedent).
+        // GiST opclasses (gist.md §5/§6): range_ops over a range column, or the in-core
+        // btree_gist-equivalent scalar `=` opclass over a FIXED-WIDTH keyable scalar (integers /
+        // boolean / uuid / date / timestamp / timestamptz — its bound is [min,max] over that type's
+        // order-preserving key encoding, all pure byte comparison). A keyable-but-deferred scalar
+        // (text / bytea / decimal / interval) is 0A000 — we will support it (the GIN element-staging
+        // precedent, §11); any other type has no GiST opclass at all — 42704 (PG's wording).
         if (!typeIsRange(ty)) {
-          throw engineError(
-            "undefined_object",
-            "data type " +
-              typeCanonicalName(ty) +
-              " has no default operator class for access method gist",
-          );
+          if (isGistScalarType(ty)) {
+            // supported scalar `=` opclass — ok
+          } else if (isGistDeferredScalarType(ty)) {
+            throw engineError(
+              "feature_not_supported",
+              "a gist index on " + typeCanonicalName(ty) + " is not supported yet",
+            );
+          } else {
+            throw engineError(
+              "undefined_object",
+              "data type " +
+                typeCanonicalName(ty) +
+                " has no default operator class for access method gist",
+            );
+          }
         }
       } else if (
         !typeIsInteger(ty) &&
@@ -4355,16 +4373,26 @@ export class Database {
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // The query operand is a constant; evaluating it (extract query) is a planning step, NOT metered.
     const qv = evalExpr(query, [], env, new Meter());
-    if (qv.kind !== "range") return { entries: [], pages: 0, slabs: 0 }; // a NULL/non-range Q never TRUE
-    if (qv.empty) {
-      if (gb.strategy === "contains") {
-        // col @> 'empty' is TRUE for every row, but an empty bound is absorbed by the union, so it is
-        // invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall back to the full
-        // scan; the residual @> keeps every row.
-        const u = store.scanWithUnits(mask);
-        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
+    // Form the resident-tree search query from the constant, handling strategy-specific degenerate
+    // cases. A NULL query is never TRUE for any row (all strategies).
+    let gq: GistQuery;
+    if (gb.strategy === "equal") {
+      // scalar `=` (gist.md §6): encode the constant to its order-preserving key bytes.
+      if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
+      gq = { skey: encodeKeyValue(gb.scalarType!, qv, null) };
+    } else {
+      if (qv.kind !== "range") return { entries: [], pages: 0, slabs: 0 }; // NULL/non-range never TRUE
+      if (qv.empty) {
+        if (gb.strategy === "contains") {
+          // col @> 'empty' is TRUE for every row, but an empty bound is absorbed by the union, so it
+          // is invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall back to the
+          // full scan; the residual @> keeps every row.
+          const u = store.scanWithUnits(mask);
+          return { entries: u.entries, pages: u.pages, slabs: u.slabs };
+        }
+        return { entries: [], pages: 0, slabs: 0 }; // col && 'empty' overlaps nothing
       }
-      return { entries: [], pages: 0, slabs: 0 }; // col && 'empty' overlaps nothing
+      gq = { rng: qv };
     }
     // Descend the resident R-tree (rebuilt at each mutating statement, gist.md §3/§4.1) — no per-query
     // build. page_read per node touched + gist_descent per interior node.
@@ -4372,7 +4400,7 @@ export class Database {
     let skeys: Uint8Array[] = [];
     const tree = this.readSnap().gistTreeFor(gb.nameKey);
     if (tree !== undefined) {
-      const r = gistSearch(tree, qv, gb.strategy);
+      const r = gistSearch(tree, gq, gb.strategy);
       skeys = r.keys;
       pages += r.nodes;
       meter.charge(COSTS.gistDescent * BigInt(r.interior));
@@ -5611,8 +5639,8 @@ export class Database {
       } else if (gtb !== null) {
         // GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree; the
         // &&/@> predicate stays the residual filter re-applied per candidate below.
-        const m = filter !== null ? gistMatch(filter, gtb.colGlobal) : null;
-        const r = this.gistBoundRows(del.table, gtb, m?.query ?? null, env, meter, mask);
+        const q = filter !== null ? gistQueryOperand(filter, gtb) : null;
+        const r = this.gistBoundRows(del.table, gtb, q, env, meter, mask);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -5890,8 +5918,8 @@ export class Database {
       } else if (gtb !== null) {
         // GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree over
         // the PRE-update state; the &&/@> predicate stays the residual filter re-applied per candidate.
-        const m = filter !== null ? gistMatch(filter, gtb.colGlobal) : null;
-        const r = this.gistBoundRows(upd.table, gtb, m?.query ?? null, env, meter, mask);
+        const q = filter !== null ? gistQueryOperand(filter, gtb) : null;
+        const r = this.gistBoundRows(upd.table, gtb, q, env, meter, mask);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -8521,17 +8549,10 @@ export class Database {
       nodeCount = r.pages;
       slabs = r.slabs;
     } else if (relBound !== null && relBound.kind === "gist") {
-      // Re-find the constant query Q (the conjunct plan-time gistMatch chose — gist.md §5); the &&/@>
-      // predicate also stays the residual filter downstream (always-recheck).
-      const m = plan.filter !== null ? gistMatch(plan.filter, relBound.gist.colGlobal) : null;
-      const r = this.gistBoundRows(
-        rel.tableName,
-        relBound.gist,
-        m?.query ?? null,
-        env,
-        meter,
-        plan.relMasks[ri]!,
-      );
+      // Re-find the constant query Q (the conjunct plan-time analysis chose — gist.md §5/§6); the
+      // &&/@>/= predicate also stays the residual filter downstream (always-recheck).
+      const q = plan.filter !== null ? gistQueryOperand(plan.filter, relBound.gist) : null;
+      const r = this.gistBoundRows(rel.tableName, relBound.gist, q, env, meter, plan.relMasks[ri]!);
       rows = r.entries.map((e) => e.row);
       nodeCount = r.pages;
       slabs = r.slabs;
@@ -9187,6 +9208,10 @@ type GistBound = {
   nameKey: string;
   strategy: GistStrategy;
   colGlobal: number;
+  // scalarType is the GiST-indexed column's scalar type for the scalar `=` opclass (strategy "equal",
+  // GX2): gistBoundRows encodes the equality constant to its order-preserving key bytes with it.
+  // Undefined for range_ops, whose &&/@> query is a range constant the R-tree compares directly.
+  scalarType?: ScalarType;
 };
 
 // GinStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
@@ -9253,9 +9278,11 @@ function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBoun
     }
   }
   for (const idx of rel.table.indexes) {
-    // A GIN index is not an ordered-equality bound — its array column is keyed by terms, not the
-    // whole value (handled by the GIN pass below, gin.md §6).
-    if (idx.kind === "gin") continue;
+    // Only an ordered B-tree is an ordered-equality bound. A GIN index is keyed by array terms
+    // (gin.md §6); a GiST index is keyed by a bounding [min,max] / range, NOT the whole value — a
+    // scalar GiST index's store key is [v,v]‖skey, not the ordered-index key form, so it must NOT be
+    // probed here (handled by the GiST pass below, gist.md §5/§6). Both are skipped.
+    if (idx.kind !== "btree") continue;
     const ci = idx.columns[0]!;
     // An ordered index whose leading (or any) key column is a non-scalar (range) does not pushdown —
     // point-lookup is deferred for containers (ranges.md §10); the index is still maintained.
@@ -9456,14 +9483,51 @@ function detectGistBound(
   for (const idx of indexes) {
     if (idx.kind !== "gist") continue;
     const ci = idx.columns[0]!;
-    if (columns[ci]!.type.kind !== "range") continue; // a GiST column is always a range (the gate)
     const colGlobal = offset + ci;
-    const m = gistMatch(filter, colGlobal);
-    if (m !== null) {
-      return { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal };
+    const colType = columns[ci]!.type;
+    if (colType.kind === "range") {
+      // range_ops (GX1): a `col && Q` / `col @> Q` conjunct.
+      const m = gistMatch(filter, colGlobal);
+      if (m !== null) {
+        return { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal };
+      }
+    } else if (isGistScalarType(colType)) {
+      // scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
+      if (gistScalarMatch(filter, colGlobal) !== null) {
+        return {
+          nameKey: idx.name.toLowerCase(),
+          strategy: "equal",
+          colGlobal,
+          scalarType: typeScalar(colType),
+        };
+      }
     }
   }
   return null;
+}
+
+// gistScalarMatch finds the first WHERE AND-chain conjunct a GiST scalar `=` opclass on colGlobal
+// accelerates (spec/design/gist.md §6): `col = Q` where Q is a constant (re-evaluable per scan).
+// Equality is commutative (the column may be either operand). <> and the inequalities are not
+// accelerated (the `=` opclass has only the equal strategy). Returns the constant operand — used at
+// plan time (existence) and exec time (recover from plan.filter).
+function gistScalarMatch(filter: RExpr, colGlobal: number): { query: RExpr } | null {
+  if (filter.kind === "and") {
+    return gistScalarMatch(filter.lhs, colGlobal) ?? gistScalarMatch(filter.rhs, colGlobal);
+  }
+  if (filter.kind === "compare" && filter.op === "eq") {
+    if (isColumnRef(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs)) return { query: filter.rhs };
+    if (isColumnRef(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs)) return { query: filter.lhs };
+  }
+  return null;
+}
+
+// gistQueryOperand recovers a GiST bound's constant query operand from the live filter at exec time —
+// gistMatch for range_ops (&&/@>), gistScalarMatch for the scalar `=` opclass. Centralizes the
+// strategy dispatch so every scan site (SELECT / UPDATE / DELETE) recovers the operand uniformly.
+function gistQueryOperand(filter: RExpr, gb: GistBound): RExpr | null {
+  if (gb.strategy === "equal") return gistScalarMatch(filter, gb.colGlobal)?.query ?? null;
+  return gistMatch(filter, gb.colGlobal)?.query ?? null;
 }
 
 // gistMatch finds the first WHERE AND-chain conjunct a GiST range_ops index on colGlobal accelerates
@@ -9650,18 +9714,22 @@ function indexEntryKeys(
   return [indexEntryKey(columns, colls, def, storageKey, row)];
 }
 
-// gistElemColType is a GiST range column's element (sub)type as a ColType — the codec/comparator key
-// for the R-tree bounds (spec/design/gist.md §4.1). Computed consistently in gistEntries, the
-// resident-tree rebuild, and the serializer, so the bytes match across cores.
-function gistElemColType(colType: Type): ColType {
-  if (colType.kind !== "range") throw new Error("a GiST index column is a range (CREATE INDEX gate)");
-  return { kind: "scalar", scalar: typeScalar(colType.elem) };
+// gistOpclassFor is the opclass for a GiST index over a column of type colType (gist.md §5/§6):
+// range_ops for a range column (its element subtype as a ColType — the codec/comparator key for the
+// R-tree bounds, §4.1), the scalar `=` opclass otherwise (a fixed-width keyable scalar, the CREATE
+// INDEX gate). Computed consistently in gistEntries, the resident-tree rebuild, and the serializer.
+function gistOpclassFor(colType: Type): GistOpclass {
+  if (colType.kind === "range") {
+    return gistRangeOpclass({ kind: "scalar", scalar: typeScalar(colType.elem) });
+  }
+  return GIST_SCALAR_OPCLASS;
 }
 
 // gistEntries builds a GiST index's entry keys for one row (spec/design/gist.md §4.1): exactly one
-// leaf key, encodeRangeBody(bound) ‖ storage_key (the GIN term ‖ skey pattern), so all existing index
-// maintenance (insert/update/delete) reuses it unchanged. A NULL range value is not indexed; the
-// empty range is a real value and IS indexed.
+// leaf key, bound ‖ storage_key (the GIN term ‖ skey pattern), so all existing index maintenance
+// (insert/update/delete) reuses it unchanged. range_ops uses the row range's value-codec bytes; the
+// scalar `=` opclass uses the value's order-preserving KEY bytes as [v,v] (gist.md §6). A NULL value
+// is not indexed; the empty range is a real value and IS indexed.
 function gistEntries(
   columns: Column[],
   def: IndexDef,
@@ -9669,10 +9737,17 @@ function gistEntries(
   row: Row,
 ): Uint8Array[] {
   const ci = def.columns[0]!;
-  const elem = gistElemColType(columns[ci]!.type);
+  const colType = columns[ci]!.type;
   const v = row[ci]!;
-  if (v.kind !== "range") return []; // a NULL range yields no entry
-  return [encodeGistLeafKey(elem, v, storageKey)];
+  if (colType.kind === "range") {
+    if (v.kind !== "range") return []; // a NULL range yields no entry
+    return [rangeGistLeafKey({ kind: "scalar", scalar: typeScalar(colType.elem) }, v, storageKey)];
+  }
+  // scalar `=` opclass: the column is a FIXED-WIDTH keyable (the CREATE INDEX gate), so the key
+  // encoding is collation-free and infallible.
+  if (v.kind === "null") return [];
+  const k = encodeKeyValue(typeScalar(colType), v, null);
+  return [scalarGistLeafKey(k, storageKey)];
 }
 
 // ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
@@ -9696,6 +9771,28 @@ function isGinElementType(elem: Type): boolean {
     typeIsTimestamptz(elem) ||
     typeIsDate(elem)
   );
+}
+
+// isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
+// the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
+// [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
+// Exactly isGinElementType's set, kept a separate predicate so the two surfaces evolve independently.
+function isGistScalarType(ty: Type): boolean {
+  return (
+    typeIsInteger(ty) ||
+    typeIsBoolean(ty) ||
+    typeIsUuid(ty) ||
+    typeIsTimestamp(ty) ||
+    typeIsTimestamptz(ty) ||
+    typeIsDate(ty)
+  );
+}
+
+// isGistDeferredScalarType reports a keyable scalar the GiST scalar `=` opclass will eventually admit
+// but defers this slice (gist.md §6/§11): the VARIABLE-width / collation-sensitive keyables — text,
+// bytea, decimal, interval. A column of one of these is 0A000 ("not supported yet"), not 42704.
+function isGistDeferredScalarType(ty: Type): boolean {
+  return typeIsText(ty) || typeIsBytea(ty) || typeIsDecimal(ty) || typeIsInterval(ty);
 }
 
 function ginEntries(

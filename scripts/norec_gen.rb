@@ -133,6 +133,9 @@ GIN_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_mutati
 GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
               dml.insert_multi_row query.select query.order_by types.i32 types.range
               func.range_constructors func.range_operators].freeze
+GIST_SCALAR_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_scalar_index query.gist_scalar_scan
+                     dml.insert dml.insert_multi_row query.select query.order_by
+                     query.comparison_order query.logical_connectives types.i32 query.where_eq].freeze
 PREDICATE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                    query.comparison_order query.order_by query.logical_connectives expr.between
                    expr.in_list expr.comparison_value types.i32 null.three_valued].freeze
@@ -503,6 +506,51 @@ def gen_gist(seed)
   gpair.call("@> a mid singleton {3}=[3,4)", 3, 4)
   gpair.call("@> a small span [2,5)", 2, 5)
   gpair.call("@> a high span [50,60) (likely absent)", 50, 60)
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GiST scalar `=` gather (col = c via the GiST index vs col >= c AND col <= c full scan)
+# A `scalar_col = const` over a GiST-indexed FIXED-WIDTH scalar column gathers via the scalar `=`
+# opclass's resident R-tree (spec/design/gist.md §6; query.gist_scalar_scan). The SEMANTICALLY
+# IDENTICAL `col >= c AND col <= c` (a range predicate over a total order, ≡ `col = c`) is NOT a `=`
+# conjunct, so it takes NO GiST bound and full-scans (the column is non-PK with only a GiST index, so
+# no PK / B-tree range bound applies either). The metamorphic pair is `room = c` vs
+# `room >= c AND room <= c` — both mean "room equals c", the GiST `=` bound taken on one side and not
+# the other; both must return identical rows. Expected rows are known by construction (a row matches
+# iff its room is non-NULL and equals c), so no oracle is consulted — this catches a scalar-GiST gather
+# bug ALL cores might share, which differential testing alone cannot.
+def gen_gist_scalar(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, room): a small room domain so `=` admits duplicates; one row is NULL.
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, rng.rand(0..5)]
+  end
+  matches = lambda do |c|
+    rows.select { |_id, room| !room.nil? && room == c }.map { |id, _| id.to_s }
+  end
+
+  out = header(seed, GIST_SCALAR_REQ, "GiST scalar `=` gather (room = c via the GiST index vs the range predicate full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, room| "(#{id}, #{room.nil? ? 'NULL' : room})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_room_gist ON t USING gist (room)")
+
+  epair = lambda do |title, c|
+    exp = matches.call(c)
+    out << "# #{title}"
+    out << "# GiST `=` bound (room = const -> consistent-descent gather)"
+    q(out, "I", "SELECT id FROM t WHERE room = #{c} ORDER BY id", exp)
+    out << "# full scan (room >= c AND room <= c is the same predicate, not GiST-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE room >= #{c} AND room <= #{c} ORDER BY id", exp)
+  end
+
+  epair.call("= a low value (likely several rows)", 1)
+  epair.call("= a mid value", 3)
+  epair.call("= a high value (likely absent)", 9)
 
   out.join("\n") + "\n"
 end
@@ -1052,6 +1100,7 @@ SCENARIOS = {
   "gin_eq" => method(:gen_gin_eq),
   "gin_mut" => method(:gen_gin_mutation),
   "gist" => method(:gen_gist),
+  "gist_scalar" => method(:gen_gist_scalar),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
   "window" => method(:gen_window_frame),

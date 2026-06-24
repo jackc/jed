@@ -39,11 +39,18 @@ test("gist create and query (overlap / contains / maintenance)", () => {
 });
 
 test("gist divergences (42704 / 0A000)", () => {
-  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, r i32range, s i32range, n i32)"]);
-  // A GiST index on a non-range column → 42704.
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, s i32range, f f64, txt text)",
+  ]);
+  // A GiST index on a non-keyable, non-range type (float) → 42704 (no GiST opclass at all, §6).
   assert.equal(
-    errCode(() => execute(db, "CREATE INDEX ON t USING gist (n)")),
+    errCode(() => execute(db, "CREATE INDEX ON t USING gist (f)")),
     "42704",
+  );
+  // A keyable-but-deferred scalar (text) → 0A000 (on the roadmap, the GIN element-staging precedent).
+  assert.equal(
+    errCode(() => execute(db, "CREATE INDEX ON t USING gist (txt)")),
+    "0A000",
   );
   // An unknown access method → 42704.
   assert.equal(
@@ -88,6 +95,65 @@ test("gist whole-image roundtrip persists the R-tree", () => {
   const loaded2 = loadDatabase(toImage(loaded, 256, 1n));
   assert.deepEqual(query(loaded2, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"), [
     ["3"],
+    ["9"],
+  ]);
+});
+
+// GX2: the scalar `=` opclass (the in-core btree_gist). A GiST index over a fixed-width keyable scalar
+// accelerates `=` — the planner descends the resident R-tree and re-applies `=` as the residual,
+// identical rows to a full scan (duplicates and all) across INSERT/UPDATE/DELETE.
+test("scalar gist `=` gather and maintenance", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, room i32)",
+    "CREATE INDEX t_room_gist ON t USING gist (room)",
+    "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 10), (7, NULL)",
+  ]);
+  assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [
+    ["1"],
+    ["3"],
+    ["6"],
+  ]);
+  assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [["2"], ["5"]]);
+  // `= NULL` is 3VL-unknown → no rows; a value with no row → no rows.
+  assert.deepEqual(query(db, "SELECT id FROM t WHERE room = NULL ORDER BY id"), []);
+  assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 99 ORDER BY id"), []);
+  // Maintenance: DELETE / INSERT / UPDATE the indexed column.
+  execute(db, "DELETE FROM t WHERE id = 3");
+  assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [["1"], ["6"]]);
+  execute(db, "INSERT INTO t VALUES (8, 10)");
+  assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [
+    ["1"],
+    ["6"],
+    ["8"],
+  ]);
+  execute(db, "UPDATE t SET room = 20 WHERE id = 1");
+  assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [
+    ["1"],
+    ["2"],
+    ["5"],
+  ]);
+});
+
+// GX2: a scalar `=` GiST index persists (page-5/6 R-tree, v20 — the bound is a [min,max] key blob,
+// distinguished from a range bound by the column's catalog type) and reloads.
+test("scalar gist whole-image roundtrip persists the R-tree", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, room i32)",
+    "CREATE INDEX t_room_gist ON t USING gist (room)",
+    "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), (8, 50)",
+  ]);
+  const loaded = loadDatabase(toImage(db, 256, 1n));
+  assert.deepEqual(query(loaded, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [
+    ["1"],
+    ["3"],
+    ["7"],
+  ]);
+  assert.deepEqual(query(loaded, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [["2"], ["5"]]);
+  execute(loaded, "INSERT INTO t VALUES (9, 20)");
+  const loaded2 = loadDatabase(toImage(loaded, 256, 1n));
+  assert.deepEqual(query(loaded2, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [
+    ["2"],
+    ["5"],
     ["9"],
   ]);
 });

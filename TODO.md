@@ -505,13 +505,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         GiST are `0A000`. Capability `ddl.gist_index` + `query.gist_scan`; the oracle-clean
         `query/gist_scan.test` corpus + the `gist` NoREC relation. Realizes
         [ranges.md §10](spec/design/ranges.md). _(size: XL; ×3 cores)_
-  - [ ] **GX2 — GiST `=` over the keyable scalars (the `btree_gist` equivalent).** A scalar GiST opclass
-        over the engine's keyable scalars (integers / `boolean` / `uuid` / `date` / `timestamp` /
-        `timestamptz` / `text` / `bytea` / `decimal` / `interval`) whose bounding key is the value's
-        existing order-preserving key encoding and whose only strategy is `=`. PG needs the `btree_gist`
-        extension for this; jed owns its surface (§1), so it ships in-core. This is what lets a
-        **multi-column** GiST index carry a `=` column beside a `&&` range column — the canonical
-        exclusion shape. _(size: L; ×3 cores)_
+  - [x] **GX2 — GiST `=` over the keyable scalars (the `btree_gist` equivalent).** ✅ **DONE** (all
+        three cores + the Ruby golden, byte-identical). Generalized the tree core to an **opclass seam**
+        (`range_ops` + scalar `=`, the only type-specific part) and added the scalar `=` opclass over the
+        **FIXED-WIDTH** keyables (integers / `boolean` / `uuid` / `date` / `timestamp` / `timestamptz`)
+        whose bounding key is `[min,max]` over the value's existing order-preserving key encoding,
+        compared / unioned / descended as **raw bytes** (no decode, no comparator, no collation). The
+        planner `=` gather is the **fallback bound** (a PK / B-tree column wins; ordered-index pushdown
+        skips a GiST index). Persisted within v20's pages 5/6 — **no format bump** (the bound flavor is
+        keyed off the indexed column's catalog type) + the `gist_scalar_table.jed` golden. PG needs the
+        `btree_gist` extension; jed ships it in-core (§1). The VARIABLE-width / collation-sensitive
+        keyables (`text` / `bytea` / `decimal` / `interval`) are deferred `0A000` (the GIN element-staging
+        precedent, gist.md §6/§11); a no-opclass type is `42704`. This is what lets a **multi-column**
+        GiST index carry a `=` column beside a `&&` range column — the canonical exclusion shape (GX3).
+        Capabilities `ddl.gist_scalar_index` / `query.gist_scalar_scan`; the `query/gist_scalar_scan.test`
+        corpus + the `gist_scalar` NoREC relation. _(size: L; ×3 cores)_
   - [ ] **GX3 — `EXCLUDE` constraints.** `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])`:
         the constraint **is** its backing GiST index (the UNIQUE-is-its-index model,
         [constraints.md §5](spec/design/constraints.md), generalized to N `(column, operator)` pairs).

@@ -902,8 +902,7 @@ type bodyPage struct {
 // alloc hands out page numbers (a counter for the whole image, the free-list allocator for an
 // incremental commit). Returns the node pages + the root; an empty index returns no pages and root 0.
 func serializeGistIndex(s *Snapshot, table *Table, idx IndexDef, alloc func() uint32) ([]gistPage, uint32, error) {
-	rt, _ := table.Columns[idx.Columns[0]].Type.RangeElement()
-	elem := ScalarColType(rt.Scalar)
+	op := gistOpclassFor(table.Columns[idx.Columns[0]].Type)
 	var keys [][]byte
 	if istore := s.indexStores[strings.ToLower(idx.Name)]; istore != nil {
 		entries, err := istore.EntriesInKeyOrder()
@@ -918,11 +917,11 @@ func serializeGistIndex(s *Snapshot, table *Table, idx IndexDef, alloc func() ui
 	if len(keys) == 0 {
 		return nil, 0, nil
 	}
-	tree, err := buildGistFromLeafKeys(elem, keys)
+	tree, err := buildGistFromLeafKeys(op, keys)
 	if err != nil {
 		return nil, 0, err
 	}
-	pages, root := serializeGistTree(tree, elem, alloc)
+	pages, root := serializeGistTree(tree, op, alloc)
 	return pages, root, nil
 }
 

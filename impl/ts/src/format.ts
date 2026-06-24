@@ -34,7 +34,14 @@ import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database, Snapshot } from "./executor.ts";
-import { buildGistFromLeafKeys, readGistLeafKeys, serializeGistTree } from "./gist.ts";
+import {
+  buildGistFromLeafKeys,
+  GIST_SCALAR_OPCLASS,
+  type GistOpclass,
+  gistRangeOpclass,
+  readGistLeafKeys,
+  serializeGistTree,
+} from "./gist.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { onDiskRef, residentRef } from "./pmap.ts";
 import { rangeForElement } from "./range.ts";
@@ -1562,7 +1569,7 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
         // GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md §4.1).
         const r = serializeGistIndex(
           snap.indexStore(idx.name.toLowerCase()),
-          gistColElem(store, idx.columns[0]!),
+          gistColOpclass(store, idx.columns[0]!),
           nextIndex,
           body,
         );
@@ -1648,10 +1655,12 @@ type BodyPage = {
 // gistColElem is a GiST range column's element ColType — the codec/comparator key for the R-tree
 // bounds (spec/design/gist.md §4.1). Taken from the TABLE store's resolved column types (a range
 // column's ColType is { kind: "range", elem }), so it matches the executor's gistEntries encoding.
-function gistColElem(tableStore: TableStore, ci: number): ColType {
+// gistColOpclass is the opclass for a GiST index on column ci (gist.md §5/§6): range_ops over a
+// range column (its element ColType the codec key), the scalar `=` opclass over a fixed-width keyable
+// scalar. The bound flavor a node holds is keyed off this column type (no format-version distinction).
+function gistColOpclass(tableStore: TableStore, ci: number): GistOpclass {
   const ct = tableStore.columnTypes()[ci]!;
-  if (ct.kind !== "range") throw new Error("a GiST index column is a range (CREATE INDEX gate)");
-  return ct.elem;
+  return ct.kind === "range" ? gistRangeOpclass(ct.elem) : GIST_SCALAR_OPCLASS;
 }
 
 // serializeGistIndex builds a GiST index's canonical R-tree from its leaf-key store and serializes it
@@ -1662,15 +1671,15 @@ function gistColElem(tableStore: TableStore, ci: number): ColType {
 // root 0 and writes no pages.
 function serializeGistIndex(
   istore: TableStore,
-  elem: ColType,
+  op: GistOpclass,
   nextIndex: number,
   body: BodyPage[],
 ): { index: number; next: number } {
   const keys = istore.entriesInKeyOrder().map((e) => e.key);
   if (keys.length === 0) return { index: 0, next: nextIndex };
-  const tree = buildGistFromLeafKeys(elem, keys);
+  const tree = buildGistFromLeafKeys(op, keys);
   let n = nextIndex;
-  const { pages, root } = serializeGistTree(tree, elem, () => n++);
+  const { pages, root } = serializeGistTree(tree, op, () => n++);
   for (const p of pages) {
     body.push({
       index: p.pageNo,
@@ -1831,12 +1840,9 @@ export function incrementalImage(
         const istore = snap.indexStore(idx.name.toLowerCase());
         const keysList = istore.entriesInKeyOrder().map((e) => e.key);
         if (keysList.length > 0) {
-          const tree = buildGistFromLeafKeys(gistColElem(store, idx.columns[0]!), keysList);
-          const { pages: gpages, root } = serializeGistTree(
-            tree,
-            gistColElem(store, idx.columns[0]!),
-            () => alloc.take(),
-          );
+          const op = gistColOpclass(store, idx.columns[0]!);
+          const tree = buildGistFromLeafKeys(op, keysList);
+          const { pages: gpages, root } = serializeGistTree(tree, op, () => alloc.take());
           for (const p of gpages) {
             pages.push({
               index: p.pageNo,

@@ -329,6 +329,24 @@ fn gist_range_table_db() -> Database {
     db
 }
 
+/// A GiST index over a SCALAR `i32` column — the scalar `=` opclass (kind 2, v20 — spec/design/
+/// gist.md GX2): pins the scalar bounding-key bytes (`[min,max]` over the order-preserving key
+/// encoding, distinguished from a range bound by the indexed column's catalog type). 8 rows with
+/// duplicate room numbers force a median split at `GIST_FANOUT = 4`, so the on-disk tree is two
+/// levels, exercising both page types + post-order allocation with the scalar bound codec. Row 9's
+/// NULL is not indexed. Mirrors the Ruby reference's `GIST_SCALAR_TABLE`.
+fn gist_scalar_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), \
+         (8, 50), (9, NULL)",
+    );
+    run(&mut db, "CREATE INDEX t_room_gist ON t USING gist (room)");
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -955,6 +973,7 @@ fn write_matches_goldens() {
         ("range_table.jed", range_table_db),
         ("range_pk_table.jed", range_pk_table_db),
         ("gist_range_table.jed", gist_range_table_db),
+        ("gist_scalar_table.jed", gist_scalar_table_db),
         ("array_composite_table.jed", array_composite_table_db),
         (
             "composite_array_field_table.jed",
@@ -1014,6 +1033,7 @@ fn read_goldens_reproduces_rows() {
         ("range_table.jed", range_table_db, "t"),
         ("range_pk_table.jed", range_pk_table_db, "t"),
         ("gist_range_table.jed", gist_range_table_db, "t"),
+        ("gist_scalar_table.jed", gist_scalar_table_db, "t"),
         ("array_composite_table.jed", array_composite_table_db, "t"),
         (
             "composite_array_field_table.jed",

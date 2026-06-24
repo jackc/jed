@@ -2035,30 +2035,26 @@ fn serialize_gist_index<A: FnMut() -> u32>(
     idx: &IndexDef,
     alloc: &mut A,
 ) -> Result<(Vec<crate::gist::GistPage>, u32)> {
-    let elem = ColType::Scalar(
-        table.columns[idx.columns[0]]
-            .ty
-            .range_element()
-            .expect("a GiST index column is a range (CREATE INDEX gate)")
-            .scalar(),
-    );
+    let op = crate::gist::opclass_for(&table.columns[idx.columns[0]].ty);
     let istore = snap.index_store(&idx.name.to_ascii_lowercase());
     let keys: Vec<Vec<u8>> = istore.iter_entries()?.into_iter().map(|(k, _)| k).collect();
     if keys.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let tree = crate::gist::build_from_leaf_keys(&elem, keys.iter().map(|k| k.as_slice()))?;
-    Ok(crate::gist::serialize_tree(&tree, &elem, alloc))
+    let tree = crate::gist::build_from_leaf_keys(&op, keys.iter().map(|k| k.as_slice()))?;
+    Ok(crate::gist::serialize_tree(&tree, &op, alloc))
 }
 
 /// Walk a persisted GiST R-tree (rooted at `root`, page types 5/6 — spec/design/gist.md §4.1),
 /// marking every node page in `reached` (so the free-list keeps the live tree) and collecting each
-/// leaf's **leaf key** (`encode_range_body(bound) ‖ skey` — the bound bytes concatenated with the
-/// storage key, recovered by re-joining the two length-prefixed fields). The leaf keys repopulate
-/// the in-memory leaf-key store (the maintenance source of truth); the resident R-tree the planner
-/// descends is rebuilt canonically from them afterward (`Snapshot::rebuild_gist_trees`). Pure byte
-/// walk — no element type needed (the bound bytes are copied verbatim). `read` returns one page's
-/// `(page_type, item_count, payload)`, reading from the whole image or through the pager.
+/// leaf's **leaf key** (`bound ‖ skey` — the bound bytes concatenated with the storage key,
+/// recovered by re-joining the two length-prefixed fields). The bound bytes are the opclass's
+/// self-delimiting form (`range_ops`' range body / the scalar `=` opclass's `[min,max]` key blob),
+/// copied verbatim — so this walk is **opclass-agnostic** (no element type needed). The leaf keys
+/// repopulate the in-memory leaf-key store (the maintenance source of truth); the resident R-tree
+/// the planner descends is rebuilt canonically from them afterward (`Snapshot::rebuild_gist_trees`).
+/// `read` returns one page's `(page_type, item_count, payload)`, reading from the whole image or
+/// through the pager.
 fn read_gist_leaf_keys<F>(
     read: &F,
     page_no: u32,

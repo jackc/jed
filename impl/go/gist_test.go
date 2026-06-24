@@ -55,10 +55,14 @@ func TestGistCreateAndQuery(t *testing.T) {
 
 func TestGistDivergences(t *testing.T) {
 	db := NewDatabase()
-	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, s i32range, n i32)")
-	// A GiST index on a non-range column → 42704 (no default operator class).
-	if got := errCode(t, db, "CREATE INDEX ON t USING gist (n)"); got != "42704" {
-		t.Errorf("gist on non-range: got %s, want 42704", got)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, s i32range, f f64, txt text)")
+	// A GiST index on a non-keyable, non-range type (float) → 42704 (no GiST opclass at all, §6).
+	if got := errCode(t, db, "CREATE INDEX ON t USING gist (f)"); got != "42704" {
+		t.Errorf("gist on float: got %s, want 42704", got)
+	}
+	// A keyable-but-deferred scalar (text) → 0A000 (on the roadmap, the GIN element-staging precedent).
+	if got := errCode(t, db, "CREATE INDEX ON t USING gist (txt)"); got != "0A000" {
+		t.Errorf("gist on text: got %s, want 0A000", got)
 	}
 	// An unknown access method → 42704.
 	if got := errCode(t, db, "CREATE INDEX ON t USING brin (r)"); got != "42704" {
@@ -75,6 +79,74 @@ func TestGistDivergences(t *testing.T) {
 	run(t, db, "CREATE TEMP TABLE tmp (id i32 PRIMARY KEY, r i32range)")
 	if got := errCode(t, db, "CREATE INDEX ON tmp USING gist (r)"); got != "0A000" {
 		t.Errorf("gist on temp: got %s, want 0A000", got)
+	}
+}
+
+// TestScalarGistEqualGather: the scalar `=` opclass (GX2, the in-core btree_gist). A GiST index over a
+// fixed-width keyable scalar accelerates `=` — the planner descends the resident R-tree and re-applies
+// `=` as the residual, identical rows to a full scan (duplicates and all) across INSERT/UPDATE/DELETE.
+func TestScalarGistEqualGather(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)")
+	run(t, db, "CREATE INDEX t_room_gist ON t USING gist (room)")
+	run(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 10), (7, NULL)")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = 10 ORDER BY id")); !eqInts(got, 1, 3, 6) {
+		t.Errorf("room = 10: got %v, want [1 3 6]", got)
+	}
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = 20 ORDER BY id")); !eqInts(got, 2, 5) {
+		t.Errorf("room = 20: got %v, want [2 5]", got)
+	}
+	// `= NULL` is 3VL-unknown → no rows; a value with no row → no rows.
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = NULL ORDER BY id")); len(got) != 0 {
+		t.Errorf("room = NULL: got %v, want []", got)
+	}
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = 99 ORDER BY id")); len(got) != 0 {
+		t.Errorf("room = 99: got %v, want []", got)
+	}
+	// Maintenance: DELETE / INSERT / UPDATE the indexed column.
+	run(t, db, "DELETE FROM t WHERE id = 3")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = 10 ORDER BY id")); !eqInts(got, 1, 6) {
+		t.Errorf("after delete room = 10: got %v, want [1 6]", got)
+	}
+	run(t, db, "INSERT INTO t VALUES (8, 10)")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = 10 ORDER BY id")); !eqInts(got, 1, 6, 8) {
+		t.Errorf("after insert room = 10: got %v, want [1 6 8]", got)
+	}
+	run(t, db, "UPDATE t SET room = 20 WHERE id = 1")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = 20 ORDER BY id")); !eqInts(got, 1, 2, 5) {
+		t.Errorf("after update room = 20: got %v, want [1 2 5]", got)
+	}
+}
+
+// TestScalarGistFileRoundTrip: a scalar `=` GiST index persists (page-5/6 R-tree, v20 — the bound is a
+// [min,max] key blob, distinguished from a range bound by the column's catalog type) and reloads.
+func TestScalarGistFileRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gist_scalar_round_trip.jed")
+	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)")
+	run(t, db, "CREATE INDEX t_room_gist ON t USING gist (room)")
+	run(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), (8, 50)")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE room = 10 ORDER BY id")); !eqInts(got, 1, 3, 7) {
+		t.Errorf("before close room = 10: got %v, want [1 3 7]", got)
+	}
+
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gistIDs(queryRows(t, db2, "SELECT id FROM t WHERE room = 20 ORDER BY id")); !eqInts(got, 2, 5) {
+		t.Errorf("after reopen room = 20: got %v, want [2 5]", got)
+	}
+	run(t, db2, "INSERT INTO t VALUES (9, 20)")
+	db3, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gistIDs(queryRows(t, db3, "SELECT id FROM t WHERE room = 20 ORDER BY id")); !eqInts(got, 2, 5, 9) {
+		t.Errorf("after maintenance reopen room = 20: got %v, want [2 5 9]", got)
 	}
 }
 

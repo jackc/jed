@@ -156,8 +156,12 @@ order-preserving key encoding (lossy for some elements) cannot guarantee. `range
 `encode_range_body(elem, row_range)`; an interior bound is `encode_range_body(elem, union)` where the
 union is the convex hull `range_merge` covering the subtree. The **canonical order** the §3 split and
 node layout sort by is `range_total_cmp` (the range total order, [ranges.md §6](ranges.md)) — a pure
-deterministic function — not the raw codec bytes. (A scalar opclass, §6, stores `[min, max]` over the
-value codec and orders by the scalar's comparator; the tree core is identical.)
+deterministic function — not the raw codec bytes. (The **scalar `=` opclass**, §6, instead stores
+`[min, max]` over the **order-preserving key encoding** ([encoding.md §2](encoding.md)) — each
+component the value's *key* bytes, length-prefixed — and orders by **raw byte comparison** of those
+bytes, which reproduces the value order by construction; the tree core is byte-for-byte identical, only
+the bound's encode/decode and the descend predicate differ. The scalar opclass never decodes a bound
+back to a value — `=` needs only comparison, so the bound is compared, never reconstructed.)
 
 ### 4.1 The on-disk node format (GX1, `format_version` 20)
 
@@ -234,16 +238,40 @@ are deferred rather than risk an unsound prune — the GIN-`<@` precedent. Empty
 indexed and correct under `&&`/`@>` (they simply never match a non-empty query). Applies to SELECT
 and GiST-bounded UPDATE/DELETE.
 
-## 6. Scalar `=` opclasses — the in-core `btree_gist` equivalent (GX2)
+## 6. Scalar `=` opclasses — the in-core `btree_gist` equivalent (GX2) ✅ LANDED
 
-A GiST opclass over each **keyable scalar** (the integers / `boolean` / `uuid` / `date` /
-`timestamp` / `timestamptz` / `text` / `bytea` / `decimal` / `interval` — exactly the set with an
-order-preserving key encoding) whose bounding key is `[min, max]` over that encoding and whose only
-strategy is **`=`** (`consistent`: descend iff the node's `[min,max]` brackets the query value).
-PostgreSQL needs the `btree_gist` *extension* for this; jed owns its surface (§1) so it ships
-in-core. Its purpose is to let a **multi-column** GiST index carry a `=` column beside a `&&` range
-column — the canonical exclusion shape (§7). Standalone it is a (cost-inferior) alternative to the
-ordered B-tree and not something a user would reach for; it exists for the constraint case.
+A GiST opclass over a **keyable scalar** whose bounding key is `[min, max]` over that type's
+**order-preserving key encoding** ([encoding.md §2](encoding.md)) and whose only strategy is **`=`**
+(`consistent`: descend iff the node's `[min,max]` brackets the query value's key bytes). The bound is
+two length-prefixed key blobs, compared / unioned / descended as **raw bytes** — the key encoding makes
+byte order reproduce value order, so the opclass needs **no value decode, no per-type comparator, and
+no collation context** at compare time. The executor encodes a row value (and the equality constant)
+to its key bytes via the shared `encode_key_value` ([encoding.md §2](encoding.md)); the tree only ever
+compares. PostgreSQL needs the `btree_gist` *extension* for this; jed owns its surface (§1) so it ships
+in-core (a documented divergence, §10). Its purpose is to let a **multi-column** GiST index carry a `=`
+column beside a `&&` range column — the canonical exclusion shape (§7). Standalone it is a
+(cost-inferior) alternative to the ordered B-tree and not something a user would reach for; it exists
+for the constraint case.
+
+**GX2 ships the FIXED-WIDTH keyables first** — the integers, `boolean`, `uuid`, `date`, `timestamp`,
+`timestamptz` (exactly GIN's `is_gin_element_type` set) — whose key encoding is collation-free and
+infallible. The **variable-width / collation-sensitive** keyables — `text`, `bytea`, `decimal`,
+`interval` — are a deferred follow-on (§11): a column of one is `0A000` ("not supported yet", on the
+roadmap), the GIN element-staging precedent. A column with no GiST opclass at all (`float` / `json` /
+`array` / composite / `jsonpath`) is `42704` ("no default operator class", PG's wording).
+
+**Persistence — no format bump (§8).** A scalar `=` index reuses v20's GiST page types `5`/`6`
+(§4.1); the on-disk bound is the `[min, max]` key-blob pair instead of a range body, **distinguished
+from a range bound only by the indexed column's catalog type** (range → `range_ops`, scalar →
+scalar `=`). The page walk that repopulates the leaf store on load is opclass-agnostic (it copies the
+bound bytes verbatim), so the same reader handles either. Golden: `gist_scalar_table.jed`
+(`rust == go == ts == ruby`).
+
+**A scalar GiST index is the FALLBACK bound** (cost.md §3, the scan-bound precedence). A `col = const`
+over a column that is the primary key or has an ordered B-tree index takes the cheaper PK / index
+bound; the GiST `=` gather fires only when a GiST index is the *only* index on that column. The
+ordered-index pushdown explicitly **skips** a GiST index (its store key is `[v, v]‖skey`, not the
+ordered-index key form, so it must never be probed as a B-tree).
 
 ## 7. `EXCLUDE` constraints (GX3)
 
@@ -296,6 +324,14 @@ index always has `index_flags` bit0 (`unique`) clear (§1). The node/record fram
 index tree's; only the entry *key bytes* differ (a bounding key, §4). Golden: `gist_range_table.jed`
 (`rust == go == ts == ruby`, the §8 cross-core round-trip).
 
+**GX2 — no further bump.** The scalar `=` opclass (§6) reuses v20's GiST page types `5`/`6` and the
+`index_kind = 2` discriminator unchanged; only the *content* of a bound differs (a `[min, max]`
+key-blob pair instead of a range body), and which flavor a node holds is determined by the **indexed
+column's catalog type** (range → range bounds, scalar → scalar bounds). So a v20 file may now contain
+either flavor with no version change, and the page walk that repopulates the leaf store on load is
+opclass-agnostic (it copies bound bytes verbatim). Golden: `gist_scalar_table.jed`
+(`rust == go == ts == ruby`).
+
 **GX3 — the exclusion-constraint catalog entry (a further `format_version` bump).** Unlike UNIQUE,
 an exclusion constraint must persist the **operator per column** (UNIQUE is always `=` and records
 nothing constraint-specific, [constraints.md §5.5](constraints.md)). GX3 adds a per-table exclusion
@@ -330,6 +366,11 @@ corpus directives when GX1 lands.
 
 Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md §8](conformance.md)):
 
+- **The scalar `=` opclass over the VARIABLE-width / collation-sensitive keyables** — `text`,
+  `bytea`, `decimal`, `interval` (GX2 ships the fixed-width keyables; these are `0A000` for now,
+  §6). `text` additionally needs the column collation threaded into the key encoding (the ordered
+  index's `key_collation_ctx` precedent), so its sort-key bound matches the collated probe. Each is
+  its own small slice; the codec already length-prefixes the bound, so no node-format change.
 - **The `EXCLUDE … WHERE (predicate)` partial form**; **general-expression** WITH operands;
   `EXCLUDE USING btree (a WITH =)` lowering an all-`=` exclude onto an ordered unique index (a
   `UNIQUE` alias); `ALTER TABLE … ADD CONSTRAINT … EXCLUDE`.
@@ -360,19 +401,23 @@ Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md �
 GX0 is spec-only and unblocks the rest; GX1 is independently useful (a range overlap accelerator,
 the [ranges.md §10](ranges.md) follow-on) before any constraint exists.
 
-**GX0 + GX1 have LANDED** across all three cores (Rust/Go/TS) + the Ruby golden reference, byte-identical
-(`rust == go == ts == ruby`). GX1's implementation realizes §3/§4.1 concretely: the GiST index's
-**in-memory** form is the flat leaf-key store (the GIN `term ‖ skey` precedent, so all insert/update/
-delete maintenance is reused), with a **resident R-tree** rebuilt **canonically** (`build_from_leaf_keys`,
-content-deterministic) at each mutating statement; the planner gather descends that resident tree
-(`page_read` per node + `gist_descent` per interior). The **on-disk** form is the persisted R-tree
-(pages 5/6, `format_version` 20), serialized from the canonical leaf set at commit and parsed back
-into the leaf store + resident tree on open — so the in-memory and on-disk trees are the *same* pure
-function of the row set, and the cross-core round-trip holds. GX2/GX3 remain.
+**GX0 + GX1 + GX2 have LANDED** across all three cores (Rust/Go/TS) + the Ruby golden reference,
+byte-identical (`rust == go == ts == ruby`). GX1's implementation realizes §3/§4.1 concretely: the GiST
+index's **in-memory** form is the flat leaf-key store (the GIN `term ‖ skey` precedent, so all
+insert/update/delete maintenance is reused), with a **resident R-tree** rebuilt **canonically**
+(`build_from_leaf_keys`, content-deterministic) at each mutating statement; the planner gather descends
+that resident tree (`page_read` per node + `gist_descent` per interior). The **on-disk** form is the
+persisted R-tree (pages 5/6, `format_version` 20), serialized from the canonical leaf set at commit and
+parsed back into the leaf store + resident tree on open — so the in-memory and on-disk trees are the
+*same* pure function of the row set, and the cross-core round-trip holds. **GX2** generalized the tree
+core to an opclass seam (the only type-specific part) and added the **scalar `=` opclass** over the
+fixed-width keyables — bounds are `[min, max]` over the order-preserving key encoding, compared as raw
+bytes — reusing the entire tree machinery, maintenance, gather, persistence (no format bump), and cost
+unit unchanged. GX3 remains.
 
 | Slice | Content |
 |---|---|
 | **GX0** ✅ | this doc + the §3 determinism decision + the §2 opclass seam + register `23P01` + reserve `index_kind = 2` / the `format_version` bump (no code, no corpus, no format change) |
 | **GX1** ✅ | the GiST index *kind* + `range_ops` (§5) + the consistent-descent planner gather (SELECT + UPDATE/DELETE) + the `gist_descent` cost unit + `format_version` 20 (`index_kind = 2`, pages 5/6) + the `gist_range_table.jed` golden + `CREATE UNIQUE … USING gist` → `0A000` (+ multi-column / temp → `0A000`); capabilities `ddl.gist_index` / `query.gist_scan`; the `query/gist_scan.test` corpus (oracle-clean) + the `gist` NoREC relation |
-| **GX2** | the scalar `=` opclass family (§6) — the in-core `btree_gist` equivalent over the keyable scalars |
+| **GX2** ✅ | the scalar `=` opclass (§6) — the in-core `btree_gist` equivalent over the **fixed-width** keyables (integers / boolean / uuid / date / timestamp / timestamptz); the opclass seam (the tree core generalized to `range_ops` + scalar `=`); bounds are `[min,max]` over the order-preserving key encoding (raw-byte compare); the planner `=` gather (the cost-inferior fallback bound — ordered-index pushdown skips a GiST index); persisted within v20's pages 5/6 (no bump — bound flavor keyed off the column type) + the `gist_scalar_table.jed` golden; deferred keyable (text/bytea/decimal/interval) → `0A000`, no-opclass type → `42704`; capabilities `ddl.gist_scalar_index` / `query.gist_scalar_scan`; the `query/gist_scalar_scan.test` corpus + the `gist_scalar` NoREC relation |
 | **GX3** | `EXCLUDE [USING gist] (col WITH op, …)` (§7) — the backing-index constraint, the conjunction probe, `23P01`, the NULL rule, multi-column; the exclusion-constraint catalog entry (a further `format_version` bump); capability `ddl.exclusion_constraint` |

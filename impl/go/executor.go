@@ -781,7 +781,7 @@ func (s *Snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[na
 func (s *Snapshot) rebuildGistTrees() error {
 	type spec struct {
 		nameKey string
-		elem    ColType
+		op      gistOpclass
 	}
 	var specs []spec
 	for _, t := range s.tables {
@@ -790,8 +790,7 @@ func (s *Snapshot) rebuildGistTrees() error {
 			if idx.Kind != IndexGist {
 				continue
 			}
-			rt, _ := t.Columns[idx.Columns[0]].Type.RangeElement()
-			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), elem: ScalarColType(rt.Scalar)})
+			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), op: gistOpclassFor(t.Columns[idx.Columns[0]].Type)})
 		}
 	}
 	live := make(map[string]bool, len(specs))
@@ -815,7 +814,7 @@ func (s *Snapshot) rebuildGistTrees() error {
 				keys[i] = e.Key
 			}
 		}
-		tree, err := buildGistFromLeafKeys(sp.elem, keys)
+		tree, err := buildGistFromLeafKeys(sp.op, keys)
 		if err != nil {
 			return err
 		}
@@ -4686,12 +4685,24 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 					"a gin index on "+ty.CanonicalName()+" is not supported yet")
 			}
 		case IndexGist:
-			// GiST's range_ops opclass applies only to a range column; any other type has no
-			// default operator class for access method gist — 42704 (gist.md §5, the GIN-no-opclass
-			// precedent, PG's wording).
+			// GiST opclasses (gist.md §5/§6): range_ops over a range column, or the in-core
+			// btree_gist-equivalent scalar `=` opclass over a FIXED-WIDTH keyable scalar (integers /
+			// boolean / uuid / date / timestamp / timestamptz — its bound is [min,max] over that type's
+			// order-preserving key encoding, all pure byte comparison). A keyable-but-deferred scalar
+			// (text / bytea / decimal / interval) is 0A000 — we will support it (the GIN element-staging
+			// precedent, §11); any other type (float / json / array / composite / jsonpath) has no GiST
+			// opclass at all — 42704 (PG's wording).
 			if !ty.IsRange() {
-				return Outcome{}, NewError(UndefinedObject,
-					"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
+				switch {
+				case isGistScalarType(ty):
+					// supported scalar `=` opclass — ok
+				case isGistDeferredScalarType(ty):
+					return Outcome{}, NewError(FeatureNotSupported,
+						"a gist index on "+ty.CanonicalName()+" is not supported yet")
+				default:
+					return Outcome{}, NewError(UndefinedObject,
+						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
+				}
 			}
 		}
 		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
@@ -5159,13 +5170,26 @@ func indexEntryKeys(columns []Column, colls []*Collation, def IndexDef, storageK
 // the empty range is a real value and IS indexed.
 func gistEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
 	ci := def.Columns[0]
-	rt, _ := columns[ci].Type.RangeElement()
-	elem := ScalarColType(rt.Scalar)
+	col := columns[ci]
 	v := row[ci]
-	if v.Kind != ValRange {
-		return nil // a NULL range yields no entry
+	if rt, ok := col.Type.RangeElement(); ok {
+		// range_ops: the row range's value-codec bytes ‖ storage key.
+		if v.Kind != ValRange {
+			return nil // a NULL range yields no entry
+		}
+		return [][]byte{rangeGistLeafKey(rt.Scalar, v.Range, storageKey)}
 	}
-	return [][]byte{encodeGistLeafKey(elem, v.Range, storageKey)}
+	// scalar `=` opclass: the value's order-preserving KEY bytes as [v,v] ‖ storage key (gist.md §6).
+	// The column is a FIXED-WIDTH keyable (the CREATE INDEX gate), so the key encoding is
+	// collation-free and infallible.
+	if v.Kind == ValNull {
+		return nil
+	}
+	k, err := encodeKeyValue(col.Type.ScalarTy(), v, nil)
+	if err != nil {
+		panic("a fixed-width GiST scalar key is infallible (no collation)")
+	}
+	return [][]byte{scalarGistLeafKey(k, storageKey)}
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
@@ -5178,6 +5202,22 @@ func gistEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][
 func isGinElementType(elem ScalarType) bool {
 	return elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
 		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate()
+}
+
+// isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
+// the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
+// [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
+// Exactly isGinElementType's set, kept a separate predicate so the two surfaces evolve independently.
+func isGistScalarType(ty Type) bool {
+	return ty.IsInteger() || ty.IsBool() || ty.IsUuid() ||
+		ty.IsTimestamp() || ty.IsTimestamptz() || ty.IsDate()
+}
+
+// isGistDeferredScalarType reports a keyable scalar the GiST scalar `=` opclass will eventually admit
+// but defers this slice (gist.md §6/§11): the VARIABLE-width / collation-sensitive keyables — text,
+// bytea, decimal, interval. A column of one of these is 0A000 ("not supported yet"), not 42704.
+func isGistDeferredScalarType(ty Type) bool {
+	return ty.IsText() || ty.IsBytea() || ty.IsDecimal() || ty.IsInterval()
 }
 
 // ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
@@ -6951,7 +6991,7 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 		// GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree; the
 		// &&/@> predicate stays the residual filter re-applied per candidate below.
 		var query *rExpr
-		if _, q, ok := gistMatch(filter, gb.colGlobal); ok {
+		if q, ok := gistQueryOperand(filter, gb); ok {
 			query = q
 		}
 		if entries, overlap, slabs, err = db.gistBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
@@ -7277,7 +7317,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 		// GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree over
 		// the PRE-update state; the &&/@> predicate stays the residual filter re-applied per candidate.
 		var query *rExpr
-		if _, q, ok := gistMatch(filter, gb.colGlobal); ok {
+		if q, ok := gistQueryOperand(filter, gb); ok {
 			query = q
 		}
 		if entries, overlap, slabs, err = db.gistBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
@@ -11253,6 +11293,10 @@ type gistBoundPlan struct {
 	nameKey   string
 	strategy  gistStrategy
 	colGlobal int
+	// scalarType is the GiST-indexed column's scalar type for the scalar `=` opclass (strategy
+	// gistEqual, GX2): gistBoundRows encodes the equality constant to its order-preserving key bytes
+	// with it. Unused for range_ops, whose &&/@> query is a range constant the R-tree compares directly.
+	scalarType ScalarType
 }
 
 // ginStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
@@ -11329,9 +11373,11 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *Database) *scanBound {
 		}
 	}
 	for _, idx := range rel.table.Indexes {
-		// A GIN index is not an ordered-equality bound — its array column is keyed by terms, not
-		// the whole value (handled by the GIN pass below, gin.md §6).
-		if idx.Kind == IndexGin {
+		// Only an ordered B-tree is an ordered-equality bound. A GIN index is keyed by array terms
+		// (gin.md §6); a GiST index is keyed by a bounding [min,max] / range, NOT the whole value — a
+		// scalar GiST index's store key is [v,v]‖skey, not the ordered-index key form, so it must NOT
+		// be probed here (handled by the GiST pass below, gist.md §5/§6). Both are skipped.
+		if idx.Kind != IndexBtree {
 			continue
 		}
 		ci := idx.Columns[0]
@@ -11516,15 +11562,59 @@ func detectGistBound(filter *rExpr, indexes []IndexDef, columns []Column, offset
 			continue
 		}
 		ci := idx.Columns[0]
-		if !columns[ci].Type.IsRange() {
-			continue // a GiST column is always a range (the CREATE INDEX gate); defensive
-		}
 		colGlobal := offset + ci
-		if s, _, ok := gistMatch(filter, colGlobal); ok {
-			return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}
+		colTy := columns[ci].Type
+		if colTy.IsRange() {
+			// range_ops (GX1): a `col && Q` / `col @> Q` conjunct.
+			if s, _, ok := gistMatch(filter, colGlobal); ok {
+				return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}
+			}
+		} else if isGistScalarType(colTy) {
+			// scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
+			if _, _, ok := gistScalarMatch(filter, colGlobal); ok {
+				return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}
+			}
 		}
 	}
 	return nil
+}
+
+// gistScalarMatch finds the first WHERE AND-chain conjunct a GiST scalar `=` opclass on colGlobal
+// accelerates (spec/design/gist.md §6): `col = Q` where Q is a constant (re-evaluable per scan).
+// Equality is commutative (the column may be either operand). <> and the inequalities are not
+// accelerated (the `=` opclass has only the equal strategy). Returns the Equal strategy and the
+// constant operand — used at plan time (strategy) and exec time (recover from plan.filter).
+func gistScalarMatch(filter *rExpr, colGlobal int) (gistStrategy, *rExpr, bool) {
+	if filter == nil {
+		return 0, nil, false
+	}
+	if filter.kind == reAnd {
+		if s, q, ok := gistScalarMatch(filter.lhs, colGlobal); ok {
+			return s, q, true
+		}
+		return gistScalarMatch(filter.rhs, colGlobal)
+	}
+	if filter.kind == reCompare && filter.op == OpEq {
+		if isColumn(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs) {
+			return gistEqual, filter.rhs, true
+		}
+		if isColumn(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs) {
+			return gistEqual, filter.lhs, true
+		}
+	}
+	return 0, nil, false
+}
+
+// gistQueryOperand recovers a GiST bound's constant query operand from the live filter at exec time
+// — gistMatch for range_ops (&&/@>), gistScalarMatch for the scalar `=` opclass. Centralizes the
+// strategy dispatch so every scan site (SELECT / UPDATE / DELETE) recovers the operand uniformly.
+func gistQueryOperand(filter *rExpr, gb *gistBoundPlan) (*rExpr, bool) {
+	if gb.strategy == gistEqual {
+		_, q, ok := gistScalarMatch(filter, gb.colGlobal)
+		return q, ok
+	}
+	_, q, ok := gistMatch(filter, gb.colGlobal)
+	return q, ok
 }
 
 // gistMatch finds the first WHERE AND-chain conjunct a GiST range_ops index on colGlobal accelerates
@@ -11848,28 +11938,44 @@ func (db *Database) gistBoundRows(tableName string, gb *gistBoundPlan, query *rE
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if qv.Kind != ValRange {
-		return nil, 0, 0, nil // a NULL (or non-range) query is never TRUE (both && and @>)
-	}
-	qr := qv.Range
-	if qr.Empty {
-		switch gb.strategy {
-		case gistContains:
-			// col @> 'empty' is TRUE for every row, but an empty bound is absorbed by the union, so it
-			// is invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall back to the
-			// full scan; the residual @> keeps every row.
-			entries, p, sl, e := store.ScanWithUnits(mask)
-			return entries, p, sl, e
-		case gistOverlaps:
-			return nil, 0, 0, nil // col && 'empty' overlaps nothing
+	// Form the resident-tree search query from the constant, handling strategy-specific degenerate
+	// cases. A NULL query is never TRUE for any row (all strategies).
+	var gq gistQuery
+	if gb.strategy == gistEqual {
+		// scalar `=` (gist.md §6): encode the constant to its order-preserving key bytes.
+		if qv.Kind == ValNull {
+			return nil, 0, 0, nil
 		}
+		k, e := encodeKeyValue(gb.scalarType, qv, nil)
+		if e != nil {
+			panic("a fixed-width GiST scalar key is infallible (no collation)")
+		}
+		gq = gistQuery{skey: k}
+	} else {
+		if qv.Kind != ValRange {
+			return nil, 0, 0, nil // a NULL (or non-range) query is never TRUE (both && and @>)
+		}
+		qr := qv.Range
+		if qr.Empty {
+			switch gb.strategy {
+			case gistContains:
+				// col @> 'empty' is TRUE for every row, but an empty bound is absorbed by the union, so
+				// it is invisible to the overlap-descend (a false-negative trap, gist.md §5). Fall back
+				// to the full scan; the residual @> keeps every row.
+				entries, p, sl, e := store.ScanWithUnits(mask)
+				return entries, p, sl, e
+			default:
+				return nil, 0, 0, nil // col && 'empty' overlaps nothing
+			}
+		}
+		gq = gistQuery{rng: qr}
 	}
 	// Descend the resident R-tree (rebuilt at each mutating statement, gist.md §3/§4.1) — no per-query
 	// build. page_read per node touched + gist_descent per interior node.
 	var skeys [][]byte
 	if tree := db.readSnap().gistTreeFor(gb.nameKey); tree != nil {
 		nodes, interior := 0, 0
-		skeys, nodes, interior = tree.search(qr, gb.strategy)
+		skeys, nodes, interior = tree.search(gq, gb.strategy)
 		pages += nodes
 		meter.Charge(Costs.GistDescent * int64(interior))
 	}
@@ -12673,7 +12779,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 		// &&/@> predicate also stays the residual filter downstream (always-recheck).
 		var query *rExpr
 		if plan.filter != nil {
-			if _, q, ok := gistMatch(plan.filter, sb.gist.colGlobal); ok {
+			if q, ok := gistQueryOperand(plan.filter, sb.gist); ok {
 				query = q
 			}
 		}

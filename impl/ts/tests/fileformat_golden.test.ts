@@ -242,6 +242,22 @@ function gistRangeTableDB(): Database {
   return db;
 }
 
+// gistScalarTableDB has a GiST index over a SCALAR i32 column — the scalar `=` opclass (kind 2, v20 —
+// spec/design/gist.md GX2): pins the scalar bounding-key bytes ([min,max] over the order-preserving key
+// encoding, distinguished from a range bound by the column's catalog type). 8 rows with duplicate room
+// numbers force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels. Row 9's NULL is
+// not indexed. Mirrors the Ruby reference GIST_SCALAR_TABLE.
+function gistScalarTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), (8, 50), (9, NULL)",
+  );
+  run(db, "CREATE INDEX t_room_gist ON t USING gist (room)");
+  return db;
+}
+
 // ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
 // golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
@@ -814,6 +830,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "range_table.jed", build: rangeTableDB },
     { name: "range_pk_table.jed", build: rangePkTableDB },
     { name: "gist_range_table.jed", build: gistRangeTableDB },
+    { name: "gist_scalar_table.jed", build: gistScalarTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
     { name: "json_table.jed", build: jsonTableDB },
@@ -876,6 +893,7 @@ test("read goldens reproduces rows", () => {
     { name: "range_table.jed", build: rangeTableDB, table: "t" },
     { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },
     { name: "gist_range_table.jed", build: gistRangeTableDB, table: "t" },
+    { name: "gist_scalar_table.jed", build: gistScalarTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
     { name: "json_table.jed", build: jsonTableDB, table: "t" },
