@@ -191,7 +191,12 @@ deterministic function of the tree, identical cross-core.
 loaded** on open, not demand-paged (the pager seam stays open, [pager.md](pager.md); fine for the
 RAM-sized target, CLAUDE.md §9). (b) A commit **rewrites the whole GiST tree** (fresh pages for all
 nodes, the old pages reclaimed by the free-list) rather than writing only dirty nodes — the pre-P6.1
-whole-image flavor, scoped to GiST. Incremental GiST COW and demand-paging are follow-ons.
+whole-image flavor, scoped to GiST. The **in-memory** companion of (b): the planner descends a
+**resident** R-tree, and that tree is **rebuilt canonically and whole** (`build_from_leaf_keys` over
+the leaf store) after each mutating statement that touched the index — so a read always descends a
+fresh, content-deterministic tree (the `gist_descent` cost is then a pure function of the row set,
+sound for the untrusted SELECT-only surface, which never triggers a rebuild — CLAUDE.md §13). Both
+rewrites are O(rows); incremental GiST COW (and demand-paging) are follow-ons (§11).
 
 ## 5. `range_ops` — the first opclass (GX1)
 
@@ -340,17 +345,34 @@ Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md �
   such a type lands — at which point it slots into the same seam.
 - **SP-GiST** (`index_kind = 3`) — a space-partitioning sibling, a separate access method, not
   scheduled.
+- **GiST on a TEMP table** — `0A000` in GX1: the resident R-tree (§4.1) would live on the temp /
+  shared-temp snapshot, deferred with the rest of the container-on-temp work
+  ([temp-tables.md](temp-tables.md)). A persistent table's GiST index is fully supported.
 - **Quality / perf refinements** — a better (still deterministic) split than median-linear;
-  bulk-load packing for `CREATE INDEX`; node-level skip during descent.
+  bulk-load packing for `CREATE INDEX`; node-level skip during descent. GX1's resident tree is
+  rebuilt **canonically and whole** at each mutating statement (§4.1) — content-deterministic and
+  simple, but O(rows) per mutation; **incremental copy-on-write GiST maintenance** is the perf
+  follow-on (the COW table B-tree's precedent), as is **demand-paging** the tree rather than
+  eager-loading it on open (the pager seam stays open, [pager.md](pager.md)).
 
 ## 12. Slice delivery
 
 GX0 is spec-only and unblocks the rest; GX1 is independently useful (a range overlap accelerator,
 the [ranges.md §10](ranges.md) follow-on) before any constraint exists.
 
+**GX0 + GX1 have LANDED** across all three cores (Rust/Go/TS) + the Ruby golden reference, byte-identical
+(`rust == go == ts == ruby`). GX1's implementation realizes §3/§4.1 concretely: the GiST index's
+**in-memory** form is the flat leaf-key store (the GIN `term ‖ skey` precedent, so all insert/update/
+delete maintenance is reused), with a **resident R-tree** rebuilt **canonically** (`build_from_leaf_keys`,
+content-deterministic) at each mutating statement; the planner gather descends that resident tree
+(`page_read` per node + `gist_descent` per interior). The **on-disk** form is the persisted R-tree
+(pages 5/6, `format_version` 20), serialized from the canonical leaf set at commit and parsed back
+into the leaf store + resident tree on open — so the in-memory and on-disk trees are the *same* pure
+function of the row set, and the cross-core round-trip holds. GX2/GX3 remain.
+
 | Slice | Content |
 |---|---|
-| **GX0** | this doc + the §3 determinism decision + the §2 opclass seam + register `23P01` + reserve `index_kind = 2` / the `format_version` bump (no code, no corpus, no format change) |
-| **GX1** | the GiST index *kind* + `range_ops` (§5) + the consistent-descent planner gather + the `gist_descent` cost unit + `format_version` 20 (`index_kind = 2`) + the `gist_range_table.jed` golden + `CREATE UNIQUE … USING gist` → `0A000`; capabilities `ddl.gist_index` / `query.gist_scan` |
+| **GX0** ✅ | this doc + the §3 determinism decision + the §2 opclass seam + register `23P01` + reserve `index_kind = 2` / the `format_version` bump (no code, no corpus, no format change) |
+| **GX1** ✅ | the GiST index *kind* + `range_ops` (§5) + the consistent-descent planner gather (SELECT + UPDATE/DELETE) + the `gist_descent` cost unit + `format_version` 20 (`index_kind = 2`, pages 5/6) + the `gist_range_table.jed` golden + `CREATE UNIQUE … USING gist` → `0A000` (+ multi-column / temp → `0A000`); capabilities `ddl.gist_index` / `query.gist_scan`; the `query/gist_scan.test` corpus (oracle-clean) + the `gist` NoREC relation |
 | **GX2** | the scalar `=` opclass family (§6) — the in-core `btree_gist` equivalent over the keyable scalars |
 | **GX3** | `EXCLUDE [USING gist] (col WITH op, …)` (§7) — the backing-index constraint, the conjunction probe, `23P01`, the NULL rule, multi-column; the exclusion-constraint catalog entry (a further `format_version` bump); capability `ddl.exclusion_constraint` |

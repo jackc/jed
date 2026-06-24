@@ -15,7 +15,17 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 19)
+## Version scope (`format_version` 20)
+
+`format_version` **20** — **GiST indexes** ([../design/gist.md](../design/gist.md), GX1). A per-index
+`index_kind = 2` selects the GiST access method, and the index's on-disk form is a persisted **R-tree**
+of bounding-predicate nodes, in two new `page_type`s — `5` (GiST leaf) / `6` (GiST interior) (see
+*Page header* + *Catalog* below). A leaf entry is `bound_len u16 ‖ encode_range_body(bound) ‖
+skey_len u16 ‖ skey`; an interior entry is `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`;
+nodes are ordered canonically (`range_total_cmp`, ties by storage key / subtree-min key) and allocated
+post-order, so the tree is a pure function of the indexed row set — byte-identical cross-core. The
+catalog index entry is otherwise unchanged (`index_root_page` points at the R-tree root, `0` for an
+empty index). A file with no GiST index moves to v20 only by its version byte + meta CRC.
 
 The current on-disk version is **`format_version` 19** — **storable `json` / `jsonb` columns**
 ([../design/json.md](../design/json.md), slices J1/J1b). A column type can now be **`json`**
@@ -336,7 +346,7 @@ slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `d
 
 | offset | size | field |
 |---|---|---|
-| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior** (**reserved** — named at GX0, claimed by a future `format_version`, [../design/gist.md §4.1](../design/gist.md)) |
+| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior** (**new in v20** — a persisted R-tree node, [../design/gist.md §4.1](../design/gist.md): a leaf entry is `bound_len u16 ‖ encode_range_body(bound) ‖ skey_len u16 ‖ skey`, an interior entry `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`) |
 | 1 | 1 | reserved (0) |
 | 2 | 2 | reserved (0) |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
@@ -422,7 +432,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key column: |
 | &nbsp;&nbsp;`key_ordinal` ×`key_col_count` | u16 each — column ordinals in **index-key order**; each must be `< col_count` (duplicates allowed — indexes.md §1; else `XX001`) |
 | &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
-| &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**reserved** — named at GX0, claimed by a future `format_version`, [../design/gist.md](../design/gist.md)); `3…` reserved. At v19 a value `> 1` is `XX001`. A GIN index always has `index_flags` bit0 (`unique`) clear |
+| &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**new in v20** — a persisted R-tree, `index_root_page` points at its root, pages 5/6 above, [../design/gist.md](../design/gist.md)); `3…` reserved. At v20 a value `> 2` is `XX001`. A GIN/GiST index always has `index_flags` bit0 (`unique`) clear |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | `fk_count` | u16 — the table's `FOREIGN KEY` constraints (**new in v11**; `0` for a table with none) |
 | per foreign key (×`fk_count`): | |

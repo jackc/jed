@@ -473,7 +473,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       deferred follow-on, finally built (arrays already have GIN; jed has no geometric types, so range +
       scalars are the realistic opclasses). _(size: XL; deps: ranges R0–R4 (done), the GIN index-kind +
       opclass seam (done); §4)_
-  - [ ] **GX0 — spec + the determinism decision (the §8 pre-coding hotspot).** Author
+  - [x] **GX0 — spec + the determinism decision (the §8 pre-coding hotspot).** ✅ **DONE.** Author
         `spec/design/gist.md`. The load-bearing call: PG's GiST is a **lossy bounding-predicate balanced
         tree whose shape is insertion-order- and heuristic-dependent** (`penalty`/`picksplit`), which
         **cannot** be cross-core byte-identical as written (§2/§8). Decision — jed's GiST is an
@@ -492,17 +492,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         bounding key, never hard-wired to a range. Registers **`23P01 exclusion_violation`**
         ([registry.toml](spec/errors/registry.toml)) and reserves the `format_version` bump for
         `index_kind = 2`. _(size: M; spec-only)_
-  - [ ] **GX1 — the GiST index kind + `range_ops` opclass (acceleration; no constraint yet).**
-        `CREATE INDEX … USING gist (range_col)` over a range column, bounding key = the `range-bounds`
-        order-preserving encoding ([encoding.md §2.11](spec/design/encoding.md)). The planner pushdown
-        seam ([indexes.md §5](spec/design/indexes.md), the GIN precedent) gains a GiST
-        **consistent-descent gather** accelerating `&&` / `@>` / `<@` / `<<` / `>>` / `&<` / `&>` /
-        `-|-` / `=` for SELECT and GiST-bounded UPDATE/DELETE — same rows as the full-scan residual,
-        lower cost; a new `gist_descent` cost unit. `format_version` 20 (writes `index_kind = 2`); the
-        `gist_range_table.jed` golden (`rust == go == ts == ruby`); `CREATE UNIQUE INDEX … USING gist`
-        is `0A000` (uniqueness is undefined for a bounding tree — the GIN-`UNIQUE` precedent). Capability
-        `ddl.gist_index` + `query.gist_scan`. Realizes [ranges.md §10](spec/design/ranges.md).
-        _(size: XL; ×3 cores)_
+  - [x] **GX1 — the GiST index kind + `range_ops` opclass (acceleration; no constraint yet).**
+        ✅ **DONE** (all three cores + the Ruby golden, byte-identical). `CREATE INDEX … USING gist
+        (range_col)` over a range column. The on-disk form is the persisted R-tree (pages 5/6); the
+        in-memory form is the flat leaf store (GIN `term ‖ skey` reuse) + a **resident R-tree rebuilt
+        canonically** at each mutating statement (content-deterministic, gist.md §4.1). The planner
+        pushdown seam gains a GiST **consistent-descent gather** accelerating **`&&` and `@>`** (the
+        positional / `<@` / `=` operators stay full-scan this slice — gist.md §5) for SELECT and
+        GiST-bounded UPDATE/DELETE — same rows as the full-scan residual, lower cost; the `gist_descent`
+        cost unit. `format_version` 20 (writes `index_kind = 2`); the `gist_range_table.jed` golden
+        (`rust == go == ts == ruby`); `CREATE UNIQUE INDEX … USING gist` / multi-column / a temp-table
+        GiST are `0A000`. Capability `ddl.gist_index` + `query.gist_scan`; the oracle-clean
+        `query/gist_scan.test` corpus + the `gist` NoREC relation. Realizes
+        [ranges.md §10](spec/design/ranges.md). _(size: XL; ×3 cores)_
   - [ ] **GX2 — GiST `=` over the keyable scalars (the `btree_gist` equivalent).** A scalar GiST opclass
         over the engine's keyable scalars (integers / `boolean` / `uuid` / `date` / `timestamp` /
         `timestamptz` / `text` / `bytea` / `decimal` / `interval`) whose bounding key is the value's

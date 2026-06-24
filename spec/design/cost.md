@@ -419,6 +419,35 @@ column's overflow-chain `page_read` / `value_decompress` if its values spilled (
 set is the array column, which **can** be large — unlike the fixed-width ordered build); an empty
 table charges 0, `DROP INDEX` charges 0.
 
+### GiST-bounded scan — an R-tree narrows a range-column scan
+
+A `range_col && const` / `range_col @> const` over a **GiST-indexed** range column
+([gist.md §5](gist.md)) bounds the scan: the planner **descends the index's resident R-tree**,
+visiting only the children whose bounding union is `consistent` with the query. In place of the
+full-scan block it accrues:
+
+- **`page_read` × the tree nodes visited** (interior + leaf) — the logical node-touch count, like a
+  B-tree scan's per-node `page_read`;
+- **`gist_descent` × the INTERIOR nodes visited** — the per-node consistent-descent work the bare
+  node count leaves implicit (weight 1, [schedule.toml](../cost/schedule.toml));
+- per **candidate** leaf hit, the table point-lookup's `page_read` + `storage_row_read` (+ its
+  touched-column chain/decompress units);
+- the residual `operator_eval` of the always-rechecked `&&`/`@>` per candidate, and `row_produced`
+  per emitted row.
+
+The count is byte-identical across cores: the resident tree is rebuilt **canonically** from the leaf
+set (`build_from_leaf_keys` — content-deterministic, gist.md §3), so the nodes-visited and the
+`gist_descent` charge are a pure function of `(query, row set)`, independent of insertion order or
+medium (in-memory vs reopened file). **Narrowings this slice** (gist.md §5): constant query operand
+only, `&&`/`@>` only; an empty `&&` query is provably empty (charges 0), an empty `@>` query falls
+back to the full scan. A **GiST-bounded `UPDATE`/`DELETE`** accrues this same block in place of its
+full-scan block (PK then GIN then GiST; the phase-2 writes + index maintenance are unmetered). The
+in-memory tree rebuild after each mutating statement is unmetered structure maintenance on the
+(trusted) write path — the untrusted SELECT-only surface never triggers it (gist.md §4.1, CLAUDE.md
+§13). **DDL cost:** `CREATE INDEX … USING gist` charges its build scan (`page_read` × the table node
+count + `storage_row_read` per row + the bounding-key work); an empty table charges 0, `DROP INDEX`
+charges 0.
+
 ### `collate` — a non-`C` collation's per-code-point sort-key work
 
 A non-`C` collation ([collation.md](collation.md)) orders text by its **UCA sort key** rather than
