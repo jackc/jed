@@ -299,12 +299,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       canonicalized on store. On-disk type code 12. → [float.md](spec/design/float.md),
       [determinism.md](spec/design/determinism.md)
   - [ ] _follow-on:_ float in a PRIMARY KEY/index (`0A000`); key rule authored, unexercised.
-- [ ] **`json` / `jsonb` + SQL/JSON** — the committed XL headline feature (§1, §4). **Designed
-      spec-first** across four docs ([json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md),
-      [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md));
-      implementation is sliced. Stable type codes 18/19/20; one `format_version` bump (v18→v19) at
-      the first storable slice. Critical path **J0 → {J1,J2,J3} → C0 → P1 → {P2,S2} → {R1,T1}**;
-      B-series runs parallel off J0/C0. _(size: XL)_
+- [x] **`json` / `jsonb` + SQL/JSON** — ✅ the committed XL headline feature (§1, §4), **all
+      non-deferred slices landed** across all three cores (oracle-clean, 230/230 conformance ×3).
+      **Designed spec-first** across four docs ([json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md),
+      [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md)).
+      Stable type codes 18/19/20; one `format_version` bump (v18→v19) at J1. Delivered along the
+      critical path **J0 → {J1,J2,J3} → C0 → P1 → {P2,S2} → {R1,T1}** (B-series parallel off J0/C0).
+      The remaining items below are deferred `0A000` follow-ons (the dictionary builder, jsonb-as-key,
+      a GIN opclass, the explicit `PLAN` clause T2, `DEFAULT <expr>` S3, jsonpath `like_regex` / item
+      methods / arithmetic / `$name` vars). _(size: XL — done)_
   - [x] **J0** — ✅ `json`/`jsonb` scalar arms + `json_in`/`out` + `jsonb_in`/`out` + the
         `'…'::json`/`'…'::jsonb` literal cast (+ the `json '…'`/`jsonb '…'` typed-literal form); no
         columns yet (a json/jsonb column is `0A000`); stable type codes 18/19; dictionary door
@@ -489,8 +492,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           (same deferred `0A000` sources); a `json` element canonicalizes (per-core divergence test).
           All 3 cores, cap `func.json_agg`, oracle-clean. _follow-on:_ in-aggregate `ORDER BY`, and the
           two-operand `json[b]_object_agg` / `_unique` (dup-key `22030`/`22037`).
-  - [ ] **T1** — `JSON_TABLE` (default plan: nested-path LEFT-OUTER/UNION expansion); explicit `PLAN`
-        → `0A000`. The highest-risk slice. → json-table.md §3
   - [ ] _follow-ons (deferred `0A000`):_ the string-**dictionary builder** (opens the json.md §3 door);
         `jsonb`-as-PK/index (exercise [encoding.md §2.13](spec/design/encoding.md)); GIN **`jsonb_ops`**
         opclass for `@>`/`?` (the [gin.md](spec/design/gin.md) seam already seats it); `JSON_TABLE`
