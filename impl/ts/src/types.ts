@@ -25,7 +25,8 @@ export type ScalarType =
   | "interval"
   | "date"
   | "json"
-  | "jsonb";
+  | "jsonb"
+  | "jsonpath";
 
 export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "i16",
@@ -44,6 +45,7 @@ export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "date",
   "json",
   "jsonb",
+  "jsonpath",
 ];
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. precision >= 1;
@@ -110,6 +112,13 @@ export function isJson(t: ScalarType): boolean {
 // isJsonb reports whether this is the canonicalized-binary jsonb type (spec/design/json.md §2).
 export function isJsonb(t: ScalarType): boolean {
   return t === "jsonb";
+}
+
+// isJsonPath reports whether this is the compiled SQL/JSON path type (spec/design/jsonpath.md,
+// P1a). NOT comparable (PG ships no opclass — 42883); literal-only this slice (a jsonpath column
+// is 0A000). Reserved on-disk type code 20.
+export function isJsonPath(t: ScalarType): boolean {
+  return t === "jsonpath";
 }
 
 // isInteger reports whether this is one of the fixed-width signed integer types.
@@ -196,6 +205,8 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
       return "json";
     case "jsonb":
       return "jsonb";
+    case "jsonpath":
+      return "jsonpath";
     default:
       return undefined;
   }
@@ -254,6 +265,8 @@ export function widthBytes(t: ScalarType): number {
       throw new Error("json is variable-width; widthBytes is integer-only");
     case "jsonb":
       throw new Error("jsonb is variable-width; widthBytes is integer-only");
+    case "jsonpath":
+      throw new Error("jsonpath is non-storable; widthBytes is integer-only");
   }
 }
 
@@ -269,7 +282,8 @@ export function isFixedWidth(t: ScalarType): boolean {
     t !== "bytea" &&
     t !== "interval" &&
     t !== "json" &&
-    t !== "jsonb"
+    t !== "jsonb" &&
+    t !== "jsonpath"
   );
 }
 
@@ -306,6 +320,8 @@ export function minOf(t: ScalarType): bigint {
       throw new Error("json has no integer range");
     case "jsonb":
       throw new Error("jsonb has no integer range");
+    case "jsonpath":
+      throw new Error("jsonpath has no integer range");
   }
 }
 
@@ -342,6 +358,8 @@ export function maxOf(t: ScalarType): bigint {
       throw new Error("json has no integer range");
     case "jsonb":
       throw new Error("jsonb has no integer range");
+    case "jsonpath":
+      throw new Error("jsonpath has no integer range");
   }
 }
 
@@ -379,6 +397,8 @@ export function rank(t: ScalarType): number {
       throw new Error("json has no promotion rank");
     case "jsonb":
       throw new Error("jsonb has no promotion rank");
+    case "jsonpath":
+      throw new Error("jsonpath has no promotion rank");
   }
 }
 
@@ -559,4 +579,7 @@ export function typeIsJson(t: Type): boolean {
 }
 export function typeIsJsonb(t: Type): boolean {
   return t.kind === "scalar" && isJsonb(t.scalar);
+}
+export function typeIsJsonPath(t: Type): boolean {
+  return t.kind === "scalar" && isJsonPath(t.scalar);
 }

@@ -430,3 +430,19 @@ id = "jsonb"
 aliases = []
 family = "jsonb"
 storable = true
+
+# --- jsonpath: a compiled SQL/JSON path (../design/jsonpath.md, slice P1a) ------
+# PostgreSQL's `jsonpath` type: a first-class scalar (reserved on-disk type code 20) built from a
+# `'…'::jsonpath` / `jsonpath '…'` literal, compiled at resolve through `JsonPath::compile` (a
+# hand-written recursive-descent parser per core — the regex-VM precedent). The stored value is the
+# canonical NORMALIZED source text (`$.a` → `$."a"`, `lax` omitted, `strict` kept). NOT comparable
+# (PG ships no btree/hash opclass — every comparison is 42883) and LITERAL-ONLY this slice: a
+# `jsonpath` COLUMN is 0A000 (storable=false, like a J0-stage json type). P1a parses the
+# STRUCTURAL-accessor subset ($, `.key`, `.*`, `[subscripts]`, `[*]`, numeric / `last` indices, `to`
+# slices, lax/strict); a valid-PG filter / item method / arithmetic / like_regex / `$name` variable
+# is a deferred 0A000 (P1b). A malformed path literal is 42601 (PG's syntax-error class).
+[[type]]
+id = "jsonpath"
+aliases = []
+family = "jsonpath"
+storable = false

@@ -479,6 +479,9 @@ function writeValue(w: ByteWriter, v: Value): void {
       w.u8(20);
       w.bytesField(new TextEncoder().encode(jsonbOut(v.node)));
       break;
+    case "jsonpath":
+      // jsonpath is literal-only (non-storable), so it never rides a spilling sort.
+      throw new Error("a jsonpath value never reaches the spill codec");
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it.

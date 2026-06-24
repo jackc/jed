@@ -61,6 +61,12 @@ const (
 	// (numbers exact Decimal, object keys deduped last-wins + sorted), stored compactly. On-disk type
 	// code 19. Variable-width; comparable by PG's total btree order (§5); not a key this slice.
 	Jsonb
+	// JsonPathType is a compiled SQL/JSON path (spec/design/jsonpath.md, slice P1a): a first-class
+	// scalar (reserved on-disk type code 20), built from a '…'::jsonpath literal. NOT comparable (PG
+	// ships no opclass — 42883), and literal-only this slice (a jsonpath COLUMN is 0A000, like a
+	// J0-stage json column). The stored value is the canonical normalized source text. (Named
+	// JsonPathType, not JsonPath, because JsonPath is the compiled-path struct in jsonpath.go.)
+	JsonPathType
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -106,6 +112,8 @@ func (t ScalarType) CanonicalName() string {
 		return "json"
 	case Jsonb:
 		return "jsonb"
+	case JsonPathType:
+		return "jsonpath"
 	default:
 		return "?"
 	}
@@ -160,6 +168,8 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Json, true
 	case "jsonb":
 		return Jsonb, true
+	case "jsonpath":
+		return JsonPathType, true
 	default:
 		return 0, false
 	}
@@ -197,6 +207,9 @@ func (t ScalarType) IsJson() bool { return t == Json }
 
 // IsJsonb reports whether this is the canonicalized-binary jsonb type.
 func (t ScalarType) IsJsonb() bool { return t == Jsonb }
+
+// IsJsonPath reports whether this is the jsonpath type.
+func (t ScalarType) IsJsonPath() bool { return t == JsonPathType }
 
 // IsFloat32 reports whether this is the binary32 float type (real).
 func (t ScalarType) IsFloat32() bool { return t == Float32 }
@@ -255,7 +268,7 @@ func (t ScalarType) WidthBytes() int {
 // over a variable-width tail it would advance by WidthBytes()==0 and mis-parse the row's key.
 func (t ScalarType) IsFixedWidth() bool {
 	switch t {
-	case Text, DecimalType, Bytea, IntervalType, Json, Jsonb:
+	case Text, DecimalType, Bytea, IntervalType, Json, Jsonb, JsonPathType:
 		return false
 	default:
 		return true
@@ -313,7 +326,7 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64, Date, Json, Jsonb}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64, Date, Json, Jsonb, JsonPathType}
 }
 
 // Type is a column / value type: either a built-in ScalarType or a reference to a user-defined
@@ -489,3 +502,6 @@ func (t Type) IsJson() bool { return t.isScalar() && t.Scalar.IsJson() }
 
 // IsJsonb reports whether this is the scalar jsonb type (false for a composite/array).
 func (t Type) IsJsonb() bool { return t.isScalar() && t.Scalar.IsJsonb() }
+
+// IsJsonPath reports whether this is the scalar jsonpath type (false for a composite/array).
+func (t Type) IsJsonPath() bool { return t.isScalar() && t.Scalar.IsJsonPath() }

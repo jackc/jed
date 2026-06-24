@@ -362,8 +362,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         composite/array column type / a rename-only list → `0A000`. `SrfKind::JsonRecord` + `record_cols`
         on the SrfPlan + `json_record_row`/`coerce_json_member`. All 3 cores, cap `func.json_record`,
         oracle-clean. _R2 follow-on:_ `json[b]_populate_record(set)` (shape from a composite-type base arg).
-  - [ ] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +
+  - [~] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +
         `like_regex`→Pike-VM (`i`/`q` flags; `s`/`m`/`x`→`0A000`) + the `2203x` error class. → jsonpath.md
+    - [x] **P1a — the jsonpath type + literal + compile + canonical render** — ✅ the `jsonpath` scalar
+          type (type code 20), the `'…'::jsonpath` / `jsonpath '…'` literal compiled at resolve to the
+          canonical normalized text (`$.a` → `$."a"`, `lax` omitted / `strict` kept, `[*]`/`[i]`/`[i to j]`/
+          `[last]`). Literal-only (a jsonpath COLUMN is `0A000`, storable=false); NOT comparable (`42883`).
+          Hand-written recursive-descent parser per core (new `jsonpath.{rs,go,ts}` module). P1a parses the
+          STRUCTURAL-accessor subset; a valid-PG filter/method/arithmetic/`like_regex`/`$name` is a deferred
+          `0A000` (P1b), a malformed path `42601`. All 3 cores, cap `types.jsonpath`, oracle-clean, NO format
+          bump (literal-only). _P1b follow-on (with P2):_ the lax/strict eval engine + item methods + filters
+          + `like_regex` + the `2203x` error class — the eval needs a consumer (the P2 query functions) to test.
   - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
         + `@?`/`@@` + `vars`/`silent`; then the `_tz` variants. → jsonpath.md §5
   - [~] **S1 ✅ / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅; then S2

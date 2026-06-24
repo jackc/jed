@@ -84,6 +84,12 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The JSON cast matrix (J3) — runtime json↔jsonb, json/jsonb→text, text→json/jsonb
   // (spec/design/json.md §6.1).
   "types.json_casts",
+  // The jsonpath scalar type (P1a, spec/design/jsonpath.md): a first-class type (reserved type
+  // code 20) built from a '…'::jsonpath / jsonpath '…' literal, compiled at resolve and rendered
+  // to its canonical normalized form. LITERAL-ONLY (a jsonpath column is 0A000; a jsonpath value is
+  // NOT comparable → 42883). A valid-PG filter / item method / arithmetic / $name is a deferred
+  // 0A000 (P1b); a malformed path literal is 42601.
+  "types.jsonpath",
   // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
   "func.jsonb_access",
   // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).

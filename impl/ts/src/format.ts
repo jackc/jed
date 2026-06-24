@@ -159,6 +159,10 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 18;
     case "jsonb":
       return 19;
+    // jsonpath reserves type code 20, but is literal-only this slice (no storable column), so this
+    // code is never written to disk yet — a storable jsonpath column is a P1a follow-on.
+    case "jsonpath":
+      return 20;
   }
 }
 
@@ -197,6 +201,9 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "json";
     case 19:
       return "jsonb";
+    // jsonpath reserves code 20 (non-storable this slice, so never actually decoded off disk).
+    case 20:
+      return "jsonpath";
     default:
       return undefined;
   }
@@ -722,6 +729,11 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
     out[0] = 0x00; // present
     out.set(body, 1);
     return out;
+  }
+  // jsonpath is literal-only (non-storable) — it never reaches the scalar codec (a jsonpath column
+  // is 0A000 at CREATE TABLE, so no value is ever stored).
+  if (v.kind === "jsonpath") {
+    throw new Error("BUG: a jsonpath value reached the scalar codec");
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);

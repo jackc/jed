@@ -482,6 +482,8 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&[20])?;
             write_bytes(w, json::jsonb_out(n).as_bytes())
         }
+        // jsonpath is literal-only (non-storable), so it never rides a spilling sort.
+        Value::JsonPath(_) => unreachable!("a jsonpath value never reaches the spill codec"),
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
         Value::Unfetched(Unfetched::External { first_page, len }) => {

@@ -60,6 +60,11 @@ pub enum ScalarType {
     /// exact `Decimal`, object keys deduped last-wins + sorted), stored compactly. On-disk type
     /// code 19. Variable-width; comparable by PG's total btree order (§5); not a key this slice.
     Jsonb,
+    /// A compiled SQL/JSON path (spec/design/jsonpath.md, slice P1a): a first-class scalar
+    /// (reserved type code 20), built from a `'…'::jsonpath` literal. NOT comparable (PG ships no
+    /// opclass — `42883`), and literal-only this slice (a `jsonpath` COLUMN is `0A000`, like a
+    /// J0-stage json column). The stored value is the canonical normalized source text.
+    JsonPath,
 }
 
 impl ScalarType {
@@ -82,6 +87,7 @@ impl ScalarType {
             ScalarType::Date => "date",
             ScalarType::Json => "json",
             ScalarType::Jsonb => "jsonb",
+            ScalarType::JsonPath => "jsonpath",
         }
     }
 
@@ -117,6 +123,7 @@ impl ScalarType {
             "date" => Some(ScalarType::Date),
             "json" => Some(ScalarType::Json),
             "jsonb" => Some(ScalarType::Jsonb),
+            "jsonpath" => Some(ScalarType::JsonPath),
             _ => None,
         }
     }
@@ -228,7 +235,8 @@ impl ScalarType {
             | ScalarType::Bytea
             | ScalarType::Interval
             | ScalarType::Json
-            | ScalarType::Jsonb => {
+            | ScalarType::Jsonb
+            | ScalarType::JsonPath => {
                 unreachable!(
                     "text/decimal/bytea/interval/json/jsonb are not serialized through the fixed-width codec; width_bytes covers integers + uuid + boolean + timestamps + floats"
                 )
@@ -250,6 +258,7 @@ impl ScalarType {
                 | ScalarType::Interval
                 | ScalarType::Json
                 | ScalarType::Jsonb
+                | ScalarType::JsonPath
         )
     }
 
@@ -271,7 +280,8 @@ impl ScalarType {
             | ScalarType::Float64
             | ScalarType::Date
             | ScalarType::Json
-            | ScalarType::Jsonb => {
+            | ScalarType::Jsonb
+            | ScalarType::JsonPath => {
                 unreachable!(
                     "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date/json/jsonb have no integer range"
                 )
@@ -297,7 +307,8 @@ impl ScalarType {
             | ScalarType::Float64
             | ScalarType::Date
             | ScalarType::Json
-            | ScalarType::Jsonb => {
+            | ScalarType::Jsonb
+            | ScalarType::JsonPath => {
                 unreachable!(
                     "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date/json/jsonb have no integer range"
                 )
@@ -328,7 +339,8 @@ impl ScalarType {
             | ScalarType::Interval
             | ScalarType::Date
             | ScalarType::Json
-            | ScalarType::Jsonb => {
+            | ScalarType::Jsonb
+            | ScalarType::JsonPath => {
                 unreachable!(
                     "text/boolean/decimal/bytea/uuid/timestamp/interval/date/json/jsonb have no promotion rank"
                 )
@@ -342,7 +354,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 16] {
+    pub fn all() -> [ScalarType; 17] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -360,6 +372,7 @@ impl ScalarType {
             ScalarType::Date,
             ScalarType::Json,
             ScalarType::Jsonb,
+            ScalarType::JsonPath,
         ]
     }
 }

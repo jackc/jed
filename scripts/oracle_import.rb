@@ -58,6 +58,8 @@ class OracleImport
     "tsrange" => "T", "tstzrange" => "T", "daterange" => "T",
     # json/jsonb render as text (json_out / jsonb_out canonical form — spec/design/json.md §6.2).
     "json" => "T", "jsonb" => "T",
+    # jsonpath renders as its canonical normalized text (spec/design/jsonpath.md §2, P1a).
+    "jsonpath" => "T",
   }.freeze
 
   def initialize(path)

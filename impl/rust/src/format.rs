@@ -145,6 +145,9 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         // 14 (composite) / 15 (array) / 17 (range) are container element-type codes, not scalars.
         ScalarType::Json => 18,
         ScalarType::Jsonb => 19,
+        // `jsonpath` reserves type code 20, but is literal-only this slice (no storable column), so
+        // this code is never written to disk yet — a storable jsonpath column is a P1a follow-on.
+        ScalarType::JsonPath => 20,
     }
 }
 
@@ -225,6 +228,8 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         16 => Some(ScalarType::Date),
         18 => Some(ScalarType::Json),
         19 => Some(ScalarType::Jsonb),
+        // `jsonpath` reserves code 20 (non-storable this slice, so never actually decoded off disk).
+        20 => Some(ScalarType::JsonPath),
         _ => None,
     }
 }
@@ -662,6 +667,7 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
         Value::Array(_) => panic!("BUG: an array value reached the scalar codec"),
         // A range value is not storable yet (R2 adds the range codec); it never reaches here.
         Value::Range(_) => panic!("BUG: a range value reached the scalar codec (R2)"),
+        Value::JsonPath(_) => panic!("BUG: a jsonpath value reached the scalar codec"),
         // json: the verbatim text body, length-prefixed exactly like `text` (spec/design/json.md §4).
         Value::Json(s) => {
             let bytes = s.as_bytes();

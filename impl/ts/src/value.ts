@@ -93,6 +93,10 @@ export type Value =
   // equality/ordering go through eq3/lt3/gt3 / the value-key (jsonNodeCmp == 0 IS value equality —
   // the canonical form makes structural equality the value equality). Rendered canonically (jsonb_out).
   | { kind: "jsonb"; node: JsonNode }
+  // A `jsonpath` value (spec/design/jsonpath.md, P1a) — the canonical normalized source text. NOT
+  // comparable (the resolver maps any comparison to 42883); rendered as its text. Literal-only this
+  // slice (a jsonpath column is 0A000), so it never reaches the storage / spill codecs.
+  | { kind: "jsonpath"; text: string }
   // An UNFETCHED large-value reference (spec/design/large-values.md §14): a stored
   // external/compressed value loaded as its on-disk pointer instead of being materialized.
   // Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -217,6 +221,12 @@ export function jsonValue(text: string): Value {
 // jsonbValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
 export function jsonbValue(node: JsonNode): Value {
   return { kind: "jsonb", node };
+}
+
+// jsonPathValue builds a non-null jsonpath value from its canonical normalized text
+// (spec/design/jsonpath.md, P1a).
+export function jsonPathValue(text: string): Value {
+  return { kind: "jsonpath", text };
 }
 
 // compositeValue builds a composite (row) value from its ordered field values (spec/design/composite.md §2).
@@ -470,6 +480,9 @@ export function render(v: Value): string {
     case "jsonb":
       // jsonb renders the canonical PG text (jsonb_out — §6.2).
       return jsonbOut(v.node);
+    case "jsonpath":
+      // jsonpath renders its stored canonical normalized text (spec/design/jsonpath.md §2).
+      return v.text;
     case "unfetched":
       throw new Error("BUG: unfetched large value escaped the storage layer");
     default:

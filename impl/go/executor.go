@@ -3406,6 +3406,11 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			if err != nil {
 				return Outcome{}, err
 			}
+			// jsonpath is literal-only this slice (P1a) — a jsonpath COLUMN is 0A000, like a J0-stage
+			// json column (a storable jsonpath is a follow-on).
+			if ty == JsonPathType {
+				return Outcome{}, NewError(FeatureNotSupported, "a jsonpath column is not supported yet")
+			}
 			colType = ScalarT(ty)
 			decimal = d
 		} else if ctype := db.readSnap().compositeType(def.TypeName); ctype != nil {
@@ -9048,6 +9053,9 @@ func scalarForParamHint(rt resolvedType) *ScalarType {
 	case rtJsonb:
 		t := Jsonb
 		return &t
+	case rtJsonPath:
+		t := JsonPathType
+		return &t
 	default:
 		return nil
 	}
@@ -13032,6 +13040,8 @@ func valueToRExpr(v Value) *rExpr {
 		return &rExpr{kind: reConstRange, cRange: v.Range}
 	case ValJson:
 		return &rExpr{kind: reConstJson, cText: v.Str}
+	case ValJsonPath:
+		return &rExpr{kind: reConstJsonPath, cText: v.Str}
 	case ValJsonb:
 		return &rExpr{kind: reConstJsonb, cJsonb: v.Json}
 	default: // ValNull
@@ -13248,6 +13258,9 @@ const (
 	// rtJsonb is the jsonb family (canonical binary — spec/design/json.md §2). Comparable with itself
 	// by PG's total btree order (§5).
 	rtJsonb
+	// rtJsonPath is the jsonpath type (spec/design/jsonpath.md, P1a). NOT comparable (42883);
+	// literal-only.
+	rtJsonPath
 )
 
 // isFloatKind reports whether a resolvedType is one of the two float kinds.
@@ -13413,6 +13426,8 @@ func rtName(t resolvedType) string {
 		return "json"
 	case rtJsonb:
 		return "jsonb"
+	case rtJsonPath:
+		return "jsonpath"
 	case rtComposite:
 		// A named composite is its type name; an anonymous ROW(...) is "record" (PG).
 		if t.comp != nil && t.comp.named {
@@ -13510,6 +13525,9 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtJsonb:
 		ty := Jsonb
 		return &ty
+	case rtJsonPath:
+		ty := JsonPathType
+		return &ty
 	default:
 		return nil
 	}
@@ -13542,6 +13560,9 @@ const (
 	// reConstJsonb is a jsonb constant — the canonical tagged-node tree (spec/design/json.md §2),
 	// parsed + canonicalized at resolve. Held in cJsonb.
 	reConstJsonb
+	// reConstJsonPath is a jsonpath constant — the canonical normalized source text
+	// (spec/design/jsonpath.md, P1a), compiled + rendered at resolve. Held in cText.
+	reConstJsonPath
 	reConstNull
 	reCast
 	reNeg
@@ -16642,6 +16663,8 @@ func argFamily(t resolvedType) string {
 		return "json"
 	case rtJsonb:
 		return "jsonb"
+	case rtJsonPath:
+		return "jsonpath"
 	default: // rtNull
 		return ""
 	}
@@ -17070,6 +17093,8 @@ func elemScalarHint(t resolvedType) (ScalarType, bool) {
 		return Json, true
 	case rtJsonb:
 		return Jsonb, true
+	case rtJsonPath:
+		return JsonPathType, true
 	default:
 		return 0, false
 	}
@@ -18035,6 +18060,9 @@ func valueToNode(v Value) (JsonNode, error) {
 	case ValRange:
 		return JsonNode{}, NewError(FeatureNotSupported,
 			"to_jsonb of a range value is not supported yet")
+	case ValJsonPath:
+		return JsonNode{}, NewError(FeatureNotSupported,
+			"to_jsonb of a jsonpath value is not supported yet")
 	default: // ValUnfetched
 		panic("BUG: unfetched large value escaped the storage layer")
 	}
@@ -20845,7 +20873,7 @@ func requireNumericOperand(t resolvedType) error {
 	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid ||
 		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate ||
 		t.kind == rtRange || t.kind == rtComposite || t.kind == rtArray ||
-		t.kind == rtJson || t.kind == rtJsonb ||
+		t.kind == rtJson || t.kind == rtJsonb || t.kind == rtJsonPath ||
 		isFloatKind(t.kind) {
 		// float is handled by the dedicated float branch in resolveBinary BEFORE this is reached;
 		// reject here too so any other caller treats it as a non-(int/decimal) operand. A range/
@@ -20934,6 +20962,11 @@ func classifyComparable(lt, rt resolvedType) error {
 	// 42804 other types use. Must precede the jsonb arms so json × jsonb is 42883.
 	if lt.kind == rtJson || rt.kind == rtJson {
 		return NewError(UndefinedFunction, "operator does not exist: json is not comparable")
+	}
+	// jsonpath is likewise NOT comparable (PG ships no opclass — jsonpath.md §1): every comparison is
+	// 42883.
+	if lt.kind == rtJsonPath || rt.kind == rtJsonPath {
+		return NewError(UndefinedFunction, "operator does not exist: jsonpath is not comparable")
 	}
 	// jsonb IS comparable — PostgreSQL's total btree order (spec/design/json.md §5) — but only with
 	// another jsonb (or a bare NULL). jsonb vs any other family is 42804 (jed's cross-family
@@ -21269,6 +21302,14 @@ func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*r
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstJsonb, cJsonb: &node}, resolvedType{kind: rtJsonb}, nil
+	case JsonPathType:
+		// '…'::jsonpath / jsonpath '…' — compile (P1a structural subset) + store the canonical
+		// normalized text. Malformed → 42601; an unsupported (valid-PG) construct → 0A000.
+		jp, err := Compile(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstJsonPath, cText: jp.Render()}, resolvedType{kind: rtJsonPath}, nil
 	case Text:
 		// text 'x' is identity — the string IS the value.
 		return &rExpr{kind: reConstText, cText: s}, resolvedType{kind: rtText}, nil
@@ -21559,7 +21600,7 @@ func promote(a, b resolvedType) ScalarType {
 func requireBool(t resolvedType, msg string) error {
 	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid ||
 		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate ||
-		t.kind == rtRange || t.kind == rtJson || t.kind == rtJsonb {
+		t.kind == rtRange || t.kind == rtJson || t.kind == rtJsonb || t.kind == rtJsonPath {
 		return typeError(msg)
 	}
 	return nil
@@ -22696,6 +22737,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reConstJson:
 		// A json constant — its verbatim text (validated at resolve).
 		return JsonValue(e.cText), nil
+	case reConstJsonPath:
+		// A jsonpath constant — its canonical normalized text (compiled + rendered at resolve).
+		return JsonPathValue(e.cText), nil
 	case reConstJsonb:
 		// A jsonb constant — its canonical node tree (parsed + canonicalized at resolve).
 		return JsonbValue(*e.cJsonb), nil
@@ -25846,6 +25890,9 @@ func familyRank(v Value) int {
 		return 15
 	case ValJsonb:
 		return 16
+	case ValJsonPath:
+		// jsonpath never sorts (42883 at resolve); a cross-family rank for totality only.
+		return 17
 	default:
 		return 12
 	}

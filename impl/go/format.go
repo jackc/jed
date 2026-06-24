@@ -88,6 +88,10 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 18
 	case Jsonb:
 		return 19
+	// jsonpath reserves type code 20, but is literal-only this slice (no storable column), so this
+	// code is never written to disk yet — a storable jsonpath column is a P1a follow-on.
+	case JsonPathType:
+		return 20
 	default:
 		return 0
 	}
@@ -199,6 +203,9 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Json, true
 	case 19:
 		return Jsonb, true
+	// jsonpath reserves code 20 (non-storable this slice, so never actually decoded off disk).
+	case 20:
+		return JsonPathType, true
 	default:
 		return 0, false
 	}
@@ -620,6 +627,9 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 	case ValRange:
 		// A range value is encoded by encodeValue's range arm, never here.
 		panic("BUG: a range value reached the scalar codec")
+	case ValJsonPath:
+		// jsonpath is literal-only (non-storable), so a value never reaches the codec.
+		panic("BUG: a jsonpath value reached the scalar codec")
 	case ValJson:
 		// json: the verbatim text body, length-prefixed exactly like text (spec/design/json.md §4).
 		out := make([]byte, 0, 3+len(v.Str))

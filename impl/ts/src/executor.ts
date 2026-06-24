@@ -155,6 +155,7 @@ import {
   isDate,
   isJson,
   isJsonb,
+  isJsonPath,
   promoteFloat,
   rangeT,
   rank,
@@ -253,7 +254,9 @@ import {
   dateValue,
   jsonValue,
   jsonbValue,
+  jsonPathValue,
 } from "./value.ts";
+import { compile as jsonPathCompile, render as jsonPathRender } from "./jsonpath.ts";
 import {
   type JsonMember,
   type JsonNode,
@@ -2755,6 +2758,11 @@ export class Database {
         decimal = null;
       } else if (scalarTypeFromName(def.typeName) !== undefined) {
         const [s, d] = resolveTypeAndTypmod(def.typeName, def.typeMod);
+        // jsonpath is literal-only this slice (P1a) — a jsonpath COLUMN is 0A000, like a J0-stage
+        // json column (a storable jsonpath is a follow-on).
+        if (s === "jsonpath") {
+          throw engineError("feature_not_supported", "a jsonpath column is not supported yet");
+        }
         colType = scalarT(s);
         decimal = d;
       } else if (ctype !== undefined) {
@@ -10424,6 +10432,8 @@ function valueToRExpr(v: Value): RExpr {
       return { kind: "constJson", value: v.text };
     case "jsonb":
       return { kind: "constJsonb", value: v.node };
+    case "jsonpath":
+      return { kind: "constJsonPath", value: v.text };
     case "composite":
       // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
       // composite value (spec/design/composite.md).
@@ -10496,6 +10506,10 @@ function distinctValueKey(v: Value): string {
       // jsonb keys by its canonical render under a distinct 'J' tag — the canonical form makes the
       // text a pure function of the value, so jsonNodeCmp-equal values share a key (§5).
       return "J" + jsonbOut(v.node);
+    case "jsonpath":
+      // jsonpath is not SQL-comparable (42883 at resolve), but a value-level dedup key under a
+      // distinct 'p' tag keeps it collision-free (mirrors the Rust Hash impl — spec/design/jsonpath.md).
+      return "p" + v.text.length.toString() + ":" + v.text;
     case "null":
       return "n";
     case "int":
@@ -10582,6 +10596,8 @@ type ResolvedType =
   // The jsonb family (canonical binary — spec/design/json.md §2). Comparable with itself by PG's
   // total btree order (§5).
   | { kind: "jsonb" }
+  // The jsonpath type (spec/design/jsonpath.md, P1a). NOT comparable (42883); literal-only.
+  | { kind: "jsonpath" }
   // A composite (row) type (spec/design/composite.md §5). `name` is non-null for a named catalog
   // type — rendered in the `# types:` output and the basis for cross-comparability — or null for an
   // anonymous ROW(...) result. `fields` are the resolved (name, type) pairs in declaration order
@@ -10633,6 +10649,9 @@ type RExpr =
   // A jsonb constant — the canonical tagged-node tree (spec/design/json.md §2), parsed + canonicalized
   // at resolve.
   | { kind: "constJsonb"; value: JsonNode }
+  // A jsonpath constant — the canonical normalized source text (spec/design/jsonpath.md, P1a),
+  // compiled + rendered at resolve.
+  | { kind: "constJsonPath"; value: string }
   | { kind: "constNull" }
   // A ROW(...) constructor (spec/design/composite.md §1): evaluate each field and assemble a
   // composite value. Also the folded form of a composite constant (valueToRExpr wraps each field's
@@ -13123,6 +13142,8 @@ function argFamily(t: ResolvedType): string | null {
       return "json";
     case "jsonb":
       return "jsonb";
+    case "jsonpath":
+      return "jsonpath";
     case "composite":
       // No catalog function takes a composite this slice; it matches no concrete family (only the
       // wildcard "any" slot, via familyMatches) — spec/design/composite.md.
@@ -13877,6 +13898,8 @@ function elemScalarHint(t: ResolvedType): ScalarType | null {
       return "json";
     case "jsonb":
       return "jsonb";
+    case "jsonpath":
+      return "jsonpath";
     default:
       return null;
   }
@@ -14423,6 +14446,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   if (isInterval(ty)) return { kind: "interval" };
   if (isJson(ty)) return { kind: "json" };
   if (isJsonb(ty)) return { kind: "jsonb" };
+  if (isJsonPath(ty)) return { kind: "jsonpath" };
   return { kind: "int", ty };
 }
 
@@ -14510,6 +14534,9 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
     case "json":
     case "jsonb":
       return false;
+    // A jsonpath value never assigns to a column (a jsonpath column is 0A000 — literal-only).
+    case "jsonpath":
+      return false;
   }
 }
 
@@ -14550,6 +14577,8 @@ function rtName(t: ResolvedType): string {
       return "json";
     case "jsonb":
       return "jsonb";
+    case "jsonpath":
+      return "jsonpath";
     case "composite":
       // A named composite is its type name; an anonymous ROW(...) is `record` (PG).
       return t.name ?? "record";
@@ -15040,6 +15069,8 @@ function typeFromResolved(rt: ResolvedType): Type {
       return scalarT("json");
     case "jsonb":
       return scalarT("jsonb");
+    case "jsonpath":
+      return scalarT("jsonpath");
     case "composite":
       if (rt.name !== null) return compositeT(rt.name);
       throw engineError(
@@ -16798,8 +16829,12 @@ function resolve(
         throw engineError("feature_not_supported", "casting an array value is not supported yet");
       }
       // Casting FROM json/jsonb (json↔jsonb, json[b]→text) lands in J3 (spec/design/json.md §6);
-      // deferred this slice.
-      if (inner.type.kind === "json" || inner.type.kind === "jsonb") {
+      // deferred this slice. Casting FROM jsonpath is likewise deferred.
+      if (
+        inner.type.kind === "json" ||
+        inner.type.kind === "jsonb" ||
+        inner.type.kind === "jsonpath"
+      ) {
         throw engineError("feature_not_supported", "casting a json value is not supported yet");
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
@@ -17659,6 +17694,11 @@ function valueToNode(v: Value): JsonNode {
       throw engineError("feature_not_supported", "to_jsonb of this type is not supported yet");
     case "range":
       throw engineError("feature_not_supported", "to_jsonb of a range value is not supported yet");
+    case "jsonpath":
+      throw engineError(
+        "feature_not_supported",
+        "to_jsonb of a jsonpath value is not supported yet",
+      );
     default: // unfetched
       throw new Error("BUG: unfetched large value escaped the storage layer");
   }
@@ -18284,6 +18324,11 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if (lt.kind === "json" || rt.kind === "json") {
     throw engineError("undefined_function", "operator does not exist: json is not comparable");
   }
+  // jsonpath is likewise NOT comparable (PG ships no opclass — jsonpath.md §1): every comparison
+  // is 42883.
+  if (lt.kind === "jsonpath" || rt.kind === "jsonpath") {
+    throw engineError("undefined_function", "operator does not exist: jsonpath is not comparable");
+  }
   // jsonb IS comparable — PostgreSQL's total btree order (spec/design/json.md §5) — but only with
   // another jsonb (or a bare NULL). jsonb vs any other family is 42804 (jed's cross-family
   // convention, like uuid/bytea/range; a documented divergence from PG's 42883).
@@ -18433,9 +18478,10 @@ function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "timestamptz") return "timestamptz";
   if (t.kind === "interval") return "interval";
   if (t.kind === "date") return "date";
-  // A json/jsonb sibling offers its type so a string literal parses as that type.
+  // A json/jsonb/jsonpath sibling offers its type so a string literal parses as that type.
   if (t.kind === "json") return "json";
   if (t.kind === "jsonb") return "jsonb";
+  if (t.kind === "jsonpath") return "jsonpath";
   return null;
 }
 
@@ -18579,6 +18625,13 @@ function coerceStringLiteral(
       // `jsonb '…'` / CAST('…' AS jsonb) — parse + canonicalize (numbers→decimal, keys deduped +
       // sorted — §2); malformed → 22P02.
       return { node: { kind: "constJsonb", value: jsonbIn(s) }, type: { kind: "jsonb" } };
+    case "jsonpath":
+      // `'…'::jsonpath` / `jsonpath '…'` — compile (P1a structural subset) + store the canonical
+      // normalized text. Malformed → 42601; an unsupported (valid-PG) construct → 0A000.
+      return {
+        node: { kind: "constJsonPath", value: jsonPathRender(jsonPathCompile(s)) },
+        type: { kind: "jsonpath" },
+      };
     case "text":
       // text 'x' is identity — the string IS the value.
       return { node: { kind: "constText", value: s }, type: { kind: "text" } };
@@ -18890,6 +18943,7 @@ function requireNumericOperand(t: ResolvedType): void {
     t.kind === "date" ||
     t.kind === "json" ||
     t.kind === "jsonb" ||
+    t.kind === "jsonpath" ||
     // A range/composite/array operand is non-numeric (range arithmetic + * - lands in RF4).
     t.kind === "range" ||
     t.kind === "composite" ||
@@ -18970,6 +19024,7 @@ function requireBool(t: ResolvedType, msg: string): void {
     t.kind === "date" ||
     t.kind === "json" ||
     t.kind === "jsonb" ||
+    t.kind === "jsonpath" ||
     t.kind === "range"
   ) {
     throw typeError(msg);
@@ -19683,6 +19738,8 @@ function scalarForParamHint(rt: ResolvedType): ScalarType | null {
       return "json";
     case "jsonb":
       return "jsonb";
+    case "jsonpath":
+      return "jsonpath";
     default:
       return null;
   }
@@ -20016,6 +20073,11 @@ function storeValue(
       if (isJsonb(colTy)) return v;
       throw typeError(
         "cannot store a jsonb value in " + canonicalName(colTy) + " column " + colName,
+      );
+    case "jsonpath":
+      // A jsonpath value never stores into a column (a jsonpath column is 0A000 — literal-only).
+      throw typeError(
+        "cannot store a jsonpath value in " + canonicalName(colTy) + " column " + colName,
       );
     default: // bool
       if (isBool(colTy)) return v;
@@ -20355,6 +20417,8 @@ function rexprConstToValue(e: RExpr): Value {
       return jsonValue(e.value);
     case "constJsonb":
       return jsonbValue(e.value);
+    case "constJsonPath":
+      return jsonPathValue(e.value);
     case "constFloat":
       return e.ty === "f32" ? float32Value(e.value) : float64Value(e.value);
     default:
@@ -20499,6 +20563,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return jsonValue(e.value);
     case "constJsonb":
       return jsonbValue(e.value);
+    case "constJsonPath":
+      return jsonPathValue(e.value);
     case "constNull":
       return nullValue();
     case "row": {
@@ -23133,6 +23199,8 @@ function familyRank(v: Value): number {
       return 15;
     case "jsonb":
       return 16;
+    case "jsonpath":
+      return 17;
     default:
       return 13;
   }

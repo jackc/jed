@@ -97,6 +97,9 @@ pub enum Value {
     /// is consistent with `JsonNode::cmp == Equal` (the canonical form makes structural equality
     /// the value equality). Rendered canonically (`jsonb_out`).
     Jsonb(JsonNode),
+    /// A `jsonpath` value — the canonical normalized source text (spec/design/jsonpath.md, P1a).
+    /// NOT comparable (the resolver maps any comparison to 42883); rendered as its text.
+    JsonPath(String),
     /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
     /// external/compressed value loaded as its on-disk pointer instead of being materialized.
     /// Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -360,6 +363,7 @@ impl std::hash::Hash for Value {
             // Hash the canonical tree / verbatim text (consistent with the structural `PartialEq`).
             Value::Jsonb(n) => n.hash(state),
             Value::Json(s) => s.hash(state),
+            Value::JsonPath(s) => s.hash(state),
             Value::Unfetched(u) => u.hash(state),
         }
     }
@@ -466,6 +470,7 @@ impl Value {
             Value::Range(r) => crate::range::range_out(r),
             // json renders its stored bytes verbatim (`json_out` — the identity, §4).
             Value::Json(s) => s.clone(),
+            Value::JsonPath(s) => s.clone(),
             // jsonb renders the canonical PG text (`jsonb_out` — §6.2).
             Value::Jsonb(n) => json::jsonb_out(n),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),

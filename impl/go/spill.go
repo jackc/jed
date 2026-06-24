@@ -451,6 +451,9 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		// output is canonical), spec/design/json.md.
 		_ = w.WriteByte(20)
 		spillWriteBytes(w, []byte(jsonbOut(v.Json)))
+	case ValJsonPath:
+		// jsonpath is literal-only (non-storable), so it never rides a spilling sort.
+		panic("BUG: a jsonpath value never reaches the spill codec")
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it.

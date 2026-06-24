@@ -84,6 +84,11 @@ const (
 	// Decimal, object keys deduped + sorted. Comparable by PG's total btree order (§5). Rendered
 	// canonically (jsonb_out).
 	ValJsonb
+	// ValJsonPath is a jsonpath value (spec/design/jsonpath.md, P1a) — the canonical normalized source
+	// text, held in Str (like ValJson's verbatim text). NOT comparable (the resolver maps any
+	// comparison to 42883); rendered as its text. Literal-only this slice (non-storable), so it never
+	// reaches the value/spill codec — those paths panic.
+	ValJsonPath
 )
 
 // Unfetched is the on-disk form of a lazily-loaded large value (spec/design/large-values.md §14;
@@ -239,6 +244,10 @@ func JsonValue(s string) Value { return Value{Kind: ValJson, Str: s} }
 // JsonbValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
 // The node is held by pointer so Value stays ==-comparable; equality/ordering go through Eq3/Cmp.
 func JsonbValue(n JsonNode) Value { return Value{Kind: ValJsonb, Json: &n} }
+
+// JsonPathValue builds a non-null jsonpath value from its canonical normalized text
+// (spec/design/jsonpath.md, P1a). The text lives in Str, like a verbatim json value.
+func JsonPathValue(s string) Value { return Value{Kind: ValJsonPath, Str: s} }
 
 // CompositeValue builds a non-null composite (row) value from its field values
 // (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
@@ -497,6 +506,9 @@ func (v Value) Render() string {
 	case ValJsonb:
 		// jsonb renders the canonical PG text (jsonb_out — §6.2).
 		return jsonbOut(v.Json)
+	case ValJsonPath:
+		// jsonpath renders its canonical normalized text (the stored Str).
+		return v.Str
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
