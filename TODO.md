@@ -463,6 +463,81 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         **ordered-index** equality bound for UPDATE/DELETE (mutations use PK+GIN but not the ordered
         index yet); the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`**
         opclass (the lossy-recheck path the seam already seats) and a future object/document opclass.
+- [ ] **GiST index access method → `EXCLUDE` constraints** — a **third index *kind*** beside the
+      ordered B-tree (`index_kind = 0`) and GIN (`index_kind = 1`): the reserved `index_kind = 2`
+      ([format.md](spec/fileformat/format.md) *Catalog*, currently `XX001`; [gin.md §7](spec/design/gin.md)),
+      whose payoff is **PostgreSQL exclusion constraints** — `EXCLUDE USING gist (during WITH &&)`: no
+      two rows may make the WITH operators TRUE pairwise (`UNIQUE` is the degenerate all-`=` case). GiST
+      is the access method PG's overlap/containment queries and every non-`=` exclusion ride on; jed's
+      first and primary beneficiary is the **`range` type** — the [ranges.md §10](spec/design/ranges.md)
+      deferred follow-on, finally built (arrays already have GIN; jed has no geometric types, so range +
+      scalars are the realistic opclasses). _(size: XL; deps: ranges R0–R4 (done), the GIN index-kind +
+      opclass seam (done); §4)_
+  - [ ] **GX0 — spec + the determinism decision (the §8 pre-coding hotspot).** Author
+        `spec/design/gist.md`. The load-bearing call: PG's GiST is a **lossy bounding-predicate balanced
+        tree whose shape is insertion-order- and heuristic-dependent** (`penalty`/`picksplit`), which
+        **cannot** be cross-core byte-identical as written (§2/§8). Decision — jed's GiST is an
+        **operation-deterministic** R-tree-style structure: `union`/`penalty`/`picksplit`/`same` are
+        **pure deterministic functions** (canonical bounding-key-byte tiebreaks; split = sort the entry
+        bounding keys by their order-preserving encoding + split at the median), so the identical
+        mutation sequence every core replays builds the **byte-identical** tree (the
+        content-deterministic-split precedent, [gin.md §8](spec/design/gin.md)). A deliberate
+        **structural** divergence from PG — *which rows match* is identical (behavior tracks PG, §1); the
+        tree shape, plan/cost, and on-disk bytes are jed's own and ledgered. Defines the **opclass seam**
+        (the GiST analogue of GIN's three-function seam — the only type-specific part; the tree machinery
+        is shared). The seam is designed **general from day one** so it does not foreclose the opclasses
+        jed is likely to want next (the follow-on below) — `multirange_ops`, an `hstore`/dictionary-type
+        opclass, a `pg_trgm`-style trigram `text` opclass, and an `intarray`-style signature opclass over
+        array columns; GX0 must keep `union`/`consistent`/`penalty`/`picksplit` typed over an abstract
+        bounding key, never hard-wired to a range. Registers **`23P01 exclusion_violation`**
+        ([registry.toml](spec/errors/registry.toml)) and reserves the `format_version` bump for
+        `index_kind = 2`. _(size: M; spec-only)_
+  - [ ] **GX1 — the GiST index kind + `range_ops` opclass (acceleration; no constraint yet).**
+        `CREATE INDEX … USING gist (range_col)` over a range column, bounding key = the `range-bounds`
+        order-preserving encoding ([encoding.md §2.11](spec/design/encoding.md)). The planner pushdown
+        seam ([indexes.md §5](spec/design/indexes.md), the GIN precedent) gains a GiST
+        **consistent-descent gather** accelerating `&&` / `@>` / `<@` / `<<` / `>>` / `&<` / `&>` /
+        `-|-` / `=` for SELECT and GiST-bounded UPDATE/DELETE — same rows as the full-scan residual,
+        lower cost; a new `gist_descent` cost unit. `format_version` 20 (writes `index_kind = 2`); the
+        `gist_range_table.jed` golden (`rust == go == ts == ruby`); `CREATE UNIQUE INDEX … USING gist`
+        is `0A000` (uniqueness is undefined for a bounding tree — the GIN-`UNIQUE` precedent). Capability
+        `ddl.gist_index` + `query.gist_scan`. Realizes [ranges.md §10](spec/design/ranges.md).
+        _(size: XL; ×3 cores)_
+  - [ ] **GX2 — GiST `=` over the keyable scalars (the `btree_gist` equivalent).** A scalar GiST opclass
+        over the engine's keyable scalars (integers / `boolean` / `uuid` / `date` / `timestamp` /
+        `timestamptz` / `text` / `bytea` / `decimal` / `interval`) whose bounding key is the value's
+        existing order-preserving key encoding and whose only strategy is `=`. PG needs the `btree_gist`
+        extension for this; jed owns its surface (§1), so it ships in-core. This is what lets a
+        **multi-column** GiST index carry a `=` column beside a `&&` range column — the canonical
+        exclusion shape. _(size: L; ×3 cores)_
+  - [ ] **GX3 — `EXCLUDE` constraints.** `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])`:
+        the constraint **is** its backing GiST index (the UNIQUE-is-its-index model,
+        [constraints.md §5](spec/design/constraints.md), generalized to N `(column, operator)` pairs).
+        Enforced inside the two-phase / all-or-nothing pass at INSERT/UPDATE via a GiST probe — a
+        candidate row conflicts iff some existing row makes **every** WITH-operator comparison TRUE →
+        **`23P01`**; a NULL in any WITH operand exempts that row (PG behavior). The single-column range
+        form (`EXCLUDE USING gist (during WITH &&)`) needs only GX1; the canonical
+        `EXCLUDE USING gist (room WITH =, during WITH &&)` (no double-booking) needs GX2 too. Persists a
+        per-constraint `(key_ordinal, operator_strategy)` list + backing-index ref (the operator-per-column
+        that UNIQUE doesn't record → its own catalog entry; a further `format_version` bump). Columns-only
+        WITH exprs first. Capability `ddl.exclusion_constraint`. _(size: L; ×3 cores)_
+  - [ ] _follow-on (each its own slice + NoREC/oracle obligation):_ the `EXCLUDE … WHERE (predicate)`
+        partial form; `DEFERRABLE` / `INITIALLY DEFERRED` (jed has no deferred-constraint machinery yet —
+        its own axis); `EXCLUDE USING btree (a WITH =)` lowering an all-`=` exclude onto an ordered unique
+        index (a `UNIQUE` alias); `ALTER TABLE … ADD CONSTRAINT … EXCLUDE`; **SP-GiST** (`index_kind = 3`)
+        and GiST KNN `ORDER BY col <-> const` (needs a distance scalar — far off); general-expression WITH
+        operands; multi-column GiST beyond the exclusion shape.
+  - [ ] _follow-on — future GiST opclasses (each its own slice, gated on its type/operator surface
+        landing first; all anticipated by GX0's general seam):_ **`multirange_ops`** once a multirange
+        type lands ([ranges.md §10](spec/design/ranges.md) — a recognized future want); an
+        **`hstore`/dictionary-type opclass** (`@>`/`?`/`?&`/`?|`) for a future map type — a new type axis,
+        or riding the [json.md §3](spec/design/json.md) dictionary door — which would bring a **GIN**
+        opclass too ([gin.md §10](spec/design/gin.md)); a **`pg_trgm`-style trigram `text` opclass**
+        accelerating similarity (`%`) / `LIKE` / `ILIKE` (jed's regex is its own flavor,
+        [regex.md](spec/design/regex.md), so accelerating it needs care — likely LIKE/ILIKE first); and an
+        **`intarray`-style signature GiST opclass** over array columns (an alternative to the shipped GIN
+        `array_ops`), alongside the extra intarray query operators. Each is "build it when its type /
+        operator surface exists"; none is foreclosed by the GiST seam.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
       rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.

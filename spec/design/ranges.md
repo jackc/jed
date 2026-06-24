@@ -261,7 +261,10 @@ determinism exception (CLAUDE.md §10).
   `array_ops` jed shipped for arrays); this is its own slice with its own NoREC obligation. Until
   then range operators and a range equality `WHERE` are full-scan predicates, and cannot mis-fire
   the existing integer-array GIN `gin_match` planner (a range operand never matches a GIN index).
-- **Multirange types** (`int4multirange` etc., PG 14+) — a separate axis, not scheduled.
+- **Multirange types** (`int4multirange` etc., PG 14+) — a separate type axis layered over the range
+  axis. **A recognized future want** (not yet scheduled): the type lands first (its own value codec /
+  canonical merge / `multirange_cmp`), then optionally its **`multirange_ops` GiST opclass** for
+  `&&`/`@>`/… (the GiST follow-on in [TODO.md](../../TODO.md), Phase 4). Nothing here forecloses it.
 - **Custom range types** via `CREATE TYPE … AS RANGE` — jed ships only the six built-ins;
   the structural model would need a nominal escape hatch, deferred.
 - **The `@>`/`<@` with the element on the left** beyond what RF3 ships, `range_agg`,
