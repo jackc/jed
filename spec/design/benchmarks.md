@@ -235,6 +235,17 @@ verifies the fingerprint before running** and aborts with `stale benchmark data:
 'rake bench:setup'` on mismatch or absence — a benchmark can never silently run against
 wrong data.
 
+The fingerprint covers `datasets.toml` but **not** jed's on-disk format version: a format
+bump (`spec/fileformat/format.md`) leaves the dataset spec untouched, so the SQLite and PG
+databases (stable formats) correctly stay valid, but the `.jed` files — written by the core
+at the old version — are now stale and the current core rejects them as `XX001`. So the jed
+skip carries one extra gate: `bench-setup` skips a `.jed` file only when its fingerprint
+matches **and the file actually opens** with the current core; an unreadable file is
+regenerated regardless of the fingerprint. (SQLite/PG keep the plain fingerprint check.)
+Folding the format version into the fingerprint would couple the bench module to an
+unexported core constant per core; the open-it-and-see gate auto-heals on any format bump,
+partial write, or corruption without that coupling.
+
 ## 6. Harness contract
 
 Every benchmark binary takes the same positional arguments:

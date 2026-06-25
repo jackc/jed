@@ -98,11 +98,9 @@ func load(what string) { fmt.Fprintf(os.Stderr, "%s: generating...\n", what) }
 
 func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool) error {
 	path := filepath.Join(dataDir, ds.Name+".jed")
-	if !force && bench.ReadSidecar(dataDir, ds.Name, "jed") == fingerprint {
-		if _, err := os.Stat(path); err == nil {
-			skip("jed/" + ds.Name)
-			return nil
-		}
+	if !force && bench.ReadSidecar(dataDir, ds.Name, "jed") == fingerprint && jedFileReadable(path) {
+		skip("jed/" + ds.Name)
+		return nil
 	}
 	load("jed/" + ds.Name)
 	os.Remove(path)
@@ -166,6 +164,19 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 		}
 	}
 	return bench.WriteSidecar(dataDir, ds.Name, "jed", fingerprint)
+}
+
+// jedFileReadable reports whether path is a .jed file the current core can open. A matching
+// fingerprint alone does not authorize a skip: the corpus fingerprint covers datasets.toml
+// but NOT jed's on-disk format version (fingerprint.go), so a format bump leaves a stale .jed
+// that the current core rejects (XX001) — regenerate whenever the existing file no longer opens.
+func jedFileReadable(path string) bool {
+	db, err := jed.Open(path)
+	if err != nil {
+		return false
+	}
+	_ = db.Close()
+	return true
 }
 
 // writeLiteralRow renders one generated row as a SQL VALUES tuple. Generated text is
