@@ -1345,6 +1345,11 @@ null           = "propagates"
 precedence     = 50
 errors         = ["22003", "22012"]
 
+# The `%` (modulo) operator. PostgreSQL also spells this as the function `mod(a, b)`; jed accepts
+# that spelling by routing a two-arg `mod(...)` call to THIS operator in the resolver (so mod() and
+# `%` are observably identical — same promotion, kernels, and 22012/22003), rather than a separate
+# catalog function row. PG's mod() is integer/numeric only; jed additionally accepts mod(float), the
+# `%`-over-float extension (float.md §4, oracle_overrides.toml).
 [[operator]]
 name           = "mod"
 symbol         = "%"

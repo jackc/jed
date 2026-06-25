@@ -15700,6 +15700,15 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveRegexFunc(scope, e, ag, params);
   }
+  // `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME arithmetic
+  // machinery so mod() and % are observably identical (promotion, the integer/decimal/float kernels,
+  // 22012/22003). PG's mod() is integer/numeric only; jed additionally accepts mod(float), the
+  // `%`-over-float extension. Only the two-arg form is mod(); else fall through → 42883.
+  if (lname === "mod" && e.args.length === 2) {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    return resolveBinary(scope, "mod", e.args[0]!, e.args[1]!, ag, params);
+  }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);

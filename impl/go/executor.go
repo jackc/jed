@@ -21482,6 +21482,19 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveRegexFunc(s, fc, ag, params)
 	}
+	// `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME
+	// arithmetic machinery so mod() and % are observably identical (promotion, the integer/decimal/
+	// float kernels, 22012/22003). PG's mod() is integer/numeric only; jed additionally accepts
+	// mod(float), the `%`-over-float extension. Only the two-arg form is mod(); else fall through → 42883.
+	if name == "mod" && len(fc.Args) == 2 {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		return resolveBinary(s, &BinaryExpr{Op: OpMod, Lhs: *fc.Args[0], Rhs: *fc.Args[1]}, ag, params)
+	}
 	if isScalarFuncName(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err

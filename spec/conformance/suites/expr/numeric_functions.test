@@ -69,3 +69,34 @@ SELECT sign(f64 '-Infinity')
 # sign over a bare integer is 42883: no implicit int→decimal/float promotion (like sqrt(int)).
 statement error 42883
 SELECT sign(2)
+
+# --- mod(a, b): the function spelling of the `%` (mod) operator; sign of the dividend --
+query I nosort
+SELECT mod(5, 3)
+----
+2
+
+query I nosort
+SELECT mod(-5, 3)
+----
+-2
+
+query I nosort
+SELECT mod(5, -3)
+----
+2
+
+# mod over numeric (the integer divisor widens): result scale max(s1, s2)
+query D nosort
+SELECT mod(5.5, 2)
+----
+1.5
+
+query D nosort
+SELECT mod(-5.5, 2)
+----
+-1.5
+
+# mod by zero traps 22012, exactly like the `%` operator
+statement error 22012
+SELECT mod(7, 0)

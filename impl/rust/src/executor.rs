@@ -20848,6 +20848,21 @@ fn resolve_func_call(
         }
         return resolve_regex_func(scope, &lname, args, agg, params);
     }
+    // `mod(a, b)` is the function spelling of the `%` (mod) operator (catalog name "mod") — route it
+    // to the SAME arithmetic machinery so mod() and % are observably identical (promotion, the
+    // integer/decimal/float kernels, 22012/22003). PG's mod() is integer/numeric only; jed
+    // additionally accepts mod(float), the `%`-over-float extension (oracle_overrides.toml). Only the
+    // two-arg form is mod(); any other arity falls through to 42883.
+    if lname == "mod" && args.len() == 2 {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_binary(scope, BinaryOp::Mod, &args[0], &args[1], agg, params);
+    }
     if is_scalar_func_name(&lname) {
         reject_named(&lname, arg_names)?;
         return resolve_scalar_func(scope, &lname, args, star, agg, params);
