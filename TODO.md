@@ -109,11 +109,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         and `ORDER BY 1 + 1` is a constant no-op (PG). DISTINCT requires the key to match a
         select-list expression (`42P10`); a non-orderable result is `42883`
         (`query.order_by_expr`). → [grammar.md §10](spec/design/grammar.md)
-  - [ ] _follow-on:_ an output **alias** sort key (`SELECT a+b AS s ... ORDER BY s`, currently
-        `42703` — a bare name still resolves against the table); a general-expression key in a
-        **set-operation** ORDER BY (`0A000`), a window function / `GROUPING()` inside a key, an
-        expression key in a grouped+window query, and a correlated key (each `0A000`); the
-        general-expression `WITHIN GROUP` order key.
+  - [x] **Output-alias sort keys** (`SELECT a + b AS s ... ORDER BY s`) — a bare name resolves an
+        OUTPUT column (an `AS` alias or item's derived name) BEFORE an input column (PG's SQL92 rule,
+        the opposite of `GROUP BY`); shadows a same-named input column; a matched plain column keeps
+        the PK-scan fast path, a computed item is materialized. Binds only a whole bare-name key
+        (`ORDER BY s + 1` → `42703`); same-name items with different exprs are `42702`
+        (`query.order_by_alias`). → [grammar.md §10](spec/design/grammar.md)
+  - [ ] _follow-on:_ a general-expression key in a **set-operation** ORDER BY (`0A000`), a window
+        function / `GROUPING()` inside a key, an expression key in a grouped+window query, and a
+        correlated key (each `0A000`); the general-expression `WITHIN GROUP` order key.
 - [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,
       non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK columns (sorting by each
       column's stored key order) elides the sort and streams the scan; with a `LIMIT` it
