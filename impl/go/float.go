@@ -573,6 +573,9 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 	case sfAtan2:
 		// atan2(y, x): y is vals[0] (x here), x is vals[1]. Quadrant-aware; no domain trap.
 		return Float64Value(math.Atan2(x, vals[1].asF64())), nil
+	case sfCot:
+		// cot(x) = 1/tan(x) (no math.Cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
+		return Float64Value(1.0 / math.Tan(x)), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}

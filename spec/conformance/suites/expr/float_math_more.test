@@ -238,3 +238,26 @@ query R nosort
 SELECT atan2(y, x) FROM m2 WHERE id = 5
 ----
 NULL
+
+# --- cot(x): cotangent = 1/tan(x); cot(0) = +Infinity (not a trap) --------------------
+query R nosort
+SELECT cot(x) FROM m WHERE id = 5
+----
+0.6420926159343306
+
+query R nosort
+SELECT cot(x) FROM m WHERE id = 6
+----
+1.830487721712452
+
+# cot(0) is +Infinity (PG-faithful; no error)
+query R nosort
+SELECT cot(x) FROM m WHERE id = 4
+----
+Infinity
+
+# NULL propagates
+query R nosort
+SELECT cot(x) FROM m WHERE id = 9
+----
+NULL

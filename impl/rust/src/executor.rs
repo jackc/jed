@@ -12926,6 +12926,9 @@ enum ScalarFunc {
     /// atan2(y, x) → f64 — quadrant-aware inverse tangent of y/x (float.md §8). Transcendental,
     /// exempted; two float operands (the resolver widens both to f64), no domain trap.
     Atan2,
+    /// cot(x) → f64 — the cotangent, 1/tan(x) (float.md §8). Transcendental, exempted; cot(0) =
+    /// +Infinity (no trap).
+    Cot,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18961,6 +18964,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "acos" => ScalarFunc::Acos,
         "atan" => ScalarFunc::Atan,
         "atan2" => ScalarFunc::Atan2,
+        "cot" => ScalarFunc::Cot,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29578,7 +29582,8 @@ impl RExpr {
                     | ScalarFunc::Asin
                     | ScalarFunc::Acos
                     | ScalarFunc::Atan
-                    | ScalarFunc::Atan2 => {
+                    | ScalarFunc::Atan2
+                    | ScalarFunc::Cot => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30598,6 +30603,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
             };
             x.atan2(x2)
         }
+        // cot(x) = 1/tan(x) (no libm cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
+        ScalarFunc::Cot => 1.0 / x.tan(),
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi

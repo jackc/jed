@@ -20,7 +20,7 @@
 # --- f64: transcendental function values ---------------------------------
 [[exception]]
 id           = "float-transcendental"
-surface      = "exp, ln, log10, pow, sin, cos, tan, cbrt, asin, acos, atan, atan2 over f32/f64 (../design/float.md §8)"
+surface      = "exp, ln, log10, pow, sin, cos, tan, cbrt, asin, acos, atan, atan2, cot over f32/f64 (../design/float.md §8)"
 class        = "A"
 drops        = ["G2", "G3"]
 blast_radius = "the function's result column; promotes to the row multiset / other columns ONLY via a float-gated WHERE / ORDER BY...LIMIT / narrowing CAST (the f64-control-flow entry below). A f64 query that does not call a transcendental stays bit-identical cross-core."

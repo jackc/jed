@@ -12429,6 +12429,9 @@ type ScalarFuncName =
   // atan2(y, x) → f64 — quadrant-aware inverse tangent of y/x (float.md §8). Transcendental,
   // exempted; two float operands (widened to f64), no domain trap.
   | "atan2"
+  // cot(x) → f64 — the cotangent, 1/tan(x) (float.md §8). Transcendental, exempted; cot(0) =
+  // +Infinity (no trap).
+  | "cot"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24737,6 +24740,9 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
     case "atan":
       // atan is defined on all of ℝ (no domain trap); atan(±Inf) = ±π/2, atan(NaN) = NaN.
       return out(Math.atan(x));
+    case "cot":
+      // cot(x) = 1/tan(x) (no Math.cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
+      return out(1 / Math.tan(x));
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }
