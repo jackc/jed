@@ -17,7 +17,7 @@
 # weigh 1, so for every record:
 #   cost = page_read (visited nodes) + storage_row_read (rows read) + filter operator_evals
 #          (per scanned row) + row_produced + projection operator_evals.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.order_by_pk_scan, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.order_by_alias, query.limit, query.order_by_pk_scan, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t (a i32, b i32, c i32, PRIMARY KEY (a, b))
@@ -44,6 +44,19 @@ SELECT a, b FROM t ORDER BY a, b LIMIT 2
 # cost: 5
 query II nosort
 SELECT a, b FROM t ORDER BY a LIMIT 2
+----
+1
+10
+2
+20
+
+# An OUTPUT ALIAS bound to the PK leading column keeps the elision (query.order_by_alias): `k` is the
+# alias for `a`, so `ORDER BY k` resolves to the column `a` (the fast path — a bound plain-column
+# alias is NOT materialized), and the LIMIT short-circuits exactly as `ORDER BY a` above. This pins
+# that the alias form does not silently force the blocking sort. 1 page + 2 scanned + 2 produced = 5.
+# cost: 5
+query II nosort
+SELECT a AS k, b FROM t ORDER BY k LIMIT 2
 ----
 1
 10

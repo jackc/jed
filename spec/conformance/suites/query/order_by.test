@@ -7,7 +7,7 @@
 # FIRST|LAST overrides that default regardless of direction. The sort is unmetered (cost.md
 # §3): cost = storage_row_read per scanned row + row_produced per produced row (+ filter
 # operator_eval); multi-key/NULLS placement adds nothing.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.order_by_ordinal, query.order_by_expr, query.select_star, query.column_alias, query.comparison_order, query.limit, expr.arithmetic, func.abs, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.order_by_ordinal, query.order_by_expr, query.order_by_alias, query.select_star, query.column_alias, query.comparison_order, query.limit, expr.arithmetic, func.abs, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -335,6 +335,96 @@ SELECT a FROM t ORDER BY nope
 # A general expression referencing an unknown column is likewise 42703 (resolved like any expression).
 statement error 42703
 SELECT a FROM t ORDER BY nope + 1
+
+# --- Output-alias sort keys (grammar.md §10, query.order_by_alias) --------------------------------
+# A bare ORDER BY name resolves an OUTPUT column (an AS alias or item's derived name) BEFORE an input
+# column — PostgreSQL's SQL92 rule. `ORDER BY x` binds the alias `x` for column `a`, so this is
+# identical to `ORDER BY a` and stays on the COLUMN fast path (no materialization): 1 page + 5
+# storage_row_read + 5 row_produced = 11. The output column is named by the alias, as written (§8).
+# names: x
+# cost: 11
+query I nosort
+SELECT a AS x FROM t ORDER BY x
+----
+10
+10
+10
+20
+NULL
+
+# The alias binds a COMPUTED item too, materialized like a general-expression key: `bp` is `b + 1`,
+# so this sorts by b+1 = 6,NULL,8,6,10 → DESC NULLS FIRST gives NULL, 10, 8, 6, 6. (The alias `s + 1`
+# case below shows the alias is NOT in scope inside a larger expression — only a bare name binds.)
+# names: bp
+query I nosort
+SELECT b + 1 AS bp FROM t ORDER BY bp DESC
+----
+NULL
+10
+8
+6
+6
+
+# PRIORITY: a bare name binds the OUTPUT column even when it SHADOWS a same-named input column —
+# `ORDER BY b` here binds the alias `b` (for column `a`), NOT the table column `b`. So the order is by
+# `a` (10,10,10,20,NULL), not by `b` (which would be 5,5,5,7,9,NULL). This is PostgreSQL's documented
+# inconsistency vs GROUP BY (which would bind the input column). Column fast path: cost 11.
+# names: b
+# cost: 11
+query I nosort
+SELECT a AS b FROM t ORDER BY b
+----
+10
+10
+10
+20
+NULL
+
+# Two select-list items that are the SAME expression sharing a name are NOT ambiguous (PostgreSQL):
+# `ORDER BY a` binds either — both are column `a`. Orders by a (the tie within the a=10 group is
+# invisible). names: a, a
+query II nosort
+SELECT a, a FROM t ORDER BY a
+----
+10
+10
+10
+10
+10
+10
+20
+20
+NULL
+NULL
+
+# AMBIGUOUS: two output columns named `b` with DIFFERENT expressions (`a AS b` and the column `b`)
+# make a bare `ORDER BY b` key 42702 — there is no single output column to bind (PostgreSQL).
+statement error 42702
+SELECT a AS b, b FROM t ORDER BY b
+
+# The alias is visible ONLY for a bare-name key. Inside a larger expression (`s + 1`) the name `s`
+# resolves against the INPUT columns like any expression operand — there is no column `s`, so 42703
+# (PostgreSQL: an alias is not in scope within an ORDER BY expression).
+statement error 42703
+SELECT a + b AS s FROM t ORDER BY s + 1
+
+# An alias composes with a second column key and a direction: `ORDER BY x DESC, id` sorts by `a`
+# (the alias) descending, ties broken by id. a = 10,10,20,10,NULL → DESC NULLS FIRST: NULL (id5),
+# 20 (id3), then the a=10 group by id (1,2,4). Both output columns make the order observable.
+# names: x, id
+query II nosort
+SELECT a AS x, id FROM t ORDER BY x DESC, id
+----
+NULL
+5
+20
+3
+10
+1
+10
+2
+10
+4
 
 # G12 — empty scanned table. ORDER BY over zero rows yields zero rows at zero cost: nothing is
 # scanned (no storage_row_read), nothing is produced (no row_produced), and the sort is a no-op

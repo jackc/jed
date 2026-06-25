@@ -193,10 +193,17 @@ here and asserted in the corpus via the `# names:` directive
 this order:
 
 1. **`expr AS alias`** → the `alias`, **as written**. The alias is a pure output label, so
-   it is *not* case-folded and *not* entered into any resolution namespace — WHERE,
-   ORDER BY, and sibling select items never see it. Aliases may collide with a real column
-   name or with each other (no uniqueness check); this is harmless precisely because they
-   are never looked up.
+   it is *not* case-folded and *not* entered into the **input** resolution namespace —
+   WHERE, HAVING, and sibling select items never see it (they resolve against the FROM
+   columns). The one place an alias *is* visible is the trailing **`ORDER BY`** of the same
+   query (and a set-operation `ORDER BY`), which resolves a bare sort-key name against the
+   **output** columns first — the SQL-standard rule (§10). Matching there is
+   **case-insensitive** (an `ORDER BY` name folds like any unquoted identifier — §3 — so
+   `… AS Total … ORDER BY total` binds), even though the *printed* name stays as written.
+   Aliases may collide with a real column name or with each other (no uniqueness check); a
+   colliding bare-name `ORDER BY` key is the one place that is observable — two output
+   columns of the same name with **different** expressions make such a key `42702`
+   (*ambiguous*, §10).
 2. **A bare column reference** (no alias) → the **catalog's canonical column name** at the
    resolved index, i.e. the spelling from `CREATE TABLE`, *not* the spelling typed in the
    SELECT. So with `c i32` declared, `SELECT C FROM t` names the column `c`. (Identifiers
@@ -264,10 +271,10 @@ is a deliberate, documented determinism choice beyond the SQL standard — CLAUD
 unlike row order *without* `ORDER BY` (now unspecified), order *under* `ORDER BY` is fully
 deterministic. Today it is realized by a **stable** sort over the primary-key scan; under
 future parallel execution it is the same observable result via an implicit primary-key
-tie-break, so it stays parallelism-compatible.) A **column-name** key resolves against the
-*table's* columns, independent of the select list — an `AS` alias is invisible here (§8), and such
-a key need not appear in the projection. An **ordinal** key instead resolves by *position* into
-the select list (below).
+tie-break, so it stays parallelism-compatible.) A **bare-name** key resolves an **output
+column first**, then an input column (the alias form, below) — a name need not appear in the
+projection (an unmatched name falls through to the *table's* columns); an **ordinal** key
+resolves by *position* into the select list (below).
 
 **The general-expression form (`ORDER BY a + 1`).** A sort key may be **any expression** — `ORDER
 BY a + b`, `ORDER BY b % 2`, `ORDER BY abs(b - 25)`, `ORDER BY (b > 15)` — evaluated **per row**
@@ -306,10 +313,30 @@ in a `WITHIN GROUP (ORDER BY …)` an integer is a constant expression, not an o
 again — aggregates.md §13), and that clause stays column-only (its general-expression form is a
 separate deferred follow-on).
 
-**Still narrowed (§5).** An output **alias** key (`SELECT a + b AS s ... ORDER BY s`) is not yet
-resolved against the select list — a bare name still resolves against the *table's* columns (§8),
-so it is `42703` when no such column exists (PostgreSQL would bind the alias); this is the
-remaining ORDER-BY follow-on. A **set-operation** `ORDER BY` (after `UNION`/`INTERSECT`/`EXCEPT`)
+**The alias form (`ORDER BY s`).** A **bare** sort-key name (one unqualified identifier, no
+direction/COLLATE before it changes this) resolves against the **output columns first**, then the
+input columns — PostgreSQL's SQL92 rule, the *opposite* of `GROUP BY`'s precedence and the reason
+the docs call it an inconsistency. So `SELECT a + b AS s FROM t ORDER BY s` sorts by the computed
+`a + b` (the alias binds), `SELECT a AS x FROM t ORDER BY x` sorts by `a` even though no column `x`
+exists, and a bare name shadows a same-named input column — `SELECT a AS b FROM t ORDER BY b`
+sorts by `a` (the output column `b`), not the table column `b`. The match uses each select item's
+**output name** — its `AS` alias, else its derived name (a bare column's canonical name, an
+un-aliased aggregate's lowercased function name, so `SELECT count(*) FROM t ORDER BY count`
+binds), case-insensitively (§8); an un-nameable item (`?column?`) never matches. A matched name
+behaves exactly like the **ordinal** pointing at that item: a plain-column item stays on the
+column fast path (so PK-scan elision still applies — `SELECT id AS k FROM t ORDER BY k` over the
+primary key needs no sort), and a **computed** item is materialized like a general-expression key.
+The alias binds **only when the whole key is a bare name** — `ORDER BY s + 1` is a general
+expression, so `s` there resolves against the *input* columns and is `42703` when no such column
+exists (PostgreSQL again: the alias is not in scope inside an expression). When **two** output
+columns share the name with **different** expressions the bare key is **`42702`**
+(`ambiguous_column`, *"ORDER BY \"s\" is ambiguous"*); two items that are the *same* expression
+(`SELECT a, a FROM t ORDER BY a`) are not ambiguous. A **set-operation** `ORDER BY` already
+resolves names against the unified output columns (below), so the alias form is the single-`SELECT`
+counterpart of that.
+
+**Still narrowed (§5).** *(The output **alias** key is now supported — the alias form above.)*
+A **set-operation** `ORDER BY` (after `UNION`/`INTERSECT`/`EXCEPT`)
 accepts only an output column name or ordinal — a general-expression key there is `0A000`
 (*"invalid UNION/INTERSECT/EXCEPT ORDER BY clause"*, matching PostgreSQL, which rejects expressions
 once the inputs are unified). A **window function** inside an `ORDER BY` key, a `GROUPING(...)`

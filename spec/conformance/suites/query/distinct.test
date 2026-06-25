@@ -14,7 +14,7 @@
 # column in the select list (or the list is `*`), else 42P10 — once duplicates collapse, a
 # key not in the output has no single value per row. (NULL ordering also follows PostgreSQL,
 # §10 — NULL is the largest value, so ASC defaults to NULLS LAST.)
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.order_by_ordinal, query.order_by_expr, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, query.order_by_pk_scan, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.order_by_ordinal, query.order_by_expr, query.order_by_alias, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, query.order_by_pk_scan, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -197,9 +197,9 @@ SELECT DISTINCT a = b FROM t
 NULL
 false
 
-# An alias is just an output label: `ORDER BY a` references the underlying bare-projected
-# column `a` (the alias `x` is invisible to ORDER BY, §8), so this is allowed and names the
-# column `x`. 5 scanned + 3 produced = 8.
+# `ORDER BY a` binds the INPUT column `a` — the only OUTPUT column is named `x` (the alias), and a
+# bare name binds an output column first, then an input column (§10). Either way it is the projected
+# value, so it is allowed under DISTINCT. 5 scanned + 3 produced = 8.
 # names: x
 # cost: 9
 query I nosort
@@ -209,14 +209,21 @@ SELECT DISTINCT a AS x FROM t ORDER BY a
 20
 NULL
 
-# 42P10: ORDER BY key `b` is not in the select list (only `a` is) — rejected under DISTINCT.
+# 42P10: ORDER BY key `b` is not in the select list (only `a` is) — rejected under DISTINCT. No
+# OUTPUT column is named `b`, so it falls through to the input column `b`, which is not projected.
 statement error 42P10
 SELECT DISTINCT a FROM t ORDER BY b
 
-# 42P10: an alias does not satisfy the rule. `a AS b` bare-projects column `a`, not `b`;
-# ORDER BY `b` resolves to the real column `b`, which is not projected.
-statement error 42P10
+# An OUTPUT alias DOES satisfy the rule (the alias form, §10): `a AS b` names the output column `b`,
+# so `ORDER BY b` binds it (ordering by `a`) even though it shadows the input column `b` — and since
+# it names a projected output column, DISTINCT is satisfied. distinct a = 10, 20, NULL.
+# names: b
+query I nosort
 SELECT DISTINCT a AS b FROM t ORDER BY b
+----
+10
+20
+NULL
 
 # --- General-expression ORDER BY under DISTINCT (grammar.md §10/§11, query.order_by_expr) ----------
 # A general-expression ORDER BY key is allowed under DISTINCT when it STRUCTURALLY matches a select-
@@ -225,6 +232,17 @@ SELECT DISTINCT a AS b FROM t ORDER BY b
 # names: s
 query I nosort
 SELECT DISTINCT a + b AS s FROM t ORDER BY a + b
+----
+15
+27
+NULL
+
+# The same key reached via its OUTPUT ALIAS (the alias form, §10): `ORDER BY s` binds the computed
+# output column `s` (= a + b), so it is allowed under DISTINCT (it names a projected column) and is
+# materialized like the expression key above. distinct a+b = 15, 27, NULL.
+# names: s
+query I nosort
+SELECT DISTINCT a + b AS s FROM t ORDER BY s
 ----
 15
 27

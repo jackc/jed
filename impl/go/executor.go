@@ -10244,12 +10244,33 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		} else if key.Expr != nil {
 			orderExpr = key.Expr
 		} else if key.Qualifier != "" {
+			// A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
 			if slotRes, err = s.resolveQualified(key.Qualifier, key.Column); err != nil {
 				return nil, err
 			}
 		} else {
-			if slotRes, err = s.resolveBare(key.Column); err != nil {
-				return nil, err
+			// A bare name resolves an OUTPUT column (an AS alias or item's derived name) BEFORE an input
+			// column — PostgreSQL's SQL92 rule (grammar.md §10). A match routes the item EXACTLY like the
+			// same ORDER BY ordinal; no match falls through to the FROM scope (the prior behavior).
+			matched, merr := orderAliasMatch(items, key.Column, s)
+			if merr != nil {
+				return nil, merr
+			}
+			switch {
+			case matched == nil:
+				if slotRes, err = s.resolveBare(key.Column); err != nil {
+					return nil, err
+				}
+			case matched.Kind == ExprColumn:
+				if slotRes, err = s.resolveBare(matched.Column); err != nil {
+					return nil, err
+				}
+			case matched.Kind == ExprQualifiedColumn:
+				if slotRes, err = s.resolveQualified(matched.Qualifier, matched.Column); err != nil {
+					return nil, err
+				}
+			default:
+				orderExpr = matched
 			}
 		}
 
@@ -10412,6 +10433,14 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 					}
 				}
 			default:
+				// A bare name that binds an output column (alias/derived name) names a select-list
+				// item, so it is projected (the alias form, §10). Ambiguity was already raised above.
+				if key.Qualifier == "" {
+					if m, _ := orderAliasMatch(items, key.Column, s); m != nil {
+						inList = true
+						break
+					}
+				}
 				var r resolved
 				var e error
 				if key.Qualifier != "" {
@@ -21802,6 +21831,40 @@ func outputName(s *scope, e Expr) string {
 	default:
 		return "?column?"
 	}
+}
+
+// orderAliasMatch resolves a bare ORDER BY name against the SELECT output columns — PostgreSQL's
+// SQL92 rule that an ORDER BY simple name binds an OUTPUT column (an AS alias or an item's derived
+// name — grammar.md §8/§10) BEFORE an input column, the opposite of GROUP BY's precedence. Returns
+// the matching select-list item's expression (the caller routes it exactly like the same ordinal:
+// a plain column stays on the slot fast path, a computed item is materialized), or nil when no
+// output name matches (the caller falls back to the FROM scope, the prior behavior). Matching is
+// case-insensitive (§8). Only an explicit list is scanned — with * the output names are the scope
+// columns, so the FROM-scope fallback already binds the same column. Two items of the same name
+// with DIFFERENT expressions are ambiguous (42702); the same expression twice is not, matching PG.
+func orderAliasMatch(items SelectItems, name string, s *scope) (*Expr, error) {
+	if items.All {
+		return nil, nil
+	}
+	var found *Expr
+	for i := range items.Items {
+		it := &items.Items[i]
+		var oname string
+		if it.Alias != nil {
+			oname = *it.Alias
+		} else {
+			oname = outputName(s, it.Expr)
+		}
+		if !strings.EqualFold(oname, name) {
+			continue
+		}
+		if found == nil {
+			found = &it.Expr
+		} else if !exprEqual(*found, it.Expr) {
+			return nil, NewError(AmbiguousColumn, fmt.Sprintf("ORDER BY \"%s\" is ambiguous", name))
+		}
+	}
+	return found, nil
 }
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an

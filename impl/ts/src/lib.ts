@@ -298,6 +298,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.order_by_ordinal",
   // ORDER BY by a general expression (`ORDER BY a + 1`, `ORDER BY sum(b)`), materialized (grammar.md §10).
   "query.order_by_expr",
+  // ORDER BY by an output-column alias / name (`... AS s ... ORDER BY s`), output-first (grammar.md §10).
+  "query.order_by_alias",
   // Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
   "query.select_star",
   "query.column_alias",

@@ -8974,11 +8974,22 @@ impl Database {
                 }
             } else if let Some(e) = &key.expr {
                 Target::Expr(e)
+            } else if let Some(q) = &key.qualifier {
+                // A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
+                Target::Slot(scope.resolve_qualified(q, &key.column)?)
             } else {
-                Target::Slot(match &key.qualifier {
-                    Some(q) => scope.resolve_qualified(q, &key.column)?,
-                    None => scope.resolve_bare(&key.column)?,
-                })
+                // A bare name resolves an OUTPUT column (an `AS` alias or an item's derived name) BEFORE
+                // an input column — PostgreSQL's SQL92 rule (grammar.md §10). A match routes the item
+                // EXACTLY like the same ORDER BY ordinal (a plain column to a slot, a computed item to a
+                // materialized key); no match falls through to the FROM scope, the prior behavior.
+                match order_alias_match(items_ref, &key.column, &scope)? {
+                    Some(Expr::Column(name)) => Target::Slot(scope.resolve_bare(name)?),
+                    Some(Expr::QualifiedColumn { qualifier, name }) => {
+                        Target::Slot(scope.resolve_qualified(qualifier, name)?)
+                    }
+                    Some(e) => Target::Expr(e),
+                    None => Target::Slot(scope.resolve_bare(&key.column)?),
+                }
             };
 
             match target {
@@ -9161,6 +9172,17 @@ impl Database {
                     }
                     if let Some(e) = &key.expr {
                         return items.iter().any(|it| &it.expr == e);
+                    }
+                    // A bare name that binds an output column (an alias / derived name) names a
+                    // select-list item by definition, so it is projected (the alias form, §10). Any
+                    // ambiguity was already raised in the resolution loop above, so `Ok(Some(_))` is safe.
+                    if key.qualifier.is_none()
+                        && matches!(
+                            order_alias_match(items_ref, &key.column, &scope),
+                            Ok(Some(_))
+                        )
+                    {
+                        return true;
                     }
                     let r = match &key.qualifier {
                         Some(q) => scope.resolve_qualified(q, &key.column),
@@ -20828,6 +20850,47 @@ fn output_name(scope: &Scope, e: &Expr) -> String {
         Expr::Subscript { base, .. } => output_name(scope, base),
         _ => "?column?".to_string(),
     }
+}
+
+/// Resolve a bare `ORDER BY` name against the SELECT output columns — PostgreSQL's SQL92 rule that
+/// an `ORDER BY` simple name binds an **output** column (an `AS` alias or an item's derived name —
+/// grammar.md §8/§10) BEFORE an input column, the opposite of `GROUP BY`'s precedence. Returns the
+/// matching select-list item's **expression** (the caller routes it exactly like the same ordinal:
+/// a plain column stays on the slot fast path, a computed item is materialized), or `None` when no
+/// output name matches (the caller falls back to the FROM scope, the prior behavior). Matching is
+/// case-insensitive (§8). Only an explicit list is scanned — with `*` the output names are the scope
+/// columns, so the FROM-scope fallback already binds the same column. Two items of the same name
+/// with DIFFERENT expressions are ambiguous (`42702`); the same expression twice is not
+/// (`SELECT a, a … ORDER BY a`), matching PostgreSQL.
+fn order_alias_match<'a>(
+    items: &'a SelectItems,
+    name: &str,
+    scope: &Scope,
+) -> Result<Option<&'a Expr>> {
+    let SelectItems::Items(items) = items else {
+        return Ok(None);
+    };
+    let mut found: Option<&Expr> = None;
+    for it in items {
+        let oname = match &it.alias {
+            Some(a) => a.clone(),
+            None => output_name(scope, &it.expr),
+        };
+        if !oname.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        match found {
+            None => found = Some(&it.expr),
+            Some(prev) if *prev != it.expr => {
+                return Err(EngineError::new(
+                    SqlState::AmbiguousColumn,
+                    format!("ORDER BY \"{name}\" is ambiguous"),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(found)
 }
 
 /// Resolve a WHERE / ON expression: it must resolve to boolean (or an untyped NULL, which

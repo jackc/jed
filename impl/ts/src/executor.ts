@@ -7586,9 +7586,18 @@ export class Database {
       } else if (key.expr !== null) {
         orderExpr = key.expr;
       } else if (key.qualifier !== null) {
+        // A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
         slotRes = scope.resolveQualified(key.qualifier, key.column);
       } else {
-        slotRes = scope.resolveBare(key.column);
+        // A bare name resolves an OUTPUT column (an AS alias or item's derived name) BEFORE an input
+        // column — PostgreSQL's SQL92 rule (grammar.md §10). A match routes the item EXACTLY like the
+        // same ORDER BY ordinal; no match falls through to the FROM scope (the prior behavior).
+        const matched = orderAliasMatch(items, key.column, scope);
+        if (matched === null) slotRes = scope.resolveBare(key.column);
+        else if (matched.kind === "column") slotRes = scope.resolveBare(matched.name);
+        else if (matched.kind === "qualifiedColumn")
+          slotRes = scope.resolveQualified(matched.qualifier, matched.name);
+        else orderExpr = matched;
       }
 
       if (orderExpr === null) {
@@ -7726,6 +7735,10 @@ export class Database {
         } else if (key.expr !== null) {
           const ke = key.expr;
           inList = items.items.some((it) => exprEqual(ke, it.expr));
+        } else if (key.qualifier === null && orderAliasMatch(items, key.column, scope) !== null) {
+          // A bare name that binds an output column (alias/derived name) names a select-list item, so
+          // it is projected (the alias form, §10). Ambiguity was already raised in the loop above.
+          inList = true;
         } else {
           const r =
             key.qualifier !== null
@@ -17928,6 +17941,29 @@ function outputName(scope: Scope, e: Expr): string {
   // same base. A non-column base falls through to `?column?`.
   if (e.kind === "subscript") return outputName(scope, e.base);
   return "?column?";
+}
+
+// orderAliasMatch resolves a bare ORDER BY name against the SELECT output columns — PostgreSQL's
+// SQL92 rule that an ORDER BY simple name binds an OUTPUT column (an AS alias or an item's derived
+// name — grammar.md §8/§10) BEFORE an input column, the opposite of GROUP BY's precedence. Returns
+// the matching select-list item's expression (the caller routes it exactly like the same ordinal: a
+// plain column stays on the slot fast path, a computed item is materialized), or null when no output
+// name matches (the caller falls back to the FROM scope, the prior behavior). Matching is
+// case-insensitive (§8). Only an explicit list is scanned — with * the output names are the scope
+// columns, so the FROM-scope fallback already binds the same column. Two items of the same name with
+// DIFFERENT expressions are ambiguous (42702); the same expression twice is not, matching PG.
+function orderAliasMatch(items: SelectItems, name: string, scope: Scope): Expr | null {
+  if (items.kind !== "list") return null;
+  const lower = name.toLowerCase();
+  let found: Expr | null = null;
+  for (const it of items.items) {
+    const oname = it.alias ?? outputName(scope, it.expr);
+    if (oname.toLowerCase() !== lower) continue;
+    if (found === null) found = it.expr;
+    else if (!exprEqual(found, it.expr))
+      throw engineError("ambiguous_column", `ORDER BY "${name}" is ambiguous`);
+  }
+  return found;
 }
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an

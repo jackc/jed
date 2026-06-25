@@ -3,7 +3,7 @@
 # a non-aggregated SELECT/ORDER BY column not in GROUP BY is 42803. ORDER BY over a grouping
 # column sorts the group rows. Cost = rows scanned + rows x aggregates accumulated + 1 per
 # emitted group (the bucketing/sort is unmetered — cost.md §3).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.order_by, query.order_by_expr, query.limit, types.i32, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.order_by, query.order_by_expr, query.order_by_alias, query.limit, types.i32, types.decimal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32)
@@ -175,3 +175,37 @@ SELECT g FROM t GROUP BY g ORDER BY a + 1
 # The same column bare (not in an expression) is the existing 42803 path.
 statement error 42803
 SELECT g FROM t GROUP BY g ORDER BY a
+
+# --- Output-alias ORDER BY in a grouped query (grammar.md §10, query.order_by_alias) --------------
+# A bare ORDER BY name binds an OUTPUT column first (the alias form). `s` is the alias for the
+# aggregate sum(a), so ORDER BY s DESC sorts the groups by sum(a) descending: 110 (NULL group), 70
+# (g=2), 30 (g=1) — the same order as `ORDER BY sum(a) DESC` above, reached via the alias.
+# names: g, s
+query II nosort
+SELECT g, sum(a) AS s FROM t GROUP BY g ORDER BY s DESC
+----
+NULL
+110
+2
+70
+1
+30
+
+# The alias may bind the GROUPING column: `gg` is the alias for g, so ORDER BY gg sorts the groups
+# by g (1, 2, NULL last) — the column fast path through the group-key slot.
+# names: gg
+query I nosort
+SELECT g AS gg FROM t GROUP BY g ORDER BY gg
+----
+1
+2
+NULL
+
+# A DERIVED output name (no alias) also binds: an un-aliased aggregate is named by its lowercased
+# function name (§8), so `SELECT count(*) ... ORDER BY count` binds the count column. One implicit
+# group over the whole table → a single row (count 6).
+# names: count
+query I nosort
+SELECT count(*) FROM t ORDER BY count
+----
+6
