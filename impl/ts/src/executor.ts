@@ -12420,6 +12420,9 @@ type ScalarFuncName =
   // asin(x) → f64 — inverse sine in radians (float.md §8). Transcendental, exempted; domain
   // [-1, 1], |x| > 1 (or ±Inf) → 22003, NaN propagates.
   | "asin"
+  // acos(x) → f64 — inverse cosine in radians (float.md §8). Transcendental, exempted; same
+  // domain [-1, 1] as asin.
+  | "acos"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24715,6 +24718,11 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
       if (!Number.isNaN(x) && (x < -1 || x > 1))
         throw engineError("numeric_value_out_of_range", "input is out of range");
       return out(Math.asin(x));
+    case "acos":
+      // acos shares asin's domain [-1, 1]: |x| > 1 (or ±Inf) → 22003, NaN propagates.
+      if (!Number.isNaN(x) && (x < -1 || x > 1))
+        throw engineError("numeric_value_out_of_range", "input is out of range");
+      return out(Math.acos(x));
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }

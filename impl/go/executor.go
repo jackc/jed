@@ -15806,6 +15806,9 @@ const (
 	// sfAsin is the inverse sine in radians (float.md §8) — transcendental, exempted; domain
 	// [-1, 1], |x| > 1 (or ±Inf) → 22003, NaN propagates.
 	sfAsin
+	// sfAcos is the inverse cosine in radians (float.md §8) — transcendental, exempted; same
+	// domain [-1, 1] as asin.
+	sfAcos
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19347,6 +19350,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfDegrees
 	case "asin":
 		return sfAsin
+	case "acos":
+		return sfAcos
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile

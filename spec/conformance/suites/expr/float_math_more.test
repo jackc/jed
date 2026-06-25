@@ -146,3 +146,34 @@ query R nosort
 SELECT asin(x) FROM m WHERE id = 9
 ----
 NULL
+
+# --- acos(x): inverse cosine in radians; domain [-1, 1] -------------------------------
+query R nosort
+SELECT acos(x) FROM m WHERE id = 6
+----
+1.0471975511965979
+
+query R nosort
+SELECT acos(x) FROM m WHERE id = 5
+----
+0
+
+query R nosort
+SELECT acos(x) FROM m WHERE id = 8
+----
+3.141592653589793
+
+query R nosort
+SELECT acos(x) FROM m WHERE id = 4
+----
+1.5707963267948966
+
+# out of domain (|x| > 1) → 22003
+statement error 22003
+SELECT acos(x) FROM m WHERE id = 2
+
+# NULL propagates
+query R nosort
+SELECT acos(x) FROM m WHERE id = 9
+----
+NULL

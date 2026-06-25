@@ -12917,6 +12917,9 @@ enum ScalarFunc {
     /// asin(x) → f64 — inverse sine in radians (float.md §8). Transcendental, exempted; domain
     /// [-1, 1], |x| > 1 (or ±Inf) → 22003, NaN propagates.
     Asin,
+    /// acos(x) → f64 — inverse cosine in radians (float.md §8). Transcendental, exempted; same
+    /// domain [-1, 1] as asin.
+    Acos,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18949,6 +18952,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "radians" => ScalarFunc::Radians,
         "degrees" => ScalarFunc::Degrees,
         "asin" => ScalarFunc::Asin,
+        "acos" => ScalarFunc::Acos,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29563,7 +29567,8 @@ impl RExpr {
                     | ScalarFunc::Cbrt
                     | ScalarFunc::Radians
                     | ScalarFunc::Degrees
-                    | ScalarFunc::Asin => {
+                    | ScalarFunc::Asin
+                    | ScalarFunc::Acos => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30561,6 +30566,16 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
                 ));
             }
             x.asin()
+        }
+        // acos shares asin's domain [-1, 1]: |x| > 1 (or ±Inf) → 22003, NaN propagates.
+        ScalarFunc::Acos => {
+            if !x.is_nan() && (x < -1.0 || x > 1.0) {
+                return Err(EngineError::new(
+                    SqlState::NumericValueOutOfRange,
+                    "input is out of range",
+                ));
+            }
+            x.acos()
         }
         ScalarFunc::Abs
         | ScalarFunc::Round

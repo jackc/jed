@@ -561,6 +561,12 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
 		}
 		return Float64Value(math.Asin(x)), nil
+	case sfAcos:
+		// acos shares asin's domain [-1, 1]: |x| > 1 (or ±Inf) → 22003, NaN propagates.
+		if !math.IsNaN(x) && (x < -1 || x > 1) {
+			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+		}
+		return Float64Value(math.Acos(x)), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}
