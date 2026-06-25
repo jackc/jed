@@ -119,6 +119,33 @@ fn range_narrowings_are_0a000() {
     assert_eq!(err(&mut db, "INSERT INTO t SELECT id, r FROM src"), "0A000",);
 }
 
+/// Updating a range COLUMN works (ranges.md §4, oracle-clean in types/range.test) but three sub-cases
+/// stay `0A000` — PG supports them, so they are jed-stricter and cannot live in the oracle corpus: a
+/// `$N` parameter into a range column, the ON CONFLICT DO UPDATE conflict-action path, and a composite
+/// column (a separate slice). The happy-path forms (literal / cast / constructor / set-op / NULL /
+/// re-key) and the 42804 type errors live in types/range.test.
+#[test]
+fn range_update_deferrals_are_0a000() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
+    run(&mut db, "INSERT INTO t VALUES (1, '[1,5)')");
+    assert_eq!(err(&mut db, "UPDATE t SET r = $1 WHERE id = 1"), "0A000");
+    assert_eq!(
+        err(
+            &mut db,
+            "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'",
+        ),
+        "0A000",
+    );
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY, a addr)");
+    run(&mut db, "INSERT INTO p VALUES (1, ROW('x', 5))");
+    assert_eq!(
+        err(&mut db, "UPDATE p SET a = ROW('y', 9) WHERE id = 1"),
+        "0A000"
+    );
+}
+
 /// Range comparison (R3) is restricted to the SAME element type (spec/design/ranges.md §6): a range
 /// is comparable only to a range over an equal element, never to a different-element range or to a
 /// bare scalar. jed reports its uniform comparison-mismatch code `42804`; PostgreSQL reports `42883`

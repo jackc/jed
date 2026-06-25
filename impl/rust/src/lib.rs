@@ -227,6 +227,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "error.overflow_trap",
     // Step 6 — row mutation: UPDATE (in-place) + DELETE.
     "dml.update",
+    // Assigning a range/array (container) column in an UPDATE (ranges.md §4 / array.md §4).
+    "dml.update_container",
     "dml.delete",
     // The RETURNING clause on INSERT/UPDATE/DELETE — the statement becomes a query result
     // projecting each affected row (grammar.md §32, cost.md §3).

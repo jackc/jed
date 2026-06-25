@@ -266,6 +266,27 @@ func TestSingleColumnRangeExclude(t *testing.T) {
 	}
 }
 
+// TestExcludeRescheduleViaUpdate: updating a range column on an EXCLUDE-constrained table re-checks
+// the constraint over the statement's end state (the GX3 + dml.update_container integration). A
+// reschedule to a free slot succeeds; one that newly overlaps a same-room booking traps 23P01;
+// moving to a different room clears the conflict. Needs the multi-column GiST index, so it lives here
+// rather than the oracle corpus (PG needs btree_gist for the scalar `=` member).
+func TestExcludeRescheduleViaUpdate(t *testing.T) {
+	db := bookingDB(t)
+	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[30,40)')")
+	// reschedule booking 1 to a free slot → ok
+	run(t, db, "UPDATE booking SET during = '[50,60)' WHERE id = 1")
+	// reschedule booking 1 to overlap booking 2 (same room) → 23P01
+	if got := errCode(t, db, "UPDATE booking SET during = '[35,45)' WHERE id = 1"); got != "23P01" {
+		t.Errorf("conflicting reschedule: got %s, want 23P01", got)
+	}
+	// moving to a different room AND the overlapping slot is fine
+	run(t, db, "UPDATE booking SET room = 102, during = '[35,45)' WHERE id = 1")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM booking ORDER BY id")); !eqInts(got, 1, 2) {
+		t.Errorf("end state: got %v, want [1 2]", got)
+	}
+}
+
 // TestExcludeTypeErrors: the WITH operator must pair with the column's GiST opclass.
 func TestExcludeTypeErrors(t *testing.T) {
 	db := NewDatabase()

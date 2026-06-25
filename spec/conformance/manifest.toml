@@ -129,6 +129,10 @@ id = "dml.update"
 description = "UPDATE ... SET ... [WHERE] (in-place value replacement)"
 
 [[capability]]
+id = "dml.update_container"
+description = "UPDATE ... SET <range|array column> = … — assigning a CONTAINER (range or array) column in an UPDATE (spec/design/ranges.md §4, array.md §4). The RHS adapts like INSERT: a bare string literal via range_in/array_in, a bare NULL to the typed NULL, an ARRAY[…]/i32range(…)/cast/column-ref/set-op expression resolving to the SAME container type (a mismatched element or a scalar RHS is 42804). Stored through the same coerce_for_store container codec as INSERT, so the row round-trips identically; index maintenance (a GiST tree over a range column, a GIN index over an array column) and the EXCLUDE/UNIQUE/FK end-state probes all consume the new value, so an EXCLUDE-constrained range reschedules correctly (23P01 on a real conflict) and a range PRIMARY-KEY re-key moves the row (23505 on an end-state collision). Composite-column UPDATE and a top-level $N parameter into a container column stay 0A000 (per-core), as does the ON CONFLICT DO UPDATE conflict-action path for a container column. No on-disk format change. Builds on dml.update + types.range / types.array"
+
+[[capability]]
 id = "dml.delete"
 description = "DELETE FROM ... [WHERE]"
 

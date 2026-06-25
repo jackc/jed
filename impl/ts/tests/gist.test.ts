@@ -181,6 +181,22 @@ test("exclude rejects conflict, admits compatible", () => {
   assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), [["1"], ["2"], ["3"]]);
 });
 
+// Updating a range column on an EXCLUDE-constrained table re-checks the constraint over the
+// statement's end state (the GX3 + dml.update_container integration): a reschedule to a free slot
+// succeeds; one that newly overlaps a same-room booking traps 23P01; moving to a different room
+// clears the conflict. Needs the multi-column GiST index (PG needs btree_gist), so it lives here.
+test("exclude reschedule via update", () => {
+  const db = bookingDb();
+  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[30,40)')");
+  execute(db, "UPDATE booking SET during = '[50,60)' WHERE id = 1");
+  assert.equal(
+    errCode(() => execute(db, "UPDATE booking SET during = '[35,45)' WHERE id = 1")),
+    "23P01",
+  );
+  execute(db, "UPDATE booking SET room = 102, during = '[35,45)' WHERE id = 1");
+  assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), [["1"], ["2"]]);
+});
+
 // A NULL excluded column (the NULL rule) or an empty range (empty && anything is FALSE) exempts a row.
 test("exclude null and empty range are exempt", () => {
   const db = bookingDb();

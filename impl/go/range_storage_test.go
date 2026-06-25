@@ -132,6 +132,32 @@ func TestRangeNarrowingsAre0A000(t *testing.T) {
 	}
 }
 
+// TestRangeUpdateDeferrals: updating a range COLUMN works (ranges.md §4, oracle-clean in
+// types/range.test) but three sub-cases stay 0A000 — PG supports them, so they are jed-stricter and
+// cannot live in the oracle corpus: a $N parameter into a range column, the ON CONFLICT DO UPDATE
+// conflict-action path, and a composite column (a separate slice). The happy-path forms (literal /
+// cast / constructor / set-op / NULL / re-key) and the 42804 type errors live in types/range.test.
+func TestRangeUpdateDeferrals(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)")
+	run(t, db, "INSERT INTO t VALUES (1, '[1,5)')")
+	// A bound parameter into a range column is deferred (INSERT's param-to-container path is special).
+	if got := errRange(t, db, "UPDATE t SET r = $1 WHERE id = 1"); got != "0A000" {
+		t.Errorf("$N into range column: got %s, want 0A000", got)
+	}
+	// The ON CONFLICT DO UPDATE conflict-action path does not yet update a container column.
+	if got := errRange(t, db, "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'"); got != "0A000" {
+		t.Errorf("ON CONFLICT DO UPDATE range: got %s, want 0A000", got)
+	}
+	// A composite column UPDATE is a separate slice (anonymous-record → named-composite coercion).
+	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
+	run(t, db, "CREATE TABLE p (id i32 PRIMARY KEY, a addr)")
+	run(t, db, "INSERT INTO p VALUES (1, ROW('x', 5))")
+	if got := errRange(t, db, "UPDATE p SET a = ROW('y', 9) WHERE id = 1"); got != "0A000" {
+		t.Errorf("composite column UPDATE: got %s, want 0A000", got)
+	}
+}
+
 // TestRangeCrossElementComparisonIs42804: range comparison (R3) is restricted to the SAME element
 // type (spec/design/ranges.md §6): a range is comparable only to a range over an equal element, never
 // to a different-element range or to a bare scalar. jed reports its uniform comparison-mismatch code

@@ -71,6 +71,19 @@ in an excluded column — or an empty range under `&&` — never conflicts (it i
 is backed by a GiST index and enforced on every write, all-or-nothing like the others. (PostgreSQL
 needs `CREATE EXTENSION btree_gist` for the scalar `=` member; jed ships it in-core.)
 
+Rescheduling is just an `UPDATE` — assigning a range (or array) column re-checks every constraint
+over the statement's end state, so moving a booking to a free slot succeeds and one that would
+overlap a *different* same-room booking is rejected:
+
+```sql
+INSERT INTO booking VALUES (2, 101, '[30,40)');      -- a second slot in room 101
+UPDATE booking SET during = '[20,28)' WHERE id = 1;  -- ok: still no overlap
+UPDATE booking SET during = '[35,45)' WHERE id = 1;  -- error 23P01: now overlaps booking 2
+```
+
+The range literal on the right adapts to the column's type; an `i32range(20,28)` constructor, a cast,
+or a `during + '[5,8)'::i32range` expression work too.
+
 ## Auto-numbering with `serial`
 
 A `serial` column (or `bigserial` / `smallserial` for `i64` / `i16`) is shorthand for an

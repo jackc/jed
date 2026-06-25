@@ -5949,48 +5949,57 @@ export class Database {
         }
       }
       const col = table.columns[idx]!;
-      // Updating a composite-typed column lands in a later slice (the storable + INSERT/SELECT
-      // round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
+      // Updating a composite-typed column lands in a later slice (anonymous-record → named-composite
+      // assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
+      // ARE updatable (ranges.md §4 / array.md §4), via the container path below.
       if (col.type.kind === "composite") {
         throw engineError(
           "feature_not_supported",
           "updating composite column " + a.column + " is not supported yet",
         );
       }
-      if (col.type.kind === "array") {
-        throw engineError(
-          "feature_not_supported",
-          "updating array column " + a.column + " is not supported yet",
+      if (col.type.kind === "scalar") {
+        const targetScalar = col.type.scalar;
+        // The RHS is a general expression evaluated against the OLD row; a literal operand
+        // adapts to the target column's type. The result must be assignable to the column's
+        // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
+        const { node, type } = resolve(
+          scope,
+          a.value,
+          targetScalar,
+          { collecting: false, groupKeys: [], specs: [] },
+          ptypes,
         );
-      }
-      if (col.type.kind === "range") {
-        // Updating a range column is deferred this slice (the storable column round-trips via INSERT
-        // VALUES; assignment lands with the range operator surface) — reject it 0A000, like array.
-        throw engineError(
-          "feature_not_supported",
-          "updating range column " + a.column + " is not supported yet",
+        requireAssignable(type, targetScalar, a.column);
+        plans.push({
+          idx,
+          name: col.name,
+          target: targetScalar,
+          decimal: col.decimal,
+          notNull: col.notNull,
+          source: node,
+        });
+      } else {
+        // A range or array column: the RHS adapts (a bare string literal via range_in/array_in, a
+        // bare NULL to the typed NULL) or must resolve to the SAME container type. Stored through
+        // coerceForStore (carried on the plan as colType).
+        const node = resolveContainerAssign(
+          scope,
+          col,
+          a.value,
+          { collecting: false, groupKeys: [], specs: [] },
+          ptypes,
         );
+        plans.push({
+          idx,
+          name: col.name,
+          target: "i32", // unused (colType drives checkAssign)
+          decimal: col.decimal,
+          notNull: col.notNull,
+          source: node,
+          colType: scope.catalog.colTypeOf(col.type),
+        });
       }
-      const targetScalar = col.type.scalar;
-      // The RHS is a general expression evaluated against the OLD row; a literal operand
-      // adapts to the target column's type. The result must be assignable to the column's
-      // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-      const { node, type } = resolve(
-        scope,
-        a.value,
-        targetScalar,
-        { collecting: false, groupKeys: [], specs: [] },
-        ptypes,
-      );
-      requireAssignable(type, targetScalar, a.column);
-      plans.push({
-        idx,
-        name: col.name,
-        target: targetScalar,
-        decimal: col.decimal,
-        notNull: col.notNull,
-        source: node,
-      });
     }
     // A re-keying UPDATE assigns at least one key member: each matched row's storage key is
     // recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key member
@@ -20552,6 +20561,63 @@ function floatFromDecimalLiteral(d: Decimal, ty: ScalarType): { node: RExpr; typ
 // ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
 // canonicalize (spec/design/ranges.md §4/§5). Folds to a constRange. 22P02 malformed / 22000
 // lower>upper / 22003 canonicalize overflow.
+// resolveContainerAssign resolves an UPDATE assignment RHS against a RANGE or ARRAY column (the
+// caller has already rejected composite — 0A000). Mirrors INSERT's value adaptation (ranges.md §5 /
+// array.md §7): a bare string literal adapts to the container via range_in / array_in, a bare NULL
+// is the typed NULL, and any other expression must resolve to the SAME container type (matching
+// element) else 42804. A top-level $N parameter is deferred (0A000) — INSERT's param-to-container
+// handling is special and not generalized to the assignment RHS yet.
+function resolveContainerAssign(
+  scope: Scope,
+  col: Column,
+  e: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): RExpr {
+  const colRT = resolvedTypeOfCol(col.type, scope.catalog);
+  // A bare string literal adapts to the container context (the same string-adapts-to-context rule
+  // the cast and INSERT VALUES paths use).
+  if (e.kind === "literal" && e.literal.kind === "text") {
+    if (col.type.kind === "range") {
+      if (col.type.elem.kind !== "scalar")
+        throw new Error("a range element is always a scalar (ranges.md §2)");
+      const desc = rangeForElement(col.type.elem.scalar);
+      if (desc === undefined) throw new Error("a range column's element always has a range type");
+      return coerceStringToRangeExpr(e.literal.text, desc).node;
+    }
+    // array
+    const elem = (col.type as { kind: "array"; elem: Type }).elem;
+    return valueToRExpr(coerceStringToArray(e.literal.text, scope.catalog.colTypeOf(elem)));
+  }
+  if (e.kind === "literal" && e.literal.kind === "null") {
+    return { kind: "constNull" };
+  }
+  if (e.kind === "param") {
+    const kind = col.type.kind === "array" ? "array" : "range";
+    throw engineError(
+      "feature_not_supported",
+      `updating ${kind} column ${col.name} from a parameter is not supported yet`,
+    );
+  }
+  // For an array column over a SCALAR element, pass the element type as the hint so a bare
+  // ARRAY[1,2] constructor adapts its literal elements to the column's element type (the same
+  // adaptation `col = ARRAY[…]` uses — without it, bare int literals would type as i64 and miss a
+  // narrower i32[]/i16[] column). A range gets no scalar hint (its bare-literal form was handled
+  // above; other forms self-describe their element).
+  let hint: ScalarType | null = null;
+  if (col.type.kind === "array" && col.type.elem.kind === "scalar") hint = col.type.elem.scalar;
+  const { node, type } = resolve(scope, e, hint, ag, params);
+  if (type.kind === "null") return node; // a NULL-typed expression (e.g. a CASE that may be NULL)
+  // Ranges/arrays are assignable only over equal element types (resolvedTypeEqual compares the
+  // element recursively), matching the comparison rule (ranges.md §6 / array.md §5).
+  if (!resolvedTypeEqual(type, colRT)) {
+    throw typeError(
+      `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+    );
+  }
+  return node;
+}
+
 function coerceStringToRangeExpr(
   text: string,
   desc: RangeDesc,
@@ -25326,12 +25392,18 @@ type AssignPlan = {
   decimal: DecimalTypmod | null;
   notNull: boolean;
   source: RExpr;
+  // The resolved ColType for a NON-scalar (range / array) column — when set, checkAssign stores
+  // through coerceForStore (the container codec, ranges.md §4 / array.md §4); null for a scalar
+  // column, which stays on the storeValue fast path. Composite columns are deferred (0A000) at
+  // resolution, so they never reach here.
+  colType?: ColType;
 };
 
-// checkAssign type-checks + coerces a candidate value against a column — the same storeValue
-// path INSERT uses (NULL into NOT NULL → 23502; an integer out of range → 22003; a decimal
-// rounds to scale; a boolean into a boolean column is accepted as-is). The resolver proved the
-// value's family is assignable.
+// checkAssign type-checks + coerces a candidate value against a column — the same store path
+// INSERT uses (NULL into NOT NULL → 23502; an integer out of range → 22003; a decimal rounds to
+// scale; a boolean into a boolean column is accepted as-is; a range/array re-coerces its
+// elements). The resolver proved the value's family is assignable.
 function checkAssign(p: AssignPlan, v: Value): Value {
+  if (p.colType !== undefined) return coerceForStore(v, p.colType, p.decimal, p.notNull, p.name);
   return storeValue(v, p.target, p.decimal, p.notNull, p.name);
 }

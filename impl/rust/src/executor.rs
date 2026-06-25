@@ -5739,13 +5739,19 @@ impl Database {
                         ));
                     }
                     let col = &tdef.columns[idx];
+                    // Updating a non-scalar column (composite / range / array) on the ON CONFLICT DO
+                    // UPDATE path is deferred (0A000): standalone UPDATE of a range/array column has
+                    // landed, but extending the conflict-action path to non-scalar columns is a
+                    // separate follow-on (upsert.md §9).
                     let Type::Scalar(target_scalar) = &col.ty else {
+                        let noun = match &col.ty {
+                            Type::Range(_) => "range",
+                            Type::Array(_) => "array",
+                            _ => "composite",
+                        };
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
-                            format!(
-                                "updating composite column {} is not supported yet",
-                                a.column
-                            ),
+                            format!("updating {noun} column {} is not supported yet", a.column),
                         ));
                     };
                     let target_scalar = *target_scalar;
@@ -5764,6 +5770,7 @@ impl Database {
                         decimal: col.decimal,
                         not_null: col.not_null,
                         source,
+                        col_type: None,
                     });
                 }
                 let filter = match filter {
@@ -6810,38 +6817,67 @@ impl Database {
                 ));
             }
             let col = &table.columns[idx];
-            // Updating a composite-typed column lands in a later slice (the storable + INSERT/SELECT
-            // round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
-            let Type::Scalar(target_scalar) = &col.ty else {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!(
-                        "updating composite column {} is not supported yet",
-                        a.column
-                    ),
-                ));
-            };
-            let target_scalar = *target_scalar;
-            // The RHS is a general expression evaluated against the *old* row; a literal
-            // operand adapts to the target column's type. The result must be assignable to
-            // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
-            // is explicit-CAST only) — spec/design/decimal.md §6.
-            let (source, ty) = resolve(
-                &scope,
-                &a.value,
-                Some(target_scalar),
-                &mut AggCtx::Forbidden,
-                &mut ptypes,
-            )?;
-            require_assignable(&ty, target_scalar, &a.column)?;
-            plans.push(AssignPlan {
-                idx,
-                name: col.name.clone(),
-                target: target_scalar,
-                decimal: col.decimal,
-                not_null: col.not_null,
-                source,
-            });
+            match &col.ty {
+                // Updating a composite-typed column lands in a later slice (anonymous-record →
+                // named-composite assignment coercion — composite.md §12); reject it (0A000). Range
+                // and array columns ARE updatable (ranges.md §4 / array.md §4), via the container
+                // path below.
+                Type::Composite(_) => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "updating composite column {} is not supported yet",
+                            a.column
+                        ),
+                    ));
+                }
+                Type::Scalar(target_scalar) => {
+                    let target_scalar = *target_scalar;
+                    // The RHS is a general expression evaluated against the *old* row; a literal
+                    // operand adapts to the target column's type. The result must be assignable to
+                    // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
+                    // is explicit-CAST only) — spec/design/decimal.md §6.
+                    let (source, ty) = resolve(
+                        &scope,
+                        &a.value,
+                        Some(target_scalar),
+                        &mut AggCtx::Forbidden,
+                        &mut ptypes,
+                    )?;
+                    require_assignable(&ty, target_scalar, &a.column)?;
+                    plans.push(AssignPlan {
+                        idx,
+                        name: col.name.clone(),
+                        target: target_scalar,
+                        decimal: col.decimal,
+                        not_null: col.not_null,
+                        source,
+                        col_type: None,
+                    });
+                }
+                Type::Range(_) | Type::Array(_) => {
+                    // A range or array column: the RHS adapts (a bare string literal via
+                    // range_in/array_in, a bare NULL to the typed NULL) or must resolve to the SAME
+                    // container type. Stored through coerce_for_store (carried as col_type).
+                    let source = resolve_container_assign(
+                        &scope,
+                        col,
+                        &a.value,
+                        &mut AggCtx::Forbidden,
+                        &mut ptypes,
+                    )?;
+                    let ct = resolve_col_type(&col.ty, &scope.catalog.read_snap().types);
+                    plans.push(AssignPlan {
+                        idx,
+                        name: col.name.clone(),
+                        target: ScalarType::Int32, // unused (col_type drives check)
+                        decimal: col.decimal,
+                        not_null: col.not_null,
+                        source,
+                        col_type: Some(ct),
+                    });
+                }
+            }
         }
         // A re-keying UPDATE assigns at least one key member: each matched row's storage key is
         // recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key
@@ -26207,6 +26243,74 @@ fn coerce_string_to_composite(
 /// `i32range '[1,5)'`). Parses the literal, coerces each bound to the element type via the
 /// string-literal coercion, then canonicalizes (spec/design/ranges.md §4/§5). Folds to a
 /// `ConstRange`. Malformed → `22P02`; `lower>upper` → `22000`; a canonicalize overflow → `22003`.
+/// Resolve an UPDATE assignment RHS against a RANGE or ARRAY column (the caller has already
+/// rejected composite — 0A000). Mirrors INSERT's value adaptation (ranges.md §5 / array.md §7): a
+/// bare string literal adapts to the container via range_in / array_in, a bare NULL is the typed
+/// NULL, and any other expression must resolve to the SAME container type (matching element) else
+/// 42804. A top-level `$N` parameter is deferred (0A000) — INSERT's param-to-container handling is
+/// special and not generalized to the assignment RHS yet.
+fn resolve_container_assign(
+    scope: &Scope,
+    col: &Column,
+    e: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<RExpr> {
+    let col_rt = resolved_type_of_col(&col.ty, scope.catalog);
+    // A bare string literal adapts to the container context (the same string-adapts-to-context
+    // rule the cast and INSERT VALUES paths use).
+    if let Expr::Literal(Literal::Text(s)) = e {
+        match &col.ty {
+            Type::Range(elem) => {
+                let desc = crate::range::range_for_element(elem.scalar())
+                    .expect("a range column's element always has a range type");
+                let (node, _) = coerce_string_to_range_expr(s, desc)?;
+                return Ok(node);
+            }
+            Type::Array(elem) => {
+                let elem_col = resolve_col_type(elem, &scope.catalog.read_snap().types);
+                let val = coerce_string_to_array(s, &elem_col)?;
+                return Ok(value_to_rexpr(&val));
+            }
+            _ => unreachable!("resolve_container_assign is only called for range/array columns"),
+        }
+    }
+    if let Expr::Literal(Literal::Null) = e {
+        return Ok(RExpr::ConstNull);
+    }
+    if let Expr::Param(_) = e {
+        let kind = if col.ty.is_array() { "array" } else { "range" };
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!(
+                "updating {kind} column {} from a parameter is not supported yet",
+                col.name
+            ),
+        ));
+    }
+    // For an array column over a SCALAR element, pass the element type as the hint so a bare
+    // `ARRAY[1,2]` constructor adapts its literal elements to the column's element type (the same
+    // adaptation `col = ARRAY[…]` uses — without it, bare int literals would type as i64 and miss a
+    // narrower i32[]/i16[] column). A range gets no scalar hint (its bare-literal form was handled
+    // above; other forms self-describe their element).
+    let hint = col.ty.array_element().and_then(|t| t.as_scalar());
+    let (node, ty) = resolve(scope, e, hint, agg, params)?;
+    if matches!(ty, ResolvedType::Null) {
+        return Ok(node); // a NULL-typed expression (e.g. a CASE that may be NULL)
+    }
+    // Ranges/arrays compare equal only over equal element types (ResolvedType's derived Eq compares
+    // the boxed element), matching the comparison rule (ranges.md §6 / array.md §5).
+    if ty != col_rt {
+        return Err(type_error(format!(
+            "column {} is of type {} but expression is of type {}",
+            col.name,
+            col.ty.canonical_name(),
+            ty.type_name()
+        )));
+    }
+    Ok(node)
+}
+
 fn coerce_string_to_range_expr(
     text: &str,
     desc: &crate::ranges_gen::RangeDesc,
@@ -26623,17 +26727,25 @@ struct AssignPlan {
     decimal: Option<DecimalTypmod>,
     not_null: bool,
     source: RExpr,
+    /// The resolved `ColType` for a NON-scalar (range / array) column — `Some` ⇒ `check` stores
+    /// through `coerce_for_store` (the container codec, ranges.md §4 / array.md §4); `None` for a
+    /// scalar column, which stays on the `store_value` fast path. Composite columns are deferred
+    /// (0A000) at resolution, so they never reach here.
+    col_type: Option<ColType>,
 }
 
 impl AssignPlan {
-    /// Type-check + coerce a candidate value against this column — the same `store_value`
-    /// path INSERT uses (NULL into NOT NULL → 23502; an integer outside range → 22003; an
-    /// integer into a decimal column widens and coerces to the typmod; a decimal into a
-    /// decimal column rounds to its scale; a boolean into a boolean column is accepted
-    /// as-is). The resolver already proved the value's family is assignable (never
+    /// Type-check + coerce a candidate value against this column — the same store path INSERT
+    /// uses (NULL into NOT NULL → 23502; an integer outside range → 22003; an integer into a
+    /// decimal column widens and coerces to the typmod; a decimal into a decimal column rounds
+    /// to its scale; a boolean into a boolean column is accepted as-is; a range/array re-coerces
+    /// its elements). The resolver already proved the value's family is assignable (never
     /// decimal→int implicitly).
     fn check(&self, v: Value) -> Result<Value> {
-        store_value(v, self.target, self.decimal, self.not_null, &self.name)
+        match &self.col_type {
+            Some(ct) => coerce_for_store(v, ct, self.decimal, self.not_null, &self.name),
+            None => store_value(v, self.target, self.decimal, self.not_null, &self.name),
+        }
     }
 }
 

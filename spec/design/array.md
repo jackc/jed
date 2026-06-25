@@ -194,6 +194,18 @@ This is the **value** codec (a stored value never needs to sort), which is *why*
 non-order-preserving fixed-width bodies. The separate order-preserving **key** encoding (§8) is what
 needs self-delimiting + terminator framing.
 
+**Updating an array column** (`UPDATE t SET xs = …`) reuses this exact store coercion — the same
+`store_array` path INSERT uses — so the stored value round-trips identically (capability
+`dml.update_container`). The RHS adapts like INSERT's: a bare `ARRAY[…]` constructor adapts its
+literal elements to the column's element type (the resolver is given the element scalar as the hint,
+exactly as `col = ARRAY[…]` does — so a bare-int `ARRAY[1,2]` reaches a narrower `i32[]`/`i16[]`
+column), a bare `'{…}'` string literal via `array_in`, and a bare `NULL` to the typed NULL; any other
+expression must resolve to the **same** array type (a different element type, or a scalar RHS, is
+`42804`). A GIN index over the column is maintained over the new value (the same per-term entry
+move as INSERT/DELETE). A top-level `$N` parameter into an array column stays `0A000` (INSERT's
+param-to-container handling is special — a per-core divergence test), as does the
+`ON CONFLICT DO UPDATE` conflict-action path.
+
 ## 5. Comparison, ordering, and NULL — PG btree semantics, NOT composite 3VL
 
 Array comparison is **recursive / structural**, so — like composite — it is a hand-written special

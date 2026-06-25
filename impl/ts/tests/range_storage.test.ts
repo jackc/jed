@@ -100,6 +100,35 @@ test("range narrowings are 0A000", () => {
   );
 });
 
+// Updating a range COLUMN works (ranges.md §4, oracle-clean in types/range.test) but three sub-cases
+// stay 0A000 — PG supports them, so they are jed-stricter and cannot live in the oracle corpus: a $N
+// parameter into a range column, the ON CONFLICT DO UPDATE conflict-action path, and a composite
+// column (a separate slice). The happy-path forms (literal / cast / constructor / set-op / NULL /
+// re-key) and the 42804 type errors live in types/range.test.
+test("range update deferrals are 0A000", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
+    "INSERT INTO t VALUES (1, '[1,5)')",
+  ]);
+  assert.equal(
+    errCode(() => execute(db, "UPDATE t SET r = $1 WHERE id = 1")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() =>
+      execute(db, "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'"),
+    ),
+    "0A000",
+  );
+  execute(db, "CREATE TYPE addr AS (street text, zip i32)");
+  execute(db, "CREATE TABLE p (id i32 PRIMARY KEY, a addr)");
+  execute(db, "INSERT INTO p VALUES (1, ROW('x', 5))");
+  assert.equal(
+    errCode(() => execute(db, "UPDATE p SET a = ROW('y', 9) WHERE id = 1")),
+    "0A000",
+  );
+});
+
 // Range comparison (R3) is restricted to the SAME element type (spec/design/ranges.md §6): a range
 // is comparable only to a range over an equal element, never to a different-element range or to a
 // bare scalar. jed reports its uniform comparison-mismatch code `42804`; PostgreSQL reports `42883`

@@ -179,6 +179,20 @@ Worked bytes, `i32range '[1,5)'` (already canonical `[)`, both finite): presence
 (`80 00 00 01`, sign-flipped BE) and of `5` (`80 00 00 05`). Empty `i32range`: presence `00`,
 flags `0x01`.
 
+**Updating a range column** (`UPDATE t SET r = …`) reuses this exact store coercion — the same
+`store_range` path INSERT uses — so the stored value round-trips identically (capability
+`dml.update_container`). The RHS adapts like INSERT's: a bare string literal via `range_in`, a bare
+`NULL` to the typed NULL, and an `i32range(…)` constructor / `'[1,5)'::i32range` cast / range
+column-reference / `+`/`-`/`*` set-op expression that resolves to the **same** range type (a
+mismatched element subtype, or a scalar RHS, is `42804` — the §6 same-element rule applied to
+assignment). When the range column is (part of) the `PRIMARY KEY` the assignment **re-keys** the row
+via the §-above `range-bounds` key (an end-state collision is `23505`, like any re-key); when it is
+indexed by GiST (an `EXCLUDE` backing index, [gist.md §7](gist.md)) the constraint is re-checked over
+the statement's end state (a real conflict is `23P01`). Two sub-cases stay `0A000` (PG supports them —
+per-core divergence tests): a top-level `$N` parameter into a range column (INSERT's
+param-to-container handling is special and not generalized to the assignment RHS), and the
+`ON CONFLICT DO UPDATE` conflict-action path (the upsert follow-on, [upsert.md §9](upsert.md)).
+
 ## 5. Text I/O — `range_in` / `range_out`
 
 `range_out` (render) and `range_in` (parse) match PostgreSQL (oracle-pinned):

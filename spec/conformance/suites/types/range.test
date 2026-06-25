@@ -13,7 +13,7 @@
 # of i32range/i64range, used here so the SQL is oracle-clean (the canonical i32range/i64range spelling
 # is a per-core divergence test). range_out matches PostgreSQL byte-for-byte. Format:
 # ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.foreign_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.distinct, query.is_null, types.range, types.i32, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.update_container, query.select, query.where_eq, query.order_by, query.distinct, query.is_null, types.range, types.i32, types.decimal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, r int4range, br int8range)
@@ -335,3 +335,70 @@ INSERT INTO rchild VALUES (1, '[2,4)'), (2, '[1,4]')
 # an FK value with no matching parent range key is a foreign-key violation (23503)
 statement error 23503
 INSERT INTO rchild VALUES (3, '[100,200)')
+
+# ── Updating a range column (dml.update_container, ranges.md §4) ──────────────────────────────────
+statement ok
+CREATE TABLE rupd (id i32 PRIMARY KEY, during int4range)
+
+statement ok
+INSERT INTO rupd VALUES (1, '[10,20)'), (2, '[5,9)'), (3, '[100,200)')
+
+# A bare string literal adapts to the range column (range_in), like INSERT.
+statement ok
+UPDATE rupd SET during = '[30,40)' WHERE id = 1
+
+# An explicit cast and the type constructor are both valid RHS forms.
+statement ok
+UPDATE rupd SET during = '[1,5)'::int4range WHERE id = 2
+
+statement ok
+UPDATE rupd SET during = int4range(50, 60) WHERE id = 2
+
+# The RHS is a general expression over the OLD row: a range set-op (union) reads `during` and stores
+# the result. Discrete canonicalization applies to the stored value ([)).
+statement ok
+UPDATE rupd SET during = during + int4range(60, 70) WHERE id = 2
+
+# NULL clears the range (the column is nullable).
+statement ok
+UPDATE rupd SET during = NULL WHERE id = 3
+
+query IT nosort
+SELECT id, during FROM rupd ORDER BY id
+----
+1
+[30,40)
+2
+[50,70)
+3
+NULL
+
+# A scalar RHS is not assignable to a range column (42804).
+statement error 42804
+UPDATE rupd SET during = 5 WHERE id = 1
+
+# A range of a DIFFERENT element type is not assignable (int8range ⇏ int4range) — 42804.
+statement error 42804
+UPDATE rupd SET during = '[1,2)'::int8range WHERE id = 1
+
+# Re-keying a range PRIMARY KEY: the row moves to its new key; an end-state collision is 23505.
+statement ok
+CREATE TABLE rkupd (during int4range PRIMARY KEY, note text)
+
+statement ok
+INSERT INTO rkupd VALUES ('[1,5)', 'a'), ('[10,20)', 'b')
+
+statement ok
+UPDATE rkupd SET during = '[100,200)' WHERE note = 'a'
+
+query TT nosort
+SELECT during, note FROM rkupd ORDER BY during
+----
+[10,20)
+b
+[100,200)
+a
+
+# Re-keying onto an existing key collides (end-state 23505).
+statement error 23505
+UPDATE rkupd SET during = '[10,20)' WHERE note = 'a'

@@ -384,6 +384,38 @@ fn exclude_rejects_conflicting_and_admits_compatible() {
     );
 }
 
+/// Updating a range column on an EXCLUDE-constrained table re-checks the constraint over the
+/// statement's end state (the GX3 + dml.update_container integration): a reschedule to a free slot
+/// succeeds; one that newly overlaps a same-room booking traps 23P01; moving to a different room
+/// clears the conflict. Needs the multi-column GiST index (PG needs btree_gist), so it lives here.
+#[test]
+fn exclude_reschedule_via_update() {
+    let mut db = booking_db();
+    run(
+        &mut db,
+        "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[30,40)')",
+    );
+    run(
+        &mut db,
+        "UPDATE booking SET during = '[50,60)' WHERE id = 1",
+    );
+    assert_eq!(
+        err_code(
+            &mut db,
+            "UPDATE booking SET during = '[35,45)' WHERE id = 1"
+        ),
+        "23P01"
+    );
+    run(
+        &mut db,
+        "UPDATE booking SET room = 102, during = '[35,45)' WHERE id = 1",
+    );
+    assert_eq!(
+        ids(&mut db, "SELECT id FROM booking ORDER BY id"),
+        vec![1, 2]
+    );
+}
+
 #[test]
 fn exclude_null_and_empty_range_are_exempt() {
     let mut db = booking_db();

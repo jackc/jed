@@ -5742,9 +5742,19 @@ func (db *Database) resolveOnConflict(table *Table, oc *OnConflict, ptypes *para
 			}
 		}
 		col := table.Columns[idx]
-		if col.Type.IsComposite() {
+		// Updating a non-scalar column (composite / range / array) on the ON CONFLICT DO UPDATE path
+		// is deferred (0A000): standalone UPDATE of a range/array column has landed, but extending the
+		// conflict-action path to non-scalar columns is a separate follow-on (upsert.md §9).
+		if _, ok := col.Type.AsScalar(); !ok {
+			noun := "composite"
+			switch {
+			case col.Type.IsRange():
+				noun = "range"
+			case col.Type.IsArray():
+				noun = "array"
+			}
 			return nil, NewError(FeatureNotSupported,
-				"updating composite column "+a.Column+" is not supported yet")
+				"updating "+noun+" column "+a.Column+" is not supported yet")
 		}
 		colScalar := col.Type.ScalarTy()
 		src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
@@ -7404,26 +7414,41 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 			}
 		}
 		col := table.Columns[idx]
-		// Updating a composite-typed column lands in a later slice (the storable + INSERT/SELECT
-		// round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
+		// Updating a composite-typed column lands in a later slice (anonymous-record → named-composite
+		// assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
+		// ARE updatable (ranges.md §4 / array.md §4) through the container path below.
 		if col.Type.IsComposite() {
 			return Outcome{}, NewError(FeatureNotSupported,
 				"updating composite column "+a.Column+" is not supported yet")
 		}
-		// The RHS is a general expression evaluated against the *old* row; a literal operand
-		// adapts to the target column's type. The result must be assignable to the column's
-		// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-		colScalar := col.Type.ScalarTy()
-		src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
-		if err != nil {
-			return Outcome{}, err
+		if scalar, ok := col.Type.AsScalar(); ok {
+			// The RHS is a general expression evaluated against the *old* row; a literal operand
+			// adapts to the target column's type. The result must be assignable to the column's
+			// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
+			colScalar := scalar
+			src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return Outcome{}, err
+			}
+			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
+				return Outcome{}, err
+			}
+			plans = append(plans, assignPlan{
+				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, notNull: col.NotNull, source: src,
+			})
+		} else {
+			// A range or array column: the RHS adapts (a bare string literal via range_in/array_in,
+			// a bare NULL to the typed NULL) or must resolve to the SAME container type. Stored
+			// through coerceForStore (carried on the plan as colType).
+			src, err := resolveContainerAssign(s, col, a.Value, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return Outcome{}, err
+			}
+			ct := ResolveColType(col.Type, s.catalog.readSnap().types)
+			plans = append(plans, assignPlan{
+				idx: idx, name: col.Name, notNull: col.NotNull, source: src, colType: &ct,
+			})
 		}
-		if err := requireAssignable(ty, colScalar, a.Column); err != nil {
-			return Outcome{}, err
-		}
-		plans = append(plans, assignPlan{
-			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, notNull: col.NotNull, source: src,
-		})
 	}
 	// A re-keying UPDATE assigns at least one key member: each matched row's storage key is
 	// recomputed (phase 1) and the row is moved (phase 2). An UPDATE that touches no key member
@@ -23316,6 +23341,90 @@ func coerceStringToComposite(text string, ct *CompositeType, catalog *Database) 
 // ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
 // canonicalize (spec/design/ranges.md §4/§5). Folds to a reConstRange. Malformed → 22P02;
 // lower>upper → 22000; a canonicalize overflow → 22003.
+// resolveContainerAssign resolves an UPDATE assignment RHS against a RANGE or ARRAY column (the
+// caller has already rejected composite — 0A000). It mirrors INSERT's value adaptation
+// (ranges.md §5 / array.md §7): a bare string literal adapts to the container via range_in /
+// array_in, a bare NULL is the typed NULL, and any other expression must resolve to the SAME
+// container type (matching element) else 42804. A top-level $N parameter is deferred (0A000) —
+// INSERT's param-to-container handling is special and not generalized to the assignment RHS yet.
+func resolveContainerAssign(s *scope, col Column, e Expr, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+	snap := s.catalog.readSnap()
+	colRT := resolvedTypeOfCol(col.Type, snap)
+	// A bare string literal adapts to the container context (the same string-adapts-to-context rule
+	// the cast and INSERT VALUES paths use).
+	if e.Kind == ExprLiteral && e.Literal != nil && e.Literal.Kind == LiteralText {
+		if col.Type.IsRange() {
+			elem, _ := col.Type.RangeElement()
+			desc, ok := rangeForElement(elem.Scalar)
+			if !ok {
+				panic("a range column's element always has a range type")
+			}
+			node, _, err := coerceStringToRangeExpr(e.Literal.Str, desc)
+			return node, err
+		}
+		// array
+		val, err := coerceStringToArray(e.Literal.Str, ResolveColType(*col.Type.Array, snap.types))
+		if err != nil {
+			return nil, err
+		}
+		return valueToRExpr(val), nil
+	}
+	if e.Kind == ExprLiteral && e.Literal != nil && e.Literal.Kind == LiteralNull {
+		return &rExpr{kind: reConstNull}, nil
+	}
+	if e.Kind == ExprParam {
+		kind := "range"
+		if col.Type.IsArray() {
+			kind = "array"
+		}
+		return nil, NewError(FeatureNotSupported,
+			"updating "+kind+" column "+col.Name+" from a parameter is not supported yet")
+	}
+	// For an array column over a SCALAR element, pass the element type as the hint so a bare
+	// `ARRAY[1,2]` constructor adapts its literal elements to the column's element type (the same
+	// adaptation `col = ARRAY[…]` uses — without it, bare int literals would type as i64 and miss a
+	// narrower i32[]/i16[] column). A range gets no scalar hint (its bare-literal form was handled
+	// above; other forms self-describe their element).
+	var hint *ScalarType
+	if col.Type.IsArray() {
+		if es, ok := col.Type.Array.AsScalar(); ok {
+			hint = &es
+		}
+	}
+	node, ty, err := resolve(s, e, hint, ag, params)
+	if err != nil {
+		return nil, err
+	}
+	if ty.kind == rtNull {
+		return node, nil // a NULL-typed expression (e.g. a CASE that may be NULL)
+	}
+	if !containerAssignable(ty, colRT) {
+		return nil, typeError("column " + col.Name + " is of type " + col.Type.CanonicalName() +
+			" but expression is of type " + rtName(ty))
+	}
+	return node, nil
+}
+
+// containerAssignable reports whether a resolved RHS type is assignable to a range/array column
+// type. Ranges require the SAME element scalar (i32range ⇍ i64range — no implicit cross-element
+// range conversion, matching the comparison rule, ranges.md §6); arrays require structurally equal
+// element types (array.md §5). A NULL RHS is handled by the caller.
+func containerAssignable(rhs, col resolvedType) bool {
+	if rhs.kind != col.kind {
+		return false
+	}
+	switch col.kind {
+	case rtRange:
+		re, rok := resolvedRangeElementScalar(rhs.elem)
+		ce, cok := resolvedRangeElementScalar(col.elem)
+		return rok && cok && re == ce
+	case rtArray:
+		return resolvedTypeEqual(rhs, col)
+	default:
+		return false
+	}
+}
+
 func coerceStringToRangeExpr(text string, desc RangeDesc) (*rExpr, resolvedType, error) {
 	val, err := coerceStringToRange(text, desc)
 	if err != nil {
@@ -28185,13 +28294,22 @@ type assignPlan struct {
 	decimal *DecimalTypmod
 	notNull bool
 	source  *rExpr
+	// colType is the resolved ColType for a NON-scalar (range / array) column — when set, check
+	// stores through coerceForStore (the container codec, ranges.md §4 / array.md §4); nil for a
+	// scalar column, which stays on the storeValue fast path. Composite columns are deferred
+	// (0A000) at resolution, so they never reach here.
+	colType *ColType
 }
 
-// check type-checks + coerces a candidate value against this column — the same storeValue path
-// INSERT uses (NULL into NOT NULL → 23502; an integer out of range → 22003; an integer into a
-// decimal column widens to the typmod; a decimal rounds to scale; a boolean into a boolean
-// column is accepted as-is). The resolver proved the value's family is assignable.
+// check type-checks + coerces a candidate value against this column — the same store path INSERT
+// uses (NULL into NOT NULL → 23502; an integer out of range → 22003; an integer into a decimal
+// column widens to the typmod; a decimal rounds to scale; a boolean into a boolean column is
+// accepted as-is; a range/array re-coerces its elements). The resolver proved the value's family
+// is assignable.
 func (p assignPlan) check(v Value) (Value, error) {
+	if p.colType != nil {
+		return coerceForStore(v, *p.colType, p.decimal, p.notNull, p.name)
+	}
 	return storeValue(v, p.target, p.decimal, p.notNull, p.name)
 }
 
