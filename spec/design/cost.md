@@ -793,6 +793,28 @@ ON a.k = b.k` where 1 `a`-row matches 1 `b`-row and the other 2 `a`-rows match n
 emitted rows → **(1 + 3) + (1 + 2) + 6 + 3 = 16** (the INNER form of the same query is
 `… + 1 = 14`; the +2 is the two preserved-left rows).
 
+**ORDER BY satisfied by the OUTER relation's PK scan order — the join top-N.** Because the nested
+loop drives the **outer** (first) relation in primary-key order, a two-table INNER/CROSS join whose
+`ORDER BY` is a prefix of the **outer** relation's PK — and which has a `LIMIT` — needs **no sort**:
+the join output already arrives in `(outer PK, inner key)` order. The engine elides the sort and
+**STOPS the nested loop once the `LIMIT`/`OFFSET` window is filled**, so the `ON`/WHERE
+`operator_eval`s and `row_produced` drop to the combinations *actually examined* — the cost-visible
+win. Both tables are still **materialized in full** (`storage_row_read` = the sum of cardinalities,
+the rule above; the bound a WHERE pushes onto the inner still applies), so only the in-memory loop
+short-circuits. The rows are byte-identical to the eager nested-loop-then-sort. Gated by
+`query.order_by_join_scan`; engages only when:
+- exactly **two non-lateral base relations**, an **INNER or CROSS** join, and a **`LIMIT`**;
+- the `ORDER BY` is a **pure prefix of the outer PK** (forward/`ASC`, collation-matching) with **no
+  trailing key** — the outer PK is unique over the *outer table* but **not** over the join output (one
+  outer row fans out to many), so an extra key (`ORDER BY a.id, b.x`) is a real tie-break the outer
+  scan order does not satisfy, unlike the single-table "runs past the PK" case;
+- the outer carries **no non-PK bound** (a PK bound / no bound keeps it in PK order).
+
+`joins/order_by_outer_pk.test` pins the top-N (with the ON-eval drop), the OFFSET, the inner-PK-bound
+composition, the CROSS form, and the `ORDER BY a.id, b.id` contrast that keeps the full nested loop +
+sort. Narrowings (follow-ons): `DESC` (a reverse outer scan), more than two relations, an
+outer-table non-PK bound, `LEFT`/`RIGHT`/`FULL`, and `DISTINCT`.
+
 ### FROM-less `SELECT` — the virtual row charges no scan units
 
 A `SELECT` with no `FROM` clause ([grammar.md](grammar.md) §34) evaluates its select list over

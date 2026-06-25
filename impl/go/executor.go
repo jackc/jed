@@ -10606,13 +10606,30 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		planRels[0].derived == nil && relBounds[0] == nil {
 		indexOrder = db.orderSatisfiedByIndex(s.rels[0].table, planRels[0].offset, order)
 	}
+	// ORDER BY satisfied by the OUTER relation's PK scan order in a two-table INNER/CROSS join
+	// (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so the join output
+	// is already in (outer PK, inner key) order — the sort is elided, and with a LIMIT the loop
+	// short-circuits a top-N. Gated to exactly two non-lateral base relations, an INNER/CROSS join, a
+	// LIMIT, and a FORWARD outer-PK order with NO key beyond the outer PK (an extra key is a real
+	// tie-break the outer scan order does not satisfy — the outer PK is not unique over the join
+	// output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
+	joinPkOrdered := false
+	if !isAgg && !hasWindow && !sel.Distinct && len(order) > 0 && len(orderExprs) == 0 && sel.Limit != nil &&
+		len(planRels) == 2 && len(joins) == 1 && (joins[0].kind == JoinInner || joins[0].kind == JoinCross) &&
+		!planRels[0].lateral && planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil &&
+		!planRels[1].lateral && planRels[1].srf == nil && planRels[1].cte == nil && planRels[1].derived == nil &&
+		(relBounds[0] == nil || (relBounds[0].index == nil && relBounds[0].gin == nil && relBounds[0].gist == nil)) &&
+		len(order) <= len(s.rels[0].table.PKIndices()) {
+		ok, reverse := db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
+		joinPkOrdered = ok && !reverse
+	}
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		groupSets: groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, relBounds: relBounds, relMasks: relMasks,
+		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, joinPkOrdered: joinPkOrdered, relBounds: relBounds, relMasks: relMasks,
 	}, nil
 }
 
@@ -13449,6 +13466,85 @@ func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Met
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
+// execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
+// OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). A left-deep nested loop produces
+// combined rows in (outer PK, inner key) order — which IS the requested order — so the sort is
+// elided, and with a LIMIT the loop STOPS once the window is filled. Both tables are still
+// materialized in full (storage_row_read = the sum of cardinalities, the join contract); only the
+// ON/WHERE operator_evals and row_produced short-circuit. Gated (by the caller / plan.joinPkOrdered)
+// to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
+// ORDER BY.
+func (db *Database) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Meter, params []Value, outer []Row, rng *StmtRng) (selectResult, error) {
+	leftRows, err := db.materializeRel(plan, 0, params, outer, rng, env.ctes, meter)
+	if err != nil {
+		return selectResult{}, err
+	}
+	rightRows, err := db.materializeRel(plan, 1, params, outer, rng, env.ctes, meter)
+	if err != nil {
+		return selectResult{}, err
+	}
+	on := plan.joins[0].on
+
+	var offset int64
+	if plan.offset != nil {
+		offset = *plan.offset
+	}
+	out := make([][]Value, 0)
+	if plan.limit == nil || *plan.limit > 0 {
+		var passed int64
+	outerLoop:
+		for _, left := range leftRows {
+			for _, right := range rightRows {
+				combined := make(Row, 0, len(left)+len(right))
+				combined = append(combined, left...)
+				combined = append(combined, right...)
+				// INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
+				if on != nil {
+					v, err := on.eval(combined, env, meter)
+					if err != nil {
+						return selectResult{}, err
+					}
+					if !v.IsTrue() {
+						continue
+					}
+				}
+				// The residual WHERE over the combined row (per surviving pair).
+				if plan.filter != nil {
+					v, err := plan.filter.eval(combined, env, meter)
+					if err != nil {
+						return selectResult{}, err
+					}
+					if !v.IsTrue() {
+						continue
+					}
+				}
+				passed++
+				if passed <= offset {
+					continue
+				}
+				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+					return selectResult{}, err
+				}
+				meter.Charge(Costs.RowProduced)
+				projected := make([]Value, len(plan.projections))
+				for j, p := range plan.projections {
+					v, err := p.eval(combined, env, meter)
+					if err != nil {
+						return selectResult{}, err
+					}
+					projected[j] = v
+				}
+				out = append(out, projected)
+				// Stop the whole nested loop once the LIMIT window is filled.
+				if plan.limit != nil && int64(len(out)) >= *plan.limit {
+					break outerLoop
+				}
+			}
+		}
+	}
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+}
+
 // newSorterFor builds a sorter for order, bounded by this handle's workMem. Spilling is enabled only
 // for a file-backed database (an in-memory one has nowhere to spill — spill.md §2); spill runs live
 // next to the database file (same filesystem, guaranteed writable).
@@ -13686,6 +13782,14 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		// A derived table takes the eager path (grammar.md §42).
 		plan.rels[0].derived == nil {
 		return db.execStreamingSort(plan, env, meter, params)
+	}
+
+	// Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
+	// INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
+	// nested loop drives the outer in PK order so the output is already ordered — the sort is elided
+	// and the loop short-circuits a top-N.
+	if plan.joinPkOrdered {
+		return db.execStreamingJoin(plan, env, meter, params, outer, env.rng)
 	}
 
 	// Materialize each relation once, in primary-key order (base tables drain a scanSource — the
@@ -16382,6 +16486,11 @@ type selectPlan struct {
 	// (cost.md §3 "secondary-index order"). Mutually exclusive with pkOrdered (the PK scan is
 	// cheaper). nil keeps the eager/streaming sort.
 	indexOrder *indexOrderPlan
+	// joinPkOrdered reports that ORDER BY is satisfied by the OUTER relation's PK scan order in a
+	// two-table INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer in PK order, so
+	// its output is already in order — the sort is elided and a LIMIT short-circuits the loop. Set only
+	// for exactly two non-lateral base relations, a LIMIT, and a forward outer-PK ORDER BY.
+	joinPkOrdered bool
 	// relBounds is the scan-bound pushdown, ONE entry per relation in rels: the WHERE
 	// conjuncts that bound that relation's storage key, so its scan seeks/ranges instead of walking
 	// the whole B-tree (spec/design/cost.md §3 "bounded scan"). nil ⇒ a full scan of that relation.

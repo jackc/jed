@@ -162,9 +162,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         dedups **streaming** in scan order (the sort elided), so with a `LIMIT` it short-circuits a
         top-N (projection + `storage_row_read` drop to the scanned rows). Composes with the reverse
         (`DESC`) scan. A no-`ORDER-BY` `DISTINCT` keeps the eager project-all-then-dedup path.
-  - [ ] _follow-on (each its own slice + NoREC obligation):_ multi-table joins. _(Further index-order
-        sub-follow-ons: combine with a `WHERE` pushdown bound; `DESC` reverse index walk over a unique
-        index; a strict-prefix-of-a-multi-column-index `ORDER BY`; index-order under `DISTINCT`.)_
+  - [x] _follow-on:_ **multi-table joins** — a two-table INNER/CROSS join whose `ORDER BY` is a prefix
+        of the OUTER relation's PK (and which has a `LIMIT`) is served by the nested loop in
+        `(outer PK, inner key)` order: the sort is elided and the loop short-circuits a top-N, so the
+        `ON`/WHERE evals + `row_produced` drop to the combinations examined (both tables still
+        materialized in full). Capability `query.order_by_join_scan`. _(Sub-follow-ons: `DESC` reverse
+        outer scan; >2 relations; outer-table non-PK bound; `LEFT`/`RIGHT`/`FULL`; `DISTINCT`; and the
+        index-order sub-follow-ons — `WHERE` pushdown bound, `DESC` reverse unique-index walk,
+        strict-prefix-of-a-multi-column-index `ORDER BY`, index-order under `DISTINCT`.)_
 - [x] **`DISTINCT`** — NULL-safe dedup of projected rows, after ORDER BY before LIMIT; PG
       restriction on ORDER BY keys (`42P10`). → [grammar.md §11](spec/design/grammar.md)
 - [x] **FROM-less `SELECT`** — `SELECT 1` over one virtual zero-column row.

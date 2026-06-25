@@ -1,0 +1,102 @@
+# ORDER BY satisfied by the OUTER relation's primary-key scan order in a two-table join
+# (spec/design/cost.md §3 "JOIN"). A left-deep nested loop drives the OUTER (first) relation in
+# primary-key order, so a two-table INNER/CROSS join whose ORDER BY is a prefix of the outer
+# relation's PK — and which has a LIMIT — needs no sort: the join output already arrives in
+# `(outer PK, inner key)` order. The engine elides the sort and STOPS the nested loop once the
+# LIMIT/OFFSET window is filled, so the ON/WHERE operator_evals and row_produced drop to the
+# combinations actually examined. Both tables are still materialized in full (storage_row_read = the
+# sum of cardinalities, the join contract); only the in-memory loop short-circuits.
+#
+# Every ORDER BY here is the outer `a.id` over a 1:1 join, so it is a TOTAL order (oracle-clean); the
+# outer-PK tie-break beyond SQL (a strict prefix with inner-key ties) is left to the NoREC sweep. All
+# units weigh 1, so for every record:
+#   cost = page_read (1 per materialized table) + storage_row_read (every row of both tables) +
+#          ON operator_evals (per examined pair, until short-circuit) + WHERE operator_evals +
+#          row_produced + projection operator_evals.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.cross_join, query.order_by, query.order_by_keys, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.limit, query.offset, query.order_by_join_scan, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
+
+# 1:1 on the join key `k`, so `ORDER BY a.id` is a TOTAL order over the joined rows.
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+statement ok
+INSERT INTO b VALUES (101, 10), (102, 20), (103, 30), (104, 40), (105, 50)
+
+# ORDER BY the OUTER PK `a.id` with a LIMIT: the nested loop drives `a` in id order, so the output is
+# already `ORDER BY a.id`; LIMIT 2 STOPS the loop once 2 rows are produced. a.id=1 scans all 5 b rows
+# (only b=101 matches → 1 produced), a.id=2 scans b until its match (b=102, the 2nd) and stops. So 5+2
+# = 7 ON evals, not the full 25. 2 page + 10 scanned + 7 ON + 2 produced = 21.
+# cost: 21
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id LIMIT 2
+----
+1
+101
+2
+102
+
+# CONTRAST — `ORDER BY a.id, b.id` references the INNER PK too, so it is NOT satisfied by the outer
+# scan order alone (the inner key is the tie-break, not part of `a`'s PK): the eager path runs the
+# FULL 5x5 nested loop, sorts, then windows. Same rows. 2 page + 10 scanned + 25 ON + 2 produced = 39
+# — the proof the outer-PK short-circuit is what drops the ON evals from 25 to 7.
+# cost: 39
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id LIMIT 2
+----
+1
+101
+2
+102
+
+# OFFSET composes: skip the first joined row (a.id=1), take the next two. The loop produces a.id=1
+# [skipped], a.id=2, a.id=3 [window full, stop]. a.id=1 scans all 5 b, a.id=2 scans all 5 b (its match
+# does not fill the window so the inner loop runs on), a.id=3 scans b until its match (b=103, the 3rd).
+# 5+5+3 = 13 ON evals. 2 page + 10 scanned + 13 ON + 2 produced = 27.
+# cost: 27
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id LIMIT 2 OFFSET 1
+----
+2
+102
+3
+103
+
+# A WHERE on the INNER PK composes with both optimizations: `b.id >= 103` is a join-pushdown PK range
+# bound (query.join_pushdown), so `b` materializes only rows 103,104,105 (3, not 5) — and the outer
+# scan order still elides the sort and short-circuits. The loop produces a.id=3 (b=103), a.id=4 (b=104)
+# and stops. Over the bounded `b`: a.id=1,2 scan all 3 b (no match), a.id=3 scans all 3 (match b=103,
+# produced, window not full), a.id=4 scans b=103,104 (match b=104 → window full, stop). 3+3+3+2 = 11
+# ON evals; the 2 matches each pass the residual WHERE (2 WHERE). 2 page + 8 scanned (5 a + 3 bounded b)
+# + 11 ON + 2 WHERE + 2 produced = 25.
+# cost: 25
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE b.id >= 103 ORDER BY a.id LIMIT 2
+----
+3
+103
+4
+104
+
+# CROSS JOIN to a single-row inner: every a row pairs with the one b row, so `ORDER BY a.id` is a
+# TOTAL order and the loop short-circuits with NO ON evals (a CROSS has no ON). LIMIT 2 → a.id 1,2.
+# 2 page + 6 scanned (5 a + 1 b) + 0 ON + 2 produced = 10.
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (7)
+
+# cost: 10
+query II nosort
+SELECT a.id, one.id FROM a CROSS JOIN one ORDER BY a.id LIMIT 2
+----
+1
+7
+2
+7

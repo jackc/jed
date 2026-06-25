@@ -35,6 +35,10 @@
 #   distinct_order — `SELECT DISTINCT a ... ORDER BY a` over a composite PK (a, b) dedups STREAMING in
 #              PK scan order (the sort elided, cost.md §3 "DISTINCT"); with a LIMIT it short-circuits a
 #              top-N. The distinct-`a` windows must reconstruct the by-construction sorted distinct set.
+#   join_order — a two-table INNER join `... ORDER BY a.id LIMIT k` whose ORDER BY is the OUTER PK is
+#              served by the nested loop in (outer PK, inner key) order (the sort elided, cost.md §3
+#              "JOIN"); with a LIMIT it short-circuits the loop. The windows + the no-LIMIT eager full
+#              must reconstruct the SAME by-construction (a.id, b.id)-ordered join.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -126,6 +130,10 @@ DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_k
                         dml.insert_multi_row query.select query.distinct query.order_by
                         query.order_by_keys query.limit query.offset query.order_by_pk_scan
                         types.i32].freeze
+JOIN_ORDER_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                    query.join_inner query.qualified_column query.table_alias query.where_eq
+                    query.comparison_order query.order_by query.order_by_keys query.limit
+                    query.offset query.order_by_join_scan types.i32].freeze
 TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.subquery_scalar
@@ -430,6 +438,50 @@ def gen_index(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim}")
   ipair.call("v = #{present} after DELETE removed id #{victim}", present,
              flat.call(with_v.call(present)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: two-table join ORDER BY the OUTER PK (nested-loop top-N reconstructs the order) ----
+def gen_join_order(seed)
+  rng = Random.new(seed)
+  aids = (1..40).to_a.sample(6, random: rng).sort
+  bids = (101..160).to_a.sample(8, random: rng).sort
+  ks = (1..4).to_a
+  arows = aids.map { |id| [id, ks.sample(random: rng)] }
+  brows = bids.map { |id| [id, ks.sample(random: rng)] }
+  # The deterministic join order: outer `a` in id (PK) order, inner `b` in id (PK) order, matching on
+  # k — exactly what the nested loop yields and what `ORDER BY a.id` ties break to (a.id, b.id).
+  joined = arows.flat_map { |aid, ak| brows.select { |_bid, bk| bk == ak }.map { |bid, _| [aid, bid] } }
+  flat = ->(rs) { rs.flat_map { |aid, bid| [aid.to_s, bid.to_s] } }
+  n = joined.size
+  # Guard a degenerate (tiny) join: if too few matches, force a shared k so there is something to slice.
+  if n < 3
+    arows = arows.map { |id, _| [id, 1] }
+    brows = brows.map { |id, _| [id, 1] }
+    joined = arows.flat_map { |aid, _| brows.map { |bid, _| [aid, bid] } }
+    n = joined.size
+  end
+  k = rng.rand(1..[n - 1, 1].max)
+
+  out = header(seed, JOIN_ORDER_REQ, "two-table join ORDER BY the OUTER PK (nested-loop top-N)")
+  stmt(out, "CREATE TABLE a (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "INSERT INTO a VALUES #{arows.map { |id, kk| "(#{id}, #{kk})" }.join(', ')}")
+  stmt(out, "INSERT INTO b VALUES #{brows.map { |id, kk| "(#{id}, #{kk})" }.join(', ')}")
+
+  # `ORDER BY a.id` is the OUTER PK, so the LIMITed forms walk the nested loop in (a.id, b.id) order
+  # and short-circuit a top-N; the no-LIMIT form is the eager-sort reference. Every window must match
+  # its by-construction slice of the deterministic join.
+  windows = [
+    ["LIMIT #{k}", joined[0, k]],
+    ["LIMIT #{k} OFFSET 1", joined[1, k] || []],
+    ["", joined],
+  ]
+  windows.each do |clause, exp|
+    out << "# a JOIN b ON a.k = b.k ORDER BY a.id #{clause.empty? ? '(full eager reference)' : clause}"
+    q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id #{clause}".strip, flat.call(exp))
+  end
 
   out.join("\n") + "\n"
 end
@@ -1203,6 +1255,7 @@ SCENARIOS = {
   "index" => method(:gen_index),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
+  "join_order" => method(:gen_join_order),
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),

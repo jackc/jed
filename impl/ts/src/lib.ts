@@ -264,6 +264,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.limit_short_circuit",
   "query.order_by_pk_scan",
   "query.order_by_index_scan",
+  "query.order_by_join_scan",
   "query.correlated_pushdown",
   "query.join_pushdown",
   // GIN-bounded scan — `col @> const` / `col && const` over a GIN-indexed array column narrows

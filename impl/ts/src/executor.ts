@@ -7901,6 +7901,36 @@ export class Database {
       relBounds[0] === null
         ? orderSatisfiedByIndex(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order)
         : null;
+    // ORDER BY satisfied by the OUTER relation's PK scan order in a two-table INNER/CROSS join
+    // (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so the join output
+    // is already in (outer PK, inner key) order — the sort is elided, and with a LIMIT the loop
+    // short-circuits a top-N. Gated to exactly two non-lateral base relations, an INNER/CROSS join, a
+    // LIMIT, and a FORWARD outer-PK order with NO key beyond the outer PK (an extra key is a real
+    // tie-break the outer scan order does not satisfy — the outer PK is not unique over the join
+    // output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
+    let joinPkOrdered = false;
+    if (
+      !isAgg &&
+      !hasWindow &&
+      !sel.distinct &&
+      order.length > 0 &&
+      orderExprs.length === 0 &&
+      sel.limit !== null &&
+      planRels.length === 2 &&
+      joins.length === 1 &&
+      (joins[0]!.kind === "inner" || joins[0]!.kind === "cross") &&
+      planRels.every(
+        (r) =>
+          r.lateral !== true && r.srf === undefined && r.cte === undefined && r.derived === undefined,
+      ) &&
+      relBounds[0]?.kind !== "index" &&
+      relBounds[0]?.kind !== "gin" &&
+      relBounds[0]?.kind !== "gist" &&
+      order.length <= pkIndices(scope.rels[0]!.table).length
+    ) {
+      const dir = orderSatisfiedByPK(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order);
+      joinPkOrdered = dir !== null && !dir.reverse;
+    }
     return {
       kind: "select",
       rels: planRels,
@@ -7926,6 +7956,7 @@ export class Database {
       pkOrdered: pkDir !== null,
       pkReverse: pkDir !== null && pkDir.reverse,
       indexOrder,
+      joinPkOrdered,
       relBounds,
       relMasks,
     };
@@ -8924,6 +8955,55 @@ export class Database {
     }
   }
 
+  // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
+  // OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). A left-deep nested loop produces
+  // combined rows in (outer PK, inner key) order — which IS the requested order — so the sort is
+  // elided, and with a LIMIT the loop STOPS once the window is filled. Both tables are still
+  // materialized in full (storageRowRead = the sum of cardinalities, the join contract); only the
+  // ON/WHERE operator_evals and rowProduced short-circuit. Gated (by the caller / plan.joinPkOrdered)
+  // to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
+  // ORDER BY.
+  private execStreamingJoin(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    outer: Row[],
+  ): SelectResult {
+    const leftRows = this.materializeRel(plan, 0, outer, env, params, meter);
+    const rightRows = this.materializeRel(plan, 1, outer, env, params, meter);
+    const on = plan.joins[0]!.on;
+
+    const limit = plan.limit;
+    const offset = plan.offset ?? 0n;
+    const out: Value[][] = [];
+    if (limit !== 0n) {
+      let passed = 0n;
+      outer: for (const left of leftRows) {
+        for (const right of rightRows) {
+          const combined = [...left, ...right];
+          // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
+          if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) continue;
+          // The residual WHERE over the combined row (per surviving pair).
+          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, combined, env, meter))) continue;
+          passed += 1n;
+          if (passed <= offset) continue;
+          meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+          meter.charge(COSTS.rowProduced);
+          out.push(plan.projections.map((p) => evalExpr(p, combined, env, meter)));
+          // Stop the whole nested loop once the LIMIT window is filled.
+          if (limit !== null && BigInt(out.length) >= limit) break outer;
+        }
+      }
+    }
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows: out,
+      cost: meter.accrued,
+    };
+  }
+
   // newSorterFor builds a Sorter for order, bounded by this handle's workMem. Spilling is enabled only
   // when a spillSink is present — a durable host that can spill to disk sets one (file.ts →
   // FileSpillSink, writing runs next to the database file); an in-memory or OPFS database leaves it
@@ -9166,6 +9246,14 @@ export class Database {
       plan.rels[0]!.derived === undefined
     ) {
       return this.execStreamingSort(plan, env, meter, params);
+    }
+
+    // Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
+    // INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
+    // nested loop drives the outer in PK order so the output is already ordered — the sort is elided
+    // and the loop short-circuits a top-N.
+    if (plan.joinPkOrdered) {
+      return this.execStreamingJoin(plan, env, meter, params, outer);
     }
 
     // Materialize each relation once, in primary-key order (base tables drain a scanSource — the
@@ -13105,6 +13193,11 @@ type SelectPlan = {
   // (cost.md §3 "secondary-index order"). Mutually exclusive with pkOrdered (the PK scan is
   // cheaper). null keeps the eager/streaming sort.
   indexOrder: IndexOrder | null;
+  // joinPkOrdered reports that ORDER BY is satisfied by the OUTER relation's PK scan order in a
+  // two-table INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer in PK order, so
+  // its output is already in order — the sort is elided and a LIMIT short-circuits the loop. Set only
+  // for exactly two non-lateral base relations, a LIMIT, and a forward outer-PK ORDER BY.
+  joinPkOrdered: boolean;
   // Primary-key predicate pushdown, ONE entry per relation in rels: the WHERE conjuncts that bound
   // that relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
   // (cost.md §3 "bounded scan"). null ⇒ a full scan of that relation. In a JOIN each base table is

@@ -9443,6 +9443,37 @@ impl Database {
             None
         };
 
+        // ORDER BY satisfied by the OUTER relation's PK scan order in a two-table INNER/CROSS join
+        // (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so the join
+        // output is already in `(outer PK, inner key)` order — the sort is elided, and with a LIMIT
+        // the loop short-circuits a top-N. Gated to exactly two non-lateral base relations, an
+        // INNER/CROSS join, a LIMIT, and a FORWARD outer-PK order (the eager stable sort ties in input
+        // order, which a reverse outer scan would invert — reverse join is a follow-on). The outer
+        // must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
+        let join_pk_ordered = !is_agg
+            && !has_window
+            && !sel.distinct
+            && !order.is_empty()
+            && order_exprs.is_empty()
+            && sel.limit.is_some()
+            && rels.len() == 2
+            && joins.len() == 1
+            && matches!(joins[0].kind, JoinKind::Inner | JoinKind::Cross)
+            && rels.iter().all(|r| {
+                !r.lateral && r.srf.is_none() && r.cte.is_none() && r.derived.is_none()
+            })
+            && !matches!(
+                rel_bounds[0],
+                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+            )
+            // No ORDER BY key beyond the outer PK: the outer PK is unique over the OUTER table but
+            // NOT over the join output (one outer row fans out to many), so an extra key (`ORDER BY
+            // a.id, b.x`) is a real tie-break the outer scan order does not satisfy — unlike the
+            // single-table case where a past-the-PK key is genuinely redundant. So require the order
+            // to be a pure prefix of the outer PK (no trailing keys).
+            && order.len() <= scope.rels[0].table.pk_indices().len()
+            && order_satisfied_by_pk(scope.rels[0].table, rels[0].offset, &order, self) == Some(false);
+
         Ok(SelectPlan {
             rels,
             joins,
@@ -9467,6 +9498,7 @@ impl Database {
             pk_ordered,
             pk_reverse,
             index_order,
+            join_pk_ordered,
             rel_bounds,
             rel_masks,
         })
@@ -10707,6 +10739,84 @@ impl Database {
         })
     }
 
+    /// Streaming two-table INNER/CROSS join whose `ORDER BY` is satisfied by the OUTER (first)
+    /// relation's primary-key scan order (cost.md §3 "secondary-index order" companion — the join
+    /// top-N). A left-deep nested loop produces combined rows in `(outer PK, inner key)` order — which
+    /// IS the requested order, since the outer drives the loop in PK order — so the blocking sort is
+    /// elided, and with a `LIMIT` the loop STOPS once the window is filled. Both tables are still
+    /// materialized in full (`storage_row_read` = the sum of cardinalities, the join contract), but the
+    /// `ON`/`WHERE` `operator_eval`s and `row_produced` drop to the combinations actually examined —
+    /// the cost-visible win. Gated (by the caller / `plan.join_pk_ordered`) to exactly two non-lateral
+    /// base relations, an INNER or CROSS join, a `LIMIT`, and an `ORDER BY` the outer PK satisfies.
+    fn exec_streaming_join(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        params: &[Value],
+        outer: &[&[Value]],
+        stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
+    ) -> Result<SelectResult> {
+        // Materialize both relations once, in primary-key order (the page_read block + per-row
+        // storage_row_read accrue inside materialize_rel, cost.md §3) — the same full materialization
+        // the eager join does; only the nested-loop work short-circuits.
+        let left_rows = self.materialize_rel(plan, 0, params, outer, stmt_rng, env.ctes, meter)?;
+        let right_rows = self.materialize_rel(plan, 1, params, outer, stmt_rng, env.ctes, meter)?;
+        let on = &plan.joins[0].on;
+
+        let limit = plan.limit;
+        let offset = plan.offset.unwrap_or(0);
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        if limit != Some(0) {
+            let mut passed: i64 = 0;
+            'outer: for left in &left_rows {
+                for right in &right_rows {
+                    let mut combined = left.clone();
+                    combined.extend_from_slice(right);
+                    // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
+                    let keep = match on {
+                        Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
+                        None => true,
+                    };
+                    if !keep {
+                        continue;
+                    }
+                    // The residual WHERE over the combined row (per surviving pair).
+                    let pass = match &plan.filter {
+                        Some(f) => f.eval(&combined, env, meter)?.is_true(),
+                        None => true,
+                    };
+                    if !pass {
+                        continue;
+                    }
+                    passed += 1;
+                    if passed <= offset {
+                        continue;
+                    }
+                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                    meter.charge(COSTS.row_produced);
+                    let mut projected = Vec::with_capacity(plan.projections.len());
+                    for p in &plan.projections {
+                        projected.push(p.eval(&combined, env, meter)?);
+                    }
+                    out.push(projected);
+                    // Stop the whole nested loop once the LIMIT window is filled.
+                    if let Some(l) = limit
+                        && out.len() as i64 >= l
+                    {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        Ok(SelectResult {
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
+            rows: out,
+            cost: meter.accrued,
+        })
+    }
+
     /// Build an [`Sorter`](crate::spill::Sorter) for `order`, bounded by this handle's `work_mem`.
     /// Spilling is enabled only for a **file-backed** database (an in-memory one has nowhere to
     /// spill — spill.md §2); spill runs live next to the database file (same filesystem, guaranteed
@@ -10964,6 +11074,14 @@ impl Database {
             && plan.rels[0].derived.is_none()
         {
             return self.exec_streaming_sort(plan, &env, &mut meter, params);
+        }
+
+        // Streaming two-table join (cost.md §3 "JOIN"): the planner set `join_pk_ordered` only for a
+        // two-table INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with
+        // a LIMIT. The nested loop drives the outer in PK order so the output is already ordered — the
+        // sort is elided and the loop short-circuits a top-N.
+        if plan.join_pk_ordered {
+            return self.exec_streaming_join(plan, &env, &mut meter, params, outer, &stmt_rng);
         }
 
         // Materialize each relation once, in primary-key order (base tables drain a ScanSource — the
@@ -15011,6 +15129,11 @@ struct SelectPlan {
     /// (cost.md §3 "secondary-index order"). Mutually exclusive with `pk_ordered` (the PK scan is
     /// cheaper). `None` keeps the eager/streaming sort.
     index_order: Option<IndexOrder>,
+    /// `ORDER BY` is satisfied by the OUTER relation's primary-key scan order in a two-table
+    /// INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer in PK order, so its
+    /// output is already in order — the sort is elided and a `LIMIT` short-circuits the loop. Set only
+    /// for exactly two non-lateral base relations, a `LIMIT`, and a forward outer-PK `ORDER BY`.
+    join_pk_ordered: bool,
     /// Scan-bound pushdown, **one entry per relation** in `rels`: the WHERE conjuncts that
     /// bound that relation's scan — a primary-key range, or (when no PK bound applies) a
     /// secondary-index equality (cost.md §3 "bounded scan" / "index-bounded scan"). `None` ⇒
