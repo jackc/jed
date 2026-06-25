@@ -19350,7 +19350,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfLn
 	case "log10":
 		return sfLog10
-	case "pow":
+	case "pow", "power":
+		// `power` is PG's name for `pow` (the documented name gap) — same kernel.
 		return sfPow
 	case "sin":
 		return sfSin

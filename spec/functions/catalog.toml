@@ -1981,6 +1981,22 @@ result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
+# power(x, y) — PostgreSQL's name for jed's pow (the documented PG-name gap, float.md §8). The
+# FLOAT overload only: power(double precision, double precision) → double precision, reusing the
+# SAME pow kernel (each core maps the name to its Pow id), so it inherits pow's overflow trap
+# (a finite^finite result out of f64 range → 22003, exactly PG) and its transcendental exemption.
+# The EXACT-numeric power(numeric, numeric) is a deferred follow-on (needs a PG-faithful
+# arbitrary-precision exp/ln port — see the §8 deferral note above).
+[[operator]]
+name           = "power"
+kind           = "function"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "f64"
+null           = "propagates"
+errors         = ["22003"]
+
 [[operator]]
 name           = "sin"
 kind           = "function"

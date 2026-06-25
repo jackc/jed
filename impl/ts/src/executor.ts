@@ -15890,7 +15890,10 @@ function resolveScalarFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  const name = e.name.toLowerCase() as ScalarFuncName;
+  let name = e.name.toLowerCase() as ScalarFuncName;
+  // `power(x, y)` is PG's name for jed's pow (the documented name gap, float.md §8) — alias it to
+  // the pow kernel here so the overload lookup, the (float, float) promote, and eval all reuse pow.
+  if ((name as string) === "power") name = "pow";
   const rargs: RExpr[] = [];
   const tys: ResolvedType[] = [];
   for (const a of e.args) {

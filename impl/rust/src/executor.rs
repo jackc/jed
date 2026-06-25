@@ -18961,7 +18961,8 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "exp" => ScalarFunc::Exp,
         "ln" => ScalarFunc::Ln,
         "log10" => ScalarFunc::Log10,
-        "pow" => ScalarFunc::Pow,
+        // `power` is PG's name for `pow` (the documented name gap) — same kernel.
+        "pow" | "power" => ScalarFunc::Pow,
         "sin" => ScalarFunc::Sin,
         "cos" => ScalarFunc::Cos,
         "tan" => ScalarFunc::Tan,
