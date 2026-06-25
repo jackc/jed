@@ -576,6 +576,27 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 	case sfCot:
 		// cot(x) = 1/tan(x) (no math.Cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
 		return Float64Value(1.0 / math.Tan(x)), nil
+	case sfSinh:
+		// sinh/cosh overflow to ±Inf with NO trap (PG-faithful, unlike exp/pow). NaN propagates.
+		return Float64Value(math.Sinh(x)), nil
+	case sfCosh:
+		return Float64Value(math.Cosh(x)), nil
+	case sfTanh:
+		return Float64Value(math.Tanh(x)), nil
+	case sfAsinh:
+		return Float64Value(math.Asinh(x)), nil
+	case sfAcosh:
+		// acosh domain [1, ∞): a finite x < 1 → 22003 (a NaN propagates, acosh(+Inf) = +Inf).
+		if !math.IsNaN(x) && x < 1 {
+			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+		}
+		return Float64Value(math.Acosh(x)), nil
+	case sfAtanh:
+		// atanh domain [-1, 1]: a finite |x| > 1 (and ±Inf) → 22003; atanh(±1) = ±Inf is admissible.
+		if !math.IsNaN(x) && (x < -1 || x > 1) {
+			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+		}
+		return Float64Value(math.Atanh(x)), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}

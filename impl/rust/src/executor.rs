@@ -12929,6 +12929,15 @@ enum ScalarFunc {
     /// cot(x) → f64 — the cotangent, 1/tan(x) (float.md §8). Transcendental, exempted; cot(0) =
     /// +Infinity (no trap).
     Cot,
+    /// Hyperbolic functions (float.md §8). Transcendental, exempted. sinh/cosh/tanh/asinh have no
+    /// domain trap (sinh/cosh overflow to ±Inf, PG-faithful); acosh traps below 1, atanh outside
+    /// [-1, 1] (but atanh(±1) = ±Inf is admissible).
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18965,6 +18974,12 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "atan" => ScalarFunc::Atan,
         "atan2" => ScalarFunc::Atan2,
         "cot" => ScalarFunc::Cot,
+        "sinh" => ScalarFunc::Sinh,
+        "cosh" => ScalarFunc::Cosh,
+        "tanh" => ScalarFunc::Tanh,
+        "asinh" => ScalarFunc::Asinh,
+        "acosh" => ScalarFunc::Acosh,
+        "atanh" => ScalarFunc::Atanh,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29583,7 +29598,13 @@ impl RExpr {
                     | ScalarFunc::Acos
                     | ScalarFunc::Atan
                     | ScalarFunc::Atan2
-                    | ScalarFunc::Cot => {
+                    | ScalarFunc::Cot
+                    | ScalarFunc::Sinh
+                    | ScalarFunc::Cosh
+                    | ScalarFunc::Tanh
+                    | ScalarFunc::Asinh
+                    | ScalarFunc::Acosh
+                    | ScalarFunc::Atanh => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30605,6 +30626,31 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         }
         // cot(x) = 1/tan(x) (no libm cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
         ScalarFunc::Cot => 1.0 / x.tan(),
+        // Hyperbolics: sinh/cosh overflow to ±Inf with NO trap (PG-faithful, unlike exp/pow);
+        // tanh/asinh are total. acosh traps below 1; atanh traps outside [-1, 1] (atanh(±1) =
+        // ±Inf is admissible). A NaN operand propagates through every one.
+        ScalarFunc::Sinh => x.sinh(),
+        ScalarFunc::Cosh => x.cosh(),
+        ScalarFunc::Tanh => x.tanh(),
+        ScalarFunc::Asinh => x.asinh(),
+        ScalarFunc::Acosh => {
+            if !x.is_nan() && x < 1.0 {
+                return Err(EngineError::new(
+                    SqlState::NumericValueOutOfRange,
+                    "input is out of range",
+                ));
+            }
+            x.acosh()
+        }
+        ScalarFunc::Atanh => {
+            if !x.is_nan() && (x < -1.0 || x > 1.0) {
+                return Err(EngineError::new(
+                    SqlState::NumericValueOutOfRange,
+                    "input is out of range",
+                ));
+            }
+            x.atanh()
+        }
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi

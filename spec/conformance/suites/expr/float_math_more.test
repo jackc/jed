@@ -261,3 +261,55 @@ query R nosort
 SELECT cot(x) FROM m WHERE id = 9
 ----
 NULL
+
+# --- hyperbolics: sinh/cosh/tanh and inverses asinh/acosh/atanh -----------------------
+query R nosort
+SELECT sinh(x) FROM m WHERE id = 5
+----
+1.1752011936438014
+
+query R nosort
+SELECT cosh(x) FROM m WHERE id = 5
+----
+1.5430806348152437
+
+query R nosort
+SELECT tanh(x) FROM m WHERE id = 5
+----
+0.7615941559557649
+
+query R nosort
+SELECT asinh(x) FROM m WHERE id = 5
+----
+0.881373587019543
+
+# acosh domain [1, ∞): acosh(2) defined, acosh(1) = 0
+query R nosort
+SELECT acosh(x) FROM m WHERE id = 3
+----
+1.3169578969248166
+
+query R nosort
+SELECT acosh(x) FROM m WHERE id = 5
+----
+0
+
+# acosh(x < 1) is out of range → 22003
+statement error 22003
+SELECT acosh(x) FROM m WHERE id = 6
+
+# atanh domain (-1, 1)
+query R nosort
+SELECT atanh(x) FROM m WHERE id = 6
+----
+0.5493061443340548
+
+# atanh(|x| > 1) is out of range → 22003
+statement error 22003
+SELECT atanh(x) FROM m WHERE id = 3
+
+# NULL propagates through every hyperbolic
+query R nosort
+SELECT cosh(x) FROM m WHERE id = 9
+----
+NULL

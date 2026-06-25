@@ -15818,6 +15818,15 @@ const (
 	// sfCot is the cotangent, 1/tan(x) (float.md §8) — transcendental, exempted; cot(0) =
 	// +Infinity (no trap).
 	sfCot
+	// Hyperbolic functions (float.md §8) — transcendental, exempted. sinh/cosh/tanh/asinh have no
+	// domain trap (sinh/cosh overflow to ±Inf, PG-faithful); acosh traps below 1, atanh outside
+	// [-1, 1] (atanh(±1) = ±Inf is admissible).
+	sfSinh
+	sfCosh
+	sfTanh
+	sfAsinh
+	sfAcosh
+	sfAtanh
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19367,6 +19376,18 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfAtan2
 	case "cot":
 		return sfCot
+	case "sinh":
+		return sfSinh
+	case "cosh":
+		return sfCosh
+	case "tanh":
+		return sfTanh
+	case "asinh":
+		return sfAsinh
+	case "acosh":
+		return sfAcosh
+	case "atanh":
+		return sfAtanh
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile

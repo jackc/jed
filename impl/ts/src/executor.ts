@@ -12432,6 +12432,15 @@ type ScalarFuncName =
   // cot(x) → f64 — the cotangent, 1/tan(x) (float.md §8). Transcendental, exempted; cot(0) =
   // +Infinity (no trap).
   | "cot"
+  // Hyperbolic functions (float.md §8) — transcendental, exempted. sinh/cosh/tanh/asinh have no
+  // domain trap (sinh/cosh overflow to ±Inf, PG-faithful); acosh traps below 1, atanh outside
+  // [-1, 1] (atanh(±1) = ±Inf is admissible).
+  | "sinh"
+  | "cosh"
+  | "tanh"
+  | "asinh"
+  | "acosh"
+  | "atanh"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24743,6 +24752,25 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
     case "cot":
       // cot(x) = 1/tan(x) (no Math.cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
       return out(1 / Math.tan(x));
+    case "sinh":
+      // sinh/cosh overflow to ±Inf with NO trap (PG-faithful, unlike exp/pow). NaN propagates.
+      return out(Math.sinh(x));
+    case "cosh":
+      return out(Math.cosh(x));
+    case "tanh":
+      return out(Math.tanh(x));
+    case "asinh":
+      return out(Math.asinh(x));
+    case "acosh":
+      // acosh domain [1, ∞): a finite x < 1 → 22003 (a NaN propagates, acosh(+Inf) = +Inf).
+      if (!Number.isNaN(x) && x < 1)
+        throw engineError("numeric_value_out_of_range", "input is out of range");
+      return out(Math.acosh(x));
+    case "atanh":
+      // atanh domain [-1, 1]: a finite |x| > 1 (and ±Inf) → 22003; atanh(±1) = ±Inf is admissible.
+      if (!Number.isNaN(x) && (x < -1 || x > 1))
+        throw engineError("numeric_value_out_of_range", "input is out of range");
+      return out(Math.atanh(x));
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }
