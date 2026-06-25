@@ -15800,6 +15800,9 @@ const (
 	// sfRadians is degrees → radians (float.md §8): x · RADIANS_PER_DEGREE. A single
 	// correctly-rounded IEEE multiply, IN-CONTRACT (not ledgered).
 	sfRadians
+	// sfDegrees is radians → degrees (float.md §8): x / RADIANS_PER_DEGREE. A single
+	// correctly-rounded IEEE divide, IN-CONTRACT (not ledgered).
+	sfDegrees
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19337,6 +19340,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfPi
 	case "radians":
 		return sfRadians
+	case "degrees":
+		return sfDegrees
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile

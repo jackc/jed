@@ -93,3 +93,25 @@ query R nosort
 SELECT radians(x) FROM m WHERE id = 9
 ----
 NULL
+
+# --- degrees(x): radians → degrees; degrees(π) = 180 exactly --------------------------
+query R nosort
+SELECT degrees(pi())
+----
+180
+
+query R nosort
+SELECT degrees(x) FROM m WHERE id = 5
+----
+57.29577951308232
+
+query R nosort
+SELECT degrees(x) FROM m WHERE id = 4
+----
+0
+
+# NULL propagates
+query R nosort
+SELECT degrees(x) FROM m WHERE id = 9
+----
+NULL

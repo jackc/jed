@@ -552,6 +552,8 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 		// radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
 		// RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
 		return Float64Value(x * radiansPerDegree), nil
+	case sfDegrees:
+		return Float64Value(x / radiansPerDegree), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}

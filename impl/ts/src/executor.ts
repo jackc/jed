@@ -12414,6 +12414,9 @@ type ScalarFuncName =
   // radians(x) → f64 — degrees → radians (float.md §8): x · RADIANS_PER_DEGREE. A single
   // correctly-rounded IEEE multiply, IN-CONTRACT (not ledgered).
   | "radians"
+  // degrees(x) → f64 — radians → degrees (float.md §8): x / RADIANS_PER_DEGREE. A single
+  // correctly-rounded IEEE divide, IN-CONTRACT (not ledgered).
+  | "degrees"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24701,6 +24704,8 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
       // radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
       // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
       return out(x * RADIANS_PER_DEGREE);
+    case "degrees":
+      return out(x / RADIANS_PER_DEGREE);
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }

@@ -12911,6 +12911,9 @@ enum ScalarFunc {
     /// radians(x) → f64 — degrees → radians (float.md §8): x · RADIANS_PER_DEGREE. A single
     /// correctly-rounded IEEE multiply, IN-CONTRACT (not ledgered).
     Radians,
+    /// degrees(x) → f64 — radians → degrees (float.md §8): x / RADIANS_PER_DEGREE. A single
+    /// correctly-rounded IEEE divide, IN-CONTRACT (not ledgered).
+    Degrees,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18941,6 +18944,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "cbrt" => ScalarFunc::Cbrt,
         "pi" => ScalarFunc::Pi,
         "radians" => ScalarFunc::Radians,
+        "degrees" => ScalarFunc::Degrees,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29553,7 +29557,8 @@ impl RExpr {
                     | ScalarFunc::Cos
                     | ScalarFunc::Tan
                     | ScalarFunc::Cbrt
-                    | ScalarFunc::Radians => {
+                    | ScalarFunc::Radians
+                    | ScalarFunc::Degrees => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30540,6 +30545,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         // radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
         // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
         ScalarFunc::Radians => x * RADIANS_PER_DEGREE,
+        ScalarFunc::Degrees => x / RADIANS_PER_DEGREE,
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi
