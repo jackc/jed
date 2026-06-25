@@ -610,12 +610,14 @@ produces, the sort is a no-op and is **elided** — the scan streams rows straig
 (with a `LIMIT`) short-circuits exactly like the no-`ORDER BY` case above. Gated by the
 `query.order_by_pk_scan` capability.
 
-The base-table scan walks the table tree forward in **storage-key (primary-key) order**, so an
-`ORDER BY` is satisfied by the scan when it is a single-table, non-aggregate, non-`DISTINCT` `SELECT`
-whose `ORDER BY` keys are a **prefix of the PRIMARY KEY columns** (in key order), each:
+The base-table scan walks the table tree in **storage-key (primary-key) order** — **forward** for an
+`ASC` order, **backward** (a reverse scan) for a `DESC` one — so an `ORDER BY` is satisfied by the
+scan when it is a single-table, non-aggregate, non-`DISTINCT` `SELECT` whose `ORDER BY` keys are a
+**prefix of the PRIMARY KEY columns** (in key order), each:
 
-- **`ASC`** — the forward scan is ascending; `DESC` (a reverse traversal) is a follow-on, and keeps
-  the blocking sort.
+- **all one direction** — every PK-prefix key `ASC` (a forward scan) or every one `DESC` (a reverse
+  scan); a *mixed* `ASC`/`DESC` order is no single scan direction and keeps the blocking sort. The
+  direction is taken from the first key.
 - sorting by the **same order the stored key realizes** — for a collated key, the column's frozen
   collation (the tree stores the UCA sort key, so its byte order *is* the collation order —
   [encoding.md §2.12](encoding.md), [collation.md §8](collation.md)); a mismatching explicit
@@ -623,31 +625,45 @@ whose `ORDER BY` keys are a **prefix of the PRIMARY KEY columns** (in key order)
   used for order — the stored keys are at the file's pinned version, so the scan order would be wrong
   for the loaded one; it keeps the blocking sort, which recomputes against the loaded collation.
 
-The PK columns are `NOT NULL`, so a key's `NULLS FIRST|LAST` is a no-op (no NULLs to place). Two
-coverage shapes both qualify: an `ORDER BY` **shorter** than the PK is a prefix — ties are broken by
-the remaining PK columns, which is exactly the canonical PK tie-break the eager stable sort produces;
-an `ORDER BY` that runs **past** the full PK matches the whole (unique) key, so its extra keys are
-redundant (no ties remain).
+The PK columns are `NOT NULL`, so a key's `NULLS FIRST|LAST` is a no-op (no NULLs to place).
+
+**Coverage differs by direction**, because the eager sort the scan replaces is a **stable sort that
+breaks ties in input = PK-ascending order**:
+- **`ASC` (forward)** admits a strict **prefix** of the PK — its remaining PK columns tie-break
+  ascending, exactly the input order the stable sort preserves, so the forward scan's continuation
+  matches — *and* an order that runs **past** the full (unique) key, whose extra keys are redundant
+  (no ties remain).
+- **`DESC` (reverse)** requires the **full PK** (the order is at least as long as the key). A strict
+  `DESC` prefix of a *composite* PK would have the eager sort break ties in PK-**ascending** input
+  order, which a reverse scan inverts — so reverse is restricted to the unique full key, where no
+  ties remain. (An order running past the full `DESC` key is still fine — the extra keys are
+  redundant.)
 
 - **Cost — no `LIMIT`.** The scan reads every row either way, and the sort is unmetered (below), so
   eliding it does **not** move the cost. The observable contract is the **row order** (the scan
   already delivers it). `query/order_by_pk_scan.test` pins the composite-key order.
 - **Cost — with `LIMIT`.** The deliberate change: the scan short-circuits once the window is filled,
   so `storage_row_read` (and the filter `operator_eval`s) drop to the rows actually read — a top-N
-  early-out, the same drop as the no-`ORDER BY` `LIMIT` short-circuit. `query/limit_offset.test` pins
-  `ORDER BY id LIMIT 2` at the short-circuited cost (and the non-PK `ORDER BY val LIMIT 2` at the
-  full-scan cost, the contrast).
+  early-out, the same drop as the no-`ORDER BY` `LIMIT` short-circuit. A **reverse** scan
+  short-circuits identically, reading from the **high end** of the key (the leaves past the stop
+  point — here the *low* keys — are never faulted). `query/limit_offset.test` pins `ORDER BY id
+  LIMIT 2` and the full-PK `ORDER BY id DESC LIMIT 2` at the same short-circuited cost (and the
+  non-PK `ORDER BY val LIMIT 2` at the full-scan cost, the contrast); `query/order_by_pk_scan.test`
+  pins the composite-PK `ORDER BY a DESC, b DESC LIMIT 2` reverse scan and the strict-prefix
+  `ORDER BY a DESC` that does *not* qualify.
 - **The collation payoff.** A collated PK (or any collated key the scan walks) is stored in collation
   order, so a collated `ORDER BY` is satisfied **without** the in-memory collated decorate-sort (and
   with **no** `collate` units — there is no ordering *comparison*, just the scan emitting in stored
-  order). `collation/collated_pushdown.test` pins `ORDER BY name LIMIT 2` over a `unicode` PK.
+  order). This holds in **both directions**: a reverse scan of a collated key emits reverse-collation
+  order. `collation/collated_pushdown.test` pins `ORDER BY name LIMIT 2` and `ORDER BY name DESC
+  LIMIT 2` over a `unicode` PK.
 - **Composes with the PK bound** the same way the `LIMIT` short-circuit does: a `WHERE pk <range>`
-  forward range walk is already PK order, so the bound narrows *which* rows are scanned and the
-  `ORDER BY` still streams within it.
+  range walk is already PK order (forward or reversed), so the bound narrows *which* rows are scanned
+  and the `ORDER BY` still streams within it.
 
-Narrowings (each a follow-on optimization slice): `DESC` (reverse scan), **secondary-index** order
-(walk the index tree + point-lookup — the general non-PK collation payoff), `DISTINCT`, and multi-
-table joins all keep the blocking sort / eager path.
+Narrowings (each a follow-on optimization slice): **secondary-index** order (walk the index tree +
+point-lookup — the general non-PK collation payoff), `DISTINCT`, and multi-table joins all keep the
+blocking sort / eager path.
 
 ### `SELECT DISTINCT` — the projection-vs-produce asymmetry
 

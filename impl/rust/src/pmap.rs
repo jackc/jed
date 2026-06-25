@@ -503,6 +503,24 @@ impl PMap {
         }
         Ok(())
     }
+
+    /// Like [`scan_range`](PMap::scan_range) but visits the in-bound rows in **descending** key
+    /// order — the exact reverse of the forward traversal's row sequence — for a `DESC` reverse
+    /// scan (spec/design/cost.md §3 "ORDER BY satisfied by primary-key order"). It windows with the
+    /// same `child_window`/`entry_window` prune (so the visited-node set and `page_read` cost are
+    /// identical), and stops the moment `visit` returns `Ok(false)` without faulting leaves past the
+    /// stop point — so a reverse top-N faults from the high end.
+    pub(crate) fn scan_range_rev(
+        &self,
+        b: &KeyBound,
+        src: Option<&dyn LeafSource>,
+        visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
+    ) -> Result<()> {
+        if let Some(root) = &self.root {
+            walk_range_visit_rev(root, b, src, visit)?;
+        }
+        Ok(())
+    }
 }
 
 /// Build a node from its parts; if its payload overflows `cap`, split it 2-way and promote one
@@ -928,6 +946,44 @@ fn walk_range_visit(
     Ok(true)
 }
 
+/// The reverse-order `walk_range_visit`: visits the in-bound entries in **descending** key order,
+/// the exact reverse of the forward traversal's sequence (so an `ORDER BY pk DESC` is satisfied by
+/// the scan). For an interior node the forward order is `[key[ef] if ef<cf]`, then for `i` in
+/// `cf..=cl`: child[i], `key[i]` (when in the entry window); the reverse walks `i` from `cl` down to
+/// `cf`, emitting the in-window separator BEFORE descending its child, and the asymmetric
+/// inclusive-`lo` separator `key[ef]` (when `ef<cf`) LAST. Stops the whole traversal (returning
+/// `Ok(false)`) when `visit` does, without faulting leaves past the stop point.
+fn walk_range_visit_rev(
+    node: &Node,
+    b: &KeyBound,
+    src: Option<&dyn LeafSource>,
+    visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
+) -> Result<bool> {
+    let (ef, el) = b.entry_window(node);
+    if node.is_leaf() {
+        for i in (ef..el).rev() {
+            if !visit(&node.keys[i], &node.vals[i])? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    let (cf, cl) = b.child_window(node);
+    for i in (cf..=cl).rev() {
+        if i >= ef && i < el && !visit(&node.keys[i], &node.vals[i])? {
+            return Ok(false);
+        }
+        let ch = child(node, i, src)?;
+        if !walk_range_visit_rev(&ch, b, src, visit)? {
+            return Ok(false);
+        }
+    }
+    if ef < cf && !visit(&node.keys[ef], &node.vals[ef])? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,5 +1227,92 @@ mod tests {
         let unb = KeyBound::unbounded();
         assert_eq!(pm.overlap_node_count(&unb), pm.node_count());
         assert_eq!(pm.range_entries(&unb, None).unwrap().len(), 200);
+    }
+
+    #[test]
+    fn reverse_scan_is_forward_reversed() {
+        // scan_range_rev must yield the EXACT reverse of scan_range's row sequence over a MULTI-LEVEL
+        // tree — the interior-node interleaving (separators between children) and the asymmetric
+        // inclusive-lo edge that single-leaf conformance tables (the DESC-LIMIT corpus cases) cannot
+        // exercise. 200 entries at CAP 244 build several levels.
+        let mut pm = PMap::new();
+        for n in 0..200u64 {
+            pm.insert(key(n), row(n as i64), W, CAP, None).unwrap();
+        }
+        assert!(pm.node_count() > 2, "test needs a multi-level tree");
+
+        let decode = |k: &[u8]| u64::from_be_bytes(k.try_into().unwrap());
+        let collect = |b: &KeyBound, rev: bool| -> Vec<u64> {
+            let mut out = Vec::new();
+            let mut visit = |k: &[u8], _r: &Row| -> Result<bool> {
+                out.push(decode(k));
+                Ok(true)
+            };
+            if rev {
+                pm.scan_range_rev(b, None, &mut visit).unwrap();
+            } else {
+                pm.scan_range(b, None, &mut visit).unwrap();
+            }
+            out
+        };
+
+        // Every bound shape: unbounded, an inclusive range spanning many leaves, exclusive endpoints,
+        // a half-open tail, a point, and an inclusive-lo whose separator sits at a pruned child edge.
+        for (i, b) in [
+            KeyBound::unbounded(),
+            KeyBound {
+                lo: Some(key(50)),
+                lo_inc: true,
+                hi: Some(key(150)),
+                hi_inc: true,
+            },
+            KeyBound {
+                lo: Some(key(50)),
+                lo_inc: false,
+                hi: Some(key(150)),
+                hi_inc: false,
+            },
+            KeyBound {
+                lo: Some(key(195)),
+                lo_inc: true,
+                hi: None,
+                hi_inc: false,
+            },
+            KeyBound {
+                lo: Some(key(100)),
+                lo_inc: true,
+                hi: Some(key(100)),
+                hi_inc: true,
+            },
+            KeyBound {
+                lo: Some(key(73)),
+                lo_inc: true,
+                hi: Some(key(181)),
+                hi_inc: false,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fwd = collect(&b, false);
+            let rev = collect(&b, true);
+            fwd.reverse();
+            assert_eq!(
+                fwd, rev,
+                "reverse scan must equal forward-reversed for bound #{i}"
+            );
+        }
+
+        // The reverse short-circuit stops from the HIGH end: stopping after 3 visits yields the 3
+        // largest keys in descending order, faulting no further.
+        let mut got = Vec::new();
+        let mut n = 0;
+        pm.scan_range_rev(&KeyBound::unbounded(), None, &mut |k, _r| {
+            got.push(decode(k));
+            n += 1;
+            Ok(n < 3)
+        })
+        .unwrap();
+        assert_eq!(got, vec![199, 198, 197]);
     }
 }

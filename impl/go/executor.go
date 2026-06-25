@@ -10585,35 +10585,44 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	}
 	// ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
 	// non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the relation's PRIMARY
-	// KEY columns — each ASC, collation-matching the column's stored key form — needs no sort, since
-	// the table scan already yields rows in that order. The streaming scan then elides the sort (and,
-	// with a LIMIT, short-circuits a top-N).
-	pkOrdered := !isAgg && !sel.Distinct && len(order) > 0 && len(orderExprs) == 0 && len(planRels) == 1 &&
-		planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil &&
-		db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
+	// KEY columns — collation-matching the column's stored key form, all in one direction (ASC ⇒
+	// forward scan, DESC ⇒ a reverse scan over the full PK) — needs no sort, since the table scan
+	// already yields rows in that order. The streaming scan then elides the sort (and, with a LIMIT,
+	// short-circuits a top-N).
+	pkOrdered, pkReverse := false, false
+	if !isAgg && !sel.Distinct && len(order) > 0 && len(orderExprs) == 0 && len(planRels) == 1 &&
+		planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil {
+		pkOrdered, pkReverse = db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
+	}
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		groupSets: groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, relBounds: relBounds, relMasks: relMasks,
+		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, relBounds: relBounds, relMasks: relMasks,
 	}, nil
 }
 
-// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied BY ITS
-// PRIMARY-KEY scan order (spec/design/cost.md §3 "ORDER BY satisfied by primary-key order") — the
-// table tree, walked forward in storage-key order, already delivers rows in the requested order, so
-// the sort is a no-op. True iff the ORDER BY keys are a PREFIX of the PK columns (in key order),
-// each ASC (a DESC reverse scan is a follow-on) and sorting by the SAME order the stored PK key
-// realizes (collation.md §8/§12). The PK columns are NOT NULL, so a key's NULLS FIRST|LAST is a
-// no-op (no NULLs to place) and is ignored. An ORDER BY shorter than the PK is a prefix (ties broken
-// by the remaining PK columns — the canonical tie-break the eager stable sort produces); an ORDER BY
-// longer than the PK matches the whole PK and its extra keys are redundant (the PK is unique).
-func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSlot) bool {
+// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied by its
+// PRIMARY-KEY scan order (spec/design/cost.md §3), and in which DIRECTION: it returns
+// (satisfied, reverse) where reverse=true means the order is all-DESC over the full PK, served by a
+// REVERSE scan, and reverse=false means all-ASC (forward). The direction comes from the first ORDER
+// BY key; every PK-prefix key must share it (no mixed ASC/DESC). Two asymmetric coverage rules,
+// both grounded in the eager sort being a STABLE sort that breaks ties in input = PK-ascending
+// order: forward (ASC) allows a strict PREFIX of the PK (the remaining columns tie-break ascending,
+// exactly the input order the stable sort preserves); reverse (DESC) requires the FULL PK
+// (len(order) >= len(pk)) because a strict DESC prefix of a composite PK would have the eager sort
+// break ties in PK-ascending input order, which a reverse scan inverts — so reverse is restricted
+// to the unique full key, where no ties remain.
+func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSlot) (bool, bool) {
 	pk := table.PKIndices()
 	if len(pk) == 0 {
-		return false // no PK (synthetic rowid order is not a user-visible column)
+		return false, false // no PK (synthetic rowid order is not a user-visible column)
+	}
+	reverse := order[0].descending // direction comes from the first ORDER BY key
+	if reverse && len(order) < len(pk) {
+		return false, false // a reverse scan needs the full (unique) PK so no ties remain
 	}
 	m := len(order)
 	if len(pk) < m {
@@ -10621,11 +10630,11 @@ func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSl
 	}
 	for i := 0; i < m; i++ {
 		o := order[i]
-		if o.descending {
-			return false // ASC only this slice (a DESC reverse scan is a follow-on)
+		if o.descending != reverse {
+			return false, false // every PK-prefix key must share the scan direction (no mixed ASC/DESC)
 		}
 		if o.idx != offset+pk[i] {
-			return false // must be the i-th PK column, in key order
+			return false, false // must be the i-th PK column, in key order
 		}
 		// The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
 		// (C/non-text) key matches a key with no collation; a Full-collated key matches the SAME
@@ -10633,19 +10642,19 @@ func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSl
 		// file's pinned version, so the scan order would be wrong for the loaded one — §12).
 		coll, push := db.keyCollationCtx(table.Columns[pk[i]])
 		if !push {
-			return false // Skewed / unresolvable
+			return false, false // Skewed / unresolvable
 		}
 		if coll == nil {
 			if o.collation != nil {
-				return false // raw-byte key, but the ORDER BY key carries a collation
+				return false, false // raw-byte key, but the ORDER BY key carries a collation
 			}
 		} else {
 			if o.collation == nil || o.collation.Name != coll.Name {
-				return false
+				return false, false
 			}
 		}
 	}
-	return true
+	return true, reverse
 }
 
 // resolveSRF resolves a FROM-clause set-returning function call (generate_series(...)) into a
@@ -12995,7 +13004,9 @@ func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Met
 	// Skip the scan entirely for LIMIT 0 (no window to fill).
 	if !empty && (plan.limit == nil || *plan.limit > 0) {
 		var passed int64
-		err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
+		// A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
+		// (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
+		visit := func(_ []byte, row Row) (bool, error) {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 				return false, err
 			}
@@ -13030,12 +13041,18 @@ func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Met
 			}
 			out = append(out, projected)
 			// Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
-			// survivor after OFFSET, in primary-key order).
+			// survivor after OFFSET, in primary-key scan order).
 			if plan.limit != nil {
 				return int64(len(out)) < *plan.limit, nil
 			}
 			return true, nil
-		})
+		}
+		var err error
+		if plan.pkReverse {
+			err = store.ScanRangeRev(b, visit)
+		} else {
+			err = store.ScanRange(b, visit)
+		}
 		if err != nil {
 			return selectResult{}, err
 		}
@@ -16141,10 +16158,13 @@ type selectPlan struct {
 	// pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
 	// order — the table tree already yields rows in this order, so the sort is elided (and with a
 	// LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
-	// non-DISTINCT SELECT whose ORDER BY keys are a prefix of the PK columns, each ASC with the
-	// column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by primary-key
-	// order"). DESC (reverse scan) and secondary-index order are follow-ons.
+	// non-DISTINCT SELECT whose ORDER BY keys are a prefix of the PK columns, all one direction with
+	// the column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by primary-key
+	// order"). Secondary-index order is a follow-on.
 	pkOrdered bool
+	// pkReverse is the PK scan direction when pkOrdered: true ⇒ the order is all-DESC over the full
+	// PK, served by a REVERSE scan; false ⇒ all-ASC (forward). Always false when !pkOrdered.
+	pkReverse bool
 	// relBounds is the scan-bound pushdown, ONE entry per relation in rels: the WHERE
 	// conjuncts that bound that relation's storage key, so its scan seeks/ranges instead of walking
 	// the whole B-tree (spec/design/cost.md §3 "bounded scan"). nil ⇒ a full scan of that relation.

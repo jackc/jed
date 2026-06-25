@@ -4,8 +4,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { PMap } from "../src/pmap.ts";
-import type { PNode } from "../src/pmap.ts";
+import { PMap, unboundedBound } from "../src/pmap.ts";
+import type { KeyBound, PNode } from "../src/pmap.ts";
 import { intValue } from "../src/lib.ts";
 import type { Row } from "../src/storage.ts";
 
@@ -155,4 +155,52 @@ test("pmap: empty and single", () => {
   assert.deepEqual(pm.get(key(1), null), row(1));
   assert.deepEqual(pm.remove(key(1), CAP, null), row(1));
   assert.equal(pm.size, 0);
+});
+
+test("pmap: reverse scan is the forward scan reversed", () => {
+  // scanRangeRev must yield the EXACT reverse of scanRange's row sequence over a MULTI-LEVEL tree —
+  // the interior-node interleaving (separators between children) and the asymmetric inclusive-lo
+  // edge that single-leaf conformance tables (the DESC-LIMIT corpus cases) cannot exercise. 200
+  // entries at CAP build several levels.
+  const pm = new PMap();
+  for (let n = 0; n < 200; n++) pm.insert(key(n), row(n), W, CAP, null);
+  assert.ok(pm.nodeCount() > 2, "test needs a multi-level tree");
+
+  const decode = (k: Uint8Array): number =>
+    Number(new DataView(k.buffer, k.byteOffset, 8).getBigUint64(0));
+  const collect = (b: KeyBound, rev: boolean): number[] => {
+    const out: number[] = [];
+    const visit = (k: Uint8Array): boolean => {
+      out.push(decode(k));
+      return true;
+    };
+    if (rev) pm.scanRangeRev(b, null, visit);
+    else pm.scanRange(b, null, visit);
+    return out;
+  };
+  const bounds: KeyBound[] = [
+    unboundedBound(),
+    { lo: key(50), loInc: true, hi: key(150), hiInc: true },
+    { lo: key(50), loInc: false, hi: key(150), hiInc: false },
+    { lo: key(195), loInc: true, hi: null, hiInc: false },
+    { lo: key(100), loInc: true, hi: key(100), hiInc: true },
+    { lo: key(73), loInc: true, hi: key(181), hiInc: false },
+  ];
+  for (let i = 0; i < bounds.length; i++) {
+    const fwd = collect(bounds[i]!, false);
+    const rev = collect(bounds[i]!, true);
+    assert.deepEqual(
+      rev,
+      [...fwd].reverse(),
+      `reverse scan must equal forward-reversed for bound #${i}`,
+    );
+  }
+  // The reverse short-circuit stops from the HIGH end: stopping after 3 visits yields the 3 largest
+  // keys descending, faulting no further.
+  const got: number[] = [];
+  pm.scanRangeRev(unboundedBound(), null, (k) => {
+    got.push(decode(k));
+    return got.length < 3;
+  });
+  assert.deepEqual(got, [199, 198, 197]);
 });

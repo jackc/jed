@@ -358,6 +358,19 @@ impl TableStore {
         self.rows.scan_range(b, src_ref, visit)
     }
 
+    /// Like [`scan_range`](TableStore::scan_range) but yields the in-bound rows in **descending**
+    /// key order — a `DESC` reverse scan (spec/design/cost.md §3), stopping the same way on a false
+    /// `visit` so a reverse top-N short-circuits from the high end.
+    pub(crate) fn scan_range_rev(
+        &self,
+        b: &KeyBound,
+        visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
+    ) -> Result<()> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows.scan_range_rev(b, src_ref, visit)
+    }
+
     /// The root B-tree node of this table's store, for the page-backed serializer
     /// (spec/fileformat/format.md). `None` for an empty table.
     pub(crate) fn tree_root(&self) -> Option<&Arc<Node>> {

@@ -309,6 +309,13 @@ export class TableStore {
     this.rows.scanRange(b, this.leafSrc(), visit);
   }
 
+  // scanRangeRev is scanRange in reverse: it yields the in-bound rows in DESCENDING key order — a
+  // DESC reverse scan (spec/design/cost.md §3), stopping the same way on a false visit so a reverse
+  // top-N short-circuits from the high end.
+  scanRangeRev(b: KeyBound, visit: (key: Uint8Array, row: Row) => boolean): void {
+    this.rows.scanRangeRev(b, this.leafSrc(), visit);
+  }
+
   // treeRoot is the root B-tree node of this store, for the page-backed serializer
   // (spec/fileformat/format.md). null for an empty table.
   treeRoot(): PNode | null {

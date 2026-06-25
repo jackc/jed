@@ -9398,10 +9398,11 @@ impl Database {
 
         // ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base
         // table, non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the
-        // relation's PRIMARY KEY columns — each ASC, collation-matching the column's stored key
-        // form — needs no sort, since the table scan already yields rows in that order. The
-        // streaming scan then elides the sort (and, with a LIMIT, short-circuits a top-N).
-        let pk_ordered = !is_agg
+        // relation's PRIMARY KEY columns — collation-matching the column's stored key form, all in
+        // one direction (ASC ⇒ forward scan, DESC ⇒ a reverse scan over the full PK) — needs no
+        // sort, since the table scan already yields rows in that order. The streaming scan then
+        // elides the sort (and, with a LIMIT, short-circuits a top-N).
+        let pk_dir = if !is_agg
             && !sel.distinct
             && !order.is_empty()
             && order_exprs.is_empty() // a materialized expression key always takes the blocking sort
@@ -9409,7 +9410,13 @@ impl Database {
             && rels[0].srf.is_none()
             && rels[0].cte.is_none()
             && rels[0].derived.is_none()
-            && order_satisfied_by_pk(scope.rels[0].table, rels[0].offset, &order, self);
+        {
+            order_satisfied_by_pk(scope.rels[0].table, rels[0].offset, &order, self)
+        } else {
+            None
+        };
+        let pk_ordered = pk_dir.is_some();
+        let pk_reverse = pk_dir == Some(true);
 
         Ok(SelectPlan {
             rels,
@@ -9433,6 +9440,7 @@ impl Database {
             limit: sel.limit,
             offset: sel.offset,
             pk_ordered,
+            pk_reverse,
             rel_bounds,
             rel_masks,
         })
@@ -10333,6 +10341,9 @@ impl Database {
         params: &[Value],
     ) -> Result<SelectResult> {
         let store = self.store(&plan.rels[0].table_name);
+        // A `pk_reverse` plan (ORDER BY the full PK all-DESC) walks the tree backward; everything
+        // else (forward `pk_ordered`, or the no-ORDER-BY LIMIT short-circuit) walks forward.
+        let reverse = plan.pk_reverse;
 
         // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. This path
         // is single-table (gated below), so the only relation is `rel_bounds[0]`. A correlated bound
@@ -10362,7 +10373,7 @@ impl Database {
         let mut out: Vec<Vec<Value>> = Vec::new();
         if !empty && limit != Some(0) {
             let mut passed: i64 = 0;
-            store.scan_range(&bound, &mut |_key, row| {
+            let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
                 meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                 meter.charge(COSTS.storage_row_read);
                 // Materialize the touched columns if the lazy load left them unfetched
@@ -10395,12 +10406,17 @@ impl Database {
                 }
                 out.push(projected);
                 // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
-                // survivor after OFFSET, in primary-key order).
+                // survivor after OFFSET, in primary-key scan order).
                 Ok(match limit {
                     Some(l) => (out.len() as i64) < l,
                     None => true,
                 })
-            })?;
+            };
+            if reverse {
+                store.scan_range_rev(&bound, &mut visit)?;
+            } else {
+                store.scan_range(&bound, &mut visit)?;
+            }
         }
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
@@ -14845,10 +14861,14 @@ struct SelectPlan {
     /// `ORDER BY` is satisfied by the single base relation's **primary-key scan order** — the
     /// table tree already yields rows in this order, so the sort is elided (and with a `LIMIT`
     /// the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
-    /// non-`DISTINCT` `SELECT` whose `ORDER BY` keys are a prefix of the PK columns, each `ASC`
-    /// with the column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by
-    /// primary-key order"). `DESC` (reverse scan) and secondary-index order are follow-ons.
+    /// non-`DISTINCT` `SELECT` whose `ORDER BY` keys are a prefix of the PK columns, all one
+    /// direction, with the column's stored key collation (spec/design/cost.md §3 "ORDER BY
+    /// satisfied by primary-key order"). Secondary-index order is a follow-on.
     pk_ordered: bool,
+    /// The PK scan direction when `pk_ordered`: `true` ⇒ the order is all-`DESC` over the full PK,
+    /// served by a **reverse** scan; `false` ⇒ all-`ASC` (forward). Always `false` when
+    /// `!pk_ordered`.
+    pk_reverse: bool,
     /// Scan-bound pushdown, **one entry per relation** in `rels`: the WHERE conjuncts that
     /// bound that relation's scan — a primary-key range, or (when no PK bound applies) a
     /// secondary-index equality (cost.md §3 "bounded scan" / "index-bounded scan"). `None` ⇒
@@ -15140,23 +15160,40 @@ fn key_collation_ctx(
 /// shorter than the PK is a prefix (ties are broken by the remaining PK columns — the canonical PK
 /// tie-break, matching the eager stable sort); an `ORDER BY` longer than the PK matches the whole
 /// PK and its extra keys are redundant (the PK is unique, so there are no ties left to break).
+/// Reports whether a single base relation's `ORDER BY` is satisfied by its PRIMARY-KEY scan order
+/// (spec/design/cost.md §3), and in which **direction** — `Some(false)` for a forward (`ASC`) scan,
+/// `Some(true)` for a reverse (`DESC`) scan, `None` when the sort cannot be elided.
+///
+/// The direction is taken from the first `ORDER BY` key; every PK-prefix key must share it (a mixed
+/// `ASC`/`DESC` order is no pure scan direction). Two asymmetric coverage rules, both grounded in the
+/// eager sort being a **stable sort that breaks ties in input = PK-ascending order**:
+/// - **Forward (`ASC`)** allows a strict **prefix** of the PK — the remaining PK columns tie-break
+///   ascending, exactly the input order the stable sort preserves (so the forward scan's
+///   continuation matches).
+/// - **Reverse (`DESC`)** requires the **full PK** (`order.len() >= pk.len()`): a strict DESC prefix
+///   of a composite PK would have the eager sort break ties in PK-**ascending** input order, which a
+///   reverse scan inverts — so reverse is restricted to the unique full key, where no ties remain.
 fn order_satisfied_by_pk(
     table: &Table,
     offset: usize,
     order: &[crate::spill::SortKey],
     catalog: &Database,
-) -> bool {
+) -> Option<bool> {
     let pk = table.pk_indices();
     if pk.is_empty() {
-        return false; // no PK (synthetic rowid order is not a user-visible column)
+        return None; // no PK (synthetic rowid order is not a user-visible column)
+    }
+    let reverse = order[0].1; // direction comes from the first ORDER BY key's `descending` flag
+    if reverse && order.len() < pk.len() {
+        return None; // a reverse scan needs the full (unique) PK so no ties remain (see above)
     }
     let m = order.len().min(pk.len());
     for (i, (slot, descending, _nulls_first, coll)) in order.iter().take(m).enumerate() {
-        if *descending {
-            return false; // ASC only this slice (a DESC reverse scan is a follow-on)
+        if *descending != reverse {
+            return None; // every PK-prefix key must share the scan direction (no mixed ASC/DESC)
         }
         if *slot != offset + pk[i] {
-            return false; // must be the i-th PK column, in key order
+            return None; // must be the i-th PK column, in key order
         }
         // The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
         // (`C`/non-text) key matches a key with no collation; a `Full`-collated key matches the
@@ -15164,19 +15201,19 @@ fn order_satisfied_by_pk(
         // the file's pinned version, so the scan order would be wrong for the loaded one — the
         // read-safety rule §12; recompute via the eager/streaming sort instead).
         match key_collation_ctx(catalog, &table.columns[pk[i]]) {
-            None => return false,
+            None => return None,
             Some(None) => {
                 if coll.is_some() {
-                    return false;
+                    return None;
                 }
             }
             Some(Some(c)) => match coll {
                 Some(c2) if c2.name == c.name => {}
-                _ => return false,
+                _ => return None,
             },
         }
     }
-    true
+    Some(reverse)
 }
 
 /// Detect a GIN-bounded scan over `columns`/`indexes` (gin.md §6): the lowest-named GIN index

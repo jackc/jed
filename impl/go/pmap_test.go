@@ -225,3 +225,57 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 		t.Fatal("not empty after removing the only key")
 	}
 }
+
+// TestPMapReverseScanIsForwardReversed checks scanRangeRev yields the EXACT reverse of scanRange's
+// row sequence over a MULTI-LEVEL tree — the interior-node interleaving (separators between
+// children) and the asymmetric inclusive-lo edge that single-leaf conformance tables (the
+// DESC-LIMIT corpus cases) cannot exercise. 200 entries at pmCap build several levels.
+func TestPMapReverseScanIsForwardReversed(t *testing.T) {
+	var pm PMap
+	for n := uint64(0); n < 200; n++ {
+		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, nil)
+	}
+	if pm.nodeCount() <= 2 {
+		t.Fatal("test needs a multi-level tree")
+	}
+	decode := func(k []byte) uint64 { return binary.BigEndian.Uint64(k) }
+	collect := func(b keyBound, rev bool) []uint64 {
+		var out []uint64
+		visit := func(k []byte, _ Row) (bool, error) { out = append(out, decode(k)); return true, nil }
+		if rev {
+			pm.scanRangeRev(b, nil, visit)
+		} else {
+			pm.scanRange(b, nil, visit)
+		}
+		return out
+	}
+	bounds := []keyBound{
+		unboundedBound(),
+		{lo: pmKey(50), loInc: true, hi: pmKey(150), hiInc: true},
+		{lo: pmKey(50), loInc: false, hi: pmKey(150), hiInc: false},
+		{lo: pmKey(195), loInc: true, hi: nil, hiInc: false},
+		{lo: pmKey(100), loInc: true, hi: pmKey(100), hiInc: true},
+		{lo: pmKey(73), loInc: true, hi: pmKey(181), hiInc: false},
+	}
+	for i, b := range bounds {
+		fwd := collect(b, false)
+		rev := collect(b, true)
+		for j, k := 0, len(fwd)-1; j < len(fwd); j, k = j+1, k-1 {
+			if rev[j] != fwd[k] {
+				t.Fatalf("reverse scan must equal forward-reversed for bound #%d", i)
+			}
+		}
+	}
+	// The reverse short-circuit stops from the HIGH end: stopping after 3 visits yields the 3
+	// largest keys descending, faulting no further.
+	var got []uint64
+	n := 0
+	pm.scanRangeRev(unboundedBound(), nil, func(k []byte, _ Row) (bool, error) {
+		got = append(got, decode(k))
+		n++
+		return n < 3, nil
+	})
+	if !reflect.DeepEqual(got, []uint64{199, 198, 197}) {
+		t.Fatalf("reverse short-circuit got %v, want [199 198 197]", got)
+	}
+}

@@ -8,10 +8,11 @@
 # When the ORDER BY is satisfied by the table's PRIMARY-KEY scan order (cost.md §3 "ORDER BY
 # satisfied by primary-key order" — here `ORDER BY id` over the PK `id`), the rows already arrive
 # in order, so the engine STREAMS scan→filter→project and STOPS once the LIMIT/OFFSET window is
-# filled: a row beyond the window is never even scanned. An ORDER BY the scan does NOT satisfy —
-# a non-PK key like `ORDER BY val`, or DESC (a reverse scan is a follow-on) — is a blocking sort
-# that must read every row first; those keep the full scan (the `ORDER BY val` cases below are the
-# contrast). storage_row_read counts exactly the rows the scan reads in either case.
+# filled: a row beyond the window is never even scanned. A DESC order over the full (unique) PK is
+# served the same way by a REVERSE scan (cost.md §3 "reverse scan"), so `ORDER BY id DESC LIMIT 2`
+# short-circuits too. An ORDER BY the scan does NOT satisfy — a non-PK key like `ORDER BY val` — is
+# a blocking sort that must read every row first; those keep the full scan (the `ORDER BY val` case
+# below is the contrast). storage_row_read counts exactly the rows the scan reads in either case.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.offset, types.i32, dml.insert_multi_row, query.point_lookup, query.limit_short_circuit, query.order_by_pk_scan, resource.cost_metering
 
 statement ok
@@ -125,11 +126,13 @@ SELECT id FROM t ORDER BY val LIMIT 2
 1
 2
 
-# Contrast — DESC is a reverse traversal the forward scan does not satisfy (a reverse-scan
-# optimization is a follow-on), so `ORDER BY id DESC LIMIT 2` also keeps the full scan + sort.
-# 1 page + 5 scanned + 2 produced = 8.
+# DESC over the full (unique) PK `id` is a REVERSE scan (cost.md §3 "reverse scan") whose backward
+# walk IS `ORDER BY id DESC` order, so `ORDER BY id DESC LIMIT 2` short-circuits after the 2 produced
+# rows — the high-end rows are read first, the low ids never scanned. 1 page + 2 scanned +
+# 2 produced = 5 — the same short-circuit cost as the ASC case, the proof the reverse scan elides
+# the sort just like the forward scan.
 # names: id
-# cost: 8
+# cost: 5
 query I nosort
 SELECT id FROM t ORDER BY id DESC LIMIT 2
 ----

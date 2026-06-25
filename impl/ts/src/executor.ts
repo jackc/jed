@@ -7867,10 +7867,11 @@ export class Database {
     const relMasks = planRels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
     // ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
     // non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the relation's PRIMARY
-    // KEY columns — each ASC, collation-matching the column's stored key form — needs no sort, since
-    // the table scan already yields rows in that order. The streaming scan then elides the sort (and,
-    // with a LIMIT, short-circuits a top-N).
-    const pkOrdered =
+    // KEY columns — collation-matching the column's stored key form, all in one direction (ASC ⇒
+    // forward scan, DESC ⇒ a reverse scan over the full PK) — needs no sort, since the table scan
+    // already yields rows in that order. The streaming scan then elides the sort (and, with a LIMIT,
+    // short-circuits a top-N).
+    const pkDir =
       !isAgg &&
       !sel.distinct &&
       order.length > 0 &&
@@ -7878,8 +7879,9 @@ export class Database {
       planRels.length === 1 &&
       planRels[0]!.srf === undefined &&
       planRels[0]!.cte === undefined &&
-      planRels[0]!.derived === undefined &&
-      orderSatisfiedByPK(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order);
+      planRels[0]!.derived === undefined
+        ? orderSatisfiedByPK(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order)
+        : null;
     return {
       kind: "select",
       rels: planRels,
@@ -7902,7 +7904,8 @@ export class Database {
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
-      pkOrdered,
+      pkOrdered: pkDir !== null,
+      pkReverse: pkDir !== null && pkDir.reverse,
       relBounds,
       relMasks,
     };
@@ -8674,7 +8677,7 @@ export class Database {
     // Skip the scan entirely for LIMIT 0 (no window to fill).
     if (!empty && limit !== 0n) {
       let passed = 0n;
-      store.scanRange(bound, (_key, rawRow) => {
+      const visit = (_key: Uint8Array, rawRow: Row): boolean => {
         meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         // Materialize the touched columns if the lazy load left them unfetched
@@ -8688,9 +8691,13 @@ export class Database {
         meter.charge(COSTS.rowProduced);
         out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
         // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every survivor
-        // after OFFSET, in primary-key order).
+        // after OFFSET, in primary-key scan order).
         return limit === null ? true : BigInt(out.length) < limit;
-      });
+      };
+      // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
+      // (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
+      if (plan.pkReverse) store.scanRangeRev(bound, visit);
+      else store.scanRange(bound, visit);
     }
     return {
       columnNames: plan.columnNames,
@@ -9747,41 +9754,46 @@ function keyCollationCtx(snap: Snapshot, col: Column): { coll: Collation | null 
   return c !== undefined ? { coll: c } : null;
 }
 
-// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied BY ITS
-// PRIMARY-KEY scan order (spec/design/cost.md §3 "ORDER BY satisfied by primary-key order") — the
-// table tree, walked forward in storage-key order, already delivers rows in the requested order, so
-// the sort is a no-op. True iff the ORDER BY keys are a PREFIX of the PK columns (in key order),
-// each ASC (a DESC reverse scan is a follow-on) and sorting by the SAME order the stored PK key
-// realizes (collation.md §8/§12). The PK columns are NOT NULL, so a key's NULLS FIRST|LAST is a
-// no-op (no NULLs to place) and is ignored. An ORDER BY shorter than the PK is a prefix (ties broken
-// by the remaining PK columns — the canonical tie-break the eager stable sort produces); an ORDER BY
-// longer than the PK matches the whole PK and its extra keys are redundant (the PK is unique).
+// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied by its
+// PRIMARY-KEY scan order (spec/design/cost.md §3), and in which DIRECTION: it returns
+// { reverse } where reverse=true means the order is all-DESC over the full PK, served by a REVERSE
+// scan, and reverse=false means all-ASC (forward); null when the sort cannot be elided. The
+// direction comes from the first ORDER BY key; every PK-prefix key must share it (no mixed
+// ASC/DESC). Two asymmetric coverage rules, both grounded in the eager sort being a STABLE sort
+// that breaks ties in input = PK-ascending order: forward (ASC) allows a strict PREFIX of the PK
+// (the remaining columns tie-break ascending, exactly the input order the stable sort preserves);
+// reverse (DESC) requires the FULL PK (order.length >= pk.length) because a strict DESC prefix of a
+// composite PK would have the eager sort break ties in PK-ascending input order, which a reverse
+// scan inverts — so reverse is restricted to the unique full key, where no ties remain. The PK
+// columns are NOT NULL, so a key's NULLS FIRST|LAST is a no-op and is ignored.
 function orderSatisfiedByPK(
   snap: Snapshot,
   table: Table,
   offset: number,
   order: OrderSlot[],
-): boolean {
+): { reverse: boolean } | null {
   const pk = pkIndices(table);
-  if (pk.length === 0) return false; // no PK (synthetic rowid order is not a user-visible column)
+  if (pk.length === 0) return null; // no PK (synthetic rowid order is not a user-visible column)
+  const reverse = order[0]!.descending; // direction comes from the first ORDER BY key
+  if (reverse && order.length < pk.length) return null; // reverse needs the full (unique) PK
   const m = Math.min(order.length, pk.length);
   for (let i = 0; i < m; i++) {
     const o = order[i]!;
-    if (o.descending) return false; // ASC only this slice (a DESC reverse scan is a follow-on)
-    if (o.idx !== offset + pk[i]!) return false; // must be the i-th PK column, in key order
+    if (o.descending !== reverse) return null; // every PK-prefix key must share the scan direction
+    if (o.idx !== offset + pk[i]!) return null; // must be the i-th PK column, in key order
     // The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
     // (C/non-text) key matches a key with no collation; a Full-collated key matches the SAME
     // collation; a Skewed/unresolvable collation never matches (its stored keys are at the file's
     // pinned version, so the scan order would be wrong for the loaded one — §12).
     const ctx = keyCollationCtx(snap, table.columns[pk[i]!]!);
-    if (ctx === null) return false; // Skewed / unresolvable
+    if (ctx === null) return null; // Skewed / unresolvable
     if (ctx.coll === null) {
-      if (o.collation !== null) return false; // raw-byte key, but the ORDER BY key carries a collation
+      if (o.collation !== null) return null; // raw-byte key, but the ORDER BY key carries a collation
     } else if (o.collation === null || o.collation.name !== ctx.coll.name) {
-      return false;
+      return null;
     }
   }
-  return true;
+  return { reverse };
 }
 
 // detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named GIN
@@ -12903,10 +12915,13 @@ type SelectPlan = {
   // pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
   // order — the table tree already yields rows in this order, so the sort is elided (and with a
   // LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
-  // non-DISTINCT SELECT whose ORDER BY keys are a prefix of the PK columns, each ASC with the
-  // column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by primary-key
-  // order"). DESC (reverse scan) and secondary-index order are follow-ons.
+  // non-DISTINCT SELECT whose ORDER BY keys are a prefix of the PK columns, all one direction with
+  // the column's stored key collation (spec/design/cost.md §3 "ORDER BY satisfied by primary-key
+  // order"). Secondary-index order is a follow-on.
   pkOrdered: boolean;
+  // pkReverse is the PK scan direction when pkOrdered: true ⇒ the order is all-DESC over the full
+  // PK, served by a REVERSE scan; false ⇒ all-ASC (forward). Always false when !pkOrdered.
+  pkReverse: boolean;
   // Primary-key predicate pushdown, ONE entry per relation in rels: the WHERE conjuncts that bound
   // that relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
   // (cost.md §3 "bounded scan"). null ⇒ a full scan of that relation. In a JOIN each base table is

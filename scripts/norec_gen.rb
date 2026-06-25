@@ -15,7 +15,9 @@
 #              and it full-scans. Both must return identical rows.
 #   limit    — LIMIT short-circuits the streaming scan at the window; OFFSET / the full query do
 #              not. Over a total order (`ORDER BY` the unique pk) the windows must reconstruct the
-#              whole — each window matches its by-construction slice.
+#              whole — each window matches its by-construction slice. Both directions: `ORDER BY id`
+#              (forward scan) and `ORDER BY id DESC` over the full pk (a REVERSE scan, cost.md §3),
+#              whose DESC windows must match the reversed by-construction slices.
 #   join     — a constant WHERE predicate on a base relation's bare pk bounds THAT relation's scan
 #              in a join (`detect_pk_bound` per relation); `pk + 0 = K` defeats it (full scan).
 #              Both must return identical rows — for INNER and for a preserved-side LEFT predicate.
@@ -250,6 +252,22 @@ def gen_limit(seed)
   windows.each do |clause, exp|
     out << "# ORDER BY id #{clause.empty? ? '(full reference)' : clause}"
     q(out, "II", "SELECT id, v FROM t ORDER BY id #{clause}".strip, flat.call(exp))
+  end
+
+  # DESC over the full (unique) pk `id` is a REVERSE scan (cost.md §3 "reverse scan"): the same
+  # windows over the reversed total order must match the reversed by-construction slices, so the
+  # reverse short-circuit (LIMIT) reconstructs the same whole the forward scan does.
+  rev = rows.reverse
+  desc_windows = [
+    ["LIMIT #{a}", rev[0, a]],
+    ["LIMIT #{a} OFFSET #{a}", rev[a, a] || []],
+    ["OFFSET #{a}", rev[a..] || []],
+    ["LIMIT #{n}", rev],
+    ["", rev],
+  ]
+  desc_windows.each do |clause, exp|
+    out << "# ORDER BY id DESC #{clause.empty? ? '(full reverse reference)' : clause}"
+    q(out, "II", "SELECT id, v FROM t ORDER BY id DESC #{clause}".strip, flat.call(exp))
   end
 
   out.join("\n") + "\n"

@@ -8,13 +8,14 @@
 # cost.md §3 — so eliding it does not move the cost; the contract there is the ROW ORDER).
 #
 # This file pins the COMPOSITE-PK behavior + the contrasts the single-column query/limit_offset.test
-# does not: a STRICT PREFIX of a composite key satisfies the order, an ORDER BY that runs PAST the
-# full (unique) key (the extra keys are redundant), and the cases that do NOT qualify (DESC — a
-# reverse scan is a follow-on; a non-PK leading key) which keep the full scan + sort. Every ORDER BY
-# here is a TOTAL order (the leading column `a` and the non-key `c` are both unique), so the rows are
-# unambiguous and agree with the PostgreSQL oracle — jed's deliberate PK tie-break beyond SQL
-# (CLAUDE.md §8) is exercised by the existing query/order_by.test, not re-pinned here. All units
-# weigh 1, so for every record:
+# does not: a STRICT PREFIX of a composite key satisfies an ASC order, an ORDER BY that runs PAST the
+# full (unique) key (the extra keys are redundant), a DESC order over the FULL key served by a
+# REVERSE scan (cost.md §3 "reverse scan"), and the cases that do NOT qualify (a STRICT-PREFIX DESC —
+# whose tie-break direction a reverse scan would invert; a non-PK leading key) which keep the full
+# scan + sort. Every ORDER BY here is a TOTAL order (the leading column `a` and the non-key `c` are
+# both unique), so the rows are unambiguous and agree with the PostgreSQL oracle — jed's deliberate
+# PK tie-break beyond SQL (CLAUDE.md §8) is exercised by the existing query/order_by.test, not
+# re-pinned here. All units weigh 1, so for every record:
 #   cost = page_read (visited nodes) + storage_row_read (rows read) + filter operator_evals
 #          (per scanned row) + row_produced + projection operator_evals.
 # requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.order_by_alias, query.limit, query.order_by_pk_scan, types.i32, resource.cost_metering
@@ -106,10 +107,49 @@ SELECT a, b FROM t ORDER BY a, b
 5
 50
 
-# CONTRAST — DESC is a reverse traversal the forward scan does not satisfy (a reverse-scan
-# optimization is a follow-on), so `ORDER BY a DESC LIMIT 2` keeps the full scan + sort. 1 page +
-# 5 scanned + 2 produced = 8 — higher than the cost-5 ASC cases, the proof the short-circuit is
-# forward-ASC-only.
+# Full composite key, DESC: `ORDER BY a DESC, b DESC` IS the REVERSE scan order (cost.md §3
+# "reverse scan"), so LIMIT 2 short-circuits after the first two rows read from the HIGH end —
+# (5,50),(4,40) — and (3,30) and below are never scanned. 1 page + 2 scanned + 2 produced = 5, the
+# same short-circuit as the ASC case.
+# cost: 5
+query II nosort
+SELECT a, b FROM t ORDER BY a DESC, b DESC LIMIT 2
+----
+5
+50
+4
+40
+
+# DESC running PAST the full key: `a DESC, b DESC` is the whole (unique) PK, so the trailing
+# `c DESC` is redundant — still a reverse scan, LIMIT 2 short-circuits. 1 page + 2 scanned +
+# 2 produced = 5.
+# cost: 5
+query II nosort
+SELECT a, b FROM t ORDER BY a DESC, b DESC, c DESC LIMIT 2
+----
+5
+50
+4
+40
+
+# Reverse scan composes with OFFSET: `ORDER BY a DESC, b DESC LIMIT 2 OFFSET 1` reads the high end
+# (5,50) [skipped by OFFSET], then (4,40),(3,30) [produced], and stops. 1 page + 3 scanned +
+# 2 produced = 6.
+# cost: 6
+query II nosort
+SELECT a, b FROM t ORDER BY a DESC, b DESC LIMIT 2 OFFSET 1
+----
+4
+40
+3
+30
+
+# CONTRAST — a STRICT-PREFIX DESC (`ORDER BY a DESC`, only the FIRST of the two PK columns) is NOT
+# served by a reverse scan: the eager stable sort breaks `a`-ties in input = (a,b)-ASCENDING order,
+# which a reverse scan would invert (b descending), so a reverse scan is restricted to the FULL PK
+# (here `a` is unique so the rows happen to coincide, but the planner cannot assume that). It keeps
+# the full scan + sort. 1 page + 5 scanned + 2 produced = 8 — the proof the reverse short-circuit is
+# full-PK-only.
 # cost: 8
 query II nosort
 SELECT a, b FROM t ORDER BY a DESC LIMIT 2

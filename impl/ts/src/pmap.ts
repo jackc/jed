@@ -425,6 +425,37 @@ export class PMap {
     };
     if (this.root !== null) walk(this.root);
   }
+
+  // scanRangeRev is scanRange in reverse: it visits the in-bound (key, row) pairs in DESCENDING key
+  // order — the exact reverse of scanRange's row sequence — for a DESC reverse scan (cost.md §3
+  // "ORDER BY satisfied by primary-key order"). It windows with the same childWindow/entryWindow
+  // prune (so the visited-node set and pageRead cost match), and stops the moment visit returns
+  // false without faulting leaves past the stop point (a reverse top-N faults from the high end).
+  // For an interior node it walks children from cl down to cf, emitting the in-window separator
+  // BEFORE descending its child, and the asymmetric inclusive-lo separator key[ef] (when ef<cf) LAST.
+  scanRangeRev(
+    b: KeyBound,
+    src: LeafSource | null,
+    visit: (key: Uint8Array, row: Row) => boolean,
+  ): void {
+    const walk = (n: PNode): boolean => {
+      const [ef, el] = entryWindow(b, n);
+      if (isLeaf(n)) {
+        for (let i = el - 1; i >= ef; i--) {
+          if (!visit(n.keys[i], n.vals[i])) return false;
+        }
+        return true;
+      }
+      const [cf, cl] = childWindow(b, n);
+      for (let i = cl; i >= cf; i--) {
+        if (i >= ef && i < el && !visit(n.keys[i], n.vals[i])) return false;
+        if (!walk(resolveChild(n.children[i], src))) return false;
+      }
+      if (ef < cf && !visit(n.keys[ef], n.vals[ef])) return false;
+      return true;
+    };
+    if (this.root !== null) walk(this.root);
+  }
 }
 
 // pmapFromLoaded reconstructs a map from a loaded root (format.ts loadDatabase).

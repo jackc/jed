@@ -104,6 +104,17 @@ SELECT name FROM cp ORDER BY name LIMIT 2
 a
 A
 
+# DESC over the collated PK is a REVERSE scan (cost.md §3 "reverse scan"): the tree is stored in
+# unicode sort-key order, so walking it BACKWARD IS `ORDER BY name DESC` order — no re-sort, no
+# collate units, and LIMIT 2 short-circuits from the high end. Unicode order is a < A < b < z, so
+# the two largest are z, b. 1 page + 2 scanned + 2 produced = 5, the same as the ASC payoff.
+# cost: 5
+query T nosort
+SELECT name FROM cp ORDER BY name DESC LIMIT 2
+----
+z
+b
+
 # CONTRAST — an explicit `COLLATE "C"` orders by RAW BYTES, which disagrees with the column's
 # unicode key order, so the scan order does NOT satisfy it: a blocking byte-order sort over the full
 # table (no short-circuit). Byte order is 'A'(0x41) < 'a'(0x61), the OPPOSITE of unicode, and the

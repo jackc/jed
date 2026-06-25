@@ -323,6 +323,13 @@ func (s *TableStore) ScanRange(b keyBound, visit func(key []byte, row Row) (bool
 	return s.rows.scanRange(b, s.leafSrc(), visit)
 }
 
+// ScanRangeRev is ScanRange in reverse: it yields the in-bound rows in DESCENDING key order — a
+// DESC reverse scan (spec/design/cost.md §3), stopping the same way on a false `continue` so a
+// reverse top-N short-circuits from the high end.
+func (s *TableStore) ScanRangeRev(b keyBound, visit func(key []byte, row Row) (bool, error)) error {
+	return s.rows.scanRangeRev(b, s.leafSrc(), visit)
+}
+
 // Entry is one stored (encoded key, row) pair.
 type Entry struct {
 	Key []byte

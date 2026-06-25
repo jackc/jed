@@ -509,6 +509,58 @@ func (m *PMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 	return err
 }
 
+// scanRangeRev is scanRange in reverse: it visits the in-bound (key, row) pairs in DESCENDING key
+// order — the exact reverse of scanRange's row sequence — for a DESC reverse scan (spec/design/
+// cost.md §3 "ORDER BY satisfied by primary-key order"). It windows with the same childWindow/
+// entryWindow prune (so the visited-node set and page_read cost match), and stops the moment visit
+// returns a false `continue` without faulting leaves past the stop point (a reverse top-N faults
+// from the high end). For an interior node it walks children from cl down to cf, emitting the
+// in-window separator BEFORE descending its child, and the asymmetric inclusive-lo separator
+// key[ef] (when ef<cf) LAST.
+func (m *PMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, row Row) (bool, error)) error {
+	var walk func(n *pnode) (bool, error)
+	walk = func(n *pnode) (bool, error) {
+		ef, el := b.entryWindow(n)
+		if n.isLeaf() {
+			for i := el - 1; i >= ef; i-- {
+				cont, err := visit(n.keys[i], n.vals[i])
+				if err != nil || !cont {
+					return cont, err
+				}
+			}
+			return true, nil
+		}
+		cf, cl := b.childWindow(n)
+		for i := cl; i >= cf; i-- {
+			if i >= ef && i < el {
+				cont, err := visit(n.keys[i], n.vals[i])
+				if err != nil || !cont {
+					return cont, err
+				}
+			}
+			child, err := resolveChild(n.children[i], src)
+			if err != nil {
+				return false, err
+			}
+			if cont, err := walk(child); err != nil || !cont {
+				return cont, err
+			}
+		}
+		if ef < cf {
+			cont, err := visit(n.keys[ef], n.vals[ef])
+			if err != nil || !cont {
+				return cont, err
+			}
+		}
+		return true, nil
+	}
+	if m.root == nil {
+		return nil
+	}
+	_, err := walk(m.root)
+	return err
+}
+
 // insOut is the result of inserting into a subtree: a whole rebuilt node, or a split.
 type insOut struct {
 	whole *pnode // non-nil ⇒ no split
