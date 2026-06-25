@@ -15,6 +15,10 @@ import (
 	"strconv"
 )
 
+// radiansPerDegree is PG's exact RADIANS_PER_DEGREE literal (float.c), shared by radians/degrees
+// so the single IEEE multiply/divide is byte-identical cross-core and matches PG (in-contract).
+const radiansPerDegree = 0.0174532925199432957692
+
 // --- the total order (spec/design/float.md §3) --------------------------------------------
 //
 // IEEE comparison is a PARTIAL order (NaN unordered; -0 == +0). SQL needs a TOTAL order for
@@ -544,6 +548,10 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 	case sfCbrt:
 		// cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
 		return Float64Value(math.Cbrt(x)), nil
+	case sfRadians:
+		// radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
+		// RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
+		return Float64Value(x * radiansPerDegree), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}

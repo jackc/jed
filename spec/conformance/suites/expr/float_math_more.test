@@ -71,3 +71,25 @@ query R nosort
 SELECT pi() + pi()
 ----
 6.283185307179586
+
+# --- radians(x): degrees → radians; radians(180) = π exactly --------------------------
+query R nosort
+SELECT radians(x) FROM m WHERE id = 7
+----
+3.141592653589793
+
+query R nosort
+SELECT radians(x) FROM m WHERE id = 5
+----
+0.017453292519943295
+
+query R nosort
+SELECT radians(x) FROM m WHERE id = 4
+----
+0
+
+# NULL propagates
+query R nosort
+SELECT radians(x) FROM m WHERE id = 9
+----
+NULL

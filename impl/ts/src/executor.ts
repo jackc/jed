@@ -12411,6 +12411,9 @@ type ScalarFuncName =
   // pi() → f64 — the constant π (float.md §8). Zero-arg; IN-CONTRACT (the same f64 literal in
   // every core), not in the transcendental ledger.
   | "pi"
+  // radians(x) → f64 — degrees → radians (float.md §8): x · RADIANS_PER_DEGREE. A single
+  // correctly-rounded IEEE multiply, IN-CONTRACT (not ledgered).
+  | "radians"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24628,6 +24631,9 @@ function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType):
 // propagates through the exact functions; the transcendentals call native Math.* (exempted — the R
 // tag absorbs cross-core ULP differences). Domain / overflow errors trap (float.md §8):
 //   sqrt(neg) → 22003; ln(0)/ln(neg) → 22003; exp overflow → 22003; sin/cos/tan never trap.
+// PG's exact RADIANS_PER_DEGREE literal (float.c) — shared by radians/degrees so the single IEEE
+// multiply/divide is byte-identical cross-core and matches PG (in-contract).
+const RADIANS_PER_DEGREE = 0.0174532925199432957692;
 function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: ScalarType): Value {
   const out = (r: number): Value => {
     // result is f64 for all but abs; abs's result is the operand width, so fround for f32.
@@ -24691,6 +24697,10 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
     case "cbrt":
       // cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
       return out(Math.cbrt(x));
+    case "radians":
+      // radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
+      // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
+      return out(x * RADIANS_PER_DEGREE);
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }

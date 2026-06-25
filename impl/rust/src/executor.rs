@@ -12908,6 +12908,9 @@ enum ScalarFunc {
     /// pi() → f64 — the constant π (float.md §8). Zero-arg; IN-CONTRACT (the same f64 literal in
     /// every core), so NOT in the transcendental ledger.
     Pi,
+    /// radians(x) → f64 — degrees → radians (float.md §8): x · RADIANS_PER_DEGREE. A single
+    /// correctly-rounded IEEE multiply, IN-CONTRACT (not ledgered).
+    Radians,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18937,6 +18940,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "tan" => ScalarFunc::Tan,
         "cbrt" => ScalarFunc::Cbrt,
         "pi" => ScalarFunc::Pi,
+        "radians" => ScalarFunc::Radians,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29548,7 +29552,8 @@ impl RExpr {
                     | ScalarFunc::Sin
                     | ScalarFunc::Cos
                     | ScalarFunc::Tan
-                    | ScalarFunc::Cbrt => {
+                    | ScalarFunc::Cbrt
+                    | ScalarFunc::Radians => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30454,6 +30459,9 @@ fn round_f64_places(f: f64, places: i64) -> f64 {
 /// (exp/ln/log10/pow/sin/cos/tan) calls Rust's libm (exempted, may differ by an ULP cross-core).
 /// Domain/overflow errors trap 22003, keeping NaN/Inf input-only (a NaN/Inf *operand* propagates).
 fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Value> {
+    // PG's exact RADIANS_PER_DEGREE literal (float.c) — shared by radians/degrees so the single
+    // IEEE multiply/divide is byte-identical cross-core and matches PG.
+    const RADIANS_PER_DEGREE: f64 = 0.0174532925199432957692;
     let r = match func {
         ScalarFunc::Ceil => x.ceil(),
         ScalarFunc::Floor => x.floor(),
@@ -30529,6 +30537,9 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Tan => x.tan(),
         // cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
         ScalarFunc::Cbrt => x.cbrt(),
+        // radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
+        // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
+        ScalarFunc::Radians => x * RADIANS_PER_DEGREE,
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi

@@ -15797,6 +15797,9 @@ const (
 	// sfPi is the constant π as f64 (float.md §8) — zero-arg, IN-CONTRACT (same f64 literal in
 	// every core), not in the transcendental ledger.
 	sfPi
+	// sfRadians is degrees → radians (float.md §8): x · RADIANS_PER_DEGREE. A single
+	// correctly-rounded IEEE multiply, IN-CONTRACT (not ledgered).
+	sfRadians
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19332,6 +19335,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfCbrt
 	case "pi":
 		return sfPi
+	case "radians":
+		return sfRadians
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
