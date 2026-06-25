@@ -254,7 +254,8 @@ rows are asserted.
 ## 10. `ORDER BY`
 
 `ORDER BY` is **one or more sort keys** (`order_by` / `order_term` in the grammar), each a
-**bare table column** or an **output-column ordinal** (`ORDER BY 1` — see below) with an optional
+**general expression** (`ORDER BY a + 1` — see below; a bare table column is its simplest form)
+or an **output-column ordinal** (`ORDER BY 1` — see below) with an optional
 direction (`ASC` / `DESC`, default `ASC`) and an
 optional explicit NULL placement (`NULLS FIRST | LAST`). Keys apply **left to right**: the
 first is primary, the next breaks its ties, and **a full tie across all keys is broken by the
@@ -268,27 +269,52 @@ tie-break, so it stays parallelism-compatible.) A **column-name** key resolves a
 a key need not appear in the projection. An **ordinal** key instead resolves by *position* into
 the select list (below).
 
+**The general-expression form (`ORDER BY a + 1`).** A sort key may be **any expression** — `ORDER
+BY a + b`, `ORDER BY b % 2`, `ORDER BY abs(b - 25)`, `ORDER BY (b > 15)` — evaluated **per row**
+and sorted by the computed value (a bare column is just its degenerate case, kept on the fast
+path below). In a **plain** query the expression resolves against the FROM columns; in a **grouped /
+aggregate** query it resolves against the group context exactly as a select-list item does — it may
+combine grouping expressions and aggregates and may introduce a **new aggregate not in the select
+list** (`SELECT a FROM t GROUP BY a ORDER BY sum(b)`), while a non-grouped, non-aggregated column is
+the usual `42803`. The value is **materialized** (evaluated once per pre-sort row and appended,
+the same mechanism a window key uses — window.md §5.1) so the slot-based sort/`LIMIT`/projection
+pipeline below is unchanged and the cost stays *sort-before-project*; the per-row expression
+evaluation is **metered** like a projection (an `operator_eval` per node — the only new cost, and
+none for a bare-column key). A **non-orderable** result type — `json` (no btree opclass, json.md
+§5) — is `42883`; `jsonb` is orderable. A text-typed expression takes its **derived collation**
+(an inner `COLLATE`, else a bare column's frozen collation, else `C`/byte order — collation.md §1),
+overridable by a trailing `COLLATE` on the key. Because the key is a full expression, `ORDER BY
+1 + 1` is a **constant expression** (a no-op sort — PostgreSQL's reading), **not** an ordinal.
+Materializing a key disables the PK-scan elision below, so an expression key always takes the
+blocking sort.
+
 **The ordinal form (`ORDER BY 1`).** A sort key may also be an **output-column ordinal** — an
 integer literal naming the **1-based position** of a select-list item, the SQL92 form PostgreSQL
-accepts. The ordinal resolves to the item's underlying column: `SELECT a, b FROM t ORDER BY 1`
+accepts. The ordinal resolves to the item's value: `SELECT a, b FROM t ORDER BY 1`
 orders by `a`, `SELECT a AS x, b FROM t ORDER BY 1` orders by the real column `a` (the alias is
 just a label — §8), and with `SELECT *` the ordinal indexes the expanded scope columns left to
-right. A position **< 1 or greater than the number of output columns** is `42P10`
+right. An ordinal pointing at a **computed** select-list item (`SELECT a + 1 ... ORDER BY 1`)
+sorts by that item's value — the same materialization as a general-expression key. A position
+**< 1 or greater than the number of output columns** is `42P10`
 (`invalid_column_reference`, *"ORDER BY position N is not in select list"*) — matching PostgreSQL,
-which also reports `ORDER BY 0` / `ORDER BY -1` this way (jed folds an optional leading `-` into
-the ordinal so a negative position reaches the same `42P10`, not a syntax error). The ordinal is
-parsed only in the **query / set-operation** `ORDER BY`; in a `WITHIN GROUP (ORDER BY …)` an
-integer is a constant expression, not an ordinal (PostgreSQL again — aggregates.md §13), so it
-stays column-only there.
+which also reports `ORDER BY 0` / `ORDER BY -1` this way. The ordinal/expression split matches
+PostgreSQL exactly: a **bare** integer literal (optionally a leading `-`, folded so a negative
+position reaches `42P10` not a syntax error) is an ordinal, but anything more — `ORDER BY 1 + 1`,
+`ORDER BY -1 + 1`, `ORDER BY (1)` *(which folds to the bare literal, so still an ordinal)* — is a
+constant **expression**. The ordinal is parsed only in the **query / set-operation** `ORDER BY`;
+in a `WITHIN GROUP (ORDER BY …)` an integer is a constant expression, not an ordinal (PostgreSQL
+again — aggregates.md §13), and that clause stays column-only (its general-expression form is a
+separate deferred follow-on).
 
-**Still narrowed (§5):** a key is a column name **or an ordinal** — not a general expression
-(`ORDER BY a + 1`), not an output alias. A general expression key is a `42601` syntax error
-(`expect_identifier`, not the expression parser, consumes a non-ordinal key), and an ordinal that
-points at a **non-column** select-list expression (`SELECT a + 1 ... ORDER BY 1`) is a deferred
-`0A000` (the engine sorts by source columns, not computed projections, today); both remain
-relaxable later. Because jed parses no expression keys, `ORDER BY 1 + 1` — which PostgreSQL reads
-as a constant expression, not an ordinal — is likewise `42601` here (the same documented
-expression-key narrowing), not a no-op sort.
+**Still narrowed (§5).** An output **alias** key (`SELECT a + b AS s ... ORDER BY s`) is not yet
+resolved against the select list — a bare name still resolves against the *table's* columns (§8),
+so it is `42703` when no such column exists (PostgreSQL would bind the alias); this is the
+remaining ORDER-BY follow-on. A **set-operation** `ORDER BY` (after `UNION`/`INTERSECT`/`EXCEPT`)
+accepts only an output column name or ordinal — a general-expression key there is `0A000`
+(*"invalid UNION/INTERSECT/EXCEPT ORDER BY clause"*, matching PostgreSQL, which rejects expressions
+once the inputs are unified). A **window function** inside an `ORDER BY` key, a `GROUPING(...)`
+call inside one, an expression key in a **grouped query that also has window functions**, and a
+**correlated** key (one referencing an enclosing query) are each `0A000` deferrals.
 
 **NULL placement and the default.** The physical key order ratifies NULL as the **largest**
 value ([types.md](types.md) §4, `null_ordering = "nulls-last-ascending"` in

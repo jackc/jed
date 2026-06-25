@@ -3198,10 +3198,13 @@ func (p *Parser) parseHaving(sel *Select) error {
 	return nil
 }
 
-// parseOrderBy parses the query / set-operation `ORDER BY`. A key may be an output-column ordinal
-// — an optionally-negative integer literal naming the 1-based select-list position (grammar.md §10),
-// its value validated at resolve (42P10) — or a bare/qualified column. (WITHIN GROUP inlines its own
-// column-only loop, so an integer there is a 42601, matching PostgreSQL's "integer is a constant".)
+// parseOrderBy parses the query / set-operation `ORDER BY`. Each key is parsed as a general
+// expression and classified into one of the three OrderKey modes (grammar.md §10): a bare integer
+// literal (the unary-minus fold makes `-1` one negative Int) is an ordinal; a bare (optionally
+// COLLATE-wrapped) column reference is a column key (kept on the fast path so PK-scan elision + the
+// column's collation still apply); anything else is a general expression key. (WITHIN GROUP inlines
+// its own column-only loop, so an integer there is a 42601 — matching PostgreSQL where a WITHIN GROUP
+// integer is a constant, not an ordinal.)
 func (p *Parser) parseOrderBy(sel *Select) error {
 	if p.peekKeyword() != "order" {
 		return nil
@@ -3211,46 +3214,15 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		return err
 	}
 	for {
-		var key OrderKey
-		// An ordinal sort key: an optional leading `-` then an integer literal. The lexer caps a
-		// magnitude at 2^63; clamp to math.MaxInt64 so the signed position always fits (an out-of-range
-		// position is 42P10 at resolve regardless of the exact value). A `-` not followed by an integer
-		// (`ORDER BY -a`) is an unsupported general expression and falls through to a 42601.
-		if k := p.peek().Kind; k == TokInt || k == TokMinus {
-			negate := false
-			if p.peek().Kind == TokMinus {
-				p.advance()
-				negate = true
-			}
-			t := p.advance()
-			if t.Kind != TokInt {
-				return NewError(SyntaxError, "expected an ORDER BY column or ordinal")
-			}
-			mag := t.Int
-			if mag > uint64(math.MaxInt64) {
-				mag = uint64(math.MaxInt64)
-			}
-			ord := int64(mag)
-			if negate {
-				ord = -ord
-			}
-			collation, descending, nullsFirst, err := p.parseSortSuffix()
-			if err != nil {
-				return err
-			}
-			key = OrderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
-		} else {
-			qualifier, col, err := p.parseColumnRef()
-			if err != nil {
-				return err
-			}
-			collation, descending, nullsFirst, err := p.parseSortSuffix()
-			if err != nil {
-				return err
-			}
-			key = OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+		expr, err := p.parseExpr()
+		if err != nil {
+			return err
 		}
-		sel.OrderBy = append(sel.OrderBy, key)
+		collation, descending, nullsFirst, err := p.parseSortSuffix()
+		if err != nil {
+			return err
+		}
+		sel.OrderBy = append(sel.OrderBy, classifyOrderKey(expr, collation, descending, nullsFirst))
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue
@@ -3258,6 +3230,36 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		break
 	}
 	return nil
+}
+
+// classifyOrderKey classifies a parsed query/set-operation ORDER BY key expression into one of the
+// three OrderKey modes (grammar.md §10), matching PostgreSQL's rule that only a bare integer constant
+// is an ordinal: an integer literal (positive, or negative via the parser's unary-minus-on-literal
+// fold) is an ordinal; a bare column reference — directly, or wrapped in a COLLATE that parseExpr
+// absorbed (`ORDER BY name COLLATE "x"`) — is a column key carrying that collation, so it stays on the
+// fast path (PK-scan elision, per-column collation); every other shape is a general expression key.
+func classifyOrderKey(expr Expr, collation string, descending, nullsFirst bool) OrderKey {
+	switch expr.Kind {
+	case ExprLiteral:
+		if expr.Literal != nil && expr.Literal.Kind == LiteralInt {
+			ord := expr.Literal.Int
+			return OrderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+		}
+	case ExprColumn:
+		return OrderKey{Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+	case ExprQualifiedColumn:
+		return OrderKey{Qualifier: expr.Qualifier, Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+	case ExprCollate:
+		// parseExpr folds a trailing `COLLATE "x"` into the key (collation.md §1). When it wraps a bare
+		// column, unwrap back to a column key carrying that explicit collation — exactly the column-only
+		// OrderKey the old parser built, so the column fast path is byte-identical.
+		if inner := expr.Collate.Inner; inner.Kind == ExprColumn {
+			return OrderKey{Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
+		} else if inner.Kind == ExprQualifiedColumn {
+			return OrderKey{Qualifier: inner.Qualifier, Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
+		}
+	}
+	return OrderKey{Expr: &expr, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 }
 
 // parseSortSuffix parses the trailing modifiers shared by every sort key: an optional `COLLATE

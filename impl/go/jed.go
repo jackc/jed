@@ -204,6 +204,8 @@ var SupportedCapabilities = []string{
 	"query.order_by_keys",
 	// ORDER BY by an output-column ordinal (`ORDER BY 1`), incl. the set-op ORDER BY (grammar.md §10).
 	"query.order_by_ordinal",
+	// ORDER BY by a general expression (`ORDER BY a + 1`, `ORDER BY sum(b)`), materialized (grammar.md §10).
+	"query.order_by_expr",
 	// Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
 	"query.select_star",
 	"query.column_alias",

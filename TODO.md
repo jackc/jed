@@ -102,8 +102,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] **Output-column ordinal** (`ORDER BY 1`) — 1-based select-list position, incl. the set-op
         `ORDER BY`; out of range `42P10`; an ordinal pointing at a non-column projection is `0A000`;
         `WITHIN GROUP` stays column-only (`query.order_by_ordinal`). → [grammar.md §10](spec/design/grammar.md)
-  - [ ] _follow-on:_ general-expression / alias sort keys (and an ordinal resolving to a computed
-        projection, currently `0A000`).
+  - [x] **General-expression sort keys** (`ORDER BY a + 1`, `ORDER BY b % 2`, `ORDER BY abs(b)`,
+        and `ORDER BY sum(b)` in a grouped query) — evaluated per row and sorted by the computed
+        value (materialized like a window key — window.md §5.1; metered per node). An ordinal that
+        points at a computed select-list item now sorts by that value too (the old `0A000` lifted),
+        and `ORDER BY 1 + 1` is a constant no-op (PG). DISTINCT requires the key to match a
+        select-list expression (`42P10`); a non-orderable result is `42883`
+        (`query.order_by_expr`). → [grammar.md §10](spec/design/grammar.md)
+  - [ ] _follow-on:_ an output **alias** sort key (`SELECT a+b AS s ... ORDER BY s`, currently
+        `42703` — a bare name still resolves against the table); a general-expression key in a
+        **set-operation** ORDER BY (`0A000`), a window function / `GROUPING()` inside a key, an
+        expression key in a grouped+window query, and a correlated key (each `0A000`); the
+        general-expression `WITHIN GROUP` order key.
 - [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,
       non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK columns (sorting by each
       column's stored key order) elides the sort and streams the scan; with a `LIMIT` it

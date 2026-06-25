@@ -481,7 +481,13 @@ cross-core-identical metering point:
   its input cardinality is already bounded by the upstream `storage_row_read` / `row_produced`. (The
   set-operation sort path carries no `Meter` at all, so the comparison evaluator is the one
   consistent, meterable site — collation.md §11.) Pinned cross-core by `# cost:` assertions in
-  `spec/conformance/suites/collation/collate.test`.
+  `spec/conformance/suites/collation/collate.test`. An **`ORDER BY` *expression* key** (`ORDER BY
+  a + 1`, `ORDER BY abs(b)` — grammar.md §10) is the one ORDER-BY cost beyond the scan/produce
+  block: its value is **materialized once per pre-sort row** (every post-`WHERE` row in a plain
+  query, every group row in an aggregate query — *before* `LIMIT`, since the sort needs them all),
+  so it charges an `operator_eval` per expression node per row exactly like a projection or filter
+  expression. The sort *comparisons* over the materialized values stay unmetered. A bare-column /
+  ordinal key materializes nothing and adds no cost (byte-identical to before).
 
 ### `varlen_compare` — a text / bytea comparison's length-scaled byte scan
 

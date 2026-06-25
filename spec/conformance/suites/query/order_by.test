@@ -7,7 +7,7 @@
 # FIRST|LAST overrides that default regardless of direction. The sort is unmetered (cost.md
 # §3): cost = storage_row_read per scanned row + row_produced per produced row (+ filter
 # operator_eval); multi-key/NULLS placement adds nothing.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.order_by_ordinal, query.select_star, query.column_alias, query.comparison_order, query.limit, expr.arithmetic, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.order_by_ordinal, query.order_by_expr, query.select_star, query.column_alias, query.comparison_order, query.limit, expr.arithmetic, func.abs, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -247,25 +247,94 @@ SELECT a FROM t ORDER BY 0
 statement error 42P10
 SELECT a FROM t ORDER BY -1
 
-# An expression sort key (ORDER BY a + 1) is still out of scope — a key is a column or an ordinal,
-# never a general expression.
-statement error 42601
+# --- General-expression sort keys (grammar.md §10, query.order_by_expr) ---------------------------
+# A general expression is evaluated per row and sorted by the computed value. ORDER BY a + 1: the
+# a+1 values are 11,11,21,11,NULL, so ASC NULLS LAST gives the a=10 group (output 10 for each, the
+# tie is invisible in the output), then a=20, then the a NULL row last. The expression is
+# materialized — evaluated once per scanned row — so it charges operator_eval per node: 1 page_read
+# + 5 storage_row_read + 5 operator_eval (the `+`) + 5 row_produced = 16.
+# names: a
+# cost: 16
+query I nosort
 SELECT a FROM t ORDER BY a + 1
+----
+10
+10
+10
+20
+NULL
 
-# `ORDER BY 1 + 1` is an expression, not an ordinal: PostgreSQL reads it as a constant-expression
-# (no-op) sort, but jed rejects every expression key as 42601 (a documented narrowing, grammar.md §10).
-statement error 42601
+# A two-key sort whose primary key is an expression and secondary is a column: ORDER BY a % 100, id.
+# a % 100 is 10,10,20,10,NULL → ASC NULLS LAST, broken by id: (a=10: id1,id2,id4), a=20 (id3), then
+# a NULL (id5). The output `id` makes the order fully observable.
+# names: id
+query I nosort
+SELECT id FROM t ORDER BY a % 100, id
+----
+1
+2
+4
+3
+5
+
+# `ORDER BY 1 + 1` is a CONSTANT expression (not an ordinal — only a bare integer literal is): a no-op
+# sort, matching PostgreSQL. The order is therefore unspecified, so the multiset is asserted with
+# rowsort (the constant key fixes nothing).
+# names: a
+query I rowsort
 SELECT a FROM t ORDER BY 1 + 1
+----
+10
+10
+10
+20
+NULL
 
-# An ordinal that points at a NON-column select-list item (here the expression `a + 1`) is a deferred
-# 0A000: the engine sorts source columns, not computed projections (grammar.md §10). PostgreSQL sorts
-# by the computed value, so this is a documented narrowing.
-statement error 0A000
-SELECT a + 1, b FROM t ORDER BY 1
+# An ordinal that points at a COMPUTED select-list item now sorts by that item's value (the old 0A000
+# is lifted — grammar.md §10): ORDER BY 1 over `SELECT a + 1` sorts by a+1 = 11,11,11,21,NULL.
+# names: ?column?
+query I nosort
+SELECT a + 1 FROM t ORDER BY 1
+----
+11
+11
+11
+21
+NULL
+
+# An expression key over the FROM columns need not appear in the select list (it is materialized from
+# the scanned row): ORDER BY abs(b - 6) ranks rows by distance of b from 6 — b = 5,NULL,7,5,9 gives
+# 1,NULL,1,1,3, so the |·|=1 rows (id1,id3,id4) then |·|=3 (id5) then NULL (id2), broken by id.
+# names: id
+query I nosort
+SELECT id FROM t ORDER BY abs(b - 6), id
+----
+1
+3
+4
+5
+2
+
+# A boolean expression key (false < true, NULLs last): ORDER BY (a > 15) puts the a<=15 rows first.
+# a = 10,10,20,10,NULL → (a>15) = false,false,true,false,NULL, so the four non-true rows (a=10 ×3
+# then... no: id1,id2,id4 are a=10=false, id3 a=20=true, id5 a NULL=unknown→last). Broken by id.
+# names: id
+query I nosort
+SELECT id FROM t ORDER BY (a > 15), id
+----
+1
+2
+4
+3
+5
 
 # An ORDER BY key that names no column is an undefined-column error, reusing the existing path.
 statement error 42703
 SELECT a FROM t ORDER BY nope
+
+# A general expression referencing an unknown column is likewise 42703 (resolved like any expression).
+statement error 42703
+SELECT a FROM t ORDER BY nope + 1
 
 # G12 — empty scanned table. ORDER BY over zero rows yields zero rows at zero cost: nothing is
 # scanned (no storage_row_read), nothing is produced (no row_produced), and the sort is a no-op

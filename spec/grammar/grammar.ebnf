@@ -657,25 +657,31 @@ select_item    ::= expr ("AS" identifier)?
 
 /* ORDER BY is one or more sort terms, applied left to right (the first term is
  * primary, ties broken by the next, and a full tie keeps the primary-key scan
- * order via a stable sort). An order_term is EITHER a bare table column OR an
- * output-column ordinal (ORDER BY 1) — an integer literal naming the 1-based
- * position of a select-list item (../design/grammar.md §10). It is still NOT a
- * general expression (ORDER BY a + 1) nor an output alias (those stay deferred,
- * ../design/grammar.md §5). Each term carries an optional direction and an optional
- * explicit NULL placement. Default NULL placement follows direction: ASC => NULLS
- * LAST, DESC => NULLS FIRST, because the physical key order ratifies NULL as the
- * LARGEST value (the PostgreSQL model; ../design/types.md §4, ../types/compare.toml
- * null_ordering). An explicit NULLS FIRST | LAST overrides that default regardless
- * of direction. "NULLS" not followed by FIRST | LAST is a syntax error (42601). */
+ * order via a stable sort). An order_term is a GENERAL EXPRESSION (ORDER BY a + 1,
+ * ORDER BY abs(b), ORDER BY sum(x) in a grouped query) — a bare column being its
+ * simplest form — OR an output-column ordinal (ORDER BY 1), an integer literal
+ * naming the 1-based position of a select-list item (../design/grammar.md §10). An
+ * output ALIAS (ORDER BY my_alias) is still deferred (../design/grammar.md §5). Each
+ * term carries an optional direction and an optional explicit NULL placement. Default
+ * NULL placement follows direction: ASC => NULLS LAST, DESC => NULLS FIRST, because
+ * the physical key order ratifies NULL as the LARGEST value (the PostgreSQL model;
+ * ../design/types.md §4, ../types/compare.toml null_ordering). An explicit NULLS
+ * FIRST | LAST overrides that default regardless of direction. "NULLS" not followed
+ * by FIRST | LAST is a syntax error (42601). */
 order_by       ::= "ORDER" "BY" order_term ("," order_term)*
 
-/* An order_term is a column reference or an ordinal, plus the shared sort suffix. An
- * ordinal is an (optionally negative) integer literal; its VALUE is validated at resolve
- * (42P10 invalid_column_reference — "ORDER BY position N is not in select list" — when N is
- * < 1 or > the number of output columns), and an ordinal that points at a non-column
- * select-list expression is a deferred 0A000 (../design/grammar.md §10). */
-order_term     ::= ( ordinal | column_ref ) collate_clause? ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
-ordinal        ::= "-"? integer
+/* An order_term is a general expression plus the shared sort suffix. The expression is
+ * classified at parse: a bare integer literal (optionally negated) is an ORDINAL — its VALUE
+ * is validated at resolve (42P10 invalid_column_reference, "ORDER BY position N is not in
+ * select list", when N < 1 or > the number of output columns; an ordinal pointing at a
+ * computed select-list item sorts by that item's value); a bare column reference (optionally
+ * COLLATE-wrapped) is a COLUMN KEY (it may enable the primary-key-scan-order sort elision); any
+ * other shape is a general EXPRESSION KEY, evaluated per row and sorted by the computed value
+ * (../design/grammar.md §10). A non-orderable result (json) is 42883. Because the key is a full
+ * expression, "ORDER BY 1 + 1" is a constant expression (PostgreSQL's reading — a no-op sort),
+ * not an ordinal. In a set-operation ORDER BY only an output column name or ordinal is allowed —
+ * an expression key there is 0A000 (PostgreSQL: "invalid UNION/INTERSECT/EXCEPT ORDER BY"). */
+order_term     ::= expr collate_clause? ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
 
 /* A sort_key (the WITHIN GROUP order key — § within_group_clause) may carry an explicit
  * "COLLATE name" between the column and the direction (../design/collation.md §1): the column

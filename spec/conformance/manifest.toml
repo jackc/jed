@@ -226,7 +226,11 @@ description = "ORDER BY with multiple keys, per-key ASC/DESC, and per-key NULLS 
 
 [[capability]]
 id = "query.order_by_ordinal"
-description = "ORDER BY by an output-column ordinal (ORDER BY 1, the 1-based select-list position; out of range is 42P10). Also applies to a set-operation ORDER BY. An ordinal that points at a non-column select-list expression is 0A000; WITHIN GROUP stays column-only."
+description = "ORDER BY by an output-column ordinal (ORDER BY 1, the 1-based select-list position; out of range is 42P10). Also applies to a set-operation ORDER BY. An ordinal pointing at a computed select-list item sorts by that item's value (query.order_by_expr); WITHIN GROUP stays column-only."
+
+[[capability]]
+id = "query.order_by_expr"
+description = "ORDER BY by a general expression (ORDER BY a + 1, ORDER BY b % 2, ORDER BY abs(b)) — evaluated per row and sorted by the computed value (materialized like a window key, metered per node). In a grouped query the key resolves against the group context (grouping expressions + aggregates) and may introduce a new aggregate not in the select list (ORDER BY sum(b)); a non-grouped column is 42803. A bare integer is still an ordinal and ORDER BY 1 + 1 is a constant no-op (PostgreSQL). A non-orderable result (json) is 42883. A SELECT DISTINCT expression key must match a select-list expression (42P10). A set-operation ORDER BY expression key, a window function or GROUPING() inside a key, an expression key in a grouped+window query, an output alias, and a correlated key are each deferred (0A000 / 42703). Builds on query.order_by and query.order_by_ordinal."
 
 [[capability]]
 id = "query.select_star"

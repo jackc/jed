@@ -1358,19 +1358,27 @@ type CaseWhen struct {
 	Result Expr
 }
 
-// OrderKey is one ORDER BY sort key: a bare table column OR an output-column ordinal, a sort
-// direction, and a resolved NULL placement. NullsFirst is resolved at parse time — an explicit
-// NULLS FIRST|LAST, else the direction default (Descending: ASC -> last, DESC -> first, the
+// OrderKey is one ORDER BY sort key, in one of three modes resolved at parse time
+// (spec/design/grammar.md §10): an output-column ordinal (Ordinal != nil), a general expression
+// (Expr != nil), or a column reference (Qualifier/Column, the fast path that keeps PK-scan elision).
+// Plus a sort direction and a resolved NULL placement. NullsFirst is resolved at parse time — an
+// explicit NULLS FIRST|LAST, else the direction default (Descending: ASC -> last, DESC -> first, the
 // PostgreSQL model where NULL is the largest value) — and is applied independently of the
-// Descending value flip (spec/design/grammar.md §10).
+// Descending value flip.
 type OrderKey struct {
 	// Ordinal is an output-column ordinal (`ORDER BY 1`): non-nil is the 1-based position of a
 	// select-list item (resolved by position, the value validated as 42P10 if out of range —
-	// grammar.md §10), and then Qualifier/Column are unused. nil is a column-reference key, below.
-	// An optional leading `-` is folded in, so a negative position reaches 42P10, not a syntax
-	// error. Ordinals are parsed only in the query / set-operation ORDER BY, never in WITHIN GROUP.
+	// grammar.md §10), and then Expr/Qualifier/Column are unused. An optional leading `-` is folded
+	// in, so a negative position reaches 42P10, not a syntax error. Ordinals are parsed only in the
+	// query / set-operation ORDER BY, never in WITHIN GROUP.
 	Ordinal *int64
-	// Qualifier is an optional relation qualifier (`ORDER BY t.a`); "" is a bare column.
+	// Expr is a general-expression key (`ORDER BY a + 1`): non-nil is the key expression, evaluated
+	// per row and sorted by the computed value (grammar.md §10); Ordinal/Qualifier/Column are then
+	// unused. The parser sets this only when the key is neither a bare ordinal nor a bare (optionally
+	// COLLATE-wrapped) column reference, so a column key still takes the fast path below.
+	Expr *Expr
+	// Qualifier is an optional relation qualifier (`ORDER BY t.a`); "" is a bare column. Used only by
+	// a column-reference key (Ordinal and Expr both unset).
 	Qualifier string
 	Column    string
 	// Collation is an optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md

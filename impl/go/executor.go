@@ -6,12 +6,20 @@ import (
 	"math"
 	"math/big"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 )
+
+// exprEqual reports whether two parsed expression trees are STRUCTURALLY equal (spec/design/grammar.md
+// §10) — the Go equivalent of the Rust core's derived PartialEq on Expr. Used by the SELECT DISTINCT
+// ORDER BY restriction to decide whether an expression sort key matches a select-list expression. The
+// AST carries no source positions, so textually-identical fragments (`a + b` here and there) compare
+// equal; following the node pointers is exactly the recursive tree comparison.
+func exprEqual(a, b Expr) bool { return reflect.DeepEqual(a, b) }
 
 // Statement executor (CLAUDE.md §10).
 //
@@ -9716,6 +9724,12 @@ func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
 // column names (the left operand's). A qualified key is 42P01 (no relation scope after a set
 // operation); an unknown name is 42703. Returns the output column index.
 func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
+	// A set-operation ORDER BY accepts only an output column name or ordinal — a general expression key
+	// (after the inputs are unified) is 0A000, matching PostgreSQL's "invalid UNION/INTERSECT/EXCEPT
+	// ORDER BY clause" (grammar.md §10).
+	if key.Expr != nil {
+		return 0, NewError(FeatureNotSupported, "invalid UNION/INTERSECT/EXCEPT ORDER BY clause")
+	}
 	// An output-column ordinal (`... ORDER BY 1`) resolves by position into the output columns; out
 	// of [1, ncols] is 42P10 (grammar.md §10). It precedes the name path (an ordinal has no column).
 	if key.Ordinal != nil {
@@ -9735,39 +9749,6 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 		}
 	}
 	return 0, NewError(UndefinedColumn, "column "+key.Column+" does not exist")
-}
-
-// resolveOrderOrdinal resolves an ORDER BY ordinal (`ORDER BY 1`) to a source-row resolution
-// (grammar.md §10). The 1-based ord indexes the select-list output columns: a position outside
-// [1, ncols] is 42P10 (matching PostgreSQL, including `ORDER BY 0` / a negative position); with
-// SELECT * the ordinal indexes the scope columns left to right; with an explicit list it must
-// point at a bare or qualified COLUMN item (a non-column projection is a deferred 0A000 — the
-// engine sorts source columns, not computed projections). Returns the resolved a column name would.
-func resolveOrderOrdinal(ord int64, items *SelectItems, s *scope) (resolved, error) {
-	var ncols int64
-	if items.All {
-		ncols = int64(s.width())
-	} else {
-		ncols = int64(len(items.Items))
-	}
-	if ord < 1 || ord > ncols {
-		return resolved{}, NewError(InvalidColumnReference,
-			fmt.Sprintf("ORDER BY position %d is not in select list", ord))
-	}
-	pos := int(ord - 1)
-	if items.All {
-		return resolved{level: 0, index: pos}, nil
-	}
-	e := items.Items[pos].Expr
-	switch e.Kind {
-	case ExprColumn:
-		return s.resolveBare(e.Column)
-	case ExprQualifiedColumn:
-		return s.resolveQualified(e.Qualifier, e.Column)
-	default:
-		return resolved{}, NewError(FeatureNotSupported,
-			"ORDER BY by an output-column expression is not supported")
-	}
 }
 
 // runSelect analyzes and runs a SELECT: resolve projected columns and the WHERE/ORDER BY columns
@@ -10216,72 +10197,196 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
 	// keys resolve against the FROM scope (a flat row index). An outer (correlated) ORDER BY key
 	// — ordering by an enclosing-query constant — is degenerate and 0A000 (§26).
+	// ORDER BY resolution (spec/design/grammar.md §10). Each key is one of three modes (set at parse):
+	// an output-column ORDINAL, a COLUMN reference, or a general EXPRESSION. A column / ordinal-to-column
+	// key resolves to a real row slot (against the GROUP KEYS in an aggregate query — a grouping column
+	// gives its synthetic slot, a non-grouping column is 42803; else against the FROM scope). A general-
+	// expression key (and an ordinal pointing at a COMPUTED select-list item) is MATERIALIZED: its
+	// expression is resolved here (introducing a new aggregate in a grouped query if it names one),
+	// collected into orderExprs, and given a placeholder sort slot orderExprBase+k rebased to
+	// final_width+k below — the window-key precedent (window.md §5.1).
 	order := make([]orderSlot, 0, len(sel.OrderBy))
+	var orderExprs []*rExpr
 	for _, key := range sel.OrderBy {
-		var r resolved
+		// Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
+		// general expression, or an ordinal pointing at a computed projection).
+		var slotRes resolved
+		var orderExpr *Expr
 		if key.Ordinal != nil {
-			// An output-column ordinal (`ORDER BY 1`) resolves by position into the select list,
-			// yielding the same resolved a column name would (grammar.md §10).
-			r, err = resolveOrderOrdinal(*key.Ordinal, &sel.Items, s)
+			ord := *key.Ordinal
+			var ncols int64
+			if items.All {
+				ncols = int64(s.width())
+			} else {
+				ncols = int64(len(items.Items))
+			}
+			if ord < 1 || ord > ncols {
+				return nil, NewError(InvalidColumnReference,
+					fmt.Sprintf("ORDER BY position %d is not in select list", ord))
+			}
+			pos := int(ord - 1)
+			if items.All {
+				slotRes = resolved{level: 0, index: pos}
+			} else {
+				switch e := items.Items[pos].Expr; e.Kind {
+				case ExprColumn:
+					if slotRes, err = s.resolveBare(e.Column); err != nil {
+						return nil, err
+					}
+				case ExprQualifiedColumn:
+					if slotRes, err = s.resolveQualified(e.Qualifier, e.Column); err != nil {
+						return nil, err
+					}
+				default:
+					orderExpr = &items.Items[pos].Expr
+				}
+			}
+		} else if key.Expr != nil {
+			orderExpr = key.Expr
 		} else if key.Qualifier != "" {
-			r, err = s.resolveQualified(key.Qualifier, key.Column)
+			if slotRes, err = s.resolveQualified(key.Qualifier, key.Column); err != nil {
+				return nil, err
+			}
 		} else {
-			r, err = s.resolveBare(key.Column)
+			if slotRes, err = s.resolveBare(key.Column); err != nil {
+				return nil, err
+			}
 		}
-		if err != nil {
-			return nil, err
+
+		if orderExpr == nil {
+			// A column / ordinal-to-column key resolves to a real row slot.
+			r := slotRes
+			if r.level != 0 {
+				return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
+			}
+			// `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
+			// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
+			if s.columnOf(r).Type.IsJson() {
+				return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
+			}
+			idx := r.index
+			// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
+			// text column (42804) and name a loaded collation ("C" → byte order, else 42704); absent a
+			// clause, the key inherits the column's frozen (implicit) collation.
+			var coll *Collation
+			if key.Collation != "" {
+				if !s.columnOf(r).Type.IsText() {
+					return nil, typeError(fmt.Sprintf(
+						"collations are not supported by type %s", s.columnOf(r).Type.CanonicalName(),
+					))
+				}
+				if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+					return nil, err
+				}
+			} else if cn := s.columnOf(r).Collation; cn != "" {
+				if coll, err = resolveCollationName(s.catalog, cn); err != nil {
+					return nil, err
+				}
+			}
+			slot := idx
+			if isAgg {
+				slot = -1
+				for pos, gk := range groupKeys {
+					if gk == idx {
+						slot = pos
+						break
+					}
+				}
+				if slot < 0 {
+					return nil, groupingErrorColumn(key.Column)
+				}
+			}
+			order = append(order, orderSlot{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
+			continue
 		}
-		if r.level != 0 {
+
+		// A general-expression key in a grouped query that ALSO windows is deferred (its row is extended
+		// by the window stage over the grouped row — a follow-on; grammar.md §10).
+		if isAgg && hasWindow {
+			return nil, NewError(FeatureNotSupported, "ORDER BY by an expression in a grouped windowed query is not supported")
+		}
+		// Resolve the key expression. A grouped query resolves it against the group context (group keys +
+		// aggregates), where it may introduce a NEW aggregate — collected back into aggSpecs. A fresh
+		// empty groupingSpecs isolates any GROUPING(...) call it contains (a deferred 0A000). A plain
+		// query resolves it under the Forbidden mode (columns are real input slots; an aggregate is 42803,
+		// a window function 42P20).
+		var rexpr *rExpr
+		var ty resolvedType
+		if isAgg {
+			octx := &aggCtx{collecting: true, groupKeys: groupKeys, specs: aggSpecs}
+			rexpr, ty, err = resolve(s, *orderExpr, nil, octx, ptypes)
+			aggSpecs = octx.specs
+			if err != nil {
+				return nil, err
+			}
+			if len(octx.groupingSpecs) > 0 {
+				return nil, NewError(FeatureNotSupported, "ORDER BY by a GROUPING() expression is not supported")
+			}
+		} else {
+			octx := &aggCtx{}
+			rexpr, ty, err = resolve(s, *orderExpr, nil, octx, ptypes)
+			if err != nil {
+				return nil, err
+			}
+		}
+		// A correlated ORDER BY expression (one referencing an enclosing query) is degenerate and 0A000.
+		if rexprReferencesOuter(rexpr, 0) {
 			return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
 		}
-		// `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
-		// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
-		if s.columnOf(r).Type.IsJson() {
+		// A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
+		if ty.kind == rtJson {
 			return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
 		}
-		idx := r.index
-		// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
-		// text column (42804) and name a loaded collation ("C" → byte order, else 42704); absent a
-		// clause, the key inherits the column's frozen (implicit) collation — so `ORDER BY name` over
-		// an en-US column sorts by en-US (slice 1d). A single column can't conflict (no 42P22 here).
+		// The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
+		// parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
+		// DERIVED from the key expression.
 		var coll *Collation
 		if key.Collation != "" {
-			if !s.columnOf(r).Type.IsText() {
-				return nil, typeError(fmt.Sprintf(
-					"collations are not supported by type %s", s.columnOf(r).Type.CanonicalName(),
-				))
+			if ty.kind != rtText && ty.kind != rtNull {
+				return nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
 			}
 			if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
 				return nil, err
 			}
-		} else if cn := s.columnOf(r).Collation; cn != "" {
-			if coll, err = resolveCollationName(s.catalog, cn); err != nil {
+		} else {
+			d, derr := deriveCollation(s, *orderExpr)
+			if derr != nil {
+				return nil, derr
+			}
+			if coll, err = resolveDeriv(s.catalog, d); err != nil {
 				return nil, err
 			}
 		}
-		slot := idx
-		if isAgg {
-			slot = -1
-			for pos, gk := range groupKeys {
-				if gk == idx {
-					slot = pos
-					break
-				}
-			}
-			if slot < 0 {
-				return nil, groupingErrorColumn(key.Column)
-			}
+		k := len(orderExprs)
+		orderExprs = append(orderExprs, rexpr)
+		order = append(order, orderSlot{idx: orderExprBase + k, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
+	}
+	// Rebase each materialized expression-key slot to its real trailing position now that the row layout
+	// is final (aggSpecs may have grown above). The materialized order values are appended AFTER the
+	// input / window / grouped columns (grammar.md §10).
+	var orderValueBase int
+	switch {
+	case isAgg:
+		orderValueBase = len(groupKeys) + len(aggSpecs) + len(groupingSpecs)
+	case hasWindow:
+		orderValueBase = s.width() + len(windowKeys) + len(windowSpecs)
+	default:
+		orderValueBase = s.width()
+	}
+	for i := range order {
+		if order[i].idx >= orderExprBase {
+			order[i].idx = orderValueBase + (order[i].idx - orderExprBase)
 		}
-		order = append(order, orderSlot{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
 	}
 
-	// SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
-	// as a bare/qualified column in the select list (resolved to the same flat index; or the
-	// list is `*`). Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8). Only a
-	// local match counts as "projected" (an outer reference has no per-row value).
-	if sel.Distinct && len(order) > 0 && !sel.Items.All {
+	// SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates collapse, an ORDER BY
+	// key must have a per-row value in the projected output — a bare/qualified column that is projected,
+	// an ordinal (which names a select-list item by position), or a general expression that STRUCTURALLY
+	// matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases are invisible to ORDER
+	// BY (§8); a SELECT DISTINCT * projects every column, so the restriction never bites.
+	if sel.Distinct && len(sel.OrderBy) > 0 && !items.All {
 		projected := make(map[int]bool)
-		for _, it := range sel.Items.Items {
+		for _, it := range items.Items {
 			switch it.Expr.Kind {
 			case ExprColumn:
 				if r, e := s.resolveBare(it.Expr.Column); e == nil && r.level == 0 {
@@ -10293,8 +10398,30 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 				}
 			}
 		}
-		for _, key := range order {
-			if !projected[key.idx] {
+		for i := range sel.OrderBy {
+			key := &sel.OrderBy[i]
+			inList := false
+			switch {
+			case key.Ordinal != nil:
+				inList = true
+			case key.Expr != nil:
+				for j := range items.Items {
+					if exprEqual(*key.Expr, items.Items[j].Expr) {
+						inList = true
+						break
+					}
+				}
+			default:
+				var r resolved
+				var e error
+				if key.Qualifier != "" {
+					r, e = s.resolveQualified(key.Qualifier, key.Column)
+				} else {
+					r, e = s.resolveBare(key.Column)
+				}
+				inList = e == nil && r.level == 0 && projected[r.index]
+			}
+			if !inList {
 				return nil, NewError(InvalidColumnReference,
 					"for SELECT DISTINCT, ORDER BY expressions must appear in select list")
 			}
@@ -10352,8 +10479,19 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		for _, p := range projections {
 			collectTouched(p, 0, touched)
 		}
+		// A column-key ORDER BY slot is a real input column (< totalCols) — mark it; a materialized
+		// expression-key slot is synthetic (>= totalCols, after rebase) whose input columns are reached
+		// through its orderExprs expression instead (collected below).
 		for _, o := range order {
-			touched[o.idx] = true
+			if o.idx < totalCols {
+				touched[o.idx] = true
+			}
+		}
+		// Each materialized ORDER BY expression key reads real input columns (a plain query resolves it
+		// against the FROM scope; a grouped query reaches them through its group keys / aggregate
+		// arguments, already marked above).
+		for _, oe := range orderExprs {
+			collectTouched(oe, 0, touched)
 		}
 		// A window query also reads each window function's PARTITION BY + ORDER BY keys, beyond what
 		// the projection's window-result slots reference. A bare-column key is a real input slot
@@ -10386,14 +10524,14 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// KEY columns — each ASC, collation-matching the column's stored key form — needs no sort, since
 	// the table scan already yields rows in that order. The streaming scan then elides the sort (and,
 	// with a LIMIT, short-circuits a top-N).
-	pkOrdered := !isAgg && !sel.Distinct && len(order) > 0 && len(planRels) == 1 &&
+	pkOrdered := !isAgg && !sel.Distinct && len(order) > 0 && len(orderExprs) == 0 && len(planRels) == 1 &&
 		planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil &&
 		db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		groupSets: groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
-		order: order, projections: projections,
+		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
 		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, relBounds: relBounds, relMasks: relMasks,
 	}, nil
@@ -13246,7 +13384,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// join take the eager path below, and an index bound does not stream (like the LIMIT
 	// short-circuit). Results + cost are identical to the eager sort (the sort is unmetered —
 	// cost.md §3; spill.md §6).
-	if len(plan.order) > 0 && !plan.pkOrdered && len(plan.rels) == 1 && len(plan.joins) == 0 &&
+	if len(plan.order) > 0 && !plan.pkOrdered && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
 		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil && plan.relBounds[0].gist == nil)) &&
 		plan.rels[0].srf == nil &&
@@ -13424,6 +13562,13 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// GROUP rows in the aggregate branch below — not these pre-aggregation rows — so this is
 	// gated to plain queries.
 	if !plan.isAgg && len(plan.order) > 0 {
+		// Materialize each general-expression ORDER BY key (grammar.md §10): evaluate it against the
+		// post-WHERE (post-window) row and append the value, so its sort slot final_width+k reads the
+		// appended column and the slot-based sort below is unchanged — the window-key precedent. The
+		// evaluation is metered per node (cost.md §3); a no-op for a column/ordinal-only ORDER BY.
+		if err := materializeOrderExprs(rows, plan.orderExprs, env, meter); err != nil {
+			return selectResult{}, err
+		}
 		if err := sortRows(rows, plan.order); err != nil {
 			return selectResult{}, err
 		}
@@ -13614,8 +13759,12 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				return selectResult{}, err
 			}
 		}
-		// ORDER BY over the grouped output (keys are synthetic group-key slots).
+		// ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
+		// expression key is materialized against the grouped row and appended — grammar.md §10).
 		if len(plan.order) > 0 {
+			if err := materializeOrderExprs(groupRows, plan.orderExprs, env, meter); err != nil {
+				return selectResult{}, err
+			}
 			if err := sortRows(groupRows, plan.order); err != nil {
 				return selectResult{}, err
 			}
@@ -14049,6 +14198,13 @@ const windowKeyBase = 1 << 29
 // bases, below 2^31 (32-bit-usize / wasm32 safe). GROUPING is mutually exclusive with window functions, so its
 // placeholders never coexist with the window ones in a projection.
 const groupingGsBase = 1 << 30
+
+// orderExprBase is the placeholder base a materialized ORDER BY EXPRESSION key's sort slot carries
+// until it is rebased to its real trailing slot final_row_width+k (the materialized order values are
+// appended after the input / window / grouped columns — grammar.md §10). Used only in the orderSlot
+// idx field (a different namespace from the rExpr column bases above), but kept disjoint and below
+// 2^31 (32-bit-usize / wasm32 safe) for the same reasons. A column / ordinal key keeps its real slot.
+const orderExprBase = 1 << 27
 
 // maxGroupingSets bounds a GROUP BY's total expansion (CUBE of n columns alone is 2^n). Beyond this
 // the statement is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (a
@@ -15895,9 +16051,15 @@ type selectPlan struct {
 	// — `PARTITION BY a + b`, `ORDER BY a % 2`), in synthetic-slot order. Before the window stage each
 	// row evaluates these and appends the values at flat slots input_width+k, so the slot-based
 	// partition / sort / frame machinery is unchanged. Empty when every window key is a bare column.
-	windowKeys  []*rExpr
-	having      *rExpr
-	order       []orderSlot
+	windowKeys []*rExpr
+	having     *rExpr
+	order      []orderSlot
+	// orderExprs is the materialized ORDER BY expression-key expressions (`ORDER BY a + 1`,
+	// `ORDER BY abs(b)`), in the order their sort slots reference them. Just before the sort each row
+	// evaluates these and appends the values at final_row_width+k (after any window / grouped columns),
+	// so the slot-based sort stays unchanged — the window-key precedent (window.md §5.1). Empty when
+	// every ORDER BY key is a bare column or ordinal (the common case, byte-identical to before).
+	orderExprs  []*rExpr
 	projections []*rExpr
 	columnNames []string
 	columnTypes []resolvedType
@@ -27443,6 +27605,31 @@ func clampIdx(x, np int) int {
 // The frame-sensitive plans (aggregate windows, first/last/nth_value) use a frameCtx, which
 // precomputes the partition's peer-group structure once and maps each row to its [lo, hi) frame.
 // spec/design/window.md §6.
+// materializeOrderExprs materializes the general-expression ORDER BY keys before the sort
+// (spec/design/grammar.md §10): for each row evaluate every orderExprs[k] and append the value, so its
+// sort slot final_width+k reads the appended column and the slot-based comparator stays unchanged —
+// the exact mechanism a non-column window key uses (window.md §5.1, applyWindowStage). Runs over every
+// pre-sort row (before LIMIT, since the sort needs them all); the per-row evaluation is metered like a
+// projection (operator_eval per node, charged inside eval). A no-op — and zero added cost — when
+// orderExprs is empty (a column/ordinal-only ORDER BY, byte-identical to before).
+func materializeOrderExprs(rows []Row, orderExprs []*rExpr, env *evalEnv, meter *Meter) error {
+	if len(orderExprs) == 0 {
+		return nil
+	}
+	for i := range rows {
+		vals := make([]Value, len(orderExprs))
+		for k, oe := range orderExprs {
+			v, err := oe.eval(rows[i], env, meter)
+			if err != nil {
+				return err
+			}
+			vals[k] = v
+		}
+		rows[i] = append(rows[i], vals...)
+	}
+	return nil
+}
+
 func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *evalEnv, meter *Meter) error {
 	n := len(rows)
 	if n == 0 {

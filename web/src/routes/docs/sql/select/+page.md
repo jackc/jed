@@ -150,8 +150,10 @@ ORDER BY on_day;`;
 
 `SELECT` supports the usual shape: `WHERE`, `ORDER BY`, `LIMIT` / `OFFSET`, `DISTINCT`, joins,
 `GROUP BY` with `HAVING`, set operations, subqueries, and `WITH` (common table expressions).
-An `ORDER BY` key is a column name or an **output-column position** (`ORDER BY 1` sorts by the
-first select-list item), each with optional `ASC` / `DESC` and `NULLS FIRST` / `NULLS LAST`.
+An `ORDER BY` key is a **general expression** (`ORDER BY a + b`, `ORDER BY abs(x)`, `ORDER BY sum(x)`
+in a grouped query — a column name is its simplest form) or an **output-column position**
+(`ORDER BY 1` sorts by the first select-list item), each with optional `ASC` / `DESC` and
+`NULLS FIRST` / `NULLS LAST`.
 Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).

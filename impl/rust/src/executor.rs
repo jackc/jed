@@ -8930,78 +8930,212 @@ impl Database {
                 _ => None,
             })
             .collect();
-        // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
-        // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
-        // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain
-        // query keys resolve against the FROM scope (a flat row index). An outer (correlated)
-        // ORDER BY key — ordering by an enclosing-query constant — is degenerate and 0A000 (§26).
+        // ORDER BY resolution (spec/design/grammar.md §10). Each key is one of three modes (set at
+        // parse): an output-column ORDINAL, a COLUMN reference, or a general EXPRESSION. A column /
+        // ordinal-to-column key resolves to a real row slot — against the GROUP KEYS in an aggregate
+        // query (a grouping column gives its synthetic slot, a non-grouping column is 42803), else
+        // against the FROM scope. A general-expression key (and an ordinal pointing at a COMPUTED
+        // select-list item) is MATERIALIZED: its expression is resolved here (introducing a new
+        // aggregate in a grouped query if it names one), collected into `order_exprs`, and given a
+        // placeholder sort slot `ORDER_EXPR_BASE + k` rebased to `final_width + k` below — the
+        // window-key precedent (window.md §5.1). The sort then runs over the appended values.
         let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(sel.order_by.len());
+        let mut order_exprs: Vec<RExpr> = Vec::new();
         for key in &sel.order_by {
-            let r = match key.ordinal {
-                // An output-column ordinal (`ORDER BY 1`) resolves by position into the select list,
-                // yielding the same `Resolved::Local` a column name would (grammar.md §10).
-                Some(ord) => resolve_order_ordinal(ord, &sel.items, &scope)?,
-                None => match &key.qualifier {
-                    Some(q) => scope.resolve_qualified(q, &key.column)?,
-                    None => scope.resolve_bare(&key.column)?,
-                },
-            };
-            let idx = match r {
-                Resolved::Local(i) => i,
-                Resolved::Outer { .. } => {
+            // Classify the key into a row slot (a column / ordinal-to-column) or a source expression
+            // (a general expression, or an ordinal pointing at a computed projection).
+            enum Target<'a> {
+                Slot(Resolved),
+                Expr(&'a Expr),
+            }
+            let target = if let Some(ord) = key.ordinal {
+                // An ordinal indexes the select list by 1-based position; out of `[1, ncols]` is 42P10.
+                let ncols = match items_ref {
+                    SelectItems::All => scope.width() as i64,
+                    SelectItems::Items(its) => its.len() as i64,
+                };
+                if ord < 1 || ord > ncols {
                     return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "ORDER BY may not reference an outer query column",
+                        SqlState::InvalidColumnReference,
+                        format!("ORDER BY position {ord} is not in select list"),
                     ));
                 }
-            };
-            // `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
-            // ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
-            if scope.column_of(r).ty.is_json() {
-                return Err(EngineError::new(
-                    SqlState::UndefinedFunction,
-                    "could not identify an ordering operator for type json",
-                ));
-            }
-            // The sort key's collation (spec/design/collation.md §1/§7). An explicit `COLLATE` must
-            // be on a text column (42804) and name a loaded collation ("C" → byte order, else 42704);
-            // absent a clause, the key inherits the column's frozen (implicit) collation — so
-            // `ORDER BY name` over an `en-US` column sorts by en-US (slice 1d). A single column can't
-            // conflict, so no 42P22 here.
-            let coll = match &key.collation {
-                Some(name) => {
-                    if !scope.column_of(r).ty.is_text() {
-                        return Err(type_error(format!(
-                            "collations are not supported by type {}",
-                            scope.column_of(r).ty.canonical_name()
-                        )));
-                    }
-                    resolve_collation_name(scope.catalog, name)?
+                let pos = (ord - 1) as usize;
+                match items_ref {
+                    SelectItems::All => Target::Slot(Resolved::Local(pos)),
+                    SelectItems::Items(its) => match &its[pos].expr {
+                        Expr::Column(name) => Target::Slot(scope.resolve_bare(name)?),
+                        Expr::QualifiedColumn { qualifier, name } => {
+                            Target::Slot(scope.resolve_qualified(qualifier, name)?)
+                        }
+                        // An ordinal at a computed item sorts by that item's value (grammar.md §10).
+                        e => Target::Expr(e),
+                    },
                 }
-                None => match &scope.column_of(r).collation {
-                    Some(cn) => resolve_collation_name(scope.catalog, cn)?,
-                    None => None,
-                },
-            };
-            let slot = if is_agg {
-                group_keys
-                    .iter()
-                    .position(|&gk| gk == idx)
-                    .ok_or_else(|| grouping_error_column(&key.column))?
+            } else if let Some(e) = &key.expr {
+                Target::Expr(e)
             } else {
-                idx
+                Target::Slot(match &key.qualifier {
+                    Some(q) => scope.resolve_qualified(q, &key.column)?,
+                    None => scope.resolve_bare(&key.column)?,
+                })
             };
-            order.push((slot, key.descending, key.nulls_first, coll));
+
+            match target {
+                Target::Slot(r) => {
+                    let idx = match r {
+                        Resolved::Local(i) => i,
+                        Resolved::Outer { .. } => {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "ORDER BY may not reference an outer query column",
+                            ));
+                        }
+                    };
+                    // `json` has no ordering operator (PG ships no btree opclass — json.md §5): ORDER BY
+                    // a json column is 42883. jsonb IS orderable (its btree total order, §5).
+                    if scope.column_of(r).ty.is_json() {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedFunction,
+                            "could not identify an ordering operator for type json",
+                        ));
+                    }
+                    // The sort key's collation (collation.md §1/§7). An explicit `COLLATE` must be on a
+                    // text column (42804) and name a loaded collation ("C" → byte order, else 42704);
+                    // absent a clause, the key inherits the column's frozen (implicit) collation.
+                    let coll = match &key.collation {
+                        Some(name) => {
+                            if !scope.column_of(r).ty.is_text() {
+                                return Err(type_error(format!(
+                                    "collations are not supported by type {}",
+                                    scope.column_of(r).ty.canonical_name()
+                                )));
+                            }
+                            resolve_collation_name(scope.catalog, name)?
+                        }
+                        None => match &scope.column_of(r).collation {
+                            Some(cn) => resolve_collation_name(scope.catalog, cn)?,
+                            None => None,
+                        },
+                    };
+                    let slot = if is_agg {
+                        group_keys
+                            .iter()
+                            .position(|&gk| gk == idx)
+                            .ok_or_else(|| grouping_error_column(&key.column))?
+                    } else {
+                        idx
+                    };
+                    order.push((slot, key.descending, key.nulls_first, coll));
+                }
+                Target::Expr(e) => {
+                    // A general-expression key in a grouped query that ALSO windows is deferred (its row
+                    // is extended by the window stage over the grouped row — a follow-on; grammar.md §10).
+                    if is_agg && has_window {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "ORDER BY by an expression in a grouped windowed query is not supported",
+                        ));
+                    }
+                    // Resolve the key expression. A grouped query resolves it against the group context
+                    // (group keys + aggregates), where it may introduce a NEW aggregate — collected back
+                    // into `agg_specs`. A fresh empty `grouping_specs` isolates any `GROUPING(...)` call
+                    // it contains; that is a deferred 0A000 (grammar.md §10). A plain query resolves it
+                    // under `Forbidden` (columns are real input slots; an aggregate is 42803, a window
+                    // function 42P20). A window function in either context is 42P20 (the sub-context).
+                    let (rexpr, ty) = if is_agg {
+                        let mut octx = AggCtx::Collect {
+                            group_keys: group_keys.clone(),
+                            specs: std::mem::take(&mut agg_specs),
+                            grouping_specs: Vec::new(),
+                        };
+                        let res = resolve(&scope, e, None, &mut octx, ptypes);
+                        let local_grouping = if let AggCtx::Collect {
+                            specs,
+                            grouping_specs: gs,
+                            ..
+                        } = octx
+                        {
+                            agg_specs = specs;
+                            gs
+                        } else {
+                            unreachable!("octx stays Collect")
+                        };
+                        let resolved = res?;
+                        if !local_grouping.is_empty() {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "ORDER BY by a GROUPING() expression is not supported",
+                            ));
+                        }
+                        resolved
+                    } else {
+                        let mut octx = AggCtx::Forbidden;
+                        resolve(&scope, e, None, &mut octx, ptypes)?
+                    };
+                    // A correlated ORDER BY expression (one referencing an enclosing query) is degenerate
+                    // and 0A000, the same narrowing a correlated window key takes (window.md §5.1).
+                    if rexpr_references_outer(&rexpr, 0) {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "ORDER BY may not reference an outer query column",
+                        ));
+                    }
+                    // A non-orderable result type — `json` (no btree opclass) — is 42883; `jsonb` orders.
+                    if matches!(ty, ResolvedType::Json) {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedFunction,
+                            "could not identify an ordering operator for type json",
+                        ));
+                    }
+                    // The collation of an expression key (collation.md §1): an explicit trailing
+                    // `COLLATE` (rare — `parse_expr` usually absorbs one into the key) must be on a text
+                    // key (42804); otherwise it is DERIVED from the key expression (an inner `COLLATE` is
+                    // explicit, a bare text column its frozen collation, every other shape resets to C).
+                    let coll = match &key.collation {
+                        Some(cn) => {
+                            if !matches!(ty, ResolvedType::Text | ResolvedType::Null) {
+                                return Err(type_error(format!(
+                                    "collations are not supported by type {}",
+                                    ty.type_name()
+                                )));
+                            }
+                            resolve_collation_name(scope.catalog, cn)?
+                        }
+                        None => resolve_deriv(scope.catalog, derive_collation(&scope, e)?)?,
+                    };
+                    let k = order_exprs.len();
+                    order_exprs.push(rexpr);
+                    order.push((ORDER_EXPR_BASE + k, key.descending, key.nulls_first, coll));
+                }
+            }
+        }
+        // Rebase each materialized expression-key slot to its real trailing position now that the row
+        // layout is final (agg_specs may have grown above). The materialized order values are appended
+        // AFTER the input / window / grouped columns (grammar.md §10): a plain query's pre-sort row is
+        // `scope.width()` wide (`+ window keys + window results` for a window query); a grouped query's
+        // grouped row is `group_keys + aggregates + GROUPING() results` wide.
+        let order_value_base = if is_agg {
+            group_keys.len() + agg_specs.len() + grouping_specs.len()
+        } else if has_window {
+            scope.width() + window_keys.len() + window_specs.len()
+        } else {
+            scope.width()
+        };
+        for (slot, ..) in &mut order {
+            if *slot >= ORDER_EXPR_BASE {
+                *slot = order_value_base + (*slot - ORDER_EXPR_BASE);
+            }
         }
 
-        // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
-        // collapsed, an ORDER BY key not in the projected output has no single value per row,
-        // so each key must appear as a bare/qualified column in the select list (resolved to
-        // the same flat index; or the list is `*`). Matches PostgreSQL (42P10). Aliases are
-        // invisible to ORDER BY (§8), so an aliased bare column still counts as projecting it.
-        // Only a Local match counts as "projected" (an outer reference has no per-row value).
-        if sel.distinct && !order.is_empty() {
-            if let SelectItems::Items(items) = &sel.items {
+        // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are collapsed, an
+        // ORDER BY key must have a per-row value in the projected output — a bare/qualified column that
+        // is projected, an ordinal (which names a select-list item by position), or a general expression
+        // that STRUCTURALLY matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases
+        // are invisible to ORDER BY (§8), so an aliased bare column still counts as projecting it. A
+        // `SELECT DISTINCT *` projects every column, so the restriction never bites.
+        if sel.distinct && !sel.order_by.is_empty() {
+            if let SelectItems::Items(items) = items_ref {
                 let mut projected: HashSet<usize> = HashSet::new();
                 for it in items {
                     let idx = match &it.expr {
@@ -9021,7 +9155,20 @@ impl Database {
                         projected.insert(i);
                     }
                 }
-                if order.iter().any(|(idx, ..)| !projected.contains(idx)) {
+                let in_list = |key: &OrderKey| -> bool {
+                    if key.ordinal.is_some() {
+                        return true;
+                    }
+                    if let Some(e) = &key.expr {
+                        return items.iter().any(|it| &it.expr == e);
+                    }
+                    let r = match &key.qualifier {
+                        Some(q) => scope.resolve_qualified(q, &key.column),
+                        None => scope.resolve_bare(&key.column),
+                    };
+                    matches!(r, Ok(Resolved::Local(i)) if projected.contains(&i))
+                };
+                if !sel.order_by.iter().all(in_list) {
                     return Err(EngineError::new(
                         SqlState::InvalidColumnReference,
                         "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
@@ -9120,8 +9267,19 @@ impl Database {
             for p in &projections {
                 collect_touched(p, 0, &mut touched);
             }
+            // A column-key ORDER BY slot is a real input column (`< total_cols`) — mark it; a
+            // materialized expression-key slot is synthetic (`>= total_cols`, after rebase) whose input
+            // columns are reached through its `order_exprs` expression instead (collected below).
             for (slot, ..) in &order {
-                touched[*slot] = true;
+                if *slot < total_cols {
+                    touched[*slot] = true;
+                }
+            }
+            // Each materialized ORDER BY expression key reads real input columns (a plain query resolves
+            // it against the FROM scope; a grouped query reaches them through its group keys / aggregate
+            // arguments, already marked above).
+            for oe in &order_exprs {
+                collect_touched(oe, 0, &mut touched);
             }
             // A window query also reads each window function's PARTITION BY + ORDER BY keys, beyond
             // what the projection's window-result slots reference. A bare-column key is a real input
@@ -9159,6 +9317,7 @@ impl Database {
         let pk_ordered = !is_agg
             && !sel.distinct
             && !order.is_empty()
+            && order_exprs.is_empty() // a materialized expression key always takes the blocking sort
             && rels.len() == 1
             && rels[0].srf.is_none()
             && rels[0].cte.is_none()
@@ -9179,6 +9338,7 @@ impl Database {
             window_keys,
             having,
             order,
+            order_exprs,
             projections,
             column_names,
             column_types,
@@ -10546,6 +10706,7 @@ impl Database {
         // eager sort (the sort is unmetered — cost.md §3; spill.md §6).
         if !plan.order.is_empty()
             && !plan.pk_ordered
+            && plan.order_exprs.is_empty() // a materialized expression key takes the eager path below
             && plan.rels.len() == 1
             && plan.joins.is_empty()
             && !plan.is_agg
@@ -10720,6 +10881,11 @@ impl Database {
         // (Aggregate queries sort their GROUP rows in the aggregate branch below — not these
         // pre-aggregation rows — so the sort here is gated to plain queries.)
         if !plan.is_agg && !plan.order.is_empty() {
+            // Materialize each general-expression ORDER BY key (grammar.md §10): evaluate it against the
+            // post-WHERE (post-window) row and append the value, so its sort slot `final_width + k` reads
+            // the appended column and the slot-based sort below is unchanged — the window-key precedent.
+            // The evaluation is metered per node (cost.md §3); empty for a column/ordinal-only ORDER BY.
+            materialize_order_exprs(&mut rows, &plan.order_exprs, &env, &mut meter)?;
             sort_rows(&mut rows, &plan.order)?;
         }
 
@@ -10876,8 +11042,10 @@ impl Database {
                     &mut meter,
                 )?;
             }
-            // ORDER BY over the grouped output (keys are synthetic group-key slots).
+            // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
+            // expression key is materialized against the grouped row and appended — grammar.md §10).
             if !plan.order.is_empty() {
+                materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, &mut meter)?;
                 sort_rows(&mut group_rows, &plan.order)?;
             }
             // Window + project; only an emitted row charges row_produced + projection cost.
@@ -14571,8 +14739,16 @@ struct SelectPlan {
     /// when every window key is a bare column (the common case, byte-identical to before).
     window_keys: Vec<RExpr>,
     having: Option<RExpr>,
-    /// (flat slot, descending, nulls_first) per ORDER BY key.
+    /// (flat slot, descending, nulls_first, collation) per ORDER BY key. A column / ordinal key's slot
+    /// is its real input / grouped-row slot; a general-**expression** key's slot is `final_row_width +
+    /// k`, indexing the k-th materialized order value appended to the pre-sort row (grammar.md §10).
     order: Vec<crate::spill::SortKey>,
+    /// The materialized `ORDER BY` expression-key expressions (`ORDER BY a + 1`, `ORDER BY abs(b)`), in
+    /// the order their sort slots reference them. Just before the sort each row evaluates these and
+    /// appends the values at `final_row_width + k` (after any window / grouped columns), so the
+    /// slot-based sort stays unchanged — the window-key precedent (window.md §5.1). Empty when every
+    /// ORDER BY key is a bare column or ordinal (the common case, byte-identical to before).
+    order_exprs: Vec<RExpr>,
     projections: Vec<RExpr>,
     column_names: Vec<String>,
     column_types: Vec<ResolvedType>,
@@ -16114,6 +16290,13 @@ const WINDOW_KEY_BASE: usize = 1 << 29;
 /// GROUPING is mutually exclusive with window functions, so its placeholders never coexist with the
 /// window ones in a projection.
 const GROUPING_GS_BASE: usize = 1 << 30;
+
+/// The placeholder base a materialized `ORDER BY` **expression** key's sort slot carries until it is
+/// rebased to its real trailing slot `final_row_width + k` (the materialized order values are appended
+/// after the input / window / grouped columns — grammar.md §10). Used only in the `SortKey` slot field
+/// (a different namespace from the `RExpr::Column` bases above), but kept disjoint and below 2³¹
+/// (32-bit-`usize` / wasm32 safe) for the same reasons. A column / ordinal key keeps its real slot.
+const ORDER_EXPR_BASE: usize = 1 << 27;
 
 /// The maximum number of grouping sets a `GROUP BY` may expand to (`CUBE` of n columns alone is
 /// 2ⁿ). Beyond this the statement is aborted `54001` (statement_too_complex) — jed's structural-
@@ -25953,6 +26136,15 @@ fn combine_setop(
 /// operand's). A qualified key is 42P01 (no relation scope after a set operation); an unknown name
 /// is 42703. Returns the output column index.
 fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Result<usize> {
+    // A set-operation ORDER BY accepts only an output column name or ordinal — a general expression key
+    // (after the inputs are unified) is 0A000, matching PostgreSQL's "invalid UNION/INTERSECT/EXCEPT
+    // ORDER BY clause" (grammar.md §10).
+    if key.expr.is_some() {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "invalid UNION/INTERSECT/EXCEPT ORDER BY clause",
+        ));
+    }
     // An output-column ordinal (`... ORDER BY 1`) resolves by position into the output columns; out
     // of [1, ncols] is 42P10 (grammar.md §10). It precedes the name path (an ordinal has no column).
     if let Some(ord) = key.ordinal {
@@ -25979,37 +26171,6 @@ fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Result<usize> {
                 format!("column {} does not exist", key.column),
             )
         })
-}
-
-/// Resolve an ORDER BY ordinal (`ORDER BY 1`) to a source-row resolution (grammar.md §10). The
-/// 1-based `ord` indexes the select-list output columns: a position outside `[1, ncols]` is `42P10`
-/// (matching PostgreSQL, including `ORDER BY 0` / a negative position); with `SELECT *` the ordinal
-/// indexes the scope columns left to right; with an explicit list it must point at a bare or
-/// qualified COLUMN item (a non-column projection is a deferred `0A000` — the engine sorts source
-/// columns, not computed projections). Returns the same `Resolved::Local` a column-name key would.
-fn resolve_order_ordinal(ord: i64, items: &SelectItems, scope: &Scope) -> Result<Resolved> {
-    let ncols = match items {
-        SelectItems::All => scope.width() as i64,
-        SelectItems::Items(its) => its.len() as i64,
-    };
-    if ord < 1 || ord > ncols {
-        return Err(EngineError::new(
-            SqlState::InvalidColumnReference,
-            format!("ORDER BY position {ord} is not in select list"),
-        ));
-    }
-    let pos = (ord - 1) as usize;
-    match items {
-        SelectItems::All => Ok(Resolved::Local(pos)),
-        SelectItems::Items(its) => match &its[pos].expr {
-            Expr::Column(name) => scope.resolve_bare(name),
-            Expr::QualifiedColumn { qualifier, name } => scope.resolve_qualified(qualifier, name),
-            _ => Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "ORDER BY by an output-column expression is not supported",
-            )),
-        },
-    }
 }
 
 fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
@@ -29940,6 +30101,32 @@ fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()>
         return sort_rows_collated(rows, order);
     }
     rows.sort_by(|a, b| cmp_rows_by_order(a, b, order));
+    Ok(())
+}
+
+/// Materialize the general-expression ORDER BY keys before the sort (spec/design/grammar.md §10): for
+/// each row evaluate every `order_exprs[k]` and append the value, so its sort slot `final_width + k`
+/// reads the appended column and the slot-based comparator stays unchanged — the exact mechanism a
+/// non-column window key uses (window.md §5.1, `apply_window_stage`). Runs over every pre-sort row
+/// (before `LIMIT`, since the sort needs them all); the per-row evaluation is metered like a
+/// projection (an `operator_eval` per node, charged inside `eval`). A no-op — and zero added cost —
+/// when `order_exprs` is empty (a column/ordinal-only ORDER BY, byte-identical to before).
+fn materialize_order_exprs(
+    rows: &mut [Row],
+    order_exprs: &[RExpr],
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<()> {
+    if order_exprs.is_empty() {
+        return Ok(());
+    }
+    for row in rows.iter_mut() {
+        let mut vals = Vec::with_capacity(order_exprs.len());
+        for oe in order_exprs {
+            vals.push(oe.eval(row, env, meter)?);
+        }
+        row.extend(vals);
+    }
     Ok(())
 }
 

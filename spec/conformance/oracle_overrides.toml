@@ -556,22 +556,6 @@ reason = "jed: WITH ORDINALITY is deferred (array-functions.md §6) — the trai
 # documented surface narrowing, registered now so `corpus:check` stays silent on them.
 # ============================================================================================
 
-# --- ORDER BY key is a column or an ordinal (grammar.md §10); PG also accepts arbitrary expression keys.
-[[override]]
-file = "query/order_by.test"
-sql = "SELECT a FROM t ORDER BY a + 1"
-reason = "jed: ORDER BY keys are a column or an output-column ordinal (grammar.md §10), so a general expression key is 42601. PostgreSQL accepts ORDER BY <expression>. A documented surface narrowing."
-
-[[override]]
-file = "query/order_by.test"
-sql = "SELECT a FROM t ORDER BY 1 + 1"
-reason = "jed: `1 + 1` is an expression, not an ordinal, and jed rejects every expression key as 42601 (grammar.md §10). PostgreSQL reads it as a constant-expression (no-op) sort and returns the rows. A documented surface narrowing."
-
-[[override]]
-file = "query/order_by.test"
-sql = "SELECT a + 1, b FROM t ORDER BY 1"
-reason = "jed: an ORDER BY ordinal that points at a non-column select-list item is a deferred 0A000 — the engine sorts source columns, not computed projections (grammar.md §10). PostgreSQL sorts by the computed value. A documented surface narrowing."
-
 # --- the i64-magnitude literal boundary (grammar.md §4, types.md §6); PG types them as numeric.
 [[override]]
 file = "expr/unary_minus.test"

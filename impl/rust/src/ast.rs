@@ -1207,20 +1207,28 @@ pub enum BinaryOp {
     JsonPathMatch,
 }
 
-/// One ORDER BY sort key: a bare table column OR an output-column ordinal, a sort direction,
-/// and a resolved NULL placement. `nulls_first` is resolved at parse time — an explicit
+/// One ORDER BY sort key, in one of three modes resolved at parse time (spec/design/grammar.md §10):
+/// an **output-column ordinal** (`ordinal = Some(n)`), a **general expression** (`expr = Some(e)`),
+/// or a **column reference** (`qualifier`/`column`, the fast path that keeps PK-scan elision). Plus a
+/// sort direction and a resolved NULL placement. `nulls_first` is resolved at parse time — an explicit
 /// `NULLS FIRST|LAST`, else the direction default (`descending`: ASC → last, DESC → first, the
 /// PostgreSQL model where NULL is the largest value) — so the executor never re-derives it.
-/// Placement is applied independently of the `descending` value flip (spec/design/grammar.md §10).
+/// Placement is applied independently of the `descending` value flip.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OrderKey {
     /// An output-column ordinal (`ORDER BY 1`): `Some(n)` is the 1-based position of a select-list
     /// item (resolved by position, the value validated as `42P10` if out of range — grammar.md §10),
-    /// and then `qualifier`/`column` are unused. `None` is a column-reference key, below. An optional
-    /// leading `-` is folded into `n`, so a negative position reaches `42P10` rather than a syntax
-    /// error. Ordinals are parsed only in the query / set-operation ORDER BY, never in WITHIN GROUP.
+    /// and then `qualifier`/`column`/`expr` are unused. An optional leading `-` is folded into `n`, so
+    /// a negative position reaches `42P10` rather than a syntax error. Ordinals are parsed only in the
+    /// query / set-operation ORDER BY, never in WITHIN GROUP.
     pub ordinal: Option<i64>,
-    /// An optional relation qualifier (`ORDER BY t.a`); `None` is a bare column.
+    /// A general-expression key (`ORDER BY a + 1`): `Some(e)` is the key expression, evaluated per row
+    /// and sorted by the computed value (grammar.md §10); `ordinal`/`qualifier`/`column` are then
+    /// unused. The parser sets this only when the key is neither a bare ordinal nor a bare (optionally
+    /// COLLATE-wrapped) column reference, so a column key still takes the fast path below.
+    pub expr: Option<Expr>,
+    /// An optional relation qualifier (`ORDER BY t.a`); `None` is a bare column. Used only by a
+    /// column-reference key (`ordinal` and `expr` both `None`).
     pub qualifier: Option<String>,
     pub column: String,
     /// An optional explicit `COLLATE "name"` on this sort key (`ORDER BY name COLLATE "en-US"`,

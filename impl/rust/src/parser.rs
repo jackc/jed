@@ -2664,17 +2664,19 @@ impl Parser {
         Ok(Some(JoinClause { kind, table, on }))
     }
 
-    /// Parse an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare column with
-    /// an optional `ASC`/`DESC` and an optional `NULLS FIRST|LAST`. `nulls_first` is resolved
-    /// here: explicit if given, else the direction default (ASC → last, DESC → first). A bare
-    /// `NULLS` not followed by `FIRST`/`LAST` is a syntax error (42601). Returns an empty vec
-    /// when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
-    /// Parse an optional `ORDER BY <key> ("," <key>)*`. When `allow_ordinal` is set (the query and
-    /// set-operation ORDER BY), a key may be an output-column ordinal — an optionally-negative integer
-    /// literal naming the 1-based select-list position (grammar.md §10); its value is validated at
-    /// resolve (42P10). WITHIN GROUP passes `false`, so an integer there is consumed as a (missing)
-    /// column ref and is a 42601 — matching PostgreSQL, where a WITHIN GROUP integer is a constant.
-    fn parse_order_by(&mut self, allow_ordinal: bool) -> Result<Vec<OrderKey>> {
+    /// Parse an optional `ORDER BY <key> ("," <key>)*` (spec/grammar/grammar.ebnf `order_by`).
+    /// `nulls_first` is resolved here: explicit if given, else the direction default (ASC → last,
+    /// DESC → first). A bare `NULLS` not followed by `FIRST`/`LAST` is a syntax error (42601). Returns
+    /// an empty vec when there is no ORDER BY.
+    ///
+    /// When `allow_expr` is set (the query and set-operation ORDER BY) each key is parsed as a **general
+    /// expression** and classified into one of the three `OrderKey` modes (grammar.md §10): a bare
+    /// integer literal (the unary-minus fold makes `-1` one negative `Int`) is an **ordinal**; a bare
+    /// (optionally `COLLATE`-wrapped) column reference is a **column key** (kept on the fast path so
+    /// PK-scan elision + the column's collation still apply); anything else is a general **expression
+    /// key**. WITHIN GROUP passes `false`, staying column-only — a bare integer there is a (missing)
+    /// column ref → 42601, matching PostgreSQL where a WITHIN GROUP integer is a constant, not an ordinal.
+    fn parse_order_by(&mut self, allow_expr: bool) -> Result<Vec<OrderKey>> {
         let mut keys = Vec::new();
         if self.peek_keyword().as_deref() != Some("order") {
             return Ok(keys);
@@ -2682,40 +2684,16 @@ impl Parser {
         self.advance();
         self.expect_keyword("by")?;
         loop {
-            // An ordinal sort key: an optional leading `-` then an integer literal. The lexer caps a
-            // magnitude at 2^63; clamp to i64::MAX so the signed position always fits (an out-of-range
-            // position is 42P10 at resolve regardless of the exact value). A `-` not followed by an
-            // integer (`ORDER BY -a`) is a general expression — unsupported — so it falls to 42601.
-            let key = if allow_ordinal && matches!(self.peek(), Token::Int(_) | Token::Minus) {
-                let negate = if matches!(self.peek(), Token::Minus) {
-                    self.advance();
-                    true
-                } else {
-                    false
-                };
-                let magnitude = match self.advance() {
-                    Token::Int(m) => m.min(i64::MAX as u64) as i64,
-                    other => {
-                        return Err(syntax(format!(
-                            "expected an ORDER BY column or ordinal, found {other:?}"
-                        )));
-                    }
-                };
-                let ordinal = if negate { -magnitude } else { magnitude };
+            let key = if allow_expr {
+                let expr = self.parse_expr()?;
                 let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
-                OrderKey {
-                    ordinal: Some(ordinal),
-                    qualifier: None,
-                    column: String::new(),
-                    collation,
-                    descending,
-                    nulls_first,
-                }
+                Self::classify_order_key(expr, collation, descending, nulls_first)
             } else {
                 let (qualifier, column) = self.parse_column_ref()?;
                 let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
                 OrderKey {
                     ordinal: None,
+                    expr: None,
                     qualifier,
                     column,
                     collation,
@@ -2731,6 +2709,60 @@ impl Parser {
             break;
         }
         Ok(keys)
+    }
+
+    /// Classify a parsed query/set-operation ORDER BY key expression into one of the three `OrderKey`
+    /// modes (grammar.md §10), matching PostgreSQL's rule that only a **bare integer constant** is an
+    /// ordinal: a `Literal::Int` (positive, or negative via the parser's unary-minus-on-literal fold) is
+    /// an **ordinal**; a bare column reference — directly, or wrapped in a `COLLATE` that `parse_expr`
+    /// absorbed (`ORDER BY name COLLATE "x"`) — is a **column key** carrying that collation, so it stays
+    /// on the fast path (PK-scan elision, per-column collation); every other shape (`a + 1`, `1 + 1`,
+    /// `abs(b)`, a COLLATE over a compound) is a general **expression key**.
+    fn classify_order_key(
+        expr: Expr,
+        collation: Option<String>,
+        descending: bool,
+        nulls_first: bool,
+    ) -> OrderKey {
+        let mk = |ordinal, expr, qualifier, column, collation| OrderKey {
+            ordinal,
+            expr,
+            qualifier,
+            column,
+            collation,
+            descending,
+            nulls_first,
+        };
+        match expr {
+            Expr::Literal(Literal::Int(n)) => mk(Some(n), None, None, String::new(), collation),
+            Expr::Column(name) => mk(None, None, None, name, collation),
+            Expr::QualifiedColumn { qualifier, name } => {
+                mk(None, None, Some(qualifier), name, collation)
+            }
+            // `parse_expr` folds a trailing `COLLATE "x"` into the key (collation.md §1). When it wraps a
+            // bare column, unwrap back to a column key carrying that explicit collation — exactly the
+            // OrderKey the old column-only parser built, so the column fast path is byte-identical.
+            Expr::Collate {
+                inner,
+                collation: c,
+            } => match *inner {
+                Expr::Column(name) => mk(None, None, None, name, Some(c)),
+                Expr::QualifiedColumn { qualifier, name } => {
+                    mk(None, None, Some(qualifier), name, Some(c))
+                }
+                other => mk(
+                    None,
+                    Some(Expr::Collate {
+                        inner: Box::new(other),
+                        collation: c,
+                    }),
+                    None,
+                    String::new(),
+                    collation,
+                ),
+            },
+            other => mk(None, Some(other), None, String::new(), collation),
+        }
     }
 
     /// The trailing modifiers shared by every sort key: an optional `COLLATE "name"`, an optional

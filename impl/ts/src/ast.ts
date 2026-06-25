@@ -347,19 +347,27 @@ export type SelectItem = { expr: Expr; alias: string | null };
 // SelectItems is either all columns (*) or a list of projected expressions.
 export type SelectItems = { kind: "all" } | { kind: "list"; items: SelectItem[] };
 
-// OrderKey is one ORDER BY sort key: a bare table column OR an output-column ordinal, a sort
-// direction, and a resolved NULL placement. nullsFirst is resolved at parse time — an explicit
-// NULLS FIRST|LAST, else the direction default (descending: ASC -> last, DESC -> first, the
-// PostgreSQL model where NULL is the largest value) — and is applied independently of the
-// descending value flip (spec/design/grammar.md §10).
+// OrderKey is one ORDER BY sort key, in one of three modes resolved at parse time
+// (spec/design/grammar.md §10): an output-column ordinal (ordinal != null), a general expression
+// (expr != null), or a column reference (qualifier/column, the fast path that keeps PK-scan elision).
+// Plus a sort direction and a resolved NULL placement. nullsFirst is resolved at parse time — an
+// explicit NULLS FIRST|LAST, else the direction default (descending: ASC -> last, DESC -> first, the
+// PostgreSQL model where NULL is the largest value) — and is applied independently of the descending
+// value flip.
 export type OrderKey = {
   // An output-column ordinal (`ORDER BY 1`): non-null is the 1-based position of a select-list item
   // (resolved by position, the value validated as 42P10 if out of range — grammar.md §10), and then
-  // qualifier/column are unused. null is a column-reference key, below. An optional leading `-` is
-  // folded in, so a negative position reaches 42P10, not a syntax error. Ordinals are parsed only in
-  // the query / set-operation ORDER BY, never in WITHIN GROUP.
+  // expr/qualifier/column are unused. An optional leading `-` is folded in, so a negative position
+  // reaches 42P10, not a syntax error. Ordinals are parsed only in the query / set-operation ORDER BY,
+  // never in WITHIN GROUP.
   ordinal: number | null;
-  // An optional relation qualifier (`ORDER BY t.a`); null is a bare column.
+  // A general-expression key (`ORDER BY a + 1`): non-null is the key expression, evaluated per row and
+  // sorted by the computed value (grammar.md §10); ordinal/qualifier/column are then unused. The parser
+  // sets this only when the key is neither a bare ordinal nor a bare (optionally COLLATE-wrapped)
+  // column reference, so a column key still takes the fast path below.
+  expr: Expr | null;
+  // An optional relation qualifier (`ORDER BY t.a`); null is a bare column. Used only by a
+  // column-reference key (ordinal and expr both null).
   qualifier: string | null;
   column: string;
   // An optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md §1); null means

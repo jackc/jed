@@ -125,6 +125,81 @@ function binaryExpr(op: BinaryOp, lhs: Expr, rhs: Expr): Expr {
   return { kind: "binary", op, lhs, rhs };
 }
 
+// classifyOrderKey classifies a parsed query/set-operation ORDER BY key expression into one of the
+// three OrderKey modes (grammar.md §10), matching PostgreSQL's rule that only a bare integer constant
+// is an ordinal: an integer literal (positive, or negative via the parser's unary-minus-on-literal
+// fold) is an ordinal; a bare column reference — directly, or wrapped in a COLLATE that parseExpr
+// absorbed (`ORDER BY name COLLATE "x"`) — is a column key carrying that collation, so it stays on the
+// fast path (PK-scan elision, per-column collation); every other shape is a general expression key.
+function classifyOrderKey(
+  expr: Expr,
+  collation: string | null,
+  descending: boolean,
+  nullsFirst: boolean,
+): OrderKey {
+  if (expr.kind === "literal" && expr.literal.kind === "int") {
+    return {
+      ordinal: Number(expr.literal.int),
+      expr: null,
+      qualifier: null,
+      column: "",
+      collation,
+      descending,
+      nullsFirst,
+    };
+  }
+  if (expr.kind === "column") {
+    return {
+      ordinal: null,
+      expr: null,
+      qualifier: null,
+      column: expr.name,
+      collation,
+      descending,
+      nullsFirst,
+    };
+  }
+  if (expr.kind === "qualifiedColumn") {
+    return {
+      ordinal: null,
+      expr: null,
+      qualifier: expr.qualifier,
+      column: expr.name,
+      collation,
+      descending,
+      nullsFirst,
+    };
+  }
+  // parseExpr folds a trailing `COLLATE "x"` into the key (collation.md §1). When it wraps a bare
+  // column, unwrap back to a column key carrying that explicit collation — exactly the column-only
+  // OrderKey the old parser built, so the column fast path is byte-identical.
+  if (expr.kind === "collate") {
+    if (expr.inner.kind === "column") {
+      return {
+        ordinal: null,
+        expr: null,
+        qualifier: null,
+        column: expr.inner.name,
+        collation: expr.collation,
+        descending,
+        nullsFirst,
+      };
+    }
+    if (expr.inner.kind === "qualifiedColumn") {
+      return {
+        ordinal: null,
+        expr: null,
+        qualifier: expr.inner.qualifier,
+        column: expr.inner.name,
+        collation: expr.collation,
+        descending,
+        nullsFirst,
+      };
+    }
+  }
+  return { ordinal: null, expr, qualifier: null, column: "", collation, descending, nullsFirst };
+}
+
 // parseSQL parses a single complete statement from sql.
 // MAX_EXPR_DEPTH is the maximum expression / subquery / set-operation nesting depth a statement
 // may reach (spec/design/cost.md §7; CLAUDE.md §13). The §13 native-stack-safety gate for
@@ -2292,47 +2367,40 @@ class Parser {
     return [null, first];
   }
 
-  // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare
-  // column with an optional ASC/DESC and an optional NULLS FIRST|LAST. nullsFirst is resolved
-  // here: explicit if given, else the direction default (ASC -> last, DESC -> first). A bare
-  // NULLS not followed by FIRST/LAST is a syntax error (42601). Returns [] when there is no
-  // ORDER BY (spec/grammar/grammar.ebnf `order_by`).
-  // When allowOrdinal is set (the query and set-operation ORDER BY), a key may be an output-column
-  // ordinal — an optionally-negative integer literal naming the 1-based select-list position
-  // (grammar.md §10); its value is validated at resolve (42P10). WITHIN GROUP passes false, so an
-  // integer there is consumed as a (missing) column ref → 42601, matching PostgreSQL, where a WITHIN
-  // GROUP integer is a constant.
-  private parseOrderBy(allowOrdinal: boolean): OrderKey[] {
+  // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*` (spec/grammar/grammar.ebnf
+  // `order_by`). nullsFirst is resolved here: explicit if given, else the direction default (ASC ->
+  // last, DESC -> first). A bare NULLS not followed by FIRST/LAST is a syntax error (42601). Returns []
+  // when there is no ORDER BY.
+  //
+  // When allowExpr is set (the query and set-operation ORDER BY) each key is parsed as a general
+  // expression and classified into one of the three OrderKey modes (grammar.md §10): a bare integer
+  // literal (the unary-minus fold makes `-1` one negative int) is an ordinal; a bare (optionally
+  // COLLATE-wrapped) column reference is a column key (kept on the fast path so PK-scan elision + the
+  // column's collation still apply); anything else is a general expression key. WITHIN GROUP passes
+  // false, staying column-only — a bare integer there is a (missing) column ref → 42601, matching
+  // PostgreSQL where a WITHIN GROUP integer is a constant, not an ordinal.
+  private parseOrderBy(allowExpr: boolean): OrderKey[] {
     const keys: OrderKey[] = [];
     if (this.peekKeyword() !== "order") return keys;
     this.advance();
     this.expectKeyword("by");
     for (;;) {
-      // An ordinal sort key: an optional leading `-` then an integer literal. The lexer caps a
-      // magnitude at 2^63; clamp to i64's max so the signed position always fits (an out-of-range
-      // position is 42P10 at resolve regardless of the exact value). A `-` not followed by an integer
-      // (`ORDER BY -a`) is an unsupported general expression and falls through to a 42601.
-      const k = this.peek().kind;
-      if (allowOrdinal && (k === "int" || k === "minus")) {
-        let negate = false;
-        if (this.peek().kind === "minus") {
-          this.advance();
-          negate = true;
-        }
-        const t = this.advance();
-        if (t.kind !== "int") {
-          throw engineError("syntax_error", "expected an ORDER BY column or ordinal");
-        }
-        const MAXI64 = (1n << 63n) - 1n;
-        let mag = t.int!;
-        if (mag > MAXI64) mag = MAXI64;
-        const ordinal = Number(negate ? -mag : mag);
+      if (allowExpr) {
+        const expr = this.parseExpr();
         const { collation, descending, nullsFirst } = this.parseSortSuffix();
-        keys.push({ ordinal, qualifier: null, column: "", collation, descending, nullsFirst });
+        keys.push(classifyOrderKey(expr, collation, descending, nullsFirst));
       } else {
         const [qualifier, column] = this.parseColumnRef();
         const { collation, descending, nullsFirst } = this.parseSortSuffix();
-        keys.push({ ordinal: null, qualifier, column, collation, descending, nullsFirst });
+        keys.push({
+          ordinal: null,
+          expr: null,
+          qualifier,
+          column,
+          collation,
+          descending,
+          nullsFirst,
+        });
       }
       if (this.peek().kind === "comma") {
         this.advance();
