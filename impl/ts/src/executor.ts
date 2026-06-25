@@ -12423,6 +12423,9 @@ type ScalarFuncName =
   // acos(x) → f64 — inverse cosine in radians (float.md §8). Transcendental, exempted; same
   // domain [-1, 1] as asin.
   | "acos"
+  // atan(x) → f64 — inverse tangent in radians (float.md §8). Transcendental, exempted; no
+  // domain restriction (atan(±Inf) = ±π/2).
+  | "atan"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24723,6 +24726,9 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
       if (!Number.isNaN(x) && (x < -1 || x > 1))
         throw engineError("numeric_value_out_of_range", "input is out of range");
       return out(Math.acos(x));
+    case "atan":
+      // atan is defined on all of ℝ (no domain trap); atan(±Inf) = ±π/2, atan(NaN) = NaN.
+      return out(Math.atan(x));
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }

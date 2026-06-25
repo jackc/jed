@@ -567,6 +567,9 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
 		}
 		return Float64Value(math.Acos(x)), nil
+	case sfAtan:
+		// atan is defined on all of ℝ (no domain trap); atan(±Inf) = ±π/2, atan(NaN) = NaN.
+		return Float64Value(math.Atan(x)), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}

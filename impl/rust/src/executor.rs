@@ -12920,6 +12920,9 @@ enum ScalarFunc {
     /// acos(x) → f64 — inverse cosine in radians (float.md §8). Transcendental, exempted; same
     /// domain [-1, 1] as asin.
     Acos,
+    /// atan(x) → f64 — inverse tangent in radians (float.md §8). Transcendental, exempted; no
+    /// domain restriction (atan(±Inf) = ±π/2).
+    Atan,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18953,6 +18956,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "degrees" => ScalarFunc::Degrees,
         "asin" => ScalarFunc::Asin,
         "acos" => ScalarFunc::Acos,
+        "atan" => ScalarFunc::Atan,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29568,7 +29572,8 @@ impl RExpr {
                     | ScalarFunc::Radians
                     | ScalarFunc::Degrees
                     | ScalarFunc::Asin
-                    | ScalarFunc::Acos => {
+                    | ScalarFunc::Acos
+                    | ScalarFunc::Atan => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30577,6 +30582,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
             }
             x.acos()
         }
+        // atan is defined on all of ℝ (no domain trap); atan(±Inf) = ±π/2, atan(NaN) = NaN.
+        ScalarFunc::Atan => x.atan(),
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi

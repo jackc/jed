@@ -177,3 +177,25 @@ query R nosort
 SELECT acos(x) FROM m WHERE id = 9
 ----
 NULL
+
+# --- atan(x): inverse tangent in radians; defined on all of ℝ (no domain trap) --------
+query R nosort
+SELECT atan(x) FROM m WHERE id = 5
+----
+0.7853981633974483
+
+query R nosort
+SELECT atan(x) FROM m WHERE id = 4
+----
+0
+
+query R nosort
+SELECT atan(x) FROM m WHERE id = 1
+----
+1.5337762109209665
+
+# NULL propagates
+query R nosort
+SELECT atan(x) FROM m WHERE id = 9
+----
+NULL
