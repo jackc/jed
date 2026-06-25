@@ -570,6 +570,9 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 	case sfAtan:
 		// atan is defined on all of ℝ (no domain trap); atan(±Inf) = ±π/2, atan(NaN) = NaN.
 		return Float64Value(math.Atan(x)), nil
+	case sfAtan2:
+		// atan2(y, x): y is vals[0] (x here), x is vals[1]. Quadrant-aware; no domain trap.
+		return Float64Value(math.Atan2(x, vals[1].asF64())), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}

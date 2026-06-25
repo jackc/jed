@@ -199,3 +199,42 @@ query R nosort
 SELECT atan(x) FROM m WHERE id = 9
 ----
 NULL
+
+# --- atan2(y, x): quadrant-aware inverse tangent of y/x -------------------------------
+statement ok
+CREATE TABLE m2 (id i32 PRIMARY KEY, y f64, x f64)
+
+statement ok
+INSERT INTO m2 VALUES
+  (1, 1.0, 1.0),
+  (2, 1.0, 0.0),
+  (3, 0.0, 1.0),
+  (4, -1.0, -1.0),
+  (5, NULL, 1.0)
+
+query R nosort
+SELECT atan2(y, x) FROM m2 WHERE id = 1
+----
+0.7853981633974483
+
+query R nosort
+SELECT atan2(y, x) FROM m2 WHERE id = 2
+----
+1.5707963267948966
+
+query R nosort
+SELECT atan2(y, x) FROM m2 WHERE id = 3
+----
+0
+
+# third quadrant (both negative): -3π/4
+query R nosort
+SELECT atan2(y, x) FROM m2 WHERE id = 4
+----
+-2.356194490192345
+
+# a NULL operand propagates
+query R nosort
+SELECT atan2(y, x) FROM m2 WHERE id = 5
+----
+NULL

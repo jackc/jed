@@ -2105,6 +2105,19 @@ result         = "f64"
 null           = "propagates"
 errors         = []
 
+# atan2(y, x) — the inverse tangent of y/x in radians, using the signs of BOTH operands to pick
+# the quadrant (float.md §8). TRANSCENDENTAL, exempted. Two float operands reconciled to one
+# width (arg_resolution = "promote", like pow), result f64; no domain trap (atan2(0, 0) = 0).
+[[operator]]
+name           = "atan2"
+kind           = "function"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "f64"
+null           = "propagates"
+errors         = []
+
 # --- interval constructor (make_interval) ------------------------------------
 # PostgreSQL's interval builder, and the engine's FIRST named + defaulted function
 # (../design/functions.md §11). Every parameter is NAMED and DEFAULTs to 0, so it is callable

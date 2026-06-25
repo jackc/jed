@@ -12923,6 +12923,9 @@ enum ScalarFunc {
     /// atan(x) → f64 — inverse tangent in radians (float.md §8). Transcendental, exempted; no
     /// domain restriction (atan(±Inf) = ±π/2).
     Atan,
+    /// atan2(y, x) → f64 — quadrant-aware inverse tangent of y/x (float.md §8). Transcendental,
+    /// exempted; two float operands (the resolver widens both to f64), no domain trap.
+    Atan2,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18957,6 +18960,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "asin" => ScalarFunc::Asin,
         "acos" => ScalarFunc::Acos,
         "atan" => ScalarFunc::Atan,
+        "atan2" => ScalarFunc::Atan2,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29573,7 +29577,8 @@ impl RExpr {
                     | ScalarFunc::Degrees
                     | ScalarFunc::Asin
                     | ScalarFunc::Acos
-                    | ScalarFunc::Atan => {
+                    | ScalarFunc::Atan
+                    | ScalarFunc::Atan2 => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30584,6 +30589,15 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         }
         // atan is defined on all of ℝ (no domain trap); atan(±Inf) = ±π/2, atan(NaN) = NaN.
         ScalarFunc::Atan => x.atan(),
+        // atan2(y, x): y is the first operand (x here), the second (arg2) is the denominator.
+        // Quadrant-aware; no domain trap. The resolver widened both operands to f64.
+        ScalarFunc::Atan2 => {
+            let x2 = match arg2 {
+                Some(Value::Float64(v)) => *v,
+                _ => unreachable!("atan2's second arg is a widened f64"),
+            };
+            x.atan2(x2)
+        }
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi

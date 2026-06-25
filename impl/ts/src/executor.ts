@@ -12426,6 +12426,9 @@ type ScalarFuncName =
   // atan(x) → f64 — inverse tangent in radians (float.md §8). Transcendental, exempted; no
   // domain restriction (atan(±Inf) = ±π/2).
   | "atan"
+  // atan2(y, x) → f64 — quadrant-aware inverse tangent of y/x (float.md §8). Transcendental,
+  // exempted; two float operands (widened to f64), no domain trap.
+  | "atan2"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24084,6 +24087,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           // pow(x, y): both operands are float (promoted to one width at resolve); result f64.
           const v1 = vals[1] as { value: number };
           return evalFloatPow(v0.value, v1.value, e.result);
+        }
+        if (e.func === "atan2") {
+          // atan2(y, x): y is vals[0], x is vals[1] (both widened to f64). Quadrant-aware; no trap.
+          const v1 = vals[1] as { value: number };
+          return float64Value(Math.atan2(v0.value, v1.value));
         }
         // round(x, n): n is an int operand; the unary funcs ignore it.
         const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
