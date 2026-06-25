@@ -10594,13 +10594,23 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil {
 		pkOrdered, pkReverse = db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
 	}
+	// ORDER BY satisfied by SECONDARY-INDEX scan order (cost.md §3): when the PK scan does NOT
+	// satisfy the order but a B-tree index's columns do, and there is a LIMIT, walk that index and
+	// point-look-up each row — a top-N that avoids the blocking sort. Gated to a LIMIT and to no
+	// WHERE pushdown bound (combining them is a follow-on); mutually exclusive with pkOrdered.
+	var indexOrder *indexOrderPlan
+	if !isAgg && !hasWindow && !sel.Distinct && !pkOrdered && sel.Limit != nil && len(order) > 0 &&
+		len(orderExprs) == 0 && len(planRels) == 1 && planRels[0].srf == nil && planRels[0].cte == nil &&
+		planRels[0].derived == nil && relBounds[0] == nil {
+		indexOrder = db.orderSatisfiedByIndex(s.rels[0].table, planRels[0].offset, order)
+	}
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		groupSets: groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, relBounds: relBounds, relMasks: relMasks,
+		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, relBounds: relBounds, relMasks: relMasks,
 	}, nil
 }
 
@@ -10655,6 +10665,89 @@ func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSl
 		}
 	}
 	return true, reverse
+}
+
+// pkStorageWidth returns the fixed byte width of a table's stored primary key (encodePKKey = the
+// bare per-column order-preserving keys concatenated, no NULL tags — a PK is NOT NULL) and true, or
+// (0, false) when ANY PK column is variable-width (text/decimal/bytea/interval) or non-scalar
+// (range/composite), or the table has no PK. Used by the secondary-index-order scan to peel the PK
+// suffix off the END of each index entry key (the "key-suffix skip", cost.md §3) — sound only when
+// that suffix is a known fixed length.
+func pkStorageWidth(table *Table) (int, bool) {
+	pk := table.PKIndices()
+	if len(pk) == 0 {
+		return 0, false // a no-PK table keys on a synthetic rowid — not handled this slice
+	}
+	w := 0
+	for _, ci := range pk {
+		s, ok := table.Columns[ci].Type.AsScalar()
+		if !ok || !s.IsFixedWidth() {
+			return 0, false // a non-scalar / variable-width PK suffix is not a fixed peel
+		}
+		w += s.WidthBytes()
+	}
+	return w, true
+}
+
+// indexOrderPlan is the secondary-index-order plan: walk a B-tree index in key order to satisfy an
+// ORDER BY without a sort, point-looking-up each row by its primary key (cost.md §3).
+type indexOrderPlan struct {
+	nameKey string // the index store's key — the lowercased index name
+	pkWidth int    // the fixed PK-suffix byte width to peel off the END of each index entry key
+}
+
+// orderSatisfiedByIndex reports whether a single base relation's ORDER BY is satisfied by walking one
+// of its B-tree SECONDARY indexes in key order (cost.md §3 "secondary-index order"), and which index.
+// The index store holds its entries in (indexed columns, storage key) order, so a forward walk
+// delivers rows in ORDER BY <indexed columns> ASC NULLS LAST order, ties broken by the PK — exactly
+// the eager stable sort's tie-break. Returns non-nil iff the ORDER BY keys are EXACTLY a B-tree
+// index's columns (same count, same columns in key order), each ASC with default NULLS LAST (the
+// index stores NULL as 0x01 after a present 0x00 → NULLS LAST; an explicit NULLS FIRST does not
+// match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
+// the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
+// multi-column index would tie-break by the remaining index columns, not the PK.
+func (db *Database) orderSatisfiedByIndex(table *Table, offset int, order []orderSlot) *indexOrderPlan {
+	pkWidth, ok := pkStorageWidth(table)
+	if !ok {
+		return nil
+	}
+	for _, idx := range table.Indexes {
+		if idx.Kind != IndexBtree {
+			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
+		}
+		if len(order) != len(idx.Columns) {
+			continue // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
+		}
+		matches := true
+		for i, o := range order {
+			if o.descending || o.nullsFirst {
+				matches = false // ASC + NULLS LAST only — the order a forward index walk realizes
+				break
+			}
+			if o.idx != offset+idx.Columns[i] {
+				matches = false
+				break
+			}
+			coll, push := db.keyCollationCtx(table.Columns[idx.Columns[i]])
+			if !push { // Skewed / unresolvable — never walked for order (§12)
+				matches = false
+				break
+			}
+			if coll == nil {
+				if o.collation != nil {
+					matches = false
+					break
+				}
+			} else if o.collation == nil || o.collation.Name != coll.Name {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return &indexOrderPlan{nameKey: strings.ToLower(idx.Name), pkWidth: pkWidth}
+		}
+	}
+	return nil
 }
 
 // resolveSRF resolves a FROM-clause set-returning function call (generate_series(...)) into a
@@ -13060,6 +13153,84 @@ func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Met
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
+// execIndexOrderScan is the streaming secondary-index-order scan (cost.md §3 "secondary-index
+// order"): an ORDER BY the PK scan does NOT satisfy but a B-tree index does, with a LIMIT (the gate
+// — plan.indexOrder non-nil). It walks the index store forward in key order, peels the fixed-width
+// PK suffix off the END of each entry key (the "key-suffix skip"), point-looks-up the row, applies
+// the residual filter, and STOPS once the LIMIT/OFFSET window is filled — a top-N that elides the
+// blocking sort (and, for a collated index, the collate units). The index-tree page_read is charged
+// up front as the full block (like the streaming PK scan — only the per-row work short-circuits);
+// each scanned entry then charges its point-lookup's page_read/value_decompress + one
+// storage_row_read, plus row_produced and projection operator_evals per produced row.
+func (db *Database) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *evalEnv, meter *Meter) (selectResult, error) {
+	store := db.lkpStore(plan.rels[0].tableName)
+	istore := db.lkpIndexStore(io.nameKey)
+	// Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
+	meter.Charge(Costs.PageRead * int64(istore.NodeCount()))
+
+	var offset int64
+	if plan.offset != nil {
+		offset = *plan.offset
+	}
+	out := make([][]Value, 0)
+	if plan.limit == nil || *plan.limit > 0 {
+		var passed int64
+		err := istore.ScanRange(unboundedBound(), func(ekey []byte, _ Row) (bool, error) {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
+				return false, err
+			}
+			// Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3):
+			// the entry key is `<index columns> ‖ storage_key`, and storage_key is exactly
+			// io.pkWidth bytes — so the suffix is the row's storage key with no prefix parse.
+			rowKey := ekey[len(ekey)-io.pkWidth:]
+			row, ok, n, sl, err := store.GetWithUnits(rowKey, plan.relMasks[0])
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				panic("an index entry references a stored row")
+			}
+			meter.Charge(Costs.PageRead*int64(n) + Costs.ValueDecompress*int64(sl) + Costs.StorageRowRead)
+			row, err = store.resolveColumns(row, plan.relMasks[0])
+			if err != nil {
+				return false, err
+			}
+			if plan.filter != nil {
+				v, err := plan.filter.eval(row, env, meter)
+				if err != nil {
+					return false, err
+				}
+				if !v.IsTrue() {
+					return true, nil
+				}
+			}
+			passed++
+			if passed <= offset {
+				return true, nil
+			}
+			meter.Charge(Costs.RowProduced)
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, err := p.eval(row, env, meter)
+				if err != nil {
+					return false, err
+				}
+				projected[i] = v
+			}
+			out = append(out, projected)
+			// Stop once a LIMIT window is filled (a top-N over the index order).
+			if plan.limit != nil {
+				return int64(len(out)) < *plan.limit, nil
+			}
+			return true, nil
+		})
+		if err != nil {
+			return selectResult{}, err
+		}
+	}
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+}
+
 // execStreamingSort is the streaming external sort for a single-table ORDER BY (spec/design/spill.md
 // §4/§5). It streams scan→filter→sorter, so the input is never materialized in the executor heap;
 // the sorter spills sorted runs to disk under workMem (file-backed databases) and k-way-merges them
@@ -13456,6 +13627,14 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		// A derived table is a computed source too (grammar.md §42) — eager path.
 		plan.rels[0].derived == nil {
 		return db.execStreamingScan(plan, env, meter, params)
+	}
+
+	// Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
+	// indexOrder only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed query
+	// whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
+	// point-lookup; the eager sort is elided.
+	if plan.indexOrder != nil {
+		return db.execIndexOrderScan(plan, plan.indexOrder, env, meter)
 	}
 
 	// Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
@@ -16165,6 +16344,11 @@ type selectPlan struct {
 	// pkReverse is the PK scan direction when pkOrdered: true ⇒ the order is all-DESC over the full
 	// PK, served by a REVERSE scan; false ⇒ all-ASC (forward). Always false when !pkOrdered.
 	pkReverse bool
+	// indexOrder reports that ORDER BY is satisfied by walking a B-tree SECONDARY index in key order
+	// (with a LIMIT top-N) — non-nil when the PK scan does not satisfy the order but the index does
+	// (cost.md §3 "secondary-index order"). Mutually exclusive with pkOrdered (the PK scan is
+	// cheaper). nil keeps the eager/streaming sort.
+	indexOrder *indexOrderPlan
 	// relBounds is the scan-bound pushdown, ONE entry per relation in rels: the WHERE
 	// conjuncts that bound that relation's storage key, so its scan seeks/ranges instead of walking
 	// the whole B-tree (spec/design/cost.md §3 "bounded scan"). nil ⇒ a full scan of that relation.

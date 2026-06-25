@@ -149,9 +149,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       bound; a collated PK is stored in collation order, so a collated `ORDER BY` is satisfied with
       no in-memory re-sort and no `collate` units. Capability `query.order_by_pk_scan`.
       → [cost.md §3](spec/design/cost.md), [grammar.md §10](spec/design/grammar.md)
-  - [ ] _follow-on (each its own slice + NoREC obligation):_ `DESC` (reverse scan); **secondary-index
-        order** (walk the index tree + point-lookup — the general non-PK collated-`ORDER BY` payoff,
-        needs a variable-width key-suffix skip); `DISTINCT`; multi-table joins.
+  - [x] _follow-on:_ **`DESC` (reverse scan)** — an `ORDER BY` over the **full PK** all-`DESC` is
+        served by a reverse tree walk (the eager stable sort tie-breaks ascending, so a strict-prefix
+        DESC keeps the eager path). With a `LIMIT` it short-circuits a top-N from the high end; a
+        collated PK reverse-scans in reverse-collation order with no `collate` units.
+  - [x] _follow-on:_ **secondary-index order** — when the PK scan does not satisfy an `ORDER BY` but a
+        B-tree index's columns do (exactly), and there is a `LIMIT`, walk that index in key order +
+        point-look-up each row (a top-N); the general non-PK collated-`ORDER BY` payoff. The PK suffix
+        is peeled off the END of each index entry key (the fixed-width key-suffix skip), so the indexed
+        column may be variable-width / collated. Capability `query.order_by_index_scan`.
+  - [ ] _follow-on (each its own slice + NoREC obligation):_ `DISTINCT`; multi-table joins. _(Further
+        index-order sub-follow-ons: combine with a `WHERE` pushdown bound; `DESC` reverse index walk
+        over a unique index; a strict-prefix-of-a-multi-column-index `ORDER BY`.)_
 - [x] **`DISTINCT`** — NULL-safe dedup of projected rows, after ORDER BY before LIMIT; PG
       restriction on ORDER BY keys (`42P10`). → [grammar.md §11](spec/design/grammar.md)
 - [x] **FROM-less `SELECT`** — `SELECT 1` over one virtual zero-column row.

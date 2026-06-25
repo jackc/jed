@@ -9418,6 +9418,30 @@ impl Database {
         let pk_ordered = pk_dir.is_some();
         let pk_reverse = pk_dir == Some(true);
 
+        // ORDER BY satisfied by SECONDARY-INDEX scan order (cost.md §3 "secondary-index order"): when
+        // the PK scan does NOT satisfy the order but a B-tree index's columns do, and there is a
+        // LIMIT, walk that index in key order and point-look-up each row — a top-N that avoids the
+        // blocking sort (and, for a collated index, the collate units). Gated to a LIMIT because
+        // without one the index walk + N point lookups costs more than a full scan + sort. A WHERE
+        // pushdown bound (combining the two) is a follow-on, so it requires no rel bound.
+        let index_order = if !is_agg
+            && !has_window
+            && !sel.distinct
+            && !pk_ordered
+            && sel.limit.is_some()
+            && !order.is_empty()
+            && order_exprs.is_empty()
+            && rels.len() == 1
+            && rels[0].srf.is_none()
+            && rels[0].cte.is_none()
+            && rels[0].derived.is_none()
+            && rel_bounds[0].is_none()
+        {
+            order_satisfied_by_index(scope.rels[0].table, rels[0].offset, &order, self)
+        } else {
+            None
+        };
+
         Ok(SelectPlan {
             rels,
             joins,
@@ -9441,6 +9465,7 @@ impl Database {
             offset: sel.offset,
             pk_ordered,
             pk_reverse,
+            index_order,
             rel_bounds,
             rel_masks,
         })
@@ -10426,6 +10451,85 @@ impl Database {
         })
     }
 
+    /// Streaming secondary-index-order scan (spec/design/cost.md §3 "secondary-index order"): an
+    /// `ORDER BY` the PK scan does NOT satisfy but a B-tree index does, with a `LIMIT` (the gate —
+    /// `plan.index_order` is `Some`). Walks the index store forward in key order (the indexed
+    /// columns' order), peels the fixed-width PK suffix off the END of each entry key (the
+    /// "key-suffix skip" — sound because `pk_storage_width` confirmed the suffix length), point-looks-
+    /// up the row, applies the residual filter, and STOPS once the LIMIT/OFFSET window is filled — a
+    /// top-N that elides the blocking sort (and, for a collated index, the `collate` units).
+    ///
+    /// Cost: the index tree's `page_read` is charged up front as the full block (like the streaming
+    /// PK scan — only the per-row work short-circuits); each scanned entry then charges its table
+    /// point-lookup's `page_read`/`value_decompress` + one `storage_row_read`, plus `row_produced`
+    /// and projection `operator_eval`s per produced row. The rows match the eager sort exactly (the
+    /// index order IS `ORDER BY <indexed columns> ASC NULLS LAST`, ties by PK — the stable tie-break).
+    fn exec_index_order_scan(
+        &self,
+        plan: &SelectPlan,
+        io: &IndexOrder,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<SelectResult> {
+        let store = self.store(&plan.rels[0].table_name);
+        let istore = self.index_store(&io.name_key);
+        // Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
+        meter.charge(COSTS.page_read * istore.node_count() as i64);
+
+        let limit = plan.limit;
+        let offset = plan.offset.unwrap_or(0);
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        if limit != Some(0) {
+            let mut passed: i64 = 0;
+            let mut visit = |ekey: &[u8], _erow: &Row| -> Result<bool> {
+                meter.guard()?; // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
+                // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3):
+                // the entry key is `<index columns> ‖ storage_key`, and `storage_key` is exactly
+                // `io.pk_width` bytes — so the suffix is the row's storage key with no prefix parse.
+                let row_key = &ekey[ekey.len() - io.pk_width..];
+                let (row, pages, slabs) = store.get_with_units(row_key, &plan.rel_masks[0])?;
+                let mut row = row.expect("an index entry references a stored row");
+                meter.charge(
+                    COSTS.page_read * pages as i64
+                        + COSTS.value_decompress * slabs as i64
+                        + COSTS.storage_row_read,
+                );
+                if TableStore::needs_resolution(&row, &plan.rel_masks[0]) {
+                    store.resolve_columns(&mut row, &plan.rel_masks[0])?;
+                }
+                let keep = match &plan.filter {
+                    Some(f) => f.eval(&row, env, meter)?.is_true(),
+                    None => true,
+                };
+                if !keep {
+                    return Ok(true);
+                }
+                passed += 1;
+                if passed <= offset {
+                    return Ok(true);
+                }
+                meter.charge(COSTS.row_produced);
+                let mut projected = Vec::with_capacity(plan.projections.len());
+                for p in &plan.projections {
+                    projected.push(p.eval(&row, env, meter)?);
+                }
+                out.push(projected);
+                // Stop once a LIMIT window is filled (a top-N over the index order).
+                Ok(match limit {
+                    Some(l) => (out.len() as i64) < l,
+                    None => true,
+                })
+            };
+            istore.scan_range(&KeyBound::unbounded(), &mut visit)?;
+        }
+        Ok(SelectResult {
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
+            rows: out,
+            cost: meter.accrued,
+        })
+    }
+
     /// Streaming external sort for a single-table `ORDER BY` (spec/design/spill.md §4/§5). Streams
     /// scan→filter→[`Sorter`], so the input is never materialized in the executor heap; the sorter
     /// spills sorted runs to disk under `work_mem` (file-backed databases) and k-way-merges them at
@@ -10798,6 +10902,14 @@ impl Database {
             && plan.rels[0].derived.is_none()
         {
             return self.exec_streaming_scan(plan, &env, &mut meter, params);
+        }
+
+        // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
+        // `index_order` only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed
+        // query whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
+        // point-lookup; the eager sort is elided.
+        if let Some(io) = &plan.index_order {
+            return self.exec_index_order_scan(plan, io, &env, &mut meter);
         }
 
         // Streaming external sort (spec/design/spill.md §5): a single-table, no-join,
@@ -14869,6 +14981,11 @@ struct SelectPlan {
     /// served by a **reverse** scan; `false` ⇒ all-`ASC` (forward). Always `false` when
     /// `!pk_ordered`.
     pk_reverse: bool,
+    /// `ORDER BY` is satisfied by walking a **B-tree secondary index** in key order (with a `LIMIT`
+    /// top-N) — `Some(index)` when the PK scan does not satisfy the order but the index does
+    /// (cost.md §3 "secondary-index order"). Mutually exclusive with `pk_ordered` (the PK scan is
+    /// cheaper). `None` keeps the eager/streaming sort.
+    index_order: Option<IndexOrder>,
     /// Scan-bound pushdown, **one entry per relation** in `rels`: the WHERE conjuncts that
     /// bound that relation's scan — a primary-key range, or (when no PK bound applies) a
     /// secondary-index equality (cost.md §3 "bounded scan" / "index-bounded scan"). `None` ⇒
@@ -15214,6 +15331,92 @@ fn order_satisfied_by_pk(
         }
     }
     Some(reverse)
+}
+
+/// The fixed byte width of a table's stored primary key (`encode_pk_key` = the bare per-column
+/// order-preserving keys concatenated, no NULL tags — a PK is `NOT NULL`), or `None` when ANY PK
+/// column is variable-width (`text`/`decimal`/`bytea`/`interval`) or non-scalar (range/composite),
+/// or the table has no PK. Used by the secondary-index-order scan to **peel the PK suffix off the
+/// END of each index entry key** (the "key-suffix skip", cost.md §3) — sound only when that suffix
+/// is a known fixed length, which is exactly when this returns `Some`.
+fn pk_storage_width(table: &Table) -> Option<usize> {
+    let pk = table.pk_indices();
+    if pk.is_empty() {
+        return None; // a no-PK table keys on a synthetic rowid — not handled this slice
+    }
+    let mut w = 0usize;
+    for &ci in &pk {
+        let s = table.columns[ci].ty.as_scalar()?; // a non-scalar (range/composite) PK has no fixed width
+        if !s.is_fixed_width() {
+            return None; // a variable-width (text/decimal/…) PK suffix is not a fixed peel
+        }
+        w += s.width_bytes();
+    }
+    Some(w)
+}
+
+/// The secondary-index-order plan: walk a B-tree index in key order to satisfy an `ORDER BY` without
+/// a sort, point-looking-up each row by its primary key (cost.md §3 "secondary-index order").
+struct IndexOrder {
+    /// The index store's key — the lowercased index name.
+    name_key: String,
+    /// The fixed byte width of the PK suffix to peel off the END of each index entry key
+    /// ([`pk_storage_width`]) — the row's storage key, fed to the table point lookup.
+    pk_width: usize,
+}
+
+/// Reports whether a single base relation's `ORDER BY` is satisfied by walking one of its **B-tree
+/// secondary indexes** in key order (cost.md §3 "secondary-index order"), and which index. The index
+/// store holds its entries in `(indexed columns, storage key)` order, so a forward walk delivers rows
+/// in `ORDER BY <indexed columns> ASC NULLS LAST` order, ties broken by the PK — exactly the eager
+/// stable sort's tie-break.
+///
+/// Returns `Some` iff the `ORDER BY` keys are **exactly** a B-tree index's columns (same count, same
+/// columns in key order), each `ASC` with **default `NULLS LAST`** (the index stores `NULL` as `0x01`
+/// after a present `0x00`, so it realizes NULLS-LAST; an explicit `NULLS FIRST` does not match) and
+/// sorting by the column's stored key collation (`Skewed`/unresolvable → refuse, the §12 read-safety
+/// rule), **and** the table's PK is fixed-width ([`pk_storage_width`]). The exact-match requirement is
+/// load-bearing: a strict prefix of a *multi*-column index would tie-break by the remaining index
+/// columns rather than the PK, diverging from the eager sort (the same tie-break trap the
+/// composite-PK reverse case carries). `DESC` (a reverse index walk) is a follow-on.
+fn order_satisfied_by_index(
+    table: &Table,
+    offset: usize,
+    order: &[crate::spill::SortKey],
+    catalog: &Database,
+) -> Option<IndexOrder> {
+    let pk_width = pk_storage_width(table)?;
+    for idx in &table.indexes {
+        if idx.kind != IndexKind::Btree {
+            continue; // only an ordered B-tree realizes the column order (GIN/GiST do not)
+        }
+        if order.len() != idx.columns.len() {
+            continue; // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
+        }
+        let matches = order
+            .iter()
+            .enumerate()
+            .all(|(i, (slot, descending, nulls_first, coll))| {
+                if *descending || *nulls_first {
+                    return false; // ASC + NULLS LAST only — the order a forward index walk realizes
+                }
+                if *slot != offset + idx.columns[i] {
+                    return false; // the i-th index column, in key order
+                }
+                match key_collation_ctx(catalog, &table.columns[idx.columns[i]]) {
+                    None => false, // Skewed / unresolvable — never walked for order (§12)
+                    Some(None) => coll.is_none(),
+                    Some(Some(c)) => matches!(coll, Some(c2) if c2.name == c.name),
+                }
+            });
+        if matches {
+            return Some(IndexOrder {
+                name_key: idx.name.to_ascii_lowercase(),
+                pk_width,
+            });
+        }
+    }
+    None
 }
 
 /// Detect a GIN-bounded scan over `columns`/`indexes` (gin.md §6): the lowest-named GIN index

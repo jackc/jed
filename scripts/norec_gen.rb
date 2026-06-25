@@ -28,6 +28,10 @@
 #              lookups (spec/design/indexes.md §5); `v + 0 = K` is a `BinaryOp`, so the detector
 #              (bare column only) does NOT use the index and it full-scans. Both must return
 #              identical rows — including across UPDATE/DELETE maintenance and a NULL value (3VL).
+#   index_order — `ORDER BY v LIMIT k` over a secondary-indexed non-PK column walks the index tree
+#              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
+#              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
+#              the eager full sort must reconstruct the SAME by-construction sorted whole.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -111,6 +115,10 @@ INDEX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert d
                dml.update dml.delete query.select query.where_eq query.comparison_order
                query.order_by expr.arithmetic expr.comparison_value types.i32
                null.three_valued].freeze
+INDEX_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                     dml.insert_multi_row query.select query.order_by query.order_by_keys
+                     query.limit query.offset query.order_by_index_scan types.i32
+                     null.three_valued].freeze
 TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.subquery_scalar
@@ -415,6 +423,45 @@ def gen_index(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim}")
   ipair.call("v = #{present} after DELETE removed id #{victim}", present,
              flat.call(with_v.call(present)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: secondary-index ORDER BY (index walk top-N reconstructs the sorted whole) --------
+def gen_index_order(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(10, random: rng).sort
+  vals = (1..80).to_a.sample(9, random: rng) # 9 DISTINCT non-NULL values → a total order on v
+  null_id = ids.sample(random: rng)          # one row's v is NULL (sorts LAST in the index walk)
+  vi = -1
+  rows = ids.map do |id|
+    id == null_id ? [id, nil] : [id, vals[vi += 1]]
+  end
+  # ORDER BY v ASC NULLS LAST, ties by id (PK) — exactly the index walk order (and the eager sort).
+  sorted = rows.sort_by { |id, v| [v.nil? ? 1 : 0, v || 0, id] }
+  flat = ->(rs) { rs.flat_map { |id, v| [id.to_s, v.nil? ? "NULL" : v.to_s] } }
+  n = rows.size
+  a = rng.rand(2..n - 2)
+
+  out = header(seed, INDEX_ORDER_REQ, "secondary-index ORDER BY (index walk top-N reconstructs the sorted whole)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v.nil? ? 'NULL' : v})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_v ON t (v)")
+
+  # Each window of `ORDER BY v` (a total order, NULLS LAST) must match its by-construction slice: the
+  # LIMITed forms walk the t_v index (a top-N — query.order_by_index_scan); the no-LIMIT forms are the
+  # eager-sort reference. Both directions of the metamorphic relation must reconstruct the same whole.
+  windows = [
+    ["LIMIT #{a}", sorted[0, a]],
+    ["LIMIT #{a} OFFSET #{a}", sorted[a, a] || []],
+    ["LIMIT #{n}", sorted],
+    ["OFFSET #{a}", sorted[a..] || []],
+    ["", sorted],
+  ]
+  windows.each do |clause, exp|
+    out << "# ORDER BY v #{clause.empty? ? '(full eager-sort reference)' : clause}"
+    q(out, "II", "SELECT id, v FROM t ORDER BY v #{clause}".strip, flat.call(exp))
+  end
 
   out.join("\n") + "\n"
 end
@@ -1113,6 +1160,7 @@ SCENARIOS = {
   "join" => method(:gen_join),
   "correlated" => method(:gen_correlated),
   "index" => method(:gen_index),
+  "index_order" => method(:gen_index_order),
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),

@@ -1,0 +1,95 @@
+# ORDER BY satisfied by SECONDARY-INDEX scan order (spec/design/cost.md §3 "secondary-index order").
+# When the PK scan does NOT satisfy an ORDER BY but a B-tree secondary index's columns do, and there
+# is a LIMIT, the engine walks that index in key order — which IS the indexed-column order — and
+# point-looks-up each row by its primary key, instead of full-scanning + sorting. With the LIMIT it
+# STOPS once the window is filled (a top-N early-out), so it reads only the first few index entries
+# and looks up only those rows. The PK suffix is peeled off the END of each index entry key (the
+# fixed-width "key-suffix skip"), so the indexed column may itself be variable-width (text / collated).
+#
+# Gated to a LIMIT: without one, walking the whole index + one point lookup per row costs MORE than a
+# full scan + sort, so a no-LIMIT ORDER BY keeps the eager sort (the contrast below). The ORDER BY
+# must be EXACTLY the index's columns (a strict prefix of a multi-column index would tie-break by the
+# remaining index columns, not the PK — a divergence from the eager stable sort). DESC (a reverse
+# index walk) is a follow-on. All units weigh 1, so for every record:
+#   cost = page_read (index tree nodes + each point lookup's nodes) + storage_row_read (one per
+#          looked-up row) + filter operator_evals (per looked-up row) + row_produced + projection
+#          operator_evals (per produced row).
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.offset, query.order_by_index_scan, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, name text, amt i32)
+
+statement ok
+CREATE INDEX t_name ON t (name)
+
+# name order differs from id (PK) order, and name is DISTINCT (so ORDER BY name is a TOTAL order —
+# unambiguous, agreeing with the PostgreSQL oracle). name ASC: apple(2), banana(3), cherry(1),
+# date(4), elderberry(5).
+statement ok
+INSERT INTO t VALUES (1, 'cherry', 30), (2, 'apple', 10), (3, 'banana', 20), (4, 'date', 40), (5, 'elderberry', 50)
+
+# ORDER BY the indexed non-PK column `name` with a LIMIT: the t_name index walk yields rows in name
+# order, so LIMIT 2 short-circuits after the first two index entries (apple, banana) — only those two
+# rows are looked up. 1 index page + 2 point-lookup pages + 2 storage_row_read + 2 produced = 7.
+# cost: 7
+query IT nosort
+SELECT id, name FROM t ORDER BY name LIMIT 2
+----
+2
+apple
+3
+banana
+
+# A residual WHERE composes: `amt >= 20` filters per looked-up row. The index walk yields name order
+# apple(amt 10, filtered), banana(20, kept), cherry(30, kept), and stops at LIMIT 2. Three rows are
+# looked up (incl. the filtered apple). 1 index page + 3 lookup pages + 3 storage_row_read + 3 filter
+# + 2 produced = 12.
+# cost: 12
+query IT nosort
+SELECT id, name FROM t WHERE amt >= 20 ORDER BY name LIMIT 2
+----
+3
+banana
+1
+cherry
+
+# OFFSET composes: skip the first index entry (apple), then take banana, cherry. The skipped row IS
+# looked up (and counted). 1 index page + 3 lookup pages + 3 storage_row_read + 2 produced = 9.
+# cost: 9
+query IT nosort
+SELECT id, name FROM t ORDER BY name LIMIT 2 OFFSET 1
+----
+3
+banana
+1
+cherry
+
+# CONTRAST — no LIMIT keeps the eager full scan + sort (the index walk + a lookup per row would cost
+# more). The full result is name order, computed by reading every row. 1 table page + 5 storage_row_read
+# + 5 produced = 11. (No collate units — `name` is the default C-collation text, byte order.)
+# cost: 11
+query IT nosort
+SELECT id, name FROM t ORDER BY name
+----
+2
+apple
+3
+banana
+1
+cherry
+4
+date
+5
+elderberry
+
+# CONTRAST — ORDER BY a NON-indexed column (`amt`) with a LIMIT keeps the eager scan + sort: there is
+# no index to walk. amt ascending is 10,20,… → rows 2,3. 1 table page + 5 storage_row_read + 2
+# produced = 8 — higher than the cost-7 indexed case, the proof the index walk is what short-circuits.
+# cost: 8
+query IT nosort
+SELECT id, name FROM t ORDER BY amt LIMIT 2
+----
+2
+apple
+3
+banana

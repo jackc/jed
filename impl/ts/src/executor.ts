@@ -7882,6 +7882,25 @@ export class Database {
       planRels[0]!.derived === undefined
         ? orderSatisfiedByPK(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order)
         : null;
+    // ORDER BY satisfied by SECONDARY-INDEX scan order (cost.md §3): when the PK scan does NOT
+    // satisfy the order but a B-tree index's columns do, and there is a LIMIT, walk that index and
+    // point-look-up each row — a top-N that avoids the blocking sort. Gated to a LIMIT and to no
+    // WHERE pushdown bound (combining them is a follow-on); mutually exclusive with pkOrdered.
+    const indexOrder =
+      !isAgg &&
+      !hasWindow &&
+      !sel.distinct &&
+      pkDir === null &&
+      sel.limit !== null &&
+      order.length > 0 &&
+      orderExprs.length === 0 &&
+      planRels.length === 1 &&
+      planRels[0]!.srf === undefined &&
+      planRels[0]!.cte === undefined &&
+      planRels[0]!.derived === undefined &&
+      relBounds[0] === null
+        ? orderSatisfiedByIndex(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order)
+        : null;
     return {
       kind: "select",
       rels: planRels,
@@ -7906,6 +7925,7 @@ export class Database {
       offset: sel.offset,
       pkOrdered: pkDir !== null,
       pkReverse: pkDir !== null && pkDir.reverse,
+      indexOrder,
       relBounds,
       relMasks,
     };
@@ -8707,6 +8727,63 @@ export class Database {
     };
   }
 
+  // execIndexOrderScan is the streaming secondary-index-order scan (cost.md §3 "secondary-index
+  // order"): an ORDER BY the PK scan does NOT satisfy but a B-tree index does, with a LIMIT (the gate
+  // — plan.indexOrder non-null). It walks the index store forward in key order, peels the fixed-width
+  // PK suffix off the END of each entry key (the "key-suffix skip"), point-looks-up the row, applies
+  // the residual filter, and STOPS once the LIMIT/OFFSET window is filled — a top-N that elides the
+  // blocking sort (and, for a collated index, the collate units). The index-tree pageRead is charged
+  // up front as the full block (like the streaming PK scan — only the per-row work short-circuits);
+  // each scanned entry then charges its point-lookup's pageRead/valueDecompress + one storageRowRead,
+  // plus rowProduced and projection operator_evals per produced row.
+  private execIndexOrderScan(
+    plan: SelectPlan,
+    io: IndexOrder,
+    env: EvalEnv,
+    meter: Meter,
+  ): SelectResult {
+    const store = this.lkpStore(plan.rels[0]!.tableName);
+    const istore = this.lkpIndexStore(io.nameKey);
+    // Up-front index-tree pageRead (the full block; the index store has no payload, so no slabs).
+    meter.charge(COSTS.pageRead * BigInt(istore.nodeCount()));
+
+    const limit = plan.limit;
+    const offset = plan.offset ?? 0n;
+    const out: Value[][] = [];
+    if (limit !== 0n) {
+      let passed = 0n;
+      istore.scanRange(unboundedBound(), (ekey) => {
+        meter.guard(); // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
+        // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3): the
+        // entry key is `<index columns> ‖ storage_key`, and storage_key is exactly io.pkWidth bytes.
+        const rowKey = ekey.slice(ekey.length - io.pkWidth);
+        const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
+        if (u.row === undefined) throw new Error("an index entry references a stored row");
+        meter.charge(
+          COSTS.pageRead * BigInt(u.pages) +
+            COSTS.valueDecompress * BigInt(u.slabs) +
+            COSTS.storageRowRead,
+        );
+        const row = store.resolveColumns(u.row, plan.relMasks[0]!);
+        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
+          return true;
+        }
+        passed += 1n;
+        if (passed <= offset) return true;
+        meter.charge(COSTS.rowProduced);
+        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+        // Stop once a LIMIT window is filled (a top-N over the index order).
+        return limit === null ? true : BigInt(out.length) < limit;
+      });
+    }
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows: out,
+      cost: meter.accrued,
+    };
+  }
+
   // execStreamingSort is the streaming external sort for a single-table ORDER BY (spec/design/spill.md
   // §4/§5). It streams scan→filter→sorter, so the input is never materialized in the executor heap;
   // the sorter spills sorted runs to disk under workMem (file-backed databases) and k-way-merges them
@@ -9033,6 +9110,14 @@ export class Database {
       plan.rels[0]!.derived === undefined
     ) {
       return this.execStreamingScan(plan, env, meter, params);
+    }
+
+    // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
+    // indexOrder only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed query
+    // whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
+    // point-lookup; the eager sort is elided.
+    if (plan.indexOrder !== null) {
+      return this.execIndexOrderScan(plan, plan.indexOrder, env, meter);
     }
 
     // Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
@@ -9794,6 +9879,80 @@ function orderSatisfiedByPK(
     }
   }
   return { reverse };
+}
+
+// pkStorageWidth returns the fixed byte width of a table's stored primary key (encodePkKey = the
+// bare per-column order-preserving keys concatenated, no NULL tags — a PK is NOT NULL), or null when
+// ANY PK column is variable-width (text/decimal/bytea/interval) or non-scalar (range/composite), or
+// the table has no PK. Used by the secondary-index-order scan to peel the PK suffix off the END of
+// each index entry key (the "key-suffix skip", cost.md §3) — sound only when that suffix is a known
+// fixed length.
+function pkStorageWidth(table: Table): number | null {
+  const pk = pkIndices(table);
+  if (pk.length === 0) return null; // a no-PK table keys on a synthetic rowid — not handled here
+  let w = 0;
+  for (const ci of pk) {
+    const ty = table.columns[ci]!.type;
+    if (ty.kind !== "scalar" || !isFixedWidth(ty.scalar)) return null; // non-scalar / variable-width
+    w += widthBytes(ty.scalar);
+  }
+  return w;
+}
+
+// IndexOrder is the secondary-index-order plan: walk a B-tree index in key order to satisfy an ORDER
+// BY without a sort, point-looking-up each row by its primary key (cost.md §3).
+type IndexOrder = { nameKey: string; pkWidth: number };
+
+// orderSatisfiedByIndex reports whether a single base relation's ORDER BY is satisfied by walking one
+// of its B-tree SECONDARY indexes in key order (cost.md §3 "secondary-index order"), and which index.
+// The index store holds its entries in (indexed columns, storage key) order, so a forward walk
+// delivers rows in ORDER BY <indexed columns> ASC NULLS LAST order, ties broken by the PK — exactly
+// the eager stable sort's tie-break. Returns non-null iff the ORDER BY keys are EXACTLY a B-tree
+// index's columns (same count, same columns in key order), each ASC with default NULLS LAST (the
+// index stores NULL as 0x01 after a present 0x00 → NULLS LAST; an explicit NULLS FIRST does not
+// match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
+// the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
+// multi-column index would tie-break by the remaining index columns, not the PK.
+function orderSatisfiedByIndex(
+  snap: Snapshot,
+  table: Table,
+  offset: number,
+  order: OrderSlot[],
+): IndexOrder | null {
+  const pkWidth = pkStorageWidth(table);
+  if (pkWidth === null) return null;
+  for (const idx of table.indexes) {
+    if (idx.kind !== "btree") continue; // only an ordered B-tree realizes the column order
+    if (order.length !== idx.columns.length) continue; // ORDER BY must be EXACTLY the index columns
+    let matches = true;
+    for (let i = 0; i < order.length; i++) {
+      const o = order[i]!;
+      if (o.descending || o.nullsFirst) {
+        matches = false; // ASC + NULLS LAST only — the order a forward index walk realizes
+        break;
+      }
+      if (o.idx !== offset + idx.columns[i]!) {
+        matches = false;
+        break;
+      }
+      const ctx = keyCollationCtx(snap, table.columns[idx.columns[i]!]!);
+      if (ctx === null) {
+        matches = false; // Skewed / unresolvable — never walked for order (§12)
+        break;
+      }
+      if (ctx.coll === null) {
+        if (o.collation !== null) {
+          matches = false;
+          break;
+        }
+      } else if (o.collation === null || o.collation.name !== ctx.coll.name) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return { nameKey: idx.name.toLowerCase(), pkWidth };
+  }
+  return null;
 }
 
 // detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named GIN
@@ -12922,6 +13081,11 @@ type SelectPlan = {
   // pkReverse is the PK scan direction when pkOrdered: true ⇒ the order is all-DESC over the full
   // PK, served by a REVERSE scan; false ⇒ all-ASC (forward). Always false when !pkOrdered.
   pkReverse: boolean;
+  // indexOrder reports that ORDER BY is satisfied by walking a B-tree SECONDARY index in key order
+  // (with a LIMIT top-N) — non-null when the PK scan does not satisfy the order but the index does
+  // (cost.md §3 "secondary-index order"). Mutually exclusive with pkOrdered (the PK scan is
+  // cheaper). null keeps the eager/streaming sort.
+  indexOrder: IndexOrder | null;
   // Primary-key predicate pushdown, ONE entry per relation in rels: the WHERE conjuncts that bound
   // that relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
   // (cost.md §3 "bounded scan"). null ⇒ a full scan of that relation. In a JOIN each base table is

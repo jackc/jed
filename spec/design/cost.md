@@ -661,9 +661,46 @@ breaks ties in input = PK-ascending order**:
   range walk is already PK order (forward or reversed), so the bound narrows *which* rows are scanned
   and the `ORDER BY` still streams within it.
 
-Narrowings (each a follow-on optimization slice): **secondary-index** order (walk the index tree +
-point-lookup — the general non-PK collation payoff), `DISTINCT`, and multi-table joins all keep the
-blocking sort / eager path.
+Narrowings (each a follow-on optimization slice): `DISTINCT` and multi-table joins keep the blocking
+sort / eager path. **Secondary-index order** is the next subsection.
+
+### ORDER BY satisfied by secondary-index order — the top-N index walk
+
+When the PK scan does **not** satisfy an `ORDER BY` but a **B-tree secondary index**'s columns do,
+*and there is a `LIMIT`*, the engine walks that index in key order — which **is** the indexed-column
+order — and **point-looks-up** each row by its primary key, instead of full-scanning + sorting. This
+is the general non-PK (and collated) `ORDER BY` payoff: a `unicode`-collated index is stored in
+collation order, so `ORDER BY name LIMIT 10` reads only the first ten index entries and looks up only
+those ten rows, with **no** in-memory collated sort and **no** `collate` units. Gated by the
+`query.order_by_index_scan` capability.
+
+The index store holds its entries as `(indexed columns, storage key)`, so a forward walk delivers
+`ORDER BY <indexed columns> ASC NULLS LAST` (the index stores a `NULL` as the `0x01` tag, which sorts
+*after* a present `0x00` — exactly NULLS-LAST), ties broken by the PK suffix — precisely the eager
+stable sort's tie-break. It engages when:
+
+- the `ORDER BY` keys are **exactly** the index's columns (same count, same order), each **`ASC` with
+  default `NULLS LAST`** and sorting by the column's stored key collation (a `Skewed` collated index
+  is never walked — the §12 read-safety rule). *Exactly*, because a strict prefix of a *multi*-column
+  index would tie-break by the remaining index columns rather than the PK, diverging from the eager
+  sort (the composite-PK reverse trap again);
+- the table's **PK is fixed-width**, so the row's storage key is a known fixed length **peeled off the
+  END of each index entry key** (the "key-suffix skip" — this is what lets the indexed column itself
+  be variable-width `text`/collated without parsing the index prefix);
+- there is a **`LIMIT`**. Without one, walking the whole index + one point lookup per row costs *more*
+  than a full scan + sort, so a no-`LIMIT` `ORDER BY` keeps the eager sort.
+
+- **Cost.** The index tree's `page_read` is charged up front as the **full block** (like the streaming
+  PK scan — only the per-row work short-circuits). Each scanned entry then charges its table
+  point-lookup's `page_read`/`value_decompress` + one `storage_row_read`, with the `LIMIT` stopping
+  the walk once the window is filled — so `storage_row_read` and the point-lookup `page_read`s drop to
+  the rows actually looked up. `row_produced` and projection `operator_eval`s accrue per produced row.
+  The rows match the eager sort exactly. `query/order_by_index_scan.test` pins the top-N, the residual
+  filter, the OFFSET, and the no-`LIMIT` / non-indexed-column contrasts that keep the eager sort.
+
+Narrowings (each a follow-on): combining the index walk with a `WHERE` pushdown bound, `DESC` (a
+reverse index walk — restricted to a unique index, the same tie-break trap), and a strict-prefix-of-a-
+multi-column-index `ORDER BY` all keep the eager path.
 
 ### `SELECT DISTINCT` — the projection-vs-produce asymmetry
 
