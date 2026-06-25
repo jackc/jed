@@ -287,6 +287,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.order_by_expr",
     // ORDER BY by an output-column alias / name (`... AS s ... ORDER BY s`), output-first (grammar.md §10).
     "query.order_by_alias",
+    // A correlated ORDER BY key — an inner ORDER BY referencing an enclosing-query column (grammar.md §26).
+    "query.order_by_correlated",
     // Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
     "query.select_star",
     "query.column_alias",

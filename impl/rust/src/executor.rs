@@ -8993,15 +8993,41 @@ impl Database {
             };
 
             match target {
+                Target::Slot(Resolved::Outer { level, index }) => {
+                    // A correlated (outer) column ORDER BY key — the local sort row has no slot for an
+                    // enclosing-query column, so materialize it as an OuterColumn expression evaluated per
+                    // row against the outer-row environment (query.order_by_correlated), exactly like a
+                    // general-expression key. PostgreSQL accepts it (a degenerate constant leading key).
+                    let r = Resolved::Outer { level, index };
+                    if scope.column_of(r).ty.is_json() {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedFunction,
+                            "could not identify an ordering operator for type json",
+                        ));
+                    }
+                    let coll = match &key.collation {
+                        Some(name) => {
+                            if !scope.column_of(r).ty.is_text() {
+                                return Err(type_error(format!(
+                                    "collations are not supported by type {}",
+                                    scope.column_of(r).ty.canonical_name()
+                                )));
+                            }
+                            resolve_collation_name(scope.catalog, name)?
+                        }
+                        None => match &scope.column_of(r).collation {
+                            Some(cn) => resolve_collation_name(scope.catalog, cn)?,
+                            None => None,
+                        },
+                    };
+                    let k = order_exprs.len();
+                    order_exprs.push(RExpr::OuterColumn { level, index });
+                    order.push((ORDER_EXPR_BASE + k, key.descending, key.nulls_first, coll));
+                }
                 Target::Slot(r) => {
                     let idx = match r {
                         Resolved::Local(i) => i,
-                        Resolved::Outer { .. } => {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                "ORDER BY may not reference an outer query column",
-                            ));
-                        }
+                        Resolved::Outer { .. } => unreachable!("the outer slot is handled above"),
                     };
                     // `json` has no ordering operator (PG ships no btree opclass — json.md §5): ORDER BY
                     // a json column is 42883. jsonb IS orderable (its btree total order, §5).
@@ -9084,14 +9110,11 @@ impl Database {
                         let mut octx = AggCtx::Forbidden;
                         resolve(&scope, e, None, &mut octx, ptypes)?
                     };
-                    // A correlated ORDER BY expression (one referencing an enclosing query) is degenerate
-                    // and 0A000, the same narrowing a correlated window key takes (window.md §5.1).
-                    if rexpr_references_outer(&rexpr, 0) {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "ORDER BY may not reference an outer query column",
-                        ));
-                    }
+                    // A correlated ORDER BY expression (one referencing an enclosing query) is allowed
+                    // (query.order_by_correlated): the outer column is a per-evaluation constant of the
+                    // enclosing row, evaluated against the outer-row environment that is still in scope
+                    // when `materialize_order_exprs` runs (the same env that binds the rest of this
+                    // subquery). PostgreSQL accepts it; it is a degenerate (constant) leading key.
                     // A non-orderable result type — `json` (no btree opclass) — is 42883; `jsonb` orders.
                     if matches!(ty, ResolvedType::Json) {
                         return Err(EngineError::new(
@@ -17778,6 +17801,14 @@ fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> bool {
             .projections
             .iter()
             .any(|p| rexpr_references_outer(p, depth))
+        // A materialized ORDER BY expression may itself carry a correlated reference
+        // (query.order_by_correlated): a subquery whose ONLY outer reference is in its ORDER BY is
+        // still correlated and must re-execute per outer row (else its OuterColumn reads an empty
+        // outer-row environment).
+        || sp
+            .order_exprs
+            .iter()
+            .any(|oe| rexpr_references_outer(oe, depth))
         // A set-returning relation's arguments may carry a correlated reference (an implicitly-
         // lateral SRF arg sees params / outer / an earlier sibling — functions.md §10, grammar.md
         // §44), which makes the enclosing query correlated, so it must NOT be folded once.

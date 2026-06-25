@@ -1,9 +1,11 @@
 # Correlated subqueries (spec/design/grammar.md §26): a subquery referencing a column of an
 # enclosing query, resolved via the scope chain (inner FROM first, then outward) and re-executed
 # per outer row. Covers correlated EXISTS / scalar / IN, correlation in a JOIN ON, an outer
-# reference inside an aggregate argument, multi-level + skip-level (grandparent) correlation, and
-# the degenerate GROUP BY / ORDER BY-outer-key narrowing (0A000). Results verified against PostgreSQL 18.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.table_alias, query.join_inner, query.aggregates, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.i32, resource.cost_metering
+# reference inside an aggregate argument, multi-level + skip-level (grandparent) correlation, a
+# correlated ORDER BY key (an inner ORDER BY referencing an enclosing-query column — now allowed,
+# query.order_by_correlated), and the degenerate GROUP BY-outer-key narrowing (still 0A000). Results
+# verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.order_by_correlated, query.qualified_column, query.table_alias, query.join_inner, query.aggregates, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t1 (id i32 PRIMARY KEY, v i32)
@@ -139,12 +141,56 @@ INSERT INTO inr VALUES (1, 10)
 statement error 42702
 SELECT t1.id FROM t1 JOIN t3 ON t1.id = t3.id WHERE EXISTS (SELECT 1 FROM inr WHERE inr.x = v)
 
-# Degenerate narrowings: grouping or ordering a subquery BY an enclosing-query column is 0A000.
+# Degenerate narrowing: GROUPING a subquery BY an enclosing-query column is still 0A000.
 statement error 0A000
 SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 GROUP BY t1.v)
 
-statement error 0A000
-SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v)
+# A correlated ORDER BY key — an inner ORDER BY referencing an enclosing-query column — is now
+# allowed (query.order_by_correlated). The outer column is a per-evaluation constant of the enclosing
+# row (a degenerate leading sort key), so a deterministic later key decides the order; PostgreSQL
+# matches. The subquery becomes correlated PURELY through its ORDER BY, so it re-executes per outer row.
+
+# Outer t1.v leads (constant), t2.v DESC decides -> the max t2.v (30) for every outer row.
+# names: id, pick
+query II nosort
+SELECT t1.id, (SELECT t2.v FROM t2 ORDER BY t1.v, t2.v DESC LIMIT 1) AS pick FROM t1 ORDER BY t1.id
+----
+1
+30
+2
+30
+
+# Outer key combined into an arithmetic expression key (t1.v + t2.v DESC) -> t2.id 2 each.
+# names: id, pid
+query II nosort
+SELECT t1.id, (SELECT t2.id FROM t2 ORDER BY t1.v + t2.v DESC LIMIT 1) AS pid FROM t1 ORDER BY t1.id
+----
+1
+2
+2
+2
+
+# Ordering inside an EXISTS subquery by an outer column is a no-op but must not error: t2 is
+# non-empty so EXISTS holds for every t1 row.
+# names: id
+query I nosort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v) ORDER BY t1.id
+----
+1
+2
+
+# A grandparent (skip-level, level 2) correlated ORDER BY key: the innermost ORDER BY references
+# t1.v two frames out. t3.id DESC decides -> 2 for every outer row.
+# names: id, x
+query II nosort
+SELECT t1.id,
+       (SELECT (SELECT t3.id FROM t3 ORDER BY t1.v, t3.id DESC LIMIT 1) FROM t2 WHERE t2.id = t1.id) AS x
+FROM t1 ORDER BY t1.id
+----
+1
+2
+2
+2
 
 # G15 — a correlated scalar subquery used as an expression must return at most ONE row; more than
 # one is a cardinality violation (21000). This is a PER-OUTER-ROW check made at EXECUTION, not a

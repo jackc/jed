@@ -335,13 +335,24 @@ columns share the name with **different** expressions the bare key is **`42702`*
 resolves names against the unified output columns (below), so the alias form is the single-`SELECT`
 counterpart of that.
 
-**Still narrowed (§5).** *(The output **alias** key is now supported — the alias form above.)*
-A **set-operation** `ORDER BY` (after `UNION`/`INTERSECT`/`EXCEPT`)
+**Correlated key (now supported, `query.order_by_correlated`).** An `ORDER BY` key inside a subquery
+may reference a column of an **enclosing** query (`SELECT a, (SELECT b FROM u ORDER BY t.a LIMIT 1)
+FROM t`). The outer column is a per-evaluation **constant** of the enclosing row, so it is a degenerate
+(constant) leading sort key — a deterministic later key decides the order — and PostgreSQL accepts it.
+Both a bare/qualified outer-column key and a general expression that *contains* an outer reference
+(`ORDER BY t.a + u.b`) are **materialized as an `OuterColumn` expression** evaluated per outer row
+against the outer-row environment (never a local sort-row slot, which holds only this query's columns).
+A subquery correlated **only** through its `ORDER BY` is still correlated, so it re-executes per outer
+row (the correlation detector inspects the materialized order expressions). Skip-level (grandparent)
+references work. The analogous degenerate `GROUP BY` by an enclosing column stays `0A000`.
+
+**Still narrowed (§5).** *(The output **alias** key and the **correlated** key are now supported —
+above.)* A **set-operation** `ORDER BY` (after `UNION`/`INTERSECT`/`EXCEPT`)
 accepts only an output column name or ordinal — a general-expression key there is `0A000`
 (*"invalid UNION/INTERSECT/EXCEPT ORDER BY clause"*, matching PostgreSQL, which rejects expressions
 once the inputs are unified). A **window function** inside an `ORDER BY` key, a `GROUPING(...)`
-call inside one, an expression key in a **grouped query that also has window functions**, and a
-**correlated** key (one referencing an enclosing query) are each `0A000` deferrals.
+call inside one, and an expression key in a **grouped query that also has window functions** are each
+`0A000` deferrals.
 
 **NULL placement and the default.** The physical key order ratifies NULL as the **largest**
 value ([types.md](types.md) §4, `null_ordering = "nulls-last-ascending"` in

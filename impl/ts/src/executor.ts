@@ -7604,10 +7604,37 @@ export class Database {
         // A column / ordinal-to-column key resolves to a real row slot.
         const r = slotRes!;
         if (r.level !== 0) {
-          throw engineError(
-            "feature_not_supported",
-            "ORDER BY may not reference an outer query column",
-          );
+          // A correlated (outer) column ORDER BY key — the local sort row has no slot for an
+          // enclosing-query column, so materialize it as an OuterColumn expression evaluated per row
+          // against the outer-row environment (query.order_by_correlated), exactly like a general-
+          // expression key. PostgreSQL accepts it (a degenerate constant leading key).
+          const col = scope.columnOf(r);
+          if (typeIsJson(col.type)) {
+            throw engineError(
+              "undefined_function",
+              "could not identify an ordering operator for type json",
+            );
+          }
+          let oCollation: Collation | null = null;
+          if (key.collation !== null) {
+            if (!typeIsText(col.type)) {
+              throw typeError(
+                `collations are not supported by type ${typeCanonicalName(col.type)}`,
+              );
+            }
+            oCollation = resolveCollationName(scope.catalog, key.collation);
+          } else if (col.collation !== null) {
+            oCollation = resolveCollationName(scope.catalog, col.collation);
+          }
+          const k = orderExprs.length;
+          orderExprs.push({ kind: "outerColumn", level: r.level, index: r.index });
+          order.push({
+            idx: ORDER_EXPR_BASE + k,
+            descending: key.descending,
+            nullsFirst: key.nullsFirst,
+            collation: oCollation,
+          });
+          continue;
         }
         // `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
         // ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
@@ -7670,13 +7697,10 @@ export class Database {
         const octx: AggCtx = { collecting: false, groupKeys: [], specs: [] };
         ({ node, type } = resolve(scope, orderExpr, null, octx, ptypes));
       }
-      // A correlated ORDER BY expression (one referencing an enclosing query) is degenerate and 0A000.
-      if (rexprReferencesOuter(node, 0)) {
-        throw engineError(
-          "feature_not_supported",
-          "ORDER BY may not reference an outer query column",
-        );
-      }
+      // A correlated ORDER BY expression (one referencing an enclosing query) is allowed
+      // (query.order_by_correlated): the outer column is a per-evaluation constant of the enclosing
+      // row, evaluated against the outer-row environment still in scope when materializeOrderExprs
+      // runs. PostgreSQL accepts it; it is a degenerate (constant) leading key.
       // A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
       if (type.kind === "json") {
         throw engineError(
@@ -11031,6 +11055,10 @@ function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   for (const s of plan.aggSpecs)
     if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
   for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
+  // A materialized ORDER BY expression may itself carry a correlated reference (query.order_by_correlated):
+  // a subquery whose ONLY outer reference is in its ORDER BY is still correlated and must re-execute per
+  // outer row (else its OuterColumn reads an empty outer-row environment).
+  for (const oe of plan.orderExprs) if (rexprReferencesOuter(oe, depth)) return true;
   // A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral SRF
   // arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making the
   // enclosing query correlated. A LATERAL derived table's body is one frame deeper; a reference in it

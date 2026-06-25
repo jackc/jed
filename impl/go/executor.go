@@ -10278,7 +10278,34 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			// A column / ordinal-to-column key resolves to a real row slot.
 			r := slotRes
 			if r.level != 0 {
-				return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
+				// A correlated (outer) column ORDER BY key — the local sort row has no slot for an
+				// enclosing-query column, so materialize it as an OuterColumn expression evaluated per row
+				// against the outer-row environment (query.order_by_correlated), exactly like a general-
+				// expression key. PostgreSQL accepts it (a degenerate constant leading key).
+				rexpr, ty, rerr := resolveColumnRef(s, &aggCtx{}, r, key.Column)
+				if rerr != nil {
+					return nil, rerr
+				}
+				if ty.kind == rtJson {
+					return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
+				}
+				var coll *Collation
+				if key.Collation != "" {
+					if ty.kind != rtText && ty.kind != rtNull {
+						return nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
+					}
+					if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+						return nil, err
+					}
+				} else if cn := s.columnOf(r).Collation; cn != "" {
+					if coll, err = resolveCollationName(s.catalog, cn); err != nil {
+						return nil, err
+					}
+				}
+				k := len(orderExprs)
+				orderExprs = append(orderExprs, rexpr)
+				order = append(order, orderSlot{idx: orderExprBase + k, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
+				continue
 			}
 			// `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
 			// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
@@ -10350,10 +10377,10 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 				return nil, err
 			}
 		}
-		// A correlated ORDER BY expression (one referencing an enclosing query) is degenerate and 0A000.
-		if rexprReferencesOuter(rexpr, 0) {
-			return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
-		}
+		// A correlated ORDER BY expression (one referencing an enclosing query) is allowed
+		// (query.order_by_correlated): the outer column is a per-evaluation constant of the enclosing
+		// row, evaluated against the outer-row environment still in scope when materializeOrderExprs
+		// runs. PostgreSQL accepts it; it is a degenerate (constant) leading key.
 		// A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
 		if ty.kind == rtJson {
 			return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
@@ -14102,6 +14129,14 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 	}
 	for _, p := range sp.projections {
 		if rexprReferencesOuter(p, depth) {
+			return true
+		}
+	}
+	// A materialized ORDER BY expression may itself carry a correlated reference (query.order_by_correlated):
+	// a subquery whose ONLY outer reference is in its ORDER BY is still correlated and must re-execute per
+	// outer row (else its OuterColumn reads an empty outer-row environment).
+	for _, oe := range sp.orderExprs {
+		if rexprReferencesOuter(oe, depth) {
 			return true
 		}
 	}
