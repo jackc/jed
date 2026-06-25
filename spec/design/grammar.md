@@ -357,14 +357,19 @@ counts are final (an order-introduced window spec or window key shifts every slo
 query whose **only** `OVER` call sits in the `ORDER BY` still sets up the window machinery, and sorting
 by a select-list window value via its **output alias** works the same way (the alias binds the computed
 item, which is materialized — it no longer re-resolves to `42P20`). Execution is unchanged: the window
-stage appends its results before `ORDER BY` materializes the key over those rows.
+stage appends its results before `ORDER BY` materializes the key over those rows. This composes with a
+**grouped** query: an expression key in a query that **both** groups and has window functions
+(`SELECT g, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY g ORDER BY sum(v) + 1`, or `ORDER BY
+rank() OVER (ORDER BY sum(v)) DESC`) resolves in the grouped+window context — collecting aggregates and
+window specs at once — and is materialized over the grouped rows **after** the window stage extends
+them, so the order values follow the window results (`query.order_by_grouped_window`).
 
-**Still narrowed (§5).** *(The output **alias** key, the **correlated** key, and a **window function /
-`GROUPING()`** in a key are now supported — above.)* A **set-operation** `ORDER BY` (after
-`UNION`/`INTERSECT`/`EXCEPT`) accepts only an output column name or ordinal — a general-expression key
-there is `0A000` (*"invalid UNION/INTERSECT/EXCEPT ORDER BY clause"*, matching PostgreSQL, which rejects
-expressions once the inputs are unified). An expression key in a **grouped query that also has window
-functions** (`query.order_by_grouped_window`) is still a `0A000` deferral.
+**Still narrowed (§5).** *(The output **alias** key, the **correlated** key, a **window function /
+`GROUPING()`** in a key, and the **grouped+window** expression key are now supported — above.)* A
+**set-operation** `ORDER BY` (after `UNION`/`INTERSECT`/`EXCEPT`) accepts only an output column name or
+ordinal — a general-expression key there is `0A000` (*"invalid UNION/INTERSECT/EXCEPT ORDER BY clause"*,
+matching PostgreSQL, which rejects expressions once the inputs are unified). **GROUPING SETS** (more
+than one set) combined with **window functions** remains a `0A000` deferral.
 
 **NULL placement and the default.** The physical key order ratifies NULL as the **largest**
 value ([types.md](types.md) §4, `null_ordering = "nulls-last-ascending"` in

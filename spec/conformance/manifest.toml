@@ -249,6 +249,10 @@ id = "query.order_by_grouping"
 description = "A GROUPING() call inside a query ORDER BY key (SELECT a, sum(v) FROM t GROUP BY ROLLUP (a) ORDER BY GROUPING(a), a) — typically to push the higher-level subtotal / grand-total rows (GROUPING = 1) to one end. The call collects into the same grouping spec as a select-list GROUPING(), is materialized as the ORDER BY key, and sorted over the grouped rows; the GROUPING() placeholder rebases run after ORDER BY resolution. A plain (non-GROUPING-SETS) GROUP BY makes GROUPING(col) a constant 0 leading key, matching PostgreSQL. Builds on query.grouping_sets, query.order_by_expr."
 
 [[capability]]
+id = "query.order_by_grouped_window"
+description = "A general-expression ORDER BY key in a query that BOTH groups (GROUP BY / aggregates) AND has window functions (SELECT g, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY g ORDER BY sum(v) + 1; ORDER BY rank() OVER (ORDER BY sum(v)) DESC). The key is resolved in the grouped+window context (collecting aggregates AND window specs at once), so it may name an aggregate the select list lacks or be a window function over a grouped aggregate; it is materialized over the grouped rows AFTER the window stage appends its results, so the order values follow the window results in the grouped row. GROUPING SETS (more than one set) combined with window functions remains 0A000. Builds on query.window_grouped, query.order_by_window."
+
+[[capability]]
 id = "query.select_star"
 description = "SELECT * expands to all columns with their canonical names"
 

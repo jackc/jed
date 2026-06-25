@@ -10303,18 +10303,13 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			continue
 		}
 
-		// A general-expression key in a grouped query that ALSO has window functions is deferred (its row
-		// is extended by the window stage over the grouped row — query.order_by_grouped_window).
-		if isAgg && hasWindowSyntax {
-			return nil, NewError(FeatureNotSupported, "ORDER BY by an expression in a grouped windowed query is not supported")
-		}
 		// Resolve the key expression in the SAME context the projection used, so a window function /
 		// GROUPING() / aggregate it contains collects into the shared specs and references the same
-		// placeholders (rebased together after this loop — grammar.md §10): a grouped query (no window)
-		// resolves in collect mode over the group keys + aggregates + GROUPING() calls (a new aggregate or
-		// GROUPING() the select list lacks is allowed); a window query (no grouping) resolves in windowing
-		// mode (a window function collects a window spec); a plain query forbids both (aggregate 42803,
-		// window function 42P20).
+		// placeholders (rebased together after this loop — grammar.md §10): a grouped query collects over
+		// the group keys + aggregates + GROUPING() calls (a new aggregate or GROUPING() the select list
+		// lacks is allowed); a window query collects window specs/keys; a grouped+window query does both
+		// (query.order_by_grouped_window); a plain query forbids aggregates (42803) and window functions
+		// (42P20).
 		var rexpr *rExpr
 		var ty resolvedType
 		octx := &aggCtx{collecting: isAgg, groupKeys: groupKeys, specs: aggSpecs, groupingSpecs: groupingSpecs}

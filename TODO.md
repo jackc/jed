@@ -134,10 +134,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         so an order-introduced spec shifts every slot consistently. A query whose only `OVER` is in the
         `ORDER BY` still sets up the window stage, and sorting by a window value via its output alias now
         works (`query.order_by_window`, `query.order_by_grouping`). → [grammar.md §10](spec/design/grammar.md)
-  - [ ] _follow-on:_ an expression key in a **grouped+window** query (`0A000`,
-        `query.order_by_grouped_window`). _(An expression key in a **set-operation** `ORDER BY` is
-        **not** a follow-on: PostgreSQL itself rejects it with `0A000`, and jed already matches that code
-        + message — grammar.md §10. Implementing it would be a divergence, not a feature.)_
+  - [x] **Expression key in a grouped+window query** (`SELECT g, sum(v), rank() OVER (ORDER BY sum(v))
+        FROM t GROUP BY g ORDER BY sum(v) + 1`; `ORDER BY rank() OVER (ORDER BY sum(v)) DESC`) — an
+        expression key in a query that BOTH groups and has window functions, resolved in the grouped+window
+        context (aggregates + window specs at once) and materialized over the grouped rows after the window
+        stage extends them (`query.order_by_grouped_window`). → [grammar.md §10](spec/design/grammar.md)
+    _(Two remaining `0A000`s are deliberate non-features, not follow-ons: a general-expression key in a
+    **set-operation** `ORDER BY` — PostgreSQL itself rejects it with `0A000` and jed already matches that
+    code + message; and **GROUPING SETS + window functions**, an orthogonal grouping/window deferral.)_
 - [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,
       non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK columns (sorting by each
       column's stored key order) elides the sort and streams the scan; with a `LIMIT` it

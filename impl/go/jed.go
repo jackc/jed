@@ -214,6 +214,8 @@ var SupportedCapabilities = []string{
 	"query.order_by_window",
 	// A GROUPING() call inside an ORDER BY key (`ORDER BY GROUPING(a)`, aggregates.md §12).
 	"query.order_by_grouping",
+	// A general-expression ORDER BY key in a grouped query that ALSO has window functions (window.md §5.2).
+	"query.order_by_grouped_window",
 	// Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
 	"query.select_star",
 	"query.column_alias",

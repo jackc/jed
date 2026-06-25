@@ -9028,23 +9028,35 @@ impl Database {
                     order.push((slot, key.descending, key.nulls_first, coll));
                 }
                 Target::Expr(e) => {
-                    // A general-expression key in a grouped query that ALSO has window functions is
-                    // deferred (its row is extended by the window stage over the grouped row —
-                    // query.order_by_grouped_window).
-                    if is_agg && has_window_syntax {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "ORDER BY by an expression in a grouped windowed query is not supported",
-                        ));
-                    }
                     // Resolve the key expression in the SAME context the projection used, so a window
                     // function / GROUPING() / aggregate it contains collects into the shared specs and
                     // references the same placeholders (rebased together after this loop — grammar.md §10):
-                    // a grouped query (no window) resolves in `Collect` over the group keys + aggregates +
-                    // GROUPING() calls (a new aggregate or GROUPING() the select list lacks is allowed); a
-                    // window query (no grouping) resolves in `Window` (a window function collects a window
-                    // spec); a plain query is `Forbidden` (an aggregate is 42803, a window function 42P20).
-                    let (rexpr, ty) = if has_window_syntax {
+                    // a grouped+window query resolves in `GroupedWindow` (collecting aggregates AND window
+                    // specs — query.order_by_grouped_window); a window-only query in `Window` (a window
+                    // function collects a window spec); a grouped-only query in `Collect` over the group
+                    // keys + aggregates + GROUPING() calls (a new aggregate or GROUPING() the select list
+                    // lacks is allowed); a plain query is `Forbidden` (aggregate 42803, window 42P20).
+                    let (rexpr, ty) = if is_agg && has_window_syntax {
+                        let mut octx = AggCtx::GroupedWindow {
+                            group_keys: group_keys.clone(),
+                            agg_specs: std::mem::take(&mut agg_specs),
+                            window_specs: std::mem::take(&mut window_specs),
+                            window_keys: std::mem::take(&mut window_keys),
+                        };
+                        let res = resolve(&scope, e, None, &mut octx, ptypes);
+                        if let AggCtx::GroupedWindow {
+                            agg_specs: a,
+                            window_specs: ws,
+                            window_keys: wk,
+                            ..
+                        } = octx
+                        {
+                            agg_specs = a;
+                            window_specs = ws;
+                            window_keys = wk;
+                        }
+                        res?
+                    } else if has_window_syntax {
                         let mut octx = AggCtx::Window {
                             specs: std::mem::take(&mut window_specs),
                             window_keys: std::mem::take(&mut window_keys),
