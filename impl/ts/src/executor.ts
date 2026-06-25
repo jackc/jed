@@ -7870,10 +7870,10 @@ export class Database {
     // KEY columns — collation-matching the column's stored key form, all in one direction (ASC ⇒
     // forward scan, DESC ⇒ a reverse scan over the full PK) — needs no sort, since the table scan
     // already yields rows in that order. The streaming scan then elides the sort (and, with a LIMIT,
-    // short-circuits a top-N).
+    // short-circuits a top-N). DISTINCT is allowed: the dedup runs streaming in scan order, keeping
+    // the first occurrence, and the sort is elided (cost.md §3 "DISTINCT").
     const pkDir =
       !isAgg &&
-      !sel.distinct &&
       order.length > 0 &&
       orderExprs.length === 0 &&
       planRels.length === 1 &&
@@ -8694,6 +8694,12 @@ export class Database {
     const limit = plan.limit;
     const offset = plan.offset ?? 0n;
     const out: Value[][] = [];
+    // DISTINCT (cost.md §3): when the scan already yields ORDER BY order, dedup runs streaming —
+    // project EVERY scanned filtered row (the dedup key), drop a value already in `seen` keeping the
+    // first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort is
+    // elided; the projection is charged per scanned filtered row (the §3 asymmetry).
+    const distinct = plan.distinct;
+    const seen = new Set<string>();
     // Skip the scan entirely for LIMIT 0 (no window to fill).
     if (!empty && limit !== 0n) {
       let passed = 0n;
@@ -8706,10 +8712,23 @@ export class Database {
         if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
           return true;
         }
-        passed += 1n;
-        if (passed <= offset) return true;
-        meter.charge(COSTS.rowProduced);
-        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+        if (distinct) {
+          // Project per scanned filtered row (the dedup key) and drop duplicates by first occurrence;
+          // the OFFSET/LIMIT then window the DISTINCT rows.
+          const tuple = plan.projections.map((p) => evalExpr(p, row, env, meter));
+          const key = distinctRowKey(tuple);
+          if (seen.has(key)) return true; // a duplicate of an already-emitted/seen value
+          seen.add(key);
+          passed += 1n;
+          if (passed <= offset) return true;
+          meter.charge(COSTS.rowProduced);
+          out.push(tuple);
+        } else {
+          passed += 1n;
+          if (passed <= offset) return true;
+          meter.charge(COSTS.rowProduced);
+          out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+        }
         // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every survivor
         // after OFFSET, in primary-key scan order).
         return limit === null ? true : BigInt(out.length) < limit;
@@ -9085,16 +9104,16 @@ export class Database {
     // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
     // LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
     // (plan.pkOrdered) — streams scan→filter→project with NO sort, and with a LIMIT STOPS the scan
-    // once the window is filled, so storageRowRead counts only the rows actually read. A non-PK-ordered
-    // ORDER BY, DISTINCT, aggregate, or join must see every row, so it keeps the sort/eager path below.
-    // pageRead stays the full block; only row reads short-circuit.
+    // once the window is filled, so storageRowRead counts only the rows actually read. A pkOrdered
+    // DISTINCT streams too: the dedup runs in scan order (the sort elided), so it short-circuits a
+    // top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY, a no-ORDER-BY DISTINCT, aggregate,
+    // or join must see every row, so it keeps the eager path below. pageRead stays the full block.
     if (
       plan.rels.length === 1 &&
       plan.joins.length === 0 &&
       !plan.isAgg &&
       !plan.hasWindow &&
-      !plan.distinct &&
-      (plan.pkOrdered || (plan.order.length === 0 && plan.limit !== null)) &&
+      (plan.pkOrdered || (!plan.distinct && plan.order.length === 0 && plan.limit !== null)) &&
       // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
       // gin.md §6): it reads the full admitted set via the eager path below.
       plan.relBounds[0]?.kind !== "index" &&

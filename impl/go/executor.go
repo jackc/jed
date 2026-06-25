@@ -10589,8 +10589,10 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// forward scan, DESC ⇒ a reverse scan over the full PK) — needs no sort, since the table scan
 	// already yields rows in that order. The streaming scan then elides the sort (and, with a LIMIT,
 	// short-circuits a top-N).
+	// (DISTINCT is allowed: when the scan already yields ORDER BY order, the dedup runs streaming —
+	// keeping first occurrence in scan order — and the sort is elided, cost.md §3 "DISTINCT".)
 	pkOrdered, pkReverse := false, false
-	if !isAgg && !sel.Distinct && len(order) > 0 && len(orderExprs) == 0 && len(planRels) == 1 &&
+	if !isAgg && len(order) > 0 && len(orderExprs) == 0 && len(planRels) == 1 &&
 		planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil {
 		pkOrdered, pkReverse = db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
 	}
@@ -13094,6 +13096,11 @@ func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Met
 		offset = *plan.offset
 	}
 	out := make([][]Value, 0)
+	// DISTINCT (cost.md §3): when the scan already yields ORDER BY order, dedup runs streaming —
+	// project EVERY scanned filtered row (the dedup key), drop a value already in `seen` keeping the
+	// first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort is
+	// elided; the projection is charged per scanned filtered row (the §3 asymmetry).
+	seen := make(map[string]bool)
 	// Skip the scan entirely for LIMIT 0 (no window to fill).
 	if !empty && (plan.limit == nil || *plan.limit > 0) {
 		var passed int64
@@ -13119,20 +13126,44 @@ func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Met
 					return true, nil
 				}
 			}
-			passed++
-			if passed <= offset {
-				return true, nil
-			}
-			meter.Charge(Costs.RowProduced)
-			projected := make([]Value, len(plan.projections))
-			for i, p := range plan.projections {
-				v, err := p.eval(row, env, meter)
-				if err != nil {
-					return false, err
+			if plan.distinct {
+				// Project per scanned filtered row (the dedup key) and drop duplicates by first
+				// occurrence; the OFFSET/LIMIT then window the DISTINCT rows.
+				projected := make([]Value, len(plan.projections))
+				for i, p := range plan.projections {
+					v, err := p.eval(row, env, meter)
+					if err != nil {
+						return false, err
+					}
+					projected[i] = v
 				}
-				projected[i] = v
+				if key := distinctRowKey(projected); seen[key] {
+					return true, nil // a duplicate of an already-emitted/seen value
+				} else {
+					seen[key] = true
+				}
+				passed++
+				if passed <= offset {
+					return true, nil
+				}
+				meter.Charge(Costs.RowProduced)
+				out = append(out, projected)
+			} else {
+				passed++
+				if passed <= offset {
+					return true, nil
+				}
+				meter.Charge(Costs.RowProduced)
+				projected := make([]Value, len(plan.projections))
+				for i, p := range plan.projections {
+					v, err := p.eval(row, env, meter)
+					if err != nil {
+						return false, err
+					}
+					projected[i] = v
+				}
+				out = append(out, projected)
 			}
-			out = append(out, projected)
 			// Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
 			// survivor after OFFSET, in primary-key scan order).
 			if plan.limit != nil {
@@ -13616,9 +13647,11 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// the full admitted set via the eager path below.
 	// A set-returning relation is generated, not scanned — it takes the eager path
 	// (functions.md §10); the streaming reader assumes a table store.
+	// A pkOrdered DISTINCT streams too: the dedup runs in scan order (the sort elided), so it
+	// short-circuits a top-N like the non-DISTINCT case. A no-ORDER-BY DISTINCT keeps the eager path.
 	if len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
-		(plan.pkOrdered || (len(plan.order) == 0 && plan.limit != nil)) &&
+		!plan.isAgg && !plan.hasWindow &&
+		(plan.pkOrdered || (!plan.distinct && len(plan.order) == 0 && plan.limit != nil)) &&
 		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil && plan.relBounds[0].gist == nil)) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference is a computed/buffered source, not a table store — the eager path

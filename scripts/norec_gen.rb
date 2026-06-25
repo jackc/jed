@@ -32,6 +32,9 @@
 #              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
 #              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
 #              the eager full sort must reconstruct the SAME by-construction sorted whole.
+#   distinct_order — `SELECT DISTINCT a ... ORDER BY a` over a composite PK (a, b) dedups STREAMING in
+#              PK scan order (the sort elided, cost.md §3 "DISTINCT"); with a LIMIT it short-circuits a
+#              top-N. The distinct-`a` windows must reconstruct the by-construction sorted distinct set.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -119,6 +122,10 @@ INDEX_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.in
                      dml.insert_multi_row query.select query.order_by query.order_by_keys
                      query.limit query.offset query.order_by_index_scan types.i32
                      null.three_valued].freeze
+DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
+                        dml.insert_multi_row query.select query.distinct query.order_by
+                        query.order_by_keys query.limit query.offset query.order_by_pk_scan
+                        types.i32].freeze
 TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.subquery_scalar
@@ -423,6 +430,40 @@ def gen_index(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim}")
   ipair.call("v = #{present} after DELETE removed id #{victim}", present,
              flat.call(with_v.call(present)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: DISTINCT satisfied by PK scan order (streaming dedup top-N) -----------------------
+def gen_distinct_order(seed)
+  rng = Random.new(seed)
+  avals = (1..30).to_a.sample(6, random: rng).sort # 6 distinct `a` values (the distinct set)
+  rows = []
+  avals.each do |a|
+    # 1..3 DISTINCT b's per a, so (a, b) is the unique PK and `a` has duplicates to dedup.
+    (1..10).to_a.sample(rng.rand(1..3), random: rng).each { |b| rows << [a, b] }
+  end
+  flat = ->(xs) { xs.map(&:to_s) }
+  n = avals.size
+  k = rng.rand(2..n - 2)
+
+  out = header(seed, DISTINCT_ORDER_REQ, "DISTINCT satisfied by PK scan order (streaming dedup top-N)")
+  stmt(out, "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |a, b| "(#{a}, #{b})" }.join(', ')}")
+
+  # `ORDER BY a` is a PREFIX of the (a, b) PK, so a DISTINCT-`a` query dedups streaming in scan order
+  # (the sort elided); the LIMITed forms short-circuit a top-N, the no-LIMIT form streams the whole.
+  # Every window must match its by-construction slice of the sorted distinct `a` set.
+  windows = [
+    ["LIMIT #{k}", avals[0, k]],
+    ["LIMIT #{k} OFFSET 2", avals[2, k] || []],
+    ["LIMIT #{n + 3}", avals],
+    ["", avals],
+  ]
+  windows.each do |clause, exp|
+    out << "# SELECT DISTINCT a ORDER BY a #{clause.empty? ? '(full)' : clause}"
+    q(out, "I", "SELECT DISTINCT a FROM t ORDER BY a #{clause}".strip, flat.call(exp))
+  end
 
   out.join("\n") + "\n"
 end
@@ -1161,6 +1202,7 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index" => method(:gen_index),
   "index_order" => method(:gen_index_order),
+  "distinct_order" => method(:gen_distinct_order),
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),

@@ -158,9 +158,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         point-look-up each row (a top-N); the general non-PK collated-`ORDER BY` payoff. The PK suffix
         is peeled off the END of each index entry key (the fixed-width key-suffix skip), so the indexed
         column may be variable-width / collated. Capability `query.order_by_index_scan`.
-  - [ ] _follow-on (each its own slice + NoREC obligation):_ `DISTINCT`; multi-table joins. _(Further
-        index-order sub-follow-ons: combine with a `WHERE` pushdown bound; `DESC` reverse index walk
-        over a unique index; a strict-prefix-of-a-multi-column-index `ORDER BY`.)_
+  - [x] _follow-on:_ **`DISTINCT`** — a `DISTINCT` whose `ORDER BY` is satisfied by the PK scan order
+        dedups **streaming** in scan order (the sort elided), so with a `LIMIT` it short-circuits a
+        top-N (projection + `storage_row_read` drop to the scanned rows). Composes with the reverse
+        (`DESC`) scan. A no-`ORDER-BY` `DISTINCT` keeps the eager project-all-then-dedup path.
+  - [ ] _follow-on (each its own slice + NoREC obligation):_ multi-table joins. _(Further index-order
+        sub-follow-ons: combine with a `WHERE` pushdown bound; `DESC` reverse index walk over a unique
+        index; a strict-prefix-of-a-multi-column-index `ORDER BY`; index-order under `DISTINCT`.)_
 - [x] **`DISTINCT`** — NULL-safe dedup of projected rows, after ORDER BY before LIMIT; PG
       restriction on ORDER BY keys (`42P10`). → [grammar.md §11](spec/design/grammar.md)
 - [x] **FROM-less `SELECT`** — `SELECT 1` over one virtual zero-column row.

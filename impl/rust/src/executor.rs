@@ -9402,8 +9402,9 @@ impl Database {
         // one direction (ASC ⇒ forward scan, DESC ⇒ a reverse scan over the full PK) — needs no
         // sort, since the table scan already yields rows in that order. The streaming scan then
         // elides the sort (and, with a LIMIT, short-circuits a top-N).
+        // (DISTINCT is allowed: when the scan already yields ORDER BY order, the dedup runs streaming
+        // — keeping first occurrence in scan order — and the sort is elided, cost.md §3 "DISTINCT".)
         let pk_dir = if !is_agg
-            && !sel.distinct
             && !order.is_empty()
             && order_exprs.is_empty() // a materialized expression key always takes the blocking sort
             && rels.len() == 1
@@ -10395,9 +10396,15 @@ impl Database {
         // survivor in order, eliding the sort), while the LIMIT short-circuit always has one.
         let limit = plan.limit;
         let offset = plan.offset.unwrap_or(0);
+        // DISTINCT (cost.md §3): when the scan already yields ORDER BY order, dedup runs streaming —
+        // project EVERY scanned filtered row (the dedup key), drop a value already in `seen` keeping
+        // the first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort
+        // is elided; the projection is charged per scanned filtered row (the §3 asymmetry).
+        let distinct = plan.distinct;
         let mut out: Vec<Vec<Value>> = Vec::new();
         if !empty && limit != Some(0) {
             let mut passed: i64 = 0;
+            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
             let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
                 meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                 meter.charge(COSTS.storage_row_read);
@@ -10420,16 +10427,34 @@ impl Database {
                 if !keep {
                     return Ok(true);
                 }
-                passed += 1;
-                if passed <= offset {
-                    return Ok(true);
+                if distinct {
+                    // Project per scanned filtered row (the dedup key) and drop duplicates by first
+                    // occurrence; the OFFSET/LIMIT then window the DISTINCT rows.
+                    let mut projected = Vec::with_capacity(plan.projections.len());
+                    for p in &plan.projections {
+                        projected.push(p.eval(row, env, meter)?);
+                    }
+                    if !seen.insert(projected.clone()) {
+                        return Ok(true); // a duplicate of an already-emitted/seen value
+                    }
+                    passed += 1;
+                    if passed <= offset {
+                        return Ok(true);
+                    }
+                    meter.charge(COSTS.row_produced);
+                    out.push(projected);
+                } else {
+                    passed += 1;
+                    if passed <= offset {
+                        return Ok(true);
+                    }
+                    meter.charge(COSTS.row_produced);
+                    let mut projected = Vec::with_capacity(plan.projections.len());
+                    for p in &plan.projections {
+                        projected.push(p.eval(row, env, meter)?);
+                    }
+                    out.push(projected);
                 }
-                meter.charge(COSTS.row_produced);
-                let mut projected = Vec::with_capacity(plan.projections.len());
-                for p in &plan.projections {
-                    projected.push(p.eval(row, env, meter)?);
-                }
-                out.push(projected);
                 // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
                 // survivor after OFFSET, in primary-key scan order).
                 Ok(match limit {
@@ -10877,15 +10902,15 @@ impl Database {
         // a LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key
         // scan order (`plan.pk_ordered`) — streams scan→filter→project with NO sort, and with a
         // LIMIT STOPS the scan once the window is filled (so storage_row_read counts only the rows
-        // actually read). A non-PK-ordered ORDER BY, DISTINCT, aggregate, or join must see every row
-        // (sort/dedup/group/combine), so it keeps the sort/eager path below. page_read stays the
-        // full block; only the row reads short-circuit.
+        // actually read). A `pk_ordered` DISTINCT streams too: the dedup runs in scan order (the sort
+        // elided), so it short-circuits a top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY,
+        // a no-ORDER-BY DISTINCT, aggregate, or join must see every row (sort/dedup/group/combine), so
+        // it keeps the eager path below. page_read stays the full block; only the row reads short-circuit.
         if plan.rels.len() == 1
             && plan.joins.is_empty()
             && !plan.is_agg
             && !plan.has_window
-            && !plan.distinct
-            && (plan.pk_ordered || (plan.order.is_empty() && plan.limit.is_some()))
+            && (plan.pk_ordered || (!plan.distinct && plan.order.is_empty() && plan.limit.is_some()))
             // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
             // gin.md §6): it reads the full admitted set via the eager path below.
             && !matches!(

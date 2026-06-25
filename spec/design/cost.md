@@ -723,10 +723,24 @@ keeps together:
 
 A consequence worth stating because it is observable and is a cross-core abort-point contract
 (§6): because all filtered rows are projected, a projection that traps fires **even under a
-`LIMIT` that would exclude the offending row**. `SELECT DISTINCT 1/a FROM t LIMIT 1` traps
-`22012` if *any* filtered row has `a = 0`, whereas un-`DISTINCT` `SELECT 1/a FROM t LIMIT 1`
-windows first and does not. The trapping row is deterministic (primary-key scan order), so
-all three cores trap identically.
+`LIMIT` that would exclude the offending row** — *in the eager `DISTINCT` path*.
+`SELECT DISTINCT 1/a FROM t LIMIT 1` traps `22012` if *any* filtered row has `a = 0`, whereas
+un-`DISTINCT` `SELECT 1/a FROM t LIMIT 1` windows first and does not. The trapping row is
+deterministic (primary-key scan order), so all three cores trap identically.
+
+**Exception — `DISTINCT` satisfied by primary-key scan order streams.** When the `ORDER BY` is
+satisfied by the table's primary-key scan order (the `query.order_by_pk_scan` cases above), a
+`DISTINCT` query dedups **streaming** in scan order — keeping the first (scan-order) occurrence — and
+the sort is **elided**, because the scan already delivers the rows in `ORDER BY` order and dedup
+preserves that order. With a `LIMIT` it therefore **short-circuits a top-N**, exactly like the
+non-`DISTINCT` case: projection and `storage_row_read` drop to the rows actually scanned (the trap
+consequence above then narrows to *scanned* rows, not *all* filtered rows — `SELECT DISTINCT 1/a … 
+ORDER BY pk LIMIT 1` over a `pk`-ordered scan stops after the first distinct row). Without a `LIMIT`
+the cost is unchanged (every filtered row is still scanned and projected; only the sort, unmetered, is
+elided). The rows are byte-identical to the eager `DISTINCT`-then-sort (the deduped set in `ORDER BY`
+order). `query/distinct.test`'s composite-PK section pins the streaming top-N (and the reverse-scan
+`DESC` variant). A `DISTINCT` whose `ORDER BY` the scan does *not* satisfy — or a no-`ORDER-BY`
+`DISTINCT` — keeps the eager project-all-then-dedup path.
 
 ### JOIN — multi-table FROM (the nested-loop contract)
 

@@ -8,13 +8,16 @@
 # Cost asymmetry (cost.md §3): DISTINCT must project EVERY filtered row to compute its dedup
 # key, so projection operator_eval is charged per filtered row (independent of LIMIT and of
 # duplicates), while row_produced counts only the emitted distinct+windowed rows. Dedup
-# itself is unmetered, like the sort and the slice.
+# itself is unmetered, like the sort and the slice. EXCEPTION — when the ORDER BY is satisfied by
+# the primary-key scan order (query.order_by_pk_scan), the dedup runs STREAMING in scan order and
+# the sort is elided, so with a LIMIT it STOPS once the window fills (a top-N): projection +
+# storage_row_read then drop to the rows actually scanned (the composite-PK section at the end).
 #
 # ORDER BY under DISTINCT takes the PostgreSQL restriction: every key must appear as a bare
 # column in the select list (or the list is `*`), else 42P10 — once duplicates collapse, a
 # key not in the output has no single value per row. (NULL ordering also follows PostgreSQL,
 # §10 — NULL is the largest value, so ASC defaults to NULLS LAST.)
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.order_by_ordinal, query.order_by_expr, query.order_by_alias, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, query.order_by_pk_scan, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.distinct, query.order_by, query.order_by_keys, query.order_by_ordinal, query.order_by_expr, query.order_by_alias, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, query.order_by_pk_scan, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -383,3 +386,58 @@ SELECT DISTINCT distinct FROM tk
 ----
 100
 200
+
+# --- DISTINCT satisfied by primary-key scan order: streaming dedup + LIMIT short-circuit ----------
+#
+# When the ORDER BY is satisfied by the table's primary-key scan order (query.order_by_pk_scan), a
+# DISTINCT query dedups STREAMING in scan order — keeping the first (scan-order) occurrence — and the
+# sort is elided. With a LIMIT it STOPS once the window fills (a top-N), so projection + storage_row_read
+# drop to the rows actually scanned, exactly like the non-DISTINCT PK-scan short-circuit. Here `a` is a
+# strict PREFIX of the composite PK (a, b), so `ORDER BY a` is satisfied by the (a, b) scan order; the
+# distinct `a` values are a TOTAL order (oracle-clean).
+statement ok
+CREATE TABLE d (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO d VALUES (1, 1), (1, 2), (2, 1), (2, 2), (3, 1)
+
+# DISTINCT a, no LIMIT: scan all 5 rows in (a, b) order, project `a` per row (bare column, 0 cost),
+# dedup to 1, 2, 3. 1 page + 5 scanned + 3 produced = 9 — the full-scan cost (no short-circuit).
+# cost: 9
+query I nosort
+SELECT DISTINCT a FROM d ORDER BY a
+----
+1
+2
+3
+
+# DISTINCT a with a LIMIT: the streaming dedup STOPS once 2 distinct values are emitted. The scan
+# reads (1,1) [emit 1], (1,2) [dup], (2,1) [emit 2 → window full, STOP] — 3 rows, never reaching
+# a=3. 1 page + 3 scanned + 2 produced = 6 — the top-N short-circuit (lower than the cost-9 full scan).
+# cost: 6
+query I nosort
+SELECT DISTINCT a FROM d ORDER BY a LIMIT 2
+----
+1
+2
+
+# OFFSET composes: skip the first distinct (a=1), take the next (a=2). The scan reads (1,1) [distinct
+# 1, skipped by OFFSET], (1,2) [dup], (2,1) [distinct 2, emitted → STOP]. 1 page + 3 scanned +
+# 1 produced = 5.
+# cost: 5
+query I nosort
+SELECT DISTINCT a FROM d ORDER BY a LIMIT 1 OFFSET 1
+----
+2
+
+# DESC over the full PK is a REVERSE scan (cost.md §3), and DISTINCT streams over it the same way:
+# `ORDER BY a DESC, b DESC` walks (a, b) backward, dedup of the full `(a, b)` is a no-op (unique), and
+# LIMIT 2 short-circuits the high end → (3,1),(2,2). 1 page + 2 scanned + 2 produced = 5.
+# cost: 5
+query II nosort
+SELECT DISTINCT a, b FROM d ORDER BY a DESC, b DESC LIMIT 2
+----
+3
+1
+2
+2
