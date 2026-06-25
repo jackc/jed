@@ -265,6 +265,21 @@ func gistScalarTableDB(t *testing.T) *Database {
 	return db
 }
 
+// gistExcludeTableDB has an EXCLUDE constraint (v21 — spec/design/gist.md §7/§8, GX3): pins the
+// per-table exclusion catalog list (name + backing index name + the (column, operator) element
+// vector) AND a MULTI-COLUMN GiST index whose leaf bound is a scalar [min,max] room component
+// concatenated with a range during component. 7 indexed rows force a median split at GIST_FANOUT = 4.
+// Row 8's NULL room is exempt (not indexed). Mirrors the Ruby reference GIST_EXCLUDE_TABLE.
+func gistExcludeTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, "+
+		"EXCLUDE USING gist (room WITH =, during WITH &&))")
+	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), "+
+		"(3, 102, '[10,20)'), (4, 102, '[30,40)'), (5, 103, '[10,20)'), "+
+		"(6, 104, '[50,60)'), (7, 105, '[1,5)'), (8, NULL, '[10,20)')")
+	return db
+}
+
 // ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
 // golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
@@ -823,6 +838,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"range_pk_table.jed", rangePKTableDB},
 		{"gist_range_table.jed", gistRangeTableDB},
 		{"gist_scalar_table.jed", gistScalarTableDB},
+		{"gist_exclude_table.jed", gistExcludeTableDB},
 		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
 		{"sequence_table.jed", sequenceTableDB},
@@ -891,6 +907,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"range_pk_table.jed", rangePKTableDB, "t"},
 		{"gist_range_table.jed", gistRangeTableDB, "t"},
 		{"gist_scalar_table.jed", gistScalarTableDB, "t"},
+		{"gist_exclude_table.jed", gistExcludeTableDB, "booking"},
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
 		{"sequence_table.jed", sequenceTableDB, "t"},

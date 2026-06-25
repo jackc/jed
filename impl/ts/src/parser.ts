@@ -9,6 +9,7 @@ import type {
   Cte,
   CteBody,
   DefaultDef,
+  ExcludeDef,
   ForeignKeyDef,
   RefAction,
   UniqueDef,
@@ -323,6 +324,7 @@ class Parser {
     const checks: CheckDef[] = [];
     const uniques: UniqueDef[] = [];
     const fks: ForeignKeyDef[] = [];
+    const excludes: ExcludeDef[] = [];
     for (;;) {
       if (this.peekKeyword() === "primary" && this.peekKeywordAt(1) === "key") {
         this.advance();
@@ -334,6 +336,8 @@ class Parser {
         uniques.push(this.parseUniqueTableConstraint());
       } else if (this.atForeignKeyTableConstraint()) {
         fks.push(this.parseForeignKeyTableConstraint());
+      } else if (this.atExclusionTableConstraint()) {
+        excludes.push(this.parseExclusionTableConstraint());
       } else {
         columns.push(this.parseColumnDef(name, checks, uniques, fks));
       }
@@ -355,7 +359,56 @@ class Parser {
       checks,
       uniques,
       fks,
+      excludes,
     };
+  }
+
+  // atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:
+  // the keyword EXCLUDE (followed by USING or `(`), or CONSTRAINT <ident> EXCLUDE
+  // (spec/design/gist.md §7). The keyword stays non-reserved — a column named "exclude" is followed
+  // by a type name (an identifier), never USING or `(`, so the lookahead loses nothing.
+  private atExclusionTableConstraint(): boolean {
+    if (
+      this.peekKeyword() === "exclude" &&
+      (this.peekKeywordAt(1) === "using" || this.peekKindAt(1) === "lparen")
+    ) {
+      return true;
+    }
+    return this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "exclude";
+  }
+
+  // parseExclusionTableConstraint parses one `[CONSTRAINT name] EXCLUDE [USING method] ( col WITH op
+  // [, col2 WITH op2 ...] )` (the cursor is verified by atExclusionTableConstraint). Each operand is
+  // a bare column name; the WITH operator is captured as its source text (= / &&) and mapped to a
+  // strategy at execution (spec/design/gist.md §7). The USING method (only gist) is captured verbatim.
+  private parseExclusionTableConstraint(): ExcludeDef {
+    let name: string | null = null;
+    if (this.peekKeyword() === "constraint") {
+      this.advance();
+      name = this.expectIdentifier();
+    }
+    this.expectKeyword("exclude");
+    let using: string | null = null;
+    if (this.peekKeyword() === "using") {
+      this.advance();
+      using = this.expectIdentifier();
+    }
+    this.expect("lparen");
+    const elements: { column: string; op: string }[] = [];
+    for (;;) {
+      const column = this.expectIdentifier();
+      this.expectKeyword("with");
+      // The operator is a single token (= / &&); render it to source text for execution.
+      const start = this.pos;
+      this.advance();
+      const op = renderTokens(this.tokens.slice(start, this.pos));
+      elements.push({ column, op });
+      const k = this.advance().kind;
+      if (k === "comma") continue;
+      if (k === "rparen") break;
+      throw engineError("syntax_error", "expected ',' or ')'");
+    }
+    return { name, using, elements };
   }
 
   // atForeignKeyTableConstraint reports whether the cursor sits on a table-level FOREIGN KEY

@@ -185,3 +185,136 @@ func TestGistFileRoundTrip(t *testing.T) {
 		t.Errorf("after maintenance reopen: got %v, want [3 9]", got)
 	}
 }
+
+// ---- GX3: EXCLUDE constraints (spec/design/gist.md §7) -----------------------------------------
+
+func bookingDB(t *testing.T) *Database {
+	t.Helper()
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, "+
+		"EXCLUDE USING gist (room WITH =, during WITH &&))")
+	return db
+}
+
+// TestExcludeRejectsConflict: the canonical no-double-booking constraint — no two rows may share a
+// room AND have overlapping during. Needs the scalar `=` opclass (room) + range_ops (during).
+func TestExcludeRejectsConflict(t *testing.T) {
+	db := bookingDB(t)
+	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)')")
+	if got := errCode(t, db, "INSERT INTO booking VALUES (2, 101, '[15,25)')"); got != "23P01" {
+		t.Errorf("same room + overlap: got %s, want 23P01", got)
+	}
+	run(t, db, "INSERT INTO booking VALUES (2, 101, '[20,30)')") // same room, no overlap → ok
+	run(t, db, "INSERT INTO booking VALUES (3, 102, '[10,20)')") // diff room, overlap → ok
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM booking ORDER BY id")); !eqInts(got, 1, 2, 3) {
+		t.Errorf("end state: got %v, want [1 2 3]", got)
+	}
+}
+
+// TestExcludeNullAndEmptyExempt: a NULL excluded column (the NULL rule) or an empty range (empty &&
+// anything is FALSE) makes a row exempt — it never conflicts.
+func TestExcludeNullAndEmptyExempt(t *testing.T) {
+	db := bookingDB(t)
+	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)')")
+	run(t, db, "INSERT INTO booking VALUES (2, NULL, '[10,20)')") // NULL room → exempt
+	run(t, db, "INSERT INTO booking VALUES (3, NULL, '[10,20)')")
+	run(t, db, "INSERT INTO booking VALUES (4, 101, 'empty')") // empty range → exempt
+	run(t, db, "INSERT INTO booking VALUES (5, 101, 'empty')")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM booking ORDER BY id")); !eqInts(got, 1, 2, 3, 4, 5) {
+		t.Errorf("exempt rows: got %v, want [1 2 3 4 5]", got)
+	}
+}
+
+// TestExcludeInBatchConflict: two rows in the SAME insert batch that conflict with each other → 23P01.
+func TestExcludeInBatchConflict(t *testing.T) {
+	db := bookingDB(t)
+	if got := errCode(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[15,25)')"); got != "23P01" {
+		t.Errorf("in-batch conflict: got %s, want 23P01", got)
+	}
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM booking ORDER BY id")); len(got) != 0 {
+		t.Errorf("nothing written: got %v, want []", got)
+	}
+}
+
+// TestExcludeUpdateEndStateSwap: a swap of rooms succeeds (the per-row transient collides but the END
+// STATE is conflict-free); an UPDATE that creates a genuine conflict traps 23P01.
+func TestExcludeUpdateEndStateSwap(t *testing.T) {
+	db := bookingDB(t)
+	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)')")
+	run(t, db, "INSERT INTO booking VALUES (2, 102, '[10,20)')")
+	run(t, db, "UPDATE booking SET room = CASE WHEN room = 101 THEN 102 ELSE 101 END")
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM booking WHERE room = 102 ORDER BY id")); !eqInts(got, 1) {
+		t.Errorf("after swap room=102: got %v, want [1]", got)
+	}
+	// After the swap row1=(102,[10,20)), row2=(101,[10,20)); moving row1 back to 101 collides w/ row2.
+	if got := errCode(t, db, "UPDATE booking SET room = 101 WHERE id = 1"); got != "23P01" {
+		t.Errorf("conflicting update: got %s, want 23P01", got)
+	}
+}
+
+// TestSingleColumnRangeExclude: a single-column range exclusion needs only GX1.
+func TestSingleColumnRangeExclude(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE rsv (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))")
+	run(t, db, "INSERT INTO rsv VALUES (1, '[1,5)')")
+	if got := errCode(t, db, "INSERT INTO rsv VALUES (2, '[3,8)')"); got != "23P01" {
+		t.Errorf("overlap: got %s, want 23P01", got)
+	}
+	run(t, db, "INSERT INTO rsv VALUES (2, '[5,10)')") // adjacent, not overlapping → ok
+	if got := gistIDs(queryRows(t, db, "SELECT id FROM rsv ORDER BY id")); !eqInts(got, 1, 2) {
+		t.Errorf("end state: got %v, want [1 2]", got)
+	}
+}
+
+// TestExcludeTypeErrors: the WITH operator must pair with the column's GiST opclass.
+func TestExcludeTypeErrors(t *testing.T) {
+	db := NewDatabase()
+	if got := errCode(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH &&))"); got != "42704" {
+		t.Errorf("&& on non-range: got %s, want 42704", got)
+	}
+	if got := errCode(t, db, "CREATE TABLE b (id i32 PRIMARY KEY, s text, EXCLUDE USING gist (s WITH =))"); got != "0A000" {
+		t.Errorf("= on deferred text: got %s, want 0A000", got)
+	}
+	if got := errCode(t, db, "CREATE TABLE c (id i32 PRIMARY KEY, f f64, EXCLUDE USING gist (f WITH =))"); got != "42704" {
+		t.Errorf("= on no-opclass f64: got %s, want 42704", got)
+	}
+	if got := errCode(t, db, "CREATE TABLE d (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH <))"); got != "0A000" {
+		t.Errorf("unsupported operator: got %s, want 0A000", got)
+	}
+	if got := errCode(t, db, "CREATE TEMP TABLE e (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))"); got != "0A000" {
+		t.Errorf("exclude on temp: got %s, want 0A000", got)
+	}
+}
+
+// TestExcludeBackingIndexCannotBeDropped: the backing GiST index is owned by the constraint → 2BP01.
+func TestExcludeBackingIndexCannotBeDropped(t *testing.T) {
+	db := bookingDB(t)
+	if got := errCode(t, db, "DROP INDEX booking_room_during_excl"); got != "2BP01" {
+		t.Errorf("drop backing index: got %s, want 2BP01", got)
+	}
+}
+
+// TestExcludeFileRoundTrip: the backing multi-column GiST index persists (v21) and reloads, still
+// enforcing the conjunction across a close/reopen.
+func TestExcludeFileRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gist_exclude_round_trip.jed")
+	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(t, db, "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, "+
+		"EXCLUDE USING gist (room WITH =, during WITH &&))")
+	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), (3, 102, '[10,20)')")
+
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := errCode(t, db2, "INSERT INTO booking VALUES (4, 101, '[15,25)')"); got != "23P01" {
+		t.Errorf("after reopen, conflict: got %s, want 23P01", got)
+	}
+	run(t, db2, "INSERT INTO booking VALUES (4, 103, '[10,20)')")
+	if got := gistIDs(queryRows(t, db2, "SELECT id FROM booking ORDER BY id")); !eqInts(got, 1, 2, 3, 4) {
+		t.Errorf("after reopen end state: got %v, want [1 2 3 4]", got)
+	}
+}

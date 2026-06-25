@@ -85,6 +85,45 @@ type Table struct {
 	// (the catalog's on-disk order and the child-side evaluation order —
 	// spec/design/constraints.md §6.9). Empty for a table with none.
 	ForeignKeys []ForeignKey
+	// Exclusions is the table's EXCLUDE constraints in ascending lowercased-name order (the
+	// catalog's on-disk order — spec/design/gist.md §7/§8). Each is backed by a GiST index in
+	// Indexes. Empty for a table with none.
+	Exclusions []ExclusionConstraint
+}
+
+// ExclusionOp is one element's operator in an EXCLUDE constraint (spec/design/gist.md §7) — the
+// WITH operator of a (column WITH op) pair. ExclOverlaps is && (a range column, range_ops);
+// ExclEqual is = (a fixed-width keyable scalar, the in-core btree_gist). Both are SYMMETRIC, the
+// property an exclusion operator must have. Persisted as the v21 per-element strategy byte (&& = 0,
+// = 1; format.md).
+type ExclusionOp int
+
+const (
+	// ExclOverlaps is && (range overlap), on-disk code 0.
+	ExclOverlaps ExclusionOp = iota
+	// ExclEqual is = (scalar equality), on-disk code 1.
+	ExclEqual
+)
+
+// ExclusionElement is one (column, operator) element of an EXCLUDE constraint — a member column
+// ordinal into the owning table and its WITH operator. The element order matches the backing GiST
+// index's column order (spec/design/gist.md §7/§8).
+type ExclusionElement struct {
+	Column int
+	Op     ExclusionOp
+}
+
+// ExclusionConstraint is one EXCLUDE constraint (spec/design/gist.md §7): its (relation-namespace)
+// name, the backing GiST index that enforces it (by name — the constraint IS its index, the
+// UNIQUE-is-its-index model generalized to an explicit operator list), and the (column, operator)
+// element vector the conjunction probe needs. Held in ascending lowercased-name order on the table.
+// The NULL rule (§7) is enforced at probe time: a row with a NULL in any excluded column never
+// conflicts.
+type ExclusionConstraint struct {
+	Name string
+	// Index is the backing GiST index's name (equal to Name for a GX3 constraint — it owns the index).
+	Index    string
+	Elements []ExclusionElement
 }
 
 // FkAction is the persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`

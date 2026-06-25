@@ -490,6 +490,23 @@ export type CreateTable = {
   // each (42703/42701/42P01/42830/42804), rejects unsupported actions (0A000), and names the
   // unnamed ones (42710).
   fks: ForeignKeyDef[];
+  // Every table-level `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])` of the
+  // statement, in TEXTUAL DEFINITION ORDER (spec/design/gist.md §7). Execution resolves each
+  // element (42703/42701/42704/0A000), builds the backing multi-column GiST index, and names the
+  // unnamed ones (42P07/42710).
+  excludes: ExcludeDef[];
+};
+
+// ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional
+// explicit CONSTRAINT name (null = unnamed; it names the backing GiST index), the optional USING
+// method (null = the default gist; anything else is 42704 at execution), and the (column, operator)
+// element list in declaration order. Each operand is a bare column name; the operator is the WITH
+// operator's source text (= or &&). Execution resolves the columns + operators
+// (42703/42701/42704/0A000), creates the multi-column GiST index, and names the unnamed ones.
+export type ExcludeDef = {
+  name: string | null;
+  using: string | null;
+  elements: { column: string; op: string }[];
 };
 
 // RefAction is a referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md

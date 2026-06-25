@@ -46,6 +46,31 @@ Things to try in the panel above:
 Each is rejected before anything is written — a statement is all-or-nothing. See the
 [error reference](../../reference/errors/) for every code.
 
+## Exclusion constraints — `EXCLUDE`
+
+An `EXCLUDE` constraint generalizes `UNIQUE`: instead of forbidding two rows with the *equal* key,
+it forbids two rows that make a list of comparisons all true at once. The classic use is
+no-double-booking — no two reservations may share a room **and** have overlapping time ranges. Paste
+this into the panel above:
+
+```sql
+CREATE TABLE booking (
+  id i32 PRIMARY KEY,
+  room i32,
+  during i32range,
+  EXCLUDE USING gist (room WITH =, during WITH &&)
+);
+INSERT INTO booking VALUES (1, 101, '[10,20)');
+INSERT INTO booking VALUES (2, 101, '[15,25)');  -- error 23P01: same room, overlapping time
+```
+
+The second insert is rejected with `23P01` — room `101` is already booked for an overlapping
+range. A different room, or a non-overlapping range, is fine. The supported operators are `=` (over a
+fixed-width scalar) and `&&` (range overlap); `UNIQUE` is the special all-`=` case. A row with `NULL`
+in an excluded column — or an empty range under `&&` — never conflicts (it is exempt). The constraint
+is backed by a GiST index and enforced on every write, all-or-nothing like the others. (PostgreSQL
+needs `CREATE EXTENSION btree_gist` for the scalar `=` member; jed ships it in-core.)
+
 ## Auto-numbering with `serial`
 
 A `serial` column (or `bigserial` / `smallserial` for `i64` / `i16`) is shorthand for an

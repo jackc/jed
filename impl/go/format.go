@@ -23,7 +23,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 20    // on-disk format version (20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 21    // on-disk format version (21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -902,7 +902,9 @@ type bodyPage struct {
 // alloc hands out page numbers (a counter for the whole image, the free-list allocator for an
 // incremental commit). Returns the node pages + the root; an empty index returns no pages and root 0.
 func serializeGistIndex(s *Snapshot, table *Table, idx IndexDef, alloc func() uint32) ([]gistPage, uint32, error) {
-	op := gistOpclassFor(table.Columns[idx.Columns[0]].Type)
+	// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per WITH column
+	// for an EXCLUDE backing index.
+	ops := gistOpclassesFor(idx.Columns, table.Columns)
 	var keys [][]byte
 	if istore := s.indexStores[strings.ToLower(idx.Name)]; istore != nil {
 		entries, err := istore.EntriesInKeyOrder()
@@ -917,11 +919,11 @@ func serializeGistIndex(s *Snapshot, table *Table, idx IndexDef, alloc func() ui
 	if len(keys) == 0 {
 		return nil, 0, nil
 	}
-	tree, err := buildGistFromLeafKeys(op, keys)
+	tree, err := buildGistFromLeafKeys(ops, keys)
 	if err != nil {
 		return nil, 0, err
 	}
-	pages, root := serializeGistTree(tree, op, alloc)
+	pages, root := serializeGistTree(tree, ops, alloc)
 	return pages, root, nil
 }
 
@@ -2616,8 +2618,46 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		}
 		out = append(out, fkActionCode(fk.OnDelete)|(fkActionCode(fk.OnUpdate)<<2))
 	}
+	// EXCLUDE constraints (v21): count, then per exclusion the name, the backing GiST index name, and
+	// the (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1), in ascending
+	// lowercased-name order (spec/design/gist.md §7/§8). The backing index is stored like any GiST
+	// index (in the index list above); this entry layers the operator vector the probe needs.
+	out = appendU16(out, uint16(len(table.Exclusions)))
+	for _, ex := range table.Exclusions {
+		out = appendU16(out, uint16(len(ex.Name)))
+		out = append(out, ex.Name...)
+		out = appendU16(out, uint16(len(ex.Index)))
+		out = append(out, ex.Index...)
+		out = appendU16(out, uint16(len(ex.Elements)))
+		for _, el := range ex.Elements {
+			out = appendU16(out, uint16(el.Column))
+			out = append(out, exclusionOpCode(el.Op))
+		}
+	}
 	out = appendU32(out, rootDataPage)
 	return out
+}
+
+// exclusionOpCode is the 1-byte on-disk code for an EXCLUDE element operator (format.md): && = 0,
+// = 1.
+func exclusionOpCode(op ExclusionOp) byte {
+	if op == ExclEqual {
+		return 1
+	}
+	return 0
+}
+
+// exclusionOpFromCode decodes an EXCLUDE element operator code; an unsupported code in an
+// otherwise-valid file is XX001 (reserved for future GiST exclusion operators).
+func exclusionOpFromCode(c byte) (ExclusionOp, error) {
+	switch c {
+	case 0:
+		return ExclOverlaps, nil
+	case 1:
+		return ExclEqual, nil
+	default:
+		return 0, NewError(DataCorrupted, "unsupported exclusion-constraint operator code")
+	}
 }
 
 // fkActionCode is the 2-bit on-disk code for a referential action (format.md): NO ACTION = 0,
@@ -3220,11 +3260,55 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			OnUpdate:   onUpdate,
 		})
 	}
+	// EXCLUDE constraints (v21): name + backing GiST index name + the (column ordinal, operator)
+	// element vector, in name order (spec/design/gist.md §7/§8).
+	excCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	exclusions := make([]ExclusionConstraint, 0, excCount)
+	for i := uint16(0); i < excCount; i++ {
+		ename, err := readString(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		iname, err := readString(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		ec, err := readU16(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if ec == 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "exclusion constraint with no elements")
+		}
+		elements := make([]ExclusionElement, 0, ec)
+		for j := uint16(0); j < ec; j++ {
+			ord, err := readU16(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if int(ord) >= len(columns) {
+				return nil, 0, nil, NewError(DataCorrupted, "invalid exclusion-constraint column ordinal")
+			}
+			opb, err := readU8(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			op, err := exclusionOpFromCode(opb)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			elements = append(elements, ExclusionElement{Column: int(ord), Op: op})
+		}
+		exclusions = append(exclusions, ExclusionConstraint{Name: ename, Index: iname, Elements: elements})
+	}
 	root, err := readU32(buf, pos)
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	return &Table{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys}, root, indexRoots, nil
+	return &Table{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions}, root, indexRoots, nil
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

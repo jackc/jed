@@ -19,6 +19,8 @@ import {
   type CompositeField,
   type CompositeType,
   type DefaultExpr,
+  type ExclusionConstraint,
+  type ExclusionElement,
   type FkAction,
   type ForeignKey,
   type IdentityKind,
@@ -94,7 +96,7 @@ import {
 } from "./value.ts";
 import type { JsonNode } from "./json.ts";
 
-const FORMAT_VERSION = 20; // on-disk format version (20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 21; // on-disk format version (21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -1271,6 +1273,24 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     for (const c of fk.refColumns) w.u16(c);
     w.u8(fkActionCode(fk.onDelete) | (fkActionCode(fk.onUpdate) << 2));
   }
+  // EXCLUDE constraints (v21): count, then per exclusion the name, the backing GiST index name, and
+  // the (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1), in ascending
+  // lowercased-name order (spec/design/gist.md §7/§8). The backing index is stored like any GiST
+  // index (in the index list above); this entry layers the operator vector the probe needs.
+  w.u16(table.exclusions.length);
+  for (const ex of table.exclusions) {
+    const en = UTF8.encode(ex.name);
+    w.u16(en.length);
+    w.bytes(en);
+    const ei = UTF8.encode(ex.index);
+    w.u16(ei.length);
+    w.bytes(ei);
+    w.u16(ex.elements.length);
+    for (const el of ex.elements) {
+      w.u16(el.column);
+      w.u8(el.op === "equal" ? 1 : 0);
+    }
+  }
   w.u32(rootDataPage);
   return w.toBytes();
 }
@@ -1569,7 +1589,7 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
         // GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md §4.1).
         const r = serializeGistIndex(
           snap.indexStore(idx.name.toLowerCase()),
-          gistColOpclass(store, idx.columns[0]!),
+          gistColOpclasses(store, idx.columns),
           nextIndex,
           body,
         );
@@ -1652,15 +1672,17 @@ type BodyPage = {
   payload: Uint8Array;
 };
 
-// gistColElem is a GiST range column's element ColType — the codec/comparator key for the R-tree
-// bounds (spec/design/gist.md §4.1). Taken from the TABLE store's resolved column types (a range
-// column's ColType is { kind: "range", elem }), so it matches the executor's gistEntries encoding.
-// gistColOpclass is the opclass for a GiST index on column ci (gist.md §5/§6): range_ops over a
-// range column (its element ColType the codec key), the scalar `=` opclass over a fixed-width keyable
-// scalar. The bound flavor a node holds is keyed off this column type (no format-version distinction).
-function gistColOpclass(tableStore: TableStore, ci: number): GistOpclass {
-  const ct = tableStore.columnTypes()[ci]!;
-  return ct.kind === "range" ? gistRangeOpclass(ct.elem) : GIST_SCALAR_OPCLASS;
+// gistColOpclasses are the per-column opclasses of a GiST index (spec/design/gist.md §5/§6/§7): one
+// per indexed column — range_ops over a range column (its element ColType the codec key), the scalar
+// `=` opclass over a fixed-width keyable scalar. Single for a GX1/GX2 index, one per WITH column for
+// an EXCLUDE backing index. Taken from the TABLE store's resolved column types so it matches the
+// executor's gistEntries encoding; the bound flavor a node holds is keyed off the column type.
+function gistColOpclasses(tableStore: TableStore, cols: number[]): GistOpclass[] {
+  const types = tableStore.columnTypes();
+  return cols.map((ci) => {
+    const ct = types[ci]!;
+    return ct.kind === "range" ? gistRangeOpclass(ct.elem) : GIST_SCALAR_OPCLASS;
+  });
 }
 
 // serializeGistIndex builds a GiST index's canonical R-tree from its leaf-key store and serializes it
@@ -1671,15 +1693,15 @@ function gistColOpclass(tableStore: TableStore, ci: number): GistOpclass {
 // root 0 and writes no pages.
 function serializeGistIndex(
   istore: TableStore,
-  op: GistOpclass,
+  ops: GistOpclass[],
   nextIndex: number,
   body: BodyPage[],
 ): { index: number; next: number } {
   const keys = istore.entriesInKeyOrder().map((e) => e.key);
   if (keys.length === 0) return { index: 0, next: nextIndex };
-  const tree = buildGistFromLeafKeys(op, keys);
+  const tree = buildGistFromLeafKeys(ops, keys);
   let n = nextIndex;
-  const { pages, root } = serializeGistTree(tree, op, () => n++);
+  const { pages, root } = serializeGistTree(tree, ops, () => n++);
   for (const p of pages) {
     body.push({
       index: p.pageNo,
@@ -1840,9 +1862,9 @@ export function incrementalImage(
         const istore = snap.indexStore(idx.name.toLowerCase());
         const keysList = istore.entriesInKeyOrder().map((e) => e.key);
         if (keysList.length > 0) {
-          const op = gistColOpclass(store, idx.columns[0]!);
-          const tree = buildGistFromLeafKeys(op, keysList);
-          const { pages: gpages, root } = serializeGistTree(tree, op, () => alloc.take());
+          const ops = gistColOpclasses(store, idx.columns);
+          const tree = buildGistFromLeafKeys(ops, keysList);
+          const { pages: gpages, root } = serializeGistTree(tree, ops, () => alloc.take());
           for (const p of gpages) {
             pages.push({
               index: p.pageNo,
@@ -2866,8 +2888,30 @@ function decodeTableEntry(
       onUpdate: fkActionFromCode((actions >> 2) & 0b11),
     });
   }
+  // EXCLUDE constraints (v21): name + backing GiST index name + the (column ordinal, operator)
+  // element vector, in name order (spec/design/gist.md §7/§8).
+  const excCount = readU16(buf, cur);
+  const exclusions: ExclusionConstraint[] = [];
+  for (let i = 0; i < excCount; i++) {
+    const ename = readString(buf, cur);
+    const iname = readString(buf, cur);
+    const ec = readU16(buf, cur);
+    if (ec === 0) throw engineError("data_corrupted", "exclusion constraint with no elements");
+    const elements: ExclusionElement[] = [];
+    for (let j = 0; j < ec; j++) {
+      const ord = readU16(buf, cur);
+      if (ord >= columns.length) {
+        throw engineError("data_corrupted", "invalid exclusion-constraint column ordinal");
+      }
+      const opb = readU8(buf, cur);
+      if (opb > 1)
+        throw engineError("data_corrupted", "unsupported exclusion-constraint operator code");
+      elements.push({ column: ord, op: opb === 1 ? "equal" : "overlaps" });
+    }
+    exclusions.push({ name: ename, index: iname, elements });
+  }
   const root = readU32(buf, cur);
-  return { table: { name, columns, pk, checks, indexes, fks }, root, indexRoots };
+  return { table: { name, columns, pk, checks, indexes, fks, exclusions }, root, indexRoots };
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

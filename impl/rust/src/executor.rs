@@ -15,8 +15,8 @@ use crate::ast::{
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SeqDataType, SeqOwner,
-    SequenceDef, Table, resolve_col_type,
+    ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
+    IdentityKind, IndexDef, IndexKind, SeqDataType, SeqOwner, SequenceDef, Table, resolve_col_type,
 };
 use crate::collation::{self, Collation};
 use crate::cost::{Lifetime, Meter};
@@ -874,24 +874,30 @@ impl Snapshot {
     pub(crate) fn rebuild_gist_trees(&mut self) -> Result<()> {
         // Collect (index name key, opclass) for every GiST index, dropping the borrow on
         // `self.tables` before mutating `self.gist_trees`.
-        let mut specs: Vec<(String, crate::gist::GistOpclass)> = Vec::new();
+        let mut specs: Vec<(String, Vec<crate::gist::GistOpclass>)> = Vec::new();
         for table in self.tables.values() {
             for idx in &table.indexes {
                 if idx.kind != IndexKind::Gist {
                     continue;
                 }
-                let op = crate::gist::opclass_for(&table.columns[idx.columns[0]].ty);
-                specs.push((idx.name.to_ascii_lowercase(), op));
+                // One opclass per indexed column (gist.md §7): a single-column GX1/GX2 index has
+                // one; an EXCLUDE backing index has one per `WITH` column.
+                let ops: Vec<crate::gist::GistOpclass> = idx
+                    .columns
+                    .iter()
+                    .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
+                    .collect();
+                specs.push((idx.name.to_ascii_lowercase(), ops));
             }
         }
         let live: std::collections::HashSet<&str> = specs.iter().map(|(k, _)| k.as_str()).collect();
         self.gist_trees.retain(|k, _| live.contains(k.as_str()));
-        for (name_key, op) in &specs {
+        for (name_key, ops) in &specs {
             let keys: Vec<Vec<u8>> = match self.index_stores.get(name_key) {
                 Some(store) => store.iter_entries()?.into_iter().map(|(k, _)| k).collect(),
                 None => Vec::new(),
             };
-            let tree = crate::gist::build_from_leaf_keys(op, keys.iter().map(|k| k.as_slice()))?;
+            let tree = crate::gist::build_from_leaf_keys(ops, keys.iter().map(|k| k.as_slice()))?;
             self.gist_trees
                 .insert(name_key.clone(), std::sync::Arc::new(tree));
         }
@@ -3006,6 +3012,15 @@ impl Database {
         // before any persistent parent resolves, so the error is a clean 0A000 (not a 42P01 from
         // resolving a parent). The other temp narrowings (composite/collated columns, serial/IDENTITY)
         // are checked just before registration, once the columns are built.
+        if ct.temp && !ct.excludes.is_empty() {
+            // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred
+            // with the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000
+            // before any column resolves.
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "an EXCLUDE constraint on a temporary table is not yet supported",
+            ));
+        }
         if ct.temp && !ct.foreign_keys.is_empty() {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
@@ -3497,6 +3512,7 @@ impl Database {
             checks: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
         };
         for def in &ct.checks {
             // Structural rejections first (a single pre-walk — a documented micro-order
@@ -3846,6 +3862,164 @@ impl Database {
         // Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
         resolved_fks.sort_by_key(|f| f.name.to_ascii_lowercase());
         table.foreign_keys = resolved_fks;
+
+        // EXCLUDE constraints (spec/design/gist.md §7). Resolved AFTER the PK / UNIQUE / CHECK / FK
+        // constraints, each in textual order: resolve the element columns (42703/42701) and the
+        // `WITH` operators against the column types (42704 no-opclass / 0A000 deferred-or-unsupported),
+        // name the constraint + its backing GiST index (the constraint IS its index — they share a
+        // name; 42P07/42710 across the relation + constraint namespaces), and build the
+        // **multi-column** GiST index that enforces it. The probe + `23P01` live in INSERT/UPDATE.
+        for exc in &ct.excludes {
+            // Only the GiST access method (the default) backs an exclusion constraint.
+            if let Some(m) = &exc.using {
+                if !m.eq_ignore_ascii_case("gist") {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("access method {m} does not support exclusion constraints"),
+                    ));
+                }
+            }
+            let mut indices: Vec<usize> = Vec::with_capacity(exc.elements.len());
+            let mut elements: Vec<ExclusionElement> = Vec::with_capacity(exc.elements.len());
+            for (cname, optext) in &exc.elements {
+                let ci = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(cname))
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column {cname} named in key does not exist"),
+                        )
+                    })?;
+                if indices.contains(&ci) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateColumn,
+                        format!("column {cname} appears twice in exclusion constraint"),
+                    ));
+                }
+                let ty = &table.columns[ci].ty;
+                // The `WITH` operator must pair with the column's GiST opclass (gist.md §7): `&&`
+                // over a range column (`range_ops`), `=` over a fixed-width keyable scalar (the
+                // in-core `btree_gist`). A deferred keyable scalar with `=` is 0A000; a no-opclass
+                // type, or `&&` on a non-range column, is 42704; any other operator is 0A000.
+                let op = match optext.as_str() {
+                    "&&" => {
+                        if ty.range_element().is_none() {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!(
+                                    "data type {} has no default operator class for access method gist that accepts operator &&",
+                                    ty.canonical_name()
+                                ),
+                            ));
+                        }
+                        ExclusionOp::Overlaps
+                    }
+                    "=" => {
+                        if is_gist_scalar_type(ty) {
+                            ExclusionOp::Equal
+                        } else if is_gist_deferred_scalar_type(ty) {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                format!(
+                                    "an exclusion constraint with = over {} is not supported yet",
+                                    ty.canonical_name()
+                                ),
+                            ));
+                        } else {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!(
+                                    "data type {} has no default operator class for access method gist",
+                                    ty.canonical_name()
+                                ),
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!("exclusion constraint operator {other} is not supported yet"),
+                        ));
+                    }
+                };
+                indices.push(ci);
+                elements.push(ExclusionElement { column: ci, op });
+            }
+            // Name the constraint (= its backing index name). An explicit name checks the relation
+            // namespace (42P07) then the table's constraint names (42710); a derived
+            // `<table>_<cols>_excl` suffix-walks both.
+            let taken = |exec: &Self, t: &Table, n: &str| {
+                exec.relation_exists(n)
+                    || t.name.eq_ignore_ascii_case(n)
+                    || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+            };
+            let constraint_taken = |t: &Table, n: &str| {
+                t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(n))
+                    || t.foreign_keys
+                        .iter()
+                        .any(|f| f.name.eq_ignore_ascii_case(n))
+                    || t.exclusions.iter().any(|e| e.name.eq_ignore_ascii_case(n))
+            };
+            let name = match &exc.name {
+                Some(n) => {
+                    if taken(self, &table, n) {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateTable,
+                            format!("relation already exists: {n}"),
+                        ));
+                    }
+                    if constraint_taken(&table, n) {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateObject,
+                            format!("constraint {n} for relation {} already exists", table.name),
+                        ));
+                    }
+                    n.clone()
+                }
+                None => {
+                    let mut base = table.name.to_ascii_lowercase();
+                    for &i in &indices {
+                        base.push('_');
+                        base.push_str(&table.columns[i].name.to_ascii_lowercase());
+                    }
+                    base.push_str("_excl");
+                    let mut candidate = base.clone();
+                    let mut suffix = 0u32;
+                    while taken(self, &table, &candidate) || constraint_taken(&table, &candidate) {
+                        suffix += 1;
+                        candidate = format!("{base}{suffix}");
+                    }
+                    candidate
+                }
+            };
+            // Insert the backing GiST index in catalog (ascending lowercased-name) order.
+            let name_key = name.to_ascii_lowercase();
+            let pos = table
+                .indexes
+                .iter()
+                .position(|i| i.name.to_ascii_lowercase() > name_key)
+                .unwrap_or(table.indexes.len());
+            table.indexes.insert(
+                pos,
+                IndexDef {
+                    name: name.clone(),
+                    columns: indices,
+                    unique: false,
+                    kind: IndexKind::Gist,
+                },
+            );
+            table.exclusions.push(ExclusionConstraint {
+                name: name.clone(),
+                index: name,
+                elements,
+            });
+        }
+        // Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
+        table
+            .exclusions
+            .sort_by_key(|e| e.name.to_ascii_lowercase());
 
         let index_keys: Vec<String> = table
             .indexes
@@ -4390,6 +4564,26 @@ impl Database {
             ));
         }
         let name_key = di.name.to_ascii_lowercase();
+        // An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns
+        // it (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet, so the
+        // index lives until DROP TABLE). 2BP01, matching PG's "cannot drop index … because
+        // constraint … requires it" (spec/design/gist.md §7).
+        if let Some(table_key) = self.find_index(&di.name).map(|(tk, _)| tk.to_string()) {
+            if let Some(t) = self.table(&table_key) {
+                if t.exclusions
+                    .iter()
+                    .any(|e| e.index.eq_ignore_ascii_case(&di.name))
+                {
+                    return Err(EngineError::new(
+                        SqlState::DependentObjectsStillExist,
+                        format!(
+                            "cannot drop index {} because constraint {} on table {} requires it",
+                            di.name, di.name, t.name
+                        ),
+                    ));
+                }
+            }
+        }
         if self.is_temp_index(&di.name) {
             let table_key = self
                 .temp_read_snap()
@@ -5371,6 +5565,56 @@ impl Database {
                             fk.name
                         ),
                     ));
+                }
+            }
+        }
+
+        // EXCLUDE constraints (spec/design/gist.md §7), after FK existence — a batch pass over the
+        // statement's END STATE: each new row must conflict with no STORED row (probe the backing
+        // GiST tree, whose leaf recheck is the full `(expr_i op_i)` conjunction) and no OTHER new
+        // row of this batch (pairwise — the resident tree holds only stored rows). The NULL rule /
+        // empty-range exempt a row (`exclusion_probe_query`). Unmetered validation, before any write.
+        let exclusions: Vec<ExclusionConstraint> = self
+            .table(table)
+            .map(|t| t.exclusions.clone())
+            .unwrap_or_default();
+        if !exclusions.is_empty() {
+            let tcols: Vec<Column> = self
+                .table(table)
+                .map(|t| t.columns.clone())
+                .unwrap_or_default();
+            for exc in &exclusions {
+                let ikey = exc.index.to_ascii_lowercase();
+                for (_, row) in &prepared {
+                    let Some((q, strats)) = exclusion_probe_query(&tcols, exc, row) else {
+                        continue; // exempt (NULL / empty range)
+                    };
+                    let conflict = match self.gist_tree(&ikey) {
+                        Some(tree) => !tree.search(&q, &strats).0.is_empty(),
+                        None => false,
+                    };
+                    if conflict {
+                        return Err(EngineError::new(
+                            SqlState::ExclusionViolation,
+                            format!(
+                                "conflicting key value violates exclusion constraint: {}",
+                                exc.name
+                            ),
+                        ));
+                    }
+                }
+                for i in 0..prepared.len() {
+                    for j in 0..i {
+                        if exclusion_pair_conflicts(&tcols, exc, &prepared[i].1, &prepared[j].1) {
+                            return Err(EngineError::new(
+                                SqlState::ExclusionViolation,
+                                format!(
+                                    "conflicting key value violates exclusion constraint: {}",
+                                    exc.name
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -6850,6 +7094,59 @@ impl Database {
                                 def.name
                             ),
                         ));
+                    }
+                }
+            }
+        }
+
+        // EXCLUDE end-state validation (spec/design/gist.md §7), mirroring UNIQUE's: each updated
+        // NEW row must conflict with no OTHER row in the statement's END STATE — neither a STORED
+        // row that is NOT being updated (probe the backing GiST tree, drop a hit whose storage key
+        // is a rewritten OLD key — that row is vacated by this statement) nor another updated NEW
+        // row (pairwise). The NULL rule / empty-range exempt a row. An end-state-valid swap thus
+        // succeeds where PG fails the per-row transient (the documented UNIQUE end-state divergence,
+        // constraints.md §6.5). Unmetered, phase 1, before any write.
+        let exclusions: Vec<ExclusionConstraint> = self
+            .table(&upd.table)
+            .map(|t| t.exclusions.clone())
+            .unwrap_or_default();
+        if !exclusions.is_empty() && !updates.is_empty() {
+            let rewritten: HashSet<&[u8]> =
+                updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
+            for exc in &exclusions {
+                let ikey = exc.index.to_ascii_lowercase();
+                for (_, _, new_row, _) in &updates {
+                    if let Some((q, strats)) = exclusion_probe_query(&tcolumns, exc, new_row) {
+                        let conflict = match self.gist_tree(&ikey) {
+                            Some(tree) => tree
+                                .search(&q, &strats)
+                                .0
+                                .iter()
+                                .any(|h| !rewritten.contains(h.as_slice())),
+                            None => false,
+                        };
+                        if conflict {
+                            return Err(EngineError::new(
+                                SqlState::ExclusionViolation,
+                                format!(
+                                    "conflicting key value violates exclusion constraint: {}",
+                                    exc.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+                for i in 0..updates.len() {
+                    for j in 0..i {
+                        if exclusion_pair_conflicts(&tcolumns, exc, &updates[i].2, &updates[j].2) {
+                            return Err(EngineError::new(
+                                SqlState::ExclusionViolation,
+                                format!(
+                                    "conflicting key value violates exclusion constraint: {}",
+                                    exc.name
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -9168,6 +9465,7 @@ impl Database {
             checks: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
         });
         Ok((table, vec![rarg], SrfKind::JsonRecord { jsonb, set }))
     }
@@ -9252,6 +9550,7 @@ impl Database {
             checks: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
         });
         // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
         Ok((table, vec![doc], SrfKind::JsonRecord { jsonb, set }))
@@ -9329,6 +9628,7 @@ impl Database {
             checks: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
         });
         Ok((
             table,
@@ -11394,7 +11694,7 @@ impl Database {
         // gather visits only consistent nodes — no per-query build. An index with no tree yet (never
         // populated) yields no candidates. `page_read` per node touched + `gist_descent` per interior.
         let (mut skeys, nodes, interior) = match self.gist_tree(&gb.name_key) {
-            Some(tree) => tree.search(&gquery, gb.strategy),
+            Some(tree) => tree.search(std::slice::from_ref(&gquery), &[gb.strategy]),
             None => (Vec::new(), 0, 0),
         };
         meter.charge(COSTS.gist_descent * interior as i64);
@@ -13369,6 +13669,7 @@ fn cte_synthetic_table_cols(
         checks: Vec::new(),
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
+        exclusions: Vec::new(),
     }))
 }
 
@@ -13639,6 +13940,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
         checks: Vec::new(),
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
+        exclusions: Vec::new(),
     })
 }
 
@@ -14167,6 +14469,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
         checks: Vec::new(),
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
+        exclusions: Vec::new(),
     })
 }
 
@@ -14619,6 +14922,12 @@ fn detect_gist_bound(
         if idx.kind != IndexKind::Gist {
             continue;
         }
+        // The planner gather is single-operator: only a single-column GiST index accelerates a
+        // `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE
+        // backing structure, gist.md §7) is probed only by the constraint, never the planner.
+        if idx.columns.len() != 1 {
+            continue;
+        }
         let ci = idx.columns[0];
         let col_global = offset + ci;
         let col_ty = &columns[ci].ty;
@@ -14937,34 +15246,120 @@ fn index_entry_keys(
     })
 }
 
-/// A GiST index's entry keys for one row (spec/design/gist.md §4.1): exactly one leaf key,
-/// `encode_range_body(bound) ‖ storage_key` ([`gist::encode_leaf_key`]) — the GIN `term ‖ skey`
-/// pattern, so all existing index maintenance (insert/update/delete) reuses it unchanged. A NULL
-/// range value is not indexed (the §7 exclusion NULL rule / GIN's NULL skip); the empty range is a
-/// real value and IS indexed.
+/// A GiST index's entry keys for one row (spec/design/gist.md §4.1/§7): exactly one leaf key, the
+/// per-column component bounds concatenated then `‖ storage_key` ([`gist::leaf_key_multi`]) — the
+/// GIN `term ‖ skey` pattern, so all existing index maintenance (insert/update/delete) reuses it
+/// unchanged. A single-column GX1/GX2 index has one component; an EXCLUDE backing index one per
+/// `WITH` column. A NULL in **any** indexed column produces NO entry (the §7 exclusion NULL rule —
+/// a row with a NULL excluded column never conflicts and is left out of the tree; the GIN NULL-skip
+/// precedent). The empty range is a real value and IS indexed.
 fn gist_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<Vec<u8>> {
-    let ci = def.columns[0];
-    let col = &columns[ci];
-    if let Some(elem) = col.ty.range_element() {
-        // `range_ops`: the row range's value-codec bytes ‖ storage key.
-        match &row[ci] {
-            Value::Range(rv) => vec![crate::gist::range_leaf_key(elem.scalar(), rv, storage_key)],
-            Value::Null => Vec::new(),
-            _ => unreachable!("a GiST range index column holds a range or NULL"),
+    // Pre-encode scalar key bytes so the borrowed `GistLeafComp::Scalar(&[u8])` outlives the build.
+    let mut scalar_keys: Vec<Vec<u8>> = Vec::new();
+    for &ci in &def.columns {
+        let col = &columns[ci];
+        if matches!(row[ci], Value::Null) {
+            return Vec::new(); // any NULL excluded column → row not indexed (NULL rule)
         }
-    } else {
-        // scalar `=` opclass: the value's order-preserving KEY bytes as `[v, v]` ‖ storage key
-        // (gist.md §6). The column is a FIXED-WIDTH keyable (the CREATE INDEX gate), so the key
-        // encoding is collation-free and infallible.
-        match &row[ci] {
-            Value::Null => Vec::new(),
-            v => {
-                let k = encode_key_value(col.ty.scalar(), v, None)
-                    .expect("a fixed-width GiST scalar key is infallible (no collation)");
-                vec![crate::gist::scalar_leaf_key(&k, storage_key)]
+        if col.ty.range_element().is_none() {
+            // scalar `=` opclass: the value's order-preserving KEY bytes (gist.md §6). The column
+            // is a FIXED-WIDTH keyable (the gate), so the key encoding is collation-free/infallible.
+            let k = encode_key_value(col.ty.scalar(), &row[ci], None)
+                .expect("a fixed-width GiST scalar key is infallible (no collation)");
+            scalar_keys.push(k);
+        }
+    }
+    let mut comps: Vec<crate::gist::GistLeafComp> = Vec::with_capacity(def.columns.len());
+    let mut next_scalar = 0usize;
+    for &ci in &def.columns {
+        let col = &columns[ci];
+        match col.ty.range_element() {
+            Some(elem) => match &row[ci] {
+                Value::Range(rv) => comps.push(crate::gist::GistLeafComp::Range(elem.scalar(), rv)),
+                _ => unreachable!("a GiST range index column holds a range or NULL"),
+            },
+            None => {
+                comps.push(crate::gist::GistLeafComp::Scalar(&scalar_keys[next_scalar]));
+                next_scalar += 1;
             }
         }
     }
+    vec![crate::gist::leaf_key_multi(&comps, storage_key)]
+}
+
+/// Build a row's `EXCLUDE` conjunction probe (spec/design/gist.md §7): one GiST query operand +
+/// strategy per excluded column, in the backing index's column order. Returns `None` (the row is
+/// **exempt**, never conflicts) when the **NULL rule** fires (any excluded column is NULL) or when a
+/// `&&` element holds the **empty range** (`empty && anything` is FALSE, so the conjunction can
+/// never be TRUE — this also sidesteps the empty-range overlap-descend trap, gist.md §5). The query
+/// is fed to the resident GiST tree's `search`, whose leaf recheck IS the full conjunction, so a hit
+/// is a genuine conflict.
+fn exclusion_probe_query(
+    columns: &[Column],
+    exc: &ExclusionConstraint,
+    row: &Row,
+) -> Option<(Vec<crate::gist::GistQuery>, Vec<crate::gist::GistStrategy>)> {
+    use crate::gist::{GistQuery, GistStrategy};
+    let mut q = Vec::with_capacity(exc.elements.len());
+    let mut strats = Vec::with_capacity(exc.elements.len());
+    for el in &exc.elements {
+        let ci = el.column;
+        match (&row[ci], el.op) {
+            (Value::Null, _) => return None, // NULL rule: exempt
+            (Value::Range(rv), ExclusionOp::Overlaps) => {
+                if rv.empty {
+                    return None; // empty && anything is FALSE → exempt
+                }
+                q.push(GistQuery::Range(rv.clone()));
+                strats.push(GistStrategy::Overlaps);
+            }
+            (v, ExclusionOp::Equal) => {
+                let key = encode_key_value(columns[ci].ty.scalar(), v, None)
+                    .expect("a fixed-width GiST scalar key is infallible (no collation)");
+                q.push(GistQuery::Scalar(key));
+                strats.push(GistStrategy::Equal);
+            }
+            _ => unreachable!("an && exclusion column holds a range or NULL"),
+        }
+    }
+    Some((q, strats))
+}
+
+/// Does the `(expr_i op_i)` conjunction hold between two rows (spec/design/gist.md §7)? Used for the
+/// in-batch new-row-vs-new-row check (the resident GiST tree holds only stored rows). A NULL in any
+/// excluded column of either row, or an empty range under `&&` (`range_overlaps` of an empty range
+/// is FALSE), makes that element not-TRUE → no conflict. Returns `true` only when EVERY element is
+/// definitely TRUE.
+fn exclusion_pair_conflicts(
+    columns: &[Column],
+    exc: &ExclusionConstraint,
+    a: &Row,
+    b: &Row,
+) -> bool {
+    for el in &exc.elements {
+        let ci = el.column;
+        let (va, vb) = (&a[ci], &b[ci]);
+        if matches!(va, Value::Null) || matches!(vb, Value::Null) {
+            return false;
+        }
+        let ok = match el.op {
+            ExclusionOp::Overlaps => match (va, vb) {
+                (Value::Range(ra), Value::Range(rb)) => crate::range::range_overlaps(ra, rb),
+                _ => unreachable!("an && exclusion column holds a range or NULL"),
+            },
+            ExclusionOp::Equal => {
+                let ka = encode_key_value(columns[ci].ty.scalar(), va, None)
+                    .expect("a fixed-width GiST scalar key is infallible");
+                let kb = encode_key_value(columns[ci].ty.scalar(), vb, None)
+                    .expect("a fixed-width GiST scalar key is infallible");
+                ka == kb
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 /// Is `elem` an element type a GIN (`array_ops`) index admits? The integers, `boolean`, `uuid`,

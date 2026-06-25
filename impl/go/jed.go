@@ -50,6 +50,10 @@ var SupportedCapabilities = []string{
 	// USING gist over a fixed-width keyable scalar column; bounds are [min,max] over the
 	// order-preserving key encoding. The query-side planner bound is query.gist_scalar_scan.
 	"ddl.gist_scalar_index",
+	// EXCLUDE constraints (spec/design/gist.md §7, GX3): EXCLUDE [USING gist] (col WITH op, …),
+	// backed by a multi-column GiST index; the conjunction probe traps 23P01 at INSERT/UPDATE,
+	// with the NULL rule + end-state semantics. format_version 21.
+	"ddl.exclusion_constraint",
 	// Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9); composite
 	// columns/values are a later slice (spec/design/composite.md).
 	"types.composite",

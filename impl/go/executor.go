@@ -781,7 +781,7 @@ func (s *Snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[na
 func (s *Snapshot) rebuildGistTrees() error {
 	type spec struct {
 		nameKey string
-		op      gistOpclass
+		ops     []gistOpclass
 	}
 	var specs []spec
 	for _, t := range s.tables {
@@ -790,7 +790,9 @@ func (s *Snapshot) rebuildGistTrees() error {
 			if idx.Kind != IndexGist {
 				continue
 			}
-			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), op: gistOpclassFor(t.Columns[idx.Columns[0]].Type)})
+			// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per
+			// WITH column for an EXCLUDE backing index.
+			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), ops: gistOpclassesFor(idx.Columns, t.Columns)})
 		}
 	}
 	live := make(map[string]bool, len(specs))
@@ -814,7 +816,7 @@ func (s *Snapshot) rebuildGistTrees() error {
 				keys[i] = e.Key
 			}
 		}
-		tree, err := buildGistFromLeafKeys(sp.op, keys)
+		tree, err := buildGistFromLeafKeys(sp.ops, keys)
 		if err != nil {
 			return err
 		}
@@ -3443,6 +3445,11 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
 	// parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
 	// columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+	if ct.Temp && len(ct.Excludes) > 0 {
+		// An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
+		// the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
+		return Outcome{}, NewError(FeatureNotSupported, "an EXCLUDE constraint on a temporary table is not yet supported")
+	}
 	if ct.Temp && len(ct.ForeignKeys) > 0 {
 		return Outcome{}, NewError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
 	}
@@ -4138,6 +4145,130 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		return strings.ToLower(resolvedFks[i].Name) < strings.ToLower(resolvedFks[j].Name)
 	})
 	table.ForeignKeys = resolvedFks
+
+	// EXCLUDE constraints (spec/design/gist.md §7). Resolved AFTER the PK / UNIQUE / CHECK / FK
+	// constraints, each in textual order: resolve the element columns (42703/42701) and the WITH
+	// operators against the column types (42704 no-opclass / 0A000 deferred-or-unsupported), name the
+	// constraint + its backing GiST index (the constraint IS its index — they share a name;
+	// 42P07/42710 across the relation + constraint namespaces), and build the MULTI-COLUMN GiST index
+	// that enforces it. The probe + 23P01 live in INSERT/UPDATE.
+	for _, exc := range ct.Excludes {
+		if exc.Using != "" && !strings.EqualFold(exc.Using, "gist") {
+			return Outcome{}, NewError(UndefinedObject, "access method "+exc.Using+" does not support exclusion constraints")
+		}
+		indices := make([]int, 0, len(exc.Elements))
+		elements := make([]ExclusionElement, 0, len(exc.Elements))
+		for _, el := range exc.Elements {
+			ci := -1
+			for i := range table.Columns {
+				if strings.EqualFold(table.Columns[i].Name, el.Column) {
+					ci = i
+					break
+				}
+			}
+			if ci < 0 {
+				return Outcome{}, NewError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
+			}
+			if slices.Contains(indices, ci) {
+				return Outcome{}, NewError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
+			}
+			ty := table.Columns[ci].Type
+			// The WITH operator must pair with the column's GiST opclass (gist.md §7): && over a
+			// range column (range_ops), = over a fixed-width keyable scalar (the in-core btree_gist).
+			var op ExclusionOp
+			switch el.Op {
+			case "&&":
+				if !ty.IsRange() {
+					return Outcome{}, NewError(UndefinedObject,
+						"data type "+ty.CanonicalName()+" has no default operator class for access method gist that accepts operator &&")
+				}
+				op = ExclOverlaps
+			case "=":
+				switch {
+				case isGistScalarType(ty):
+					op = ExclEqual
+				case isGistDeferredScalarType(ty):
+					return Outcome{}, NewError(FeatureNotSupported,
+						"an exclusion constraint with = over "+ty.CanonicalName()+" is not supported yet")
+				default:
+					return Outcome{}, NewError(UndefinedObject,
+						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
+				}
+			default:
+				return Outcome{}, NewError(FeatureNotSupported, "exclusion constraint operator "+el.Op+" is not supported yet")
+			}
+			indices = append(indices, ci)
+			elements = append(elements, ExclusionElement{Column: ci, Op: op})
+		}
+		// Name the constraint (= its backing index name). An explicit name checks the relation
+		// namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
+		// suffix-walks both.
+		relTaken := func(n string) bool {
+			if db.relationExists(n) || strings.EqualFold(table.Name, n) {
+				return true
+			}
+			for _, ix := range table.Indexes {
+				if strings.EqualFold(ix.Name, n) {
+					return true
+				}
+			}
+			return false
+		}
+		conTaken := func(n string) bool {
+			for _, c := range table.Checks {
+				if strings.EqualFold(c.Name, n) {
+					return true
+				}
+			}
+			for _, f := range table.ForeignKeys {
+				if strings.EqualFold(f.Name, n) {
+					return true
+				}
+			}
+			for _, e := range table.Exclusions {
+				if strings.EqualFold(e.Name, n) {
+					return true
+				}
+			}
+			return false
+		}
+		var name string
+		if exc.Name != "" {
+			if relTaken(exc.Name) {
+				return Outcome{}, NewError(DuplicateTable, "relation already exists: "+exc.Name)
+			}
+			if conTaken(exc.Name) {
+				return Outcome{}, NewError(DuplicateObject, "constraint "+exc.Name+" for relation "+table.Name+" already exists")
+			}
+			name = exc.Name
+		} else {
+			base := strings.ToLower(table.Name)
+			for _, i := range indices {
+				base += "_" + strings.ToLower(table.Columns[i].Name)
+			}
+			base += "_excl"
+			name = base
+			for suffix := 1; relTaken(name) || conTaken(name); suffix++ {
+				name = base + strconv.Itoa(suffix)
+			}
+		}
+		// Insert the backing GiST index in catalog (ascending lowercased-name) order.
+		def := IndexDef{Name: name, Columns: indices, Unique: false, Kind: IndexGist}
+		nameKey := strings.ToLower(name)
+		pos := len(table.Indexes)
+		for i, ix := range table.Indexes {
+			if strings.ToLower(ix.Name) > nameKey {
+				pos = i
+				break
+			}
+		}
+		table.Indexes = slices.Insert(table.Indexes, pos, def)
+		table.Exclusions = append(table.Exclusions, ExclusionConstraint{Name: name, Index: name, Elements: elements})
+	}
+	// Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
+	sort.SliceStable(table.Exclusions, func(i, j int) bool {
+		return strings.ToLower(table.Exclusions[i].Name) < strings.ToLower(table.Exclusions[j].Name)
+	})
 
 	if ct.Temp {
 		// Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean 0A000:
@@ -4859,6 +4990,17 @@ func (db *Database) executeDropIndex(di *DropIndex) (Outcome, error) {
 		if !ok {
 			return Outcome{}, NewError(UndefinedObject, "index does not exist: "+di.Name)
 		}
+		// An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns
+		// it (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01,
+		// matching PG's "cannot drop index … because constraint … requires it" (gist.md §7).
+		if t, tok := db.lkpTable(tableKey); tok {
+			for _, e := range t.Exclusions {
+				if strings.EqualFold(e.Index, di.Name) {
+					return Outcome{}, NewError(DependentObjectsStillExist,
+						"cannot drop index "+di.Name+" because constraint "+di.Name+" on table "+t.Name+" requires it")
+				}
+			}
+		}
 		db.working().removeIndex(tableKey, nameKey)
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -5169,27 +5311,98 @@ func indexEntryKeys(columns []Column, colls []*Collation, def IndexDef, storageK
 // index maintenance (insert/update/delete) reuses it unchanged. A NULL range value is not indexed;
 // the empty range is a real value and IS indexed.
 func gistEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
-	ci := def.Columns[0]
-	col := columns[ci]
-	v := row[ci]
-	if rt, ok := col.Type.RangeElement(); ok {
-		// range_ops: the row range's value-codec bytes ‖ storage key.
-		if v.Kind != ValRange {
-			return nil // a NULL range yields no entry
+	ops := make([]gistOpclass, len(def.Columns))
+	bound := make([]gistBound, len(def.Columns))
+	for i, ci := range def.Columns {
+		col := columns[ci]
+		v := row[ci]
+		if v.Kind == ValNull {
+			return nil // any NULL excluded column → row not indexed (the §7 NULL rule)
 		}
-		return [][]byte{rangeGistLeafKey(rt.Scalar, v.Range, storageKey)}
+		if rt, ok := col.Type.RangeElement(); ok {
+			// range_ops: the row range's value-codec bytes.
+			ops[i] = gistOpclass{scalar: false, elem: ScalarColType(rt.Scalar)}
+			bound[i] = gistBound{rng: v.Range}
+			continue
+		}
+		// scalar `=` opclass: the value's order-preserving KEY bytes (gist.md §6). The column is a
+		// FIXED-WIDTH keyable (the gate), so the key encoding is collation-free and infallible.
+		k, err := encodeKeyValue(col.Type.ScalarTy(), v, nil)
+		if err != nil {
+			panic("a fixed-width GiST scalar key is infallible (no collation)")
+		}
+		ops[i] = gistOpclass{scalar: true}
+		bound[i] = gistBound{smin: k, smax: k}
 	}
-	// scalar `=` opclass: the value's order-preserving KEY bytes as [v,v] ‖ storage key (gist.md §6).
-	// The column is a FIXED-WIDTH keyable (the CREATE INDEX gate), so the key encoding is
-	// collation-free and infallible.
-	if v.Kind == ValNull {
-		return nil
+	return [][]byte{gistLeafKey(ops, bound, storageKey)}
+}
+
+// exclusionProbeQuery builds a row's EXCLUDE conjunction probe (spec/design/gist.md §7): one GiST
+// query operand + strategy per excluded column, in the backing index's column order. Returns ok=false
+// (the row is EXEMPT, never conflicts) when the NULL rule fires (any excluded column is NULL) or when
+// a && element holds the empty range (empty && anything is FALSE, so the conjunction can never be
+// TRUE — this also sidesteps the empty-range overlap-descend trap, gist.md §5). The query is fed to
+// the resident GiST tree's search, whose leaf recheck IS the full conjunction, so a hit is a conflict.
+func exclusionProbeQuery(columns []Column, exc ExclusionConstraint, row Row) ([]gistQuery, []gistStrategy, bool) {
+	q := make([]gistQuery, 0, len(exc.Elements))
+	strats := make([]gistStrategy, 0, len(exc.Elements))
+	for _, el := range exc.Elements {
+		ci := el.Column
+		v := row[ci]
+		if v.Kind == ValNull {
+			return nil, nil, false // NULL rule: exempt
+		}
+		switch el.Op {
+		case ExclOverlaps:
+			if v.Range.Empty {
+				return nil, nil, false // empty && anything is FALSE → exempt
+			}
+			q = append(q, gistQuery{rng: v.Range})
+			strats = append(strats, gistOverlaps)
+		case ExclEqual:
+			k, err := encodeKeyValue(columns[ci].Type.ScalarTy(), v, nil)
+			if err != nil {
+				panic("a fixed-width GiST scalar key is infallible (no collation)")
+			}
+			q = append(q, gistQuery{skey: k})
+			strats = append(strats, gistEqual)
+		}
 	}
-	k, err := encodeKeyValue(col.Type.ScalarTy(), v, nil)
-	if err != nil {
-		panic("a fixed-width GiST scalar key is infallible (no collation)")
+	return q, strats, true
+}
+
+// exclusionPairConflicts reports whether the (expr_i op_i) conjunction holds between two rows
+// (spec/design/gist.md §7). Used for the in-batch new-row-vs-new-row check (the resident GiST tree
+// holds only stored rows). A NULL in any excluded column of either row, or an empty range under &&
+// (rangeOverlaps of an empty range is FALSE), makes that element not-TRUE → no conflict. Returns true
+// only when EVERY element is definitely TRUE.
+func exclusionPairConflicts(columns []Column, exc ExclusionConstraint, a, b Row) bool {
+	for _, el := range exc.Elements {
+		ci := el.Column
+		va, vb := a[ci], b[ci]
+		if va.Kind == ValNull || vb.Kind == ValNull {
+			return false
+		}
+		var ok bool
+		switch el.Op {
+		case ExclOverlaps:
+			ok = rangeOverlaps(va.Range, vb.Range)
+		case ExclEqual:
+			ka, err := encodeKeyValue(columns[ci].Type.ScalarTy(), va, nil)
+			if err != nil {
+				panic("a fixed-width GiST scalar key is infallible")
+			}
+			kb, err := encodeKeyValue(columns[ci].Type.ScalarTy(), vb, nil)
+			if err != nil {
+				panic("a fixed-width GiST scalar key is infallible")
+			}
+			ok = bytes.Equal(ka, kb)
+		}
+		if !ok {
+			return false
+		}
 	}
-	return [][]byte{scalarGistLeafKey(k, storageKey)}
+	return true
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
@@ -6149,6 +6362,41 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			if !hit {
 				return nil, NewError(ForeignKeyViolation,
 					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
+			}
+		}
+	}
+
+	// EXCLUDE constraints (spec/design/gist.md §7), after FK existence — a batch pass over the
+	// statement's END STATE: each new row must conflict with no STORED row (probe the backing GiST
+	// tree, whose leaf recheck is the full (expr_i op_i) conjunction) and no OTHER new row of this
+	// batch (pairwise — the resident tree holds only stored rows). The NULL rule / empty-range exempt
+	// a row. Unmetered validation, before any write.
+	if len(table.Exclusions) > 0 {
+		tcols := table.Columns
+		for _, exc := range table.Exclusions {
+			ikey := strings.ToLower(exc.Index)
+			for _, pr := range prepared {
+				q, strats, ok := exclusionProbeQuery(tcols, exc, pr.row)
+				if !ok {
+					continue // exempt
+				}
+				conflict := false
+				if tree := db.readSnap().gistTreeFor(ikey); tree != nil {
+					hits, _, _ := tree.search(q, strats)
+					conflict = len(hits) > 0
+				}
+				if conflict {
+					return nil, NewError(ExclusionViolation,
+						"conflicting key value violates exclusion constraint: "+exc.Name)
+				}
+			}
+			for i := range prepared {
+				for j := 0; j < i; j++ {
+					if exclusionPairConflicts(tcols, exc, prepared[i].row, prepared[j].row) {
+						return nil, NewError(ExclusionViolation,
+							"conflicting key value violates exclusion constraint: "+exc.Name)
+					}
+				}
 			}
 		}
 	}
@@ -7462,6 +7710,50 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 						"duplicate key value violates unique constraint: "+def.Name)
 				}
 				batch[string(prefix)] = struct{}{}
+			}
+		}
+	}
+
+	// EXCLUDE end-state validation (spec/design/gist.md §7), mirroring UNIQUE's: each updated NEW row
+	// must conflict with no OTHER row in the statement's END STATE — neither a STORED row that is NOT
+	// being updated (probe the backing GiST tree, drop a hit whose storage key is a rewritten OLD key
+	// — that row is vacated) nor another updated NEW row (pairwise). The NULL rule / empty-range
+	// exempt a row. An end-state-valid swap thus succeeds where PG fails the per-row transient (the
+	// documented UNIQUE end-state divergence). Unmetered, phase 1, before any write.
+	if len(table.Exclusions) > 0 && len(updates) > 0 {
+		rewritten := make(map[string]struct{}, len(updates))
+		for _, u := range updates {
+			rewritten[string(u.key)] = struct{}{}
+		}
+		for _, exc := range table.Exclusions {
+			ikey := strings.ToLower(exc.Index)
+			for _, u := range updates {
+				q, strats, ok := exclusionProbeQuery(table.Columns, exc, u.row)
+				if !ok {
+					continue
+				}
+				conflict := false
+				if tree := db.readSnap().gistTreeFor(ikey); tree != nil {
+					hits, _, _ := tree.search(q, strats)
+					for _, h := range hits {
+						if _, own := rewritten[string(h)]; !own {
+							conflict = true
+							break
+						}
+					}
+				}
+				if conflict {
+					return Outcome{}, NewError(ExclusionViolation,
+						"conflicting key value violates exclusion constraint: "+exc.Name)
+				}
+			}
+			for i := range updates {
+				for j := 0; j < i; j++ {
+					if exclusionPairConflicts(table.Columns, exc, updates[i].row, updates[j].row) {
+						return Outcome{}, NewError(ExclusionViolation,
+							"conflicting key value violates exclusion constraint: "+exc.Name)
+					}
+				}
 			}
 		}
 	}
@@ -11561,6 +11853,12 @@ func detectGistBound(filter *rExpr, indexes []IndexDef, columns []Column, offset
 		if idx.Kind != IndexGist {
 			continue
 		}
+		// The planner gather is single-operator: only a single-column GiST index accelerates a
+		// `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE backing
+		// structure, gist.md §7) is probed only by the constraint, never the planner.
+		if len(idx.Columns) != 1 {
+			continue
+		}
 		ci := idx.Columns[0]
 		colGlobal := offset + ci
 		colTy := columns[ci].Type
@@ -11975,7 +12273,7 @@ func (db *Database) gistBoundRows(tableName string, gb *gistBoundPlan, query *rE
 	var skeys [][]byte
 	if tree := db.readSnap().gistTreeFor(gb.nameKey); tree != nil {
 		nodes, interior := 0, 0
-		skeys, nodes, interior = tree.search(gq, gb.strategy)
+		skeys, nodes, interior = tree.search([]gistQuery{gq}, []gistStrategy{gb.strategy})
 		pages += nodes
 		meter.Charge(Costs.GistDescent * int64(interior))
 	}

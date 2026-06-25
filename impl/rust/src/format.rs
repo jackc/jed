@@ -18,7 +18,8 @@ use std::sync::atomic::Ordering;
 
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SequenceDef, Table,
+    ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
+    IdentityKind, IndexDef, IndexKind, SequenceDef, Table,
 };
 use crate::collation::Collation;
 use crate::decimal::Decimal;
@@ -36,7 +37,13 @@ use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 18 = reference-only collations (the reference-only pivot,
+/// On-disk format version — 21 = **`EXCLUDE` constraints** (spec/design/gist.md §7/§8, GX3): a
+/// per-table exclusion list after the foreign-key list — each entry the constraint name, its backing
+/// GiST index name, and a `(column ordinal, operator strategy)` element vector (`&&` = 0, `=` = 1).
+/// The backing GiST index is stored like any GiST index (the index list now admits **multi-column**
+/// GiST indexes, whose leaf/interior bound is the per-column components concatenated — single-column
+/// GX1/GX2 bytes are unchanged). A table with no exclusion still moves to v21 by its version byte +
+/// the zero count. 20 = GiST indexes (GX1). 18 = reference-only collations (the reference-only pivot,
 /// spec/design/collation.md §2/§3/§5): the `entry_kind = 3` collation entry is now **metadata only**
 /// — a flags byte (`is_default`) + name + `(unicode_version, cldr_version)` version pin + description,
 /// with **no compiled table**. The table is vendored into the binary (§9) and resolved by name on
@@ -74,7 +81,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
 /// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
 /// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
-const FORMAT_VERSION: u16 = 20;
+const FORMAT_VERSION: u16 = 21;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -2035,14 +2042,20 @@ fn serialize_gist_index<A: FnMut() -> u32>(
     idx: &IndexDef,
     alloc: &mut A,
 ) -> Result<(Vec<crate::gist::GistPage>, u32)> {
-    let op = crate::gist::opclass_for(&table.columns[idx.columns[0]].ty);
+    // One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per `WITH`
+    // column for an EXCLUDE backing index.
+    let ops: Vec<crate::gist::GistOpclass> = idx
+        .columns
+        .iter()
+        .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
+        .collect();
     let istore = snap.index_store(&idx.name.to_ascii_lowercase());
     let keys: Vec<Vec<u8>> = istore.iter_entries()?.into_iter().map(|(k, _)| k).collect();
     if keys.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let tree = crate::gist::build_from_leaf_keys(&op, keys.iter().map(|k| k.as_slice()))?;
-    Ok(crate::gist::serialize_tree(&tree, &op, alloc))
+    let tree = crate::gist::build_from_leaf_keys(&ops, keys.iter().map(|k| k.as_slice()))?;
+    Ok(crate::gist::serialize_tree(&tree, &ops, alloc))
 }
 
 /// Walk a persisted GiST R-tree (rooted at `root`, page types 5/6 — spec/design/gist.md §4.1),
@@ -2357,8 +2370,44 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         }
         out.push(fk_action_code(fk.on_delete) | (fk_action_code(fk.on_update) << 2));
     }
+    // EXCLUDE constraints (v21): count, then per exclusion the name, the backing GiST index name,
+    // and the `(column ordinal, operator strategy)` element vector — in the catalog's ascending
+    // lowercased-name order (spec/design/gist.md §7/§8). The backing index is stored like any GiST
+    // index (in the index list above); this entry layers the operator vector the §7 probe needs.
+    out.extend_from_slice(&(table.exclusions.len() as u16).to_be_bytes());
+    for exc in &table.exclusions {
+        let en = exc.name.as_bytes();
+        out.extend_from_slice(&(en.len() as u16).to_be_bytes());
+        out.extend_from_slice(en);
+        let ei = exc.index.as_bytes();
+        out.extend_from_slice(&(ei.len() as u16).to_be_bytes());
+        out.extend_from_slice(ei);
+        out.extend_from_slice(&(exc.elements.len() as u16).to_be_bytes());
+        for el in &exc.elements {
+            out.extend_from_slice(&(el.column as u16).to_be_bytes());
+            out.push(exclusion_op_code(el.op));
+        }
+    }
     out.extend_from_slice(&root_data_page.to_be_bytes());
     out
+}
+
+/// The 1-byte on-disk code for an `EXCLUDE` element operator (format.md): `&&` = 0, `=` = 1.
+fn exclusion_op_code(op: ExclusionOp) -> u8 {
+    match op {
+        ExclusionOp::Overlaps => 0,
+        ExclusionOp::Equal => 1,
+    }
+}
+
+/// Decode an `EXCLUDE` element operator code; an unsupported code in an otherwise-valid file is
+/// `XX001` (reserved for future GiST exclusion operators).
+fn exclusion_op_from_code(c: u8) -> Result<ExclusionOp> {
+    match c {
+        0 => Ok(ExclusionOp::Overlaps),
+        1 => Ok(ExclusionOp::Equal),
+        _ => Err(corrupt("unsupported exclusion-constraint operator code")),
+    }
 }
 
 /// The 2-bit on-disk code for a referential action (format.md): NO ACTION = 0, RESTRICT = 1.
@@ -3090,6 +3139,33 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             on_update: fk_action_from_code((actions >> 2) & 0b11)?,
         });
     }
+    // EXCLUDE constraints (v21): name + backing index name + the `(column ordinal, operator)`
+    // element vector, in the catalog's (lowercased-name ascending) order — a reader trusts the
+    // order. The column ordinals index THIS table (spec/design/gist.md §7/§8).
+    let exc_count = read_u16(buf, pos)? as usize;
+    let mut exclusions = Vec::with_capacity(exc_count);
+    for _ in 0..exc_count {
+        let ename = read_string(buf, pos)?;
+        let eindex = read_string(buf, pos)?;
+        let ec = read_u16(buf, pos)? as usize;
+        if ec == 0 {
+            return Err(corrupt("exclusion constraint with no elements"));
+        }
+        let mut elements = Vec::with_capacity(ec);
+        for _ in 0..ec {
+            let ord = read_u16(buf, pos)? as usize;
+            if ord >= columns.len() {
+                return Err(corrupt("invalid exclusion-constraint column ordinal"));
+            }
+            let op = exclusion_op_from_code(read_u8(buf, pos)?)?;
+            elements.push(ExclusionElement { column: ord, op });
+        }
+        exclusions.push(ExclusionConstraint {
+            name: ename,
+            index: eindex,
+            elements,
+        });
+    }
     let root_data_page = read_u32(buf, pos)?;
     Ok((
         Table {
@@ -3099,6 +3175,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             checks,
             indexes,
             foreign_keys,
+            exclusions,
         },
         root_data_page,
         index_roots,

@@ -77,6 +77,33 @@ export type Table = {
   // on-disk order and the child-side evaluation order — spec/design/constraints.md §6.9).
   // Empty for a table with none.
   fks: ForeignKey[];
+  // The table's EXCLUDE constraints in ascending lowercased-name order (the catalog's on-disk
+  // order — spec/design/gist.md §7/§8). Each is backed by a GiST index in `indexes`. Empty for a
+  // table with none.
+  exclusions: ExclusionConstraint[];
+};
+
+// ExclusionOp is one element's operator in an EXCLUDE constraint (spec/design/gist.md §7) — the WITH
+// operator of a (column WITH op) pair. "overlaps" is && (a range column, range_ops); "equal" is = (a
+// fixed-width keyable scalar, the in-core btree_gist). Both are SYMMETRIC, the property an exclusion
+// operator must have. Persisted as the v21 per-element strategy byte (&& = 0, = 1; format.md).
+export type ExclusionOp = "overlaps" | "equal";
+
+// ExclusionElement is one (column, operator) element of an EXCLUDE constraint — a member column
+// ordinal into the owning table and its WITH operator. The element order matches the backing GiST
+// index's column order (spec/design/gist.md §7/§8).
+export type ExclusionElement = { column: number; op: ExclusionOp };
+
+// ExclusionConstraint is one EXCLUDE constraint (spec/design/gist.md §7): its (relation-namespace)
+// name, the backing GiST index that enforces it (by name — the constraint IS its index, the
+// UNIQUE-is-its-index model generalized to an explicit operator list), and the (column, operator)
+// element vector the conjunction probe needs. The NULL rule (§7) is enforced at probe time: a row
+// with a NULL in any excluded column never conflicts.
+export type ExclusionConstraint = {
+  name: string;
+  // The backing GiST index's name (equal to `name` for a GX3 constraint — it owns the index).
+  index: string;
+  elements: ExclusionElement[];
 };
 
 // FkAction is the persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`

@@ -92,6 +92,30 @@ type CreateTable struct {
 	// execution resolves each (42703/42701/42P01/42830/42804), rejects unsupported actions
 	// (0A000), and names the unnamed ones (42710).
 	ForeignKeys []ForeignKeyDef
+	// Excludes is every table-level `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])`
+	// of the statement, in TEXTUAL DEFINITION ORDER (spec/design/gist.md §7). Execution resolves
+	// each element (42703/42701/42704/0A000), builds the backing multi-column GiST index, and
+	// names the unnamed ones (42P07/42710).
+	Excludes []ExcludeDef
+}
+
+// ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional
+// explicit CONSTRAINT name (empty = unnamed; it names the backing GiST index), the optional USING
+// method (empty = the default gist; anything else is 42704 at execution), and the (column, operator)
+// element list in declaration order. Each operand is a bare column name; the operator is the WITH
+// operator's source text (= or &&). Execution resolves the columns + operators
+// (42703/42701/42704/0A000), creates the multi-column GiST index, and names the unnamed ones.
+type ExcludeDef struct {
+	Name  string
+	Using string
+	// Elements is (column name, operator source text) per element, in declaration order.
+	Elements []ExcludeElementDef
+}
+
+// ExcludeElementDef is one parsed (column WITH operator) element of an EXCLUDE constraint.
+type ExcludeElementDef struct {
+	Column string
+	Op     string
 }
 
 // RefAction is a referential action for `ON DELETE` / `ON UPDATE`

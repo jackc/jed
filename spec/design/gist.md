@@ -273,7 +273,7 @@ bound; the GiST `=` gather fires only when a GiST index is the *only* index on t
 ordered-index pushdown explicitly **skips** a GiST index (its store key is `[v, v]‖skey`, not the
 ordered-index key form, so it must never be probed as a B-tree).
 
-## 7. `EXCLUDE` constraints (GX3)
+## 7. `EXCLUDE` constraints (GX3) ✅ LANDED
 
 ```sql
 [CONSTRAINT name] EXCLUDE [USING gist] (expr WITH operator [, expr2 WITH operator2 ...])
@@ -312,6 +312,25 @@ exclusion (`EXCLUDE USING gist (during WITH &&)`) needs only GX1.
   [constraints.md §6.5](constraints.md)).
 - **Columns-only WITH exprs first** (a bare column reference); a general expression
   (`EXCLUDE USING gist ((lower(name)) WITH =)`) is a deferred follow-on (§11).
+- **Supported WITH operators: `&&` (a range column) and `=` (a fixed-width keyable scalar)** — the
+  symmetric operators the §5/§6 opclasses serve. A `&&` over a non-range column or a `=` over a
+  no-opclass type is `42704`; a `=` over a deferred keyable (`text`/`bytea`/`decimal`/`interval`) is
+  `0A000`; any other operator is `0A000` (the broader operator set is a §11 follow-on). The backing
+  GiST index cannot be `DROP INDEX`'d directly (it is owned by the constraint — `2BP01`, the
+  UNIQUE-backing precedent; jed has no `ALTER TABLE … DROP CONSTRAINT` yet). `EXCLUDE` on a TEMP
+  table is `0A000` (the GiST-on-temp narrowing, §11).
+- **Implementation.** The constraint resolves at `CREATE TABLE` into a **multi-column GiST index**
+  (one opclass per `WITH` column, §2 generalized to a tuple bound — the per-column component bounds
+  concatenated; a single-column index is the degenerate one-component case, byte-unchanged) plus a
+  per-table exclusion catalog entry recording the `(column, operator)` vector (§8). Each write's
+  `gist_entries` builds the row's tuple leaf key (skipping a row with any NULL excluded column); a
+  read never uses the multi-column index (the planner gather is single-operator), so the backing
+  tree is probed **only** by the constraint. The probe builds the per-column `(query, strategy)`
+  conjunction and descends the resident tree (whose leaf recheck IS the full conjunction, so a hit
+  is a genuine conflict); the in-batch new-row-vs-new-row case is a direct pairwise conjunction
+  (the resident tree holds only stored rows). Both the empty-range exemption and the NULL rule
+  short-circuit the probe (return "exempt"), which also sidesteps the empty-range overlap-descend
+  trap (§5).
 
 ## 8. Persistence
 
@@ -332,12 +351,16 @@ either flavor with no version change, and the page walk that repopulates the lea
 opclass-agnostic (it copies bound bytes verbatim). Golden: `gist_scalar_table.jed`
 (`rust == go == ts == ruby`).
 
-**GX3 — the exclusion-constraint catalog entry (a further `format_version` bump).** Unlike UNIQUE,
-an exclusion constraint must persist the **operator per column** (UNIQUE is always `=` and records
+**GX3 — the exclusion-constraint catalog entry (`format_version` 21).** ✅ Unlike UNIQUE, an
+exclusion constraint must persist the **operator per column** (UNIQUE is always `=` and records
 nothing constraint-specific, [constraints.md §5.5](constraints.md)). GX3 adds a per-table exclusion
-list after the index list: each entry the constraint `name`, its backing-index reference, and a
-`(key_ordinal, operator_strategy)` pair per element. The backing GiST index itself is stored like
-any GiST index; the exclusion entry layers the operator vector the §7 probe needs on top.
+list **after the foreign-key list**: a count, then per exclusion the constraint `name`, its backing
+GiST index name, and a `(column_ordinal u16, operator_strategy u8)` pair per element (`&&` = 0,
+`=` = 1). The backing GiST index itself is stored like any GiST index — the index list now admits
+**multi-column** GiST indexes whose leaf/interior bound is the per-column component bounds
+concatenated, so a single-column GX1/GX2 index is byte-unchanged; the exclusion entry layers the
+operator vector the §7 probe needs on top. A table with no exclusion still moves to v21 by its
+version byte + the zero count. Golden: `gist_exclude_table.jed` (`rust == go == ts == ruby`).
 
 ## 9. Cost
 
@@ -401,7 +424,7 @@ Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md �
 GX0 is spec-only and unblocks the rest; GX1 is independently useful (a range overlap accelerator,
 the [ranges.md §10](ranges.md) follow-on) before any constraint exists.
 
-**GX0 + GX1 + GX2 have LANDED** across all three cores (Rust/Go/TS) + the Ruby golden reference,
+**GX0 + GX1 + GX2 + GX3 have LANDED** across all three cores (Rust/Go/TS) + the Ruby golden reference,
 byte-identical (`rust == go == ts == ruby`). GX1's implementation realizes §3/§4.1 concretely: the GiST
 index's **in-memory** form is the flat leaf-key store (the GIN `term ‖ skey` precedent, so all
 insert/update/delete maintenance is reused), with a **resident R-tree** rebuilt **canonically**
@@ -413,11 +436,16 @@ parsed back into the leaf store + resident tree on open — so the in-memory and
 core to an opclass seam (the only type-specific part) and added the **scalar `=` opclass** over the
 fixed-width keyables — bounds are `[min, max]` over the order-preserving key encoding, compared as raw
 bytes — reusing the entire tree machinery, maintenance, gather, persistence (no format bump), and cost
-unit unchanged. GX3 remains.
+unit unchanged. **GX3** generalized that seam once more to **multi-column** GiST indexes (a tuple bound,
+the per-column components concatenated — single-column bytes unchanged) and added **`EXCLUDE`
+constraints** (§7): the constraint *is* its backing multi-column GiST index, enforced by a
+conjunction probe inside the two-phase INSERT/UPDATE pass (`23P01`), with the NULL rule + end-state
+semantics; the exclusion catalog entry (the `(column, operator)` vector) bumps `format_version` 21.
+The whole feature has landed.
 
 | Slice | Content |
 |---|---|
 | **GX0** ✅ | this doc + the §3 determinism decision + the §2 opclass seam + register `23P01` + reserve `index_kind = 2` / the `format_version` bump (no code, no corpus, no format change) |
 | **GX1** ✅ | the GiST index *kind* + `range_ops` (§5) + the consistent-descent planner gather (SELECT + UPDATE/DELETE) + the `gist_descent` cost unit + `format_version` 20 (`index_kind = 2`, pages 5/6) + the `gist_range_table.jed` golden + `CREATE UNIQUE … USING gist` → `0A000` (+ multi-column / temp → `0A000`); capabilities `ddl.gist_index` / `query.gist_scan`; the `query/gist_scan.test` corpus (oracle-clean) + the `gist` NoREC relation |
 | **GX2** ✅ | the scalar `=` opclass (§6) — the in-core `btree_gist` equivalent over the **fixed-width** keyables (integers / boolean / uuid / date / timestamp / timestamptz); the opclass seam (the tree core generalized to `range_ops` + scalar `=`); bounds are `[min,max]` over the order-preserving key encoding (raw-byte compare); the planner `=` gather (the cost-inferior fallback bound — ordered-index pushdown skips a GiST index); persisted within v20's pages 5/6 (no bump — bound flavor keyed off the column type) + the `gist_scalar_table.jed` golden; deferred keyable (text/bytea/decimal/interval) → `0A000`, no-opclass type → `42704`; capabilities `ddl.gist_scalar_index` / `query.gist_scalar_scan`; the `query/gist_scalar_scan.test` corpus + the `gist_scalar` NoREC relation |
-| **GX3** | `EXCLUDE [USING gist] (col WITH op, …)` (§7) — the backing-index constraint, the conjunction probe, `23P01`, the NULL rule, multi-column; the exclusion-constraint catalog entry (a further `format_version` bump); capability `ddl.exclusion_constraint` |
+| **GX3** ✅ | `EXCLUDE [USING gist] (col WITH op, …)` (§7) — the backing-index constraint, the conjunction probe (INSERT + UPDATE), `23P01`, the NULL rule + empty-range exemption, end-state semantics; the tree core generalized to **multi-column** (a tuple bound); the per-table exclusion-constraint catalog entry (`format_version` 21) + the `gist_exclude_table.jed` golden; `&&`/`=` operators (others `0A000`), backing-index `DROP INDEX` → `2BP01`, exclude-on-temp `0A000`; capability `ddl.exclusion_constraint`; the `ddl/exclusion_constraint.test` corpus (the multi-column form is a jed in-core divergence — PG needs `btree_gist`) |

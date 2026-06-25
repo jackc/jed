@@ -15,7 +15,19 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 20)
+## Version scope (`format_version` 21)
+
+`format_version` **21** — **`EXCLUDE` constraints** ([../design/gist.md](../design/gist.md) §7/§8,
+GX3). The table entry gains a per-table **exclusion list** *after* the foreign-key list (before
+`root_data_page`): `excl_count u16`, then per exclusion the constraint **name** (`u16` length +
+UTF-8), the backing **GiST index name** (`u16` length + UTF-8), and an **element vector**
+(`elem_count u16`, then per element a `column_ordinal u16` + an `operator_strategy u8` — `&&` = 0,
+`=` = 1) — in ascending lowercased-name order (*Exclusion list* in the *Catalog* section below). The
+backing GiST index is stored like any GiST index, but the **index list now admits multi-column GiST
+indexes**: a leaf/interior bound is the per-column component bounds **concatenated** (each `range_ops`
+range body or scalar `[min,max]` key blob), so a single-column GX1/GX2 index is byte-unchanged. An
+exclusion constraint owns no extra B-tree beyond its backing index. A table with no exclusion still
+moves to v21 by its version byte + meta CRC (every table entry gains `excl_count = 0`).
 
 `format_version` **20** — **GiST indexes** ([../design/gist.md](../design/gist.md), GX1). A per-index
 `index_kind = 2` selects the GiST access method, and the index's on-disk form is a persisted **R-tree**
@@ -445,6 +457,14 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`fk_ref_count` | u16 — the referenced column count; must equal `fk_local_count` (else `XX001`) |
 | &nbsp;&nbsp;`fk_ref_ordinal` ×`fk_ref_count` | u16 each — referenced-column ordinals into the **parent** table, in list order |
 | &nbsp;&nbsp;`fk_actions` | u8 — bits 0–1 `on_delete`, bits 2–3 `on_update` (`0` = NO ACTION, `1` = RESTRICT; `2`/`3` reserved for CASCADE/SET NULL/SET DEFAULT, not written this slice); bits 4–7 reserved, written 0 (a set reserved bit, or an unknown 2-bit action, is `XX001`) |
+| `excl_count` | u16 — the table's `EXCLUDE` constraint count (v21; 0 for a table with none) |
+| &nbsp;&nbsp;`excl_name_len` | u16 |
+| &nbsp;&nbsp;`excl_name` | UTF-8 (original case) — the constraint name |
+| &nbsp;&nbsp;`excl_index_len` | u16 |
+| &nbsp;&nbsp;`excl_index` | UTF-8 (original case) — the backing GiST index name (= `excl_name` for a GX3 constraint) |
+| &nbsp;&nbsp;`excl_elem_count` | u16 — the constraint's element count (≥ 1, else `XX001`) |
+| &nbsp;&nbsp;&nbsp;&nbsp;`excl_col_ordinal` | u16 — the element's column ordinal into **this** table (per element) |
+| &nbsp;&nbsp;&nbsp;&nbsp;`excl_op` | u8 — the element's operator strategy (`0` = `&&`, `1` = `=`; other values are `XX001`) (per element, immediately after its `excl_col_ordinal`) |
 | `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
 
 Columns are emitted in declaration order. Checks are emitted in their **evaluation order** —
@@ -458,7 +478,11 @@ in-memory order and the planner's tie-break order — [../design/indexes.md
 the reader trusts that order. A foreign key owns no B-tree, so it stores no root page; the
 referenced table/column ordinals are resolved by name against the loaded catalog, and a
 reference to a missing table or out-of-range parent column in an otherwise-valid file is
-`XX001`.
+`XX001`. **Exclusion constraints** (v21) are emitted **after** the foreign-key list, in
+**ascending byte order of the lowercased `excl_name`** (the catalog's in-memory order —
+[../design/gist.md §7/§8](../design/gist.md)); the reader trusts that order. An exclusion
+constraint owns no extra B-tree (its backing GiST index is in the index list); an out-of-range
+`excl_col_ordinal` or an unknown `excl_op` in an otherwise-valid file is `XX001`.
 
 A **composite column** (a column whose type is a user-defined composite — `type_code == 14`)
 appends, in the column entry's typmod slot (where a decimal appends precision/scale), a

@@ -83,6 +83,11 @@ pub struct CreateTable {
     /// resolves each (42703/42701/42P01/42830/42804), rejects unsupported actions (0A000), and
     /// names the unnamed ones (42710).
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// Every table-level `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])` of the
+    /// statement, in **textual definition order** (spec/design/gist.md §7). CREATE TABLE's execution
+    /// resolves each element (42703/42701/42704/0A000), builds the backing multi-column GiST index,
+    /// and names the unnamed ones (42P07/42710).
+    pub excludes: Vec<ExcludeDef>,
 }
 
 /// A referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md §6.6). Only
@@ -121,6 +126,20 @@ pub struct ForeignKeyDef {
 pub struct UniqueDef {
     pub name: Option<String>,
     pub columns: Vec<String>,
+}
+
+/// One parsed `EXCLUDE` constraint (spec/design/gist.md §7, grammar.md): the optional explicit
+/// `CONSTRAINT` name (it names the backing GiST index), an optional `USING <method>` (only `gist` —
+/// the default — is supported; anything else is 42704 at execution), and the `(column, operator)`
+/// element list in declaration order. Each operand is a bare column name; the operator is the
+/// `WITH` operator's source text (`=` or `&&`). Execution resolves the columns + operators
+/// (42703/42701/42704/0A000), creates the multi-column GiST index, and names the unnamed ones.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExcludeDef {
+    pub name: Option<String>,
+    pub using: Option<String>,
+    /// `(column name, operator source text)` per element, in declaration order.
+    pub elements: Vec<(String, String)>,
 }
 
 /// One parsed `CHECK` constraint (spec/design/grammar.md §29): the optional explicit

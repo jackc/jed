@@ -7,12 +7,12 @@
 use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
-    Delete, DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, GroupItem,
-    IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior,
-    JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
-    QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef,
-    WithExpr, WithQuery,
+    Delete, DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr, ForeignKeyDef,
+    GroupItem, IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
+    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
+    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
+    SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
+    Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -260,6 +260,7 @@ impl Parser {
         let mut checks = Vec::new();
         let mut uniques = Vec::new();
         let mut foreign_keys = Vec::new();
+        let mut excludes = Vec::new();
         loop {
             if self.peek_keyword().as_deref() == Some("primary")
                 && self.peek_keyword_at(1).as_deref() == Some("key")
@@ -273,6 +274,8 @@ impl Parser {
                 uniques.push(self.parse_unique_table_constraint()?);
             } else if self.at_foreign_key_table_constraint() {
                 foreign_keys.push(self.parse_foreign_key_table_constraint()?);
+            } else if self.at_exclusion_table_constraint() {
+                excludes.push(self.parse_exclusion_table_constraint()?);
             } else {
                 columns.push(self.parse_column_def(
                     &name,
@@ -299,6 +302,61 @@ impl Parser {
             checks,
             uniques,
             foreign_keys,
+            excludes,
+        })
+    }
+
+    /// Whether the cursor sits on a table-level `EXCLUDE` constraint: the keyword `EXCLUDE`, or
+    /// `CONSTRAINT <ident> EXCLUDE` (spec/design/gist.md §7). The keyword stays non-reserved — a
+    /// column named `exclude` is followed by a type name (an identifier), and `EXCLUDE` here is
+    /// followed by `USING` or `(` (never a type name), so the lookahead loses nothing.
+    fn at_exclusion_table_constraint(&self) -> bool {
+        (self.peek_keyword().as_deref() == Some("exclude")
+            && (self.peek_keyword_at(1).as_deref() == Some("using")
+                || matches!(self.peek_at(1), Token::LParen)))
+            || (self.peek_keyword().as_deref() == Some("constraint")
+                && self.peek_keyword_at(2).as_deref() == Some("exclude"))
+    }
+
+    /// Parse one `[CONSTRAINT name] EXCLUDE [USING method] ( col WITH op [, col2 WITH op2 ...] )`
+    /// (the cursor is verified by `at_exclusion_table_constraint`). Each operand is a bare column
+    /// name; the `WITH` operator is captured as its source text (`=` / `&&`) and mapped to a
+    /// strategy at execution (spec/design/gist.md §7). The `USING` method (only `gist`) is captured
+    /// verbatim and validated at execution.
+    fn parse_exclusion_table_constraint(&mut self) -> Result<ExcludeDef> {
+        let name = if self.peek_keyword().as_deref() == Some("constraint") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        self.expect_keyword("exclude")?;
+        let using = if self.peek_keyword().as_deref() == Some("using") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        self.expect(&Token::LParen)?;
+        let mut elements = Vec::new();
+        loop {
+            let col = self.expect_identifier()?;
+            self.expect_keyword("with")?;
+            // The operator is a single token (`=` / `&&`); render it to source text for execution.
+            let start = self.pos;
+            self.advance();
+            let op = render_tokens(&self.tokens[start..self.pos]);
+            elements.push((col, op));
+            match self.advance() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+            }
+        }
+        Ok(ExcludeDef {
+            name,
+            using,
+            elements,
         })
     }
 

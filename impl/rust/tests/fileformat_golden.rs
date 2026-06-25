@@ -347,6 +347,28 @@ fn gist_scalar_table_db() -> Database {
     db
 }
 
+/// An `EXCLUDE USING gist (room WITH =, during WITH &&)` constraint (GX3, v21 — spec/design/gist.md
+/// §7/§8): pins the per-table exclusion catalog list (name + backing index name + the
+/// `(column, operator)` element vector) AND the **multi-column** GiST node bytes (each leaf bound a
+/// scalar `[min,max]` component concatenated with a range component). 7 rows force a median split at
+/// `GIST_FANOUT = 4`, so the backing R-tree is two levels. Row 8's NULL room is exempt (not indexed).
+/// Mirrors the Ruby reference's `GIST_EXCLUDE_TABLE`.
+fn gist_exclude_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, \
+         EXCLUDE USING gist (room WITH =, during WITH &&))",
+    );
+    run(
+        &mut db,
+        "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), \
+         (3, 102, '[10,20)'), (4, 102, '[30,40)'), (5, 103, '[10,20)'), \
+         (6, 104, '[50,60)'), (7, 105, '[1,5)'), (8, NULL, '[10,20)')",
+    );
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -974,6 +996,7 @@ fn write_matches_goldens() {
         ("range_pk_table.jed", range_pk_table_db),
         ("gist_range_table.jed", gist_range_table_db),
         ("gist_scalar_table.jed", gist_scalar_table_db),
+        ("gist_exclude_table.jed", gist_exclude_table_db),
         ("array_composite_table.jed", array_composite_table_db),
         (
             "composite_array_field_table.jed",
@@ -1034,6 +1057,7 @@ fn read_goldens_reproduces_rows() {
         ("range_pk_table.jed", range_pk_table_db, "t"),
         ("gist_range_table.jed", gist_range_table_db, "t"),
         ("gist_scalar_table.jed", gist_scalar_table_db, "t"),
+        ("gist_exclude_table.jed", gist_exclude_table_db, "booking"),
         ("array_composite_table.jed", array_composite_table_db, "t"),
         (
             "composite_array_field_table.jed",

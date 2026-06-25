@@ -68,6 +68,9 @@ import {
   type CompositeField,
   type CompositeType,
   type DefaultExpr,
+  type ExclusionConstraint,
+  type ExclusionElement,
+  type ExclusionOp,
   type FkAction,
   type ForeignKey,
   type IdentityKind,
@@ -320,14 +323,14 @@ import {
 import {
   buildGistFromLeafKeys,
   GIST_SCALAR_OPCLASS,
+  type GistLeafInput,
+  gistLeafKeyMulti,
   type GistOpclass,
   gistRangeOpclass,
   type GistQuery,
   type GistStrategy,
   type GistTree,
   gistSearch,
-  rangeGistLeafKey,
-  scalarGistLeafKey,
 } from "./gist.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 import {
@@ -545,13 +548,15 @@ export class Snapshot {
   // a pure function of the leaf SET — content-deterministic, cross-core identical, and identical to the
   // on-disk persisted R-tree. Trees whose index has been dropped are removed.
   rebuildGistTrees(): void {
-    const specs: { nameKey: string; op: GistOpclass }[] = [];
+    const specs: { nameKey: string; ops: GistOpclass[] }[] = [];
     for (const t of this.tables.values()) {
       for (const idx of t.indexes) {
         if (idx.kind !== "gist") continue;
+        // One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per WITH
+        // column for an EXCLUDE backing index.
         specs.push({
           nameKey: idx.name.toLowerCase(),
-          op: gistOpclassFor(t.columns[idx.columns[0]!]!.type),
+          ops: idx.columns.map((ci) => gistOpclassFor(t.columns[ci]!.type)),
         });
       }
     }
@@ -560,7 +565,7 @@ export class Snapshot {
     for (const sp of specs) {
       const store = this.indexStores.get(sp.nameKey);
       const keys = store ? store.entriesInKeyOrder().map((e) => e.key) : [];
-      this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.op, keys));
+      this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.ops, keys));
     }
   }
 
@@ -2742,6 +2747,14 @@ export class Database {
     // FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
     // parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
     // columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+    if (ct.temp && ct.excludes.length > 0) {
+      // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
+      // the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
+      throw engineError(
+        "feature_not_supported",
+        "an EXCLUDE constraint on a temporary table is not yet supported",
+      );
+    }
     if (ct.temp && ct.fks.length > 0) {
       throw engineError(
         "feature_not_supported",
@@ -3148,6 +3161,7 @@ export class Database {
       checks: [],
       indexes: [],
       fks: [],
+      exclusions: [],
     };
     for (const def of ct.checks) {
       // Structural rejections first (a single pre-walk — a documented micro-order
@@ -3414,6 +3428,117 @@ export class Database {
       return an < bn ? -1 : an > bn ? 1 : 0;
     });
     table.fks = resolvedFks;
+
+    // EXCLUDE constraints (spec/design/gist.md §7). Resolved AFTER the PK / UNIQUE / CHECK / FK
+    // constraints, each in textual order: resolve the element columns (42703/42701) and the WITH
+    // operators against the column types (42704 no-opclass / 0A000 deferred-or-unsupported), name the
+    // constraint + its backing GiST index (the constraint IS its index — they share a name;
+    // 42P07/42710 across the relation + constraint namespaces), and build the MULTI-COLUMN GiST index
+    // that enforces it. The probe + 23P01 live in INSERT/UPDATE.
+    for (const exc of ct.excludes) {
+      if (exc.using !== null && exc.using.toLowerCase() !== "gist") {
+        throw engineError(
+          "undefined_object",
+          "access method " + exc.using + " does not support exclusion constraints",
+        );
+      }
+      const indices: number[] = [];
+      const elements: ExclusionElement[] = [];
+      for (const el of exc.elements) {
+        const ci = table.columns.findIndex(
+          (c) => c.name.toLowerCase() === el.column.toLowerCase(),
+        );
+        if (ci < 0) {
+          throw engineError("undefined_column", "column " + el.column + " named in key does not exist");
+        }
+        if (indices.includes(ci)) {
+          throw engineError(
+            "duplicate_column",
+            "column " + el.column + " appears twice in exclusion constraint",
+          );
+        }
+        const ty = table.columns[ci]!.type;
+        // The WITH operator must pair with the column's GiST opclass (gist.md §7): && over a range
+        // column (range_ops), = over a fixed-width keyable scalar (the in-core btree_gist).
+        let op: ExclusionOp;
+        if (el.op === "&&") {
+          if (ty.kind !== "range") {
+            throw engineError(
+              "undefined_object",
+              "data type " +
+                typeCanonicalName(ty) +
+                " has no default operator class for access method gist that accepts operator &&",
+            );
+          }
+          op = "overlaps";
+        } else if (el.op === "=") {
+          if (isGistScalarType(ty)) {
+            op = "equal";
+          } else if (isGistDeferredScalarType(ty)) {
+            throw engineError(
+              "feature_not_supported",
+              "an exclusion constraint with = over " + typeCanonicalName(ty) + " is not supported yet",
+            );
+          } else {
+            throw engineError(
+              "undefined_object",
+              "data type " + typeCanonicalName(ty) + " has no default operator class for access method gist",
+            );
+          }
+        } else {
+          throw engineError(
+            "feature_not_supported",
+            "exclusion constraint operator " + el.op + " is not supported yet",
+          );
+        }
+        indices.push(ci);
+        elements.push({ column: ci, op });
+      }
+      // Name the constraint (= its backing index name). An explicit name checks the relation
+      // namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
+      // suffix-walks both.
+      const relTaken = (n: string): boolean =>
+        this.relationExists(n) ||
+        table.name.toLowerCase() === n.toLowerCase() ||
+        table.indexes.some((ix) => ix.name.toLowerCase() === n.toLowerCase());
+      const conTaken = (n: string): boolean =>
+        table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase()) ||
+        table.fks.some((f) => f.name.toLowerCase() === n.toLowerCase()) ||
+        table.exclusions.some((e) => e.name.toLowerCase() === n.toLowerCase());
+      let name: string;
+      if (exc.name !== null) {
+        if (relTaken(exc.name)) {
+          throw engineError("duplicate_table", "relation already exists: " + exc.name);
+        }
+        if (conTaken(exc.name)) {
+          throw engineError(
+            "duplicate_object",
+            "constraint " + exc.name + " for relation " + table.name + " already exists",
+          );
+        }
+        name = exc.name;
+      } else {
+        let base = table.name.toLowerCase();
+        for (const i of indices) base += "_" + table.columns[i]!.name.toLowerCase();
+        base += "_excl";
+        name = base;
+        for (let suffix = 1; relTaken(name) || conTaken(name); suffix++) {
+          name = base + suffix.toString();
+        }
+      }
+      // Insert the backing GiST index in catalog (ascending lowercased-name) order.
+      const nameKey = name.toLowerCase();
+      let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
+      if (pos < 0) pos = table.indexes.length;
+      table.indexes.splice(pos, 0, { name, columns: indices, unique: false, kind: "gist" });
+      table.exclusions.push({ name, index: name, elements });
+    }
+    // Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
+    table.exclusions.sort((a, b) => {
+      const an = a.name.toLowerCase();
+      const bn = b.name.toLowerCase();
+      return an < bn ? -1 : an > bn ? 1 : 0;
+    });
 
     if (ct.temp) {
       // Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean 0A000:
@@ -3942,6 +4067,16 @@ export class Database {
       if (!found) {
         throw engineError("undefined_object", "index does not exist: " + di.name);
       }
+      // An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns it
+      // (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01, matching
+      // PG's "cannot drop index … because constraint … requires it" (gist.md §7).
+      const owner = this.table(found[0]);
+      if (owner !== undefined && owner.exclusions.some((e) => e.index.toLowerCase() === nameKey)) {
+        throw engineError(
+          "dependent_objects_still_exist",
+          "cannot drop index " + di.name + " because constraint " + di.name + " on table " + owner.name + " requires it",
+        );
+      }
       this.working().removeIndex(found[0], nameKey);
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
@@ -4400,7 +4535,7 @@ export class Database {
     let skeys: Uint8Array[] = [];
     const tree = this.readSnap().gistTreeFor(gb.nameKey);
     if (tree !== undefined) {
-      const r = gistSearch(tree, gq, gb.strategy);
+      const r = gistSearch(tree, [gq], [gb.strategy]);
       skeys = r.keys;
       pages += r.nodes;
       meter.charge(COSTS.gistDescent * BigInt(r.interior));
@@ -4875,6 +5010,41 @@ export class Database {
             "foreign_key_violation",
             "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
           );
+        }
+      }
+    }
+
+    // EXCLUDE constraints (spec/design/gist.md §7), after FK existence — a batch pass over the
+    // statement's END STATE: each new row must conflict with no STORED row (probe the backing GiST
+    // tree, whose leaf recheck is the full (expr_i op_i) conjunction) and no OTHER new row of this
+    // batch (pairwise — the resident tree holds only stored rows). The NULL rule / empty-range exempt
+    // a row. Unmetered validation, before any write.
+    const exclusions = this.table(table.name)?.exclusions ?? [];
+    if (exclusions.length > 0) {
+      const tcols = table.columns;
+      for (const exc of exclusions) {
+        const ikey = exc.index.toLowerCase();
+        for (const pr of prepared) {
+          const probe = exclusionProbeQuery(tcols, exc, pr.row);
+          if (probe === null) continue; // exempt
+          const tree = this.readSnap().gistTreeFor(ikey);
+          const conflict = tree !== undefined && gistSearch(tree, probe.query, probe.strats).keys.length > 0;
+          if (conflict) {
+            throw engineError(
+              "exclusion_violation",
+              "conflicting key value violates exclusion constraint: " + exc.name,
+            );
+          }
+        }
+        for (let i = 0; i < prepared.length; i++) {
+          for (let j = 0; j < i; j++) {
+            if (exclusionPairConflicts(tcols, exc, prepared[i]!.row, prepared[j]!.row)) {
+              throw engineError(
+                "exclusion_violation",
+                "conflicting key value violates exclusion constraint: " + exc.name,
+              );
+            }
+          }
         }
       }
     }
@@ -6011,6 +6181,45 @@ export class Database {
             );
           }
           batch.add(k);
+        }
+      }
+    }
+
+    // EXCLUDE end-state validation (spec/design/gist.md §7), mirroring UNIQUE's: each updated NEW row
+    // must conflict with no OTHER row in the statement's END STATE — neither a STORED row that is NOT
+    // being updated (probe the backing GiST tree, drop a hit whose storage key is a rewritten OLD key
+    // — that row is vacated) nor another updated NEW row (pairwise). The NULL rule / empty-range
+    // exempt a row. An end-state-valid swap thus succeeds where PG fails the per-row transient (the
+    // documented UNIQUE end-state divergence). Unmetered, phase 1, before any write.
+    if (table.exclusions.length > 0 && updates.length > 0) {
+      const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
+      for (const exc of table.exclusions) {
+        const ikey = exc.index.toLowerCase();
+        for (const u of updates) {
+          const probe = exclusionProbeQuery(table.columns, exc, u.row);
+          if (probe === null) continue;
+          const tree = this.readSnap().gistTreeFor(ikey);
+          const conflict =
+            tree !== undefined &&
+            gistSearch(tree, probe.query, probe.strats).keys.some(
+              (h) => !rewritten.has(h.join(",")),
+            );
+          if (conflict) {
+            throw engineError(
+              "exclusion_violation",
+              "conflicting key value violates exclusion constraint: " + exc.name,
+            );
+          }
+        }
+        for (let i = 0; i < updates.length; i++) {
+          for (let j = 0; j < i; j++) {
+            if (exclusionPairConflicts(table.columns, exc, updates[i]!.row, updates[j]!.row)) {
+              throw engineError(
+                "exclusion_violation",
+                "conflicting key value violates exclusion constraint: " + exc.name,
+              );
+            }
+          }
         }
       }
     }
@@ -7775,6 +7984,7 @@ export class Database {
       checks: [],
       indexes: [],
       fks: [],
+      exclusions: [],
     };
     // The declared columns ride on the plan so the row generator can map members → columns by name.
     return {
@@ -7844,6 +8054,7 @@ export class Database {
       checks: [],
       indexes: [],
       fks: [],
+      exclusions: [],
     };
     // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
     return {
@@ -7899,6 +8110,7 @@ export class Database {
       checks: [],
       indexes: [],
       fks: [],
+      exclusions: [],
     };
     return {
       table,
@@ -9482,6 +9694,10 @@ function detectGistBound(
   if (filter === null) return null;
   for (const idx of indexes) {
     if (idx.kind !== "gist") continue;
+    // The planner gather is single-operator: only a single-column GiST index accelerates a
+    // `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE backing
+    // structure, gist.md §7) is probed only by the constraint, never the planner.
+    if (idx.columns.length !== 1) continue;
     const ci = idx.columns[0]!;
     const colGlobal = offset + ci;
     const colType = columns[ci]!.type;
@@ -9725,29 +9941,91 @@ function gistOpclassFor(colType: Type): GistOpclass {
   return GIST_SCALAR_OPCLASS;
 }
 
-// gistEntries builds a GiST index's entry keys for one row (spec/design/gist.md §4.1): exactly one
-// leaf key, bound ‖ storage_key (the GIN term ‖ skey pattern), so all existing index maintenance
-// (insert/update/delete) reuses it unchanged. range_ops uses the row range's value-codec bytes; the
-// scalar `=` opclass uses the value's order-preserving KEY bytes as [v,v] (gist.md §6). A NULL value
-// is not indexed; the empty range is a real value and IS indexed.
+// gistEntries builds a GiST index's entry keys for one row (spec/design/gist.md §4.1/§7): exactly one
+// leaf key, the per-column component bounds concatenated then ‖ storage_key (the GIN term ‖ skey
+// pattern), so all existing index maintenance (insert/update/delete) reuses it unchanged. A
+// single-column GX1/GX2 index has one component; an EXCLUDE backing index one per WITH column. A NULL
+// in ANY indexed column produces no entry (the §7 exclusion NULL rule — a row with a NULL excluded
+// column never conflicts and is left out of the tree). The empty range is a real value and IS indexed.
 function gistEntries(
   columns: Column[],
   def: IndexDef,
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
-  const ci = def.columns[0]!;
-  const colType = columns[ci]!.type;
-  const v = row[ci]!;
-  if (colType.kind === "range") {
-    if (v.kind !== "range") return []; // a NULL range yields no entry
-    return [rangeGistLeafKey({ kind: "scalar", scalar: typeScalar(colType.elem) }, v, storageKey)];
+  const inputs: GistLeafInput[] = [];
+  for (const ci of def.columns) {
+    const colType = columns[ci]!.type;
+    const v = row[ci]!;
+    if (v.kind === "null") return []; // any NULL excluded column → row not indexed (NULL rule)
+    if (colType.kind === "range" && v.kind === "range") {
+      inputs.push({ range: { kind: "scalar", scalar: typeScalar(colType.elem) }, value: v });
+    } else if (colType.kind === "range") {
+      return []; // unreachable: a range column holds a range or NULL (handled above)
+    } else {
+      // scalar `=` opclass: the column is a FIXED-WIDTH keyable (the gate), so the key encoding is
+      // collation-free and infallible.
+      inputs.push({ scalarKey: encodeKeyValue(typeScalar(colType), v, null) });
+    }
   }
-  // scalar `=` opclass: the column is a FIXED-WIDTH keyable (the CREATE INDEX gate), so the key
-  // encoding is collation-free and infallible.
-  if (v.kind === "null") return [];
-  const k = encodeKeyValue(typeScalar(colType), v, null);
-  return [scalarGistLeafKey(k, storageKey)];
+  return [gistLeafKeyMulti(inputs, storageKey)];
+}
+
+// exclusionProbeQuery builds a row's EXCLUDE conjunction probe (spec/design/gist.md §7): one GiST
+// query operand + strategy per excluded column, in the backing index's column order. Returns null
+// (the row is EXEMPT, never conflicts) when the NULL rule fires (any excluded column is NULL) or when
+// a && element holds the empty range (empty && anything is FALSE, so the conjunction can never be
+// TRUE — this also sidesteps the empty-range overlap-descend trap, gist.md §5). The query is fed to
+// the resident GiST tree's search, whose leaf recheck IS the full conjunction, so a hit is a conflict.
+function exclusionProbeQuery(
+  columns: Column[],
+  exc: ExclusionConstraint,
+  row: Row,
+): { query: GistQuery[]; strats: GistStrategy[] } | null {
+  const query: GistQuery[] = [];
+  const strats: GistStrategy[] = [];
+  for (const el of exc.elements) {
+    const v = row[el.column]!;
+    if (v.kind === "null") return null; // NULL rule: exempt
+    if (el.op === "overlaps") {
+      if (v.kind !== "range" || v.empty) return null; // empty && anything is FALSE → exempt
+      query.push({ rng: v });
+      strats.push("overlaps");
+    } else {
+      const k = encodeKeyValue(typeScalar(columns[el.column]!.type), v, null);
+      query.push({ skey: k });
+      strats.push("equal");
+    }
+  }
+  return { query, strats };
+}
+
+// exclusionPairConflicts reports whether the (expr_i op_i) conjunction holds between two rows
+// (spec/design/gist.md §7). Used for the in-batch new-row-vs-new-row check (the resident GiST tree
+// holds only stored rows). A NULL in any excluded column of either row, or an empty range under &&
+// (rangeOverlaps of an empty range is FALSE), makes that element not-TRUE → no conflict. Returns true
+// only when EVERY element is definitely TRUE.
+function exclusionPairConflicts(
+  columns: Column[],
+  exc: ExclusionConstraint,
+  a: Row,
+  b: Row,
+): boolean {
+  for (const el of exc.elements) {
+    const va = a[el.column]!;
+    const vb = b[el.column]!;
+    if (va.kind === "null" || vb.kind === "null") return false;
+    let ok: boolean;
+    if (el.op === "overlaps") {
+      ok = va.kind === "range" && vb.kind === "range" && rangeOverlaps(va, vb);
+    } else {
+      const ka = encodeKeyValue(typeScalar(columns[el.column]!.type), va, null);
+      const kb = encodeKeyValue(typeScalar(columns[el.column]!.type), vb, null);
+      ok = bytesEq(ka, kb);
+    }
+    if (!ok) return false;
+  }
+  return true;
 }
 
 // ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
@@ -11938,6 +12216,7 @@ function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
     checks: [],
     indexes: [],
     fks: [],
+    exclusions: [],
   };
 }
 
@@ -11963,6 +12242,7 @@ function srfTableCols(funcName: string, alias: string | null, cols: [string, Typ
     checks: [],
     indexes: [],
     fks: [],
+    exclusions: [],
   };
 }
 
@@ -16502,7 +16782,7 @@ function cteSyntheticTableCols(
     identity: null,
     collation: null,
   }));
-  return { name, columns, pk: [], checks: [], indexes: [], fks: [] };
+  return { name, columns, pk: [], checks: [], indexes: [], fks: [], exclusions: [] };
 }
 
 // typeFromResolved is the catalog Type that round-trips a column's ResolvedType — used to give a

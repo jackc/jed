@@ -463,7 +463,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         **ordered-index** equality bound for UPDATE/DELETE (mutations use PK+GIN but not the ordered
         index yet); the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`**
         opclass (the lossy-recheck path the seam already seats) and a future object/document opclass.
-- [ ] **GiST index access method → `EXCLUDE` constraints** — a **third index *kind*** beside the
+- [x] **GiST index access method → `EXCLUDE` constraints** ✅ **DONE** (GX0–GX3 all landed, all three
+      cores + Ruby golden, byte-identical) — a **third index *kind*** beside the
       ordered B-tree (`index_kind = 0`) and GIN (`index_kind = 1`): the reserved `index_kind = 2`
       ([format.md](spec/fileformat/format.md) *Catalog*, currently `XX001`; [gin.md §7](spec/design/gin.md)),
       whose payoff is **PostgreSQL exclusion constraints** — `EXCLUDE USING gist (during WITH &&)`: no
@@ -520,17 +521,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         GiST index carry a `=` column beside a `&&` range column — the canonical exclusion shape (GX3).
         Capabilities `ddl.gist_scalar_index` / `query.gist_scalar_scan`; the `query/gist_scalar_scan.test`
         corpus + the `gist_scalar` NoREC relation. _(size: L; ×3 cores)_
-  - [ ] **GX3 — `EXCLUDE` constraints.** `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])`:
-        the constraint **is** its backing GiST index (the UNIQUE-is-its-index model,
-        [constraints.md §5](spec/design/constraints.md), generalized to N `(column, operator)` pairs).
-        Enforced inside the two-phase / all-or-nothing pass at INSERT/UPDATE via a GiST probe — a
-        candidate row conflicts iff some existing row makes **every** WITH-operator comparison TRUE →
-        **`23P01`**; a NULL in any WITH operand exempts that row (PG behavior). The single-column range
-        form (`EXCLUDE USING gist (during WITH &&)`) needs only GX1; the canonical
-        `EXCLUDE USING gist (room WITH =, during WITH &&)` (no double-booking) needs GX2 too. Persists a
-        per-constraint `(key_ordinal, operator_strategy)` list + backing-index ref (the operator-per-column
-        that UNIQUE doesn't record → its own catalog entry; a further `format_version` bump). Columns-only
-        WITH exprs first. Capability `ddl.exclusion_constraint`. _(size: L; ×3 cores)_
+  - [x] **GX3 — `EXCLUDE` constraints.** ✅ **DONE** (all three cores + the Ruby golden reference,
+        byte-identical). `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])`: the constraint
+        **is** its backing **multi-column** GiST index (the UNIQUE-is-its-index model,
+        [constraints.md §5](spec/design/constraints.md), generalized to N `(column, operator)` pairs — the
+        tree core was generalized to a **tuple bound**, the per-column components concatenated, so a
+        single-column GX1/GX2 index stays byte-unchanged). Enforced inside the two-phase / all-or-nothing
+        pass at INSERT/**UPDATE** via a conjunction probe (the backing tree's leaf recheck IS the full
+        conjunction, so a hit is a conflict) + an in-batch pairwise check → **`23P01`**; the NULL rule
+        (a NULL in any WITH operand, or an empty range under `&&`, exempts the row) and **end-state**
+        semantics (a swap succeeds where PG fails the per-row transient). `&&`/`=` operators (others
+        `0A000`); backing-index `DROP INDEX` → `2BP01`; EXCLUDE-on-temp `0A000`. Persists a per-table
+        exclusion list (`(column_ordinal, operator_strategy)` per element + backing-index name) after the
+        FK list — **`format_version` 21** + the `gist_exclude_table.jed` golden. Columns-only WITH exprs.
+        Capability `ddl.exclusion_constraint`; the `ddl/exclusion_constraint.test` corpus (the multi-column
+        form is a jed in-core divergence — PG needs `btree_gist`).
   - [ ] _follow-on (each its own slice + NoREC/oracle obligation):_ the `EXCLUDE … WHERE (predicate)`
         partial form; `DEFERRABLE` / `INITIALLY DEFERRED` (jed has no deferred-constraint machinery yet —
         its own axis); `EXCLUDE USING btree (a WITH =)` lowering an all-`=` exclude onto an ordered unique

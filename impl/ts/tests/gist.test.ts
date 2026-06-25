@@ -157,3 +157,152 @@ test("scalar gist whole-image roundtrip persists the R-tree", () => {
     ["9"],
   ]);
 });
+
+// ---- GX3: EXCLUDE constraints (spec/design/gist.md §7) -----------------------------------------
+
+function bookingDb(): Database {
+  return dbWith([
+    "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, " +
+      "EXCLUDE USING gist (room WITH =, during WITH &&))",
+  ]);
+}
+
+// The canonical no-double-booking constraint — no two rows may share a room AND have overlapping
+// during. Needs the scalar `=` opclass (room) + range_ops (during).
+test("exclude rejects conflict, admits compatible", () => {
+  const db = bookingDb();
+  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)')");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO booking VALUES (2, 101, '[15,25)')")),
+    "23P01",
+  );
+  execute(db, "INSERT INTO booking VALUES (2, 101, '[20,30)')"); // same room, no overlap → ok
+  execute(db, "INSERT INTO booking VALUES (3, 102, '[10,20)')"); // diff room, overlap → ok
+  assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), [["1"], ["2"], ["3"]]);
+});
+
+// A NULL excluded column (the NULL rule) or an empty range (empty && anything is FALSE) exempts a row.
+test("exclude null and empty range are exempt", () => {
+  const db = bookingDb();
+  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)')");
+  execute(db, "INSERT INTO booking VALUES (2, NULL, '[10,20)')"); // NULL room → exempt
+  execute(db, "INSERT INTO booking VALUES (3, NULL, '[10,20)')");
+  execute(db, "INSERT INTO booking VALUES (4, 101, 'empty')"); // empty range → exempt
+  execute(db, "INSERT INTO booking VALUES (5, 101, 'empty')");
+  assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), [
+    ["1"],
+    ["2"],
+    ["3"],
+    ["4"],
+    ["5"],
+  ]);
+});
+
+// Two rows in the SAME insert batch that conflict with each other → 23P01, nothing written.
+test("exclude in-batch insert conflict", () => {
+  const db = bookingDb();
+  assert.equal(
+    errCode(() =>
+      execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[15,25)')"),
+    ),
+    "23P01",
+  );
+  assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), []);
+});
+
+// A swap of rooms succeeds (the per-row transient collides but the END STATE is conflict-free); a
+// genuine conflict traps 23P01.
+test("exclude update end-state swap succeeds", () => {
+  const db = bookingDb();
+  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)')");
+  execute(db, "INSERT INTO booking VALUES (2, 102, '[10,20)')");
+  execute(db, "UPDATE booking SET room = CASE WHEN room = 101 THEN 102 ELSE 101 END");
+  assert.deepEqual(query(db, "SELECT id FROM booking WHERE room = 102 ORDER BY id"), [["1"]]);
+  // After the swap row1=(102,[10,20)), row2=(101,[10,20)); moving row1 back to 101 collides w/ row2.
+  assert.equal(
+    errCode(() => execute(db, "UPDATE booking SET room = 101 WHERE id = 1")),
+    "23P01",
+  );
+});
+
+// A single-column range exclusion needs only GX1.
+test("single-column range exclude", () => {
+  const db = dbWith([
+    "CREATE TABLE rsv (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))",
+  ]);
+  execute(db, "INSERT INTO rsv VALUES (1, '[1,5)')");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO rsv VALUES (2, '[3,8)')")),
+    "23P01",
+  );
+  execute(db, "INSERT INTO rsv VALUES (2, '[5,10)')"); // adjacent, not overlapping → ok
+  assert.deepEqual(query(db, "SELECT id FROM rsv ORDER BY id"), [["1"], ["2"]]);
+});
+
+// The WITH operator must pair with the column's GiST opclass.
+test("exclude type errors", () => {
+  const db = dbWith(["CREATE TABLE z (id i32 PRIMARY KEY)"]);
+  assert.equal(
+    errCode(() =>
+      execute(db, "CREATE TABLE a (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH &&))"),
+    ),
+    "42704",
+  );
+  assert.equal(
+    errCode(() =>
+      execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, s text, EXCLUDE USING gist (s WITH =))"),
+    ),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() =>
+      execute(db, "CREATE TABLE c (id i32 PRIMARY KEY, f f64, EXCLUDE USING gist (f WITH =))"),
+    ),
+    "42704",
+  );
+  assert.equal(
+    errCode(() =>
+      execute(db, "CREATE TABLE d (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH <))"),
+    ),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() =>
+      execute(
+        db,
+        "CREATE TEMP TABLE e (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))",
+      ),
+    ),
+    "0A000",
+  );
+});
+
+// The backing GiST index is owned by the constraint → 2BP01.
+test("exclude backing index cannot be dropped", () => {
+  const db = bookingDb();
+  assert.equal(
+    errCode(() => execute(db, "DROP INDEX booking_room_during_excl")),
+    "2BP01",
+  );
+});
+
+// The backing multi-column GiST index persists (v21) and reloads, still enforcing the conjunction.
+test("exclude whole-image roundtrip persists the constraint", () => {
+  const db = dbWith([
+    "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, " +
+      "EXCLUDE USING gist (room WITH =, during WITH &&))",
+    "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), (3, 102, '[10,20)')",
+  ]);
+  const loaded = loadDatabase(toImage(db, 256, 1n));
+  assert.equal(
+    errCode(() => execute(loaded, "INSERT INTO booking VALUES (4, 101, '[15,25)')")),
+    "23P01",
+  );
+  execute(loaded, "INSERT INTO booking VALUES (4, 103, '[10,20)')");
+  assert.deepEqual(query(loaded, "SELECT id FROM booking ORDER BY id"), [
+    ["1"],
+    ["2"],
+    ["3"],
+    ["4"],
+  ]);
+});

@@ -258,6 +258,27 @@ function gistScalarTableDB(): Database {
   return db;
 }
 
+// gistExcludeTableDB has an EXCLUDE constraint (v21 — spec/design/gist.md §7/§8, GX3): pins the
+// per-table exclusion catalog list (name + backing index name + the (column, operator) element
+// vector) AND a MULTI-COLUMN GiST index whose leaf bound is a scalar [min,max] room component
+// concatenated with a range during component. 7 indexed rows force a median split at GIST_FANOUT = 4.
+// Row 8's NULL room is exempt (not indexed). Mirrors the Ruby reference GIST_EXCLUDE_TABLE.
+function gistExcludeTableDB(): Database {
+  const db = goldenDb();
+  run(
+    db,
+    "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, " +
+      "EXCLUDE USING gist (room WITH =, during WITH &&))",
+  );
+  run(
+    db,
+    "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), " +
+      "(3, 102, '[10,20)'), (4, 102, '[30,40)'), (5, 103, '[10,20)'), " +
+      "(6, 104, '[50,60)'), (7, 105, '[1,5)'), (8, NULL, '[10,20)')",
+  );
+  return db;
+}
+
 // ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
 // golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
@@ -831,6 +852,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "range_pk_table.jed", build: rangePkTableDB },
     { name: "gist_range_table.jed", build: gistRangeTableDB },
     { name: "gist_scalar_table.jed", build: gistScalarTableDB },
+    { name: "gist_exclude_table.jed", build: gistExcludeTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
     { name: "json_table.jed", build: jsonTableDB },
@@ -894,6 +916,7 @@ test("read goldens reproduces rows", () => {
     { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },
     { name: "gist_range_table.jed", build: gistRangeTableDB, table: "t" },
     { name: "gist_scalar_table.jed", build: gistScalarTableDB, table: "t" },
+    { name: "gist_exclude_table.jed", build: gistExcludeTableDB, table: "booking" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
     { name: "json_table.jed", build: jsonTableDB, table: "t" },

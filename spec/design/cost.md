@@ -449,7 +449,11 @@ the GiST `=` block fires only when a GiST index is the column's only index. A **
 PK → ordered index → GiST → GIN; the phase-2 writes + index maintenance are unmetered). The
 in-memory tree rebuild after each mutating statement is unmetered structure maintenance on the
 (trusted) write path — the untrusted SELECT-only surface never triggers it (gist.md §4.1, CLAUDE.md
-§13). **DDL cost:** `CREATE INDEX … USING gist` charges its build scan (`page_read` × the table node
+§13). The **`EXCLUDE`-constraint conjunction probe** (gist.md §7, GX3) likewise runs on the
+(trusted) write path inside the two-phase INSERT/UPDATE pass and is **unmetered** — like the
+UNIQUE/FK duplicate-and-existence probes (the descent over the backing multi-column tree, the leaf
+recheck, and the in-batch pairwise check accrue no cost), since a write is not the untrusted
+surface. **DDL cost:** `CREATE INDEX … USING gist` charges its build scan (`page_read` × the table node
 count + `storage_row_read` per row + the bounding-key work); an empty table charges 0, `DROP INDEX`
 charges 0.
 

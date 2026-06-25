@@ -139,6 +139,41 @@ pub struct ForeignKeyConstraint {
     pub on_update: FkAction,
 }
 
+/// One element's operator in an `EXCLUDE` constraint (spec/design/gist.md §7) — the `WITH` operator
+/// of a `(column WITH op)` pair. `Overlaps` is `&&` (a range column, `range_ops`); `Equal` is `=` (a
+/// fixed-width keyable scalar, the in-core `btree_gist`). Both are **symmetric**, the property an
+/// exclusion operator must have. Persisted as the v21 per-element strategy byte (format.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExclusionOp {
+    /// `&&` — range overlap.
+    Overlaps,
+    /// `=` — scalar equality.
+    Equal,
+}
+
+/// One `(column, operator)` element of an `EXCLUDE` constraint — a member column ordinal into the
+/// owning table and its `WITH` operator. The element order matches the backing GiST index's column
+/// order (spec/design/gist.md §7/§8).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExclusionElement {
+    pub column: usize,
+    pub op: ExclusionOp,
+}
+
+/// One `EXCLUDE` constraint (spec/design/gist.md §7): its (relation-namespace) name, the backing
+/// **GiST** index that enforces it (by name — the constraint *is* its index, the UNIQUE-is-its-index
+/// model generalized from a single implicit `=` to an explicit operator list), and the
+/// `(column, operator)` element vector the conjunction probe needs. Held in ascending
+/// lowercased-name order on the table (the catalog's on-disk order). The NULL rule (§7) is enforced
+/// at probe time: a row with a NULL in any excluded column never conflicts.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExclusionConstraint {
+    pub name: String,
+    /// The backing GiST index's name (equal to `name` for a GX3 constraint — it owns the index).
+    pub index: String,
+    pub elements: Vec<ExclusionElement>,
+}
+
 /// A user-defined **composite (row) type** (spec/design/composite.md): a named, ordered list of
 /// typed fields, living in the database's type catalog (a database-level object, not per-table).
 /// Created by `CREATE TYPE name AS (field type, …)`, referenced by name from a column's `Type`.
@@ -283,6 +318,10 @@ pub struct Table {
     /// on-disk order and the child-side evaluation order — spec/design/constraints.md §6.9).
     /// Empty for a table with none.
     pub foreign_keys: Vec<ForeignKeyConstraint>,
+    /// The table's `EXCLUDE` constraints in **ascending lowercased-name order** (the catalog's
+    /// on-disk order — spec/design/gist.md §7/§8). Each is backed by a GiST index in `indexes`.
+    /// Empty for a table with none.
+    pub exclusions: Vec<ExclusionConstraint>,
 }
 
 /// A fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar, or a

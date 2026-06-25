@@ -332,6 +332,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	var checks []CheckDef
 	var uniques []UniqueDef
 	var foreignKeys []ForeignKeyDef
+	var excludes []ExcludeDef
 	for {
 		if p.peekKeyword() == "primary" && p.peekKeywordAt(1) == "key" {
 			p.advance()
@@ -359,6 +360,12 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 				return nil, err
 			}
 			foreignKeys = append(foreignKeys, fk)
+		} else if p.atExclusionTableConstraint() {
+			ex, err := p.parseExclusionTableConstraint()
+			if err != nil {
+				return nil, err
+			}
+			excludes = append(excludes, ex)
 		} else {
 			col, err := p.parseColumnDef(name, &checks, &uniques, &foreignKeys)
 			if err != nil {
@@ -378,7 +385,73 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if len(columns) == 0 {
 		return nil, NewError(SyntaxError, "a table must have at least one column")
 	}
-	return &CreateTable{Name: name, Temp: temp, Shared: shared, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys}, nil
+	return &CreateTable{Name: name, Temp: temp, Shared: shared, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
+}
+
+// atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:
+// the keyword EXCLUDE (followed by USING or `(`), or CONSTRAINT <ident> EXCLUDE
+// (spec/design/gist.md §7). The keyword stays non-reserved — a column named "exclude" is followed
+// by a type name (an identifier), never USING or `(`, so the lookahead loses nothing.
+func (p *Parser) atExclusionTableConstraint() bool {
+	if p.peekKeyword() == "exclude" && (p.peekKeywordAt(1) == "using" || p.peekKindAt(1) == TokLParen) {
+		return true
+	}
+	return p.peekKeyword() == "constraint" && p.peekKeywordAt(2) == "exclude"
+}
+
+// parseExclusionTableConstraint parses one `[CONSTRAINT name] EXCLUDE [USING method] ( col WITH op
+// [, col2 WITH op2 ...] )` (the cursor is verified by atExclusionTableConstraint). Each operand is a
+// bare column name; the WITH operator is captured as its source text (= / &&) and mapped to a
+// strategy at execution (spec/design/gist.md §7). The USING method (only gist) is captured verbatim.
+func (p *Parser) parseExclusionTableConstraint() (ExcludeDef, error) {
+	var name string
+	if p.peekKeyword() == "constraint" {
+		p.advance()
+		n, err := p.expectIdentifier()
+		if err != nil {
+			return ExcludeDef{}, err
+		}
+		name = n
+	}
+	if err := p.expectKeyword("exclude"); err != nil {
+		return ExcludeDef{}, err
+	}
+	var using string
+	if p.peekKeyword() == "using" {
+		p.advance()
+		u, err := p.expectIdentifier()
+		if err != nil {
+			return ExcludeDef{}, err
+		}
+		using = u
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return ExcludeDef{}, err
+	}
+	var elements []ExcludeElementDef
+	for {
+		col, err := p.expectIdentifier()
+		if err != nil {
+			return ExcludeDef{}, err
+		}
+		if err := p.expectKeyword("with"); err != nil {
+			return ExcludeDef{}, err
+		}
+		// The operator is a single token (= / &&); render it to source text for execution.
+		start := p.pos
+		p.advance()
+		op := renderTokens(p.tokens[start:p.pos])
+		elements = append(elements, ExcludeElementDef{Column: col, Op: op})
+		switch p.advance().Kind {
+		case TokComma:
+			continue
+		case TokRParen:
+		default:
+			return ExcludeDef{}, NewError(SyntaxError, "expected ',' or ')'")
+		}
+		break
+	}
+	return ExcludeDef{Name: name, Using: using, Elements: elements}, nil
 }
 
 // atForeignKeyTableConstraint reports whether the cursor sits on a table-level FOREIGN KEY
