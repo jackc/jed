@@ -249,6 +249,8 @@ var SupportedCapabilities = []string{
 	// Ordered-set aggregates mode() / percentile_cont(f) / percentile_disc(f) WITHIN GROUP
 	// (ORDER BY col) (spec/design/aggregates.md §13, grammar.md §17).
 	"query.ordered_set_aggregate",
+	// A general-expression WITHIN GROUP order key (ORDER BY a + b), not just a bare column.
+	"query.within_group_expr",
 	// Window functions (OVER) — the window stage + row_number() (spec/design/window.md, S0). A
 	// window-only function without OVER is 42809; a window function in WHERE/HAVING is 42P20.
 	"query.window",

@@ -355,18 +355,22 @@ so the sort key is written explicitly as a `WITHIN GROUP (ORDER BY …)` clause 
 | `percentile_disc(fraction)` | `f64` fraction | any sortable | the input type | the **discrete** percentile (an actual input value) |
 
 **Syntax** ([grammar.md](grammar.md) §17). `agg ( direct_args ) WITHIN GROUP ( ORDER BY sort_key )`,
-where `sort_key` is a single bare/qualified **column** with the ordinary `ASC`/`DESC` /
-`NULLS FIRST|LAST` suffix (the same column-only narrowing as the query `ORDER BY`, §10 — a general
-expression sort key is the deferred follow-on). The `WITHIN GROUP` clause comes between the argument
-list and any `FILTER (WHERE …)` / `OVER (…)`. **Exactly one** sort key is allowed for all three (PG:
-a second key produces *"function mode(…, …) does not exist"*); a second column → **`42883`**.
+where `sort_key` is a single key — a bare/qualified **column** *or* a general **expression**
+(`ORDER BY a + b`, `ORDER BY abs(x)`) — with the ordinary `ASC`/`DESC` / `NULLS FIRST|LAST` suffix
+(`query.within_group_expr`, the same general-expression key as the query `ORDER BY`, §10: a column key
+stays a leaf, any other expression is evaluated per row and the values are sorted). One PG divergence
+from the query `ORDER BY`: a bare **integer** here is a **constant** (every row sorts equal), *not* an
+ordinal — PostgreSQL treats a `WITHIN GROUP` integer as a constant. The `WITHIN GROUP` clause comes
+between the argument list and any `FILTER (WHERE …)` / `OVER (…)`. **Exactly one** sort key is allowed
+for all three (PG: a second key produces *"function mode(…, …) does not exist"*); a second key →
+**`42883`**. An **aggregate** nested in the order key is **`42803`** (aggregates cannot be nested).
 
 **The direct argument vs. the aggregated argument.** A `percentile_*` call has **two** argument
 lists. The parenthesized **direct argument** (the fraction) is a per-group **constant**, evaluated
 **once** — jed resolves it in an empty (no-column) scope and folds it to an `f64` at plan time (a
 column reference in the direct argument is the deferred non-constant form). The **aggregated
-argument** is the `WITHIN GROUP` `ORDER BY` column, evaluated **per row** (it is the aggregate's
-operand). `mode()` has no direct argument.
+argument** is the `WITHIN GROUP` `ORDER BY` key — a column or a general expression — evaluated **per
+row** (it is the aggregate's operand). `mode()` has no direct argument.
 
 **NULL handling.** NULL aggregated values are **skipped**, exactly as for the §7 aggregates: a group
 whose every input is NULL (or that is empty) yields **`NULL`** for all three. A **NULL fraction**

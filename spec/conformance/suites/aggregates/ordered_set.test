@@ -1,6 +1,7 @@
 # Ordered-set aggregates: mode() / percentile_cont(f) / percentile_disc(f) WITHIN GROUP (ORDER BY
-# col) (spec/design/aggregates.md §13). The result is defined by the rows sorted by the WITHIN GROUP
-# order key (one bare/qualified column, ASC/DESC/NULLS — the column-only query-ORDER-BY narrowing).
+# key) (spec/design/aggregates.md §13). The result is defined by the rows sorted by the WITHIN GROUP
+# order key (one key — a column OR a general expression `a + b` / `abs(x)` evaluated per row, ASC/DESC/
+# NULLS; a bare integer is a constant, not an ordinal — query.within_group_expr).
 # mode() -> the most frequent value (tie broken by sort order), result the input type.
 # percentile_cont(f) -> the continuous (interpolated) percentile, ALWAYS f64, numeric input only:
 # pos = f*(N-1); result = val[floor(pos)] + (pos-floor(pos))*(val[ceil(pos)]-val[floor(pos)]) in f64,
@@ -10,7 +11,7 @@
 # check). NULL aggregated values skipped; empty/all-NULL group -> NULL. Composes with GROUP BY /
 # HAVING / FILTER. DISTINCT -> 42601; OVER -> 0A000 (PG matches); a second order key, WITHIN GROUP on
 # a non-ordered-set function, or an ordered-set aggregate with no WITHIN GROUP -> 42883.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.ordered_set_aggregate, query.aggregate_filter, types.i32, types.decimal, types.text, types.f64, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.ordered_set_aggregate, query.within_group_expr, query.aggregate_filter, types.i32, types.decimal, types.text, types.f64, resource.cost_metering
 
 statement ok
 CREATE TABLE osa (id i32 PRIMARY KEY, g i32, v decimal, t text)
@@ -181,6 +182,60 @@ SELECT mode() WITHIN GROUP (ORDER BY v) FROM osa
 ----
 5
 
+# === general-expression WITHIN GROUP order key (query.within_group_expr) =====
+# The order key may be any expression evaluated per row, not just a bare column (matching the query
+# ORDER BY general-expression key). The fold/finalize are unchanged — they sort the computed values.
+
+# --- percentile_cont over v + g (g=1: 11,21,31,41) -> cont(0.5) = 26 ---
+# names: percentile_cont
+query R nosort
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v + g) FROM osa WHERE g = 1
+----
+26
+
+# --- percentile_disc over v * 2 (g=1: 20,40,60,80) -> ceil(0.5*4)=2 -> 40, input (decimal) type ---
+# names: percentile_disc
+query D nosort
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY v * 2) FROM osa WHERE g = 1
+----
+40
+
+# --- percentile_cont over id * 10 (g=1: 10,20,30,40) -> 25 ---
+# names: percentile_cont
+query R nosort
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id * 10) FROM osa WHERE g = 1
+----
+25
+
+# --- mode() over abs(v - 25) (g=1: 15,5,5,15) -> tie {5,15} broken by sort order -> 5 ---
+# names: mode
+query D nosort
+SELECT mode() WITHIN GROUP (ORDER BY abs(v - 25)) FROM osa WHERE g = 1
+----
+5
+
+# --- a bare integer in WITHIN GROUP is a CONSTANT, not an ordinal (PG divergence from a query
+# ORDER BY): every row sorts equal, percentile_disc(0.5) returns that constant. Result is i64. ---
+# names: percentile_disc
+query I nosort
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY 1) FROM osa WHERE g = 1
+----
+1
+
+# --- composes with GROUP BY: one expression-keyed value per group (v + g) ---
+# g=1 (11,21,31,41) disc(0.5)=21; g=2 (12,32) disc(0.5)=12; g=3 (8,8,10) disc(0.5)=8
+# names: g, pd
+query ID nosort
+SELECT g, percentile_disc(0.5) WITHIN GROUP (ORDER BY v + g) AS pd
+FROM osa WHERE g < 4 GROUP BY g ORDER BY g
+----
+1
+21
+2
+12
+3
+8
+
 # === error cases (all match PostgreSQL) =====================================
 
 # A fraction outside [0,1] is 22003 (per group at finalize, before the empty check).
@@ -209,3 +264,7 @@ SELECT mode() WITHIN GROUP (ORDER BY v, t) FROM osa
 # OVER on an ordered-set aggregate is 0A000 (PostgreSQL matches).
 statement error 0A000
 SELECT mode() WITHIN GROUP (ORDER BY v) OVER () FROM osa
+
+# An aggregate inside the WITHIN GROUP expression key is 42803 (aggregates cannot be nested).
+statement error 42803
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY sum(v)) FROM osa

@@ -18094,10 +18094,14 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 	if key.Collation != "" {
 		return nil, resolvedType{}, NewError(FeatureNotSupported, "COLLATE in a WITHIN GROUP ORDER BY is not supported")
 	}
-	// The aggregated argument: the sort-key column, resolved per row with aggregates FORBIDDEN (a
-	// nested aggregate in the order key is 42803, matching PG).
+	// The aggregated argument: the WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN
+	// (a nested aggregate in the order key is 42803, matching PG). A general-expression key
+	// (`ORDER BY a + b`) carries Expr; a bare/qualified column key carries Column (rebuilt here as an
+	// Expr so both paths share one resolve).
 	var keyExpr Expr
-	if key.Qualifier != "" {
+	if key.Expr != nil {
+		keyExpr = *key.Expr
+	} else if key.Qualifier != "" {
 		keyExpr = Expr{Kind: ExprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
 	} else {
 		keyExpr = Expr{Kind: ExprColumn, Column: key.Column}

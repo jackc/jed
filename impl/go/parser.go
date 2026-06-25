@@ -3222,7 +3222,7 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		if err != nil {
 			return err
 		}
-		sel.OrderBy = append(sel.OrderBy, classifyOrderKey(expr, collation, descending, nullsFirst))
+		sel.OrderBy = append(sel.OrderBy, classifyOrderKey(expr, collation, descending, nullsFirst, true))
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue
@@ -3232,16 +3232,18 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 	return nil
 }
 
-// classifyOrderKey classifies a parsed query/set-operation ORDER BY key expression into one of the
-// three OrderKey modes (grammar.md §10), matching PostgreSQL's rule that only a bare integer constant
-// is an ordinal: an integer literal (positive, or negative via the parser's unary-minus-on-literal
-// fold) is an ordinal; a bare column reference — directly, or wrapped in a COLLATE that parseExpr
-// absorbed (`ORDER BY name COLLATE "x"`) — is a column key carrying that collation, so it stays on the
-// fast path (PK-scan elision, per-column collation); every other shape is a general expression key.
-func classifyOrderKey(expr Expr, collation string, descending, nullsFirst bool) OrderKey {
+// classifyOrderKey classifies a parsed ORDER BY key expression into one of the three OrderKey modes
+// (grammar.md §10). allowOrdinal matches PostgreSQL's rule that only a bare integer constant is an
+// ordinal — and only in a query/set-operation ORDER BY: when set, an integer literal (positive, or
+// negative via the parser's unary-minus-on-literal fold) is an ordinal; when clear (WITHIN GROUP), the
+// same bare integer falls through to a constant expression key. A bare column reference — directly, or
+// wrapped in a COLLATE that parseExpr absorbed (`ORDER BY name COLLATE "x"`) — is a column key carrying
+// that collation, so it stays on the fast path (PK-scan elision, per-column collation); every other
+// shape is a general expression key.
+func classifyOrderKey(expr Expr, collation string, descending, nullsFirst, allowOrdinal bool) OrderKey {
 	switch expr.Kind {
 	case ExprLiteral:
-		if expr.Literal != nil && expr.Literal.Kind == LiteralInt {
+		if allowOrdinal && expr.Literal != nil && expr.Literal.Kind == LiteralInt {
 			ord := expr.Literal.Int
 			return OrderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 		}
@@ -4603,8 +4605,9 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	// A trailing WITHIN GROUP (ORDER BY <key>) marks an ordered-set aggregate (mode /
 	// percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list and
 	// any FILTER / OVER (PG order). WITHIN/GROUP are not reserved; right after the call's `)` they are
-	// always the clause. The order key reuses the column-only query ORDER BY; the resolver enforces
-	// exactly one key (42883) and the per-name rules.
+	// always the clause. The order key is a general expression (`ORDER BY a + b`) classified with
+	// allowOrdinal OFF, so a bare integer is a constant (not an ordinal), matching PostgreSQL; the
+	// resolver enforces exactly one key (42883) and the per-name rules.
 	if p.peekKeyword() == "within" {
 		p.advance()
 		if err := p.expectKeyword("group"); err != nil {
@@ -4622,7 +4625,7 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 		}
 		keys := []OrderKey{}
 		for {
-			qualifier, col, err := p.parseColumnRef()
+			expr, err := p.parseExpr()
 			if err != nil {
 				return Expr{}, err
 			}
@@ -4630,7 +4633,7 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 			if err != nil {
 				return Expr{}, err
 			}
-			keys = append(keys, OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
+			keys = append(keys, classifyOrderKey(expr, collation, descending, nullsFirst, false))
 			if p.peek().Kind == TokComma {
 				p.advance()
 				continue

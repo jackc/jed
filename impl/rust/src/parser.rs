@@ -2669,14 +2669,14 @@ impl Parser {
     /// DESC → first). A bare `NULLS` not followed by `FIRST`/`LAST` is a syntax error (42601). Returns
     /// an empty vec when there is no ORDER BY.
     ///
-    /// When `allow_expr` is set (the query and set-operation ORDER BY) each key is parsed as a **general
-    /// expression** and classified into one of the three `OrderKey` modes (grammar.md §10): a bare
-    /// integer literal (the unary-minus fold makes `-1` one negative `Int`) is an **ordinal**; a bare
-    /// (optionally `COLLATE`-wrapped) column reference is a **column key** (kept on the fast path so
-    /// PK-scan elision + the column's collation still apply); anything else is a general **expression
-    /// key**. WITHIN GROUP passes `false`, staying column-only — a bare integer there is a (missing)
-    /// column ref → 42601, matching PostgreSQL where a WITHIN GROUP integer is a constant, not an ordinal.
-    fn parse_order_by(&mut self, allow_expr: bool) -> Result<Vec<OrderKey>> {
+    /// Each key is parsed as a **general expression** and classified into one of the three `OrderKey`
+    /// modes (grammar.md §10): a bare (optionally `COLLATE`-wrapped) column reference is a **column key**
+    /// (kept on the fast path so PK-scan elision + the column's collation still apply); anything else is
+    /// a general **expression key**. `allow_ordinal` governs the bare-integer case: when set (the query
+    /// and set-operation ORDER BY) a bare integer literal (the unary-minus fold makes `-1` one negative
+    /// `Int`) is an **ordinal**; when clear (WITHIN GROUP) a bare integer is just a constant expression
+    /// key, matching PostgreSQL where a WITHIN GROUP integer is a constant, not an ordinal.
+    fn parse_order_by(&mut self, allow_ordinal: bool) -> Result<Vec<OrderKey>> {
         let mut keys = Vec::new();
         if self.peek_keyword().as_deref() != Some("order") {
             return Ok(keys);
@@ -2684,23 +2684,10 @@ impl Parser {
         self.advance();
         self.expect_keyword("by")?;
         loop {
-            let key = if allow_expr {
-                let expr = self.parse_expr()?;
-                let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
-                Self::classify_order_key(expr, collation, descending, nulls_first)
-            } else {
-                let (qualifier, column) = self.parse_column_ref()?;
-                let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
-                OrderKey {
-                    ordinal: None,
-                    expr: None,
-                    qualifier,
-                    column,
-                    collation,
-                    descending,
-                    nulls_first,
-                }
-            };
+            let expr = self.parse_expr()?;
+            let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
+            let key =
+                Self::classify_order_key(expr, collation, descending, nulls_first, allow_ordinal);
             keys.push(key);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -2711,10 +2698,12 @@ impl Parser {
         Ok(keys)
     }
 
-    /// Classify a parsed query/set-operation ORDER BY key expression into one of the three `OrderKey`
-    /// modes (grammar.md §10), matching PostgreSQL's rule that only a **bare integer constant** is an
-    /// ordinal: a `Literal::Int` (positive, or negative via the parser's unary-minus-on-literal fold) is
-    /// an **ordinal**; a bare column reference — directly, or wrapped in a `COLLATE` that `parse_expr`
+    /// Classify a parsed ORDER BY key expression into one of the three `OrderKey` modes (grammar.md §10).
+    /// `allow_ordinal` matches PostgreSQL's rule that only a **bare integer constant** is an ordinal — and
+    /// only in a query/set-operation ORDER BY: when set, a `Literal::Int` (positive, or negative via the
+    /// parser's unary-minus-on-literal fold) is an **ordinal**; when clear (WITHIN GROUP), the same bare
+    /// integer falls through to a constant **expression key**. A bare column reference — directly, or
+    /// wrapped in a `COLLATE` that `parse_expr`
     /// absorbed (`ORDER BY name COLLATE "x"`) — is a **column key** carrying that collation, so it stays
     /// on the fast path (PK-scan elision, per-column collation); every other shape (`a + 1`, `1 + 1`,
     /// `abs(b)`, a COLLATE over a compound) is a general **expression key**.
@@ -2723,6 +2712,7 @@ impl Parser {
         collation: Option<String>,
         descending: bool,
         nulls_first: bool,
+        allow_ordinal: bool,
     ) -> OrderKey {
         let mk = |ordinal, expr, qualifier, column, collation| OrderKey {
             ordinal,
@@ -2734,7 +2724,9 @@ impl Parser {
             nulls_first,
         };
         match expr {
-            Expr::Literal(Literal::Int(n)) => mk(Some(n), None, None, String::new(), collation),
+            Expr::Literal(Literal::Int(n)) if allow_ordinal => {
+                mk(Some(n), None, None, String::new(), collation)
+            }
             Expr::Column(name) => mk(None, None, None, name, collation),
             Expr::QualifiedColumn { qualifier, name } => {
                 mk(None, None, Some(qualifier), name, collation)
@@ -4017,10 +4009,9 @@ impl Parser {
         // percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list
         // and any FILTER / OVER (PG order). `WITHIN`/`GROUP` are not reserved; right after the call's
         // `)` they are always the clause. The order key reuses `parse_order_by` with `allow_ordinal`
-        // OFF — column-only, so a bare integer here is a (missing) column ref → 42601, matching
-        // PostgreSQL where a WITHIN GROUP integer is a constant, not an ordinal; the resolver enforces
-        // exactly one key
-        // (42883) and the per-name rules.
+        // OFF — a general expression (`ORDER BY a + b`) but with a bare integer treated as a constant
+        // (not an ordinal), matching PostgreSQL; the resolver enforces exactly one key (42883) and the
+        // per-name rules.
         let within_group = if self.peek_keyword().as_deref() == Some("within") {
             self.advance();
             self.expect_keyword("group")?;

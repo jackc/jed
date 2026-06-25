@@ -807,13 +807,17 @@ and any `FILTER` / `OVER`. The parenthesized argument list is the per-group **di
 (the percentile fraction; empty for `mode`); the `WITHIN GROUP` order key is the **aggregated**
 argument (the value sorted over). Parser rules, byte-identical across the three cores:
 
-1. **One column-only sort key.** `WITHIN GROUP`'s `sort_key` is a single bare/qualified
-   `column_ref` with the ordinary `ASC`/`DESC` / `NULLS FIRST|LAST` suffix — the same column-only
-   narrowing as the query `ORDER BY` (§10). The clause carries a `Some(sort_key)` onto the
-   `FuncCall` node (an ordinary call carries `None` and parses byte-identically to before); the
-   one-key restriction, the per-name validity, and every error below are resolve-time concerns
-   driven by [aggregates.md](aggregates.md) §13. `WITHIN`/`GROUP` are recognized positionally,
-   right after the call's `)`, so they stay non-reserved.
+1. **One sort key — column or general expression.** `WITHIN GROUP`'s `sort_key` is a single key
+   parsed as a general expression with the ordinary `ASC`/`DESC` / `NULLS FIRST|LAST` suffix — the
+   same general-expression key as the query `ORDER BY` (§10, `query.within_group_expr`): a
+   bare/qualified column stays a column key (a leaf), any other expression (`a + b`, `abs(x)`) is the
+   aggregate's per-row operand. The one PG divergence from the query `ORDER BY` is the bare-integer
+   case: there an integer is an **ordinal**, but in `WITHIN GROUP` it is a **constant** expression
+   (PostgreSQL), so `WITHIN GROUP (ORDER BY 1)` sorts every row equal rather than by output column 1.
+   The clause carries a `Some(sort_key)` onto the `FuncCall` node (an ordinary call carries `None` and
+   parses byte-identically to before); the one-key restriction, the per-name validity, and every error
+   below are resolve-time concerns driven by [aggregates.md](aggregates.md) §13. `WITHIN`/`GROUP` are
+   recognized positionally, right after the call's `)`, so they stay non-reserved.
 2. **Resolve-time meaning.** A second sort key, `WITHIN GROUP` on a non-ordered-set function, and
    an ordered-set aggregate **without** `WITHIN GROUP` are all **`42883`**; `OVER` on an
    ordered-set aggregate is **`0A000`**; an out-of-range percentile fraction is **`22003`**; an

@@ -14411,12 +14411,16 @@ function resolveOrderedSetAggregate(
       "COLLATE in a WITHIN GROUP ORDER BY is not supported",
     );
   }
-  // The aggregated argument: the sort-key column, resolved per row with aggregates FORBIDDEN (a
-  // nested aggregate in the order key is 42803, matching PG).
+  // The aggregated argument: the WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN (a
+  // nested aggregate in the order key is 42803, matching PG). A general-expression key (`ORDER BY a + b`)
+  // carries expr; a bare/qualified column key carries column (rebuilt here as an Expr so both paths
+  // share one resolve).
   const keyExpr: Expr =
-    key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
-      ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column }
-      : { kind: "column", name: key.column };
+    key.expr !== null && key.expr !== undefined
+      ? key.expr
+      : key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
+        ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column }
+        : { kind: "column", name: key.column };
   const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
   const r = resolve(scope, keyExpr, null, sub, params);
   const operand = r.node;

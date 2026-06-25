@@ -341,6 +341,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Ordered-set aggregates mode() / percentile_cont(f) / percentile_disc(f) WITHIN GROUP
   // (ORDER BY col) (spec/design/aggregates.md §13, grammar.md §17).
   "query.ordered_set_aggregate",
+  // A general-expression WITHIN GROUP order key (ORDER BY a + b), not just a bare column.
+  "query.within_group_expr",
   // Window functions — OVER (PARTITION BY / ORDER BY), the window stage, row_number() (S0,
   // spec/design/window.md).
   "query.window",

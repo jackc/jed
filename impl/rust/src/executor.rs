@@ -19323,17 +19323,24 @@ fn resolve_ordered_set_aggregate(
             "COLLATE in a WITHIN GROUP ORDER BY is not supported",
         ));
     }
-    // The aggregated argument: the sort-key column, resolved per row with aggregates FORBIDDEN
-    // (a nested aggregate in the order key is 42803, matching PG).
-    let key_expr = match &key.qualifier {
-        Some(q) => Expr::QualifiedColumn {
-            qualifier: q.clone(),
-            name: key.column.clone(),
-        },
-        None => Expr::Column(key.column.clone()),
-    };
+    // The aggregated argument: the WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN
+    // (a nested aggregate in the order key is 42803, matching PG). A general-expression key
+    // (`ORDER BY a + b`) carries a resolved `expr`; a bare/qualified column key carries `column`
+    // (rebuilt here as an `Expr` so both paths share one resolve).
     let mut sub = AggCtx::Forbidden;
-    let (operand, optype) = resolve(scope, &key_expr, None, &mut sub, params)?;
+    let (operand, optype) = match &key.expr {
+        Some(e) => resolve(scope, e, None, &mut sub, params)?,
+        None => {
+            let key_expr = match &key.qualifier {
+                Some(q) => Expr::QualifiedColumn {
+                    qualifier: q.clone(),
+                    name: key.column.clone(),
+                },
+                None => Expr::Column(key.column.clone()),
+            };
+            resolve(scope, &key_expr, None, &mut sub, params)?
+        }
+    };
 
     let lname = name.to_ascii_lowercase();
     let (plan, frac, result) = match lname.as_str() {

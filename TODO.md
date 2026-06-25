@@ -115,11 +115,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         the PK-scan fast path, a computed item is materialized. Binds only a whole bare-name key
         (`ORDER BY s + 1` → `42703`); same-name items with different exprs are `42702`
         (`query.order_by_alias`). → [grammar.md §10](spec/design/grammar.md)
+  - [x] **General-expression `WITHIN GROUP` order key** (`percentile_cont(0.5) WITHIN GROUP (ORDER BY
+        a + b)`, `mode() WITHIN GROUP (ORDER BY abs(x))`) — the ordered-set-aggregate order key may be
+        any expression, evaluated per row and sorted by the computed value (`query.within_group_expr`).
+        A bare integer there is a **constant**, not an ordinal (PG divergence from the query `ORDER
+        BY`); a nested aggregate is `42803`. → [aggregates.md §13](spec/design/aggregates.md)
   - [ ] _follow-on:_ a window function / `GROUPING()` inside a key, an expression key in a
-        grouped+window query, and a correlated key (each `0A000`); the general-expression
-        `WITHIN GROUP` order key. _(An expression key in a **set-operation** `ORDER BY` is **not**
-        a follow-on: PostgreSQL itself rejects it with `0A000`, and jed already matches that code +
-        message — grammar.md §10. Implementing it would be a divergence, not a feature.)_
+        grouped+window query, and a correlated key (each `0A000`). _(An expression key in a
+        **set-operation** `ORDER BY` is **not** a follow-on: PostgreSQL itself rejects it with `0A000`,
+        and jed already matches that code + message — grammar.md §10. Implementing it would be a
+        divergence, not a feature.)_
 - [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,
       non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK columns (sorting by each
       column's stored key order) elides the sort and streams the scan; with a `LIMIT` it
