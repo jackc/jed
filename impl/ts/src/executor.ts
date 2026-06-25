@@ -12405,6 +12405,9 @@ type ScalarFuncName =
   | "sin"
   | "cos"
   | "tan"
+  // cbrt — the real cube root (float.md §8). Transcendental, exempted; no domain restriction
+  // (cbrt of a negative is the negative real root).
+  | "cbrt"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24677,6 +24680,9 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
       return out(Math.cos(x));
     case "tan":
       return out(Math.tan(x));
+    case "cbrt":
+      // cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
+      return out(Math.cbrt(x));
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }

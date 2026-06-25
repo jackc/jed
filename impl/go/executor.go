@@ -15791,6 +15791,9 @@ const (
 	sfSin
 	sfCos
 	sfTan
+	// sfCbrt is the real cube root (float.md §8) — transcendental, exempted; no domain
+	// restriction (cbrt of a negative is the negative real root).
+	sfCbrt
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19322,6 +19325,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfCos
 	case "tan":
 		return sfTan
+	case "cbrt":
+		return sfCbrt
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile

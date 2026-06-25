@@ -1862,11 +1862,14 @@ errors         = []
 #     negative, a DOMAIN error -> 22003 (NaN stays input-only, §3).
 #
 #   TRANSCENDENTAL — EXEMPTED (libm differs by an ULP per core; ledgered class A): exp, ln,
-#     log10, pow, sin, cos, tan. result "f64". exp/ln/log10/pow carry 22003 (overflow /
-#     domain, e.g. ln(0), ln(-1), exp(710)); sin/cos/tan cannot trap (a NaN/Inf operand
-#     propagates). These are PG-oracle-only in the corpus and compared at `R` tolerance.
-# Further functions (sign, asin/acos/atan/atan2, cbrt, log(b,x), the `^` power operator) are
-# easy additive follow-ons (../design/float.md §8).
+#     log10, pow, sin, cos, tan, and cbrt. result "f64". exp/ln/log10/pow carry 22003 (overflow /
+#     domain, e.g. ln(0), ln(-1), exp(710)); sin/cos/tan/cbrt cannot trap (a NaN/Inf operand
+#     propagates). These are PG-oracle-only in the corpus and compared at `R` tolerance, sharing
+#     the `float-transcendental` determinism ledger entry. The trig follow-ons (asin/acos/atan/
+#     atan2/cot, the hyperbolics, radians/degrees, pi) land in later commits under the same rule.
+# The EXACT-numeric follow-ons (`power(numeric,numeric)`, `log(numeric)`, `log(b, x)`) are deferred
+# — they must be byte-identical across cores (decimal is in-contract), which needs a PG-faithful
+# arbitrary-precision ln/exp port (../design/float.md §8).
 
 [[operator]]
 name           = "abs"
@@ -2000,6 +2003,19 @@ errors         = []
 
 [[operator]]
 name           = "tan"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "f64"
+null           = "propagates"
+errors         = []
+
+# cbrt(x) — the real cube root (float.md §8). TRANSCENDENTAL/irrational, exempted (native libm,
+# the `R` tag). Unlike sqrt it has NO domain restriction: cbrt of a negative is the negative real
+# root (cbrt(-8) = -2), so errors = [] and a NaN/±Inf operand propagates.
+[[operator]]
+name           = "cbrt"
 kind           = "function"
 arity          = 1
 arg_families   = ["float"]

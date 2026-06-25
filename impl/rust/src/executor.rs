@@ -12902,6 +12902,9 @@ enum ScalarFunc {
     Sin,
     Cos,
     Tan,
+    /// cbrt — the real cube root (float.md §8). Transcendental/irrational, exempted; no domain
+    /// restriction (cbrt of a negative is the negative real root).
+    Cbrt,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18929,6 +18932,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "sin" => ScalarFunc::Sin,
         "cos" => ScalarFunc::Cos,
         "tan" => ScalarFunc::Tan,
+        "cbrt" => ScalarFunc::Cbrt,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29536,7 +29540,8 @@ impl RExpr {
                     | ScalarFunc::Pow
                     | ScalarFunc::Sin
                     | ScalarFunc::Cos
-                    | ScalarFunc::Tan => {
+                    | ScalarFunc::Tan
+                    | ScalarFunc::Cbrt => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
                             _ => unreachable!("resolver widens a float function arg to f64"),
@@ -30515,6 +30520,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Sin => x.sin(),
         ScalarFunc::Cos => x.cos(),
         ScalarFunc::Tan => x.tan(),
+        // cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
+        ScalarFunc::Cbrt => x.cbrt(),
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::MakeInterval

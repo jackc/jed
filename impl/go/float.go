@@ -541,6 +541,9 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 		return Float64Value(math.Cos(x)), nil
 	case sfTan:
 		return Float64Value(math.Tan(x)), nil
+	case sfCbrt:
+		// cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
+		return Float64Value(math.Cbrt(x)), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}
