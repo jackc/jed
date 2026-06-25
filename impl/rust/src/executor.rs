@@ -12905,6 +12905,9 @@ enum ScalarFunc {
     /// cbrt — the real cube root (float.md §8). Transcendental/irrational, exempted; no domain
     /// restriction (cbrt of a negative is the negative real root).
     Cbrt,
+    /// pi() → f64 — the constant π (float.md §8). Zero-arg; IN-CONTRACT (the same f64 literal in
+    /// every core), so NOT in the transcendental ledger.
+    Pi,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18933,6 +18936,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "cos" => ScalarFunc::Cos,
         "tan" => ScalarFunc::Tan,
         "cbrt" => ScalarFunc::Cbrt,
+        "pi" => ScalarFunc::Pi,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29525,6 +29529,9 @@ impl RExpr {
                         };
                         Ok(Value::Decimal(d.round_places(places)?))
                     }
+                    // pi() — the constant π, no operand (float.md §8). In-contract: the same f64
+                    // literal in every core.
+                    ScalarFunc::Pi => Ok(Value::Float64(std::f64::consts::PI)),
                     // The other float functions all take a single f64 arg (the resolver widened
                     // it) and return f64 (spec/design/float.md §8). EXACT (in-contract):
                     // ceil/floor/trunc/sqrt. sqrt of a negative is a DOMAIN error → 22003 (NaN stays
@@ -30524,6 +30531,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Cbrt => x.cbrt(),
         ScalarFunc::Abs
         | ScalarFunc::Round
+        | ScalarFunc::Pi
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

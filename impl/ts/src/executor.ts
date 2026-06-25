@@ -12408,6 +12408,9 @@ type ScalarFuncName =
   // cbrt — the real cube root (float.md §8). Transcendental, exempted; no domain restriction
   // (cbrt of a negative is the negative real root).
   | "cbrt"
+  // pi() → f64 — the constant π (float.md §8). Zero-arg; IN-CONTRACT (the same f64 literal in
+  // every core), not in the transcendental ledger.
+  | "pi"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24050,6 +24053,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         if (v0.kind === "json") return textValue(v0.text);
         if (v0.kind === "jsonb") return textValue(jsonbOut(v0.node));
         throw new Error("BUG: resolver restricts JSON_SERIALIZE to json/jsonb");
+      }
+      if (e.func === "pi") {
+        // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64
+        // literal in every core.
+        return float64Value(Math.PI);
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

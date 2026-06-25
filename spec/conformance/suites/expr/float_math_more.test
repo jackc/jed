@@ -59,3 +59,15 @@ query R nosort
 SELECT cbrt(x) FROM m WHERE id = 9
 ----
 NULL
+
+# --- pi(): the constant π, a zero-arg function (no FROM) ---------------------------------
+query R nosort
+SELECT pi()
+----
+3.141592653589793
+
+# pi() composes in a float expression (f64 + f64; 2·π is an exact double)
+query R nosort
+SELECT pi() + pi()
+----
+6.283185307179586

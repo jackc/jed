@@ -15794,6 +15794,9 @@ const (
 	// sfCbrt is the real cube root (float.md §8) — transcendental, exempted; no domain
 	// restriction (cbrt of a negative is the negative real root).
 	sfCbrt
+	// sfPi is the constant π as f64 (float.md §8) — zero-arg, IN-CONTRACT (same f64 literal in
+	// every core), not in the transcendental ledger.
+	sfPi
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19327,6 +19330,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfTan
 	case "cbrt":
 		return sfCbrt
+	case "pi":
+		return sfPi
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
@@ -26778,6 +26783,10 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			default:
 				panic("BUG: resolver restricts JSON_SERIALIZE to json/jsonb")
 			}
+		case sfPi:
+			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
+			// f64 literal in every core.
+			return Float64Value(math.Pi), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).
