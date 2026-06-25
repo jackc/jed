@@ -1,0 +1,71 @@
+# Additional EXACT numeric scalar functions (spec/functions/catalog.toml, kind = "function"):
+# sign, mod, div, gcd, lcm, factorial, width_bucket — the exact follow-ons named in float.md §8.
+# Unlike the float transcendentals these are EXACT and IN-CONTRACT (byte-identical cross-core, no
+# determinism-ledger entry): integer/decimal arithmetic is reproducible. They charge one
+# operator_eval per call and propagate NULL. arg_resolution = "none": like sqrt, a bare integer
+# where only a decimal/float overload exists is 42883 (no implicit cross-family promotion — a
+# documented divergence from PG's implicit cast, oracle_overrides.toml). PostgreSQL-oracle-checked.
+# Gated by the type capabilities the overloads use. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i16, types.i32, types.i64, types.decimal, types.f64, resource.cost_metering
+
+statement ok
+CREATE TABLE nm (id i32 PRIMARY KEY, d numeric, f f64)
+
+statement ok
+INSERT INTO nm VALUES
+  (1, 1.50, 2.5),
+  (2, -2.5, -1.5),
+  (3, 0.00, 0.0),
+  (4, NULL, NULL)
+
+# --- sign(numeric): -1 / 0 / +1 at scale 0 --------------------------------------------
+query D nosort
+SELECT sign(d) FROM nm WHERE id = 1
+----
+1
+
+query D nosort
+SELECT sign(d) FROM nm WHERE id = 2
+----
+-1
+
+query D nosort
+SELECT sign(d) FROM nm WHERE id = 3
+----
+0
+
+# NULL propagates
+query D nosort
+SELECT sign(d) FROM nm WHERE id = 4
+----
+NULL
+
+# --- sign(f64): EXACT, in-contract; sign(NaN) = 0, sign(±Inf) = ±1 --------------------
+query R nosort
+SELECT sign(f) FROM nm WHERE id = 1
+----
+1
+
+query R nosort
+SELECT sign(f) FROM nm WHERE id = 2
+----
+-1
+
+query R nosort
+SELECT sign(f64 'NaN')
+----
+0
+
+query R nosort
+SELECT sign(f64 'Infinity')
+----
+1
+
+query R nosort
+SELECT sign(f64 '-Infinity')
+----
+-1
+
+# sign over a bare integer is 42883: no implicit int→decimal/float promotion (like sqrt(int)).
+statement error 42883
+SELECT sign(2)

@@ -12441,6 +12441,9 @@ type ScalarFuncName =
   | "asinh"
   | "acosh"
   | "atanh"
+  // sign(x) → -1 / 0 / +1 (float.md §8). Decimal → numeric (scale 0), float → f64 (EXACT,
+  // in-contract; sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1). Dispatches on the operand, like abs.
+  | "sign"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24123,6 +24126,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
         return decimalValue((v0 as { dec: Decimal }).dec.abs());
       }
+      if (e.func === "sign") {
+        // sign over a decimal → numeric at scale 0 (-1 / 0 / +1).
+        const d = (v0 as { dec: Decimal }).dec;
+        const s = d.limbs.length === 0 ? 0n : d.neg ? -1n : 1n;
+        return decimalValue(Decimal.fromBigInt(s));
+      }
       // round
       const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
       const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
@@ -24774,6 +24783,10 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
       if (!Number.isNaN(x) && (x < -1 || x > 1))
         throw engineError("numeric_value_out_of_range", "input is out of range");
       return out(Math.atanh(x));
+    case "sign":
+      // sign over a float (EXACT, in-contract): sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1 (PG
+      // dsign tests x > 0 / x < 0, so a NaN falls through to 0).
+      return out(x > 0 ? 1 : x < 0 ? -1 : 0);
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }

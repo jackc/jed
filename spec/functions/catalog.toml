@@ -2218,6 +2218,39 @@ result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
+# === additional numeric scalar functions =====================================
+# sign / mod / div / gcd / lcm / factorial / width_bucket and the decimal-introspection trio
+# scale / min_scale / trim_scale — the EXACT numeric follow-ons named in float.md §8 / decimal.md.
+# Unlike the float transcendentals these are EXACT and IN-CONTRACT (no determinism-ledger entry):
+# integer/decimal arithmetic is byte-identical cross-core. arg_resolution = "none" (no cross-family
+# promotion), so — like sqrt — a bare integer where only a decimal/float overload exists is 42883,
+# a documented divergence from PG's implicit int→numeric/float8 cast (oracle_overrides.toml).
+#
+# sign(x): -1 / 0 / +1 with the operand's sign. The DECIMAL overload returns numeric at SCALE 0
+# (PG sign(numeric)); the FLOAT overload returns f64 and is EXACT/in-contract (the float.md §8
+# exact set, alongside abs/sqrt) — sign(NaN) = 0, sign(±0) = 0, sign(±Inf) = ±1 (PG dsign, which
+# tests x > 0 / x < 0 so a NaN falls through to 0). There is no integer overload (PG resolves
+# sign(int) to float8 via its preferred-type rule, which jed's strict families do not mirror).
+[[operator]]
+name           = "sign"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "sign"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "f64"
+null           = "propagates"
+errors         = []
+
 # --- interval constructor (make_interval) ------------------------------------
 # PostgreSQL's interval builder, and the engine's FIRST named + defaulted function
 # (../design/functions.md §11). Every parameter is NAMED and DEFAULTs to 0, so it is callable

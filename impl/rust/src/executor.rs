@@ -12938,6 +12938,10 @@ enum ScalarFunc {
     Asinh,
     Acosh,
     Atanh,
+    /// sign(x) → -1 / 0 / +1 (float.md §8). Two overloads: decimal → numeric (scale 0), float →
+    /// f64 (EXACT/in-contract; sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1). Dispatches on the
+    /// operand value, like abs.
+    Sign,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18981,6 +18985,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "asinh" => ScalarFunc::Asinh,
         "acosh" => ScalarFunc::Acosh,
         "atanh" => ScalarFunc::Atanh,
+        "sign" => ScalarFunc::Sign,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29543,6 +29548,32 @@ impl RExpr {
                         Value::Float64(f) => Ok(Value::Float64(f.abs())),
                         _ => unreachable!("resolver restricts abs to numeric operands"),
                     },
+                    // sign: -1 / 0 / +1. Decimal → numeric at scale 0; float → f64 (EXACT,
+                    // in-contract). sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1 (PG dsign tests
+                    // x > 0 / x < 0, so NaN falls through to 0). Dispatches on the operand, like abs.
+                    ScalarFunc::Sign => match &vals[0] {
+                        Value::Decimal(d) => {
+                            let s = if d.is_zero() {
+                                0
+                            } else if d.is_negative() {
+                                -1
+                            } else {
+                                1
+                            };
+                            Ok(Value::Decimal(Decimal::from_i64(s)))
+                        }
+                        Value::Float64(f) => {
+                            let r = if *f > 0.0 {
+                                1.0
+                            } else if *f < 0.0 {
+                                -1.0
+                            } else {
+                                0.0 // NaN and ±0 → 0 (PG-faithful)
+                            };
+                            Ok(Value::Float64(r))
+                        }
+                        _ => unreachable!("resolver restricts sign to decimal/float operands"),
+                    },
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -30655,6 +30686,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi
+        | ScalarFunc::Sign
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

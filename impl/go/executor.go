@@ -15827,6 +15827,9 @@ const (
 	sfAsinh
 	sfAcosh
 	sfAtanh
+	// sfSign is sign(x) → -1 / 0 / +1 (float.md §8). Decimal → numeric (scale 0), float → f64
+	// (EXACT/in-contract; sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1). Dispatches on the operand.
+	sfSign
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19389,6 +19392,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfAcosh
 	case "atanh":
 		return sfAtanh
+	case "sign":
+		return sfSign
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
@@ -26844,6 +26849,26 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
 			return Float64Value(math.Pi), nil
+		case sfSign:
+			// sign: -1 / 0 / +1. Decimal → numeric (scale 0); float → f64 (EXACT, in-contract).
+			// sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1 (PG dsign tests x > 0 / x < 0, so NaN → 0).
+			if vals[0].Kind == ValDecimal {
+				s := int64(1)
+				if vals[0].Dec.IsZero() {
+					s = 0
+				} else if vals[0].Dec.Neg {
+					s = -1
+				}
+				return DecimalValue(DecimalFromInt64(s)), nil
+			}
+			f := vals[0].asF64()
+			r := 0.0
+			if f > 0 {
+				r = 1
+			} else if f < 0 {
+				r = -1
+			}
+			return Float64Value(r), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).
