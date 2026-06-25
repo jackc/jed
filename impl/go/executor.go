@@ -15830,6 +15830,10 @@ const (
 	// sfSign is sign(x) → -1 / 0 / +1 (float.md §8). Decimal → numeric (scale 0), float → f64
 	// (EXACT/in-contract; sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1). Dispatches on the operand.
 	sfSign
+	// sfDiv is div(a, b) → numeric — the TRUNCATED (toward zero) integer quotient at scale 0
+	// (PG div(numeric, numeric)). Computed exactly as (a − a%b)/b. Resolver-routed (the catalog
+	// name "div" belongs to the `/` operator); integers promote; 22012 on a zero divisor.
+	sfDiv
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -21482,6 +21486,28 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveRegexFunc(s, fc, ag, params)
 	}
+	// `div(a, b)` — the truncated (toward zero) integer quotient of two numerics, at scale 0 (PG
+	// div(numeric, numeric)). Resolver-routed because the catalog name "div" already belongs to the
+	// `/` operator. Accepts integer + decimal operands (integers promote, as PG does); a float/other
+	// operand → 42883. Two-arg only; else fall through → 42883.
+	if name == "div" && len(fc.Args) == 2 {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		rl, lt, rr, rt, err := resolveOperandPair(s, *fc.Args[0], *fc.Args[1], ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		numericOK := func(k rtKind) bool { return k == rtInt || k == rtDecimal || k == rtNull }
+		if !numericOK(lt.kind) || !numericOK(rt.kind) {
+			return nil, resolvedType{}, noFuncOverload("div")
+		}
+		dec := scalarResultType("decimal", nil)
+		return &rExpr{kind: reScalarFunc, sfunc: sfDiv, sargs: []*rExpr{rl, rr}, result: dec}, resolvedTypeOf(dec), nil
+	}
 	// `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME
 	// arithmetic machinery so mod() and % are observably identical (promotion, the integer/decimal/
 	// float kernels, 22012/22003). PG's mod() is integer/numeric only; jed additionally accepts
@@ -26882,6 +26908,30 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				r = -1
 			}
 			return Float64Value(r), nil
+		case sfDiv:
+			// div(a, b): the truncated integer quotient at scale 0, computed EXACTLY as
+			// (a − a%b)/b — a − a%b is exactly q·b, so the division is exact and RoundToScale(0)
+			// only drops the (already-zero) fraction. 22012 on a zero divisor (the a%b step traps).
+			toDec := func(v Value) Decimal {
+				if v.Kind == ValInt {
+					return DecimalFromInt64(v.Int)
+				}
+				return *v.Dec
+			}
+			a, b := toDec(vals[0]), toDec(vals[1])
+			rr, err := a.Rem(b)
+			if err != nil {
+				return Value{}, err
+			}
+			diff, err := a.Sub(rr)
+			if err != nil {
+				return Value{}, err
+			}
+			q, err := diff.Div(b)
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(q.RoundToScale(0)), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

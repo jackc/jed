@@ -12444,6 +12444,9 @@ type ScalarFuncName =
   // sign(x) → -1 / 0 / +1 (float.md §8). Decimal → numeric (scale 0), float → f64 (EXACT,
   // in-contract; sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1). Dispatches on the operand, like abs.
   | "sign"
+  // div(a, b) → numeric — the TRUNCATED (toward zero) integer quotient at scale 0 (PG div). Computed
+  // exactly as (a − a%b)/b; resolver-routed (the catalog name "div" belongs to the `/` operator).
+  | "div"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -15708,6 +15711,19 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     return resolveBinary(scope, "mod", e.args[0]!, e.args[1]!, ag, params);
+  }
+  // `div(a, b)` — the truncated (toward zero) integer quotient of two numerics, at scale 0 (PG
+  // div(numeric, numeric)). Resolver-routed because the catalog name "div" already belongs to the
+  // `/` operator. Accepts integer + decimal operands (integers promote); a float/other operand →
+  // 42883. Two-arg only; else fall through → 42883.
+  if (lname === "div" && e.args.length === 2) {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    const p = resolveOperandPair(scope, e.args[0]!, e.args[1]!, ag, params);
+    const numericOK = (t: ResolvedType) =>
+      t.kind === "int" || t.kind === "decimal" || t.kind === "null";
+    if (!numericOK(p.lt) || !numericOK(p.rt)) throw noFuncOverload("div");
+    return scalarFuncNode("div", [p.rl, p.rr], "decimal", undefined);
   }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
@@ -24103,6 +24119,17 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64
         // literal in every core.
         return float64Value(Math.PI);
+      }
+      if (e.func === "div") {
+        // div(a, b): the truncated integer quotient at scale 0, computed EXACTLY as (a − a%b)/b —
+        // a − a%b is exactly q·b, so the division is exact and roundToScale(0) only drops the
+        // (already-zero) fraction. rem() traps 22012 on a zero divisor. Integer operands promote.
+        const toDec = (v: Value): Decimal =>
+          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+        const a = toDec(vals[0]!);
+        const b = toDec(vals[1]!);
+        const q = a.sub(a.rem(b)).div(b);
+        return decimalValue(q.roundToScale(0));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

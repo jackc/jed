@@ -12942,6 +12942,11 @@ enum ScalarFunc {
     /// f64 (EXACT/in-contract; sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1). Dispatches on the
     /// operand value, like abs.
     Sign,
+    /// div(a, b) → numeric — the TRUNCATED (toward zero) integer quotient of two numerics, at
+    /// scale 0 (PG div(numeric, numeric)). Computed exactly as (a − a%b)/b so it is EXACT/in-contract.
+    /// Resolver-routed (the catalog name "div" is taken by the `/` operator), accepts integer +
+    /// decimal operands (integers promote), 22012 on a zero divisor.
+    Div,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -20847,6 +20852,38 @@ fn resolve_func_call(
             ));
         }
         return resolve_regex_func(scope, &lname, args, agg, params);
+    }
+    // `div(a, b)` — the truncated (toward zero) integer quotient of two numerics, at scale 0 (PG
+    // div(numeric, numeric)). Resolver-routed because the catalog name "div" already belongs to the
+    // `/` operator (verify.rb keys uniqueness on [name, arg_families], so a function row would clash
+    // with the `/` decimal row). Accepts integer + decimal operands (integers promote to numeric, as
+    // PG does); a float/other operand → 42883. Two-arg only; else fall through to 42883.
+    if lname == "div" && args.len() == 2 {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        let (rl, lt, rr, rt) = resolve_operand_pair(scope, &args[0], &args[1], agg, params)?;
+        let numeric_ok = |t: &ResolvedType| {
+            matches!(
+                t,
+                ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
+            )
+        };
+        if !numeric_ok(&lt) || !numeric_ok(&rt) {
+            return Err(no_func_overload("div"));
+        }
+        return Ok((
+            RExpr::ScalarFunc {
+                func: ScalarFunc::Div,
+                args: vec![rl, rr],
+                result: ScalarType::Decimal,
+            },
+            resolved_type_of(ScalarType::Decimal),
+        ));
     }
     // `mod(a, b)` is the function spelling of the `%` (mod) operator (catalog name "mod") — route it
     // to the SAME arithmetic machinery so mod() and % are observably identical (promotion, the
@@ -29589,6 +29626,23 @@ impl RExpr {
                         }
                         _ => unreachable!("resolver restricts sign to decimal/float operands"),
                     },
+                    // div(a, b): the truncated integer quotient at scale 0, computed EXACTLY as
+                    // (a − a%b)/b — a − a%b is exactly q·b, so the division is exact and the
+                    // round_to_scale(0) only drops the (already-zero) fraction. 22012 on a zero
+                    // divisor (the a%b step traps, like the `%` operator). Integer operands promote.
+                    ScalarFunc::Div => {
+                        let to_dec = |v: &Value| match v {
+                            Value::Int(n) => Decimal::from_i64(*n),
+                            Value::Decimal(d) => d.clone(),
+                            _ => unreachable!("resolver restricts div to integer/decimal operands"),
+                        };
+                        let a = to_dec(&vals[0]);
+                        let b = to_dec(&vals[1]);
+                        let r = a.rem(&b)?;
+                        let diff = a.sub(&r)?;
+                        let q = diff.div(&b)?;
+                        Ok(Value::Decimal(q.round_to_scale(0)))
+                    }
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -30702,6 +30756,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Round
         | ScalarFunc::Pi
         | ScalarFunc::Sign
+        | ScalarFunc::Div
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

@@ -100,3 +100,36 @@ SELECT mod(-5.5, 2)
 # mod by zero traps 22012, exactly like the `%` operator
 statement error 22012
 SELECT mod(7, 0)
+
+# --- div(a, b): truncated (toward zero) integer quotient at scale 0 -------------------
+# integer operands promote to numeric (PG div(int,int) → numeric)
+query D nosort
+SELECT div(9, 4)
+----
+2
+
+# truncation toward zero: div(9.5, 2) = 4 (not the rounded 5)
+query D nosort
+SELECT div(9.5, 2)
+----
+4
+
+query D nosort
+SELECT div(-9.5, 2)
+----
+-4
+
+query D nosort
+SELECT div(9.5, -2)
+----
+-4
+
+# div over a NULL numeric column propagates
+query D nosort
+SELECT div(d, 2) FROM nm WHERE id = 4
+----
+NULL
+
+# div by zero traps 22012
+statement error 22012
+SELECT div(7, 0)
