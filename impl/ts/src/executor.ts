@@ -12417,6 +12417,9 @@ type ScalarFuncName =
   // degrees(x) → f64 — radians → degrees (float.md §8): x / RADIANS_PER_DEGREE. A single
   // correctly-rounded IEEE divide, IN-CONTRACT (not ledgered).
   | "degrees"
+  // asin(x) → f64 — inverse sine in radians (float.md §8). Transcendental, exempted; domain
+  // [-1, 1], |x| > 1 (or ±Inf) → 22003, NaN propagates.
+  | "asin"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24706,6 +24709,12 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
       return out(x * RADIANS_PER_DEGREE);
     case "degrees":
       return out(x / RADIANS_PER_DEGREE);
+    case "asin":
+      // asin domain is [-1, 1]: a finite |x| > 1 (and ±Inf, magnitude > 1) is out of range →
+      // 22003, exactly PG; a NaN operand propagates (no trap).
+      if (!Number.isNaN(x) && (x < -1 || x > 1))
+        throw engineError("numeric_value_out_of_range", "input is out of range");
+      return out(Math.asin(x));
     default:
       throw typeError("internal: unsupported float scalar function " + func);
   }

@@ -554,6 +554,13 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 		return Float64Value(x * radiansPerDegree), nil
 	case sfDegrees:
 		return Float64Value(x / radiansPerDegree), nil
+	case sfAsin:
+		// asin domain is [-1, 1]: a finite |x| > 1 (and ±Inf, magnitude > 1) is out of range →
+		// 22003, exactly PG; a NaN operand propagates (no trap).
+		if !math.IsNaN(x) && (x < -1 || x > 1) {
+			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+		}
+		return Float64Value(math.Asin(x)), nil
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}

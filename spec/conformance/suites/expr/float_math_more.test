@@ -115,3 +115,34 @@ query R nosort
 SELECT degrees(x) FROM m WHERE id = 9
 ----
 NULL
+
+# --- asin(x): inverse sine in radians; domain [-1, 1] ---------------------------------
+query R nosort
+SELECT asin(x) FROM m WHERE id = 6
+----
+0.5235987755982989
+
+query R nosort
+SELECT asin(x) FROM m WHERE id = 5
+----
+1.5707963267948966
+
+query R nosort
+SELECT asin(x) FROM m WHERE id = 8
+----
+-1.5707963267948966
+
+query R nosort
+SELECT asin(x) FROM m WHERE id = 4
+----
+0
+
+# out of domain (|x| > 1) → 22003
+statement error 22003
+SELECT asin(x) FROM m WHERE id = 1
+
+# NULL propagates
+query R nosort
+SELECT asin(x) FROM m WHERE id = 9
+----
+NULL

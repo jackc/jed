@@ -15803,6 +15803,9 @@ const (
 	// sfDegrees is radians → degrees (float.md §8): x / RADIANS_PER_DEGREE. A single
 	// correctly-rounded IEEE divide, IN-CONTRACT (not ledgered).
 	sfDegrees
+	// sfAsin is the inverse sine in radians (float.md §8) — transcendental, exempted; domain
+	// [-1, 1], |x| > 1 (or ±Inf) → 22003, NaN propagates.
+	sfAsin
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19342,6 +19345,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfRadians
 	case "degrees":
 		return sfDegrees
+	case "asin":
+		return sfAsin
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
