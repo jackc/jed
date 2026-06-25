@@ -225,6 +225,10 @@ id = "query.order_by_keys"
 description = "ORDER BY with multiple keys, per-key ASC/DESC, and per-key NULLS FIRST|LAST"
 
 [[capability]]
+id = "query.order_by_ordinal"
+description = "ORDER BY by an output-column ordinal (ORDER BY 1, the 1-based select-list position; out of range is 42P10). Also applies to a set-operation ORDER BY. An ordinal that points at a non-column select-list expression is 0A000; WITHIN GROUP stays column-only."
+
+[[capability]]
 id = "query.select_star"
 description = "SELECT * expands to all columns with their canonical names"
 

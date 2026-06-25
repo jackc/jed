@@ -1409,7 +1409,7 @@ class Parser {
   // no new nesting level — the body is at the statement top level.
   private parseQueryExprNode(): Select | SetOp {
     const node = this.parseSetExpr();
-    const orderBy = this.parseOrderBy();
+    const orderBy = this.parseOrderBy(true);
     const { limit, offset } = this.parseLimitOffsetClauses();
     // Both Select and SetOp carry orderBy/limit/offset; the spread keeps the `kind` discriminant.
     return { ...node, orderBy, limit, offset };
@@ -1532,7 +1532,7 @@ class Parser {
   // (parseWithQueryExpr) reuses it.
   private parseSubqueryInner(): QueryExpr {
     const node = this.parseSetExpr();
-    const orderBy = this.parseOrderBy();
+    const orderBy = this.parseOrderBy(true);
     const { limit, offset } = this.parseLimitOffsetClauses();
     return { ...node, orderBy, limit, offset };
   }
@@ -1692,7 +1692,7 @@ class Parser {
   // pre-set-operations parseSelect: a select_core plus the trailing clauses.
   private parseSelect(): Select {
     const sel = this.parseSelectCore();
-    sel.orderBy = this.parseOrderBy();
+    sel.orderBy = this.parseOrderBy(true);
     const { limit, offset } = this.parseLimitOffsetClauses();
     sel.limit = limit;
     sel.offset = offset;
@@ -2297,15 +2297,43 @@ class Parser {
   // here: explicit if given, else the direction default (ASC -> last, DESC -> first). A bare
   // NULLS not followed by FIRST/LAST is a syntax error (42601). Returns [] when there is no
   // ORDER BY (spec/grammar/grammar.ebnf `order_by`).
-  private parseOrderBy(): OrderKey[] {
+  // When allowOrdinal is set (the query and set-operation ORDER BY), a key may be an output-column
+  // ordinal — an optionally-negative integer literal naming the 1-based select-list position
+  // (grammar.md §10); its value is validated at resolve (42P10). WITHIN GROUP passes false, so an
+  // integer there is consumed as a (missing) column ref → 42601, matching PostgreSQL, where a WITHIN
+  // GROUP integer is a constant.
+  private parseOrderBy(allowOrdinal: boolean): OrderKey[] {
     const keys: OrderKey[] = [];
     if (this.peekKeyword() !== "order") return keys;
     this.advance();
     this.expectKeyword("by");
     for (;;) {
-      const [qualifier, column] = this.parseColumnRef();
-      const { collation, descending, nullsFirst } = this.parseSortSuffix();
-      keys.push({ qualifier, column, collation, descending, nullsFirst });
+      // An ordinal sort key: an optional leading `-` then an integer literal. The lexer caps a
+      // magnitude at 2^63; clamp to i64's max so the signed position always fits (an out-of-range
+      // position is 42P10 at resolve regardless of the exact value). A `-` not followed by an integer
+      // (`ORDER BY -a`) is an unsupported general expression and falls through to a 42601.
+      const k = this.peek().kind;
+      if (allowOrdinal && (k === "int" || k === "minus")) {
+        let negate = false;
+        if (this.peek().kind === "minus") {
+          this.advance();
+          negate = true;
+        }
+        const t = this.advance();
+        if (t.kind !== "int") {
+          throw engineError("syntax_error", "expected an ORDER BY column or ordinal");
+        }
+        const MAXI64 = (1n << 63n) - 1n;
+        let mag = t.int!;
+        if (mag > MAXI64) mag = MAXI64;
+        const ordinal = Number(negate ? -mag : mag);
+        const { collation, descending, nullsFirst } = this.parseSortSuffix();
+        keys.push({ ordinal, qualifier: null, column: "", collation, descending, nullsFirst });
+      } else {
+        const [qualifier, column] = this.parseColumnRef();
+        const { collation, descending, nullsFirst } = this.parseSortSuffix();
+        keys.push({ ordinal: null, qualifier, column, collation, descending, nullsFirst });
+      }
       if (this.peek().kind === "comma") {
         this.advance();
         continue;
@@ -3296,8 +3324,10 @@ class Parser {
     // A trailing `WITHIN GROUP (ORDER BY <key>)` marks an ordered-set aggregate (mode /
     // percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list and
     // any FILTER / OVER (PG order). WITHIN/GROUP are not reserved; right after the call's `)` they are
-    // always the clause. The order key reuses the column-only query ORDER BY (parseOrderBy consumes
-    // the ORDER BY keywords); the resolver enforces exactly one key (42883) and the per-name rules.
+    // always the clause. The order key reuses parseOrderBy with allowOrdinal OFF — column-only, so a
+    // bare integer here is a (missing) column ref → 42601, matching PostgreSQL where a WITHIN GROUP
+    // integer is a constant, not an ordinal; the resolver enforces exactly one key (42883) and the
+    // per-name rules.
     let withinGroup: OrderKey[] | null = null;
     if (this.peekKeyword() === "within") {
       this.advance();
@@ -3306,7 +3336,7 @@ class Parser {
       if (this.peekKeyword() !== "order") {
         throw engineError("syntax_error", "WITHIN GROUP requires an ORDER BY clause");
       }
-      withinGroup = this.parseOrderBy();
+      withinGroup = this.parseOrderBy(false);
       this.expect("rparen");
     }
     // A trailing `FILTER (WHERE cond)` restricts which input rows feed THIS aggregate

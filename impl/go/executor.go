@@ -9716,6 +9716,16 @@ func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
 // column names (the left operand's). A qualified key is 42P01 (no relation scope after a set
 // operation); an unknown name is 42703. Returns the output column index.
 func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
+	// An output-column ordinal (`... ORDER BY 1`) resolves by position into the output columns; out
+	// of [1, ncols] is 42P10 (grammar.md §10). It precedes the name path (an ordinal has no column).
+	if key.Ordinal != nil {
+		ord := *key.Ordinal
+		if ord < 1 || ord > int64(len(names)) {
+			return 0, NewError(InvalidColumnReference,
+				fmt.Sprintf("ORDER BY position %d is not in select list", ord))
+		}
+		return int(ord - 1), nil
+	}
 	if key.Qualifier != "" {
 		return 0, NewError(UndefinedTable, "missing FROM-clause entry for table "+key.Qualifier)
 	}
@@ -9725,6 +9735,39 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 		}
 	}
 	return 0, NewError(UndefinedColumn, "column "+key.Column+" does not exist")
+}
+
+// resolveOrderOrdinal resolves an ORDER BY ordinal (`ORDER BY 1`) to a source-row resolution
+// (grammar.md §10). The 1-based ord indexes the select-list output columns: a position outside
+// [1, ncols] is 42P10 (matching PostgreSQL, including `ORDER BY 0` / a negative position); with
+// SELECT * the ordinal indexes the scope columns left to right; with an explicit list it must
+// point at a bare or qualified COLUMN item (a non-column projection is a deferred 0A000 — the
+// engine sorts source columns, not computed projections). Returns the resolved a column name would.
+func resolveOrderOrdinal(ord int64, items *SelectItems, s *scope) (resolved, error) {
+	var ncols int64
+	if items.All {
+		ncols = int64(s.width())
+	} else {
+		ncols = int64(len(items.Items))
+	}
+	if ord < 1 || ord > ncols {
+		return resolved{}, NewError(InvalidColumnReference,
+			fmt.Sprintf("ORDER BY position %d is not in select list", ord))
+	}
+	pos := int(ord - 1)
+	if items.All {
+		return resolved{level: 0, index: pos}, nil
+	}
+	e := items.Items[pos].Expr
+	switch e.Kind {
+	case ExprColumn:
+		return s.resolveBare(e.Column)
+	case ExprQualifiedColumn:
+		return s.resolveQualified(e.Qualifier, e.Column)
+	default:
+		return resolved{}, NewError(FeatureNotSupported,
+			"ORDER BY by an output-column expression is not supported")
+	}
 }
 
 // runSelect analyzes and runs a SELECT: resolve projected columns and the WHERE/ORDER BY columns
@@ -10176,7 +10219,11 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	order := make([]orderSlot, 0, len(sel.OrderBy))
 	for _, key := range sel.OrderBy {
 		var r resolved
-		if key.Qualifier != "" {
+		if key.Ordinal != nil {
+			// An output-column ordinal (`ORDER BY 1`) resolves by position into the select list,
+			// yielding the same resolved a column name would (grammar.md §10).
+			r, err = resolveOrderOrdinal(*key.Ordinal, &sel.Items, s)
+		} else if key.Qualifier != "" {
 			r, err = s.resolveQualified(key.Qualifier, key.Column)
 		} else {
 			r, err = s.resolveBare(key.Column)
@@ -21275,6 +21322,16 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 		return outerOf(r), nil
 	}
 	return resolved{}, missingFromEntry(qualifier)
+}
+
+// width returns the flat column count of this scope (the input-row width), the column count a
+// `SELECT *` expands to and the base for an ORDER BY ordinal over `*` (grammar.md §10).
+func (s *scope) width() int {
+	n := 0
+	for i := range s.rels {
+		n += len(s.rels[i].table.Columns)
+	}
+	return n
 }
 
 // columnAt returns the column at a flat index in THIS scope (index known valid).

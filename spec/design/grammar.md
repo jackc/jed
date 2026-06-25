@@ -113,10 +113,11 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   list** (`INSERT INTO t (a, c) VALUES ...`) landed alongside `DEFAULT` (§12, §16).
   `INSERT ... SELECT` — inserting the rows a query produces — now also lands (§24). What stays
   deferred is **general expressions in a `VALUES` value slot**.
-- **`ORDER BY` keys are bare columns** — a sort key is a table column, never a general
-  expression (`ORDER BY a + 1`), an output alias, or an ordinal position (`ORDER BY 1`);
-  those stay deferred. The richer surface that *did* land — multiple keys, per-key
-  `ASC` / `DESC`, and per-key `NULLS FIRST | LAST` — is described in §10.
+- **`ORDER BY` keys are a column or an output-column ordinal** — a sort key is a table column
+  or an **ordinal** (`ORDER BY 1`, the 1-based position of a select-list item), never a general
+  expression (`ORDER BY a + 1`) or an output alias; those stay deferred. The richer surface that
+  *did* land — multiple keys, per-key `ASC` / `DESC`, per-key `NULLS FIRST | LAST`, and the
+  ordinal form — is described in §10.
 - **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression
   (the same literal-only narrowing `INSERT` makes). The two clauses may appear in either
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
@@ -252,8 +253,9 @@ rows are asserted.
 
 ## 10. `ORDER BY`
 
-`ORDER BY` is **one or more sort keys** (`order_by` / `sort_key` in the grammar), each a
-**bare table column** with an optional direction (`ASC` / `DESC`, default `ASC`) and an
+`ORDER BY` is **one or more sort keys** (`order_by` / `order_term` in the grammar), each a
+**bare table column** or an **output-column ordinal** (`ORDER BY 1` — see below) with an optional
+direction (`ASC` / `DESC`, default `ASC`) and an
 optional explicit NULL placement (`NULLS FIRST | LAST`). Keys apply **left to right**: the
 first is primary, the next breaks its ties, and **a full tie across all keys is broken by the
 primary key** — so `ORDER BY` fixes the order *completely*, ties included. (That last tie-break
@@ -261,14 +263,32 @@ is a deliberate, documented determinism choice beyond the SQL standard — CLAUD
 unlike row order *without* `ORDER BY` (now unspecified), order *under* `ORDER BY` is fully
 deterministic. Today it is realized by a **stable** sort over the primary-key scan; under
 future parallel execution it is the same observable result via an implicit primary-key
-tie-break, so it stays parallelism-compatible.) Resolution is against the *table's* columns and
-is independent of the select list — an `AS` alias is invisible here (§8), and a key need not
-appear in the projection.
+tie-break, so it stays parallelism-compatible.) A **column-name** key resolves against the
+*table's* columns, independent of the select list — an `AS` alias is invisible here (§8), and such
+a key need not appear in the projection. An **ordinal** key instead resolves by *position* into
+the select list (below).
 
-**Still narrowed (§5):** a key is a column name only — not a general expression
-(`ORDER BY a + 1`), an output alias, or an ordinal (`ORDER BY 1`). `expect_identifier` (not the
-expression parser) consumes each key, so those forms are a `42601` syntax error; all remain
-relaxable later.
+**The ordinal form (`ORDER BY 1`).** A sort key may also be an **output-column ordinal** — an
+integer literal naming the **1-based position** of a select-list item, the SQL92 form PostgreSQL
+accepts. The ordinal resolves to the item's underlying column: `SELECT a, b FROM t ORDER BY 1`
+orders by `a`, `SELECT a AS x, b FROM t ORDER BY 1` orders by the real column `a` (the alias is
+just a label — §8), and with `SELECT *` the ordinal indexes the expanded scope columns left to
+right. A position **< 1 or greater than the number of output columns** is `42P10`
+(`invalid_column_reference`, *"ORDER BY position N is not in select list"*) — matching PostgreSQL,
+which also reports `ORDER BY 0` / `ORDER BY -1` this way (jed folds an optional leading `-` into
+the ordinal so a negative position reaches the same `42P10`, not a syntax error). The ordinal is
+parsed only in the **query / set-operation** `ORDER BY`; in a `WITHIN GROUP (ORDER BY …)` an
+integer is a constant expression, not an ordinal (PostgreSQL again — aggregates.md §13), so it
+stays column-only there.
+
+**Still narrowed (§5):** a key is a column name **or an ordinal** — not a general expression
+(`ORDER BY a + 1`), not an output alias. A general expression key is a `42601` syntax error
+(`expect_identifier`, not the expression parser, consumes a non-ordinal key), and an ordinal that
+points at a **non-column** select-list expression (`SELECT a + 1 ... ORDER BY 1`) is a deferred
+`0A000` (the engine sorts by source columns, not computed projections, today); both remain
+relaxable later. Because jed parses no expression keys, `ORDER BY 1 + 1` — which PostgreSQL reads
+as a constant expression, not an ordinal — is likewise `42601` here (the same documented
+expression-key narrowing), not a no-op sort.
 
 **NULL placement and the default.** The physical key order ratifies NULL as the **largest**
 value ([types.md](types.md) §4, `null_ordering = "nulls-last-ascending"` in

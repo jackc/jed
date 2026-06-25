@@ -99,7 +99,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `2201W`/`2201X`), applied after ORDER BY before projection. → [grammar.md §9](spec/design/grammar.md)
 - [x] **Richer `ORDER BY`** — multiple keys, per-key `ASC`/`DESC`, `NULLS FIRST|LAST` (PG
       NULL-largest default). → [grammar.md §10](spec/design/grammar.md)
-  - [ ] _follow-on:_ ordinal / expression / alias sort keys.
+  - [x] **Output-column ordinal** (`ORDER BY 1`) — 1-based select-list position, incl. the set-op
+        `ORDER BY`; out of range `42P10`; an ordinal pointing at a non-column projection is `0A000`;
+        `WITHIN GROUP` stays column-only (`query.order_by_ordinal`). → [grammar.md §10](spec/design/grammar.md)
+  - [ ] _follow-on:_ general-expression / alias sort keys (and an ordinal resolving to a computed
+        projection, currently `0A000`).
 - [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,
       non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK columns (sorting by each
       column's stored key order) elides the sort and streams the scan; with a `LIMIT` it
@@ -392,7 +396,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         VALUES holding a general expression); **row-valued** subqueries. _(size: S)_
 - [x] **Set operations — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`** — a query-expression
       precedence tree (INTERSECT binds tighter), full-PG per-column type unification, NULL-safe
-      multiset semantics, trailing ORDER BY by output-column name. → [grammar.md §25](spec/design/grammar.md)
+      multiset semantics, trailing ORDER BY by output-column name or ordinal. → [grammar.md §25](spec/design/grammar.md)
   - [ ] _follow-on:_ parenthesized operands `(SELECT …) UNION …`; ORDER BY/LIMIT inside an operand;
         ORDER BY ordinals; a set op in an `INSERT … SELECT` source.
 - [x] **Common table expressions (`WITH`)** — `WITH name [(cols)] AS [NOT] MATERIALIZED (query)

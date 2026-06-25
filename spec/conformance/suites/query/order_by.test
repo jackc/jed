@@ -7,7 +7,7 @@
 # FIRST|LAST overrides that default regardless of direction. The sort is unmetered (cost.md
 # §3): cost = storage_row_read per scanned row + row_produced per produced row (+ filter
 # operator_eval); multi-key/NULLS placement adds nothing.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.comparison_order, query.limit, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.order_by_ordinal, query.select_star, query.column_alias, query.comparison_order, query.limit, expr.arithmetic, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -147,6 +147,80 @@ SELECT id FROM t WHERE a >= 10 ORDER BY a DESC, id ASC LIMIT 2
 3
 1
 
+# An output-column ordinal (ORDER BY 1) names the 1-based position of a select-list item
+# (grammar.md §10). Position 1 here is `a`, so this is identical to `ORDER BY a` — the a=10 group
+# in stable scan order, then a=20, then the a NULL last (ASC defaults NULLS LAST). 5 + 5.
+# names: a
+# cost: 11
+query I nosort
+SELECT a FROM t ORDER BY 1
+----
+10
+10
+10
+20
+NULL
+
+# Ordinals compose with per-key direction and tie-breaking: position 2 (`a`) DESC (NULLS FIRST)
+# then position 1 (`id`) ASC. NULL `a` (id5) leads, then a=20 (id3), then the a=10 group in id
+# order (1,2,4). Mixing an ordinal with another ordinal across keys. 5 + 5.
+# names: id, a
+# cost: 11
+query II nosort
+SELECT id, a FROM t ORDER BY 2 DESC, 1 ASC
+----
+5
+NULL
+3
+20
+1
+10
+2
+10
+4
+10
+
+# With SELECT * the ordinal indexes the expanded scope columns left to right: position 3 is `b`.
+# b ASC NULLS LAST: the two b=5 rows (id1 before id4, the PK tie-break), then b=7, b=9, then the
+# b NULL row (id2) last. Proves ordinal resolution over the star projection. 5 + 5.
+# names: id, a, b
+query III nosort
+SELECT * FROM t ORDER BY 3
+----
+1
+10
+5
+4
+10
+5
+3
+20
+7
+5
+NULL
+9
+2
+10
+NULL
+
+# An ordinal resolves to the item's underlying column, NOT its output alias: position 1 is the
+# real column `a` even though it is labeled `x`. a ASC (NULLS LAST), the a=10 group broken by the
+# PK (id1, id2, id4), then a=20, then the a NULL last. 5 + 5.
+# names: x, b
+query II nosort
+SELECT a AS x, b FROM t ORDER BY 1
+----
+10
+5
+10
+NULL
+10
+5
+20
+7
+NULL
+9
+
 # NULLS must be followed by FIRST or LAST — a bare trailing NULLS is a syntax error.
 statement error 42601
 SELECT a FROM t ORDER BY a NULLS
@@ -159,13 +233,35 @@ SELECT a FROM t ORDER BY a NULLS MIDDLE
 statement error 42601
 SELECT a FROM t ORDER BY a,
 
-# An ordinal sort key (ORDER BY 1) is out of scope: a key must be a column identifier.
-statement error 42601
-SELECT a FROM t ORDER BY 1
+# An ordinal greater than the number of output columns is 42P10 (invalid_column_reference) — the
+# select list has one column, so position 2 is "not in select list" (matches PostgreSQL).
+statement error 42P10
+SELECT a FROM t ORDER BY 2
 
-# An expression sort key (ORDER BY a + 1) is out of scope for the same reason.
+# Position 0 is out of range the same way (ordinals are 1-based).
+statement error 42P10
+SELECT a FROM t ORDER BY 0
+
+# A negative ordinal is folded into the position and is likewise 42P10 (not a syntax error) —
+# PostgreSQL reports "ORDER BY position -1 is not in select list".
+statement error 42P10
+SELECT a FROM t ORDER BY -1
+
+# An expression sort key (ORDER BY a + 1) is still out of scope — a key is a column or an ordinal,
+# never a general expression.
 statement error 42601
 SELECT a FROM t ORDER BY a + 1
+
+# `ORDER BY 1 + 1` is an expression, not an ordinal: PostgreSQL reads it as a constant-expression
+# (no-op) sort, but jed rejects every expression key as 42601 (a documented narrowing, grammar.md §10).
+statement error 42601
+SELECT a FROM t ORDER BY 1 + 1
+
+# An ordinal that points at a NON-column select-list item (here the expression `a + 1`) is a deferred
+# 0A000: the engine sorts source columns, not computed projections (grammar.md §10). PostgreSQL sorts
+# by the computed value, so this is a documented narrowing.
+statement error 0A000
+SELECT a + 1, b FROM t ORDER BY 1
 
 # An ORDER BY key that names no column is an undefined-column error, reusing the existing path.
 statement error 42703

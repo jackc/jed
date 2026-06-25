@@ -1358,12 +1358,18 @@ type CaseWhen struct {
 	Result Expr
 }
 
-// OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved
-// NULL placement. NullsFirst is resolved at parse time — an explicit NULLS FIRST|LAST, else
-// the direction default (Descending: ASC -> last, DESC -> first, the PostgreSQL model where
-// NULL is the largest value) — and is applied independently of the Descending value flip
-// (spec/design/grammar.md §10).
+// OrderKey is one ORDER BY sort key: a bare table column OR an output-column ordinal, a sort
+// direction, and a resolved NULL placement. NullsFirst is resolved at parse time — an explicit
+// NULLS FIRST|LAST, else the direction default (Descending: ASC -> last, DESC -> first, the
+// PostgreSQL model where NULL is the largest value) — and is applied independently of the
+// Descending value flip (spec/design/grammar.md §10).
 type OrderKey struct {
+	// Ordinal is an output-column ordinal (`ORDER BY 1`): non-nil is the 1-based position of a
+	// select-list item (resolved by position, the value validated as 42P10 if out of range —
+	// grammar.md §10), and then Qualifier/Column are unused. nil is a column-reference key, below.
+	// An optional leading `-` is folded in, so a negative position reaches 42P10, not a syntax
+	// error. Ordinals are parsed only in the query / set-operation ORDER BY, never in WITHIN GROUP.
+	Ordinal *int64
 	// Qualifier is an optional relation qualifier (`ORDER BY t.a`); "" is a bare column.
 	Qualifier string
 	Column    string

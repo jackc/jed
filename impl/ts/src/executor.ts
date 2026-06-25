@@ -7551,10 +7551,14 @@ export class Database {
     // and 0A000 (§26).
     const order: OrderSlot[] = [];
     for (const key of sel.orderBy) {
+      // An output-column ordinal (`ORDER BY 1`) resolves by position into the select list, yielding
+      // the same Resolved a column name would (grammar.md §10).
       const r =
-        key.qualifier !== null
-          ? scope.resolveQualified(key.qualifier, key.column)
-          : scope.resolveBare(key.column);
+        key.ordinal !== null
+          ? resolveOrderOrdinal(key.ordinal, sel.items, scope)
+          : key.qualifier !== null
+            ? scope.resolveQualified(key.qualifier, key.column)
+            : scope.resolveBare(key.column);
       if (r.level !== 0) {
         throw engineError(
           "feature_not_supported",
@@ -21943,12 +21947,46 @@ function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value
 // column names (the left operand's). A qualified key is 42P01 (no relation scope after a set
 // operation); an unknown name is 42703. Returns the output column index.
 function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
+  // An output-column ordinal (`... ORDER BY 1`) resolves by position into the output columns; out of
+  // [1, ncols] is 42P10 (grammar.md §10). It precedes the name path (an ordinal has no column).
+  if (key.ordinal !== null) {
+    const ord = key.ordinal;
+    if (ord < 1 || ord > names.length) {
+      throw engineError(
+        "invalid_column_reference",
+        `ORDER BY position ${ord} is not in select list`,
+      );
+    }
+    return ord - 1;
+  }
   if (key.qualifier !== null) {
     throw engineError("undefined_table", "missing FROM-clause entry for table " + key.qualifier);
   }
   const idx = names.findIndex((n) => n.toLowerCase() === key.column.toLowerCase());
   if (idx < 0) throw engineError("undefined_column", "column " + key.column + " does not exist");
   return idx;
+}
+
+// resolveOrderOrdinal resolves an ORDER BY ordinal (`ORDER BY 1`) to a source-row resolution
+// (grammar.md §10). The 1-based ord indexes the select-list output columns: a position outside
+// [1, ncols] is 42P10 (matching PostgreSQL, including `ORDER BY 0` / a negative position); with
+// SELECT * the ordinal indexes the scope columns left to right; with an explicit list it must point
+// at a bare or qualified COLUMN item (a non-column projection is a deferred 0A000 — the engine sorts
+// source columns, not computed projections). Returns the same Resolved a column name would.
+function resolveOrderOrdinal(ord: number, items: SelectItems, scope: Scope): Resolved {
+  const ncols = items.kind === "all" ? scope.width() : items.items.length;
+  if (ord < 1 || ord > ncols) {
+    throw engineError("invalid_column_reference", `ORDER BY position ${ord} is not in select list`);
+  }
+  const pos = ord - 1;
+  if (items.kind === "all") return { level: 0, index: pos };
+  const e = items.items[pos].expr;
+  if (e.kind === "column") return scope.resolveBare(e.name);
+  if (e.kind === "qualifiedColumn") return scope.resolveQualified(e.qualifier, e.name);
+  throw engineError(
+    "feature_not_supported",
+    "ORDER BY by an output-column expression is not supported",
+  );
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column

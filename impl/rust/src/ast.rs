@@ -1207,13 +1207,19 @@ pub enum BinaryOp {
     JsonPathMatch,
 }
 
-/// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL
-/// placement. `nulls_first` is resolved at parse time — an explicit `NULLS FIRST|LAST`,
-/// else the direction default (`descending`: ASC → last, DESC → first, the PostgreSQL
-/// model where NULL is the largest value) — so the executor never re-derives it. Placement
-/// is applied independently of the `descending` value flip (spec/design/grammar.md §10).
+/// One ORDER BY sort key: a bare table column OR an output-column ordinal, a sort direction,
+/// and a resolved NULL placement. `nulls_first` is resolved at parse time — an explicit
+/// `NULLS FIRST|LAST`, else the direction default (`descending`: ASC → last, DESC → first, the
+/// PostgreSQL model where NULL is the largest value) — so the executor never re-derives it.
+/// Placement is applied independently of the `descending` value flip (spec/design/grammar.md §10).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OrderKey {
+    /// An output-column ordinal (`ORDER BY 1`): `Some(n)` is the 1-based position of a select-list
+    /// item (resolved by position, the value validated as `42P10` if out of range — grammar.md §10),
+    /// and then `qualifier`/`column` are unused. `None` is a column-reference key, below. An optional
+    /// leading `-` is folded into `n`, so a negative position reaches `42P10` rather than a syntax
+    /// error. Ordinals are parsed only in the query / set-operation ORDER BY, never in WITHIN GROUP.
+    pub ordinal: Option<i64>,
     /// An optional relation qualifier (`ORDER BY t.a`); `None` is a bare column.
     pub qualifier: Option<String>,
     pub column: String,

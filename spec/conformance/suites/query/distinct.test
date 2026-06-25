@@ -14,7 +14,7 @@
 # column in the select list (or the list is `*`), else 42P10 — once duplicates collapse, a
 # key not in the output has no single value per row. (NULL ordering also follows PostgreSQL,
 # §10 — NULL is the largest value, so ASC defaults to NULLS LAST.)
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, query.order_by_pk_scan, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.order_by_ordinal, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, error.division_by_zero, query.point_lookup, query.order_by_pk_scan, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -68,6 +68,17 @@ NULL
 # cost: 9
 query I nosort
 SELECT DISTINCT a FROM t ORDER BY a
+----
+10
+20
+NULL
+
+# The same ordering by an ordinal: position 1 (`a`) is bare-projected, so it satisfies the
+# DISTINCT "key must appear in the select list" restriction (grammar.md §11). Identical result.
+# names: a
+# cost: 9
+query I nosort
+SELECT DISTINCT a FROM t ORDER BY 1
 ----
 10
 20

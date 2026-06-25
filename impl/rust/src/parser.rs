@@ -1673,7 +1673,7 @@ impl Parser {
     /// `parse_subquery` it opens no new nesting level — the body is at the statement top level.
     fn parse_query_expr_node(&mut self) -> Result<QueryExpr> {
         let node = self.parse_set_expr()?;
-        let order_by = self.parse_order_by()?;
+        let order_by = self.parse_order_by(true)?;
         let (limit, offset) = self.parse_limit_offset()?;
         Ok(match node {
             QueryExpr::Select(mut sel) => {
@@ -1828,7 +1828,7 @@ impl Parser {
     /// query (`parse_with_query_expr`) reuses it.
     fn parse_subquery_inner(&mut self) -> Result<QueryExpr> {
         let node = self.parse_set_expr()?;
-        let order_by = self.parse_order_by()?;
+        let order_by = self.parse_order_by(true)?;
         let (limit, offset) = self.parse_limit_offset()?;
         Ok(match node {
             QueryExpr::Select(mut sel) => {
@@ -1994,7 +1994,7 @@ impl Parser {
     /// pre-set-operations `select`: a `select_core` plus the trailing clauses.
     fn parse_select(&mut self) -> Result<Select> {
         let mut sel = self.parse_select_core()?;
-        sel.order_by = self.parse_order_by()?;
+        sel.order_by = self.parse_order_by(true)?;
         let (limit, offset) = self.parse_limit_offset()?;
         sel.limit = limit;
         sel.offset = offset;
@@ -2669,7 +2669,12 @@ impl Parser {
     /// here: explicit if given, else the direction default (ASC → last, DESC → first). A bare
     /// `NULLS` not followed by `FIRST`/`LAST` is a syntax error (42601). Returns an empty vec
     /// when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
-    fn parse_order_by(&mut self) -> Result<Vec<OrderKey>> {
+    /// Parse an optional `ORDER BY <key> ("," <key>)*`. When `allow_ordinal` is set (the query and
+    /// set-operation ORDER BY), a key may be an output-column ordinal — an optionally-negative integer
+    /// literal naming the 1-based select-list position (grammar.md §10); its value is validated at
+    /// resolve (42P10). WITHIN GROUP passes `false`, so an integer there is consumed as a (missing)
+    /// column ref and is a 42601 — matching PostgreSQL, where a WITHIN GROUP integer is a constant.
+    fn parse_order_by(&mut self, allow_ordinal: bool) -> Result<Vec<OrderKey>> {
         let mut keys = Vec::new();
         if self.peek_keyword().as_deref() != Some("order") {
             return Ok(keys);
@@ -2677,15 +2682,48 @@ impl Parser {
         self.advance();
         self.expect_keyword("by")?;
         loop {
-            let (qualifier, column) = self.parse_column_ref()?;
-            let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
-            keys.push(OrderKey {
-                qualifier,
-                column,
-                collation,
-                descending,
-                nulls_first,
-            });
+            // An ordinal sort key: an optional leading `-` then an integer literal. The lexer caps a
+            // magnitude at 2^63; clamp to i64::MAX so the signed position always fits (an out-of-range
+            // position is 42P10 at resolve regardless of the exact value). A `-` not followed by an
+            // integer (`ORDER BY -a`) is a general expression — unsupported — so it falls to 42601.
+            let key = if allow_ordinal && matches!(self.peek(), Token::Int(_) | Token::Minus) {
+                let negate = if matches!(self.peek(), Token::Minus) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let magnitude = match self.advance() {
+                    Token::Int(m) => m.min(i64::MAX as u64) as i64,
+                    other => {
+                        return Err(syntax(format!(
+                            "expected an ORDER BY column or ordinal, found {other:?}"
+                        )));
+                    }
+                };
+                let ordinal = if negate { -magnitude } else { magnitude };
+                let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
+                OrderKey {
+                    ordinal: Some(ordinal),
+                    qualifier: None,
+                    column: String::new(),
+                    collation,
+                    descending,
+                    nulls_first,
+                }
+            } else {
+                let (qualifier, column) = self.parse_column_ref()?;
+                let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
+                OrderKey {
+                    ordinal: None,
+                    qualifier,
+                    column,
+                    collation,
+                    descending,
+                    nulls_first,
+                }
+            };
+            keys.push(key);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;
@@ -3946,8 +3984,10 @@ impl Parser {
         // A trailing `WITHIN GROUP (ORDER BY <key>)` marks an ordered-set aggregate (mode /
         // percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list
         // and any FILTER / OVER (PG order). `WITHIN`/`GROUP` are not reserved; right after the call's
-        // `)` they are always the clause. The order key reuses the column-only query `ORDER BY`
-        // (parse_order_by consumes the `ORDER BY` keywords); the resolver enforces exactly one key
+        // `)` they are always the clause. The order key reuses `parse_order_by` with `allow_ordinal`
+        // OFF — column-only, so a bare integer here is a (missing) column ref → 42601, matching
+        // PostgreSQL where a WITHIN GROUP integer is a constant, not an ordinal; the resolver enforces
+        // exactly one key
         // (42883) and the per-name rules.
         let within_group = if self.peek_keyword().as_deref() == Some("within") {
             self.advance();
@@ -3956,7 +3996,7 @@ impl Parser {
             if self.peek_keyword().as_deref() != Some("order") {
                 return Err(syntax("WITHIN GROUP requires an ORDER BY clause"));
             }
-            let keys = self.parse_order_by()?;
+            let keys = self.parse_order_by(false)?;
             self.expect(&Token::RParen)?;
             Some(Box::new(keys))
         } else {

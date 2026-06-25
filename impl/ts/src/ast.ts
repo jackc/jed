@@ -347,12 +347,18 @@ export type SelectItem = { expr: Expr; alias: string | null };
 // SelectItems is either all columns (*) or a list of projected expressions.
 export type SelectItems = { kind: "all" } | { kind: "list"; items: SelectItem[] };
 
-// OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved
-// NULL placement. nullsFirst is resolved at parse time — an explicit NULLS FIRST|LAST, else
-// the direction default (descending: ASC -> last, DESC -> first, the PostgreSQL model where
-// NULL is the largest value) — and is applied independently of the descending value flip
-// (spec/design/grammar.md §10).
+// OrderKey is one ORDER BY sort key: a bare table column OR an output-column ordinal, a sort
+// direction, and a resolved NULL placement. nullsFirst is resolved at parse time — an explicit
+// NULLS FIRST|LAST, else the direction default (descending: ASC -> last, DESC -> first, the
+// PostgreSQL model where NULL is the largest value) — and is applied independently of the
+// descending value flip (spec/design/grammar.md §10).
 export type OrderKey = {
+  // An output-column ordinal (`ORDER BY 1`): non-null is the 1-based position of a select-list item
+  // (resolved by position, the value validated as 42P10 if out of range — grammar.md §10), and then
+  // qualifier/column are unused. null is a column-reference key, below. An optional leading `-` is
+  // folded in, so a negative position reaches 42P10, not a syntax error. Ordinals are parsed only in
+  // the query / set-operation ORDER BY, never in WITHIN GROUP.
+  ordinal: number | null;
   // An optional relation qualifier (`ORDER BY t.a`); null is a bare column.
   qualifier: string | null;
   column: string;

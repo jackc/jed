@@ -8937,9 +8937,14 @@ impl Database {
         // ORDER BY key — ordering by an enclosing-query constant — is degenerate and 0A000 (§26).
         let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(sel.order_by.len());
         for key in &sel.order_by {
-            let r = match &key.qualifier {
-                Some(q) => scope.resolve_qualified(q, &key.column)?,
-                None => scope.resolve_bare(&key.column)?,
+            let r = match key.ordinal {
+                // An output-column ordinal (`ORDER BY 1`) resolves by position into the select list,
+                // yielding the same `Resolved::Local` a column name would (grammar.md §10).
+                Some(ord) => resolve_order_ordinal(ord, &sel.items, &scope)?,
+                None => match &key.qualifier {
+                    Some(q) => scope.resolve_qualified(q, &key.column)?,
+                    None => scope.resolve_bare(&key.column)?,
+                },
             };
             let idx = match r {
                 Resolved::Local(i) => i,
@@ -25948,6 +25953,17 @@ fn combine_setop(
 /// operand's). A qualified key is 42P01 (no relation scope after a set operation); an unknown name
 /// is 42703. Returns the output column index.
 fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Result<usize> {
+    // An output-column ordinal (`... ORDER BY 1`) resolves by position into the output columns; out
+    // of [1, ncols] is 42P10 (grammar.md §10). It precedes the name path (an ordinal has no column).
+    if let Some(ord) = key.ordinal {
+        if ord < 1 || ord > names.len() as i64 {
+            return Err(EngineError::new(
+                SqlState::InvalidColumnReference,
+                format!("ORDER BY position {ord} is not in select list"),
+            ));
+        }
+        return Ok((ord - 1) as usize);
+    }
     if let Some(q) = &key.qualifier {
         return Err(EngineError::new(
             SqlState::UndefinedTable,
@@ -25963,6 +25979,37 @@ fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Result<usize> {
                 format!("column {} does not exist", key.column),
             )
         })
+}
+
+/// Resolve an ORDER BY ordinal (`ORDER BY 1`) to a source-row resolution (grammar.md §10). The
+/// 1-based `ord` indexes the select-list output columns: a position outside `[1, ncols]` is `42P10`
+/// (matching PostgreSQL, including `ORDER BY 0` / a negative position); with `SELECT *` the ordinal
+/// indexes the scope columns left to right; with an explicit list it must point at a bare or
+/// qualified COLUMN item (a non-column projection is a deferred `0A000` — the engine sorts source
+/// columns, not computed projections). Returns the same `Resolved::Local` a column-name key would.
+fn resolve_order_ordinal(ord: i64, items: &SelectItems, scope: &Scope) -> Result<Resolved> {
+    let ncols = match items {
+        SelectItems::All => scope.width() as i64,
+        SelectItems::Items(its) => its.len() as i64,
+    };
+    if ord < 1 || ord > ncols {
+        return Err(EngineError::new(
+            SqlState::InvalidColumnReference,
+            format!("ORDER BY position {ord} is not in select list"),
+        ));
+    }
+    let pos = (ord - 1) as usize;
+    match items {
+        SelectItems::All => Ok(Resolved::Local(pos)),
+        SelectItems::Items(its) => match &its[pos].expr {
+            Expr::Column(name) => scope.resolve_bare(name),
+            Expr::QualifiedColumn { qualifier, name } => scope.resolve_qualified(qualifier, name),
+            _ => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "ORDER BY by an output-column expression is not supported",
+            )),
+        },
+    }
 }
 
 fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {

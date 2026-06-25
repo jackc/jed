@@ -655,22 +655,33 @@ select_items   ::= "*"
 
 select_item    ::= expr ("AS" identifier)?
 
-/* ORDER BY is one or more sort keys, applied left to right (the first key is
+/* ORDER BY is one or more sort terms, applied left to right (the first term is
  * primary, ties broken by the next, and a full tie keeps the primary-key scan
- * order via a stable sort). A sort_key is a bare table column — NOT a general
- * expression, an output alias, or an ordinal position (those stay deferred,
- * ../design/grammar.md §5) — with an optional direction and an optional explicit
- * NULL placement. Default NULL placement follows direction: ASC => NULLS LAST,
- * DESC => NULLS FIRST, because the physical key order ratifies NULL as the LARGEST
- * value (the PostgreSQL model; ../design/types.md §4, ../types/compare.toml
+ * order via a stable sort). An order_term is EITHER a bare table column OR an
+ * output-column ordinal (ORDER BY 1) — an integer literal naming the 1-based
+ * position of a select-list item (../design/grammar.md §10). It is still NOT a
+ * general expression (ORDER BY a + 1) nor an output alias (those stay deferred,
+ * ../design/grammar.md §5). Each term carries an optional direction and an optional
+ * explicit NULL placement. Default NULL placement follows direction: ASC => NULLS
+ * LAST, DESC => NULLS FIRST, because the physical key order ratifies NULL as the
+ * LARGEST value (the PostgreSQL model; ../design/types.md §4, ../types/compare.toml
  * null_ordering). An explicit NULLS FIRST | LAST overrides that default regardless
  * of direction. "NULLS" not followed by FIRST | LAST is a syntax error (42601). */
-order_by       ::= "ORDER" "BY" sort_key ("," sort_key)*
+order_by       ::= "ORDER" "BY" order_term ("," order_term)*
 
-/* A sort_key may carry an explicit "COLLATE name" between the column and the direction
- * (../design/collation.md §1): the column must be text (42804) and the collation must be
- * loaded ("C" else db.ImportCollation, 42704); it orders this key by that collation's UCA
- * sort key. */
+/* An order_term is a column reference or an ordinal, plus the shared sort suffix. An
+ * ordinal is an (optionally negative) integer literal; its VALUE is validated at resolve
+ * (42P10 invalid_column_reference — "ORDER BY position N is not in select list" — when N is
+ * < 1 or > the number of output columns), and an ordinal that points at a non-column
+ * select-list expression is a deferred 0A000 (../design/grammar.md §10). */
+order_term     ::= ( ordinal | column_ref ) collate_clause? ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
+ordinal        ::= "-"? integer
+
+/* A sort_key (the WITHIN GROUP order key — § within_group_clause) may carry an explicit
+ * "COLLATE name" between the column and the direction (../design/collation.md §1): the column
+ * must be text (42804) and the collation must be loaded ("C" else db.ImportCollation, 42704);
+ * it orders this key by that collation's UCA sort key. Unlike order_term it is column-only —
+ * a bare integer there is a constant expression, not an ordinal (matching PostgreSQL). */
 sort_key       ::= column_ref collate_clause? ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
 
 /* The COLLATE postfix operator: "name" is a double-quoted identifier (case-sensitive,
@@ -957,8 +968,9 @@ filter_clause  ::= "FILTER" "(" "WHERE" expr ")"
  * §13) attaches its sort key as a WITHIN GROUP ( ORDER BY … ) clause, between the argument list
  * and any FILTER / OVER. The parenthesized argument list is the per-group DIRECT argument (the
  * percentile fraction; empty for mode), the WITHIN GROUP order key is the AGGREGATED argument
- * (the sorted input). Exactly one sort key (a second column is 42883); column-only, like the
- * query order_by (§ order_by). WITHIN GROUP on a non-ordered-set function — or its absence on an
+ * (the sorted input). Exactly one sort key (a second column is 42883); column-only — UNLIKE the
+ * query order_by (§ order_by), a bare integer here is a constant, not an ordinal (matching
+ * PostgreSQL). WITHIN GROUP on a non-ordered-set function — or its absence on an
  * ordered-set aggregate — is 42883; OVER on an ordered-set aggregate is 0A000. */
 within_group_clause ::= "WITHIN" "GROUP" "(" "ORDER" "BY" sort_key ")"
 

@@ -3198,6 +3198,10 @@ func (p *Parser) parseHaving(sel *Select) error {
 	return nil
 }
 
+// parseOrderBy parses the query / set-operation `ORDER BY`. A key may be an output-column ordinal
+// — an optionally-negative integer literal naming the 1-based select-list position (grammar.md §10),
+// its value validated at resolve (42P10) — or a bare/qualified column. (WITHIN GROUP inlines its own
+// column-only loop, so an integer there is a 42601, matching PostgreSQL's "integer is a constant".)
 func (p *Parser) parseOrderBy(sel *Select) error {
 	if p.peekKeyword() != "order" {
 		return nil
@@ -3207,15 +3211,46 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		return err
 	}
 	for {
-		qualifier, col, err := p.parseColumnRef()
-		if err != nil {
-			return err
+		var key OrderKey
+		// An ordinal sort key: an optional leading `-` then an integer literal. The lexer caps a
+		// magnitude at 2^63; clamp to math.MaxInt64 so the signed position always fits (an out-of-range
+		// position is 42P10 at resolve regardless of the exact value). A `-` not followed by an integer
+		// (`ORDER BY -a`) is an unsupported general expression and falls through to a 42601.
+		if k := p.peek().Kind; k == TokInt || k == TokMinus {
+			negate := false
+			if p.peek().Kind == TokMinus {
+				p.advance()
+				negate = true
+			}
+			t := p.advance()
+			if t.Kind != TokInt {
+				return NewError(SyntaxError, "expected an ORDER BY column or ordinal")
+			}
+			mag := t.Int
+			if mag > uint64(math.MaxInt64) {
+				mag = uint64(math.MaxInt64)
+			}
+			ord := int64(mag)
+			if negate {
+				ord = -ord
+			}
+			collation, descending, nullsFirst, err := p.parseSortSuffix()
+			if err != nil {
+				return err
+			}
+			key = OrderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+		} else {
+			qualifier, col, err := p.parseColumnRef()
+			if err != nil {
+				return err
+			}
+			collation, descending, nullsFirst, err := p.parseSortSuffix()
+			if err != nil {
+				return err
+			}
+			key = OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 		}
-		collation, descending, nullsFirst, err := p.parseSortSuffix()
-		if err != nil {
-			return err
-		}
-		sel.OrderBy = append(sel.OrderBy, OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
+		sel.OrderBy = append(sel.OrderBy, key)
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue

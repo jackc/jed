@@ -6,7 +6,7 @@
 # of cost.md §3: cost = lhs.cost + rhs.cost; the dedup, the ORDER BY sort, and the LIMIT/OFFSET
 # slice are all unmetered — so a bare-column `SELECT col FROM t` operand costs 2*|t|
 # (storage_row_read + row_produced per row), and LIMIT does NOT lower the cost.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.column_alias, query.limit, query.offset, types.i32, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.order_by_ordinal, query.column_alias, query.limit, query.offset, types.i32, types.decimal, resource.cost_metering
 
 statement ok
 CREATE TABLE a (id i32 PRIMARY KEY, k i32)
@@ -92,6 +92,22 @@ SELECT k AS code FROM a UNION SELECT k FROM b ORDER BY code
 20
 30
 40
+
+# A trailing ORDER BY on a set operation also accepts an output-column ordinal: position 1 is the
+# single output column, DESC. Resolves by position into the combined result (grammar.md §10).
+# names: k
+# cost: 14
+query I nosort
+SELECT k FROM a UNION SELECT k FROM b ORDER BY 1 DESC
+----
+40
+30
+20
+10
+
+# An ordinal past the output width is 42P10 (the set operation has one output column).
+statement error 42P10
+SELECT k FROM a UNION SELECT k FROM b ORDER BY 2
 
 # LIMIT / OFFSET window the ordered combined result. They are UNMETERED and the operands still
 # produce all their rows, so the cost stays 12 even though only two rows are emitted.
