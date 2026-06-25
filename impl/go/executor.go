@@ -10009,7 +10009,9 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// (spec/design/window.md §5.1). A grouped query that ALSO windows is both collecting and
 	// windowing (the window stage runs over the grouped rows — §2); a plain window query is only
 	// windowing.
-	hasWindowSyntax := itemsHaveWindow(sel.Items)
+	// A window function may appear in the SELECT list OR in an ORDER BY key (grammar.md §10): either
+	// sets up the window machinery so the key can be sorted by the computed window value.
+	hasWindowSyntax := itemsHaveWindow(sel.Items) || orderByHasWindow(sel.OrderBy)
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
 	if hasWindowSyntax {
 		projAgg.windowing = true
@@ -10079,40 +10081,9 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		aggSpecs = hctx.specs
 		groupingSpecs = hctx.groupingSpecs
 	}
-	// Rebase the window placeholder slots now that the row layout is final (window.md §5.1). The
-	// window stage's row is [input… , materialized window keys… , window results…], where inputWidth
-	// is the grouped row's width (group keys + every aggregate) for a grouped+window query, else the
-	// FROM scope width. A materialized window-key slot windowKeyBase+k rewrites to inputWidth+k (in
-	// each spec's PARTITION BY / ORDER BY); a window-result slot windowResultBase+w rewrites to
-	// inputWidth+len(windowKeys)+w (in the projection only — 42P20 elsewhere). With no expression keys
-	// windowKeys is empty, so a plain query's results land at inputWidth+w exactly as before.
-	if hasWindow {
-		inputWidth := 0
-		if isAgg {
-			inputWidth = len(groupKeys) + len(aggSpecs)
-		} else {
-			for _, rel := range s.rels {
-				inputWidth += len(rel.table.Columns)
-			}
-		}
-		keyBase := inputWidth
-		resultBase := inputWidth + len(windowKeys)
-		for i := range windowSpecs {
-			for j, pk := range windowSpecs[i].partition {
-				if pk >= windowKeyBase {
-					windowSpecs[i].partition[j] = keyBase + (pk - windowKeyBase)
-				}
-			}
-			for j := range windowSpecs[i].order {
-				if windowSpecs[i].order[j].idx >= windowKeyBase {
-					windowSpecs[i].order[j].idx = keyBase + (windowSpecs[i].order[j].idx - windowKeyBase)
-				}
-			}
-		}
-		for _, p := range projections {
-			rebasePlaceholderCols(p, windowResultBase, resultBase)
-		}
-	}
+	// (The window / GROUPING() placeholder rebases run AFTER the ORDER BY resolution below, because an
+	// ORDER BY key may itself introduce a window function / aggregate / GROUPING() — so the final spec
+	// counts, and thus every placeholder's real slot, are not known until ORDER BY is resolved.)
 	// Build the grouping sets (spec/design/aggregates.md §12). For an aggregate query with no GROUP BY
 	// this is the single empty (whole-table) set; otherwise one entry per resolved set, each recording
 	// its bucket key columns, the per-master-slot value source (or -1 = NULL), and the GROUPING() mask.
@@ -10143,24 +10114,8 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			groupSets = append(groupSets, groupSetPlan{keyCols: keyCols, slotSrc: slotSrc, mask: mask})
 		}
 	}
-	// GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
-	// (spec/design/aggregates.md §12) — both want the grouped-row trailing slots, and the combination
-	// is deferred. A pure single-set GROUP BY + window stays on the existing path.
-	if hasWindow && (len(groupSets) > 1 || len(groupingSpecs) > 0) {
-		return nil, NewError(FeatureNotSupported, "GROUPING SETS / GROUPING() with window functions is not supported")
-	}
-	// Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
-	// len(groupKeys)+len(aggSpecs)+g (the GROUPING results follow the master columns and aggregate
-	// results — §12). GROUPING never coexists with window functions (guarded above).
-	if len(groupingSpecs) > 0 {
-		gbase := len(groupKeys) + len(aggSpecs)
-		for _, p := range projections {
-			rebasePlaceholderCols(p, groupingGsBase, gbase)
-		}
-		if having != nil {
-			rebasePlaceholderCols(having, groupingGsBase, gbase)
-		}
-	}
+	// (The GROUPING SETS/window mutual-exclusion check and the GROUPING() placeholder rebase also run
+	// after the ORDER BY resolution below — an ORDER BY GROUPING() grows groupingSpecs.)
 	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
 	if isAgg && sel.Distinct {
 		return nil, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
@@ -10348,35 +10303,35 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			continue
 		}
 
-		// A general-expression key in a grouped query that ALSO windows is deferred (its row is extended
-		// by the window stage over the grouped row — a follow-on; grammar.md §10).
-		if isAgg && hasWindow {
+		// A general-expression key in a grouped query that ALSO has window functions is deferred (its row
+		// is extended by the window stage over the grouped row — query.order_by_grouped_window).
+		if isAgg && hasWindowSyntax {
 			return nil, NewError(FeatureNotSupported, "ORDER BY by an expression in a grouped windowed query is not supported")
 		}
-		// Resolve the key expression. A grouped query resolves it against the group context (group keys +
-		// aggregates), where it may introduce a NEW aggregate — collected back into aggSpecs. A fresh
-		// empty groupingSpecs isolates any GROUPING(...) call it contains (a deferred 0A000). A plain
-		// query resolves it under the Forbidden mode (columns are real input slots; an aggregate is 42803,
-		// a window function 42P20).
+		// Resolve the key expression in the SAME context the projection used, so a window function /
+		// GROUPING() / aggregate it contains collects into the shared specs and references the same
+		// placeholders (rebased together after this loop — grammar.md §10): a grouped query (no window)
+		// resolves in collect mode over the group keys + aggregates + GROUPING() calls (a new aggregate or
+		// GROUPING() the select list lacks is allowed); a window query (no grouping) resolves in windowing
+		// mode (a window function collects a window spec); a plain query forbids both (aggregate 42803,
+		// window function 42P20).
 		var rexpr *rExpr
 		var ty resolvedType
-		if isAgg {
-			octx := &aggCtx{collecting: true, groupKeys: groupKeys, specs: aggSpecs}
-			rexpr, ty, err = resolve(s, *orderExpr, nil, octx, ptypes)
-			aggSpecs = octx.specs
-			if err != nil {
-				return nil, err
-			}
-			if len(octx.groupingSpecs) > 0 {
-				return nil, NewError(FeatureNotSupported, "ORDER BY by a GROUPING() expression is not supported")
-			}
-		} else {
-			octx := &aggCtx{}
-			rexpr, ty, err = resolve(s, *orderExpr, nil, octx, ptypes)
-			if err != nil {
-				return nil, err
-			}
+		octx := &aggCtx{collecting: isAgg, groupKeys: groupKeys, specs: aggSpecs, groupingSpecs: groupingSpecs}
+		if hasWindowSyntax {
+			octx.windowing = true
+			octx.windowBase = windowResultBase
+			octx.windowSpecs = windowSpecs
+			octx.windowKeys = windowKeys
 		}
+		rexpr, ty, err = resolve(s, *orderExpr, nil, octx, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		aggSpecs = octx.specs
+		groupingSpecs = octx.groupingSpecs
+		windowSpecs = octx.windowSpecs
+		windowKeys = octx.windowKeys
 		// A correlated ORDER BY expression (one referencing an enclosing query) is allowed
 		// (query.order_by_correlated): the outer column is a per-evaluation constant of the enclosing
 		// row, evaluated against the outer-row environment still in scope when materializeOrderExprs
@@ -10409,11 +10364,69 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		orderExprs = append(orderExprs, rexpr)
 		order = append(order, orderSlot{idx: orderExprBase + k, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
 	}
+	// All specs are now final (an ORDER BY key may have introduced a window function / aggregate /
+	// GROUPING()). Recompute hasWindow and rebase every placeholder — in the projections, HAVING, AND
+	// the materialized ORDER BY expressions — to its real trailing slot (window.md §5.1). The window
+	// stage's row is [input… , materialized window keys… , window results…]; inputWidth is the grouped
+	// row's width (group keys + every aggregate) for a grouped+window query, else the FROM scope width.
+	hasWindow = len(windowSpecs) > 0
+	if hasWindow {
+		inputWidth := 0
+		if isAgg {
+			inputWidth = len(groupKeys) + len(aggSpecs)
+		} else {
+			inputWidth = s.width()
+		}
+		keyBase := inputWidth
+		resultBase := inputWidth + len(windowKeys)
+		for i := range windowSpecs {
+			for j, pk := range windowSpecs[i].partition {
+				if pk >= windowKeyBase {
+					windowSpecs[i].partition[j] = keyBase + (pk - windowKeyBase)
+				}
+			}
+			for j := range windowSpecs[i].order {
+				if windowSpecs[i].order[j].idx >= windowKeyBase {
+					windowSpecs[i].order[j].idx = keyBase + (windowSpecs[i].order[j].idx - windowKeyBase)
+				}
+			}
+		}
+		for _, p := range projections {
+			rebasePlaceholderCols(p, windowResultBase, resultBase)
+		}
+		for _, oe := range orderExprs {
+			rebasePlaceholderCols(oe, windowResultBase, resultBase)
+		}
+	}
+	// GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
+	// (spec/design/aggregates.md §12) — both want the grouped-row trailing slots. A pure single-set
+	// GROUP BY + window stays on the existing path.
+	if hasWindow && (len(groupSets) > 1 || len(groupingSpecs) > 0) {
+		return nil, NewError(FeatureNotSupported, "GROUPING SETS / GROUPING() with window functions is not supported")
+	}
+	// Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
+	// len(groupKeys)+len(aggSpecs)+g (the GROUPING results follow the master columns and aggregate
+	// results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
+	if len(groupingSpecs) > 0 {
+		gbase := len(groupKeys) + len(aggSpecs)
+		for _, p := range projections {
+			rebasePlaceholderCols(p, groupingGsBase, gbase)
+		}
+		if having != nil {
+			rebasePlaceholderCols(having, groupingGsBase, gbase)
+		}
+		for _, oe := range orderExprs {
+			rebasePlaceholderCols(oe, groupingGsBase, gbase)
+		}
+	}
 	// Rebase each materialized expression-key slot to its real trailing position now that the row layout
-	// is final (aggSpecs may have grown above). The materialized order values are appended AFTER the
-	// input / window / grouped columns (grammar.md §10).
+	// is final. The materialized order values are appended AFTER the input / window / grouped columns
+	// (grammar.md §10): for a grouped+window query the grouped row is first extended by the window stage,
+	// so the order values follow the window results.
 	var orderValueBase int
 	switch {
+	case isAgg && hasWindow:
+		orderValueBase = len(groupKeys) + len(aggSpecs) + len(windowKeys) + len(windowSpecs)
 	case isAgg:
 		orderValueBase = len(groupKeys) + len(aggSpecs) + len(groupingSpecs)
 	case hasWindow:
@@ -17128,6 +17141,18 @@ func itemsHaveWindow(items SelectItems) bool {
 	}
 	for _, it := range items.Items {
 		if exprHasWindow(it.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// orderByHasWindow reports whether any ORDER BY key is (or contains) a window function, so a query
+// whose only OVER call sits in the ORDER BY still sets up the window machinery (grammar.md §10,
+// window.md §5.1). An ordinal/column key carries no expression.
+func orderByHasWindow(keys []OrderKey) bool {
+	for _, k := range keys {
+		if k.Expr != nil && exprHasWindow(*k.Expr) {
 			return true
 		}
 	}

@@ -8693,7 +8693,9 @@ impl Database {
         // where bare columns read the input/grouped row and window calls collect into synthetic slots
         // (spec/design/window.md §5.1). A grouped query that ALSO windows uses `GroupedWindow` (the
         // window stage runs over the grouped rows — §2); a plain window query uses `Window`.
-        let has_window_syntax = items_have_window(&sel.items);
+        // A window function may appear in the SELECT list OR in an ORDER BY key (grammar.md §10):
+        // either sets up the window machinery so the key can be sorted by the computed window value.
+        let has_window_syntax = items_have_window(&sel.items) || order_by_has_window(&sel.order_by);
         let mut agg_ctx = if is_agg && has_window_syntax {
             AggCtx::GroupedWindow {
                 group_keys: group_keys.clone(),
@@ -8747,7 +8749,7 @@ impl Database {
         // `grouping_specs` (the GROUPING() calls — only ever collected in `Collect`) is pulled out
         // alongside the aggregate/window specs (spec/design/aggregates.md §12).
         let mut grouping_specs: Vec<Vec<usize>> = Vec::new();
-        let (mut agg_specs, mut window_specs, window_keys): (
+        let (mut agg_specs, mut window_specs, mut window_keys): (
             Vec<AggSpec>,
             Vec<WindowSpec>,
             Vec<RExpr>,
@@ -8771,7 +8773,8 @@ impl Database {
             } => (agg_specs, window_specs, window_keys),
             AggCtx::Forbidden => (Vec::new(), Vec::new(), Vec::new()),
         };
-        let has_window = !window_specs.is_empty();
+        // `has_window` is computed after ORDER BY resolution (below) — an ORDER BY key may introduce
+        // the first window spec, so the count is not final here.
         // SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality
         // operator (PG ships no opclass — spec/design/json.md §5), so a json output column under
         // DISTINCT is 42883. jsonb IS distinguishable (its btree equality, §5).
@@ -8819,30 +8822,9 @@ impl Database {
         // rewrites to `input_width + window_keys.len() + w` (in the projection only — a window function
         // is 42P20 in WHERE / GROUP BY / HAVING, §7). With no expression keys `window_keys` is empty, so
         // a plain query's results land at `input_width + w` exactly as before (byte-identical).
-        if has_window {
-            let input_width = if is_agg {
-                group_keys.len() + agg_specs.len()
-            } else {
-                scope.width()
-            };
-            let key_base = input_width;
-            let result_base = input_width + window_keys.len();
-            for spec in &mut window_specs {
-                for pk in &mut spec.partition {
-                    if *pk >= WINDOW_KEY_BASE {
-                        *pk = key_base + (*pk - WINDOW_KEY_BASE);
-                    }
-                }
-                for (slot, ..) in &mut spec.order {
-                    if *slot >= WINDOW_KEY_BASE {
-                        *slot = key_base + (*slot - WINDOW_KEY_BASE);
-                    }
-                }
-            }
-            for p in &mut projections {
-                rebase_placeholder_cols(p, WINDOW_RESULT_BASE, result_base);
-            }
-        }
+        // (The window / GROUPING() placeholder rebases run AFTER the ORDER BY resolution below, because
+        // an ORDER BY key may itself introduce a window function / aggregate / GROUPING() — so the final
+        // spec counts, and thus every placeholder's real slot, are not known until ORDER BY is resolved.)
         // Build the grouping sets (spec/design/aggregates.md §12). For an aggregate query with no
         // GROUP BY this is the single empty (whole-table) set; otherwise one entry per resolved set,
         // each recording its bucket key columns, the per-master-slot value source (or NULL), and the
@@ -8872,29 +8854,9 @@ impl Database {
         } else {
             Vec::new()
         };
-        // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one
-        // query (spec/design/aggregates.md §12) — both want the grouped-row trailing slots, and the
-        // combination is deferred. A pure single-set GROUP BY + window stays on the existing path.
-        if has_window && (group_sets.len() > 1 || !grouping_specs.is_empty()) {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "GROUPING SETS / GROUPING() with window functions is not supported",
-            ));
-        }
-        // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
-        // `group_keys.len() + agg_specs.len() + g` (the GROUPING results follow the master columns and
-        // aggregate results — §12). GROUPING never coexists with window functions (guarded above), so
-        // these are the only placeholders left in the projection / HAVING.
+        // (The GROUPING SETS/window mutual-exclusion check and the GROUPING() placeholder rebase also run
+        // after the ORDER BY resolution below — an ORDER BY GROUPING() grows `grouping_specs`.)
         let mut having = having;
-        if !grouping_specs.is_empty() {
-            let gbase = group_keys.len() + agg_specs.len();
-            for p in &mut projections {
-                rebase_placeholder_cols(p, GROUPING_GS_BASE, gbase);
-            }
-            if let Some(h) = &mut having {
-                rebase_placeholder_cols(h, GROUPING_GS_BASE, gbase);
-            }
-        }
         // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
         if is_agg && sel.distinct {
             return Err(EngineError::new(
@@ -9066,46 +9028,55 @@ impl Database {
                     order.push((slot, key.descending, key.nulls_first, coll));
                 }
                 Target::Expr(e) => {
-                    // A general-expression key in a grouped query that ALSO windows is deferred (its row
-                    // is extended by the window stage over the grouped row — a follow-on; grammar.md §10).
-                    if is_agg && has_window {
+                    // A general-expression key in a grouped query that ALSO has window functions is
+                    // deferred (its row is extended by the window stage over the grouped row —
+                    // query.order_by_grouped_window).
+                    if is_agg && has_window_syntax {
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
                             "ORDER BY by an expression in a grouped windowed query is not supported",
                         ));
                     }
-                    // Resolve the key expression. A grouped query resolves it against the group context
-                    // (group keys + aggregates), where it may introduce a NEW aggregate — collected back
-                    // into `agg_specs`. A fresh empty `grouping_specs` isolates any `GROUPING(...)` call
-                    // it contains; that is a deferred 0A000 (grammar.md §10). A plain query resolves it
-                    // under `Forbidden` (columns are real input slots; an aggregate is 42803, a window
-                    // function 42P20). A window function in either context is 42P20 (the sub-context).
-                    let (rexpr, ty) = if is_agg {
+                    // Resolve the key expression in the SAME context the projection used, so a window
+                    // function / GROUPING() / aggregate it contains collects into the shared specs and
+                    // references the same placeholders (rebased together after this loop — grammar.md §10):
+                    // a grouped query (no window) resolves in `Collect` over the group keys + aggregates +
+                    // GROUPING() calls (a new aggregate or GROUPING() the select list lacks is allowed); a
+                    // window query (no grouping) resolves in `Window` (a window function collects a window
+                    // spec); a plain query is `Forbidden` (an aggregate is 42803, a window function 42P20).
+                    let (rexpr, ty) = if has_window_syntax {
+                        let mut octx = AggCtx::Window {
+                            specs: std::mem::take(&mut window_specs),
+                            window_keys: std::mem::take(&mut window_keys),
+                        };
+                        let res = resolve(&scope, e, None, &mut octx, ptypes);
+                        if let AggCtx::Window {
+                            specs,
+                            window_keys: wk,
+                            ..
+                        } = octx
+                        {
+                            window_specs = specs;
+                            window_keys = wk;
+                        }
+                        res?
+                    } else if is_agg {
                         let mut octx = AggCtx::Collect {
                             group_keys: group_keys.clone(),
                             specs: std::mem::take(&mut agg_specs),
-                            grouping_specs: Vec::new(),
+                            grouping_specs: std::mem::take(&mut grouping_specs),
                         };
                         let res = resolve(&scope, e, None, &mut octx, ptypes);
-                        let local_grouping = if let AggCtx::Collect {
+                        if let AggCtx::Collect {
                             specs,
                             grouping_specs: gs,
                             ..
                         } = octx
                         {
                             agg_specs = specs;
-                            gs
-                        } else {
-                            unreachable!("octx stays Collect")
-                        };
-                        let resolved = res?;
-                        if !local_grouping.is_empty() {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                "ORDER BY by a GROUPING() expression is not supported",
-                            ));
+                            grouping_specs = gs;
                         }
-                        resolved
+                        res?
                     } else {
                         let mut octx = AggCtx::Forbidden;
                         resolve(&scope, e, None, &mut octx, ptypes)?
@@ -9144,12 +9115,71 @@ impl Database {
                 }
             }
         }
+        // All specs are now final (an ORDER BY key may have introduced a window function / aggregate /
+        // GROUPING()). Recompute `has_window` and rebase every placeholder — in the projections, HAVING,
+        // AND the materialized ORDER BY expressions — to its real trailing slot (window.md §5.1). The
+        // window stage's row is `[input… , materialized window keys… , window results…]`; `input_width`
+        // is the grouped row's width (group keys + every aggregate) for a grouped+window query, else the
+        // FROM scope width.
+        let has_window = !window_specs.is_empty();
+        if has_window {
+            let input_width = if is_agg {
+                group_keys.len() + agg_specs.len()
+            } else {
+                scope.width()
+            };
+            let key_base = input_width;
+            let result_base = input_width + window_keys.len();
+            for spec in &mut window_specs {
+                for pk in &mut spec.partition {
+                    if *pk >= WINDOW_KEY_BASE {
+                        *pk = key_base + (*pk - WINDOW_KEY_BASE);
+                    }
+                }
+                for (slot, ..) in &mut spec.order {
+                    if *slot >= WINDOW_KEY_BASE {
+                        *slot = key_base + (*slot - WINDOW_KEY_BASE);
+                    }
+                }
+            }
+            for p in &mut projections {
+                rebase_placeholder_cols(p, WINDOW_RESULT_BASE, result_base);
+            }
+            for oe in &mut order_exprs {
+                rebase_placeholder_cols(oe, WINDOW_RESULT_BASE, result_base);
+            }
+        }
+        // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
+        // (spec/design/aggregates.md §12) — both want the grouped-row trailing slots. A pure single-set
+        // GROUP BY + window stays on the existing path.
+        if has_window && (group_sets.len() > 1 || !grouping_specs.is_empty()) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "GROUPING SETS / GROUPING() with window functions is not supported",
+            ));
+        }
+        // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
+        // `group_keys.len() + agg_specs.len() + g` (the GROUPING results follow the master columns and
+        // aggregate results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
+        if !grouping_specs.is_empty() {
+            let gbase = group_keys.len() + agg_specs.len();
+            for p in &mut projections {
+                rebase_placeholder_cols(p, GROUPING_GS_BASE, gbase);
+            }
+            if let Some(h) = &mut having {
+                rebase_placeholder_cols(h, GROUPING_GS_BASE, gbase);
+            }
+            for oe in &mut order_exprs {
+                rebase_placeholder_cols(oe, GROUPING_GS_BASE, gbase);
+            }
+        }
         // Rebase each materialized expression-key slot to its real trailing position now that the row
-        // layout is final (agg_specs may have grown above). The materialized order values are appended
-        // AFTER the input / window / grouped columns (grammar.md §10): a plain query's pre-sort row is
-        // `scope.width()` wide (`+ window keys + window results` for a window query); a grouped query's
-        // grouped row is `group_keys + aggregates + GROUPING() results` wide.
-        let order_value_base = if is_agg {
+        // layout is final. The materialized order values are appended AFTER the input / window / grouped
+        // columns (grammar.md §10): for a grouped+window query the grouped row is first extended by the
+        // window stage, so the order values follow the window results.
+        let order_value_base = if is_agg && has_window {
+            group_keys.len() + agg_specs.len() + window_keys.len() + window_specs.len()
+        } else if is_agg {
             group_keys.len() + agg_specs.len() + grouping_specs.len()
         } else if has_window {
             scope.width() + window_keys.len() + window_specs.len()
@@ -17168,6 +17198,14 @@ fn items_have_window(items: &SelectItems) -> bool {
         SelectItems::All => false,
         SelectItems::Items(items) => items.iter().any(|it| expr_has_window(&it.expr)),
     }
+}
+
+/// Whether any ORDER BY key is (or contains) a window function, so a query whose only `OVER` call
+/// sits in the ORDER BY still sets up the window machinery (grammar.md §10, window.md §5.1). An
+/// ordinal/column key carries no expression.
+fn order_by_has_window(keys: &[OrderKey]) -> bool {
+    keys.iter()
+        .any(|k| k.expr.as_ref().is_some_and(expr_has_window))
 }
 
 /// Whether an expression tree contains a window-function call anywhere (a `FuncCall` whose `over`

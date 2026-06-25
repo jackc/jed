@@ -7413,7 +7413,9 @@ export class Database {
     // bare columns read the input/grouped row and window calls collect into synthetic slots
     // (spec/design/window.md §5.1). A grouped query that ALSO windows is both collecting AND windowing
     // (the window stage runs over the grouped rows — §2); a plain window query is only windowing.
-    const hasWindowSyntax = itemsHaveWindow(sel.items);
+    // A window function may appear in the SELECT list OR in an ORDER BY key (grammar.md §10): either
+    // sets up the window machinery so the key can be sorted by the computed window value.
+    const hasWindowSyntax = itemsHaveWindow(sel.items) || orderByHasWindow(sel.orderBy);
     // Window results land AFTER the materialized window keys, and (for a grouped query) after every
     // aggregate — neither final count is known until resolution finishes (an aggregate may be nested
     // in a later window argument or HAVING). So a window result carries the PLACEHOLDER base
@@ -7454,7 +7456,9 @@ export class Database {
     // spec/design/window.md §5.1.
     const windowSpecs: WindowSpec[] = projAgg.window?.windowSpecs ?? [];
     const windowKeys: RExpr[] = projAgg.window?.windowKeys ?? [];
-    const hasWindow = windowSpecs.length > 0;
+    // hasWindow is computed after ORDER BY resolution (below) — an ORDER BY key may introduce the
+    // first window spec, so the count is not final here.
+    let hasWindow = false;
     // SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality operator
     // (PG ships no opclass — spec/design/json.md §5), so a json output column under DISTINCT is
     // 42883. jsonb IS distinguishable (its btree equality, §5).
@@ -7479,29 +7483,9 @@ export class Database {
       aggSpecs = hctx.specs;
       groupingSpecs = hctx.groupingSpecs ?? groupingSpecs;
     }
-    // Rebase the window placeholder slots now that the row layout is final (window.md §5.1). The
-    // window stage's row is [input… , materialized window keys… , window results…], where inputWidth
-    // is the grouped row's width (group keys + every aggregate) for a grouped+window query, else the
-    // FROM scope width. A materialized window-key slot WINDOW_KEY_BASE+k rewrites to inputWidth+k (in
-    // each spec's PARTITION BY / ORDER BY); a window-result slot WINDOW_RESULT_BASE+w rewrites to
-    // inputWidth+windowKeys.length+w (in the projection only — 42P20 elsewhere). With no expression
-    // keys windowKeys is empty, so a plain query's results land at inputWidth+w exactly as before.
-    if (hasWindow) {
-      const inputWidth = isAgg ? groupKeys.length + aggSpecs.length : scope.width();
-      const keyBase = inputWidth;
-      const resultBase = inputWidth + windowKeys.length;
-      for (const spec of windowSpecs) {
-        for (let j = 0; j < spec.partition.length; j++) {
-          if (spec.partition[j] >= WINDOW_KEY_BASE) {
-            spec.partition[j] = keyBase + (spec.partition[j] - WINDOW_KEY_BASE);
-          }
-        }
-        for (const o of spec.order) {
-          if (o.idx >= WINDOW_KEY_BASE) o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
-        }
-      }
-      for (const p of projections) rebasePlaceholderCols(p, WINDOW_RESULT_BASE, resultBase);
-    }
+    // (The window / GROUPING() placeholder rebases run AFTER the ORDER BY resolution below, because an
+    // ORDER BY key may itself introduce a window function / aggregate / GROUPING() — so the final spec
+    // counts, and thus every placeholder's real slot, are not known until ORDER BY is resolved.)
     // Build the grouping sets (spec/design/aggregates.md §12). For an aggregate query with no GROUP BY
     // this is the single empty (whole-table) set; otherwise one entry per resolved set, each recording
     // its bucket key columns, the per-master-slot value source (or -1 = NULL), and the GROUPING() mask.
@@ -7518,23 +7502,8 @@ export class Database {
           return { keyCols: set.slice(), slotSrc, mask };
         })
       : [];
-    // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
-    // (spec/design/aggregates.md §12) — both want the grouped-row trailing slots, and the combination
-    // is deferred. A pure single-set GROUP BY + window stays on the existing path.
-    if (hasWindow && (groupSets.length > 1 || groupingSpecs.length > 0)) {
-      throw engineError(
-        "feature_not_supported",
-        "GROUPING SETS / GROUPING() with window functions is not supported",
-      );
-    }
-    // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
-    // groupKeys.length+aggSpecs.length+g (the GROUPING results follow the master columns and aggregate
-    // results — §12). GROUPING never coexists with window functions (guarded above).
-    if (groupingSpecs.length > 0) {
-      const gbase = groupKeys.length + aggSpecs.length;
-      for (const p of projections) rebasePlaceholderCols(p, GROUPING_GS_BASE, gbase);
-      if (having !== null) rebasePlaceholderCols(having, GROUPING_GS_BASE, gbase);
-    }
+    // (The GROUPING SETS/window mutual-exclusion check and the GROUPING() placeholder rebase also run
+    // after the ORDER BY resolution below — an ORDER BY GROUPING() grows groupingSpecs.)
     // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
     if (isAgg && sel.distinct) {
       throw engineError(
@@ -7669,34 +7638,35 @@ export class Database {
         continue;
       }
 
-      // A general-expression key in a grouped query that ALSO windows is deferred (its row is extended
-      // by the window stage over the grouped row — a follow-on; grammar.md §10).
-      if (isAgg && hasWindow) {
+      // A general-expression key in a grouped query that ALSO has window functions is deferred (its row
+      // is extended by the window stage over the grouped row — query.order_by_grouped_window).
+      if (isAgg && hasWindowSyntax) {
         throw engineError(
           "feature_not_supported",
           "ORDER BY by an expression in a grouped windowed query is not supported",
         );
       }
-      // Resolve the key expression. A grouped query resolves it against the group context (group keys +
-      // aggregates), where it may introduce a NEW aggregate — collected back into aggSpecs (the shared
-      // array). A fresh empty groupingSpecs isolates any GROUPING(...) call it contains (a deferred
-      // 0A000). A plain query resolves it under the Forbidden mode (columns are real input slots; an
-      // aggregate is 42803, a window function 42P20).
+      // Resolve the key expression in the SAME context the projection used, so a window function /
+      // GROUPING() / aggregate it contains collects into the shared specs and references the same
+      // placeholders (rebased together after this loop — grammar.md §10): a grouped query (no window)
+      // resolves in collect mode over the group keys + aggregates + GROUPING() calls (a new aggregate or
+      // GROUPING() the select list lacks is allowed); a window query (no grouping) resolves in windowing
+      // mode (a window function collects a window spec); a plain query forbids both (aggregate 42803,
+      // window function 42P20).
       let node: RExpr;
       let type: ResolvedType;
-      if (isAgg) {
-        const octx: AggCtx = { collecting: true, groupKeys, specs: aggSpecs, groupingSpecs: [] };
-        ({ node, type } = resolve(scope, orderExpr, null, octx, ptypes));
-        if ((octx.groupingSpecs?.length ?? 0) > 0) {
-          throw engineError(
-            "feature_not_supported",
-            "ORDER BY by a GROUPING() expression is not supported",
-          );
-        }
-      } else {
-        const octx: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-        ({ node, type } = resolve(scope, orderExpr, null, octx, ptypes));
-      }
+      const octx: AggCtx = hasWindowSyntax
+        ? {
+            collecting: isAgg,
+            groupKeys,
+            specs: aggSpecs,
+            groupingSpecs,
+            window: { base: WINDOW_RESULT_BASE, windowSpecs, windowKeys },
+          }
+        : { collecting: isAgg, groupKeys, specs: aggSpecs, groupingSpecs };
+      ({ node, type } = resolve(scope, orderExpr, null, octx, ptypes));
+      aggSpecs = octx.specs;
+      groupingSpecs = octx.groupingSpecs ?? groupingSpecs;
       // A correlated ORDER BY expression (one referencing an enclosing query) is allowed
       // (query.order_by_correlated): the outer column is a per-evaluation constant of the enclosing
       // row, evaluated against the outer-row environment still in scope when materializeOrderExprs
@@ -7724,14 +7694,59 @@ export class Database {
       orderExprs.push(node);
       order.push({ idx: ORDER_EXPR_BASE + k, descending: key.descending, nullsFirst: key.nullsFirst, collation: coll });
     }
+    // All specs are now final (an ORDER BY key may have introduced a window function / aggregate /
+    // GROUPING()). Recompute hasWindow and rebase every placeholder — in the projections, HAVING, AND
+    // the materialized ORDER BY expressions — to its real trailing slot (window.md §5.1). The window
+    // stage's row is [input… , materialized window keys… , window results…]; inputWidth is the grouped
+    // row's width (group keys + every aggregate) for a grouped+window query, else the FROM scope width.
+    hasWindow = windowSpecs.length > 0;
+    if (hasWindow) {
+      const inputWidth = isAgg ? groupKeys.length + aggSpecs.length : scope.width();
+      const keyBase = inputWidth;
+      const resultBase = inputWidth + windowKeys.length;
+      for (const spec of windowSpecs) {
+        for (let j = 0; j < spec.partition.length; j++) {
+          if (spec.partition[j] >= WINDOW_KEY_BASE) {
+            spec.partition[j] = keyBase + (spec.partition[j] - WINDOW_KEY_BASE);
+          }
+        }
+        for (const o of spec.order) {
+          if (o.idx >= WINDOW_KEY_BASE) o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
+        }
+      }
+      for (const p of projections) rebasePlaceholderCols(p, WINDOW_RESULT_BASE, resultBase);
+      for (const oe of orderExprs) rebasePlaceholderCols(oe, WINDOW_RESULT_BASE, resultBase);
+    }
+    // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
+    // (spec/design/aggregates.md §12) — both want the grouped-row trailing slots. A pure single-set
+    // GROUP BY + window stays on the existing path.
+    if (hasWindow && (groupSets.length > 1 || groupingSpecs.length > 0)) {
+      throw engineError(
+        "feature_not_supported",
+        "GROUPING SETS / GROUPING() with window functions is not supported",
+      );
+    }
+    // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
+    // groupKeys.length+aggSpecs.length+g (the GROUPING results follow the master columns and aggregate
+    // results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
+    if (groupingSpecs.length > 0) {
+      const gbase = groupKeys.length + aggSpecs.length;
+      for (const p of projections) rebasePlaceholderCols(p, GROUPING_GS_BASE, gbase);
+      if (having !== null) rebasePlaceholderCols(having, GROUPING_GS_BASE, gbase);
+      for (const oe of orderExprs) rebasePlaceholderCols(oe, GROUPING_GS_BASE, gbase);
+    }
     // Rebase each materialized expression-key slot to its real trailing position now that the row layout
-    // is final (aggSpecs may have grown above). The materialized order values are appended AFTER the
-    // input / window / grouped columns (grammar.md §10).
-    const orderValueBase = isAgg
-      ? groupKeys.length + aggSpecs.length + groupingSpecs.length
-      : hasWindow
-        ? scope.width() + windowKeys.length + windowSpecs.length
-        : scope.width();
+    // is final. The materialized order values are appended AFTER the input / window / grouped columns
+    // (grammar.md §10): for a grouped+window query the grouped row is first extended by the window stage,
+    // so the order values follow the window results.
+    const orderValueBase =
+      isAgg && hasWindow
+        ? groupKeys.length + aggSpecs.length + windowKeys.length + windowSpecs.length
+        : isAgg
+          ? groupKeys.length + aggSpecs.length + groupingSpecs.length
+          : hasWindow
+            ? scope.width() + windowKeys.length + windowSpecs.length
+            : scope.width();
     for (const o of order) {
       if (o.idx >= ORDER_EXPR_BASE) o.idx = orderValueBase + (o.idx - ORDER_EXPR_BASE);
     }
@@ -13802,6 +13817,13 @@ function exprHasAggregate(e: Expr): boolean {
 function itemsHaveWindow(items: SelectItems): boolean {
   if (items.kind === "all") return false;
   return items.items.some((it) => exprHasWindow(it.expr));
+}
+
+// orderByHasWindow reports whether any ORDER BY key is (or contains) a window function, so a query
+// whose only OVER call sits in the ORDER BY still sets up the window machinery (grammar.md §10,
+// window.md §5.1). An ordinal/column key carries no expression.
+function orderByHasWindow(keys: OrderKey[]): boolean {
+  return keys.some((k) => k.expr !== null && exprHasWindow(k.expr));
 }
 
 // exprHasWindow reports whether an expression tree contains a window-function call anywhere (a

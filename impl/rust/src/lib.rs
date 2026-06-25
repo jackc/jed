@@ -289,6 +289,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.order_by_alias",
     // A correlated ORDER BY key — an inner ORDER BY referencing an enclosing-query column (grammar.md §26).
     "query.order_by_correlated",
+    // A window function inside an ORDER BY key (`ORDER BY row_number() OVER (...)`, window.md §5.1).
+    "query.order_by_window",
+    // A GROUPING() call inside an ORDER BY key (`ORDER BY GROUPING(a)`, aggregates.md §12).
+    "query.order_by_grouping",
     // Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
     "query.select_star",
     "query.column_alias",

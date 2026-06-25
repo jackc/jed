@@ -127,8 +127,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `ORDER BY` re-executes per outer row (the correlation detector inspects the order expressions).
         Skip-level (grandparent) refs work; the `GROUP BY`-outer-key case stays `0A000`.
         → [grammar.md §10](spec/design/grammar.md)
-  - [ ] _follow-on:_ a window function / `GROUPING()` inside a key, and an expression key in a
-        grouped+window query (each `0A000`). _(An expression key in a **set-operation** `ORDER BY` is
+  - [x] **Window function / `GROUPING()` inside an `ORDER BY` key** (`ORDER BY row_number() OVER
+        (ORDER BY b)`, `ORDER BY rank() OVER (...) % 2`; `GROUP BY ROLLUP (a) ORDER BY GROUPING(a), a`)
+        — the key resolves in the same window / group context as the projection, collecting into the
+        shared window-spec / grouping-spec list; the placeholder rebases run after ORDER BY resolution
+        so an order-introduced spec shifts every slot consistently. A query whose only `OVER` is in the
+        `ORDER BY` still sets up the window stage, and sorting by a window value via its output alias now
+        works (`query.order_by_window`, `query.order_by_grouping`). → [grammar.md §10](spec/design/grammar.md)
+  - [ ] _follow-on:_ an expression key in a **grouped+window** query (`0A000`,
+        `query.order_by_grouped_window`). _(An expression key in a **set-operation** `ORDER BY` is
         **not** a follow-on: PostgreSQL itself rejects it with `0A000`, and jed already matches that code
         + message — grammar.md §10. Implementing it would be a divergence, not a feature.)_
 - [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,

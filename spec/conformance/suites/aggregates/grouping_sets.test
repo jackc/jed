@@ -6,7 +6,7 @@
 # row came from projects as NULL. GROUPING(c1,...,ck) returns an integer bitmask: bit (k-1-j) is 1
 # iff c_j was grouped away (NULL because not in this set), 0 if actually grouped. Columns only (the
 # same narrowing as plain GROUP BY); GROUPING() args must be grouping columns (else 42803).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.grouping_sets, query.window, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.grouping_sets, query.window, query.order_by, query.order_by_expr, query.order_by_grouping, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE gt (id i32 PRIMARY KEY, a i32, b i32, v i32)
@@ -224,6 +224,79 @@ SELECT a, COUNT(*) FROM gt GROUP BY ROLLUP(a) ORDER BY a
 2
 NULL
 5
+
+# --- GROUPING() inside an ORDER BY key (query.order_by_grouping) -----------------------------
+# The GROUPING() bitmask may sort the result rows — typically to push the higher-level subtotal /
+# grand-total rows (GROUPING = 1) to one end. The call collects into the same grouping set as a
+# select-list GROUPING(), is materialized as the ORDER BY key, and sorted over the grouped rows.
+
+# ROLLUP: detail rows (GROUPING(a)=0) first, then the grand total (NULL, GROUPING(a)=1).
+# names: a, sum
+query II nosort
+SELECT a, sum(v) FROM gt GROUP BY ROLLUP (a) ORDER BY GROUPING(a), a
+----
+1
+80
+2
+70
+NULL
+150
+
+# CUBE ordered by both GROUPING() bits then the columns: full detail, then a-subtotals, then
+# b-subtotals, then the grand total.
+# names: a, b, sum
+query III nosort
+SELECT a, b, sum(v) FROM gt GROUP BY CUBE (a, b) ORDER BY GROUPING(a), GROUPING(b), a, b
+----
+1
+1
+60
+1
+2
+20
+2
+1
+30
+2
+2
+40
+1
+NULL
+80
+2
+NULL
+70
+NULL
+1
+90
+NULL
+2
+60
+NULL
+NULL
+150
+
+# A plain GROUP BY: GROUPING(a) is always 0, so it is a constant leading key (rows ordered by a).
+# names: a, sum
+query II nosort
+SELECT a, sum(v) FROM gt GROUP BY a ORDER BY GROUPING(a), a
+----
+1
+80
+2
+70
+
+# GROUPING() DESC pushes the grand total to the top.
+# names: a, sum
+query II nosort
+SELECT a, sum(v) FROM gt GROUP BY ROLLUP (a) ORDER BY GROUPING(a) DESC, a NULLS FIRST
+----
+NULL
+150
+1
+80
+2
+70
 
 # --- error cases ----------------------------------------------------------------------------
 

@@ -346,13 +346,25 @@ A subquery correlated **only** through its `ORDER BY` is still correlated, so it
 row (the correlation detector inspects the materialized order expressions). Skip-level (grandparent)
 references work. The analogous degenerate `GROUP BY` by an enclosing column stays `0A000`.
 
-**Still narrowed (§5).** *(The output **alias** key and the **correlated** key are now supported —
-above.)* A **set-operation** `ORDER BY` (after `UNION`/`INTERSECT`/`EXCEPT`)
-accepts only an output column name or ordinal — a general-expression key there is `0A000`
-(*"invalid UNION/INTERSECT/EXCEPT ORDER BY clause"*, matching PostgreSQL, which rejects expressions
-once the inputs are unified). A **window function** inside an `ORDER BY` key, a `GROUPING(...)`
-call inside one, and an expression key in a **grouped query that also has window functions** are each
-`0A000` deferrals.
+**Window function / `GROUPING()` inside a key (now supported, `query.order_by_window` /
+`query.order_by_grouping`).** An `ORDER BY` key may be — or contain — a **window function**
+(`ORDER BY row_number() OVER (ORDER BY b)`, `ORDER BY rank() OVER (...) % 2`) or a **`GROUPING(...)`**
+call (`GROUP BY ROLLUP (a) ORDER BY GROUPING(a), a`). The key is resolved in the **same** context the
+projection uses — windowing for a window query, the group context for a grouped query — so the call
+collects into the **same** window-spec / grouping-spec list and references the same placeholder; the
+window/`GROUPING()` placeholder rebases therefore run **after** ORDER BY resolution, once the spec
+counts are final (an order-introduced window spec or window key shifts every slot consistently). A
+query whose **only** `OVER` call sits in the `ORDER BY` still sets up the window machinery, and sorting
+by a select-list window value via its **output alias** works the same way (the alias binds the computed
+item, which is materialized — it no longer re-resolves to `42P20`). Execution is unchanged: the window
+stage appends its results before `ORDER BY` materializes the key over those rows.
+
+**Still narrowed (§5).** *(The output **alias** key, the **correlated** key, and a **window function /
+`GROUPING()`** in a key are now supported — above.)* A **set-operation** `ORDER BY` (after
+`UNION`/`INTERSECT`/`EXCEPT`) accepts only an output column name or ordinal — a general-expression key
+there is `0A000` (*"invalid UNION/INTERSECT/EXCEPT ORDER BY clause"*, matching PostgreSQL, which rejects
+expressions once the inputs are unified). An expression key in a **grouped query that also has window
+functions** (`query.order_by_grouped_window`) is still a `0A000` deferral.
 
 **NULL placement and the default.** The physical key order ratifies NULL as the **largest**
 value ([types.md](types.md) §4, `null_ordering = "nulls-last-ascending"` in
