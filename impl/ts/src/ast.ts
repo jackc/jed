@@ -862,8 +862,11 @@ export type JoinKind = "inner" | "cross" | "left" | "right" | "full";
 
 // JoinClause is one JOIN step in the left-deep FROM chain: the join kind, the right-hand
 // table reference, and the optional ON predicate (null for CROSS JOIN; set for INNER/outer,
-// which require an ON). See spec/design/grammar.md §15.
-export type JoinClause = { kind: JoinKind; table: TableRef; on: Expr | null };
+// which require an ON). `comma` is true for the implicit CROSS JOIN synthesized from a comma
+// in the FROM list (`FROM a, b`): the comma binds LOOSER than JOIN, so each comma-separated
+// FROM item is its own ON-resolution segment (a later join's ON may not reference an earlier
+// comma item — matching PostgreSQL). See spec/design/grammar.md §15.
+export type JoinClause = { kind: JoinKind; table: TableRef; on: Expr | null; comma?: boolean };
 
 // GroupItem is one GROUP BY grouping term (spec/design/aggregates.md §12). Most queries use only
 // "set" with one column each (plain `GROUP BY a, b` → two "set" items); the ROLLUP/CUBE/GROUPING SETS

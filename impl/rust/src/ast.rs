@@ -581,6 +581,12 @@ pub struct JoinClause {
     pub kind: JoinKind,
     pub table: TableRef,
     pub on: Option<Expr>,
+    /// `true` when this is the implicit `CROSS JOIN` synthesized from a **comma** in the FROM
+    /// list (`FROM a, b` — grammar.md §15). The comma binds LOOSER than `JOIN`, so each
+    /// comma-separated FROM item is its own ON-resolution segment: a later join's `ON` may not
+    /// reference relations in an *earlier* comma item (matching PostgreSQL). This flag marks the
+    /// segment boundary; it is otherwise an ordinary `CROSS` join (`kind == Cross`, `on == None`).
+    pub comma: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

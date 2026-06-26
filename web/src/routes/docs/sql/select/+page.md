@@ -268,9 +268,15 @@ dependent join re-evaluated once per left-hand row. It is the idiomatic way to e
 <LiveSql {seed} query={lateral} rows={2} />
 
 Reach it through explicit join syntax — `CROSS JOIN LATERAL`, `JOIN LATERAL … ON …`, or `LEFT JOIN
-LATERAL … ON …` (a `LEFT JOIN` keeps a left row even when the lateral side produces no rows). A
+LATERAL … ON …` (a `LEFT JOIN` keeps a left row even when the lateral side produces no rows) — or
+through a **comma**: `FROM t, LATERAL (…)` is the same as `t CROSS JOIN LATERAL (…)`. A
 sub-`SELECT` or `VALUES` body is lateral only with the keyword; a **table function** (`generate_series`,
 `unnest`) is *implicitly* lateral, so `… CROSS JOIN unnest(t.tags)` correlates with or without it.
+
+A comma in `FROM` is an implicit `CROSS JOIN` generally — `FROM a, b` is `a CROSS JOIN b`. The comma
+binds looser than `JOIN`, so each comma-separated item is its own join group: a join's `ON` may
+reference only relations inside its own group (`FROM a, b JOIN c ON a.x = c.x` is an error), matching
+PostgreSQL.
 
 ## Set-returning functions in `FROM`
 

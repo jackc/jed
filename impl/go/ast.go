@@ -588,6 +588,12 @@ type JoinClause struct {
 	Kind  JoinKind
 	Table TableRef
 	On    *Expr
+	// Comma is true when this is the implicit CROSS JOIN synthesized from a comma in the FROM
+	// list (`FROM a, b`). The comma binds LOOSER than JOIN, so each comma-separated FROM item is
+	// its own ON-resolution segment: a later join's ON may not reference an earlier comma item
+	// (matching PostgreSQL). This flag marks the segment boundary; it is otherwise an ordinary
+	// CROSS join (Kind == JoinCross, On == nil). See spec/design/grammar.md §15.
+	Comma bool
 }
 
 // Select is a SELECT. The FROM clause is a left-deep chain: From followed by zero or more

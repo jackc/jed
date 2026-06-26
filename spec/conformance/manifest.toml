@@ -297,6 +297,10 @@ id = "query.cross_join"
 description = "CROSS JOIN — the Cartesian product of two tables (no ON)"
 
 [[capability]]
+id = "query.comma_from"
+description = "Comma-separated FROM — `FROM a, b` is an implicit CROSS JOIN (the Cartesian product), identical in result to `a CROSS JOIN b` (spec/design/grammar.md §15). The comma binds LOOSER than JOIN, so each comma-separated FROM item is its own join sub-chain and its own ON-resolution segment: a later join's ON may reference only relations within its own comma item — `FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a` (matching PostgreSQL). Composes with `FROM t, LATERAL (…)` (a lateral item still sees earlier comma items). More than two comma items chain left-deep."
+
+[[capability]]
 id = "query.join_left"
 description = "LEFT [OUTER] JOIN ... ON <expr> — every left row preserved; an unmatched left row is emitted once with the right side NULL-extended (3-valued ON; a NULL join key never matches → NULL-extends). spec/design/grammar.md §15"
 

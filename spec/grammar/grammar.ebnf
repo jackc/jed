@@ -552,10 +552,15 @@ group_item     ::= "ROLLUP" "(" group_set ("," group_set)* ")"
                  | group_set
 group_set      ::= "(" (column_ref ("," column_ref)*)? ")" | column_ref
 
-/* The FROM clause is a left-deep chain: a first table_ref followed by zero or more
- * join_clauses. With no join_clause it is the single-table SELECT the rest of the
- * engine already supported (../design/grammar.md §5/§15). A table_ref is one of three
- * row sources, each with an alias:
+/* The FROM clause is one or more COMMA-separated from_items, each a left-deep chain: a
+ * first table_ref followed by zero or more join_clauses. With one item and no join_clause
+ * it is the single-table SELECT the rest of the engine already supported (../design/grammar.md
+ * §5/§15). A COMMA between from_items is an implicit CROSS JOIN — `FROM a, b` is `a CROSS JOIN b`
+ * (../design/grammar.md §15) — but the comma binds LOOSER than JOIN, so each from_item is its own
+ * ON-resolution segment: a join's ON inside one item may NOT reference a relation in an earlier
+ * item (`FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a`, matching PostgreSQL). A LATERAL item
+ * still sees earlier comma items (`FROM t, LATERAL (…)`); only a join's ON is segment-restricted.
+ * A table_ref is one of three row sources, each with an alias:
  *   - a DERIVED TABLE — a parenthesized subquery "(" query_expr ")" used as a relation
  *     (../design/grammar.md §42), e.g. "(SELECT id, n FROM t) AS d". It reuses the same
  *     computed-row-source seam as a single-reference CTE (../design/cte.md §3): the body
@@ -591,7 +596,8 @@ group_set      ::= "(" (column_ref ("," column_ref)*)? ")" | column_ref
  * relations with or without the keyword — PG); the keyword is accepted but redundant there. A
  * sub-SELECT / VALUES derived table is lateral ONLY with the keyword (without it a sibling
  * reference is 42P01/42703 — the §42 non-correlation rule). */
-from_clause    ::= table_ref join_clause*
+from_clause    ::= from_item ("," from_item)*
+from_item      ::= table_ref join_clause*
 
 table_ref      ::= "LATERAL"? derived_table derived_alias?
                  | "LATERAL"? table_function ("AS"? identifier)?

@@ -1,7 +1,8 @@
 # JOIN error surface (spec/design/grammar.md §15). A non-boolean ON is 42804 (the WHERE rule).
-# An INNER/bare JOIN requires ON (a missing ON is 42601); a CROSS JOIN takes no ON. Comma-FROM
-# (`FROM a, b`) is dropped (42601). An unknown table in FROM is 42P01. (The OUTER family now
-# executes — its semantics are covered by left.test / right.test / full.test.)
+# An INNER/bare JOIN requires ON (a missing ON is 42601); a CROSS JOIN takes no ON. An unknown
+# table in FROM is 42P01. (The OUTER family now executes — its semantics are covered by left.test
+# / right.test / full.test; comma-FROM `FROM a, b` now executes as an implicit CROSS JOIN — see
+# comma.test.)
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.join_inner, query.cross_join, query.qualified_column, types.i32, resource.cost_metering
 
 statement ok
@@ -38,10 +39,6 @@ SELECT p.id FROM p JOIN q
 # A CROSS JOIN takes no ON; a trailing ON is a syntax error.
 statement error 42601
 SELECT p.id FROM p CROSS JOIN q ON p.id = q.id
-
-# Comma-separated FROM (the old implicit cross join) is dropped — use CROSS JOIN.
-statement error 42601
-SELECT p.id FROM p, q
 
 # An unknown table anywhere in the FROM chain is 42P01.
 statement error 42P01

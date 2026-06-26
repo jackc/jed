@@ -8220,14 +8220,22 @@ export class Database {
     }
 
     // Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
-    // relations joined so far — rels[0..k+1]), so a forward reference to a not-yet-joined table
-    // is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER and
-    // the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
+    // relations joined so far — rels[segStart..k+1]), so a forward reference to a not-yet-joined
+    // table is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER
+    // and the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
     // changes how unmatched rows are handled in the loop below (§15). The partial scope keeps the
     // same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
+    //
+    // Comma-FROM (grammar.md §15): the comma binds looser than JOIN, so a join's ON may reference
+    // only relations in its OWN comma item, not an earlier one. segStart is that item's first
+    // relation — the most recent comma-introduced relation at or before k+1 (the comma flag marks
+    // each) — so `FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a` exactly as PostgreSQL rejects
+    // it. With no commas every join's segment starts at rel 0.
     const joins: PlanJoin[] = sel.joins.map((j, k) => {
       if (j.on === null) return { kind: j.kind, on: null };
-      const partial = new Scope(scope.rels.slice(0, k + 2), this, parent, true, ctes);
+      let segStart = k + 1;
+      while (segStart >= 1 && !sel.joins[segStart - 1]!.comma) segStart--;
+      const partial = new Scope(scope.rels.slice(segStart, k + 2), this, parent, true, ctes);
       return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
     });
 

@@ -2256,8 +2256,27 @@ impl Parser {
     fn parse_from_clause(&mut self) -> Result<(TableRef, Vec<JoinClause>)> {
         let from = self.parse_table_ref()?;
         let mut joins = Vec::new();
-        while let Some(j) = self.parse_join_clause()? {
-            joins.push(j);
+        loop {
+            while let Some(j) = self.parse_join_clause()? {
+                joins.push(j);
+            }
+            // Comma-FROM (grammar.md §15): `FROM a, b` is an implicit `CROSS JOIN`. The comma
+            // separates top-level FROM items, each of which is its own join sub-chain; it binds
+            // LOOSER than `JOIN`, so the new item begins a fresh ON-resolution segment (recorded
+            // by `comma: true`). After the comma's table_ref, the inner loop picks up any joins of
+            // the new item (`a, b JOIN c ON …`) before the next comma is considered.
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                let table = self.parse_table_ref()?;
+                joins.push(JoinClause {
+                    kind: JoinKind::Cross,
+                    table,
+                    on: None,
+                    comma: true,
+                });
+                continue;
+            }
+            break;
         }
         Ok((from, joins))
     }
@@ -2662,7 +2681,12 @@ impl Parser {
             self.expect_keyword("on")?;
             Some(self.parse_expr()?)
         };
-        Ok(Some(JoinClause { kind, table, on }))
+        Ok(Some(JoinClause {
+            kind,
+            table,
+            on,
+            comma: false,
+        }))
     }
 
     /// Parse an optional `ORDER BY <key> ("," <key>)*` (spec/grammar/grammar.ebnf `order_by`).

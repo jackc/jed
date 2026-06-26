@@ -244,6 +244,7 @@ var SupportedCapabilities = []string{
 	// (grammar.md §15).
 	"query.join_inner",
 	"query.cross_join",
+	"query.comma_from",
 	"query.join_left",
 	"query.join_right",
 	"query.join_full",

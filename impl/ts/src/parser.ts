@@ -2026,9 +2026,22 @@ class Parser {
     const from = this.parseTableRef();
     const joins: JoinClause[] = [];
     for (;;) {
-      const j = this.parseJoinClause();
-      if (j === null) break;
-      joins.push(j);
+      for (;;) {
+        const j = this.parseJoinClause();
+        if (j === null) break;
+        joins.push(j);
+      }
+      // Comma-FROM (grammar.md §15): `FROM a, b` is an implicit CROSS JOIN. The comma separates
+      // top-level FROM items, each its own join sub-chain; it binds LOOSER than JOIN, so the new
+      // item begins a fresh ON-resolution segment (recorded by comma: true). The inner loop then
+      // picks up any joins of the new item (`a, b JOIN c ON …`) before the next comma.
+      if (this.peek().kind === "comma") {
+        this.advance();
+        const table = this.parseTableRef();
+        joins.push({ kind: "cross", table, on: null, comma: true });
+        continue;
+      }
+      break;
     }
     return { from, joins };
   }

@@ -10589,16 +10589,26 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	}
 
 	// Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
-	// relations joined so far — rels[:k+2]), so a forward reference to a not-yet-joined table
-	// is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER and
-	// the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
+	// relations joined so far — rels[segStart:k+2]), so a forward reference to a not-yet-joined
+	// table is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER
+	// and the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
 	// changes how unmatched rows are handled in the loop below (§15). The partial scope keeps the
 	// same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
+	//
+	// Comma-FROM (grammar.md §15): the comma binds looser than JOIN, so a join's ON may reference
+	// only relations in its OWN comma item, not an earlier one. segStart is that item's first
+	// relation — the most recent comma-introduced relation at or before k+1 (the Comma flag marks
+	// each) — so `FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a` exactly as PostgreSQL rejects
+	// it. With no commas every join's segment starts at rel 0.
 	joins := make([]planJoin, len(sel.Joins))
 	for k, j := range sel.Joins {
 		var on *rExpr
 		if j.On != nil {
-			partial := &scope{rels: s.rels[:k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+			segStart := k + 1
+			for segStart >= 1 && !sel.Joins[segStart-1].Comma {
+				segStart--
+			}
+			partial := &scope{rels: s.rels[segStart : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 			on, err = resolveBooleanFilter(partial, j.On, ptypes)
 			if err != nil {
 				return nil, err

@@ -2527,14 +2527,30 @@ func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
 	}
 	var joins []JoinClause
 	for {
-		j, ok, err := p.parseJoinClause()
-		if err != nil {
-			return TableRef{}, nil, err
+		for {
+			j, ok, err := p.parseJoinClause()
+			if err != nil {
+				return TableRef{}, nil, err
+			}
+			if !ok {
+				break
+			}
+			joins = append(joins, j)
 		}
-		if !ok {
-			break
+		// Comma-FROM (grammar.md §15): `FROM a, b` is an implicit CROSS JOIN. The comma separates
+		// top-level FROM items, each its own join sub-chain; it binds LOOSER than JOIN, so the new
+		// item begins a fresh ON-resolution segment (recorded by Comma: true). The inner loop then
+		// picks up any joins of the new item (`a, b JOIN c ON …`) before the next comma.
+		if p.peek().Kind == TokComma {
+			p.advance()
+			table, err := p.parseTableRef()
+			if err != nil {
+				return TableRef{}, nil, err
+			}
+			joins = append(joins, JoinClause{Kind: JoinCross, Table: table, Comma: true})
+			continue
 		}
-		joins = append(joins, j)
+		break
 	}
 	return from, joins, nil
 }

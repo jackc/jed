@@ -389,15 +389,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`JOIN` — multi-table FROM + `INNER`/`CROSS` + outer (`LEFT`/`RIGHT`/`FULL`)** — left-deep
       nested-loop executor, table aliases, qualified column refs, a flat-index scope resolver; the outer
       NULL-extension branch + WHERE-downgrades-to-inner. → [grammar.md §15](spec/design/grammar.md)
-  - [ ] _follow-on:_ `USING` / `NATURAL` / comma-`FROM` / `t.*`.
+  - [ ] _follow-on:_ `USING` / `NATURAL` / `t.*`.
+    - [x] **comma-`FROM`** (`FROM a, b` = implicit `CROSS JOIN`; comma binds looser than `JOIN`, so
+          each comma item is its own ON-resolution segment — a join's `ON` may not reach an earlier
+          comma item (`42P01`); `LATERAL` still crosses the comma, so `FROM t, LATERAL (…)` now
+          works). → [grammar.md §15](spec/design/grammar.md)
 - [x] **Subqueries** — uncorrelated scalar, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS`, **correlated**,
       subqueries in `UPDATE`/`DELETE`, `$N` inside a subquery, **derived tables**, a `VALUES` body,
       **`LATERAL`**, and `x op ANY/ALL(SELECT …)`.
       → [grammar.md §26/§42/§44](spec/design/grammar.md), [array-functions.md §11.6](spec/design/array-functions.md)
   - [ ] _follow-on:_ a correlated `GROUP BY` / `ORDER BY` key (`0A000`, degenerate).
   - [ ] _follow-on:_ a **parenthesized-join FROM** (`FROM (a JOIN b ON …)`); a trailing **`ORDER
-        BY`/`LIMIT` on a VALUES body**; **comma-`FROM`** (`FROM t, LATERAL (…)`) — until it lands,
-        LATERAL is reached only through explicit `JOIN` syntax.
+        BY`/`LIMIT` on a VALUES body**. (**comma-`FROM`** has landed — `FROM t, LATERAL (…)` now
+        works; see the JOIN follow-on above.)
   - [ ] **Subqueries — remaining seams:** subqueries in an **`INSERT ... VALUES`** slot (blocked on
         VALUES holding a general expression); **row-valued** subqueries. _(size: S)_
 - [x] **Set operations — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`** — a query-expression

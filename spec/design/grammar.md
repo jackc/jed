@@ -686,11 +686,31 @@ grammar/AST/parser reshape was needed. Semantics (PostgreSQL by default, [../../
   nullable key with `IS NULL` for an anti-join. No special-casing — column resolution is positional and
   never folds on a column's declared nullability.
 
+**Comma-`FROM` (the implicit cross join).** `FROM a, b` is an **implicit `CROSS JOIN`** — the
+Cartesian product, byte-identical in result and cost to `a CROSS JOIN b`. The `from_clause` grew
+from one chain to `from_item ("," from_item)*`, where each `from_item` is the old `table_ref
+join_clause*`. A comma synthesizes a `CROSS` `JoinClause` (no `ON`) for the next item, flagged
+`comma: true`; because the engine already executes `CROSS` and the flat-row model concatenates
+relations, this is **resolver-only** beyond the parser loop. Left-deep flattening (`a, b JOIN c …`
+becomes `a CROSS b JOIN c …`) yields the **identical row multiset** as the precedence-correct
+parse, because a cross product crossed with a (possibly outer) join commutes through the preserved
+left rows; only jed's *cost* reflects its own left-deep execution (the rows still match PG — the
+oracle confirms it).
+
+The one place the comma's looser precedence is **observable** is ON-resolution scope: a comma binds
+**looser than `JOIN`**, so each `from_item` is its own segment and a join's `ON` may reference only
+relations **within its own comma item**, never an earlier one. So `FROM a, b JOIN c ON a.x = c.x` is
+`42P01` on `a` (*"missing FROM-clause entry for table a"*) — exactly as PostgreSQL rejects it. The
+planner computes each join's **segment start** (the most recent `comma`-flagged relation at or
+before it) and resolves its `ON` against `rels[seg_start..=k+1]` rather than `rels[..=k+1]`; with no
+commas every segment starts at relation 0, so a pure `JOIN` chain is unchanged. **`LATERAL` is not
+segment-restricted** — a lateral item's body resolves against *all* preceding relations, so
+`FROM t, LATERAL (… t.col …)` correlates across the comma (PostgreSQL); only a join's `ON` is
+narrowed. This makes `FROM t, LATERAL (…)` reachable for the first time (until now LATERAL needed
+explicit `JOIN` syntax — [../../TODO.md](../../TODO.md)).
+
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
-- **No comma-`FROM`.** `FROM a, b` (the old implicit cross join) is **dropped**, not deferred:
-  `CROSS JOIN` covers the same semantics and comma-`FROM`'s precedence-vs-`JOIN` interaction is a
-  future trap. A `,` after the first `table_ref` is a `42601`.
 - **No `USING` / `NATURAL`** join forms (they need column-name matching / merge semantics), **no
   `t.*`** qualified-star, **no parenthesized-join FROM** (`FROM (a JOIN b ON …)`). A **derived table**
   (`FROM (SELECT …) AS t`) *is* now supported — see §42.
