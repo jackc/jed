@@ -15838,6 +15838,9 @@ const (
 	// operands → the promoted integer type (Euclid; an overflowing-magnitude result → 22003); a
 	// decimal operand → numeric at scale max(sₐ, s_b). gcd(0, 0) = 0. Resolver-routed.
 	sfGcd
+	// sfLcm is lcm(a, b) → the least common multiple (non-negative), EXACT/in-contract, |a/gcd·b|.
+	// lcm(_, 0) = 0. Integer → the promoted type (overflow → 22003); decimal → numeric. Resolver-routed.
+	sfLcm
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -21512,21 +21515,25 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		dec := scalarResultType("decimal", nil)
 		return &rExpr{kind: reScalarFunc, sfunc: sfDiv, sargs: []*rExpr{rl, rr}, result: dec}, resolvedTypeOf(dec), nil
 	}
-	// `gcd(a, b)` — the greatest common divisor, resolver-routed for the same integer-promotion the
-	// arithmetic operators do (a function row's "promoted" result would take only the first operand's
-	// width). EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
-	if name == "gcd" && len(fc.Args) == 2 {
+	// `gcd(a, b)` / `lcm(a, b)` — resolver-routed for the same integer-promotion the arithmetic
+	// operators do (a function row's "promoted" result would take only the first operand's width).
+	// EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
+	if (name == "gcd" || name == "lcm") && len(fc.Args) == 2 {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
 			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
-		rl, rr, result, err := resolveIntOrDecimalPair(s, "gcd", *fc.Args[0], *fc.Args[1], ag, params)
+		rl, rr, result, err := resolveIntOrDecimalPair(s, name, *fc.Args[0], *fc.Args[1], ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reScalarFunc, sfunc: sfGcd, sargs: []*rExpr{rl, rr}, result: result}, resolvedTypeOf(result), nil
+		sf := sfGcd
+		if name == "lcm" {
+			sf = sfLcm
+		}
+		return &rExpr{kind: reScalarFunc, sfunc: sf, sargs: []*rExpr{rl, rr}, result: result}, resolvedTypeOf(result), nil
 	}
 	// `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME
 	// arithmetic machinery so mod() and % are observably identical (promotion, the integer/decimal/
@@ -23883,6 +23890,56 @@ func gcdDecimal(a, b Decimal) (Decimal, error) {
 		x, y = y, r
 	}
 	return x.Abs().RoundToScale(target), nil
+}
+
+// lcmI64 is the lcm of two int64, NON-NEGATIVE: |a/gcd·b| with checked arithmetic. ok is false on
+// int64 overflow (the product, or the final abs) — the caller maps that (or an out-of-result-type
+// magnitude) to 22003, like PG. lcm(_, 0) = 0.
+func lcmI64(a, b int64) (int64, bool) {
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	g, ok := gcdI64(a, b)
+	if !ok {
+		return 0, false
+	}
+	q := a / g
+	prod := q * b
+	if b != 0 && prod/b != q { // overflow check on the multiply
+		return 0, false
+	}
+	if prod == math.MinInt64 {
+		return 0, false
+	}
+	if prod < 0 {
+		prod = -prod
+	}
+	return prod, true
+}
+
+// lcmDecimal is the lcm of two decimals, NON-NEGATIVE at scale max(sₐ, s_b): |a/gcd·b| (the a/gcd
+// division is exact). lcm(_, 0) = 0. A magnitude over the decimal value cap traps 22003 via the mul.
+func lcmDecimal(a, b Decimal) (Decimal, error) {
+	target := a.Scale
+	if b.Scale > target {
+		target = b.Scale
+	}
+	if a.IsZero() || b.IsZero() {
+		return Decimal{Scale: target}, nil // zero at the target scale (empty Limbs)
+	}
+	g, err := gcdDecimal(a, b)
+	if err != nil {
+		return Decimal{}, err
+	}
+	q, err := a.Div(g)
+	if err != nil {
+		return Decimal{}, err
+	}
+	prod, err := q.Mul(b)
+	if err != nil {
+		return Decimal{}, err
+	}
+	return prod.Abs().RoundToScale(target), nil
 }
 
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
@@ -27035,6 +27092,21 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return DecimalValue(g), nil
+		case sfLcm:
+			// lcm: |a/gcd·b|. Integer → the promoted type (an int64-overflow or out-of-result-type
+			// magnitude → 22003); a decimal operand → exact at scale max(sₐ, s_b). lcm(_, 0) = 0.
+			if vals[0].Kind == ValInt && vals[1].Kind == ValInt {
+				l, ok := lcmI64(vals[0].Int, vals[1].Int)
+				if !ok || !e.result.InRange(l) {
+					return Value{}, overflowErr(e.result)
+				}
+				return IntValue(l), nil
+			}
+			l, err := lcmDecimal(valueToDecimal(vals[0]), valueToDecimal(vals[1]))
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(l), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

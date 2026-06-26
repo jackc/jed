@@ -12951,6 +12951,10 @@ enum ScalarFunc {
     /// the promoted integer type (Euclid; a result whose magnitude overflows the type → 22003); a
     /// decimal operand → numeric at scale max(sₐ, s_b). gcd(0, 0) = 0. Resolver-routed.
     Gcd,
+    /// lcm(a, b) → the least common multiple (non-negative), EXACT/in-contract, |a/gcd · b|.
+    /// lcm(_, 0) = 0. Integer → the promoted type (overflow → 22003); decimal → numeric at scale
+    /// max(sₐ, s_b). Resolver-routed (shares gcd's resolution).
+    Lcm,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -20889,10 +20893,10 @@ fn resolve_func_call(
             resolved_type_of(ScalarType::Decimal),
         ));
     }
-    // `gcd(a, b)` — the greatest common divisor, resolver-routed for the same integer-promotion the
-    // arithmetic operators do (a function row's "promoted" result would take only the first operand's
-    // width). EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
-    if lname == "gcd" && args.len() == 2 {
+    // `gcd(a, b)` / `lcm(a, b)` — resolver-routed for the same integer-promotion the arithmetic
+    // operators do (a function row's "promoted" result would take only the first operand's width).
+    // EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
+    if (lname == "gcd" || lname == "lcm") && args.len() == 2 {
         reject_named(&lname, arg_names)?;
         if star {
             return Err(EngineError::new(
@@ -20901,10 +20905,15 @@ fn resolve_func_call(
             ));
         }
         let (rl, rr, result) =
-            resolve_int_or_decimal_pair(scope, "gcd", &args[0], &args[1], agg, params)?;
+            resolve_int_or_decimal_pair(scope, &lname, &args[0], &args[1], agg, params)?;
+        let func = if lname == "gcd" {
+            ScalarFunc::Gcd
+        } else {
+            ScalarFunc::Lcm
+        };
         return Ok((
             RExpr::ScalarFunc {
-                func: ScalarFunc::Gcd,
+                func,
                 args: vec![rl, rr],
                 result,
             },
@@ -25462,6 +25471,30 @@ fn gcd_decimal(a: &Decimal, b: &Decimal) -> Result<Decimal> {
     Ok(x.abs().round_to_scale(target))
 }
 
+/// lcm of two i64, NON-NEGATIVE: |a/gcd · b|, with checked arithmetic. `None` on i64 overflow
+/// (the product, or the final abs) — the caller maps that (or an out-of-result-type magnitude) to
+/// 22003, like PG. lcm(_, 0) = 0 (no division by the gcd, which would be 0).
+fn lcm_i64(a: i64, b: i64) -> Option<i64> {
+    if a == 0 || b == 0 {
+        return Some(0);
+    }
+    let g = gcd_i64(a, b)?; // ≥ 1 for nonzero operands
+    let prod = (a / g).checked_mul(b)?;
+    prod.checked_abs()
+}
+
+/// lcm of two decimals, NON-NEGATIVE at scale max(sₐ, s_b): |a/gcd · b| (the a/gcd division is
+/// exact). lcm(_, 0) = 0. A magnitude over the decimal value cap traps 22003 via the mul.
+fn lcm_decimal(a: &Decimal, b: &Decimal) -> Result<Decimal> {
+    let target = a.scale().max(b.scale());
+    if a.is_zero() || b.is_zero() {
+        return Ok(Decimal::zero(target));
+    }
+    let g = gcd_decimal(a, b)?;
+    let prod = a.div(&g)?.mul(b)?;
+    Ok(prod.abs().round_to_scale(target))
+}
+
 fn resolve_operand_pair(
     scope: &Scope,
     lhs: &Expr,
@@ -29753,6 +29786,23 @@ impl RExpr {
                             Ok(Value::Decimal(gcd_decimal(&a, &b)?))
                         }
                     },
+                    // lcm: |a/gcd · b|. Integer → the promoted type (an i64-overflow or
+                    // out-of-result-type magnitude → 22003); a decimal operand → exact at scale
+                    // max(sₐ, s_b). lcm(_, 0) = 0.
+                    ScalarFunc::Lcm => match (&vals[0], &vals[1]) {
+                        (Value::Int(a), Value::Int(b)) => {
+                            let l = lcm_i64(*a, *b).ok_or_else(|| overflow(*result))?;
+                            if result.in_range(l) {
+                                Ok(Value::Int(l))
+                            } else {
+                                Err(overflow(*result))
+                            }
+                        }
+                        _ => {
+                            let (a, b) = (value_to_decimal(&vals[0]), value_to_decimal(&vals[1]));
+                            Ok(Value::Decimal(lcm_decimal(&a, &b)?))
+                        }
+                    },
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -30868,6 +30918,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Sign
         | ScalarFunc::Div
         | ScalarFunc::Gcd
+        | ScalarFunc::Lcm
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

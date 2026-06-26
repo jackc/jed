@@ -12451,6 +12451,9 @@ type ScalarFuncName =
   // integer (an overflowing-magnitude result → 22003); a decimal operand → numeric at scale
   // max(sₐ, s_b). gcd(0, 0) = 0. Resolver-routed.
   | "gcd"
+  // lcm(a, b) → the least common multiple (non-negative), EXACT/in-contract, |a/gcd·b|. lcm(_, 0) =
+  // 0. Integer → the promoted type (overflow → 22003); decimal → numeric. Resolver-routed.
+  | "lcm"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -15729,14 +15732,14 @@ function resolveFuncCall(
     if (!numericOK(p.lt) || !numericOK(p.rt)) throw noFuncOverload("div");
     return scalarFuncNode("div", [p.rl, p.rr], "decimal", undefined);
   }
-  // `gcd(a, b)` — the greatest common divisor, resolver-routed for the same integer-promotion the
-  // arithmetic operators do (a function row's "promoted" result would take only the first operand's
-  // width). EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
-  if (lname === "gcd" && e.args.length === 2) {
+  // `gcd(a, b)` / `lcm(a, b)` — resolver-routed for the same integer-promotion the arithmetic
+  // operators do (a function row's "promoted" result would take only the first operand's width).
+  // EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
+  if ((lname === "gcd" || lname === "lcm") && e.args.length === 2) {
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-    const { args, result } = resolveIntOrDecimalPair(scope, "gcd", e.args[0]!, e.args[1]!, ag, params);
-    return scalarFuncNode("gcd", args, result, undefined);
+    const { args, result } = resolveIntOrDecimalPair(scope, lname, e.args[0]!, e.args[1]!, ag, params);
+    return scalarFuncNode(lname, args, result, undefined);
   }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
@@ -20941,6 +20944,25 @@ function gcdDecimalValue(a: Decimal, b: Decimal): Decimal {
   return x.abs().roundToScale(target);
 }
 
+// lcmBigint is the lcm of two bigints, NON-NEGATIVE: |a/gcd·b| (bigint is exact). The caller
+// range-checks the result against the promoted integer type (an out-of-range magnitude → 22003,
+// matching the other cores' checked-overflow). lcm(_, 0) = 0.
+function lcmBigint(a: bigint, b: bigint): bigint {
+  if (a === 0n || b === 0n) return 0n;
+  const g = gcdBigint(a, b);
+  const prod = (a / g) * b;
+  return prod < 0n ? -prod : prod;
+}
+
+// lcmDecimalValue is the lcm of two decimals, NON-NEGATIVE at scale max(sₐ, s_b): |a/gcd·b| (the
+// a/gcd division is exact). lcm(_, 0) = 0. A magnitude over the decimal value cap traps 22003.
+function lcmDecimalValue(a: Decimal, b: Decimal): Decimal {
+  const target = Math.max(a.scale, b.scale);
+  if (a.isZero() || b.isZero()) return Decimal.zero(target);
+  const g = gcdDecimalValue(a, b);
+  return a.div(g).mul(b).abs().roundToScale(target);
+}
+
 function resolveOperandPair(
   scope: Scope,
   lhs: Expr,
@@ -24203,6 +24225,20 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const toDec = (v: Value): Decimal =>
           v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
         return decimalValue(gcdDecimalValue(toDec(a0), toDec(b0)));
+      }
+      if (e.func === "lcm") {
+        // lcm: |a/gcd·b|. Integer → the promoted type (an out-of-range magnitude → 22003); a
+        // decimal operand → exact at scale max(sₐ, s_b). lcm(_, 0) = 0.
+        const a0 = vals[0]!;
+        const b0 = vals[1]!;
+        if (a0.kind === "int" && b0.kind === "int") {
+          const l = lcmBigint(a0.int, b0.int);
+          if (!inRange(e.result, l)) throw overflow(e.result);
+          return intValue(l);
+        }
+        const toDec = (v: Value): Decimal =>
+          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+        return decimalValue(lcmDecimalValue(toDec(a0), toDec(b0)));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

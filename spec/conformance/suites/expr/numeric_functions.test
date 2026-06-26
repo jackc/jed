@@ -166,3 +166,29 @@ query D nosort
 SELECT gcd(6.0, 4.0)
 ----
 2.0
+
+# --- lcm(a, b): least common multiple, non-negative; lcm(_, 0) = 0 --------------------
+query I nosort
+SELECT lcm(4, 6)
+----
+12
+
+query I nosort
+SELECT lcm(-4, 6)
+----
+12
+
+query I nosort
+SELECT lcm(0, 5)
+----
+0
+
+# lcm over numerics: result scale = max(sₐ, s_b)
+query D nosort
+SELECT lcm(8.40, 3.6)
+----
+25.20
+
+# lcm overflow traps 22003 (the i64 product exceeds the type; bare integer literals are i64)
+statement error 22003
+SELECT lcm(9223372036854775807, 9223372036854775806)
