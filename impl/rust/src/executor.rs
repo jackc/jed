@@ -13038,6 +13038,9 @@ enum ScalarFunc {
     OctetLength,
     /// bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
     BitLength,
+    /// substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
+    /// indexed). A negative count is 22011 (string-functions.md §3).
+    Substr,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19062,6 +19065,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "length" | "char_length" | "character_length" => ScalarFunc::Length,
         "octet_length" => ScalarFunc::OctetLength,
         "bit_length" => ScalarFunc::BitLength,
+        "substr" => ScalarFunc::Substr,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30352,6 +30356,16 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Int(s.len() as i64 * 8)),
                         _ => unreachable!("resolver restricts bit_length to text"),
                     },
+                    // substr(text, start[, count]) → text — the function form of SUBSTRING.
+                    ScalarFunc::Substr => {
+                        let s = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts substr to text"),
+                        };
+                        let start = int_value(&vals[1]);
+                        let count = vals.get(2).map(int_value);
+                        Ok(Value::Text(substr_chars(s, start, count)?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31222,7 +31236,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::JsonSerialize
         | ScalarFunc::Length
         | ScalarFunc::OctetLength
-        | ScalarFunc::BitLength => {
+        | ScalarFunc::BitLength
+        | ScalarFunc::Substr => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31238,6 +31253,44 @@ fn to_decimal(v: Value) -> Decimal {
         Value::Int(n) => Decimal::from_i64(n),
         _ => unreachable!("resolver guarantees a numeric operand here"),
     }
+}
+
+// === string / text function kernels (spec/design/string-functions.md) ===============
+
+/// The i64 of an integer Value (every int width is stored as `Value::Int`). For the string
+/// functions' integer arguments (start / count / pad length / field number).
+fn int_value(v: &Value) -> i64 {
+    match v {
+        Value::Int(n) => *n,
+        _ => unreachable!("resolver guarantees an integer operand here"),
+    }
+}
+
+/// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window
+/// `[start, start+count)` (or `[start, ∞)` for the 2-arg form) intersected with `[1, n]`. A start
+/// ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text `substr`.
+fn substr_chars(s: &str, start: i64, count: Option<i64>) -> Result<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let to = match count {
+        Some(c) => {
+            if c < 0 {
+                return Err(EngineError::new(
+                    SqlState::SubstringError,
+                    "negative substring length not allowed",
+                ));
+            }
+            start.saturating_add(c).min(n + 1)
+        }
+        None => n + 1,
+    };
+    let from = start.max(1);
+    if to <= from {
+        return Ok(String::new());
+    }
+    Ok(chars[(from - 1) as usize..(to - 1) as usize]
+        .iter()
+        .collect())
 }
 
 /// The `decimal_work` W of an arithmetic node — which group-count formula applies per op

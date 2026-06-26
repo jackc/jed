@@ -15919,6 +15919,9 @@ const (
 	sfOctetLength
 	// bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
 	sfBitLength
+	// substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
+	// indexed). A negative count is 22011 (string-functions.md §3).
+	sfSubstr
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19498,6 +19501,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfOctetLength
 	case "bit_length":
 		return sfBitLength
+	case "substr":
+		return sfSubstr
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24027,6 +24032,46 @@ func satAdd1(n int64) int64 {
 	return n + 1
 }
 
+// === string / text function kernels (spec/design/string-functions.md) ===============
+
+// satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
+// used, the right operand being non-negative).
+func satAddInt64(a, b int64) int64 {
+	s := a + b
+	if a > 0 && b > 0 && s < 0 {
+		return math.MaxInt64
+	}
+	return s
+}
+
+// substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
+// window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
+// ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr.
+func substrChars(s string, start int64, count *int64) (string, error) {
+	runes := []rune(s)
+	n := int64(len(runes))
+	var to int64
+	if count != nil {
+		if *count < 0 {
+			return "", NewError(SubstringError, "negative substring length not allowed")
+		}
+		to = satAddInt64(start, *count)
+		if to > n+1 {
+			to = n + 1
+		}
+	} else {
+		to = n + 1
+	}
+	from := start
+	if from < 1 {
+		from = 1
+	}
+	if to <= from {
+		return "", nil
+	}
+	return string(runes[from-1 : to-1]), nil
+}
+
 // widthBucketErr is the 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
 func widthBucketErr(detail string) error {
 	return NewError(InvalidArgumentForWidthBucketFunction, detail)
@@ -27236,6 +27281,18 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfBitLength:
 			// bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
 			return IntValue(int64(len(vals[0].Str)) * 8), nil
+		case sfSubstr:
+			// substr(text, start[, count]) → text — the function form of SUBSTRING.
+			var count *int64
+			if len(vals) > 2 {
+				c := vals[2].Int
+				count = &c
+			}
+			r, err := substrChars(vals[0].Str, vals[1].Int, count)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(r), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

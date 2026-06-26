@@ -115,3 +115,62 @@ SELECT bit_length('abc'), bit_length(''), bit_length(NULL::text)
 24
 0
 NULL
+
+# === substr(text, start[, count]) → text: the function form of SUBSTRING ================
+
+# 2-arg form: characters from `start` to the end (1-based)
+query T
+SELECT substr('alphabet', 3)
+----
+phabet
+
+# 3-arg form: `count` characters starting at `start`
+query T
+SELECT substr('alphabet', 3, 2)
+----
+ph
+
+# start ≤ 0 clips: the window [0,3) keeps positions 1..2
+query T
+SELECT substr('alphabet', 0, 3)
+----
+al
+
+# a negative start also clips (window [-2,3) → positions 1..2)
+query T
+SELECT substr('alphabet', -2, 5)
+----
+al
+
+# count past the end clips to the end
+query T
+SELECT substr('alphabet', 5, 100)
+----
+abet
+
+# start past the end, or count 0, yields the empty string (asserted via = '' since the harness
+# cannot carry an empty / edge-whitespace value in an expected block)
+query B
+SELECT substr('alphabet', 100, 2) = '', substr('alphabet', 5, 0) = ''
+----
+true
+true
+
+# code-point indexed (not bytes): position 2 of 'héllo' is é
+query T
+SELECT substr('héllo', 2, 3)
+----
+éll
+
+# a NEGATIVE count is 22011 (substring_error, "negative substring length not allowed")
+statement error 22011
+SELECT substr('abc', 1, -1)
+
+# any NULL argument propagates (typed NULLs — a bare untyped NULL argument matches no overload
+# family, 42883, jed's documented scalar-function behavior; here the NULLs carry a type)
+query T
+SELECT substr('abc', NULL::int, 2), substr(NULL::text, 1, 2), substr('abc', 2, NULL::int)
+----
+NULL
+NULL
+NULL

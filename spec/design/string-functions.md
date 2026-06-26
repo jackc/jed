@@ -77,3 +77,23 @@ defines `octet_length(bytea)`; jed implements the `text` overload.
 
 The number of **bits** in the UTF-8 encoding — `octet_length × 8`. `bit_length('héllo') = 48`,
 `bit_length('') = 0`. Same code path as `octet_length`, multiplied by eight.
+
+### `substr(text, start [, count]) → text`
+
+The **function** spelling of `SUBSTRING` (jed's `SUBSTRING … FROM … FOR` syntax is separate);
+1-based and **code-point indexed** (`substr('héllo', 2, 3) = 'éll'`). Two overloads:
+
+- `substr(s, start)` — the characters from position `start` to the end of the string.
+- `substr(s, start, count)` — the `count` characters starting at `start`: the window
+  `[start, start+count)` intersected with the valid range `[1, n]`.
+
+A `start ≤ 0` or past the end **clips** rather than erroring, matching PostgreSQL:
+`substr('alphabet', 0, 3) = 'al'` (the window `[0, 3)` keeps positions 1–2),
+`substr('alphabet', -2, 5) = 'al'`, `substr('alphabet', 100, 2) = ''`,
+`substr('alphabet', 5, 100) = 'abet'`. A **negative `count`** traps **`22011`**
+(`substring_error`, *"negative substring length not allowed"*) — PostgreSQL's exact code. Any
+NULL argument propagates. The shared per-core kernel works on a code-point vector
+(`chars().collect()` / `[]rune` / `[...s]`) and computes the window with a saturating add so a
+huge `start + count` cannot overflow (TS bigint is already exact). PostgreSQL's `substr` accepts
+`bigint` positions; jed's `integer` family accepts any width (a bare integer literal is `i64`),
+so `substr('x', 1, 2)` resolves directly without an int4 cast.

@@ -81,6 +81,13 @@ name = "invalid_argument_for_nth_value"
 class = "data exception"
 template = "argument of nth_value must be greater than zero"
 
+# substr(text, start, length) with a negative length (spec/design/string-functions.md). PostgreSQL's code.
+[[error]]
+code = "22011"
+name = "substring_error"
+class = "data exception"
+template = "negative substring length not allowed"
+
 # width_bucket's count must be > 0, and its lower/upper bounds must differ (spec/functions/catalog.toml,
 # float.md §8). PostgreSQL's code; {detail} carries which of the two conditions failed.
 [[error]]

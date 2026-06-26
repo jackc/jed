@@ -425,6 +425,28 @@ function utf8ByteLength(s: string): number {
   return SQL_BYTE_ENCODER.encode(s).length;
 }
 
+// === string / text function kernels (spec/design/string-functions.md) ===============
+
+// substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
+// window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
+// ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
+// are bigint (so start+count never overflows); [...s] yields code points, not UTF-16 units.
+function substrChars(s: string, start: bigint, count: bigint | null): string {
+  const chars = [...s];
+  const n = BigInt(chars.length);
+  let to: bigint;
+  if (count !== null) {
+    if (count < 0n) throw engineError("substring_error", "negative substring length not allowed");
+    to = start + count;
+    if (to > n + 1n) to = n + 1n;
+  } else {
+    to = n + 1n;
+  }
+  const from = start < 1n ? 1n : start;
+  if (to <= from) return "";
+  return chars.slice(Number(from - 1n), Number(to - 1n)).join("");
+}
+
 // CollationVerdict is the slice-2d version-skew verdict for one referenced collation
 // (spec/design/collation.md §12, compatibility.md §7). "full" ⇒ a loaded bundle provides the name at
 // the file's pinned (unicode, cldr), so the collation's objects are read-write. "skewed" ⇒ a loaded
@@ -12529,7 +12551,10 @@ type ScalarFuncName =
   // octet_length(text) → i32 — the number of UTF-8 bytes (utf8ByteLength). octet_length('héllo') = 6.
   | "octet_length"
   // bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
-  | "bit_length";
+  | "bit_length"
+  // substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
+  // indexed). A negative count is 22011 (string-functions.md §3).
+  | "substr";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24323,6 +24348,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "bit_length") {
         // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
         return intValue(BigInt(utf8ByteLength((vals[0] as { text: string }).text) * 8));
+      }
+      if (e.func === "substr") {
+        // substr(text, start[, count]) → text — the function form of SUBSTRING.
+        const s = (vals[0] as { text: string }).text;
+        const start = (vals[1] as { int: bigint }).int;
+        const count = vals.length > 2 ? (vals[2] as { int: bigint }).int : null;
+        return textValue(substrChars(s, start, count));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64
