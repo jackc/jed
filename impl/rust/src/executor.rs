@@ -8759,6 +8759,7 @@ impl Database {
                 group_keys: group_keys.clone(),
                 group_key_exprs: group_key_exprs.clone(),
                 agg_specs: Vec::new(),
+                grouping_specs: Vec::new(),
                 window_specs: Vec::new(),
                 window_keys: Vec::new(),
             }
@@ -8827,10 +8828,14 @@ impl Database {
             } => (Vec::new(), specs, window_keys),
             AggCtx::GroupedWindow {
                 agg_specs,
+                grouping_specs: gs,
                 window_specs,
                 window_keys,
                 ..
-            } => (agg_specs, window_specs, window_keys),
+            } => {
+                grouping_specs = gs;
+                (agg_specs, window_specs, window_keys)
+            }
             AggCtx::Forbidden => (Vec::new(), Vec::new(), Vec::new()),
         };
         // `has_window` is computed after ORDER BY resolution (below) — an ORDER BY key may introduce
@@ -9100,18 +9105,21 @@ impl Database {
                             group_keys: group_keys.clone(),
                             group_key_exprs: group_key_exprs.clone(),
                             agg_specs: std::mem::take(&mut agg_specs),
+                            grouping_specs: std::mem::take(&mut grouping_specs),
                             window_specs: std::mem::take(&mut window_specs),
                             window_keys: std::mem::take(&mut window_keys),
                         };
                         let res = resolve(&scope, e, None, &mut octx, ptypes);
                         if let AggCtx::GroupedWindow {
                             agg_specs: a,
+                            grouping_specs: gs,
                             window_specs: ws,
                             window_keys: wk,
                             ..
                         } = octx
                         {
                             agg_specs = a;
+                            grouping_specs = gs;
                             window_specs = ws;
                             window_keys = wk;
                         }
@@ -9196,21 +9204,26 @@ impl Database {
         // FROM scope width.
         let has_window = !window_specs.is_empty();
         if has_window {
+            // The grouped row the window stage extends is `[master cols…, agg results…, GROUPING
+            // results…]` (the GROUPING columns precede the window columns — aggregates.md §21), so
+            // a grouped+window query's window input width includes the GROUPING() results.
             let input_width = if is_agg {
-                group_keys.len() + agg_specs.len()
+                group_keys.len() + agg_specs.len() + grouping_specs.len()
             } else {
                 scope.width()
             };
             let key_base = input_width;
             let result_base = input_width + window_keys.len();
+            // Bound to [WINDOW_KEY_BASE, 2·WINDOW_KEY_BASE) so a GROUPING() placeholder (the higher
+            // GROUPING_GS_BASE) in a window key is not clobbered here (it rebases below — §21).
             for spec in &mut window_specs {
                 for pk in &mut spec.partition {
-                    if *pk >= WINDOW_KEY_BASE {
+                    if *pk >= WINDOW_KEY_BASE && *pk < WINDOW_KEY_BASE * 2 {
                         *pk = key_base + (*pk - WINDOW_KEY_BASE);
                     }
                 }
                 for (slot, ..) in &mut spec.order {
-                    if *slot >= WINDOW_KEY_BASE {
+                    if *slot >= WINDOW_KEY_BASE && *slot < WINDOW_KEY_BASE * 2 {
                         *slot = key_base + (*slot - WINDOW_KEY_BASE);
                     }
                 }
@@ -9222,15 +9235,10 @@ impl Database {
                 rebase_placeholder_cols(oe, WINDOW_RESULT_BASE, result_base);
             }
         }
-        // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
-        // (spec/design/aggregates.md §12) — both want the grouped-row trailing slots. A pure single-set
-        // GROUP BY + window stays on the existing path.
-        if has_window && (group_sets.len() > 1 || !grouping_specs.is_empty()) {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "GROUPING SETS / GROUPING() with window functions is not supported",
-            ));
-        }
+        // GROUPING SETS / GROUPING() combined with window functions (aggregates.md §21): the window
+        // stage runs over the unioned grouping-set rows. The grouped row is `[master cols…, agg
+        // results…, GROUPING results…]` and the window stage appends `[window keys…, window results…]`
+        // after, so the two no longer collide — GROUPING rebases below the window bases.
         // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
         // `group_keys.len() + agg_specs.len() + g` (the GROUPING results follow the master columns and
         // aggregate results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
@@ -9251,7 +9259,11 @@ impl Database {
         // columns (grammar.md §10): for a grouped+window query the grouped row is first extended by the
         // window stage, so the order values follow the window results.
         let order_value_base = if is_agg && has_window {
-            group_keys.len() + agg_specs.len() + window_keys.len() + window_specs.len()
+            group_keys.len()
+                + agg_specs.len()
+                + grouping_specs.len()
+                + window_keys.len()
+                + window_specs.len()
         } else if is_agg {
             group_keys.len() + agg_specs.len() + grouping_specs.len()
         } else if has_window {
@@ -17034,6 +17046,9 @@ enum AggCtx {
         /// aggregates.md §15). A grouped+window query matches them the same way in its projection.
         group_key_exprs: Vec<Option<(Expr, ResolvedType)>>,
         agg_specs: Vec<AggSpec>,
+        /// `GROUPING(...)` calls collected from the projection / HAVING when the query ALSO has window
+        /// functions (GROUPING SETS + window, aggregates.md §21) — same as `Collect::grouping_specs`.
+        grouping_specs: Vec<Vec<usize>>,
         window_specs: Vec<WindowSpec>,
         /// Materialized window-key expressions (a non-column PARTITION BY / ORDER BY key —
         /// `PARTITION BY g + 1`, or `ORDER BY sum(x) + 1`), resolved against the grouped row and
@@ -19444,15 +19459,17 @@ fn grouping_value(positions: &[usize], mask: i64) -> i64 {
     r
 }
 
-/// Rewrite placeholder column slots `>= base` (a window-result `WINDOW_RESULT_BASE + w` or a
-/// `GROUPING(...)` `GROUPING_GS_BASE + g`) to their real synthetic slot `target + (slot - base)`,
-/// once the grouped/windowed row layout is final (spec/design/window.md §5.1, aggregates.md §12).
-/// Window functions and GROUPING are mutually exclusive in a projection, so only one base's
-/// placeholders ever appear.
+/// Rewrite placeholder column slots in `[base, 2·base)` (a window-result `WINDOW_RESULT_BASE + w` or
+/// a `GROUPING(...)` `GROUPING_GS_BASE + g`) to their real synthetic slot `target + (slot - base)`,
+/// once the grouped/windowed row layout is final (spec/design/window.md §5.1, aggregates.md §12/§21).
+/// Each placeholder base is 2× the previous (`1<<28`, `1<<29`, `1<<30`) and a base's placeholder
+/// count is far below that gap, so bounding the rewrite to `[base, 2·base)` keeps the bases isolated —
+/// a window-result rebase no longer clobbers a `GROUPING()` placeholder (the two now COEXIST in a
+/// GROUPING SETS + window query — aggregates.md §21).
 fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize) {
     match e {
         RExpr::Column(i) => {
-            if *i >= from {
+            if *i >= from && *i < from * 2 {
                 *i = target + (*i - from);
             }
         }
@@ -21107,10 +21124,13 @@ fn resolve_grouping(
             "arguments to GROUPING must be grouping expressions of the associated query level",
         )
     };
-    // GROUPING is meaningful only in a grouped query; outside one (Forbidden / Window) — or, this
-    // slice, with window functions (GroupedWindow) — its arguments cannot be grouping expressions.
+    // GROUPING is meaningful only in a grouped query — `Collect`, or `GroupedWindow` when the query
+    // also has window functions (GROUPING SETS + window, aggregates.md §21). Outside one (Forbidden /
+    // Window) its arguments cannot be grouping expressions.
     let group_keys: Vec<usize> = match agg {
-        AggCtx::Collect { group_keys, .. } => group_keys.clone(),
+        AggCtx::Collect { group_keys, .. } | AggCtx::GroupedWindow { group_keys, .. } => {
+            group_keys.clone()
+        }
         _ => return Err(grouping_arg_err()),
     };
     // Map each argument (a grouping column) to its master-grouping-column position.
@@ -21134,12 +21154,12 @@ fn resolve_grouping(
         }
     }
     let slot = match agg {
-        AggCtx::Collect { grouping_specs, .. } => {
+        AggCtx::Collect { grouping_specs, .. } | AggCtx::GroupedWindow { grouping_specs, .. } => {
             let s = GROUPING_GS_BASE + grouping_specs.len();
             grouping_specs.push(positions);
             s
         }
-        _ => unreachable!("Collect verified above"),
+        _ => unreachable!("Collect / GroupedWindow verified above"),
     };
     Ok((RExpr::Column(slot), ResolvedType::Int(ScalarType::Int32)))
 }
@@ -21261,6 +21281,7 @@ fn resolve_window_call(
             group_keys,
             group_key_exprs,
             agg_specs,
+            grouping_specs,
             window_keys,
             ..
         } => (
@@ -21268,7 +21289,7 @@ fn resolve_window_call(
                 group_keys: group_keys.clone(),
                 group_key_exprs: group_key_exprs.clone(),
                 specs: std::mem::take(agg_specs),
-                grouping_specs: Vec::new(),
+                grouping_specs: std::mem::take(grouping_specs),
             },
             std::mem::take(window_keys),
         ),
@@ -21460,12 +21481,19 @@ fn resolve_window_call(
     match agg {
         AggCtx::GroupedWindow {
             agg_specs,
+            grouping_specs,
             window_specs,
             window_keys: wk,
             ..
         } => {
-            if let AggCtx::Collect { specs, .. } = sub {
+            if let AggCtx::Collect {
+                specs,
+                grouping_specs: gs,
+                ..
+            } = sub
+            {
                 *agg_specs = specs;
+                *grouping_specs = gs;
             }
             *wk = window_keys;
             let slot = WINDOW_RESULT_BASE + window_specs.len();

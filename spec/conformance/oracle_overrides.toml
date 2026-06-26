@@ -54,11 +54,6 @@ reason = "jed: a window PARTITION BY / ORDER BY key may not reference an enclosi
 
 [[override]]
 file = "aggregates/grouping_sets.test"
-sql = "SELECT a, COUNT(*), row_number() OVER () FROM gt GROUP BY GROUPING SETS ((a), (b))"
-reason = "jed: GROUPING SETS / GROUPING() combined with a window function is deferred 0A000 (aggregates.md §12) — both want the grouped row's trailing synthetic slots, and the combination is a follow-on. PostgreSQL runs the window stage over the unioned grouping-set rows and returns rows. A documented narrowing, not a semantic disagreement on the supported surface; a single-grouping-set GROUP BY + window works."
-
-[[override]]
-file = "aggregates/grouping_sets.test"
 sql = "SELECT a FROM gt GROUP BY CUBE (a, a, a, a, a, a, a, a, a, a, a, a, a)"
 reason = "jed: a GROUP BY whose grouping sets exceed jed's MAX_GROUPING_SETS (4096) is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (aggregates.md §12, cost.md §7). PostgreSQL caps each construct instead ('CUBE is limited to 12 elements', 54011, a code jed's registry does not define). jed bounds the total expansion uniformly (CUBE(12)=4096 ok, CUBE(13)=8192 over), the deterministic resource bound the untrusted-query guarantee needs (CLAUDE.md §13). A documented divergence on the limit's code, not the supported surface."
 

@@ -350,7 +350,11 @@ description = "Functional-dependency grouping (aggregates.md §16, PG): when the
 
 [[capability]]
 id = "query.grouping_sets"
-description = "GROUP BY GROUPING SETS / ROLLUP / CUBE and the GROUPING() function: several grouping sets in one GROUP BY (ROLLUP(a,b)={(a,b),(a),()}, CUBE(a,b)=every subset; a plain term cross-products with these); a column not grouped in a row's set projects NULL; a select column must be in the union of all sets else 42803; GROUPING(c1,...,ck) -> integer bitmask (1 = grouped away), its args must be grouping columns else 42803; columns only; combined with window functions or over MAX_GROUPING_SETS is deferred/limited (54001) (spec/design/aggregates.md §12, grammar.md §18)"
+description = "GROUP BY GROUPING SETS / ROLLUP / CUBE and the GROUPING() function: several grouping sets in one GROUP BY (ROLLUP(a,b)={(a,b),(a),()}, CUBE(a,b)=every subset; a plain term cross-products with these); a column not grouped in a row's set projects NULL; a select column must be in the union of all sets else 42803; GROUPING(c1,...,ck) -> integer bitmask (1 = grouped away), its args must be grouping columns else 42803; columns only; over MAX_GROUPING_SETS aborts 54001; combined with window functions is query.grouping_sets_window (spec/design/aggregates.md §12, grammar.md §18)"
+
+[[capability]]
+id = "query.grouping_sets_window"
+description = "GROUPING SETS / ROLLUP / CUBE / GROUPING() combined with window functions (aggregates.md §21): the window stage runs over the unioned grouping-set rows (the grouped row is [master cols, agg results, GROUPING results, window keys, window results], so GROUPING and window no longer collide for the trailing slots). PARTITION BY / ORDER BY window keys reference the grouped row (a grouped-away master column is NULL there); GROUPING() works in the projection / HAVING / ORDER BY of a grouped+window query. Builds on query.grouping_sets + query.window"
 
 [[capability]]
 id = "query.having"

@@ -344,6 +344,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // GROUPING SETS / ROLLUP / CUBE and the GROUPING() function — multiple grouping sets in one
     // GROUP BY (spec/design/aggregates.md §12, grammar.md §18).
     "query.grouping_sets",
+    // GROUPING SETS / ROLLUP / CUBE / GROUPING() combined with window functions — the window stage
+    // runs over the unioned grouping-set rows (spec/design/aggregates.md §21).
+    "query.grouping_sets_window",
     // HAVING: a boolean filter over grouped rows, after aggregation, before ORDER BY
     // (spec/design/aggregates.md §8, grammar.md §19).
     "query.having",

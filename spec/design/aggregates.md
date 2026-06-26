@@ -244,8 +244,8 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
 - **`FILTER` on a window aggregate** (landed) — folds only the passing frame rows (§20).
 - **Hypothetical-set aggregates** (landed) — `rank`/`dense_rank`/`percent_rank`/`cume_dist`
   `WITHIN GROUP` (§19).
-- **Deferred / out of scope**: **`GROUPING SETS` combined with window functions**. An additive later
-  feature ([../../TODO.md](../../TODO.md)).
+- **`GROUPING SETS` combined with window functions** (landed) — the window stage runs over the
+  unioned grouping-set rows; `GROUPING()` and window functions coexist in one query (§21).
 
 ## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
 
@@ -337,9 +337,10 @@ query resource bound, CLAUDE.md §13). This is a **deliberate divergence** from 
 each construct instead (`CUBE is limited to 12 elements`, `54011`, a code jed's registry does not
 define); jed bounds the uniform total (`CUBE(12)` = 4096 is fine, `CUBE(13)` = 8192 trips it).
 
-**Window functions** combined with `GROUPING SETS` / `GROUPING()` are **deferred** (`0A000`) — both
-want the grouped row's trailing synthetic slots; a single-grouping-set `GROUP BY` with a window
-function is unaffected (§10).
+**Window functions** combined with `GROUPING SETS` / `GROUPING()` **landed** (§21): the window stage
+runs over the unioned grouping-set rows, with the grouped row's trailing synthetic slots laid out as
+`[master cols…, agg results…, GROUPING results…, window keys…, window results…]` so the two no longer
+collide; a single-grouping-set `GROUP BY` with a window function is on the same path (§10).
 
 ## 13. Ordered-set aggregates (`WITHIN GROUP (ORDER BY …)`)
 
@@ -621,3 +622,41 @@ non-passing row; an explicit frame takes the naive per-row re-fold path, the sam
 `window_frame_step` is charged per **visited** frame row and the filter's own `operator_eval`s per
 row; only a passing row folds. Deterministic and cross-core identical. New capability
 `query.window_aggregate_filter`.
+
+## 21. `GROUPING SETS` combined with window functions
+
+§12 deferred (`0A000`) the combination of `GROUPING SETS` / `ROLLUP` / `CUBE` / `GROUPING()` with
+window functions — both want the grouped row's trailing synthetic slots. It now **landed**: the window
+stage simply runs over the **unioned grouping-set rows** (the rows §12 already produces), so a window
+function ranks / aggregates / numbers the grouped rows across **every** grouping set at once.
+`SELECT a, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY ROLLUP(a)` ranks the per-`a` subtotals
+and the grand total together; `count(*) OVER ()` over `GROUP BY GROUPING SETS ((a), (b))` is the total
+number of grouped rows; `GROUPING(a)` and `row_number() OVER (…)` coexist in one select list.
+
+**The grouped-row layout.** The grouped row a grouping-set query builds is `[master cols…, agg
+results…, GROUPING results…]` (§12); the window stage extends it to `[master cols…, agg results…,
+GROUPING results…, window keys…, window results…]`. The `GROUPING()` columns precede the window
+columns, so the two no longer collide — the window input width and the materialized-`ORDER BY` value
+base both include the `GROUPING()` result count.
+
+**The placeholder bases.** Each synthetic slot a window result, a materialized window key, or a
+`GROUPING()` call carries during resolution is a *placeholder* base, rebased to its real trailing slot
+once the final row layout is known (window result `1<<28`, window key `1<<29`, GROUPING `1<<30`). Each
+base is **2× the previous**, and any one base's placeholder count is far below that gap, so the rebase
+of one base must be **bounded to `[base, 2·base)`** — otherwise a window-result rebase (from `1<<28`)
+would also rewrite a `GROUPING()` placeholder (at `1<<30`) that has not yet been rebased, corrupting
+its slot. This bounded rewrite is what lets `GROUPING()` and window placeholders **coexist** in one
+projection. (Before this slice they were mutually exclusive, so an unbounded `slot >= base` rewrite was
+safe; it no longer is.)
+
+**`GROUPING()` collection.** `GROUPING(…)` is collectable in a grouped+window query exactly as in a
+plain grouped query (§12) — a grouped query that also has window functions is still a *grouping*
+context — and a `GROUPING()` nested inside a window function's argument collects into the same shared
+grouping-spec list.
+
+**Cost / execution.** No new execution machinery: the grouping-set finalize already pushes each
+`GROUPING()` value after the aggregate results into every grouped row (§12), and the window stage
+already runs over the full set of grouped rows (the same code a single-set `GROUP BY` + window uses) —
+only the slot layout / rebase change. The post-`WHERE` scan, the per-`(set × row × aggregate)`
+accumulate (§12), and the window stage's `window_frame_step` (§20) are charged unchanged.
+Deterministic and cross-core identical. New capability `query.grouping_sets_window`.

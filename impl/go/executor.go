@@ -10433,22 +10433,27 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// row's width (group keys + every aggregate) for a grouped+window query, else the FROM scope width.
 	hasWindow = len(windowSpecs) > 0
 	if hasWindow {
+		// The grouped row the window stage extends is [master cols…, agg results…, GROUPING results…]
+		// (the GROUPING columns precede the window columns — aggregates.md §21), so a grouped+window
+		// query's window input width includes the GROUPING() results.
 		inputWidth := 0
 		if isAgg {
-			inputWidth = len(groupKeys) + len(aggSpecs)
+			inputWidth = len(groupKeys) + len(aggSpecs) + len(groupingSpecs)
 		} else {
 			inputWidth = s.width()
 		}
 		keyBase := inputWidth
 		resultBase := inputWidth + len(windowKeys)
+		// Bound to [windowKeyBase, 2·windowKeyBase) so a GROUPING() placeholder (the higher
+		// groupingGsBase) in a window key is not clobbered here (it rebases below — §21).
 		for i := range windowSpecs {
 			for j, pk := range windowSpecs[i].partition {
-				if pk >= windowKeyBase {
+				if pk >= windowKeyBase && pk < windowKeyBase*2 {
 					windowSpecs[i].partition[j] = keyBase + (pk - windowKeyBase)
 				}
 			}
 			for j := range windowSpecs[i].order {
-				if windowSpecs[i].order[j].idx >= windowKeyBase {
+				if windowSpecs[i].order[j].idx >= windowKeyBase && windowSpecs[i].order[j].idx < windowKeyBase*2 {
 					windowSpecs[i].order[j].idx = keyBase + (windowSpecs[i].order[j].idx - windowKeyBase)
 				}
 			}
@@ -10460,12 +10465,10 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			rebasePlaceholderCols(oe, windowResultBase, resultBase)
 		}
 	}
-	// GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
-	// (spec/design/aggregates.md §12) — both want the grouped-row trailing slots. A pure single-set
-	// GROUP BY + window stays on the existing path.
-	if hasWindow && (len(groupSets) > 1 || len(groupingSpecs) > 0) {
-		return nil, NewError(FeatureNotSupported, "GROUPING SETS / GROUPING() with window functions is not supported")
-	}
+	// GROUPING SETS / GROUPING() combined with window functions (aggregates.md §21): the window stage
+	// runs over the unioned grouping-set rows. The grouped row is [master cols…, agg results…, GROUPING
+	// results…] and the window stage appends [window keys…, window results…] after, so the two no longer
+	// collide — GROUPING rebases below the window bases.
 	// Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
 	// len(groupKeys)+len(aggSpecs)+g (the GROUPING results follow the master columns and aggregate
 	// results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
@@ -10488,7 +10491,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	var orderValueBase int
 	switch {
 	case isAgg && hasWindow:
-		orderValueBase = len(groupKeys) + len(aggSpecs) + len(windowKeys) + len(windowSpecs)
+		orderValueBase = len(groupKeys) + len(aggSpecs) + len(groupingSpecs) + len(windowKeys) + len(windowSpecs)
 	case isAgg:
 		orderValueBase = len(groupKeys) + len(aggSpecs) + len(groupingSpecs)
 	case hasWindow:
@@ -15056,19 +15059,25 @@ func groupingValue(positions []int, mask int64) int64 {
 	return r
 }
 
-// rebaseWindowResults rewrites a grouped+window projection's window-result placeholder slots to their
-// real grouped-row slot (spec/design/window.md §5.1). During resolution a window result of index w is
-// assigned the placeholder windowResultBase+w, because its real slot len(groupKeys)+len(aggSpecs)+w is
-// unknown until every aggregate (including any nested in a later window argument or HAVING) has been
-// collected. It descends into a subquery's lhs (current row space) but NOT its plan (those columns
-// index the subquery's own rows; a nested grouped+window plan was already rebased when it was built).
+// rebasePlaceholderCols rewrites placeholder column slots in [from, 2·from) — a window-result
+// (windowResultBase+w), a materialized window-key (windowKeyBase+k), or a GROUPING() (groupingGsBase+g)
+// placeholder — to their real synthetic slot target+(slot-from), once the grouped/windowed row layout
+// is final (spec/design/window.md §5.1, aggregates.md §12/§21). During resolution a window result of
+// index w is assigned the placeholder windowResultBase+w, because its real slot
+// len(groupKeys)+len(aggSpecs)+w is unknown until every aggregate (including any nested in a later
+// window argument or HAVING) has been collected. Each placeholder base is 2× the previous (1<<28,
+// 1<<29, 1<<30) and a base's placeholder count is far below that gap, so bounding the rewrite to
+// [from, 2·from) keeps the bases isolated — a window-result rebase no longer clobbers a GROUPING()
+// placeholder (the two now COEXIST in a GROUPING SETS + window query — aggregates.md §21). It descends
+// into a subquery's lhs (current row space) but NOT its plan (those columns index the subquery's own
+// rows; a nested grouped+window plan was already rebased when it was built).
 func rebasePlaceholderCols(e *rExpr, from, target int) {
 	if e == nil {
 		return
 	}
 	switch e.kind {
 	case reColumn:
-		if e.index >= from {
+		if e.index >= from && e.index < from*2 {
 			e.index = target + (e.index - from)
 		}
 		return
@@ -19696,8 +19705,9 @@ func resolveGrouping(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedTy
 	groupingArgErr := func() error {
 		return NewError(GroupingError, "arguments to GROUPING must be grouping expressions of the associated query level")
 	}
-	// GROUPING is meaningful only in a grouped query; outside one its arguments cannot be grouping
-	// expressions. (GROUPING with window functions is rejected 0A000 earlier in resolveSelectPlan.)
+	// GROUPING is meaningful only in a grouped query (ag.collecting) — including a grouped query that
+	// ALSO has window functions (GROUPING SETS + window, aggregates.md §21); outside one its arguments
+	// cannot be grouping expressions.
 	if !ag.collecting {
 		return nil, resolvedType{}, groupingArgErr()
 	}
@@ -19761,7 +19771,10 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 	// specs are written back into ag at the end so the next window's nested aggregates keep numbering.
 	sub := &aggCtx{}
 	if ag.collecting {
-		sub = &aggCtx{collecting: true, groupKeys: ag.groupKeys, groupKeyExprs: ag.groupKeyExprs, specs: ag.specs}
+		// Seed with the running grouping specs too, so a GROUPING() nested in a window argument collects
+		// into the query's shared grouping specs (GROUPING SETS + window, aggregates.md §21); written
+		// back alongside specs below.
+		sub = &aggCtx{collecting: true, groupKeys: ag.groupKeys, groupKeyExprs: ag.groupKeyExprs, specs: ag.specs, groupingSpecs: ag.groupingSpecs}
 	}
 	// The frame-insensitive no-argument ranking functions (S0/S1): row_number/rank/dense_rank → i64.
 	noArgI64, isNoArg := map[string]windowPlan{
@@ -19961,6 +19974,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 	// §5.1).
 	if ag.collecting {
 		ag.specs = sub.specs
+		ag.groupingSpecs = sub.groupingSpecs
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
 	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame, filter: rfilter})

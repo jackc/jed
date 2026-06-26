@@ -8110,31 +8110,36 @@ export class Database {
     // row's width (group keys + every aggregate) for a grouped+window query, else the FROM scope width.
     hasWindow = windowSpecs.length > 0;
     if (hasWindow) {
-      const inputWidth = isAgg ? groupKeys.length + aggSpecs.length : scope.width();
+      // The grouped row the window stage extends is `[master cols…, agg results…, GROUPING
+      // results…]` (the GROUPING columns precede the window columns — aggregates.md §21), so a
+      // grouped+window query's window input width includes the GROUPING() results.
+      const inputWidth = isAgg
+        ? groupKeys.length + aggSpecs.length + groupingSpecs.length
+        : scope.width();
       const keyBase = inputWidth;
       const resultBase = inputWidth + windowKeys.length;
+      // Bound each manual WINDOW_KEY_BASE rewrite to [WINDOW_KEY_BASE, 2·WINDOW_KEY_BASE) so a
+      // GROUPING() placeholder (the higher GROUPING_GS_BASE) in a window key is not clobbered here
+      // (it rebases below — §21).
       for (const spec of windowSpecs) {
         for (let j = 0; j < spec.partition.length; j++) {
-          if (spec.partition[j] >= WINDOW_KEY_BASE) {
+          if (spec.partition[j] >= WINDOW_KEY_BASE && spec.partition[j] < WINDOW_KEY_BASE * 2) {
             spec.partition[j] = keyBase + (spec.partition[j] - WINDOW_KEY_BASE);
           }
         }
         for (const o of spec.order) {
-          if (o.idx >= WINDOW_KEY_BASE) o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
+          if (o.idx >= WINDOW_KEY_BASE && o.idx < WINDOW_KEY_BASE * 2) {
+            o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
+          }
         }
       }
       for (const p of projections) rebasePlaceholderCols(p, WINDOW_RESULT_BASE, resultBase);
       for (const oe of orderExprs) rebasePlaceholderCols(oe, WINDOW_RESULT_BASE, resultBase);
     }
-    // GROUPING() and multiple grouping sets are mutually exclusive with window functions in one query
-    // (spec/design/aggregates.md §12) — both want the grouped-row trailing slots. A pure single-set
-    // GROUP BY + window stays on the existing path.
-    if (hasWindow && (groupSets.length > 1 || groupingSpecs.length > 0)) {
-      throw engineError(
-        "feature_not_supported",
-        "GROUPING SETS / GROUPING() with window functions is not supported",
-      );
-    }
+    // GROUPING SETS / GROUPING() combined with window functions (spec/design/aggregates.md §21): the
+    // window stage runs over the unioned grouping-set rows. The grouped row is `[master cols…, agg
+    // results…, GROUPING results…]` and the window stage appends `[window keys…, window results…]`
+    // after, so the two no longer collide — GROUPING rebases below the window bases.
     // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
     // groupKeys.length+aggSpecs.length+g (the GROUPING results follow the master columns and aggregate
     // results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
@@ -8150,7 +8155,11 @@ export class Database {
     // so the order values follow the window results.
     const orderValueBase =
       isAgg && hasWindow
-        ? groupKeys.length + aggSpecs.length + windowKeys.length + windowSpecs.length
+        ? groupKeys.length +
+          aggSpecs.length +
+          groupingSpecs.length +
+          windowKeys.length +
+          windowSpecs.length
         : isAgg
           ? groupKeys.length + aggSpecs.length + groupingSpecs.length
           : hasWindow
@@ -12352,10 +12361,16 @@ function groupingValue(positions: number[], mask: bigint): bigint {
 // window argument or HAVING) has been collected. It descends into a subquery's lhs (current row space)
 // but NOT its plan (those columns index the subquery's own rows; a nested grouped+window plan was
 // already rebased when it was built). Mirrors collectTouched's variant coverage.
+//
+// The rewrite is bounded to slots in [from, 2·from): each placeholder base is 2× the previous
+// (WINDOW_RESULT_BASE=2**28, WINDOW_KEY_BASE=2**29, GROUPING_GS_BASE=2**30) and a base's placeholder
+// count is far below that gap, so bounding to [from, 2·from) keeps the bases isolated — a
+// window-result rebase no longer clobbers a GROUPING() placeholder (the two now COEXIST in a
+// GROUPING SETS + window query — aggregates.md §21).
 function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
   switch (e.kind) {
     case "column":
-      if (e.index >= from) e.index = target + (e.index - from);
+      if (e.index >= from && e.index < from * 2) e.index = target + (e.index - from);
       return;
     case "outerColumn":
       return;
@@ -16107,8 +16122,9 @@ function resolveGrouping(
       "grouping_error",
       "arguments to GROUPING must be grouping expressions of the associated query level",
     );
-  // GROUPING is meaningful only in a grouped query; outside one its arguments cannot be grouping
-  // expressions. (GROUPING with window functions is rejected 0A000 earlier in resolveSelectPlan.)
+  // GROUPING is meaningful only in a grouped query (collecting) — including a grouped query that ALSO
+  // has window functions (GROUPING SETS + window, aggregates.md §21). Outside a grouped query (a plain
+  // window query, or a Forbidden context) its arguments cannot be grouping expressions.
   if (!ag.collecting) throw groupingArgErr();
   const positions: number[] = [];
   for (const arg of e.args) {
@@ -16201,9 +16217,19 @@ function resolveWindowCall(
   // must be a grouping key (else 42803) — while a nested window is 42P20 (`sub` has no `window`). In
   // a plain window query `sub` is Forbidden (no aggregate/window nesting). `grouped`/`ag.groupKeys`
   // also map the window's PARTITION BY / ORDER BY columns to grouped-row slots.
+  // A GROUPING(...) nested in a window argument (GROUPING SETS + window, aggregates.md §21) collects
+  // into the query's SHARED groupingSpecs — the same by-reference share as `specs` — so the placeholder
+  // it returns is rebased with the rest. Mirrors Rust's mem::take + write-back of grouping_specs.
   const grouped = ag.collecting;
+  if (grouped && ag.groupingSpecs === undefined) ag.groupingSpecs = [];
   const sub: AggCtx = grouped
-    ? { collecting: true, groupKeys: ag.groupKeys, groupKeyExprs: ag.groupKeyExprs, specs: ag.specs }
+    ? {
+        collecting: true,
+        groupKeys: ag.groupKeys,
+        groupKeyExprs: ag.groupKeyExprs,
+        specs: ag.specs,
+        groupingSpecs: ag.groupingSpecs,
+      }
     : { collecting: false, groupKeys: [], specs: [] };
   if (lname in noArgI64) {
     if (e.star || e.args.length !== 0) {

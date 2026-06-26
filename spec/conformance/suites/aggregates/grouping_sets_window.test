@@ -1,0 +1,80 @@
+# GROUPING SETS / ROLLUP / CUBE / GROUPING() combined with window functions (spec/design/aggregates.md
+# §21). The window stage runs over the unioned grouping-set rows. The grouped row is [master cols, agg
+# results, GROUPING results, window keys, window results], so GROUPING and window no longer collide.
+# requires: ddl.create_table, dml.insert, query.select, query.aggregates, query.group_by, query.grouping_sets, query.window, query.window_ranking, query.grouping_sets_window, types.i32
+
+statement ok
+CREATE TABLE t (a i32, b i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1,1,10),(1,2,20),(2,1,30),(2,2,40)
+
+# ROLLUP(a) + a ranking window over sum(v): the three grouped rows (a=1, a=2, grand total) are ranked
+# by their sum. The grand-total row (a NULL) sorts last by sum.
+# names: a, sum, rank
+query III nosort
+SELECT a, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY ROLLUP(a) ORDER BY sum(v)
+----
+1
+30
+1
+2
+70
+2
+NULL
+100
+3
+
+# GROUPING() AND a window function in the same query: the GROUPING() bitmask + a row_number over the
+# unioned rows both work.
+# names: a, ga, sum, rn
+query IIII nosort
+SELECT a, grouping(a) AS ga, sum(v), row_number() OVER (ORDER BY a NULLS LAST) AS rn
+FROM t GROUP BY ROLLUP(a) ORDER BY a NULLS LAST
+----
+1
+0
+30
+1
+2
+0
+70
+2
+NULL
+1
+100
+3
+
+# A bare window aggregate counts the unioned grouping-set rows: GROUPING SETS ((a),(b)) -> 4 groups.
+# names: a, b, total
+query III nosort
+SELECT a, b, count(*) OVER () AS total FROM t GROUP BY GROUPING SETS ((a),(b)) ORDER BY a NULLS LAST, b NULLS LAST
+----
+1
+NULL
+4
+2
+NULL
+4
+NULL
+1
+4
+NULL
+2
+4
+
+# CUBE(a) + a window aggregate OVER an aggregate (sum(sum(v)) OVER ()) — the grand total across all
+# grouped rows (30 + 70 + 100 = 200).
+# names: a, sum, grand
+query III nosort
+SELECT a, sum(v), sum(sum(v)) OVER () AS grand FROM t GROUP BY CUBE(a) ORDER BY a NULLS LAST
+----
+1
+30
+200
+2
+70
+200
+NULL
+100
+200

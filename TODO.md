@@ -242,8 +242,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         frame rows where `cond` is TRUE (default/explicit frames, EXCLUDE, PARTITION BY); a FILTER
         disables the sliding-frame optimization (naive re-fold). A non-aggregate window function with
         FILTER stays `0A000`. New capability `query.window_aggregate_filter`. → aggregates.md §20
-  - [ ] _follow-on:_
-        `GROUPING SETS` combined with window functions.
+  - [x] **`GROUPING SETS` combined with window functions** — the window stage runs over the unioned
+        grouping-set rows; `GROUPING()` and window functions coexist (the grouped row is `[master,
+        agg, GROUPING, window keys, window results]`, the placeholder rebases bounded per base). New
+        capability `query.grouping_sets_window`. → aggregates.md §21
   - [x] **Non-constant ordered-set fraction** — `percentile_cont(expr)` / `percentile_disc(expr)`
         where `expr` references grouping columns, evaluated per group (a non-grouped column is `42803`).
         New capability `query.ordered_set_nonconstant_fraction`. → aggregates.md §17
