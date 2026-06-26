@@ -15849,6 +15849,8 @@ const (
 	// Two overloads (numeric exact, float in f64); dispatches on the operand. 2201G on a bad count /
 	// equal bounds (and, for float, a NaN operand / infinite bound); a result past int4 → 22003.
 	sfWidthBucket
+	// sfScale is scale(numeric) → i32 — the decimal's display (fractional-digit) scale (decimal.md).
+	sfScale
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19415,6 +19417,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfSign
 	case "factorial":
 		return sfFactorial
+	case "scale":
+		return sfScale
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
@@ -27304,6 +27308,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, overflowErr(Int32)
 			}
 			return IntValue(idx), nil
+		case sfScale:
+			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
+			return IntValue(int64(vals[0].Dec.Scale)), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

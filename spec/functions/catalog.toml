@@ -2272,6 +2272,24 @@ result         = "decimal"
 null           = "propagates"
 errors         = ["22003"]
 
+# scale / min_scale / trim_scale — decimal introspection (decimal.md), EXACT/in-contract.
+#   scale(numeric) → int — the DISPLAY scale (fractional-digit count): scale(1.50) = 2, scale(5) = 0.
+#   min_scale(numeric) → int — the smallest scale that represents the value exactly (trailing zeros
+#     dropped): min_scale(1.50) = 1, min_scale(1.00) = min_scale(0.0) = 0.
+#   trim_scale(numeric) → numeric — the value re-scaled DOWN to its min_scale (trailing zeros removed),
+#     value-identical: trim_scale(1.50) = 1.5, trim_scale(1.00) = 1.
+# Decimal-only (an integer operand is 42883, like sqrt — no implicit int→numeric, a documented PG
+# divergence). result int4 for scale/min_scale, numeric for trim_scale.
+[[operator]]
+name           = "scale"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
 # width_bucket(operand, low, high, count) — the bucket index (1..count) of `operand` in an equi-width
 # histogram over [low, high) with `count` buckets; 0 below low, count+1 at/above high; handles a
 # reversed (low > high) range. RESOLVER-ROUTED (like gcd/lcm) so the three value operands reconcile

@@ -12963,6 +12963,8 @@ enum ScalarFunc {
     /// (numeric exact, float in f64); dispatches on the operand value. 2201G on a bad count / equal
     /// bounds (and, for float, a NaN operand / infinite bound); a result past int4 → 22003.
     WidthBucket,
+    /// scale(numeric) → i32 — the decimal's display (fractional-digit) scale (decimal.md).
+    Scale,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -19008,6 +19010,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "atanh" => ScalarFunc::Atanh,
         "sign" => ScalarFunc::Sign,
         "factorial" => ScalarFunc::Factorial,
+        "scale" => ScalarFunc::Scale,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -30003,6 +30006,11 @@ impl RExpr {
                             Err(overflow(ScalarType::Int32))
                         }
                     }
+                    // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
+                    ScalarFunc::Scale => match &vals[0] {
+                        Value::Decimal(d) => Ok(Value::Int(d.scale() as i64)),
+                        _ => unreachable!("resolver restricts scale to a decimal operand"),
+                    },
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -31121,6 +31129,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Lcm
         | ScalarFunc::Factorial
         | ScalarFunc::WidthBucket
+        | ScalarFunc::Scale
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

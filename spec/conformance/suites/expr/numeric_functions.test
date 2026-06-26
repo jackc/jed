@@ -260,3 +260,24 @@ SELECT width_bucket(5.0, 3, 3, 5)
 # a NaN operand on the float overload → 2201G
 statement error 2201G
 SELECT width_bucket(f64 'NaN', 0::f64, 10::f64, 5)
+
+# --- scale(numeric): the display (fractional-digit) scale -----------------------------
+query I nosort
+SELECT scale(1.50)
+----
+2
+
+query I nosort
+SELECT scale(120.0)
+----
+1
+
+query I nosort
+SELECT scale(5.000)
+----
+3
+
+query I nosort
+SELECT scale(d) FROM nm WHERE id = 4
+----
+NULL

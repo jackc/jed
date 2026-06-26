@@ -12461,6 +12461,8 @@ type ScalarFuncName =
   // (numeric exact, float in f64); dispatches on the operand. 2201G on a bad count / equal bounds
   // (and, for float, a NaN operand / infinite bound); a result past int4 → 22003.
   | "width_bucket"
+  // scale(numeric) → i32 — the decimal's display (fractional-digit) scale (decimal.md).
+  | "scale"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24358,6 +24360,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
             : widthBucketNumeric(toDec(op), toDec(vals[1]!), toDec(vals[2]!), count);
         if (!inRange("i32", idx)) throw overflow("i32");
         return intValue(idx);
+      }
+      if (e.func === "scale") {
+        // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
+        return intValue(BigInt((vals[0] as { dec: Decimal }).dec.scale));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
