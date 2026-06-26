@@ -30,6 +30,8 @@ pub enum SqlState {
     InvalidArgumentForNtile,
     /// 22016 — argument of nth_value must be greater than zero
     InvalidArgumentForNthValue,
+    /// 2201G — {detail}
+    InvalidArgumentForWidthBucketFunction,
     /// 22013 — frame starting or ending offset must not be negative
     InvalidPrecedingOrFollowingSize,
     /// 2200H — nextval: reached {bound} value of sequence {sequence}
@@ -175,6 +177,7 @@ impl SqlState {
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidArgumentForNtile => "22014",
             SqlState::InvalidArgumentForNthValue => "22016",
+            SqlState::InvalidArgumentForWidthBucketFunction => "2201G",
             SqlState::InvalidPrecedingOrFollowingSize => "22013",
             SqlState::SequenceGeneratorLimitExceeded => "2200H",
             SqlState::InvalidRowCountInLimitClause => "2201W",
@@ -265,6 +268,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "22012", name: "division_by_zero", class: "data exception" },
     ErrorDesc { code: "22014", name: "invalid_argument_for_ntile", class: "data exception" },
     ErrorDesc { code: "22016", name: "invalid_argument_for_nth_value", class: "data exception" },
+    ErrorDesc { code: "2201G", name: "invalid_argument_for_width_bucket_function", class: "data exception" },
     ErrorDesc { code: "22013", name: "invalid_preceding_or_following_size", class: "data exception" },
     ErrorDesc { code: "2200H", name: "sequence_generator_limit_exceeded", class: "data exception" },
     ErrorDesc { code: "2201W", name: "invalid_row_count_in_limit_clause", class: "data exception" },

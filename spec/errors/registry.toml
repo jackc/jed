@@ -81,6 +81,14 @@ name = "invalid_argument_for_nth_value"
 class = "data exception"
 template = "argument of nth_value must be greater than zero"
 
+# width_bucket's count must be > 0, and its lower/upper bounds must differ (spec/functions/catalog.toml,
+# float.md §8). PostgreSQL's code; {detail} carries which of the two conditions failed.
+[[error]]
+code = "2201G"
+name = "invalid_argument_for_width_bucket_function"
+class = "data exception"
+template = "{detail}"
+
 # A window frame PRECEDING/FOLLOWING offset must not be negative (spec/design/window.md §6). PG's code.
 [[error]]
 code = "22013"

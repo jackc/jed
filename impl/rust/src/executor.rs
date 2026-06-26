@@ -12959,6 +12959,10 @@ enum ScalarFunc {
     /// The O(n) multiply loop is metered per step (decimal_work, guarded) so the cost ceiling bounds
     /// a large factorial before the limb work runs (§13).
     Factorial,
+    /// width_bucket(op, low, high, count) → i32 — the equi-width histogram bucket. Two overloads
+    /// (numeric exact, float in f64); dispatches on the operand value. 2201G on a bad count / equal
+    /// bounds (and, for float, a NaN operand / infinite bound); a result past int4 → 22003.
+    WidthBucket,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -20925,6 +20929,53 @@ fn resolve_func_call(
             resolved_type_of(result),
         ));
     }
+    // `width_bucket(op, low, high, count)` — resolver-routed so the three value operands reconcile
+    // across the integer/decimal families PG's implicit casts span (all-integer or mixed
+    // integer/decimal → numeric; all-float → float). count must be integer. result int4.
+    if lname == "width_bucket" && args.len() == 4 {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        let mut rargs = Vec::with_capacity(4);
+        let mut tys = Vec::with_capacity(4);
+        for a in args {
+            let (r, t) = resolve(scope, a, None, agg, params)?;
+            rargs.push(r);
+            tys.push(t);
+        }
+        // count (4th) is integer (a NULL adapts and propagates).
+        if !matches!(tys[3], ResolvedType::Int(_) | ResolvedType::Null) {
+            return Err(no_func_overload("width_bucket"));
+        }
+        // The value trio is EITHER all float (+NULL) → the float kernel, OR all integer/decimal
+        // (+NULL) → the numeric kernel; a float mixed with a decimal/integer is 42883.
+        let any_float = tys[..3].iter().any(|t| matches!(t, ResolvedType::Float(_)));
+        let ok = |t: &ResolvedType| {
+            if any_float {
+                matches!(t, ResolvedType::Float(_) | ResolvedType::Null)
+            } else {
+                matches!(
+                    t,
+                    ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
+                )
+            }
+        };
+        if !tys[..3].iter().all(ok) {
+            return Err(no_func_overload("width_bucket"));
+        }
+        return Ok((
+            RExpr::ScalarFunc {
+                func: ScalarFunc::WidthBucket,
+                args: rargs,
+                result: ScalarType::Int32,
+            },
+            resolved_type_of(ScalarType::Int32),
+        ));
+    }
     // `mod(a, b)` is the function spelling of the `%` (mod) operator (catalog name "mod") — route it
     // to the SAME arithmetic machinery so mod() and % are observably identical (promotion, the
     // integer/decimal/float kernels, 22012/22003). PG's mod() is integer/numeric only; jed
@@ -25500,6 +25551,88 @@ fn lcm_decimal(a: &Decimal, b: &Decimal) -> Result<Decimal> {
     Ok(prod.abs().round_to_scale(target))
 }
 
+/// The 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
+fn width_bucket_err(detail: &str) -> EngineError {
+    EngineError::new(SqlState::InvalidArgumentForWidthBucketFunction, detail)
+}
+
+/// width_bucket over numerics (spec/functions/catalog.toml): floor((operand−low)·count/(high−low))
+/// + 1, with 0 below low / count+1 at-or-above high, and the reversed (low > high) range. The bucket
+/// is an EXACT truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw
+/// index (the caller range-checks it to int4). `count > 0` is checked by the caller.
+fn width_bucket_numeric(op: &Decimal, low: &Decimal, high: &Decimal, count: i64) -> Result<i64> {
+    use std::cmp::Ordering;
+    let cmp_bounds = low.cmp_value(high);
+    if cmp_bounds == Ordering::Equal {
+        return Err(width_bucket_err("lower bound cannot equal upper bound"));
+    }
+    let count_dec = Decimal::from_i64(count);
+    // floor((hi_num − lo_num)·count / (hi_den − lo_den)), all operands ≥ 0 in range (trunc == floor).
+    let bucket =
+        |hi_num: &Decimal, lo_num: &Decimal, hi_den: &Decimal, lo_den: &Decimal| -> Result<i64> {
+            let num = hi_num.sub(lo_num)?.mul(&count_dec)?;
+            let den = hi_den.sub(lo_den)?;
+            let q = num.sub(&num.rem(&den)?)?.div(&den)?.round_to_scale(0);
+            let b = q
+                .to_i64_round()
+                .ok_or_else(|| overflow(ScalarType::Int32))?;
+            Ok(b.saturating_add(1))
+        };
+    if cmp_bounds == Ordering::Less {
+        // ascending low < high
+        if op.cmp_value(low) == Ordering::Less {
+            Ok(0)
+        } else if op.cmp_value(high) != Ordering::Less {
+            Ok(count.saturating_add(1))
+        } else {
+            bucket(op, low, high, low)
+        }
+    } else {
+        // descending low > high
+        if op.cmp_value(low) == Ordering::Greater {
+            Ok(0)
+        } else if op.cmp_value(high) != Ordering::Greater {
+            Ok(count.saturating_add(1))
+        } else {
+            bucket(low, op, low, high)
+        }
+    }
+}
+
+/// width_bucket over f64 (spec/functions/catalog.toml): the same index in binary64 (a single
+/// correctly-rounded chain, so cross-core identical). A NaN operand/bound → 2201G; a non-finite
+/// bound → 2201G (the operand may be ±Inf, handled by the comparisons). Returns the raw index.
+fn width_bucket_float(op: f64, low: f64, high: f64, count: i64) -> Result<i64> {
+    if op.is_nan() || low.is_nan() || high.is_nan() {
+        return Err(width_bucket_err(
+            "operand, lower bound, and upper bound cannot be NaN",
+        ));
+    }
+    if !low.is_finite() || !high.is_finite() {
+        return Err(width_bucket_err("lower and upper bounds must be finite"));
+    }
+    if low == high {
+        return Err(width_bucket_err("lower bound cannot equal upper bound"));
+    }
+    let cf = count as f64;
+    let idx = if low < high {
+        if op < low {
+            0
+        } else if op >= high {
+            count.saturating_add(1)
+        } else {
+            (((op - low) / (high - low) * cf).floor() as i64).saturating_add(1)
+        }
+    } else if op > low {
+        0
+    } else if op <= high {
+        count.saturating_add(1)
+    } else {
+        (((low - op) / (low - high) * cf).floor() as i64).saturating_add(1)
+    };
+    Ok(idx)
+}
+
 fn resolve_operand_pair(
     scope: &Scope,
     lhs: &Expr,
@@ -29836,6 +29969,40 @@ impl RExpr {
                         }
                         Ok(Value::Decimal(acc))
                     }
+                    // width_bucket(op, low, high, count): the histogram bucket index. count > 0
+                    // (else 2201G); dispatch numeric vs float on the operand; the raw index is
+                    // range-checked to int4 (count+1 past int4 max → 22003 "integer out of range").
+                    ScalarFunc::WidthBucket => {
+                        let count = match &vals[3] {
+                            Value::Int(n) => *n,
+                            _ => unreachable!("resolver restricts width_bucket count to integer"),
+                        };
+                        if count <= 0 {
+                            return Err(width_bucket_err("count must be greater than zero"));
+                        }
+                        // The resolver guarantees the value trio is homogeneous: all float → the
+                        // float kernel; otherwise the numeric kernel (integers promote to decimal).
+                        let idx = if matches!(vals[0], Value::Float32(_) | Value::Float64(_)) {
+                            let f = |v: &Value| match v {
+                                Value::Float32(f) => *f as f64,
+                                Value::Float64(f) => *f,
+                                _ => unreachable!("resolver makes the float trio homogeneous"),
+                            };
+                            width_bucket_float(f(&vals[0]), f(&vals[1]), f(&vals[2]), count)?
+                        } else {
+                            let (op, low, high) = (
+                                value_to_decimal(&vals[0]),
+                                value_to_decimal(&vals[1]),
+                                value_to_decimal(&vals[2]),
+                            );
+                            width_bucket_numeric(&op, &low, &high, count)?
+                        };
+                        if ScalarType::Int32.in_range(idx) {
+                            Ok(Value::Int(idx))
+                        } else {
+                            Err(overflow(ScalarType::Int32))
+                        }
+                    }
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -30953,6 +31120,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Gcd
         | ScalarFunc::Lcm
         | ScalarFunc::Factorial
+        | ScalarFunc::WidthBucket
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

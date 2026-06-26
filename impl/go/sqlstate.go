@@ -33,6 +33,8 @@ const (
 	InvalidArgumentForNtile
 	// InvalidArgumentForNthValue is 22016 — argument of nth_value must be greater than zero.
 	InvalidArgumentForNthValue
+	// InvalidArgumentForWidthBucketFunction is 2201G — {detail}.
+	InvalidArgumentForWidthBucketFunction
 	// InvalidPrecedingOrFollowingSize is 22013 — frame starting or ending offset must not be negative.
 	InvalidPrecedingOrFollowingSize
 	// SequenceGeneratorLimitExceeded is 2200H — nextval: reached {bound} value of sequence {sequence}.
@@ -186,6 +188,8 @@ func (s SqlState) Code() string {
 		return "22014"
 	case InvalidArgumentForNthValue:
 		return "22016"
+	case InvalidArgumentForWidthBucketFunction:
+		return "2201G"
 	case InvalidPrecedingOrFollowingSize:
 		return "22013"
 	case SequenceGeneratorLimitExceeded:
@@ -341,6 +345,7 @@ var Errors = []ErrorDesc{
 	{Code: "22012", Name: "division_by_zero", Class: "data exception"},
 	{Code: "22014", Name: "invalid_argument_for_ntile", Class: "data exception"},
 	{Code: "22016", Name: "invalid_argument_for_nth_value", Class: "data exception"},
+	{Code: "2201G", Name: "invalid_argument_for_width_bucket_function", Class: "data exception"},
 	{Code: "22013", Name: "invalid_preceding_or_following_size", Class: "data exception"},
 	{Code: "2200H", Name: "sequence_generator_limit_exceeded", Class: "data exception"},
 	{Code: "2201W", Name: "invalid_row_count_in_limit_clause", Class: "data exception"},

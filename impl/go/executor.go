@@ -15845,6 +15845,10 @@ const (
 	// operand → 22003. The O(n) multiply loop is metered per step (decimal_work, guarded) so the
 	// cost ceiling bounds a large factorial before its limb work runs (§13).
 	sfFactorial
+	// sfWidthBucket is width_bucket(op, low, high, count) → i32 — the equi-width histogram bucket.
+	// Two overloads (numeric exact, float in f64); dispatches on the operand. 2201G on a bad count /
+	// equal bounds (and, for float, a NaN operand / infinite bound); a result past int4 → 22003.
+	sfWidthBucket
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -21541,6 +21545,41 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return &rExpr{kind: reScalarFunc, sfunc: sf, sargs: []*rExpr{rl, rr}, result: result}, resolvedTypeOf(result), nil
 	}
+	// `width_bucket(op, low, high, count)` — resolver-routed so the three value operands reconcile
+	// across the integer/decimal families PG's implicit casts span (all-integer or mixed
+	// integer/decimal → numeric; all-float → float). count must be integer. result int4.
+	if name == "width_bucket" && len(fc.Args) == 4 {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		rargs := make([]*rExpr, 4)
+		tys := make([]resolvedType, 4)
+		for i, a := range fc.Args {
+			r, t, err := resolve(s, *a, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			rargs[i] = r
+			tys[i] = t
+		}
+		if tys[3].kind != rtInt && tys[3].kind != rtNull {
+			return nil, resolvedType{}, noFuncOverload("width_bucket")
+		}
+		anyFloat := isFloatKind(tys[0].kind) || isFloatKind(tys[1].kind) || isFloatKind(tys[2].kind)
+		ok := func(k rtKind) bool {
+			if anyFloat {
+				return isFloatKind(k) || k == rtNull
+			}
+			return k == rtInt || k == rtDecimal || k == rtNull
+		}
+		if !ok(tys[0].kind) || !ok(tys[1].kind) || !ok(tys[2].kind) {
+			return nil, resolvedType{}, noFuncOverload("width_bucket")
+		}
+		return &rExpr{kind: reScalarFunc, sfunc: sfWidthBucket, sargs: rargs, result: Int32}, resolvedTypeOf(Int32), nil
+	}
 	// `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME
 	// arithmetic machinery so mod() and % are observably identical (promotion, the integer/decimal/
 	// float kernels, 22012/22003). PG's mod() is integer/numeric only; jed additionally accepts
@@ -23946,6 +23985,112 @@ func lcmDecimal(a, b Decimal) (Decimal, error) {
 		return Decimal{}, err
 	}
 	return prod.Abs().RoundToScale(target), nil
+}
+
+// satAdd1 is n+1 saturating at MaxInt64 (so an out-of-int4 count+1 stays out of range for the
+// width_bucket range-check rather than wrapping to a negative).
+func satAdd1(n int64) int64 {
+	if n == math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return n + 1
+}
+
+// widthBucketErr is the 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
+func widthBucketErr(detail string) error {
+	return NewError(InvalidArgumentForWidthBucketFunction, detail)
+}
+
+// widthBucketNumeric is width_bucket over numerics: floor((operand−low)·count/(high−low)) + 1, with
+// 0 below low / count+1 at-or-above high, and the reversed (low > high) range. The bucket is an EXACT
+// truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw index (the
+// caller range-checks it to int4). count > 0 is checked by the caller.
+func widthBucketNumeric(op, low, high Decimal, count int64) (int64, error) {
+	cmpBounds := low.CmpValue(high)
+	if cmpBounds == 0 {
+		return 0, widthBucketErr("lower bound cannot equal upper bound")
+	}
+	countDec := DecimalFromInt64(count)
+	bucket := func(hiNum, loNum, hiDen, loDen Decimal) (int64, error) {
+		diff, err := hiNum.Sub(loNum)
+		if err != nil {
+			return 0, err
+		}
+		num, err := diff.Mul(countDec)
+		if err != nil {
+			return 0, err
+		}
+		den, err := hiDen.Sub(loDen)
+		if err != nil {
+			return 0, err
+		}
+		r, err := num.Rem(den)
+		if err != nil {
+			return 0, err
+		}
+		numMinusR, err := num.Sub(r)
+		if err != nil {
+			return 0, err
+		}
+		q, err := numMinusR.Div(den)
+		if err != nil {
+			return 0, err
+		}
+		b, ok := q.RoundToScale(0).ToInt64Round()
+		if !ok {
+			return 0, overflowErr(Int32)
+		}
+		return satAdd1(b), nil
+	}
+	if cmpBounds < 0 { // ascending low < high
+		if op.CmpValue(low) < 0 {
+			return 0, nil
+		}
+		if op.CmpValue(high) >= 0 {
+			return satAdd1(count), nil
+		}
+		return bucket(op, low, high, low)
+	}
+	// descending low > high
+	if op.CmpValue(low) > 0 {
+		return 0, nil
+	}
+	if op.CmpValue(high) <= 0 {
+		return satAdd1(count), nil
+	}
+	return bucket(low, op, low, high)
+}
+
+// widthBucketFloat is width_bucket over f64: the same index in binary64 (a single correctly-rounded
+// chain, so cross-core identical). A NaN operand/bound → 2201G; a non-finite bound → 2201G (the
+// operand may be ±Inf, handled by the comparisons). Returns the raw index.
+func widthBucketFloat(op, low, high float64, count int64) (int64, error) {
+	if math.IsNaN(op) || math.IsNaN(low) || math.IsNaN(high) {
+		return 0, widthBucketErr("operand, lower bound, and upper bound cannot be NaN")
+	}
+	if math.IsInf(low, 0) || math.IsInf(high, 0) {
+		return 0, widthBucketErr("lower and upper bounds must be finite")
+	}
+	if low == high {
+		return 0, widthBucketErr("lower bound cannot equal upper bound")
+	}
+	cf := float64(count)
+	if low < high {
+		if op < low {
+			return 0, nil
+		}
+		if op >= high {
+			return satAdd1(count), nil
+		}
+		return int64(math.Floor((op-low)/(high-low)*cf)) + 1, nil
+	}
+	if op > low {
+		return 0, nil
+	}
+	if op <= high {
+		return satAdd1(count), nil
+	}
+	return int64(math.Floor((low-op)/(low-high)*cf)) + 1, nil
 }
 
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
@@ -27135,6 +27280,30 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				acc = prod
 			}
 			return DecimalValue(acc), nil
+		case sfWidthBucket:
+			// width_bucket(op, low, high, count): the histogram bucket index. count > 0 (else 2201G);
+			// dispatch numeric vs float on the operand; the raw index is range-checked to int4 (a
+			// count+1 past int4 max → 22003).
+			count := vals[3].Int
+			if count <= 0 {
+				return Value{}, widthBucketErr("count must be greater than zero")
+			}
+			// The resolver guarantees the value trio is homogeneous: all float → the float kernel;
+			// otherwise the numeric kernel (integers promote to decimal).
+			var idx int64
+			var err error
+			if vals[0].Kind == ValFloat32 || vals[0].Kind == ValFloat64 {
+				idx, err = widthBucketFloat(vals[0].asF64(), vals[1].asF64(), vals[2].asF64(), count)
+			} else {
+				idx, err = widthBucketNumeric(valueToDecimal(vals[0]), valueToDecimal(vals[1]), valueToDecimal(vals[2]), count)
+			}
+			if err != nil {
+				return Value{}, err
+			}
+			if !Int32.InRange(idx) {
+				return Value{}, overflowErr(Int32)
+			}
+			return IntValue(idx), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

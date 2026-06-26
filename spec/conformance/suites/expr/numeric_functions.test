@@ -214,3 +214,49 @@ SELECT factorial(25)
 # a negative operand is undefined → 22003
 statement error 22003
 SELECT factorial(-3)
+
+# --- width_bucket(op, low, high, count): equi-width histogram bucket -------------------
+# numeric: bucket 3 of [0,10)/5; at low → 1; at/above high → count+1; below low → 0
+query I nosort
+SELECT width_bucket(5.0, 0, 10, 5)
+----
+3
+
+query I nosort
+SELECT width_bucket(0, 0, 10, 5)
+----
+1
+
+query I nosort
+SELECT width_bucket(10, 0, 10, 5)
+----
+6
+
+query I nosort
+SELECT width_bucket(-1, 0, 10, 5)
+----
+0
+
+# a reversed (low > high) range buckets descending
+query I nosort
+SELECT width_bucket(5.0, 10, 0, 5)
+----
+3
+
+# float overload (same index, computed in f64)
+query I nosort
+SELECT width_bucket(2.5::f64, 0::f64, 10::f64, 4)
+----
+2
+
+# count <= 0 → 2201G
+statement error 2201G
+SELECT width_bucket(5.0, 0, 10, 0)
+
+# equal bounds → 2201G
+statement error 2201G
+SELECT width_bucket(5.0, 3, 3, 5)
+
+# a NaN operand on the float overload → 2201G
+statement error 2201G
+SELECT width_bucket(f64 'NaN', 0::f64, 10::f64, 5)

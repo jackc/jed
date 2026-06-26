@@ -19,6 +19,7 @@ export type SqlState =
   | "division_by_zero" // 22012 — division by zero
   | "invalid_argument_for_ntile" // 22014 — argument of ntile must be greater than zero
   | "invalid_argument_for_nth_value" // 22016 — argument of nth_value must be greater than zero
+  | "invalid_argument_for_width_bucket_function" // 2201G — {detail}
   | "invalid_preceding_or_following_size" // 22013 — frame starting or ending offset must not be negative
   | "sequence_generator_limit_exceeded" // 2200H — nextval: reached {bound} value of sequence {sequence}
   | "invalid_row_count_in_limit_clause" // 2201W — LIMIT must not be negative
@@ -95,6 +96,7 @@ const CODES: Record<SqlState, string> = {
   division_by_zero: "22012",
   invalid_argument_for_ntile: "22014",
   invalid_argument_for_nth_value: "22016",
+  invalid_argument_for_width_bucket_function: "2201G",
   invalid_preceding_or_following_size: "22013",
   sequence_generator_limit_exceeded: "2200H",
   invalid_row_count_in_limit_clause: "2201W",
@@ -187,6 +189,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "22012", name: "division_by_zero", class: "data exception" },
   { code: "22014", name: "invalid_argument_for_ntile", class: "data exception" },
   { code: "22016", name: "invalid_argument_for_nth_value", class: "data exception" },
+  { code: "2201G", name: "invalid_argument_for_width_bucket_function", class: "data exception" },
   { code: "22013", name: "invalid_preceding_or_following_size", class: "data exception" },
   { code: "2200H", name: "sequence_generator_limit_exceeded", class: "data exception" },
   { code: "2201W", name: "invalid_row_count_in_limit_clause", class: "data exception" },

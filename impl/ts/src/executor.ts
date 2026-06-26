@@ -12457,6 +12457,10 @@ type ScalarFuncName =
   // factorial(n) → numeric — n! at scale 0 (PG factorial(bigint)). A negative operand → 22003. The
   // O(n) multiply loop is metered per step (decimal_work, guarded) so the cost ceiling bounds it (§13).
   | "factorial"
+  // width_bucket(op, low, high, count) → i32 — the equi-width histogram bucket. Two overloads
+  // (numeric exact, float in f64); dispatches on the operand. 2201G on a bad count / equal bounds
+  // (and, for float, a NaN operand / infinite bound); a result past int4 → 22003.
+  | "width_bucket"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -15743,6 +15747,28 @@ function resolveFuncCall(
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     const { args, result } = resolveIntOrDecimalPair(scope, lname, e.args[0]!, e.args[1]!, ag, params);
     return scalarFuncNode(lname, args, result, undefined);
+  }
+  // `width_bucket(op, low, high, count)` — resolver-routed so the three value operands reconcile
+  // across the integer/decimal families PG's implicit casts span (all-integer or mixed
+  // integer/decimal → numeric; all-float → float). count must be integer. result int4.
+  if (lname === "width_bucket" && e.args.length === 4) {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    const rargs: RExpr[] = [];
+    const tys: ResolvedType[] = [];
+    for (const a of e.args) {
+      const r = resolve(scope, a, null, ag, params);
+      rargs.push(r.node);
+      tys.push(r.type);
+    }
+    if (tys[3]!.kind !== "int" && tys[3]!.kind !== "null") throw noFuncOverload("width_bucket");
+    const anyFloat = tys[0]!.kind === "float" || tys[1]!.kind === "float" || tys[2]!.kind === "float";
+    const ok = (t: ResolvedType) =>
+      anyFloat
+        ? t.kind === "float" || t.kind === "null"
+        : t.kind === "int" || t.kind === "decimal" || t.kind === "null";
+    if (!ok(tys[0]!) || !ok(tys[1]!) || !ok(tys[2]!)) throw noFuncOverload("width_bucket");
+    return scalarFuncNode("width_bucket", rargs, "i32", undefined);
   }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
@@ -20966,6 +20992,59 @@ function lcmDecimalValue(a: Decimal, b: Decimal): Decimal {
   return a.div(g).mul(b).abs().roundToScale(target);
 }
 
+// widthBucketErr is the 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
+function widthBucketErr(detail: string): EngineError {
+  return engineError("invalid_argument_for_width_bucket_function", detail);
+}
+
+// widthBucketNumeric is width_bucket over numerics: floor((operand−low)·count/(high−low)) + 1, with
+// 0 below low / count+1 at-or-above high, and the reversed (low > high) range. The bucket is an EXACT
+// truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw index (the
+// caller range-checks it to int4). count > 0 is checked by the caller.
+function widthBucketNumeric(op: Decimal, low: Decimal, high: Decimal, count: bigint): bigint {
+  const cmpBounds = low.cmpValue(high);
+  if (cmpBounds === 0) throw widthBucketErr("lower bound cannot equal upper bound");
+  const countDec = Decimal.fromBigInt(count);
+  const bucket = (hiNum: Decimal, loNum: Decimal, hiDen: Decimal, loDen: Decimal): bigint => {
+    const num = hiNum.sub(loNum).mul(countDec);
+    const den = hiDen.sub(loDen);
+    const q = num.sub(num.rem(den)).div(den).roundToScale(0);
+    const b = q.toBigIntRound();
+    if (b === null) throw overflow("i32");
+    return b + 1n;
+  };
+  if (cmpBounds < 0) {
+    // ascending low < high
+    if (op.cmpValue(low) < 0) return 0n;
+    if (op.cmpValue(high) >= 0) return count + 1n;
+    return bucket(op, low, high, low);
+  }
+  // descending low > high
+  if (op.cmpValue(low) > 0) return 0n;
+  if (op.cmpValue(high) <= 0) return count + 1n;
+  return bucket(low, op, low, high);
+}
+
+// widthBucketFloat is width_bucket over f64: the same index in binary64 (a single correctly-rounded
+// chain, so cross-core identical). A NaN operand/bound → 2201G; a non-finite bound → 2201G (the
+// operand may be ±Inf, handled by the comparisons). Returns the raw index.
+function widthBucketFloat(op: number, low: number, high: number, count: bigint): bigint {
+  if (Number.isNaN(op) || Number.isNaN(low) || Number.isNaN(high))
+    throw widthBucketErr("operand, lower bound, and upper bound cannot be NaN");
+  if (!Number.isFinite(low) || !Number.isFinite(high))
+    throw widthBucketErr("lower and upper bounds must be finite");
+  if (low === high) throw widthBucketErr("lower bound cannot equal upper bound");
+  const cf = Number(count);
+  if (low < high) {
+    if (op < low) return 0n;
+    if (op >= high) return count + 1n;
+    return BigInt(Math.floor(((op - low) / (high - low)) * cf)) + 1n;
+  }
+  if (op > low) return 0n;
+  if (op <= high) return count + 1n;
+  return BigInt(Math.floor(((low - op) / (low - high)) * cf)) + 1n;
+}
+
 function resolveOperandPair(
   scope: Scope,
   lhs: Expr,
@@ -24261,6 +24340,24 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           acc = acc.mul(kd);
         }
         return decimalValue(acc);
+      }
+      if (e.func === "width_bucket") {
+        // width_bucket(op, low, high, count): the histogram bucket index. count > 0 (else 2201G);
+        // dispatch numeric vs float on the operand; the raw index is range-checked to int4.
+        const count = (vals[3] as { int: bigint }).int;
+        if (count <= 0n) throw widthBucketErr("count must be greater than zero");
+        const op = vals[0]!;
+        // The resolver guarantees the value trio is homogeneous: all float → the float kernel;
+        // otherwise the numeric kernel (integers promote to decimal).
+        const fv = (v: Value): number => (v as { value: number }).value;
+        const toDec = (v: Value): Decimal =>
+          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+        const idx =
+          op.kind === "f32" || op.kind === "f64"
+            ? widthBucketFloat(fv(op), fv(vals[1]!), fv(vals[2]!), count)
+            : widthBucketNumeric(toDec(op), toDec(vals[1]!), toDec(vals[2]!), count);
+        if (!inRange("i32", idx)) throw overflow("i32");
+        return intValue(idx);
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
