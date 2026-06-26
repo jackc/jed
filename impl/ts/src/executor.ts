@@ -462,6 +462,22 @@ function leftChars(s: string, n: bigint): string {
   return chars.slice(0, Number(end)).join("");
 }
 
+// rightChars is right(s, n) over CODE POINTS (string-functions.md §3): the last n characters; a
+// negative n returns all but the first |n|. Matches PostgreSQL's right.
+function rightChars(s: string, n: bigint): string {
+  const chars = [...s];
+  const len = BigInt(chars.length);
+  let start: bigint;
+  if (n < 0n) {
+    const skip = -n;
+    start = skip > len ? len : skip;
+  } else {
+    start = len - n;
+    if (start < 0n) start = 0n;
+  }
+  return chars.slice(Number(start)).join("");
+}
+
 // CollationVerdict is the slice-2d version-skew verdict for one referenced collation
 // (spec/design/collation.md §12, compatibility.md §7). "full" ⇒ a loaded bundle provides the name at
 // the file's pinned (unicode, cldr), so the collation's objects are read-write. "skewed" ⇒ a loaded
@@ -12571,7 +12587,9 @@ type ScalarFuncName =
   // indexed). A negative count is 22011 (string-functions.md §3).
   | "substr"
   // left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
-  | "left";
+  | "left"
+  // right(text, n) → text — the last n characters; a negative n drops the first |n| (§3).
+  | "right";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24377,6 +24395,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // left(text, n) → text — the first n characters (negative n drops the last |n|).
         const s = (vals[0] as { text: string }).text;
         return textValue(leftChars(s, (vals[1] as { int: bigint }).int));
+      }
+      if (e.func === "right") {
+        // right(text, n) → text — the last n characters (negative n drops the first |n|).
+        const s = (vals[0] as { text: string }).text;
+        return textValue(rightChars(s, (vals[1] as { int: bigint }).int));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

@@ -15924,6 +15924,8 @@ const (
 	sfSubstr
 	// left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
 	sfLeft
+	// right(text, n) → text — the last n characters; a negative n drops the first |n| (§3).
+	sfRight
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19507,6 +19509,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfSubstr
 	case "left":
 		return sfLeft
+	case "right":
+		return sfRight
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24096,6 +24100,30 @@ func leftChars(s string, n int64) string {
 	return string(runes[:end])
 }
 
+// rightChars is right(s, n) over CODE POINTS (string-functions.md §3): the last n characters; a
+// negative n returns all but the first |n|. Matches PostgreSQL's right.
+func rightChars(s string, n int64) string {
+	runes := []rune(s)
+	length := int64(len(runes))
+	var start int64
+	if n < 0 {
+		if n == math.MinInt64 {
+			start = length // |n| ≥ length ⇒ skip everything
+		} else {
+			start = -n
+			if start > length {
+				start = length
+			}
+		}
+	} else {
+		start = length - n
+		if start < 0 {
+			start = 0
+		}
+	}
+	return string(runes[start:])
+}
+
 // widthBucketErr is the 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
 func widthBucketErr(detail string) error {
 	return NewError(InvalidArgumentForWidthBucketFunction, detail)
@@ -27320,6 +27348,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfLeft:
 			// left(text, n) → text — the first n characters (negative n drops the last |n|).
 			return TextValue(leftChars(vals[0].Str, vals[1].Int)), nil
+		case sfRight:
+			// right(text, n) → text — the last n characters (negative n drops the first |n|).
+			return TextValue(rightChars(vals[0].Str, vals[1].Int)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

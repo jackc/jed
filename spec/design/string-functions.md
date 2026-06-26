@@ -105,3 +105,11 @@ characters: `left('abcde', 2) = 'ab'`, `left('abcde', -2) = 'abc'`, `left('abcde
 `left('abcde', 10) = 'abcde'`, `left('abcde', -10) = ''`. The kernel takes `chars[..end]` where
 `end = clamp(n < 0 ? len+n : n, 0, len)` (a saturating add so an extreme negative `n` cannot
 underflow). NULL args propagate.
+
+### `right(text, n) → text`
+
+The mirror of `left`: the last `n` characters (code points). A **negative** `n` returns all but
+the first `|n|`: `right('abcde', 2) = 'de'`, `right('abcde', -2) = 'cde'`, `right('abcde', 0) = ''`,
+`right('abcde', -10) = ''`. The kernel takes `chars[start..]` where
+`start = clamp(n < 0 ? |n| : len-n, 0, len)` (`checked_neg` guards `i64::MIN` so the magnitude
+cannot overflow). NULL args propagate.

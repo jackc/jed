@@ -13043,6 +13043,8 @@ enum ScalarFunc {
     Substr,
     /// left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
     Left,
+    /// right(text, n) → text — the last n characters; a negative n drops the first |n| (§3).
+    Right,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19069,6 +19071,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "bit_length" => ScalarFunc::BitLength,
         "substr" => ScalarFunc::Substr,
         "left" => ScalarFunc::Left,
+        "right" => ScalarFunc::Right,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30374,6 +30377,11 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Text(left_chars(s, int_value(&vals[1])))),
                         _ => unreachable!("resolver restricts left to text"),
                     },
+                    // right(text, n) → text — the last n characters (negative n drops the first |n|).
+                    ScalarFunc::Right => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Text(right_chars(s, int_value(&vals[1])))),
+                        _ => unreachable!("resolver restricts right to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31246,7 +31254,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::OctetLength
         | ScalarFunc::BitLength
         | ScalarFunc::Substr
-        | ScalarFunc::Left => {
+        | ScalarFunc::Left
+        | ScalarFunc::Right => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31313,6 +31322,20 @@ fn left_chars(s: &str, n: i64) -> String {
         n.min(len)
     };
     chars[..end as usize].iter().collect()
+}
+
+/// `right(s, n)` over CODE POINTS (string-functions.md §3): the last `n` characters; a negative
+/// `n` returns all but the first `|n|`. Matches PostgreSQL's `right`.
+fn right_chars(s: &str, n: i64) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    let start = if n < 0 {
+        // skip the first |n|; checked_neg guards n == i64::MIN (skip everything).
+        n.checked_neg().unwrap_or(i64::MAX).min(len)
+    } else {
+        (len - n).max(0)
+    };
+    chars[start as usize..].iter().collect()
 }
 
 /// The `decimal_work` W of an arithmetic node — which group-count formula applies per op

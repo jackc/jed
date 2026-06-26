@@ -207,3 +207,34 @@ SELECT left(NULL::text, 2), left('abc', NULL::int)
 ----
 NULL
 NULL
+
+# === right(text, n) → text: the last n characters (negative drops from the left) ======
+
+query T
+SELECT right('abcde', 2)
+----
+de
+
+query T
+SELECT right('héllo', 2)
+----
+lo
+
+# a negative n returns all but the first |n| characters
+query T
+SELECT right('abcde', -2)
+----
+cde
+
+# n=0 or a too-large negative is empty
+query B
+SELECT right('abcde', 0) = '', right('abcde', -10) = ''
+----
+true
+true
+
+query T
+SELECT right(NULL::text, 2), right('abc', NULL::int)
+----
+NULL
+NULL
