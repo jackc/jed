@@ -326,6 +326,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // FILTER (WHERE cond) on an aggregate — agg(x) FILTER (WHERE cond): fold only the input rows for
     // which cond is TRUE (spec/design/aggregates.md §11). 42809 on a non-aggregate, 0A000 on a window.
     "query.aggregate_filter",
+    // SELECT DISTINCT in an aggregate query — dedup the projected grouped output rows by equality,
+    // keeping first occurrence, then LIMIT/OFFSET (spec/design/aggregates.md §10).
+    "query.aggregate_select_distinct",
     // GROUP BY: one row per grouping-key combination + the grouping-error rule + ORDER BY over
     // grouping keys (spec/design/aggregates.md §5-6, grammar.md §18).
     "query.group_by",

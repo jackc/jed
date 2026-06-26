@@ -223,8 +223,8 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   value). `GROUP BY` over an empty table → zero rows. **`ORDER BY` over the grouped output**
   resolves each key against the grouping keys — a grouping column sorts the group rows
   (after aggregation, before `LIMIT`/`OFFSET`); a non-grouping column is `42803`
-  ([grammar.md](grammar.md) §18). `SELECT DISTINCT` in an aggregate query is still deferred
-  (`0A000`).
+  ([grammar.md](grammar.md) §18). **`SELECT DISTINCT` in an aggregate query** (landed) dedups the
+  projected grouped output rows (§14).
 - **`HAVING`** (landed) — a boolean predicate over grouped rows (§8), evaluated after
   aggregation and before `ORDER BY`; may reference aggregates (even ones not projected — they
   collect into the same synthetic row) and grouping keys; a non-grouped column is `42803`,
@@ -435,3 +435,30 @@ mode/percentile **finalize**, and the constant fraction evaluation are **unmeter
 order), so the sorted multiset — and therefore mode's tie-break, the discrete index, and the
 continuous interpolation — is byte-identical across cores. No hash-map iteration order enters the
 result. Result `f64`s are the in-contract correctly-rounded exception (above).
+
+## 14. `SELECT DISTINCT` in an aggregate query
+
+`SELECT DISTINCT` is normally a post-projection dedup of an ordinary query's output rows
+([grammar.md](grammar.md) §11). In an **aggregate** query it dedups the *grouped* output: after
+`GROUP BY` / `HAVING` / the window stage produce the grouped rows and the query `ORDER BY` sorts
+them, the rows are **projected** and **deduplicated by equality** keeping the **first occurrence**,
+then `LIMIT`/`OFFSET` is applied — the exact `project → dedup → window` pipeline the non-aggregate
+`DISTINCT` uses (§11 of [grammar.md](grammar.md)). So `SELECT DISTINCT count(*) FROM t GROUP BY a`
+collapses repeated per-group counts to the distinct multiset of counts.
+
+The **`DISTINCT` `ORDER BY` restriction** applies unchanged ([grammar.md](grammar.md) §11): once
+duplicates are collapsed, every `ORDER BY` key must be a **select-list item** (a projected
+column/ordinal, a structurally-matching expression, or an output alias), else `42P10` — matching
+PostgreSQL (*"for SELECT DISTINCT, ORDER BY expressions must appear in select list"*). This is why
+the dedup may run **after** the sort and still be correct: two grouped rows that project to the same
+output tuple agree on every select-list item, hence on every order key, so they are adjacent after a
+stable sort and the first-occurrence rule keeps exactly one — a sorted, deduplicated result. A `json`
+column in the select list is still `0A000` (`json` has no equality — the §11 of [grammar.md](grammar.md)
+rule, shared with the non-aggregate path).
+
+**Cost** (the cross-core contract, §8). Every grouped row is **projected** (its projection
+`operator_eval`s charged — the §3 asymmetry the non-aggregate `DISTINCT` shares: dedup must see every
+row's projected value), and only an **emitted** (post-`LIMIT`) row charges `row_produced`. The dedup
+itself is unmetered (like the `ORDER BY` sort and the `DISTINCT` set insert). Deterministic and
+identical across cores (the output order comes from the grouped-row iteration / sort, never set
+iteration — CLAUDE.md §8/§10). New capability `query.aggregate_select_distinct`.

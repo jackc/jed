@@ -224,7 +224,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         second key / `WITHIN GROUP` on a non-ordered-set fn / no `WITHIN GROUP` → `42883`. New
         capability `query.ordered_set_aggregate`; cost = an ordinary aggregate's (sort + finalize
         unmetered). → aggregates.md §13
-  - [ ] _follow-on:_ `SELECT DISTINCT` in an aggregate query, GROUP BY by
+  - [x] **`SELECT DISTINCT` in an aggregate query** — dedups the projected grouped output rows by
+        equality (first occurrence), then LIMIT/OFFSET — the same project->dedup->window pipeline as
+        the non-aggregate DISTINCT. The DISTINCT ORDER BY restriction applies (each key a select-list
+        item, else `42P10`). New capability `query.aggregate_select_distinct`. → aggregates.md §14
+  - [ ] _follow-on:_ GROUP BY by
         expression/ordinal/alias, functional-dependency grouping,
         `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate, and the
         ordered-set follow-ons (hypothetical-set aggregates `rank`/`dense_rank`/`percent_rank`/

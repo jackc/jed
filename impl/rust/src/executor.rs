@@ -8857,13 +8857,11 @@ impl Database {
         // (The GROUPING SETS/window mutual-exclusion check and the GROUPING() placeholder rebase also run
         // after the ORDER BY resolution below — an ORDER BY GROUPING() grows `grouping_specs`.)
         let mut having = having;
-        // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
-        if is_agg && sel.distinct {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "SELECT DISTINCT with aggregates is not supported yet",
-            ));
-        }
+        // SELECT DISTINCT over an aggregate query's output (output-row dedup) dedups the projected
+        // group rows by equality (aggregates.md §10): the grouped rows are projected, deduplicated
+        // keeping the first occurrence, then LIMIT/OFFSET applied — the same project→dedup→window
+        // pipeline as the non-aggregate DISTINCT path (§11 below). The ORDER BY restriction (each
+        // key must be a select-list item) is enforced once for both paths at the §11 block.
         let filter = match &sel.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
             None => None,
@@ -11406,19 +11404,47 @@ impl Database {
                 materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, &mut meter)?;
                 sort_rows(&mut group_rows, &plan.order)?;
             }
-            // Window + project; only an emitted row charges row_produced + projection cost.
-            let (start, end) = window_bounds(group_rows.len());
-            let mut out_rows = Vec::with_capacity(end - start);
-            for srow in &group_rows[start..end] {
-                meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                meter.charge(COSTS.row_produced);
-                let mut out = Vec::with_capacity(plan.projections.len());
-                for p in &plan.projections {
-                    out.push(p.eval(srow, &env, &mut meter)?);
+            if plan.distinct {
+                // SELECT DISTINCT: project EVERY grouped row (charging its projection operator_evals,
+                // the §3 asymmetry — like the non-aggregate DISTINCT path below), dedup by equality
+                // keeping the first occurrence in the (already ORDER-BY-sorted) order, then apply
+                // LIMIT/OFFSET. `seen` is membership-only; output order comes from the deterministic
+                // group iteration / sort, never set iteration (no hashmap-order leak — CLAUDE.md §8/§10).
+                let mut seen: std::collections::HashSet<Vec<Value>> =
+                    std::collections::HashSet::new();
+                let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
+                for srow in &group_rows {
+                    let mut out = Vec::with_capacity(plan.projections.len());
+                    for p in &plan.projections {
+                        out.push(p.eval(srow, &env, &mut meter)?);
+                    }
+                    if seen.insert(out.clone()) {
+                        distinct_rows.push(out);
+                    }
                 }
-                out_rows.push(out);
+                let (start, end) = window_bounds(distinct_rows.len());
+                let mut out_rows = Vec::with_capacity(end - start);
+                for row in distinct_rows.drain(start..end) {
+                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                    meter.charge(COSTS.row_produced);
+                    out_rows.push(row);
+                }
+                out_rows
+            } else {
+                // Window + project; only an emitted row charges row_produced + projection cost.
+                let (start, end) = window_bounds(group_rows.len());
+                let mut out_rows = Vec::with_capacity(end - start);
+                for srow in &group_rows[start..end] {
+                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                    meter.charge(COSTS.row_produced);
+                    let mut out = Vec::with_capacity(plan.projections.len());
+                    for p in &plan.projections {
+                        out.push(p.eval(srow, &env, &mut meter)?);
+                    }
+                    out_rows.push(out);
+                }
+                out_rows
             }
-            out_rows
         } else if plan.distinct {
             // Project every filtered row (charging projection cost per row, the §3
             // asymmetry), keeping first occurrences. `seen` is membership-only: the

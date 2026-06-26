@@ -10116,10 +10116,10 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	}
 	// (The GROUPING SETS/window mutual-exclusion check and the GROUPING() placeholder rebase also run
 	// after the ORDER BY resolution below — an ORDER BY GROUPING() grows groupingSpecs.)
-	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
-	if isAgg && sel.Distinct {
-		return nil, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
-	}
+	// SELECT DISTINCT over an aggregate query's output (output-row dedup) dedups the projected
+	// group rows by equality, keeping the first occurrence, then LIMIT/OFFSET (aggregates.md §10) —
+	// the same project->dedup->window pipeline as the non-aggregate DISTINCT path. The ORDER BY
+	// restriction (each key must be a select-list item) is enforced once for both at the §11 block.
 	var filter *rExpr
 	if sel.Filter != nil {
 		filter, err = resolveBooleanFilter(s, sel.Filter, ptypes)
@@ -14166,23 +14166,56 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				return selectResult{}, err
 			}
 		}
-		// Window + project; only an emitted row charges row_produced + its projection cost.
-		start, end := windowBounds(int64(len(groupRows)))
-		out = make([][]Value, 0, end-start)
-		for _, srow := range groupRows[start:end] {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
-				return selectResult{}, err
-			}
-			meter.Charge(Costs.RowProduced)
-			projected := make([]Value, len(plan.projections))
-			for i, p := range plan.projections {
-				v, perr := p.eval(srow, env, meter)
-				if perr != nil {
-					return selectResult{}, perr
+		if plan.distinct {
+			// SELECT DISTINCT: project EVERY grouped row (charging its projection operator_evals,
+			// the §3 asymmetry — like the non-aggregate DISTINCT path below), dedup by equality
+			// keeping the first occurrence in the (already ORDER-BY-sorted) order, then LIMIT/OFFSET.
+			// `seen` is membership-only; output order comes from the deterministic group iteration /
+			// sort, never map iteration (no map-order leak — CLAUDE.md §8/§10).
+			seen := make(map[string]bool)
+			var distinctRows [][]Value
+			for _, srow := range groupRows {
+				projected := make([]Value, len(plan.projections))
+				for i, p := range plan.projections {
+					v, perr := p.eval(srow, env, meter)
+					if perr != nil {
+						return selectResult{}, perr
+					}
+					projected[i] = v
 				}
-				projected[i] = v
+				if key := distinctRowKey(projected); !seen[key] {
+					seen[key] = true
+					distinctRows = append(distinctRows, projected)
+				}
 			}
-			out = append(out, projected)
+			start, end := windowBounds(int64(len(distinctRows)))
+			out = make([][]Value, 0, end-start)
+			for _, row := range distinctRows[start:end] {
+				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+					return selectResult{}, err
+				}
+				meter.Charge(Costs.RowProduced)
+				out = append(out, row)
+			}
+		} else {
+			// Window + project; only an emitted row charges row_produced + its projection cost.
+			start, end := windowBounds(int64(len(groupRows)))
+			out = make([][]Value, 0, end-start)
+			for _, srow := range groupRows[start:end] {
+				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+					return selectResult{}, err
+				}
+				meter.Charge(Costs.RowProduced)
+				projected := make([]Value, len(plan.projections))
+				for i, p := range plan.projections {
+					v, perr := p.eval(srow, env, meter)
+					if perr != nil {
+						return selectResult{}, perr
+					}
+					projected[i] = v
+				}
+				out = append(out, projected)
+			}
 		}
 	} else if plan.distinct {
 		// Project every filtered row (charging projection cost per row, the §3 asymmetry),

@@ -7865,13 +7865,10 @@ export class Database {
       : [];
     // (The GROUPING SETS/window mutual-exclusion check and the GROUPING() placeholder rebase also run
     // after the ORDER BY resolution below — an ORDER BY GROUPING() grows groupingSpecs.)
-    // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
-    if (isAgg && sel.distinct) {
-      throw engineError(
-        "feature_not_supported",
-        "SELECT DISTINCT with aggregates is not supported yet",
-      );
-    }
+    // SELECT DISTINCT over an aggregate query's output (output-row dedup) dedups the projected
+    // group rows by equality, keeping the first occurrence, then LIMIT/OFFSET (aggregates.md §10) —
+    // the same project->dedup->window pipeline as the non-aggregate DISTINCT path. The ORDER BY
+    // restriction (each key must be a select-list item) is enforced once for both at the §11 block.
     const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter, ptypes) : null;
     // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
     // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
@@ -9842,13 +9839,37 @@ export class Database {
         materializeOrderExprs(groupRows, plan.orderExprs, env, meter);
         sortRows(groupRows, plan.order);
       }
-      // Window + project; only an emitted row charges rowProduced + its projection cost.
-      const [start, end] = windowBounds(groupRows.length);
-      out = groupRows.slice(start, end).map((srow) => {
-        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
-        meter.charge(COSTS.rowProduced);
-        return plan.projections.map((p) => evalExpr(p, srow, env, meter));
-      });
+      if (plan.distinct) {
+        // SELECT DISTINCT: project EVERY grouped row (charging its projection operatorEvals, the §3
+        // asymmetry — like the non-aggregate DISTINCT path below), dedup by equality keeping the
+        // first occurrence in the (already ORDER-BY-sorted) order, then LIMIT/OFFSET. `seen` is
+        // membership-only; output order comes from the deterministic group iteration / sort, never
+        // Set iteration (no order leak — CLAUDE.md §8/§10).
+        const seen = new Set<string>();
+        const distinctRows: Value[][] = [];
+        for (const srow of groupRows) {
+          const tuple = plan.projections.map((p) => evalExpr(p, srow, env, meter));
+          const key = distinctRowKey(tuple);
+          if (!seen.has(key)) {
+            seen.add(key);
+            distinctRows.push(tuple);
+          }
+        }
+        const [start, end] = windowBounds(distinctRows.length);
+        out = distinctRows.slice(start, end).map((tuple) => {
+          meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+          meter.charge(COSTS.rowProduced);
+          return tuple;
+        });
+      } else {
+        // Window + project; only an emitted row charges rowProduced + its projection cost.
+        const [start, end] = windowBounds(groupRows.length);
+        out = groupRows.slice(start, end).map((srow) => {
+          meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+          meter.charge(COSTS.rowProduced);
+          return plan.projections.map((p) => evalExpr(p, srow, env, meter));
+        });
+      }
     } else if (plan.distinct) {
       // Project every filtered row (charging projection cost per row, the §3 asymmetry),
       // keeping first occurrences. `seen` is membership-only: output order comes from the
