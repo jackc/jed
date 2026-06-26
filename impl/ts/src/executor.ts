@@ -12520,7 +12520,12 @@ type ScalarFuncName =
   // JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
   | "json_scalar"
   // JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
-  | "json_serialize";
+  | "json_serialize"
+  // --- string / text functions (spec/design/string-functions.md). All STRICT (NULL propagates via
+  // the generic scalarFunc short-circuit). Character functions count Unicode CODE POINTS — TS strings
+  // are UTF-16, so iterate with [...s] (code-point units), NOT .length; octet/bit functions count
+  // UTF-8 bytes (via TextEncoder). length(text) → i32 — the number of characters. length('héllo') = 5.
+  | "length";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24295,6 +24300,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         if (v0.kind === "json") return textValue(v0.text);
         if (v0.kind === "jsonb") return textValue(jsonbOut(v0.node));
         throw new Error("BUG: resolver restricts JSON_SERIALIZE to json/jsonb");
+      }
+      if (e.func === "length") {
+        // length(text) → i32 — the number of characters (Unicode code points). TS strings are
+        // UTF-16, so [...s] (the code-point iterator) counts code points, NOT s.length, which
+        // would over-count astral characters as surrogate pairs (string-functions.md §2/§3).
+        const s = (vals[0] as { text: string }).text;
+        return intValue(BigInt([...s].length));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

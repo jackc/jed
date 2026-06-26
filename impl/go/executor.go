@@ -15910,6 +15910,11 @@ const (
 	sfJsonScalar
 	// json_serialize(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
 	sfJsonSerialize
+	// --- string / text functions (spec/design/string-functions.md). All STRICT (NULL propagates via
+	// the generic scalarFunc short-circuit). Character functions count Unicode code points (Go strings
+	// are UTF-8, so `range`/utf8.RuneCountInString); octet/bit functions count UTF-8 bytes.
+	// length(text) → i32 — the number of characters (code points). length('héllo') = 5.
+	sfLength
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19481,6 +19486,9 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfJsonScalar
 	case "json_serialize":
 		return sfJsonSerialize
+	// string / text functions (string-functions.md).
+	case "length":
+		return sfLength
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27208,6 +27216,10 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			default:
 				panic("BUG: resolver restricts JSON_SERIALIZE to json/jsonb")
 			}
+		case sfLength:
+			// length(text) → i32 — the number of characters (Unicode code points). Go strings are
+			// UTF-8, so utf8.RuneCountInString counts code points (string-functions.md §3).
+			return IntValue(int64(utf8.RuneCountInString(vals[0].Str))), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

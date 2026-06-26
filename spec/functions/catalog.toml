@@ -3091,6 +3091,24 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# --- string / text scalar functions (../design/string-functions.md) ---------------------------
+# Pure text-processing built-ins (PG's string functions, manual §9.4), STRICT (null = "propagates":
+# a NULL argument → NULL). They reuse the generic scalar-function mold (functions.md §9) — resolved
+# by argument family, result by the `result` code, kernel by name, NULL short-circuited at eval. The
+# character-counting / character-indexing functions count UNICODE CODE POINTS (matching PG's UTF8
+# character semantics — NOT UTF-8 bytes nor UTF-16 units, the cross-core trap handled per core,
+# string-functions.md §2); octet_length / bit_length count UTF-8 bytes / bits. Oracle-pinned (pg18).
+#   length(text) → int — the number of characters (code points). length('héllo') = 5.
+[[operator]]
+name           = "length"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

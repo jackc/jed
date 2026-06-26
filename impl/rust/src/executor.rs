@@ -13029,6 +13029,11 @@ enum ScalarFunc {
     JsonScalar,
     /// JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
     JsonSerialize,
+    // --- string / text functions (spec/design/string-functions.md). All STRICT (NULL propagates,
+    // handled by the generic ScalarFunc null short-circuit). Character functions count Unicode code
+    // points (`chars()`); octet/bit functions count UTF-8 bytes.
+    /// length(text) → i32 — the number of characters (code points). length('héllo') = 5.
+    Length,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19048,6 +19053,8 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "to_json" => ScalarFunc::ToJson,
         "json_scalar" => ScalarFunc::JsonScalar,
         "json_serialize" => ScalarFunc::JsonSerialize,
+        // string / text functions (string-functions.md).
+        "length" => ScalarFunc::Length,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30321,6 +30328,12 @@ impl RExpr {
                     // json input verbatim, everything else the compact to_jsonb render (PG's
                     // datum_to_json). This is the same per-type rule the json builders embed.
                     ScalarFunc::ToJson => Ok(Value::Json(elem_json_text(&vals[0])?)),
+                    // length(text) → i32 — the number of characters (Unicode code points). Rust
+                    // String is UTF-8, so `chars()` yields one item per code point (string-functions.md §3).
+                    ScalarFunc::Length => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Int(s.chars().count() as i64)),
+                        _ => unreachable!("resolver restricts length to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31188,9 +31201,10 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::ToJsonb
         | ScalarFunc::ToJson
         | ScalarFunc::JsonScalar
-        | ScalarFunc::JsonSerialize => {
+        | ScalarFunc::JsonSerialize
+        | ScalarFunc::Length => {
             unreachable!(
-                "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json fns are handled before eval_float_func"
+                "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
         }
     };

@@ -1,0 +1,63 @@
+# String / text scalar functions (spec/design/string-functions.md). Pure per-row text built-ins
+# (PostgreSQL's "String Functions and Operators", manual §9.4), STRICT (a NULL argument → NULL).
+# They reuse the generic scalar-function mold (functions.md §9): resolved by argument family, kernel
+# by name, NULL short-circuited at eval, one operator_eval per call. The character-counting /
+# character-indexing functions count UNICODE CODE POINTS (matching PG's UTF8 character semantics —
+# NOT UTF-8 bytes nor UTF-16 units, the cross-core trap exercised by the astral 😀 below);
+# octet_length / bit_length count UTF-8 bytes / bits. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, resource.cost_metering
+
+# === length(text) → int: the number of characters (code points) ========================
+
+query I
+SELECT length('hello')
+----
+5
+
+# 'héllo' is 5 code points but 6 UTF-8 bytes (é = 2 bytes) — length counts characters, not bytes.
+query I
+SELECT length('héllo')
+----
+5
+
+# the empty string is 0 characters
+query I
+SELECT length('')
+----
+0
+
+# an astral character (😀 = U+1F600) is ONE code point — but TWO UTF-16 units, so a naïve TS
+# `.length` would over-count it as 2. The code-point count of 'a😀b' is 3.
+query I
+SELECT length('a😀b')
+----
+3
+
+# NULL propagates
+query I
+SELECT length(NULL::text)
+----
+NULL
+
+# length is valid anywhere an expression is (here in WHERE), like any scalar function.
+statement ok
+CREATE TABLE words (id i32 PRIMARY KEY, w text)
+
+statement ok
+INSERT INTO words VALUES (1, 'a'), (2, 'bb'), (3, 'ccc'), (4, NULL)
+
+query IT rowsort
+SELECT length(w), w FROM words WHERE length(w) >= 2
+----
+2
+bb
+3
+ccc
+
+# the cost of a single length() over a constant is the uniform scalar-function shape — node
+# operator_eval + the literal argument's own eval + the one produced row — identical cross-core.
+# cost: 2
+query I
+SELECT length('abc')
+----
+3
