@@ -2,8 +2,8 @@
 # (§1), the compact value codec (§4), array_out rendering (§7), element-wise comparison with PG
 # BTREE NULL semantics (§5 — NULLs comparable and mutually equal, NOT the composite 3VL rule),
 # ORDER BY / DISTINCT array keys (the array_cmp total order — NULLs-last per element,
-# shorter-prefix-first), and the whole-value IS NULL rule. v1 ships 1-D values of scalar elements;
-# arrays-in-keys, multidim values, slices, and the array function surface are deferred. array_out
+# shorter-prefix-first), and the whole-value IS NULL rule. A keyable-element array is now a valid
+# PRIMARY KEY (the lift is pinned here; the full key surface is types/array_key.test). array_out
 # matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.update, dml.update_container, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.aggregates, query.group_by, expr.not_equal, types.array, types.i32, types.text, resource.cost_metering
 
@@ -118,8 +118,11 @@ INSERT INTO t VALUES (4, '{1,2', NULL)
 statement error 42804
 SELECT id FROM t WHERE xs = tags
 
-# An array PRIMARY KEY is rejected 0A000 — the key encoding is authored but unexercised.
-statement error 0A000
+# An array of a key-encodable scalar element IS a valid PRIMARY KEY (the array-elements-terminated
+# key, encoding.md §2.14) — the positive surface (point lookup, 23505, ordering, secondary index,
+# UNIQUE, FK) is exercised in types/array_key.test. Here just the lift: a keyable-element array PK is
+# accepted where it was 0A000 before.
+statement ok
 CREATE TABLE k (xs i32[] PRIMARY KEY)
 
 # --- array comparison with NULL ELEMENTS yields a DEFINITE boolean (PG btree semantics, array.md

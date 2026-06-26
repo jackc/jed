@@ -242,6 +242,22 @@ fn range_pk_table_db() -> Database {
     db
 }
 
+/// A table with an i32[] PRIMARY KEY — the SECOND container key (encoding.md §2.14), the first whose
+/// key length varies with the element count. The array-elements-terminated key (per-element markers +
+/// terminator + shape suffix) lands in the key slot. Rows are inserted in ASCENDING array_total_cmp
+/// order (empty, shorter-prefix, element-wise, NULL element last) to match verify.rb's ascending-key
+/// tree builder. Pins array_pk_table.jed cross-core.
+fn array_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE k (key i32[] PRIMARY KEY, v i32)");
+    run(&mut db, "INSERT INTO k VALUES ('{}', 40)");
+    run(&mut db, "INSERT INTO k VALUES ('{1,2}', 20)");
+    run(&mut db, "INSERT INTO k VALUES ('{1,2,3}', 10)");
+    run(&mut db, "INSERT INTO k VALUES ('{1,NULL}', 50)");
+    run(&mut db, "INSERT INTO k VALUES ('{2}', 60)");
+    db
+}
+
 /// A table with a `json` column (verbatim text body, type_code 18 — spec/design/json.md §4). The
 /// stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
 /// length-prefixed text-shaped json body. Pins json_table.jed cross-core.
@@ -994,6 +1010,7 @@ fn write_matches_goldens() {
         ("array_table.jed", array_table_db),
         ("range_table.jed", range_table_db),
         ("range_pk_table.jed", range_pk_table_db),
+        ("array_pk_table.jed", array_pk_table_db),
         ("gist_range_table.jed", gist_range_table_db),
         ("gist_scalar_table.jed", gist_scalar_table_db),
         ("gist_exclude_table.jed", gist_exclude_table_db),
@@ -1055,6 +1072,7 @@ fn read_goldens_reproduces_rows() {
         ("array_table.jed", array_table_db, "t"),
         ("range_table.jed", range_table_db, "t"),
         ("range_pk_table.jed", range_pk_table_db, "t"),
+        ("array_pk_table.jed", array_pk_table_db, "k"),
         ("gist_range_table.jed", gist_range_table_db, "t"),
         ("gist_scalar_table.jed", gist_scalar_table_db, "t"),
         ("gist_exclude_table.jed", gist_exclude_table_db, "booking"),

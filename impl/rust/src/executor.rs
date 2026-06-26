@@ -3164,9 +3164,11 @@ impl Database {
                 // the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md §2.4/§2.6) and
                 // `decimal` (`decimal-order-preserving` §2.5), all self-delimiting so they compose in
                 // composite keys / index suffixes — plus the `range` container (`range-bounds` §2.11,
-                // the first container key, recursing into the element codec). Still rejected `0A000`:
-                // `float` (the principled determinism carve-out — determinism.md §4) and the recursive
-                // composite/array containers. An oversized text/bytea/decimal/range key (one that can't
+                // the first container key) and the `array` container (`array-elements-terminated`
+                // §2.14, the second container key — keyable when its element is a key-encodable scalar,
+                // `is_array_keyable`). Still rejected `0A000`: `float` (the principled determinism
+                // carve-out — determinism.md §4), a `float`/composite-element array, and the recursive
+                // composite container. An oversized text/bytea/decimal/range/array key (one that can't
                 // fit a node) trips the existing RECORD_MAX oversized-item 0A000, mirroring PG's btree
                 // key-size limit.
                 if !ty.is_integer()
@@ -3180,6 +3182,7 @@ impl Database {
                     && !ty.is_date()
                     && !ty.is_interval()
                     && !ty.is_range()
+                    && !is_array_keyable(&ty)
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -3435,6 +3438,7 @@ impl Database {
                     && !ty.is_date()
                     && !ty.is_interval()
                     && !ty.is_range()
+                    && !is_array_keyable(ty)
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -3488,6 +3492,7 @@ impl Database {
                     && !ty.is_date()
                     && !ty.is_interval()
                     && !ty.is_range()
+                    && !is_array_keyable(ty)
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -4332,6 +4337,7 @@ impl Database {
                         && !ty.is_date()
                         && !ty.is_interval()
                         && !ty.is_range()
+                        && !is_array_keyable(ty)
                     {
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
@@ -16575,8 +16581,68 @@ fn encode_typed_key(ty: &Type, value: &Value, coll: Option<&Collation>) -> Resul
                 .scalar();
             Ok(crate::range::encode_range_key(elem, rv))
         }
+        Value::Array(a) => {
+            let elem = ty
+                .array_element()
+                .expect("an array key value has an array column type");
+            encode_array_key(elem, a)
+        }
         _ => encode_key_value(ty.scalar(), value, coll),
     }
+}
+
+/// Whether `ty` is an **array** whose element is a key-encodable scalar — so the array is a valid
+/// `PRIMARY KEY` / index / `UNIQUE` / FK key (encoding.md §2.14, the `array-elements-terminated` rule).
+/// A `float`-element array (the §2.8 determinism carve-out) or a composite-element array (composite is
+/// not yet keyable) is NOT keyable, the same narrowing the bare `float` / composite scalar key carries.
+fn is_array_keyable(ty: &Type) -> bool {
+    ty.array_element().is_some_and(is_keyable_scalar)
+}
+
+/// Whether `ty` is a key-encodable **scalar** (every keyable scalar except `float`, the §2.8 carve-out)
+/// — the element-type gate for [`is_array_keyable`]. Mirrors the inline scalar gate the PK/UNIQUE/index
+/// resolvers apply directly.
+fn is_keyable_scalar(ty: &Type) -> bool {
+    ty.is_integer()
+        || ty.is_bool()
+        || ty.is_text()
+        || ty.is_bytea()
+        || ty.is_decimal()
+        || ty.is_uuid()
+        || ty.is_timestamp()
+        || ty.is_timestamptz()
+        || ty.is_date()
+        || ty.is_interval()
+}
+
+/// The order-preserving `array-elements-terminated` key for an array value (encoding.md §2.14) — the
+/// engine's second container key, recursing into each element's own key. Reproduces the in-memory
+/// `array_total_cmp` order (array.md §5) under `memcmp`: per flattened (row-major) element a marker
+/// (`0x01` present ‖ the element key, `0x02` NULL) so present sorts before NULL and a shorter list
+/// reaches the `0x00` terminator first; then the shape suffix (`ndim`, then per dimension a `u32` BE
+/// length and the `i32` `int-be-signflip` lower bound) breaks ties among equal-element-prefix,
+/// equal-count arrays. The element is a key-encodable **scalar** (the DDL gate rejects a `float` /
+/// composite element `0A000`), so the per-element key is [`encode_key_value`]; an array element key
+/// uses the `C` byte order (a collated array-element key is not a feature this slice).
+fn encode_array_key(elem_ty: &Type, a: &ArrayVal) -> Result<Vec<u8>> {
+    let elem = elem_ty.scalar();
+    let mut out = Vec::new();
+    for e in &a.elements {
+        match e {
+            Value::Null => out.push(0x02), // NULL element — sorts after every present element
+            v => {
+                out.push(0x01); // present element marker
+                out.extend_from_slice(&encode_key_value(elem, v, None)?);
+            }
+        }
+    }
+    out.push(0x00); // terminator — a shorter element list sorts before a longer one
+    out.push(a.ndim() as u8);
+    for d in 0..a.ndim() {
+        out.extend_from_slice(&(a.dims[d] as u32).to_be_bytes());
+        out.extend_from_slice(&encode_int(ScalarType::Int32, a.lbounds[d] as i64));
+    }
+    Ok(out)
 }
 
 /// A built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look up in the

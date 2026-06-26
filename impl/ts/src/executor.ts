@@ -3253,7 +3253,8 @@ export class Database {
           !typeIsTimestamptz(colType) &&
           !typeIsDate(colType) &&
           !typeIsInterval(colType) &&
-          !typeIsRange(colType)
+          !typeIsRange(colType) &&
+          !typeIsArrayKeyable(colType)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -3453,7 +3454,8 @@ export class Database {
           !typeIsTimestamptz(ty) &&
           !typeIsDate(ty) &&
           !typeIsInterval(ty) &&
-          !typeIsRange(ty)
+          !typeIsRange(ty) &&
+          !typeIsArrayKeyable(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -3503,7 +3505,8 @@ export class Database {
           !typeIsTimestamptz(ty) &&
           !typeIsDate(ty) &&
           !typeIsInterval(ty) &&
-          !typeIsRange(ty)
+          !typeIsRange(ty) &&
+          !typeIsArrayKeyable(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -4282,7 +4285,8 @@ export class Database {
         !typeIsTimestamptz(ty) &&
         !typeIsDate(ty) &&
         !typeIsInterval(ty) &&
-        !typeIsRange(ty)
+        !typeIsRange(ty) &&
+        !typeIsArrayKeyable(ty)
       ) {
         throw engineError(
           "feature_not_supported",
@@ -10877,6 +10881,9 @@ function indexEntryKey(
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
       parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
+    } else if (v.kind === "array") {
+      // the recursive array-elements-terminated container key (encoding.md §2.14)
+      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
     } else {
       throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
@@ -11185,10 +11192,13 @@ function encodePkKey(
     } else if (pkv.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11, the first container key)
       parts.push(encodeTypedKey(table.columns[i]!.type, pkv, null));
+    } else if (pkv.kind === "array") {
+      // the recursive array-elements-terminated container key (encoding.md §2.14, second container key)
+      parts.push(encodeTypedKey(table.columns[i]!.type, pkv, null));
     } else {
       throw engineError(
         "data_corrupted",
-        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, range, or timestamp value",
+        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, range, array, or timestamp value",
       );
     }
   }
@@ -11312,6 +11322,9 @@ function indexPrefixKey(
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
       parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
+    } else if (v.kind === "array") {
+      // the recursive array-elements-terminated container key (encoding.md §2.14)
+      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
     } else {
       throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
@@ -11377,7 +11390,69 @@ function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Ar
     }
     return encodeRangeKey(typeScalar(ty.elem), value);
   }
+  if (value.kind === "array") {
+    if (ty.kind !== "array") {
+      throw new Error("an array key value has an array column type");
+    }
+    return encodeArrayKey(typeScalar(ty.elem), value);
+  }
   return encodeKeyValue(typeScalar(ty), value, coll);
+}
+
+// encodeArrayKey is the order-preserving array-elements-terminated key for an array value
+// (encoding.md §2.14) — the engine's second container key, recursing into each element's own key.
+// Reproduces the in-memory array total order (array.md §5) under memcmp: per flattened (row-major)
+// element a marker (0x01 present ‖ the element key, 0x02 NULL) so present sorts before NULL and a
+// shorter list reaches the 0x00 terminator first; then the shape suffix (ndim, then per dimension a
+// u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (the
+// DDL gate rejects a float/composite element 0A000), so the per-element key is encodeKeyValue with
+// the C byte order (a collated array-element key is not a feature this slice).
+function encodeArrayKey(
+  elem: ScalarType,
+  a: { dims: number[]; lbounds: number[]; elements: Value[] },
+): Uint8Array {
+  const out: number[] = [];
+  for (const e of a.elements) {
+    if (e.kind === "null") {
+      out.push(0x02); // NULL element — sorts after every present element
+      continue;
+    }
+    out.push(0x01); // present element marker
+    for (const b of encodeKeyValue(elem, e, null)) out.push(b);
+  }
+  out.push(0x00); // terminator — a shorter element list sorts before a longer one
+  out.push(a.dims.length & 0xff); // ndim
+  for (let d = 0; d < a.dims.length; d++) {
+    const n = a.dims[d]! >>> 0;
+    out.push((n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff);
+    for (const b of encodeInt("i32", BigInt(a.lbounds[d]!))) out.push(b);
+  }
+  return Uint8Array.from(out);
+}
+
+// typeIsKeyableScalar reports whether a Type is a key-encodable scalar — every keyable scalar except
+// float (the §2.8 determinism carve-out). The element-type gate for typeIsArrayKeyable.
+function typeIsKeyableScalar(t: Type): boolean {
+  return (
+    typeIsInteger(t) ||
+    typeIsBoolean(t) ||
+    typeIsText(t) ||
+    typeIsBytea(t) ||
+    typeIsDecimal(t) ||
+    typeIsUuid(t) ||
+    typeIsTimestamp(t) ||
+    typeIsTimestamptz(t) ||
+    typeIsDate(t) ||
+    typeIsInterval(t)
+  );
+}
+
+// typeIsArrayKeyable reports whether t is an array whose element is a key-encodable scalar — so the
+// array is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated).
+// A float-element or composite-element array is NOT keyable (the same narrowing the bare float/
+// composite scalar key carries).
+function typeIsArrayKeyable(t: Type): boolean {
+  return t.kind === "array" && typeIsKeyableScalar(t.elem);
 }
 
 // FkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look

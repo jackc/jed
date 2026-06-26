@@ -658,6 +658,25 @@ RANGE_PK_TABLE = {
          [{ lower: 2, upper: nil, lower_inc: true, upper_inc: false }, 5]]    # [2,)
 }.freeze
 
+# A table with an i32[] PRIMARY KEY (the array-PK slice — array is the SECOND container key and the
+# first whose key length varies with the element count; encoding.md §2.14, array-elements-terminated).
+# Pins the recursive array key in the key slot: the empty array (key 0x00 0x00), shorter-prefix
+# arrays, a value with a NULL element (the 0x02 NULL marker, sorting after present elements), all in
+# ASCENDING array_total_cmp (= byte) order (the builder inserts in key order). The `key` value bodies
+# travel through the array value codec too (type_code 15). PK is the array; `v` is an ordinary i32.
+# The cores build this via
+#   CREATE TABLE k (key i32[] PRIMARY KEY, v i32)
+#   INSERT ('{}',40); ('{1,2}',20); ('{1,2,3}',10); ('{1,NULL}',50); ('{2}',60)
+ARRAY_PK_TABLE = {
+  name: "k",
+  columns: [col("key", "i32[]", pk: true), col("v", "i32")],
+  rows: [[[], 40],          # {} (empty array sorts first)
+         [[1, 2], 20],      # {1,2}
+         [[1, 2, 3], 10],   # {1,2,3} (shorter-prefix before)
+         [[1, nil], 50],    # {1,NULL} (NULL element sorts after every present element)
+         [[2], 60]]         # {2} (a larger first element sorts last)
+}.freeze
+
 # A table with a json column (v19 — spec/design/json.md §4): pins the catalog json-column entry
 # (type_code 18, a plain scalar — no extra descriptor) and the VERBATIM text body, length-prefixed
 # exactly like text. The stored bytes are the input text exactly (whitespace + key order preserved).
@@ -1052,6 +1071,7 @@ FIXTURES = [
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
   { file: "range_pk_table.jed", page_size: 256, tables: [RANGE_PK_TABLE] },
+  { file: "array_pk_table.jed", page_size: 256, tables: [ARRAY_PK_TABLE] },
   { file: "gist_range_table.jed", page_size: 256, tables: [GIST_RANGE_TABLE] },
   { file: "gist_scalar_table.jed", page_size: 256, tables: [GIST_SCALAR_TABLE] },
   { file: "gist_exclude_table.jed", page_size: 256, tables: [GIST_EXCLUDE_TABLE] },
@@ -1238,6 +1258,10 @@ def key_body(type, v, collation = nil)
     return encode_range_key(relem, v)
   end
 
+  if (aelem = array_elem(type))
+    return encode_array_key(aelem, v)
+  end
+
   return collated_sort_key(collation, v) if collation && type == "text"
 
   case type
@@ -1345,6 +1369,38 @@ def encode_array_body(elem_type, val)
     out << bitmap.pack("C*")
   end
   elems.each { |e| out << encode_value(elem_type, e).byteslice(1..) unless e.nil? }
+  out
+end
+
+# The order-preserving array-elements-terminated KEY (encoding.md §2.14 — the second container key,
+# the first whose length varies with the element count): per flattened (row-major) element a marker
+# (0x01 present ‖ the element's bare key_body, 0x02 NULL), then a 0x00 terminator, then the shape
+# suffix (ndim, per-dim u32 BE length + i32 int-be-signflip lower bound). memcmp reproduces
+# array_total_cmp (array.md §5). `val` is the array fixture value (a flat Array = 1-D lower bound 1,
+# or a Hash {dims:, lbounds:, elements:}). The element is a key-encodable scalar (the DDL gate), so
+# key_body with the C byte order encodes each present element.
+def encode_array_key(elem, val)
+  if val.is_a?(Hash)
+    dims = val[:dims]
+    lbounds = val[:lbounds]
+    elems = val[:elements]
+  else
+    elems = val
+    dims = elems.empty? ? [] : [elems.size]
+    lbounds = elems.empty? ? [] : [1]
+  end
+  out = +"".b
+  elems.each do |e|
+    if e.nil?
+      out << [0x02].pack("C") # NULL element — sorts after every present element
+    else
+      out << [0x01].pack("C") # present element marker
+      out << key_body(elem, e)
+    end
+  end
+  out << [0x00].pack("C") # terminator — a shorter element list sorts before a longer one
+  out << [dims.size].pack("C") # ndim
+  dims.each_with_index { |d, i| out << u32(d) << encode_int(4, lbounds[i]) }
   out
 end
 

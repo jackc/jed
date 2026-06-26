@@ -1,0 +1,109 @@
+# Array as a KEY (spec/design/array.md §8, encoding.md §2.14 — the `array-elements-terminated` rule,
+# the engine's SECOND container key after range and the first whose key length varies with the
+# element count). An array of a key-encodable scalar element is a valid PRIMARY KEY / ordered
+# secondary index / UNIQUE key / FK target. The order-preserving key reproduces the in-memory
+# array_cmp total order under memcmp: element-wise (NULLs-last), then fewer elements first, then the
+# shape (ndim/lengths/lower bounds). This suite pins the ONE-DIMENSIONAL surface, which agrees with
+# PostgreSQL byte-for-byte; the multidim / custom-lower-bound tiebreak (where PG's single-column
+# ORDER BY has an abbreviated-key artifact jed deliberately avoids — array.md §5) is pinned against
+# jed's own comparator in the per-core array_key tests, not here.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.foreign_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.is_null, types.array, types.i32, types.text, resource.cost_metering
+
+# --- an array PRIMARY KEY: ordered storage by the array_cmp total order -----------------------------
+statement ok
+CREATE TABLE k (key i32[] PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO k VALUES
+  (ARRAY[1, 2, 3], 10),
+  (ARRAY[1, 2], 20),
+  (ARRAY[1, 2, 4], 30),
+  ('{}', 40),
+  ('{1,NULL}', 50),
+  (ARRAY[2], 60)
+
+# The PK store iterates in array_cmp order: empty first, then shorter-prefix, then element-wise,
+# with a NULL element sorting after every present element.
+query TI nosort
+SELECT key, v FROM k ORDER BY key
+----
+{}
+40
+{1,2}
+20
+{1,2,3}
+10
+{1,2,4}
+30
+{1,NULL}
+50
+{2}
+60
+
+# A point lookup against the array PK returns the row (the equality probe encodes the literal key).
+query I nosort
+SELECT v FROM k WHERE key = ARRAY[1, 2, 4]
+----
+30
+
+# A duplicate array key violates the PRIMARY KEY (23505).
+statement error 23505
+INSERT INTO k VALUES (ARRAY[1, 2], 99)
+
+# A NULL array PRIMARY KEY violates NOT NULL (23502).
+statement error 23502
+INSERT INTO k VALUES (NULL, 99)
+
+# --- a UNIQUE text[] column + a secondary index ----------------------------------------------------
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, tags text[] UNIQUE)
+
+statement ok
+INSERT INTO u VALUES (1, ARRAY['a', 'b']), (2, ARRAY['a']), (3, ARRAY['a', 'b', 'c'])
+
+# A duplicate array value violates the UNIQUE constraint.
+statement error 23505
+INSERT INTO u VALUES (4, ARRAY['a', 'b'])
+
+# The unique index iterates text[] keys in array_cmp order (shorter prefix first).
+query IT nosort
+SELECT id, tags FROM u ORDER BY tags
+----
+2
+{a}
+1
+{a,b}
+3
+{a,b,c}
+
+# --- an array column as a FOREIGN KEY target -------------------------------------------------------
+statement ok
+CREATE TABLE parent (k i32[] PRIMARY KEY)
+
+statement ok
+INSERT INTO parent VALUES (ARRAY[1, 2]), (ARRAY[3])
+
+statement ok
+CREATE TABLE child (id i32 PRIMARY KEY, ref i32[] REFERENCES parent(k))
+
+statement ok
+INSERT INTO child VALUES (1, ARRAY[1, 2]), (2, ARRAY[3])
+
+# A child referencing an absent parent array key violates the FK (23503).
+statement error 23503
+INSERT INTO child VALUES (3, ARRAY[9, 9])
+
+# A NULL FK reference is allowed (MATCH SIMPLE — no parent row required).
+statement ok
+INSERT INTO child VALUES (4, NULL)
+
+query II nosort
+SELECT id, (ref IS NULL)::int FROM child ORDER BY id
+----
+1
+0
+2
+0
+4
+1

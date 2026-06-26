@@ -209,6 +209,20 @@ function rangePkTableDB(): Database {
   return db;
 }
 
+// arrayPkTableDB: an i32[] PRIMARY KEY — the SECOND container key (encoding.md §2.14), the first
+// whose key length varies with the element count. Rows are inserted in ASCENDING array_total_cmp
+// order (empty, shorter-prefix, element-wise, NULL element last). Pins array_pk_table.jed cross-core.
+function arrayPkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE k (key i32[] PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO k VALUES ('{}', 40)");
+  run(db, "INSERT INTO k VALUES ('{1,2}', 20)");
+  run(db, "INSERT INTO k VALUES ('{1,2,3}', 10)");
+  run(db, "INSERT INTO k VALUES ('{1,NULL}', 50)");
+  run(db, "INSERT INTO k VALUES ('{2}', 60)");
+  return db;
+}
+
 // ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
 // i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
 // column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
@@ -850,6 +864,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "array_table.jed", build: arrayTableDB },
     { name: "range_table.jed", build: rangeTableDB },
     { name: "range_pk_table.jed", build: rangePkTableDB },
+    { name: "array_pk_table.jed", build: arrayPkTableDB },
     { name: "gist_range_table.jed", build: gistRangeTableDB },
     { name: "gist_scalar_table.jed", build: gistScalarTableDB },
     { name: "gist_exclude_table.jed", build: gistExcludeTableDB },
@@ -914,6 +929,7 @@ test("read goldens reproduces rows", () => {
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "range_table.jed", build: rangeTableDB, table: "t" },
     { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },
+    { name: "array_pk_table.jed", build: arrayPkTableDB, table: "k" },
     { name: "gist_range_table.jed", build: gistRangeTableDB, table: "t" },
     { name: "gist_scalar_table.jed", build: gistScalarTableDB, table: "t" },
     { name: "gist_exclude_table.jed", build: gistExcludeTableDB, table: "booking" },

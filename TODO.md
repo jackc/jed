@@ -362,12 +362,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       slices `a[m:n]` in S5); the **AF1–AF7 function/operator surface** (`anyarray`/`anyelement`
       polymorphism, introspectors, builders, `||`/`@>`/`<@`/`&&`, `unnest`, `ANY`/`ALL`/`SOME` + the
       subquery quantifier form, `VARIADIC`); and **composite-element arrays** (AC1, the composite
-      array-field CMP-ARR-FIELD, `unnest(composite[])` AF7); and the **three runtime array casts**
+      array-field CMP-ARR-FIELD, `unnest(composite[])` AF7); the **three runtime array casts**
       (capability `cast.array`, array.md §7 — runtime text→`T[]`, `array::text` (explicit-only), and
-      element-wise array→array; no format bump). → [array.md](spec/design/array.md), [array-functions.md](spec/design/array-functions.md)
-  - [ ] _remaining follow-on (its own slice + obligations):_ **arrays-in-keys** (`0A000`, encoding
-        authored array.md §8) — the order-preserving array key encoding, so an array `PRIMARY KEY` /
-        secondary index / `UNIQUE` / FK target (the text/decimal/bytea/composite-key precedent).
+      element-wise array→array; no format bump); and **arrays-in-keys** (the `array-elements-terminated`
+      key, encoding.md §2.14 — an array of a key-encodable scalar element is a valid `PRIMARY KEY` /
+      ordered secondary index / `UNIQUE` / FK target, the **second container key**; `array_pk_table.jed`
+      golden, `types/array_key.test`; a `float`/composite-element array key stays `0A000`; no format
+      bump). **Every array follow-on has landed.** → [array.md](spec/design/array.md), [array-functions.md](spec/design/array-functions.md)
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis** turning the *closed* type enum into an *open* one: `Type { Scalar |
       Composite(catalog-ref) }` threaded through all three cores; `CREATE`/`DROP TYPE`, nested +

@@ -561,6 +561,77 @@ This composes with the §2.2 nullable slot and §2.3 descending inversion unchan
 AUTHORED, UNEXERCISED.** Like float (§2.8) it is written but not yet a live key; `json` (never
 comparable) and `jsonpath` get no key rule at all.
 
+### 2.14 Array — `array-elements-terminated` (the second container key)
+
+`array` is the engine's **second container key** (after `range` §2.11) and the first *variable-arity*
+one — a structural type over a scalar element ([array.md §2](array.md)), so its key is **recursive**
+(it embeds each element's own order-preserving key) *and* **self-delimiting by a terminator** (an array
+has a variable element count, unlike a fixed-arity composite or a two-bound range). The layout
+reproduces the in-memory `array_total_cmp` total order ([array.md §5](array.md)) **exactly** under
+`memcmp`: element-wise over the **flattened** (row-major) elements, then fewer total elements first,
+then smaller `ndim`, then per dimension smaller length then smaller lower bound. (This is jed's
+*consistent* `array_cmp` order — the one its `=`/`<` operators use — which can differ from PostgreSQL's
+single-column `ORDER BY` on the multidim/lower-bound tiebreak, an abbreviated-key artifact jed
+deliberately avoids; [array.md §5](array.md). So the multidim/lower-bound edges are pinned against
+jed's own comparator, not the PG oracle.)
+
+```
+per flattened element e (row-major order):
+   present:  0x01 ‖ <element order-preserving key>   (the element's §2.1/§2.4/§2.5/… key bytes)
+   NULL:     0x02                                     (no body)
+terminator:  0x00                                     (ends the element list)
+shape suffix:
+   ndim     u8
+   per dimension d in [0, ndim):
+     len_d  u32 BE                                    element count along dimension d (≥ 1)
+     lb_d   i32 int-be-signflip (§2.1)                lower bound of dimension d
+```
+
+1. **Element marker ordering `term 0x00 < present 0x01 < NULL 0x02`.** The marker that opens each
+   element slot is `0x01` for a present element (followed by its element key) and `0x02` for a NULL
+   element (no body); the list ends with the terminator `0x00`. Because `0x00 < 0x01 < 0x02`: (a) a
+   **shorter** element list reaches the terminator while a longer one still has a marker, so the
+   shorter sorts first ("fewer total elements first"); (b) at a shared position a **present** element
+   sorts before a **NULL** element, and two NULLs are equal — the NULLs-last element order
+   ([compare.toml] `null_ordering`), the same rule §2.4's byte-terminator gives a short string. This
+   replaces the §2.2 nullable slot *within the element list* (whose `0x00` present byte would collide
+   with the terminator); the array key as a whole still rides the §2.2 slot and §2.3 inversion
+   unchanged when it is itself an index column / nullable member.
+2. **Element key = the element's own order-preserving key.** After the `0x01` present marker comes the
+   element scalar's order-preserving key — the bare integer (§2.1), `text`/`bytea`-terminated-escape
+   (§2.4/§2.6), `decimal-order-preserving` (§2.5), `uuid-raw16` (§2.7), `bool-byte` (§2.9), the i64/i32
+   timestamp/date rule, or `interval-span-i128` (§2.10) — each self-delimiting, so the next marker (or
+   the terminator) follows unambiguously under `memcmp`. The element is a **key-encodable scalar**; a
+   `float` element (the §2.8 carve-out) or a composite element (composite is not yet keyable) makes the
+   whole array `0A000` at the DDL gate, never reaching this rule. Array-of-array does not exist
+   ([array.md §2](array.md)).
+3. **Shape suffix breaks ties among equal-element-prefix, equal-count arrays.** After the terminator,
+   `ndim` then, per dimension, `len_d` (`u32` BE — lengths are ≥ 1, so unsigned big-endian orders them)
+   and `lb_d` (the signed `int-be-signflip` rule, so a negative lower bound sorts first). Two arrays
+   with identical flattened elements and identical total count differ here exactly as `array_total_cmp`
+   ranks them — smaller `ndim` first, then smaller per-dimension length, then smaller lower bound — so
+   e.g. `'{1,2,3,4}'` (1-D) sorts **before** `'{{1,2},{3,4}}'` (2-D), and `'{1,2,3}'` before
+   `'[2:4]={1,2,3}'` (lower bound 1 < 2). The empty array `'{}'` (`ndim 0`, no elements) is the two
+   bytes `00`(terminator) `00`(ndim) and sorts below every non-empty array.
+
+Worked structure for `'{1,2}'::i32[]` (1-D, lower bound 1; each `i32` key is the 4-byte
+`int-be-signflip`):
+
+```
+01 80000001  01 80000002  00   01  00000002 80000001
+└─ elem 1 ─┘ └─ elem 2 ─┘ term ndim  len=2    lb=1
+```
+
+= `01 80000001 01 80000002 00 01 00000002 80000001`. The on-disk image (these key bytes in the
+B-tree leaf nodes) is pinned cross-core by the `array_pk_table.jed` golden (`rust == go == ts ==
+ruby`, via `spec/fileformat/verify.rb`'s independent `encode_array_key`). **Status — EXERCISED.** An
+`array` of a key-encodable scalar element is a
+valid `PRIMARY KEY` / ordered secondary index / `UNIQUE` key / FK target ([array.md §8](array.md)); like
+the other container keys, point-lookup pushdown stays deferred (an array PK/index `WHERE k = …`
+full-scans + residual-filters) and an array is not a GIN *key* (the separate GIN element index is
+unrelated). The lone remaining non-integer scalar `float` (§2.8) and the recursive `composite`
+container stay `0A000` keys.
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**
@@ -586,13 +657,15 @@ golden. Nullable **secondary indexes** have since **landed** ([indexes.md](index
 rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule), `text`/`bytea`
 keys (the `…-terminated-escape` rules §2.4/§2.6), `decimal` keys (the
 `decimal-order-preserving` rule §2.5, `decimal_pk_table.jed`), `interval` keys (the
-`interval-span-i128` span rule §2.10, `interval_pk_table.jed`), and `range` keys (the recursive
-`range-bounds` container rule §2.11, `range_pk_table.jed` — the first *container* key). A **non-`C`
-collated `text` key** (the `text-collated-sortkey` *form* §2.12) has since landed too — the same
-`text` key type, but its body is the column collation's baked UCA sort key rather than the raw UTF-8,
-pinned by the `collation_pk_table.jed` golden. The lone
-remaining non-integer scalar, `float`, adds its own §2 key path only if the determinism carve-out
-(§2.8) ever lifts; the recursive `composite`/`array` containers stay `0A000` keys.
+`interval-span-i128` span rule §2.10, `interval_pk_table.jed`), `range` keys (the recursive
+`range-bounds` container rule §2.11, `range_pk_table.jed` — the first *container* key), and **`array`
+keys** (the recursive, variable-arity `array-elements-terminated` rule §2.14, `array_pk_table.jed` —
+the **second container key**, and the first whose key length varies with the value's element count). A
+**non-`C` collated `text` key** (the `text-collated-sortkey` *form* §2.12) has since landed too — the
+same `text` key type, but its body is the column collation's baked UCA sort key rather than the raw
+UTF-8, pinned by the `collation_pk_table.jed` golden. The lone remaining non-integer scalar, `float`,
+adds its own §2 key path only if the determinism carve-out (§2.8) ever lifts; the recursive
+`composite` container stays a `0A000` key.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

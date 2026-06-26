@@ -351,18 +351,37 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
   (`suites/cast/array_casts.test`); the jed-only `uuid`⇄`bytea` element casts and the forbidden-pair /
   explicit-only divergences are per-core unit tests (`cast_array_runtime`).
 
-## 8. Key encoding — authored, deferred
+## 8. Key encoding — EXERCISED (`array-elements-terminated`, the second container key)
 
-The order-preserving array key encoding is **authored** ([encoding.md §2.11](encoding.md)) but **not
-exercised** this slice: an array `PRIMARY KEY` / index / `UNIQUE` column is rejected `0A000` at the
-DDL resolver (the site that already rejects a text/decimal/bytea/composite key). The rule, when
-lifted: each element's order-preserving encoding wrapped in the [encoding.md §2.2](encoding.md)
-nullable slot, concatenated in element order, then a **terminator** so a shorter array sorts before a
-longer one that extends it (the variable-length, self-delimiting composition text/bytea already use
-— §2.4/§2.6 — since an array, unlike a fixed-arity composite, has a variable element count). The
-narrowing is doubly forced: most element types' own key encodings are themselves still deferred.
-Array **values** remain fully storable, orderable, and groupable via the in-memory structural
-comparator (§5) — no key bytes required.
+An array of a **key-encodable scalar element** is a valid `PRIMARY KEY` / ordered secondary index /
+`UNIQUE` key / FK target — the engine's **second container key** after `range`, and the first whose
+key length varies with the element count. The order-preserving `array-elements-terminated` rule is
+authored with byte vectors in [encoding.md §2.14](encoding.md) and pinned cross-core by the
+`array_pk_table.jed` golden (`rust == go == ts == ruby`). The layout reproduces the in-memory
+`array_total_cmp` total order (§5) under `memcmp`: **per flattened (row-major) element a marker** —
+`0x01` present ‖ the element's own order-preserving key, `0x02` NULL (no body) — so present sorts
+before NULL; then a `0x00` **terminator** so a shorter element list sorts before a longer one (the
+variable-length, self-delimiting composition `text`/`bytea` already use — §2.4/§2.6 — since an
+array, unlike a fixed-arity composite, has a variable element count); then a **shape suffix** (`ndim`,
+then per dimension a `u32` BE length and the `i32` `int-be-signflip` lower bound) that breaks ties
+among equal-element-prefix, equal-count arrays exactly as `array_total_cmp` ranks them (smaller `ndim`,
+then per-dimension smaller length, then smaller lower bound).
+
+- **Element gate.** The element must be a **key-encodable scalar** (the same set a scalar key uses —
+  integers, `bool`, `text`, `bytea`, `decimal`, `uuid`, `timestamp`/`timestamptz`/`date`, `interval`);
+  a **`float`-element** array (the §2.8 determinism carve-out) or a **composite-element** array (composite
+  is not yet keyable) is rejected `0A000` at the DDL resolver, the same narrowing the bare
+  `float`/composite scalar key carries. This relaxes the previous blanket array-key `0A000`.
+- **Divergence from PG's `ORDER BY`, by design.** The key reproduces jed's *consistent* `array_cmp`
+  order (the one its `=`/`<` operators use), which can differ from PostgreSQL's single-column `ORDER BY`
+  on the multidim / lower-bound tiebreak — an abbreviated-key artifact jed deliberately avoids (§5). So
+  the 1-D surface is oracle-checked (`types/array_key.test`) while the multidim/lower-bound tiebreak is
+  pinned against jed's own comparator in the per-core `array_key` tests.
+- **Point-lookup pushdown** stays deferred (an array PK/index `WHERE k = …` full-scans + residual-
+  filters — the container-key precedent), and an array is not a GIN *key* (the separate GIN element
+  index is unrelated). No `format_version` bump (an array PK is an existing array column marked as a
+  key; the key bytes are computed, not a stored format field). Array **values** remain fully storable,
+  orderable, and groupable via the in-memory structural comparator (§5).
 
 ## 9. Cost
 
@@ -453,7 +472,7 @@ corpus lands.
 | Non-rectangular multidim construction `ARRAY[…]` (mismatched sub-array dims, incl. a NULL sub-array); a `'[l:u]'` literal bound with `u < l` | `2202E` array_subscript_error |
 | Malformed string / out-of-range element on the runtime `text → T[]` cast (§7) | `22P02` / `22003` (per row) |
 | Element-wise `array → array` cast (§7) between scalar element types with no cast between them (PG reports `42846`) | `42804` datatype_mismatch |
-| Array `PRIMARY KEY`/index/`UNIQUE`; nested array (array-of-array); a composite-element `array → array` cast (the composite cast surface stays deferred, §7); a bind parameter into an array type (`$1::T[]`, §4) | `0A000` feature_not_supported |
+| A **float-element or composite-element** array `PRIMARY KEY`/index/`UNIQUE`/FK (a key-encodable-scalar-element array IS a valid key, §8); nested array (array-of-array); a composite-element `array → array` cast (the composite cast surface stays deferred, §7); a bind parameter into an array type (`$1::T[]`, §4) | `0A000` feature_not_supported |
 | Corrupt array body (bad `ndim`/length/element) | `XX001` data_corrupted |
 
 `2202E` is registered in [../errors/registry.toml](../errors/registry.toml) (added with the S5
@@ -550,9 +569,17 @@ NOT the bare-`ROW` 3VL — §5).
 `array → other-element-array` (each element through the scalar cast, for the casts.toml-admitted
 element pairs). No `format_version` bump. The numeric/text element pairs are oracle-checked
 (`suites/cast/array_casts.test`); the jed-only `uuid`⇄`bytea` element casts + the forbidden-pair /
-explicit-only divergences are per-core (`cast_array_runtime`). **Still deferred (its own follow-on):**
-arrays-in-keys (`0A000`, encoding authored §8) — the order-preserving array key, so an array
-`PRIMARY KEY` / index / `UNIQUE` / FK target.
+explicit-only divergences are per-core (`cast_array_runtime`).
+
+**Arrays-in-keys landed (the `array-elements-terminated` key, §8):** an array of a key-encodable
+scalar element is a valid `PRIMARY KEY` / ordered secondary index / `UNIQUE` key / FK target — the
+engine's **second container key**. Byte vectors in [encoding.md §2.14](encoding.md), pinned cross-core
+by `array_pk_table.jed` (`rust == go == ts == ruby`); the 1-D surface is oracle-checked
+(`types/array_key.test`) and the multidim/lower-bound tiebreak (divergent from PG's `ORDER BY`) is
+per-core (`array_key`). A `float`/composite-element array key stays `0A000`. **No `format_version`
+bump** (an array PK is an existing array column marked as a key). With this, **every array follow-on
+has landed**; the remaining arms (nested array-of-array, GIN as a *key*, point-lookup pushdown for a
+container key) are out-of-scope / shared deferrals, not array-specific.
 
 **Known gap — the `MAXDIM = 6` bound is enforced only on the literal path.** A `'{{…}}'` **text
 literal** nested beyond 6 dimensions is rejected by `array_in` (`22P02`; pinned in

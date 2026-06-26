@@ -3563,18 +3563,20 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// the 16-byte span key §2.10) — plus the variable-width text/bytea (…-terminated-escape
 			// §2.4/§2.6) and decimal (decimal-order-preserving §2.5), all self-delimiting so they
 			// compose in composite keys / index suffixes — plus the range container (range-bounds
-			// §2.11, the first container key). Still 0A000: float (the principled determinism
-			// carve-out — §4) and the recursive composite/array containers.
-			if isComposite || isArray {
-				// A composite/array PRIMARY KEY is rejected 0A000 — the key encoding is authored
-				// but unexercised (composite.md §6, array.md §8). colType.CanonicalName() gives the
-				// canonical type name (i32range, even when declared with the int4range alias).
+			// §2.11, the first container key) and the array container (array-elements-terminated
+			// §2.14, the second container key — keyable when its element is a key-encodable scalar,
+			// isArrayKeyable). Still 0A000: float (the determinism carve-out — §4), a float/composite-
+			// element array, and the recursive composite container.
+			if isComposite || (isArray && !isArrayKeyable(colType)) {
+				// A composite PRIMARY KEY (composite.md §6) or a non-keyable array PRIMARY KEY (a
+				// float/composite element) is rejected 0A000. colType.CanonicalName() gives the
+				// canonical type name (e.g. f64[], even when declared with an alias).
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
-			// A range is keyable (its recursive range-bounds container key, encoding.md §2.11);
-			// every other keyable column is a scalar, gated here.
-			if !isRange {
+			// A range / keyable array is a container key (encoding.md §2.11/§2.14); every other
+			// keyable column is a scalar, gated here.
+			if !isRange && !isArray {
 				if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
 					return Outcome{}, NewError(FeatureNotSupported,
 						"a "+ty.CanonicalName()+" primary key is not supported yet")
@@ -3771,7 +3773,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() && !isArrayKeyable(ty) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -3815,7 +3817,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() && !isArrayKeyable(ty) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -4805,7 +4807,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		ty := columns[idx].Type
 		switch kind {
 		case IndexBtree:
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() && !isArrayKeyable(ty) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}
@@ -5287,6 +5289,14 @@ func indexEntryKey(columns []Column, colls []*Collation, def IndexDef, storageKe
 			out = append(out, 0x00)
 			elem, _ := columns[ci].Type.RangeElement()
 			out = append(out, encodeRangeKey(elem.ScalarTy(), v.Range)...)
+		case ValArray:
+			// the recursive array-elements-terminated container key (encoding.md §2.14)
+			out = append(out, 0x00)
+			ab, err := encodeTypedKey(columns[ci].Type, v, nil)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ab...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -5546,6 +5556,14 @@ func indexPrefixKey(columns []Column, colls []*Collation, def IndexDef, row Row)
 			out = append(out, 0x00)
 			elem, _ := columns[ci].Type.RangeElement()
 			out = append(out, encodeRangeKey(elem.ScalarTy(), v.Range)...)
+		case ValArray:
+			// the recursive array-elements-terminated container key (encoding.md §2.14)
+			out = append(out, 0x00)
+			ab, err := encodeTypedKey(columns[ci].Type, v, nil)
+			if err != nil {
+				return nil, false, err
+			}
+			out = append(out, ab...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -5609,6 +5627,14 @@ func encodePkKey(table *Table, pk []int, colls []*Collation, row Row) ([]byte, e
 			// container key — empty/±∞/inclusivity framing around the element key).
 			elem, _ := table.Columns[i].Type.RangeElement()
 			key = append(key, encodeRangeKey(elem.ScalarTy(), row[i].Range)...)
+		case table.Columns[i].Type.IsArray():
+			// array: the recursive array-elements-terminated container key (encoding.md §2.14, the
+			// second container key — element markers + terminator + shape suffix).
+			b, err := encodeArrayKey(table.Columns[i].Type.Array.ScalarTy(), row[i].Array)
+			if err != nil {
+				return nil, err
+			}
+			key = append(key, b...)
 		default:
 			// integers / timestamp / timestamptz / date: the fixed-width key codec.
 			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
@@ -32779,7 +32805,60 @@ func encodeTypedKey(ty Type, value Value, coll *Collation) ([]byte, error) {
 		}
 		return encodeRangeKey(elem.ScalarTy(), value.Range), nil
 	}
+	if value.Kind == ValArray {
+		if ty.Array == nil {
+			panic("an array key value has an array column type")
+		}
+		return encodeArrayKey(ty.Array.ScalarTy(), value.Array)
+	}
 	return encodeKeyValue(ty.ScalarTy(), value, coll)
+}
+
+// encodeArrayKey is the order-preserving array-elements-terminated key for an array value
+// (encoding.md §2.14) — the engine's second container key, recursing into each element's own key.
+// Reproduces the in-memory arrayTotalCmp order (array.md §5) under memcmp: per flattened (row-major)
+// element a marker (0x01 present ‖ the element key, 0x02 NULL) so present sorts before NULL and a
+// shorter list reaches the 0x00 terminator first; then the shape suffix (ndim, then per dimension a
+// u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (the
+// DDL gate rejects a float/composite element 0A000), so the per-element key is encodeKeyValue with
+// the C byte order (a collated array-element key is not a feature this slice).
+func encodeArrayKey(elem ScalarType, a *ArrayVal) ([]byte, error) {
+	var out []byte
+	for _, e := range a.Elements {
+		if e.Kind == ValNull {
+			out = append(out, 0x02) // NULL element — sorts after every present element
+			continue
+		}
+		out = append(out, 0x01) // present element marker
+		eb, err := encodeKeyValue(elem, e, nil)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, eb...)
+	}
+	out = append(out, 0x00) // terminator — a shorter element list sorts before a longer one
+	out = append(out, byte(a.Ndim()))
+	for d := 0; d < a.Ndim(); d++ {
+		n := uint32(a.Dims[d])
+		out = append(out, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+		out = append(out, EncodeInt(Int32, int64(a.Lbounds[d]))...)
+	}
+	return out, nil
+}
+
+// isKeyableScalarType reports whether a scalar is key-encodable — every keyable scalar except float
+// (the §2.8 determinism carve-out). The element-type gate for isArrayKeyable.
+func isKeyableScalarType(s ScalarType) bool {
+	return s.IsInteger() || s.IsBool() || s.IsText() || s.IsBytea() || s.IsDecimal() ||
+		s.IsUuid() || s.IsTimestamp() || s.IsTimestamptz() || s.IsDate() || s.IsInterval()
+}
+
+// isArrayKeyable reports whether ty is an array whose element is a key-encodable scalar — so the array
+// is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated). A
+// float-element or composite-element array is NOT keyable (the same narrowing the bare float/composite
+// scalar key carries).
+func isArrayKeyable(ty Type) bool {
+	return ty.Array != nil && ty.Array.isScalar() && isKeyableScalarType(ty.Array.Scalar)
 }
 
 // fkProbeKind tags which physical tree a built foreign-key probe addresses.

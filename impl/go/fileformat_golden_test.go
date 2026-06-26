@@ -197,6 +197,20 @@ func rangePKTableDB(t *testing.T) *Database {
 	return db
 }
 
+// arrayPKTableDB: an i32[] PRIMARY KEY — the SECOND container key (encoding.md §2.14), the first
+// whose key length varies with the element count. Rows are inserted in ASCENDING array_total_cmp
+// order (empty, shorter-prefix, element-wise, NULL element last). Pins array_pk_table.jed cross-core.
+func arrayPKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE k (key i32[] PRIMARY KEY, v i32)")
+	run(t, db, "INSERT INTO k VALUES ('{}', 40)")
+	run(t, db, "INSERT INTO k VALUES ('{1,2}', 20)")
+	run(t, db, "INSERT INTO k VALUES ('{1,2,3}', 10)")
+	run(t, db, "INSERT INTO k VALUES ('{1,NULL}', 50)")
+	run(t, db, "INSERT INTO k VALUES ('{2}', 60)")
+	return db
+}
+
 // jsonTableDB has a json column (verbatim text body, type_code 18 — spec/design/json.md §4). The
 // stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
 // length-prefixed text-shaped json body. Pins json_table.jed cross-core.
@@ -836,6 +850,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"array_table.jed", arrayTableDB},
 		{"range_table.jed", rangeTableDB},
 		{"range_pk_table.jed", rangePKTableDB},
+		{"array_pk_table.jed", arrayPKTableDB},
 		{"gist_range_table.jed", gistRangeTableDB},
 		{"gist_scalar_table.jed", gistScalarTableDB},
 		{"gist_exclude_table.jed", gistExcludeTableDB},
@@ -905,6 +920,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"array_table.jed", arrayTableDB, "t"},
 		{"range_table.jed", rangeTableDB, "t"},
 		{"range_pk_table.jed", rangePKTableDB, "t"},
+		{"array_pk_table.jed", arrayPKTableDB, "k"},
 		{"gist_range_table.jed", gistRangeTableDB, "t"},
 		{"gist_scalar_table.jed", gistScalarTableDB, "t"},
 		{"gist_exclude_table.jed", gistExcludeTableDB, "booking"},
