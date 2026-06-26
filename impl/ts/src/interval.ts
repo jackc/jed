@@ -132,9 +132,11 @@ export function intervalMul(span: Interval, factor: number): Interval {
   // TSROUND: round to microsecond precision (PG TS_PREC_INV = 1e6). PG rint = ties-to-EVEN.
   const tsround = (j: number): number => roundTiesEven(j * USECS_PER_SEC_F) / USECS_PER_SEC_F;
   const oor = () => intervalFieldOverflow("interval out of range");
-  // FLOAT8_FITS_IN_INT32/64: x in [INT_MIN, -INT_MIN) — matches Rust's fits_i32/fits_i64.
-  const fitsI32 = (x: number): boolean => x >= -2147483648 && x < 2147483648;
-  const fitsI64 = (x: number): boolean => x >= -9223372036854775808 && x < 9223372036854775808;
+  // FLOAT8_FITS_IN_INT32/64: x in [INT_MIN, -INT_MIN) — matches Rust's fits_i32/fits_i64. The
+  // bounds are exact powers of two (written `2 ** 31` / `2 ** 63` so the i64 bound is an f64-exact
+  // literal — `9223372036854775808` does not round-trip as a decimal literal).
+  const fitsI32 = (x: number): boolean => x >= -(2 ** 31) && x < 2 ** 31;
+  const fitsI64 = (x: number): boolean => x >= -(2 ** 63) && x < 2 ** 63;
 
   const origMonth = span.months;
   const origDay = span.days;
