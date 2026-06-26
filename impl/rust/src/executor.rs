@@ -13041,6 +13041,8 @@ enum ScalarFunc {
     /// substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
     /// indexed). A negative count is 22011 (string-functions.md §3).
     Substr,
+    /// left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
+    Left,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19066,6 +19068,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "octet_length" => ScalarFunc::OctetLength,
         "bit_length" => ScalarFunc::BitLength,
         "substr" => ScalarFunc::Substr,
+        "left" => ScalarFunc::Left,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30366,6 +30369,11 @@ impl RExpr {
                         let count = vals.get(2).map(int_value);
                         Ok(Value::Text(substr_chars(s, start, count)?))
                     }
+                    // left(text, n) → text — the first n characters (negative n drops the last |n|).
+                    ScalarFunc::Left => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Text(left_chars(s, int_value(&vals[1])))),
+                        _ => unreachable!("resolver restricts left to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31237,7 +31245,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Length
         | ScalarFunc::OctetLength
         | ScalarFunc::BitLength
-        | ScalarFunc::Substr => {
+        | ScalarFunc::Substr
+        | ScalarFunc::Left => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31291,6 +31300,19 @@ fn substr_chars(s: &str, start: i64, count: Option<i64>) -> Result<String> {
     Ok(chars[(from - 1) as usize..(to - 1) as usize]
         .iter()
         .collect())
+}
+
+/// `left(s, n)` over CODE POINTS (string-functions.md §3): the first `n` characters; a negative
+/// `n` returns all but the last `|n|`. Matches PostgreSQL's `left`.
+fn left_chars(s: &str, n: i64) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    let end = if n < 0 {
+        len.saturating_add(n).max(0)
+    } else {
+        n.min(len)
+    };
+    chars[..end as usize].iter().collect()
 }
 
 /// The `decimal_work` W of an arithmetic node — which group-count formula applies per op

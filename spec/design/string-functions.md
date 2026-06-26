@@ -97,3 +97,11 @@ NULL argument propagates. The shared per-core kernel works on a code-point vecto
 huge `start + count` cannot overflow (TS bigint is already exact). PostgreSQL's `substr` accepts
 `bigint` positions; jed's `integer` family accepts any width (a bare integer literal is `i64`),
 so `substr('x', 1, 2)` resolves directly without an int4 cast.
+
+### `left(text, n) → text`
+
+The first `n` characters (code points). A **negative** `n` returns all but the last `|n|`
+characters: `left('abcde', 2) = 'ab'`, `left('abcde', -2) = 'abc'`, `left('abcde', 0) = ''`,
+`left('abcde', 10) = 'abcde'`, `left('abcde', -10) = ''`. The kernel takes `chars[..end]` where
+`end = clamp(n < 0 ? len+n : n, 0, len)` (a saturating add so an extreme negative `n` cannot
+underflow). NULL args propagate.

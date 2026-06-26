@@ -15922,6 +15922,8 @@ const (
 	// substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
 	// indexed). A negative count is 22011 (string-functions.md §3).
 	sfSubstr
+	// left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
+	sfLeft
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19503,6 +19505,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfBitLength
 	case "substr":
 		return sfSubstr
+	case "left":
+		return sfLeft
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24072,6 +24076,26 @@ func substrChars(s string, start int64, count *int64) (string, error) {
 	return string(runes[from-1 : to-1]), nil
 }
 
+// leftChars is left(s, n) over CODE POINTS (string-functions.md §3): the first n characters; a
+// negative n returns all but the last |n|. Matches PostgreSQL's left.
+func leftChars(s string, n int64) string {
+	runes := []rune(s)
+	length := int64(len(runes))
+	var end int64
+	if n < 0 {
+		end = satAddInt64(length, n)
+		if end < 0 {
+			end = 0
+		}
+	} else {
+		end = n
+		if end > length {
+			end = length
+		}
+	}
+	return string(runes[:end])
+}
+
 // widthBucketErr is the 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
 func widthBucketErr(detail string) error {
 	return NewError(InvalidArgumentForWidthBucketFunction, detail)
@@ -27293,6 +27317,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
+		case sfLeft:
+			// left(text, n) → text — the first n characters (negative n drops the last |n|).
+			return TextValue(leftChars(vals[0].Str, vals[1].Int)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

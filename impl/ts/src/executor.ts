@@ -447,6 +447,21 @@ function substrChars(s: string, start: bigint, count: bigint | null): string {
   return chars.slice(Number(from - 1n), Number(to - 1n)).join("");
 }
 
+// leftChars is left(s, n) over CODE POINTS (string-functions.md §3): the first n characters; a
+// negative n returns all but the last |n|. Matches PostgreSQL's left.
+function leftChars(s: string, n: bigint): string {
+  const chars = [...s];
+  const len = BigInt(chars.length);
+  let end: bigint;
+  if (n < 0n) {
+    end = len + n;
+    if (end < 0n) end = 0n;
+  } else {
+    end = n > len ? len : n;
+  }
+  return chars.slice(0, Number(end)).join("");
+}
+
 // CollationVerdict is the slice-2d version-skew verdict for one referenced collation
 // (spec/design/collation.md §12, compatibility.md §7). "full" ⇒ a loaded bundle provides the name at
 // the file's pinned (unicode, cldr), so the collation's objects are read-write. "skewed" ⇒ a loaded
@@ -12554,7 +12569,9 @@ type ScalarFuncName =
   | "bit_length"
   // substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
   // indexed). A negative count is 22011 (string-functions.md §3).
-  | "substr";
+  | "substr"
+  // left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
+  | "left";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24355,6 +24372,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const start = (vals[1] as { int: bigint }).int;
         const count = vals.length > 2 ? (vals[2] as { int: bigint }).int : null;
         return textValue(substrChars(s, start, count));
+      }
+      if (e.func === "left") {
+        // left(text, n) → text — the first n characters (negative n drops the last |n|).
+        const s = (vals[0] as { text: string }).text;
+        return textValue(leftChars(s, (vals[1] as { int: bigint }).int));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

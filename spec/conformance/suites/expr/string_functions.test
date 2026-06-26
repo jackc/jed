@@ -174,3 +174,36 @@ SELECT substr('abc', NULL::int, 2), substr(NULL::text, 1, 2), substr('abc', 2, N
 NULL
 NULL
 NULL
+
+# === left(text, n) → text: the first n characters (negative drops from the right) =====
+
+query T
+SELECT left('abcde', 2)
+----
+ab
+
+# code-point indexed
+query T
+SELECT left('héllo', 2)
+----
+hé
+
+# a negative n returns all but the last |n| characters
+query T
+SELECT left('abcde', -2)
+----
+abc
+
+# n past the length returns the whole string; n=0 or a too-large negative is empty
+query B
+SELECT left('abcde', 10) = 'abcde', left('abcde', 0) = '', left('abcde', -10) = ''
+----
+true
+true
+true
+
+query T
+SELECT left(NULL::text, 2), left('abc', NULL::int)
+----
+NULL
+NULL
