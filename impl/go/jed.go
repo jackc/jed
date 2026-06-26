@@ -279,6 +279,9 @@ var SupportedCapabilities = []string{
 	// An array-valued percentile_*(ARRAY[...]) fraction — one percentile per element, result an
 	// array (spec/design/aggregates.md §18).
 	"query.ordered_set_array_fraction",
+	// A collated WITHIN GROUP key — mode/percentile_disc honor an explicit COLLATE (or a column's
+	// frozen collation) in the WITHIN GROUP sort (spec/design/aggregates.md §13).
+	"query.ordered_set_collation",
 	// Window functions (OVER) — the window stage + row_number() (spec/design/window.md, S0). A
 	// window-only function without OVER is 42809; a window function in WHERE/HAVING is 42P20.
 	"query.window",

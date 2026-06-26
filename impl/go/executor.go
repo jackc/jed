@@ -17149,6 +17149,10 @@ type aggSpec struct {
 	// row. nil for mode (no direct argument).
 	osaDesc bool
 	osaFrac *rExpr
+	// osaCollation is the WITHIN GROUP key's collation (aggregates.md §13) — non-nil for an explicit
+	// COLLATE on the key or a column's frozen non-C collation, nil for the default byte (C) order. The
+	// finalize sort applies it to the buffered text values.
+	osaCollation *Collation
 }
 
 // acc is a running aggregate accumulator (one per aggSpec), folded per input row then finalized.
@@ -17182,10 +17186,13 @@ type acc struct {
 	// group against the synthetic row just before finalize (aggregates.md §13/§17): non-nil for
 	// percentile_* (the Value may be NULL → NULL result, or numeric), nil for mode. Sorted +
 	// computed at finalize.
-	osaDesc   bool
-	osaFrac   *Value
-	osaVals   []Value
-	osaFloats []float64
+	osaDesc bool
+	osaFrac *Value
+	// osaCollation is the WITHIN GROUP key collation (aggregates.md §13) applied to the finalize sort
+	// of the buffered text values; nil is the default byte (C) order.
+	osaCollation *Collation
+	osaVals      []Value
+	osaFloats    []float64
 }
 
 // objAggPair is one (key, value) pair accumulated by json[b]_object_agg (the key already coerced to
@@ -17234,7 +17241,7 @@ func newAccFromSpec(s aggSpec) *acc {
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		// The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
 		// evaluated against the synthetic row); mode keeps it nil.
-		return &acc{plan: s.plan, osaDesc: s.osaDesc}
+		return &acc{plan: s.plan, osaDesc: s.osaDesc, osaCollation: s.osaCollation}
 	default:
 		return newAcc(s.plan)
 	}
@@ -17553,9 +17560,12 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		if len(vals) == 0 {
 			return NullValue(), nil
 		}
-		sort.SliceStable(vals, func(i, j int) bool {
-			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
-		})
+		// Sort by the WITHIN GROUP order (honoring the key's collation), then take the first value of
+		// the longest run of equal values. Run equality is value-canonical (byte equality), so the
+		// collation affects only which tied value comes first.
+		if err := sortOsaVals(vals, a.osaCollation, desc); err != nil {
+			return NullValue(), err
+		}
 		// The first value of the longest run of equal values — the most frequent, ties broken by
 		// sort order (the first such run).
 		bestIdx, bestCount, runStart := 0, 1, 0
@@ -17574,9 +17584,9 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		// an array (aggregates.md §18); finalizePercentile dispatches and applies the NULL /
 		// range-check / empty rules per PG, computing each percentile over the sorted vals.
 		vals := a.osaVals
-		sort.SliceStable(vals, func(i, j int) bool {
-			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
-		})
+		if err := sortOsaVals(vals, a.osaCollation, desc); err != nil {
+			return NullValue(), err
+		}
 		return finalizePercentile(a.osaFrac, len(vals) == 0, func(p float64) (Value, error) {
 			return percentileDiscAt(vals, p), nil
 		})
@@ -17590,11 +17600,12 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		})
 	case planPercentileContInterval:
 		// percentile_cont over interval input: interpolate in the interval domain (PG interval_lerp
-		// — aggregates.md §13). Values are sorted by their canonical span.
+		// — aggregates.md §13). Values are sorted by their canonical span (interval has no collation,
+		// so sortOsaVals uses the value order).
 		vals := a.osaVals
-		sort.SliceStable(vals, func(i, j int) bool {
-			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
-		})
+		if err := sortOsaVals(vals, a.osaCollation, desc); err != nil {
+			return NullValue(), err
+		}
 		return finalizePercentile(a.osaFrac, len(vals) == 0, func(p float64) (Value, error) {
 			n := len(vals)
 			pos := p * float64(n-1)
@@ -17828,6 +17839,46 @@ func dirCmp(c int, desc bool) int {
 		return -c
 	}
 	return c
+}
+
+// sortOsaVals sorts an ordered-set aggregate's buffered values by its WITHIN GROUP order
+// (aggregates.md §13). With no collation, the value-canonical comparison (the same total order
+// ORDER BY/MIN/MAX use). With a collation, a stable decorate-sort by the precomputed collation sort
+// key bytes (a collated key is always text; an unmapped code point fails 0A000 at this deterministic
+// point, like the query ORDER BY). The stable sort keeps collation-equal values in scan order, so
+// the result is deterministic and cross-core identical.
+func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
+	if collation == nil {
+		sort.SliceStable(vals, func(i, j int) bool {
+			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
+		})
+		return nil
+	}
+	// Decorate each value with its collation sort key (text only), sort stably by the key bytes, then
+	// undecorate. The keys are built once up front so a SortKey failure (0A000 for an unmapped code
+	// point) surfaces at this deterministic point rather than inside the comparator.
+	type deco struct {
+		key []byte
+		val Value
+	}
+	d := make([]deco, len(vals))
+	for i, v := range vals {
+		if v.Kind != ValText {
+			panic("a collated WITHIN GROUP key buffers only text")
+		}
+		sk, err := SortKey(collation, v.Str)
+		if err != nil {
+			return err
+		}
+		d[i] = deco{key: sk, val: v}
+	}
+	sort.SliceStable(d, func(i, j int) bool {
+		return dirCmp(bytes.Compare(d[i].key, d[j].key), desc) < 0
+	})
+	for i := range d {
+		vals[i] = d[i].val
+	}
+	return nil
 }
 
 // checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
@@ -19102,11 +19153,6 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 		return nil, resolvedType{}, noAggOverload(name)
 	}
 	key := fc.WithinGroup[0]
-	// An explicit COLLATE on the WITHIN GROUP key is deferred (the sort uses the value's default
-	// order); reject it rather than silently ignore the requested collation.
-	if key.Collation != "" {
-		return nil, resolvedType{}, NewError(FeatureNotSupported, "COLLATE in a WITHIN GROUP ORDER BY is not supported")
-	}
 	// The aggregated argument: the WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN
 	// (a nested aggregate in the order key is 42803, matching PG). A general-expression key
 	// (`ORDER BY a + b`) carries Expr; a bare/qualified column key carries Column (rebuilt here as an
@@ -19123,6 +19169,36 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 	operand, optype, err := resolve(s, keyExpr, nil, sub, params)
 	if err != nil {
 		return nil, resolvedType{}, err
+	}
+	// The WITHIN GROUP key's COLLATION drives the sort (aggregates.md §13): an explicit COLLATE on the
+	// key (text operand only — else "collations are not supported by type T", like the query ORDER BY),
+	// else a bare/qualified column key inherits its column's frozen collation; otherwise the default C
+	// (byte) order. Resolved to the loaded Collation (42704 if not loaded). The finalize sort applies
+	// it (an unmapped code point → 0A000 there).
+	var collation *Collation
+	if key.Collation != "" {
+		if optype.kind != rtText && optype.kind != rtNull {
+			return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(optype)))
+		}
+		if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+			return nil, resolvedType{}, err
+		}
+	} else if key.Expr == nil {
+		// A bare/qualified column key with no explicit COLLATE inherits the column's frozen collation.
+		var r resolved
+		if key.Qualifier != "" {
+			r, err = s.resolveQualified(key.Qualifier, key.Column)
+		} else {
+			r, err = s.resolveBare(key.Column)
+		}
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if cn := s.columnOf(r).Collation; cn != "" {
+			if collation, err = resolveCollationName(s.catalog, cn); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
 	}
 	var (
 		plan   aggPlan
@@ -19180,7 +19256,7 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 		filter = rf
 	}
 	slot := len(ag.groupKeys) + len(ag.specs)
-	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: false, filter: filter, osaDesc: key.Descending, osaFrac: frac})
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: false, filter: filter, osaDesc: key.Descending, osaFrac: frac, osaCollation: collation})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 

@@ -14136,6 +14136,10 @@ type AggSpec = {
   // at finalize against the synthetic row. null for mode (no direct argument).
   osaDesc?: boolean;
   osaFrac?: RExpr | null;
+  // The WITHIN GROUP key's collation (aggregates.md §13) — set for an explicit COLLATE on the key
+  // or a column's frozen non-C collation, null/undefined for the default byte (C) order. The
+  // finalize sort applies it to the buffered text values.
+  osaCollation?: Collation | null;
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -14286,6 +14290,9 @@ type Acc = {
   // NULL → NULL result, or numeric), null for mode. Sorted + computed at finalize.
   osaDesc?: boolean;
   osaFrac?: Value | null;
+  // The WITHIN GROUP key collation (aggregates.md §13) applied to the finalize sort of the buffered
+  // text values; null/undefined is the default byte (C) order.
+  osaCollation?: Collation | null;
   osaVals?: Value[];
   osaFloats?: number[];
 };
@@ -14328,6 +14335,7 @@ function newAccFromSpec(s: AggSpec): Acc {
   ) {
     const a = newAcc(s.plan);
     a.osaDesc = s.osaDesc;
+    a.osaCollation = s.osaCollation ?? null;
     // The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
     // evaluated against the synthetic row); mode keeps it null/undefined.
     a.osaVals = [];
@@ -14578,7 +14586,10 @@ function finalizeOrderedSet(a: Acc): Value {
   if (a.plan === "mode") {
     const vals = a.osaVals!;
     if (vals.length === 0) return nullValue();
-    vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
+    // Sort by the WITHIN GROUP order (honoring the key's collation), then take the first value of the
+    // longest run of equal values. Run equality is value-canonical (byte equality), so the collation
+    // affects only which tied value comes first.
+    sortOsaVals(vals, a.osaCollation ?? null, desc);
     // The first value of the longest run of equal values — the most frequent, ties broken by sort
     // order (the first such run).
     let bestIdx = 0;
@@ -14602,14 +14613,15 @@ function finalizeOrderedSet(a: Acc): Value {
     // array (aggregates.md §18); finalizePercentile dispatches and applies the NULL / range-check /
     // empty rules per PG, computing each percentile over the sorted vals.
     const vals = a.osaVals!;
-    vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
+    sortOsaVals(vals, a.osaCollation ?? null, desc);
     return finalizePercentile(a.osaFrac, vals.length === 0, (p) => percentileDiscAt(vals, p));
   }
   if (a.plan === "orderedSetContInterval") {
     // percentile_cont over interval input: interpolate in the interval domain (PG interval_lerp —
-    // aggregates.md §13). Values are sorted by their canonical span (the WITHIN GROUP order).
+    // aggregates.md §13). Values are sorted by their canonical span (interval has no collation, so
+    // sortOsaVals uses the value order).
     const vals = a.osaVals!;
-    vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
+    sortOsaVals(vals, a.osaCollation ?? null, desc);
     return finalizePercentile(a.osaFrac, vals.length === 0, (p) => {
       const n = vals.length;
       const pos = p * (n - 1);
@@ -14722,6 +14734,30 @@ function percentileContAt(floats: number[], p: number): number {
 // dirCmp applies a WITHIN GROUP sort direction to a comparison result (DESC reverses).
 function dirCmp(c: number, desc: boolean): number {
   return desc ? -c : c;
+}
+
+// sortOsaVals sorts an ordered-set aggregate's buffered values by its WITHIN GROUP order
+// (aggregates.md §13). With no collation, the value-canonical comparison (the same total order
+// ORDER BY/MIN/MAX use). With a collation, a stable decorate-sort by the precomputed collation sort
+// key bytes (a collated key is always text; an unmapped code point fails 0A000 at this deterministic
+// point, like the query ORDER BY). JS Array.prototype.sort is stable, so a comparator that returns 0
+// for collation-equal keys keeps them in scan order — deterministic and cross-core identical.
+function sortOsaVals(vals: Value[], collation: Collation | null, desc: boolean): void {
+  if (collation === null) {
+    vals.sort((a, b) => dirCmp(valueCmp(a, b), desc));
+    return;
+  }
+  // Decorate each value with its collation sort key (text only), sort stably by the key bytes, then
+  // undecorate. The keys are built once up front so a sortKey failure (0A000 for an unmapped code
+  // point) surfaces at this deterministic point rather than inside the comparator.
+  const deco: { key: Uint8Array; val: Value }[] = vals.map((v) => {
+    if (v.kind !== "text") {
+      throw new Error("a collated WITHIN GROUP key buffers only text");
+    }
+    return { key: collationSortKey(collation, v.text), val: v };
+  });
+  deco.sort((a, b) => dirCmp(cmpBytes(a.key, b.key), desc));
+  for (let i = 0; i < deco.length; i++) vals[i] = deco[i]!.val;
 }
 
 // checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
@@ -15567,14 +15603,6 @@ function resolveOrderedSetAggregate(
   // Exactly one WITHIN GROUP sort key (PG models a second as a missing overload → 42883).
   if (keys.length !== 1) throw noAggOverload(name);
   const key = keys[0]!;
-  // An explicit COLLATE on the WITHIN GROUP key is deferred (the sort uses the value's default
-  // order); reject it rather than silently ignore the requested collation.
-  if (key.collation !== null && key.collation !== undefined && key.collation !== "") {
-    throw engineError(
-      "feature_not_supported",
-      "COLLATE in a WITHIN GROUP ORDER BY is not supported",
-    );
-  }
   // The aggregated argument: the WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN (a
   // nested aggregate in the order key is 42803, matching PG). A general-expression key (`ORDER BY a + b`)
   // carries expr; a bare/qualified column key carries column (rebuilt here as an Expr so both paths
@@ -15589,6 +15617,27 @@ function resolveOrderedSetAggregate(
   const r = resolve(scope, keyExpr, null, sub, params);
   const operand = r.node;
   const optype = r.type;
+
+  // The WITHIN GROUP key's COLLATION drives the sort (aggregates.md §13): an explicit COLLATE on the
+  // key (text operand only — else "collations are not supported by type T", like the query ORDER BY),
+  // else a bare/qualified column key inherits its column's frozen collation; otherwise the default C
+  // (byte) order. Resolved to the loaded Collation (42704 if not loaded). The finalize sort applies it
+  // (an unmapped code point → 0A000 there).
+  let collation: Collation | null = null;
+  if (key.collation !== null && key.collation !== undefined) {
+    if (optype.kind !== "text" && optype.kind !== "null") {
+      throw typeError(`collations are not supported by type ${rtName(optype)}`);
+    }
+    collation = resolveCollationName(scope.catalog, key.collation);
+  } else if (key.expr === null || key.expr === undefined) {
+    // A bare/qualified column key with no explicit COLLATE inherits the column's frozen collation.
+    const res =
+      key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
+        ? scope.resolveQualified(key.qualifier, key.column)
+        : scope.resolveBare(key.column);
+    const cn = scope.columnOf(res).collation;
+    if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
+  }
 
   let plan: AggPlan;
   let frac: RExpr | null;
@@ -15637,7 +15686,15 @@ function resolveOrderedSetAggregate(
   }
 
   const slot = ag.groupKeys.length + ag.specs.length;
-  ag.specs.push({ plan, operand, distinct: false, filter, osaDesc: key.descending, osaFrac: frac });
+  ag.specs.push({
+    plan,
+    operand,
+    distinct: false,
+    filter,
+    osaDesc: key.descending,
+    osaFrac: frac,
+    osaCollation: collation,
+  });
   return { node: { kind: "column", index: slot }, type: result };
 }
 

@@ -17175,6 +17175,10 @@ enum AggPlan {
 struct OsaParams {
     desc: bool,
     frac: Option<RExpr>,
+    /// The `WITHIN GROUP` key's collation — `Some` for an explicit `COLLATE` or a column's frozen
+    /// non-`C` collation; `None` for the default byte (`C`) order (aggregates.md §13). The finalize
+    /// sort applies it to the buffered text values.
+    collation: Option<std::sync::Arc<Collation>>,
 }
 
 /// One resolved aggregate: its plan and its resolved argument expression (evaluated per
@@ -17261,6 +17265,9 @@ enum Acc {
         kind: AggPlan,
         desc: bool,
         frac: Option<Value>,
+        /// The `WITHIN GROUP` key collation (aggregates.md §13) applied to the finalize sort of the
+        /// buffered text values; `None` is the default byte (`C`) order.
+        collation: Option<std::sync::Arc<Collation>>,
         vals: Vec<Value>,
         floats: Vec<f64>,
     },
@@ -17288,6 +17295,7 @@ impl Acc {
                     // The per-group fraction is filled in just before finalize (the direct argument
                     // evaluated against the synthetic row); `mode` keeps `None`.
                     frac: None,
+                    collation: osa.collation.clone(),
                     vals: Vec::new(),
                     floats: Vec::new(),
                 }
@@ -17640,9 +17648,17 @@ impl Acc {
                 kind,
                 desc,
                 frac,
+                collation,
                 vals,
                 floats,
-            } => finalize_ordered_set(kind, desc, frac.as_ref(), vals, floats)?,
+            } => finalize_ordered_set(
+                kind,
+                desc,
+                collation.as_deref(),
+                frac.as_ref(),
+                vals,
+                floats,
+            )?,
         })
     }
 }
@@ -17655,6 +17671,7 @@ impl Acc {
 fn finalize_ordered_set(
     kind: AggPlan,
     desc: bool,
+    collation: Option<&Collation>,
     frac: Option<&Value>,
     mut vals: Vec<Value>,
     mut floats: Vec<f64>,
@@ -17664,9 +17681,11 @@ fn finalize_ordered_set(
             if vals.is_empty() {
                 return Ok(Value::Null);
             }
-            // Sort by the WITHIN GROUP order, then take the first value of the longest run of
-            // equal values — the most frequent, ties broken by sort order (the first such run).
-            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            // Sort by the WITHIN GROUP order (honoring the key's collation), then take the first
+            // value of the longest run of equal values — the most frequent, ties broken by sort
+            // order (the first such run). Run equality is value-canonical (byte equality), so the
+            // collation affects only which tied value comes first.
+            sort_osa_vals(&mut vals, collation, desc)?;
             let mut best_idx = 0usize;
             let mut best_count = 1usize;
             let mut run_start = 0usize;
@@ -17687,7 +17706,7 @@ fn finalize_ordered_set(
             // percentile_disc: an actual sorted value at row ceil(p·N). The fraction may be a scalar
             // or an array (aggregates.md §18); `finalize_percentile` dispatches and applies the
             // NULL / range-check / empty rules per PG, computing each percentile over the sorted vals.
-            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            sort_osa_vals(&mut vals, collation, desc)?;
             finalize_percentile(frac, vals.is_empty(), |p| Ok(percentile_disc_at(&vals, p)))
         }
         AggPlan::OrderedSetCont => {
@@ -17698,8 +17717,9 @@ fn finalize_ordered_set(
         }
         AggPlan::OrderedSetContInterval => {
             // percentile_cont over interval input: interpolate in the interval domain (PG
-            // `interval_lerp` — aggregates.md §13). Values are sorted by their canonical span.
-            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            // `interval_lerp` — aggregates.md §13). Values are sorted by their canonical span
+            // (interval has no collation, so `sort_osa_vals` uses the value order).
+            sort_osa_vals(&mut vals, collation, desc)?;
             finalize_percentile(frac, vals.is_empty(), |p| {
                 let n = vals.len();
                 let pos = p * ((n - 1) as f64);
@@ -17905,6 +17925,36 @@ fn percentile_cont_at(floats: &[f64], p: f64) -> f64 {
 /// Apply a `WITHIN GROUP` sort direction to a comparison result (DESC reverses).
 fn dir_cmp(ord: std::cmp::Ordering, desc: bool) -> std::cmp::Ordering {
     if desc { ord.reverse() } else { ord }
+}
+
+/// Sort an ordered-set aggregate's buffered values by its `WITHIN GROUP` order (aggregates.md §13).
+/// With no collation, the value-canonical comparison (the same total order `ORDER BY`/`MIN`/`MAX`
+/// use). With a collation, a stable decorate-sort by the precomputed collation `sort_key` bytes (a
+/// collated key is always text; an unmapped code point fails `0A000` at this deterministic point,
+/// like the query ORDER BY). The stable sort keeps collation-equal values in scan order, so the
+/// result is deterministic and cross-core identical.
+fn sort_osa_vals(vals: &mut Vec<Value>, collation: Option<&Collation>, desc: bool) -> Result<()> {
+    match collation {
+        None => {
+            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            Ok(())
+        }
+        Some(c) => {
+            let mut decorated: Vec<(Vec<u8>, Value)> = Vec::with_capacity(vals.len());
+            for v in vals.drain(..) {
+                let key = match &v {
+                    Value::Text(s) => collation::sort_key(c, s)?,
+                    other => {
+                        unreachable!("a collated WITHIN GROUP key buffers only text: {other:?}")
+                    }
+                };
+                decorated.push((key, v));
+            }
+            decorated.sort_by(|a, b| dir_cmp(a.0.cmp(&b.0), desc));
+            vals.extend(decorated.into_iter().map(|(_, v)| v));
+            Ok(())
+        }
+    }
 }
 
 /// The percentile fraction range gate (spec/design/aggregates.md §13): `< 0`, `> 1`, or NaN is
@@ -20418,14 +20468,6 @@ fn resolve_ordered_set_aggregate(
     let [key] = keys else {
         return Err(no_agg_overload(name));
     };
-    // An explicit COLLATE on the WITHIN GROUP key is deferred (the sort uses the value's default
-    // order); reject it rather than silently ignore the requested collation.
-    if key.collation.is_some() {
-        return Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            "COLLATE in a WITHIN GROUP ORDER BY is not supported",
-        ));
-    }
     // The aggregated argument: the WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN
     // (a nested aggregate in the order key is 42803, matching PG). A general-expression key
     // (`ORDER BY a + b`) carries a resolved `expr`; a bare/qualified column key carries `column`
@@ -20443,6 +20485,36 @@ fn resolve_ordered_set_aggregate(
             };
             resolve(scope, &key_expr, None, &mut sub, params)?
         }
+    };
+    // The WITHIN GROUP key's COLLATION drives the sort (aggregates.md §13): an explicit `COLLATE`
+    // on the key (text operand only — else "collations are not supported by type T", like the query
+    // ORDER BY), else a bare/qualified column key inherits its column's frozen collation; otherwise
+    // the default `C` (byte) order. Resolved to the loaded `Collation` (42704 if not loaded). The
+    // finalize sort applies it (an unmapped code point → 0A000 there).
+    let collation: Option<std::sync::Arc<Collation>> = match &key.collation {
+        Some(name) => {
+            if !matches!(optype, ResolvedType::Text) {
+                return Err(type_error(format!(
+                    "collations are not supported by type {}",
+                    optype.type_name()
+                )));
+            }
+            resolve_collation_name(scope.catalog, name)?
+        }
+        None => match (&key.expr, &key.qualifier, &key.column) {
+            // A bare/qualified column key with no explicit COLLATE inherits the column's collation.
+            (None, q, col) => {
+                let r = match q {
+                    Some(q) => scope.resolve_qualified(q, col)?,
+                    None => scope.resolve_bare(col)?,
+                };
+                match &scope.column_of(r).collation {
+                    Some(cn) => resolve_collation_name(scope.catalog, cn)?,
+                    None => None,
+                }
+            }
+            _ => None,
+        },
     };
 
     let lname = name.to_ascii_lowercase();
@@ -20507,6 +20579,7 @@ fn resolve_ordered_set_aggregate(
     let osa = OsaParams {
         desc: key.descending,
         frac,
+        collation,
     };
     match agg {
         AggCtx::Collect {
