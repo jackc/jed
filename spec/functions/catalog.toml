@@ -3384,6 +3384,21 @@ result         = "i32"
 null           = "propagates"
 errors         = []
 
+# split_part(text, delimiter text, n int) → text — split the string on `delimiter` and return the
+# n-th field (1-based; a NEGATIVE n counts from the end, PG 14+). Out of range → ''; n = 0 traps
+# 22023 ("field position must not be zero"). An EMPTY delimiter treats the whole string as field 1
+# (a cross-core trap — the host split built-ins split into characters; string-functions.md §3).
+# split_part('a,b,c',',',2) = 'b', split_part('a,b,c',',',-1) = 'c'. NULL args propagate.
+[[operator]]
+name           = "split_part"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22023"]
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

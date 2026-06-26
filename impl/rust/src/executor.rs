@@ -13066,6 +13066,8 @@ enum ScalarFunc {
     Reverse,
     /// strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
     Strpos,
+    /// split_part(text, delimiter, n) → text — the n-th field of the split; n=0 traps 22023 (§3).
+    SplitPart,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19103,6 +19105,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "repeat" => ScalarFunc::Repeat,
         "reverse" => ScalarFunc::Reverse,
         "strpos" => ScalarFunc::Strpos,
+        "split_part" => ScalarFunc::SplitPart,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30528,6 +30531,14 @@ impl RExpr {
                             None => 0,
                         }))
                     }
+                    // split_part(text, delimiter, n) → text — the n-th split field.
+                    ScalarFunc::SplitPart => {
+                        let (s, delim) = match (&vals[0], &vals[1]) {
+                            (Value::Text(s), Value::Text(d)) => (s, d),
+                            _ => unreachable!("resolver restricts split_part to text"),
+                        };
+                        Ok(Value::Text(split_part(s, delim, int_value(&vals[2]))?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31411,7 +31422,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Translate
         | ScalarFunc::Repeat
         | ScalarFunc::Reverse
-        | ScalarFunc::Strpos => {
+        | ScalarFunc::Strpos
+        | ScalarFunc::SplitPart => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31541,6 +31553,30 @@ fn repeat_text(s: &str, n: i64) -> Result<String> {
         ));
     }
     Ok(s.repeat(n as usize))
+}
+
+/// `split_part(s, delim, n)` (string-functions.md §3): split `s` on the substring `delim` and return
+/// the n-th field (1-based; a negative n counts from the end). Out of range → `''`; `n = 0` traps
+/// `22023`. An EMPTY `delim` treats the whole string as one field (str::split would otherwise split
+/// between every character — a cross-core trap). Matches PostgreSQL's split_part.
+fn split_part(s: &str, delim: &str, n: i64) -> Result<String> {
+    if n == 0 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "field position must not be zero",
+        ));
+    }
+    let fields: Vec<&str> = if delim.is_empty() {
+        vec![s]
+    } else {
+        s.split(delim).collect()
+    };
+    let len = fields.len() as i64;
+    let idx = if n > 0 { n - 1 } else { len + n };
+    if idx < 0 || idx >= len {
+        return Ok(String::new());
+    }
+    Ok(fields[idx as usize].to_string())
 }
 
 /// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window

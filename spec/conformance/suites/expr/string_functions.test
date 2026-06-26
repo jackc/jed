@@ -520,3 +520,35 @@ SELECT strpos(NULL::text, 'a'), strpos('abc', NULL::text)
 ----
 NULL
 NULL
+
+# === split_part(text, delimiter, n) → text: the n-th field ============================
+
+query T
+SELECT split_part('a,b,c', ',', 2)
+----
+b
+
+# a negative n counts from the end (PG 14+)
+query T
+SELECT split_part('a,b,c', ',', -1)
+----
+c
+
+# an empty delimiter treats the whole string as field 1; out-of-range fields are empty
+query B
+SELECT split_part('a,b,c', '', 1) = 'a,b,c', split_part('a,b,c', ',', 4) = '', split_part('a,b,c', ',', -4) = ''
+----
+true
+true
+true
+
+# n = 0 traps 22023 (field position must not be zero)
+statement error 22023
+SELECT split_part('a,b,c', ',', 0)
+
+query T
+SELECT split_part(NULL::text, ',', 1), split_part('a,b', NULL::text, 1), split_part('a,b', ',', NULL::int)
+----
+NULL
+NULL
+NULL

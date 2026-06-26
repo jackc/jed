@@ -199,3 +199,13 @@ position of the first occurrence of `substring`, or `0` if absent; an empty subs
 the match's **byte** (or UTF-16-unit, in TS) offset with its native search, then converts to a
 code-point position by counting the code points in the prefix — so the result is the same character
 position cross-core regardless of the encoding the search uses. NULL args propagate.
+
+### `split_part(text, delimiter, n) → text`
+
+Split the string on the substring `delimiter` and return the `n`-th field (1-based). A **negative**
+`n` counts from the end (PostgreSQL 14+): `split_part('a,b,c', ',', 2) = 'b'`,
+`split_part('a,b,c', ',', -1) = 'c'`. An out-of-range field is `''`; `n = 0` traps **`22023`**
+(*"field position must not be zero"*). An **empty delimiter** treats the whole string as a single
+field — `split_part('a,b,c', '', 1) = 'a,b,c'` (the per-core `split("")` built-ins would instead
+split into characters, a cross-core trap, so it is special-cased). For a non-empty delimiter the
+field boundaries are a literal substring split, identical across cores. NULL args propagate.

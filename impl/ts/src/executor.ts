@@ -499,6 +499,19 @@ function repeatText(s: string, n: bigint): string {
   return s.repeat(Number(n));
 }
 
+// splitPart is split_part(s, delim, n) (string-functions.md §3): split s on the substring delim and
+// return the n-th field (1-based; a negative n counts from the end). Out of range → ''; n = 0 traps
+// 22023. An EMPTY delim treats the whole string as one field (String.split would otherwise split
+// into characters — a cross-core trap). Matches PostgreSQL's split_part.
+function splitPart(s: string, delim: string, n: bigint): string {
+  if (n === 0n) throw engineError("invalid_parameter_value", "field position must not be zero");
+  const fields = delim === "" ? [s] : s.split(delim);
+  const len = BigInt(fields.length);
+  const idx = n > 0n ? n - 1n : len + n;
+  if (idx < 0n || idx >= len) return "";
+  return fields[Number(idx)]!;
+}
+
 // substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
@@ -12682,7 +12695,9 @@ type ScalarFuncName =
   // reverse(text) → text — the code points in reverse order (§3).
   | "reverse"
   // strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
-  | "strpos";
+  | "strpos"
+  // split_part(text, delimiter, n) → text — the n-th field of the split; n=0 traps 22023 (§3).
+  | "split_part";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24560,6 +24575,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const sub = (vals[1] as { text: string }).text;
         const idx = s.indexOf(sub);
         return intValue(idx < 0 ? 0n : BigInt([...s.slice(0, idx)].length + 1));
+      }
+      if (e.func === "split_part") {
+        // split_part(text, delimiter, n) → text — the n-th split field.
+        const s = (vals[0] as { text: string }).text;
+        const delim = (vals[1] as { text: string }).text;
+        return textValue(splitPart(s, delim, (vals[2] as { int: bigint }).int));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

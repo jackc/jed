@@ -15947,6 +15947,8 @@ const (
 	sfReverse
 	// strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
 	sfStrpos
+	// split_part(text, delimiter, n) → text — the n-th field of the split; n=0 traps 22023 (§3).
+	sfSplitPart
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19552,6 +19554,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfReverse
 	case "strpos":
 		return sfStrpos
+	case "split_part":
+		return sfSplitPart
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24196,6 +24200,33 @@ func repeatText(s string, n int64) (string, error) {
 	return strings.Repeat(s, int(n)), nil
 }
 
+// splitPart is split_part(s, delim, n) (string-functions.md §3): split s on the substring delim and
+// return the n-th field (1-based; a negative n counts from the end). An out-of-range field is empty;
+// n = 0 traps 22023. An EMPTY delim treats the whole string as one field (strings.Split would
+// otherwise split into characters — a cross-core trap). Matches PostgreSQL's split_part.
+func splitPart(s, delim string, n int64) (string, error) {
+	if n == 0 {
+		return "", NewError(InvalidParameterValue, "field position must not be zero")
+	}
+	var fields []string
+	if delim == "" {
+		fields = []string{s}
+	} else {
+		fields = strings.Split(s, delim)
+	}
+	length := int64(len(fields))
+	var idx int64
+	if n > 0 {
+		idx = n - 1
+	} else {
+		idx = length + n
+	}
+	if idx < 0 || idx >= length {
+		return "", nil
+	}
+	return fields[idx], nil
+}
+
 // satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
 // used, the right operand being non-negative).
 func satAddInt64(a, b int64) int64 {
@@ -27581,6 +27612,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return IntValue(0), nil
 			}
 			return IntValue(int64(utf8.RuneCountInString(vals[0].Str[:idx])) + 1), nil
+		case sfSplitPart:
+			// split_part(text, delimiter, n) → text — the n-th split field.
+			r, err := splitPart(vals[0].Str, vals[1].Str, vals[2].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(r), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
