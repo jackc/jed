@@ -224,3 +224,18 @@ The Unicode **code point** of the first character; the empty string is `0`. `asc
 `ascii('é') = 233`, `ascii('😀') = 128512` (the full astral code point — TS uses `codePointAt(0)`,
 not `charCodeAt`, so it returns `128512` rather than the high surrogate). The inverse of `chr`.
 NULL propagates.
+
+### `chr(int) → text`
+
+The one-character string for a Unicode code point: `chr(65) = 'A'`, `chr(233) = 'é'`,
+`chr(128512) = '😀'`. The inverse of `ascii`. PostgreSQL's error split is matched exactly (the
+corpus pins the SQLSTATE, not the message):
+
+- a **negative** code point traps **`22023`** (*"character number must be positive"*);
+- **`0`** traps **`54000`** (*"null character not permitted"*);
+- a value **above `U+10FFFF`** traps **`54000`** (*"requested character too large for encoding"*);
+- a **UTF-16 surrogate** (`U+D800..U+DFFF`, which has no scalar value — `char::from_u32` returns
+  `None`) traps **`54000`** (*"requested character not valid for encoding"*).
+
+jed's `integer` family accepts any width, so `chr` takes an `i64`; the range checks bound it before
+constructing the character. NULL propagates.

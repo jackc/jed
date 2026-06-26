@@ -512,6 +512,19 @@ function splitPart(s: string, delim: string, n: bigint): string {
   return fields[Number(idx)]!;
 }
 
+// chrText is chr(n) (string-functions.md §3): the one-character string for the Unicode code point n.
+// PostgreSQL's error split: a negative n traps 22023; 0, a value above U+10FFFF, and a UTF-16
+// surrogate (U+D800..U+DFFF) trap 54000.
+function chrText(n: bigint): string {
+  if (n < 0n) throw engineError("invalid_parameter_value", "character number must be positive");
+  if (n === 0n) throw engineError("program_limit_exceeded", "null character not permitted");
+  if (n > 0x10ffffn)
+    throw engineError("program_limit_exceeded", `requested character too large for encoding: ${n}`);
+  if (n >= 0xd800n && n <= 0xdfffn)
+    throw engineError("program_limit_exceeded", `requested character not valid for encoding: ${n}`);
+  return String.fromCodePoint(Number(n));
+}
+
 // substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
@@ -12701,7 +12714,9 @@ type ScalarFuncName =
   // starts_with(text, prefix) → boolean — true iff the string begins with `prefix` (§3).
   | "starts_with"
   // ascii(text) → i32 — the Unicode code point of the first character; empty → 0 (§3).
-  | "ascii";
+  | "ascii"
+  // chr(int) → text — the one-character string for a Unicode code point; bad point traps (§3).
+  | "chr";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24597,6 +24612,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // returns the full code point (an astral char is one value, not a surrogate, §2).
         const s = (vals[0] as { text: string }).text;
         return intValue(BigInt(s.length === 0 ? 0 : (s.codePointAt(0) ?? 0)));
+      }
+      if (e.func === "chr") {
+        // chr(int) → text — the one-character string for a code point.
+        return textValue(chrText((vals[0] as { int: bigint }).int));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

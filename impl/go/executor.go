@@ -15953,6 +15953,8 @@ const (
 	sfStartsWith
 	// ascii(text) → i32 — the Unicode code point of the first character; empty → 0 (§3).
 	sfAscii
+	// chr(int) → text — the one-character string for a Unicode code point; bad point traps (§3).
+	sfChr
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19564,6 +19566,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfStartsWith
 	case "ascii":
 		return sfAscii
+	case "chr":
+		return sfChr
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24235,6 +24239,25 @@ func splitPart(s, delim string, n int64) (string, error) {
 	return fields[idx], nil
 }
 
+// chrText is chr(n) (string-functions.md §3): the one-character string for the Unicode code point n.
+// PostgreSQL's error split: a negative n traps 22023; 0, a value above U+10FFFF, and a UTF-16
+// surrogate (U+D800..U+DFFF) trap 54000.
+func chrText(n int64) (string, error) {
+	if n < 0 {
+		return "", NewError(InvalidParameterValue, "character number must be positive")
+	}
+	if n == 0 {
+		return "", NewError(ProgramLimitExceeded, "null character not permitted")
+	}
+	if n > 0x10FFFF {
+		return "", NewError(ProgramLimitExceeded, fmt.Sprintf("requested character too large for encoding: %d", n))
+	}
+	if n >= 0xD800 && n <= 0xDFFF {
+		return "", NewError(ProgramLimitExceeded, fmt.Sprintf("requested character not valid for encoding: %d", n))
+	}
+	return string(rune(n)), nil
+}
+
 // satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
 // used, the right operand being non-negative).
 func satAddInt64(a, b int64) int64 {
@@ -27636,6 +27659,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return IntValue(int64(r)), nil // first rune
 			}
 			return IntValue(0), nil
+		case sfChr:
+			// chr(int) → text — the one-character string for a code point.
+			r, err := chrText(vals[0].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(r), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

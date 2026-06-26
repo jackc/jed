@@ -13072,6 +13072,8 @@ enum ScalarFunc {
     StartsWith,
     /// ascii(text) → i32 — the Unicode code point of the first character; empty → 0 (§3).
     Ascii,
+    /// chr(int) → text — the one-character string for a Unicode code point; bad point traps (§3).
+    Chr,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19112,6 +19114,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "split_part" => ScalarFunc::SplitPart,
         "starts_with" => ScalarFunc::StartsWith,
         "ascii" => ScalarFunc::Ascii,
+        "chr" => ScalarFunc::Chr,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30557,6 +30560,8 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Int(s.chars().next().map_or(0, |c| c as i64))),
                         _ => unreachable!("resolver restricts ascii to text"),
                     },
+                    // chr(int) → text — the one-character string for a code point.
+                    ScalarFunc::Chr => Ok(Value::Text(chr_text(int_value(&vals[0]))?)),
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31443,7 +31448,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Strpos
         | ScalarFunc::SplitPart
         | ScalarFunc::StartsWith
-        | ScalarFunc::Ascii => {
+        | ScalarFunc::Ascii
+        | ScalarFunc::Chr => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31597,6 +31603,38 @@ fn split_part(s: &str, delim: &str, n: i64) -> Result<String> {
         return Ok(String::new());
     }
     Ok(fields[idx as usize].to_string())
+}
+
+/// `chr(n)` (string-functions.md §3): the one-character string for the Unicode code point `n`.
+/// PostgreSQL's error split: a negative `n` traps `22023`; `0`, a value above `U+10FFFF`, and a
+/// UTF-16 surrogate (`U+D800..U+DFFF`, rejected by `char::from_u32`) trap `54000`.
+fn chr_text(n: i64) -> Result<String> {
+    if n < 0 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "character number must be positive",
+        ));
+    }
+    if n == 0 {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "null character not permitted",
+        ));
+    }
+    if n > 0x10FFFF {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            format!("requested character too large for encoding: {n}"),
+        ));
+    }
+    match char::from_u32(n as u32) {
+        Some(c) => Ok(c.to_string()),
+        // a surrogate code point has no scalar value
+        None => Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            format!("requested character not valid for encoding: {n}"),
+        )),
+    }
 }
 
 /// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window

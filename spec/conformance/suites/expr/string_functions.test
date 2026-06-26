@@ -590,3 +590,41 @@ SELECT ascii(''), ascii(NULL::text)
 ----
 0
 NULL
+
+# === chr(int) → text: the one-character string for a code point =======================
+
+query T
+SELECT chr(65), chr(233)
+----
+A
+é
+
+# an astral code point builds the full character
+query T
+SELECT chr(128512)
+----
+😀
+
+# ascii and chr are inverses
+query B
+SELECT ascii(chr(128512)) = 128512
+----
+true
+
+# a negative code point is 22023; 0, too-large, and a surrogate are 54000 (PG's split)
+statement error 22023
+SELECT chr(-1)
+
+statement error 54000
+SELECT chr(0)
+
+statement error 54000
+SELECT chr(1114112)
+
+statement error 54000
+SELECT chr(55296)
+
+query T
+SELECT chr(NULL::int)
+----
+NULL
