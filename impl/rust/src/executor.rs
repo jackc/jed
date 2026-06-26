@@ -13084,6 +13084,8 @@ enum ScalarFunc {
     Decode,
     /// quote_literal(text) → text — wrap as a SQL string literal (§3).
     QuoteLiteral,
+    /// quote_ident(text) → text — wrap as a SQL identifier (§3).
+    QuoteIdent,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19130,6 +19132,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "encode" => ScalarFunc::Encode,
         "decode" => ScalarFunc::Decode,
         "quote_literal" => ScalarFunc::QuoteLiteral,
+        "quote_ident" => ScalarFunc::QuoteIdent,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30607,6 +30610,11 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Text(quote_literal_text(s))),
                         _ => unreachable!("resolver restricts quote_literal to text"),
                     },
+                    // quote_ident(text) → text — wrap as a SQL identifier.
+                    ScalarFunc::QuoteIdent => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Text(quote_ident_text(s))),
+                        _ => unreachable!("resolver restricts quote_ident to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31499,7 +31507,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::ToHex
         | ScalarFunc::Encode
         | ScalarFunc::Decode
-        | ScalarFunc::QuoteLiteral => {
+        | ScalarFunc::QuoteLiteral
+        | ScalarFunc::QuoteIdent => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31768,6 +31777,35 @@ fn quote_literal_text(s: &str) -> String {
     } else {
         format!("'{inner}'")
     }
+}
+
+/// `quote_ident(s)` (string-functions.md §3): wrap `s` as a SQL identifier — returned unchanged if it
+/// is already a safe unquoted identifier (`^[a-z_][a-z0-9_]*$`), else double-quoted with each internal
+/// `"` doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword quoting (jed has no
+/// enumerated keyword set), a documented divergence from PostgreSQL.
+fn quote_ident_text(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes().enumerate().all(|(i, b)| {
+            if i == 0 {
+                b == b'_' || b.is_ascii_lowercase()
+            } else {
+                b == b'_' || b.is_ascii_lowercase() || b.is_ascii_digit()
+            }
+        });
+    if safe {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push_str("\"\"");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `decode(s, format)` (string-functions.md §3): the inverse of `encode`. `hex` and `base64` ignore

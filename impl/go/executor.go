@@ -15965,6 +15965,8 @@ const (
 	sfDecode
 	// quote_literal(text) → text — wrap as a SQL string literal (§3).
 	sfQuoteLiteral
+	// quote_ident(text) → text — wrap as a SQL identifier (§3).
+	sfQuoteIdent
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19588,6 +19590,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfDecode
 	case "quote_literal":
 		return sfQuoteLiteral
+	case "quote_ident":
+		return sfQuoteIdent
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24373,6 +24377,37 @@ func quoteLiteralText(s string) string {
 	return "'" + inner.String() + "'"
 }
 
+// quoteIdentText is quote_ident(s) (string-functions.md §3): wrap s as a SQL identifier — returned
+// unchanged if it is already a safe unquoted identifier (^[a-z_][a-z0-9_]*$), else double-quoted with
+// each internal " doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword quoting (jed
+// has no enumerated keyword set), a documented divergence from PostgreSQL.
+func quoteIdentText(s string) string {
+	safe := len(s) > 0
+	for i := 0; i < len(s) && safe; i++ {
+		b := s[i]
+		lower := b == '_' || (b >= 'a' && b <= 'z')
+		if i == 0 {
+			safe = lower
+		} else {
+			safe = lower || (b >= '0' && b <= '9')
+		}
+	}
+	if safe {
+		return s
+	}
+	var out strings.Builder
+	out.WriteByte('"')
+	for _, c := range s {
+		if c == '"' {
+			out.WriteString("\"\"")
+		} else {
+			out.WriteRune(c)
+		}
+	}
+	out.WriteByte('"')
+	return out.String()
+}
+
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
 // ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
 // 22P02 (PostgreSQL's split). An unrecognized format traps 22023.
@@ -27981,6 +28016,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfQuoteLiteral:
 			// quote_literal(text) → text — wrap as a SQL string literal.
 			return TextValue(quoteLiteralText(vals[0].Str)), nil
+		case sfQuoteIdent:
+			// quote_ident(text) → text — wrap as a SQL identifier.
+			return TextValue(quoteIdentText(vals[0].Str)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

@@ -586,6 +586,23 @@ function quoteLiteralText(s: string): string {
   return hasBackslash ? `E'${inner}'` : `'${inner}'`;
 }
 
+// quoteIdentText is quote_ident(s) (string-functions.md §3): wrap s as a SQL identifier — returned
+// unchanged if it is already a safe unquoted identifier (^[a-z_][a-z0-9_]*$), else double-quoted
+// with each internal " doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword
+// quoting (jed has no enumerated keyword set), a documented divergence from PostgreSQL.
+function quoteIdentText(s: string): string {
+  let safe = s.length > 0;
+  for (let i = 0; i < s.length && safe; i++) {
+    const code = s.charCodeAt(i);
+    const lower = code === 95 || (code >= 97 && code <= 122); // '_' or a-z
+    safe = i === 0 ? lower : lower || (code >= 48 && code <= 57); // + 0-9 after the first
+  }
+  if (safe) return s;
+  let out = '"';
+  for (const c of s) out += c === '"' ? '""' : c;
+  return out + '"';
+}
+
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
 // ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
 // 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
@@ -12919,7 +12936,9 @@ type ScalarFuncName =
   // decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
   | "decode"
   // quote_literal(text) → text — wrap as a SQL string literal (§3).
-  | "quote_literal";
+  | "quote_literal"
+  // quote_ident(text) → text — wrap as a SQL identifier (§3).
+  | "quote_ident";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24845,6 +24864,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "quote_literal") {
         // quote_literal(text) → text — wrap as a SQL string literal.
         return textValue(quoteLiteralText((vals[0] as { text: string }).text));
+      }
+      if (e.func === "quote_ident") {
+        // quote_ident(text) → text — wrap as a SQL identifier.
+        return textValue(quoteIdentText((vals[0] as { text: string }).text));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

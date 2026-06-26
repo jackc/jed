@@ -781,3 +781,25 @@ query T
 SELECT quote_literal(NULL::text)
 ----
 NULL
+
+# === quote_ident(text) → text: wrap as a SQL identifier ===============================
+
+# a safe lowercase identifier is returned unchanged; otherwise it is double-quoted
+query T
+SELECT quote_ident('foo'), quote_ident('Foo'), quote_ident('foo bar')
+----
+foo
+"Foo"
+"foo bar"
+
+# an internal double-quote is doubled
+query T
+SELECT quote_ident('a"b')
+----
+"a""b"
+
+# STRICT: NULL → NULL
+query T
+SELECT quote_ident(NULL::text)
+----
+NULL
