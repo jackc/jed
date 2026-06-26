@@ -3359,6 +3359,18 @@ result         = "text"
 null           = "propagates"
 errors         = ["54000"]
 
+# reverse(text) → text — the characters (code points) in reverse order. reverse('abc') = 'cba'. A
+# code-point reversal (not bytes / UTF-16 units — an astral char stays intact). NULL args propagate.
+[[operator]]
+name           = "reverse"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

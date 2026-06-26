@@ -15943,6 +15943,8 @@ const (
 	sfTranslate
 	// repeat(text, n) → text — the string concatenated n times; over-large result traps 54000 (§3).
 	sfRepeat
+	// reverse(text) → text — the code points in reverse order (§3).
+	sfReverse
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19544,6 +19546,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfTranslate
 	case "repeat":
 		return sfRepeat
+	case "reverse":
+		return sfReverse
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27558,6 +27562,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
+		case sfReverse:
+			// reverse(text) → text — the code points in reverse order.
+			runes := []rune(vals[0].Str)
+			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+				runes[i], runes[j] = runes[j], runes[i]
+			}
+			return TextValue(string(runes)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

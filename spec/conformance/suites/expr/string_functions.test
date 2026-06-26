@@ -464,3 +464,32 @@ SELECT repeat(NULL::text, 3), repeat('x', NULL::int)
 ----
 NULL
 NULL
+
+# === reverse(text) → text: the code points in reverse order ===========================
+
+query T
+SELECT reverse('abc')
+----
+cba
+
+# code-point reversal: a multibyte char stays whole
+query T
+SELECT reverse('héllo')
+----
+olléh
+
+# an astral character (😀) reverses as ONE code point, not two UTF-16 units
+query T
+SELECT reverse('a😀b')
+----
+b😀a
+
+query B
+SELECT reverse('') = ''
+----
+true
+
+query T
+SELECT reverse(NULL::text)
+----
+NULL

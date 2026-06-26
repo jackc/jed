@@ -12678,7 +12678,9 @@ type ScalarFuncName =
   // translate(text, from, to) → text — per-character map/delete by position in `from`/`to` (§3).
   | "translate"
   // repeat(text, n) → text — the string concatenated n times; over-large result traps 54000 (§3).
-  | "repeat";
+  | "repeat"
+  // reverse(text) → text — the code points in reverse order (§3).
+  | "reverse";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24541,6 +24543,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // repeat(text, n) → text — concatenate the string n times.
         const s = (vals[0] as { text: string }).text;
         return textValue(repeatText(s, (vals[1] as { int: bigint }).int));
+      }
+      if (e.func === "reverse") {
+        // reverse(text) → text — the code points in reverse order. [...s] splits by code point
+        // (not UTF-16 unit), so an astral character stays intact (string-functions.md §2).
+        const s = (vals[0] as { text: string }).text;
+        return textValue([...s].reverse().join(""));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

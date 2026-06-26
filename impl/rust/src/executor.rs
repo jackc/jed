@@ -13062,6 +13062,8 @@ enum ScalarFunc {
     Translate,
     /// repeat(text, n) → text — the string concatenated n times; over-large result traps 54000 (§3).
     Repeat,
+    /// reverse(text) → text — the code points in reverse order (§3).
+    Reverse,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19097,6 +19099,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "replace" => ScalarFunc::Replace,
         "translate" => ScalarFunc::Translate,
         "repeat" => ScalarFunc::Repeat,
+        "reverse" => ScalarFunc::Reverse,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30504,6 +30507,11 @@ impl RExpr {
                         };
                         Ok(Value::Text(repeat_text(s, int_value(&vals[1]))?))
                     }
+                    // reverse(text) → text — the code points in reverse order.
+                    ScalarFunc::Reverse => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Text(s.chars().rev().collect())),
+                        _ => unreachable!("resolver restricts reverse to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31385,7 +31393,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Rtrim
         | ScalarFunc::Replace
         | ScalarFunc::Translate
-        | ScalarFunc::Repeat => {
+        | ScalarFunc::Repeat
+        | ScalarFunc::Reverse => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

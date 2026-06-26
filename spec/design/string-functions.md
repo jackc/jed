@@ -183,3 +183,10 @@ size (`n · byte_length(s)`) would exceed `MAX_RESULT_CHARS` (PG's `MaxAllocSize
 (`program_limit_exceeded`) — the cap is computed without overflowing (`checked_mul` / a division-form
 bound). The byte-size basis (not code points) matches `len(s)` / `s.len()` / `utf8ByteLength(s)`
 across cores, so the cap fires identically. NULL args propagate.
+
+### `reverse(text) → text`
+
+The characters (code points) in reverse order: `reverse('abc') = 'cba'`, `reverse('héllo') = 'olléh'`.
+Reverses the **code-point** sequence, not the bytes nor the UTF-16 units — so an astral character
+stays intact (`reverse('a😀b') = 'b😀a'`; a naïve TS `s.split('').reverse()` would break the
+surrogate pair, the §2 trap). NULL args propagate.
