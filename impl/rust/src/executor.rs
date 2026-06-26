@@ -13036,6 +13036,8 @@ enum ScalarFunc {
     Length,
     /// octet_length(text) → i32 — the number of UTF-8 bytes. octet_length('héllo') = 6.
     OctetLength,
+    /// bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
+    BitLength,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19059,6 +19061,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         // SQL-standard aliases of length (same code-point-count kernel).
         "length" | "char_length" | "character_length" => ScalarFunc::Length,
         "octet_length" => ScalarFunc::OctetLength,
+        "bit_length" => ScalarFunc::BitLength,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30344,6 +30347,11 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Int(s.len() as i64)),
                         _ => unreachable!("resolver restricts octet_length to text"),
                     },
+                    // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
+                    ScalarFunc::BitLength => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Int(s.len() as i64 * 8)),
+                        _ => unreachable!("resolver restricts bit_length to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31213,7 +31221,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::JsonScalar
         | ScalarFunc::JsonSerialize
         | ScalarFunc::Length
-        | ScalarFunc::OctetLength => {
+        | ScalarFunc::OctetLength
+        | ScalarFunc::BitLength => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

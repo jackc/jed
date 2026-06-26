@@ -12527,7 +12527,9 @@ type ScalarFuncName =
   // UTF-8 bytes (via TextEncoder). length(text) → i32 — the number of characters. length('héllo') = 5.
   | "length"
   // octet_length(text) → i32 — the number of UTF-8 bytes (utf8ByteLength). octet_length('héllo') = 6.
-  | "octet_length";
+  | "octet_length"
+  // bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
+  | "bit_length";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24317,6 +24319,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // octet_length(text) → i32 — the UTF-8 byte count, distinct from length's code-point
         // count (string-functions.md §3). utf8ByteLength encodes via TextEncoder.
         return intValue(BigInt(utf8ByteLength((vals[0] as { text: string }).text)));
+      }
+      if (e.func === "bit_length") {
+        // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
+        return intValue(BigInt(utf8ByteLength((vals[0] as { text: string }).text) * 8));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

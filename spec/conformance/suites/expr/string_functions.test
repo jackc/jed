@@ -101,3 +101,17 @@ SELECT octet_length(''), octet_length('abc'), octet_length(NULL::text)
 0
 3
 NULL
+
+# === bit_length(text) → int: UTF-8 bits = octet_length × 8 =============================
+
+query I
+SELECT bit_length('héllo')
+----
+48
+
+query I
+SELECT bit_length('abc'), bit_length(''), bit_length(NULL::text)
+----
+24
+0
+NULL

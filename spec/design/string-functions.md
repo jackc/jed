@@ -72,3 +72,8 @@ two bytes), `octet_length('') = 0`, `octet_length('😀') = 4`. The byte counter
 `len(s)`); TS computes it through the shared UTF-8 encoder (`utf8ByteLength`), since a JS
 string is UTF-16 and `.length` would be neither bytes nor code points. PostgreSQL also
 defines `octet_length(bytea)`; jed implements the `text` overload.
+
+### `bit_length(text) → int`
+
+The number of **bits** in the UTF-8 encoding — `octet_length × 8`. `bit_length('héllo') = 48`,
+`bit_length('') = 0`. Same code path as `octet_length`, multiplied by eight.

@@ -15917,6 +15917,8 @@ const (
 	sfLength
 	// octet_length(text) → i32 — the number of UTF-8 bytes. octet_length('héllo') = 6.
 	sfOctetLength
+	// bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
+	sfBitLength
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19494,6 +19496,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfLength
 	case "octet_length":
 		return sfOctetLength
+	case "bit_length":
+		return sfBitLength
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27229,6 +27233,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// octet_length(text) → i32 — the UTF-8 byte count (len of the Go string's bytes),
 			// distinct from length's code-point count (string-functions.md §3).
 			return IntValue(int64(len(vals[0].Str))), nil
+		case sfBitLength:
+			// bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
+			return IntValue(int64(len(vals[0].Str)) * 8), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
