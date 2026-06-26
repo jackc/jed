@@ -357,6 +357,10 @@ id = "query.ordered_set_nonconstant_fraction"
 description = "A non-constant ordered-set-aggregate fraction (aggregates.md §17): the direct argument of percentile_cont / percentile_disc may be any numeric expression over GROUPING columns (not just a literal), evaluated once per group against the group's key values. percentile_cont(p) / percentile_disc(1-p) WITHIN GROUP (ORDER BY v) GROUP BY p uses each group's own fraction. A non-grouped column in the direct argument is 42803 (PG: direct arguments must use only grouped columns); an aggregate inside it is 42803; a non-numeric fraction is 42883. A NULL fraction still yields NULL and an out-of-range fraction still 22003, per group. Builds on query.ordered_set_aggregate"
 
 [[capability]]
+id = "query.ordered_set_array_fraction"
+description = "An array-valued ordered-set fraction (aggregates.md §18): percentile_cont(ARRAY[...]) / percentile_disc(ARRAY[...]) computes one percentile per array element and returns an array (f64[] for percentile_cont numeric, input-type[] for percentile_disc, interval[] for percentile_cont over interval), in element order. A NULL element yields a NULL element; every non-NULL element is range-checked (22003) BEFORE the empty-group check; an empty/all-NULL group yields NULL (the whole result, not an array of NULLs). The array element type must be numeric. Builds on query.ordered_set_aggregate"
+
+[[capability]]
 id = "query.ordered_set_interval"
 description = "percentile_cont over an INTERVAL WITHIN GROUP input (aggregates.md §13): the continuous percentile is interpolated in the interval domain (PG interval_lerp = lo + (hi-lo)*pct, with interval_mul's exact field cascade + microsecond rounding, byte-identical to PG) and the result is interval, not f64. Values are sorted by the canonical interval span. mode()/percentile_disc already accept interval (any sortable type). Builds on query.ordered_set_aggregate + types.interval"
 

@@ -355,6 +355,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // percentile_cont over an interval WITHIN GROUP input — interpolated in the interval domain
     // (PG interval_lerp), result interval (spec/design/aggregates.md §13).
     "query.ordered_set_interval",
+    // An array-valued percentile_*(ARRAY[...]) fraction — one percentile per element, result an
+    // array (spec/design/aggregates.md §18).
+    "query.ordered_set_array_fraction",
     // Window functions — OVER (PARTITION BY / ORDER BY), the window stage, row_number() (S0,
     // spec/design/window.md).
     "query.window",

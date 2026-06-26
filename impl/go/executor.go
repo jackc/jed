@@ -17570,84 +17570,109 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		}
 		return vals[bestIdx], nil
 	case planPercentileDisc:
-		// The per-group fraction (the direct argument, aggregates.md §13/§17). A NULL fraction →
-		// NULL (checked before the range check); out of [0,1]/NaN → 22003.
-		p, err := fractionToF64(a.osaFrac)
-		if err != nil {
-			return NullValue(), err
-		}
-		if p == nil {
-			return NullValue(), nil
-		}
-		if err := checkPercentileFraction(*p); err != nil {
-			return NullValue(), err
-		}
+		// percentile_disc: an actual sorted value at row ceil(p·N). The fraction may be a scalar or
+		// an array (aggregates.md §18); finalizePercentile dispatches and applies the NULL /
+		// range-check / empty rules per PG, computing each percentile over the sorted vals.
 		vals := a.osaVals
-		if len(vals) == 0 {
-			return NullValue(), nil
-		}
 		sort.SliceStable(vals, func(i, j int) bool {
 			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
 		})
-		return percentileDiscAt(vals, *p), nil
+		return finalizePercentile(a.osaFrac, len(vals) == 0, func(p float64) (Value, error) {
+			return percentileDiscAt(vals, p), nil
+		})
 	case planPercentileCont:
-		p, err := fractionToF64(a.osaFrac)
-		if err != nil {
-			return NullValue(), err
-		}
-		if p == nil {
-			return NullValue(), nil
-		}
-		if err := checkPercentileFraction(*p); err != nil {
-			return NullValue(), err
-		}
 		fs := a.osaFloats
-		if len(fs) == 0 {
-			return NullValue(), nil
-		}
 		sort.SliceStable(fs, func(i, j int) bool {
 			return dirCmp(floatTotalCmp(fs[i], fs[j]), desc) < 0
 		})
-		return Float64Value(percentileContAt(fs, *p)), nil
+		return finalizePercentile(a.osaFrac, len(fs) == 0, func(p float64) (Value, error) {
+			return Float64Value(percentileContAt(fs, p)), nil
+		})
 	case planPercentileContInterval:
 		// percentile_cont over interval input: interpolate in the interval domain (PG interval_lerp
-		// — aggregates.md §13). The fraction is f64; the bracketing values are intervals sorted by
-		// their canonical span (the WITHIN GROUP order).
-		p, err := fractionToF64(a.osaFrac)
-		if err != nil {
-			return NullValue(), err
-		}
-		if p == nil {
-			return NullValue(), nil
-		}
-		if err := checkPercentileFraction(*p); err != nil {
-			return NullValue(), err
-		}
+		// — aggregates.md §13). Values are sorted by their canonical span.
 		vals := a.osaVals
-		if len(vals) == 0 {
-			return NullValue(), nil
-		}
 		sort.SliceStable(vals, func(i, j int) bool {
 			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
 		})
-		n := len(vals)
-		pos := *p * float64(n-1)
-		first := int(math.Floor(pos))
-		second := int(math.Ceil(pos))
-		lo := expectInterval(vals[first])
-		if first == second {
-			return IntervalValue(lo), nil
-		}
-		hi := expectInterval(vals[second])
-		proportion := pos - float64(first)
-		r, err := intervalLerp(lo, hi, proportion)
-		if err != nil {
-			return NullValue(), err
-		}
-		return IntervalValue(r), nil
+		return finalizePercentile(a.osaFrac, len(vals) == 0, func(p float64) (Value, error) {
+			n := len(vals)
+			pos := p * float64(n-1)
+			first := int(math.Floor(pos))
+			second := int(math.Ceil(pos))
+			lo := expectInterval(vals[first])
+			if first == second {
+				return IntervalValue(lo), nil
+			}
+			hi := expectInterval(vals[second])
+			r, err := intervalLerp(lo, hi, pos-float64(first))
+			if err != nil {
+				return NullValue(), err
+			}
+			return IntervalValue(r), nil
+		})
 	default:
 		panic("finalizeOrderedSet called for a non-ordered-set plan")
 	}
+}
+
+// finalizePercentile applies the percentile fraction (scalar or array) to a sorted group, computing
+// each percentile via compute (spec/design/aggregates.md §13/§18). PG's check order is preserved: a
+// scalar None/NULL fraction → NULL; otherwise the range check (22003) fires per fraction BEFORE the
+// empty-group check; an empty/all-NULL group → NULL (the whole result, even for an array). For an
+// array fraction the result is an array with one percentile per element (a NULL element → a NULL
+// element), after every non-NULL element has passed the range check.
+func finalizePercentile(frac *Value, empty bool, compute func(p float64) (Value, error)) (Value, error) {
+	if frac == nil || frac.IsNull() {
+		return NullValue(), nil
+	}
+	if frac.Kind == ValArray {
+		// Range-check every non-NULL element FIRST (before the empty-group check, PG).
+		fracs := make([]*float64, 0, len(frac.Array.Elements))
+		for i := range frac.Array.Elements {
+			el := frac.Array.Elements[i]
+			pf, err := fractionToF64(&el)
+			if err != nil {
+				return NullValue(), err
+			}
+			if pf != nil {
+				if err := checkPercentileFraction(*pf); err != nil {
+					return NullValue(), err
+				}
+			}
+			fracs = append(fracs, pf)
+		}
+		if empty {
+			return NullValue(), nil // an empty/all-NULL group → NULL (not an array of NULLs), PG
+		}
+		out := make([]Value, 0, len(fracs))
+		for _, pf := range fracs {
+			if pf == nil {
+				out = append(out, NullValue())
+				continue
+			}
+			v, err := compute(*pf)
+			if err != nil {
+				return NullValue(), err
+			}
+			out = append(out, v)
+		}
+		return ArrayValueOf(&ArrayVal{Dims: []int{len(out)}, Lbounds: []int32{1}, Elements: out}), nil
+	}
+	p, err := fractionToF64(frac)
+	if err != nil {
+		return NullValue(), err
+	}
+	if p == nil {
+		return NullValue(), nil
+	}
+	if err := checkPercentileFraction(*p); err != nil {
+		return NullValue(), err
+	}
+	if empty {
+		return NullValue(), nil
+	}
+	return compute(*p)
 }
 
 // expectInterval returns the Interval of a buffered ValInterval (a planPercentileContInterval group
@@ -19112,25 +19137,28 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 		}
 		plan, frac, result = planMode, nil, optype
 	case "percentile_disc":
-		f, err := resolveOsaFraction(s, name, fc.Args, ag, params)
+		// An ARRAY fraction (percentile_disc(ARRAY[…])) returns an array of percentiles, one per
+		// element; a scalar fraction returns one value (aggregates.md §18).
+		f, isArray, err := resolveOsaFraction(s, name, fc.Args, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		plan, frac, result = planPercentileDisc, f, optype
+		plan, frac, result = planPercentileDisc, f, arrayIf(optype, isArray)
 	case "percentile_cont":
 		// percentile_cont interpolates: over a NUMERIC input it widens to f64 and returns f64; over
 		// an INTERVAL input it interpolates in the interval domain (PG interval_lerp) and returns
 		// interval. Any other WITHIN GROUP type matches no overload (42883). The fraction resolves
-		// first (matching Rust's order) so an arity/type error on it is raised before the operand check.
-		f, err := resolveOsaFraction(s, name, fc.Args, ag, params)
+		// first (matching Rust's order) so an arity/type error on it is raised before the operand
+		// check. An ARRAY fraction makes the result an array of those percentiles (aggregates.md §18).
+		f, isArray, err := resolveOsaFraction(s, name, fc.Args, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		switch optype.kind {
 		case rtInt, rtDecimal, rtFloat32, rtFloat64:
-			plan, frac, result = planPercentileCont, f, resolvedType{kind: rtFloat64}
+			plan, frac, result = planPercentileCont, f, arrayIf(resolvedType{kind: rtFloat64}, isArray)
 		case rtInterval:
-			plan, frac, result = planPercentileContInterval, f, resolvedType{kind: rtInterval}
+			plan, frac, result = planPercentileContInterval, f, arrayIf(resolvedType{kind: rtInterval}, isArray)
 		default:
 			return nil, resolvedType{}, noAggOverload(name)
 		}
@@ -19157,33 +19185,53 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 }
 
 // resolveOsaFraction resolves an ordered-set aggregate's direct argument — the percentile fraction
-// (aggregates.md §13/§17). The fraction is evaluated **once per group**, so it may be any expression
-// over **grouping columns** (resolved here in the grouped agg context, so a grouping column binds
-// its synthetic key slot and a non-grouped column is 42803 — PG's "direct arguments … must use only
-// grouped columns"; a constant folds the usual way). An aggregate inside the fraction is 42803 (PG
-// forbids nesting). Resolved with a float hint so a bare numeric literal folds to f64. The returned
-// node is stored and evaluated per group at finalize. A non-numeric fraction or a wrong argument
-// count matches no overload (42883); a NULL fraction yields a NULL result at finalize.
-func resolveOsaFraction(s *scope, name string, args []*Expr, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+// (aggregates.md §13/§17/§18). The fraction is evaluated **once per group**, so it may be any
+// expression over **grouping columns** (resolved here in the grouped agg context, so a grouping
+// column binds its synthetic key slot and a non-grouped column is 42803 — PG's "direct arguments …
+// must use only grouped columns"; a constant folds the usual way). An aggregate inside the fraction
+// is 42803 (PG forbids nesting). Resolved with a float hint so a bare numeric literal folds to f64.
+// The returned node is stored and evaluated per group at finalize. Returns (node, isArray) — a
+// NUMERIC array fraction (percentile_cont(ARRAY[…])) computes one percentile per element and returns
+// an array (§18). A non-numeric fraction or a wrong argument count matches no overload (42883); a
+// NULL fraction yields a NULL result at finalize.
+func resolveOsaFraction(s *scope, name string, args []*Expr, ag *aggCtx, params *paramTypes) (*rExpr, bool, error) {
 	if len(args) != 1 {
-		return nil, noAggOverload(name) // wrong argument count
+		return nil, false, noAggOverload(name) // wrong argument count
 	}
 	// The fraction is evaluated before the fold (it is a direct argument, not an aggregate operand),
 	// so a nested aggregate is illegal — 42803, matching PG.
 	if exprHasAggregate(*args[0]) {
-		return nil, NewError(GroupingError, "aggregate function calls cannot be nested")
+		return nil, false, NewError(GroupingError, "aggregate function calls cannot be nested")
 	}
 	fl := Float64
 	rarg, rtype, err := resolve(s, *args[0], &fl, ag, params)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	switch rtype.kind {
 	case rtNull, rtFloat32, rtFloat64, rtInt, rtDecimal:
-		return rarg, nil
+		return rarg, false, nil
+	case rtArray:
+		// A NUMERIC array fraction returns an array of percentiles, one per element (§18); a
+		// non-numeric element matches no overload.
+		switch rtype.elem.kind {
+		case rtFloat32, rtFloat64, rtInt, rtDecimal:
+			return rarg, true, nil
+		default:
+			return nil, false, noAggOverload(name)
+		}
 	default:
-		return nil, noAggOverload(name) // a non-numeric fraction matches no overload
+		return nil, false, noAggOverload(name) // a non-numeric fraction matches no overload
 	}
+}
+
+// arrayIf returns Array(t) when isArray, else t — the result type of an ordered-set aggregate whose
+// direct argument is an array vs. a scalar fraction (aggregates.md §18).
+func arrayIf(t resolvedType, isArray bool) resolvedType {
+	if isArray {
+		return resolvedType{kind: rtArray, elem: &t}
+	}
+	return t
 }
 
 // resolveGrouping resolves GROUPING(c1, …, ck) (spec/design/aggregates.md §12) — the grouping-sets

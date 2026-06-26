@@ -276,6 +276,9 @@ var SupportedCapabilities = []string{
 	// percentile_cont over an interval WITHIN GROUP input — interpolated in the interval domain
 	// (PG interval_lerp), result interval (spec/design/aggregates.md §13).
 	"query.ordered_set_interval",
+	// An array-valued percentile_*(ARRAY[...]) fraction — one percentile per element, result an
+	// array (spec/design/aggregates.md §18).
+	"query.ordered_set_array_fraction",
 	// Window functions (OVER) — the window stage + row_number() (spec/design/window.md, S0). A
 	// window-only function without OVER is 42809; a window function in WHERE/HAVING is 42P20.
 	"query.window",

@@ -241,14 +241,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_
         `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate, and the
         ordered-set follow-ons (hypothetical-set aggregates `rank`/`dense_rank`/`percent_rank`/
-        `cume_dist` `WITHIN GROUP`, the array-valued `percentile_*` fraction, a collated
-        `WITHIN GROUP` key).
+        `cume_dist` `WITHIN GROUP`, a collated `WITHIN GROUP` key).
   - [x] **Non-constant ordered-set fraction** — `percentile_cont(expr)` / `percentile_disc(expr)`
         where `expr` references grouping columns, evaluated per group (a non-grouped column is `42803`).
         New capability `query.ordered_set_nonconstant_fraction`. → aggregates.md §17
   - [x] **Interval input to `percentile_cont`** — interpolated in the interval domain (PG
         `interval_lerp`/`interval_mul`, byte-identical incl. `rint` ties-to-even), result `interval`.
         New capability `query.ordered_set_interval`. → aggregates.md §13
+  - [x] **Array-valued `percentile_*` fraction** — `percentile_cont(ARRAY[…])` /
+        `percentile_disc(ARRAY[…])` computes one percentile per element, result an array (NULL element
+        → NULL element; range-check before empty; empty group → NULL). New capability
+        `query.ordered_set_array_fraction`. → aggregates.md §18
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
       optimization.** Per-row values folded over a related row set in a dedicated **window stage**
       (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/

@@ -544,3 +544,23 @@ columns** — evaluated **once per group** (a direct argument, *not* a per-row o
   metered cost is unchanged from a constant fraction — deterministic and cross-core identical.
 
 New capability `query.ordered_set_nonconstant_fraction`.
+
+## 18. An array-valued `percentile_*` fraction
+
+PostgreSQL's `percentile_cont` / `percentile_disc` accept an **array** of fractions, computing one
+percentile per element and returning an **array** — `percentile_cont(ARRAY[0.25, 0.5, 0.75]) WITHIN
+GROUP (ORDER BY v)` returns the quartiles as `float8[]`. jed matches:
+
+- The direct argument may be a numeric **array** (any of the §17 forms, but array-typed); the result
+  type becomes an **array** of the scalar result type — `float8[]` for `percentile_cont` over numeric,
+  the input-type `[]` for `percentile_disc`, `interval[]` for `percentile_cont` over interval (§13).
+- The group is sorted **once**; each array element yields one percentile, in element order. A **NULL
+  element** yields a **NULL element** in the result (it is not the whole-result NULL of a scalar NULL
+  fraction). Every **non-NULL** element is range-checked (`22003`) **before** the empty-group check
+  (PG's order), so an out-of-range element fails the whole statement.
+- An **empty / all-NULL** group yields **NULL** — the *whole* result, not an array of NULLs (PG).
+
+The array fraction reuses the §17 per-group evaluation (the direct argument is evaluated against the
+group's key values) and the same `percentile_disc` / `percentile_cont` / `interval_lerp` kernels, so
+it composes with the non-constant fraction and the interval input. New capability
+`query.ordered_set_array_fraction`.

@@ -14598,44 +14598,70 @@ function finalizeOrderedSet(a: Acc): Value {
     return vals[bestIdx]!;
   }
   if (a.plan === "percentileDisc") {
-    // The per-group fraction (the direct argument, aggregates.md §13/§17). A NULL fraction → NULL
-    // (checked before the range check); out of [0,1]/NaN → 22003.
-    const p = fractionToF64(a.osaFrac);
-    if (p === null) return nullValue();
-    checkPercentileFraction(p);
+    // percentile_disc: an actual sorted value at row ceil(p·N). The fraction may be a scalar or an
+    // array (aggregates.md §18); finalizePercentile dispatches and applies the NULL / range-check /
+    // empty rules per PG, computing each percentile over the sorted vals.
     const vals = a.osaVals!;
-    if (vals.length === 0) return nullValue();
     vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
-    return percentileDiscAt(vals, p);
+    return finalizePercentile(a.osaFrac, vals.length === 0, (p) => percentileDiscAt(vals, p));
   }
   if (a.plan === "orderedSetContInterval") {
     // percentile_cont over interval input: interpolate in the interval domain (PG interval_lerp —
-    // aggregates.md §13). The fraction is f64; the bracketing values are intervals sorted by their
-    // canonical span (the WITHIN GROUP order).
-    const p = fractionToF64(a.osaFrac);
-    if (p === null) return nullValue();
-    checkPercentileFraction(p);
+    // aggregates.md §13). Values are sorted by their canonical span (the WITHIN GROUP order).
     const vals = a.osaVals!;
-    if (vals.length === 0) return nullValue();
     vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
-    const n = vals.length;
-    const pos = p * (n - 1);
-    const first = Math.floor(pos);
-    const second = Math.ceil(pos);
-    const lo = expectInterval(vals[first]!);
-    if (first === second) return intervalValue(lo);
-    const hi = expectInterval(vals[second]!);
-    const proportion = pos - first;
-    return intervalValue(intervalLerp(lo, hi, proportion));
+    return finalizePercentile(a.osaFrac, vals.length === 0, (p) => {
+      const n = vals.length;
+      const pos = p * (n - 1);
+      const first = Math.floor(pos);
+      const second = Math.ceil(pos);
+      const lo = expectInterval(vals[first]!);
+      if (first === second) return intervalValue(lo);
+      const hi = expectInterval(vals[second]!);
+      return intervalValue(intervalLerp(lo, hi, pos - first));
+    });
   }
   // percentileCont
-  const p = fractionToF64(a.osaFrac);
+  const fs = a.osaFloats!;
+  fs.sort((x, y) => dirCmp(floatTotalCmp(x, y), desc));
+  return finalizePercentile(a.osaFrac, fs.length === 0, (p) =>
+    float64Value(percentileContAt(fs, p)),
+  );
+}
+
+// finalizePercentile applies the percentile fraction (scalar or array) to a sorted group, computing
+// each percentile via compute (spec/design/aggregates.md §13/§18). PG's check order is preserved: a
+// scalar null/NULL fraction → NULL; otherwise the range check (22003) fires per fraction BEFORE the
+// empty-group check; an empty/all-NULL group → NULL (the whole result, even for an array). For an
+// array fraction the result is an array with one percentile per element (a NULL element → a NULL
+// element), after every non-NULL element has passed the range check.
+function finalizePercentile(
+  frac: Value | null | undefined,
+  empty: boolean,
+  compute: (p: number) => Value,
+): Value {
+  if (frac === null || frac === undefined || frac.kind === "null") return nullValue();
+  if (frac.kind === "array") {
+    // Range-check every non-NULL element FIRST (before the empty-group check, PG).
+    const fracs: (number | null)[] = [];
+    for (const el of frac.elements) {
+      const pf = fractionToF64(el);
+      if (pf !== null) checkPercentileFraction(pf);
+      fracs.push(pf);
+    }
+    if (empty) return nullValue(); // an empty/all-NULL group → NULL (not an array of NULLs), PG
+    const out: Value[] = [];
+    for (const pf of fracs) {
+      out.push(pf === null ? nullValue() : compute(pf));
+    }
+    const n = out.length;
+    return { kind: "array", dims: [n], lbounds: [1], elements: out };
+  }
+  const p = fractionToF64(frac);
   if (p === null) return nullValue();
   checkPercentileFraction(p);
-  const fs = a.osaFloats!;
-  if (fs.length === 0) return nullValue();
-  fs.sort((x, y) => dirCmp(floatTotalCmp(x, y), desc));
-  return float64Value(percentileContAt(fs, p));
+  if (empty) return nullValue();
+  return compute(p);
 }
 
 // expectInterval returns the Interval of a buffered interval Value (an orderedSetContInterval group
@@ -14666,7 +14692,8 @@ function fractionToF64(frac: Value | null | undefined): number | null {
 
 // percentileDiscAt computes percentile_disc over the already-sorted group values: the value at row
 // ceil(p·N) (1-based), i.e. the smallest K with K/N ≥ p (PG orderedsetaggs.c). Caller guarantees
-// non-empty + the fraction in range. spec/design/aggregates.md §13.
+// non-empty + the fraction in range. Reads vals non-destructively (returns the picked element by
+// reference, never removing it) so an array fraction can read it repeatedly. spec/design/aggregates.md §13.
 function percentileDiscAt(vals: Value[], p: number): Value {
   const n = vals.length;
   // PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
@@ -15573,20 +15600,25 @@ function resolveOrderedSetAggregate(
     frac = null;
     result = optype;
   } else if (name === "percentile_disc") {
-    frac = resolveOsaFraction(scope, name, e.args, ag, params);
+    // An ARRAY fraction (percentile_disc(ARRAY[…])) returns an array of percentiles, one per element;
+    // a scalar fraction returns one value (aggregates.md §18).
+    const f = resolveOsaFraction(scope, name, e.args, ag, params);
+    frac = f.node;
     plan = "percentileDisc";
-    result = optype;
+    result = arrayIf(optype, f.isArray);
   } else {
     // percentile_cont interpolates: over a NUMERIC input it widens to f64 and returns f64; over an
     // INTERVAL input it interpolates in the interval domain (PG interval_lerp) and returns interval.
-    // Any other WITHIN GROUP type matches no overload (42883).
-    frac = resolveOsaFraction(scope, name, e.args, ag, params);
+    // Any other WITHIN GROUP type matches no overload (42883). An ARRAY fraction makes the result an
+    // array of those percentiles (aggregates.md §18).
+    const f = resolveOsaFraction(scope, name, e.args, ag, params);
+    frac = f.node;
     if (optype.kind === "int" || optype.kind === "decimal" || optype.kind === "float") {
       plan = "percentileCont";
-      result = { kind: "float", ty: "f64" };
+      result = arrayIf({ kind: "float", ty: "f64" }, f.isArray);
     } else if (optype.kind === "interval") {
       plan = "orderedSetContInterval";
-      result = { kind: "interval" };
+      result = arrayIf({ kind: "interval" }, f.isArray);
     } else {
       throw noAggOverload(name);
     }
@@ -15615,15 +15647,17 @@ function resolveOrderedSetAggregate(
 // synthetic key slot and a non-grouped column is 42803 — PG's "direct arguments … must use only
 // grouped columns"; a constant folds the usual way). An aggregate inside the fraction is 42803 (PG
 // forbids nesting). Resolved with a float hint so a bare numeric literal folds to f64. The returned
-// node is stored and evaluated per group at finalize. A non-numeric fraction or a wrong argument
-// count matches no overload (42883); a NULL fraction yields a NULL result at finalize.
+// node is stored and evaluated per group at finalize. Returns { node, isArray } — a NUMERIC array
+// fraction (percentile_cont(ARRAY[…])) computes one percentile per element and returns an array (§18).
+// A non-numeric fraction or a wrong argument count matches no overload (42883); a NULL fraction yields
+// a NULL result at finalize.
 function resolveOsaFraction(
   scope: Scope,
   name: string,
   args: Expr[],
   ag: AggCtx,
   params: ParamTypes,
-): RExpr {
+): { node: RExpr; isArray: boolean } {
   if (args.length !== 1) throw noAggOverload(name); // wrong argument count
   // The fraction is evaluated before the fold (it is a direct argument, not an aggregate operand),
   // so a nested aggregate is illegal — 42803, matching PG.
@@ -15637,9 +15671,22 @@ function resolveOsaFraction(
     r.type.kind === "int" ||
     r.type.kind === "decimal"
   ) {
-    return r.node;
+    return { node: r.node, isArray: false };
+  }
+  // A NUMERIC array fraction returns an array of percentiles, one per element (aggregates.md §18).
+  if (
+    r.type.kind === "array" &&
+    (r.type.elem.kind === "float" || r.type.elem.kind === "int" || r.type.elem.kind === "decimal")
+  ) {
+    return { node: r.node, isArray: true };
   }
   throw noAggOverload(name); // a non-numeric fraction matches no overload
+}
+
+// arrayIf returns Array(t) when isArray, else t — the result type of an ordered-set aggregate whose
+// direct argument is an array vs. a scalar fraction (aggregates.md §18).
+function arrayIf(t: ResolvedType, isArray: boolean): ResolvedType {
+  return isArray ? { kind: "array", elem: t } : t;
 }
 
 // resolveGrouping resolves GROUPING(c1, …, ck) (spec/design/aggregates.md §12) — the grouping-sets

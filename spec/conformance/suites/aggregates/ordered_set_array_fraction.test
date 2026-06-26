@@ -1,0 +1,59 @@
+# An array-valued ordered-set fraction (spec/design/aggregates.md §18). percentile_cont(ARRAY[...]) /
+# percentile_disc(ARRAY[...]) computes one percentile per element and returns an array. A NULL element
+# yields a NULL element; every non-NULL element is range-checked (22003) before the empty-group check;
+# an empty/all-NULL group yields NULL (the whole result).
+# requires: ddl.create_table, dml.insert, query.select, query.aggregates, query.ordered_set_aggregate, query.ordered_set_array_fraction, query.ordered_set_interval, types.i32, types.f64, types.array, types.interval
+
+statement ok
+CREATE TABLE t (v i32)
+
+statement ok
+INSERT INTO t VALUES (10),(20),(30),(40),(50)
+
+# percentile_cont(ARRAY[0.25,0.5,0.75]) over [10,20,30,40,50] -> {20,30,40} (f64[]).
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v) FROM t
+----
+{20,30,40}
+
+# percentile_disc(ARRAY[0.0,0.5,1.0]) -> {10,30,50} (i32[]).
+# names: percentile_disc
+query T nosort
+SELECT percentile_disc(ARRAY[0.0,0.5,1.0]) WITHIN GROUP (ORDER BY v) FROM t
+----
+{10,30,50}
+
+# A NULL element yields a NULL element in the result array.
+# names: percentile_disc
+query T nosort
+SELECT percentile_disc(ARRAY[0.5,NULL]) WITHIN GROUP (ORDER BY v) FROM t
+----
+{30,NULL}
+
+# An out-of-range element raises 22003 (the range check fires per element).
+statement error 22003
+SELECT percentile_cont(ARRAY[0.5,1.5]) WITHIN GROUP (ORDER BY v) FROM t
+
+# An empty group with an array fraction yields NULL (the whole result, not an array of NULLs).
+statement ok
+CREATE TABLE e (v i32)
+
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(ARRAY[0.25,0.5]) WITHIN GROUP (ORDER BY v) FROM e
+----
+NULL
+
+# Array fraction over an INTERVAL input -> interval[].
+statement ok
+CREATE TABLE iv (d interval)
+
+statement ok
+INSERT INTO iv VALUES ('1 day'),('3 days'),('5 days')
+
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(ARRAY[0.0,0.5,1.0]) WITHIN GROUP (ORDER BY d) FROM iv
+----
+{"1 day","3 days","5 days"}

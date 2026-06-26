@@ -17684,54 +17684,89 @@ fn finalize_ordered_set(
             Ok(vals.swap_remove(best_idx))
         }
         AggPlan::OrderedSetDisc => {
-            // The per-group fraction (the direct argument, aggregates.md §13/§17). A NULL fraction
-            // → NULL (checked before the range check); out of [0,1]/NaN → 22003.
-            let Some(p) = fraction_to_f64(frac)? else {
-                return Ok(Value::Null);
-            };
-            check_percentile_fraction(p)?;
-            if vals.is_empty() {
-                return Ok(Value::Null);
-            }
+            // percentile_disc: an actual sorted value at row ceil(p·N). The fraction may be a scalar
+            // or an array (aggregates.md §18); `finalize_percentile` dispatches and applies the
+            // NULL / range-check / empty rules per PG, computing each percentile over the sorted vals.
             vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
-            Ok(percentile_disc_at(&mut vals, p))
+            finalize_percentile(frac, vals.is_empty(), |p| Ok(percentile_disc_at(&vals, p)))
         }
         AggPlan::OrderedSetCont => {
-            let Some(p) = fraction_to_f64(frac)? else {
-                return Ok(Value::Null);
-            };
-            check_percentile_fraction(p)?;
-            if floats.is_empty() {
-                return Ok(Value::Null);
-            }
             floats.sort_by(|a, b| dir_cmp(crate::value::total_cmp_f64(*a, *b), desc));
-            Ok(Value::Float64(percentile_cont_at(&floats, p)))
+            finalize_percentile(frac, floats.is_empty(), |p| {
+                Ok(Value::Float64(percentile_cont_at(&floats, p)))
+            })
         }
         AggPlan::OrderedSetContInterval => {
             // percentile_cont over interval input: interpolate in the interval domain (PG
-            // `interval_lerp` — aggregates.md §13). The fraction is f64; the bracketing values are
-            // intervals sorted by their canonical span (the WITHIN GROUP order).
-            let Some(p) = fraction_to_f64(frac)? else {
+            // `interval_lerp` — aggregates.md §13). Values are sorted by their canonical span.
+            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            finalize_percentile(frac, vals.is_empty(), |p| {
+                let n = vals.len();
+                let pos = p * ((n - 1) as f64);
+                let first = pos.floor() as usize;
+                let second = pos.ceil() as usize;
+                let lo = expect_interval(&vals[first]);
+                if first == second {
+                    return Ok(Value::Interval(lo));
+                }
+                let hi = expect_interval(&vals[second]);
+                Ok(Value::Interval(interval_lerp(lo, hi, pos - first as f64)?))
+            })
+        }
+        _ => unreachable!("finalize_ordered_set is only called for the ordered-set plans"),
+    }
+}
+
+/// Apply the percentile fraction (scalar or array) to a sorted group, computing each percentile via
+/// `compute` (spec/design/aggregates.md §13/§18). PG's check order is preserved: a **scalar** NULL
+/// fraction → NULL; otherwise the range check (`22003`) fires per fraction **before** the empty-group
+/// check; an empty/all-NULL group → NULL (the whole result, even for an array). For an **array**
+/// fraction the result is an array with one percentile per element (a NULL element → a NULL element),
+/// after every non-NULL element has passed the range check.
+fn finalize_percentile(
+    frac: Option<&Value>,
+    empty: bool,
+    compute: impl Fn(f64) -> Result<Value>,
+) -> Result<Value> {
+    match frac {
+        None | Some(Value::Null) => Ok(Value::Null),
+        Some(Value::Array(arr)) => {
+            // Range-check every non-NULL element FIRST (before the empty-group check, PG).
+            let mut fracs: Vec<Option<f64>> = Vec::with_capacity(arr.elements.len());
+            for el in &arr.elements {
+                let pf = fraction_to_f64(Some(el))?;
+                if let Some(p) = pf {
+                    check_percentile_fraction(p)?;
+                }
+                fracs.push(pf);
+            }
+            if empty {
+                return Ok(Value::Null); // an empty/all-NULL group → NULL (not an array of NULLs), PG
+            }
+            let mut out = Vec::with_capacity(fracs.len());
+            for pf in fracs {
+                out.push(match pf {
+                    Some(p) => compute(p)?,
+                    None => Value::Null,
+                });
+            }
+            let n = out.len();
+            Ok(Value::Array(crate::value::ArrayVal {
+                dims: vec![n],
+                lbounds: vec![1],
+                elements: out,
+            }))
+        }
+        Some(scalar) => {
+            let Some(p) = fraction_to_f64(Some(scalar))? else {
                 return Ok(Value::Null);
             };
             check_percentile_fraction(p)?;
-            if vals.is_empty() {
+            if empty {
                 return Ok(Value::Null);
             }
-            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
-            let n = vals.len();
-            let pos = p * ((n - 1) as f64);
-            let first = pos.floor() as usize;
-            let second = pos.ceil() as usize;
-            let lo = expect_interval(&vals[first]);
-            if first == second {
-                return Ok(Value::Interval(lo));
-            }
-            let hi = expect_interval(&vals[second]);
-            let proportion = pos - first as f64;
-            Ok(Value::Interval(interval_lerp(lo, hi, proportion)?))
+            compute(p)
         }
-        _ => unreachable!("finalize_ordered_set is only called for the ordered-set plans"),
     }
 }
 
@@ -17839,13 +17874,14 @@ fn fraction_to_f64(frac: Option<&Value>) -> Result<Option<f64>> {
 
 /// `percentile_disc` over the already-sorted group values: the value at row `ceil(p·N)` (1-based),
 /// i.e. the smallest `K` with `K/N ≥ p` (PG `orderedsetaggs.c`). Caller guarantees non-empty + the
-/// fraction in range. spec/design/aggregates.md §13.
-fn percentile_disc_at(vals: &mut Vec<Value>, p: f64) -> Value {
+/// fraction in range. Takes `&[Value]` (clones the picked value) so an array fraction can read it
+/// repeatedly. spec/design/aggregates.md §13.
+fn percentile_disc_at(vals: &[Value], p: f64) -> Value {
     let n = vals.len();
     let rownum = (p * n as f64).ceil() as i64;
     let idx = if rownum < 1 { 0 } else { (rownum - 1) as usize };
     let idx = idx.min(n - 1);
-    vals.swap_remove(idx)
+    vals[idx].clone()
 }
 
 /// `percentile_cont` over the already-sorted f64 group values: interpolate between the two bracketing
@@ -20419,24 +20455,28 @@ fn resolve_ordered_set_aggregate(
             (AggPlan::OrderedSetMode, None, optype.clone())
         }
         "percentile_disc" => {
-            let frac = resolve_osa_fraction(scope, &lname, args, agg, params)?;
-            (AggPlan::OrderedSetDisc, Some(frac), optype.clone())
+            // An ARRAY fraction (`percentile_disc(ARRAY[…])`) returns an array of percentiles, one
+            // per element; a scalar fraction returns one value (aggregates.md §18).
+            let (frac, is_array) = resolve_osa_fraction(scope, &lname, args, agg, params)?;
+            let result = array_if(optype.clone(), is_array);
+            (AggPlan::OrderedSetDisc, Some(frac), result)
         }
         "percentile_cont" => {
             // percentile_cont interpolates: over a NUMERIC input it widens to f64 and returns f64;
             // over an INTERVAL input it interpolates in the interval domain (PG `interval_lerp`) and
-            // returns interval. Any other WITHIN GROUP type matches no overload (42883).
-            let frac = resolve_osa_fraction(scope, &lname, args, agg, params)?;
+            // returns interval. Any other WITHIN GROUP type matches no overload (42883). An ARRAY
+            // fraction makes the result an array of those percentiles (aggregates.md §18).
+            let (frac, is_array) = resolve_osa_fraction(scope, &lname, args, agg, params)?;
             match optype {
                 ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Float(_) => (
                     AggPlan::OrderedSetCont,
                     Some(frac),
-                    ResolvedType::Float(ScalarType::Float64),
+                    array_if(ResolvedType::Float(ScalarType::Float64), is_array),
                 ),
                 ResolvedType::Interval => (
                     AggPlan::OrderedSetContInterval,
                     Some(frac),
-                    ResolvedType::Interval,
+                    array_if(ResolvedType::Interval, is_array),
                 ),
                 _ => return Err(no_agg_overload(&lname)),
             }
@@ -20507,15 +20547,17 @@ fn resolve_ordered_set_aggregate(
 /// synthetic key slot and a non-grouped column is `42803` — PG's *"direct arguments … must use only
 /// grouped columns"*); a constant folds the usual way. An aggregate inside the fraction is `42803`
 /// (PG forbids nesting). Resolved with a float hint so a bare numeric literal folds to `f64`. The
-/// returned node is stored and evaluated per group at finalize. A non-numeric fraction or a wrong
-/// argument count matches no overload (`42883`); a NULL fraction yields a NULL result at finalize.
+/// returned node is stored and evaluated per group at finalize. Returns `(node, is_array)` — a
+/// NUMERIC array fraction (`percentile_cont(ARRAY[…])`) computes one percentile per element and
+/// returns an array (§18). A non-numeric fraction or a wrong argument count matches no overload
+/// (`42883`); a NULL fraction yields a NULL result at finalize.
 fn resolve_osa_fraction(
     scope: &Scope,
     name: &str,
     args: &[Expr],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<RExpr> {
+) -> Result<(RExpr, bool)> {
     let [arg] = args else {
         return Err(no_agg_overload(name)); // wrong argument count
     };
@@ -20532,8 +20574,26 @@ fn resolve_osa_fraction(
         ResolvedType::Null
         | ResolvedType::Float(_)
         | ResolvedType::Int(_)
-        | ResolvedType::Decimal => Ok(rarg),
+        | ResolvedType::Decimal => Ok((rarg, false)),
+        ResolvedType::Array(elem)
+            if matches!(
+                *elem,
+                ResolvedType::Float(_) | ResolvedType::Int(_) | ResolvedType::Decimal
+            ) =>
+        {
+            Ok((rarg, true))
+        }
         _ => Err(no_agg_overload(name)), // a non-numeric fraction matches no overload
+    }
+}
+
+/// `Array(t)` when `is_array`, else `t` — the result type of an ordered-set aggregate whose direct
+/// argument is an array vs. a scalar fraction (aggregates.md §18).
+fn array_if(t: ResolvedType, is_array: bool) -> ResolvedType {
+    if is_array {
+        ResolvedType::Array(Box::new(t))
+    } else {
+        t
     }
 }
 
