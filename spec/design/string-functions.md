@@ -209,3 +209,11 @@ Split the string on the substring `delimiter` and return the `n`-th field (1-bas
 field — `split_part('a,b,c', '', 1) = 'a,b,c'` (the per-core `split("")` built-ins would instead
 split into characters, a cross-core trap, so it is special-cased). For a non-empty delimiter the
 field boundaries are a literal substring split, identical across cores. NULL args propagate.
+
+### `starts_with(text, prefix) → boolean`
+
+True iff the string begins with `prefix` (an empty prefix is always true):
+`starts_with('abcde', 'abc') = true`, `starts_with('abc', 'bc') = false`. A plain prefix check
+(`str::starts_with` / `strings.HasPrefix` / `String.startsWith`), encoding-agnostic, so the three
+cores agree directly. NULL args propagate. (jed has no `^@` operator spelling; the function is the
+only surface.)

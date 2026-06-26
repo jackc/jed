@@ -15949,6 +15949,8 @@ const (
 	sfStrpos
 	// split_part(text, delimiter, n) → text — the n-th field of the split; n=0 traps 22023 (§3).
 	sfSplitPart
+	// starts_with(text, prefix) → boolean — true iff the string begins with `prefix` (§3).
+	sfStartsWith
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19556,6 +19558,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfStrpos
 	case "split_part":
 		return sfSplitPart
+	case "starts_with":
+		return sfStartsWith
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27619,6 +27623,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
+		case sfStartsWith:
+			// starts_with(text, prefix) → boolean — string begins with prefix.
+			return BoolValue(strings.HasPrefix(vals[0].Str, vals[1].Str)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

@@ -3399,6 +3399,18 @@ result         = "text"
 null           = "propagates"
 errors         = ["22023"]
 
+# starts_with(text, prefix text) → boolean — true iff the string begins with `prefix` (an empty
+# prefix is always true). starts_with('abcde','abc') = true. NULL args propagate.
+[[operator]]
+name           = "starts_with"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

@@ -12697,7 +12697,9 @@ type ScalarFuncName =
   // strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
   | "strpos"
   // split_part(text, delimiter, n) → text — the n-th field of the split; n=0 traps 22023 (§3).
-  | "split_part";
+  | "split_part"
+  // starts_with(text, prefix) → boolean — true iff the string begins with `prefix` (§3).
+  | "starts_with";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24581,6 +24583,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const s = (vals[0] as { text: string }).text;
         const delim = (vals[1] as { text: string }).text;
         return textValue(splitPart(s, delim, (vals[2] as { int: bigint }).int));
+      }
+      if (e.func === "starts_with") {
+        // starts_with(text, prefix) → boolean — string begins with prefix.
+        const s = (vals[0] as { text: string }).text;
+        const pfx = (vals[1] as { text: string }).text;
+        return boolValue(s.startsWith(pfx));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

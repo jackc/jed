@@ -552,3 +552,19 @@ SELECT split_part(NULL::text, ',', 1), split_part('a,b', NULL::text, 1), split_p
 NULL
 NULL
 NULL
+
+# === starts_with(text, prefix) → boolean ==============================================
+
+query B
+SELECT starts_with('abcde', 'abc'), starts_with('abc', 'bc'), starts_with('abc', ''), starts_with('héllo', 'hé')
+----
+true
+false
+true
+true
+
+query B
+SELECT starts_with(NULL::text, 'a') IS NULL, starts_with('abc', NULL::text) IS NULL
+----
+true
+true
