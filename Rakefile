@@ -618,6 +618,31 @@ task :mutation, [:files, :n, :seed] do |_, args|
   Dir.chdir(GO_DIR) { sh("go", "run", "./cmd/mutate", "-json", File.join(dir, "go.jsonl"), *flags) { |_ok, _res| } }
 end
 
+# fuzz — coverage-guided fuzzing of the Go core's crash / corruption durability surface
+# (.scratch/testing-ideas.md §1 items 3 & 4; the §3 Go carve-out). The oracle is INTRINSIC — never
+# crash, never loop, fail closed (no differential needed) — so these live in Go, the maintainer's
+# `go test -fuzz` daily driver. Like bench/stress/mutation this is a slow EXPLORER, deliberately
+# OUTSIDE `rake ci`; the fuzz seed corpora still run inside `rake ci` via `unit:go` (every f.Add seed
+# executes under a plain `go test`), so the paths are covered there — `-fuzz` just explores wider.
+#   rake fuzz                 # both targets, 60s each
+#   rake fuzz[120s]           # both targets, 120s each
+#   rake 'fuzz:one[FuzzCorruptFile,300s]'   # one target, custom time
+GO_FUZZ_TARGETS = %w[FuzzCorruptFile FuzzCommitCrash].freeze
+namespace :fuzz do
+  desc "Fuzz one crash/corruption target: rake 'fuzz:one[<FuzzName>,<time>]' (default 60s)"
+  task :one, [:name, :time] do |_, args|
+    name = args[:name] or abort "usage: rake 'fuzz:one[FuzzCorruptFile,60s]'"
+    time = args[:time] || "60s"
+    puts "go:   go test -fuzz=^#{name}$ -fuzztime=#{time} (intrinsic oracle: no crash/hang, fail closed)"
+    Dir.chdir(GO_DIR) { sh "go", "test", "-run", "^$", "-fuzz", "^#{name}$", "-fuzztime", time, "./" }
+  end
+end
+desc "Run every crash/corruption fuzz target (default 60s each, OUTSIDE rake ci)"
+task :fuzz, [:time] do |_, args|
+  time = args[:time] || "60s"
+  GO_FUZZ_TARGETS.each { |name| Rake::Task["fuzz:one"].execute(Rake::TaskArguments.new(%i[name time], [name, time])) }
+end
+
 # conformance — the §7 contract: every core walks the hand-authored corpus
 # (spec/conformance/suites) and must produce identical pass/fail. This is the spine of the
 # project (CLAUDE.md §7/§10) — the example-based truth `rake test`/`rake ci` rest on. Each
