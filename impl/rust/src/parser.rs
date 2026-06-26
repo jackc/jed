@@ -2273,6 +2273,7 @@ impl Parser {
                     table,
                     on: None,
                     using: None,
+                    natural: false,
                     comma: true,
                 });
                 continue;
@@ -2638,8 +2639,19 @@ impl Parser {
     /// `ON` is 42601). The outer kinds (`LEFT`/`RIGHT`/`FULL [OUTER]`) parse into the AST but
     /// are rejected at execution (0A000) — spec/design/grammar.md §15.
     fn parse_join_clause(&mut self) -> Result<Option<JoinClause>> {
+        // An optional leading `NATURAL` (grammar.md §15) makes the join derive its USING column list
+        // from the common column names. It is non-reserved (`natural` is in the table-ref stop set so
+        // it is not swallowed as the prior relation's alias); once consumed it MUST be followed by a
+        // join (a `NATURAL CROSS JOIN` / bare `NATURAL <non-join>` is 42601), and takes no ON/USING.
+        let natural = self.peek_keyword().as_deref() == Some("natural");
+        if natural {
+            self.advance();
+        }
         let kw = match self.peek_keyword() {
             Some(k) => k,
+            None if natural => {
+                return Err(syntax("NATURAL must be followed by a join".to_string()));
+            }
             None => return Ok(None),
         };
         let (kind, is_cross) = match kw.as_str() {
@@ -2653,7 +2665,11 @@ impl Parser {
                 self.expect_keyword("join")?;
                 (JoinKind::Inner, false)
             }
+            // `NATURAL CROSS JOIN` is invalid (PostgreSQL): NATURAL implies a derived condition.
             "cross" => {
+                if natural {
+                    return Err(syntax("NATURAL CROSS JOIN is not allowed".to_string()));
+                }
                 self.advance();
                 self.expect_keyword("join")?;
                 (JoinKind::Cross, true)
@@ -2672,15 +2688,16 @@ impl Parser {
                 };
                 (kind, false)
             }
-            // Not a join keyword: the FROM chain ends here.
+            // After NATURAL a join keyword is required; otherwise the FROM chain just ends here.
+            _ if natural => return Err(syntax("NATURAL must be followed by a join".to_string())),
             _ => return Ok(None),
         };
         let table = self.parse_table_ref()?;
-        // A non-CROSS join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15). USING is
-        // not reserved (§3): it is the join condition only as the keyword immediately following the
-        // right table_ref (a bare `JOIN b ON …` / `JOIN b USING (…)`). The column list has one or
-        // more names; an empty list is a 42601.
-        let (on, using) = if is_cross {
+        // A non-CROSS, non-NATURAL join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15).
+        // A NATURAL join derives its condition (no ON/USING), and CROSS takes none. USING is not
+        // reserved (§3): it is the join condition only as the keyword immediately following the right
+        // table_ref. The column list has one or more names; an empty list is a 42601.
+        let (on, using) = if is_cross || natural {
             (None, None)
         } else if self.peek_keyword().as_deref() == Some("using") {
             self.advance();
@@ -2701,6 +2718,7 @@ impl Parser {
             table,
             on,
             using,
+            natural,
             comma: false,
         }))
     }
@@ -4475,6 +4493,9 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
             // USING introduces a join condition after the right table_ref (`JOIN b USING (k)`), so
             // it must not be swallowed as `b`'s implicit alias (grammar.md §15).
             | "using"
+            // NATURAL prefixes a join (`a NATURAL JOIN b`), so it must not be swallowed as the prior
+            // relation's alias (grammar.md §15).
+            | "natural"
             | "as"
             // set operators end a SELECT core — they must not be swallowed as an implicit table
             // alias (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.

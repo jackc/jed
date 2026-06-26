@@ -288,6 +288,10 @@ first, before the other columns). A bare `k` then refers to the merged column; `
 reach each side. It works with `LEFT`/`RIGHT` joins and multi-column lists; `FULL JOIN ... USING` is
 not yet supported.
 
+`NATURAL JOIN` is the shorthand: `a NATURAL JOIN b` joins on **every column the two tables share by
+name** (merging each, like `USING`). With no shared column it is a `CROSS JOIN`. It composes with
+`LEFT`/`RIGHT` (`a NATURAL LEFT JOIN b`); `NATURAL FULL JOIN` is not yet supported.
+
 ## Set-returning functions in `FROM`
 
 A `FROM` item can be a set-returning function — a computed row source instead of a stored table.

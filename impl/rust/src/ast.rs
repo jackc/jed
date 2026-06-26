@@ -582,12 +582,16 @@ pub struct JoinClause {
     pub table: TableRef,
     pub on: Option<Expr>,
     /// The `USING (col, …)` column list (spec/design/grammar.md §15), mutually exclusive with `on`
-    /// (a join has exactly one of `ON`/`USING`, or neither for `CROSS`/comma). Each named column
-    /// must exist in BOTH sides; the join matches on their equality and the output MERGES them into
-    /// a single column (`FULL JOIN ... USING` is a deferred `0A000`). `Some` only for a `USING` /
-    /// `NATURAL` join. `NATURAL` (commit 4) sets `natural` and leaves this `None` at parse, deriving
-    /// the common-column list at resolution.
+    /// (a join has exactly one of `ON`/`USING`, or neither for `CROSS`/comma/`NATURAL`). Each named
+    /// column must exist in BOTH sides; the join matches on their equality and the output MERGES
+    /// them into a single column (`FULL JOIN ... USING` is a deferred `0A000`). `Some` only for an
+    /// explicit `USING` join.
     pub using: Option<Vec<String>>,
+    /// `true` for a `NATURAL` join (spec/design/grammar.md §15): the USING column list is DERIVED at
+    /// resolution as the column names common to both sides (in left order), then the merge proceeds
+    /// exactly like `USING`. With no common column it degenerates to a `CROSS` join. Mutually
+    /// exclusive with `on`/`using` (a `NATURAL ... ON`/`USING` is `42601`).
+    pub natural: bool,
     /// `true` when this is the implicit `CROSS JOIN` synthesized from a **comma** in the FROM
     /// list (`FROM a, b` — grammar.md §15). The comma binds LOOSER than `JOIN`, so each
     /// comma-separated FROM item is its own ON-resolution segment: a later join's `ON` may not

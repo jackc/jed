@@ -10004,14 +10004,23 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 				segHidden = append(segHidden, i)
 			}
 		}
+		// A NATURAL join (grammar.md §15) derives its USING list as the column names common to both
+		// sides (left order); an explicit USING uses its written list. A NATURAL join with NO common
+		// column degenerates to a CROSS join (an empty list → no predicate, no merge).
+		var usingCols []string
+		if j.Using != nil {
+			usingCols = j.Using
+		} else if j.Natural {
+			usingCols = naturalCommonCols(rels, seg, k)
+		}
 		switch {
-		case j.Using != nil:
+		case len(usingCols) > 0:
 			if j.Kind == JoinFull {
-				return nil, NewError(FeatureNotSupported, "FULL JOIN with USING is not supported yet")
+				return nil, NewError(FeatureNotSupported, "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet")
 			}
 			left := &scope{rels: rels[seg : k+1], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
 			var predAST *Expr
-			for _, name := range j.Using {
+			for _, name := range usingCols {
 				lr, lerr := left.resolveBare(name)
 				if lerr != nil || lr.level != 0 {
 					return nil, NewError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in left table")
@@ -23512,6 +23521,30 @@ func (s *scope) columnAt(flat int) *Column {
 		}
 	}
 	panic("a resolved flat column index is always in range")
+}
+
+// naturalCommonCols is the USING column list a NATURAL join derives (grammar.md §15): the column
+// names common to the LEFT relations of the join (rels[seg:k+1]) and the right relation (rels[k+1]),
+// in LEFT order with each name taken once (its first occurrence). An empty result degenerates the
+// join to a CROSS join. (A merged column on the left keeps its underlying name, so a re-merge via a
+// NATURAL chain is found here too.)
+func naturalCommonCols(rels []scopeRel, seg, k int) []string {
+	right := &rels[k+1]
+	seen := map[string]bool{}
+	var out []string
+	for i := seg; i <= k; i++ {
+		for ci := range rels[i].table.Columns {
+			name := rels[i].table.Columns[ci].Name
+			lc := strings.ToLower(name)
+			if !seen[lc] {
+				seen[lc] = true
+				if right.table.ColumnIndex(name) >= 0 {
+					out = append(out, name)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // relOfIndex returns the (label, column-name) of the relation owning a flat row index — used to

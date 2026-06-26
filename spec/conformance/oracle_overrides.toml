@@ -1062,3 +1062,10 @@ reason = "jed: FULL JOIN ... USING is 0A000 (grammar.md §15). The merged column
 file = "joins/using.test"
 sql = "SELECT * FROM a JOIN tt USING(k)"
 reason = "jed: a USING column whose two sides have different types reaches jed's strict comparison, which rejects a mixed i32 = text pair as 42804 (types.md §4 — no implicit cast). PostgreSQL instead reports 42883 'operator does not exist: integer = text'. Same rejection (the join key types are incompatible), different SQLSTATE — jed's strict static type system is the documented default divergence (CLAUDE.md §4/§8)."
+
+# --- NATURAL FULL JOIN with a common column reuses the USING merge machinery, so it inherits the
+# same FULL-merge deferral as FULL JOIN USING (grammar.md §15).
+[[override]]
+file = "joins/natural.test"
+sql = "SELECT * FROM a NATURAL FULL JOIN b"
+reason = "jed: NATURAL FULL JOIN with a common column is 0A000 — its merged column is COALESCE(left, right), which jed's single-flat-index merge model does not carry (the same deferral as FULL JOIN USING, grammar.md §15). PostgreSQL supports it and returns the coalesced merge. A deliberate, relaxable narrowing."

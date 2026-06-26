@@ -327,6 +327,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.cross_join",
     "query.comma_from",
     "query.join_using",
+    "query.join_natural",
     "query.join_left",
     "query.join_right",
     "query.join_full",

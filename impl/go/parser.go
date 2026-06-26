@@ -2973,6 +2973,14 @@ func (p *Parser) parseValuesBody() ([][]*Expr, error) {
 // is 42601). The outer kinds (LEFT/RIGHT/FULL [OUTER]) parse into the AST but are rejected at
 // execution (0A000) — spec/design/grammar.md §15.
 func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
+	// An optional leading NATURAL (grammar.md §15) makes the join derive its USING list from the
+	// common column names. It is non-reserved (in the table-ref stop set so it is not swallowed as
+	// the prior relation's alias); once consumed it MUST be followed by a join (a NATURAL CROSS JOIN
+	// / bare NATURAL <non-join> is 42601), and takes no ON/USING.
+	natural := p.peekKeyword() == "natural"
+	if natural {
+		p.advance()
+	}
 	kw := p.peekKeyword()
 	var kind JoinKind
 	isCross := false
@@ -2987,6 +2995,9 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 		}
 		kind = JoinInner
 	case "cross":
+		if natural {
+			return JoinClause{}, false, NewError(SyntaxError, "NATURAL CROSS JOIN is not allowed")
+		}
 		p.advance()
 		if err := p.expectKeyword("join"); err != nil {
 			return JoinClause{}, false, err
@@ -3009,21 +3020,26 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 		default:
 			kind = JoinFull
 		}
-	default: // not a join keyword: the FROM chain ends here
+	default:
+		// After NATURAL a join keyword is required; otherwise the FROM chain just ends here.
+		if natural {
+			return JoinClause{}, false, NewError(SyntaxError, "NATURAL must be followed by a join")
+		}
 		return JoinClause{}, false, nil
 	}
 	table, err := p.parseTableRef()
 	if err != nil {
 		return JoinClause{}, false, err
 	}
-	// A non-CROSS join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15). USING is not
+	// A non-CROSS, non-NATURAL join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15).
+	// A NATURAL join derives its condition (no ON/USING), and CROSS takes none. USING is not
 	// reserved (§3): it is the join condition only as the keyword immediately following the right
 	// table_ref. The column list has one or more names; an empty list is a 42601.
 	var on *Expr
 	var using []string
 	switch {
-	case isCross:
-		// no condition
+	case isCross || natural:
+		// no condition (NATURAL derives it; CROSS has none)
 	case p.peekKeyword() == "using":
 		p.advance()
 		if err := p.expect(TokLParen); err != nil {
@@ -3055,7 +3071,7 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 		}
 		on = &e
 	}
-	return JoinClause{Kind: kind, Table: table, On: on, Using: using}, true, nil
+	return JoinClause{Kind: kind, Table: table, On: on, Using: using, Natural: natural}, true, nil
 }
 
 // isTableRefStopKeyword reports whether kw (already lower-cased) is a keyword that may legally
@@ -3070,6 +3086,9 @@ func isTableRefStopKeyword(kw string) bool {
 		// USING introduces a join condition after the right table_ref (`JOIN b USING (k)`), so it
 		// must not be swallowed as `b`'s implicit alias (grammar.md §15).
 		"using",
+		// NATURAL prefixes a join (`a NATURAL JOIN b`), so it must not be swallowed as the prior
+		// relation's alias (grammar.md §15).
+		"natural",
 		// set operators end a SELECT core — they must not be swallowed as an implicit table
 		// alias (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.
 		"union", "intersect", "except",

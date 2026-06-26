@@ -873,14 +873,18 @@ export type JoinKind = "inner" | "cross" | "left" | "right" | "full";
 // FROM item is its own ON-resolution segment (a later join's ON may not reference an earlier
 // comma item — matching PostgreSQL). See spec/design/grammar.md §15.
 // `using` is the `USING (col, …)` column list (spec/design/grammar.md §15), mutually exclusive with
-// `on` (a join has exactly one of ON/USING, or neither for CROSS/comma). Each named column must
-// exist in BOTH sides; the join matches on their equality and the output MERGES them into a single
-// column (FULL JOIN ... USING is a deferred 0A000). Defined only for a USING / NATURAL join.
+// `on` (a join has exactly one of ON/USING, or neither for CROSS/comma/NATURAL). Each named column
+// must exist in BOTH sides; the join matches on their equality and the output MERGES them into a
+// single column (FULL JOIN ... USING is a deferred 0A000). Defined only for an explicit USING join.
+// `natural` is true for a NATURAL join: the USING list is DERIVED at resolution as the column names
+// common to both sides (left order), then the merge proceeds exactly like USING (no common column →
+// CROSS). Mutually exclusive with on/using.
 export type JoinClause = {
   kind: JoinKind;
   table: TableRef;
   on: Expr | null;
   using?: string[];
+  natural?: boolean;
   comma?: boolean;
 };
 

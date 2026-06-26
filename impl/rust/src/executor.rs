@@ -8654,11 +8654,26 @@ impl Database {
                 .cloned()
                 .collect();
             let seg_hidden: Vec<usize> = hidden.iter().copied().filter(|&i| i >= seg_off).collect();
-            let pred = if let Some(cols) = &j.using {
+            // A NATURAL join (grammar.md §15) derives its USING list as the column names common to
+            // both sides (left order); an explicit USING uses its written list. A NATURAL join with
+            // NO common column degenerates to a CROSS join (an empty list → no predicate, no merge).
+            let derived: Vec<String> = if j.natural && j.using.is_none() {
+                natural_common_cols(&rels, seg, k)
+            } else {
+                Vec::new()
+            };
+            let using_cols: Option<&[String]> = if let Some(cols) = &j.using {
+                Some(cols.as_slice())
+            } else if j.natural {
+                Some(derived.as_slice())
+            } else {
+                None
+            };
+            let pred = if let Some(cols) = using_cols.filter(|c| !c.is_empty()) {
                 if matches!(j.kind, JoinKind::Full) {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
-                        "FULL JOIN with USING is not supported yet",
+                        "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet",
                     ));
                 }
                 // The left side is the relations of this comma item to the left of the join; resolving
@@ -19949,6 +19964,27 @@ fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }
+}
+
+/// The `USING` column list a `NATURAL` join derives (spec/design/grammar.md §15): the column names
+/// common to the LEFT relations of the join (`rels[seg..=k]`) and the right relation (`rels[k+1]`),
+/// in LEFT order with each name taken once (its first occurrence). An empty result degenerates the
+/// join to a `CROSS` join. (A merged column on the left keeps its underlying name, so a re-merge via
+/// a NATURAL chain is found here too.)
+fn natural_common_cols(rels: &[ScopeRel], seg: usize, k: usize) -> Vec<String> {
+    let right = &rels[k + 1];
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in &rels[seg..=k] {
+        for c in &r.table.columns {
+            if seen.insert(c.name.to_ascii_lowercase())
+                && right.table.column_index(&c.name).is_some()
+            {
+                out.push(c.name.clone());
+            }
+        }
+    }
+    out
 }
 
 /// The `(label, column-name)` of the relation owning a flat row index — used to synthesize a

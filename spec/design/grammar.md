@@ -106,9 +106,10 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   select-item alias; `table_ref` now adds the optional `AS` of a **table** alias (§15).
 - **Single-table `UPDATE` / `DELETE`** — those two still take one table (no `JOIN`, no `USING`).
   `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON`, `CROSS JOIN`, the
-  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family, comma-`FROM`, and `JOIN ... USING (cols)` all execute
-  (subqueries / derived tables / `IN` / `EXISTS` / correlated landed too). Only **`NATURAL`** and
-  `FULL JOIN USING` remain deferred join forms.
+  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family, comma-`FROM`, `JOIN ... USING (cols)`, and
+  `NATURAL JOIN` all execute (subqueries / derived tables / `IN` / `EXISTS` / correlated landed too).
+  Only **`FULL JOIN USING`** / `NATURAL FULL JOIN` (the `COALESCE` merge) and a parenthesized-join
+  FROM remain deferred join forms.
 - **`INSERT` values are *literals only*** (not general expressions; see the `literal`
   production) — but the `DEFAULT` keyword is now also a value slot, and an explicit **column
   list** (`INSERT INTO t (a, c) VALUES ...`) landed alongside `DEFAULT` (§12, §16).
@@ -674,6 +675,17 @@ them; this is computed **before** GROUP BY / DISTINCT / projection so every clau
 right `table_ref`, joining the implicit-alias stop set so `JOIN b USING (…)` never reads `using` as
 `b`'s alias.
 
+**`NATURAL` — the derived `USING`.** A `NATURAL` prefix (`a NATURAL JOIN b`, `a NATURAL LEFT JOIN b`)
+**derives** the `USING` column list at resolution as the column names **common to both sides**, in
+**left order** (each taken once), then merges them exactly like `USING` — so all the merge behavior
+above (merged-first `*`, unambiguous bare reference, surviving-side value, the `FULL` `0A000`) carries
+over unchanged. With **no** common column the join degenerates to a **`CROSS` join** (the Cartesian
+product — an empty derived list means no predicate and no merge). `NATURAL` is a parser prefix on the
+join type, takes **no** `ON`/`USING` (a `NATURAL … ON`/`USING` is `42601`), and **`NATURAL CROSS
+JOIN`** is `42601` (NATURAL implies a condition). Like `USING`, `NATURAL` is non-reserved and joins
+the implicit-alias stop set (it is the prefix only immediately before a join — `FROM t NATURAL JOIN
+…` never reads `natural` as `t`'s alias); a bare `NATURAL` not followed by a join is `42601`.
+
 Evaluating each `ON` **at its own join node** (not folding all `ON`s into the trailing WHERE) is
 deliberate: for INNER it is observationally identical to a WHERE, but it is the executor shape the
 deferred OUTER joins need (an unmatched row is NULL-extended *at the node*, before any later
@@ -750,11 +762,10 @@ explicit `JOIN` syntax — [../../TODO.md](../../TODO.md)).
 
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
-- **No `NATURAL`** join form (it derives a `USING` list from the common column names — a follow-on
-  on the now-landed `USING` machinery), **no parenthesized-join FROM** (`FROM (a JOIN b ON …)`), and
-  **no `FULL JOIN ... USING`** (its `COALESCE` merge — above). A **derived table**
-  (`FROM (SELECT …) AS t`) *is* supported — see §42; the **`t.*`** qualified star and **`USING`** have
-  landed (above).
+- **No parenthesized-join FROM** (`FROM (a JOIN b ON …)`), and **no `FULL JOIN ... USING`** /
+  `NATURAL FULL JOIN` (its `COALESCE` merge — above). A **derived table** (`FROM (SELECT …) AS t`)
+  *is* supported — see §42; the **`t.*`** qualified star, **`USING`**, and **`NATURAL`** have landed
+  (above).
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
   (though a qualified `WHERE t.a = 1` referencing their sole table now resolves, harmlessly).
 

@@ -7751,13 +7751,25 @@ export class Database {
         s.hidden = segHidden;
         return s;
       };
-      if (j.using !== undefined) {
+      // A NATURAL join (grammar.md §15) derives its USING list as the column names common to both
+      // sides (left order); an explicit USING uses its written list. A NATURAL join with NO common
+      // column degenerates to a CROSS join (an empty list → no predicate, no merge).
+      const usingCols =
+        j.using !== undefined
+          ? j.using
+          : j.natural === true
+            ? naturalCommonCols(rels, seg, k)
+            : undefined;
+      if (usingCols !== undefined && usingCols.length > 0) {
         if (j.kind === "full") {
-          throw engineError("feature_not_supported", "FULL JOIN with USING is not supported yet");
+          throw engineError(
+            "feature_not_supported",
+            "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet",
+          );
         }
         const left = mkScope(seg, k);
         let predAst: Expr | null = null;
-        for (const name of j.using) {
+        for (const name of usingCols) {
           let li = -1;
           try {
             const lr = left.resolveBare(name);
@@ -18137,6 +18149,27 @@ type MergeCol = { name: string; index: number };
 // outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
 function outerOf(r: Resolved): Resolved {
   return { level: r.level + 1, index: r.index };
+}
+
+// naturalCommonCols is the USING column list a NATURAL join derives (spec/design/grammar.md §15):
+// the column names common to the LEFT relations of the join (rels[seg..k]) and the right relation
+// (rels[k+1]), in LEFT order with each name taken once (its first occurrence). An empty result
+// degenerates the join to a CROSS join. (A merged column on the left keeps its underlying name, so a
+// re-merge via a NATURAL chain is found here too.)
+function naturalCommonCols(rels: ScopeRel[], seg: number, k: number): string[] {
+  const right = rels[k + 1]!;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (let i = seg; i <= k; i++) {
+    for (const c of rels[i]!.table.columns) {
+      const lc = c.name.toLowerCase();
+      if (!seen.has(lc)) {
+        seen.add(lc);
+        if (columnIndex(right.table, c.name) >= 0) out.push(c.name);
+      }
+    }
+  }
+  return out;
 }
 
 // relOfIndex returns the [label, column-name] of the relation owning a flat row index — used to

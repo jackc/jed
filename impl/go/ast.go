@@ -589,11 +589,16 @@ type JoinClause struct {
 	Table TableRef
 	On    *Expr
 	// Using is the `USING (col, …)` column list (spec/design/grammar.md §15), mutually exclusive
-	// with On (a join has exactly one of ON/USING, or neither for CROSS/comma). Each named column
-	// must exist in BOTH sides; the join matches on their equality and the output MERGES them into a
-	// single column (FULL JOIN ... USING is a deferred 0A000). Non-nil only for a USING / NATURAL
-	// join (NATURAL, commit 4, derives the common-column list at resolution).
+	// with On (a join has exactly one of ON/USING, or neither for CROSS/comma/NATURAL). Each named
+	// column must exist in BOTH sides; the join matches on their equality and the output MERGES them
+	// into a single column (FULL JOIN ... USING is a deferred 0A000). Non-nil only for an explicit
+	// USING join.
 	Using []string
+	// Natural is true for a NATURAL join (spec/design/grammar.md §15): the USING column list is
+	// DERIVED at resolution as the column names common to both sides (left order), then the merge
+	// proceeds exactly like USING. With no common column it degenerates to a CROSS join. Mutually
+	// exclusive with On/Using.
+	Natural bool
 	// Comma is true when this is the implicit CROSS JOIN synthesized from a comma in the FROM
 	// list (`FROM a, b`). The comma binds LOOSER than JOIN, so each comma-separated FROM item is
 	// its own ON-resolution segment: a later join's ON may not reference an earlier comma item

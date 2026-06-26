@@ -389,7 +389,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`JOIN` — multi-table FROM + `INNER`/`CROSS` + outer (`LEFT`/`RIGHT`/`FULL`)** — left-deep
       nested-loop executor, table aliases, qualified column refs, a flat-index scope resolver; the outer
       NULL-extension branch + WHERE-downgrades-to-inner. → [grammar.md §15](spec/design/grammar.md)
-  - [ ] _follow-on:_ `NATURAL`; `FULL JOIN ... USING` (its `COALESCE` merge).
+  - [x] **All four `JOIN` follow-ons landed** (comma-`FROM`, `t.*`, `USING`, `NATURAL`). Remaining
+        deferred: `FULL JOIN ... USING` / `NATURAL FULL JOIN` (its `COALESCE` merge — the single-index
+        merge model carries one column, not a coalesce).
+    - [x] **`NATURAL JOIN`** (derives the `USING` list as the columns common to both sides, in left
+          order, then merges like `USING`; no common column → `CROSS`; composes with INNER/LEFT/RIGHT;
+          `NATURAL CROSS JOIN` / `NATURAL … ON` `42601`; `NATURAL FULL` `0A000`). → [grammar.md §15](spec/design/grammar.md)
     - [x] **`USING (cols)`** (an equi-join that MERGES each named column into one output column —
           merged first in `*`, bare ref unambiguous, qualified sides still reach; merge = surviving
           side (left for INNER/LEFT, right for RIGHT); multi-col + chains + LEFT/RIGHT; missing col
