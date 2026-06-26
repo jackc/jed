@@ -628,3 +628,30 @@ query T
 SELECT chr(NULL::int)
 ----
 NULL
+
+# === initcap(text) → text: titlecase each word (ASCII word boundaries) =================
+
+query T
+SELECT initcap('hello world')
+----
+Hello World
+
+# already-uppercase tails are lowercased; punctuation/underscore separate words
+query T
+SELECT initcap('hi-THERE_now'), initcap('o''brien')
+----
+Hi-There_Now
+O'Brien
+
+# a leading digit is the word's first character, so the following letter is NOT uppercased
+query T
+SELECT initcap('123abc def'), initcap('a1b2 c')
+----
+123abc Def
+A1b2 C
+
+query B
+SELECT initcap('') = '', initcap(NULL::text) IS NULL
+----
+true
+true

@@ -15955,6 +15955,8 @@ const (
 	sfAscii
 	// chr(int) → text — the one-character string for a Unicode code point; bad point traps (§3).
 	sfChr
+	// initcap(text) → text — titlecase each word (ASCII word boundaries + ASCII case fold, §3).
+	sfInitcap
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19568,6 +19570,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfAscii
 	case "chr":
 		return sfChr
+	case "initcap":
+		return sfInitcap
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24258,6 +24262,41 @@ func chrText(n int64) (string, error) {
 	return string(rune(n)), nil
 }
 
+// initcapASCII is initcap(s) (string-functions.md §3): uppercase the first character of each word
+// and lowercase the rest, where a word is a maximal run of ASCII alphanumerics. jed classifies word
+// boundaries by ASCII alphanumerics and folds ASCII case only — deterministic and cross-core
+// (full Unicode word classification would risk the cross-core Unicode-version trap). PostgreSQL
+// agrees for ASCII input; a non-ASCII letter is treated as a word boundary (a documented divergence).
+func initcapASCII(s string) string {
+	var b strings.Builder
+	wordStart := true
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+			b.WriteRune(c)
+			wordStart = false
+		case c >= 'A' && c <= 'Z':
+			if wordStart {
+				b.WriteRune(c)
+			} else {
+				b.WriteRune(c + 32)
+			}
+			wordStart = false
+		case c >= 'a' && c <= 'z':
+			if wordStart {
+				b.WriteRune(c - 32)
+			} else {
+				b.WriteRune(c)
+			}
+			wordStart = false
+		default:
+			b.WriteRune(c)
+			wordStart = true
+		}
+	}
+	return b.String()
+}
+
 // satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
 // used, the right operand being non-negative).
 func satAddInt64(a, b int64) int64 {
@@ -27666,6 +27705,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
+		case sfInitcap:
+			// initcap(text) → text — titlecase each word.
+			return TextValue(initcapASCII(vals[0].Str)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

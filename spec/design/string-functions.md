@@ -239,3 +239,23 @@ corpus pins the SQLSTATE, not the message):
 
 jed's `integer` family accepts any width, so `chr` takes an `i64`; the range checks bound it before
 constructing the character. NULL propagates.
+
+### `initcap(text) → text`
+
+Uppercase the first character of each **word** and lowercase the rest, where a word is a maximal run
+of alphanumeric characters: `initcap('hello world') = 'Hello World'`,
+`initcap('hi-THERE_now') = 'Hi-There_Now'`, `initcap("o'brien") = "O'Brien"`,
+`initcap('123abc def') = '123abc Def'` (a leading digit is the word's first character, so the `a` is
+not uppercased).
+
+**Deliberate divergence — ASCII word classification (§2 trap avoidance).** jed classifies word
+boundaries by **ASCII alphanumerics** (`[A-Za-z0-9]`) and folds **ASCII case** only. This is
+fully deterministic and cross-core-identical. Full Unicode alphanumeric classification is *not* used
+because the three cores' runtimes carry different Unicode versions (`char::is_alphanumeric` in Rust
+std vs Go's `unicode` vs Node's `\p{}`), which would reintroduce the cross-core Unicode-version
+divergence the collation work fought (CLAUDE.md §8; the ICU trap). The consequence: a **non-ASCII
+letter is treated as a word boundary** rather than a word character, so `initcap('école')` is
+`'école'` (jed leaves the leading `é` lowercase) where PostgreSQL gives `'École'`. PostgreSQL agrees
+for **ASCII** input, which the oracle corpus exercises; the non-ASCII titlecasing (full Unicode word
+classification + a loaded-bundle case fold, like `lower`/`upper`) is a deferred refinement. NULL
+propagates.

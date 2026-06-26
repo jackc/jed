@@ -525,6 +525,37 @@ function chrText(n: bigint): string {
   return String.fromCodePoint(Number(n));
 }
 
+// initcapAscii is initcap(s) (string-functions.md §3): uppercase the first character of each word
+// and lowercase the rest, where a word is a maximal run of ASCII alphanumerics. jed classifies word
+// boundaries by ASCII alphanumerics and folds ASCII case only (by char-code arithmetic, so it is
+// deterministic and cross-core-identical — full Unicode word classification would risk the
+// cross-core Unicode-version trap). PostgreSQL agrees for ASCII; a non-ASCII letter is a word
+// boundary (a documented divergence). Iterates code points ([...s]) for UTF-16 safety.
+function initcapAscii(s: string): string {
+  let out = "";
+  let wordStart = true;
+  for (const c of s) {
+    const code = c.codePointAt(0)!;
+    if (code >= 48 && code <= 57) {
+      // ASCII digit
+      out += c;
+      wordStart = false;
+    } else if (code >= 65 && code <= 90) {
+      // ASCII upper
+      out += wordStart ? c : String.fromCharCode(code + 32);
+      wordStart = false;
+    } else if (code >= 97 && code <= 122) {
+      // ASCII lower
+      out += wordStart ? String.fromCharCode(code - 32) : c;
+      wordStart = false;
+    } else {
+      out += c;
+      wordStart = true;
+    }
+  }
+  return out;
+}
+
 // substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
@@ -12716,7 +12747,9 @@ type ScalarFuncName =
   // ascii(text) → i32 — the Unicode code point of the first character; empty → 0 (§3).
   | "ascii"
   // chr(int) → text — the one-character string for a Unicode code point; bad point traps (§3).
-  | "chr";
+  | "chr"
+  // initcap(text) → text — titlecase each word (ASCII word boundaries + ASCII case fold, §3).
+  | "initcap";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24616,6 +24649,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "chr") {
         // chr(int) → text — the one-character string for a code point.
         return textValue(chrText((vals[0] as { int: bigint }).int));
+      }
+      if (e.func === "initcap") {
+        // initcap(text) → text — titlecase each word.
+        return textValue(initcapAscii((vals[0] as { text: string }).text));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

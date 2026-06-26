@@ -13074,6 +13074,8 @@ enum ScalarFunc {
     Ascii,
     /// chr(int) → text — the one-character string for a Unicode code point; bad point traps (§3).
     Chr,
+    /// initcap(text) → text — titlecase each word (ASCII word boundaries + ASCII case fold, §3).
+    Initcap,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19115,6 +19117,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "starts_with" => ScalarFunc::StartsWith,
         "ascii" => ScalarFunc::Ascii,
         "chr" => ScalarFunc::Chr,
+        "initcap" => ScalarFunc::Initcap,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30562,6 +30565,11 @@ impl RExpr {
                     },
                     // chr(int) → text — the one-character string for a code point.
                     ScalarFunc::Chr => Ok(Value::Text(chr_text(int_value(&vals[0]))?)),
+                    // initcap(text) → text — titlecase each word.
+                    ScalarFunc::Initcap => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Text(initcap_ascii(s))),
+                        _ => unreachable!("resolver restricts initcap to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31449,7 +31457,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::SplitPart
         | ScalarFunc::StartsWith
         | ScalarFunc::Ascii
-        | ScalarFunc::Chr => {
+        | ScalarFunc::Chr
+        | ScalarFunc::Initcap => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31635,6 +31644,30 @@ fn chr_text(n: i64) -> Result<String> {
             format!("requested character not valid for encoding: {n}"),
         )),
     }
+}
+
+/// `initcap(s)` (string-functions.md §3): uppercase the first character of each word and lowercase
+/// the rest, where a *word* is a maximal run of ASCII alphanumerics. jed classifies word boundaries
+/// by ASCII alphanumerics and folds ASCII case only — deterministic and cross-core-identical (full
+/// Unicode word classification would risk the cross-core Unicode-version trap, §3). PostgreSQL agrees
+/// for ASCII input; a non-ASCII letter is treated as a word boundary (a documented divergence).
+fn initcap_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut word_start = true;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(if word_start {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            });
+            word_start = false;
+        } else {
+            out.push(c);
+            word_start = true;
+        }
+    }
+    out
 }
 
 /// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window

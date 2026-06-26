@@ -3436,6 +3436,20 @@ result         = "text"
 null           = "propagates"
 errors         = ["22023", "54000"]
 
+# initcap(text) → text — uppercase the first letter of each WORD and lowercase the rest; words are
+# maximal runs of ALPHANUMERIC characters. initcap('hi-THERE') = 'Hi-There'. jed classifies words by
+# ASCII alphanumerics and folds ASCII case (deterministic, cross-core; full-Unicode word boundaries
+# are a deferred refinement — string-functions.md §3). NULL propagates.
+[[operator]]
+name           = "initcap"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL
