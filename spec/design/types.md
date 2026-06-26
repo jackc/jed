@@ -217,12 +217,16 @@ listed).
   `CAST('42' AS int)`). The coercion is the type's own parse (the §3 datetime parse, the §13/§14
   bytea/uuid input, a decimal/integer/boolean parse matching jed's literal grammar), trapping
   `22P02` (malformed) / `22003` (out of range) / `42704` (unknown type name). A **runtime** text→`T`
-  cast on a *non-literal* text expression (`CAST(text_col AS int)`) stays **deferred** (`0A000`) —
-  the general string-function slice (§11) — **except** the runtime `text → uuid` cast, which has
-  landed (the uuid cast slice, §14): `CAST(text_col AS uuid)` parses the column's string via
-  `uuid_in` at eval. `CAST(1 AS text)` (casting *to* text) is likewise deferred, **except**
-  `uuid → text` (§14) and `json`/`jsonb → text`. The `text → text` identity is implicit, like any
-  identity cast.
+  cast on a *non-literal* text expression (`CAST(text_col AS int)`, `s :: numeric(10,2)`) now runs
+  the **same per-type coercion per-row in the evaluator** for the **numeric + boolean** scalars —
+  `i16`/`i32`/`i64`, `decimal`/`numeric` (typmod re-scale applied), `f32`/`f64`, and `boolean` —
+  reusing the identical parse functions as the literal form (so jed's own grammar still governs: hex
+  / underscore / `NaN` trap `22P02`), metered by the cast node's `operator_eval`, trapping
+  `22P02` / `22003` **per row**. The runtime `text → uuid` cast also landed (the uuid cast slice,
+  §14: `uuid_in` at eval). The runtime text→`T` cast to the **string-native** scalars `date` /
+  `timestamp` / `timestamptz` / `interval` / `bytea` stays **deferred** (`0A000`), each its own
+  follow-on. `CAST(1 AS text)` (casting *to* text) is likewise deferred, **except** `uuid → text`
+  (§14) and `json`/`jsonb → text`. The `text → text` identity is implicit, like any identity cast.
 - **Strictness is preserved.** The string→number/bool coercion fires only when the type is
   **named** (a literal or CAST). A **bare** string in a numeric context does **not** silently
   become a number: `WHERE int_col = '42'` is `42804` (§4), and a bare string adapts *only* to the

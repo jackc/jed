@@ -26,11 +26,22 @@ test('the types page autoruns the boolean ⇄ i32 cast demo', async ({ page }) =
   await expect(rows).toContainText('true');
 });
 
+test('the types page autoruns the runtime text → number/boolean cast demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // Fourth panel = the runtime text→scalar cast demo: '42'→42, '  -7 '→-7, '3.14159'→3.14, 'yes'→true.
+  const textNumPanel = page.getByTestId('live-sql').nth(3);
+  const rows = textNumPanel.getByTestId('result-rows');
+  await expect(rows).toContainText('42');
+  await expect(rows).toContainText('-7');
+  await expect(rows).toContainText('3.14');
+  await expect(rows).toContainText('true');
+});
+
 test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
-  // Fourth panel = the uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea
+  // Fifth panel = the uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea
   // (\x + 16 hex bytes), bytea→uuid (back to the canonical uuid).
-  const uuidCastPanel = page.getByTestId('live-sql').nth(3);
+  const uuidCastPanel = page.getByTestId('live-sql').nth(4);
   const rows = uuidCastPanel.getByTestId('result-rows');
   await expect(rows).toContainText('550e8400-e29b-41d4-a716-446655440000');
   await expect(rows).toContainText('\\x550e8400e29b41d4a716446655440000');

@@ -24675,8 +24675,13 @@ fn resolve(
             // convention; PG reports 42846 — a documented divergence, casts.toml).
             if target.is_bool() {
                 return match ity {
+                    // A runtime `text` source is the runtime-text-cast slice (grammar.md §36): the
+                    // eval parses the per-row string via the same `parse_bool_literal` (PG boolin)
+                    // the `'t'::boolean` literal uses. A string LITERAL operand was already coerced
+                    // above, so a `Text` here is non-literal (a column / expression).
                     ResolvedType::Int(ScalarType::Int32)
                     | ResolvedType::Bool
+                    | ResolvedType::Text
                     | ResolvedType::Null => Ok((
                         RExpr::Cast {
                             inner: Box::new(rinner),
@@ -24718,13 +24723,15 @@ fn resolve(
                 | ResolvedType::Null => {}
                 // A boolean source is handled above (the boolean cast slice) — unreachable here.
                 ResolvedType::Bool => unreachable!("boolean cast operand handled above"),
-                // Casting FROM text is likewise deferred (0A000).
-                ResolvedType::Text => {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "casting from text is not supported yet",
-                    ));
-                }
+                // A runtime `text` source to a numeric target is the runtime-text-cast slice
+                // (grammar.md §36): the only targets reaching this generic path are int / decimal /
+                // float (text / bytea / uuid / datetime / interval / bool / json targets all return
+                // in their own blocks above), so a `Text` here casts to a number. The eval coerces
+                // the per-row string via the same parse functions the literal form uses (22P02 /
+                // 22003 per row). A string LITERAL operand was already folded above, so this `Text`
+                // is non-literal (a column / expression). Fall through to the numeric `Cast` node.
+                ResolvedType::Text => {}
+                // Casting FROM bytea is likewise deferred (0A000).
                 // Casting FROM bytea is likewise deferred (0A000).
                 ResolvedType::Bytea => {
                     return Err(EngineError::new(
@@ -30154,7 +30161,23 @@ impl RExpr {
                     // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible
                     // uuid_in parser; a malformed string traps 22P02.
                     Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
-                    Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
+                    // text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same
+                    // per-row coercion the `type 'string'` literal folds at resolve, run here over
+                    // the runtime string. The resolver admits only int/decimal/float/bool targets
+                    // for a text source (uuid/json/jsonb are the guarded arms above), so this is
+                    // exhaustive. Malformed → 22P02, out of range → 22003 (per row).
+                    Value::Text(s) if target.is_bool() => Ok(Value::Bool(parse_bool_literal(&s)?)),
+                    Value::Text(s) if target.is_decimal() => Ok(Value::Decimal(coerce_decimal(
+                        parse_decimal_literal(&s)?,
+                        *typmod,
+                    )?)),
+                    Value::Text(s) if *target == ScalarType::Float32 => {
+                        Ok(Value::Float32(parse_f32_literal(&s)?))
+                    }
+                    Value::Text(s) if target.is_float() => {
+                        Ok(Value::Float64(parse_f64_literal(&s)?))
+                    }
+                    Value::Text(s) => Ok(Value::Int(parse_int_literal(&s, *target)?)),
                     // bytea → uuid (the uuid cast slice — a jed cast PG lacks): exactly 16 raw bytes;
                     // any other length traps 22P02 (the wrong-width body — no PG code to match).
                     Value::Bytea(b) if target.is_uuid() => {

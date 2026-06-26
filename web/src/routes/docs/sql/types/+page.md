@@ -14,6 +14,12 @@
   0::boolean           AS zero_to_bool,
   CAST(-5 AS boolean)  AS nonzero_to_bool;`;
 
+	const textNumCastDemo = `SELECT
+  ('42'::text)::int                AS text_to_int,
+  ('  -7 '::text)::bigint          AS trims_and_signs,
+  ('3.14159'::text)::numeric(4,2)  AS text_to_numeric,
+  ('yes'::text)::boolean           AS text_to_bool;`;
+
 	const uuidCastDemo = `SELECT
   ('550E8400-E29B-41D4-A716-446655440000'::text)::uuid  AS text_to_uuid,
   '550e8400-e29b-41d4-a716-446655440000'::uuid::text    AS uuid_to_text,
@@ -90,6 +96,21 @@ Following PostgreSQL, `boolean` casts to and from `int` (`i32`) only, and always
 
 Only `i32` is involved: a `boolean ⇄ i16` or `boolean ⇄ i64` cast is rejected (`42804`), matching
 PostgreSQL's choice of `int4` as the sole boolean-integer cast.
+
+## Parsing text into numbers and booleans
+
+An explicit `CAST` / `::` parses a `text` value into a number or boolean **at runtime** — `i16` /
+`i32` / `i64`, `decimal` (with a `numeric(p,s)` re-scale), `f32` / `f64`, and `boolean`. The string
+is trimmed, a leading sign is accepted, and a `boolean` follows PostgreSQL's spellings
+(`t`/`true`/`yes`/`on`/`1` …). A malformed string raises `22P02` and an out-of-range integer raises
+`22003`:
+
+<LiveSql query={textNumCastDemo} rows={1} />
+
+The type must be **named** — a bare string never silently becomes a number, so `int_col = '42'` stays
+a type error (`42804`). jed uses its own literal grammar, so hex, digit underscores, and `NaN` are
+rejected (`22P02`) where PostgreSQL accepts them. (Parsing a string into a `date` / `timestamp` /
+`interval` / `bytea` is a separate feature — use that type's literal form, e.g. `date '2024-01-15'`.)
 
 ## UUID ⇄ text and bytea casts
 

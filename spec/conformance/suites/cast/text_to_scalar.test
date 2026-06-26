@@ -1,0 +1,180 @@
+# Runtime text → numeric/boolean casts (the runtime-text-cast slice — spec/design/grammar.md §36,
+# spec/design/types.md §5, spec/types/casts.toml). CAST(text_expr AS T) / text_expr :: T on a
+# NON-LITERAL text expression (here a text COLUMN) for the numeric + boolean scalar targets:
+# i16/i32/i64, decimal/numeric (with the typmod re-scale), and boolean. The cast runs the SAME
+# per-type coercion the `type 'string'` LITERAL form folds at resolve (cast.string_literal,
+# expr/typed_literal.test), but per ROW in the evaluator — distinct from the literal form, which
+# folds before any scan. The accepted-grammar cases AGREE with PostgreSQL and are oracle-checked
+# here; a malformed string traps 22P02 and an out-of-range integer traps 22003 PER ROW.
+#
+# OUT of this corpus (cannot live in the PG-clean oracle): the jed-stricter grammar divergences
+# (hex / digit-underscore / NaN trap 22P02 where PG accepts them — identical to the literal path,
+# expr/typed_literal.test) and runtime text → f32/f64 (the float renderer is in the determinism
+# exception ledger), both covered by the per-core unit tests (cast_text_runtime). text → uuid is
+# the separate cast.uuid runtime cast (cast/uuid.test); text → date/timestamp/interval/bytea stay
+# deferred (0A000), each its own follow-on.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.boolean, types.text, cast.explicit, cast.operator, cast.string_literal, cast.runtime_text
+
+statement ok
+CREATE TABLE t (id integer PRIMARY KEY, s text)
+
+# Every s here is well-formed for the integer/decimal/boolean grammar jed and PG share — leading/
+# trailing whitespace is trimmed, a leading +/- is accepted — so a full-table cast never traps.
+statement ok
+INSERT INTO t VALUES
+  (1, '42'),
+  (2, '-7'),
+  (3, '  100  '),
+  (4, '+5'),
+  (5, '0'),
+  (6, NULL)
+
+# --- text → integer (RUNTIME, on a text column): trims whitespace, accepts a sign; NULL → NULL ---
+query II nosort
+SELECT id, s :: int FROM t ORDER BY id
+----
+1
+42
+2
+-7
+3
+100
+4
+5
+5
+0
+6
+NULL
+
+# the CAST(...) spelling is identical to ::int
+query II nosort
+SELECT id, CAST(s AS integer) FROM t ORDER BY id
+----
+1
+42
+2
+-7
+3
+100
+4
+5
+5
+0
+6
+NULL
+
+# the wider/narrower integer widths reach the same coercion (smallint = i16, bigint = i64)
+# types: i16
+query I nosort
+SELECT s :: smallint FROM t WHERE id = 1
+----
+42
+
+# types: i64
+query I nosort
+SELECT s :: bigint FROM t WHERE id = 3
+----
+100
+
+# the runtime cast composes in a larger expression (cast then arithmetic)
+query I nosort
+SELECT s :: int + 1 FROM t WHERE id = 1
+----
+43
+
+# --- text → numeric (RUNTIME): exact decimal, with the typmod re-scale -------------------
+statement ok
+CREATE TABLE d (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO d VALUES
+  (1, '1.5'),
+  (2, '-0.25'),
+  (3, '100'),
+  (4, '3.14159'),
+  (5, NULL)
+
+query ID nosort
+SELECT id, s :: numeric FROM d ORDER BY id
+----
+1
+1.5
+2
+-0.25
+3
+100
+4
+3.14159
+5
+NULL
+
+# a typmod re-scales the per-row coerced decimal (round half away from zero, decimal.md §3):
+# 1.5 → 1.50, 3.14159 → 3.14
+query ID nosort
+SELECT id, CAST(s AS numeric(10, 2)) FROM d WHERE id IN (1, 4) ORDER BY id
+----
+1
+1.50
+4
+3.14
+
+# --- text → boolean (RUNTIME): PG boolin — prefixes + on/off/yes/no/1/0, case-insensitive -------
+statement ok
+CREATE TABLE b (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO b VALUES
+  (1, 'true'),
+  (2, 'f'),
+  (3, '  YES '),
+  (4, 'off'),
+  (5, '1'),
+  (6, '0'),
+  (7, NULL)
+
+query IB nosort
+SELECT id, s :: boolean FROM b ORDER BY id
+----
+1
+true
+2
+false
+3
+true
+4
+false
+5
+true
+6
+false
+7
+NULL
+
+# --- RUNTIME per-row errors that AGREE with PostgreSQL ----------------------------------
+# A malformed integer string traps 22P02 mid-scan (not at plan time).
+statement ok
+CREATE TABLE bad (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO bad VALUES (1, 'abc'), (2, '99999'), (3, '4.0'), (4, 'maybe')
+
+# 'abc' is not an integer → 22P02
+statement error 22P02
+SELECT s :: int FROM bad WHERE id = 1
+
+# '99999' overflows i16 (smallint range ±32767) → 22003
+statement error 22003
+SELECT s :: smallint FROM bad WHERE id = 2
+
+# '4.0' has a fractional part — not a valid integer (both jed and PG reject) → 22P02
+statement error 22P02
+SELECT s :: int FROM bad WHERE id = 3
+
+# 'abc' is not a numeric → 22P02
+statement error 22P02
+SELECT s :: numeric FROM bad WHERE id = 1
+
+# 'maybe' is not a boolean → 22P02
+statement error 22P02
+SELECT s :: boolean FROM bad WHERE id = 4

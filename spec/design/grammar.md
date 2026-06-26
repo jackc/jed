@@ -1820,10 +1820,21 @@ just "coerce the string `x` to that type, with the type named explicitly." The p
 | `boolean` | PG's `boolin`: `t`/`tr`/`tru`/`true`, `f`/`fa`/`fal`/`fals`/`false`, `y`/`ye`/`yes`, `n`/`no`, `on`/`off`, `1`, `0` (case-insensitive, trimmed) | `22P02` malformed |
 
 The native-syntax types (`integer`/`decimal`/`boolean`) are where `type 'string'` is a genuine
-**cast from text** — coercing a *string* to a number/bool. jed allows it **only when the operand
-is a string literal** (the `type 'string'` form and `CAST(<string literal> AS T)`), folded at
-resolve. A **runtime** text→`T` cast on a non-literal text expression (`CAST(text_col AS int)`)
-stays deferred (`0A000`, [types.md](types.md) §5). And a **bare** string still does **not**
+**cast from text** — coercing a *string* to a number/bool. The literal form folds the coercion at
+**resolve** (a string-literal operand); a **runtime** text→`T` cast on a *non-literal* text
+expression (`CAST(text_col AS int)`, `s :: numeric(10,2)`) runs the **same per-type coercion
+per-row in the evaluator** (`evalCast`), so it is now admitted for the **numeric + boolean** scalar
+targets — `i16`/`i32`/`i64`, `decimal`/`numeric` (with the typmod re-scale), `f32`/`f64`, and
+`boolean`. "One coercion, three syntaxes" extends to "one coercion, literal **or** runtime": the
+runtime path calls the identical `parse_int_literal` / `parse_decimal_literal` / `parse_f*_literal`
+/ `parse_bool_literal`, so jed's **own** literal grammar still governs (hex / digit-underscore /
+`NaN` / `±Infinity` trap `22P02`, the same documented PG divergences as the literal form), the cast
+node's existing `operator_eval` charge meters it, and a malformed / out-of-range value traps
+`22P02` / `22003` **per row** during the scan rather than at plan time. The runtime text→`T` cast to
+the **string-native** targets stays deferred to each type's own follow-on — text→`date` /
+`timestamp` / `timestamptz` ([timezones.md](timezones.md) §9, [date.md](date.md) §6), text→`interval`
+([interval.md](interval.md) §6), text→`bytea` ([types.md](types.md) §13) are `0A000`; text→`uuid`
+already landed (the uuid cast slice, [types.md](types.md) §14). A **bare** string still does **not**
 silently become a number/bool in a numeric context (`WHERE int_col = '42'` is `42804`, the strict
 rule — [types.md](types.md) §4): the type must be *named* for the string→number coercion to
 happen. So strictness is preserved; only the *explicit* spelling is admitted.
@@ -1864,10 +1875,14 @@ over unchanged:
   coercion, the same primitive as the `integer '42'` typed literal of §36), `x :: int8` (widen),
   `x :: int2` (narrow, traps `22003`), `d :: int` (decimal→int, round half-away), `n :: numeric(10,2)`
   (re-scale to the typmod);
-- the **deferred narrowings** — casting **to or from** `text` / `boolean` / `bytea` / `uuid` /
-  `timestamp` / `timestamptz` / `interval` is `0A000` (except a *string-literal* operand, which
-  coerces). `5 :: text` is `0A000`, identical to `CAST(5 AS text)`; `'5' :: text` is the string
-  identity `'5'`;
+- the **deferred narrowings** — casting **to** `text` (the `T → text` render direction, except
+  the landed `json`/`jsonb`/`uuid → text`) is `0A000`: `5 :: text` is `0A000`, identical to
+  `CAST(5 AS text)`; `'5' :: text` is the string identity `'5'`. Casting **from** `text` now
+  reaches the numeric + boolean scalars at runtime (`s :: int`, `s :: numeric(10,2)`,
+  `s :: boolean`, the §36 runtime coercion) and `uuid` (the uuid cast slice); text→`date` /
+  `timestamp` / `timestamptz` / `interval` / `bytea` stay `0A000`, each its own follow-on. Casting
+  **to or from** `interval` (`interval` is a span, not a string-native scalar) stays `0A000` except
+  a string-literal operand;
 - the resolve codes `42704` (unknown type) / `22003` (out of range) / `22P02` (malformed string) /
   `22023` (bad typmod), and a **typmod on the type name** (`x :: numeric(10,2)`), exactly as CAST.
 

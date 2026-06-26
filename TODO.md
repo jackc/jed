@@ -233,8 +233,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`text` + ONE collation (`C`)** — UTF-8 byte/code-point order, on-disk type code 4, the first
       operator overload, text in a PK/index/UNIQUE via the `text-terminated-escape` key encoding.
       → [types.md §11](spec/design/types.md), [encoding.md §2.4](spec/design/encoding.md)
-  - [ ] _follow-on:_ `varchar(n)` length limits (`22001`); runtime non-literal text→T casts;
-        string functions (`||`, `length`, `lower`/`upper`, `substring`).
+  - [ ] _follow-on:_ `varchar(n)` length limits (`22001`); string functions
+        (`||`, `length`, `lower`/`upper`, `substring`). _(Runtime non-literal text→T casts landed
+        for the numeric + boolean scalars — see the typed-string-literal follow-on below.)_
   - [x] _follow-on:_ **linguistic collation (`COLLATE` / per-column / per-db default / UCA)** —
         slice 1 (a–e) landed: jed-owned UCA executor + compiler, `COLLATE`, per-column + per-db
         default, collated keys; deterministic collations only. → [collation.md](spec/design/collation.md)
@@ -292,7 +293,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         landed). → [date.md §6](spec/design/date.md)
 - [x] **Typed string literals + string-literal casts (`type 'string'`)** — one generalized production
       = `CAST('string' AS type)`; literal-only coercion preserves strictness. → [grammar.md §36](spec/design/grammar.md)
-  - [ ] _follow-on:_ runtime text→T cast on a non-literal text expression (shared with the text follow-on).
+  - [x] _follow-on:_ **runtime text→T cast on a non-literal text expression** (shared with the text
+        follow-on) — `CAST(text_col AS int)` / `s :: numeric(10,2)` / `s :: boolean` for the numeric +
+        boolean scalars (`i16`/`i32`/`i64`, `decimal`, `f32`/`f64`, `boolean`), running the SAME
+        per-type coercion the literal form folds at resolve but per-row in `evalCast` (the existing
+        `operator_eval` charge meters it; `22P02`/`22003` per row; jed's own grammar, so hex/underscore/
+        `NaN` trap `22P02` — per-core tested). New cap `cast.runtime_text`; oracle-clean
+        [text_to_scalar.test](spec/conformance/suites/cast/text_to_scalar.test). text→`uuid` already
+        landed; text→`date`/`timestamp`/`timestamptz`/`interval`/`bytea` stay deferred to each type's
+        own follow-on. → [grammar.md §36](spec/design/grammar.md), [casts.toml](spec/types/casts.toml)
 - [x] **`::` cast operator** (`expr :: type`) — desugars to the `Cast` node; binds tighter than
       unary minus; a bind-param operand takes the cast target as its type. → [grammar.md §37](spec/design/grammar.md)
 - [x] **`interval`** — PG three-field span (months/days/micros), calendar-aware arithmetic, the

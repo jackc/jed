@@ -24408,7 +24408,11 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// int/decimal/float target, so a boolean target must not fall through. A bool⇄i16 / bool⇄i64
 		// pair is a forbidden 42804 (jed's datatype-mismatch convention; PG reports 42846, casts.toml).
 		if target.IsBool() {
-			if (ity.kind == rtInt && ity.intTy == Int32) || ity.kind == rtNull || ity.kind == rtBool {
+			// A runtime `text` source is the runtime-text-cast slice (grammar.md §36): the eval
+			// parses the per-row string via the same parseBoolLiteral (PG boolin) the 't'::boolean
+			// literal uses. A string LITERAL operand was already coerced above, so a text source
+			// here is non-literal (a column / expression).
+			if (ity.kind == rtInt && ity.intTy == Int32) || ity.kind == rtNull || ity.kind == rtBool || ity.kind == rtText {
 				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod},
 					resolvedType{kind: rtBool}, nil
 			}
@@ -24422,10 +24426,13 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			}
 			return nil, resolvedType{}, typeError("cannot cast boolean to " + target.CanonicalName())
 		}
-		// Casting FROM text is likewise deferred (0A000).
-		if ity.kind == rtText {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from text is not supported yet")
-		}
+		// A runtime `text` source to a numeric target is the runtime-text-cast slice (grammar.md
+		// §36): the only targets reaching this generic path are int / decimal / float (text /
+		// bytea / uuid / datetime / interval / bool / json targets all return in their own blocks
+		// above), so a text source here casts to a number. The eval coerces the per-row string via
+		// the same parse functions the literal form uses (22P02 / 22003 per row). A string LITERAL
+		// operand was already folded above, so this text is non-literal — fall through to the
+		// numeric cast node below.
 		// Casting FROM bytea is likewise deferred (0A000).
 		if ity.kind == rtBytea {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from bytea is not supported yet")
@@ -30137,7 +30144,48 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 			}
 			return UuidValue(b), nil
 		}
-		panic("BUG: resolver rejects this text cast target")
+		// text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same per-row
+		// coercion the `type 'string'` literal folds at resolve, run here over the runtime string.
+		// The resolver admits only int/decimal/float/bool targets for a text source (uuid/json/jsonb
+		// are the arms above). Malformed → 22P02, out of range → 22003 (per row).
+		if target.IsBool() {
+			b, err := parseBoolLiteral(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return BoolValue(b), nil
+		}
+		if target.IsDecimal() {
+			d, err := parseDecimalLiteral(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			d, err = coerceDecimal(d, typmod)
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(d), nil
+		}
+		if target.IsFloat32() {
+			f, err := parseFloatLiteral(v.Str, Float32)
+			if err != nil {
+				return Value{}, err
+			}
+			return Float32Value(float32(f)), nil
+		}
+		if target.IsFloat64() {
+			f, err := parseFloatLiteral(v.Str, Float64)
+			if err != nil {
+				return Value{}, err
+			}
+			return Float64Value(f), nil
+		}
+		// An int target (i16/i32/i64): parseIntLiteral range-checks against target (22003).
+		n, err := parseIntLiteral(v.Str, target)
+		if err != nil {
+			return Value{}, err
+		}
+		return IntValue(n), nil
 	}
 	// uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw bytes) — the uuid
 	// cast slice (casts.toml/types.md §14).

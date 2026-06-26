@@ -20576,10 +20576,15 @@ function resolve(
       // float target, so a boolean target must not fall through. A bool⇄i16 / bool⇄i64 pair is a
       // forbidden 42804 (jed's datatype-mismatch convention; PG reports 42846, casts.toml).
       if (isBool(target)) {
+        // A runtime `text` source is the runtime-text-cast slice (grammar.md §36): the eval parses
+        // the per-row string via the same parseBoolLiteral (PG boolin) the 't'::boolean literal
+        // uses. A string LITERAL operand was already coerced above, so a text source here is
+        // non-literal (a column / expression).
         if (
           (inner.type.kind === "int" && inner.type.ty === "i32") ||
           inner.type.kind === "null" ||
-          inner.type.kind === "bool"
+          inner.type.kind === "bool" ||
+          inner.type.kind === "text"
         ) {
           return {
             node: { kind: "cast", target, typmod, operand: inner.node },
@@ -20598,10 +20603,12 @@ function resolve(
         }
         throw typeError("cannot cast boolean to " + canonicalName(target));
       }
-      // Casting FROM text is likewise deferred (0A000).
-      if (inner.type.kind === "text") {
-        throw engineError("feature_not_supported", "casting from text is not supported yet");
-      }
+      // A runtime `text` source to a numeric target is the runtime-text-cast slice (grammar.md
+      // §36): the only targets reaching this generic path are int / decimal / float (text / bytea /
+      // uuid / datetime / interval / bool / json targets all return in their own blocks above), so
+      // a text source here casts to a number. The eval coerces the per-row string via the same
+      // parse functions the literal form uses (22P02 / 22003 per row). A string LITERAL operand was
+      // already folded above, so this text is non-literal — fall through to the numeric cast node.
       // Casting FROM bytea is likewise deferred (0A000).
       if (inner.type.kind === "bytea") {
         throw engineError("feature_not_supported", "casting from bytea is not supported yet");
@@ -26821,7 +26828,18 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
     // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible uuid_in parser; a
     // malformed string traps 22P02.
     if (isUuid(target)) return uuidValue(decodeUuidLiteral(v.text));
-    throw new Error("BUG: resolver rejects this text cast target");
+    // text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same per-row
+    // coercion the `type 'string'` literal folds at resolve, run here over the runtime string. The
+    // resolver admits only int/decimal/float/bool targets for a text source (uuid/json/jsonb are the
+    // arms above). Malformed → 22P02, out of range → 22003 (per row).
+    if (isBool(target)) return boolValue(parseBoolLiteral(v.text));
+    if (isDecimal(target)) return decimalValue(coerceDecimal(parseDecimalLiteral(v.text), typmod));
+    if (isFloat(target)) {
+      const n = parseFloatLiteral(v.text, target);
+      return target === "f32" ? float32Value(n) : float64Value(n);
+    }
+    // An int target (i16/i32/i64): parseIntLiteral range-checks against target (22003).
+    return intValue(parseIntLiteral(v.text, target));
   }
   // uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw bytes) — the uuid
   // cast slice (casts.toml/types.md §14).

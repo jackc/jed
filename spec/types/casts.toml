@@ -398,3 +398,63 @@ to = "uuid"
 mode = "explicit"
 on_overflow = "trap"
 overflow_error = "22P02"
+
+# --- runtime text -> numeric/boolean (the runtime-text-cast slice — ../design/grammar.md §36,
+# ../design/types.md §5) ----------------------------------------------------------------------
+# CAST(text_expr AS T) / text_expr :: T on a NON-LITERAL text expression (a text column, a
+# function result) for the numeric + boolean scalar targets. Each runs the SAME per-type coercion
+# the `type 'string'` LITERAL form folds at resolve (parse_int_literal / parse_decimal_literal /
+# parse_f*_literal / parse_bool_literal), but per row in the evaluator. All EXPLICIT. A malformed
+# string traps 22P02; an out-of-range integer/decimal traps 22003 (the decimal target re-scales to
+# its numeric(p,s) typmod first). jed's OWN literal grammar governs — hex / digit-underscore /
+# NaN / +-Infinity trap 22P02 where PostgreSQL accepts them (the documented grammar.md §36
+# divergences, identical to the literal path; per-core tested). text -> uuid is the row above; the
+# string-native targets (date/timestamp/timestamptz/interval/bytea) stay deferred (0A000), each its
+# own follow-on. NULL -> NULL throughout. These AGREE with PostgreSQL for jed's accepted grammar
+# and are oracle-checked (suites/cast/text_to_scalar.test, postgres:18).
+[[cast]]
+from = "text"
+to = "i16"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "text"
+to = "i32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "text"
+to = "i64"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "text"
+to = "decimal"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "text"
+to = "f32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "text"
+to = "f64"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "text"
+to = "boolean"
+mode = "explicit"
