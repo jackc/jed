@@ -465,6 +465,29 @@ function trimChars(s: string, set: string, doLeft: boolean, doRight: boolean): s
   return chars.slice(start, end).join("");
 }
 
+// translateChars is translate(s, from, to) over CODE POINTS (string-functions.md §3): each
+// character of s that occurs in from is replaced by the character at the same position in to, or
+// DELETED if to is shorter; a character's FIRST occurrence in from wins. Matches PostgreSQL.
+function translateChars(s: string, from: string, to: string): string {
+  const tochars = [...to];
+  const fromchars = [...from];
+  const map = new Map<string, string | null>(); // null = delete
+  for (let i = 0; i < fromchars.length; i++) {
+    const c = fromchars[i]!;
+    if (!map.has(c)) map.set(c, i < tochars.length ? tochars[i]! : null);
+  }
+  let out = "";
+  for (const c of s) {
+    if (map.has(c)) {
+      const r = map.get(c);
+      if (r != null) out += r; // null = delete (skip)
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 // substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
@@ -12640,7 +12663,9 @@ type ScalarFuncName =
   // rtrim(text[, chars]) → text — trim the `chars` set from the TRAILING end only (§3).
   | "rtrim"
   // replace(text, from, to) → text — replace every occurrence of substring `from` with `to` (§3).
-  | "replace";
+  | "replace"
+  // translate(text, from, to) → text — per-character map/delete by position in `from`/`to` (§3).
+  | "translate";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24491,6 +24516,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const from = (vals[1] as { text: string }).text;
         const to = (vals[2] as { text: string }).text;
         return textValue(from === "" ? s : s.replaceAll(from, to));
+      }
+      if (e.func === "translate") {
+        // translate(text, from, to) → text — per-character map/delete.
+        const s = (vals[0] as { text: string }).text;
+        const from = (vals[1] as { text: string }).text;
+        const to = (vals[2] as { text: string }).text;
+        return textValue(translateChars(s, from, to));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

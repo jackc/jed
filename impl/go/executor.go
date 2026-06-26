@@ -15939,6 +15939,8 @@ const (
 	sfRtrim
 	// replace(text, from, to) → text — replace every occurrence of substring `from` with `to` (§3).
 	sfReplace
+	// translate(text, from, to) → text — per-character map/delete by position in `from`/`to` (§3).
+	sfTranslate
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19536,6 +19538,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfRtrim
 	case "replace":
 		return sfReplace
+	case "translate":
+		return sfTranslate
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24134,6 +24138,39 @@ func trimChars(s, set string, doLeft, doRight bool) string {
 	return string(runes[start:end])
 }
 
+// translateChars is translate(s, from, to) over CODE POINTS (string-functions.md §3): each
+// character of s that occurs in from is replaced by the character at the same position in to, or
+// DELETED if to is shorter; a character's FIRST occurrence in from wins. Matches PostgreSQL.
+func translateChars(s, from, to string) string {
+	torunes := []rune(to)
+	type repl struct {
+		ch  rune
+		del bool
+	}
+	m := make(map[rune]repl)
+	for i, c := range []rune(from) {
+		if _, ok := m[c]; ok {
+			continue // first occurrence wins
+		}
+		if i < len(torunes) {
+			m[c] = repl{ch: torunes[i]}
+		} else {
+			m[c] = repl{del: true}
+		}
+	}
+	var b strings.Builder
+	for _, c := range s {
+		if r, ok := m[c]; ok {
+			if !r.del {
+				b.WriteRune(r.ch)
+			}
+		} else {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
 // satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
 // used, the right operand being non-negative).
 func satAddInt64(a, b int64) int64 {
@@ -27494,6 +27531,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return TextValue(vals[0].Str), nil
 			}
 			return TextValue(strings.ReplaceAll(vals[0].Str, from, vals[2].Str)), nil
+		case sfTranslate:
+			// translate(text, from, to) → text — per-character map/delete.
+			return TextValue(translateChars(vals[0].Str, vals[1].Str, vals[2].Str)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

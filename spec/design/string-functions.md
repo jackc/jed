@@ -164,3 +164,13 @@ substring replacement, so the per-core built-ins (`str::replace` / `strings.Repl
 splice `to` at every character boundary (`'abc' → 'XaXbXcX'`), whereas PostgreSQL replaces nothing
 (`replace('abc', '', 'X') = 'abc'`). The kernel therefore special-cases an empty `from` to return the
 string unchanged. NULL args propagate.
+
+### `translate(text, from, to) → text`
+
+A per-**character** mapping (unlike `replace`'s per-substring): each character of the string that
+occurs in `from` is replaced by the character at the **same position** in `to`, or **deleted** if
+`to` is shorter than `from`. A character's *first* occurrence in `from` wins.
+`translate('12345', '14', 'ax') = 'a23x5'`, `translate('12345', '143', 'ax') = 'a2x5'` (`3` maps to
+the absent third `to` position, so it is deleted), `translate('abc', 'aa', 'xy') = 'xbc'`. The shared
+`translate_chars` kernel builds a code-point map (`char → Some(replacement) | None` for delete) and
+rewrites the string. NULL args propagate.

@@ -13058,6 +13058,8 @@ enum ScalarFunc {
     Rtrim,
     /// replace(text, from, to) → text — replace every occurrence of substring `from` with `to` (§3).
     Replace,
+    /// translate(text, from, to) → text — per-character map/delete by position in `from`/`to` (§3).
+    Translate,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19091,6 +19093,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "ltrim" => ScalarFunc::Ltrim,
         "rtrim" => ScalarFunc::Rtrim,
         "replace" => ScalarFunc::Replace,
+        "translate" => ScalarFunc::Translate,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30482,6 +30485,14 @@ impl RExpr {
                             s.replace(from.as_str(), to)
                         }))
                     }
+                    // translate(text, from, to) → text — per-character map/delete.
+                    ScalarFunc::Translate => {
+                        let (s, from, to) = match (&vals[0], &vals[1], &vals[2]) {
+                            (Value::Text(s), Value::Text(f), Value::Text(t)) => (s, f, t),
+                            _ => unreachable!("resolver restricts translate to text"),
+                        };
+                        Ok(Value::Text(translate_chars(s, from, to)))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31361,7 +31372,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Btrim
         | ScalarFunc::Ltrim
         | ScalarFunc::Rtrim
-        | ScalarFunc::Replace => {
+        | ScalarFunc::Replace
+        | ScalarFunc::Translate => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31451,6 +31463,27 @@ fn trim_chars(s: &str, set: &str, do_left: bool, do_right: bool) -> String {
         }
     }
     chars[start..end].iter().collect()
+}
+
+/// `translate(s, from, to)` over CODE POINTS (string-functions.md §3): each character of `s` that
+/// occurs in `from` is replaced by the character at the same position in `to`, or DELETED if `to`
+/// is shorter; a character's FIRST occurrence in `from` wins. Matches PostgreSQL's translate.
+fn translate_chars(s: &str, from: &str, to: &str) -> String {
+    let tochars: Vec<char> = to.chars().collect();
+    // map: from-char → Some(replacement) or None (delete). First occurrence wins (or_insert).
+    let mut map: std::collections::HashMap<char, Option<char>> = std::collections::HashMap::new();
+    for (i, c) in from.chars().enumerate() {
+        map.entry(c).or_insert_with(|| tochars.get(i).copied());
+    }
+    let mut out = String::new();
+    for c in s.chars() {
+        match map.get(&c) {
+            Some(Some(r)) => out.push(*r),
+            Some(None) => {} // mapped to nothing → delete
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window

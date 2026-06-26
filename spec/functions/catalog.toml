@@ -3332,6 +3332,20 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# translate(text, from text, to text) → text — per-CHARACTER mapping: each character of the string
+# that occurs in `from` is replaced by the character at the same position in `to`, or DELETED if `to`
+# is shorter. A character's FIRST occurrence in `from` wins. translate('12345','143','ax') = 'a2x5'
+# (3 deleted). NULL args propagate.
+[[operator]]
+name           = "translate"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

@@ -400,3 +400,38 @@ SELECT replace(NULL::text, 'a', 'b'), replace('abc', NULL::text, 'b'), replace('
 NULL
 NULL
 NULL
+
+# === translate(text, from, to) → text: per-character map / delete =====================
+
+# each `from` character maps to the `to` character at the same position
+query T
+SELECT translate('12345', '14', 'ax')
+----
+a23x5
+
+# a `from` character past the end of `to` is DELETED (here '3')
+query T
+SELECT translate('12345', '143', 'ax')
+----
+a2x5
+
+# a character's first occurrence in `from` wins; code-point based
+query T
+SELECT translate('abc', 'aa', 'xy'), translate('héllo', 'lo', 'LO')
+----
+xbc
+héLLO
+
+# empty `from` maps nothing; an all-mapped-to-empty `to` deletes everything
+query B
+SELECT translate('abc', '', 'x') = 'abc', translate('abc', 'abc', '') = ''
+----
+true
+true
+
+query T
+SELECT translate(NULL::text, 'a', 'b'), translate('abc', NULL::text, 'b'), translate('abc', 'a', NULL::text)
+----
+NULL
+NULL
+NULL
