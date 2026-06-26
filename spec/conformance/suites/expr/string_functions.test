@@ -435,3 +435,32 @@ SELECT translate(NULL::text, 'a', 'b'), translate('abc', NULL::text, 'b'), trans
 NULL
 NULL
 NULL
+
+# === repeat(text, n) → text: the string concatenated n times ==========================
+
+query T
+SELECT repeat('ab', 3)
+----
+ababab
+
+# code-point safe; n ≤ 0 is empty
+query T
+SELECT repeat('héllo', 2)
+----
+héllohéllo
+
+query B
+SELECT repeat('x', 0) = '', repeat('x', -1) = ''
+----
+true
+true
+
+# a pathologically large result traps 54000 (program_limit_exceeded)
+statement error 54000
+SELECT repeat('x', 2000000000)
+
+query T
+SELECT repeat(NULL::text, 3), repeat('x', NULL::int)
+----
+NULL
+NULL

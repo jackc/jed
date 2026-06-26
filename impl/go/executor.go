@@ -15941,6 +15941,8 @@ const (
 	sfReplace
 	// translate(text, from, to) → text — per-character map/delete by position in `from`/`to` (§3).
 	sfTranslate
+	// repeat(text, n) → text — the string concatenated n times; over-large result traps 54000 (§3).
+	sfRepeat
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19540,6 +19542,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfReplace
 	case "translate":
 		return sfTranslate
+	case "repeat":
+		return sfRepeat
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24171,6 +24175,19 @@ func translateChars(s, from, to string) string {
 	return b.String()
 }
 
+// repeatText is repeat(s, n) (string-functions.md §3): concatenate s n times; n ≤ 0 is empty. The
+// result's byte size is bounded at maxResultChars (PG's MaxAllocSize) — an over-large n·len(s) traps
+// 54000 (program_limit_exceeded). Matches PostgreSQL's repeat.
+func repeatText(s string, n int64) (string, error) {
+	if n <= 0 || len(s) == 0 {
+		return "", nil
+	}
+	if n > maxResultChars/int64(len(s)) {
+		return "", NewError(ProgramLimitExceeded, "requested length too large")
+	}
+	return strings.Repeat(s, int(n)), nil
+}
+
 // satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
 // used, the right operand being non-negative).
 func satAddInt64(a, b int64) int64 {
@@ -27534,6 +27551,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfTranslate:
 			// translate(text, from, to) → text — per-character map/delete.
 			return TextValue(translateChars(vals[0].Str, vals[1].Str, vals[2].Str)), nil
+		case sfRepeat:
+			// repeat(text, n) → text — concatenate the string n times.
+			r, err := repeatText(vals[0].Str, vals[1].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(r), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

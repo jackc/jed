@@ -488,6 +488,17 @@ function translateChars(s: string, from: string, to: string): string {
   return out;
 }
 
+// repeatText is repeat(s, n) (string-functions.md §3): concatenate s n times; n ≤ 0 is empty. The
+// result's byte size is bounded at MAX_RESULT_CHARS (PG's MaxAllocSize, a UTF-8-byte cap matching
+// Rust/Go) — an over-large n·bytes traps 54000. Matches PostgreSQL's repeat.
+function repeatText(s: string, n: bigint): string {
+  if (n <= 0n || s.length === 0) return "";
+  const bytes = BigInt(utf8ByteLength(s));
+  if (n > MAX_RESULT_CHARS / bytes)
+    throw engineError("program_limit_exceeded", "requested length too large");
+  return s.repeat(Number(n));
+}
+
 // substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
@@ -12665,7 +12676,9 @@ type ScalarFuncName =
   // replace(text, from, to) → text — replace every occurrence of substring `from` with `to` (§3).
   | "replace"
   // translate(text, from, to) → text — per-character map/delete by position in `from`/`to` (§3).
-  | "translate";
+  | "translate"
+  // repeat(text, n) → text — the string concatenated n times; over-large result traps 54000 (§3).
+  | "repeat";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24523,6 +24536,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const from = (vals[1] as { text: string }).text;
         const to = (vals[2] as { text: string }).text;
         return textValue(translateChars(s, from, to));
+      }
+      if (e.func === "repeat") {
+        // repeat(text, n) → text — concatenate the string n times.
+        const s = (vals[0] as { text: string }).text;
+        return textValue(repeatText(s, (vals[1] as { int: bigint }).int));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

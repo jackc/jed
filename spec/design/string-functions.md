@@ -174,3 +174,12 @@ occurs in `from` is replaced by the character at the **same position** in `to`, 
 the absent third `to` position, so it is deleted), `translate('abc', 'aa', 'xy') = 'xbc'`. The shared
 `translate_chars` kernel builds a code-point map (`char → Some(replacement) | None` for delete) and
 rewrites the string. NULL args propagate.
+
+### `repeat(text, n) → text`
+
+The string concatenated `n` times; `n ≤ 0` yields `''`. `repeat('ab', 3) = 'ababab'`,
+`repeat('héllo', 2) = 'héllohéllo'`. Like `lpad`/`rpad` it **amplifies**, so a result whose **byte**
+size (`n · byte_length(s)`) would exceed `MAX_RESULT_CHARS` (PG's `MaxAllocSize`) traps **`54000`**
+(`program_limit_exceeded`) — the cap is computed without overflowing (`checked_mul` / a division-form
+bound). The byte-size basis (not code points) matches `len(s)` / `s.len()` / `utf8ByteLength(s)`
+across cores, so the cap fires identically. NULL args propagate.

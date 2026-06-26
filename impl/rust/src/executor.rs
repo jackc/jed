@@ -13060,6 +13060,8 @@ enum ScalarFunc {
     Replace,
     /// translate(text, from, to) → text — per-character map/delete by position in `from`/`to` (§3).
     Translate,
+    /// repeat(text, n) → text — the string concatenated n times; over-large result traps 54000 (§3).
+    Repeat,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19094,6 +19096,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "rtrim" => ScalarFunc::Rtrim,
         "replace" => ScalarFunc::Replace,
         "translate" => ScalarFunc::Translate,
+        "repeat" => ScalarFunc::Repeat,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30493,6 +30496,14 @@ impl RExpr {
                         };
                         Ok(Value::Text(translate_chars(s, from, to)))
                     }
+                    // repeat(text, n) → text — concatenate the string n times.
+                    ScalarFunc::Repeat => {
+                        let s = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts repeat to text"),
+                        };
+                        Ok(Value::Text(repeat_text(s, int_value(&vals[1]))?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31373,7 +31384,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Ltrim
         | ScalarFunc::Rtrim
         | ScalarFunc::Replace
-        | ScalarFunc::Translate => {
+        | ScalarFunc::Translate
+        | ScalarFunc::Repeat => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31484,6 +31496,25 @@ fn translate_chars(s: &str, from: &str, to: &str) -> String {
         }
     }
     out
+}
+
+/// `repeat(s, n)` (string-functions.md §3): concatenate `s` `n` times; `n ≤ 0` is empty. The result's
+/// byte size is bounded at `MAX_RESULT_CHARS` (PG's MaxAllocSize) — an over-large `n·|s|` traps `54000`
+/// (program_limit_exceeded), the untrusted-query backstop. Matches PostgreSQL's repeat.
+fn repeat_text(s: &str, n: i64) -> Result<String> {
+    if n <= 0 {
+        return Ok(String::new());
+    }
+    let too_large = (s.len() as i64)
+        .checked_mul(n)
+        .is_none_or(|total| total > MAX_RESULT_CHARS);
+    if too_large {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "requested length too large",
+        ));
+    }
+    Ok(s.repeat(n as usize))
 }
 
 /// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window
