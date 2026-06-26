@@ -13078,6 +13078,8 @@ enum ScalarFunc {
     Initcap,
     /// to_hex(int) → text — lowercase hex of the value's 64-bit two's-complement pattern (§3).
     ToHex,
+    /// encode(bytea, format) → text — render bytes as hex / base64 / escape (§3).
+    Encode,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19121,6 +19123,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "chr" => ScalarFunc::Chr,
         "initcap" => ScalarFunc::Initcap,
         "to_hex" => ScalarFunc::ToHex,
+        "encode" => ScalarFunc::Encode,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30577,6 +30580,14 @@ impl RExpr {
                     ScalarFunc::ToHex => {
                         Ok(Value::Text(format!("{:x}", int_value(&vals[0]) as u64)))
                     }
+                    // encode(bytea, format) → text — hex / base64 / escape rendering.
+                    ScalarFunc::Encode => {
+                        let (bytes, fmt) = match (&vals[0], &vals[1]) {
+                            (Value::Bytea(b), Value::Text(f)) => (b, f),
+                            _ => unreachable!("resolver restricts encode to (bytea, text)"),
+                        };
+                        Ok(Value::Text(encode_bytea(bytes, fmt)?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31466,7 +31477,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Ascii
         | ScalarFunc::Chr
         | ScalarFunc::Initcap
-        | ScalarFunc::ToHex => {
+        | ScalarFunc::ToHex
+        | ScalarFunc::Encode => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31652,6 +31664,69 @@ fn chr_text(n: i64) -> Result<String> {
             format!("requested character not valid for encoding: {n}"),
         )),
     }
+}
+
+/// The standard RFC 4648 base64 alphabet (string-functions.md §3, shared by encode/decode).
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `encode(bytes, format)` (string-functions.md §3): render binary as text. `hex` = two lowercase
+/// hex digits per byte; `base64` = RFC 4648, wrapped at 76 chars with `\n` (PostgreSQL's style);
+/// `escape` = printable bytes verbatim, `0x00` → `\000`, backslash doubled, high-bit bytes → `\nnn`
+/// octal. An unrecognized format traps `22023`.
+fn encode_bytea(bytes: &[u8], format: &str) -> Result<String> {
+    match format {
+        "hex" => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+        "escape" => {
+            let mut out = String::with_capacity(bytes.len());
+            for &b in bytes {
+                match b {
+                    0x00 => out.push_str("\\000"),
+                    0x5c => out.push_str("\\\\"),
+                    0x80..=0xff => out.push_str(&format!("\\{b:03o}")),
+                    _ => out.push(b as char), // 0x01..0x7f except backslash — a single ASCII byte
+                }
+            }
+            Ok(out)
+        }
+        "base64" => Ok(base64_encode_wrapped(bytes)),
+        _ => Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("unrecognized encoding: \"{format}\""),
+        )),
+    }
+}
+
+/// RFC 4648 base64 of `bytes`, wrapped at 76 characters with `\n` between chunks (no trailing
+/// newline) — PostgreSQL's `encode(…, 'base64')` layout.
+fn base64_encode_wrapped(bytes: &[u8]) -> String {
+    let mut b64: Vec<u8> = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        b64.push(BASE64_ALPHABET[((n >> 18) & 63) as usize]);
+        b64.push(BASE64_ALPHABET[((n >> 12) & 63) as usize]);
+        b64.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[((n >> 6) & 63) as usize]
+        } else {
+            b'='
+        });
+        b64.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[(n & 63) as usize]
+        } else {
+            b'='
+        });
+    }
+    let mut out = String::with_capacity(b64.len() + b64.len() / 76);
+    for (i, &c) in b64.iter().enumerate() {
+        if i > 0 && i % 76 == 0 {
+            out.push('\n');
+        }
+        out.push(c as char);
+    }
+    out
 }
 
 /// `initcap(s)` (string-functions.md §3): uppercase the first character of each word and lowercase

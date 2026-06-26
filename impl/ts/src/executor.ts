@@ -525,6 +525,53 @@ function chrText(n: bigint): string {
   return String.fromCodePoint(Number(n));
 }
 
+// BASE64_ALPHABET is the standard RFC 4648 base64 alphabet (string-functions.md §3, encode/decode).
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// encodeBytea is encode(bytes, format) (string-functions.md §3): render binary as text. hex = two
+// lowercase hex digits per byte; base64 = RFC 4648 wrapped at 76 chars with \n (PostgreSQL's style);
+// escape = printable bytes verbatim, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal. An
+// unrecognized format traps 22023.
+function encodeBytea(bytes: Uint8Array, format: string): string {
+  if (format === "hex") {
+    let out = "";
+    for (const b of bytes) out += b.toString(16).padStart(2, "0");
+    return out;
+  }
+  if (format === "escape") {
+    let out = "";
+    for (const b of bytes) {
+      if (b === 0x00) out += "\\000";
+      else if (b === 0x5c) out += "\\\\";
+      else if (b >= 0x80) out += `\\${b.toString(8).padStart(3, "0")}`;
+      else out += String.fromCharCode(b); // 0x01..0x7f except backslash
+    }
+    return out;
+  }
+  if (format === "base64") return base64EncodeWrapped(bytes);
+  throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);
+}
+
+// base64EncodeWrapped is RFC 4648 base64 wrapped at 76 chars with \n (no trailing newline).
+function base64EncodeWrapped(bytes: Uint8Array): string {
+  let b64 = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const has1 = i + 1 < bytes.length;
+    const has2 = i + 2 < bytes.length;
+    const n = (bytes[i]! << 16) | ((has1 ? bytes[i + 1]! : 0) << 8) | (has2 ? bytes[i + 2]! : 0);
+    b64 += BASE64_ALPHABET[(n >> 18) & 63];
+    b64 += BASE64_ALPHABET[(n >> 12) & 63];
+    b64 += has1 ? BASE64_ALPHABET[(n >> 6) & 63] : "=";
+    b64 += has2 ? BASE64_ALPHABET[n & 63] : "=";
+  }
+  let out = "";
+  for (let i = 0; i < b64.length; i++) {
+    if (i > 0 && i % 76 === 0) out += "\n";
+    out += b64[i];
+  }
+  return out;
+}
+
 // initcapAscii is initcap(s) (string-functions.md §3): uppercase the first character of each word
 // and lowercase the rest, where a word is a maximal run of ASCII alphanumerics. jed classifies word
 // boundaries by ASCII alphanumerics and folds ASCII case only (by char-code arithmetic, so it is
@@ -12751,7 +12798,9 @@ type ScalarFuncName =
   // initcap(text) → text — titlecase each word (ASCII word boundaries + ASCII case fold, §3).
   | "initcap"
   // to_hex(int) → text — lowercase hex of the value's 64-bit two's-complement pattern (§3).
-  | "to_hex";
+  | "to_hex"
+  // encode(bytea, format) → text — render bytes as hex / base64 / escape (§3).
+  | "encode";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24661,6 +24710,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // maps a negative i64 to its unsigned bit pattern, matching Rust/Go.
         const n = (vals[0] as { int: bigint }).int;
         return textValue(BigInt.asUintN(64, n).toString(16));
+      }
+      if (e.func === "encode") {
+        // encode(bytea, format) → text — hex / base64 / escape.
+        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+        const fmt = (vals[1] as { text: string }).text;
+        return textValue(encodeBytea(bytes, fmt));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

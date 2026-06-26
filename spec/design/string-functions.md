@@ -275,3 +275,28 @@ bare integer literal in jed is `i64`, `to_hex(255)` matches PG for any positive 
 test pins against `::bigint` so both sides use 64 bits; a negative *narrower* column value renders 64
 bits in jed vs PG's narrower width — a consequence of jed's i64-uniform integers, documented here.
 NULL propagates.
+
+### `encode(bytea, format) → text` and `decode(text, format) → bytea`
+
+The inverse pair that converts between `bytea` and `text` in one of three formats — `hex`, `base64`,
+`escape` — matching PostgreSQL. An **unrecognized format** traps **`22023`** (*"unrecognized
+encoding"*). NULL args propagate. These are dependency-free, hand-written codecs (§14: base64 is
+RFC-4648-standardized so it agrees byte-for-byte across cores; jed hand-writes it rather than taking
+three different library deps).
+
+- **`hex`** — two lowercase hex digits per byte. `encode('\x616263'::bytea, 'hex') = '616263'`;
+  `decode` reads pairs of hex digits (case-insensitive), erroring `22023` on an odd length or a
+  non-hex digit.
+- **`base64`** — RFC 4648, and on *encode* PostgreSQL wraps the output at **76 characters** with a
+  `\n` between chunks (no trailing newline); *decode* ignores whitespace. `encode('\x616263'::bytea,
+  'base64') = 'YWJj'`. (The corpus pins short values directly and the 76-char wrap via `length`,
+  since the harness cannot carry an embedded newline in an expected row.)
+- **`escape`** — a printable byte (`0x01`–`0x7f`) is emitted **verbatim** (including control bytes
+  like tab/newline), a **backslash** (`0x5c`) is doubled, a **NUL** (`0x00`) becomes `\000`, and a
+  **high-bit byte** (`0x80`–`0xff`) becomes `\` + a 3-digit **octal**. `encode('\x00ff41'::bytea,
+  'escape') = '\000\377A'`. (This matches PostgreSQL's `bytea_output`-independent escape codec, not
+  the `\x…` hex output form.) `decode` reverses it.
+
+### `encode(bytea, format) → text`
+
+The encode half of the pair above.

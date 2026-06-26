@@ -3464,6 +3464,20 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# encode(bytea, format text) → text — render binary data as text in one of three formats: 'hex' (two
+# lowercase hex digits per byte), 'base64' (RFC 4648, wrapped at 76 chars with '\n' as PG does), or
+# 'escape' (printable bytes as-is, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal). An
+# unrecognized format is 22023. The inverse of decode. NULL args propagate. (string-functions.md §3)
+[[operator]]
+name           = "encode"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22023"]
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

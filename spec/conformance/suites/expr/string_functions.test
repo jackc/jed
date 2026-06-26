@@ -676,3 +676,44 @@ query T
 SELECT to_hex(NULL::int)
 ----
 NULL
+
+# === encode(bytea, format) → text: hex / base64 / escape ==============================
+
+# hex: two lowercase hex digits per byte
+query T
+SELECT encode(bytea '\x616263', 'hex'), encode(bytea '\x00ff41', 'hex')
+----
+616263
+00ff41
+
+# base64 (short values, no 76-char wrap): standard alphabet + '=' padding
+query T
+SELECT encode(bytea '\x616263', 'base64'), encode(bytea '\x6162', 'base64'), encode(bytea '\x61', 'base64')
+----
+YWJj
+YWI=
+YQ==
+
+# escape: printable bytes verbatim; 0x00 → \000, 0xff → \377, backslash doubled
+query T
+SELECT encode(bytea '\x00ff41', 'escape'), encode(bytea '\x415c42', 'escape')
+----
+\000\377A
+A\\B
+
+# base64 encode wraps at 76 chars with a newline (PG): 60 bytes → 80 base64 chars + 1 '\n' = 81
+query I
+SELECT length(encode(bytea '\x616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161', 'base64'))
+----
+81
+
+# an unrecognized format is 22023
+statement error 22023
+SELECT encode(bytea '\x00', 'utf8')
+
+# a NULL format propagates (jed has no text→bytea cast, so the bytea-side NULL is exercised by the
+# generic scalar-function short-circuit, identical for every argument position)
+query T
+SELECT encode(bytea '\x00', NULL::text)
+----
+NULL

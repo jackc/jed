@@ -15959,6 +15959,8 @@ const (
 	sfInitcap
 	// to_hex(int) → text — lowercase hex of the value's 64-bit two's-complement pattern (§3).
 	sfToHex
+	// encode(bytea, format) → text — render bytes as hex / base64 / escape (§3).
+	sfEncode
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19576,6 +19578,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfInitcap
 	case "to_hex":
 		return sfToHex
+	case "encode":
+		return sfEncode
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24266,6 +24270,79 @@ func chrText(n int64) (string, error) {
 	return string(rune(n)), nil
 }
 
+// base64Alphabet is the standard RFC 4648 base64 alphabet (string-functions.md §3, encode/decode).
+const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// encodeBytea is encode(bytes, format) (string-functions.md §3): render binary as text. hex = two
+// lowercase hex digits per byte; base64 = RFC 4648 wrapped at 76 chars with \n (PostgreSQL's style);
+// escape = printable bytes verbatim, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal. An
+// unrecognized format traps 22023.
+func encodeBytea(bytes []byte, format string) (string, error) {
+	switch format {
+	case "hex":
+		var b strings.Builder
+		for _, c := range bytes {
+			fmt.Fprintf(&b, "%02x", c)
+		}
+		return b.String(), nil
+	case "escape":
+		var b strings.Builder
+		for _, c := range bytes {
+			switch {
+			case c == 0x00:
+				b.WriteString("\\000")
+			case c == 0x5c:
+				b.WriteString("\\\\")
+			case c >= 0x80:
+				fmt.Fprintf(&b, "\\%03o", c)
+			default:
+				b.WriteByte(c)
+			}
+		}
+		return b.String(), nil
+	case "base64":
+		return base64EncodeWrapped(bytes), nil
+	default:
+		return "", NewError(InvalidParameterValue, fmt.Sprintf("unrecognized encoding: %q", format))
+	}
+}
+
+// base64EncodeWrapped is RFC 4648 base64 wrapped at 76 chars with \n (no trailing newline).
+func base64EncodeWrapped(bytes []byte) string {
+	var b64 []byte
+	for i := 0; i < len(bytes); i += 3 {
+		n := uint32(bytes[i]) << 16
+		l := 1
+		if i+1 < len(bytes) {
+			n |= uint32(bytes[i+1]) << 8
+			l = 2
+		}
+		if i+2 < len(bytes) {
+			n |= uint32(bytes[i+2])
+			l = 3
+		}
+		b64 = append(b64, base64Alphabet[(n>>18)&63], base64Alphabet[(n>>12)&63])
+		if l > 1 {
+			b64 = append(b64, base64Alphabet[(n>>6)&63])
+		} else {
+			b64 = append(b64, '=')
+		}
+		if l > 2 {
+			b64 = append(b64, base64Alphabet[n&63])
+		} else {
+			b64 = append(b64, '=')
+		}
+	}
+	var out strings.Builder
+	for i, c := range b64 {
+		if i > 0 && i%76 == 0 {
+			out.WriteByte('\n')
+		}
+		out.WriteByte(c)
+	}
+	return out.String()
+}
+
 // initcapASCII is initcap(s) (string-functions.md §3): uppercase the first character of each word
 // and lowercase the rest, where a word is a maximal run of ASCII alphanumerics. jed classifies word
 // boundaries by ASCII alphanumerics and folds ASCII case only — deterministic and cross-core
@@ -27715,6 +27792,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfToHex:
 			// to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern.
 			return TextValue(strconv.FormatUint(uint64(vals[0].Int), 16)), nil
+		case sfEncode:
+			// encode(bytea, format) → text — hex / base64 / escape. bytea is held as raw bytes in Str.
+			r, err := encodeBytea([]byte(vals[0].Str), vals[1].Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(r), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
