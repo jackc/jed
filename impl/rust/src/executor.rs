@@ -8696,6 +8696,42 @@ impl Database {
             resolved_sets.push(idxs);
         }
 
+        // Functional-dependency grouping (aggregates.md §16, PG): when there is a SINGLE grouping set
+        // that contains every primary-key column of a base table T, T's PK functionally determines
+        // every column of T, so any T column (and expressions over them) may appear ungrouped. Make
+        // them groupable by adding T's remaining columns as extra master grouping keys — the grouping
+        // is UNCHANGED (each is constant within a group, so bucketing by [pk…, others…] yields the
+        // same partition as by [pk…] alone, even across a join). Restricted to a single set: PG
+        // rejects the dependency when a grouping set omits the PK. A CTE / derived table / SRF has an
+        // empty `pk` (a synthetic key), so only base tables with a real PK contribute.
+        if resolved_sets.len() == 1 {
+            let mut extra: Vec<usize> = Vec::new();
+            for rel in &scope.rels {
+                if rel.qualifier_only || rel.cte.is_some() || rel.table.pk.is_empty() {
+                    continue;
+                }
+                let pk_grouped = rel
+                    .table
+                    .pk
+                    .iter()
+                    .all(|&ord| group_keys.contains(&(rel.offset + ord)));
+                if !pk_grouped {
+                    continue;
+                }
+                for c in 0..rel.table.columns.len() {
+                    let idx = rel.offset + c;
+                    if !group_keys.contains(&idx) && !extra.contains(&idx) {
+                        extra.push(idx);
+                    }
+                }
+            }
+            for idx in extra {
+                group_keys.push(idx);
+                group_key_exprs.push(None);
+                resolved_sets[0].push(idx);
+            }
+        }
+
         // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
         // resolves in Collect mode — aggregates collect into synthetic slots and a non-grouped
         // column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden

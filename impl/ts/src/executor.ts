@@ -7778,6 +7778,32 @@ export class Database {
       }),
     );
 
+    // Functional-dependency grouping (aggregates.md §16, PG): when there is a SINGLE grouping set
+    // that contains every primary-key column of a base table T, T's PK functionally determines every
+    // column of T, so any T column (and expressions over them) may appear ungrouped. Make them
+    // groupable by adding T's remaining columns as extra master grouping keys — the grouping is
+    // UNCHANGED (each is constant within a group, so bucketing by [pk…, others…] yields the same
+    // partition as by [pk…] alone, even across a join). Restricted to a single set: PG rejects the
+    // dependency when a grouping set omits the PK. A CTE / derived table / SRF has an empty pk (a
+    // synthetic key), so only base tables with a real PK contribute.
+    if (resolvedSets.length === 1) {
+      const extra: number[] = [];
+      for (const rel of scope.rels) {
+        if (rel.qualifierOnly || rel.cte !== undefined || rel.table.pk.length === 0) continue;
+        const pkGrouped = rel.table.pk.every((ord) => groupKeys.includes(rel.offset + ord));
+        if (!pkGrouped) continue;
+        for (let c = 0; c < rel.table.columns.length; c++) {
+          const idx = rel.offset + c;
+          if (!groupKeys.includes(idx) && !extra.includes(idx)) extra.push(idx);
+        }
+      }
+      for (const idx of extra) {
+        groupKeys.push(idx);
+        groupKeyExprs.push(null);
+        resolvedSets[0]!.push(idx);
+      }
+    }
+
     // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
     // resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
     // column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden

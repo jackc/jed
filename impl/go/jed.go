@@ -256,6 +256,9 @@ var SupportedCapabilities = []string{
 	// GROUP BY by a select-list ordinal (GROUP BY 1), an output alias (GROUP BY s), or a general
 	// expression (GROUP BY a + b) — not just a bare column (spec/design/aggregates.md §15).
 	"query.group_by_expr",
+	// Functional-dependency grouping: GROUP BY a base table's full primary key lets any column of
+	// that table appear ungrouped, since the PK determines it (spec/design/aggregates.md §16).
+	"query.group_by_functional_dependency",
 	// GROUPING SETS / ROLLUP / CUBE and the GROUPING() function — multiple grouping sets in one
 	// GROUP BY (spec/design/aggregates.md §12, grammar.md §18).
 	"query.grouping_sets",

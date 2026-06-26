@@ -10020,6 +10020,45 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		resolvedSets = append(resolvedSets, idxs)
 	}
 
+	// Functional-dependency grouping (aggregates.md §16, PG): when there is a SINGLE grouping set
+	// that contains every primary-key column of a base table T, T's PK functionally determines every
+	// column of T, so any T column (and expressions over them) may appear ungrouped. Make them
+	// groupable by adding T's remaining columns as extra master grouping keys — the grouping is
+	// UNCHANGED (each is constant within a group, so bucketing by [pk…, others…] yields the same
+	// partition as by [pk…] alone, even across a join). Restricted to a single set: PG rejects the
+	// dependency when a grouping set omits the PK. A CTE / derived table / SRF has an empty PK (a
+	// synthetic key), so only base tables with a real PK contribute.
+	if len(resolvedSets) == 1 {
+		var extra []int
+		for ri := range s.rels {
+			rel := &s.rels[ri]
+			if rel.qualifierOnly || rel.cte != nil || len(rel.table.PK) == 0 {
+				continue
+			}
+			pkGrouped := true
+			for _, ord := range rel.table.PK {
+				if !slices.Contains(groupKeys, rel.offset+ord) {
+					pkGrouped = false
+					break
+				}
+			}
+			if !pkGrouped {
+				continue
+			}
+			for c := range rel.table.Columns {
+				idx := rel.offset + c
+				if !slices.Contains(groupKeys, idx) && !slices.Contains(extra, idx) {
+					extra = append(extra, idx)
+				}
+			}
+		}
+		for _, idx := range extra {
+			groupKeys = append(groupKeys, idx)
+			groupKeyExprs = append(groupKeyExprs, nil)
+			resolvedSets[0] = append(resolvedSets[0], idx)
+		}
+	}
+
 	// An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
 	// resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
 	// column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden

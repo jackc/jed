@@ -234,7 +234,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         expression (`GROUP BY a+b`, materialized; a matching select/HAVING/ORDER BY expr resolves to
         the group value; an aggregate operand stays per-row). Composes with ROLLUP/CUBE/GROUPING SETS.
         New capability `query.group_by_expr`. → aggregates.md §15
-  - [ ] _follow-on:_ functional-dependency grouping,
+  - [x] **Functional-dependency grouping** — `GROUP BY` a base table's full primary key lets any
+        column of that table (and expressions over them) appear ungrouped, since the PK determines it;
+        holds across a join, requires the whole composite PK, single grouping set only. New capability
+        `query.group_by_functional_dependency`. → aggregates.md §16
+  - [ ] _follow-on:_
         `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate, and the
         ordered-set follow-ons (hypothetical-set aggregates `rank`/`dense_rank`/`percent_rank`/
         `cume_dist` `WITHIN GROUP`, the array-valued `percentile_*` fraction, interval input to

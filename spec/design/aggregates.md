@@ -240,9 +240,9 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   the rows sorted by a `WITHIN GROUP (ORDER BY …)` clause (§13).
 - **`GROUP BY` by ordinal / alias / expression** (landed) — a grouping key may be a select-list
   ordinal, an output alias, or a general expression, not just a column (§15).
-- **Deferred / out of scope**: the PG
-  **functional-dependency**
-  relaxation of the grouping rule (a column functionally dependent on a grouped PK); **`FILTER` on
+- **Functional-dependency grouping** (landed) — `GROUP BY` a base table's full primary key lets any
+  column of that table appear ungrouped (§16).
+- **Deferred / out of scope**: **`FILTER` on
   a window aggregate**; **`GROUPING SETS` combined with window functions**; **hypothetical-set
   aggregates** (`rank`/`dense_rank`/`percent_rank`/`cume_dist` `WITHIN GROUP`); and the
   **array-valued** `percentile_cont`/`percentile_disc` fraction form. Each is an additive later
@@ -497,3 +497,26 @@ post-`WHERE` row** (its `operator_eval`s charged, like an aggregate operand) and
 a synthetic column reused across grouping sets; a plain column key adds nothing. The bucketing /
 finalize stay unmetered. Deterministic and identical across cores. New capability
 `query.group_by_expr`.
+
+## 16. Functional-dependency grouping
+
+The grouping-error rule (§6/§10) requires every non-aggregated select-list / `HAVING` / `ORDER BY`
+column to be a grouping key. PostgreSQL **relaxes** it for a **functional dependency**: when the
+`GROUP BY` includes every **primary-key** column of a base table T, the PK *determines* every other
+column of T (one PK value ⇒ at most one T row), so any column of T — and expressions over them —
+may appear ungrouped, with the single per-group value used. jed matches.
+
+The dependency holds **across a join**: `GROUP BY t.id` (t's PK) over `t JOIN u` keeps every `t`
+column constant within a group even when several `u` rows match, so `t`'s columns are groupable while
+`u`'s (whose PK is *not* grouped) stay `42803`. A **composite** PK requires **all** its members to
+be grouped — a partial PK confers no dependency. The relaxation is restricted to a **single grouping
+set**: PG rejects the dependency when a `GROUPING SETS` / `ROLLUP` / `CUBE` element omits the PK (a
+column grouped away in one set has no single value), so jed applies it only to a plain `GROUP BY`.
+
+**Implementation.** When the (single) grouping set contains a base table's full PK, that table's
+remaining columns are added as **extra master grouping keys** — the grouping is **unchanged**, since
+each added column is constant within every group, so bucketing by `[pk…, others…]` yields the *same*
+partition as by `[pk…]` alone. This makes them ordinary grouping-key slots, so the projection /
+`HAVING` / `ORDER BY` resolve them through the normal column path with no new machinery. A CTE /
+derived table / SRF has no real PK (a synthetic key), so only base tables contribute. New capability
+`query.group_by_functional_dependency`.
