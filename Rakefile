@@ -345,6 +345,44 @@ namespace :corpus do
   end
 end
 
+# rqg — the RQG-vs-PG firehose (scripts/rqg_gen.rb; .scratch/testing-ideas.md §1 item 1). Generates
+# random SQL over jed's supported subset, fills expected output from the LIVE PostgreSQL oracle, and
+# runs the candidates through the Rust conformance harness (CI's exact comparator): a PASS is jed==PG
+# agreement (emit a curated/capped/deduped corpus entry to suites/rqg/), a FAIL is a divergence
+# (classify vs the override ledger, else ddmin-reduce + flag a candidate shared-core bug). OUTSIDE
+# rake ci (slow, needs live PG — like mutation/stress/bench); the PRODUCT that flows INTO rake ci is
+# the emitted suites/rqg/*.test, which then runs on all three cores.
+namespace :rqg do
+  desc "Run one RQG case (default seed 1) across every shape; check vs PG, no corpus emit"
+  task :run, [:seed] do |_, args|
+    sh RbConfig.ruby, "scripts/rqg_gen.rb", (args[:seed] || "1")
+  end
+
+  desc "RQG sweep: N seeds (default 200) vs PG; flag + reduce divergences, no corpus emit"
+  task :sweep, [:count] do |_, args|
+    sh RbConfig.ruby, "scripts/rqg_gen.rb", "--sweep", (args[:count] || "200")
+  end
+
+  desc "RQG sweep + emit curated/capped/deduped agreements to suites/rqg/ (default N=300)"
+  task :emit, [:count] do |_, args|
+    sh RbConfig.ruby, "scripts/rqg_gen.rb", "--sweep", (args[:count] || "300"), "--emit"
+  end
+
+  desc "Reproduce one RQG case: rake 'rqg:replay[<seed>,<shape>]'"
+  task :replay, [:seed, :shape] do |_, args|
+    seed = args.fetch(:seed) { abort "usage: rake 'rqg:replay[<seed>,<shape>]'" }
+    extra = args[:shape] ? ["--shapes", args[:shape]] : []
+    sh RbConfig.ruby, "scripts/rqg_gen.rb", seed, *extra
+  end
+
+  desc "Reduce a flagged RQG .test to a minimal one (ddmin; [core] rust|go|ts, default rust)"
+  task :reduce, [:file, :core] do |_, args|
+    file = args.fetch(:file) { abort "usage: rake 'rqg:reduce[path/to/flagged.test,rust]'" }
+    extra = args[:core] ? ["--core", args[:core]] : []
+    sh RbConfig.ruby, "scripts/reduce.rb", file, *extra
+  end
+end
+
 # cli — the `jed` terminal client (spec/design/cli.md), a HOST PROGRAM at /cli: a
 # standalone crate so its TUI dependencies never enter the zero-dep engine cores. Its
 # tests run as part of `rake test` (and so `rake ci`), alongside the engine cores'

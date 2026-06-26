@@ -42,3 +42,6 @@
 # no knowledge of mise's conventions, so this must be ignored explicitly.
 /mise.local.toml
 /spec/conformance/suites/_reduce_tmp/
+# RQG firehose (scripts/rqg_gen.rb): the transient candidate batch the harness runs (the curated
+# suites/rqg/*.test it emits ARE committed; the report dir lives under the ignored /bench/results/).
+/spec/conformance/suites/_rqg_tmp/
