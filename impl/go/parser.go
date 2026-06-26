@@ -923,9 +923,12 @@ func (p *Parser) expectTypmodInt() (uint64, error) {
 	return t.Int, nil
 }
 
-// parseDropTable parses `DROP TABLE <name>`. A missing table is rejected at execution
-// time (42P01), not here. Single table; no IF EXISTS, no CASCADE/RESTRICT this slice
-// (spec/design/grammar.md §13).
+// parseDropTable parses `DROP TABLE [IF EXISTS] <name>`. A missing table is rejected at
+// execution time (42P01 — or a no-op when IF EXISTS is present), not here. Single table;
+// no CASCADE/RESTRICT this slice (spec/design/grammar.md §13). IF EXISTS is recognized only
+// when the next two keywords are exactly IF EXISTS (the two-token lookahead the statement
+// dispatch uses) — a lone `if` is an ordinary non-reserved identifier, so `DROP TABLE if`
+// drops a table named `if` (PG-faithful, §1).
 func (p *Parser) parseDropTable() (*DropTable, error) {
 	if err := p.expectKeyword("drop"); err != nil {
 		return nil, err
@@ -933,11 +936,16 @@ func (p *Parser) parseDropTable() (*DropTable, error) {
 	if err := p.expectKeyword("table"); err != nil {
 		return nil, err
 	}
+	ifExists := p.peekKeyword() == "if" && p.peekKeywordAt(1) == "exists"
+	if ifExists {
+		p.advance() // IF
+		p.advance() // EXISTS
+	}
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return nil, err
 	}
-	return &DropTable{Name: name}, nil
+	return &DropTable{Name: name, IfExists: ifExists}, nil
 }
 
 // parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`

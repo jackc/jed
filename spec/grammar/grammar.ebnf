@@ -194,11 +194,13 @@ referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "
 
 /* DROP TABLE removes a table — its definition and all its rows — from the
  * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE
- * table (no "DROP TABLE a, b"), no "IF EXISTS" (dropping a table that does not
- * exist is a 42P01 undefined_table error, mirroring CREATE TABLE's 42P07 on a
- * duplicate), and no "CASCADE" / "RESTRICT" (there are no dependent objects yet).
- * Each omission is relaxable later (../../TODO.md). */
-drop_table     ::= "DROP" "TABLE" identifier
+ * table (no "DROP TABLE a, b") and no "CASCADE" / "RESTRICT" (there are no
+ * dependent objects yet) — each relaxable later (../../TODO.md). "IF EXISTS"
+ * makes a missing table a no-op success instead of the 42P01 undefined_table the
+ * bare form raises (a non-table relation is still 42809); recognized by a
+ * two-token lookahead, so a lone "if" stays an identifier and "DROP TABLE if"
+ * drops a table named "if" (PG-faithful). */
+drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier
 
 /* CREATE INDEX declares a secondary index over one or more named columns of one table
  * (../design/indexes.md). "CREATE UNIQUE INDEX" makes it a UNIQUE index: building it over

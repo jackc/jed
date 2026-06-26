@@ -1,6 +1,7 @@
 // DROP TABLE — remove a table (its definition + all its rows) from the catalog. The
-// inverse of CREATE TABLE: a missing table is 42P01 and there is no IF EXISTS this
-// slice; single table, no CASCADE/RESTRICT (spec/design/grammar.md §13).
+// inverse of CREATE TABLE: a missing table is 42P01 (or a no-op under IF EXISTS); single
+// table, no CASCADE/RESTRICT (spec/design/grammar.md §13). The IF EXISTS behavior lives in
+// the corpus (suites/ddl/drop_table.test — it agrees with PostgreSQL).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";

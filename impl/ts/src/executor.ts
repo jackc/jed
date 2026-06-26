@@ -4052,10 +4052,10 @@ export class Database {
   }
 
   // executeDropTable removes the table's definition and its row store from the catalog
-  // (both keyed by the lower-cased name). A table that does not exist is the same 42P01
-  // the DML paths raise — there is no IF EXISTS this slice (spec/design/grammar.md §13).
-  // Like CREATE TABLE it touches no rows and evaluates no expression tree (the store is
-  // discarded wholesale), so it accrues zero cost.
+  // (both keyed by the lower-cased name). A missing table without IF EXISTS is the same
+  // 42P01 the DML paths raise; with IF EXISTS it is a no-op success (spec/design/grammar.md
+  // §13). Like CREATE TABLE it touches no rows and evaluates no expression tree (the store
+  // is discarded wholesale), so it accrues zero cost.
   private executeDropTable(dt: DropTable): Outcome {
     // A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never the
     // main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never an FK
@@ -4079,9 +4079,14 @@ export class Database {
     }
     if (!this.table(dt.name)) {
       // An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
-      // anything else is the missing-table 42P01 the DML paths raise.
+      // IF EXISTS does NOT suppress this (PG keeps the wrong-object-type error).
       if (this.findIndex(dt.name)) {
         throw engineError("wrong_object_type", dt.name + " is not a table");
+      }
+      // DROP TABLE IF EXISTS <missing> is a no-op success (PG turns the missing-table error
+      // into a notice); the bare form raises the 42P01 the DML paths raise.
+      if (dt.ifExists) {
+        return { kind: "statement", cost: 0n, rowsAffected: null };
       }
       throw engineError("undefined_table", "table does not exist: " + dt.name);
     }

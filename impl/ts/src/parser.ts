@@ -846,14 +846,23 @@ class Parser {
     return t.int!;
   }
 
-  // parseDropTable parses `DROP TABLE <name>`. A missing table is rejected at execution
-  // time (42P01), not here. Single table; no IF EXISTS, no CASCADE/RESTRICT this slice
-  // (spec/design/grammar.md §13).
+  // parseDropTable parses `DROP TABLE [IF EXISTS] <name>`. A missing table is rejected at
+  // execution time (42P01 — or a no-op when IF EXISTS is present), not here. Single table;
+  // no CASCADE/RESTRICT this slice (spec/design/grammar.md §13). IF EXISTS is recognized only
+  // when the next two keywords are exactly IF EXISTS (the two-token lookahead the statement
+  // dispatch uses) — a lone `if` is an ordinary non-reserved identifier, so `DROP TABLE if`
+  // drops a table named `if` (PG-faithful, §1).
   private parseDropTable(): Statement {
     this.expectKeyword("drop");
     this.expectKeyword("table");
+    let ifExists = false;
+    if (this.peekKeyword() === "if" && this.peekKeywordAt(1) === "exists") {
+      this.advance(); // IF
+      this.advance(); // EXISTS
+      ifExists = true;
+    }
     const name = this.expectIdentifier();
-    return { kind: "dropTable", name };
+    return { kind: "dropTable", name, ifExists };
   }
 
   // parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`

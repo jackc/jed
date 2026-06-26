@@ -164,13 +164,17 @@ pub struct DefaultDef {
     pub text: String,
 }
 
-/// `DROP TABLE <name>`. Removes a table — its definition and all its rows — from the
-/// catalog. Dropping a table that does not exist is an error (42P01); there is no
-/// `IF EXISTS` this slice. Single table only; no `CASCADE` / `RESTRICT` (no dependent
-/// objects exist yet). See spec/design/grammar.md §13.
+/// `DROP TABLE [IF EXISTS] <name>`. Removes a table — its definition and all its rows —
+/// from the catalog. A missing table without `IF EXISTS` is an error (42P01); with
+/// `IF EXISTS` it is a no-op success (PostgreSQL turns the missing-table error into a
+/// notice). `IF EXISTS` suppresses only the missing-table error — a name that resolves to
+/// a non-table relation (an index) is still the 42809 wrong-object-type error. Single
+/// table only; no `CASCADE` / `RESTRICT` (no dependent objects exist yet). See
+/// spec/design/grammar.md §13.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DropTable {
     pub name: String,
+    pub if_exists: bool,
 }
 
 /// `CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* )` — a secondary index

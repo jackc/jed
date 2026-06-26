@@ -4199,12 +4199,20 @@ impl Database {
     fn execute_drop_table(&mut self, dt: DropTable) -> Result<Outcome> {
         if self.table(&dt.name).is_none() {
             // An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
-            // anything else is the missing-table 42P01 the DML paths raise.
+            // `IF EXISTS` does NOT suppress this (PG keeps the wrong-object-type error).
             if self.find_index(&dt.name).is_some() {
                 return Err(EngineError::new(
                     SqlState::WrongObjectType,
                     format!("{} is not a table", dt.name),
                 ));
+            }
+            // `DROP TABLE IF EXISTS <missing>` is a no-op success (PG turns the missing-table
+            // error into a notice); the bare form raises the 42P01 the DML paths raise.
+            if dt.if_exists {
+                return Ok(Outcome::Statement {
+                    cost: 0,
+                    rows_affected: None,
+                });
             }
             return Err(EngineError::new(
                 SqlState::UndefinedTable,

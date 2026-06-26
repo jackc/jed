@@ -765,14 +765,24 @@ impl Parser {
         }
     }
 
-    /// `DROP TABLE <name>`. Removes the named table. A missing table is rejected at
-    /// execution time (42P01), not here. Single table; no `IF EXISTS`, no
-    /// `CASCADE` / `RESTRICT` this slice (spec/design/grammar.md §13).
+    /// `DROP TABLE [IF EXISTS] <name>`. Removes the named table. A missing table is
+    /// rejected at execution time (42P01 — or a no-op when `IF EXISTS` is present), not
+    /// here. Single table; no `CASCADE` / `RESTRICT` this slice (spec/design/grammar.md
+    /// §13). `IF EXISTS` is recognized only when the next two keywords are exactly
+    /// `IF EXISTS` (the two-token lookahead the statement dispatch uses) — a lone `if` is an
+    /// ordinary non-reserved identifier, so `DROP TABLE if` drops a table named `if`
+    /// (PG-faithful, §1).
     fn parse_drop_table(&mut self) -> Result<DropTable> {
         self.expect_keyword("drop")?;
         self.expect_keyword("table")?;
+        let if_exists = self.peek_keyword().as_deref() == Some("if")
+            && self.peek_keyword_at(1).as_deref() == Some("exists");
+        if if_exists {
+            self.advance(); // IF
+            self.advance(); // EXISTS
+        }
         let name = self.expect_identifier()?;
-        Ok(DropTable { name })
+        Ok(DropTable { name, if_exists })
     }
 
     /// `CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* )` (spec/design/grammar.md

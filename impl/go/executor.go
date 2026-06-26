@@ -4436,9 +4436,9 @@ func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, met
 	return nil
 }
 
-// executeDropTable runs a DROP TABLE: remove the table's definition and its row store
-// from the catalog (both keyed by the lower-cased name). A table that does not exist is
-// the same 42P01 the DML paths raise — there is no IF EXISTS this slice
+// executeDropTable runs a DROP TABLE [IF EXISTS]: remove the table's definition and its
+// row store from the catalog (both keyed by the lower-cased name). A missing table without
+// IF EXISTS is the same 42P01 the DML paths raise; with IF EXISTS it is a no-op success
 // (spec/design/grammar.md §13). Like CREATE TABLE it touches no rows and evaluates no
 // expression tree (the store is discarded wholesale), so it accrues zero cost.
 func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
@@ -4468,9 +4468,14 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 	}
 	if _, ok := db.Table(dt.Name); !ok {
 		// An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
-		// anything else is the missing-table 42P01 the DML paths raise.
+		// IF EXISTS does NOT suppress this (PG keeps the wrong-object-type error).
 		if _, _, ok := db.findIndex(dt.Name); ok {
 			return Outcome{}, NewError(WrongObjectType, dt.Name+" is not a table")
+		}
+		// DROP TABLE IF EXISTS <missing> is a no-op success (PG turns the missing-table
+		// error into a notice); the bare form raises the 42P01 the DML paths raise.
+		if dt.IfExists {
+			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 		}
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+dt.Name)
 	}

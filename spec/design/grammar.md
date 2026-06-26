@@ -506,14 +506,20 @@ per-table row store — are dropped together, keyed by the table's lower-cased n
 case-insensitive: `DROP TABLE T` drops `t`). After a drop the name is free again, so
 `DROP TABLE t` then `CREATE TABLE t (...)` re-creates it from empty.
 
-**A missing table is an error — no `IF EXISTS`.** Dropping a table that does not exist
+**A missing table is `42P01` — unless `IF EXISTS`.** Dropping a table that does not exist
 raises `42P01` (`undefined_table`, *"table does not exist: t"*) — the same code a
 `SELECT` / `INSERT` / `UPDATE` / `DELETE` against an unknown table already raises. This
 mirrors `CREATE TABLE`'s `42P07`-on-duplicate (§1) and matches PostgreSQL's bare
-`DROP TABLE`. The idempotent **`IF EXISTS`** form (PostgreSQL turns the missing-table error
-into a notice) is **deliberately deferred** this slice, kept symmetric with the
-still-missing `CREATE TABLE IF NOT EXISTS`; both `IF [NOT] EXISTS` forms can land together
-later ([../../TODO.md](../../TODO.md)).
+`DROP TABLE`. The idempotent **`DROP TABLE IF EXISTS t`** form turns that missing-table
+error into a **no-op success** (PostgreSQL emits a notice; jed has no notice channel, so it
+is a silent success). `IF EXISTS` suppresses **only** the missing-table error — a name that
+*does* resolve, but to a non-table relation (a secondary index), is still the `42809`
+(`wrong_object_type`, *"t is not a table"*) error that the bare form raises (PG keeps it
+too). The `IF EXISTS` keyword pair is recognized by a **two-token lookahead** (the shape the
+statement dispatch uses), so a lone `if` stays an ordinary non-reserved identifier:
+`DROP TABLE if` drops a table named `if` — PG-faithful (§1) — while only the adjacent pair
+`IF EXISTS` selects the idempotent form. The symmetric `CREATE TABLE IF NOT EXISTS` is still
+deferred and can land later ([../../TODO.md](../../TODO.md)).
 
 **Deliberate narrowings (each relaxable later, §5).** As with the rest of the surface, the
 form is minimal:

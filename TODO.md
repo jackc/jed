@@ -215,7 +215,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       type `42804` checked up front (even over an empty source). → [grammar.md §24](spec/design/grammar.md)
 - [x] **`DROP TABLE`** — removes definition + rows; missing → `42P01`; zero cost.
       → [grammar.md §13](spec/design/grammar.md)
-  - [ ] _follow-on:_ `IF EXISTS`, multi-table `DROP TABLE a, b`, `CASCADE`/`RESTRICT`.
+  - [x] **`DROP TABLE IF EXISTS`** — missing table is a no-op success instead of `42P01`
+        (a non-table relation is still `42809`); two-token `IF EXISTS` lookahead so a lone
+        `if` stays an identifier (PG-faithful). Cap `ddl.drop_table_if_exists`.
+  - [ ] _follow-on:_ multi-table `DROP TABLE a, b`, `CASCADE`/`RESTRICT`.
 
 ---
 
