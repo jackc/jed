@@ -142,3 +142,9 @@ a substring; default a single space). `btrim('xxhixx', 'x') = 'hi'`, `btrim('  h
 `btrim('héllo', 'ho') = 'éll'`, `btrim('abc', '') = 'abc'` (an empty set trims nothing). The shared
 `trim_chars` kernel builds a code-point set and walks each chosen end; `ltrim`/`rtrim` reuse it with
 one side disabled. NULL args propagate.
+
+### `ltrim(text [, characters]) → text`
+
+Like `btrim` but trims only the **leading** (left) run — the function form of
+`TRIM(LEADING characters FROM text)`. `ltrim('xxhixx', 'x') = 'hixx'`, `ltrim('  hi  ') = 'hi  '`.
+Reuses `trim_chars` with `do_right = false`. NULL args propagate.

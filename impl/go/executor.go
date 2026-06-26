@@ -15933,6 +15933,8 @@ const (
 	sfRpad
 	// btrim(text[, chars]) → text — trim characters in the `chars` set from both ends (§3).
 	sfBtrim
+	// ltrim(text[, chars]) → text — trim the `chars` set from the LEADING end only (§3).
+	sfLtrim
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19524,6 +19526,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfRpad
 	case "btrim":
 		return sfBtrim
+	case "ltrim":
+		return sfLtrim
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27460,6 +27464,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				set = vals[1].Str
 			}
 			return TextValue(trimChars(vals[0].Str, set, true, true)), nil
+		case sfLtrim:
+			// ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
+			set := " "
+			if len(vals) > 1 {
+				set = vals[1].Str
+			}
+			return TextValue(trimChars(vals[0].Str, set, true, false)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

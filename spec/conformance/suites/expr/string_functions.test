@@ -335,3 +335,22 @@ SELECT btrim(NULL::text), btrim('abc', NULL::text)
 ----
 NULL
 NULL
+
+# === ltrim(text[, characters]) → text: trim from the LEADING end only =================
+
+query T
+SELECT ltrim('xxhixx', 'x')
+----
+hixx
+
+# default trims leading spaces only (trailing remain — asserted via equality)
+query B
+SELECT ltrim('  hi  ') = 'hi  '
+----
+true
+
+query T
+SELECT ltrim(NULL::text), ltrim('abc', NULL::text)
+----
+NULL
+NULL
