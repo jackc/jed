@@ -279,3 +279,26 @@ SELECT lpad(NULL::text, 5), lpad('hi', NULL::int), lpad('hi', 5, NULL::text)
 NULL
 NULL
 NULL
+
+# === rpad(text, length[, fill]) → text: right-pad / truncate ==========================
+
+query T
+SELECT rpad('hi', 5, 'xy')
+----
+hixyx
+
+# default fill is a space (assert via equality); a longer string truncates
+query B
+SELECT rpad('hi', 5) = 'hi   ', rpad('hello', 3) = 'hel'
+----
+true
+true
+
+statement error 54000
+SELECT rpad('x', 2000000000)
+
+query T
+SELECT rpad(NULL::text, 5), rpad('hi', NULL::int)
+----
+NULL
+NULL

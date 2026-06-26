@@ -12617,7 +12617,9 @@ type ScalarFuncName =
   | "right"
   // lpad(text, length[, fill]) → text — left-pad to `length` chars with `fill` (default space);
   // a longer string truncates; an over-large length traps 54000 (§3).
-  | "lpad";
+  | "lpad"
+  // rpad(text, length[, fill]) → text — the right-hand mirror of lpad (§3).
+  | "rpad";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24435,6 +24437,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const length = (vals[1] as { int: bigint }).int;
         const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
         return textValue(padChars(s, length, fill, true));
+      }
+      if (e.func === "rpad") {
+        // rpad(text, length[, fill]) → text — pad/truncate on the RIGHT (default fill a space).
+        const s = (vals[0] as { text: string }).text;
+        const length = (vals[1] as { int: bigint }).int;
+        const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
+        return textValue(padChars(s, length, fill, false));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

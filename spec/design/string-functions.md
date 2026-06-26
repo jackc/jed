@@ -127,3 +127,9 @@ request a huge output — so a `length` above `MAX_RESULT_CHARS` (PostgreSQL's `
 PostgreSQL's behavior, bounding the allocation an untrusted query can demand. (Per-character cost
 metering so the `max_cost` ceiling also bounds a sub-cap-but-still-large pad is a deferred follow-on;
 the hard cap is the backstop.)
+
+### `rpad(text, length [, fill]) → text`
+
+The right-hand mirror of `lpad`: pad/truncate on the **right**. `rpad('hi', 5) = 'hi   '`,
+`rpad('hi', 5, 'xy') = 'hixyx'`, `rpad('hello', 3) = 'hel'`. Shares the `pad_chars` kernel
+(`left = false`) and the same `54000` length cap. NULL args propagate.

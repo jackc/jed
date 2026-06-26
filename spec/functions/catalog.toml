@@ -3228,6 +3228,28 @@ result         = "text"
 null           = "propagates"
 errors         = ["54000"]
 
+# rpad(text, length int[, fill text]) → text — the right-hand mirror of lpad: pad/truncate on the
+# RIGHT. rpad('hi',5,'xy') = 'hixyx', rpad('hi',1) = 'h'. Same length cap (54000). NULL args propagate.
+[[operator]]
+name           = "rpad"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["54000"]
+
+[[operator]]
+name           = "rpad"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "integer", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["54000"]
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

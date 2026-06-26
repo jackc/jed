@@ -13048,6 +13048,8 @@ enum ScalarFunc {
     /// lpad(text, length[, fill]) → text — left-pad to `length` chars with `fill` (default space);
     /// a longer string truncates; an over-large length traps 54000 (§3).
     Lpad,
+    /// rpad(text, length[, fill]) → text — the right-hand mirror of lpad (§3).
+    Rpad,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19076,6 +19078,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "left" => ScalarFunc::Left,
         "right" => ScalarFunc::Right,
         "lpad" => ScalarFunc::Lpad,
+        "rpad" => ScalarFunc::Rpad,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30400,6 +30403,20 @@ impl RExpr {
                         };
                         Ok(Value::Text(pad_chars(s, len, fill, true)?))
                     }
+                    // rpad(text, length[, fill]) → text — pad/truncate on the RIGHT.
+                    ScalarFunc::Rpad => {
+                        let s = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts rpad to text"),
+                        };
+                        let len = int_value(&vals[1]);
+                        let fill = match vals.get(2) {
+                            Some(Value::Text(f)) => f.as_str(),
+                            Some(_) => unreachable!("resolver restricts rpad fill to text"),
+                            None => " ",
+                        };
+                        Ok(Value::Text(pad_chars(s, len, fill, false)?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31274,7 +31291,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Substr
         | ScalarFunc::Left
         | ScalarFunc::Right
-        | ScalarFunc::Lpad => {
+        | ScalarFunc::Lpad
+        | ScalarFunc::Rpad => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

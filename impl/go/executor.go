@@ -15929,6 +15929,8 @@ const (
 	// lpad(text, length[, fill]) → text — left-pad to `length` chars with `fill` (default space);
 	// a longer string truncates; an over-large length traps 54000 (§3).
 	sfLpad
+	// rpad(text, length[, fill]) → text — the right-hand mirror of lpad (§3).
+	sfRpad
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19516,6 +19518,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfRight
 	case "lpad":
 		return sfLpad
+	case "rpad":
+		return sfRpad
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27401,6 +27405,17 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				fill = vals[2].Str
 			}
 			r, err := padChars(vals[0].Str, vals[1].Int, fill, true)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(r), nil
+		case sfRpad:
+			// rpad(text, length[, fill]) → text — pad/truncate on the RIGHT (default fill a space).
+			fill := " "
+			if len(vals) > 2 {
+				fill = vals[2].Str
+			}
+			r, err := padChars(vals[0].Str, vals[1].Int, fill, false)
 			if err != nil {
 				return Value{}, err
 			}
