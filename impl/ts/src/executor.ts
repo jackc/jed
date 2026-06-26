@@ -12454,6 +12454,9 @@ type ScalarFuncName =
   // lcm(a, b) → the least common multiple (non-negative), EXACT/in-contract, |a/gcd·b|. lcm(_, 0) =
   // 0. Integer → the promoted type (overflow → 22003); decimal → numeric. Resolver-routed.
   | "lcm"
+  // factorial(n) → numeric — n! at scale 0 (PG factorial(bigint)). A negative operand → 22003. The
+  // O(n) multiply loop is metered per step (decimal_work, guarded) so the cost ceiling bounds it (§13).
+  | "factorial"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24239,6 +24242,25 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const toDec = (v: Value): Decimal =>
           v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
         return decimalValue(lcmDecimalValue(toDec(a0), toDec(b0)));
+      }
+      if (e.func === "factorial") {
+        // factorial(n) = n! at scale 0. A negative operand → 22003. Each multiply is metered
+        // (size-scaled decimal_work, guarded) so the cost ceiling bounds a large factorial before
+        // its limb work runs (cost.md §3, §13); a product over the value cap traps 22003.
+        const n = (vals[0] as { int: bigint }).int;
+        if (n < 0n)
+          throw engineError(
+            "numeric_value_out_of_range",
+            "factorial of a negative number is undefined",
+          );
+        let acc = Decimal.fromBigInt(1n);
+        for (let k = 2n; k <= n; k++) {
+          const kd = Decimal.fromBigInt(k);
+          m.charge(COSTS.decimalWork * BigInt(workMul(acc, kd) - 1));
+          m.guard();
+          acc = acc.mul(kd);
+        }
+        return decimalValue(acc);
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

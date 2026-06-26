@@ -2256,6 +2256,22 @@ result         = "f64"
 null           = "propagates"
 errors         = []
 
+# factorial(n) — n! as an EXACT numeric at scale 0 (PG factorial(bigint) → numeric). A NEGATIVE
+# operand is undefined → 22003 ("factorial of a negative number is undefined", PG's SQLSTATE).
+# factorial(0) = factorial(1) = 1. The product 1·2·…·n is built limb-exactly, so it is
+# IN-CONTRACT; its O(n) multiply loop is METERED per step (size-scaled `decimal_work`, guarded —
+# cost.md §3), so the cost ceiling bounds a large factorial before the limb work runs (§13). A
+# product over the decimal value cap traps 22003.
+[[operator]]
+name           = "factorial"
+kind           = "function"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["22003"]
+
 # --- interval constructor (make_interval) ------------------------------------
 # PostgreSQL's interval builder, and the engine's FIRST named + defaulted function
 # (../design/functions.md §11). Every parameter is NAMED and DEFAULTs to 0, so it is callable

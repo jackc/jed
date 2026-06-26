@@ -12955,6 +12955,10 @@ enum ScalarFunc {
     /// lcm(_, 0) = 0. Integer → the promoted type (overflow → 22003); decimal → numeric at scale
     /// max(sₐ, s_b). Resolver-routed (shares gcd's resolution).
     Lcm,
+    /// factorial(n) → numeric — n! at scale 0 (PG factorial(bigint)). A negative operand → 22003.
+    /// The O(n) multiply loop is metered per step (decimal_work, guarded) so the cost ceiling bounds
+    /// a large factorial before the limb work runs (§13).
+    Factorial,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -18999,6 +19003,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "acosh" => ScalarFunc::Acosh,
         "atanh" => ScalarFunc::Atanh,
         "sign" => ScalarFunc::Sign,
+        "factorial" => ScalarFunc::Factorial,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -29803,6 +29808,34 @@ impl RExpr {
                             Ok(Value::Decimal(lcm_decimal(&a, &b)?))
                         }
                     },
+                    // factorial(n) = n! at scale 0. A negative operand → 22003. Each multiply is
+                    // metered (size-scaled decimal_work, guarded) so the cost ceiling bounds a large
+                    // factorial before its limb work runs (cost.md §3, §13); a product over the
+                    // decimal value cap traps 22003.
+                    ScalarFunc::Factorial => {
+                        let n = match &vals[0] {
+                            Value::Int(n) => *n,
+                            _ => unreachable!("resolver restricts factorial to an integer operand"),
+                        };
+                        if n < 0 {
+                            return Err(EngineError::new(
+                                SqlState::NumericValueOutOfRange,
+                                "factorial of a negative number is undefined",
+                            ));
+                        }
+                        let mut acc = Decimal::from_i64(1);
+                        let mut k = 2i64;
+                        while k <= n {
+                            let kd = Decimal::from_i64(k);
+                            m.charge(
+                                COSTS.decimal_work * ((decimal::work_mul(&acc, &kd) - 1) as i64),
+                            );
+                            m.guard()?;
+                            acc = acc.mul(&kd)?;
+                            k += 1;
+                        }
+                        Ok(Value::Decimal(acc))
+                    }
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -30919,6 +30952,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Div
         | ScalarFunc::Gcd
         | ScalarFunc::Lcm
+        | ScalarFunc::Factorial
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

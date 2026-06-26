@@ -192,3 +192,25 @@ SELECT lcm(8.40, 3.6)
 # lcm overflow traps 22003 (the i64 product exceeds the type; bare integer literals are i64)
 statement error 22003
 SELECT lcm(9223372036854775807, 9223372036854775806)
+
+# --- factorial(n): n! as exact numeric at scale 0 ------------------------------------
+query D nosort
+SELECT factorial(0)
+----
+1
+
+query D nosort
+SELECT factorial(5)
+----
+120
+
+# beyond i64 range, exact (the result is arbitrary-precision numeric)
+# cost: 51
+query D nosort
+SELECT factorial(25)
+----
+15511210043330985984000000
+
+# a negative operand is undefined → 22003
+statement error 22003
+SELECT factorial(-3)

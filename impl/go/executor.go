@@ -15841,6 +15841,10 @@ const (
 	// sfLcm is lcm(a, b) → the least common multiple (non-negative), EXACT/in-contract, |a/gcd·b|.
 	// lcm(_, 0) = 0. Integer → the promoted type (overflow → 22003); decimal → numeric. Resolver-routed.
 	sfLcm
+	// sfFactorial is factorial(n) → numeric — n! at scale 0 (PG factorial(bigint)). A negative
+	// operand → 22003. The O(n) multiply loop is metered per step (decimal_work, guarded) so the
+	// cost ceiling bounds a large factorial before its limb work runs (§13).
+	sfFactorial
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19405,6 +19409,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfAtanh
 	case "sign":
 		return sfSign
+	case "factorial":
+		return sfFactorial
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
@@ -27107,6 +27113,28 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return DecimalValue(l), nil
+		case sfFactorial:
+			// factorial(n) = n! at scale 0. A negative operand → 22003. Each multiply is metered
+			// (size-scaled decimal_work, guarded) so the cost ceiling bounds a large factorial
+			// before its limb work runs (cost.md §3, §13); a product over the value cap traps 22003.
+			n := vals[0].Int
+			if n < 0 {
+				return Value{}, NewError(NumericValueOutOfRange, "factorial of a negative number is undefined")
+			}
+			acc := DecimalFromInt64(1)
+			for k := int64(2); k <= n; k++ {
+				kd := DecimalFromInt64(k)
+				m.Charge(Costs.DecimalWork * (WorkMul(acc, kd) - 1))
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+				prod, err := acc.Mul(kd)
+				if err != nil {
+					return Value{}, err
+				}
+				acc = prod
+			}
+			return DecimalValue(acc), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).
