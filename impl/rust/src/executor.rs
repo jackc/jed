@@ -13070,6 +13070,8 @@ enum ScalarFunc {
     SplitPart,
     /// starts_with(text, prefix) → boolean — true iff the string begins with `prefix` (§3).
     StartsWith,
+    /// ascii(text) → i32 — the Unicode code point of the first character; empty → 0 (§3).
+    Ascii,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19109,6 +19111,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "strpos" => ScalarFunc::Strpos,
         "split_part" => ScalarFunc::SplitPart,
         "starts_with" => ScalarFunc::StartsWith,
+        "ascii" => ScalarFunc::Ascii,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30549,6 +30552,11 @@ impl RExpr {
                         }
                         _ => unreachable!("resolver restricts starts_with to text"),
                     },
+                    // ascii(text) → i32 — the code point of the first character (empty → 0).
+                    ScalarFunc::Ascii => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Int(s.chars().next().map_or(0, |c| c as i64))),
+                        _ => unreachable!("resolver restricts ascii to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31434,7 +31442,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Reverse
         | ScalarFunc::Strpos
         | ScalarFunc::SplitPart
-        | ScalarFunc::StartsWith => {
+        | ScalarFunc::StartsWith
+        | ScalarFunc::Ascii => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

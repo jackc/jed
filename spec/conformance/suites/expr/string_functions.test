@@ -568,3 +568,25 @@ SELECT starts_with(NULL::text, 'a') IS NULL, starts_with('abc', NULL::text) IS N
 ----
 true
 true
+
+# === ascii(text) → int: the code point of the first character =========================
+
+query I
+SELECT ascii('x'), ascii('é'), ascii('abc')
+----
+120
+233
+97
+
+# an astral first character returns the FULL code point (😀 = U+1F600 = 128512), not a surrogate
+query I
+SELECT ascii('😀')
+----
+128512
+
+# the empty string is 0; NULL propagates
+query I
+SELECT ascii(''), ascii(NULL::text)
+----
+0
+NULL

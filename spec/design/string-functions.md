@@ -217,3 +217,10 @@ True iff the string begins with `prefix` (an empty prefix is always true):
 (`str::starts_with` / `strings.HasPrefix` / `String.startsWith`), encoding-agnostic, so the three
 cores agree directly. NULL args propagate. (jed has no `^@` operator spelling; the function is the
 only surface.)
+
+### `ascii(text) → int`
+
+The Unicode **code point** of the first character; the empty string is `0`. `ascii('x') = 120`,
+`ascii('é') = 233`, `ascii('😀') = 128512` (the full astral code point — TS uses `codePointAt(0)`,
+not `charCodeAt`, so it returns `128512` rather than the high surrogate). The inverse of `chr`.
+NULL propagates.

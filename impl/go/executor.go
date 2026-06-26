@@ -15951,6 +15951,8 @@ const (
 	sfSplitPart
 	// starts_with(text, prefix) → boolean — true iff the string begins with `prefix` (§3).
 	sfStartsWith
+	// ascii(text) → i32 — the Unicode code point of the first character; empty → 0 (§3).
+	sfAscii
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19560,6 +19562,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfSplitPart
 	case "starts_with":
 		return sfStartsWith
+	case "ascii":
+		return sfAscii
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27626,6 +27630,12 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfStartsWith:
 			// starts_with(text, prefix) → boolean — string begins with prefix.
 			return BoolValue(strings.HasPrefix(vals[0].Str, vals[1].Str)), nil
+		case sfAscii:
+			// ascii(text) → i32 — the code point of the first character (empty → 0).
+			for _, r := range vals[0].Str {
+				return IntValue(int64(r)), nil // first rune
+			}
+			return IntValue(0), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
