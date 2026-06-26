@@ -572,6 +572,107 @@ function base64EncodeWrapped(bytes: Uint8Array): string {
   return out;
 }
 
+// decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
+// ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
+// 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
+// bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
+function decodeText(s: string, format: string): Uint8Array {
+  const bytes = SQL_BYTE_ENCODER.encode(s);
+  if (format === "hex") return decodeHex(bytes);
+  if (format === "base64") return decodeBase64(bytes);
+  if (format === "escape") return decodeEscape(bytes);
+  throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);
+}
+
+function hexNibble(c: number): number | null {
+  if (c >= 48 && c <= 57) return c - 48; // 0-9
+  if (c >= 97 && c <= 102) return c - 97 + 10; // a-f
+  if (c >= 65 && c <= 70) return c - 65 + 10; // A-F
+  return null;
+}
+
+function isAsciiWhitespace(c: number): boolean {
+  return c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
+}
+
+// decodeHex: pairs of hex digits (case-insensitive); whitespace ignored; non-hex / odd → 22023.
+function decodeHex(bytes: Uint8Array): Uint8Array {
+  const nibbles: number[] = [];
+  for (const b of bytes) {
+    if (isAsciiWhitespace(b)) continue;
+    const v = hexNibble(b);
+    if (v === null) throw engineError("invalid_parameter_value", "invalid hexadecimal digit");
+    nibbles.push(v);
+  }
+  if (nibbles.length % 2 !== 0)
+    throw engineError("invalid_parameter_value", "invalid hexadecimal data: odd number of digits");
+  const out = new Uint8Array(nibbles.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = (nibbles[2 * i]! << 4) | nibbles[2 * i + 1]!;
+  return out;
+}
+
+// decodeBase64 (RFC 4648); whitespace ignored; out-of-alphabet / data-after-pad → 22023.
+function decodeBase64(bytes: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  let acc = 0;
+  let nbits = 0;
+  let padded = false;
+  for (const b of bytes) {
+    if (isAsciiWhitespace(b)) continue;
+    if (b === 61) {
+      padded = true;
+      continue;
+    } // '='
+    if (padded) throw engineError("invalid_parameter_value", "invalid base64 end sequence");
+    let v: number;
+    if (b >= 65 && b <= 90) v = b - 65; // A-Z
+    else if (b >= 97 && b <= 122) v = b - 97 + 26; // a-z
+    else if (b >= 48 && b <= 57) v = b - 48 + 52; // 0-9
+    else if (b === 43) v = 62; // +
+    else if (b === 47) v = 63; // /
+    else throw engineError("invalid_parameter_value", "invalid base64 end sequence");
+    acc = (acc << 6) | v;
+    nbits += 6;
+    if (nbits >= 8) {
+      nbits -= 8;
+      out.push((acc >> nbits) & 0xff);
+    }
+  }
+  return Uint8Array.from(out);
+}
+
+// decodeEscape: \\ → backslash, \nnn (exactly 3 octal digits ≤ 255) → that byte, any other byte →
+// itself. A lone/short backslash or an octal > 255 traps 22P02.
+function decodeEscape(bytes: Uint8Array): Uint8Array {
+  const bad = () => engineError("invalid_text_representation", "invalid input syntax for type bytea");
+  const oct = (c: number): number | null => (c >= 48 && c <= 55 ? c - 48 : null);
+  const out: number[] = [];
+  let i = 0;
+  while (i < bytes.length) {
+    if (bytes[i] !== 0x5c) {
+      out.push(bytes[i]!);
+      i++;
+      continue;
+    }
+    if (i + 1 < bytes.length && bytes[i + 1] === 0x5c) {
+      out.push(0x5c);
+      i += 2;
+    } else if (i + 3 < bytes.length) {
+      const a = oct(bytes[i + 1]!);
+      const b = oct(bytes[i + 2]!);
+      const c = oct(bytes[i + 3]!);
+      if (a === null || b === null || c === null) throw bad();
+      const v = a * 64 + b * 8 + c;
+      if (v > 255) throw bad();
+      out.push(v);
+      i += 4;
+    } else {
+      throw bad();
+    }
+  }
+  return Uint8Array.from(out);
+}
+
 // initcapAscii is initcap(s) (string-functions.md §3): uppercase the first character of each word
 // and lowercase the rest, where a word is a maximal run of ASCII alphanumerics. jed classifies word
 // boundaries by ASCII alphanumerics and folds ASCII case only (by char-code arithmetic, so it is
@@ -12800,7 +12901,9 @@ type ScalarFuncName =
   // to_hex(int) → text — lowercase hex of the value's 64-bit two's-complement pattern (§3).
   | "to_hex"
   // encode(bytea, format) → text — render bytes as hex / base64 / escape (§3).
-  | "encode";
+  | "encode"
+  // decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
+  | "decode";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24716,6 +24819,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
         const fmt = (vals[1] as { text: string }).text;
         return textValue(encodeBytea(bytes, fmt));
+      }
+      if (e.func === "decode") {
+        // decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
+        const s = (vals[0] as { text: string }).text;
+        const fmt = (vals[1] as { text: string }).text;
+        return byteaValue(decodeText(s, fmt));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

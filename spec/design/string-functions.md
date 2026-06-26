@@ -300,3 +300,14 @@ three different library deps).
 ### `encode(bytea, format) → text`
 
 The encode half of the pair above.
+
+### `decode(text, format) → bytea`
+
+The decode half — `decode(encode(b, fmt), fmt) = b` for each format. `hex` and `base64` **ignore
+whitespace** (so `decode` round-trips the 76-char-wrapped base64 `encode` produces); a malformed
+hex/base64 string traps `22023`. `escape` decodes over the input's UTF-8 bytes (`\\` → backslash,
+`\nnn` for exactly three octal digits ≤ 255 → that byte, any other byte verbatim); a malformed escape
+(a lone/short backslash, or an octal > 255) traps **`22P02`** — PostgreSQL's distinct code for the
+escape codec. The corpus exercises decode through `encode(decode(…), …)` round-trips (decode returns
+`bytea`, which jed renders `\x…`). NULL args propagate. (jed has no `text::bytea` cast yet, so
+`decode` is the way to construct a `bytea` from text.)

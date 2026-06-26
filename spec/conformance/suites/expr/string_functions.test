@@ -717,3 +717,45 @@ query T
 SELECT encode(bytea '\x00', NULL::text)
 ----
 NULL
+
+# === decode(text, format) → bytea: the inverse of encode ==============================
+
+# decode returns bytea (jed renders it \x… like PG's default hex output)
+query T
+SELECT decode('616263', 'hex')
+----
+\x616263
+
+# round-trips through every format; hex is case-insensitive and ignores whitespace
+query T
+SELECT encode(decode('61 62 63', 'hex'), 'hex'), encode(decode('YWJj', 'base64'), 'hex'), encode(decode('\000\377A', 'escape'), 'hex')
+----
+616263
+616263
+00ff41
+
+# base64 decode ignores whitespace, so it round-trips the 76-char-wrapped encode output (60 bytes)
+query B
+SELECT encode(decode(encode(bytea '\x616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161', 'base64'), 'base64'), 'hex') = encode(bytea '\x616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161', 'hex')
+----
+true
+
+# malformed hex/base64 is 22023; a malformed escape (here a lone backslash) is 22P02 (PG's split)
+statement error 22023
+SELECT decode('xyz', 'hex')
+
+statement error 22023
+SELECT decode('616', 'hex')
+
+statement error 22P02
+SELECT decode('\1', 'escape')
+
+# an unrecognized format is 22023
+statement error 22023
+SELECT decode('00', 'utf8')
+
+query T
+SELECT encode(decode(NULL::text, 'hex'), 'hex'), encode(decode('00', NULL::text), 'hex')
+----
+NULL
+NULL

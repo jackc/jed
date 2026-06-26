@@ -13080,6 +13080,8 @@ enum ScalarFunc {
     ToHex,
     /// encode(bytea, format) → text — render bytes as hex / base64 / escape (§3).
     Encode,
+    /// decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
+    Decode,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19124,6 +19126,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "initcap" => ScalarFunc::Initcap,
         "to_hex" => ScalarFunc::ToHex,
         "encode" => ScalarFunc::Encode,
+        "decode" => ScalarFunc::Decode,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30588,6 +30591,14 @@ impl RExpr {
                         };
                         Ok(Value::Text(encode_bytea(bytes, fmt)?))
                     }
+                    // decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
+                    ScalarFunc::Decode => {
+                        let (s, fmt) = match (&vals[0], &vals[1]) {
+                            (Value::Text(s), Value::Text(f)) => (s, f),
+                            _ => unreachable!("resolver restricts decode to (text, text)"),
+                        };
+                        Ok(Value::Bytea(decode_text(s, fmt)?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31478,7 +31489,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Chr
         | ScalarFunc::Initcap
         | ScalarFunc::ToHex
-        | ScalarFunc::Encode => {
+        | ScalarFunc::Encode
+        | ScalarFunc::Decode => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31727,6 +31739,135 @@ fn base64_encode_wrapped(bytes: &[u8]) -> String {
         out.push(c as char);
     }
     out
+}
+
+/// `decode(s, format)` (string-functions.md §3): the inverse of `encode`. `hex` and `base64` ignore
+/// whitespace; a malformed hex/base64 string traps `22023`; a malformed `escape` sequence traps
+/// `22P02` (PostgreSQL's split). An unrecognized format traps `22023`.
+fn decode_text(s: &str, format: &str) -> Result<Vec<u8>> {
+    match format {
+        "hex" => decode_hex(s.as_bytes()),
+        "base64" => decode_base64(s.as_bytes()),
+        "escape" => decode_escape(s.as_bytes()),
+        _ => Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("unrecognized encoding: \"{format}\""),
+        )),
+    }
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode `hex`: pairs of hex digits (case-insensitive); whitespace is ignored; a non-hex byte or an
+/// odd digit count traps `22023`.
+fn decode_hex(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut nibbles: Vec<u8> = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        nibbles.push(hex_nibble(b).ok_or_else(|| {
+            EngineError::new(SqlState::InvalidParameterValue, "invalid hexadecimal digit")
+        })?);
+    }
+    if nibbles.len() % 2 != 0 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "invalid hexadecimal data: odd number of digits",
+        ));
+    }
+    Ok(nibbles.chunks(2).map(|p| (p[0] << 4) | p[1]).collect())
+}
+
+/// Decode `base64` (RFC 4648); whitespace is ignored; an out-of-alphabet byte (or data after the
+/// `=` padding) traps `22023`. Bit-accumulation: each 6-bit symbol feeds a buffer that emits a byte
+/// per full 8 bits (the trailing <8 bits implied by padding are discarded).
+fn decode_base64(bytes: &[u8]) -> Result<Vec<u8>> {
+    let bad = || {
+        EngineError::new(
+            SqlState::InvalidParameterValue,
+            "invalid base64 end sequence",
+        )
+    };
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut nbits = 0;
+    let mut padded = false;
+    for &b in bytes {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            padded = true;
+            continue;
+        }
+        if padded {
+            return Err(bad()); // a data symbol after padding
+        }
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err(bad()),
+        };
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Decode `escape` (operating on the input's UTF-8 bytes): `\\` → backslash, `\nnn` (exactly 3 octal
+/// digits, value ≤ 255) → that byte, any other byte → itself. A lone/short backslash or an octal >
+/// 255 traps `22P02`.
+fn decode_escape(bytes: &[u8]) -> Result<Vec<u8>> {
+    let bad = || {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            "invalid input syntax for type bytea",
+        )
+    };
+    let oct = |c: u8| (b'0'..=b'7').contains(&c).then_some(c - b'0');
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            out.push(b'\\');
+            i += 2;
+        } else if i + 3 < bytes.len() {
+            match (oct(bytes[i + 1]), oct(bytes[i + 2]), oct(bytes[i + 3])) {
+                (Some(a), Some(b), Some(c)) => {
+                    let v = (a as u16) * 64 + (b as u16) * 8 + c as u16;
+                    if v > 255 {
+                        return Err(bad());
+                    }
+                    out.push(v as u8);
+                    i += 4;
+                }
+                _ => return Err(bad()),
+            }
+        } else {
+            return Err(bad());
+        }
+    }
+    Ok(out)
 }
 
 /// `initcap(s)` (string-functions.md §3): uppercase the first character of each word and lowercase

@@ -15961,6 +15961,8 @@ const (
 	sfToHex
 	// encode(bytea, format) → text — render bytes as hex / base64 / escape (§3).
 	sfEncode
+	// decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
+	sfDecode
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19580,6 +19582,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfToHex
 	case "encode":
 		return sfEncode
+	case "decode":
+		return sfDecode
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24343,6 +24347,148 @@ func base64EncodeWrapped(bytes []byte) string {
 	return out.String()
 }
 
+// decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
+// ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
+// 22P02 (PostgreSQL's split). An unrecognized format traps 22023.
+func decodeText(s, format string) ([]byte, error) {
+	switch format {
+	case "hex":
+		return decodeHex([]byte(s))
+	case "base64":
+		return decodeBase64([]byte(s))
+	case "escape":
+		return decodeEscape([]byte(s))
+	default:
+		return nil, NewError(InvalidParameterValue, fmt.Sprintf("unrecognized encoding: %q", format))
+	}
+}
+
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func isASCIIWhitespace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+}
+
+// decodeHex: pairs of hex digits (case-insensitive); whitespace is ignored; a non-hex byte or an odd
+// digit count traps 22023.
+func decodeHex(bytes []byte) ([]byte, error) {
+	var nibbles []byte
+	for _, b := range bytes {
+		if isASCIIWhitespace(b) {
+			continue
+		}
+		v, ok := hexNibble(b)
+		if !ok {
+			return nil, NewError(InvalidParameterValue, "invalid hexadecimal digit")
+		}
+		nibbles = append(nibbles, v)
+	}
+	if len(nibbles)%2 != 0 {
+		return nil, NewError(InvalidParameterValue, "invalid hexadecimal data: odd number of digits")
+	}
+	out := make([]byte, 0, len(nibbles)/2)
+	for i := 0; i < len(nibbles); i += 2 {
+		out = append(out, nibbles[i]<<4|nibbles[i+1])
+	}
+	return out, nil
+}
+
+// decodeBase64 (RFC 4648); whitespace is ignored; an out-of-alphabet byte (or data after the =
+// padding) traps 22023. Bit-accumulation emits a byte per full 8 bits.
+func decodeBase64(bytes []byte) ([]byte, error) {
+	bad := func() error { return NewError(InvalidParameterValue, "invalid base64 end sequence") }
+	var out []byte
+	var acc uint32
+	nbits := 0
+	padded := false
+	for _, b := range bytes {
+		if isASCIIWhitespace(b) {
+			continue
+		}
+		if b == '=' {
+			padded = true
+			continue
+		}
+		if padded {
+			return nil, bad()
+		}
+		var v byte
+		switch {
+		case b >= 'A' && b <= 'Z':
+			v = b - 'A'
+		case b >= 'a' && b <= 'z':
+			v = b - 'a' + 26
+		case b >= '0' && b <= '9':
+			v = b - '0' + 52
+		case b == '+':
+			v = 62
+		case b == '/':
+			v = 63
+		default:
+			return nil, bad()
+		}
+		acc = acc<<6 | uint32(v)
+		nbits += 6
+		if nbits >= 8 {
+			nbits -= 8
+			out = append(out, byte(acc>>uint(nbits)))
+		}
+	}
+	return out, nil
+}
+
+// decodeEscape (on the input's UTF-8 bytes): \\ → backslash, \nnn (exactly 3 octal digits ≤ 255) →
+// that byte, any other byte → itself. A lone/short backslash or an octal > 255 traps 22P02.
+func decodeEscape(bytes []byte) ([]byte, error) {
+	bad := func() error { return NewError(InvalidTextRepresentation, "invalid input syntax for type bytea") }
+	oct := func(c byte) (byte, bool) {
+		if c >= '0' && c <= '7' {
+			return c - '0', true
+		}
+		return 0, false
+	}
+	var out []byte
+	i := 0
+	for i < len(bytes) {
+		if bytes[i] != '\\' {
+			out = append(out, bytes[i])
+			i++
+			continue
+		}
+		if i+1 < len(bytes) && bytes[i+1] == '\\' {
+			out = append(out, '\\')
+			i += 2
+		} else if i+3 < len(bytes) {
+			a, aok := oct(bytes[i+1])
+			b, bok := oct(bytes[i+2])
+			c, cok := oct(bytes[i+3])
+			if !aok || !bok || !cok {
+				return nil, bad()
+			}
+			v := uint16(a)*64 + uint16(b)*8 + uint16(c)
+			if v > 255 {
+				return nil, bad()
+			}
+			out = append(out, byte(v))
+			i += 4
+		} else {
+			return nil, bad()
+		}
+	}
+	return out, nil
+}
+
 // initcapASCII is initcap(s) (string-functions.md §3): uppercase the first character of each word
 // and lowercase the rest, where a word is a maximal run of ASCII alphanumerics. jed classifies word
 // boundaries by ASCII alphanumerics and folds ASCII case only — deterministic and cross-core
@@ -27799,6 +27945,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
+		case sfDecode:
+			// decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
+			r, err := decodeText(vals[0].Str, vals[1].Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return ByteaValue(r), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

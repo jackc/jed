@@ -3478,6 +3478,20 @@ result         = "text"
 null           = "propagates"
 errors         = ["22023"]
 
+# decode(text, format text) → bytea — the inverse of encode: parse text in 'hex' / 'base64' / 'escape'
+# back to binary. hex and base64 IGNORE whitespace; a malformed hex/base64 string is 22023; a
+# malformed 'escape' sequence (a lone backslash, or not exactly 3 octal digits ≤ 255) is 22P02 (PG's
+# split). An unrecognized format is 22023. NULL args propagate. (string-functions.md §3)
+[[operator]]
+name           = "decode"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = ["22023", "22P02"]
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL
