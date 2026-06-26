@@ -133,3 +133,36 @@ NULL
 # div by zero traps 22012
 statement error 22012
 SELECT div(7, 0)
+
+# --- gcd(a, b): greatest common divisor, non-negative; gcd(0, 0) = 0 ------------------
+query I nosort
+SELECT gcd(12, 18)
+----
+6
+
+# sign is dropped (result is non-negative)
+query I nosort
+SELECT gcd(-12, 18)
+----
+6
+
+query I nosort
+SELECT gcd(0, 5)
+----
+5
+
+query I nosort
+SELECT gcd(0, 0)
+----
+0
+
+# gcd over numerics: result scale = max(sₐ, s_b)
+query D nosort
+SELECT gcd(8.40, 3.6)
+----
+1.20
+
+query D nosort
+SELECT gcd(6.0, 4.0)
+----
+2.0

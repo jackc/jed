@@ -12947,6 +12947,10 @@ enum ScalarFunc {
     /// Resolver-routed (the catalog name "div" is taken by the `/` operator), accepts integer +
     /// decimal operands (integers promote), 22012 on a zero divisor.
     Div,
+    /// gcd(a, b) → the greatest common divisor (non-negative), EXACT/in-contract. Integer operands →
+    /// the promoted integer type (Euclid; a result whose magnitude overflows the type → 22003); a
+    /// decimal operand → numeric at scale max(sₐ, s_b). gcd(0, 0) = 0. Resolver-routed.
+    Gcd,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -20885,6 +20889,28 @@ fn resolve_func_call(
             resolved_type_of(ScalarType::Decimal),
         ));
     }
+    // `gcd(a, b)` — the greatest common divisor, resolver-routed for the same integer-promotion the
+    // arithmetic operators do (a function row's "promoted" result would take only the first operand's
+    // width). EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
+    if lname == "gcd" && args.len() == 2 {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        let (rl, rr, result) =
+            resolve_int_or_decimal_pair(scope, "gcd", &args[0], &args[1], agg, params)?;
+        return Ok((
+            RExpr::ScalarFunc {
+                func: ScalarFunc::Gcd,
+                args: vec![rl, rr],
+                result,
+            },
+            resolved_type_of(result),
+        ));
+    }
     // `mod(a, b)` is the function spelling of the `%` (mod) operator (catalog name "mod") — route it
     // to the SAME arithmetic machinery so mod() and % are observably identical (promotion, the
     // integer/decimal/float kernels, 22012/22003). PG's mod() is integer/numeric only; jed
@@ -25369,6 +25395,73 @@ fn resolve_concat(
 /// otherwise staying text. When the sibling offers no usable context, the literal defaults to
 /// its own family and the caller's family check reports the mismatch. This does NOT enforce a
 /// family — `resolve_int_pair`/arithmetic and `classify_comparable` (comparison) layer that on top.
+/// Resolve a two-numeric scalar function (gcd/lcm) by reusing the arithmetic operand-pair
+/// resolution (literal adaptation), then settling the result type. Both operands must be integer
+/// or decimal (a float/other operand → 42883); the result is the promoted integer type when both
+/// are integer, else `decimal` (an integer operand promotes, as PG does). The kernel reads the
+/// result type to range-check an integer result (gcd's i64::MIN abs / lcm overflow).
+fn resolve_int_or_decimal_pair(
+    scope: &Scope,
+    name: &str,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, RExpr, ScalarType)> {
+    let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+    let numeric_ok = |t: &ResolvedType| {
+        matches!(
+            t,
+            ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
+        )
+    };
+    if !numeric_ok(&lt) || !numeric_ok(&rt) {
+        return Err(no_func_overload(name));
+    }
+    let result = if matches!(lt, ResolvedType::Decimal) || matches!(rt, ResolvedType::Decimal) {
+        ScalarType::Decimal
+    } else {
+        promote(&lt, &rt)
+    };
+    Ok((rl, rr, result))
+}
+
+/// A non-NULL integer/decimal value as a `Decimal` (the integer→decimal promotion gcd/lcm/div use).
+fn value_to_decimal(v: &Value) -> Decimal {
+    match v {
+        Value::Int(n) => Decimal::from_i64(*n),
+        Value::Decimal(d) => d.clone(),
+        _ => unreachable!("expected an integer or decimal value"),
+    }
+}
+
+/// gcd of two i64 by the Euclidean algorithm, returning the NON-NEGATIVE result. `None` iff the
+/// magnitude is `i64::MIN` (its abs overflows i64) — the caller maps that to 22003, like PG. The
+/// `b == -1` guard avoids the `i64::MIN % -1` overflow (the remainder is always 0).
+fn gcd_i64(mut a: i64, mut b: i64) -> Option<i64> {
+    while b != 0 {
+        let t = if b == -1 { 0 } else { a % b };
+        a = b;
+        b = t;
+    }
+    a.checked_abs()
+}
+
+/// gcd of two decimals by the Euclidean algorithm over `rem`, result NON-NEGATIVE at scale
+/// max(sₐ, s_b) (PG numeric gcd). The values share a fixed scale through the chain, so it reduces
+/// to an integer gcd on the coefficients and always terminates. The final pad to the target scale
+/// is exact (the value's natural scale never exceeds it).
+fn gcd_decimal(a: &Decimal, b: &Decimal) -> Result<Decimal> {
+    let target = a.scale().max(b.scale());
+    let (mut x, mut y) = (a.clone(), b.clone());
+    while !y.is_zero() {
+        let r = x.rem(&y)?;
+        x = y;
+        y = r;
+    }
+    Ok(x.abs().round_to_scale(target))
+}
+
 fn resolve_operand_pair(
     scope: &Scope,
     lhs: &Expr,
@@ -29643,6 +29736,23 @@ impl RExpr {
                         let q = diff.div(&b)?;
                         Ok(Value::Decimal(q.round_to_scale(0)))
                     }
+                    // gcd: integer operands → Euclid (a result whose magnitude overflows the promoted
+                    // type → 22003 — gcd(i64::MIN, 0) and the rare i16-cap edge); a decimal operand →
+                    // exact decimal Euclid at scale max(sₐ, s_b). gcd(0, 0) = 0.
+                    ScalarFunc::Gcd => match (&vals[0], &vals[1]) {
+                        (Value::Int(a), Value::Int(b)) => {
+                            let g = gcd_i64(*a, *b).ok_or_else(|| overflow(*result))?;
+                            if result.in_range(g) {
+                                Ok(Value::Int(g))
+                            } else {
+                                Err(overflow(*result))
+                            }
+                        }
+                        _ => {
+                            let (a, b) = (value_to_decimal(&vals[0]), value_to_decimal(&vals[1]));
+                            Ok(Value::Decimal(gcd_decimal(&a, &b)?))
+                        }
+                    },
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -30757,6 +30867,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Pi
         | ScalarFunc::Sign
         | ScalarFunc::Div
+        | ScalarFunc::Gcd
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

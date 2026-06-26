@@ -15834,6 +15834,10 @@ const (
 	// (PG div(numeric, numeric)). Computed exactly as (a − a%b)/b. Resolver-routed (the catalog
 	// name "div" belongs to the `/` operator); integers promote; 22012 on a zero divisor.
 	sfDiv
+	// sfGcd is gcd(a, b) → the greatest common divisor (non-negative), EXACT/in-contract. Integer
+	// operands → the promoted integer type (Euclid; an overflowing-magnitude result → 22003); a
+	// decimal operand → numeric at scale max(sₐ, s_b). gcd(0, 0) = 0. Resolver-routed.
+	sfGcd
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -21508,6 +21512,22 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		dec := scalarResultType("decimal", nil)
 		return &rExpr{kind: reScalarFunc, sfunc: sfDiv, sargs: []*rExpr{rl, rr}, result: dec}, resolvedTypeOf(dec), nil
 	}
+	// `gcd(a, b)` — the greatest common divisor, resolver-routed for the same integer-promotion the
+	// arithmetic operators do (a function row's "promoted" result would take only the first operand's
+	// width). EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
+	if name == "gcd" && len(fc.Args) == 2 {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		rl, rr, result, err := resolveIntOrDecimalPair(s, "gcd", *fc.Args[0], *fc.Args[1], ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reScalarFunc, sfunc: sfGcd, sargs: []*rExpr{rl, rr}, result: result}, resolvedTypeOf(result), nil
+	}
 	// `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME
 	// arithmetic machinery so mod() and % are observably identical (promotion, the integer/decimal/
 	// float kernels, 22012/22003). PG's mod() is integer/numeric only; jed additionally accepts
@@ -23796,6 +23816,73 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 		return nil, resolvedType{}, nil, resolvedType{}, err
 	}
 	return rl, lt, rr, rt, nil
+}
+
+// resolveIntOrDecimalPair resolves a two-numeric scalar function (gcd/lcm) by reusing the arithmetic
+// operand-pair resolution (literal adaptation), then settling the result type. Both operands must be
+// integer or decimal (a float/other operand → 42883); the result is the promoted integer type when
+// both are integer, else decimal (an integer operand promotes, as PG does).
+func resolveIntOrDecimalPair(s *scope, name string, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, *rExpr, ScalarType, error) {
+	rl, lt, rr, rt, err := resolveOperandPair(s, lhs, rhs, ag, params)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	ok := func(k rtKind) bool { return k == rtInt || k == rtDecimal || k == rtNull }
+	if !ok(lt.kind) || !ok(rt.kind) {
+		return nil, nil, 0, noFuncOverload(name)
+	}
+	if lt.kind == rtDecimal || rt.kind == rtDecimal {
+		return rl, rr, scalarResultType("decimal", nil), nil
+	}
+	return rl, rr, promote(lt, rt), nil
+}
+
+// valueToDecimal returns a non-NULL integer/decimal value as a Decimal (the integer→decimal
+// promotion gcd/lcm/div use).
+func valueToDecimal(v Value) Decimal {
+	if v.Kind == ValInt {
+		return DecimalFromInt64(v.Int)
+	}
+	return *v.Dec
+}
+
+// gcdI64 is the gcd of two int64 by the Euclidean algorithm, NON-NEGATIVE. ok is false iff the
+// magnitude is math.MinInt64 (its abs overflows int64) — the caller maps that to 22003, like PG.
+// The b == -1 guard avoids the math.MinInt64 % -1 overflow (the remainder is always 0).
+func gcdI64(a, b int64) (int64, bool) {
+	for b != 0 {
+		t := int64(0)
+		if b != -1 {
+			t = a % b
+		}
+		a, b = b, t
+	}
+	if a == math.MinInt64 {
+		return 0, false
+	}
+	if a < 0 {
+		a = -a
+	}
+	return a, true
+}
+
+// gcdDecimal is the gcd of two decimals by the Euclidean algorithm over Rem, NON-NEGATIVE at scale
+// max(sₐ, s_b) (PG numeric gcd). The values share a fixed scale through the chain, so it reduces to
+// an integer gcd and terminates; the final pad to the target scale is exact.
+func gcdDecimal(a, b Decimal) (Decimal, error) {
+	target := a.Scale
+	if b.Scale > target {
+		target = b.Scale
+	}
+	x, y := a, b
+	for !y.IsZero() {
+		r, err := x.Rem(y)
+		if err != nil {
+			return Decimal{}, err
+		}
+		x, y = y, r
+	}
+	return x.Abs().RoundToScale(target), nil
 }
 
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
@@ -26932,6 +27019,22 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return DecimalValue(q.RoundToScale(0)), nil
+		case sfGcd:
+			// gcd: integer operands → Euclid (a result whose magnitude overflows the promoted type →
+			// 22003 — gcd(MinInt64, 0) and the rare i16-cap edge); a decimal operand → exact decimal
+			// Euclid at scale max(sₐ, s_b). gcd(0, 0) = 0.
+			if vals[0].Kind == ValInt && vals[1].Kind == ValInt {
+				g, ok := gcdI64(vals[0].Int, vals[1].Int)
+				if !ok || !e.result.InRange(g) {
+					return Value{}, overflowErr(e.result)
+				}
+				return IntValue(g), nil
+			}
+			g, err := gcdDecimal(valueToDecimal(vals[0]), valueToDecimal(vals[1]))
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(g), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

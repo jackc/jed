@@ -12447,6 +12447,10 @@ type ScalarFuncName =
   // div(a, b) → numeric — the TRUNCATED (toward zero) integer quotient at scale 0 (PG div). Computed
   // exactly as (a − a%b)/b; resolver-routed (the catalog name "div" belongs to the `/` operator).
   | "div"
+  // gcd(a, b) → the greatest common divisor (non-negative), EXACT/in-contract. Integer → promoted
+  // integer (an overflowing-magnitude result → 22003); a decimal operand → numeric at scale
+  // max(sₐ, s_b). gcd(0, 0) = 0. Resolver-routed.
+  | "gcd"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -15724,6 +15728,15 @@ function resolveFuncCall(
       t.kind === "int" || t.kind === "decimal" || t.kind === "null";
     if (!numericOK(p.lt) || !numericOK(p.rt)) throw noFuncOverload("div");
     return scalarFuncNode("div", [p.rl, p.rr], "decimal", undefined);
+  }
+  // `gcd(a, b)` — the greatest common divisor, resolver-routed for the same integer-promotion the
+  // arithmetic operators do (a function row's "promoted" result would take only the first operand's
+  // width). EXACT/in-contract; integer → promoted integer, a decimal operand → numeric.
+  if (lname === "gcd" && e.args.length === 2) {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    const { args, result } = resolveIntOrDecimalPair(scope, "gcd", e.args[0]!, e.args[1]!, ag, params);
+    return scalarFuncNode("gcd", args, result, undefined);
   }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
@@ -20883,6 +20896,51 @@ function binaryOpSymbol(op: BinaryOp): string {
 // (intTypeOf returns null) and defaults to i64 — the caller's family check then reports
 // the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
+// resolveIntOrDecimalPair resolves a two-numeric scalar function (gcd/lcm) by reusing the arithmetic
+// operand-pair resolution (literal adaptation), then settling the result type. Both operands must be
+// integer or decimal (a float/other operand → 42883); the result is the promoted integer type when
+// both are integer, else "decimal" (an integer operand promotes, as PG does).
+function resolveIntOrDecimalPair(
+  scope: Scope,
+  name: string,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { args: RExpr[]; result: ScalarType } {
+  const p = resolveOperandPair(scope, lhs, rhs, ag, params);
+  const ok = (t: ResolvedType) =>
+    t.kind === "int" || t.kind === "decimal" || t.kind === "null";
+  if (!ok(p.lt) || !ok(p.rt)) throw noFuncOverload(name);
+  const result: ScalarType =
+    p.lt.kind === "decimal" || p.rt.kind === "decimal" ? "decimal" : promote(p.lt, p.rt);
+  return { args: [p.rl, p.rr], result };
+}
+
+// gcdBigint is the gcd of two bigints by the Euclidean algorithm, NON-NEGATIVE (bigint is exact, so
+// no intermediate overflow). The caller range-checks the result against the promoted integer type
+// (so |MinInt64| = 2^63 → 22003, matching the other cores' i64::MIN-abs overflow).
+function gcdBigint(a: bigint, b: bigint): bigint {
+  while (b !== 0n) {
+    [a, b] = [b, a % b];
+  }
+  return a < 0n ? -a : a;
+}
+
+// gcdDecimalValue is the gcd of two decimals by the Euclidean algorithm over rem, NON-NEGATIVE at
+// scale max(sₐ, s_b) (PG numeric gcd). The values share a fixed scale through the chain, so it
+// reduces to an integer gcd and terminates; the final pad to the target scale is exact.
+function gcdDecimalValue(a: Decimal, b: Decimal): Decimal {
+  const target = Math.max(a.scale, b.scale);
+  let x = a;
+  let y = b;
+  while (!y.isZero()) {
+    const r = x.rem(y);
+    [x, y] = [y, r];
+  }
+  return x.abs().roundToScale(target);
+}
+
 function resolveOperandPair(
   scope: Scope,
   lhs: Expr,
@@ -24130,6 +24188,21 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const b = toDec(vals[1]!);
         const q = a.sub(a.rem(b)).div(b);
         return decimalValue(q.roundToScale(0));
+      }
+      if (e.func === "gcd") {
+        // gcd: integer operands → Euclid over bigint (the result must fit the promoted type, else
+        // 22003 — gcd(MinInt64, 0) and the rare i16-cap edge); a decimal operand → exact decimal
+        // Euclid at scale max(sₐ, s_b). gcd(0, 0) = 0.
+        const a0 = vals[0]!;
+        const b0 = vals[1]!;
+        if (a0.kind === "int" && b0.kind === "int") {
+          const g = gcdBigint(a0.int, b0.int);
+          if (!inRange(e.result, g)) throw overflow(e.result);
+          return intValue(g);
+        }
+        const toDec = (v: Value): Decimal =>
+          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+        return decimalValue(gcdDecimalValue(toDec(a0), toDec(b0)));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
