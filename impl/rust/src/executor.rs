@@ -17160,6 +17160,10 @@ enum AggPlan {
     /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)` — the continuous (interpolated) percentile;
     /// numeric input widened to f64, result f64. Direction + fraction live on the `Acc`.
     OrderedSetCont,
+    /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)` over an **interval** input — the continuous
+    /// percentile interpolated in the interval domain (`lo + (hi-lo)·pct`, PG `interval_lerp`);
+    /// result `interval` (spec/design/aggregates.md §13). Values buffered as `Value::Interval`.
+    OrderedSetContInterval,
 }
 
 /// The resolve-time parameters of an ordered-set aggregate (spec/design/aggregates.md §13), kept
@@ -17270,7 +17274,10 @@ impl Acc {
     /// one (an ordered-set aggregate with `OVER` is 0A000, rejected at resolve).
     fn from_spec(s: &AggSpec) -> Acc {
         match s.plan {
-            AggPlan::OrderedSetMode | AggPlan::OrderedSetDisc | AggPlan::OrderedSetCont => {
+            AggPlan::OrderedSetMode
+            | AggPlan::OrderedSetDisc
+            | AggPlan::OrderedSetCont
+            | AggPlan::OrderedSetContInterval => {
                 let osa = s
                     .osa
                     .as_ref()
@@ -17343,7 +17350,10 @@ impl Acc {
                 unique,
                 seen: false,
             },
-            AggPlan::OrderedSetMode | AggPlan::OrderedSetDisc | AggPlan::OrderedSetCont => {
+            AggPlan::OrderedSetMode
+            | AggPlan::OrderedSetDisc
+            | AggPlan::OrderedSetCont
+            | AggPlan::OrderedSetContInterval => {
                 unreachable!(
                     "ordered-set accumulators are built via Acc::from_spec, never the window stage"
                 )
@@ -17697,8 +17707,114 @@ fn finalize_ordered_set(
             floats.sort_by(|a, b| dir_cmp(crate::value::total_cmp_f64(*a, *b), desc));
             Ok(Value::Float64(percentile_cont_at(&floats, p)))
         }
+        AggPlan::OrderedSetContInterval => {
+            // percentile_cont over interval input: interpolate in the interval domain (PG
+            // `interval_lerp` — aggregates.md §13). The fraction is f64; the bracketing values are
+            // intervals sorted by their canonical span (the WITHIN GROUP order).
+            let Some(p) = fraction_to_f64(frac)? else {
+                return Ok(Value::Null);
+            };
+            check_percentile_fraction(p)?;
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
+            let n = vals.len();
+            let pos = p * ((n - 1) as f64);
+            let first = pos.floor() as usize;
+            let second = pos.ceil() as usize;
+            let lo = expect_interval(&vals[first]);
+            if first == second {
+                return Ok(Value::Interval(lo));
+            }
+            let hi = expect_interval(&vals[second]);
+            let proportion = pos - first as f64;
+            Ok(Value::Interval(interval_lerp(lo, hi, proportion)?))
+        }
         _ => unreachable!("finalize_ordered_set is only called for the ordered-set plans"),
     }
+}
+
+/// The `Interval` of a buffered `Value::Interval` (an `OrderedSetContInterval` group only ever
+/// buffers intervals — the resolver gates the operand to `interval`).
+fn expect_interval(v: &Value) -> crate::interval::Interval {
+    match v {
+        Value::Interval(iv) => *iv,
+        other => unreachable!("percentile_cont(interval) buffered a non-interval: {other:?}"),
+    }
+}
+
+/// `interval_lerp(lo, hi, pct)` = `lo + (hi - lo)·pct`, PG's `orderedsetaggs.c` interval
+/// interpolation (spec/design/aggregates.md §13). `interval_mul` below replicates PG's exact
+/// field-cascade + rounding so the result is byte-identical to PostgreSQL.
+fn interval_lerp(
+    lo: crate::interval::Interval,
+    hi: crate::interval::Interval,
+    pct: f64,
+) -> Result<crate::interval::Interval> {
+    let diff = hi.sub(&lo)?;
+    let scaled = interval_mul(diff, pct)?;
+    scaled.add(&lo)
+}
+
+/// `interval * f64`, byte-identical to PostgreSQL's `interval_mul` (timestamp.c): multiply each
+/// field by the factor, then cascade the fractional month/day parts down to days/micros with PG's
+/// `TSROUND` (round to microsecond precision) and the `30 days/month`, `86400 s/day` conversions.
+/// The operand is finite (no infinite intervals here) and the factor is a finite fraction in [0,1].
+fn interval_mul(span: crate::interval::Interval, factor: f64) -> Result<crate::interval::Interval> {
+    const DAYS_PER_MONTH: f64 = 30.0;
+    const SECS_PER_DAY: f64 = 86400.0;
+    const USECS_PER_SEC: f64 = 1_000_000.0;
+    // TSROUND: round to microsecond precision (PG TS_PREC_INV = 1e6). PG uses `rint` — round to
+    // nearest, ties to EVEN — so the result is byte-identical to PostgreSQL (not half-away-from-zero).
+    let tsround = |j: f64| -> f64 { (j * USECS_PER_SEC).round_ties_even() / USECS_PER_SEC };
+    let oor = || EngineError::new(SqlState::DatetimeFieldOverflow, "interval out of range");
+    let fits_i32 = |x: f64| x >= i32::MIN as f64 && x < -(i32::MIN as f64);
+    let fits_i64 = |x: f64| x >= i64::MIN as f64 && x < -(i64::MIN as f64);
+
+    let orig_month = span.months;
+    let orig_day = span.days;
+
+    let result_double = span.months as f64 * factor;
+    if result_double.is_nan() || !fits_i32(result_double) {
+        return Err(oor());
+    }
+    let result_month = result_double as i32;
+
+    let result_double = span.days as f64 * factor;
+    if result_double.is_nan() || !fits_i32(result_double) {
+        return Err(oor());
+    }
+    let mut result_day = result_double as i32;
+
+    // Cascade fractional months → days, fractional days → micros (PG's exact sequence).
+    let month_remainder_days =
+        tsround((orig_month as f64 * factor - result_month as f64) * DAYS_PER_MONTH);
+    let mut sec_remainder = tsround(
+        (orig_day as f64 * factor - result_day as f64 + month_remainder_days
+            - month_remainder_days as i64 as f64)
+            * SECS_PER_DAY,
+    );
+    // Might exceed a day from rounding / cascade — push whole days up.
+    if sec_remainder.abs() >= SECS_PER_DAY {
+        result_day = result_day
+            .checked_add((sec_remainder / SECS_PER_DAY) as i32)
+            .ok_or_else(oor)?;
+        sec_remainder -= (sec_remainder / SECS_PER_DAY) as i64 as f64 * SECS_PER_DAY;
+    }
+    result_day = result_day
+        .checked_add(month_remainder_days as i32)
+        .ok_or_else(oor)?;
+    let result_double =
+        (span.micros as f64 * factor + sec_remainder * USECS_PER_SEC).round_ties_even();
+    if result_double.is_nan() || !fits_i64(result_double) {
+        return Err(oor());
+    }
+    Ok(crate::interval::Interval {
+        months: result_month,
+        days: result_day,
+        micros: result_double as i64,
+    })
 }
 
 /// Convert an evaluated percentile fraction (the direct argument, evaluated per group) to `f64`
@@ -20307,20 +20423,23 @@ fn resolve_ordered_set_aggregate(
             (AggPlan::OrderedSetDisc, Some(frac), optype.clone())
         }
         "percentile_cont" => {
-            // percentile_cont interpolates, so the aggregated input must be numeric (interval is a
-            // deferred follow-on); a non-numeric WITHIN GROUP column matches no overload (42883).
-            if !matches!(
-                optype,
-                ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Float(_)
-            ) {
-                return Err(no_agg_overload(&lname));
-            }
+            // percentile_cont interpolates: over a NUMERIC input it widens to f64 and returns f64;
+            // over an INTERVAL input it interpolates in the interval domain (PG `interval_lerp`) and
+            // returns interval. Any other WITHIN GROUP type matches no overload (42883).
             let frac = resolve_osa_fraction(scope, &lname, args, agg, params)?;
-            (
-                AggPlan::OrderedSetCont,
-                Some(frac),
-                ResolvedType::Float(ScalarType::Float64),
-            )
+            match optype {
+                ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Float(_) => (
+                    AggPlan::OrderedSetCont,
+                    Some(frac),
+                    ResolvedType::Float(ScalarType::Float64),
+                ),
+                ResolvedType::Interval => (
+                    AggPlan::OrderedSetContInterval,
+                    Some(frac),
+                    ResolvedType::Interval,
+                ),
+                _ => return Err(no_agg_overload(&lname)),
+            }
         }
         _ => unreachable!("is_ordered_set_aggregate_name gates the three names above"),
     };

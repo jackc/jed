@@ -17121,6 +17121,10 @@ const (
 	planMode           // mode() — the most frequent value (tie → first in sort order)
 	planPercentileDisc // percentile_disc(f) — the discrete percentile (an actual input value)
 	planPercentileCont // percentile_cont(f) — the continuous (interpolated) percentile, f64
+	// percentile_cont(f) over an interval input — the continuous percentile interpolated in the
+	// interval domain (lo + (hi-lo)·pct, PG interval_lerp); result interval (aggregates.md §13).
+	// Values buffered as ValInterval in osaVals (the non-cont branch).
+	planPercentileContInterval
 )
 
 // aggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
@@ -17227,7 +17231,7 @@ func newAcc(plan aggPlan) *acc {
 // ordered-set aggregate with OVER is 0A000, rejected at resolve).
 func newAccFromSpec(s aggSpec) *acc {
 	switch s.plan {
-	case planMode, planPercentileDisc, planPercentileCont:
+	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		// The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
 		// evaluated against the synthetic row); mode keeps it nil.
 		return &acc{plan: s.plan, osaDesc: s.osaDesc}
@@ -17385,10 +17389,11 @@ func (a *acc) fold(v Value, m *Meter) error {
 			}
 		}
 		a.objPairs = append(a.objPairs, objAggPair{key: key, val: vv})
-	case planMode, planPercentileDisc, planPercentileCont:
+	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		// Collect the non-NULL aggregated argument (the WITHIN GROUP order key, evaluated per row).
-		// percentile_cont widens each numeric value to f64 up front (the correctly-rounded cast,
-		// matching PG's numeric→float8); mode/percentile_disc keep the Value.
+		// percentile_cont (numeric) widens each value to f64 up front (the correctly-rounded cast,
+		// matching PG's numeric→float8); mode/percentile_disc and percentile_cont over interval keep
+		// the Value (the latter interpolates in the interval domain at finalize).
 		if !v.IsNull() {
 			if a.plan == planPercentileCont {
 				f, err := percentileInputF64(v)
@@ -17525,7 +17530,7 @@ func (a *acc) finalize() (Value, error) {
 			members = append(members, JsonMember{Key: p.key, Val: node})
 		}
 		return JsonbValue(makeObject(members)), nil
-	case planMode, planPercentileDisc, planPercentileCont:
+	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
 	default: // planMin, planMax
 		if a.hasCur {
@@ -17604,9 +17609,129 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 			return dirCmp(floatTotalCmp(fs[i], fs[j]), desc) < 0
 		})
 		return Float64Value(percentileContAt(fs, *p)), nil
+	case planPercentileContInterval:
+		// percentile_cont over interval input: interpolate in the interval domain (PG interval_lerp
+		// — aggregates.md §13). The fraction is f64; the bracketing values are intervals sorted by
+		// their canonical span (the WITHIN GROUP order).
+		p, err := fractionToF64(a.osaFrac)
+		if err != nil {
+			return NullValue(), err
+		}
+		if p == nil {
+			return NullValue(), nil
+		}
+		if err := checkPercentileFraction(*p); err != nil {
+			return NullValue(), err
+		}
+		vals := a.osaVals
+		if len(vals) == 0 {
+			return NullValue(), nil
+		}
+		sort.SliceStable(vals, func(i, j int) bool {
+			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
+		})
+		n := len(vals)
+		pos := *p * float64(n-1)
+		first := int(math.Floor(pos))
+		second := int(math.Ceil(pos))
+		lo := expectInterval(vals[first])
+		if first == second {
+			return IntervalValue(lo), nil
+		}
+		hi := expectInterval(vals[second])
+		proportion := pos - float64(first)
+		r, err := intervalLerp(lo, hi, proportion)
+		if err != nil {
+			return NullValue(), err
+		}
+		return IntervalValue(r), nil
 	default:
 		panic("finalizeOrderedSet called for a non-ordered-set plan")
 	}
+}
+
+// expectInterval returns the Interval of a buffered ValInterval (a planPercentileContInterval group
+// only ever buffers intervals — the resolver gates the operand to interval).
+func expectInterval(v Value) Interval {
+	if v.Kind != ValInterval {
+		panic("percentile_cont(interval) buffered a non-interval")
+	}
+	return v.Iv
+}
+
+// intervalLerp(lo, hi, pct) = lo + (hi - lo)·pct, PG's orderedsetaggs.c interval interpolation
+// (spec/design/aggregates.md §13). intervalMul below replicates PG's exact field-cascade + rounding
+// so the result is byte-identical to PostgreSQL.
+func intervalLerp(lo, hi Interval, pct float64) (Interval, error) {
+	diff, err := hi.Sub(lo)
+	if err != nil {
+		return Interval{}, err
+	}
+	scaled, err := intervalMul(diff, pct)
+	if err != nil {
+		return Interval{}, err
+	}
+	return scaled.Add(lo)
+}
+
+// intervalMul is interval * f64, byte-identical to PostgreSQL's interval_mul (timestamp.c): multiply
+// each field by the factor, then cascade the fractional month/day parts down to days/micros with
+// PG's TSROUND (round to microsecond precision) and the 30 days/month, 86400 s/day conversions. The
+// operand is finite (no infinite intervals here) and the factor is a finite fraction in [0,1].
+func intervalMul(span Interval, factor float64) (Interval, error) {
+	const (
+		daysPerMonthF = 30.0
+		secsPerDayF   = 86400.0
+		usecsPerSecF  = 1_000_000.0
+	)
+	// TSROUND: round to microsecond precision (PG TS_PREC_INV = 1e6). PG rint = ties-to-EVEN.
+	tsround := func(j float64) float64 { return math.RoundToEven(j*usecsPerSecF) / usecsPerSecF }
+	oor := func() error { return NewError(DatetimeFieldOverflow, "interval out of range") }
+	// FLOAT8_FITS_IN_INT32/64: x in [INT_MIN, -INT_MIN) — matches Rust's fits_i32/fits_i64.
+	fitsI32 := func(x float64) bool { return x >= float64(math.MinInt32) && x < -float64(math.MinInt32) }
+	fitsI64 := func(x float64) bool { return x >= float64(math.MinInt64) && x < -float64(math.MinInt64) }
+
+	origMonth := span.Months
+	origDay := span.Days
+
+	resultDouble := float64(span.Months) * factor
+	if math.IsNaN(resultDouble) || !fitsI32(resultDouble) {
+		return Interval{}, oor()
+	}
+	resultMonth := int32(resultDouble)
+
+	resultDouble = float64(span.Days) * factor
+	if math.IsNaN(resultDouble) || !fitsI32(resultDouble) {
+		return Interval{}, oor()
+	}
+	resultDay := int32(resultDouble)
+
+	// Cascade fractional months → days, fractional days → micros (PG's exact sequence).
+	monthRemainderDays := tsround((float64(origMonth)*factor - float64(resultMonth)) * daysPerMonthF)
+	secRemainder := tsround(
+		(float64(origDay)*factor - float64(resultDay) + monthRemainderDays -
+			float64(int64(monthRemainderDays))) * secsPerDayF,
+	)
+	// Might exceed a day from rounding / cascade — push whole days up.
+	if math.Abs(secRemainder) >= secsPerDayF {
+		add := int32(secRemainder / secsPerDayF)
+		nd, ok := addI32(resultDay, add)
+		if !ok {
+			return Interval{}, oor()
+		}
+		resultDay = nd
+		secRemainder -= float64(int64(secRemainder/secsPerDayF)) * secsPerDayF
+	}
+	nd, ok := addI32(resultDay, int32(monthRemainderDays))
+	if !ok {
+		return Interval{}, oor()
+	}
+	resultDay = nd
+	resultDouble = math.RoundToEven(float64(span.Micros)*factor + secRemainder*usecsPerSecF)
+	if math.IsNaN(resultDouble) || !fitsI64(resultDouble) {
+		return Interval{}, oor()
+	}
+	return Interval{Months: resultMonth, Days: resultDay, Micros: int64(resultDouble)}, nil
 }
 
 // fractionToF64 converts an evaluated percentile fraction (the direct argument, evaluated per
@@ -18993,18 +19118,22 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 		}
 		plan, frac, result = planPercentileDisc, f, optype
 	case "percentile_cont":
-		// percentile_cont interpolates, so the aggregated input must be numeric (interval is a
-		// deferred follow-on); a non-numeric WITHIN GROUP column matches no overload (42883).
-		switch optype.kind {
-		case rtInt, rtDecimal, rtFloat32, rtFloat64:
-		default:
-			return nil, resolvedType{}, noAggOverload(name)
-		}
+		// percentile_cont interpolates: over a NUMERIC input it widens to f64 and returns f64; over
+		// an INTERVAL input it interpolates in the interval domain (PG interval_lerp) and returns
+		// interval. Any other WITHIN GROUP type matches no overload (42883). The fraction resolves
+		// first (matching Rust's order) so an arity/type error on it is raised before the operand check.
 		f, err := resolveOsaFraction(s, name, fc.Args, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		plan, frac, result = planPercentileCont, f, resolvedType{kind: rtFloat64}
+		switch optype.kind {
+		case rtInt, rtDecimal, rtFloat32, rtFloat64:
+			plan, frac, result = planPercentileCont, f, resolvedType{kind: rtFloat64}
+		case rtInterval:
+			plan, frac, result = planPercentileContInterval, f, resolvedType{kind: rtInterval}
+		default:
+			return nil, resolvedType{}, noAggOverload(name)
+		}
 	default:
 		panic("isOrderedSetAggregateName gates the three names above")
 	}

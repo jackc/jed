@@ -389,11 +389,14 @@ sortable type and returns that type. Over the `1`-based sorted values it returns
 `K = ceil(p · N)` (and row `1` when `p = 0`), i.e. the smallest `K` with `K/N ≥ p` (PostgreSQL
 `orderedsetaggs.c`). Zero-based: `idx = max(0, ceil(p·N) − 1)`.
 
-**`percentile_cont(p)`** **interpolates** between the two bracketing values and always returns
-**`f64`** (PostgreSQL `float8`). The aggregated input must be **numeric** — `i16`/`i32`/`i64`/
-`decimal`/`f32`/`f64` — each value widened to `f64` (the correctly-rounded `decimal→f64` cast,
-[decimal.md](decimal.md); matching PG's implicit `numeric→float8`) **before** the sort; a non-numeric
-input column is **`42883`** (no overload), matching PG (interval input is the deferred follow-on).
+**`percentile_cont(p)`** **interpolates** between the two bracketing values. Over a **numeric** input
+— `i16`/`i32`/`i64`/`decimal`/`f32`/`f64` — each value is widened to `f64` (the correctly-rounded
+`decimal→f64` cast, [decimal.md](decimal.md); matching PG's implicit `numeric→float8`) **before** the
+sort and the result is **`f64`** (PostgreSQL `float8`). Over an **`interval`** input the interpolation
+is done in the **interval domain** (PG `interval_lerp` = `lo + (hi − lo)·pct`, where `interval_mul`'s
+field cascade + microsecond `rint` rounding is replicated **byte-identically** — `round_ties_even`,
+not half-away) and the result is **`interval`** (`query.ordered_set_interval`). Any other input type
+is **`42883`** (no overload), matching PG.
 The formula is PostgreSQL's exactly, computed in `f64` so it is **bit-identical** to PG (the same
 in-contract determinism exception the window `percent_rank`/`cume_dist` ratios use —
 [float.md](float.md) §7, [determinism.md](determinism.md), the `R` render tag):

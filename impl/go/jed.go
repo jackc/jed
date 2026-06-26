@@ -273,6 +273,9 @@ var SupportedCapabilities = []string{
 	// A non-constant ordered-set aggregate fraction — percentile_cont(expr) / percentile_disc(expr)
 	// where expr references grouping columns, evaluated per group (spec/design/aggregates.md §17).
 	"query.ordered_set_nonconstant_fraction",
+	// percentile_cont over an interval WITHIN GROUP input — interpolated in the interval domain
+	// (PG interval_lerp), result interval (spec/design/aggregates.md §13).
+	"query.ordered_set_interval",
 	// Window functions (OVER) — the window stage + row_number() (spec/design/window.md, S0). A
 	// window-only function without OVER is 42809; a window function in WHERE/HAVING is 42P20.
 	"query.window",

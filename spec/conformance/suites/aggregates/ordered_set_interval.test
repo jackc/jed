@@ -1,0 +1,66 @@
+# percentile_cont over an INTERVAL WITHIN GROUP input (spec/design/aggregates.md §13). The
+# continuous percentile is interpolated in the interval domain (PG interval_lerp: lo + (hi-lo)*pct,
+# byte-identical to PG's interval_mul field cascade), returning interval (not f64). Values are sorted
+# by the canonical interval span.
+# requires: ddl.create_table, dml.insert, query.select, query.aggregates, query.ordered_set_aggregate, query.ordered_set_interval, types.interval, types.f64
+
+statement ok
+CREATE TABLE iv (d interval)
+
+statement ok
+INSERT INTO iv VALUES ('1 day'), ('3 days'), ('5 days'), ('10 days')
+
+# percentile_cont(0.5) over [1,3,5,10] days: pos = 1.5 -> interpolate 3d + 0.5*(5d-3d) = 4 days.
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY d) FROM iv
+----
+4 days
+
+# percentile_cont(0.25): pos = 0.75 -> 1d + 0.75*(3d-1d) = 1d + 1.5d = 2 days 12:00:00 (the
+# fractional day cascades to micros via PG's interval_mul rounding).
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY d) FROM iv
+----
+2 days 12:00:00
+
+# p=0 / p=1 return the min / max value unchanged.
+# names: lo, hi
+query TT nosort
+SELECT percentile_cont(0.0) WITHIN GROUP (ORDER BY d) AS lo,
+       percentile_cont(1.0) WITHIN GROUP (ORDER BY d) AS hi FROM iv
+----
+1 day
+10 days
+
+# Months interpolate too (sorted by span: 1 mon=30d, 1 mon 15 days=45d, 2 mons=60d).
+statement ok
+CREATE TABLE iv2 (d interval)
+
+statement ok
+INSERT INTO iv2 VALUES ('1 mon'), ('2 mons'), ('1 mon 15 days')
+
+# percentile_cont(0.5): pos = 1.0 -> the middle value, 1 mon 15 days.
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY d) FROM iv2
+----
+1 mon 15 days
+
+# percentile_cont(0.3): pos = 0.6 -> 1 mon + 0.6*(1 mon 15 days - 1 mon) = 1 mon + 0.6*15d = 1 mon 9 days.
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(0.3) WITHIN GROUP (ORDER BY d) FROM iv2
+----
+1 mon 9 days
+
+# An empty / all-NULL group -> NULL.
+statement ok
+CREATE TABLE iv3 (d interval)
+
+# names: percentile_cont
+query T nosort
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY d) FROM iv3
+----
+NULL

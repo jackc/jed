@@ -197,6 +197,7 @@ import {
   intervalAdd,
   intervalCmp,
   intervalEncodeKey,
+  intervalLerp,
   intervalNeg,
   intervalSpan,
   intervalSub,
@@ -9897,7 +9898,11 @@ export class Database {
             // GROUP here, against the synthetic row's grouping-key values (aggregates.md §13/§17) — so
             // it may reference grouping columns. Unmetered (the finalize step, like the sort), via a
             // scratch meter. mode has none.
-            if (a.plan === "percentileDisc" || a.plan === "percentileCont") {
+            if (
+              a.plan === "percentileDisc" ||
+              a.plan === "percentileCont" ||
+              a.plan === "orderedSetContInterval"
+            ) {
               const fe = plan.aggSpecs[si]!.osaFrac;
               if (fe !== undefined && fe !== null) {
                 a.osaFrac = evalExpr(fe, srow, env, new Meter());
@@ -14096,7 +14101,11 @@ type AggPlan =
   // fraction ride on the AggSpec/Acc, not the plan.
   | "mode" // mode() — the most frequent value (tie → first in sort order)
   | "percentileDisc" // percentile_disc(f) — the discrete percentile (an actual input value)
-  | "percentileCont"; // percentile_cont(f) — the continuous (interpolated) percentile, f64
+  | "percentileCont" // percentile_cont(f) — the continuous (interpolated) percentile, f64
+  // percentile_cont(f) over an INTERVAL input — the continuous percentile interpolated in the
+  // interval domain (lo + (hi−lo)·pct, PG interval_lerp); result interval (spec/design/aggregates.md
+  // §13). Values are buffered as Value::Interval (in osaVals), NOT widened to f64.
+  | "orderedSetContInterval";
 
 // AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
 // row against the real row). operand is null for COUNT(*). distinct (COUNT(DISTINCT x),
@@ -14311,7 +14320,12 @@ function newAcc(
 // ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
 // ordered-set aggregate with OVER is 0A000, rejected at resolve).
 function newAccFromSpec(s: AggSpec): Acc {
-  if (s.plan === "mode" || s.plan === "percentileDisc" || s.plan === "percentileCont") {
+  if (
+    s.plan === "mode" ||
+    s.plan === "percentileDisc" ||
+    s.plan === "percentileCont" ||
+    s.plan === "orderedSetContInterval"
+  ) {
     const a = newAcc(s.plan);
     a.osaDesc = s.osaDesc;
     // The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
@@ -14453,9 +14467,11 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
     case "mode":
     case "percentileDisc":
     case "percentileCont":
+    case "orderedSetContInterval":
       // Collect the non-NULL aggregated argument (the WITHIN GROUP order key, evaluated per row).
-      // percentileCont widens each numeric value to f64 up front (the correctly-rounded cast,
-      // matching PG's numeric→float8); mode/percentileDisc keep the Value.
+      // percentileCont (the NUMERIC plan) widens each value to f64 up front (the correctly-rounded
+      // cast, matching PG's numeric→float8); mode/percentileDisc/orderedSetContInterval keep the
+      // Value (the interval plan interpolates in the interval domain at finalize).
       if (v.kind !== "null") {
         if (a.plan === "percentileCont") a.osaFloats!.push(percentileInputF64(v));
         else a.osaVals!.push(v);
@@ -14547,6 +14563,7 @@ function finalizeAcc(a: Acc): Value {
     case "mode":
     case "percentileDisc":
     case "percentileCont":
+    case "orderedSetContInterval":
       return finalizeOrderedSet(a);
   }
 }
@@ -14591,6 +14608,26 @@ function finalizeOrderedSet(a: Acc): Value {
     vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
     return percentileDiscAt(vals, p);
   }
+  if (a.plan === "orderedSetContInterval") {
+    // percentile_cont over interval input: interpolate in the interval domain (PG interval_lerp —
+    // aggregates.md §13). The fraction is f64; the bracketing values are intervals sorted by their
+    // canonical span (the WITHIN GROUP order).
+    const p = fractionToF64(a.osaFrac);
+    if (p === null) return nullValue();
+    checkPercentileFraction(p);
+    const vals = a.osaVals!;
+    if (vals.length === 0) return nullValue();
+    vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
+    const n = vals.length;
+    const pos = p * (n - 1);
+    const first = Math.floor(pos);
+    const second = Math.ceil(pos);
+    const lo = expectInterval(vals[first]!);
+    if (first === second) return intervalValue(lo);
+    const hi = expectInterval(vals[second]!);
+    const proportion = pos - first;
+    return intervalValue(intervalLerp(lo, hi, proportion));
+  }
   // percentileCont
   const p = fractionToF64(a.osaFrac);
   if (p === null) return nullValue();
@@ -14599,6 +14636,13 @@ function finalizeOrderedSet(a: Acc): Value {
   if (fs.length === 0) return nullValue();
   fs.sort((x, y) => dirCmp(floatTotalCmp(x, y), desc));
   return float64Value(percentileContAt(fs, p));
+}
+
+// expectInterval returns the Interval of a buffered interval Value (an orderedSetContInterval group
+// only ever buffers intervals — the resolver gates the operand to interval).
+function expectInterval(v: Value): Interval {
+  if (v.kind !== "interval") throw new Error("percentile_cont(interval) buffered a non-interval");
+  return v.iv;
 }
 
 // fractionToF64 converts an evaluated percentile fraction (the direct argument, evaluated per group)
@@ -15533,14 +15577,19 @@ function resolveOrderedSetAggregate(
     plan = "percentileDisc";
     result = optype;
   } else {
-    // percentile_cont interpolates, so the aggregated input must be numeric (interval is a deferred
-    // follow-on); a non-numeric WITHIN GROUP column matches no overload (42883).
-    if (optype.kind !== "int" && optype.kind !== "decimal" && optype.kind !== "float") {
+    // percentile_cont interpolates: over a NUMERIC input it widens to f64 and returns f64; over an
+    // INTERVAL input it interpolates in the interval domain (PG interval_lerp) and returns interval.
+    // Any other WITHIN GROUP type matches no overload (42883).
+    frac = resolveOsaFraction(scope, name, e.args, ag, params);
+    if (optype.kind === "int" || optype.kind === "decimal" || optype.kind === "float") {
+      plan = "percentileCont";
+      result = { kind: "float", ty: "f64" };
+    } else if (optype.kind === "interval") {
+      plan = "orderedSetContInterval";
+      result = { kind: "interval" };
+    } else {
       throw noAggOverload(name);
     }
-    frac = resolveOsaFraction(scope, name, e.args, ag, params);
-    plan = "percentileCont";
-    result = { kind: "float", ty: "f64" };
   }
 
   // FILTER (WHERE cond): resolved per input row with aggregates forbidden, exactly as for an ordinary

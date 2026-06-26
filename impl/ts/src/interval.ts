@@ -98,6 +98,72 @@ export function intervalSub(a: Interval, b: Interval): Interval {
   };
 }
 
+// roundTiesEven rounds an f64 to the nearest integer, ties to EVEN (banker's rounding) — PG's
+// `rint` / Rust's `round_ties_even` / Go's `math.RoundToEven`. JS `Math.round` rounds halves toward
+// +Infinity, so a half-way value whose nearest-up integer is ODD is corrected one step down to the
+// even neighbour (the down step is always −1 because Math.round took the tie up). For a non-tie
+// value Math.round is already nearest; for a value too large to have a fractional part there is no
+// tie. `-0` is preserved (Math.round(-0.5) = -0, and -0 is even so it is never corrected).
+function roundTiesEven(x: number): number {
+  const r = Math.round(x);
+  if (Math.abs(x - Math.trunc(x)) === 0.5 && r % 2 !== 0) return r - 1;
+  return r;
+}
+
+// intervalLerp(lo, hi, pct) = lo + (hi - lo)·pct, PG's orderedsetaggs.c interval interpolation
+// (spec/design/aggregates.md §13). intervalMul below replicates PG's exact field-cascade + rounding
+// so the result is byte-identical to PostgreSQL.
+export function intervalLerp(lo: Interval, hi: Interval, pct: number): Interval {
+  const diff = intervalSub(hi, lo);
+  const scaled = intervalMul(diff, pct);
+  return intervalAdd(scaled, lo);
+}
+
+// intervalMul is interval * f64, byte-identical to PostgreSQL's interval_mul (timestamp.c): multiply
+// each field by the factor, then cascade the fractional month/day parts down to days/micros with
+// PG's TSROUND (round to microsecond precision) and the 30 days/month, 86400 s/day conversions. The
+// operand is finite (no infinite intervals here) and the factor is a finite fraction in [0,1]. The
+// per-field arithmetic is f64 (JS number), matching PG/Rust/Go — only the FINAL micros is an i64
+// bigint. A field beyond i32/i64 traps 22008.
+export function intervalMul(span: Interval, factor: number): Interval {
+  const DAYS_PER_MONTH_F = 30.0;
+  const SECS_PER_DAY_F = 86400.0;
+  const USECS_PER_SEC_F = 1_000_000.0;
+  // TSROUND: round to microsecond precision (PG TS_PREC_INV = 1e6). PG rint = ties-to-EVEN.
+  const tsround = (j: number): number => roundTiesEven(j * USECS_PER_SEC_F) / USECS_PER_SEC_F;
+  const oor = () => intervalFieldOverflow("interval out of range");
+  // FLOAT8_FITS_IN_INT32/64: x in [INT_MIN, -INT_MIN) — matches Rust's fits_i32/fits_i64.
+  const fitsI32 = (x: number): boolean => x >= -2147483648 && x < 2147483648;
+  const fitsI64 = (x: number): boolean => x >= -9223372036854775808 && x < 9223372036854775808;
+
+  const origMonth = span.months;
+  const origDay = span.days;
+
+  let resultDouble = span.months * factor;
+  if (Number.isNaN(resultDouble) || !fitsI32(resultDouble)) throw oor();
+  const resultMonth = Math.trunc(resultDouble);
+
+  resultDouble = span.days * factor;
+  if (Number.isNaN(resultDouble) || !fitsI32(resultDouble)) throw oor();
+  let resultDay = Math.trunc(resultDouble);
+
+  // Cascade fractional months → days, fractional days → micros (PG's exact sequence).
+  const monthRemainderDays = tsround((origMonth * factor - resultMonth) * DAYS_PER_MONTH_F);
+  let secRemainder = tsround(
+    (origDay * factor - resultDay + monthRemainderDays - Math.trunc(monthRemainderDays)) *
+      SECS_PER_DAY_F,
+  );
+  // Might exceed a day from rounding / cascade — push whole days up.
+  if (Math.abs(secRemainder) >= SECS_PER_DAY_F) {
+    resultDay = checkedI32(resultDay + Math.trunc(secRemainder / SECS_PER_DAY_F));
+    secRemainder -= Math.trunc(secRemainder / SECS_PER_DAY_F) * SECS_PER_DAY_F;
+  }
+  resultDay = checkedI32(resultDay + Math.trunc(monthRemainderDays));
+  resultDouble = roundTiesEven(Number(span.micros) * factor + secRemainder * USECS_PER_SEC_F);
+  if (Number.isNaN(resultDouble) || !fitsI64(resultDouble)) throw oor();
+  return { months: resultMonth, days: resultDay, micros: BigInt(resultDouble) };
+}
+
 // makeInterval builds an interval from PostgreSQL make_interval's components (functions.md §11).
 // years/months fold into the months field (×12), weeks/days into the days field (×7), and
 // hours/mins plus the caller's pre-converted secMicros into the micros field — grouped
