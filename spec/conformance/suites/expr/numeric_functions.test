@@ -308,3 +308,25 @@ query I nosort
 SELECT min_scale(1.23)
 ----
 2
+
+# --- trim_scale(numeric): drop trailing zeros (value-identical) ------------------------
+query D nosort
+SELECT trim_scale(1.50)
+----
+1.5
+
+query D nosort
+SELECT trim_scale(1.00)
+----
+1
+
+query D nosort
+SELECT trim_scale(120.0)
+----
+120
+
+# no trailing zeros → unchanged
+query D nosort
+SELECT trim_scale(1.23)
+----
+1.23

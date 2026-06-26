@@ -15854,6 +15854,9 @@ const (
 	// sfMinScale is min_scale(numeric) → i32 — the smallest scale that represents the value exactly
 	// (trailing fractional zeros dropped); zero has min_scale 0 (decimal.md).
 	sfMinScale
+	// sfTrimScale is trim_scale(numeric) → numeric — the value re-scaled down to its min_scale
+	// (trailing zeros removed), value-identical (decimal.md).
+	sfTrimScale
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19424,6 +19427,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfScale
 	case "min_scale":
 		return sfMinScale
+	case "trim_scale":
+		return sfTrimScale
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
@@ -27334,6 +27339,11 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfMinScale:
 			// min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
 			return IntValue(int64(minScaleOf(*vals[0].Dec))), nil
+		case sfTrimScale:
+			// trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
+			// digits are zeros, so RoundToScale does not round).
+			d := *vals[0].Dec
+			return DecimalValue(d.RoundToScale(minScaleOf(d))), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

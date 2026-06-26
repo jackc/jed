@@ -12968,6 +12968,9 @@ enum ScalarFunc {
     /// min_scale(numeric) → i32 — the smallest scale that represents the value exactly (trailing
     /// fractional zeros dropped); zero has min_scale 0 (decimal.md).
     MinScale,
+    /// trim_scale(numeric) → numeric — the value re-scaled down to its min_scale (trailing zeros
+    /// removed), value-identical (decimal.md).
+    TrimScale,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -19015,6 +19018,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "factorial" => ScalarFunc::Factorial,
         "scale" => ScalarFunc::Scale,
         "min_scale" => ScalarFunc::MinScale,
+        "trim_scale" => ScalarFunc::TrimScale,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -30035,6 +30039,12 @@ impl RExpr {
                         Value::Decimal(d) => Ok(Value::Int(min_scale_of(d) as i64)),
                         _ => unreachable!("resolver restricts min_scale to a decimal operand"),
                     },
+                    // trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the
+                    // dropped digits are zeros, so round_to_scale does not round).
+                    ScalarFunc::TrimScale => match &vals[0] {
+                        Value::Decimal(d) => Ok(Value::Decimal(d.round_to_scale(min_scale_of(d)))),
+                        _ => unreachable!("resolver restricts trim_scale to a decimal operand"),
+                    },
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -31155,6 +31165,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::WidthBucket
         | ScalarFunc::Scale
         | ScalarFunc::MinScale
+        | ScalarFunc::TrimScale
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

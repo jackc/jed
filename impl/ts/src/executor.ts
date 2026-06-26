@@ -12466,6 +12466,9 @@ type ScalarFuncName =
   // min_scale(numeric) → i32 — the smallest scale that represents the value exactly (trailing
   // fractional zeros dropped); zero has min_scale 0 (decimal.md).
   | "min_scale"
+  // trim_scale(numeric) → numeric — the value re-scaled down to its min_scale (trailing zeros
+  // removed), value-identical (decimal.md).
+  | "trim_scale"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -24382,6 +24385,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "min_scale") {
         // min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
         return intValue(BigInt(minScaleOf((vals[0] as { dec: Decimal }).dec)));
+      }
+      if (e.func === "trim_scale") {
+        // trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
+        // digits are zeros, so roundToScale does not round).
+        const d = (vals[0] as { dec: Decimal }).dec;
+        return decimalValue(d.roundToScale(minScaleOf(d)));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
