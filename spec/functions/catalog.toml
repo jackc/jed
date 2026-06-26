@@ -1955,13 +1955,124 @@ result         = "decimal"
 null           = "propagates"
 errors         = []
 
+# ceil / ceiling / floor / trunc — the EXACT-numeric rounding-to-a-bound functions
+# (../design/decimal.md §6, functions.md §9), the decimal siblings of `round`. All produce scale 0
+# except trunc's 2-arg form: trunc(numeric, n) truncates TOWARD ZERO to n places (n < 0 truncates
+# to the LEFT of the point, like round/2). ceil/ceiling round toward +∞, floor toward −∞, trunc
+# toward zero. `ceiling` is a pure alias of `ceil`. ceil/floor over a non-integer decimal carry
+# 22003 (a round-up carry can cross the integer-digit cap, exactly like round); trunc never grows
+# the magnitude, so it cannot overflow, and ceil/floor over an integer (already scale 0) cannot
+# either. As with round, the INTEGER overloads return decimal/numeric (jed keeps floats out of the
+# value path — ../design/float.md §8); PG resolves the single-arg ceil/floor/trunc(int) to double
+# precision, a documented result-type divergence (oracle_overrides.toml), value-identical. PG's
+# 2-arg trunc is numeric-only, so trunc(int, int) → numeric matches PG with no override.
+[[operator]]
+name           = "ceil"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "ceil"
+kind           = "function"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "ceiling"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "ceiling"
+kind           = "function"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "floor"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "floor"
+kind           = "function"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "trunc"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "trunc"
+kind           = "function"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "trunc"
+kind           = "function"
+arity          = 2
+arg_families   = ["decimal", "integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "trunc"
+kind           = "function"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
 # --- scalar functions (f64) ----------------------------------------------
 # Two classes (../design/float.md §8), distinguished only by the determinism contract, not by
 # any catalog field — the split is enforced at the conformance layer (the `R` tag's tolerant
 # compare + the determinism_exceptions.toml ledger), so these are ordinary function rows:
 #
 #   EXACT / correctly-rounded — IN-CONTRACT (bit-identical cross-core, exact `R` assertions):
-#     abs, ceil, floor, trunc, round (half-away, 1- and 2-arg), and sqrt (IEEE-mandated
+#     abs, ceil, ceiling, floor, trunc, round (half-away, 1- and 2-arg), and sqrt (IEEE-mandated
 #     correctly-rounded). result "promoted" for abs (operand-typed, like int/decimal abs);
 #     "f64" for the others (always f64). No overflow is possible except sqrt of a
 #     negative, a DOMAIN error -> 22003 (NaN stays input-only, §3).
@@ -1988,6 +2099,18 @@ errors         = []
 
 [[operator]]
 name           = "ceil"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "f64"
+null           = "propagates"
+errors         = []
+
+# ceiling — the alias of ceil; the float overload completes the alias across every family ceil
+# covers (the decimal/integer aliases are with the exact-numeric rows above).
+[[operator]]
+name           = "ceiling"
 kind           = "function"
 arity          = 1
 arg_families   = ["float"]

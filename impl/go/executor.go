@@ -20547,7 +20547,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 			return sfFloatRound
 		}
 		return sfRound
-	case "ceil":
+	case "ceil", "ceiling":
+		// `ceiling` is PG's alias of `ceil` — same kernel.
 		return sfCeil
 	case "floor":
 		return sfFloor
@@ -29849,6 +29850,40 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, overflowErr(Int32)
 			}
 			return IntValue(idx), nil
+		case sfCeil, sfFloor, sfTrunc:
+			// ceil/ceiling/floor/trunc: the float overloads go to the libm path (default below);
+			// the decimal/integer overloads (decimal.md §6, functions.md §9) compute exactly here.
+			// ceil/floor round to scale 0 toward ±∞ (a round-up carry can trap 22003); trunc
+			// truncates toward zero to scale 0 or its n-place argument (never overflows).
+			if vals[0].Kind == ValFloat32 || vals[0].Kind == ValFloat64 {
+				return evalFloatFunc(e.sfunc, vals, e.result)
+			}
+			var d Decimal
+			if vals[0].Kind == ValInt {
+				d = DecimalFromInt64(vals[0].Int)
+			} else {
+				d = *vals[0].Dec
+			}
+			switch e.sfunc {
+			case sfCeil:
+				r, err := d.Ceil()
+				if err != nil {
+					return Value{}, err
+				}
+				return DecimalValue(r), nil
+			case sfFloor:
+				r, err := d.Floor()
+				if err != nil {
+					return Value{}, err
+				}
+				return DecimalValue(r), nil
+			default: // sfTrunc
+				places := int64(0)
+				if len(vals) > 1 {
+					places = vals[1].Int
+				}
+				return DecimalValue(d.TruncPlaces(places)), nil
+			}
 		case sfScale:
 			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
 			return IntValue(int64(vals[0].Dec.Scale)), nil

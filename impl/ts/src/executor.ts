@@ -17453,6 +17453,9 @@ function resolveScalarFunc(
   // `power(x, y)` is PG's name for jed's pow (the documented name gap, float.md §8) — alias it to
   // the pow kernel here so the overload lookup, the (float, float) promote, and eval all reuse pow.
   if ((name as string) === "power") name = "pow";
+  // `ceiling` is PG's alias of `ceil` (functions.md §9) — alias to the ceil kernel so the overload
+  // lookup and eval (both the float and the decimal/integer paths) reuse ceil.
+  if ((name as string) === "ceiling") name = "ceil";
   // char_length / character_length are SQL-standard aliases of length (string-functions.md) — alias
   // them to the length kernel so the eval reuses the one code-point-count arm.
   if ((name as string) === "char_length" || (name as string) === "character_length") name = "length";
@@ -26549,6 +26552,17 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const d = (v0 as { dec: Decimal }).dec;
         const s = d.limbs.length === 0 ? 0n : d.neg ? -1n : 1n;
         return decimalValue(Decimal.fromBigInt(s));
+      }
+      if (e.func === "ceil" || e.func === "floor" || e.func === "trunc") {
+        // ceil/ceiling/floor/trunc over decimal (and integer, promoted) — the EXACT-numeric
+        // overloads (decimal.md §6, functions.md §9). The float overloads returned above. ceil/
+        // floor round to scale 0 toward ±∞ (a round-up carry can trap 22003); trunc truncates
+        // toward zero to scale 0 or its n-place argument (never overflows).
+        const dd = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
+        if (e.func === "ceil") return decimalValue(dd.ceil());
+        if (e.func === "floor") return decimalValue(dd.floor());
+        const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+        return decimalValue(dd.truncPlaces(places));
       }
       // round
       const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;

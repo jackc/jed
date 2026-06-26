@@ -337,6 +337,71 @@ func (d Decimal) RoundPlaces(n int64) (Decimal, error) {
 	return newDecimal(d.Neg, 0, magMulPow10(q, k)).CheckCap()
 }
 
+// TruncToScale truncates toward zero to target scale — drop the dropped fractional digits, no
+// rounding. Increasing the scale only appends zeros (exact). Truncation never grows the
+// magnitude, so it cannot overflow. The toward-zero core of trunc (spec/design/functions.md §9).
+func (d Decimal) TruncToScale(target uint32) Decimal {
+	if target >= d.Scale {
+		return newDecimal(d.Neg, target, magMulPow10(d.Limbs, target-d.Scale))
+	}
+	pow := magPow10(d.Scale - target)
+	q, _ := magDivMod(d.Limbs, pow)
+	return newDecimal(d.Neg, target, q)
+}
+
+// TruncPlaces is PG trunc(numeric, n) (spec/design/functions.md §9): truncate toward zero to n
+// fractional places. n >= 0 truncates to scale n (trunc(1.567, 2) = 1.56, clamped at MaxScale);
+// n < 0 truncates to the LEFT of the point — result scale 0, a multiple of 10^-n
+// (trunc(1234.5, -2) = 1200). TruncPlaces(0) is trunc(x). Cannot overflow (truncation never grows
+// the magnitude — mirrors RoundPlaces minus the round-up carry).
+func (d Decimal) TruncPlaces(n int64) Decimal {
+	if n >= 0 {
+		target := uint32(MaxScale)
+		if n < int64(MaxScale) {
+			target = uint32(n)
+		}
+		return d.TruncToScale(target)
+	}
+	mag := uint64(-n) // two's-complement: the correct magnitude even for MinInt64
+	k := d.Precision() + 1
+	if mag < uint64(k) {
+		k = uint32(mag)
+	}
+	pow := magPow10(d.Scale + k)
+	q, _ := magDivMod(d.Limbs, pow)
+	return newDecimal(d.Neg, 0, magMulPow10(q, k))
+}
+
+// Ceil is ceil(numeric) — round toward +∞ to scale 0 (spec/design/functions.md §9).
+func (d Decimal) Ceil() (Decimal, error) { return d.roundToBound(false) }
+
+// Floor is floor(numeric) — round toward −∞ to scale 0.
+func (d Decimal) Floor() (Decimal, error) { return d.roundToBound(true) }
+
+// roundToBound is the shared kernel for Ceil/Floor to scale 0: drop the fraction toward zero, then
+// grow the magnitude by one iff a fraction was dropped AND the requested direction points away
+// from zero for this sign — Ceil (towardNeg = false) grows a positive value, Floor (towardNeg =
+// true) grows a negative one. A carry can push a value at the integer-digit cap over it → 22003
+// (like round).
+func (d Decimal) roundToBound(towardNeg bool) (Decimal, error) {
+	if d.Scale == 0 {
+		return d, nil
+	}
+	pow := magPow10(d.Scale)
+	q, r := magDivMod(d.Limbs, pow)
+	hasFrac := false
+	for _, x := range r {
+		if x != 0 {
+			hasFrac = true
+			break
+		}
+	}
+	if hasFrac && d.Neg == towardNeg {
+		q = magAdd(q, []uint32{1})
+	}
+	return newDecimal(d.Neg, 0, q).CheckCap()
+}
+
 // CoerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then trap
 // 22003 if the integer-part digits exceed precision-scale (spec/design/decimal.md §2).
 func (d Decimal) CoerceToTypmod(precision, scale uint32) (Decimal, error) {

@@ -20092,6 +20092,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "abs" => ScalarFunc::Abs,
         "round" => ScalarFunc::Round,
         "ceil" => ScalarFunc::Ceil,
+        "ceiling" => ScalarFunc::Ceil, // alias of ceil (same kernel)
         "floor" => ScalarFunc::Floor,
         "trunc" => ScalarFunc::Trunc,
         "sqrt" => ScalarFunc::Sqrt,
@@ -32221,6 +32222,40 @@ impl RExpr {
                             Some(_) => unreachable!("resolver restricts round's count to integer"),
                         };
                         Ok(Value::Decimal(d.round_places(places)?))
+                    }
+                    // ceil / ceiling / floor / trunc over decimal (and integer, promoted) — the
+                    // EXACT-numeric overloads (decimal.md §6, functions.md §9). The float overloads
+                    // fall through to the libm arm below (these guards exclude Float64). ceil/floor
+                    // round to scale 0 toward ±∞ (a round-up carry can trap 22003); trunc truncates
+                    // toward zero to scale 0 or its `n`-place argument (never overflows).
+                    ScalarFunc::Ceil if !matches!(&vals[0], Value::Float64(_)) => {
+                        let d = match &vals[0] {
+                            Value::Int(n) => Decimal::from_i64(*n),
+                            Value::Decimal(d) => d.clone(),
+                            _ => unreachable!("resolver restricts ceil to numeric operands"),
+                        };
+                        Ok(Value::Decimal(d.ceil()?))
+                    }
+                    ScalarFunc::Floor if !matches!(&vals[0], Value::Float64(_)) => {
+                        let d = match &vals[0] {
+                            Value::Int(n) => Decimal::from_i64(*n),
+                            Value::Decimal(d) => d.clone(),
+                            _ => unreachable!("resolver restricts floor to numeric operands"),
+                        };
+                        Ok(Value::Decimal(d.floor()?))
+                    }
+                    ScalarFunc::Trunc if !matches!(&vals[0], Value::Float64(_)) => {
+                        let d = match &vals[0] {
+                            Value::Int(n) => Decimal::from_i64(*n),
+                            Value::Decimal(d) => d.clone(),
+                            _ => unreachable!("resolver restricts trunc to numeric operands"),
+                        };
+                        let places = match vals.get(1) {
+                            None => 0,
+                            Some(Value::Int(k)) => *k,
+                            Some(_) => unreachable!("resolver restricts trunc's count to integer"),
+                        };
+                        Ok(Value::Decimal(d.trunc_places(places)))
                     }
                     // pi() — the constant π, no operand (float.md §8). In-contract: the same f64
                     // literal in every core.

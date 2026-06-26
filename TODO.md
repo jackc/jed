@@ -269,7 +269,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (settles the §8 rounding hotspot), PG result scales, finite-only (documented PG divergence),
       decimal in a PK/ordered index/UNIQUE via the scale-independent `decimal-order-preserving`
       encoding. → [decimal.md](spec/design/decimal.md), [encoding.md §2.5](spec/design/encoding.md)
-  - [ ] _follow-on:_ negative / `s>p` scale typmods; `round(x,n)` and other decimal functions.
+  - [x] _follow-on:_ `round(x,n)`, and `ceil`/`ceiling`/`floor`/`trunc(x[,n])` over decimal+integer
+        (round-toward-bound siblings of round; integer overloads return numeric like round, a
+        documented PG result-type divergence). gcd/lcm/width_bucket already landed. → catalog.toml,
+        [functions.md §9](spec/design/functions.md), [decimal.md §6](spec/design/decimal.md)
+  - [ ] _follow-on:_ negative / `s>p` scale typmods; the EXACT-numeric *transcendentals*
+        (`power`/`log`/`ln`/`exp`/`sqrt` over numeric) — deferred, need a PG-faithful
+        arbitrary-precision ln/exp port (float.md §8).
 - [x] **`timestamp` / `timestamptz`** — PG instant model, i64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
   - [x] **time-zone database + `AT TIME ZONE` (host-loaded `JTZ` bundle)** — Slice 1 (copies

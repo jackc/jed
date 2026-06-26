@@ -382,6 +382,63 @@ impl Decimal {
         Decimal::from_parts(self.neg, 0, scaled).check_cap()
     }
 
+    /// Truncate toward zero to `target` scale — drop the dropped fractional digits, no rounding.
+    /// Increasing the scale only appends zeros (exact). Truncation never grows the magnitude, so
+    /// it cannot overflow. The toward-zero core of `trunc` (spec/design/functions.md §9).
+    pub fn trunc_to_scale(&self, target: u32) -> Decimal {
+        if target >= self.scale {
+            let limbs = mag_mul_pow10(&self.limbs, target - self.scale);
+            return Decimal::from_parts(self.neg, target, limbs);
+        }
+        let pow = mag_pow10(self.scale - target);
+        let (q, _r) = mag_divmod(&self.limbs, &pow);
+        Decimal::from_parts(self.neg, target, q)
+    }
+
+    /// PG `trunc(numeric, n)` (spec/design/functions.md §9): truncate toward zero to `n` fractional
+    /// places. `n >= 0` truncates to scale `n` (`trunc(1.567, 2) = 1.56`, clamped at `MAX_SCALE`);
+    /// `n < 0` truncates to the LEFT of the point — result scale 0, a multiple of `10^-n`
+    /// (`trunc(1234.5, -2) = 1200`). `trunc(x)` is `trunc_places(0)`. Cannot overflow (truncation
+    /// never grows the magnitude — mirrors `round_places` minus the round-up carry).
+    pub fn trunc_places(&self, n: i64) -> Decimal {
+        if n >= 0 {
+            return self.trunc_to_scale(n.min(MAX_SCALE as i64) as u32);
+        }
+        let k = n.unsigned_abs().min((self.precision() + 1) as u64) as u32;
+        let pow = mag_pow10(self.scale + k);
+        let (q, _r) = mag_divmod(&self.limbs, &pow);
+        let scaled = mag_mul_pow10(&q, k);
+        Decimal::from_parts(self.neg, 0, scaled)
+    }
+
+    /// `ceil(numeric)` — round toward +∞ to scale 0 (spec/design/functions.md §9).
+    pub fn ceil(&self) -> Result<Decimal> {
+        self.round_to_bound(false)
+    }
+
+    /// `floor(numeric)` — round toward −∞ to scale 0.
+    pub fn floor(&self) -> Result<Decimal> {
+        self.round_to_bound(true)
+    }
+
+    /// Shared kernel for `ceil`/`floor` to scale 0: drop the fraction toward zero, then grow the
+    /// magnitude by one iff a fraction was dropped AND the requested direction points away from
+    /// zero for this sign — `ceil` (`toward_neg = false`) grows a positive value, `floor`
+    /// (`toward_neg = true`) grows a negative one. A carry can push a value at the integer-digit
+    /// cap over it → 22003 (like `round`).
+    fn round_to_bound(&self, toward_neg: bool) -> Result<Decimal> {
+        if self.scale == 0 {
+            return Ok(self.clone());
+        }
+        let pow = mag_pow10(self.scale);
+        let (mut q, r) = mag_divmod(&self.limbs, &pow);
+        let has_frac = r.iter().any(|&x| x != 0);
+        if has_frac && self.neg == toward_neg {
+            q = mag_add(&q, &[1]);
+        }
+        Decimal::from_parts(self.neg, 0, q).check_cap()
+    }
+
     /// Coerce into `numeric(precision, scale)`: round to `scale` (half away), then trap 22003
     /// if the integer-part digits exceed `precision - scale` (spec/design/decimal.md §2).
     pub fn coerce_to_typmod(&self, precision: u32, scale: u32) -> Result<Decimal> {

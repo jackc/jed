@@ -292,6 +292,58 @@ export class Decimal {
     return Decimal.fromParts(this.neg, 0, magMulPow10(quo, k)).checkCap();
   }
 
+  // truncToScale truncates toward zero to target scale — drop the dropped fractional digits, no
+  // rounding. Increasing the scale only appends zeros (exact). Truncation never grows the
+  // magnitude, so it cannot overflow. The toward-zero core of trunc (spec/design/functions.md §9).
+  truncToScale(target: number): Decimal {
+    if (target >= this.scale) {
+      return Decimal.fromParts(this.neg, target, magMulPow10(this.limbs, target - this.scale));
+    }
+    const pow = magPow10(this.scale - target);
+    const [q] = magDivMod(this.limbs, pow);
+    return Decimal.fromParts(this.neg, target, q);
+  }
+
+  // truncPlaces is PG trunc(numeric, n) (spec/design/functions.md §9): truncate toward zero to n
+  // fractional places. n >= 0 truncates to scale n (trunc(1.567, 2) = 1.56, clamped at MAX_SCALE);
+  // n < 0 truncates to the LEFT of the point — result scale 0, a multiple of 10^-n
+  // (trunc(1234.5, -2) = 1200). truncPlaces(0) is trunc(x). Cannot overflow (truncation never
+  // grows the magnitude — mirrors roundPlaces minus the round-up carry).
+  truncPlaces(n: number): Decimal {
+    if (n >= 0) {
+      return this.truncToScale(Math.min(n, MAX_SCALE));
+    }
+    const k = Math.min(-n, this.precision() + 1);
+    const pow = magPow10(this.scale + k);
+    const [q] = magDivMod(this.limbs, pow);
+    return Decimal.fromParts(this.neg, 0, magMulPow10(q, k));
+  }
+
+  // ceil is ceil(numeric) — round toward +∞ to scale 0 (spec/design/functions.md §9).
+  ceil(): Decimal {
+    return this.roundToBound(false);
+  }
+
+  // floor is floor(numeric) — round toward −∞ to scale 0.
+  floor(): Decimal {
+    return this.roundToBound(true);
+  }
+
+  // roundToBound is the shared kernel for ceil/floor to scale 0: drop the fraction toward zero,
+  // then grow the magnitude by one iff a fraction was dropped AND the requested direction points
+  // away from zero for this sign — ceil (towardNeg = false) grows a positive value, floor
+  // (towardNeg = true) grows a negative one. A carry can push a value at the integer-digit cap
+  // over it → 22003 (like round).
+  roundToBound(towardNeg: boolean): Decimal {
+    if (this.scale === 0) return this;
+    const pow = magPow10(this.scale);
+    const [q, r] = magDivMod(this.limbs, pow);
+    let quo = q;
+    const hasFrac = r.some((x) => x !== 0);
+    if (hasFrac && this.neg === towardNeg) quo = magAdd(quo, [1]);
+    return Decimal.fromParts(this.neg, 0, quo).checkCap();
+  }
+
   // coerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then
   // trap 22003 if the integer-part digits exceed precision-scale (spec/design/decimal.md §2).
   coerceToTypmod(precision: number, scale: number): Decimal {

@@ -330,3 +330,167 @@ query D nosort
 SELECT trim_scale(1.23)
 ----
 1.23
+
+# --- ceil / ceiling(numeric): round toward +∞ to scale 0 (decimal.md §6) --------------
+query D nosort
+SELECT ceil(2.3)
+----
+3
+
+query D nosort
+SELECT ceil(-2.3)
+----
+-2
+
+# a fraction below zero rounds up to zero (no negative zero)
+query D nosort
+SELECT ceil(-0.5)
+----
+0
+
+# an exact-integer value drops to scale 0 (ceil(2.00) is 2, not 2.00)
+query D nosort
+SELECT ceil(2.00)
+----
+2
+
+# ceiling is the alias of ceil
+query D nosort
+SELECT ceiling(2.3)
+----
+3
+
+query D nosort
+SELECT ceiling(-2.3)
+----
+-2
+
+# NULL propagates
+query D nosort
+SELECT ceil(d) FROM nm WHERE id = 4
+----
+NULL
+
+# --- floor(numeric): round toward −∞ to scale 0 --------------------------------------
+query D nosort
+SELECT floor(2.7)
+----
+2
+
+query D nosort
+SELECT floor(-2.3)
+----
+-3
+
+query D nosort
+SELECT floor(0.5)
+----
+0
+
+query D nosort
+SELECT floor(-0.5)
+----
+-1
+
+query D nosort
+SELECT floor(2.00)
+----
+2
+
+query D nosort
+SELECT floor(d) FROM nm WHERE id = 4
+----
+NULL
+
+# --- trunc(numeric): truncate toward zero to scale 0 ---------------------------------
+query D nosort
+SELECT trunc(2.7)
+----
+2
+
+# toward zero: a negative truncates UP toward zero (unlike floor)
+query D nosort
+SELECT trunc(-2.7)
+----
+-2
+
+query D nosort
+SELECT trunc(0.9)
+----
+0
+
+query D nosort
+SELECT trunc(d) FROM nm WHERE id = 4
+----
+NULL
+
+# --- trunc(numeric, n): truncate toward zero to n fractional places ------------------
+query D nosort
+SELECT trunc(1.567, 2)
+----
+1.56
+
+# toward zero, NOT rounded (1.567 truncated to 2 places is 1.56, not 1.57)
+query D nosort
+SELECT trunc(-1.567, 2)
+----
+-1.56
+
+# n greater than the value's scale pads with zeros (the display scale becomes n)
+query D nosort
+SELECT trunc(1.5, 3)
+----
+1.500
+
+# a negative n truncates to the LEFT of the point (a multiple of 10^-n, scale 0)
+query D nosort
+SELECT trunc(1234.5, -2)
+----
+1200
+
+query D nosort
+SELECT trunc(1289.5, -2)
+----
+1200
+
+# --- integer overloads return numeric (like round; PG resolves single-arg ceil/floor/
+# --- trunc(int) to double precision — a documented result-type divergence, value-identical) ---
+query D nosort
+SELECT ceil(5)
+----
+5
+
+query D nosort
+SELECT floor(5)
+----
+5
+
+query D nosort
+SELECT trunc(5)
+----
+5
+
+# trunc(int, int) is numeric in PostgreSQL too (its 2-arg trunc is numeric-only), so no divergence
+query D nosort
+SELECT trunc(150, -1)
+----
+150
+
+# --- a non-numeric argument is 42883 (no such function; no implicit cast) -------------
+statement error 42883
+SELECT ceil(true)
+
+statement error 42883
+SELECT trunc(true)
+
+# --- ceil/floor/trunc are valid in WHERE and over an arithmetic sub-expression --------
+query I nosort
+SELECT id FROM nm WHERE floor(d) = 1 ORDER BY id
+----
+1
+
+# cost: 5
+query D nosort
+SELECT trunc(d, 1) FROM nm WHERE id = 1
+----
+1.5

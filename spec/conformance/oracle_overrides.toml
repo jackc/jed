@@ -1021,6 +1021,27 @@ file = "expr/numeric_functions.test"
 sql = "SELECT sign(2)"
 reason = "jed: sign has decimal + float overloads with arg_resolution = none (catalog), and an integer literal does not implicitly promote to either family, so 42883. PostgreSQL resolves sign(int) to float8 (its preferred numeric type) and returns 1. The strict type system (§4): cross-family int -> decimal/float is explicit-cast-only, the same divergence sqrt(int) carries."
 
+# --- ceil/floor/trunc integer overloads: jed returns decimal/numeric (the `D` tag), like the round
+# integer overloads. PostgreSQL has no single-arg ceil/floor/trunc(integer); it resolves the call to
+# the double-precision overload via its preferred-type rule and returns double precision (the `R`
+# tag). A documented result-type divergence (jed keeps floats out of the value path, float.md §8); the
+# value is the integer itself, at jed's committed decimal rendering. PG's 2-arg trunc is numeric-only,
+# so trunc(int, int) agrees with jed and needs no override.
+[[override]]
+file = "expr/numeric_functions.test"
+sql = "SELECT ceil(5)"
+reason = "jed: ceil() over an integer argument returns decimal/numeric (the catalog ceil integer overload — the `D` tag), like round(int). PostgreSQL has no ceil(integer); it resolves the call to ceil(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
+
+[[override]]
+file = "expr/numeric_functions.test"
+sql = "SELECT floor(5)"
+reason = "jed: floor() over an integer argument returns decimal/numeric (the catalog floor integer overload — the `D` tag), like round(int). PostgreSQL has no floor(integer); it resolves the call to floor(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
+
+[[override]]
+file = "expr/numeric_functions.test"
+sql = "SELECT trunc(5)"
+reason = "jed: trunc() over a single integer argument returns decimal/numeric (the catalog trunc integer overload — the `D` tag), like round(int). PostgreSQL has no single-arg trunc(integer); it resolves the call to trunc(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
+
 # --- regexp_* flag set: jed's RE2-able flavor (regex.md §1/§8b) accepts only the `i` flag (and `g`
 # for regexp_replace), unlike PostgreSQL's larger c/g/m/n/p/q/s/t/w/x set. A flag other than `i` is
 # 2201B (invalid_regular_expression) across ALL of jed's regexp functions — consistent with the
