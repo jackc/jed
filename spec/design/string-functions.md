@@ -154,3 +154,13 @@ Reuses `trim_chars` with `do_right = false`. NULL args propagate.
 Like `btrim` but trims only the **trailing** (right) run — the function form of
 `TRIM(TRAILING characters FROM text)`. `rtrim('xxhixx', 'x') = 'xxhi'`, `rtrim('  hi  ') = '  hi'`.
 Reuses `trim_chars` with `do_left = false`. NULL args propagate.
+
+### `replace(text, from, to) → text`
+
+Replace every (non-overlapping) occurrence of the **substring** `from` with `to`:
+`replace('abcabc', 'bc', 'X') = 'aXaX'`, `replace('aaa', 'a', 'bb') = 'bbbbbb'`. This is plain
+substring replacement, so the per-core built-ins (`str::replace` / `strings.ReplaceAll` /
+`String.replaceAll`) agree byte-for-byte — **except** for an **empty `from`**: all three would
+splice `to` at every character boundary (`'abc' → 'XaXbXcX'`), whereas PostgreSQL replaces nothing
+(`replace('abc', '', 'X') = 'abc'`). The kernel therefore special-cases an empty `from` to return the
+string unchanged. NULL args propagate.

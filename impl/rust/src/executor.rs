@@ -13056,6 +13056,8 @@ enum ScalarFunc {
     Ltrim,
     /// rtrim(text[, chars]) → text — trim the `chars` set from the TRAILING end only (§3).
     Rtrim,
+    /// replace(text, from, to) → text — replace every occurrence of substring `from` with `to` (§3).
+    Replace,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19088,6 +19090,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "btrim" => ScalarFunc::Btrim,
         "ltrim" => ScalarFunc::Ltrim,
         "rtrim" => ScalarFunc::Rtrim,
+        "replace" => ScalarFunc::Replace,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30465,6 +30468,20 @@ impl RExpr {
                         };
                         Ok(Value::Text(trim_chars(s, set, false, true)))
                     }
+                    // replace(text, from, to) → text — substring replace-all; empty `from` is a no-op.
+                    ScalarFunc::Replace => {
+                        let (s, from, to) = match (&vals[0], &vals[1], &vals[2]) {
+                            (Value::Text(s), Value::Text(f), Value::Text(t)) => (s, f, t),
+                            _ => unreachable!("resolver restricts replace to text"),
+                        };
+                        // An empty `from` matches nothing in PostgreSQL; Rust's str::replace would
+                        // instead splice `to` at every boundary, so guard it (string-functions.md §3).
+                        Ok(Value::Text(if from.is_empty() {
+                            s.clone()
+                        } else {
+                            s.replace(from.as_str(), to)
+                        }))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31343,7 +31360,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Rpad
         | ScalarFunc::Btrim
         | ScalarFunc::Ltrim
-        | ScalarFunc::Rtrim => {
+        | ScalarFunc::Rtrim
+        | ScalarFunc::Replace => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

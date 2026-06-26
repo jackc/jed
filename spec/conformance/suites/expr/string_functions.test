@@ -373,3 +373,30 @@ SELECT rtrim(NULL::text), rtrim('abc', NULL::text)
 ----
 NULL
 NULL
+
+# === replace(text, from, to) → text: substring replace-all ============================
+
+query T
+SELECT replace('abcabc', 'bc', 'X')
+----
+aXaX
+
+# a single-character substring, multiple occurrences; code-point safe
+query T
+SELECT replace('héllo', 'l', 'L')
+----
+héLLo
+
+# an EMPTY `from` replaces nothing (returns the string unchanged); a non-matching `from` is a no-op
+query B
+SELECT replace('abc', '', 'X') = 'abc', replace('abc', 'x', 'y') = 'abc'
+----
+true
+true
+
+query T
+SELECT replace(NULL::text, 'a', 'b'), replace('abc', NULL::text, 'b'), replace('abc', 'a', NULL::text)
+----
+NULL
+NULL
+NULL

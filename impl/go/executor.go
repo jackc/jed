@@ -15937,6 +15937,8 @@ const (
 	sfLtrim
 	// rtrim(text[, chars]) → text — trim the `chars` set from the TRAILING end only (§3).
 	sfRtrim
+	// replace(text, from, to) → text — replace every occurrence of substring `from` with `to` (§3).
+	sfReplace
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19532,6 +19534,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfLtrim
 	case "rtrim":
 		return sfRtrim
+	case "replace":
+		return sfReplace
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27482,6 +27486,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				set = vals[1].Str
 			}
 			return TextValue(trimChars(vals[0].Str, set, false, true)), nil
+		case sfReplace:
+			// replace(text, from, to) → text — substring replace-all; empty `from` is a no-op
+			// (strings.ReplaceAll would otherwise splice `to` between every character — §3).
+			from := vals[1].Str
+			if from == "" {
+				return TextValue(vals[0].Str), nil
+			}
+			return TextValue(strings.ReplaceAll(vals[0].Str, from, vals[2].Str)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

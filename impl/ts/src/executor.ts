@@ -12638,7 +12638,9 @@ type ScalarFuncName =
   // ltrim(text[, chars]) → text — trim the `chars` set from the LEADING end only (§3).
   | "ltrim"
   // rtrim(text[, chars]) → text — trim the `chars` set from the TRAILING end only (§3).
-  | "rtrim";
+  | "rtrim"
+  // replace(text, from, to) → text — replace every occurrence of substring `from` with `to` (§3).
+  | "replace";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24481,6 +24483,14 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const s = (vals[0] as { text: string }).text;
         const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
         return textValue(trimChars(s, set, false, true));
+      }
+      if (e.func === "replace") {
+        // replace(text, from, to) → text — substring replace-all; empty `from` is a no-op
+        // (String.replaceAll would otherwise splice `to` between every character — §3).
+        const s = (vals[0] as { text: string }).text;
+        const from = (vals[1] as { text: string }).text;
+        const to = (vals[2] as { text: string }).text;
+        return textValue(from === "" ? s : s.replaceAll(from, to));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64
