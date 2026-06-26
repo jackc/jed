@@ -10,7 +10,7 @@ package jed
 // cheap, structurally-shared snapshot carries the §3 staging-buffer / transaction model.
 //
 // Since Phase 6 (P6.1) this IS the on-disk B-tree, node-for-page: its fan-out is size-driven — a
-// node holds as many entries as fit a page payload cap (= page_size − 12) and splits when it would
+// node holds as many entries as fit a page payload cap (= page_size − 16) and splits when it would
 // overflow, so the node boundaries (and serialized bytes) are a §8 byte contract (format.md). The
 // caller supplies each entry's on-disk weight (record size) so this map can sum payloads without
 // knowing the value codec; cap is passed per call (held by the TableStore). Each node also carries

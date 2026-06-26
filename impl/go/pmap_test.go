@@ -13,7 +13,7 @@ import (
 // realistic per-entry weight (8-byte key + a ~5-byte int value record), well under RECORD_MAX.
 // These maps are in-memory (no paging), so every traversal passes a nil leaf source and never faults.
 const (
-	pmCap = 244
+	pmCap = 240
 	pmW   = 15
 )
 
@@ -183,7 +183,7 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 }
 
 // Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the
-// non-empty-halves guarantee. With weight 110 (≤ 116 cap) a node holds ~2 entries.
+// non-empty-halves guarantee. With weight 110 (≤ 114 cap) a node holds ~2 entries.
 func TestPMapWideValuesKeepNodesValid(t *testing.T) {
 	var pm PMap
 	ref := map[string]bool{}

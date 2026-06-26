@@ -12,7 +12,7 @@ package jed
 type Row []Value
 
 // TableStore holds one table's rows, keyed by encoded primary key. Since Phase 6 (P6.1) the PMap is
-// the page-backed B-tree, so the store carries the page payload cap (= page_size − 12) and the
+// the page-backed B-tree, so the store carries the page payload cap (= page_size − 16) and the
 // column types to weigh each record (recordSize) for the size-driven split (spec/fileformat/format.md).
 type TableStore struct {
 	rows PMap
@@ -21,7 +21,7 @@ type TableStore struct {
 	// key. Unused for tables with a primary key. Reconstructed on load
 	// (spec/fileformat).
 	nextRowid int64
-	// cap is the page payload capacity C = page_size − 12 (the split threshold). Fixed for the
+	// cap is the page payload capacity C = page_size − 16 (the split threshold). Fixed for the
 	// database's life. colTypes are the resolved column types (scalar or composite —
 	// spec/design/composite.md §4), for computing record weights and the recursive value codec.
 	cap      int
@@ -34,7 +34,7 @@ type TableStore struct {
 }
 
 // NewTableStore builds an empty store for a table whose columns have the given resolved types,
-// serializing at page payload cap (= page_size − 12). In-memory (no paging) until attachPaging.
+// serializing at page payload cap (= page_size − 16). In-memory (no paging) until attachPaging.
 func NewTableStore(cap int, colTypes []ColType) *TableStore {
 	return &TableStore{cap: cap, colTypes: colTypes}
 }

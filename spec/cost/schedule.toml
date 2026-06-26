@@ -66,7 +66,7 @@ event  = "one C-byte slab of raw payload fed through the LZ4 encoder at a statem
 # Landed with large-values Slice B (../design/large-values.md §13, ../design/cost.md §3). An
 # over-`RECORD_MAX` record's disposition decision attempts to compress its largest values
 # (../fileformat/format.md "Large values"); each ATTEMPT — adopted or not, the CPU is spent either
-# way — fires this unit ceil(raw_len / C) times (C = page_size − 12, the same slab the chains use).
+# way — fires this unit ceil(raw_len / C) times (C = page_size − 16, the same slab the chains use).
 # Charged once per stored row version at the INSERT/UPDATE write site, never for the B-tree's
 # internal re-encodes. A record that fits inline-plain attempts nothing and charges nothing.
 

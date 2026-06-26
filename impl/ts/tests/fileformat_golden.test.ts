@@ -462,7 +462,7 @@ function byteaTableDB(): Database {
 
 // overflowTableDB has large INCOMPRESSIBLE text + bytea values that spill OUT-OF-LINE PLAIN to
 // overflow pages (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value
-// exceeds RECORD_MAX (116); compression is attempted first (Slice B) but rejected by
+// exceeds RECORD_MAX (114); compression is attempted first (Slice B) but rejected by
 // store-smaller, so the record holds a 0x02 pointer and the raw bytes live in a page_type-4
 // chain. Row 1 spills both columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL.
 // Must match the Ruby reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).

@@ -9,7 +9,7 @@
 //! version a reader holds while a writer mutates its own copy.
 //!
 //! Since Phase 6 (P6.1) the [`PMap`] is the **page-backed B-tree**: its fan-out is size-driven,
-//! so each entry's on-disk **weight** (record size) and the page payload `cap` (= `page_size − 12`)
+//! so each entry's on-disk **weight** (record size) and the page payload `cap` (= `page_size − 16`)
 //! govern when a node splits (spec/fileformat/format.md). The store holds the column types and
 //! `cap` so it can compute weights ([`crate::format::record_size`]) the map itself never needs.
 
@@ -62,8 +62,8 @@ pub struct TableStore {
     /// reused, so a DELETE-then-INSERT cannot collide with a freed key. Unused for
     /// tables that have a primary key. Reconstructed on load (spec/fileformat).
     next_rowid: i64,
-    /// Page payload capacity `C = page_size − 12` — the split threshold for the page-backed
-    /// B-tree (spec/fileformat/format.md). Fixed for the life of the database.
+    /// Page payload capacity `C = page_size − 16` (`PAGE_HEADER`) — the split threshold for the
+    /// page-backed B-tree (spec/fileformat/format.md). Fixed for the life of the database.
     cap: usize,
     /// The table's resolved column types ([`ColType`] — a scalar, or a composite resolved to its
     /// field-type tree), for the value codec and for computing each row's on-disk record weight
@@ -78,7 +78,7 @@ pub struct TableStore {
 
 impl TableStore {
     /// A new empty store for a table whose columns have the given resolved types, serializing at
-    /// page payload `cap` (= `page_size − 12`). In-memory (no paging) until [`attach_paging`].
+    /// page payload `cap` (= `page_size − 16`). In-memory (no paging) until [`attach_paging`].
     pub fn new(cap: usize, col_types: Vec<ColType>) -> Self {
         TableStore {
             rows: PMap::new(),

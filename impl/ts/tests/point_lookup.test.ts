@@ -13,7 +13,7 @@ import type { Value } from "../src/value.ts";
 
 // --- direct storage-primitive check (the page_read drop) ---
 
-const CAP = 244;
+const CAP = 240;
 const W = 15;
 
 function key(n: number): Uint8Array {

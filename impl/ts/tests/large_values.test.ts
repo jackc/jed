@@ -35,7 +35,7 @@ function textOf(v: { kind: string; text?: string } | undefined): string | null {
   return v && v.kind === "text" ? (v.text ?? null) : null;
 }
 
-// A ~1250-byte text value forces a multi-page overflow chain at page 256 (RECORD_MAX = 116, cap = 244).
+// A ~1250-byte text value forces a multi-page overflow chain at page 256 (RECORD_MAX = 114, cap = 240).
 const BIG = fillerText(1250); // incompressible, so Slice B keeps it external-plain
 
 function bigValueDB(): Database {

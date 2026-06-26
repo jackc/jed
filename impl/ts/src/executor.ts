@@ -119,7 +119,7 @@ import {
   type ExtractSrc,
   extractField,
 } from "./datetime_fn.ts";
-import { crc32Ieee } from "./format.ts";
+import { crc32Ieee, pagePayload } from "./format.ts";
 import {
   Decimal,
   decimalFromParts,
@@ -1089,7 +1089,7 @@ export class Snapshot {
         for (const e of entries)
           ekeys.push(...indexEntryKeys(table.columns, colls, def, e.key, e.row));
         ekeys.sort(compareBytes);
-        const fresh = new TableStore(pageSize - 12, []); // 12 = PAGE_HEADER
+        const fresh = new TableStore(pagePayload(pageSize), []);
         for (const ek of ekeys) fresh.insert(ek, []);
         this.putIndexStore(def.name.toLowerCase(), fresh);
       }
@@ -1258,7 +1258,7 @@ export class Snapshot {
   }
 
   // putTable registers a new table and its empty store. The store carries the page payload cap (=
-  // page_size − 12) and the column types so the page-backed B-tree can weigh records for its
+  // page_size − 16) and the column types so the page-backed B-tree can weigh records for its
   // size-driven split (spec/fileformat/format.md).
   putTable(t: Table, pageSize: number): void {
     // Resolve each column's ColType against the (already-registered) composite-type catalog —
@@ -1277,7 +1277,7 @@ export class Snapshot {
   // putTable resolves against this.types and delegates here.
   putTableResolved(t: Table, colTypes: ColType[], pageSize: number): void {
     const key = t.name.toLowerCase();
-    this.stores.set(key, new TableStore(pageSize - 12, colTypes)); // 12 = PAGE_HEADER
+    this.stores.set(key, new TableStore(pagePayload(pageSize), colTypes));
     this.tables.set(key, t);
   }
 
@@ -1318,7 +1318,7 @@ export class Snapshot {
   // is re-allocated (catalog Tables are never mutated in place — snapshots share them).
   putIndex(tableKey: string, def: IndexDef, pageSize: number): void {
     const nameKey = def.name.toLowerCase();
-    this.indexStores.set(nameKey, new TableStore(pageSize - 12, [])); // 12 = PAGE_HEADER
+    this.indexStores.set(nameKey, new TableStore(pagePayload(pageSize), []));
     const old = this.tables.get(tableKey)!;
     let pos = old.indexes.length;
     for (let i = 0; i < old.indexes.length; i++) {
@@ -3945,7 +3945,7 @@ export class Database {
       for (const ix of table.indexes) {
         ts.putIndexStore(
           ix.name.toLowerCase(),
-          new TableStore(this.pageSize - 12, []), // 12 = PAGE_HEADER
+          new TableStore(pagePayload(this.pageSize), []),
         );
       }
       // Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
@@ -3962,7 +3962,7 @@ export class Database {
     for (const ix of table.indexes) {
       this.working().putIndexStore(
         ix.name.toLowerCase(),
-        new TableStore(this.pageSize - 12, []), // 12 = PAGE_HEADER
+        new TableStore(pagePayload(this.pageSize), []),
       );
     }
     // Stage each serial column's OWNED sequence now that the table validated

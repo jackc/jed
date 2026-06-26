@@ -9,8 +9,8 @@
 
 use jed::{Database, Outcome, execute};
 
-// page_size 256 ⇒ cap = 244, RECORD_MAX = 116. A 600-byte text payload spills into
-// ceil(600/244) = 3 overflow pages; a 300-byte bytea into ceil(300/244) = 2. Payloads are
+// page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
+// ceil(600/240) = 3 overflow pages; a 300-byte bytea into ceil(300/240) = 2. Payloads are
 // incompressible filler so Slice B's compress pass rejects them (store-smaller) and they
 // genuinely spill plain — compression's own costs are pinned in compressed_cost.rs.
 const PAGE_SIZE: u32 = 256;

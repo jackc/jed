@@ -464,7 +464,7 @@ impl Snapshot {
                 }
             }
             // 2b. Rebuild each affected index store from the (re-keyed) rows.
-            let cap = page_size as usize - 12; // PAGE_HEADER
+            let cap = crate::format::page_payload(page_size);
             for def in &indexes {
                 let mut ekeys: Vec<Vec<u8>> = Vec::new();
                 for (k, row) in &entries {
@@ -735,7 +735,7 @@ impl Snapshot {
     }
 
     /// Register a new table and its (empty) store. Lower-cased name is the key. The store carries
-    /// the page payload `cap` (= `page_size − 12`) and the column types so the page-backed B-tree
+    /// the page payload `cap` (= `page_size − 16`) and the column types so the page-backed B-tree
     /// can weigh records for its size-driven split (spec/fileformat/format.md).
     pub(crate) fn put_table(&mut self, table: Table, page_size: u32) {
         // Resolve each column's `ColType` against the (already-registered) composite-type catalog
@@ -765,7 +765,7 @@ impl Snapshot {
         page_size: u32,
     ) {
         let key = table.name.to_ascii_lowercase();
-        let cap = page_size as usize - 12; // PAGE_HEADER
+        let cap = crate::format::page_payload(page_size);
         self.stores
             .insert(key.clone(), TableStore::new(cap, col_types));
         self.tables.insert(key, table);
@@ -817,7 +817,7 @@ impl Snapshot {
     /// spec/design/indexes.md §6) and create its zero-column store.
     pub(crate) fn put_index(&mut self, table_key: &str, def: IndexDef, page_size: u32) {
         let name_key = def.name.to_ascii_lowercase();
-        let cap = page_size as usize - 12; // PAGE_HEADER
+        let cap = crate::format::page_payload(page_size);
         self.index_stores
             .insert(name_key.clone(), TableStore::new(cap, Vec::new()));
         let table = self.tables.get_mut(table_key).expect("table exists");
@@ -4033,7 +4033,7 @@ impl Database {
             .map(|i| i.name.to_ascii_lowercase())
             .collect();
         // The table is brand new (no rows), so each backing index store starts empty.
-        let cap = self.page_size as usize - 12; // PAGE_HEADER
+        let cap = crate::format::page_payload(self.page_size);
 
         if ct.temp {
             // Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean

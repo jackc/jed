@@ -807,6 +807,15 @@ function isSpillable(ty: ColType): boolean {
   return isText(s) || isBytea(s) || s === "decimal" || isJson(s) || isJsonb(s);
 }
 
+// pagePayload is the page payload capacity C = pageSize − PAGE_HEADER — the bytes a single page has
+// for body content (the B-tree split threshold and the overflow-chain slab size). The in-memory
+// store, the whole-image serializer, and the cost meter must all use this one value, or the split
+// decision diverges from the serialized layout (the `−12` drift that PAGE_HEADER's v7 growth to 16
+// silently introduced — format.md §7).
+export function pagePayload(pageSize: number): number {
+  return pageSize - PAGE_HEADER;
+}
+
 // recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
 // contract — RECORD_MAX = (C-12)/2 where C = capacity is the page payload (format.md "Why the record
 // cap"). The spill planner reduces a record to ≤ this by externalizing values.

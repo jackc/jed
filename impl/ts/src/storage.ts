@@ -7,7 +7,7 @@
 // version a reader holds while a writer mutates its own copy.
 //
 // Since Phase 6 (P6.1) the PMap is the page-backed B-tree, so the store carries the page payload
-// cap (= page_size − 12) and the column types to weigh each record (recordSize) for the
+// cap (= page_size − 16) and the column types to weigh each record (recordSize) for the
 // size-driven split (spec/fileformat/format.md).
 
 import type { Value } from "./value.ts";
@@ -54,7 +54,7 @@ export class TableStore {
   // never reused, so a DELETE-then-INSERT cannot collide with a freed key. Unused for
   // tables with a primary key. Reconstructed on load (spec/fileformat).
   private nextRowid: bigint;
-  // cap is the page payload capacity C = page_size − 12 (the split threshold). colTypes are the
+  // cap is the page payload capacity C = page_size − 16 (the split threshold). colTypes are the
   // column types, for computing record weights (recordSize).
   private cap: number;
   private colTypes: ColType[];

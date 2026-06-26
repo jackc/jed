@@ -26,7 +26,7 @@ func countPageType(image []byte, ps int, ty byte) int {
 }
 
 // bigValueDB builds an in-memory table with a ~1250-byte text value (forces a multi-page overflow
-// chain at page 256: RECORD_MAX = (256-12-12)/2 = 116, cap = 244) plus a small inline value.
+// chain at page 256: RECORD_MAX = (256-16-12)/2 = 114, cap = 240) plus a small inline value.
 func bigValueDB(t *testing.T) (*Database, string) {
 	t.Helper()
 	db := NewDatabase()

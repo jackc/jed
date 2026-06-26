@@ -1822,6 +1822,15 @@ func isSpillable(ty ColType) bool {
 		ty.Scalar.IsJson() || ty.Scalar.IsJsonb()
 }
 
+// pagePayload is the page payload capacity C = pageSize − pageHeader — the bytes a single page has
+// for body content (the B-tree split threshold and the overflow-chain slab size). The in-memory
+// store, the whole-image serializer, and the cost meter must all use this one value, or the split
+// decision diverges from the serialized layout (the `−12` drift that pageHeader's v7 growth to 16
+// silently introduced — format.md §7).
+func pagePayload(pageSize uint32) int {
+	return int(pageSize) - pageHeader
+}
+
 // recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
 // contract — RECORD_MAX = (C-12)/2 where C = capacity is the page payload (format.md "Why the
 // record cap"). The spill planner reduces a record to ≤ this by externalizing values.

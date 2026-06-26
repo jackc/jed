@@ -11,8 +11,8 @@ import type { Row } from "../src/storage.ts";
 
 // A small page cap so a few-thousand-entry map is several levels deep — exercises split,
 // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256). W is a realistic
-// per-entry weight (8-byte key + a ~5-byte int value record), well under RECORD_MAX = (244-12)/2.
-const CAP = 244;
+// per-entry weight (8-byte key + a ~5-byte int value record), well under RECORD_MAX = (240-12)/2.
+const CAP = 240;
 const W = 15;
 
 function key(n: number): Uint8Array {
@@ -132,7 +132,7 @@ test("pmap: clone is an independent snapshot", () => {
 });
 
 // Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the
-// non-empty-halves guarantee. With weight 110 (≤ 116 cap) a node holds ~2 entries.
+// non-empty-halves guarantee. With weight 110 (≤ 114 cap) a node holds ~2 entries.
 test("pmap: wide values keep nodes valid", () => {
   const pm = new PMap();
   for (const k of shuffled(300)) {

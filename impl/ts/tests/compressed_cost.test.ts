@@ -3,7 +3,7 @@
 // ceil(raw/C) slabs per compressed stored value the bound admits — and valueCompress meters
 // every disposition-plan compress ATTEMPT (adopted or rejected) at the INSERT/UPDATE write
 // site. The conformance corpus cannot exercise this (its 8 KiB pages never trigger the plan),
-// so these tests pin the accrual at page_size 256 (cap C = 244, RECORD_MAX = 116) with
+// so these tests pin the accrual at page_size 256 (cap C = 240, RECORD_MAX = 114) with
 // spill-vs-control table deltas. Mirrors impl/rust/tests/compressed_cost.rs and
 // impl/go/compressed_cost_test.go.
 
@@ -13,7 +13,7 @@ import { Database, execute } from "../src/lib.ts";
 import { fillerText } from "./util.ts";
 
 const PAGE_SIZE = 256;
-// A 600-byte payload = ceil(600/244) = 3 slabs (compress at write, decompress at scan); a
+// A 600-byte payload = ceil(600/240) = 3 slabs (compress at write, decompress at scan); a
 // 400-byte payload = 2 slabs.
 const SLABS_600 = 3n;
 const SLABS_400 = 2n;
@@ -46,15 +46,15 @@ function twoTables(): Database {
 
 test("scan charges decompress slabs for an inline-compressed value", () => {
   const db = twoTables();
-  // Identical plans, rows, and tree shape — the only difference is the ceil(600/244) = 3
+  // Identical plans, rows, and tree shape — the only difference is the ceil(600/240) = 3
   // value_decompress slabs (no chain: the compressed form fits inline, so page_read is equal).
   assert.equal(cost(db, "SELECT * FROM comp"), cost(db, "SELECT * FROM control") + SLABS_600);
 });
 
 test("external-compressed charges chain pages plus decompress slabs", () => {
   // A 400-char half-filler/half-run text compresses to ~212 B — smaller than plain but still
-  // over RECORD_MAX → 0x04 external-compressed: ceil(212/244) = 1 chain page_read PLUS
-  // ceil(400/244) = 2 value_decompress slabs.
+  // over RECORD_MAX → 0x04 external-compressed: ceil(212/240) = 1 chain page_read PLUS
+  // ceil(400/240) = 2 value_decompress slabs.
   const db = smallPageDb();
   execute(db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO comp VALUES (1, '${fillerText(200)}${"y".repeat(200)}')`);
@@ -87,7 +87,7 @@ test("INSERT meters compress attempts, adopted or rejected", () => {
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   // A fully-inline row attempts nothing: INSERT stays zero-cost.
   assert.equal(cost(db, "INSERT INTO t VALUES (1, 'small')"), 0n);
-  // An adopted compression (the "x" run) costs its ceil(600/244) = 3 attempt slabs ...
+  // An adopted compression (the "x" run) costs its ceil(600/240) = 3 attempt slabs ...
   assert.equal(cost(db, `INSERT INTO t VALUES (2, '${"x".repeat(600)}')`), SLABS_600);
   // ... and a REJECTED attempt (incompressible filler → external-plain) costs the same
   // slabs — the encoder ran either way (cost.md §3).
@@ -106,7 +106,7 @@ test("UPDATE meters compress attempts per rewritten row", () => {
 test("decimal payloads compress too", () => {
   // A long-coefficient decimal's body is a spillable payload like text/bytea
   // (large-values.md §12/§13): 801 digits → 201 base-10⁴ groups → a 407-byte payload,
-  // ceil(407/244) = 2 slabs both ways.
+  // ceil(407/240) = 2 slabs both ways.
   const db = smallPageDb();
   const digits = "12".repeat(400) + ".5";
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)");

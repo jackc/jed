@@ -5,7 +5,7 @@ package jed
 // ceil(raw/C) slabs per compressed stored value the bound admits — and value_compress meters
 // every disposition-plan compress ATTEMPT (adopted or rejected) at the INSERT/UPDATE write
 // site. The conformance corpus cannot exercise this (its 8 KiB pages never trigger the plan),
-// so these tests pin the accrual at page_size 256 (cap C = 244, RECORD_MAX = 116) with
+// so these tests pin the accrual at page_size 256 (cap C = 240, RECORD_MAX = 114) with
 // spill-vs-control table deltas. Mirrors impl/rust/tests/compressed_cost.rs and
 // impl/ts/tests/compressed_cost.test.ts. Uses fillerText from fileformat_golden_test.go.
 
@@ -17,7 +17,7 @@ import (
 
 const (
 	compressedPageSize = 256
-	// A 600-byte payload = ceil(600/244) = 3 slabs (compress at write, decompress at scan);
+	// A 600-byte payload = ceil(600/240) = 3 slabs (compress at write, decompress at scan);
 	// a 400-byte payload = 2 slabs.
 	slabs600 = 3
 	slabs400 = 2
@@ -46,7 +46,7 @@ func TestCompressedCostScanChargesDecompressSlabs(t *testing.T) {
 	db := compressedTables(t)
 	comp := mustCost(t, db, "SELECT * FROM comp")
 	control := mustCost(t, db, "SELECT * FROM control")
-	// Identical plans, rows, and tree shape — the only difference is the ceil(600/244) = 3
+	// Identical plans, rows, and tree shape — the only difference is the ceil(600/240) = 3
 	// value_decompress slabs (no chain: the compressed form fits inline, so page_read is equal).
 	if comp != control+slabs600 {
 		t.Fatalf("full scan: comp %d, control %d (want +%d)", comp, control, slabs600)
@@ -55,8 +55,8 @@ func TestCompressedCostScanChargesDecompressSlabs(t *testing.T) {
 
 func TestCompressedCostExternalCompressedChargesChainPlusSlabs(t *testing.T) {
 	// A 400-char half-filler/half-run text compresses to ~212 B — smaller than plain but still
-	// over RECORD_MAX → 0x04 external-compressed: ceil(212/244) = 1 chain page_read PLUS
-	// ceil(400/244) = 2 value_decompress slabs.
+	// over RECORD_MAX → 0x04 external-compressed: ceil(212/240) = 1 chain page_read PLUS
+	// ceil(400/240) = 2 value_decompress slabs.
 	db := WithPageSize(compressedPageSize)
 	mix := fillerText(200) + strings.Repeat("y", 200)
 	mustExec(t, db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)")
@@ -93,7 +93,7 @@ func TestCompressedCostInsertMetersAttemptsAdoptedOrRejected(t *testing.T) {
 	if c := mustCost(t, db, "INSERT INTO t VALUES (1, 'small')"); c != 0 {
 		t.Fatalf("inline INSERT cost = %d, want 0", c)
 	}
-	// An adopted compression (the "x" run) costs its ceil(600/244) = 3 attempt slabs ...
+	// An adopted compression (the "x" run) costs its ceil(600/240) = 3 attempt slabs ...
 	if c := mustCost(t, db, "INSERT INTO t VALUES (2, '"+strings.Repeat("x", 600)+"')"); c != slabs600 {
 		t.Fatalf("adopted-attempt INSERT cost = %d, want %d", c, slabs600)
 	}
@@ -119,7 +119,7 @@ func TestCompressedCostUpdateMetersAttemptsPerRewrittenRow(t *testing.T) {
 func TestCompressedCostDecimalPayloadsCompressToo(t *testing.T) {
 	// A long-coefficient decimal's body is a spillable payload like text/bytea
 	// (large-values.md §12/§13): 801 digits → 201 base-10⁴ groups → a 407-byte payload,
-	// ceil(407/244) = 2 slabs both ways.
+	// ceil(407/240) = 2 slabs both ways.
 	db := WithPageSize(compressedPageSize)
 	digits := strings.Repeat("12", 400) + ".5"
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)")

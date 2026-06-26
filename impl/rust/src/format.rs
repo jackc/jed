@@ -84,7 +84,15 @@ const MAGIC: [u8; 4] = *b"JEDB";
 const FORMAT_VERSION: u16 = 21;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
-const PAGE_HEADER: usize = 16;
+pub(crate) const PAGE_HEADER: usize = 16;
+/// The page payload capacity `C = page_size − PAGE_HEADER` — the bytes a single page has for body
+/// content (the B-tree split threshold and the overflow-chain slab size). This is the **one**
+/// source of the value: the in-memory store, the whole-image serializer, and the cost meter must
+/// all use it, or the split decision diverges from the serialized layout (the `− 12` drift that
+/// `PAGE_HEADER`'s v7 growth to 16 silently introduced — format.md §7).
+pub(crate) fn page_payload(page_size: u32) -> usize {
+    page_size as usize - PAGE_HEADER
+}
 /// Bytes reserved inside `RECORD_MAX` for a two-key interior node's three child pointers (`4·3`)
 /// — **independent of `PAGE_HEADER`** (spec/fileformat/format.md "Why the record cap"). Both were
 /// 12 through v6; v7 widened the header to 16 but this reserve stays 12.
@@ -3974,7 +3982,7 @@ mod tests {
 
     /// A table with a large incompressible `text` value that must spill out-of-line at a small
     /// page size, plus a small inline value. The big value (1250 bytes) far exceeds `RECORD_MAX`
-    /// at `ps=256` (`= (256-12-12)/2 = 116`) and `cap` (`= 244`), so it spans **several**
+    /// at `ps=256` (`= (256-16-12)/2 = 114`) and `cap` (`= 240`), so it spans **several**
     /// overflow pages.
     fn big_value_db() -> Database {
         let mut db = Database::new();
@@ -3994,7 +4002,7 @@ mod tests {
         let db = big_value_db();
         let ps = 256u32;
         let image = db.to_image(ps, 1).unwrap();
-        // The 1250-byte value spilled across a multi-page chain (cap 244 ⇒ ≥ 6 pages).
+        // The 1250-byte value spilled across a multi-page chain (cap 240 ⇒ ≥ 6 pages).
         assert!(
             count_page_type(&image, ps as usize, PAGE_OVERFLOW) >= 2,
             "a large value spans several overflow pages"

@@ -21,7 +21,7 @@ import (
 
 const lazyPageSize = 256
 
-// lazySeed creates one row per stored form at ps=256 (RECORD_MAX 116, cap 244): id 1
+// lazySeed creates one row per stored form at ps=256 (RECORD_MAX 114, cap 240): id 1
 // external-plain (incompressible 600-char filler → a 3-page chain), id 2 external-compressed
 // (half filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 // inline-compressed (a 600-char run), id 4 plain inline.

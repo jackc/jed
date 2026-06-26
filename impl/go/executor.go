@@ -367,7 +367,7 @@ func (s *Snapshot) upgradeCollations(pageSize uint32) (int, error) {
 			}
 		}
 		// Rebuild each affected index store from the (re-keyed) rows.
-		c := int(pageSize) - 12 // pageHeader
+		c := pagePayload(pageSize)
 		for _, def := range indexes {
 			var ekeys [][]byte
 			for _, e := range entries {
@@ -662,7 +662,7 @@ func (s *Snapshot) compositeTypeDepth(ty Type, cache map[string]int) int {
 }
 
 // putTable registers a new table and its empty store. The store carries the page payload cap (=
-// page_size − 12) and the column types so the page-backed B-tree can weigh records for its
+// page_size − 16) and the column types so the page-backed B-tree can weigh records for its
 // size-driven split (spec/fileformat/format.md).
 func (s *Snapshot) putTable(t *Table, pageSize uint32) {
 	// Resolve each column's ColType against the (already-registered) composite-type catalog — the
@@ -685,7 +685,7 @@ func (s *Snapshot) putTable(t *Table, pageSize uint32) {
 // putTable resolves against s.types and delegates here.
 func (s *Snapshot) putTableResolved(t *Table, colTypes []ColType, pageSize uint32) {
 	key := strings.ToLower(t.Name)
-	s.stores[key] = NewTableStore(int(pageSize)-12, colTypes) // 12 = pageHeader
+	s.stores[key] = NewTableStore(pagePayload(pageSize), colTypes)
 	s.tables[key] = t
 }
 
@@ -732,7 +732,7 @@ func (s *Snapshot) storageBytes() uint64 {
 // re-allocated (catalog Tables are never mutated in place — snapshots share them).
 func (s *Snapshot) putIndex(tableKey string, def IndexDef, pageSize uint32) {
 	nameKey := strings.ToLower(def.Name)
-	s.indexStores[nameKey] = NewTableStore(int(pageSize)-12, nil) // 12 = pageHeader
+	s.indexStores[nameKey] = NewTableStore(pagePayload(pageSize), nil)
 	old := s.tables[tableKey]
 	t := *old
 	pos := len(old.Indexes)
@@ -4315,7 +4315,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		ts.putTableResolved(table, colTypes, db.pageSize)
 		for _, ix := range table.Indexes {
-			ts.putIndexStore(strings.ToLower(ix.Name), NewTableStore(int(db.pageSize)-12, nil)) // 12 = pageHeader
+			ts.putIndexStore(strings.ToLower(ix.Name), NewTableStore(pagePayload(db.pageSize), nil))
 		}
 		// Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
 		// (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
@@ -4331,7 +4331,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	db.putTable(table)
 	// The table is brand new (no rows), so each backing index store starts empty.
 	for _, ix := range table.Indexes {
-		db.working().putIndexStore(strings.ToLower(ix.Name), NewTableStore(int(db.pageSize)-12, nil)) // 12 = pageHeader
+		db.working().putIndexStore(strings.ToLower(ix.Name), NewTableStore(pagePayload(db.pageSize), nil))
 	}
 	// Stage each serial column's OWNED sequence now that the table validated
 	// (spec/design/sequences.md §12). The names were resolved (collision-free) during the column

@@ -8,7 +8,7 @@
 //! (transactions.md §2).
 //!
 //! **This is the on-disk B-tree, node-for-page (Phase 6, P6.1).** Its fan-out is **size-driven**:
-//! a node holds as many entries as fit a page payload `cap` (= `page_size − 12`) and **splits when
+//! a node holds as many entries as fit a page payload `cap` (= `page_size − 16`) and **splits when
 //! it would overflow** — so the node boundaries, and therefore the serialized bytes, are a §8 byte
 //! contract (format.md). The caller supplies each entry's on-disk **weight** (its record size) so
 //! this map can sum payloads without knowing the value codec; `cap` is passed per call (it is a
@@ -991,7 +991,7 @@ mod tests {
 
     // A small page cap so a few-thousand-entry map is several levels deep — exercises split,
     // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256).
-    const CAP: usize = 244;
+    const CAP: usize = 240;
 
     fn row(n: i64) -> Row {
         vec![Value::Int(n)]
@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     /// A realistic per-entry weight: 8-byte key + a ~5-byte int value record ≈ 15 bytes, so a
-    /// 244-byte node holds ~16 entries before splitting (well under RECORD_MAX = (244-12)/2 = 116).
+    /// 240-byte node holds ~16 entries before splitting (well under RECORD_MAX = (240-12)/2 = 114).
     const W: u32 = 15;
 
     /// A deterministic permutation of `0..n` (an LCG-driven shuffle) — no wall-clock / RNG, so the
@@ -1146,7 +1146,7 @@ mod tests {
     }
 
     /// Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and
-    /// the non-empty-halves guarantee. With weight 110 (≤ 116 cap), a node holds ~2 entries.
+    /// the non-empty-halves guarantee. With weight 110 (≤ 114 cap), a node holds ~2 entries.
     #[test]
     fn wide_values_keep_nodes_valid() {
         use std::collections::BTreeMap;
@@ -1167,7 +1167,7 @@ mod tests {
 
     #[test]
     fn bounded_range_and_overlap() {
-        // 200 entries at CAP 244 build a multi-leaf tree (the in-RAM analog of a paged store), so the
+        // 200 entries at CAP 240 build a multi-leaf tree (the in-RAM analog of a paged store), so the
         // bounded-scan primitive (spec/design/cost.md §3) can be checked where page_read drops below
         // node_count — the property single-leaf conformance tables cannot show.
         let mut pm = PMap::new();
@@ -1234,7 +1234,7 @@ mod tests {
         // scan_range_rev must yield the EXACT reverse of scan_range's row sequence over a MULTI-LEVEL
         // tree — the interior-node interleaving (separators between children) and the asymmetric
         // inclusive-lo edge that single-leaf conformance tables (the DESC-LIMIT corpus cases) cannot
-        // exercise. 200 entries at CAP 244 build several levels.
+        // exercise. 200 entries at CAP 240 build several levels.
         let mut pm = PMap::new();
         for n in 0..200u64 {
             pm.insert(key(n), row(n as i64), W, CAP, None).unwrap();

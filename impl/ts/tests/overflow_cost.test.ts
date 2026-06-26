@@ -14,8 +14,8 @@ import { test } from "node:test";
 import { Database, execute } from "../src/lib.ts";
 import { fillerBytesHex, fillerText } from "./util.ts";
 
-// page_size 256 ⇒ cap = 244, RECORD_MAX = 116. A 600-byte text payload spills into
-// ceil(600/244) = 3 overflow pages; a 300-byte bytea into ceil(300/244) = 2.
+// page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
+// ceil(600/240) = 3 overflow pages; a 300-byte bytea into ceil(300/240) = 2.
 const PAGE_SIZE = 256;
 const TEXT_CHAIN_PAGES = 3n;
 const BYTEA_CHAIN_PAGES = 2n;

@@ -3,14 +3,14 @@
 //! `ceil(raw/C)` slabs per compressed stored value the bound admits — and `value_compress`
 //! meters every disposition-plan compress ATTEMPT (adopted or rejected) at the INSERT/UPDATE
 //! write site. The conformance corpus cannot exercise this (its 8 KiB pages never trigger the
-//! plan), so these tests pin the accrual at page_size 256 (cap C = 244, RECORD_MAX = 116) with
+//! plan), so these tests pin the accrual at page_size 256 (cap C = 240, RECORD_MAX = 114) with
 //! spill-vs-control table deltas. Mirrored in Go (compressed_cost_test.go) and TS
 //! (tests/compressed_cost.test.ts).
 
 use jed::{Database, Outcome, execute};
 
 const PAGE_SIZE: u32 = 256;
-// A 600-byte payload = ceil(600/244) = 3 slabs (compress at write, decompress at scan); a
+// A 600-byte payload = ceil(600/240) = 3 slabs (compress at write, decompress at scan); a
 // 400-byte payload = 2 slabs.
 const SLABS_600: i64 = 3;
 const SLABS_400: i64 = 2;
@@ -71,7 +71,7 @@ fn scan_charges_decompress_slabs_for_an_inline_compressed_value() {
     let mut db = two_tables();
     let comp = cost(&mut db, "SELECT * FROM comp");
     let control = cost(&mut db, "SELECT * FROM control");
-    // Identical plans, rows, and tree shape — the only difference is the ceil(600/244) = 3
+    // Identical plans, rows, and tree shape — the only difference is the ceil(600/240) = 3
     // value_decompress slabs (no chain: the compressed form fits inline, so page_read is equal).
     assert_eq!(comp, control + SLABS_600);
 }
@@ -79,8 +79,8 @@ fn scan_charges_decompress_slabs_for_an_inline_compressed_value() {
 #[test]
 fn external_compressed_charges_chain_pages_plus_decompress_slabs() {
     // A 400-char half-filler/half-run text compresses to ~212 B — smaller than plain but still
-    // over RECORD_MAX → 0x04 external-compressed: ceil(212/244) = 1 chain page_read PLUS
-    // ceil(400/244) = 2 value_decompress slabs.
+    // over RECORD_MAX → 0x04 external-compressed: ceil(212/240) = 1 chain page_read PLUS
+    // ceil(400/240) = 2 value_decompress slabs.
     let mut db = Database::with_page_size(PAGE_SIZE);
     let mix = format!("{}{}", filler_text(200), "y".repeat(200));
     execute(&mut db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)").unwrap();
@@ -120,7 +120,7 @@ fn insert_meters_compress_attempts_adopted_or_rejected() {
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
     // A fully-inline row attempts nothing: INSERT stays zero-cost.
     assert_eq!(cost(&mut db, "INSERT INTO t VALUES (1, 'small')"), 0);
-    // An adopted compression (the "x" run) costs its ceil(600/244) = 3 attempt slabs ...
+    // An adopted compression (the "x" run) costs its ceil(600/240) = 3 attempt slabs ...
     let run600 = "x".repeat(600);
     assert_eq!(
         cost(&mut db, &format!("INSERT INTO t VALUES (2, '{run600}')")),
@@ -160,7 +160,7 @@ fn decimal_payloads_compress_too() {
     // A long-coefficient decimal's body (flags|scale|ndigits|groups) is a spillable payload
     // like text/bytea (large-values.md §12/§13). 801 digits (an "12"-run plus ".5" so the
     // literal types as numeric) → 201 base-10⁴ groups → a 407-byte payload: over RECORD_MAX,
-    // compressible (repeating groups), and ceil(407/244) = 2 slabs both ways.
+    // compressible (repeating groups), and ceil(407/240) = 2 slabs both ways.
     let mut db = Database::with_page_size(PAGE_SIZE);
     let digits = format!("{}.5", "12".repeat(400));
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)").unwrap();
