@@ -12749,7 +12749,9 @@ type ScalarFuncName =
   // chr(int) → text — the one-character string for a Unicode code point; bad point traps (§3).
   | "chr"
   // initcap(text) → text — titlecase each word (ASCII word boundaries + ASCII case fold, §3).
-  | "initcap";
+  | "initcap"
+  // to_hex(int) → text — lowercase hex of the value's 64-bit two's-complement pattern (§3).
+  | "to_hex";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24653,6 +24655,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "initcap") {
         // initcap(text) → text — titlecase each word.
         return textValue(initcapAscii((vals[0] as { text: string }).text));
+      }
+      if (e.func === "to_hex") {
+        // to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern. asUintN(64)
+        // maps a negative i64 to its unsigned bit pattern, matching Rust/Go.
+        const n = (vals[0] as { int: bigint }).int;
+        return textValue(BigInt.asUintN(64, n).toString(16));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

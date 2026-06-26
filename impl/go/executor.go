@@ -15957,6 +15957,8 @@ const (
 	sfChr
 	// initcap(text) → text — titlecase each word (ASCII word boundaries + ASCII case fold, §3).
 	sfInitcap
+	// to_hex(int) → text — lowercase hex of the value's 64-bit two's-complement pattern (§3).
+	sfToHex
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19572,6 +19574,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfChr
 	case "initcap":
 		return sfInitcap
+	case "to_hex":
+		return sfToHex
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27708,6 +27712,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfInitcap:
 			// initcap(text) → text — titlecase each word.
 			return TextValue(initcapASCII(vals[0].Str)), nil
+		case sfToHex:
+			// to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern.
+			return TextValue(strconv.FormatUint(uint64(vals[0].Int), 16)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

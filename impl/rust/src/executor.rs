@@ -13076,6 +13076,8 @@ enum ScalarFunc {
     Chr,
     /// initcap(text) → text — titlecase each word (ASCII word boundaries + ASCII case fold, §3).
     Initcap,
+    /// to_hex(int) → text — lowercase hex of the value's 64-bit two's-complement pattern (§3).
+    ToHex,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19118,6 +19120,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "ascii" => ScalarFunc::Ascii,
         "chr" => ScalarFunc::Chr,
         "initcap" => ScalarFunc::Initcap,
+        "to_hex" => ScalarFunc::ToHex,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30570,6 +30573,10 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Text(initcap_ascii(s))),
                         _ => unreachable!("resolver restricts initcap to text"),
                     },
+                    // to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern.
+                    ScalarFunc::ToHex => {
+                        Ok(Value::Text(format!("{:x}", int_value(&vals[0]) as u64)))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31458,7 +31465,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::StartsWith
         | ScalarFunc::Ascii
         | ScalarFunc::Chr
-        | ScalarFunc::Initcap => {
+        | ScalarFunc::Initcap
+        | ScalarFunc::ToHex => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

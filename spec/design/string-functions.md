@@ -259,3 +259,19 @@ letter is treated as a word boundary** rather than a word character, so `initcap
 for **ASCII** input, which the oracle corpus exercises; the non-ASCII titlecasing (full Unicode word
 classification + a loaded-bundle case fold, like `lower`/`upper`) is a deferred refinement. NULL
 propagates.
+
+### `to_hex(int) → text`
+
+The hexadecimal representation (lowercase, no leading zeros): `to_hex(255) = 'ff'`, `to_hex(0) = '0'`,
+`to_hex(2147483647) = '7fffffff'`. A negative value renders its **64-bit two's-complement** bit
+pattern (`to_hex(-1::i64) = 'ffffffffffffffff'`) — each core casts the `i64` to `u64` and formats
+(`{:x}` / `FormatUint(…,16)` / `BigInt.asUintN(64,…).toString(16)`), so the rendering is identical
+cross-core.
+
+**Width note.** PostgreSQL has `to_hex(int4)` and `to_hex(int8)`; for a negative value they render
+the 32- and 64-bit patterns respectively (`to_hex(-1) = 'ffffffff'`, `to_hex(-1::bigint) =
+'ffffffffffffffff'`). jed renders at **`i64` width uniformly** (= PG's `to_hex(bigint)`). Because a
+bare integer literal in jed is `i64`, `to_hex(255)` matches PG for any positive value, and a negative
+test pins against `::bigint` so both sides use 64 bits; a negative *narrower* column value renders 64
+bits in jed vs PG's narrower width — a consequence of jed's i64-uniform integers, documented here.
+NULL propagates.

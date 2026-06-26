@@ -655,3 +655,24 @@ SELECT initcap('') = '', initcap(NULL::text) IS NULL
 ----
 true
 true
+
+# === to_hex(int) → text: lowercase hexadecimal ========================================
+
+query T
+SELECT to_hex(255), to_hex(0), to_hex(2147483647)
+----
+ff
+0
+7fffffff
+
+# a negative value renders the 64-bit two's-complement pattern (pinned at ::i64 so PG uses bigint)
+query T
+SELECT to_hex((-1)::i64), to_hex((-255)::i64)
+----
+ffffffffffffffff
+ffffffffffffff01
+
+query T
+SELECT to_hex(NULL::int)
+----
+NULL
