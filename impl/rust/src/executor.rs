@@ -25384,6 +25384,28 @@ fn resolve_binary(
             {
                 return resolve_range_set_op(op, rl, lt, rr, rt);
             }
+            // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32
+            // (days between), date ± interval → timestamp. Checked BEFORE the interval/timestamp
+            // rules below: a `date ± interval` pair has an interval operand, which would otherwise
+            // make `temporal_arith_result` report a 42804 (date is not one of its temporal types).
+            // Any other arithmetic combination involving a date is a 42804 from `date_arith_result`.
+            if matches!(lt, ResolvedType::Date) || matches!(rt, ResolvedType::Date) {
+                let result = date_arith_result(op, &lt, &rt)?;
+                let aop = if matches!(op, BinaryOp::Add) {
+                    ArithOp::Add
+                } else {
+                    ArithOp::Sub
+                };
+                return Ok((
+                    RExpr::Arith {
+                        op: aop,
+                        lhs: Box::new(rl),
+                        rhs: Box::new(rr),
+                        result,
+                    },
+                    resolved_type_of(result),
+                ));
+            }
             // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
             // interval * number, number * interval (commute), interval / number. Checked before
             // the ±-only temporal rule below.
@@ -27006,6 +27028,31 @@ fn temporal_arith_result(
         }
     };
     Some(Ok(st))
+}
+
+/// The result type of a `date` arithmetic operator (spec/design/date.md §6): `date ± integer →
+/// date`, `integer + date → date` (Add commutes; an integer of any width — the family matches
+/// i16/i32/i64), `date − date → i32` (the count of days between, PG's int4), and `date ± interval
+/// → timestamp` (the date widens to midnight, then the timestamp ± interval calendar shift — PG:
+/// `date + interval` is a `timestamp`, not a date). `interval + date` commutes (Add only); there
+/// is no `integer − date` nor `interval − date`. Any other combination involving a date is a
+/// 42804 (PG reports "operator does not exist"; jed uses the datatype-mismatch code its other
+/// arithmetic type errors use). A bare untyped NULL partner is NOT adopted — `date ± NULL` is a
+/// 42804 (PG rejects the ambiguous form too); a typed NULL keeps its family and resolves here.
+fn date_arith_result(op: BinaryOp, lt: &ResolvedType, rt: &ResolvedType) -> Result<ScalarType> {
+    use BinaryOp::{Add, Sub};
+    use ResolvedType as R;
+    let st = match (op, lt, rt) {
+        (Add, R::Date, R::Int(_)) | (Add, R::Int(_), R::Date) | (Sub, R::Date, R::Int(_)) => {
+            ScalarType::Date
+        }
+        (Sub, R::Date, R::Date) => ScalarType::Int32,
+        (Add, R::Date, R::Interval) | (Add, R::Interval, R::Date) | (Sub, R::Date, R::Interval) => {
+            ScalarType::Timestamp
+        }
+        _ => return Err(type_error("unsupported operand types for date arithmetic")),
+    };
+    Ok(st)
 }
 
 /// The result type of an interval `×÷` number (spec/design/interval.md §5): `interval * number`,
@@ -29862,6 +29909,80 @@ fn eval_date_convert(v: Value, to: ScalarType, env: &EvalEnv, m: &mut Meter) -> 
     }
 }
 
+/// Midnight (00:00:00) of a `date` as timestamp microseconds, preserving the ±infinity sentinels.
+/// A finite date whose midnight instant overflows the i64-µs timestamp range traps `22008` (jed's
+/// date range is wider than the timestamp range — date.md §1). A finite day count cannot land on a
+/// timestamp sentinel (`i64::MIN`/`MAX` are not multiples of a day's micros), so no sentinel-
+/// collision check is needed here; `ts_shift` re-checks the shifted result anyway.
+fn date_midnight_micros(d: i32) -> Result<i64> {
+    use crate::timestamp::{NEG_INFINITY as TS_NEG, POS_INFINITY as TS_POS};
+    const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+    if d == crate::date::POS_INFINITY {
+        return Ok(TS_POS);
+    }
+    if d == crate::date::NEG_INFINITY {
+        return Ok(TS_NEG);
+    }
+    i64::from(d)
+        .checked_mul(MICROS_PER_DAY)
+        .ok_or_else(|| EngineError::new(SqlState::DatetimeFieldOverflow, "date out of range"))
+}
+
+/// Evaluate a `date` arithmetic node (spec/design/date.md §6): `date ± int → date` (shift the i32
+/// day count; ±infinity is returned unchanged; a finite result beyond the i32 day range or onto a
+/// reserved sentinel traps `22008`), `date − date → i32` (days between; an ±infinity operand traps
+/// `22008`, "cannot subtract infinite dates"; a difference beyond i32 traps `22008`), and
+/// `date ± interval → timestamp` (the date widens to midnight, then the timestamp ± interval
+/// calendar shift). The resolver guarantees a Date operand is present and settled `result`.
+fn eval_date_arith(op: ArithOp, a: Value, b: Value, result: ScalarType) -> Result<Value> {
+    use crate::date::{NEG_INFINITY as D_NEG, POS_INFINITY as D_POS};
+    let dt_oflow = |msg: &'static str| EngineError::new(SqlState::DatetimeFieldOverflow, msg);
+
+    // date ± interval → timestamp: widen the date to midnight micros, then the calendar shift.
+    if matches!(result, ScalarType::Timestamp) {
+        let (d, iv) = match (a, b) {
+            (Value::Date(d), Value::Interval(iv)) | (Value::Interval(iv), Value::Date(d)) => {
+                (d, iv)
+            }
+            _ => unreachable!("resolver guarantees a date ± interval pair"),
+        };
+        let mid = date_midnight_micros(d)?;
+        let r = crate::interval::ts_shift(mid, &iv, matches!(op, ArithOp::Sub))?;
+        return Ok(Value::Timestamp(r));
+    }
+
+    // date − date → i32 (days between); an ±infinity operand traps 22008.
+    if let (Value::Date(x), Value::Date(y)) = (&a, &b) {
+        if *x == D_NEG || *x == D_POS || *y == D_NEG || *y == D_POS {
+            return Err(dt_oflow("cannot subtract infinite dates"));
+        }
+        let diff = i64::from(*x) - i64::from(*y);
+        let diff = i32::try_from(diff).map_err(|_| dt_oflow("date out of range"))?;
+        return Ok(Value::Int(i64::from(diff)));
+    }
+
+    // date ± int → date: shift the day count; a ±infinity date stays the same sentinel.
+    let (d, n) = match (a, b) {
+        (Value::Date(d), Value::Int(n)) | (Value::Int(n), Value::Date(d)) => (d, n),
+        _ => unreachable!("resolver guarantees a date ± int pair"),
+    };
+    if d == D_NEG || d == D_POS {
+        return Ok(Value::Date(d));
+    }
+    let shifted = if matches!(op, ArithOp::Sub) {
+        i64::from(d).checked_sub(n)
+    } else {
+        i64::from(d).checked_add(n)
+    }
+    .ok_or_else(|| dt_oflow("date out of range"))?;
+    let days = i32::try_from(shifted).map_err(|_| dt_oflow("date out of range"))?;
+    // A finite result that lands on a reserved sentinel value is out of range.
+    if days == D_NEG || days == D_POS {
+        return Err(dt_oflow("date out of range"));
+    }
+    Ok(Value::Date(days))
+}
+
 impl RExpr {
     /// Evaluate against a row, accruing cost into `m`. Returns a `Value` (which may be a
     /// boolean for comparisons/connectives). Arithmetic traps 22003 on overflow and 22012
@@ -30166,6 +30287,13 @@ impl RExpr {
                 let b = rhs.eval(row, env, m)?;
                 if matches!(a, Value::Null) || matches!(b, Value::Null) {
                     return Ok(Value::Null);
+                }
+                // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32,
+                // date ± interval → timestamp. A Date operand is present iff this is date
+                // arithmetic (the resolver settled `result` accordingly), so intercept it before
+                // the interval/timestamp/integer dispatch below (which assume non-date operands).
+                if matches!(a, Value::Date(_)) || matches!(b, Value::Date(_)) {
+                    return eval_date_arith(*op, a, b, *result);
                 }
                 if result.is_interval() && matches!(op, ArithOp::Mul | ArithOp::Div) {
                     // interval ×÷ number → interval (the exact cascade; spec/design/interval.md

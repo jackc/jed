@@ -1692,6 +1692,106 @@ null           = "propagates"
 precedence     = 50
 errors         = ["22008", "22012"]
 
+# --- arithmetic operators (date) ---------------------------------------------
+# Date arithmetic (spec/design/date.md §6, the deferred follow-on landed). `date ± integer →
+# date` shifts the i32 day count (an integer of any width — the family matches i16/i32/i64); a
+# finite result beyond the i32 day range, or onto a ±infinity sentinel, traps 22008, while a
+# ±infinity date is returned unchanged. `integer + date` commutes (Add only — there is no
+# `integer − date`). `date − date → i32` is the count of days between (PG returns int4); an
+# ±infinity operand traps 22008 ("cannot subtract infinite dates"), and a difference beyond i32
+# traps 22008 (jed's date range is WIDER than PG's, so this edge exists where PG's cannot — a
+# documented divergence, date.md §1). `date ± interval → timestamp` widens the date to MIDNIGHT
+# and applies the timestamp ± interval calendar shift (months-first with clamping); the result is
+# a `timestamp`, NOT a date (PG: `date + interval` is `timestamp`), and a date that widens beyond
+# the i64-µs timestamp range traps 22008. `interval + date` commutes; there is no `interval −
+# date`. arg_resolution = "none" (the operands are genuinely different types, not reconciled to
+# one). These are not a key/index concern (date IS keyable via its i32 key — encoding.md §2.1 —
+# but that is the storage layer, not these ops).
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["date", "integer"]
+arg_resolution = "none"
+result         = "date"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["integer", "date"]
+arg_resolution = "none"
+result         = "date"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["date", "integer"]
+arg_resolution = "none"
+result         = "date"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["date", "date"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["date", "interval"]
+arg_resolution = "none"
+result         = "timestamp"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "date"]
+arg_resolution = "none"
+result         = "timestamp"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["date", "interval"]
+arg_resolution = "none"
+result         = "timestamp"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
 # --- arithmetic operators (f64) ------------------------------------------
 # The float-family OVERLOAD of the arithmetic operators. f64 ⊕ f64 → f64 for
 # + - * / % and unary -, each the IEEE 754 CORRECTLY-ROUNDED operation (round-ties-to-even),

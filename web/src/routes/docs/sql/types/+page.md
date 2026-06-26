@@ -45,6 +45,12 @@
   EXTRACT(epoch FROM timestamptz '2024-03-15 12:00:00+00') AS epoch,
   EXTRACT(day FROM interval '40 days 5 hours')            AS interval_days,
   (timestamp '2024-03-15 13:47:23')::date                 AS as_date;`;
+
+	const dateArithDemo = `SELECT
+  date '2024-01-15' + 30                    AS in_30_days,
+  date '2024-03-01' - date '2024-01-15'     AS days_between,
+  date '2024-01-31' + interval '1 month'    AS month_clamped,
+  date '2024-01-15' - interval '12 hours'   AS midnight_minus;`;
 </script>
 
 <svelte:head>
@@ -152,5 +158,16 @@ explicit zone:
 
 (`date_part` is deferred — it returns `double precision`, and jed has no binary float type — as are
 the `text`↔datetime casts; cast a string with the `timestamp '…'` / `date '…'` literal form instead.)
+
+### Date arithmetic
+
+A `date` does calendar arithmetic, matching PostgreSQL. Adding or subtracting an **integer** shifts
+the day count and stays a `date`; subtracting one date from another gives the **number of days
+between** as an `i32`; and adding or subtracting an **interval** widens the date to midnight and
+returns a `timestamp` (month steps clamp the day-of-month, so Jan 31 + 1 month is Feb 29 in a leap
+year). The `±infinity` dates absorb any shift, and an out-of-range result raises `22008`:
+
+<LiveSql query={dateArithDemo} rows={1} />
+
 
 See the full [type reference](../../reference/types/) for every scalar type and its range.

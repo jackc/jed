@@ -789,6 +789,10 @@ id = "expr.timestamp_arithmetic"
 description = "timestamp arithmetic (the engine's first; spec/design/interval.md §5): timestamp[tz] ± interval → timestamp[tz] (months added first with day-of-month clamping, then days as 24 h, then micros; ±infinity stays ±infinity; overflow → 22008), interval + timestamp[tz] commutes, and timestamp[tz] − timestamp[tz] → interval justified into days + time (months = 0; an infinite operand → 22008)"
 
 [[capability]]
+id = "expr.date_arithmetic"
+description = "date arithmetic (spec/design/date.md §6): date ± integer → date (shift the i32 day count; ±infinity unchanged; finite overflow / a sentinel result → 22008), integer + date commutes (Add only), date − date → i32 (days between; an ±infinity operand → 22008 'cannot subtract infinite dates'; a difference beyond i32 → 22008), and date ± interval → timestamp (the date widens to midnight, then the timestamp ± interval calendar shift; a date beyond the i64-µs timestamp range → 22008). A NULL operand propagates; date × any other arithmetic combination is 42804"
+
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 

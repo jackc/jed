@@ -16,9 +16,10 @@
 `date`: the day-granular member of the datetime family, the natural companion to
 `timestamp`/`timestamptz`. This slice implements the **core type** — storage, ISO literals,
 comparison/ordering, rendering, the `±infinity` sentinels, and a `date` PRIMARY KEY — mirroring
-the original timestamp slice. **Date arithmetic** (`date + int`, `date - date`, `date ± interval`)
-and **casts** (text↔date, date↔timestamp) are **deferred follow-ons**, exactly as the timestamp
-slice deferred interval arithmetic and casts (§6). The non-goal is wire/`pg_catalog` fidelity
+the original timestamp slice. **Date arithmetic** (`date ± int`, `date - date`, `date ± interval`)
+has since **landed** (§6); the cross-family `date ↔ timestamp`/`timestamptz` **casts** have landed
+too (timezones.md §9.3), while the runtime `text ↔ date` cast and the clock-relative literals stay
+**deferred follow-ons** (§6), exactly as the timestamp slice deferred its own. The non-goal is wire/`pg_catalog` fidelity
 (CLAUDE.md §1); the goal is PG's *observable* date behavior on the surface we implement.
 
 ## 1. Representation — i32 days since the Unix epoch
@@ -183,20 +184,61 @@ coercion to the cast follow-on (§6).
 - **Cost** ([cost.md](cost.md)): a date compare node charges **one** uniform `operator_eval`,
   like integer/timestamp — the `# cost:` contract is unchanged.
 
-## 6. Deferred follow-ons
+## 6. Arithmetic, casts, and remaining follow-ons
 
-Scoped out of this slice (each its own future slice + obligations), matching the timestamp/
-interval precedent of landing the type before its arithmetic and casts:
+### Arithmetic — landed
 
-- **Date arithmetic** — `date + int` / `date - int` → `date`; `date - date` → `int` (days
-  between); `date + interval` / `date - interval` → `timestamp`; `date + time` → `timestamp`.
-  This is the interval-arithmetic-sized surface (operator catalog rows + resolver overloads +
-  evaluator kernels).
-- **Casts** — `text ↔ date`, `date ↔ timestamp` / `timestamptz` (the latter unblocks
-  cross-family `date < timestamp` comparison, §4), and `date(p)`-style typmods (there are none).
+`date` arithmetic implements PostgreSQL's three shapes, settled by the executor's hand-written
+binary-arithmetic resolver (the interval/timestamp precedent — interval.md §5; the operator rows
+live in [../functions/catalog.toml](../functions/catalog.toml), the conformance suite is
+`expr/date_arithmetic.test`). Each arithmetic node charges one uniform `operator_eval`, like
+integer/timestamp arithmetic.
+
+- **`date ± integer → date`** — shift the i32 day count. `integer + date` commutes (addition only;
+  there is **no** `integer − date`). A ±infinity date is returned **unchanged**; a finite result
+  beyond the i32 day range, or landing on a reserved ±infinity sentinel, traps `22008`. **Width
+  divergence:** jed's `date + integer` accepts an integer of **any** width (i16/i32/i64 — one
+  family), where PostgreSQL ships only `date + int4`; so `date + bigint`, a `42883` in PG, is a
+  date in jed. This matches jed's bare integer literal being `i64` (a literal `date + 5` would
+  otherwise not resolve) — the same family-covers-all-widths posture as the rest of jed's integer
+  arithmetic.
+- **`date − date → i32`** — the count of days between (PostgreSQL's `int4`). An ±infinity operand
+  traps `22008` ("cannot subtract infinite dates"). Because jed's date range is **wider** than
+  PostgreSQL's (§1), a difference can exceed `i32`; that traps `22008` where PostgreSQL's narrower
+  range cannot reach the edge — a documented divergence.
+- **`date ± interval → timestamp`** — the date **widens to midnight** (`00:00:00`) and the
+  `timestamp ± interval` calendar shift applies (months first with day-of-month clamping, then days
+  as 24 h, then micros — interval.md §5). The result is a **`timestamp`, not a date** (PostgreSQL).
+  `interval + date` commutes (addition only; no `interval − date`). A ±infinity date stays the
+  matching timestamp ±infinity; a date that widens **beyond the i64-µs timestamp range** traps
+  `22008` (jed's date range outruns the timestamp range — §1), exactly as the date→timestamp cast
+  would. (The midnight-widening reuses the landed date→timestamp conversion — timezones.md §9.3.)
+
+A NULL operand propagates (the result is NULL). A bare untyped `NULL` partner is **not** adopted —
+`date ± NULL` is a `42804` (PostgreSQL also rejects the ambiguous form, as `42725`/`42883`); a
+typed NULL (`NULL::int`) keeps its family and resolves normally. Any other arithmetic combination
+involving a date — `date * 2`, `date / 2`, `integer − date`, `interval − date` — is a `42804`
+datatype mismatch (PostgreSQL reports `42883` "operator does not exist"; jed names it a type
+mismatch, the **same documented error-class divergence** the interval-arithmetic rule carries —
+interval.md §5, recorded in `oracle_overrides.toml`).
+
+The `date + time → timestamp` shape PostgreSQL also defines is **not** implemented — jed has no
+separate `time` type yet (timezones.md §9); it lands with that type.
+
+### Still deferred
+
+Scoped out (each its own future slice), matching the timestamp/interval precedent:
+
+- **Casts** — the runtime `text → date` cast on a non-literal text expression (text→date is
+  reachable today only as **literal adaptation**, §2/§5) and `date(p)`-style typmods (there are
+  none). The cross-family `date ↔ timestamp` / `timestamptz` casts have **landed** (timezones.md
+  §9.3); the implicit `date → timestamp` coercion that would make `date < timestamp` well-typed
+  (§4) is still deferred — `date` stays a strict comparison island.
 - **Clock-relative literals** — `today` / `tomorrow` / `yesterday` / `now` / `epoch` (on the
   entropy/clock seam, [entropy.md](entropy.md), like the deferred timestamp `now` literal).
-- **Date functions** — `make_date`, `EXTRACT`/`date_part`, `date_trunc`, `current_date`.
+- **Date functions** — `make_date`, `date_part` (float8 — needs `float`), `current_date`.
+  (`EXTRACT(field FROM date)` and `date_trunc` over the datetime family have **landed** with the tz
+  conversion slice — timezones.md §9 / datetime_fn.)
 
 ## 7. Determinism traps (the cross-core checklist)
 

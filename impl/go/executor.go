@@ -24892,6 +24892,18 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if (b.Op == OpAdd || b.Op == OpSub || b.Op == OpMul) && (lt.kind == rtRange || rt.kind == rtRange) {
 			return resolveRangeSetOp(b.Op, rl, lt, rr, rt)
 		}
+		// Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32 (days
+		// between), date ± interval → timestamp. Checked BEFORE the interval/timestamp rules below:
+		// a `date ± interval` pair has an interval operand, which would otherwise make
+		// temporalArithResult report a 42804 (date is not one of its temporal kinds). Any other
+		// arithmetic combination involving a date is a 42804 from dateArithResult.
+		if lt.kind == rtDate || rt.kind == rtDate {
+			st, derr := dateArithResult(b.Op, lt.kind, rt.kind)
+			if derr != nil {
+				return nil, resolvedType{}, derr
+			}
+			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
+		}
 		// interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Checked
 		// before the ±-only temporal rule below.
 		if st, isScale := intervalScaleResult(b.Op, lt.kind, rt.kind); isScale {
@@ -25967,6 +25979,31 @@ func temporalArithResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isTemporal 
 		return IntervalType, true, nil
 	default:
 		return 0, true, typeError("unsupported operand types for temporal arithmetic")
+	}
+}
+
+// dateArithResult settles the result type of a date arithmetic operator (spec/design/date.md §6):
+// date ± integer → date, integer + date → date (Add commutes; an integer of any width — the
+// family covers i16/i32/i64), date − date → i32 (the count of days between, PG's int4), and
+// date ± interval → timestamp (the date widens to midnight, then the timestamp ± interval calendar
+// shift — PG: date + interval is a timestamp, not a date). interval + date commutes (Add only);
+// there is no integer − date nor interval − date. Any other combination involving a date is a
+// 42804 (PG reports 42883; jed uses its datatype-mismatch code, like the interval rule). A bare
+// untyped NULL partner is NOT adopted — date ± NULL is a 42804 (PG rejects the ambiguous form too).
+func dateArithResult(op BinaryOp, lt, rt rtKind) (ScalarType, error) {
+	switch {
+	case op == OpAdd && lt == rtDate && rt == rtInt,
+		op == OpAdd && lt == rtInt && rt == rtDate,
+		op == OpSub && lt == rtDate && rt == rtInt:
+		return Date, nil
+	case op == OpSub && lt == rtDate && rt == rtDate:
+		return Int32, nil
+	case op == OpAdd && lt == rtDate && rt == rtInterval,
+		op == OpAdd && lt == rtInterval && rt == rtDate,
+		op == OpSub && lt == rtDate && rt == rtInterval:
+		return Timestamp, nil
+	default:
+		return 0, typeError("unsupported operand types for date arithmetic")
 	}
 }
 
@@ -27912,6 +27949,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		if a.Kind == ValNull || b.Kind == ValNull {
 			return NullValue(), nil
+		}
+		// Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32, date ±
+		// interval → timestamp. A Date operand is present iff this is date arithmetic (the resolver
+		// settled e.result accordingly), so intercept it before the interval/timestamp/integer
+		// dispatch below (which assume non-date operands).
+		if a.Kind == ValDate || b.Kind == ValDate {
+			return evalDateArith(e.op, a, b, e.result)
 		}
 		if e.result.IsInterval() && (e.op == OpMul || e.op == OpDiv) {
 			// interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
@@ -29930,6 +29974,93 @@ func likeMatch(subject, pattern string) (bool, error) {
 		pi++
 	}
 	return pi == len(p), nil
+}
+
+// dateMidnightMicros returns midnight (00:00:00) of a date as timestamp microseconds, preserving
+// the ±infinity sentinels. A finite date whose midnight instant overflows the i64-µs timestamp
+// range traps 22008 (jed's date range is wider than the timestamp range — date.md §1). A finite
+// day count cannot land on a timestamp sentinel (i64 min/max are not multiples of a day's micros),
+// so no sentinel-collision check is needed here; TsShift re-checks the shifted result anyway.
+func dateMidnightMicros(d int32) (int64, error) {
+	if d == DatePosInfinity {
+		return PosInfinity, nil
+	}
+	if d == DateNegInfinity {
+		return NegInfinity, nil
+	}
+	mc, ok := mul64(int64(d), microsPerDay)
+	if !ok {
+		return 0, NewError(DatetimeFieldOverflow, "date out of range")
+	}
+	return mc, nil
+}
+
+// evalDateArith evaluates a date arithmetic node (spec/design/date.md §6): date ± int → date
+// (shift the i32 day count; ±infinity unchanged; a finite result beyond the i32 day range or onto
+// a reserved sentinel traps 22008), date − date → i32 (days between; an ±infinity operand traps
+// 22008; a difference beyond i32 traps 22008), and date ± interval → timestamp (the date widens to
+// midnight, then the timestamp ± interval calendar shift). The resolver guarantees a Date operand
+// is present and settled result.
+func evalDateArith(op BinaryOp, a, b Value, result ScalarType) (Value, error) {
+	dtOflow := func(msg string) error { return NewError(DatetimeFieldOverflow, msg) }
+
+	// date ± interval → timestamp: widen the date to midnight micros, then the calendar shift.
+	if result.IsTimestamp() {
+		var d int32
+		var iv Interval
+		if a.Kind == ValDate {
+			d, iv = int32(a.Int), b.Iv
+		} else {
+			d, iv = int32(b.Int), a.Iv
+		}
+		mid, merr := dateMidnightMicros(d)
+		if merr != nil {
+			return Value{}, merr
+		}
+		r, terr := TsShift(mid, iv, op == OpSub)
+		if terr != nil {
+			return Value{}, terr
+		}
+		return TimestampValue(r), nil
+	}
+
+	// date − date → i32 (days between); an ±infinity operand traps 22008.
+	if a.Kind == ValDate && b.Kind == ValDate {
+		x, y := int32(a.Int), int32(b.Int)
+		if x == DateNegInfinity || x == DatePosInfinity || y == DateNegInfinity || y == DatePosInfinity {
+			return Value{}, dtOflow("cannot subtract infinite dates")
+		}
+		diff := int64(x) - int64(y)
+		if diff < int64(DateNegInfinity) || diff > int64(DatePosInfinity) {
+			return Value{}, dtOflow("date out of range")
+		}
+		return IntValue(diff), nil
+	}
+
+	// date ± int → date: shift the day count; a ±infinity date stays the same sentinel.
+	var d int32
+	var n int64
+	if a.Kind == ValDate {
+		d, n = int32(a.Int), b.Int
+	} else {
+		d, n = int32(b.Int), a.Int
+	}
+	if d == DateNegInfinity || d == DatePosInfinity {
+		return DateValue(d), nil
+	}
+	var shifted int64
+	var ok bool
+	if op == OpSub {
+		shifted, ok = sub64(int64(d), n)
+	} else {
+		shifted, ok = add64(int64(d), n)
+	}
+	// A finite result must land strictly inside the i32 day range (the two extremes are the
+	// reserved ±infinity sentinels — date.md §1); an i64 wrap or an out-of-range value traps 22008.
+	if !ok || shifted <= int64(DateNegInfinity) || shifted >= int64(DatePosInfinity) {
+		return Value{}, dtOflow("date out of range")
+	}
+	return DateValue(int32(shifted)), nil
 }
 
 // evalArith evaluates an integer arithmetic op in 64-bit, trapping 22012 on a zero

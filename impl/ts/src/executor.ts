@@ -21089,6 +21089,18 @@ function resolveBinary(
       ) {
         return resolveRangeSetOp(op, p.rl, p.lt, p.rr, p.rt);
       }
+      // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32 (days
+      // between), date ± interval → timestamp. Checked BEFORE the interval/timestamp rules below:
+      // a `date ± interval` pair has an interval operand, which would otherwise make
+      // temporalArithResult throw a 42804 (date is not one of its temporal kinds). Any other
+      // arithmetic combination involving a date throws a 42804 from dateArithResult.
+      if (p.lt.kind === "date" || p.rt.kind === "date") {
+        const dresult = dateArithResult(op, p.lt.kind, p.rt.kind);
+        return {
+          node: { kind: "arith", op, result: dresult, lhs: p.rl, rhs: p.rr },
+          type: resolvedTypeOf(dresult),
+        };
+      }
       // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Checked
       // before the ±-only temporal rule below.
       const scaled = intervalScaleResult(op, p.lt.kind, p.rt.kind);
@@ -23205,6 +23217,31 @@ function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType |
   throw typeError("unsupported operand types for temporal arithmetic");
 }
 
+// dateArithResult settles the result type of a date arithmetic operator (spec/design/date.md §6):
+// date ± integer → date, integer + date → date (Add commutes; an integer of any width — the family
+// covers i16/i32/i64), date − date → i32 (the count of days between, PG's int4), and date ±
+// interval → timestamp (the date widens to midnight, then the timestamp ± interval calendar shift —
+// PG: date + interval is a timestamp, not a date). interval + date commutes (Add only); there is no
+// integer − date nor interval − date. Any other combination involving a date is a 42804 (PG reports
+// 42883; jed uses its datatype-mismatch code, like the interval rule). A bare untyped NULL partner
+// is NOT adopted — date ± NULL is a 42804 (PG rejects the ambiguous form too).
+function dateArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType {
+  if (
+    (op === "add" && lt === "date" && rt === "int") ||
+    (op === "add" && lt === "int" && rt === "date") ||
+    (op === "sub" && lt === "date" && rt === "int")
+  )
+    return "date";
+  if (op === "sub" && lt === "date" && rt === "date") return "i32";
+  if (
+    (op === "add" && lt === "date" && rt === "interval") ||
+    (op === "add" && lt === "interval" && rt === "date") ||
+    (op === "sub" && lt === "date" && rt === "interval")
+  )
+    return "timestamp";
+  throw typeError("unsupported operand types for date arithmetic");
+}
+
 function requireBool(t: ResolvedType, msg: string): void {
   if (
     t.kind === "int" ||
@@ -24721,6 +24758,60 @@ function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Val
   return negated ? boolNot(inVal) : inVal;
 }
 
+// dateMidnightMicros returns midnight (00:00:00) of a date as timestamp microseconds, preserving
+// the ±infinity sentinels. A finite date whose midnight instant overflows the i64-µs timestamp
+// range traps 22008 (jed's date range is wider than the timestamp range — date.md §1). bigint
+// never overflows, so the i64 range is checked explicitly (mirroring Rust's checked_mul / Go's
+// mul64); a finite day count cannot equal a sentinel (i64 min/max are not multiples of a day).
+function dateMidnightMicros(d: bigint): bigint {
+  const MICROS_PER_DAY = 86_400n * 1_000_000n;
+  if (d === DATE_POS_INFINITY) return POS_INFINITY;
+  if (d === DATE_NEG_INFINITY) return NEG_INFINITY;
+  const mc = d * MICROS_PER_DAY;
+  if (mc < NEG_INFINITY || mc > POS_INFINITY)
+    throw engineError("datetime_field_overflow", "date out of range");
+  return mc;
+}
+
+// evalDateArith evaluates a date arithmetic node (spec/design/date.md §6): date ± int → date
+// (shift the i32 day count; ±infinity unchanged; a finite result beyond the i32 day range or onto a
+// reserved sentinel traps 22008), date − date → i32 (days between; an ±infinity operand traps
+// 22008; a difference beyond i32 traps 22008), and date ± interval → timestamp (the date widens to
+// midnight, then the timestamp ± interval calendar shift). The resolver guarantees a Date operand
+// is present and settled `result`. Day counts are bigint (the uniform-integer discipline).
+function evalDateArith(op: BinaryOp, a: Value, b: Value, result: ScalarType): Value {
+  // date ± interval → timestamp: widen the date to midnight micros, then the calendar shift.
+  if (isTimestamp(result)) {
+    const d = a.kind === "date" ? a.days : (b as { days: bigint }).days;
+    const iv = a.kind === "interval" ? a.iv : (b as { iv: Interval }).iv;
+    return timestampValue(tsShift(dateMidnightMicros(d), iv, op === "sub"));
+  }
+  // date − date → i32 (days between); an ±infinity operand traps 22008.
+  if (a.kind === "date" && b.kind === "date") {
+    if (
+      a.days === DATE_NEG_INFINITY ||
+      a.days === DATE_POS_INFINITY ||
+      b.days === DATE_NEG_INFINITY ||
+      b.days === DATE_POS_INFINITY
+    )
+      throw engineError("datetime_field_overflow", "cannot subtract infinite dates");
+    const diff = a.days - b.days;
+    if (diff < DATE_NEG_INFINITY || diff > DATE_POS_INFINITY)
+      throw engineError("datetime_field_overflow", "date out of range");
+    return intValue(diff);
+  }
+  // date ± int → date: shift the day count; a ±infinity date stays the same sentinel.
+  const d = a.kind === "date" ? a.days : (b as { days: bigint }).days;
+  const n = a.kind === "int" ? a.int : (b as { int: bigint }).int;
+  if (d === DATE_NEG_INFINITY || d === DATE_POS_INFINITY) return dateValue(d);
+  const shifted = op === "sub" ? d - n : d + n;
+  // A finite result must land strictly inside the i32 day range (the two extremes are the reserved
+  // ±infinity sentinels — date.md §1); anything else traps 22008.
+  if (shifted <= DATE_NEG_INFINITY || shifted >= DATE_POS_INFINITY)
+    throw engineError("datetime_field_overflow", "date out of range");
+  return dateValue(shifted);
+}
+
 // evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) of the non-NULL value v
 // to `to` (timestamp/timestamptz/date). The casts crossing the timestamptz boundary consult the
 // session zone (charging timezone); the others are zone-free. ±infinity maps to the target's own
@@ -24894,6 +24985,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
       if (a.kind === "null" || b.kind === "null") return nullValue();
+      // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32, date ±
+      // interval → timestamp. A Date operand is present iff this is date arithmetic (the resolver
+      // settled e.result accordingly), so intercept it before the interval/timestamp/integer
+      // dispatch below (which assume non-date operands).
+      if (a.kind === "date" || b.kind === "date") return evalDateArith(e.op, a, b, e.result);
       if (isInterval(e.result) && (e.op === "mul" || e.op === "div")) {
         // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Mul
         // commutes; Div is interval / number. A zero divisor traps 22012.

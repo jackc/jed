@@ -113,6 +113,16 @@ sql = "SELECT INTERVAL '1 day' + 1"
 reason = "jed: an interval ± non-interval operand is a 42804 datatype mismatch (the hand-written interval-arithmetic rule — interval.md §5). PG instead reports 42883 (no `interval + integer` operator). Both reject; jed names it a type mismatch, a documented error-class divergence."
 
 [[override]]
+file = "expr/date_arithmetic.test"
+sql = "SELECT d * 2 FROM t WHERE id = 1"
+reason = "jed: a date in any arithmetic combination other than date ± integer, date − date, or date ± interval is a 42804 datatype mismatch (the hand-written date-arithmetic rule — date.md §6). PG reports 42883 (no `date * integer` operator). Both reject; jed names it a type mismatch, the same error-class divergence the interval-arithmetic rule carries."
+
+[[override]]
+file = "expr/date_arithmetic.test"
+sql = "SELECT n - d FROM t WHERE id = 1"
+reason = "jed: there is no `integer − date` operator (only `integer + date` commutes; date.md §6), so this is a 42804 datatype mismatch. PG reports 42883 (no `integer − date` operator). Both reject; jed names it a type mismatch, the same documented error-class divergence as `date * 2`."
+
+[[override]]
 file = "types/interval.test"
 sql = "SELECT INTERVAL '1 m'"
 reason = "jed: a bare `m` unit is ambiguous (months vs minutes) and rejected (22007 — spec/design/interval.md §3). PG resolves `m` contextually (here to minutes, `00:01:00`); jed declines the ambiguity, a documented divergence on its own surface."

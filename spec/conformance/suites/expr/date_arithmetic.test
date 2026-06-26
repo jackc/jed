@@ -1,0 +1,155 @@
+# date arithmetic (spec/design/date.md §6, the deferred follow-on now landed). Three shapes:
+#   date ± integer  → date       (shift the i32 day count; ±infinity unchanged; an integer of any
+#                                  width — jed's `date + integer` family covers i16/i32/i64, where
+#                                  PG ships only `date + int4`, so `date + bigint` is 42883 in PG
+#                                  but a date in jed — a documented width divergence, date.md §6)
+#   date − date     → i32        (count of days between; an ±infinity operand traps 22008)
+#   date ± interval → timestamp  (the date widens to MIDNIGHT, then the timestamp ± interval
+#                                  calendar shift — months-first with day-of-month clamping; the
+#                                  result is a timestamp, NOT a date — PG)
+# integer + date and interval + date commute (Add only). A NULL operand propagates. A finite
+# result beyond the i32 day range / onto a sentinel, an infinite date − date, or a date that
+# widens beyond the i64-µs timestamp range all trap 22008. date × any other arithmetic
+# combination is a 42804 (PG reports 42883 — a documented error-class divergence, like interval).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i32, types.date, types.interval, types.timestamp, expr.date_arithmetic
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, d date, d2 date, n i32)
+
+statement ok
+INSERT INTO t VALUES
+  (1, '2024-01-15', '2024-01-01', 10),
+  (2, '2024-01-31', '2024-03-01', 5),
+  (3, 'infinity', '-infinity', 7),
+  (4, NULL, '2024-01-01', NULL),
+  (5, '0001-01-01', '2024-12-31', 100)
+
+# --- date ± integer → date ----------------------------------------------------
+
+# date + integer shifts the day count
+query T nosort
+SELECT d + n FROM t WHERE id = 1
+----
+2024-01-25
+
+# integer + date commutes
+query T nosort
+SELECT n + d FROM t WHERE id = 1
+----
+2024-01-25
+
+# date − integer
+query T nosort
+SELECT d - n FROM t WHERE id = 2
+----
+2024-01-26
+
+# the DATE keyword literal + a bare integer literal (i64 in jed, int4 in PG — the value agrees)
+query T nosort
+SELECT DATE '2024-01-15' + 10
+----
+2024-01-25
+
+# --- date − date → i32 (days between) -----------------------------------------
+
+# forward span
+query I nosort
+SELECT d - d2 FROM t WHERE id = 1
+----
+14
+
+# negative span (the earlier date on the left)
+query I nosort
+SELECT d - d2 FROM t WHERE id = 2
+----
+-30
+
+# a wide span that still fits i32 (jed's date range is wider than PG's — date.md §1)
+query I nosort
+SELECT d - d2 FROM t WHERE id = 5
+----
+-739250
+
+# --- date ± interval → timestamp (the date widens to midnight) ----------------
+
+# date + interval carries the time-of-day into the resulting timestamp
+query T nosort
+SELECT d + INTERVAL '1 day 3 hours' FROM t WHERE id = 1
+----
+2024-01-16 03:00:00
+
+# month-add clamps Jan 31 → Feb 29 (2024 is a leap year)
+query T nosort
+SELECT d + INTERVAL '1 month' FROM t WHERE id = 2
+----
+2024-02-29 00:00:00
+
+# interval + date commutes
+query T nosort
+SELECT INTERVAL '2 days' + d FROM t WHERE id = 1
+----
+2024-01-17 00:00:00
+
+# date − interval
+query T nosort
+SELECT d - INTERVAL '12 hours' FROM t WHERE id = 1
+----
+2024-01-14 12:00:00
+
+# date − interval crossing into BC renders with the timestamp's BC suffix
+query T nosort
+SELECT d - INTERVAL '1 year 1 day' FROM t WHERE id = 5
+----
+0002-12-31 00:00:00 BC
+
+# --- infinity sentinels -------------------------------------------------------
+
+# +infinity ± integer stays +infinity
+query T nosort
+SELECT d + n FROM t WHERE id = 3
+----
+infinity
+
+# −infinity − integer stays −infinity
+query T nosort
+SELECT d2 - n FROM t WHERE id = 3
+----
+-infinity
+
+# +infinity ± interval stays +infinity (rendered as a timestamp infinity)
+query T nosort
+SELECT d + INTERVAL '1 day' FROM t WHERE id = 3
+----
+infinity
+
+# --- NULL propagation ---------------------------------------------------------
+
+# a NULL date propagates through date ± integer
+query T nosort
+SELECT d + n FROM t WHERE id = 4
+----
+NULL
+
+# a NULL date propagates through date − date
+query I nosort
+SELECT d - d2 FROM t WHERE id = 4
+----
+NULL
+
+# --- errors -------------------------------------------------------------------
+
+# subtracting an infinite date traps 22008 (cannot subtract infinite dates)
+statement error 22008
+SELECT d - d2 FROM t WHERE id = 3
+
+# a date + interval that widens beyond the i64-µs timestamp range traps 22008
+statement error 22008
+SELECT DATE '300000-01-01' + INTERVAL '1 day'
+
+# date × a scalar is a 42804 (there is no date × integer operator; PG reports 42883)
+statement error 42804
+SELECT d * 2 FROM t WHERE id = 1
+
+# there is no `integer − date` operator — a 42804 (PG reports 42883)
+statement error 42804
+SELECT n - d FROM t WHERE id = 1

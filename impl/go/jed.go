@@ -464,6 +464,8 @@ var SupportedCapabilities = []string{
 	"expr.interval_scale",
 	// timestamp[tz] ± interval and timestamp[tz] − timestamp[tz] → interval (interval.md §5).
 	"expr.timestamp_arithmetic",
+	// date ± integer → date, date − date → i32, date ± interval → timestamp (date.md §6).
+	"expr.date_arithmetic",
 	// General expression substrate — integer arithmetic, the boolean type, and the
 	// AND/OR/NOT Kleene connectives (the `expression` profile).
 	"types.boolean",

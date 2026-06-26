@@ -282,11 +282,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`date`** — a calendar date (i32 days since 1970-01-01), strict ISO `YYYY-MM-DD` literals with
       BC era + `±infinity`, a date PK (on-disk type code 16, no format bump); a **strict island** — no
       compare/cast to timestamp this slice (a documented PG divergence). → [date.md](spec/design/date.md)
-  - [ ] _follow-on:_ **date arithmetic** (`date ± int` → date, `date - date` → int, `date ± interval`
-        → timestamp, `date + time` → timestamp); **casts** (text↔date, date↔timestamp — the latter
-        unblocks cross-family `date < timestamp`); **clock-relative literals** (`today`/`tomorrow`/
-        `yesterday`/`now`/`epoch`, on the entropy/clock seam); **date functions** (`make_date`,
-        `EXTRACT`/`date_part`, `date_trunc`, `current_date`). → [date.md §6](spec/design/date.md)
+  - [x] _follow-on:_ **date arithmetic** — `date ± int` → date, `date − date` → i32 (days), `date ± interval`
+        → timestamp (date widens to midnight); ±infinity-aware; 22008 on i32/timestamp-range overflow +
+        infinite `date − date`; `date × other` = 42804 (PG 42883, override-ledgered); `date + bigint` accepted
+        (one integer family, PG rejects). `date + time` needs a `time` type (deferred). → [date.md §6](spec/design/date.md)
+  - [ ] _follow-on:_ **casts** (runtime text→date; `date ↔ timestamp`/`timestamptz` landed via tz §9.3);
+        **clock-relative literals** (`today`/`tomorrow`/`yesterday`/`now`/`epoch`, entropy/clock seam);
+        remaining **date functions** (`make_date`, `date_part`, `current_date`; `EXTRACT`/`date_trunc`
+        landed). → [date.md §6](spec/design/date.md)
 - [x] **Typed string literals + string-literal casts (`type 'string'`)** — one generalized production
       = `CAST('string' AS type)`; literal-only coercion preserves strictness. → [grammar.md §36](spec/design/grammar.md)
   - [ ] _follow-on:_ runtime text→T cast on a non-literal text expression (shared with the text follow-on).
