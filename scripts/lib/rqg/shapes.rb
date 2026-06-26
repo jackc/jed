@@ -14,3 +14,7 @@ module RQG
 end
 
 require_relative "shapes/select_where"
+require_relative "shapes/join"
+require_relative "shapes/group_by"
+require_relative "shapes/subquery"
+require_relative "shapes/setop"

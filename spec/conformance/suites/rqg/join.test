@@ -1,0 +1,1119 @@
+# RQG join corpus — GENERATED + curated by scripts/rqg_gen.rb (rake rqg:emit).
+# One self-contained {schema, data, query} block per distinct query shape; expected rows are
+# the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in rake
+# ci. Do NOT hand-edit — regenerate. See .scratch/testing-ideas.md §1 (the RQG firehose).
+# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.collate, expr.in_list, expr.not_equal, expr.parens, query.comparison_order, query.cross_join, query.is_distinct_from, query.is_null, query.join_inner, query.limit, query.offset, query.order_by, query.order_by_keys, query.qualified_column, query.select, query.select_star, query.table_alias, query.where_eq, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
+
+# --- seed 1 ---
+statement ok
+CREATE TABLE ja1 (id i16 PRIMARY KEY, a i16 NOT NULL, b boolean)
+
+statement ok
+CREATE TABLE jb1 (id i32 PRIMARY KEY, a i32 NOT NULL, b decimal, r i16)
+
+statement ok
+INSERT INTO ja1 VALUES (1, -5, TRUE), (2, -6, FALSE), (3, 502, NULL), (4, -32767, TRUE), (5, -32767, FALSE)
+
+statement ok
+INSERT INTO jb1 VALUES (1, 2147483646, NULL, 3), (2, -2147483648, NULL, NULL), (3, -4, 337, NULL), (4, -2147483647, NULL, 7), (5, 6, NULL, 5), (6, 0, -804, 2)
+
+query IIBIIDI nosort
+SELECT * FROM ja1 a CROSS JOIN jb1 b WHERE a.a BETWEEN -414 AND 372 ORDER BY a.b DESC, b.r DESC, a.id, b.id
+----
+1
+-5
+true
+2
+-2147483648
+NULL
+NULL
+1
+-5
+true
+3
+-4
+337
+NULL
+1
+-5
+true
+4
+-2147483647
+NULL
+7
+1
+-5
+true
+5
+6
+NULL
+5
+1
+-5
+true
+1
+2147483646
+NULL
+3
+1
+-5
+true
+6
+0
+-804
+2
+2
+-6
+false
+2
+-2147483648
+NULL
+NULL
+2
+-6
+false
+3
+-4
+337
+NULL
+2
+-6
+false
+4
+-2147483647
+NULL
+7
+2
+-6
+false
+5
+6
+NULL
+5
+2
+-6
+false
+1
+2147483646
+NULL
+3
+2
+-6
+false
+6
+0
+-804
+2
+
+# --- seed 2 ---
+statement ok
+CREATE TABLE ja2 (id i32 PRIMARY KEY, a i16, b i64, c i64 NOT NULL)
+
+statement ok
+CREATE TABLE jb2 (id i16 PRIMARY KEY, a i64, b text, c boolean, r i32)
+
+statement ok
+INSERT INTO ja2 VALUES (1, 569, -5, 9223372036854775807), (2, -8, NULL, -6), (3, NULL, -58, 0), (4, -32768, -240, -1), (5, NULL, -10, 8), (6, 0, -162, -546)
+
+statement ok
+INSERT INTO jb2 VALUES (1, -9, 'Apple', TRUE, 8), (2, 10, 'dog', FALSE, NULL), (3, -10, 'x', FALSE, NULL), (4, -286, 'Apple', TRUE, 1), (5, 9, 'Apple', TRUE, 4), (6, 0, 'cat', TRUE, 6), (7, 8, 'mango', NULL, 4)
+
+query IIIIIITBI nosort
+SELECT * FROM ja2 a CROSS JOIN jb2 b WHERE b.r BETWEEN -231 AND -61 ORDER BY a.b, b.r, a.id, b.id LIMIT 8 OFFSET 3
+----
+
+# --- seed 3 ---
+statement ok
+CREATE TABLE ja3 (id i32 PRIMARY KEY, a i32, b i16)
+
+statement ok
+CREATE TABLE jb3 (id i16 PRIMARY KEY, a boolean NOT NULL, b i64 NOT NULL, c i16, d decimal, r i32)
+
+statement ok
+INSERT INTO ja3 VALUES (1, -166, 9), (2, -2147483647, 32766), (3, 2147483646, -5), (4, 4, NULL)
+
+statement ok
+INSERT INTO jb3 VALUES (1, TRUE, -10, -5, NULL, 1), (2, FALSE, 7, 0, -4, 1), (3, TRUE, -10, 1, 247, 1), (4, FALSE, 10, NULL, 180, NULL), (5, FALSE, 0, 7, 848.29, 4), (6, FALSE, -9223372036854775807, 32766, NULL, 2)
+
+query II rowsort
+SELECT a.b, b.c FROM ja3 a JOIN jb3 b ON a.id = b.r WHERE a.b > a.a
+----
+32766
+32766
+9
+-5
+9
+0
+9
+1
+
+# --- seed 4 ---
+statement ok
+CREATE TABLE ja4 (id i32 PRIMARY KEY, a decimal, b i16, c i64 NOT NULL, d decimal NOT NULL)
+
+statement ok
+CREATE TABLE jb4 (id i32 PRIMARY KEY, a text, b i64, r i32)
+
+statement ok
+INSERT INTO ja4 VALUES (1, 737, 4, -2, 585.87), (2, -757, NULL, 8, 395.95), (3, -438.81, NULL, 2, -849), (4, 214.23, 767, -31, -534.85)
+
+statement ok
+INSERT INTO jb4 VALUES (1, NULL, -2, 5), (2, 'AB', NULL, NULL), (3, 'x', 1, 5), (4, 'AB', 9223372036854775807, 1), (5, 'mango', 78, 4), (6, 'Mango', 2, 2), (7, 'Apple', NULL, NULL)
+
+query IIDITII rowsort
+SELECT a.id, a.c, a.d, b.id, b.a, b.b, b.r FROM ja4 a CROSS JOIN jb4 b WHERE a.a NOT BETWEEN 232 AND 622.20
+----
+1
+-2
+585.87
+1
+NULL
+-2
+5
+1
+-2
+585.87
+2
+AB
+NULL
+NULL
+1
+-2
+585.87
+3
+x
+1
+5
+1
+-2
+585.87
+4
+AB
+9223372036854775807
+1
+1
+-2
+585.87
+5
+mango
+78
+4
+1
+-2
+585.87
+6
+Mango
+2
+2
+1
+-2
+585.87
+7
+Apple
+NULL
+NULL
+2
+8
+395.95
+1
+NULL
+-2
+5
+2
+8
+395.95
+2
+AB
+NULL
+NULL
+2
+8
+395.95
+3
+x
+1
+5
+2
+8
+395.95
+4
+AB
+9223372036854775807
+1
+2
+8
+395.95
+5
+mango
+78
+4
+2
+8
+395.95
+6
+Mango
+2
+2
+2
+8
+395.95
+7
+Apple
+NULL
+NULL
+3
+2
+-849
+1
+NULL
+-2
+5
+3
+2
+-849
+2
+AB
+NULL
+NULL
+3
+2
+-849
+3
+x
+1
+5
+3
+2
+-849
+4
+AB
+9223372036854775807
+1
+3
+2
+-849
+5
+mango
+78
+4
+3
+2
+-849
+6
+Mango
+2
+2
+3
+2
+-849
+7
+Apple
+NULL
+NULL
+4
+-31
+-534.85
+1
+NULL
+-2
+5
+4
+-31
+-534.85
+2
+AB
+NULL
+NULL
+4
+-31
+-534.85
+3
+x
+1
+5
+4
+-31
+-534.85
+4
+AB
+9223372036854775807
+1
+4
+-31
+-534.85
+5
+mango
+78
+4
+4
+-31
+-534.85
+6
+Mango
+2
+2
+4
+-31
+-534.85
+7
+Apple
+NULL
+NULL
+
+# --- seed 5 ---
+statement ok
+CREATE TABLE ja5 (id i16 PRIMARY KEY, a decimal NOT NULL, b i16, c text, d boolean)
+
+statement ok
+CREATE TABLE jb5 (id i32 PRIMARY KEY, a i32 NOT NULL, b i16, r i16)
+
+statement ok
+INSERT INTO ja5 VALUES (1, 89.84, -1, 'ab', TRUE), (2, 168, -6, 'ab', FALSE), (3, -676.83, -3, 'ZZ', TRUE), (4, -165.55, -3, 'z', TRUE), (5, -856.45, 259, NULL, NULL)
+
+statement ok
+INSERT INTO jb5 VALUES (1, 4, NULL, 3), (2, -10, -472, 5), (3, -2, 1, 3), (4, -1, NULL, 5), (5, 8, NULL, 2), (6, -2147483648, NULL, 3), (7, -453, -2, 5)
+
+query DBII rowsort
+SELECT a.a, a.d, b.id, b.a FROM ja5 a JOIN jb5 b ON a.id = b.r WHERE b.a IS DISTINCT FROM a.b
+----
+-676.83
+true
+1
+4
+-676.83
+true
+3
+-2
+-676.83
+true
+6
+-2147483648
+-856.45
+NULL
+2
+-10
+-856.45
+NULL
+4
+-1
+-856.45
+NULL
+7
+-453
+168
+false
+5
+8
+
+# --- seed 6 ---
+statement ok
+CREATE TABLE ja6 (id i32 PRIMARY KEY, a boolean NOT NULL, b decimal NOT NULL, c i16)
+
+statement ok
+CREATE TABLE jb6 (id i32 PRIMARY KEY, a i32, b i32, c text, r i32)
+
+statement ok
+INSERT INTO ja6 VALUES (1, TRUE, 55.26, 650), (2, FALSE, 509.62, NULL), (3, TRUE, -681.28, NULL), (4, FALSE, 562, -766), (5, FALSE, -222.11, -1), (6, TRUE, -464, 1)
+
+statement ok
+INSERT INTO jb6 VALUES (1, -6, 5, 'mango', 11), (2, 2147483647, -2147483647, NULL, 6), (3, 2147483647, NULL, 'mango', 4), (4, -6, -4, 'ab', 11)
+
+query IBDIIIITI nosort
+SELECT * FROM ja6 a JOIN jb6 b ON a.id = b.r WHERE a.a IS NULL ORDER BY a.a, a.b NULLS LAST, a.id, b.id LIMIT 1
+----
+
+# --- seed 7 ---
+statement ok
+CREATE TABLE ja7 (id i64 PRIMARY KEY, a boolean, b text, c i16 NOT NULL)
+
+statement ok
+CREATE TABLE jb7 (id i32 PRIMARY KEY, a i16, b text, c text, d i64, r i64)
+
+statement ok
+INSERT INTO ja7 VALUES (1, FALSE, 'apple', -8), (2, FALSE, 'ab', 507), (3, TRUE, NULL, 2), (4, TRUE, 'BANANA', -3)
+
+statement ok
+INSERT INTO jb7 VALUES (1, 248, 'BANANA', 'mango', -6, 7), (2, -32767, NULL, 'banana', -7, 8), (3, 2, NULL, 'Mango', 5, NULL), (4, NULL, 'mango', 'z', NULL, 9)
+
+query II rowsort
+SELECT a.c, b.r FROM ja7 a CROSS JOIN jb7 b WHERE b.a IN (1)
+----
+
+# --- seed 8 ---
+statement ok
+CREATE TABLE ja8 (id i16 PRIMARY KEY, a i32 NOT NULL, b i64)
+
+statement ok
+CREATE TABLE jb8 (id i32 PRIMARY KEY, a decimal, b i32, r i16)
+
+statement ok
+INSERT INTO ja8 VALUES (1, 0, -651), (2, -2147483647, -3), (3, 0, -9223372036854775807), (4, 55, -2), (5, -3, -801), (6, -4, 1), (7, 8, -577)
+
+statement ok
+INSERT INTO jb8 VALUES (1, 897, -3, 4), (2, NULL, 6, NULL), (3, -888.55, 2147483647, 9), (4, 239.06, -8, 11)
+
+query IIIIDII nosort
+SELECT * FROM ja8 a JOIN jb8 b ON a.id = b.r WHERE (b.a NOT BETWEEN -72.74 AND 185 OR b.id IS NOT NULL) ORDER BY a.a NULLS LAST, a.id, b.id
+----
+4
+55
+-2
+1
+897
+-3
+4
+
+# --- seed 9 ---
+statement ok
+CREATE TABLE ja9 (id i64 PRIMARY KEY, a decimal, b boolean, c i32 NOT NULL, d boolean NOT NULL)
+
+statement ok
+CREATE TABLE jb9 (id i32 PRIMARY KEY, a decimal, b decimal, r i64)
+
+statement ok
+INSERT INTO ja9 VALUES (1, 994.62, NULL, 2147483647, FALSE), (2, 976, FALSE, -2147483648, FALSE), (3, 677, NULL, 599, FALSE), (4, -755.58, FALSE, 5, TRUE)
+
+statement ok
+INSERT INTO jb9 VALUES (1, -74.72, NULL, 3), (2, 243, 271, 4), (3, 70.29, NULL, 2), (4, 683, NULL, 9), (5, 233, NULL, 6), (6, 648.29, NULL, 9)
+
+query DBIDI nosort
+SELECT a.a, a.b, b.id, b.b, b.r FROM ja9 a JOIN jb9 b ON a.id = b.r WHERE b.id BETWEEN -273 AND 277 ORDER BY a.a NULLS LAST, a.b DESC, a.id, b.id
+----
+-755.58
+false
+2
+271
+4
+677
+NULL
+1
+NULL
+3
+976
+false
+3
+NULL
+2
+
+# --- seed 10 ---
+statement ok
+CREATE TABLE ja10 (id i32 PRIMARY KEY, a text, b i32, c i32)
+
+statement ok
+CREATE TABLE jb10 (id i32 PRIMARY KEY, a i16 NOT NULL, b i64 NOT NULL, c text, d text NOT NULL, r i32)
+
+statement ok
+INSERT INTO ja10 VALUES (1, 'Apple', 9, 3), (2, 'ZZ', 2147483647, NULL), (3, 'mango', -81, NULL), (4, 'z', 6, 2147483646), (5, 'x', 10, 2147483647), (6, 'x', 2, -2147483648)
+
+statement ok
+INSERT INTO jb10 VALUES (1, 270, 0, 'apple', 'Mango', 3), (2, 7, 0, NULL, 'mango', 2), (3, 8, -9223372036854775807, NULL, 'apple', 3), (4, -7, 10, 'BANANA', 'BANANA', 1)
+
+query ITIIIIITTI nosort
+SELECT * FROM ja10 a JOIN jb10 b ON a.id = b.r WHERE (a.a COLLATE "C" IS DISTINCT FROM b.d AND b.r IS NOT NULL) ORDER BY a.a COLLATE "C" DESC, b.a DESC NULLS LAST, a.id, b.id
+----
+3
+mango
+-81
+NULL
+1
+270
+0
+apple
+Mango
+3
+3
+mango
+-81
+NULL
+3
+8
+-9223372036854775807
+NULL
+apple
+3
+2
+ZZ
+2147483647
+NULL
+2
+7
+0
+NULL
+mango
+2
+1
+Apple
+9
+3
+4
+-7
+10
+BANANA
+BANANA
+1
+
+# --- seed 11 ---
+statement ok
+CREATE TABLE ja11 (id i32 PRIMARY KEY, a boolean, b decimal)
+
+statement ok
+CREATE TABLE jb11 (id i32 PRIMARY KEY, a decimal, b decimal, r i32)
+
+statement ok
+INSERT INTO ja11 VALUES (1, TRUE, 525.81), (2, TRUE, NULL), (3, TRUE, 632.70), (4, TRUE, NULL)
+
+statement ok
+INSERT INTO jb11 VALUES (1, 287.64, 307.05, NULL), (2, 714, 155.81, 1), (3, -886.19, NULL, 1), (4, NULL, 67, 3), (5, -697.44, -548.95, 4)
+
+query D rowsort
+SELECT b.b FROM ja11 a JOIN jb11 b ON a.id = b.r WHERE b.r IN (-132, 156, -76)
+----
+
+# --- seed 12 ---
+statement ok
+CREATE TABLE ja12 (id i16 PRIMARY KEY, a decimal NOT NULL, b boolean, c i16, d text NOT NULL)
+
+statement ok
+CREATE TABLE jb12 (id i32 PRIMARY KEY, a boolean NOT NULL, b i16, c text, d i32, r i16)
+
+statement ok
+INSERT INTO ja12 VALUES (1, 441.63, FALSE, -365, 'ZZ'), (2, -415.32, TRUE, -32767, 'AB'), (3, 796, TRUE, -6, 'Cat'), (4, -797, TRUE, -8, 'Mango')
+
+statement ok
+INSERT INTO jb12 VALUES (1, TRUE, 10, 'Apple', 2147483646, 4), (2, FALSE, 3, 'x', NULL, 3), (3, FALSE, -10, 'cat', 3, NULL), (4, FALSE, -249, 'ab', 0, 2), (5, TRUE, -6, 'Mango', -3, 4), (6, FALSE, 4, NULL, -2147483647, 9), (7, TRUE, -9, 'Apple', NULL, 3)
+
+query IDBIIBI nosort
+SELECT a.id, a.a, a.b, a.c, b.id, b.a, b.d FROM ja12 a CROSS JOIN jb12 b WHERE NOT (a.id IS DISTINCT FROM 182) ORDER BY a.a, a.b DESC NULLS FIRST, a.id, b.id LIMIT 0 OFFSET 0
+----
+
+# --- seed 13 ---
+statement ok
+CREATE TABLE ja13 (id i32 PRIMARY KEY, a i64, b i64)
+
+statement ok
+CREATE TABLE jb13 (id i64 PRIMARY KEY, a boolean, b i64, c decimal, d i32, r i32)
+
+statement ok
+INSERT INTO ja13 VALUES (1, 1, 8), (2, 9223372036854775807, NULL), (3, -3, 9223372036854775806), (4, 7, 3), (5, -4, 5), (6, 6, NULL)
+
+statement ok
+INSERT INTO jb13 VALUES (1, FALSE, 9, -403, -7, NULL), (2, FALSE, 7, NULL, NULL, 5), (3, TRUE, -7, 731, 10, NULL), (4, TRUE, NULL, -507.83, NULL, NULL)
+
+query III nosort
+SELECT a.id, a.a, b.b FROM ja13 a JOIN jb13 b ON a.id = b.r WHERE b.d IS NOT NULL ORDER BY a.a, a.b DESC, a.id, b.id
+----
+
+# --- seed 14 ---
+statement ok
+CREATE TABLE ja14 (id i16 PRIMARY KEY, a text, b i32 NOT NULL)
+
+statement ok
+CREATE TABLE jb14 (id i64 PRIMARY KEY, a i16 NOT NULL, b decimal, c boolean, d text, r i16)
+
+statement ok
+INSERT INTO ja14 VALUES (1, NULL, -5), (2, 'ab', 2147483646), (3, 'ZZ', -2147483647), (4, NULL, -1), (5, 'Cat', -743), (6, NULL, 0)
+
+statement ok
+INSERT INTO jb14 VALUES (1, -9, NULL, FALSE, 'ab', 6), (2, 3, NULL, FALSE, 'Mango', 4), (3, 32767, -515.11, FALSE, NULL, NULL), (4, -2, NULL, FALSE, 'z', 8)
+
+query III rowsort
+SELECT a.id, b.id, b.r FROM ja14 a JOIN jb14 b ON a.id = b.r WHERE b.c = FALSE
+----
+4
+2
+4
+6
+1
+6
+
+# --- seed 15 ---
+statement ok
+CREATE TABLE ja15 (id i32 PRIMARY KEY, a text, b i16, c boolean)
+
+statement ok
+CREATE TABLE jb15 (id i32 PRIMARY KEY, a i16, b text, c decimal, r i32)
+
+statement ok
+INSERT INTO ja15 VALUES (1, 'dog', 7, NULL), (2, 'z', -9, FALSE), (3, 'dog', 32767, TRUE), (4, 'Cat', 32767, TRUE), (5, 'Cat', NULL, FALSE)
+
+statement ok
+INSERT INTO jb15 VALUES (1, 32767, NULL, -682, 4), (2, NULL, 'z', NULL, 4), (3, -4, 'cat', -460.64, 5), (4, 4, 'banana', 626.41, 1)
+
+query IBIID nosort
+SELECT a.id, a.c, b.id, b.a, b.c FROM ja15 a CROSS JOIN jb15 b WHERE a.b <> -785 ORDER BY a.b DESC, a.c DESC, a.id, b.id LIMIT 4 OFFSET 3
+----
+3
+true
+4
+4
+626.41
+4
+true
+1
+32767
+-682
+4
+true
+2
+NULL
+NULL
+4
+true
+3
+-4
+-460.64
+
+# --- seed 16 ---
+statement ok
+CREATE TABLE ja16 (id i32 PRIMARY KEY, a i32 NOT NULL, b boolean NOT NULL, c text NOT NULL, d i16)
+
+statement ok
+CREATE TABLE jb16 (id i32 PRIMARY KEY, a i64, b i32 NOT NULL, c i64, d decimal, r i32)
+
+statement ok
+INSERT INTO ja16 VALUES (1, 2, TRUE, 'banana', 7), (2, 2147483647, FALSE, 'Cat', 877), (3, 2147483647, FALSE, 'AB', 2), (4, -9, FALSE, 'x', -855), (5, -7, FALSE, 'Mango', 473)
+
+statement ok
+INSERT INTO jb16 VALUES (1, -682, -6, -1, -909.22, 3), (2, -4, -5, -6, -518.98, 2), (3, -9223372036854775807, -8, 7, 914, 4), (4, 1, 7, -438, 272.70, 3)
+
+query IIII nosort
+SELECT a.a, a.d, b.id, b.r FROM ja16 a JOIN jb16 b ON a.id = b.r WHERE b.a IS DISTINCT FROM a.d ORDER BY a.b, a.c COLLATE "C", a.id, b.id LIMIT 2 OFFSET 3
+----
+-9
+-855
+3
+4
+
+# --- seed 17 ---
+statement ok
+CREATE TABLE ja17 (id i32 PRIMARY KEY, a i32 NOT NULL, b text NOT NULL, c text, d i32)
+
+statement ok
+CREATE TABLE jb17 (id i32 PRIMARY KEY, a boolean, b boolean, c i32, d i32, r i32)
+
+statement ok
+INSERT INTO ja17 VALUES (1, -5, 'dog', 'Mango', 2147483646), (2, 8, 'Apple', NULL, NULL), (3, 1, 'z', 'ab', NULL), (4, 7, 'AB', 'apple', 5), (5, -6, 'ZZ', 'BANANA', -384)
+
+statement ok
+INSERT INTO jb17 VALUES (1, FALSE, NULL, 0, 5, NULL), (2, FALSE, FALSE, 2147483646, 0, 1), (3, TRUE, NULL, 5, 4, 1), (4, FALSE, FALSE, 0, -8, 4), (5, TRUE, TRUE, -1, 8, 1)
+
+query IITIBI rowsort
+SELECT a.id, a.a, a.c, b.id, b.b, b.r FROM ja17 a CROSS JOIN jb17 b WHERE b.d IS NOT DISTINCT FROM 306
+----
+
+# --- seed 18 ---
+statement ok
+CREATE TABLE ja18 (id i32 PRIMARY KEY, a decimal, b i64)
+
+statement ok
+CREATE TABLE jb18 (id i32 PRIMARY KEY, a i32, b i64 NOT NULL, c decimal, d text, r i32)
+
+statement ok
+INSERT INTO ja18 VALUES (1, 38.13, NULL), (2, -607.58, 8), (3, -73.55, -399), (4, -389.26, 1), (5, -564.46, NULL)
+
+statement ok
+INSERT INTO jb18 VALUES (1, 4, 9, 103.27, NULL, 8), (2, NULL, 1, -597.70, 'AB', 3), (3, 8, -6, 38.36, NULL, NULL), (4, 110, 303, 811.50, 'banana', 8), (5, NULL, 602, 865, 'banana', NULL), (6, 10, -388, NULL, 'BANANA', 3), (7, -725, 4, 686.21, 'ab', NULL)
+
+query IDIIIIDTI nosort
+SELECT * FROM ja18 a CROSS JOIN jb18 b WHERE b.r BETWEEN -677 AND 513 ORDER BY a.a, b.a DESC, a.id, b.id
+----
+2
+-607.58
+8
+2
+NULL
+1
+-597.70
+AB
+3
+2
+-607.58
+8
+4
+110
+303
+811.50
+banana
+8
+2
+-607.58
+8
+6
+10
+-388
+NULL
+BANANA
+3
+2
+-607.58
+8
+1
+4
+9
+103.27
+NULL
+8
+5
+-564.46
+NULL
+2
+NULL
+1
+-597.70
+AB
+3
+5
+-564.46
+NULL
+4
+110
+303
+811.50
+banana
+8
+5
+-564.46
+NULL
+6
+10
+-388
+NULL
+BANANA
+3
+5
+-564.46
+NULL
+1
+4
+9
+103.27
+NULL
+8
+4
+-389.26
+1
+2
+NULL
+1
+-597.70
+AB
+3
+4
+-389.26
+1
+4
+110
+303
+811.50
+banana
+8
+4
+-389.26
+1
+6
+10
+-388
+NULL
+BANANA
+3
+4
+-389.26
+1
+1
+4
+9
+103.27
+NULL
+8
+3
+-73.55
+-399
+2
+NULL
+1
+-597.70
+AB
+3
+3
+-73.55
+-399
+4
+110
+303
+811.50
+banana
+8
+3
+-73.55
+-399
+6
+10
+-388
+NULL
+BANANA
+3
+3
+-73.55
+-399
+1
+4
+9
+103.27
+NULL
+8
+1
+38.13
+NULL
+2
+NULL
+1
+-597.70
+AB
+3
+1
+38.13
+NULL
+4
+110
+303
+811.50
+banana
+8
+1
+38.13
+NULL
+6
+10
+-388
+NULL
+BANANA
+3
+1
+38.13
+NULL
+1
+4
+9
+103.27
+NULL
+8
+
+# --- seed 19 ---
+statement ok
+CREATE TABLE ja19 (id i32 PRIMARY KEY, a boolean NOT NULL, b i64 NOT NULL)
+
+statement ok
+CREATE TABLE jb19 (id i32 PRIMARY KEY, a i32 NOT NULL, b i64, c i16, r i32)
+
+statement ok
+INSERT INTO ja19 VALUES (1, FALSE, -5), (2, FALSE, 7), (3, TRUE, -2), (4, FALSE, -10), (5, FALSE, -780)
+
+statement ok
+INSERT INTO jb19 VALUES (1, 2, 7, 32766, 2), (2, -95, -10, -10, 7), (3, 642, -7, NULL, NULL), (4, -2147483648, 5, 32767, 4), (5, -4, -9, 0, NULL), (6, -668, 427, 268, 4), (7, 2147483647, -9, NULL, NULL)
+
+query III nosort
+SELECT a.id, a.b, b.c FROM ja19 a CROSS JOIN jb19 b WHERE (b.b NOT BETWEEN -961 AND -621 AND b.r IS NOT NULL) ORDER BY a.b, b.b NULLS FIRST, a.id, b.id
+----
+5
+-780
+-10
+5
+-780
+32767
+5
+-780
+32766
+5
+-780
+268
+4
+-10
+-10
+4
+-10
+32767
+4
+-10
+32766
+4
+-10
+268
+1
+-5
+-10
+1
+-5
+32767
+1
+-5
+32766
+1
+-5
+268
+3
+-2
+-10
+3
+-2
+32767
+3
+-2
+32766
+3
+-2
+268
+2
+7
+-10
+2
+7
+32767
+2
+7
+32766
+2
+7
+268
+
+# --- seed 20 ---
+statement ok
+CREATE TABLE ja20 (id i16 PRIMARY KEY, a text, b text NOT NULL, c i64, d i16 NOT NULL)
+
+statement ok
+CREATE TABLE jb20 (id i32 PRIMARY KEY, a decimal, b i16, r i16)
+
+statement ok
+INSERT INTO ja20 VALUES (1, NULL, 'dog', NULL, 32766), (2, 'ZZ', 'ZZ', 0, 867), (3, 'ZZ', 'ZZ', 8, -413), (4, NULL, 'ZZ', 0, 4), (5, 'BANANA', 'banana', NULL, 4), (6, 'mango', 'AB', 4, 0), (7, 'Cat', 'banana', 0, -6)
+
+statement ok
+INSERT INTO jb20 VALUES (1, -824.48, NULL, NULL), (2, -706, -10, 12), (3, -9.73, 769, NULL), (4, -223.56, NULL, 9), (5, 714.74, -8, NULL)
+
+query ITI nosort
+SELECT a.id, a.a, b.b FROM ja20 a JOIN jb20 b ON a.id = b.r WHERE NOT (NOT (a.id IS NULL)) ORDER BY a.a COLLATE "C" DESC, a.b COLLATE "C" DESC, a.id, b.id LIMIT 10
+----
+
+# --- seed 21 ---
+statement ok
+CREATE TABLE ja21 (id i32 PRIMARY KEY, a text, b i16)
+
+statement ok
+CREATE TABLE jb21 (id i32 PRIMARY KEY, a i64, b text, c i32 NOT NULL, r i32)
+
+statement ok
+INSERT INTO ja21 VALUES (1, NULL, NULL), (2, 'x', 0), (3, 'AB', -5), (4, 'BANANA', 2), (5, NULL, -1), (6, 'apple', 32766)
+
+statement ok
+INSERT INTO jb21 VALUES (1, -79, 'z', 6, 3), (2, -8, 'Apple', 0, 1), (3, -9223372036854775807, 'apple', 2147483647, NULL), (4, -995, 'x', -10, 1)
+
+query ITIIITII nosort
+SELECT * FROM ja21 a JOIN jb21 b ON a.id = b.r WHERE a.a IS NOT NULL ORDER BY a.a COLLATE "C", b.b COLLATE "C" DESC NULLS FIRST, a.id, b.id LIMIT 3 OFFSET 4
+----
+
+# --- seed 22 ---
+statement ok
+CREATE TABLE ja22 (id i64 PRIMARY KEY, a i16, b boolean NOT NULL)
+
+statement ok
+CREATE TABLE jb22 (id i64 PRIMARY KEY, a i64, b decimal, c decimal NOT NULL, r i64)
+
+statement ok
+INSERT INTO ja22 VALUES (1, 5, TRUE), (2, NULL, FALSE), (3, 9, TRUE), (4, -465, TRUE), (5, 1, FALSE)
+
+statement ok
+INSERT INTO jb22 VALUES (1, -9, 107.60, 584, 5), (2, 2, 529.52, 411, 4), (3, NULL, 234.06, 871.32, 1), (4, NULL, NULL, 493.17, 1), (5, 9223372036854775806, -382.70, 901.57, 1), (6, -10, -567, -271.63, 3), (7, 238, NULL, 704.56, 8)
+
+query IIDI nosort
+SELECT a.id, b.a, b.c, b.r FROM ja22 a JOIN jb22 b ON a.id = b.r WHERE (b.c BETWEEN 250 AND 979 OR b.id IS DISTINCT FROM 273) ORDER BY a.b DESC, b.a DESC, a.id, b.id LIMIT 6 OFFSET 0
+----
+1
+NULL
+871.32
+1
+1
+NULL
+493.17
+1
+1
+9223372036854775806
+901.57
+1
+4
+2
+411
+4
+3
+-10
+-271.63
+3
+5
+-9
+584
+5
+
+# --- seed 23 ---
+statement ok
+CREATE TABLE ja23 (id i16 PRIMARY KEY, a i16 NOT NULL, b i16 NOT NULL, c text, d i64 NOT NULL)
+
+statement ok
+CREATE TABLE jb23 (id i16 PRIMARY KEY, a text, b boolean, c i16, r i16)
+
+statement ok
+INSERT INTO ja23 VALUES (1, 32766, -3, 'Apple', 10), (2, 127, -8, 'ZZ', -10), (3, 32767, 702, 'apple', -4), (4, -8, 4, 'BANANA', -4)
+
+statement ok
+INSERT INTO jb23 VALUES (1, 'Cat', FALSE, 271, 4), (2, NULL, TRUE, -32768, 1), (3, 'mango', FALSE, -32767, 5), (4, 'Cat', FALSE, -10, 6), (5, 'mango', TRUE, 1, NULL)
+
+query IIIT nosort
+SELECT a.id, a.a, a.b, b.a FROM ja23 a JOIN jb23 b ON a.id = b.r WHERE NOT (a.d IS NULL) ORDER BY a.a, a.c COLLATE "C" DESC NULLS FIRST, a.id, b.id LIMIT 9
+----
+4
+-8
+4
+Cat
+1
+32766
+-3
+NULL
+
+# --- seed 24 ---
+statement ok
+CREATE TABLE ja24 (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+CREATE TABLE jb24 (id i64 PRIMARY KEY, a boolean, b boolean, c i32 NOT NULL, d i32, r i32)
+
+statement ok
+INSERT INTO ja24 VALUES (1, -9, 'dog'), (2, 326, 'ab'), (3, -9, 'cat'), (4, -2147483648, 'Cat'), (5, -2147483647, 'mango'), (6, 3, 'dog'), (7, -3, 'BANANA')
+
+statement ok
+INSERT INTO jb24 VALUES (1, FALSE, TRUE, 2147483646, -4, 2), (2, TRUE, TRUE, 0, -4, NULL), (3, TRUE, TRUE, 62, 3, 12), (4, TRUE, FALSE, 10, -7, NULL)
+
+query IITIBBIII nosort
+SELECT * FROM ja24 a JOIN jb24 b ON a.id = b.r WHERE a.a <> b.id ORDER BY a.a NULLS FIRST, a.b COLLATE "C", a.id, b.id
+----
+2
+326
+ab
+1
+false
+true
+2147483646
+-4
+2
+
+# --- seed 25 ---
+statement ok
+CREATE TABLE ja25 (id i64 PRIMARY KEY, a i64, b text NOT NULL, c i16, d i32 NOT NULL)
+
+statement ok
+CREATE TABLE jb25 (id i64 PRIMARY KEY, a i32, b i16 NOT NULL, c text, r i64)
+
+statement ok
+INSERT INTO ja25 VALUES (1, -9223372036854775808, 'Mango', -6, -2147483648), (2, 7, 'banana', -5, 2147483646), (3, -8, 'Cat', 8, 1), (4, 9, 'z', -5, -694), (5, 726, 'z', -400, -5)
+
+statement ok
+INSERT INTO jb25 VALUES (1, NULL, -7, 'Mango', 1), (2, NULL, 32766, 'mango', 6), (3, -6, 4, 'Cat', 8), (4, NULL, 2, 'banana', 6), (5, -9, 226, 'AB', 5), (6, 6, 2, NULL, 4)
+
+query IIIII nosort
+SELECT a.id, a.c, b.a, b.b, b.r FROM ja25 a CROSS JOIN jb25 b WHERE a.d IS NOT DISTINCT FROM -104 ORDER BY a.a DESC, a.b COLLATE "C", a.id, b.id
+----

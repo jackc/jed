@@ -31,10 +31,10 @@ module RQG
       end
     end
 
-    # A single comparison/test predicate over one column, chosen to match the column's family.
+    # A single comparison/test predicate over one in-scope column, matched to the column's family.
     def leaf(ctx)
-      col = ctx.pick(ctx.table.columns)
-      fam = RQG.family(col.type)
+      col = ctx.pick(ctx.columns)
+      fam = col.family
       case ctx.pick(kinds(fam))
       when :is_null then is_null(ctx, col)
       when :idf then idf(ctx, col, fam)
@@ -42,7 +42,7 @@ module RQG
       when :between then between(ctx, col, fam)
       when :in_list then in_list(ctx, col, fam)
       when :like then like(ctx, col)
-      when :bool_col then ctx.chance(0.5) ? col.name : "NOT #{col.name}"
+      when :bool_col then ctx.chance(0.5) ? col.ref : "NOT #{col.ref}"
       end
     end
 
@@ -58,18 +58,18 @@ module RQG
 
     def is_null(ctx, col)
       ctx.use(:is_null)
-      "#{col.name} IS #{ctx.chance(0.5) ? 'NOT ' : ''}NULL"
+      "#{col.ref} IS #{ctx.chance(0.5) ? 'NOT ' : ''}NULL"
     end
 
     def idf(ctx, col, fam)
       ctx.use(:is_distinct_from)
       neg = ctx.chance(0.5) ? "NOT " : ""
-      "#{operand(ctx, col.name, :text == fam)} IS #{neg}DISTINCT FROM #{rhs(ctx, col, fam)}"
+      "#{operand(ctx, col.ref, :text == fam)} IS #{neg}DISTINCT FROM #{rhs(ctx, col, fam)}"
     end
 
     def cmp(ctx, col, fam)
       op = comparison_op(ctx, fam)
-      "#{operand(ctx, col.name, :text == fam)} #{op} #{rhs(ctx, col, fam)}"
+      "#{operand(ctx, col.ref, :text == fam)} #{op} #{rhs(ctx, col, fam)}"
     end
 
     # NOTE on collation: COLLATE "C" is applied ONLY to the LHS column operand (always an a_expr
@@ -93,21 +93,21 @@ module RQG
       lo, hi = order_pair(literal(ctx, fam), literal(ctx, fam), fam)
       neg = ctx.chance(0.25) ? "NOT " : ""
       # bounds are bare literals (b_expr — no COLLATE); the LHS's explicit C governs the comparison.
-      "#{operand(ctx, col.name, :text == fam)} #{neg}BETWEEN #{lo} AND #{hi}"
+      "#{operand(ctx, col.ref, :text == fam)} #{neg}BETWEEN #{lo} AND #{hi}"
     end
 
     def in_list(ctx, col, fam)
       ctx.use(:in_list)
       vals = Array.new(ctx.rand(1..3)) { literal(ctx, fam) }
       neg = ctx.chance(0.25) ? "NOT " : ""
-      "#{operand(ctx, col.name, :text == fam)} #{neg}IN (#{vals.join(', ')})"
+      "#{operand(ctx, col.ref, :text == fam)} #{neg}IN (#{vals.join(', ')})"
     end
 
     def like(ctx, col)
       kw = ctx.chance(0.5) ? "LIKE" : "ILIKE"
       ctx.use(kw == "LIKE" ? :like : :ilike)
       neg = ctx.chance(0.25) ? "NOT " : ""
-      "#{operand(ctx, col.name, true)} #{neg}#{kw} #{RQG::Data.quote(ctx.pick(LIKE_PATTERNS))}"
+      "#{operand(ctx, col.ref, true)} #{neg}#{kw} #{RQG::Data.quote(ctx.pick(LIKE_PATTERNS))}"
     end
 
     # --- operands / literals ---------------------------------------------------------------------
@@ -115,10 +115,10 @@ module RQG
     # The right-hand operand of a comparison: a bare literal, or sometimes a bare comparable column
     # (never collated — the LHS's explicit COLLATE "C" already governs the comparison).
     def rhs(ctx, col, fam)
-      others = ctx.table.columns.reject { |c| c.name == col.name }
-                  .select { |c| RQG.comparable?(RQG.family(c.type), fam) }
+      others = ctx.columns.reject { |c| c.ref == col.ref }
+                  .select { |c| RQG.comparable?(c.family, fam) }
       if !others.empty? && ctx.chance(0.30)
-        ctx.pick(others).name
+        ctx.pick(others).ref
       else
         literal(ctx, fam)
       end

@@ -1,0 +1,470 @@
+# RQG group_by corpus — GENERATED + curated by scripts/rqg_gen.rb (rake rqg:emit).
+# One self-contained {schema, data, query} block per distinct query shape; expected rows are
+# the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in rake
+# ci. Do NOT hand-edit — regenerate. See .scratch/testing-ideas.md §1 (the RQG firehose).
+# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.collate, expr.ilike, expr.in_list, expr.not_equal, expr.parens, query.aggregates, query.comparison_order, query.group_by, query.having, query.is_distinct_from, query.is_null, query.order_by, query.order_by_keys, query.select, query.where_eq, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
+
+# --- seed 1 ---
+statement ok
+CREATE TABLE g1 (id i16 PRIMARY KEY, a i16 NOT NULL, b boolean)
+
+statement ok
+INSERT INTO g1 VALUES (1, -9, NULL), (2, 305, TRUE), (3, 10, FALSE), (4, -6, FALSE), (5, 502, NULL), (6, -32767, TRUE)
+
+query IBII nosort
+SELECT id, b, sum(a), count(*) FROM g1 WHERE (a BETWEEN -569 AND -367 OR a IS DISTINCT FROM -503) GROUP BY id, b ORDER BY id, b
+----
+1
+NULL
+-9
+1
+2
+true
+305
+1
+3
+false
+10
+1
+4
+false
+-6
+1
+5
+NULL
+502
+1
+6
+true
+-32767
+1
+
+# --- seed 2 ---
+statement ok
+CREATE TABLE g2 (id i32 PRIMARY KEY, a i16, b i64, c i64 NOT NULL)
+
+statement ok
+INSERT INTO g2 VALUES (1, 10, -4, 0), (2, NULL, -7, -6), (3, -8, NULL, -6), (4, NULL, -58, 0), (5, -32768, -240, -1), (6, NULL, -10, 8), (7, 0, -162, -546), (8, -9, -4, -9223372036854775807), (9, NULL, -701, -5)
+
+query IDII nosort
+SELECT b, avg(a), min(b), count(*) FROM g2 WHERE (a NOT BETWEEN -957 AND -339 AND id >= -345) GROUP BY b ORDER BY b
+----
+-240
+-32768.000000000000
+-240
+1
+-162
+0.00000000000000000000
+-162
+1
+-4
+0.50000000000000000000
+-4
+2
+NULL
+-8.0000000000000000
+NULL
+1
+
+# --- seed 3 ---
+statement ok
+CREATE TABLE g3 (id i32 PRIMARY KEY, a i32, b i16)
+
+statement ok
+INSERT INTO g3 VALUES (1, -2147483647, 446), (2, -602, -8), (3, 9, -32767), (4, 2147483646, 32766), (5, -5, 4), (6, NULL, NULL), (7, 0, -3), (8, 7, 0), (9, -7, -10), (10, 1, 6), (11, NULL, -8)
+
+query III nosort
+SELECT id, b, count(*) FROM g3 WHERE id IN (851) GROUP BY id, b ORDER BY id, b
+----
+
+# --- seed 4 ---
+statement ok
+CREATE TABLE g4 (id i32 PRIMARY KEY, a decimal, b i16, c i64 NOT NULL, d decimal NOT NULL)
+
+statement ok
+INSERT INTO g4 VALUES (1, -54, -7, -1, -578.56), (2, NULL, -32767, -10, -320.45), (3, NULL, 8, 5, 634.50), (4, -271, 138, 987, 214.23), (5, -802.71, 205, 6, 621), (6, 83.08, 32766, 511, 376.54), (7, 508.17, -6, -7, 796.70)
+
+query DII nosort
+SELECT a, b, sum(id) FROM g4 WHERE c NOT BETWEEN 686 AND 717 GROUP BY a, b HAVING sum(d) > 14 ORDER BY a, b
+----
+-802.71
+205
+5
+-271
+138
+4
+83.08
+32766
+6
+508.17
+-6
+7
+NULL
+8
+3
+
+# --- seed 5 ---
+statement ok
+CREATE TABLE g5 (id i16 PRIMARY KEY, a decimal NOT NULL, b i16, c text, d boolean)
+
+statement ok
+INSERT INTO g5 VALUES (1, 543.53, 5, NULL, TRUE), (2, -623.41, 8, NULL, NULL), (3, 850, NULL, NULL, FALSE), (4, -676.83, -3, 'ZZ', TRUE), (5, -165.55, -3, 'z', TRUE), (6, -856.45, 259, NULL, NULL)
+
+query DIII nosort
+SELECT a, b, count(d), sum(id) FROM g5 WHERE b IS NOT NULL GROUP BY a, b ORDER BY a, b
+----
+-856.45
+259
+0
+6
+-676.83
+-3
+1
+4
+-623.41
+8
+0
+2
+-165.55
+-3
+1
+5
+543.53
+5
+1
+1
+
+# --- seed 6 ---
+statement ok
+CREATE TABLE g6 (id i32 PRIMARY KEY, a boolean NOT NULL, b decimal NOT NULL, c i16)
+
+statement ok
+INSERT INTO g6 VALUES (1, FALSE, 721.33, -9), (2, FALSE, -796, NULL), (3, FALSE, 434.86, -5), (4, TRUE, 509.66, 1), (5, TRUE, 330.40, 1), (6, FALSE, 955.24, -3), (7, TRUE, -48.68, 5)
+
+query IBDDD rowsort
+SELECT id, a, max(b), avg(c), avg(b) FROM g6 WHERE b IS NOT DISTINCT FROM -446 GROUP BY id, a
+----
+
+# --- seed 7 ---
+statement ok
+CREATE TABLE g7 (id i64 PRIMARY KEY, a boolean, b text, c i16 NOT NULL)
+
+statement ok
+INSERT INTO g7 VALUES (1, TRUE, 'x', 1), (2, FALSE, 'Cat', -32768), (3, FALSE, 'banana', -32767), (4, FALSE, NULL, -7), (5, FALSE, 'dog', -721), (6, FALSE, 'x', 248), (7, TRUE, 'mango', 9), (8, TRUE, 'ab', -1)
+
+query BTID nosort
+SELECT a, b, count(id), avg(id) FROM g7 WHERE c > -979 GROUP BY a, b ORDER BY a, b COLLATE "C"
+----
+false
+dog
+1
+5.0000000000000000
+false
+x
+1
+6.0000000000000000
+false
+NULL
+1
+4.0000000000000000
+true
+ab
+1
+8.0000000000000000
+true
+mango
+1
+7.0000000000000000
+true
+x
+1
+1.00000000000000000000
+
+# --- seed 8 ---
+statement ok
+CREATE TABLE g8 (id i16 PRIMARY KEY, a i32 NOT NULL, b i64)
+
+statement ok
+INSERT INTO g8 VALUES (1, 3, 9), (2, 0, -651), (3, -2147483647, -3), (4, 0, -9223372036854775807), (5, 55, -2), (6, -3, -801)
+
+query IIII rowsort
+SELECT a, count(b), count(*), count(b) FROM g8 WHERE id IS DISTINCT FROM 317 GROUP BY a HAVING count(*) >= 2
+----
+0
+2
+2
+2
+
+# --- seed 9 ---
+statement ok
+CREATE TABLE g9 (id i64 PRIMARY KEY, a decimal, b boolean, c i32 NOT NULL, d boolean NOT NULL)
+
+statement ok
+INSERT INTO g9 VALUES (1, NULL, TRUE, 4, FALSE), (2, 501.12, FALSE, 2147483646, FALSE), (3, 655.56, FALSE, 3, TRUE), (4, 599.40, FALSE, 0, FALSE), (5, -739, NULL, 2147483647, FALSE), (6, NULL, FALSE, 3, TRUE), (7, -760, FALSE, 4, TRUE)
+
+query IDD nosort
+SELECT id, a, sum(id) FROM g9 WHERE c IS NOT NULL GROUP BY id, a HAVING sum(c) >= -17 ORDER BY id, a
+----
+1
+NULL
+1
+2
+501.12
+2
+3
+655.56
+3
+4
+599.40
+4
+5
+-739
+5
+6
+NULL
+6
+7
+-760
+7
+
+# --- seed 10 ---
+statement ok
+CREATE TABLE g10 (id i32 PRIMARY KEY, a text, b i32, c i32)
+
+statement ok
+INSERT INTO g10 VALUES (1, NULL, 0, NULL), (2, 'apple', 368, -2), (3, 'Apple', 3, 822), (4, 'Mango', NULL, 3), (5, 'AB', -2147483647, NULL), (6, 'x', NULL, -285), (7, NULL, 2, 368), (8, 'Mango', -2147483648, 270), (9, NULL, 2, -815), (10, 'Mango', NULL, NULL), (11, 'banana', -2147483647, NULL)
+
+query TIII nosort
+SELECT a, b, count(*), sum(b) FROM g10 WHERE a IS NOT NULL GROUP BY a, b HAVING sum(c) >= -38 ORDER BY a COLLATE "C", b
+----
+Apple
+3
+1
+3
+Mango
+-2147483648
+1
+-2147483648
+Mango
+NULL
+2
+NULL
+apple
+368
+1
+368
+
+# --- seed 11 ---
+statement ok
+CREATE TABLE g11 (id i32 PRIMARY KEY, a boolean, b decimal)
+
+statement ok
+INSERT INTO g11 VALUES (1, FALSE, 837.04), (2, FALSE, 255), (3, TRUE, NULL), (4, TRUE, 632.70), (5, TRUE, NULL), (6, FALSE, NULL), (7, TRUE, 717.99), (8, FALSE, 489.32)
+
+query IBIII rowsort
+SELECT id, a, count(*), min(id), count(a) FROM g11 WHERE a = TRUE GROUP BY id, a HAVING count(*) <> 0
+----
+3
+true
+1
+3
+1
+4
+true
+1
+4
+1
+5
+true
+1
+5
+1
+7
+true
+1
+7
+1
+
+# --- seed 12 ---
+statement ok
+CREATE TABLE g12 (id i16 PRIMARY KEY, a decimal NOT NULL, b boolean, c i16, d text NOT NULL)
+
+statement ok
+INSERT INTO g12 VALUES (1, -582.74, FALSE, 32766, 'cat'), (2, -581, FALSE, 10, 'dog'), (3, -365.45, NULL, 32766, 'AB'), (4, -665, FALSE, 1, 'Cat'), (5, 395.75, NULL, 0, 'dog'), (6, -162.02, NULL, -7, 'ab'), (7, -818.97, TRUE, 1, 'banana')
+
+query IDD rowsort
+SELECT id, a, avg(a) FROM g12 WHERE d COLLATE "C" > 'BANANA' GROUP BY id, a
+----
+1
+-582.74
+-582.7400000000000000
+2
+-581
+-581.0000000000000000
+4
+-665
+-665.0000000000000000
+5
+395.75
+395.7500000000000000
+6
+-162.02
+-162.0200000000000000
+7
+-818.97
+-818.9700000000000000
+
+# --- seed 13 ---
+statement ok
+CREATE TABLE g13 (id i32 PRIMARY KEY, a i64, b i64)
+
+statement ok
+INSERT INTO g13 VALUES (1, -8, 3), (2, -8, NULL), (3, 13, 1), (4, -198, 507), (5, 7, 3), (6, -4, 5), (7, 6, NULL), (8, 853, -5), (9, -9223372036854775807, 7), (10, 9223372036854775806, 6)
+
+query IIIDI nosort
+SELECT id, a, count(*), avg(a), count(*) FROM g13 WHERE (a IS NOT DISTINCT FROM -7 AND a <> id) GROUP BY id, a ORDER BY id, a
+----
+
+# --- seed 14 ---
+statement ok
+CREATE TABLE g14 (id i16 PRIMARY KEY, a text, b i32 NOT NULL)
+
+statement ok
+INSERT INTO g14 VALUES (1, 'ZZ', 0), (2, 'dog', -6), (3, 'z', 10), (4, 'AB', -1), (5, 'BANANA', 3), (6, 'AB', -10), (7, 'mango', 1), (8, NULL, -3), (9, 'z', -9), (10, NULL, -5)
+
+query TII rowsort
+SELECT a, b, sum(id) FROM g14 WHERE a COLLATE "C" ILIKE 'cat' GROUP BY a, b HAVING sum(b) >= -47
+----
+
+# --- seed 15 ---
+statement ok
+CREATE TABLE g15 (id i32 PRIMARY KEY, a text, b i16, c boolean)
+
+statement ok
+INSERT INTO g15 VALUES (1, 'x', -1, FALSE), (2, 'ZZ', 0, NULL), (3, 'Cat', -9, FALSE), (4, 'dog', 32767, TRUE), (5, 'Cat', 32767, TRUE), (6, 'Cat', NULL, FALSE), (7, 'AB', 9, FALSE), (8, 'banana', 3, TRUE), (9, 'cat', -10, FALSE), (10, 'BANANA', NULL, TRUE), (11, 'ab', -7, FALSE)
+
+query TID nosort
+SELECT a, b, avg(id) FROM g15 WHERE (a COLLATE "C" < 'Apple' AND id IN (-172, -352, 383)) GROUP BY a, b ORDER BY a COLLATE "C", b
+----
+
+# --- seed 16 ---
+statement ok
+CREATE TABLE g16 (id i32 PRIMARY KEY, a i32 NOT NULL, b boolean NOT NULL, c text NOT NULL, d i16)
+
+statement ok
+INSERT INTO g16 VALUES (1, 10, FALSE, 'z', -5), (2, 2, TRUE, 'banana', 7), (3, 2147483647, FALSE, 'Cat', 877), (4, 2147483647, FALSE, 'AB', 2), (5, -9, FALSE, 'x', -855), (6, -7, FALSE, 'Mango', 473), (7, 2147483647, TRUE, 'mango', -6), (8, -1, FALSE, 'mango', 0)
+
+query ITITD rowsort
+SELECT a, c, count(b), max(c COLLATE "C"), avg(d) FROM g16 WHERE id BETWEEN 318 AND 377 GROUP BY a, c
+----
+
+# --- seed 17 ---
+statement ok
+CREATE TABLE g17 (id i32 PRIMARY KEY, a i32 NOT NULL, b text NOT NULL, c text, d i32)
+
+statement ok
+INSERT INTO g17 VALUES (1, -7, 'dog', NULL, -2147483647), (2, 7, 'apple', 'dog', 401), (3, 2147483646, 'z', 'Apple', NULL), (4, 2147483646, 'mango', 'x', NULL), (5, -2147483647, 'z', 'AB', 2), (6, 5, 'z', 'ZZ', 9), (7, -384, 'Cat', NULL, -7), (8, -9, 'ZZ', 'ZZ', 4)
+
+query IIIID nosort
+SELECT id, a, sum(id), sum(d), avg(a) FROM g17 WHERE b IS NULL GROUP BY id, a ORDER BY id, a
+----
+
+# --- seed 18 ---
+statement ok
+CREATE TABLE g18 (id i32 PRIMARY KEY, a decimal, b i64)
+
+statement ok
+INSERT INTO g18 VALUES (1, NULL, 1), (2, -836.65, NULL), (3, 862, -10), (4, -283, 8), (5, -73.55, -399), (6, -389.26, 1)
+
+query IIDD nosort
+SELECT id, b, avg(b), avg(id) FROM g18 WHERE b IN (442) GROUP BY id, b ORDER BY id, b
+----
+
+# --- seed 19 ---
+statement ok
+CREATE TABLE g19 (id i32 PRIMARY KEY, a boolean NOT NULL, b i64 NOT NULL)
+
+statement ok
+INSERT INTO g19 VALUES (1, TRUE, -694), (2, FALSE, 1000), (3, FALSE, 9223372036854775806), (4, FALSE, -5), (5, FALSE, 7), (6, TRUE, -2), (7, FALSE, -10), (8, FALSE, -780)
+
+query BII nosort
+SELECT a, min(b), count(*) FROM g19 WHERE NOT (a IS NOT NULL) GROUP BY a ORDER BY a
+----
+
+# --- seed 20 ---
+statement ok
+CREATE TABLE g20 (id i16 PRIMARY KEY, a text, b text NOT NULL, c i64, d i16 NOT NULL)
+
+statement ok
+INSERT INTO g20 VALUES (1, NULL, 'apple', 214, -1), (2, 'Cat', 'banana', NULL, 32766), (3, 'ZZ', 'ZZ', 0, 867), (4, 'ZZ', 'ZZ', 8, -413), (5, NULL, 'ZZ', 0, 4), (6, 'BANANA', 'banana', NULL, 4), (7, 'mango', 'AB', 4, 0), (8, 'Cat', 'banana', 0, -6)
+
+query ITTT rowsort
+SELECT id, max(b COLLATE "C"), max(b COLLATE "C"), min(a COLLATE "C") FROM g20 WHERE (b COLLATE "C" IS DISTINCT FROM 'apple' AND d IS DISTINCT FROM -65) GROUP BY id HAVING count(*) < 1
+----
+
+# --- seed 21 ---
+statement ok
+CREATE TABLE g21 (id i32 PRIMARY KEY, a text, b i16)
+
+statement ok
+INSERT INTO g21 VALUES (1, NULL, 0), (2, NULL, 10), (3, 'AB', 765), (4, 'banana', 6), (5, 'apple', -9), (6, 'banana', -1), (7, 'apple', 32766), (8, 'Mango', -10)
+
+query II nosort
+SELECT b, count(id) FROM g21 WHERE NOT (b <> -992) GROUP BY b HAVING sum(b) = 46 ORDER BY b
+----
+
+# --- seed 22 ---
+statement ok
+CREATE TABLE g22 (id i64 PRIMARY KEY, a i16, b boolean NOT NULL)
+
+statement ok
+INSERT INTO g22 VALUES (1, 0, FALSE), (2, NULL, TRUE), (3, NULL, FALSE), (4, 7, FALSE), (5, -3, FALSE), (6, 897, TRUE), (7, -3, FALSE), (8, 107, FALSE), (9, NULL, TRUE), (10, 2, TRUE)
+
+query III rowsort
+SELECT id, count(b), sum(a) FROM g22 WHERE (a IN (234) OR (id IS NOT DISTINCT FROM -538 AND a IS NULL)) GROUP BY id HAVING count(*) = 1
+----
+
+# --- seed 23 ---
+statement ok
+CREATE TABLE g23 (id i16 PRIMARY KEY, a i16 NOT NULL, b i16 NOT NULL, c text, d i64 NOT NULL)
+
+statement ok
+INSERT INTO g23 VALUES (1, -8, -5, 'Cat', -1), (2, 32766, -3, 'Apple', 10), (3, 127, -8, 'ZZ', -10), (4, 32767, 702, 'apple', -4), (5, -8, 4, 'BANANA', -4), (6, 8, 10, 'x', -574), (7, -5, -932, 'AB', -10), (8, 1, -1, 'Cat', -9223372036854775808), (9, -535, -7, 'ZZ', -996), (10, 8, -9, 'banana', -10), (11, 9, -10, 'dog', 4), (12, -32767, -3, 'dog', -9223372036854775808)
+
+query IIIII nosort
+SELECT id, b, count(*), min(b), count(*) FROM g23 WHERE a = 968 GROUP BY id, b ORDER BY id, b
+----
+
+# --- seed 24 ---
+statement ok
+CREATE TABLE g24 (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+INSERT INTO g24 VALUES (1, 1, 'BANANA'), (2, 0, 'ab'), (3, 2, 'Apple'), (4, -135, 'Apple'), (5, 0, 'z'), (6, -7, 'z'), (7, 2147483647, 'AB'), (8, NULL, 'Cat'), (9, 3, 'dog'), (10, -3, 'BANANA')
+
+query III nosort
+SELECT id, a, sum(id) FROM g24 WHERE a < -24 GROUP BY id, a HAVING sum(a) <> -38 ORDER BY id, a
+----
+4
+-135
+4
+
+# --- seed 25 ---
+statement ok
+CREATE TABLE g25 (id i64 PRIMARY KEY, a i64, b text NOT NULL, c i16, d i32 NOT NULL)
+
+statement ok
+INSERT INTO g25 VALUES (1, 795, 'AB', NULL, 3), (2, -73, 'apple', 2, -6), (3, 7, 'banana', -5, 2147483646), (4, -8, 'Cat', 8, 1), (5, 9, 'z', -5, -694), (6, 726, 'z', -400, -5), (7, NULL, 'Cat', NULL, 2), (8, NULL, 'ZZ', 32766, -5), (9, 4, 'BANANA', 7, 53), (10, 9223372036854775807, 'x', -9, 226)
+
+query ITI rowsort
+SELECT a, b, sum(c) FROM g25 WHERE id IS NOT NULL GROUP BY a, b HAVING sum(d) > 14
+----
+4
+BANANA
+7
+7
+banana
+-5
+9223372036854775807
+x
+-9

@@ -33,15 +33,25 @@ module RQG
     [fa, fb].sort == %i[decimal integer]
   end
 
-  # The generation context threaded through expr/shape builders: the PRNG, the in-scope table, the
-  # capabilities used so far (-> the `# requires:` header), and a recursion-depth budget guarding
+  # An in-scope column reference for the expression generator: its SQL text (bare `a` for a single
+  # table, qualified `t1.a` in a join), family, jed type, and nullability. Decoupling Expr from a
+  # concrete Table is what lets joins/subqueries reuse the same well-typed predicate generator.
+  ColRef = Struct.new(:ref, :family, :type, :nullable)
+
+  # Map a table's columns to ColRefs, optionally qualified by an alias/name (for joins).
+  def col_refs(table, qual = nil)
+    table.columns.map { |c| ColRef.new(qual ? "#{qual}.#{c.name}" : c.name, family(c.type), c.type, c.nullable) }
+  end
+
+  # The generation context threaded through expr/shape builders: the PRNG, the in-scope column refs,
+  # the capabilities used so far (-> the `# requires:` header), and a recursion-depth budget guarding
   # the parser's MAX_EXPR_DEPTH / 54001 gate (CLAUDE.md §13).
   class Ctx
-    attr_reader :rng, :table, :caps
+    attr_reader :rng, :columns, :caps
 
-    def initialize(rng, table)
+    def initialize(rng, columns)
       @rng = rng
-      @table = table
+      @columns = columns
       @caps = Set.new
     end
 

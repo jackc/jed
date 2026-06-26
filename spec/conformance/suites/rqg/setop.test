@@ -1,0 +1,474 @@
+# RQG setop corpus — GENERATED + curated by scripts/rqg_gen.rb (rake rqg:emit).
+# One self-contained {schema, data, query} block per distinct query shape; expected rows are
+# the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in rake
+# ci. Do NOT hand-edit — regenerate. See .scratch/testing-ideas.md §1 (the RQG firehose).
+# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.collate, expr.in_list, expr.like, expr.not_equal, expr.parens, query.comparison_order, query.except, query.intersect, query.is_distinct_from, query.is_null, query.select, query.union, query.where_eq, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
+
+# --- seed 1 ---
+statement ok
+CREATE TABLE u1 (id i16 PRIMARY KEY, a i16 NOT NULL, b boolean)
+
+statement ok
+INSERT INTO u1 VALUES (1, -9, NULL), (2, 305, TRUE), (3, 10, FALSE), (4, -6, FALSE), (5, 502, NULL), (6, -32767, TRUE)
+
+query I rowsort
+SELECT id FROM u1 WHERE b IS DISTINCT FROM FALSE UNION SELECT id FROM u1 WHERE NOT (id IS NOT NULL)
+----
+1
+2
+5
+6
+
+# --- seed 2 ---
+statement ok
+CREATE TABLE u2 (id i32 PRIMARY KEY, a i16, b i64, c i64 NOT NULL)
+
+statement ok
+INSERT INTO u2 VALUES (1, 10, -4, 0), (2, NULL, -7, -6), (3, -8, NULL, -6), (4, NULL, -58, 0), (5, -32768, -240, -1), (6, NULL, -10, 8), (7, 0, -162, -546), (8, -9, -4, -9223372036854775807), (9, NULL, -701, -5)
+
+query II rowsort
+SELECT b, c FROM u2 WHERE (NOT (c IS NOT DISTINCT FROM id) AND c IS NOT DISTINCT FROM id) INTERSECT ALL SELECT b, c FROM u2 WHERE NOT (id IN (-438, 225, -353))
+----
+
+# --- seed 3 ---
+statement ok
+CREATE TABLE u3 (id i32 PRIMARY KEY, a i32, b i16)
+
+statement ok
+INSERT INTO u3 VALUES (1, -2147483647, 446), (2, -602, -8), (3, 9, -32767), (4, 2147483646, 32766), (5, -5, 4), (6, NULL, NULL), (7, 0, -3), (8, 7, 0), (9, -7, -10), (10, 1, 6), (11, NULL, -8)
+
+query I rowsort
+SELECT id FROM u3 WHERE (a IS DISTINCT FROM 184 OR id IS NOT DISTINCT FROM a) INTERSECT ALL SELECT id FROM u3 WHERE b IS NULL
+----
+6
+
+# --- seed 4 ---
+statement ok
+CREATE TABLE u4 (id i32 PRIMARY KEY, a decimal, b i16, c i64 NOT NULL, d decimal NOT NULL)
+
+statement ok
+INSERT INTO u4 VALUES (1, -54, -7, -1, -578.56), (2, NULL, -32767, -10, -320.45), (3, NULL, 8, 5, 634.50), (4, -271, 138, 987, 214.23), (5, -802.71, 205, 6, 621), (6, 83.08, 32766, 511, 376.54), (7, 508.17, -6, -7, 796.70)
+
+query II rowsort
+SELECT id, b FROM u4 WHERE id = -362 UNION ALL SELECT id, b FROM u4 WHERE id BETWEEN -948 AND -692
+----
+
+# --- seed 5 ---
+statement ok
+CREATE TABLE u5 (id i16 PRIMARY KEY, a decimal NOT NULL, b i16, c text, d boolean)
+
+statement ok
+INSERT INTO u5 VALUES (1, 543.53, 5, NULL, TRUE), (2, -623.41, 8, NULL, NULL), (3, 850, NULL, NULL, FALSE), (4, -676.83, -3, 'ZZ', TRUE), (5, -165.55, -3, 'z', TRUE), (6, -856.45, 259, NULL, NULL)
+
+query ID rowsort
+SELECT id, a FROM u5 WHERE d <> FALSE INTERSECT ALL SELECT id, a FROM u5 WHERE (c COLLATE "C" NOT LIKE 'ab%' OR (id IS NOT NULL OR d))
+----
+1
+543.53
+4
+-676.83
+5
+-165.55
+
+# --- seed 6 ---
+statement ok
+CREATE TABLE u6 (id i32 PRIMARY KEY, a boolean NOT NULL, b decimal NOT NULL, c i16)
+
+statement ok
+INSERT INTO u6 VALUES (1, FALSE, 721.33, -9), (2, FALSE, -796, NULL), (3, FALSE, 434.86, -5), (4, TRUE, 509.66, 1), (5, TRUE, 330.40, 1), (6, FALSE, 955.24, -3), (7, TRUE, -48.68, 5)
+
+query BD rowsort
+SELECT a, b FROM u6 WHERE a IS NOT DISTINCT FROM TRUE EXCEPT ALL SELECT a, b FROM u6 WHERE id IS DISTINCT FROM -327
+----
+
+# --- seed 7 ---
+statement ok
+CREATE TABLE u7 (id i64 PRIMARY KEY, a boolean, b text, c i16 NOT NULL)
+
+statement ok
+INSERT INTO u7 VALUES (1, TRUE, 'x', 1), (2, FALSE, 'Cat', -32768), (3, FALSE, 'banana', -32767), (4, FALSE, NULL, -7), (5, FALSE, 'dog', -721), (6, FALSE, 'x', 248), (7, TRUE, 'mango', 9), (8, TRUE, 'ab', -1)
+
+query ITI rowsort
+SELECT id, b, c FROM u7 WHERE c IS NULL EXCEPT ALL SELECT id, b, c FROM u7 WHERE ((a IS NOT NULL AND c IS NULL) OR b COLLATE "C" BETWEEN 'x' AND 'ZZ')
+----
+
+# --- seed 8 ---
+statement ok
+CREATE TABLE u8 (id i16 PRIMARY KEY, a i32 NOT NULL, b i64)
+
+statement ok
+INSERT INTO u8 VALUES (1, 3, 9), (2, 0, -651), (3, -2147483647, -3), (4, 0, -9223372036854775807), (5, 55, -2), (6, -3, -801)
+
+query II rowsort
+SELECT id, a FROM u8 WHERE b < 670 INTERSECT ALL SELECT id, a FROM u8 WHERE b IS NOT DISTINCT FROM -173
+----
+
+# --- seed 9 ---
+statement ok
+CREATE TABLE u9 (id i64 PRIMARY KEY, a decimal, b boolean, c i32 NOT NULL, d boolean NOT NULL)
+
+statement ok
+INSERT INTO u9 VALUES (1, NULL, TRUE, 4, FALSE), (2, 501.12, FALSE, 2147483646, FALSE), (3, 655.56, FALSE, 3, TRUE), (4, 599.40, FALSE, 0, FALSE), (5, -739, NULL, 2147483647, FALSE), (6, NULL, FALSE, 3, TRUE), (7, -760, FALSE, 4, TRUE)
+
+query DBIB rowsort
+SELECT a, b, c, d FROM u9 WHERE NOT (c IS NULL) INTERSECT SELECT a, b, c, d FROM u9 WHERE d
+----
+-760
+false
+4
+true
+655.56
+false
+3
+true
+NULL
+false
+3
+true
+
+# --- seed 10 ---
+statement ok
+CREATE TABLE u10 (id i32 PRIMARY KEY, a text, b i32, c i32)
+
+statement ok
+INSERT INTO u10 VALUES (1, NULL, 0, NULL), (2, 'apple', 368, -2), (3, 'Apple', 3, 822), (4, 'Mango', NULL, 3), (5, 'AB', -2147483647, NULL), (6, 'x', NULL, -285), (7, NULL, 2, 368), (8, 'Mango', -2147483648, 270), (9, NULL, 2, -815), (10, 'Mango', NULL, NULL), (11, 'banana', -2147483647, NULL)
+
+query ITII rowsort
+SELECT id, a, b, c FROM u10 WHERE b IS DISTINCT FROM 440 INTERSECT ALL SELECT id, a, b, c FROM u10 WHERE NOT (b IS DISTINCT FROM -329)
+----
+
+# --- seed 11 ---
+statement ok
+CREATE TABLE u11 (id i32 PRIMARY KEY, a boolean, b decimal)
+
+statement ok
+INSERT INTO u11 VALUES (1, FALSE, 837.04), (2, FALSE, 255), (3, TRUE, NULL), (4, TRUE, 632.70), (5, TRUE, NULL), (6, FALSE, NULL), (7, TRUE, 717.99), (8, FALSE, 489.32)
+
+query IBD rowsort
+SELECT id, a, b FROM u11 WHERE a IS NULL INTERSECT ALL SELECT id, a, b FROM u11 WHERE (id IS DISTINCT FROM 99 AND b IS NULL)
+----
+
+# --- seed 12 ---
+statement ok
+CREATE TABLE u12 (id i16 PRIMARY KEY, a decimal NOT NULL, b boolean, c i16, d text NOT NULL)
+
+statement ok
+INSERT INTO u12 VALUES (1, -582.74, FALSE, 32766, 'cat'), (2, -581, FALSE, 10, 'dog'), (3, -365.45, NULL, 32766, 'AB'), (4, -665, FALSE, 1, 'Cat'), (5, 395.75, NULL, 0, 'dog'), (6, -162.02, NULL, -7, 'ab'), (7, -818.97, TRUE, 1, 'banana')
+
+query IDI rowsort
+SELECT id, a, c FROM u12 WHERE (id BETWEEN 5 AND 239 OR NOT (d COLLATE "C" IS DISTINCT FROM 'Cat')) EXCEPT SELECT id, a, c FROM u12 WHERE c IN (476, -568, 272)
+----
+4
+-665
+1
+5
+395.75
+0
+6
+-162.02
+-7
+7
+-818.97
+1
+
+# --- seed 13 ---
+statement ok
+CREATE TABLE u13 (id i32 PRIMARY KEY, a i64, b i64)
+
+statement ok
+INSERT INTO u13 VALUES (1, -8, 3), (2, -8, NULL), (3, 13, 1), (4, -198, 507), (5, 7, 3), (6, -4, 5), (7, 6, NULL), (8, 853, -5), (9, -9223372036854775807, 7), (10, 9223372036854775806, 6)
+
+query III rowsort
+SELECT id, a, b FROM u13 WHERE a BETWEEN -950 AND 81 UNION ALL SELECT id, a, b FROM u13 WHERE (id BETWEEN -507 AND 926 AND NOT (id NOT IN (-591, -863)))
+----
+1
+-8
+3
+2
+-8
+NULL
+3
+13
+1
+4
+-198
+507
+5
+7
+3
+6
+-4
+5
+7
+6
+NULL
+
+# --- seed 14 ---
+statement ok
+CREATE TABLE u14 (id i16 PRIMARY KEY, a text, b i32 NOT NULL)
+
+statement ok
+INSERT INTO u14 VALUES (1, 'ZZ', 0), (2, 'dog', -6), (3, 'z', 10), (4, 'AB', -1), (5, 'BANANA', 3), (6, 'AB', -10), (7, 'mango', 1), (8, NULL, -3), (9, 'z', -9), (10, NULL, -5)
+
+query I rowsort
+SELECT id FROM u14 WHERE a COLLATE "C" IN ('Mango', 'ab', 'cat') EXCEPT ALL SELECT id FROM u14 WHERE ((a IS NOT NULL AND id NOT BETWEEN 639 AND 824) OR NOT (id BETWEEN -2 AND 336))
+----
+
+# --- seed 15 ---
+statement ok
+CREATE TABLE u15 (id i32 PRIMARY KEY, a text, b i16, c boolean)
+
+statement ok
+INSERT INTO u15 VALUES (1, 'x', -1, FALSE), (2, 'ZZ', 0, NULL), (3, 'Cat', -9, FALSE), (4, 'dog', 32767, TRUE), (5, 'Cat', 32767, TRUE), (6, 'Cat', NULL, FALSE), (7, 'AB', 9, FALSE), (8, 'banana', 3, TRUE), (9, 'cat', -10, FALSE), (10, 'BANANA', NULL, TRUE), (11, 'ab', -7, FALSE)
+
+query ITI rowsort
+SELECT id, a, b FROM u15 WHERE id IS NULL UNION ALL SELECT id, a, b FROM u15 WHERE NOT (a COLLATE "C" <= 'Cat')
+----
+1
+x
+-1
+11
+ab
+-7
+2
+ZZ
+0
+4
+dog
+32767
+8
+banana
+3
+9
+cat
+-10
+
+# --- seed 16 ---
+statement ok
+CREATE TABLE u16 (id i32 PRIMARY KEY, a i32 NOT NULL, b boolean NOT NULL, c text NOT NULL, d i16)
+
+statement ok
+INSERT INTO u16 VALUES (1, 10, FALSE, 'z', -5), (2, 2, TRUE, 'banana', 7), (3, 2147483647, FALSE, 'Cat', 877), (4, 2147483647, FALSE, 'AB', 2), (5, -9, FALSE, 'x', -855), (6, -7, FALSE, 'Mango', 473), (7, 2147483647, TRUE, 'mango', -6), (8, -1, FALSE, 'mango', 0)
+
+query B rowsort
+SELECT b FROM u16 WHERE b IS NULL UNION ALL SELECT b FROM u16 WHERE NOT (b IS NULL)
+----
+false
+false
+false
+false
+false
+false
+true
+true
+
+# --- seed 17 ---
+statement ok
+CREATE TABLE u17 (id i32 PRIMARY KEY, a i32 NOT NULL, b text NOT NULL, c text, d i32)
+
+statement ok
+INSERT INTO u17 VALUES (1, -7, 'dog', NULL, -2147483647), (2, 7, 'apple', 'dog', 401), (3, 2147483646, 'z', 'Apple', NULL), (4, 2147483646, 'mango', 'x', NULL), (5, -2147483647, 'z', 'AB', 2), (6, 5, 'z', 'ZZ', 9), (7, -384, 'Cat', NULL, -7), (8, -9, 'ZZ', 'ZZ', 4)
+
+query II rowsort
+SELECT id, d FROM u17 WHERE d BETWEEN -754 AND 602 UNION SELECT id, d FROM u17 WHERE c COLLATE "C" NOT BETWEEN 'ab' AND 'AB'
+----
+2
+401
+3
+NULL
+4
+NULL
+5
+2
+6
+9
+7
+-7
+8
+4
+
+# --- seed 18 ---
+statement ok
+CREATE TABLE u18 (id i32 PRIMARY KEY, a decimal, b i64)
+
+statement ok
+INSERT INTO u18 VALUES (1, NULL, 1), (2, -836.65, NULL), (3, 862, -10), (4, -283, 8), (5, -73.55, -399), (6, -389.26, 1)
+
+query I rowsort
+SELECT b FROM u18 WHERE NOT (a NOT BETWEEN -181 AND 103.27) EXCEPT SELECT b FROM u18 WHERE NOT ((a IN (397, -218) OR b IN (-894)))
+----
+
+# --- seed 19 ---
+statement ok
+CREATE TABLE u19 (id i32 PRIMARY KEY, a boolean NOT NULL, b i64 NOT NULL)
+
+statement ok
+INSERT INTO u19 VALUES (1, TRUE, -694), (2, FALSE, 1000), (3, FALSE, 9223372036854775806), (4, FALSE, -5), (5, FALSE, 7), (6, TRUE, -2), (7, FALSE, -10), (8, FALSE, -780)
+
+query II rowsort
+SELECT id, b FROM u19 WHERE NOT (a) EXCEPT SELECT id, b FROM u19 WHERE b IS NULL
+----
+2
+1000
+3
+9223372036854775806
+4
+-5
+5
+7
+7
+-10
+8
+-780
+
+# --- seed 20 ---
+statement ok
+CREATE TABLE u20 (id i16 PRIMARY KEY, a text, b text NOT NULL, c i64, d i16 NOT NULL)
+
+statement ok
+INSERT INTO u20 VALUES (1, NULL, 'apple', 214, -1), (2, 'Cat', 'banana', NULL, 32766), (3, 'ZZ', 'ZZ', 0, 867), (4, 'ZZ', 'ZZ', 8, -413), (5, NULL, 'ZZ', 0, 4), (6, 'BANANA', 'banana', NULL, 4), (7, 'mango', 'AB', 4, 0), (8, 'Cat', 'banana', 0, -6)
+
+query TTI rowsort
+SELECT a, b, c FROM u20 WHERE (d IS DISTINCT FROM -65 AND a COLLATE "C" IS DISTINCT FROM 'z') UNION ALL SELECT a, b, c FROM u20 WHERE d < 605
+----
+BANANA
+banana
+NULL
+BANANA
+banana
+NULL
+Cat
+banana
+0
+Cat
+banana
+0
+Cat
+banana
+NULL
+NULL
+ZZ
+0
+NULL
+ZZ
+0
+NULL
+apple
+214
+NULL
+apple
+214
+ZZ
+ZZ
+0
+ZZ
+ZZ
+8
+ZZ
+ZZ
+8
+mango
+AB
+4
+mango
+AB
+4
+
+# --- seed 21 ---
+statement ok
+CREATE TABLE u21 (id i32 PRIMARY KEY, a text, b i16)
+
+statement ok
+INSERT INTO u21 VALUES (1, NULL, 0), (2, NULL, 10), (3, 'AB', 765), (4, 'banana', 6), (5, 'apple', -9), (6, 'banana', -1), (7, 'apple', 32766), (8, 'Mango', -10)
+
+query I rowsort
+SELECT id FROM u21 WHERE (b IS NOT NULL AND a COLLATE "C" IN ('x', 'Cat', 'mango')) INTERSECT SELECT id FROM u21 WHERE (a COLLATE "C" BETWEEN 'Apple' AND 'apple' AND NOT (b IS NOT NULL))
+----
+
+# --- seed 22 ---
+statement ok
+CREATE TABLE u22 (id i64 PRIMARY KEY, a i16, b boolean NOT NULL)
+
+statement ok
+INSERT INTO u22 VALUES (1, 0, FALSE), (2, NULL, TRUE), (3, NULL, FALSE), (4, 7, FALSE), (5, -3, FALSE), (6, 897, TRUE), (7, -3, FALSE), (8, 107, FALSE), (9, NULL, TRUE), (10, 2, TRUE)
+
+query I rowsort
+SELECT a FROM u22 WHERE (id IN (-1) AND (a IS NULL AND b = FALSE)) EXCEPT SELECT a FROM u22 WHERE b IS DISTINCT FROM TRUE
+----
+
+# --- seed 23 ---
+statement ok
+CREATE TABLE u23 (id i16 PRIMARY KEY, a i16 NOT NULL, b i16 NOT NULL, c text, d i64 NOT NULL)
+
+statement ok
+INSERT INTO u23 VALUES (1, -8, -5, 'Cat', -1), (2, 32766, -3, 'Apple', 10), (3, 127, -8, 'ZZ', -10), (4, 32767, 702, 'apple', -4), (5, -8, 4, 'BANANA', -4), (6, 8, 10, 'x', -574), (7, -5, -932, 'AB', -10), (8, 1, -1, 'Cat', -9223372036854775808), (9, -535, -7, 'ZZ', -996), (10, 8, -9, 'banana', -10), (11, 9, -10, 'dog', 4), (12, -32767, -3, 'dog', -9223372036854775808)
+
+query II rowsort
+SELECT id, a FROM u23 WHERE b < a UNION SELECT id, a FROM u23 WHERE (b BETWEEN -59 AND 303 OR b NOT BETWEEN 695 AND 980)
+----
+1
+-8
+10
+8
+11
+9
+12
+-32767
+2
+32766
+3
+127
+4
+32767
+5
+-8
+6
+8
+7
+-5
+8
+1
+9
+-535
+
+# --- seed 24 ---
+statement ok
+CREATE TABLE u24 (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+INSERT INTO u24 VALUES (1, 1, 'BANANA'), (2, 0, 'ab'), (3, 2, 'Apple'), (4, -135, 'Apple'), (5, 0, 'z'), (6, -7, 'z'), (7, 2147483647, 'AB'), (8, NULL, 'Cat'), (9, 3, 'dog'), (10, -3, 'BANANA')
+
+query I rowsort
+SELECT id FROM u24 WHERE (b COLLATE "C" IS DISTINCT FROM 'z' OR id = a) INTERSECT SELECT id FROM u24 WHERE id <= -371
+----
+
+# --- seed 25 ---
+statement ok
+CREATE TABLE u25 (id i64 PRIMARY KEY, a i64, b text NOT NULL, c i16, d i32 NOT NULL)
+
+statement ok
+INSERT INTO u25 VALUES (1, 795, 'AB', NULL, 3), (2, -73, 'apple', 2, -6), (3, 7, 'banana', -5, 2147483646), (4, -8, 'Cat', 8, 1), (5, 9, 'z', -5, -694), (6, 726, 'z', -400, -5), (7, NULL, 'Cat', NULL, 2), (8, NULL, 'ZZ', 32766, -5), (9, 4, 'BANANA', 7, 53), (10, 9223372036854775807, 'x', -9, 226)
+
+query IT rowsort
+SELECT id, b FROM u25 WHERE id = -980 UNION ALL SELECT id, b FROM u25 WHERE id IS NOT NULL
+----
+1
+AB
+10
+x
+2
+apple
+3
+banana
+4
+Cat
+5
+z
+6
+z
+7
+Cat
+8
+ZZ
+9
+BANANA

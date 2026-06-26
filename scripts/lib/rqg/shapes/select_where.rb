@@ -23,7 +23,7 @@ module RQG
         insert_caps = Set[SpecData.cap(:insert)]
         insert_caps << SpecData.cap(:insert_multi_row) if nrows > 1
 
-        ctx = Ctx.new(rng, table)
+        ctx = Ctx.new(rng, RQG.col_refs(table))
         where = Expr.predicate(ctx, rng.rand(1..3))
         proj, sortmode, tail = select_tail(ctx, table)
         query = "SELECT #{proj} FROM #{table.name} WHERE #{where}#{tail}"
