@@ -61,3 +61,21 @@ query I
 SELECT length('abc')
 ----
 3
+
+# === char_length / character_length: SQL-standard aliases of length ====================
+
+query I
+SELECT char_length('héllo')
+----
+5
+
+query I
+SELECT character_length('a😀b')
+----
+3
+
+query I
+SELECT char_length(''), character_length(NULL::text)
+----
+0
+NULL

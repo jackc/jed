@@ -19486,8 +19486,9 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfJsonScalar
 	case "json_serialize":
 		return sfJsonSerialize
-	// string / text functions (string-functions.md).
-	case "length":
+	// string / text functions (string-functions.md). char_length/character_length are
+	// SQL-standard aliases of length (same code-point-count kernel).
+	case "length", "char_length", "character_length":
 		return sfLength
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")

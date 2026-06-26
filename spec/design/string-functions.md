@@ -56,3 +56,10 @@ units — the TS trap). STRICT: `length(NULL) → NULL`. Result is `int` (i32); 
 string never exceeds the i32 range, matching PG's `int4` result. PostgreSQL also defines
 `length(bytea)` and an encoding-name 2-arg form; jed implements the `text` overload (the
 byte count is `octet_length`).
+
+### `char_length(text) → int`, `character_length(text) → int`
+
+SQL-standard **aliases** of `length(text)` — the same code-point count, the same kernel.
+PostgreSQL exposes all three names; jed routes `char_length`/`character_length` to the
+`length` kernel (the resolver aliases the name, like `power`→`pow`). The `CHAR_LENGTH(x)`
+keyword-call syntax is not special-cased — they are ordinary function names.

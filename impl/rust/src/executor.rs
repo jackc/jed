@@ -19053,8 +19053,9 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "to_json" => ScalarFunc::ToJson,
         "json_scalar" => ScalarFunc::JsonScalar,
         "json_serialize" => ScalarFunc::JsonSerialize,
-        // string / text functions (string-functions.md).
-        "length" => ScalarFunc::Length,
+        // string / text functions (string-functions.md). char_length/character_length are
+        // SQL-standard aliases of length (same code-point-count kernel).
+        "length" | "char_length" | "character_length" => ScalarFunc::Length,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }

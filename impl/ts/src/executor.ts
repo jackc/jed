@@ -15980,6 +15980,9 @@ function resolveScalarFunc(
   // `power(x, y)` is PG's name for jed's pow (the documented name gap, float.md §8) — alias it to
   // the pow kernel here so the overload lookup, the (float, float) promote, and eval all reuse pow.
   if ((name as string) === "power") name = "pow";
+  // char_length / character_length are SQL-standard aliases of length (string-functions.md) — alias
+  // them to the length kernel so the eval reuses the one code-point-count arm.
+  if ((name as string) === "char_length" || (name as string) === "character_length") name = "length";
   const rargs: RExpr[] = [];
   const tys: ResolvedType[] = [];
   for (const a of e.args) {

@@ -3109,6 +3109,28 @@ result         = "i32"
 null           = "propagates"
 errors         = []
 
+# char_length / character_length — SQL-standard aliases of length(text): the same code-point count,
+# same kernel. PG exposes all three (char_length and character_length are the SQL spellings).
+[[operator]]
+name           = "char_length"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "character_length"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL
