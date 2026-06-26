@@ -267,20 +267,37 @@ Float scalar functions split by whether they are correctly-rounded:
 (half away from zero — the engine's one mode; `round(f)` and `round(f, n)`), `sign`, and
 **`sqrt`** (IEEE-mandated correctly-rounded). These are bit-identical across cores and carry
 exact `R`-tag assertions; they reuse the existing scalar-function machinery (functions.md §9,
-the `abs`/`round` precedent) with `f64` overloads.
+the `abs`/`round` precedent) with `f64` overloads. **Also in-contract** — though their *values*
+are irrational — are **`pi()`** (a shared f64 literal, no operand) and **`radians`/`degrees`**
+(a SINGLE correctly-rounded IEEE multiply/divide by PG's exact `RADIANS_PER_DEGREE` literal):
+one IEEE op with one shared constant is byte-identical cross-core, so these carry **no** ledger
+entry, only the standing `float-render-layout` exemption (§9).
 
-**Transcendental — exempted (G2/G3 dropped, ledgered):** `exp`, `ln`, `log10`, `log(b, x)`,
-`pow(x, y)` / the `^` operator, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `cbrt`.
-Each core calls its native libm; results may differ in the last ULP across cores and from PG.
-These get a **`determinism_exceptions.toml` entry** (class **A**, drops G2/G3, blast radius =
-the result column, promoting only via float-gated control flow §1), are compared by the `R`
-tag's tolerant rule (§9), and are **PG-oracle-only** in the corpus (an `oracle_overrides.toml`
-note where PG's ULP differs). Domain errors (`sqrt(-1)`, `ln(-1)`, `ln(0)`) follow PG: `ln(0)`
-→ `22003`; `sqrt`/`ln` of a negative → `22003` (`argument ... out of range`) rather than
-returning NaN — keeping NaN an *input-only* value (§3).
+**Transcendental — exempted (G2/G3 dropped, ledgered):** `exp`, `ln`, `log10`, `pow(x, y)` /
+the `^` operator, `power` (the PG-name alias for `pow`), `sin`, `cos`, `tan`, `cbrt`, `asin`,
+`acos`, `atan`, `atan2`, `cot`, and the hyperbolics `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh`.
+Each core calls its native libm (or, for `cot`, `1/tan`); results may differ in the last ULP
+across cores and from PG. These share one **`determinism_exceptions.toml` entry**
+(`float-transcendental`, class **A**, drops G2/G3, blast radius = the result column, promoting
+only via float-gated control flow §1), are compared by the `R` tag's tolerant rule (§9), and are
+**PG-oracle-only** in the corpus (an `oracle_overrides.toml` note where PG's ULP differs). Domain
+errors follow PG exactly: `ln(0)` / `ln(-1)` / `sqrt(-1)` → `22003`; `asin`/`acos` outside
+[-1, 1] and `acosh`/`atanh` outside their domains (and ±Inf) → `22003` — rather than returning
+NaN, keeping NaN an *input-only* value (§3) — while `cot(0)` and `atanh(±1)` return `±Infinity`
+(PG-faithful, admissible since the result is in the exempted column), and a NaN *operand*
+propagates. `sinh`/`cosh` overflow to `±Infinity` with NO trap (a PG quirk, unlike `exp`/`pow`).
 
-The transcendental list is a generous starting set; further functions are easy additive
-follow-ons (each one operator-catalog row + a ledger line).
+**Numeric transcendentals are DEFERRED.** PostgreSQL also offers `power(numeric,numeric)`,
+`log(numeric)`, and `log(b, x)` (numeric — PG has no float two-arg `log`). These must be
+**byte-identical across cores** (decimal is in-contract, §5 — they cannot ride the ULP exemption
+above), so they need a PG-faithful arbitrary-precision `ln`/`exp`/`power` port (numeric.c). That
+is a future slice; `power` ships now as the **float** alias only, and `log` is not yet added.
+
+The transcendental list is a generous starting set; further FLOAT functions are easy additive
+follow-ons (each one operator-catalog row + a line on the shared ledger entry). The EXACT numeric
+follow-ons `sign`/`mod`/`div`/`gcd`/`lcm`/`factorial`/`width_bucket` and the decimal-introspection
+trio `scale`/`min_scale`/`trim_scale` have **landed** (in-contract, no ledger — see
+`spec/conformance/suites/expr/numeric_functions.test`).
 
 ## 9. Rendering and the `R` conformance tag
 

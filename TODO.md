@@ -385,6 +385,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       canonicalized on store. On-disk type code 12. → [float.md](spec/design/float.md),
       [determinism.md](spec/design/determinism.md)
   - [ ] _follow-on:_ float in a PRIMARY KEY/index (`0A000`); key rule authored, unexercised.
+  - [x] **math functions** — the [float.md §8](spec/design/float.md) follow-ons, all three cores,
+        oracle-clean (`expr/float_math_more.test`, `expr/numeric_functions.test`): `cbrt`, `pi()`,
+        `radians`/`degrees` (in-contract — one shared-constant IEEE op), `asin`/`acos`/`atan`/`atan2`/
+        `cot` + the hyperbolics `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh` (transcendental, shared
+        ledger entry), `power` (float `pow` alias); and the EXACT numerics `sign`, `mod()`, `div()`,
+        `gcd`/`lcm` (integer + numeric), `factorial` (metered loop), `width_bucket` (numeric + float,
+        new SQLSTATE `2201G`), `scale`/`min_scale`/`trim_scale`.
+    - [ ] _deferred:_ the **exact-numeric** transcendentals `power(numeric,numeric)`, `log(numeric)`,
+          `log(b, x)` — must be byte-identical cross-core (decimal is in-contract, no ULP exemption),
+          so they need a PG-faithful arbitrary-precision `ln`/`exp`/`power` port (numeric.c). Also the
+          `width_bucket(value, thresholds[])` array-threshold variant.
 - [x] **`json` / `jsonb` + SQL/JSON** — ✅ the committed XL headline feature (§1, §4): **all
       non-deferred slices landed** across all three cores, oracle-clean. Designed spec-first across
       four docs ([json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md),
