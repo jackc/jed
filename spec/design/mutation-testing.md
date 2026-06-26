@@ -40,10 +40,23 @@ core. We do it in **Go**, for two reinforcing reasons:
   maintainer's daily driver and frictionless to manipulate and rebuild. The same logic applies
   here: native builds are ~1 s, the toolchain is in-process, and there is no FFI to wrestle.
 
-The **oracle stays the shared corpus** (CLAUDE.md §7), which is the point: a Go-core kill is a kill
-by a test that also runs on Rust and TS, so a surviving mutant flags a hole in the *cross-core*
+The **primary oracle is the shared corpus** (CLAUDE.md §7), which is the point: a Go-core kill is a
+kill by a test that also runs on Rust and TS, so a surviving mutant flags a hole in the *cross-core*
 contract, not a Go-only quirk. Nothing here is Go-core-specific except the source being perturbed;
 the same harness shape could later target Rust or TS (§9).
+
+But the corpus is deliberately *not* the only oracle jed has. CLAUDE.md §10 splits coverage: the
+corpus pins **SQL-observable** behavior (rows, errors, ordering), while **byte-level** facts (key
+encoding, on-disk format, catalog bytes) are pinned by per-core **unit tests and byte fixtures**,
+because those are exactly what the corpus cannot express. So a mutant in `encoding.go` that changes
+a key byte without changing any query result *should* survive the corpus — and be killed by the
+encoding byte-fixture test. To keep the survivor list honest ("untested by **anything**", not merely
+"untested by the corpus"), the harness takes an optional **`-unit <regex>` second oracle**: when the
+corpus survives, it runs `go test ./ -run <regex>` in the same workspace and counts a unit failure as
+a kill too (attributed to `unit`, not `corpus`). It runs only on corpus-survivors, so it adds cost
+only where the corpus came up empty. With it, `encoding.go` scores 100% (every key-byte mutant the
+corpus misses, the fixtures catch) — the empirical confirmation that the two oracles partition the
+work as §10 intends.
 
 ## 3. Mechanism
 
@@ -94,16 +107,17 @@ round-half-away rounding), `encoding.go` (order-preserving key encoding). `-file
 
 | Verdict     | Meaning | In score? |
 |-------------|---------|-----------|
-| **killed**  | corpus failed → a test caught the bug | yes (numerator) |
-| **survived**| corpus still green → untested logic | yes (denominator) |
+| **killed**  | corpus failed (or, with `-unit`, the unit subset failed) → a test caught the bug | yes (numerator) |
+| **survived**| every oracle still green → untested logic | yes (denominator) |
 | **timeout** | mutant hung past the deadline → the timeout caught it | yes, as killed |
 | **invalid** | did not compile (stillborn) | **no** — excluded |
 | **error**   | harness failure (e.g. cannot launch `go`) | no — aborts |
 
-**Mutation score = killed / (killed + survived)**, reported overall, per file, and per operator.
-INVALID mutants are excluded because a bug that does not compile is not a bug the tests *could*
-catch — counting it would inflate the score with free wins. A KILLED mutant also records the
-**first failing corpus file**, so a kill is actionable ("`< → <=` at value.go:142 is caught by
+**Mutation score = killed / (killed + survived)**, reported overall, per file, and per operator,
+with the killed count split into corpus-kills and unit-kills when `-unit` is in play. INVALID
+mutants are excluded because a bug that does not compile is not a bug the tests *could* catch —
+counting it would inflate the score with free wins. A KILLED mutant also records the **oracle and
+first failing test**, so a kill is actionable ("`< → <=` at value.go:142, corpus, caught by
 `compare/ordering.test`").
 
 **Equivalent mutants are the known caveat.** Some surviving mutants are semantically equivalent to
@@ -139,7 +153,11 @@ report and the JSONL artifact under `bench/results/mutation/<stamp>/` are the de
 rake mutation                  # default targets, 300 sampled mutants (seed 1)
 rake mutation[value.go]        # scope to one file, full sweep
 rake mutation[value.go,500,7]  # file, max mutants, seed
-go run ./cmd/mutate -h         # the full flag set (-mutators, -workers, -timeout, -list, -v, -json)
+go run ./cmd/mutate -h         # the full flag set (-mutators, -workers, -timeout, -unit, -list, -v, -json)
+
+# byte-level files want the second oracle so survivors are real (not fixture-covered):
+go run ./cmd/mutate -files encoding.go -unit Encod    # corpus + the encoding byte-fixture tests
+go run ./cmd/mutate -files decimal.go -unit 'Decimal' # corpus + the decimal unit tests
 ```
 
 The mutator enumeration and splicing — pure, internal logic the corpus cannot express — is unit

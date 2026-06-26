@@ -37,7 +37,8 @@ const (
 type Result struct {
 	Mut         Mutation
 	Status      Status
-	KillingTest string // first failing corpus file, for a KILLED mutant
+	Oracle      string // what caught a KILLED mutant: "corpus", "unit", or "timeout"
+	KillingTest string // first failing corpus file, for a corpus-KILLED mutant
 	Detail      string // truncated build/run output (INVALID/ERROR diagnostics)
 	Elapsed     time.Duration
 }
@@ -74,9 +75,12 @@ func (w *Workspace) cleanup() { _ = os.RemoveAll(w.root) }
 // fileIn returns the absolute path of a target file inside this workspace.
 func (w *Workspace) fileIn(relFile string) string { return filepath.Join(w.goDir, relFile) }
 
-// run applies a single mutant, builds, runs the corpus, and restores the file to pristine.
-// originals maps relFile -> pristine bytes (shared, read-only).
-func (w *Workspace) run(m Mutation, originals map[string][]byte, timeout time.Duration) Result {
+// run applies a single mutant, builds, runs the oracle(s), and restores the file to pristine.
+// originals maps relFile -> pristine bytes (shared, read-only). unitRegex, when non-empty, adds
+// the per-core unit subset `go test ./ -run <regex>` as a second kill oracle, consulted only when
+// the corpus survives — so byte-level logic the corpus deliberately does not pin (key encoding,
+// catalog bytes) is still scored against the fixture/unit layer that DOES pin it (CLAUDE.md §10).
+func (w *Workspace) run(m Mutation, originals map[string][]byte, timeout time.Duration, unitRegex string) Result {
 	start := time.Now()
 	res := Result{Mut: m}
 
@@ -104,11 +108,39 @@ func (w *Workspace) run(m Mutation, originals map[string][]byte, timeout time.Du
 	// Run the corpus under a deadline.
 	out, status, killing := w.runCorpus(timeout)
 	res.Status, res.KillingTest = status, killing
-	if status == StatusError {
+	switch status {
+	case StatusKilled:
+		res.Oracle = "corpus"
+	case StatusTimeout:
+		res.Oracle = "timeout"
+	case StatusError:
 		res.Detail = truncate(out, 600)
+	case StatusSurvived:
+		// Second oracle: the per-core unit subset. A unit-kill means the logic IS tested, just
+		// not by the (cross-core) corpus — so it is not a corpus gap, but it is not a survivor.
+		if unitRegex != "" {
+			if uout, killedByUnit := w.runUnit(unitRegex, timeout); killedByUnit {
+				res.Status, res.Oracle = StatusKilled, "unit"
+				res.KillingTest = firstFailingTest(uout)
+			}
+		}
 	}
 	res.Elapsed = time.Since(start)
 	return res
+}
+
+// runUnit runs the per-core unit subset `go test ./ -run <regex>` in the workspace and reports
+// whether it failed (i.e. caught the mutant). A non-ExitError (e.g. a timeout) is treated as a
+// kill too — the mutant made the unit suite misbehave.
+func (w *Workspace) runUnit(regex string, timeout time.Duration) (out string, killed bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, goBinary(), "test", "./", "-run", regex, "-count=1")
+	cmd.Dir = w.goDir
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	err := cmd.Run()
+	return buf.String(), err != nil
 }
 
 func (w *Workspace) build() (string, error) {
@@ -151,6 +183,18 @@ func firstFailing(out string) string {
 			// "FAIL <rel>: <err>" or "FAIL <rel>"
 			rel, _, _ := strings.Cut(rest, ":")
 			return strings.TrimSpace(rel)
+		}
+	}
+	return ""
+}
+
+// firstFailingTest extracts the first failing Go test from `go test` output (a `--- FAIL: Name`
+// line), so a unit-killed mutant reports which test caught it.
+func firstFailingTest(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "--- FAIL: "); ok {
+			name, _, _ := strings.Cut(rest, " ")
+			return strings.TrimSpace(name)
 		}
 	}
 	return ""

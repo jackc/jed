@@ -60,6 +60,7 @@ func run() int {
 	seed := flag.Int64("seed", 1, "sample seed for reproducible mutant selection")
 	workers := flag.Int("workers", defaultWorkers(), "parallel workspaces")
 	timeoutSec := flag.Float64("timeout", 0, "per-mutant timeout in seconds (0 = auto from baseline)")
+	unitRegex := flag.String("unit", "", "also run `go test ./ -run <regex>` as a kill oracle (for byte-level files the corpus does not pin)")
 	list := flag.Bool("list", false, "only enumerate and print mutation points; do not build/run")
 	jsonPath := flag.String("json", "", "write a JSONL result line per mutant to this path")
 	verbose := flag.Bool("v", false, "stream each mutant verdict as it completes")
@@ -179,16 +180,27 @@ func run() int {
 			timeout = 10 * time.Second
 		}
 	}
-	fmt.Printf("  baseline green in %s; per-mutant timeout %s; workers %d\n\n",
-		baseElapsed.Round(time.Millisecond), timeout.Round(time.Millisecond), *workers)
+	// If a unit oracle is configured, the pristine subset must pass too, or the regex is wrong /
+	// the suite is red — either way every "unit-kill" would be spurious.
+	if *unitRegex != "" {
+		if _, killed := ws0.runUnit(*unitRegex, baseTimeout); killed {
+			fmt.Fprintf(os.Stderr, "mutate: baseline unit subset `go test ./ -run %s` is not green; fix the regex or the suite\n", *unitRegex)
+			return 2
+		}
+	}
+	fmt.Printf("  baseline green in %s; per-mutant timeout %s; workers %d", baseElapsed.Round(time.Millisecond), timeout.Round(time.Millisecond), *workers)
+	if *unitRegex != "" {
+		fmt.Printf("; unit oracle `-run %s`", *unitRegex)
+	}
+	fmt.Print("\n\n")
 
-	results := runAll(selected, originals, realGoDir, realSpec, ws0, *workers, timeout, *verbose)
+	results := runAll(selected, originals, realGoDir, realSpec, ws0, *workers, timeout, *unitRegex, *verbose)
 	return report(results, len(all), os.Stdout, *jsonPath)
 }
 
 // runAll dispatches the selected mutants across worker workspaces and returns results in input
 // order. ws0 (the baseline workspace) is reused as worker 0's; the rest are built lazily.
-func runAll(muts []Mutation, originals map[string][]byte, realGoDir, realSpec string, ws0 *Workspace, workers int, timeout time.Duration, verbose bool) []Result {
+func runAll(muts []Mutation, originals map[string][]byte, realGoDir, realSpec string, ws0 *Workspace, workers int, timeout time.Duration, unitRegex string, verbose bool) []Result {
 	if workers < 1 {
 		workers = 1
 	}
@@ -203,13 +215,13 @@ func runAll(muts []Mutation, originals map[string][]byte, realGoDir, realSpec st
 			defer ws.cleanup()
 		}
 		for i := range jobs {
-			results[i] = ws.run(muts[i], originals, timeout)
+			results[i] = ws.run(muts[i], originals, timeout, unitRegex)
 			n := atomic.AddInt64(&done, 1)
 			if verbose {
 				r := results[i]
 				extra := ""
 				if r.KillingTest != "" {
-					extra = "  (caught by " + r.KillingTest + ")"
+					extra = "  (" + r.Oracle + ": " + r.KillingTest + ")"
 				}
 				fmt.Printf("  [%d/%d] %-9s %s%s\n", n, len(muts), r.Status, r.Mut.ID(), extra)
 			} else {
@@ -246,6 +258,7 @@ func runAll(muts []Mutation, originals map[string][]byte, realGoDir, realSpec st
 // errors are a non-zero "you have work to do" signal; an all-killed run exits 0.
 func report(results []Result, enumerated int, out *os.File, jsonPath string) int {
 	var killed, survived, invalid, timeout, errored int
+	var killedCorpus, killedUnit int
 	perFile := map[string]*[2]int{} // [killed+timeout, survived]
 	perMutator := map[string]*[2]int{}
 	var survivors []Result
@@ -267,6 +280,11 @@ func report(results []Result, enumerated int, out *os.File, jsonPath string) int
 			killed++
 			pf[0]++
 			pm[0]++
+			if r.Oracle == "unit" {
+				killedUnit++
+			} else {
+				killedCorpus++
+			}
 		case StatusTimeout:
 			timeout++
 			pf[0]++
@@ -286,7 +304,11 @@ func report(results []Result, enumerated int, out *os.File, jsonPath string) int
 
 	scored := killed + timeout + survived
 	fmt.Fprintf(out, "results (%d mutants run, %d enumerated):\n", len(results), enumerated)
-	fmt.Fprintf(out, "  killed    %4d\n", killed)
+	if killedUnit > 0 {
+		fmt.Fprintf(out, "  killed    %4d  (%d by corpus, %d by unit oracle)\n", killed, killedCorpus, killedUnit)
+	} else {
+		fmt.Fprintf(out, "  killed    %4d\n", killed)
+	}
 	if timeout > 0 {
 		fmt.Fprintf(out, "  timeout   %4d  (counted as killed)\n", timeout)
 	}
@@ -302,7 +324,7 @@ func report(results []Result, enumerated int, out *os.File, jsonPath string) int
 	}
 
 	if len(survivors) > 0 {
-		fmt.Fprintf(out, "\nsurviving mutants (untested logic — the corpus did not catch these):\n")
+		fmt.Fprintf(out, "\nsurviving mutants (untested logic — no oracle caught these):\n")
 		for _, r := range survivors {
 			fmt.Fprintf(out, "  %s\n", r.Mut.ID())
 		}
@@ -370,6 +392,9 @@ func writeJSONL(path string, results []Result) error {
 			"desc":    r.Mut.Desc,
 			"status":  r.Status,
 			"elapsed": r.Elapsed.Seconds(),
+		}
+		if r.Oracle != "" {
+			row["oracle"] = r.Oracle
 		}
 		if r.KillingTest != "" {
 			row["killing_test"] = r.KillingTest

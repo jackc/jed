@@ -44,6 +44,42 @@ SELECT -2.5::int
 ----
 -3
 
+# --- decimal -> i64 cast at the i64 range boundary (ToInt64Round; decimal.md §3) ------------
+# These pin the overflow edge of the decimal->integer cast. A value with up to 3 base-10^9 limbs
+# can still fit i64, so the multi-limb accumulation and its overflow checks must run rather than
+# short-circuit; MinInt64 is the |value| == 2^63 special case. The earlier 1.5/2.5 cases never
+# reach this magnitude, so without these the whole boundary is unpinned.
+query I nosort
+SELECT 9223372036854775807.0::bigint
+----
+9223372036854775807
+
+# half-away rounding lands a fractional value exactly on MaxInt64
+query I nosort
+SELECT 9223372036854775806.5::bigint
+----
+9223372036854775807
+
+# a large fitting magnitude (3 limbs); the fraction rounds toward zero
+query I nosort
+SELECT 5000000000000000000.4::bigint
+----
+5000000000000000000
+
+# MinInt64 exactly — the |value| == 2^63 branch that maps to math.MinInt64
+query I nosort
+SELECT (-9223372036854775808.0)::bigint
+----
+-9223372036854775808
+
+# one past MaxInt64 -> 22003
+statement error 22003
+SELECT 9223372036854775808.0::bigint
+
+# one past MinInt64 (parenthesized so the negation happens before the cast) -> 22003
+statement error 22003
+SELECT (-9223372036854775809.0)::bigint
+
 # integer widening (i32 -> i64) is lossless
 query I nosort
 SELECT 1000::bigint
