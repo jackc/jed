@@ -222,6 +222,7 @@ import {
   boolAnd,
   boolNot,
   arrayValue,
+  arrayOut,
   emptyArray,
   emptyRangeValue,
   rangeValue,
@@ -10155,6 +10156,7 @@ export class Database {
         return { kind: "inValues", lhs: e.lhs!, list, negated: e.negated };
       }
       case "cast":
+      case "arrayCast":
       case "neg":
       case "not":
       case "isNull":
@@ -10770,6 +10772,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "field":
       return rexprIsConstant(e.base);
     case "cast":
+    case "arrayCast":
     case "neg":
     case "not":
     case "isNull":
@@ -11881,6 +11884,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "quantified":
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.array, depth);
     case "cast":
+    case "arrayCast":
     case "neg":
     case "not":
     case "isNull":
@@ -11996,6 +12000,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       collectTouched(e.array, depth, touched);
       return;
     case "cast":
+    case "arrayCast":
     case "neg":
     case "not":
     case "isNull":
@@ -12387,6 +12392,7 @@ function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
       rebasePlaceholderCols(e.array, from, target);
       return;
     case "cast":
+    case "arrayCast":
     case "neg":
     case "not":
     case "isNull":
@@ -12752,6 +12758,12 @@ type RExpr =
       typmod: DecimalTypmod | null;
       operand: RExpr;
     }
+  // A cast that INVOLVES an array type (spec/design/array.md §7), none expressible by the scalar
+  // `cast` node (whose `target` is a ScalarType): runtime text → T[] (array_in per row), array →
+  // text (array_out per row), and element-wise array → other-element-array (each element through the
+  // scalar cast). `toElem` is the target element ColType for the two array-producing casts and null
+  // for array → text; the eval branches on the runtime value (text vs array).
+  | { kind: "arrayCast"; toElem: ColType | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
   | { kind: "arith"; op: BinaryOp; result: ScalarType; lhs: RExpr; rhs: RExpr }
@@ -17422,6 +17434,53 @@ function isArrayFuncName(name: string): boolean {
 // resolvedTypeEqual reports structural equality of two resolved types (the unification check):
 // integers/floats by width, arrays recursively by element type, composites by name + field types,
 // everything else by kind.
+// The ScalarType of a scalar resolved type, or null for a container/null type (composite / array /
+// range / json / null). Used by the element-wise array→array cast resolver (spec/design/array.md §7)
+// to decide whether the source element is a scalar with an admitted scalarPairCastable cast.
+function resolvedToScalar(t: ResolvedType): ScalarType | null {
+  switch (t.kind) {
+    case "int":
+    case "float":
+      return t.ty;
+    case "bool":
+      return "boolean";
+    case "text":
+      return "text";
+    case "decimal":
+      return "decimal";
+    case "bytea":
+      return "bytea";
+    case "uuid":
+      return "uuid";
+    case "timestamp":
+      return "timestamp";
+    case "timestamptz":
+      return "timestamptz";
+    case "date":
+      return "date";
+    case "interval":
+      return "interval";
+    default:
+      return null; // composite / array / range / json / jsonb / jsonpath / null
+  }
+}
+
+// Whether jed admits an element-wise array→array cast from source element scalar `from` to target
+// element scalar `to` (spec/design/array.md §7). Mirrors the scalar cast matrix (spec/types/casts.toml)
+// for the pairs an array element can take: numeric↔numeric, text→numeric/boolean/uuid, boolean⇄i32,
+// uuid⇄text, uuid⇄bytea. The identity (from === to) is handled by the caller. A pair outside this set
+// is rejected (42804) at resolve.
+function scalarPairCastable(from: ScalarType, to: ScalarType): boolean {
+  const numeric = (t: ScalarType) => isInteger(t) || isDecimal(t) || isFloat(t);
+  if (numeric(from) && numeric(to)) return true;
+  if (isText(from) && (numeric(to) || isBool(to) || isUuid(to))) return true;
+  if (isBool(from) && to === "i32") return true;
+  if (from === "i32" && isBool(to)) return true;
+  if (isUuid(from) && (isText(to) || isBytea(to))) return true;
+  if (isBytea(from) && isUuid(to)) return true;
+  return false;
+}
+
 function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "int" || a.kind === "float") return a.ty === (b as { ty: ScalarType }).ty;
@@ -20351,10 +20410,53 @@ function resolve(
             type: { kind: "array", elem: elemRt },
           };
         }
-        throw engineError(
-          "feature_not_supported",
-          "casting to an array type is only supported from a string literal this slice",
-        );
+        // A bind parameter into an array stays the container-param narrowing (0A000), like INSERT's
+        // $N-into-a-container handling (spec/design/array.md §4).
+        if (e.inner.kind === "param") {
+          throw engineError(
+            "feature_not_supported",
+            "casting a parameter to an array type is not supported yet",
+          );
+        }
+        // A runtime (non-literal) operand: the two follow-on array-producing casts (array.md §7).
+        // A text expression coerces per row via array_in (runtime text→T[]); an array of the SAME
+        // element type is the identity (no node); an array of a DIFFERENT element type is an
+        // element-wise array→array cast (each element through the scalar cast, when the element pair
+        // is castable); a non-literal NULL adapts. Any other source is a 42804.
+        const inner = resolve(scope, e.inner, null, ag, params);
+        const resultType: ResolvedType = { kind: "array", elem: elemRt };
+        if (inner.type.kind === "null") {
+          return { node: inner.node, type: resultType };
+        }
+        if (inner.type.kind === "text") {
+          return {
+            node: { kind: "arrayCast", toElem: elemCol, operand: inner.node },
+            type: resultType,
+          };
+        }
+        if (inner.type.kind === "array") {
+          if (resolvedTypeEqual(inner.type.elem, elemRt)) {
+            return { node: inner.node, type: resultType }; // identity cast — same element type
+          }
+          const srcS = resolvedToScalar(inner.type.elem);
+          if (srcS !== null && elemCol.kind === "scalar" && scalarPairCastable(srcS, elemCol.scalar)) {
+            return {
+              node: { kind: "arrayCast", toElem: elemCol, operand: inner.node },
+              type: resultType,
+            };
+          }
+          // A composite element on either side is the deferred composite cast surface (0A000).
+          if (srcS === null || elemCol.kind === "composite") {
+            throw engineError(
+              "feature_not_supported",
+              "casting between composite-element arrays is not supported yet",
+            );
+          }
+          // Both elements are scalars but no cast exists between them — forbidden (42804; jed's
+          // strict-matrix convention, PG reports 42846).
+          throw engineError("datatype_mismatch", "cannot cast " + rtName(inner.type) + " to " + base + "[]");
+        }
+        throw engineError("datatype_mismatch", "cannot cast " + rtName(inner.type) + " to " + base + "[]");
       }
       // A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
       // string-literal form and a bare NULL; every other range cast is a 0A000 narrowing
@@ -20449,6 +20551,14 @@ function resolve(
         if (ik === "json" || ik === "jsonb" || ik === "uuid") {
           return {
             node: { kind: "cast", target, typmod, operand: inner.node },
+            type: { kind: "text" },
+          };
+        }
+        // array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit-only, like
+        // uuid/json → text (stricter than PG's assignment cast). Handled by arrayCast (toElem null).
+        if (ik === "array") {
+          return {
+            node: { kind: "arrayCast", toElem: null, operand: inner.node },
             type: { kind: "text" },
           };
         }
@@ -24956,6 +25066,36 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       return evalCast(v, e.target, e.typmod);
+    }
+    case "arrayCast": {
+      // The three array-involving casts (spec/design/array.md §7): array → text (array_out),
+      // runtime text → T[] (array_in per row), and element-wise array → array (each element through
+      // the scalar cast). The node carries the cast's operator_eval charge (no new cost unit).
+      m.charge(COSTS.operatorEval);
+      const v = evalExpr(e.operand, row, env, m);
+      if (v.kind === "null") return nullValue();
+      if (e.toElem === null) {
+        // array → text: render via array_out (PG-byte-exact §7).
+        return textValue(arrayOut(v as { dims: number[]; lbounds: number[]; elements: Value[] }));
+      }
+      if (v.kind === "text") {
+        // runtime text → T[]: coerce the per-row string via array_in against the target element
+        // ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
+        return coerceStringToArray(v.text, e.toElem);
+      }
+      if (v.kind !== "array") throw new Error("an arrayCast operand is text or array (resolver-gated)");
+      // element-wise array → other-element-array: every non-null element through the scalar element
+      // cast (an array type takes no typmod, so a decimal target is unconstrained — typmod null);
+      // the shape (dims/lbounds) is preserved and a NULL element stays NULL. The target element is
+      // always a scalar (a same-element array is the identity, returned with no arrayCast node).
+      if (e.toElem.kind !== "scalar") {
+        throw new Error("an array→array element cast has a scalar target element");
+      }
+      const scalar = e.toElem.scalar;
+      const elements = v.elements.map((el) =>
+        el.kind === "null" ? nullValue() : evalCast(el, scalar, null),
+      );
+      return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements };
     }
     case "neg": {
       m.charge(operatorCost("neg"));

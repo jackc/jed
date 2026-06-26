@@ -325,10 +325,31 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
   machinery routes the **string-literal → array** coercion through `array_in`, the same
   out-of-matrix path string-literal → scalar/composite coercions use (so
   [../types/casts.toml](../types/casts.toml) stays scalar-only). A bare `NULL` casts to the array; a
-  same-element-type array operand is the identity cast. The **runtime** (non-literal) text→array
-  cast, the `array::text` cast, and an `array → other-element-array` cast (element-wise coercion) are
-  each `0A000` this slice (relaxable; §12), mirroring the deferred runtime text→scalar/composite
-  casts.
+  same-element-type array operand is the identity cast.
+- **The three runtime array casts have landed** (the array cast follow-ons; capability `cast.array`),
+  reusing the same out-of-matrix path (so [../types/casts.toml](../types/casts.toml) stays
+  scalar-only):
+  - **runtime (non-literal) text → `T[]`** (`CAST(text_col AS i32[])`, `s::i32[]`) — coerces the
+    per-row string through `array_in` against the column's element type, exactly as the
+    `'{…}'::T[]` literal does but per row in the evaluator (a malformed literal traps `22P02`, an
+    inverted `[l:u]` bound `2202E`, a bad element its own parse error — all *per row*);
+  - **`array → text`** (`xs::text`) — `array_out` renders `{…}` per row (multidim nested braces, the
+    `[l:u]=` bound prefix). **Explicit only** — stricter than PG's assignment-cast-to-text, the same
+    strict-matrix convention as `uuid`/`json` → text (so `INSERT INTO text_col VALUES (arr)` and
+    `text_col = arr` stay `42804`; §10.11);
+  - **element-wise `array → other-element-array`** (`xs::i64[]`, `numeric[]::i32[]`) — each non-null
+    element through the **scalar** cast to the target element (the shape — dims/lbounds — is
+    preserved, a NULL element stays NULL), for the [casts.toml](../types/casts.toml)-admitted element
+    pairs (numeric↔numeric, `text`→numeric/boolean/uuid, boolean⇄`i32`, `uuid`⇄`text`/`bytea`,
+    `bytea`→`uuid`); an array of the **same** element type is the identity. A scalar element pair with
+    no cast is `42804` (jed's strict-matrix convention — PG reports `42846`); a composite-element
+    array cast is `0A000` (the composite cast surface stays deferred). Overflow traps `22003` per
+    element.
+
+  A bind parameter into an array type (`$1::i32[]`) stays `0A000` (the container-param narrowing, §4).
+  No on-disk format change. The numeric/text element pairs agree with PostgreSQL and are oracle-checked
+  (`suites/cast/array_casts.test`); the jed-only `uuid`⇄`bytea` element casts and the forbidden-pair /
+  explicit-only divergences are per-core unit tests (`cast_array_runtime`).
 
 ## 8. Key encoding — authored, deferred
 
@@ -407,6 +428,17 @@ corpus lands.
     — a composite type with an **array-typed field** (`CREATE TYPE t AS (xs i32[])`) — landed
     (composite.md §12), and `unnest(composite[])` + the polymorphic array **function/operator** surface
     over composite elements landed (AF7, [array-functions.md §13](array-functions.md)).
+11. **`array → text` is EXPLICIT-only** (§7) — the explicit `CAST`/`::` spelling renders via
+    `array_out`, but an **assignment** context (`INSERT INTO text_col VALUES (arr)`) or an **implicit**
+    one (`text_col = arr`) stays `42804`, *stricter* than PG (which assignment-casts any type to text
+    via I/O). This is the strict-matrix convention `uuid`/`json`/`jsonb` → text already follow (the
+    overriding reason is the strict type system, CLAUDE.md §4): jed admits only the named, explicit
+    coercion. The element-wise `array → array` cast follows the scalar matrix exactly — a forbidden
+    scalar element pair is `42804` (jed's convention; PG `42846`) and the jed-only `uuid`⇄`bytea`
+    element casts succeed where PG errors (the same divergences the scalar `uuid`/`bytea` casts carry).
+    These cannot live in the PG-clean corpus, so they are per-core unit tests (`cast_array_runtime`);
+    the agreeing numeric/text pairs are oracle-clean (`suites/cast/array_casts.test`), no override
+    needed.
 
 ## 11. Errors
 
@@ -419,7 +451,9 @@ corpus lands.
 | Malformed array text literal (`array_in`), incl. non-rectangular `'{{…},{…}}'` / declared-dims mismatch | `22P02` invalid_text_representation |
 | Bad element value inside a literal | that element's own parse error (e.g. `22P02`) |
 | Non-rectangular multidim construction `ARRAY[…]` (mismatched sub-array dims, incl. a NULL sub-array); a `'[l:u]'` literal bound with `u < l` | `2202E` array_subscript_error |
-| Array `PRIMARY KEY`/index/`UNIQUE`; nested array (array-of-array); runtime non-literal text→array cast, `array::text`, element-wise array→array cast; the still-deferred operator surface `VARIADIC` + the subquery quantifier form `op ANY(SELECT …)` (`\|\|` AF2, `unnest` AF3, `@>`/`<@`/`&&` AF4, `ANY`/`ALL`/`SOME` AF5 — array-functions.md) | `0A000` feature_not_supported |
+| Malformed string / out-of-range element on the runtime `text → T[]` cast (§7) | `22P02` / `22003` (per row) |
+| Element-wise `array → array` cast (§7) between scalar element types with no cast between them (PG reports `42846`) | `42804` datatype_mismatch |
+| Array `PRIMARY KEY`/index/`UNIQUE`; nested array (array-of-array); a composite-element `array → array` cast (the composite cast surface stays deferred, §7); a bind parameter into an array type (`$1::T[]`, §4) | `0A000` feature_not_supported |
 | Corrupt array body (bad `ndim`/length/element) | `XX001` data_corrupted |
 
 `2202E` is registered in [../errors/registry.toml](../errors/registry.toml) (added with the S5
@@ -509,9 +543,16 @@ functions, `num_nulls` VARIADIC) is oracle-checked over a composite element type
 by construction (the polymorphic resolution unifies a composite element by catalog ref; the comparison
 kernels route through the composite total order — §5); the only code was `unnest`'s composite output
 column and the `ANY`/`ALL` per-element compare (which, like `array_eq`, uses the composite total order,
-NOT the bare-`ROW` 3VL — §5). **Still deferred (each its own follow-on):** arrays-in-keys (`0A000`,
-encoding authored §8); the subquery quantifier form `op ANY(SELECT …)` (array-functions.md §11);
-runtime text→array, `array::text`, and element-wise array→array casts.
+NOT the bare-`ROW` 3VL — §5).
+
+**The three runtime array casts landed (capability `cast.array`, §7):** runtime text → `T[]`
+(`array_in` per row), `array → text` (`array_out`, explicit-only — §10.11), and element-wise
+`array → other-element-array` (each element through the scalar cast, for the casts.toml-admitted
+element pairs). No `format_version` bump. The numeric/text element pairs are oracle-checked
+(`suites/cast/array_casts.test`); the jed-only `uuid`⇄`bytea` element casts + the forbidden-pair /
+explicit-only divergences are per-core (`cast_array_runtime`). **Still deferred (its own follow-on):**
+arrays-in-keys (`0A000`, encoding authored §8) — the order-preserving array key, so an array
+`PRIMARY KEY` / index / `UNIQUE` / FK target.
 
 **Known gap — the `MAXDIM = 6` bound is enforced only on the literal path.** A `'{{…}}'` **text
 literal** nested beyond 6 dimensions is rejected by `array_in` (`22P02`; pinned in

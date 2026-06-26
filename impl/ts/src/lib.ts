@@ -72,6 +72,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Array-of-composite element types (array.md §12 AC1) — a composite is a first-class array
   // element type (addr[]); the per-element compare routes through the composite total order.
   "types.array_composite",
+  // The three array-involving casts (array.md §7): array → text (array_out), runtime text → T[]
+  // (array_in per row), and element-wise array → other-element-array (each element through the
+  // scalar cast, for the casts.toml-admitted element pairs). array → text is explicit-only.
+  "cast.array",
   // A composite type with an array-typed field (array.md §12 — the mirror nesting) — the catalog
   // composite-type entry gains a code-15 array field; the codec/comparison/text-I/O recurse.
   "types.composite_array_field",

@@ -15853,6 +15853,12 @@ const (
 	reConstJsonPath
 	reConstNull
 	reCast
+	// reArrayCast is a cast that INVOLVES an array type (spec/design/array.md §7), none expressible
+	// by the scalar reCast node (whose `result` is a ScalarType): runtime text → T[] (array_in per
+	// row), array → text (array_out per row), and element-wise array → other-element-array (each
+	// element through the scalar cast). `castElem` is the target element ColType for the two
+	// array-producing casts and nil for array → text; the eval branches on the runtime value.
+	reArrayCast
 	reNeg
 	reNot
 	reArith
@@ -16419,22 +16425,23 @@ const (
 // row. Arithmetic/neg nodes carry their (promotion-tower) result type in `result` so the
 // computed value can be range-checked against it.
 type rExpr struct {
-	kind    rExprKind
-	index   int            // reColumn
-	cInt    int64          // reConstInt
-	cBool   bool           // reConstBool
-	cText   string         // reConstText
-	cDec    Decimal        // reConstDecimal
-	cBytea  []byte         // reConstBytea
-	cIv     Interval       // reConstInterval
-	cFloat  float64        // reConstFloat32 / reConstFloat64 (a f32 const is held as the f64 of its value)
-	op      BinaryOp       // reArith, reCompare
-	result  ScalarType     // reCast target; reNeg / reArith result type
-	typmod  *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
-	lhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
-	rhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
-	operand *rExpr         // reCast, reNeg, reNot, reIsNull, reCasing
-	negated bool           // reIsNull, reDistinct
+	kind     rExprKind
+	index    int            // reColumn
+	cInt     int64          // reConstInt
+	cBool    bool           // reConstBool
+	cText    string         // reConstText
+	cDec     Decimal        // reConstDecimal
+	cBytea   []byte         // reConstBytea
+	cIv      Interval       // reConstInterval
+	cFloat   float64        // reConstFloat32 / reConstFloat64 (a f32 const is held as the f64 of its value)
+	op       BinaryOp       // reArith, reCompare
+	result   ScalarType     // reCast target; reNeg / reArith result type
+	typmod   *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
+	castElem *ColType       // reArrayCast: the target element ColType (nil ⇒ array → text)
+	lhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
+	rhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
+	operand  *rExpr         // reCast, reNeg, reNot, reIsNull, reCasing
+	negated  bool           // reIsNull, reDistinct
 	// insensitive carries ILIKE (reLike) / ~* (reRegex); casingUpper selects upper vs lower
 	// (reCasing) — both collation.md §16.
 	insensitive bool
@@ -20697,6 +20704,66 @@ func resolvedTypeEqual(a, b resolvedType) bool {
 	}
 }
 
+// resolvedToScalar returns the ScalarType of a scalar resolved type, or (_, false) for a container/
+// null type (composite / array / range / json / null). Used by the element-wise array→array cast
+// resolver (spec/design/array.md §7) to decide whether the source element is a scalar with an
+// admitted scalarPairCastable cast to the target element scalar.
+func resolvedToScalar(t resolvedType) (ScalarType, bool) {
+	switch t.kind {
+	case rtInt:
+		return t.intTy, true
+	case rtBool:
+		return Bool, true
+	case rtText:
+		return Text, true
+	case rtDecimal:
+		return DecimalType, true
+	case rtBytea:
+		return Bytea, true
+	case rtUuid:
+		return Uuid, true
+	case rtTimestamp:
+		return Timestamp, true
+	case rtTimestamptz:
+		return Timestamptz, true
+	case rtDate:
+		return Date, true
+	case rtInterval:
+		return IntervalType, true
+	case rtFloat32:
+		return Float32, true
+	case rtFloat64:
+		return Float64, true
+	default:
+		return 0, false
+	}
+}
+
+// scalarPairCastable reports whether jed admits an element-wise array→array cast from source element
+// scalar `from` to target element scalar `to` (spec/design/array.md §7). Mirrors the scalar cast
+// matrix (spec/types/casts.toml) for the pairs an array element can take: numeric↔numeric,
+// text→numeric/boolean/uuid, boolean⇄i32, uuid⇄text, uuid⇄bytea. The identity (from == to) is
+// handled by the caller. A pair outside this set is rejected (42804) at resolve.
+func scalarPairCastable(from, to ScalarType) bool {
+	numeric := func(t ScalarType) bool { return t.IsInteger() || t.IsDecimal() || t.IsFloat() }
+	switch {
+	case numeric(from) && numeric(to):
+		return true
+	case from.IsText() && (numeric(to) || to.IsBool() || to.IsUuid()):
+		return true
+	case from.IsBool() && to == Int32:
+		return true
+	case from == Int32 && to.IsBool():
+		return true
+	case from.IsUuid() && (to.IsText() || to.IsBytea()):
+		return true
+	case from.IsBytea() && to.IsUuid():
+		return true
+	default:
+		return false
+	}
+}
+
 // unifyElem binds/checks the type variable ELEM against a concrete type x: binds if unbound (*set),
 // else requires structural equality. false ⇒ a conflict (array_cat(i32[], text[])) — no match.
 func unifyElem(elem **resolvedType, x resolvedType) bool {
@@ -24168,8 +24235,49 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralNull {
 				return &rExpr{kind: reConstNull}, resolvedType{kind: rtArray, elem: &elemRT}, nil
 			}
-			return nil, resolvedType{}, NewError(FeatureNotSupported,
-				"casting to an array type is only supported from a string literal this slice")
+			// A bind parameter into an array stays the container-param narrowing (0A000), like
+			// INSERT's $N-into-a-container handling (spec/design/array.md §4).
+			if e.Cast.Inner.Kind == ExprParam {
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"casting a parameter to an array type is not supported yet")
+			}
+			// A runtime (non-literal) operand: the two follow-on array-producing casts (array.md §7).
+			// A text expression coerces per row via array_in (runtime text→T[]); an array of the SAME
+			// element type is the identity (no node); an array of a DIFFERENT element type is an
+			// element-wise array→array cast (each element through the scalar cast, when the element
+			// pair is castable); a non-literal NULL adapts. Any other source is a 42804.
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			resultRT := resolvedType{kind: rtArray, elem: &elemRT}
+			switch ity.kind {
+			case rtNull:
+				return rinner, resultRT, nil
+			case rtText:
+				ec := elemCol
+				return &rExpr{kind: reArrayCast, operand: rinner, castElem: &ec}, resultRT, nil
+			case rtArray:
+				if resolvedTypeEqual(*ity.elem, elemRT) {
+					return rinner, resultRT, nil // identity cast — same element type
+				}
+				srcS, srcScalar := resolvedToScalar(*ity.elem)
+				tgtScalar := !elemCol.Composite && elemCol.Elem == nil && elemCol.RangeElem == nil
+				if srcScalar && tgtScalar && scalarPairCastable(srcS, elemCol.Scalar) {
+					ec := elemCol
+					return &rExpr{kind: reArrayCast, operand: rinner, castElem: &ec}, resultRT, nil
+				}
+				// A composite element on either side is the deferred composite cast surface (0A000).
+				if !srcScalar || elemCol.Composite {
+					return nil, resolvedType{}, NewError(FeatureNotSupported,
+						"casting between composite-element arrays is not supported yet")
+				}
+				// Both elements are scalars but no cast exists between them — forbidden (42804;
+				// jed's strict-matrix convention, PG reports 42846).
+				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to " + base + "[]")
+			default:
+				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to " + base + "[]")
+			}
 		}
 		// A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
 		// string-literal form and a bare NULL; every other range cast is a 0A000 narrowing
@@ -24283,6 +24391,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			// assignment-cast-to-text (a documented divergence).
 			case rtJson, rtJsonb, rtUuid:
 				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtText}, nil
+			// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit-only,
+			// like uuid/json → text (stricter than PG's assignment cast). Handled by reArrayCast.
+			case rtArray:
+				return &rExpr{kind: reArrayCast, operand: rinner}, resolvedType{kind: rtText}, nil
 			default:
 				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
 			}
@@ -27903,6 +28015,49 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return NullValue(), nil
 		}
 		return evalCast(v, e.result, e.typmod)
+	case reArrayCast:
+		// The three array-involving casts (spec/design/array.md §7): array → text (array_out),
+		// runtime text → T[] (array_in per row), and element-wise array → array (each element through
+		// the scalar cast). The node carries the cast's operator_eval charge (no new cost unit).
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if v.Kind == ValNull {
+			return NullValue(), nil
+		}
+		if e.castElem == nil {
+			// array → text: render via array_out (PG-byte-exact §7).
+			return TextValue(arrayOut(v.Array)), nil
+		}
+		if v.Kind == ValText {
+			// runtime text → T[]: coerce the per-row string via array_in against the target element
+			// ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
+			return coerceStringToArray(v.Str, *e.castElem)
+		}
+		// element-wise array → other-element-array: every non-null element through the scalar element
+		// cast to the target element (22003 per element on overflow); the shape (dims/lbounds) is
+		// preserved and a NULL element stays NULL. The target element is always a scalar (a same-
+		// element array is the identity, returned with no reArrayCast node at resolve).
+		scalar := e.castElem.Scalar
+		src := v.Array
+		newElems := make([]Value, len(src.Elements))
+		for i, el := range src.Elements {
+			if el.Kind == ValNull {
+				newElems[i] = NullValue()
+				continue
+			}
+			// The element cast runs the SAME scalar conversion evalCast does (an array type takes no
+			// typmod, so a decimal target is the unconstrained form — typmod nil). The resolver gate
+			// (scalarPairCastable) guarantees the (element, target) pair is admitted.
+			ce, err := evalCast(el, scalar, nil)
+			if err != nil {
+				return Value{}, err
+			}
+			newElems[i] = ce
+		}
+		return ArrayValueOf(&ArrayVal{Dims: src.Dims, Lbounds: src.Lbounds, Elements: newElems}), nil
 	case reNeg:
 		m.Charge(operatorCost("neg"))
 		v, err := e.operand.eval(row, env, m)

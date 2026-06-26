@@ -26,6 +26,12 @@
   '550e8400-e29b-41d4-a716-446655440000'::uuid::bytea   AS uuid_to_bytea,
   '\\x550e8400e29b41d4a716446655440000'::bytea::uuid    AS bytea_to_uuid;`;
 
+	const arrayCastDemo = `SELECT
+  (ARRAY[1, 2, 3])::text                     AS array_to_text,
+  ('{10,20,30}'::text)::i32[]                AS text_to_array,
+  (ARRAY[1, 2, 3]::i32[])::i64[]             AS widen_elements,
+  (ARRAY[1.7, 2.2, -2.5]::numeric[])::i32[]  AS round_elements;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -125,6 +131,20 @@ bytes and raises `22P02` otherwise:
 `text → uuid` matches PostgreSQL. The other three are deliberately stricter or additional: jed makes
 `uuid → text` explicit-only (PostgreSQL assignment-casts any type to `text`), and the `bytea` ↔ `uuid`
 casts are a jed convenience PostgreSQL does not offer at all.
+
+## Array casts
+
+An array casts three ways, all with an explicit `CAST` / `::`. `array → text` renders the `{…}` form
+(`array_out`); `text → T[]` parses the `{…}` form per row (`array_in`); and an `array → array` of a
+different element type casts **each element** through the scalar cast, preserving the array's shape
+(its dimensions, lengths, and lower bounds):
+
+<LiveSql query={arrayCastDemo} rows={1} />
+
+The element cast follows the scalar matrix exactly — so widening (`i32[] → i64[]`), `numeric[] → i32[]`
+(rounding half away from zero), and `text[] → i32[]` all work, while an element pair with no scalar
+cast is a type error (`42804`). Like `uuid`/`json → text`, `array → text` is explicit-only: an array
+never silently lands in a `text` column.
 
 ## Three-valued NULL logic
 

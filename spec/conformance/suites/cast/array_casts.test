@@ -1,0 +1,136 @@
+# The three array-involving casts (the array cast follow-ons — spec/design/array.md §7,
+# spec/types/casts.toml). (1) array → text (array_out renders {…} per row), (2) runtime text → T[]
+# (a NON-LITERAL text expression coerced per row via array_in), and (3) element-wise array →
+# other-element-array (each element through the scalar cast). The numeric/text element pairs AGREE
+# with PostgreSQL and are oracle-checked here; the per-row evaluator runs the SAME coercion the
+# literal forms ('{…}'::T[] / the scalar typed literal) fold at resolve.
+#
+# OUT of this corpus (cannot live in the PG-clean oracle, covered by per-core cast_array_runtime):
+# the jed-only element casts (uuid⇄bytea, succeeding where PG errors), the forbidden scalar element
+# pair (42804 where PG reports 42846), a composite-element array cast (0A000), array → text being
+# EXPLICIT-only (the assignment-cast rejection 42804), and runtime text → f32/f64 element casts
+# (the float renderer is in the determinism-exception ledger).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.text, types.array, types.array_multidim, cast.explicit, cast.operator, cast.string_literal, cast.array
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, xs i32[])
+
+statement ok
+INSERT INTO t VALUES
+  (1, '{10,20,30}', ARRAY[1, 2, 3]),
+  (2, '{1,NULL,3}', ARRAY[40, 50]),
+  (3, '{}', ARRAY[7]),
+  (4, '[2:4]={5,6,7}', NULL),
+  (5, NULL, ARRAY[-2, 100])
+
+# --- (1) array → text: array_out renders the value (NULL array → NULL) -----------------------------
+query IT nosort
+SELECT id, xs :: text FROM t ORDER BY id
+----
+1
+{1,2,3}
+2
+{40,50}
+3
+{7}
+4
+NULL
+5
+{-2,100}
+
+# A multidimensional value and a custom lower bound render with nested braces / a [l:u]= prefix.
+query T nosort
+SELECT (ARRAY[ARRAY[1, 2], ARRAY[3, 4]]) :: text
+----
+{{1,2},{3,4}}
+
+query T nosort
+SELECT ('[2:4]={5,6,7}' :: i32[]) :: text
+----
+[2:4]={5,6,7}
+
+# CAST(... AS text) spelling, and a text[] element array.
+query T nosort
+SELECT CAST(ARRAY['a', 'b', 'c'] AS text)
+----
+{a,b,c}
+
+# --- (2) runtime text → T[]: array_in over a per-row text COLUMN (NULL → NULL) ---------------------
+query IT nosort
+SELECT id, (s :: i32[]) :: text FROM t ORDER BY id
+----
+1
+{10,20,30}
+2
+{1,NULL,3}
+3
+{}
+4
+[2:4]={5,6,7}
+5
+NULL
+
+# A text[] column coerced to i32[] element-wise through the runtime path (text → i32 per element).
+query T nosort
+SELECT ((ARRAY['1', '2', '3'] :: text[]) :: i32[]) :: text
+----
+{1,2,3}
+
+# --- (3) element-wise array → other-element-array --------------------------------------------------
+# Integer widening i32[] → i64[] (each element i32 → i64).
+query IT nosort
+SELECT id, (xs :: i64[]) :: text FROM t ORDER BY id
+----
+1
+{1,2,3}
+2
+{40,50}
+3
+{7}
+4
+NULL
+5
+{-2,100}
+
+# i32[] → numeric[] (lossless int → decimal), and numeric[] → i32[] (round half away from zero).
+query T nosort
+SELECT ((ARRAY[1, 2, 3] :: i32[]) :: numeric[]) :: text
+----
+{1,2,3}
+
+query T nosort
+SELECT ((ARRAY[1.7, 2.2, -2.5] :: numeric[]) :: i32[]) :: text
+----
+{2,2,-3}
+
+# Narrowing i64[] → i16[] within range; the shape (incl. a NULL element) is preserved.
+query T nosort
+SELECT ((ARRAY[1, NULL, 30000] :: i64[]) :: i16[]) :: text
+----
+{1,NULL,30000}
+
+# An identity cast (same element type) is a no-op.
+query T nosort
+SELECT ((ARRAY[1, 2] :: i32[]) :: i32[]) :: text
+----
+{1,2}
+
+# --- errors (per row) -----------------------------------------------------------------------------
+# A malformed text literal on the runtime text → T[] path traps 22P02.
+statement error 22P02
+SELECT 'notanarray' :: i32[]
+
+# An out-of-range element on the runtime text → T[] path traps 22003.
+statement error 22003
+SELECT '{99999999999}' :: i32[]
+
+# An element-wise array → array narrowing overflow traps 22003 (per element).
+statement error 22003
+SELECT (ARRAY[1, 99999999999] :: i64[]) :: i16[]
+
+# A NULL value casts through to NULL for every array cast.
+query B nosort
+SELECT (NULL :: i32[]) :: i64[] IS NULL
+----
+true

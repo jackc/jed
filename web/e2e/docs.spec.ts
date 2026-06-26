@@ -47,6 +47,16 @@ test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page 
   await expect(rows).toContainText('\\x550e8400e29b41d4a716446655440000');
 });
 
+test('the types page autoruns the array cast demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // Sixth panel = the array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and
+  // numeric[]→i32[] element rounding (1.7→2, 2.2→2, -2.5→-3, half away from zero).
+  const arrayCastPanel = page.getByTestId('live-sql').nth(5);
+  const rows = arrayCastPanel.getByTestId('result-rows');
+  await expect(rows).toContainText('{1,2,3}');
+  await expect(rows).toContainText('{2,2,-3}');
+});
+
 test('the tables page enforces a CHECK constraint live and resets to seed', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   const panel = page.getByTestId('live-sql');

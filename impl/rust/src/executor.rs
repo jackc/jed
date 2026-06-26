@@ -11818,7 +11818,9 @@ impl Database {
             return Ok(());
         }
         match e {
-            RExpr::Cast { inner, .. } => self.fold_uncorrelated_in_rexpr(inner, bound, ctes, cost),
+            RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+                self.fold_uncorrelated_in_rexpr(inner, bound, ctes, cost)
+            }
             RExpr::Neg { operand, .. } => {
                 self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
             }
@@ -13574,6 +13576,16 @@ enum RExpr {
         target: ScalarType,
         /// For a decimal target, the optional `numeric(p,s)` typmod to coerce to.
         typmod: Option<DecimalTypmod>,
+    },
+    /// A cast that *involves* an array type (spec/design/array.md §7) — the three follow-on array
+    /// casts, none expressible by the scalar [`RExpr::Cast`] node (whose `target` is a `ScalarType`):
+    /// runtime `text → T[]` (`array_in` per row), `array → text` (`array_out` per row), and
+    /// element-wise `array → other-element-array` (each element through the scalar cast). `to_elem`
+    /// is `Some(target element ColType)` for the two array-producing casts (text→array, array→array)
+    /// and `None` for `array → text`. The eval branches on the runtime value (Text vs Array).
+    ArrayCast {
+        inner: Box<RExpr>,
+        to_elem: Option<ColType>,
     },
     Neg {
         operand: Box<RExpr>,
@@ -16147,7 +16159,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
                     .flat_map(subscript_bounds)
                     .all(rexpr_is_constant)
         }
-        RExpr::Cast { inner, .. } => rexpr_is_constant(inner),
+        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => rexpr_is_constant(inner),
         RExpr::Neg { operand, .. } => rexpr_is_constant(operand),
         RExpr::Not(x) => rexpr_is_constant(x),
         RExpr::Casing { arg, .. } => rexpr_is_constant(arg),
@@ -19005,7 +19017,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::Quantified { lhs, array, .. } => {
             rexpr_references_outer(lhs, depth) || rexpr_references_outer(array, depth)
         }
-        RExpr::Cast { inner, .. } => rexpr_references_outer(inner, depth),
+        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+            rexpr_references_outer(inner, depth)
+        }
         RExpr::Neg { operand, .. } => rexpr_references_outer(operand, depth),
         RExpr::Not(x) => rexpr_references_outer(x, depth),
         RExpr::Casing { arg, .. } => rexpr_references_outer(arg, depth),
@@ -19144,7 +19158,9 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched(lhs, depth, touched);
             collect_touched(array, depth, touched);
         }
-        RExpr::Cast { inner, .. } => collect_touched(inner, depth, touched),
+        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+            collect_touched(inner, depth, touched)
+        }
         RExpr::Neg { operand, .. } => collect_touched(operand, depth, touched),
         RExpr::Not(x) => collect_touched(x, depth, touched),
         RExpr::Casing { arg, .. } => collect_touched(arg, depth, touched),
@@ -19493,7 +19509,9 @@ fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize) {
             rebase_placeholder_cols(lhs, from, target);
             rebase_placeholder_cols(array, from, target);
         }
-        RExpr::Cast { inner, .. } => rebase_placeholder_cols(inner, from, target),
+        RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
+            rebase_placeholder_cols(inner, from, target)
+        }
         RExpr::Neg { operand, .. } => rebase_placeholder_cols(operand, from, target),
         RExpr::Not(x) => rebase_placeholder_cols(x, from, target),
         RExpr::Casing { arg, .. } => rebase_placeholder_cols(arg, from, target),
@@ -19900,6 +19918,32 @@ fn resolved_scalar_type(t: &ResolvedType) -> ScalarType {
         ResolvedType::Decimal => ScalarType::Decimal,
         _ => unreachable!("resolved_scalar_type: non-numeric operand"),
     }
+}
+
+/// The `ScalarType` of a *scalar* resolved type, or `None` for a container/null type (composite /
+/// array / range / json / null). Total over every `ResolvedType`. Used by the element-wise
+/// array→array cast resolver (spec/design/array.md §7) to decide whether the source element type is
+/// a scalar with an admitted [`scalar_pair_castable`] cast to the target element scalar.
+fn resolved_to_scalar(t: &ResolvedType) -> Option<ScalarType> {
+    Some(match t {
+        ResolvedType::Int(s) | ResolvedType::Float(s) => *s,
+        ResolvedType::Decimal => ScalarType::Decimal,
+        ResolvedType::Bool => ScalarType::Bool,
+        ResolvedType::Text => ScalarType::Text,
+        ResolvedType::Bytea => ScalarType::Bytea,
+        ResolvedType::Uuid => ScalarType::Uuid,
+        ResolvedType::Timestamp => ScalarType::Timestamp,
+        ResolvedType::Timestamptz => ScalarType::Timestamptz,
+        ResolvedType::Date => ScalarType::Date,
+        ResolvedType::Interval => ScalarType::Interval,
+        ResolvedType::Composite(_)
+        | ResolvedType::Array(_)
+        | ResolvedType::Range(_)
+        | ResolvedType::Json
+        | ResolvedType::Jsonb
+        | ResolvedType::JsonPath
+        | ResolvedType::Null => return None,
+    })
 }
 
 // === Polymorphic array-function resolution (spec/design/array-functions.md §2) ======
@@ -24404,11 +24448,67 @@ fn resolve(
                 if let Expr::Literal(Literal::Null) = inner.as_ref() {
                     return Ok((RExpr::ConstNull, ResolvedType::Array(Box::new(elem_rt))));
                 }
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to an array type is only supported from a string literal this slice"
-                        .to_string(),
-                ));
+                // A bind parameter into an array stays the documented container-param narrowing
+                // (0A000), like INSERT's `$N`-into-a-container handling (spec/design/array.md §4).
+                if matches!(inner.as_ref(), Expr::Param(_)) {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting a parameter to an array type is not supported yet".to_string(),
+                    ));
+                }
+                // A runtime (non-literal) operand: the two follow-on array-producing casts
+                // (spec/design/array.md §7). A `text` expression coerces per row via `array_in`
+                // (runtime text→T[]); an array of the SAME element type is the identity (no node);
+                // an array of a DIFFERENT element type is an element-wise array→array cast (each
+                // element through the scalar cast, when the element pair is castable); a non-literal
+                // NULL adapts. Any other source is a 42804 datatype mismatch.
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                let result_rt = ResolvedType::Array(Box::new(elem_rt.clone()));
+                return match ity {
+                    ResolvedType::Null => Ok((rinner, result_rt)),
+                    ResolvedType::Text => Ok((
+                        RExpr::ArrayCast {
+                            inner: Box::new(rinner),
+                            to_elem: Some(elem_col),
+                        },
+                        result_rt,
+                    )),
+                    ResolvedType::Array(ref src_elem) if **src_elem == elem_rt => {
+                        Ok((rinner, result_rt)) // identity cast — same element type
+                    }
+                    ResolvedType::Array(ref src_elem) => {
+                        match (resolved_to_scalar(src_elem), &elem_col) {
+                            (Some(src_s), ColType::Scalar(tgt_s))
+                                if scalar_pair_castable(src_s, *tgt_s) =>
+                            {
+                                Ok((
+                                    RExpr::ArrayCast {
+                                        inner: Box::new(rinner),
+                                        to_elem: Some(elem_col),
+                                    },
+                                    result_rt,
+                                ))
+                            }
+                            // A composite element on either side is the composite cast surface
+                            // (0A000 — composite casts are deferred, composite.md §8/§12).
+                            (None, _) | (_, ColType::Composite { .. }) => Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "casting between composite-element arrays is not supported yet"
+                                    .to_string(),
+                            )),
+                            // Both elements are scalars but no cast exists between them — forbidden
+                            // (42804, jed's strict-matrix convention; PG reports 42846).
+                            _ => Err(type_error(format!(
+                                "cannot cast {} to {base}[]",
+                                ity.type_name()
+                            ))),
+                        }
+                    }
+                    _ => Err(type_error(format!(
+                        "cannot cast {} to {base}[]",
+                        ity.type_name()
+                    ))),
+                };
             }
             // A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
             // string-literal form and a bare NULL; every other range cast (runtime text→range,
@@ -24568,6 +24668,16 @@ fn resolve(
                             inner: Box::new(rinner),
                             target,
                             typmod: None,
+                        },
+                        ResolvedType::Text,
+                    )),
+                    // array → text (spec/design/array.md §7): `array_out` renders `{…}` per row.
+                    // Explicit only — like uuid/json → text, stricter than PG's assignment cast (so
+                    // `INSERT INTO text_col VALUES (arr)` stays 42804). Handled by `ArrayCast`.
+                    ResolvedType::Array(_) => Ok((
+                        RExpr::ArrayCast {
+                            inner: Box::new(rinner),
+                            to_elem: None,
                         },
                         ResolvedType::Text,
                     )),
@@ -29715,6 +29825,104 @@ fn materialize_insert_value(iv: &InsertValue, ty: &ColType, bound: &[Value]) -> 
 /// (spec/design/array.md §7): each token is coerced to the element type (an unquoted `NULL` token
 /// → NULL element). A malformed literal is `22P02`. Used by INSERT (a bare string adapting to an
 /// array column) and by the runtime string-literal → array cast.
+/// Cast one **non-null array element** value to the target element scalar — the eval kernel of the
+/// element-wise `array → other-element-array` cast (spec/design/array.md §7). It runs the *same*
+/// per-value conversions the scalar `RExpr::Cast` node does, for the pairs [`scalar_pair_castable`]
+/// admits at resolve (numeric↔numeric, text→numeric/bool/uuid, bool↔i32, uuid↔text/bytea,
+/// bytea→uuid); an array element has no `numeric(p,s)` typmod (an array type takes no modifier), so
+/// every decimal target is the unconstrained form. Overflow traps `22003`, a malformed text element
+/// `22P02` — per element, exactly like the scalar cast. The resolver gate guarantees only the
+/// admitted `(source, target)` pairs reach here, so the value/target combinations are exhaustive.
+fn cast_array_element(v: Value, target: ScalarType) -> Result<Value> {
+    match v {
+        Value::Int(n) => {
+            if target.is_bool() {
+                Ok(Value::Bool(n != 0))
+            } else if target.is_decimal() {
+                Ok(Value::Decimal(Decimal::from_i64(n)))
+            } else if target.is_float() {
+                Ok(int_to_float(n, target))
+            } else if target.in_range(n) {
+                Ok(Value::Int(n))
+            } else {
+                Err(overflow(target))
+            }
+        }
+        Value::Decimal(d) => {
+            if target.is_decimal() {
+                Ok(Value::Decimal(d))
+            } else if target.is_float() {
+                decimal_to_float(&d, target)
+            } else {
+                let v = d.to_i64_round().ok_or_else(|| overflow(target))?;
+                if target.in_range(v) {
+                    Ok(Value::Int(v))
+                } else {
+                    Err(overflow(target))
+                }
+            }
+        }
+        Value::Float32(f) => cast_from_float(f as f64, target, None),
+        Value::Float64(f) => cast_from_float(f, target, None),
+        Value::Bool(b) => {
+            if target.is_bool() {
+                Ok(Value::Bool(b))
+            } else {
+                Ok(Value::Int(i64::from(b)))
+            }
+        }
+        Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
+        Value::Text(s) if target.is_bool() => Ok(Value::Bool(parse_bool_literal(&s)?)),
+        Value::Text(s) if target.is_decimal() => Ok(Value::Decimal(parse_decimal_literal(&s)?)),
+        Value::Text(s) if target == ScalarType::Float32 => {
+            Ok(Value::Float32(parse_f32_literal(&s)?))
+        }
+        Value::Text(s) if target.is_float() => Ok(Value::Float64(parse_f64_literal(&s)?)),
+        Value::Text(s) => Ok(Value::Int(parse_int_literal(&s, target)?)),
+        Value::Uuid(u) if target.is_text() => Ok(Value::Text(render_uuid(&u))),
+        Value::Uuid(u) if target.is_bytea() => Ok(Value::Bytea(u.to_vec())),
+        Value::Bytea(b) if target.is_uuid() => {
+            let len = b.len();
+            let arr: [u8; 16] = b.try_into().map_err(|_| {
+                EngineError::new(
+                    SqlState::InvalidTextRepresentation,
+                    format!("invalid length for type uuid: {len} bytes (expected 16)"),
+                )
+            })?;
+            Ok(Value::Uuid(arr))
+        }
+        _ => unreachable!("resolver admits only the scalar_pair_castable element pairs (§7)"),
+    }
+}
+
+/// Whether jed admits an element-wise `array → other-element-array` cast from source element scalar
+/// `from` to target element scalar `to` (spec/design/array.md §7). Mirrors the scalar cast matrix
+/// (spec/types/casts.toml) for the pairs an array element can take: numeric↔numeric, text→numeric/
+/// boolean/uuid, boolean⇄i32, uuid⇄text, uuid⇄bytea. The identity (`from == to`) is handled by the
+/// caller (it needs no cast node). A pair outside this set is rejected `0A000` at resolve.
+fn scalar_pair_castable(from: ScalarType, to: ScalarType) -> bool {
+    let numeric = |t: ScalarType| t.is_integer() || t.is_decimal() || t.is_float();
+    if numeric(from) && numeric(to) {
+        return true; // numeric ↔ numeric (int/decimal/float in any combination)
+    }
+    if from.is_text() && (numeric(to) || to.is_bool() || to.is_uuid()) {
+        return true; // text → numeric / boolean / uuid (the runtime text + uuid cast slices)
+    }
+    if from.is_bool() && to == ScalarType::Int32 {
+        return true; // boolean → i32 (the boolean cast slice — i32 only)
+    }
+    if from == ScalarType::Int32 && to.is_bool() {
+        return true; // i32 → boolean
+    }
+    if from.is_uuid() && (to.is_text() || to.is_bytea()) {
+        return true; // uuid → text / bytea (the uuid cast slice)
+    }
+    if from.is_bytea() && to.is_uuid() {
+        return true; // bytea → uuid (the jed-only uuid cast)
+    }
+    false
+}
+
 fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
     let parsed = crate::value::parse_array_literal(s).map_err(|e| match e {
         crate::value::ArrayInError::Malformed => EngineError::new(
@@ -30245,6 +30453,48 @@ impl RExpr {
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
+                }
+            }
+            // The three array-involving casts (spec/design/array.md §7), none expressible by the
+            // scalar `Cast` node: array→text (`array_out`), runtime text→T[] (`array_in` per row),
+            // and element-wise array→array (each element through the scalar cast). The node carries
+            // the cast's `operator_eval` charge (no new cost unit). `to_elem` is `None` for the
+            // text target and `Some(target element)` for the two array-producing casts.
+            RExpr::ArrayCast { inner, to_elem } => {
+                m.charge(COSTS.operator_eval);
+                match inner.eval(row, env, m)? {
+                    Value::Null => Ok(Value::Null),
+                    // array → text: render via `array_out` (PG-byte-exact §7).
+                    Value::Array(a) if to_elem.is_none() => {
+                        Ok(Value::Text(crate::value::array_out(&a)))
+                    }
+                    // runtime text → T[]: coerce the per-row string via `array_in` against the
+                    // target element ColType (22P02 malformed / 2202E inverted bound — the same
+                    // errors the `'{…}'::T[]` literal path raises).
+                    Value::Text(s) => coerce_string_to_array(&s, to_elem.as_ref().unwrap()),
+                    // element-wise array → other-element-array: every non-null element through the
+                    // scalar element cast to the target element (22003 per element on overflow); the
+                    // shape (dims/lbounds) is preserved and a NULL element stays NULL. The target
+                    // element is always a scalar — a same-element array is the identity (returned
+                    // with no `ArrayCast` node at resolve) and a composite element cast is 0A000.
+                    Value::Array(a) => {
+                        let ColType::Scalar(scalar) = to_elem.as_ref().unwrap() else {
+                            unreachable!("an array→array element cast has a scalar target element")
+                        };
+                        let mut elements = Vec::with_capacity(a.elements.len());
+                        for e in a.elements {
+                            elements.push(match e {
+                                Value::Null => Value::Null,
+                                v => cast_array_element(v, *scalar)?,
+                            });
+                        }
+                        Ok(Value::Array(ArrayVal {
+                            dims: a.dims,
+                            lbounds: a.lbounds,
+                            elements,
+                        }))
+                    }
+                    _ => unreachable!("an ArrayCast operand is text or array (resolver-gated)"),
                 }
             }
             RExpr::Neg { operand, result } => {
