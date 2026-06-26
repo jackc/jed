@@ -63,3 +63,12 @@ SQL-standard **aliases** of `length(text)` — the same code-point count, the sa
 PostgreSQL exposes all three names; jed routes `char_length`/`character_length` to the
 `length` kernel (the resolver aliases the name, like `power`→`pow`). The `CHAR_LENGTH(x)`
 keyword-call syntax is not special-cased — they are ordinary function names.
+
+### `octet_length(text) → int`
+
+The number of **bytes** in the UTF-8 encoding — `octet_length('héllo') = 6` (é encodes as
+two bytes), `octet_length('') = 0`, `octet_length('😀') = 4`. The byte counterpart of
+`length`. Rust/Go take the byte length of the UTF-8 string directly (`String::len` /
+`len(s)`); TS computes it through the shared UTF-8 encoder (`utf8ByteLength`), since a JS
+string is UTF-16 and `.length` would be neither bytes nor code points. PostgreSQL also
+defines `octet_length(bytea)`; jed implements the `text` overload.

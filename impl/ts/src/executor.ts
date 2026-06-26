@@ -12525,7 +12525,9 @@ type ScalarFuncName =
   // the generic scalarFunc short-circuit). Character functions count Unicode CODE POINTS — TS strings
   // are UTF-16, so iterate with [...s] (code-point units), NOT .length; octet/bit functions count
   // UTF-8 bytes (via TextEncoder). length(text) → i32 — the number of characters. length('héllo') = 5.
-  | "length";
+  | "length"
+  // octet_length(text) → i32 — the number of UTF-8 bytes (utf8ByteLength). octet_length('héllo') = 6.
+  | "octet_length";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24310,6 +24312,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // would over-count astral characters as surrogate pairs (string-functions.md §2/§3).
         const s = (vals[0] as { text: string }).text;
         return intValue(BigInt([...s].length));
+      }
+      if (e.func === "octet_length") {
+        // octet_length(text) → i32 — the UTF-8 byte count, distinct from length's code-point
+        // count (string-functions.md §3). utf8ByteLength encodes via TextEncoder.
+        return intValue(BigInt(utf8ByteLength((vals[0] as { text: string }).text)));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

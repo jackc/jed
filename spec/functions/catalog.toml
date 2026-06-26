@@ -3131,6 +3131,18 @@ result         = "i32"
 null           = "propagates"
 errors         = []
 
+# octet_length(text) → int — the number of BYTES in the UTF-8 encoding (NOT characters):
+# octet_length('héllo') = 6 (é is 2 bytes). The byte counterpart of length.
+[[operator]]
+name           = "octet_length"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

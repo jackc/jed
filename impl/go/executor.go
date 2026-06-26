@@ -15915,6 +15915,8 @@ const (
 	// are UTF-8, so `range`/utf8.RuneCountInString); octet/bit functions count UTF-8 bytes.
 	// length(text) → i32 — the number of characters (code points). length('héllo') = 5.
 	sfLength
+	// octet_length(text) → i32 — the number of UTF-8 bytes. octet_length('héllo') = 6.
+	sfOctetLength
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19490,6 +19492,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 	// SQL-standard aliases of length (same code-point-count kernel).
 	case "length", "char_length", "character_length":
 		return sfLength
+	case "octet_length":
+		return sfOctetLength
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27221,6 +27225,10 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// length(text) → i32 — the number of characters (Unicode code points). Go strings are
 			// UTF-8, so utf8.RuneCountInString counts code points (string-functions.md §3).
 			return IntValue(int64(utf8.RuneCountInString(vals[0].Str))), nil
+		case sfOctetLength:
+			// octet_length(text) → i32 — the UTF-8 byte count (len of the Go string's bytes),
+			// distinct from length's code-point count (string-functions.md §3).
+			return IntValue(int64(len(vals[0].Str))), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

@@ -13034,6 +13034,8 @@ enum ScalarFunc {
     // points (`chars()`); octet/bit functions count UTF-8 bytes.
     /// length(text) → i32 — the number of characters (code points). length('héllo') = 5.
     Length,
+    /// octet_length(text) → i32 — the number of UTF-8 bytes. octet_length('héllo') = 6.
+    OctetLength,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19056,6 +19058,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         // string / text functions (string-functions.md). char_length/character_length are
         // SQL-standard aliases of length (same code-point-count kernel).
         "length" | "char_length" | "character_length" => ScalarFunc::Length,
+        "octet_length" => ScalarFunc::OctetLength,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30335,6 +30338,12 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Int(s.chars().count() as i64)),
                         _ => unreachable!("resolver restricts length to text"),
                     },
+                    // octet_length(text) → i32 — the UTF-8 byte count (`len()` of the String's
+                    // bytes), distinct from length's code-point count (string-functions.md §3).
+                    ScalarFunc::OctetLength => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Int(s.len() as i64)),
+                        _ => unreachable!("resolver restricts octet_length to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31203,7 +31212,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::ToJson
         | ScalarFunc::JsonScalar
         | ScalarFunc::JsonSerialize
-        | ScalarFunc::Length => {
+        | ScalarFunc::Length
+        | ScalarFunc::OctetLength => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

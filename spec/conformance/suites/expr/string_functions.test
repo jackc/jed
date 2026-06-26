@@ -79,3 +79,25 @@ SELECT char_length(''), character_length(NULL::text)
 ----
 0
 NULL
+
+# === octet_length(text) → int: the number of UTF-8 BYTES (not characters) ==============
+
+# 'héllo' is 6 bytes (é = 2 bytes) but 5 characters — octet_length counts bytes.
+query I
+SELECT octet_length('héllo')
+----
+6
+
+# an astral character (😀) is 4 UTF-8 bytes; 'a😀b' is 6 bytes (1 + 4 + 1).
+query I
+SELECT octet_length('a😀b')
+----
+6
+
+# empty string is 0 bytes; ASCII is one byte per character; NULL propagates.
+query I
+SELECT octet_length(''), octet_length('abc'), octet_length(NULL::text)
+----
+0
+3
+NULL
