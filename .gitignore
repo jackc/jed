@@ -17,6 +17,8 @@
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).
 /impl/go/bin/
+# `go build ./cmd/mutate` (the mutation-testing harness) drops a binary here.
+/impl/go/mutate
 
 # TS core: installed dev-dependencies (typescript + @types/node for the engine; vite +
 # @playwright/test for the browser/OPFS host's demo + e2e — dev-only, spec/design/hosts.md §5).

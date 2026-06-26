@@ -558,6 +558,28 @@ task :stress, [:filter] do |_, args|
   aggregate_stress(dir)
 end
 
+# mutation — mutation-testing of the Go core (spec/design/mutation-testing.md). Inject deliberate
+# bugs into the core's source and check the conformance corpus catches each one; a SURVIVING mutant
+# is untested logic, located precisely. Like bench/stress, this is a slow ANALYSIS tool, deliberately
+# OUTSIDE `rake ci` (not a merge gate): it answers "are we only testing the obvious?" with a map.
+# Args are all optional and forward to the Go harness:
+#   rake mutation                       # default targets (executor/operators/value/decimal/encoding), 300 sampled
+#   rake mutation[value.go]             # scope to one file, full sweep that file
+#   rake mutation[value.go,500,7]       # file, max mutants, sample seed
+# A non-zero exit (survivors present) is swallowed — the printed report + JSONL are the deliverable.
+desc "Mutation-test the Go core: inject bugs, check the conformance corpus catches them (OUTSIDE rake ci)"
+task :mutation, [:files, :n, :seed] do |_, args|
+  stamp = Time.now.utc.strftime("%Y%m%d-%H%M%S")
+  dir = File.join(__dir__, "bench/results/mutation", stamp)
+  FileUtils.mkdir_p(dir)
+  flags = []
+  flags += ["-files", args[:files]] if args[:files]
+  flags += ["-n", args[:n]] if args[:n]
+  flags += ["-seed", args[:seed]] if args[:seed]
+  puts "go:   go run ./cmd/mutate (mutate the Go core; the conformance corpus is the oracle)"
+  Dir.chdir(GO_DIR) { sh("go", "run", "./cmd/mutate", "-json", File.join(dir, "go.jsonl"), *flags) { |_ok, _res| } }
+end
+
 # conformance — the §7 contract: every core walks the hand-authored corpus
 # (spec/conformance/suites) and must produce identical pass/fail. This is the spine of the
 # project (CLAUDE.md §7/§10) — the example-based truth `rake test`/`rake ci` rest on. Each
