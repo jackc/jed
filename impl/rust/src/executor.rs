@@ -13086,6 +13086,8 @@ enum ScalarFunc {
     QuoteLiteral,
     /// quote_ident(text) → text — wrap as a SQL identifier (§3).
     QuoteIdent,
+    /// quote_nullable(text) → text — like quote_literal but NON-STRICT (NULL → 'NULL', §3).
+    QuoteNullable,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19133,6 +19135,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "decode" => ScalarFunc::Decode,
         "quote_literal" => ScalarFunc::QuoteLiteral,
         "quote_ident" => ScalarFunc::QuoteIdent,
+        "quote_nullable" => ScalarFunc::QuoteNullable,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -29949,6 +29952,16 @@ impl RExpr {
             RExpr::ScalarFunc { func, args, result } => {
                 // One operator_eval per call (the uniform weight); arguments charge their own.
                 m.charge(COSTS.operator_eval);
+                // quote_nullable is the one NON-STRICT scalar function (null = "none"): a NULL
+                // argument yields the text 'NULL', not a propagated NULL, so it must run before
+                // the strict short-circuit loop below (string-functions.md §3).
+                if matches!(func, ScalarFunc::QuoteNullable) {
+                    return Ok(Value::Text(match args[0].eval(row, env, m)? {
+                        Value::Null => "NULL".to_string(),
+                        Value::Text(s) => quote_literal_text(&s),
+                        _ => unreachable!("resolver restricts quote_nullable to text"),
+                    }));
+                }
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     let v = a.eval(row, env, m)?;
@@ -30615,6 +30628,11 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Text(quote_ident_text(s))),
                         _ => unreachable!("resolver restricts quote_ident to text"),
                     },
+                    // quote_nullable is handled by the non-strict pre-check above (it returns before
+                    // the strict short-circuit loop), so it never reaches this match.
+                    ScalarFunc::QuoteNullable => {
+                        unreachable!("quote_nullable is handled by the non-strict pre-check")
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31508,7 +31526,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Encode
         | ScalarFunc::Decode
         | ScalarFunc::QuoteLiteral
-        | ScalarFunc::QuoteIdent => {
+        | ScalarFunc::QuoteIdent
+        | ScalarFunc::QuoteNullable => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

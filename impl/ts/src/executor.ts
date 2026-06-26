@@ -12938,7 +12938,9 @@ type ScalarFuncName =
   // quote_literal(text) → text — wrap as a SQL string literal (§3).
   | "quote_literal"
   // quote_ident(text) → text — wrap as a SQL identifier (§3).
-  | "quote_ident";
+  | "quote_ident"
+  // quote_nullable(text) → text — like quote_literal but NON-STRICT (NULL → 'NULL', §3).
+  | "quote_nullable";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24557,6 +24559,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     case "scalarFunc": {
       // One operator_eval per call (the uniform weight); arguments charge their own.
       m.charge(COSTS.operatorEval);
+      // quote_nullable is the one NON-STRICT scalar function: a NULL argument yields the text
+      // 'NULL', not a propagated NULL, so it runs before the strict short-circuit loop below
+      // (string-functions.md §3).
+      if (e.func === "quote_nullable") {
+        const v = evalExpr(e.args[0]!, row, env, m);
+        return textValue(v.kind === "null" ? "NULL" : quoteLiteralText((v as { text: string }).text));
+      }
       const vals: Value[] = [];
       for (const a of e.args) {
         const v = evalExpr(a, row, env, m);

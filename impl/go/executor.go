@@ -15967,6 +15967,8 @@ const (
 	sfQuoteLiteral
 	// quote_ident(text) → text — wrap as a SQL identifier (§3).
 	sfQuoteIdent
+	// quote_nullable(text) → text — like quote_literal but NON-STRICT (NULL → 'NULL', §3).
+	sfQuoteNullable
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19592,6 +19594,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfQuoteLiteral
 	case "quote_ident":
 		return sfQuoteIdent
+	case "quote_nullable":
+		return sfQuoteNullable
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27621,6 +27625,19 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reScalarFunc:
 		// One operator_eval per call (the uniform weight); arguments charge their own.
 		m.Charge(Costs.OperatorEval)
+		// quote_nullable is the one NON-STRICT scalar function: a NULL argument yields the text
+		// 'NULL', not a propagated NULL, so it runs before the strict short-circuit loop below
+		// (string-functions.md §3).
+		if e.sfunc == sfQuoteNullable {
+			v, err := e.sargs[0].eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.Kind == ValNull {
+				return TextValue("NULL"), nil
+			}
+			return TextValue(quoteLiteralText(v.Str)), nil
+		}
 		vals := make([]Value, 0, len(e.sargs))
 		for _, a := range e.sargs {
 			v, err := a.eval(row, env, m)

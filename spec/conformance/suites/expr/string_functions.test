@@ -803,3 +803,27 @@ query T
 SELECT quote_ident(NULL::text)
 ----
 NULL
+
+# === quote_nullable(text) → text: like quote_literal but NON-STRICT ===================
+
+# a present value quotes exactly like quote_literal
+query T
+SELECT quote_nullable('x'), quote_nullable('O''Reilly')
+----
+'x'
+'O''Reilly'
+
+# the distinguishing case: a NULL argument yields the 4-character text 'NULL', not a SQL NULL
+# (a typed NULL — jed's family resolution needs a type; a bare untyped NULL is 42883)
+query T
+SELECT quote_nullable(NULL::text)
+----
+NULL
+
+# and the result is genuinely the non-NULL text 'NULL' (length 4), unlike quote_literal(NULL)
+query B
+SELECT quote_nullable(NULL::text) IS NOT NULL, length(quote_nullable(NULL::text)) = 4, quote_literal(NULL::text) IS NULL
+----
+true
+true
+true
