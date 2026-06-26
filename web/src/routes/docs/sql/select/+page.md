@@ -159,9 +159,13 @@ Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).
 `GROUP BY` also takes `GROUPING SETS`, `ROLLUP`, and `CUBE` to compute several groupings at once,
-with the `GROUPING(col)` function to tell subtotal rows apart. The ordered-set aggregates `mode`,
-`percentile_cont`, and `percentile_disc` are written with a `WITHIN GROUP (ORDER BY …)` clause
-(for example, `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` for the median).
+with the `GROUPING(col)` function to tell subtotal rows apart, and groups by an output column,
+a select-list position (`GROUP BY 1`), or any expression (`GROUP BY a + b`), not just a column.
+The ordered-set aggregates `mode`, `percentile_cont`, and `percentile_disc` are written with a
+`WITHIN GROUP (ORDER BY …)` clause (for example, `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`
+for the median), and the hypothetical-set aggregates `rank`, `dense_rank`, `percent_rank`, and
+`cume_dist` take a hypothetical row the same way (`rank(50) WITHIN GROUP (ORDER BY score)`).
+`FILTER (WHERE …)` and these aggregate forms also compose with window functions (`OVER`).
 
 Grouping and aggregation:
 
