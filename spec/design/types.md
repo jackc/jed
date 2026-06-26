@@ -218,8 +218,11 @@ listed).
   bytea/uuid input, a decimal/integer/boolean parse matching jed's literal grammar), trapping
   `22P02` (malformed) / `22003` (out of range) / `42704` (unknown type name). A **runtime** text→`T`
   cast on a *non-literal* text expression (`CAST(text_col AS int)`) stays **deferred** (`0A000`) —
-  the general string-function slice (§11). `CAST(1 AS text)` (casting *to* text) is likewise
-  deferred. The `text → text` identity is implicit, like any identity cast.
+  the general string-function slice (§11) — **except** the runtime `text → uuid` cast, which has
+  landed (the uuid cast slice, §14): `CAST(text_col AS uuid)` parses the column's string via
+  `uuid_in` at eval. `CAST(1 AS text)` (casting *to* text) is likewise deferred, **except**
+  `uuid → text` (§14) and `json`/`jsonb → text`. The `text → text` identity is implicit, like any
+  identity cast.
 - **Strictness is preserved.** The string→number/bool coercion fires only when the type is
   **named** (a literal or CAST). A **bare** string in a numeric context does **not** silently
   become a number: `WHERE int_col = '42'` is `42804` (§4), and a bare string adapts *only* to the
@@ -710,11 +713,36 @@ fixed-width non-integer value. For uuid the stored value body and the key body c
 raw 16 bytes), so reusing one codec is exact. A uuid is always 16 bytes, far below the page limit,
 so the oversized-item narrowing never applies.
 
+**uuid ⇄ other casts** (§5) — the four **explicit** cast pairs `text ⇄ uuid` and `bytea ⇄ uuid`
+([../types/casts.toml](../types/casts.toml)), the uuid cast slice (lifting the `0A000`/`42804`
+narrowing the deferred note below originally recorded):
+
+- **`text → uuid`** runs the same PG-flexible `uuid_in` parser as a literal in a uuid context
+  (above) — braces / hyphens-after-each-pair / 32-hex / any case all normalize, and a malformed
+  string traps **`22P02`** at eval. **Explicit** — this matches PostgreSQL exactly: PG's `text →
+  uuid` is an explicit I/O cast (no `pg_cast` row, so never implicit/assignment), so `id = '…'::text`
+  and an unqualified `INSERT … VALUES (text_expr)` into a uuid column are *not* auto-coerced there
+  either. The literal form `'…'::uuid` is still the §6 resolve-time adaptation, not this runtime cast.
+- **`uuid → text`** emits the canonical lowercase `8-4-4-4-12` spelling (`uuid_out`, the same as
+  rendering). **Explicit**, which is **stricter than PostgreSQL** (PG assignment-casts any type to
+  `text` through its I/O coercion): jed admits only the explicit `CAST` / `::` spelling, never the
+  silent assignment/implicit form — the same strict-matrix convention as `decimal → int` (§12) and
+  jed's `json`/`jsonb → text` casts. So `INSERT INTO text_col VALUES (uuid_expr)` and `text_col =
+  uuid_expr` stay `42804` (a documented divergence).
+- **`uuid ⇄ bytea`** are the 16 raw bytes in both directions. This is a cast PostgreSQL **lacks**
+  (`bytea::uuid` / `uuid::bytea` is `42846` `cannot_coerce` in PG) — a deliberate, documented
+  divergence, justified because a uuid *is* exactly 16 bytes, so the conversion is natural and
+  lossless. **Explicit**; `bytea → uuid` requires exactly 16 bytes and traps **`22P02`** on any other
+  length (the wrong-width body reuses `invalid_text_representation` — there is no PG code to match).
+  Because these two pairs **succeed where PG errors**, they cannot live in the PG-clean oracle corpus
+  and are covered by **per-core unit tests** (jed's standing convention for a cast divergence, like
+  the forbidden `boolean ⇄ i16`/`i64` pairs of §9).
+
+`text → uuid` / `uuid → text` agree with PostgreSQL and are oracle-checked in the conformance corpus.
+`text ⇄ bytea` and every other bytea cast remain deferred (the bytea cast slice's own follow-on, §13).
+
 **Deferred uuid sub-features** (relaxable narrowings, each its own follow-up):
 
-- **uuid ⇄ other casts** (§5) — `text ⇄ uuid` and `bytea ⇄ uuid` casts are deferred to a cast
-  slice (PostgreSQL has `text ⇄ uuid`); `CAST(x AS uuid)` and casting from a uuid trap `0A000` /
-  `42804` this slice, exactly as bytea's casts are deferred.
 - **uuid functions** — `gen_random_uuid()` (generation), `uuid_generate_v*`, and any uuid
   accessor functions are deferred; this slice is comparison + storage only (`= < > <= >=`,
   `IS [NOT] DISTINCT FROM`), with values supplied as literals.

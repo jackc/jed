@@ -24278,7 +24278,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			switch ity.kind {
 			case rtNull, rtText:
 				return rinner, resolvedType{kind: rtText}, nil
-			case rtJson, rtJsonb:
+			// json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
+			// casts.toml/types.md §14: canonical lowercase 8-4-4-4-12). Explicit — stricter than PG's
+			// assignment-cast-to-text (a documented divergence).
+			case rtJson, rtJsonb, rtUuid:
 				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtText}, nil
 			default:
 				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
@@ -24287,13 +24290,58 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
 		// (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 /
 		// NULL / bool source is castable), so it is handled AFTER the inner is resolved, below.
-		// bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
+		// A bytea TARGET: the uuid cast slice admits uuid → bytea (the 16 raw bytes — a jed cast PG
+		// lacks; casts.toml, types.md §14). A string LITERAL was coerced above; a NULL adapts; a bytea
+		// operand is the identity. text → bytea and every other bytea cast stay deferred (0A000 — the
+		// bytea cast slice's own follow-on, types.md §13).
 		if target.IsBytea() {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
+			if e.Cast.Inner.Kind == ExprParam {
+				t := Bytea
+				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return pinner, resolvedType{kind: rtBytea}, nil
+			}
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch ity.kind {
+			case rtNull, rtBytea:
+				return rinner, resolvedType{kind: rtBytea}, nil
+			case rtUuid:
+				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtBytea}, nil
+			default:
+				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
+			}
 		}
-		// uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
+		// The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
+		// or bytea expression. text → uuid runs uuid_in at eval (22P02 on malformed); bytea → uuid takes
+		// the 16 raw bytes (22P02 on a length ≠ 16) — a jed cast PG lacks. A string LITERAL operand was
+		// coerced above (the §6 adaptation); $1::uuid declares the param as uuid; a NULL adapts; a uuid
+		// operand is the identity.
 		if target.IsUuid() {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to uuid is not supported yet")
+			if e.Cast.Inner.Kind == ExprParam {
+				t := Uuid
+				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return pinner, resolvedType{kind: rtUuid}, nil
+			}
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch ity.kind {
+			case rtNull, rtUuid:
+				return rinner, resolvedType{kind: rtUuid}, nil
+			case rtText, rtBytea:
+				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtUuid}, nil
+			default:
+				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to uuid")
+			}
 		}
 		// Cross-family datetime casts (timezones.md §9.3): a timestamp/timestamptz/date TARGET from
 		// another datetime family. A same-family cast is the identity; a cross-family cast becomes a
@@ -29949,7 +29997,39 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 			}
 			return JsonbValue(n), nil
 		}
+		// text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible uuid_in parser;
+		// a malformed string traps 22P02.
+		if target.IsUuid() {
+			b, err := decodeUUIDLiteral(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return UuidValue(b), nil
+		}
 		panic("BUG: resolver rejects this text cast target")
+	}
+	// uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw bytes) — the uuid
+	// cast slice (casts.toml/types.md §14).
+	if v.Kind == ValUuid {
+		if target.IsText() {
+			return TextValue(renderUUID([]byte(v.Str))), nil
+		}
+		if target.IsBytea() {
+			return ByteaValue([]byte(v.Str)), nil
+		}
+		panic("BUG: resolver rejects this uuid cast target")
+	}
+	// bytea → uuid (the uuid cast slice — a jed cast PG lacks): exactly 16 raw bytes; any other
+	// length traps 22P02 (the wrong-width body — no PG code to match).
+	if v.Kind == ValBytea {
+		if target.IsUuid() {
+			if len(v.Str) != 16 {
+				return Value{}, NewError(InvalidTextRepresentation,
+					fmt.Sprintf("invalid length for type uuid: %d bytes (expected 16)", len(v.Str)))
+			}
+			return UuidValue([]byte(v.Str)), nil
+		}
+		panic("BUG: resolver rejects this bytea cast target")
 	}
 	// json → text is the identity on the verbatim bytes; json → jsonb re-parses + canonicalizes;
 	// json → json is the identity.

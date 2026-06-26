@@ -1386,7 +1386,7 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Render a UUID as its canonical RFC 4122 text form: 32 **lowercase** hex digits in the
 /// 8-4-4-4-12 grouping joined by hyphens (PostgreSQL `uuid_out`). The spelling must be
 /// byte-identical across cores (CLAUDE.md §8), so the case and grouping are fixed here.
-fn render_uuid(u: &[u8; 16]) -> String {
+pub fn render_uuid(u: &[u8; 16]) -> String {
     let mut s = String::with_capacity(36);
     for (i, b) in u.iter().enumerate() {
         if matches!(i, 4 | 6 | 8 | 10) {

@@ -26,6 +26,16 @@ test('the types page autoruns the boolean ⇄ i32 cast demo', async ({ page }) =
   await expect(rows).toContainText('true');
 });
 
+test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // Fourth panel = the uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea
+  // (\x + 16 hex bytes), bytea→uuid (back to the canonical uuid).
+  const uuidCastPanel = page.getByTestId('live-sql').nth(3);
+  const rows = uuidCastPanel.getByTestId('result-rows');
+  await expect(rows).toContainText('550e8400-e29b-41d4-a716-446655440000');
+  await expect(rows).toContainText('\\x550e8400e29b41d4a716446655440000');
+});
+
 test('the tables page enforces a CHECK constraint live and resets to seed', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   const panel = page.getByTestId('live-sql');

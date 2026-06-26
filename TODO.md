@@ -304,7 +304,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         (`length`, `||`, `substring`, `encode`/`decode`, `get_byte`).
 - [x] **`uuid`** — fixed 16 bytes, PG-flexible input, canonical lowercase output, on-disk type code 8;
       the **first non-integer `PRIMARY KEY`** (`uuid-raw16` key encoding). → [types.md §14](spec/design/types.md)
-  - [ ] _follow-on:_ uuid⇄other casts (`text ⇄ uuid`, `bytea ⇄ uuid`).
+  - [x] _follow-on:_ uuid⇄other casts (`text ⇄ uuid`, `bytea ⇄ uuid`) — four explicit pairs.
+        `text → uuid` (PG-flexible `uuid_in`, 22P02) and `uuid → text` (canonical lowercase)
+        oracle-checked; `uuid ⇄ bytea` (the 16 raw bytes, 22P02 on length≠16) is a jed cast PG
+        lacks, per-core tests. → [types.md §14](spec/design/types.md), [casts.toml](spec/types/casts.toml)
 - [x] **uuid extractor functions** — `uuid_extract_version` / `uuid_extract_timestamp` (immutable);
       landed the catalog `volatility` field. → [functions.md §12](spec/design/functions.md)
 - [x] **uuid generator functions** — `uuidv4()` / `uuidv7([shift])`; landed the host-injected

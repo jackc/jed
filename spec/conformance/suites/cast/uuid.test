@@ -1,0 +1,110 @@
+# text ⇄ uuid casts (the uuid cast slice — spec/types/casts.toml, spec/design/types.md §14). Two of
+# the four explicit pairs, the ones that AGREE with PostgreSQL and so are oracle-checked here:
+#   text → uuid : the RUNTIME cast on a non-literal text expression — uuid_in over the column's
+#                 string (the PG-flexible parser: braces / hyphens-after-each-pair / 32-hex / any
+#                 case all normalize to the same 16 bytes; a malformed string traps 22P02). This is
+#                 distinct from the '…'::uuid LITERAL, which adapts at resolve (cast.string_literal,
+#                 types/uuid.test). text → uuid matches PG exactly (PG's text→uuid is explicit).
+#   uuid → text : the canonical lowercase 8-4-4-4-12 spelling (uuid_out). EXPLICIT — jed is stricter
+#                 than PG here (PG assignment-casts to text), but the explicit `::`/CAST spelling
+#                 used below agrees with PG row-for-row.
+# The other two pairs, uuid ⇄ bytea (the 16 raw bytes), are a cast PostgreSQL LACKS (42846), so they
+# cannot live in this PG-clean corpus and are covered by the per-core unit tests (cast_uuid).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.text, types.uuid, cast.explicit, cast.operator, cast.uuid
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)
+
+# s holds the SAME uuid as u in row 1-3 but in assorted PG-flexible spellings (uppercase /
+# hyphen-less / braced+every-4); rows 1 and 3 are the same uuid in different spellings. Row 4 has a
+# NULL s and a NULL u. None of these rows is malformed (malformed lives in `bad` below), so a
+# full-table cast of s never traps.
+statement ok
+INSERT INTO t VALUES
+  (1, '550E8400-E29B-41D4-A716-446655440000',     '550e8400-e29b-41d4-a716-446655440000'),
+  (2, 'f47ac10b58cc4372a5670e02b2c3d479',         'f47ac10b-58cc-4372-a567-0e02b2c3d479'),
+  (3, '{550e-8400-e29b-41d4-a716-4466-5544-0000}', '00000000-0000-0000-0000-000000000000'),
+  (4, NULL,                                        NULL)
+
+# --- text → uuid (RUNTIME, on a text column): the PG-flexible uuid_in, normalizing to canonical
+# lowercase 8-4-4-4-12 (the `T` render tag). An UPPERCASE column value casts to the same 16 bytes.
+query T nosort
+SELECT s::uuid FROM t WHERE id = 1
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# a hyphen-less 32-hex column value casts the same way (CAST(...) spelling)
+query T nosort
+SELECT CAST(s AS uuid) FROM t WHERE id = 2
+----
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+
+# a braced + every-4-grouped column value normalizes identically (proves the runtime path uses the
+# SAME flexible uuid_in as the literal adaptation)
+query T nosort
+SELECT s::uuid FROM t WHERE id = 3
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# a NULL text casts to a NULL uuid
+query T nosort
+SELECT s::uuid FROM t WHERE id = 4
+----
+NULL
+
+# --- uuid → text: the canonical lowercase spelling (uuid_out), under the `T` tag.
+query T nosort
+SELECT u::text FROM t WHERE id = 1
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# the nil uuid renders as all-zero groups
+query T nosort
+SELECT CAST(u AS text) FROM t WHERE id = 3
+----
+00000000-0000-0000-0000-000000000000
+
+# a NULL uuid casts to a NULL text
+query T nosort
+SELECT u::text FROM t WHERE id = 4
+----
+NULL
+
+# --- round-trip: text → uuid → text yields the canonical form (the input spelling is normalized)
+query T nosort
+SELECT (s::uuid)::text FROM t WHERE id = 1
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# --- the text → uuid result is a real, comparable uuid value: equality against a uuid literal
+# matches every row whose s decodes to that uuid (rows 1 and 3 share it; row 2 differs; row 4 is
+# NULL → no match). The full-table scan casts every s — none traps (no malformed row in t).
+query I nosort
+SELECT id FROM t WHERE s::uuid = '550e8400-e29b-41d4-a716-446655440000' ORDER BY id
+----
+1
+3
+
+# --- the cast result is orderable by the uuid (unsigned byte) order. Project s::uuid over a scan,
+# ORDER BY the cast key: 550e < f47a (bytewise); the two 550e rows tie (broken by the row's PK),
+# and the NULL (row 4's s) sorts last (NULLS LAST, PG default for ASC).
+query T nosort
+SELECT s::uuid FROM t ORDER BY s::uuid
+----
+550e8400-e29b-41d4-a716-446655440000
+550e8400-e29b-41d4-a716-446655440000
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+NULL
+
+# --- a RUNTIME text → uuid over a MALFORMED string traps 22P02 (uuid_in at eval — the literal
+# pre-scan does not apply to a non-literal text expression). Kept in its own table so the full-table
+# casts above never see it.
+statement ok
+CREATE TABLE bad (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO bad VALUES (1, 'not-a-uuid')
+
+statement error 22P02
+SELECT s::uuid FROM bad

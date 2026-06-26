@@ -20,11 +20,26 @@
 # or assignment-castable to/from any integer (PG's contexts are `e` explicit): `INSERT INTO
 # int_col VALUES (true)` and `int_col = true` stay 42804.
 #
-# bytea and uuid (scalars.toml) are likewise NEITHER a cast source NOR a cast target here:
-# CAST(x AS bytea) / CAST(x AS uuid) trap 0A000 and casting FROM a bytea/uuid value is a
-# forbidden pair (42804). text/bytea/uuid inter-casts are deferred to a dedicated cast slice
-# (PostgreSQL has text<->uuid etc., authored deliberately later rather than falling out of
-# making the types storable).
+# uuid (scalars.toml) now participates in four EXPLICIT cast pairs (the uuid cast slice — the four
+# [[cast]] rows at the end of this file, ../design/types.md §14): text <-> uuid and bytea <-> uuid.
+#   text -> uuid : runtime uuid_in (the same PG-flexible parser as the literal cast); 22P02 on a
+#                  malformed string. EXPLICIT — matches PostgreSQL exactly (PG's text->uuid is an
+#                  explicit I/O cast; there is no pg_cast row, so it is never implicit/assignment).
+#   uuid -> text : the canonical lowercase 8-4-4-4-12 spelling (uuid_out). EXPLICIT — STRICTER than
+#                  PostgreSQL (which assignment-casts any type to text via I/O), the same strict-matrix
+#                  convention as decimal->int (below) and jed's json/jsonb->text casts: jed forbids the
+#                  silent (assignment/implicit) coercion, only the explicit CAST/`::` spelling. So
+#                  `INSERT INTO text_col VALUES (uuid_expr)` / `text_col = uuid_expr` stay 42804.
+#   uuid -> bytea / bytea -> uuid : the 16 raw bytes, both directions. A jed cast PostgreSQL LACKS
+#                  (PG `bytea::uuid` / `uuid::bytea` is 42846 cannot_coerce) — a deliberate, documented
+#                  divergence: a uuid IS exactly 16 bytes, so the conversion is natural and lossless.
+#                  EXPLICIT. bytea -> uuid requires exactly 16 bytes; any other length traps 22P02
+#                  (invalid_text_representation, reused for the wrong-width body — there is no PG
+#                  precedent to match). Because these two pairs SUCCEED where PG errors, they cannot
+#                  live in the PG-clean oracle corpus and are covered by per-core unit tests.
+# bytea is otherwise still NEITHER a cast source NOR target except via uuid: text<->bytea and every
+# other bytea cast remain deferred (0A000), the bytea cast slice's own follow-on (../design/types.md
+# §13).
 #
 # timestamp / timestamptz / date (scalars.toml) — the CROSS-FAMILY datetime cast matrix LANDED with
 # the tz conversion slice (../design/timezones.md §9.3): the six explicit (timestamp, timestamptz,
@@ -354,3 +369,32 @@ mode = "explicit"
 from = "date"
 to = "timestamp"
 mode = "explicit"
+
+# --- uuid cast slice: text <-> uuid and bytea <-> uuid (the header block above) --------------
+# All EXPLICIT. text -> uuid runs the PG-flexible uuid_in (22P02 on malformed); uuid -> text emits
+# the canonical lowercase 8-4-4-4-12 form (uuid_out). uuid <-> bytea are the 16 raw bytes (a jed
+# cast PG lacks — a documented divergence; bytea -> uuid traps 22P02 on any length != 16). NULL ->
+# NULL throughout; uuid -> uuid is the identity (not listed, like every identity pair).
+[[cast]]
+from = "text"
+to = "uuid"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22P02"
+
+[[cast]]
+from = "uuid"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "uuid"
+to = "bytea"
+mode = "explicit"
+
+[[cast]]
+from = "bytea"
+to = "uuid"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22P02"

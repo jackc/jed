@@ -387,6 +387,10 @@ var SupportedCapabilities = []string{
 	// boolean ⇄ i32 casts (the boolean cast slice — spec/types/casts.toml, types.md §9): both
 	// directions explicit, i32 only (bool↔i16/i64 is a forbidden 42804).
 	"cast.bool_int",
+	// uuid ⇄ other casts (the uuid cast slice — spec/types/casts.toml, types.md §14): four explicit
+	// pairs, text ⇄ uuid (uuid_in / canonical lowercase) and bytea ⇄ uuid (the 16 raw bytes, a jed
+	// cast PG lacks — per-core tested). text ⇄ uuid is oracle-checked.
+	"cast.uuid",
 	// The COLLATE expression operator + ORDER BY … COLLATE over a VENDORED collation (collation slice
 	// 1c, spec/design/collation.md §14): a vendored collation orders text by its UCA sort key in
 	// the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,

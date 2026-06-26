@@ -14,6 +14,12 @@
   0::boolean           AS zero_to_bool,
   CAST(-5 AS boolean)  AS nonzero_to_bool;`;
 
+	const uuidCastDemo = `SELECT
+  ('550E8400-E29B-41D4-A716-446655440000'::text)::uuid  AS text_to_uuid,
+  '550e8400-e29b-41d4-a716-446655440000'::uuid::text    AS uuid_to_text,
+  '550e8400-e29b-41d4-a716-446655440000'::uuid::bytea   AS uuid_to_bytea,
+  '\\x550e8400e29b41d4a716446655440000'::bytea::uuid    AS bytea_to_uuid;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -78,6 +84,20 @@ Following PostgreSQL, `boolean` casts to and from `int` (`i32`) only, and always
 
 Only `i32` is involved: a `boolean ⇄ i16` or `boolean ⇄ i64` cast is rejected (`42804`), matching
 PostgreSQL's choice of `int4` as the sole boolean-integer cast.
+
+## UUID ⇄ text and bytea casts
+
+A `uuid` casts to and from `text` and `bytea`, always with an explicit `CAST` / `::`. `text → uuid`
+parses PostgreSQL-flexibly (braces, hyphens after any byte pair, a bare 32-hex run, any case), and
+`uuid → text` always renders the canonical lowercase `8-4-4-4-12` form. Because a UUID *is* exactly
+16 bytes, it also casts to and from `bytea` (those 16 raw bytes); `bytea → uuid` requires exactly 16
+bytes and raises `22P02` otherwise:
+
+<LiveSql query={uuidCastDemo} rows={1} />
+
+`text → uuid` matches PostgreSQL. The other three are deliberately stricter or additional: jed makes
+`uuid → text` explicit-only (PostgreSQL assignment-casts any type to `text`), and the `bytea` ↔ `uuid`
+casts are a jed convenience PostgreSQL does not offer at all.
 
 ## Three-valued NULL logic
 

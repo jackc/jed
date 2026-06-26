@@ -20443,7 +20443,10 @@ function resolve(
         if (ik === "null" || ik === "text") {
           return { node: inner.node, type: { kind: "text" } };
         }
-        if (ik === "json" || ik === "jsonb") {
+        // json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
+        // casts.toml/types.md §14: canonical lowercase 8-4-4-4-12). Explicit — stricter than PG's
+        // assignment-cast-to-text (a documented divergence).
+        if (ik === "json" || ik === "jsonb" || ik === "uuid") {
           return {
             node: { kind: "cast", target, typmod, operand: inner.node },
             type: { kind: "text" },
@@ -20454,13 +20457,50 @@ function resolve(
       // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
       // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL
       // / bool source is castable), so it is handled AFTER the inner is resolved, below.
-      // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
+      // A bytea TARGET: the uuid cast slice admits uuid → bytea (the 16 raw bytes — a jed cast PG
+      // lacks; casts.toml, types.md §14). A string LITERAL was coerced above; a NULL adapts; a bytea
+      // operand is the identity. text → bytea and every other bytea cast stay deferred (0A000 — the
+      // bytea cast slice's own follow-on, types.md §13).
       if (isBytea(target)) {
+        if (e.inner.kind === "param") {
+          const pinner = resolve(scope, e.inner, "bytea", ag, params);
+          return { node: pinner.node, type: { kind: "bytea" } };
+        }
+        const inner = resolve(scope, e.inner, null, ag, params);
+        const ik = inner.type.kind;
+        if (ik === "null" || ik === "bytea") {
+          return { node: inner.node, type: { kind: "bytea" } };
+        }
+        if (ik === "uuid") {
+          return {
+            node: { kind: "cast", target, typmod, operand: inner.node },
+            type: { kind: "bytea" },
+          };
+        }
         throw engineError("feature_not_supported", "casting to bytea is not supported yet");
       }
-      // uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
+      // The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
+      // or bytea expression. text → uuid runs uuid_in at eval (22P02 on malformed); bytea → uuid takes
+      // the 16 raw bytes (22P02 on a length ≠ 16) — a jed cast PG lacks. A string LITERAL operand was
+      // coerced above (the §6 adaptation); $1::uuid declares the param as uuid; a NULL adapts; a uuid
+      // operand is the identity.
       if (isUuid(target)) {
-        throw engineError("feature_not_supported", "casting to uuid is not supported yet");
+        if (e.inner.kind === "param") {
+          const pinner = resolve(scope, e.inner, "uuid", ag, params);
+          return { node: pinner.node, type: { kind: "uuid" } };
+        }
+        const inner = resolve(scope, e.inner, null, ag, params);
+        const ik = inner.type.kind;
+        if (ik === "null" || ik === "uuid") {
+          return { node: inner.node, type: { kind: "uuid" } };
+        }
+        if (ik === "text" || ik === "bytea") {
+          return {
+            node: { kind: "cast", target, typmod, operand: inner.node },
+            type: { kind: "uuid" },
+          };
+        }
+        throw typeError("cannot cast " + rtName(inner.type) + " to uuid");
       }
       // Cross-family datetime casts (timezones.md §9.3): a timestamp/timestamptz/date TARGET from
       // another datetime family. A same-family cast is the identity; a cross-family cast becomes a
@@ -26682,7 +26722,31 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
       return jsonValue(v.text);
     }
     if (isJsonb(target)) return jsonbValue(jsonbIn(v.text));
+    // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible uuid_in parser; a
+    // malformed string traps 22P02.
+    if (isUuid(target)) return uuidValue(decodeUuidLiteral(v.text));
     throw new Error("BUG: resolver rejects this text cast target");
+  }
+  // uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw bytes) — the uuid
+  // cast slice (casts.toml/types.md §14).
+  if (v.kind === "uuid") {
+    if (isText(target)) return textValue(renderUuid(v.bytes));
+    if (isBytea(target)) return byteaValue(v.bytes);
+    throw new Error("BUG: resolver rejects this uuid cast target");
+  }
+  // bytea → uuid (the uuid cast slice — a jed cast PG lacks): exactly 16 raw bytes; any other length
+  // traps 22P02 (the wrong-width body — no PG code to match).
+  if (v.kind === "bytea") {
+    if (isUuid(target)) {
+      if (v.bytes.length !== 16) {
+        throw engineError(
+          "invalid_text_representation",
+          `invalid length for type uuid: ${v.bytes.length} bytes (expected 16)`,
+        );
+      }
+      return uuidValue(v.bytes);
+    }
+    throw new Error("BUG: resolver rejects this bytea cast target");
   }
   // json → text is the identity on the verbatim bytes; json → jsonb re-parses + canonicalizes;
   // json → json is the identity.

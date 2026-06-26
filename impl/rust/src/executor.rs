@@ -35,6 +35,7 @@ use crate::timestamp::{parse_timestamp, parse_timestamptz};
 use crate::types::{DecimalTypmod, ScalarType, Type};
 use crate::value::{
     ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
+    render_uuid,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
@@ -24559,7 +24560,10 @@ fn resolve(
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
                 return match ity {
                     ResolvedType::Null | ResolvedType::Text => Ok((rinner, ResolvedType::Text)),
-                    ResolvedType::Json | ResolvedType::Jsonb => Ok((
+                    // json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
+                    // casts.toml/types.md §14: the canonical lowercase 8-4-4-4-12 form). Explicit —
+                    // stricter than PG's assignment-cast-to-text (a documented divergence).
+                    ResolvedType::Json | ResolvedType::Jsonb | ResolvedType::Uuid => Ok((
                         RExpr::Cast {
                             inner: Box::new(rinner),
                             target,
@@ -24577,19 +24581,58 @@ fn resolve(
             // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32
             // / NULL / bool source is castable), so it is handled AFTER the inner is resolved, below
             // — not guarded here.
-            // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
+            // A bytea TARGET: the uuid cast slice admits uuid → bytea (the 16 raw bytes — a jed cast
+            // PG lacks; casts.toml, types.md §14). A string LITERAL was coerced above; a NULL adapts;
+            // a bytea operand is the identity. text → bytea and every other bytea cast stay deferred
+            // (0A000 — the bytea cast slice's own follow-on, types.md §13).
             if target.is_bytea() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to bytea is not supported yet",
-                ));
+                if matches!(inner.as_ref(), Expr::Param(_)) {
+                    let (rinner, _) = resolve(scope, inner, Some(ScalarType::Bytea), agg, params)?;
+                    return Ok((rinner, ResolvedType::Bytea));
+                }
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                return match ity {
+                    ResolvedType::Null | ResolvedType::Bytea => Ok((rinner, ResolvedType::Bytea)),
+                    ResolvedType::Uuid => Ok((
+                        RExpr::Cast {
+                            inner: Box::new(rinner),
+                            target,
+                            typmod: None,
+                        },
+                        ResolvedType::Bytea,
+                    )),
+                    _ => Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting to bytea is not supported yet",
+                    )),
+                };
             }
-            // uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
+            // The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime
+            // text or bytea expression. text → uuid runs uuid_in at eval (22P02 on malformed);
+            // bytea → uuid takes the 16 raw bytes (22P02 on a length ≠ 16) — a jed cast PG lacks. A
+            // string LITERAL operand was already coerced above (the §6 adaptation); `$1::uuid`
+            // declares the param as uuid; a NULL adapts; a uuid operand is the identity.
             if target.is_uuid() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to uuid is not supported yet",
-                ));
+                if matches!(inner.as_ref(), Expr::Param(_)) {
+                    let (rinner, _) = resolve(scope, inner, Some(ScalarType::Uuid), agg, params)?;
+                    return Ok((rinner, ResolvedType::Uuid));
+                }
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                return match ity {
+                    ResolvedType::Null | ResolvedType::Uuid => Ok((rinner, ResolvedType::Uuid)),
+                    ResolvedType::Text | ResolvedType::Bytea => Ok((
+                        RExpr::Cast {
+                            inner: Box::new(rinner),
+                            target,
+                            typmod: None,
+                        },
+                        ResolvedType::Uuid,
+                    )),
+                    _ => Err(type_error(format!(
+                        "cannot cast {} to uuid",
+                        ity.type_name()
+                    ))),
+                };
             }
             // The timestamp/timestamptz/date cross-family cast matrix is handled above (the
             // `DateConvert` block — timezones.md §9.3). `text`↔datetime casts (a string lands in a
@@ -29987,8 +30030,27 @@ impl RExpr {
                         Ok(Value::Json(s))
                     }
                     Value::Text(s) if target.is_jsonb() => Ok(Value::Jsonb(json::jsonb_in(&s)?)),
+                    // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible
+                    // uuid_in parser; a malformed string traps 22P02.
+                    Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
                     Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
+                    // bytea → uuid (the uuid cast slice — a jed cast PG lacks): exactly 16 raw bytes;
+                    // any other length traps 22P02 (the wrong-width body — no PG code to match).
+                    Value::Bytea(b) if target.is_uuid() => {
+                        let len = b.len();
+                        let arr: [u8; 16] = b.try_into().map_err(|_| {
+                            EngineError::new(
+                                SqlState::InvalidTextRepresentation,
+                                format!("invalid length for type uuid: {len} bytes (expected 16)"),
+                            )
+                        })?;
+                        Ok(Value::Uuid(arr))
+                    }
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
+                    // uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw
+                    // bytes) — the uuid cast slice (casts.toml/types.md §14).
+                    Value::Uuid(u) if target.is_text() => Ok(Value::Text(render_uuid(&u))),
+                    Value::Uuid(u) if target.is_bytea() => Ok(Value::Bytea(u.to_vec())),
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid cast operand"),
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp cast operand")
