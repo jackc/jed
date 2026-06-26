@@ -2206,7 +2206,7 @@ impl Parser {
     }
 
     /// The parenthesized `( group_set ("," group_set)* )` argument list of `ROLLUP` / `CUBE`,
-    /// where each element is a column group (`spec/design/aggregates.md` §12).
+    /// where each element is a grouping expression group (`spec/design/aggregates.md` §12/§15).
     fn parse_group_set_list(&mut self) -> Result<Vec<Vec<Expr>>> {
         self.expect(&Token::LParen)?;
         let mut sets = Vec::new();
@@ -2222,16 +2222,18 @@ impl Parser {
         Ok(sets)
     }
 
-    /// A single grouping "column group": a parenthesized `( col, ... )` / empty `()`, or a bare
-    /// column. Every member is a bare/qualified column reference.
+    /// A single grouping "expression group": a parenthesized `( e, ... )` / empty `()`, or a bare
+    /// grouping term. Each member is a general expression — a bare/qualified column, a select-list
+    /// ordinal (a bare integer literal), an output alias, or any expression (aggregates.md §15). A
+    /// parenthesized list of two-or-more is a column group `(a, b)`; a single parenthesized
+    /// expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
     fn parse_group_set(&mut self) -> Result<Vec<Expr>> {
         if matches!(self.peek(), Token::LParen) {
             self.advance();
             let mut cols = Vec::new();
             if !matches!(self.peek(), Token::RParen) {
                 loop {
-                    let (q, n) = self.parse_column_ref()?;
-                    cols.push(column_ref_expr(q, n));
+                    cols.push(self.parse_expr()?);
                     if matches!(self.peek(), Token::Comma) {
                         self.advance();
                         continue;
@@ -2242,8 +2244,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             Ok(cols)
         } else {
-            let (q, n) = self.parse_column_ref()?;
-            Ok(vec![column_ref_expr(q, n)])
+            Ok(vec![self.parse_expr()?])
         }
     }
 

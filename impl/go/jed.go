@@ -253,6 +253,9 @@ var SupportedCapabilities = []string{
 	// GROUP BY: one row per grouping-key combination + the grouping-error rule + ORDER BY over
 	// grouping keys (spec/design/aggregates.md §5-6, grammar.md §18).
 	"query.group_by",
+	// GROUP BY by a select-list ordinal (GROUP BY 1), an output alias (GROUP BY s), or a general
+	// expression (GROUP BY a + b) — not just a bare column (spec/design/aggregates.md §15).
+	"query.group_by_expr",
 	// GROUPING SETS / ROLLUP / CUBE and the GROUPING() function — multiple grouping sets in one
 	// GROUP BY (spec/design/aggregates.md §12, grammar.md §18).
 	"query.grouping_sets",

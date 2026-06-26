@@ -3117,7 +3117,7 @@ func (p *Parser) parseGroupItem() (GroupItem, error) {
 }
 
 // parseGroupSetList parses the parenthesized `( group_set ("," group_set)* )` argument list of
-// ROLLUP / CUBE, where each element is a column group (spec/design/aggregates.md §12).
+// ROLLUP / CUBE, where each element is a grouping expression group (spec/design/aggregates.md §12/§15).
 func (p *Parser) parseGroupSetList() ([][]Expr, error) {
 	if err := p.expect(TokLParen); err != nil {
 		return nil, err
@@ -3141,19 +3141,22 @@ func (p *Parser) parseGroupSetList() ([][]Expr, error) {
 	return sets, nil
 }
 
-// parseGroupSet parses a single grouping "column group": a parenthesized `( col, ... )` / empty `()`,
-// or a bare column. Every member is a bare/qualified column reference.
+// parseGroupSet parses a single grouping "expression group": a parenthesized `( e, ... )` / empty
+// `()`, or a bare grouping term. Each member is a general expression — a bare/qualified column, a
+// select-list ordinal (a bare integer literal), an output alias, or any expression (aggregates.md
+// §15). A parenthesized list of two-or-more is a column group `(a, b)`; a single parenthesized
+// expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
 func (p *Parser) parseGroupSet() ([]Expr, error) {
 	if p.peek().Kind == TokLParen {
 		p.advance()
 		cols := []Expr{}
 		if p.peek().Kind != TokRParen {
 			for {
-				qualifier, col, err := p.parseColumnRef()
+				e, err := p.parseExpr()
 				if err != nil {
 					return nil, err
 				}
-				cols = append(cols, columnRefExpr(qualifier, col))
+				cols = append(cols, e)
 				if p.peek().Kind == TokComma {
 					p.advance()
 					continue
@@ -3166,11 +3169,11 @@ func (p *Parser) parseGroupSet() ([]Expr, error) {
 		}
 		return cols, nil
 	}
-	qualifier, col, err := p.parseColumnRef()
+	e, err := p.parseExpr()
 	if err != nil {
 		return nil, err
 	}
-	return []Expr{columnRefExpr(qualifier, col)}, nil
+	return []Expr{e}, nil
 }
 
 // columnRefExpr builds a bare or qualified column-reference Expr from a parsed column_ref (the GROUP

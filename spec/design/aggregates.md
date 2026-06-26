@@ -214,9 +214,9 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
 
 ## 10. Staging & deferred
 
-- **`GROUP BY`** (landed) — partitions the post-`WHERE` rows by one or more grouping keys
-  (bare/qualified **columns** only, mirroring the `ORDER BY` narrowing — general
-  expressions, ordinals, and output-alias keys deferred), emitting one row per distinct key
+- **`GROUP BY`** (landed) — partitions the post-`WHERE` rows by one or more grouping keys —
+  a bare/qualified **column**, a select-list **ordinal**, an output **alias**, or a general
+  **expression** (§15) — emitting one row per distinct key
   combination. The **grouping-error rule** ([grammar.md](grammar.md) §18): every
   non-aggregated column in the select list (and `ORDER BY`) must be a grouping key, else `42803`. `NULL` forms its own
   group; decimal keys bucket value-canonically (the displayed key is the first occurrence's
@@ -238,7 +238,9 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   at once, and the `GROUPING()` function reports which columns a row was grouped by (§12).
 - **Ordered-set aggregates** (landed) — `mode`, `percentile_cont`, `percentile_disc`, computed over
   the rows sorted by a `WITHIN GROUP (ORDER BY …)` clause (§13).
-- **Deferred / out of scope**: `GROUP BY` by expression / ordinal / output alias; the PG
+- **`GROUP BY` by ordinal / alias / expression** (landed) — a grouping key may be a select-list
+  ordinal, an output alias, or a general expression, not just a column (§15).
+- **Deferred / out of scope**: the PG
   **functional-dependency**
   relaxation of the grouping rule (a column functionally dependent on a grouped PK); **`FILTER` on
   a window aggregate**; **`GROUPING SETS` combined with window functions**; **hypothetical-set
@@ -462,3 +464,36 @@ row's projected value), and only an **emitted** (post-`LIMIT`) row charges `row_
 itself is unmetered (like the `ORDER BY` sort and the `DISTINCT` set insert). Deterministic and
 identical across cores (the output order comes from the grouped-row iteration / sort, never set
 iteration — CLAUDE.md §8/§10). New capability `query.aggregate_select_distinct`.
+
+## 15. `GROUP BY` by ordinal / output alias / general expression
+
+The first `GROUP BY` slice grouped only by a bare/qualified **column** (the same narrowing the query
+`ORDER BY` started with). PostgreSQL allows three more grouping-key forms, all landed here:
+
+- **Ordinal** — `GROUP BY 1` names the **1-based select-list position**. Only a *bare integer
+  literal* is an ordinal; `GROUP BY 1 + 1` is a constant **expression** (PG). An out-of-range
+  position is `42P10` (*"GROUP BY position N is not in select list"*). Under `SELECT *` the ordinal
+  names the scope column at that position.
+- **Output alias** — `GROUP BY s` where `s` is an `AS` alias (or an item's derived name, e.g.
+  `GROUP BY abs` for `SELECT abs(x)`). A bare name resolves an **input column first**, and only if
+  there is no such column is the output alias used — **the opposite of `ORDER BY`'s output-first
+  rule** (PG). So `SELECT a AS b … GROUP BY b` groups by the table's column `b`, and the projected
+  `a` is then a non-grouped column → `42803`.
+- **General expression** — `GROUP BY a + b`, `GROUP BY lower(s)`. The expression is **materialized**:
+  evaluated **per post-`WHERE` row** into a synthetic grouping column, and a select-list / `HAVING` /
+  `ORDER BY` expression that **structurally matches** it resolves to that group's value (`SELECT a+b
+  … GROUP BY a+b` projects the group key; `ORDER BY a+b` sorts by it even when it is not selected).
+  An **aggregate operand stays per-row** — `sum(a+b)` under `GROUP BY a+b` is the per-row `a+b`
+  folded, *not* the single group value (the operand resolves with grouping-expression matching
+  **off**, since it is evaluated before the fold). A non-grouped column is still `42803`.
+
+All three forms compose with `ROLLUP` / `CUBE` / `GROUPING SETS` (the term may be an ordinal /
+alias / expression in any grouping set). An expression grouping key that has type `json` is `42883`
+(no equality), like a `json` column. `GROUPING(…)` arguments stay **columns only** this slice (a
+`GROUPING(a+b)` over an expression key is a deferred sub-follow-on).
+
+**Cost** (the cross-core contract, §8). A materialized grouping expression is evaluated **once per
+post-`WHERE` row** (its `operator_eval`s charged, like an aggregate operand) and the value cached in
+a synthetic column reused across grouping sets; a plain column key adds nothing. The bucketing /
+finalize stay unmetered. Deterministic and identical across cores. New capability
+`query.group_by_expr`.

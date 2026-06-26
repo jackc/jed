@@ -9949,45 +9949,73 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// the ordered union of every set's columns, i.e. the columns groupable in at least one set
 	// (spec/design/aggregates.md §12). A plain GROUP BY a, b expands to a single set [a, b]; no GROUP
 	// BY expands to a single empty set (the whole-table grand total). An unknown column is 42703.
+	// Each grouping term is one of (aggregates.md §15): a bare/qualified COLUMN; a select-list ORDINAL
+	// (a bare integer literal — `GROUP BY 1`); an output ALIAS (a bare name that is not an input
+	// column — PG's input-column-first rule); or a general EXPRESSION (`GROUP BY a+b`). A column key
+	// keeps its real row slot (groupKeys holds its flat index); an expression key is MATERIALIZED —
+	// its node collected into groupExprs and evaluated per row into a synthetic column inputWidth+k
+	// whose index is the master key. groupKeyExprs records each master key's canonical AST (set for
+	// expression keys) so a matching projection / HAVING / ORDER BY expression resolves to its
+	// synthetic slot. The whole-row equality bucket machinery (resolvedSets, GROUPING SETS) is
+	// unchanged — it works on master key indices.
 	expanded, err := expandGroupBy(sel.GroupBy)
 	if err != nil {
 		return nil, err
 	}
+	inputWidth := s.width()
 	groupKeys := make([]int, 0)
+	groupKeyExprs := make([]*groupKeyExpr, 0)
+	groupExprs := make([]*rExpr, 0)
 	resolvedSets := make([][]int, 0, len(expanded))
 	for _, set := range expanded {
 		idxs := make([]int, 0, len(set))
 		for _, key := range set {
-			var r resolved
-			if key.Kind == ExprQualifiedColumn {
-				r, err = s.resolveQualified(key.Qualifier, key.Column)
+			gr, gerr := resolveGroupTerm(s, *key, sel.Items, ptypes)
+			if gerr != nil {
+				return nil, gerr
+			}
+			var idx int
+			if gr.isColumn {
+				// `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md
+				// §5), so GROUP BY a json column is 42883. jsonb IS groupable.
+				if s.columnAt(gr.index).Type.IsJson() {
+					return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
+				}
+				idx = gr.index
+				found := false
+				for _, gk := range groupKeys {
+					if gk == idx {
+						found = true
+						break
+					}
+				}
+				if !found {
+					groupKeys = append(groupKeys, idx)
+					groupKeyExprs = append(groupKeyExprs, nil)
+				}
 			} else {
-				r, err = s.resolveBare(key.Column)
-			}
-			if err != nil {
-				return nil, err
-			}
-			// Grouping by an enclosing-query column (a per-outer-row constant) is degenerate and
-			// unsupported this slice — the key machinery is flat local indices (§26).
-			if r.level != 0 {
-				return nil, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
-			}
-			// `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md §5),
-			// so GROUP BY a json column is 42883. jsonb IS groupable.
-			if s.columnOf(r).Type.IsJson() {
-				return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
-			}
-			found := false
-			for _, gk := range groupKeys {
-				if gk == r.index {
-					found = true
-					break
+				if gr.ty.kind == rtJson {
+					return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
+				}
+				// Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
+				pos := -1
+				for p, gk := range groupKeyExprs {
+					if gk != nil && exprEqual(gk.canon, gr.canon) {
+						pos = p
+						break
+					}
+				}
+				if pos >= 0 {
+					idx = groupKeys[pos]
+				} else {
+					synth := inputWidth + len(groupExprs)
+					groupExprs = append(groupExprs, gr.node)
+					groupKeys = append(groupKeys, synth)
+					groupKeyExprs = append(groupKeyExprs, &groupKeyExpr{canon: gr.canon, ty: gr.ty})
+					idx = synth
 				}
 			}
-			if !found {
-				groupKeys = append(groupKeys, r.index)
-			}
-			idxs = append(idxs, r.index)
+			idxs = append(idxs, idx)
 		}
 		resolvedSets = append(resolvedSets, idxs)
 	}
@@ -10012,7 +10040,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// A window function may appear in the SELECT list OR in an ORDER BY key (grammar.md §10): either
 	// sets up the window machinery so the key can be sorted by the computed window value.
 	hasWindowSyntax := itemsHaveWindow(sel.Items) || orderByHasWindow(sel.OrderBy)
-	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
+	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys, groupKeyExprs: groupKeyExprs}
 	if hasWindowSyntax {
 		projAgg.windowing = true
 		// Window results land AFTER the materialized window keys, and (for a grouped query) after
@@ -10069,7 +10097,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// part of the grouped row, so the window slots that follow are rebased over the final aggregate count.
 	var having *rExpr
 	if sel.Having != nil {
-		hctx := &aggCtx{collecting: true, groupKeys: groupKeys, specs: aggSpecs, groupingSpecs: groupingSpecs}
+		hctx := &aggCtx{collecting: true, groupKeys: groupKeys, groupKeyExprs: groupKeyExprs, specs: aggSpecs, groupingSpecs: groupingSpecs}
 		node, ty, herr := resolve(s, *sel.Having, nil, hctx, ptypes)
 		if herr != nil {
 			return nil, herr
@@ -10312,7 +10340,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		// (42P20).
 		var rexpr *rExpr
 		var ty resolvedType
-		octx := &aggCtx{collecting: isAgg, groupKeys: groupKeys, specs: aggSpecs, groupingSpecs: groupingSpecs}
+		octx := &aggCtx{collecting: isAgg, groupKeys: groupKeys, groupKeyExprs: groupKeyExprs, specs: aggSpecs, groupingSpecs: groupingSpecs}
 		if hasWindowSyntax {
 			octx.windowing = true
 			octx.windowBase = windowResultBase
@@ -10533,8 +10561,16 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		collectTouched(joins[k].on, 0, touched)
 	}
 	if isAgg {
+		// A column grouping key is a real input column (mark it); an expression grouping key has a
+		// SYNTHETIC index (inputWidth+k, out of touched's range) — its real input columns are reached
+		// through its materialized groupExprs node instead (aggregates.md §15).
 		for _, gk := range groupKeys {
-			touched[gk] = true
+			if gk < totalCols {
+				touched[gk] = true
+			}
+		}
+		for _, ge := range groupExprs {
+			collectTouched(ge, 0, touched)
 		}
 		for i := range aggSpecs {
 			collectTouched(aggSpecs[i].operand, 0, touched)
@@ -10625,7 +10661,8 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	}
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
-		groupSets: groupSets, groupingSpecs: groupingSpecs,
+		groupExprs: groupExprs,
+		groupSets:  groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
@@ -14036,6 +14073,25 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		// (storage_row_read) is upstream and counted once; aggregate_accumulate + operand evals accrue
 		// per (set × row × passing aggregate). The per-set bucket index is never iterated — output order
 		// comes from the insertion-ordered groups then the set order (no map-order leak — §8/§10).
+		// Materialize the general-expression GROUP BY keys (aggregates.md §15): evaluate each per
+		// post-WHERE row ONCE (charging its operator_evals, like an aggregate operand) and append the
+		// value at flat slot inputWidth+k, so a master grouping-key index pointing there reads it. Done
+		// before the (possibly multi-) grouping-set loop so each row is extended once and the values are
+		// shared across sets. A plain column GROUP BY appends nothing.
+		if len(plan.groupExprs) > 0 {
+			for ri := range rows {
+				if err := meter.Guard(); err != nil {
+					return selectResult{}, err
+				}
+				for _, ge := range plan.groupExprs {
+					v, gerr := ge.eval(rows[ri], env, meter)
+					if gerr != nil {
+						return selectResult{}, gerr
+					}
+					rows[ri] = append(rows[ri], v)
+				}
+			}
+		}
 		var groupRows []Row
 		for gsi := range plan.groupSets {
 			gset := &plan.groupSets[gsi]
@@ -14769,6 +14825,136 @@ func expandGroupBy(items []GroupItem) ([][]*Expr, error) {
 		acc = next
 	}
 	return acc, nil
+}
+
+// groupKeyExpr records a general-expression GROUP BY key (`GROUP BY a + b`, aggregates.md §15): its
+// canonical AST (so a matching projection / HAVING / ORDER BY expression resolves to its synthetic
+// slot) and its resolved type.
+type groupKeyExpr struct {
+	canon Expr
+	ty    resolvedType
+}
+
+// groupKeyResolved is the resolution of one GROUP BY grouping term (aggregates.md §15): either an
+// input COLUMN at a flat row index (isColumn, index), or a general EXPRESSION to materialize
+// (node + ty + canonical AST). Mirrors Rust's GroupKeyResolved enum.
+type groupKeyResolved struct {
+	isColumn bool
+	index    int    // valid when isColumn
+	node     *rExpr // valid when !isColumn — the materialized expression
+	ty       resolvedType
+	canon    Expr // valid when !isColumn — the canonical AST kept for projection matching
+}
+
+// resolveGroupTerm resolves one GROUP BY grouping term to a column or a materialized expression
+// (aggregates.md §15). Classifies the term: a bare integer literal is a select-list ORDINAL (1-based;
+// out of range 42P10) whose target select item is then resolved as a term; otherwise it is a column
+// / alias / general expression (resolveGroupNamed).
+func resolveGroupTerm(s *scope, term Expr, items SelectItems, params *paramTypes) (groupKeyResolved, error) {
+	// Only a *bare* integer literal is an ordinal — `GROUP BY 1`; `GROUP BY 1 + 1` is a constant
+	// expression (PG). The parser folds a unary minus into the value, so a negative is just out of
+	// range. The select list fixes the position count: `*` expands to the scope width.
+	if term.Kind == ExprLiteral && term.Literal != nil && term.Literal.Kind == LiteralInt {
+		n := term.Literal.Int
+		var ncols int64
+		if items.All {
+			ncols = int64(s.width())
+		} else {
+			ncols = int64(len(items.Items))
+		}
+		if n < 1 || n > ncols {
+			return groupKeyResolved{}, NewError(InvalidColumnReference,
+				fmt.Sprintf("GROUP BY position %d is not in select list", n))
+		}
+		pos := int(n - 1)
+		if items.All {
+			// `SELECT *` — the ordinal names the column at that scope position directly.
+			return groupKeyResolved{isColumn: true, index: pos}, nil
+		}
+		return resolveGroupExpr(s, items.Items[pos].Expr, params)
+	}
+	return resolveGroupNamed(s, term, items, params)
+}
+
+// resolveGroupNamed resolves a non-ordinal grouping term: a bare/qualified column, an output alias,
+// or a general expression (aggregates.md §15). A bare name resolves an INPUT column FIRST, then —
+// only if there is no such column — an output alias (PG's rule, the opposite of ORDER BY's
+// output-first rule).
+func resolveGroupNamed(s *scope, term Expr, items SelectItems, params *paramTypes) (groupKeyResolved, error) {
+	switch term.Kind {
+	case ExprColumn:
+		r, err := s.resolveBare(term.Column)
+		if err != nil {
+			// No input column of this name: try an output alias (`SELECT a+b AS s … GROUP BY s`). If
+			// none matches either, propagate the original 42703.
+			if se, ok := err.(*EngineError); ok && se.State == UndefinedColumn {
+				aexpr, aerr := orderAliasMatch(items, term.Column, s)
+				if aerr != nil {
+					return groupKeyResolved{}, aerr
+				}
+				if aexpr != nil {
+					return resolveGroupExpr(s, *aexpr, params)
+				}
+			}
+			return groupKeyResolved{}, err
+		}
+		if r.level != 0 {
+			return groupKeyResolved{}, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+		}
+		return groupKeyResolved{isColumn: true, index: r.index}, nil
+	case ExprQualifiedColumn:
+		r, err := s.resolveQualified(term.Qualifier, term.Column)
+		if err != nil {
+			return groupKeyResolved{}, err
+		}
+		if r.level != 0 {
+			return groupKeyResolved{}, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+		}
+		return groupKeyResolved{isColumn: true, index: r.index}, nil
+	default:
+		return resolveGroupExpr(s, term, params)
+	}
+}
+
+// resolveGroupExpr resolves a grouping expression (the target of an ordinal/alias, or a general
+// `GROUP BY a+b`). A plain column expression stays a COLUMN key (so the projection's bare-column path
+// matches it); anything else is MATERIALIZED — resolved against the input row with aggregates
+// forbidden (an aggregate in GROUP BY is 42803), its canonical AST kept for projection matching
+// (aggregates.md §15).
+func resolveGroupExpr(s *scope, e Expr, params *paramTypes) (groupKeyResolved, error) {
+	switch e.Kind {
+	case ExprColumn:
+		if r, err := s.resolveBare(e.Column); err == nil && r.level == 0 {
+			return groupKeyResolved{isColumn: true, index: r.index}, nil
+		}
+	case ExprQualifiedColumn:
+		if r, err := s.resolveQualified(e.Qualifier, e.Column); err == nil && r.level == 0 {
+			return groupKeyResolved{isColumn: true, index: r.index}, nil
+		}
+	}
+	sub := &aggCtx{collecting: false}
+	node, ty, err := resolve(s, e, nil, sub, params)
+	if err != nil {
+		return groupKeyResolved{}, err
+	}
+	return groupKeyResolved{node: node, ty: ty, canon: e}, nil
+}
+
+// matchGroupExpr reports whether e structurally matches a general-expression GROUP BY key in this
+// aggregate context; if so it returns that group's synthetic key slot (its master position) and
+// resolved type (aggregates.md §15). Only fires in a collecting context with groupKeyExprs; an
+// aggregate operand / FILTER resolves under Forbidden (no groupKeyExprs), so a grouping expression
+// there is correctly NOT remapped (it is a per-row value, not the group key).
+func matchGroupExpr(ag *aggCtx, e Expr) (int, resolvedType, bool) {
+	if ag == nil {
+		return 0, resolvedType{}, false
+	}
+	for p, gk := range ag.groupKeyExprs {
+		if gk != nil && exprEqual(gk.canon, e) {
+			return p, gk.ty, true
+		}
+	}
+	return 0, resolvedType{}, false
 }
 
 // groupingValue computes a GROUPING(args) result for a group from the grouping set whose mask is
@@ -16593,6 +16779,12 @@ type selectPlan struct {
 	filter    *rExpr
 	isAgg     bool
 	groupKeys []int
+	// groupExprs is the materialized general-expression GROUP BY keys (`GROUP BY a + b`,
+	// aggregates.md §15), in synthetic-slot order. Before bucketing, each post-WHERE row evaluates
+	// these and appends the values at flat slots inputWidth+k, so a master grouping key index in
+	// groupKeys / groupSets may point at one — the whole-row bucket machinery stays slot-based. Empty
+	// when every grouping key is a plain column (the common case, byte-identical to before).
+	groupExprs []*rExpr
 	// groupSets are the grouping sets to compute (spec/design/aggregates.md §12). A plain GROUP BY
 	// (and the whole-table aggregate) is a single set; ROLLUP/CUBE/GROUPING SETS produce several.
 	groupSets []groupSetPlan
@@ -16725,7 +16917,13 @@ type rCaseArm struct {
 type aggCtx struct {
 	collecting bool
 	groupKeys  []int
-	specs      []aggSpec
+	// groupKeyExprs is parallel to groupKeys: for each master grouping key, a non-nil *groupKeyExpr
+	// (canonical AST + resolved type) if it is a general EXPRESSION key (`GROUP BY a + b`,
+	// aggregates.md §15) — so a projection / HAVING / ORDER BY expression that structurally matches it
+	// resolves to that group's synthetic slot — or nil for a plain COLUMN key (matched by the column
+	// path instead).
+	groupKeyExprs []*groupKeyExpr
+	specs         []aggSpec
 	// windowing marks a non-aggregate WINDOW query's projection (spec/design/window.md §5.1):
 	// bare columns resolve to the real input row (like the Forbidden mode), and a FuncCall carrying
 	// an OVER clause collects into windowSpecs and resolves to the synthetic slot
@@ -18849,7 +19047,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 	// specs are written back into ag at the end so the next window's nested aggregates keep numbering.
 	sub := &aggCtx{}
 	if ag.collecting {
-		sub = &aggCtx{collecting: true, groupKeys: ag.groupKeys, specs: ag.specs}
+		sub = &aggCtx{collecting: true, groupKeys: ag.groupKeys, groupKeyExprs: ag.groupKeyExprs, specs: ag.specs}
 	}
 	// The frame-insensitive no-argument ranking functions (S0/S1): row_number/rank/dense_rank → i64.
 	noArgI64, isNoArg := map[string]windowPlan{
@@ -22686,6 +22884,16 @@ func resolveSubscriptIntPtr(s *scope, e *Expr, ag *aggCtx, params *paramTypes) (
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to i64.
 func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	// GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
+	// matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT a+b
+	// … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own path
+	// (matched by index); an aggregate operand / FILTER resolves under the Forbidden mode (no
+	// groupKeyExprs), so this is correctly inert there (its `a+b` is a per-row value, not the group key).
+	if e.Kind != ExprColumn && e.Kind != ExprQualifiedColumn {
+		if slot, ty, ok := matchGroupExpr(ag, e); ok {
+			return &rExpr{kind: reColumn, index: slot}, ty, nil
+		}
+	}
 	switch e.Kind {
 	case ExprParam:
 		// A bind parameter is an adaptable operand (like an integer/string literal): it takes its

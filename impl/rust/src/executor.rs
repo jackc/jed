@@ -8634,41 +8634,63 @@ impl Database {
         // least one set (spec/design/aggregates.md §12). A plain `GROUP BY a, b` expands to a single
         // set `[a, b]`; no GROUP BY expands to a single empty set (the whole-table grand total). An
         // unknown column is 42703, an ambiguous bare key 42702. Each key is a bare/qualified column.
+        // Each grouping term is one of (aggregates.md §15): a bare/qualified COLUMN; a select-list
+        // ORDINAL (a bare integer literal — `GROUP BY 1`); an output ALIAS (a bare name that is not
+        // an input column — PG's input-column-first rule); or a general EXPRESSION (`GROUP BY a+b`).
+        // A column key keeps its real row slot (`group_keys` holds its flat index); an expression key
+        // is MATERIALIZED — its node collected into `group_exprs` and evaluated per row into a
+        // synthetic column `input_width + k` whose index is the master key. `group_key_exprs` records
+        // each master key's canonical AST (`Some` for expression keys) so a matching projection /
+        // HAVING / ORDER BY expression resolves to its synthetic slot. The whole-row equality bucket
+        // machinery (`resolved_sets`, GROUPING SETS) is unchanged — it works on master key indices.
         let expanded = expand_group_by(&sel.group_by)?;
+        let input_width = scope.width();
         let mut group_keys: Vec<usize> = Vec::new();
+        let mut group_key_exprs: Vec<Option<(Expr, ResolvedType)>> = Vec::new();
+        let mut group_exprs: Vec<RExpr> = Vec::new();
         let mut resolved_sets: Vec<Vec<usize>> = Vec::with_capacity(expanded.len());
         for set in &expanded {
             let mut idxs: Vec<usize> = Vec::with_capacity(set.len());
             for key in set {
-                let r = match key {
-                    Expr::Column(name) => scope.resolve_bare(name)?,
-                    Expr::QualifiedColumn { qualifier, name } => {
-                        scope.resolve_qualified(qualifier, name)?
+                let idx = match resolve_group_term(&scope, key, &sel.items, ptypes)? {
+                    GroupKeyResolved::Column(idx) => {
+                        // `json` has no equality operator (PG ships no hash/btree opclass —
+                        // spec/design/json.md §5), so GROUP BY a json column is 42883. jsonb groups.
+                        if scope.column_at(idx).ty.is_json() {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedFunction,
+                                "could not identify an equality operator for type json",
+                            ));
+                        }
+                        if !group_keys.contains(&idx) {
+                            group_keys.push(idx);
+                            group_key_exprs.push(None);
+                        }
+                        idx
                     }
-                    _ => unreachable!("the parser restricts GROUP BY keys to column references"),
-                };
-                let idx = match r {
-                    Resolved::Local(idx) => idx,
-                    // Grouping by an enclosing-query column (a per-outer-row constant) is degenerate
-                    // and unsupported this slice — the key machinery is flat local indices (§26).
-                    Resolved::Outer { .. } => {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "GROUP BY may not reference an outer query column",
-                        ));
+                    GroupKeyResolved::Expr(rexpr, ty, canon) => {
+                        if matches!(ty, ResolvedType::Json) {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedFunction,
+                                "could not identify an equality operator for type json",
+                            ));
+                        }
+                        // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
+                        match group_key_exprs
+                            .iter()
+                            .position(|gk| matches!(gk, Some((e, _)) if *e == canon))
+                        {
+                            Some(p) => group_keys[p],
+                            None => {
+                                let synth = input_width + group_exprs.len();
+                                group_exprs.push(rexpr);
+                                group_keys.push(synth);
+                                group_key_exprs.push(Some((canon, ty)));
+                                synth
+                            }
+                        }
                     }
                 };
-                // `json` has no equality operator (PG ships no hash/btree opclass —
-                // spec/design/json.md §5), so GROUP BY a json column is 42883. jsonb IS groupable.
-                if scope.column_of(r).ty.is_json() {
-                    return Err(EngineError::new(
-                        SqlState::UndefinedFunction,
-                        "could not identify an equality operator for type json",
-                    ));
-                }
-                if !group_keys.contains(&idx) {
-                    group_keys.push(idx);
-                }
                 idxs.push(idx);
             }
             resolved_sets.push(idxs);
@@ -8699,6 +8721,7 @@ impl Database {
         let mut agg_ctx = if is_agg && has_window_syntax {
             AggCtx::GroupedWindow {
                 group_keys: group_keys.clone(),
+                group_key_exprs: group_key_exprs.clone(),
                 agg_specs: Vec::new(),
                 window_specs: Vec::new(),
                 window_keys: Vec::new(),
@@ -8706,6 +8729,7 @@ impl Database {
         } else if is_agg {
             AggCtx::Collect {
                 group_keys: group_keys.clone(),
+                group_key_exprs: group_key_exprs.clone(),
                 specs: Vec::new(),
                 grouping_specs: Vec::new(),
             }
@@ -8793,6 +8817,7 @@ impl Database {
             Some(h) => {
                 let mut hctx = AggCtx::Collect {
                     group_keys: group_keys.clone(),
+                    group_key_exprs: group_key_exprs.clone(),
                     specs: std::mem::take(&mut agg_specs),
                     grouping_specs: std::mem::take(&mut grouping_specs),
                 };
@@ -9037,6 +9062,7 @@ impl Database {
                     let (rexpr, ty) = if is_agg && has_window_syntax {
                         let mut octx = AggCtx::GroupedWindow {
                             group_keys: group_keys.clone(),
+                            group_key_exprs: group_key_exprs.clone(),
                             agg_specs: std::mem::take(&mut agg_specs),
                             window_specs: std::mem::take(&mut window_specs),
                             window_keys: std::mem::take(&mut window_keys),
@@ -9073,6 +9099,7 @@ impl Database {
                     } else if is_agg {
                         let mut octx = AggCtx::Collect {
                             group_keys: group_keys.clone(),
+                            group_key_exprs: group_key_exprs.clone(),
                             specs: std::mem::take(&mut agg_specs),
                             grouping_specs: std::mem::take(&mut grouping_specs),
                         };
@@ -9340,8 +9367,16 @@ impl Database {
             }
         }
         if is_agg {
+            // A column grouping key is a real input column (mark it); an expression grouping key has a
+            // SYNTHETIC index (`input_width + k`, out of `touched`'s range) — its real input columns
+            // are reached through its materialized `group_exprs` node instead (aggregates.md §15).
             for &k in &group_keys {
-                touched[k] = true;
+                if k < total_cols {
+                    touched[k] = true;
+                }
+            }
+            for ge in &group_exprs {
+                collect_touched(ge, 0, &mut touched);
             }
             for s in &agg_specs {
                 if let Some(op) = &s.operand {
@@ -9478,6 +9513,7 @@ impl Database {
             filter,
             is_agg,
             group_keys,
+            group_exprs,
             group_sets,
             grouping_specs,
             agg_specs,
@@ -11296,6 +11332,20 @@ impl Database {
             // + operand evals accrue per (set × row × passing aggregate). The per-set bucket index is
             // never iterated — output order comes from the insertion-ordered `groups` then the set order
             // (no hashmap-order leak — CLAUDE.md §8/§10).
+            // Materialize the general-expression GROUP BY keys (aggregates.md §15): evaluate each per
+            // post-WHERE row ONCE (charging its operator_evals, like an aggregate operand) and append
+            // the value at flat slot `input_width + k`, so a master grouping-key index pointing there
+            // reads it. Done before the (possibly multi-) grouping-set loop so each row is extended
+            // once and the values are shared across sets. A plain column GROUP BY appends nothing.
+            if !plan.group_exprs.is_empty() {
+                for row in rows.iter_mut() {
+                    meter.guard()?;
+                    for ge in &plan.group_exprs {
+                        let v = ge.eval(row, &env, &mut meter)?;
+                        row.push(v);
+                    }
+                }
+            }
             let mut group_rows: Vec<Vec<Value>> = Vec::new();
             for gset in &plan.group_sets {
                 let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
@@ -15227,6 +15277,12 @@ struct SelectPlan {
     filter: Option<RExpr>,
     is_agg: bool,
     group_keys: Vec<usize>,
+    /// The materialized general-expression `GROUP BY` keys (`GROUP BY a + b`, aggregates.md §15), in
+    /// synthetic-slot order. Before bucketing, each post-WHERE row evaluates these and appends the
+    /// values at flat slots `input_width + k`, so a master grouping key index in `group_keys` /
+    /// `group_sets` may point at one — the whole-row bucket machinery stays slot-based. Empty when
+    /// every grouping key is a plain column (the common case, byte-identical to before).
+    group_exprs: Vec<RExpr>,
     /// The grouping sets to compute (spec/design/aggregates.md §12). A plain `GROUP BY` (and the
     /// whole-table aggregate) is a single set; `ROLLUP`/`CUBE`/`GROUPING SETS` produce several.
     group_sets: Vec<GroupSetPlan>,
@@ -16858,6 +16914,11 @@ enum AggCtx {
     /// projection evaluates against is `[group_key_values…, aggregate_results…]`.
     Collect {
         group_keys: Vec<usize>,
+        /// Parallel to `group_keys`: for each master grouping key, `Some((canonical AST, type))` if
+        /// it is a general **expression** key (`GROUP BY a + b`, aggregates.md §15) — so a projection
+        /// / HAVING / ORDER BY expression that structurally matches it resolves to that group's
+        /// synthetic slot — or `None` for a plain **column** key (matched by the column path instead).
+        group_key_exprs: Vec<Option<(Expr, ResolvedType)>>,
         specs: Vec<AggSpec>,
         /// One entry per `GROUPING(c1, …, ck)` call collected from the projection / HAVING — each is
         /// the list of master-grouping-column POSITIONS (indices into `group_keys`) of its arguments.
@@ -16890,6 +16951,9 @@ enum AggCtx {
     /// slot by `rebase_placeholder_cols` after resolution finishes.
     GroupedWindow {
         group_keys: Vec<usize>,
+        /// Parallel to `group_keys` — see `Collect::group_key_exprs` (general-expression group keys,
+        /// aggregates.md §15). A grouped+window query matches them the same way in its projection.
+        group_key_exprs: Vec<Option<(Expr, ResolvedType)>>,
         agg_specs: Vec<AggSpec>,
         window_specs: Vec<WindowSpec>,
         /// Materialized window-key expressions (a non-column PARTITION BY / ORDER BY key —
@@ -18755,6 +18819,133 @@ fn expand_group_by(items: &[GroupItem]) -> Result<Vec<Vec<&Expr>>> {
     Ok(acc)
 }
 
+/// The resolution of one `GROUP BY` grouping term (aggregates.md §15): either an input COLUMN at a
+/// flat row index, or a general EXPRESSION to materialize (its resolved node + type + canonical AST).
+enum GroupKeyResolved {
+    Column(usize),
+    Expr(RExpr, ResolvedType, Expr),
+}
+
+/// Resolve one `GROUP BY` grouping term to a column or a materialized expression (aggregates.md §15).
+/// Classifies the term: a bare integer literal is a select-list ORDINAL (1-based; out of range
+/// 42P10) whose target select item is then resolved as a term; otherwise it is a column / alias /
+/// general expression (`resolve_group_named`).
+fn resolve_group_term(
+    scope: &Scope,
+    term: &Expr,
+    items: &SelectItems,
+    params: &mut ParamTypes,
+) -> Result<GroupKeyResolved> {
+    // Only a *bare* integer literal is an ordinal — `GROUP BY 1`; `GROUP BY 1 + 1` is a constant
+    // expression (PG). The parser folds a unary minus into the value, so a negative is just out of
+    // range. The select list fixes the position count: `*` expands to the scope width.
+    if let Expr::Literal(Literal::Int(n)) = term {
+        let ncols = match items {
+            SelectItems::All => scope.width() as i64,
+            SelectItems::Items(its) => its.len() as i64,
+        };
+        if *n < 1 || *n > ncols {
+            return Err(EngineError::new(
+                SqlState::InvalidColumnReference,
+                format!("GROUP BY position {n} is not in select list"),
+            ));
+        }
+        let pos = (*n - 1) as usize;
+        return match items {
+            // `SELECT *` — the ordinal names the column at that scope position directly.
+            SelectItems::All => Ok(GroupKeyResolved::Column(pos)),
+            SelectItems::Items(its) => resolve_group_expr(scope, &its[pos].expr, params),
+        };
+    }
+    resolve_group_named(scope, term, items, params)
+}
+
+/// Resolve a non-ordinal grouping term: a bare/qualified column, an output alias, or a general
+/// expression (aggregates.md §15). A bare name resolves an INPUT column FIRST, then — only if there
+/// is no such column — an output alias (PG's rule, the opposite of `ORDER BY`'s output-first rule).
+fn resolve_group_named(
+    scope: &Scope,
+    term: &Expr,
+    items: &SelectItems,
+    params: &mut ParamTypes,
+) -> Result<GroupKeyResolved> {
+    match term {
+        Expr::Column(name) => match scope.resolve_bare(name) {
+            Ok(Resolved::Local(idx)) => Ok(GroupKeyResolved::Column(idx)),
+            Ok(Resolved::Outer { .. }) => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "GROUP BY may not reference an outer query column",
+            )),
+            // No input column of this name: try an output alias (`SELECT a+b AS s … GROUP BY s`).
+            // If none matches either, propagate the original 42703.
+            Err(e) if e.state == SqlState::UndefinedColumn => {
+                match order_alias_match(items, name, scope)? {
+                    Some(aexpr) => resolve_group_expr(scope, aexpr, params),
+                    None => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        },
+        Expr::QualifiedColumn { qualifier, name } => {
+            match scope.resolve_qualified(qualifier, name)? {
+                Resolved::Local(idx) => Ok(GroupKeyResolved::Column(idx)),
+                Resolved::Outer { .. } => Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "GROUP BY may not reference an outer query column",
+                )),
+            }
+        }
+        _ => resolve_group_expr(scope, term, params),
+    }
+}
+
+/// Resolve a grouping expression (the target of an ordinal/alias, or a general `GROUP BY a+b`). A
+/// plain column expression stays a COLUMN key (so the projection's bare-column path matches it);
+/// anything else is MATERIALIZED — resolved against the input row with aggregates forbidden (an
+/// aggregate in GROUP BY is 42803), its canonical AST kept for projection matching (aggregates.md §15).
+fn resolve_group_expr(
+    scope: &Scope,
+    e: &Expr,
+    params: &mut ParamTypes,
+) -> Result<GroupKeyResolved> {
+    match e {
+        Expr::Column(name) => {
+            if let Resolved::Local(idx) = scope.resolve_bare(name)? {
+                return Ok(GroupKeyResolved::Column(idx));
+            }
+        }
+        Expr::QualifiedColumn { qualifier, name } => {
+            if let Resolved::Local(idx) = scope.resolve_qualified(qualifier, name)? {
+                return Ok(GroupKeyResolved::Column(idx));
+            }
+        }
+        _ => {}
+    }
+    let mut sub = AggCtx::Forbidden;
+    let (rexpr, ty) = resolve(scope, e, None, &mut sub, params)?;
+    Ok(GroupKeyResolved::Expr(rexpr, ty, e.clone()))
+}
+
+/// If `e` structurally matches a general-expression `GROUP BY` key in this aggregate context, return
+/// that group's synthetic key slot (its master position) and resolved type (aggregates.md §15). Only
+/// fires in `Collect` / `GroupedWindow`; an aggregate operand / FILTER resolves under `Forbidden`, so
+/// a grouping expression there is correctly NOT remapped (it is a per-row value, not the group key).
+fn match_group_expr(agg: &AggCtx, e: &Expr) -> Option<(usize, ResolvedType)> {
+    let gke = match agg {
+        AggCtx::Collect {
+            group_key_exprs, ..
+        }
+        | AggCtx::GroupedWindow {
+            group_key_exprs, ..
+        } => group_key_exprs,
+        _ => return None,
+    };
+    gke.iter().enumerate().find_map(|(p, gk)| match gk {
+        Some((ge, ty)) if ge == e => Some((p, ty.clone())),
+        _ => None,
+    })
+}
+
 /// Compute a `GROUPING(args)` result for a group from the grouping set whose `mask` is given: bit
 /// `(k-1-j)` of the result is bit `positions[j]` of `mask` (1 iff that column is grouped away in this
 /// set). spec/design/aggregates.md §12.
@@ -20328,12 +20519,14 @@ fn resolve_window_call(
     let (mut sub, mut window_keys): (AggCtx, Vec<RExpr>) = match agg {
         AggCtx::GroupedWindow {
             group_keys,
+            group_key_exprs,
             agg_specs,
             window_keys,
             ..
         } => (
             AggCtx::Collect {
                 group_keys: group_keys.clone(),
+                group_key_exprs: group_key_exprs.clone(),
                 specs: std::mem::take(agg_specs),
                 grouping_specs: Vec::new(),
             },
@@ -22795,6 +22988,16 @@ fn resolve(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
+    // GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
+    // matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT
+    // a+b … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own
+    // path (matched by index); an aggregate operand / FILTER resolves under `Forbidden`, so this is
+    // correctly inert there (its `a+b` is a per-row value, not the group key).
+    if !matches!(e, Expr::Column(_) | Expr::QualifiedColumn { .. })
+        && let Some((slot, ty)) = match_group_expr(agg, e)
+    {
+        return Ok((RExpr::Column(slot), ty));
+    }
     match e {
         // A `ROW(...)` constructor (spec/design/composite.md §1): resolve each field with no type
         // context (its natural type), producing an ANONYMOUS composite (`name = None`, fields named

@@ -228,8 +228,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         equality (first occurrence), then LIMIT/OFFSET — the same project->dedup->window pipeline as
         the non-aggregate DISTINCT. The DISTINCT ORDER BY restriction applies (each key a select-list
         item, else `42P10`). New capability `query.aggregate_select_distinct`. → aggregates.md §14
-  - [ ] _follow-on:_ GROUP BY by
-        expression/ordinal/alias, functional-dependency grouping,
+  - [x] **`GROUP BY` by ordinal / output alias / general expression** — a grouping key may be a
+        select-list ordinal (`GROUP BY 1`, out of range `42P10`; only a bare int literal), an output
+        alias (`GROUP BY s`, input-column-first then alias — opposite of ORDER BY), or a general
+        expression (`GROUP BY a+b`, materialized; a matching select/HAVING/ORDER BY expr resolves to
+        the group value; an aggregate operand stays per-row). Composes with ROLLUP/CUBE/GROUPING SETS.
+        New capability `query.group_by_expr`. → aggregates.md §15
+  - [ ] _follow-on:_ functional-dependency grouping,
         `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate, and the
         ordered-set follow-ons (hypothetical-set aggregates `rank`/`dense_rank`/`percent_rank`/
         `cume_dist` `WITHIN GROUP`, the array-valued `percentile_*` fraction, interval input to

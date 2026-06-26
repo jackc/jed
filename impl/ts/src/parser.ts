@@ -1969,7 +1969,7 @@ class Parser {
   }
 
   // parseGroupSetList parses the parenthesized `( group_set ("," group_set)* )` argument list of
-  // ROLLUP / CUBE, where each element is a column group (spec/design/aggregates.md §12).
+  // ROLLUP / CUBE, where each element is a grouping expression group (spec/design/aggregates.md §12/§15).
   private parseGroupSetList(): Expr[][] {
     this.expect("lparen");
     const sets: Expr[][] = [];
@@ -1985,15 +1985,18 @@ class Parser {
     return sets;
   }
 
-  // parseGroupSet parses a single grouping "column group": a parenthesized `( col, ... )` / empty
-  // `()`, or a bare column. Every member is a bare/qualified column reference.
+  // parseGroupSet parses a single grouping "expression group": a parenthesized `( e, ... )` / empty
+  // `()`, or a bare grouping term. Each member is a general expression — a bare/qualified column, a
+  // select-list ordinal (a bare integer literal), an output alias, or any expression (aggregates.md
+  // §15). A parenthesized list of two-or-more is a column group `(a, b)`; a single parenthesized
+  // expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
   private parseGroupSet(): Expr[] {
     if (this.peek().kind === "lparen") {
       this.advance();
       const cols: Expr[] = [];
       if (this.peek().kind !== "rparen") {
         for (;;) {
-          cols.push(this.columnRefExpr());
+          cols.push(this.parseExpr());
           if (this.peek().kind === "comma") {
             this.advance();
             continue;
@@ -2004,11 +2007,10 @@ class Parser {
       this.expect("rparen");
       return cols;
     }
-    return [this.columnRefExpr()];
+    return [this.parseExpr()];
   }
 
-  // columnRefExpr parses a column_ref into a bare or qualified column-reference Expr (the GROUP BY
-  // grouping terms are columns only — spec/design/aggregates.md §12).
+  // columnRefExpr parses a column_ref into a bare or qualified column-reference Expr.
   private columnRefExpr(): Expr {
     const [qualifier, name] = this.parseColumnRef();
     return qualifier !== null

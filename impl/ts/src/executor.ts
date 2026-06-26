@@ -7727,30 +7727,54 @@ export class Database {
     // (spec/design/aggregates.md §12). A plain GROUP BY a, b expands to a single set [a, b]; no GROUP
     // BY expands to a single empty set (the whole-table grand total). An unknown column is 42703, an
     // outer (correlated) key is degenerate and 0A000 (§26).
+    // Each grouping term is one of (aggregates.md §15): a bare/qualified COLUMN; a select-list ORDINAL
+    // (a bare integer literal — `GROUP BY 1`); an output ALIAS (a bare name that is not an input
+    // column — PG's input-column-first rule); or a general EXPRESSION (`GROUP BY a+b`). A column key
+    // keeps its real row slot (groupKeys holds its flat index); an expression key is MATERIALIZED —
+    // its node collected into groupExprs and evaluated per row into a synthetic column inputWidth+k
+    // whose index is the master key. groupKeyExprs records each master key's canonical AST (non-null
+    // for expression keys) so a matching projection / HAVING / ORDER BY expression resolves to its
+    // synthetic slot. The whole-row equality bucket machinery (resolvedSets, GROUPING SETS) is
+    // unchanged — it works on master key indices.
     const expanded = expandGroupBy(sel.groupBy);
+    const inputWidth = scope.width();
     const groupKeys: number[] = [];
+    const groupKeyExprs: (GroupKeyExpr | null)[] = [];
+    const groupExprs: RExpr[] = [];
     const resolvedSets: number[][] = expanded.map((set) =>
       set.map((key) => {
-        const r =
-          key.kind === "qualifiedColumn"
-            ? scope.resolveQualified(key.qualifier, key.name)
-            : scope.resolveBare((key as { name: string }).name);
-        if (r.level !== 0) {
-          throw engineError(
-            "feature_not_supported",
-            "GROUP BY may not reference an outer query column",
-          );
+        const gr = resolveGroupTerm(scope, key, sel.items, ptypes);
+        if (gr.kind === "column") {
+          // `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md §5),
+          // so GROUP BY a json column is 42883. jsonb IS groupable.
+          if (typeIsJson(scope.columnAt(gr.index).type)) {
+            throw engineError(
+              "undefined_function",
+              "could not identify an equality operator for type json",
+            );
+          }
+          const idx = gr.index;
+          if (!groupKeys.includes(idx)) {
+            groupKeys.push(idx);
+            groupKeyExprs.push(null);
+          }
+          return idx;
         }
-        // `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md §5),
-        // so GROUP BY a json column is 42883. jsonb IS groupable.
-        if (typeIsJson(scope.columnAt(r.index).type)) {
+        // A general EXPRESSION key.
+        if (gr.ty.kind === "json") {
           throw engineError(
             "undefined_function",
             "could not identify an equality operator for type json",
           );
         }
-        if (!groupKeys.includes(r.index)) groupKeys.push(r.index);
-        return r.index;
+        // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
+        const pos = groupKeyExprs.findIndex((gk) => gk !== null && exprEqual(gk.canon, gr.canon));
+        if (pos >= 0) return groupKeys[pos]!;
+        const synth = inputWidth + groupExprs.length;
+        groupExprs.push(gr.node);
+        groupKeys.push(synth);
+        groupKeyExprs.push({ canon: gr.canon, ty: gr.ty });
+        return synth;
       }),
     );
 
@@ -7786,11 +7810,12 @@ export class Database {
       ? {
           collecting: isAgg,
           groupKeys,
+          groupKeyExprs,
           specs: [],
           groupingSpecs: [],
           window: { base: WINDOW_RESULT_BASE, windowSpecs: [], windowKeys: [] },
         }
-      : { collecting: isAgg, groupKeys, specs: [], groupingSpecs: [] };
+      : { collecting: isAgg, groupKeys, groupKeyExprs, specs: [], groupingSpecs: [] };
     // Resolve the WINDOW clause: an entry may extend an earlier entry (`w2 AS (w ORDER BY …)` —
     // window.md §5), so each is merged against the already-resolved earlier entries (a missing/
     // forward/self base is 42704; PARTITION/ORDER overrides and a framed base are 42P20). Every
@@ -7835,7 +7860,13 @@ export class Database {
     // the grouped row, so the window slots that follow are rebased over the final aggregate count.
     let having: RExpr | null = null;
     if (sel.having !== null) {
-      const hctx: AggCtx = { collecting: true, groupKeys, specs: aggSpecs, groupingSpecs };
+      const hctx: AggCtx = {
+        collecting: true,
+        groupKeys,
+        groupKeyExprs,
+        specs: aggSpecs,
+        groupingSpecs,
+      };
       const { node, type } = resolve(scope, sel.having, null, hctx, ptypes);
       if (type.kind !== "bool" && type.kind !== "null") {
         throw typeError("argument of HAVING must be boolean");
@@ -8009,11 +8040,12 @@ export class Database {
         ? {
             collecting: isAgg,
             groupKeys,
+            groupKeyExprs,
             specs: aggSpecs,
             groupingSpecs,
             window: { base: WINDOW_RESULT_BASE, windowSpecs, windowKeys },
           }
-        : { collecting: isAgg, groupKeys, specs: aggSpecs, groupingSpecs };
+        : { collecting: isAgg, groupKeys, groupKeyExprs, specs: aggSpecs, groupingSpecs };
       ({ node, type } = resolve(scope, orderExpr, null, octx, ptypes));
       aggSpecs = octx.specs;
       groupingSpecs = octx.groupingSpecs ?? groupingSpecs;
@@ -8198,7 +8230,11 @@ export class Database {
     if (filter !== null) collectTouched(filter, 0, touched);
     for (const j of joins) if (j.on !== null) collectTouched(j.on, 0, touched);
     if (isAgg) {
-      for (const gk of groupKeys) touched[gk] = true;
+      // A column grouping key is a real input column (mark it); an expression grouping key has a
+      // SYNTHETIC index (inputWidth + k, out of touched's range) — its real input columns are reached
+      // through its materialized groupExprs node instead (aggregates.md §15).
+      for (const gk of groupKeys) if (gk < totalCols) touched[gk] = true;
+      for (const ge of groupExprs) collectTouched(ge, 0, touched);
       for (const s of aggSpecs) if (s.operand !== null) collectTouched(s.operand, 0, touched);
     } else {
       for (const p of projections) collectTouched(p, 0, touched);
@@ -8296,6 +8332,7 @@ export class Database {
       filter,
       isAgg,
       groupKeys,
+      groupExprs,
       groupSets,
       groupingSpecs,
       aggSpecs,
@@ -9760,6 +9797,22 @@ export class Database {
       // (storageRowRead) is upstream and counted once; aggregateAccumulate + operand evals accrue per
       // (set × row × passing aggregate). The per-set index Map is never iterated — output order comes
       // from the insertion-ordered groups then the set order (no Map-order leak — §8/§10).
+      // Materialize the general-expression GROUP BY keys (aggregates.md §15): evaluate each per
+      // post-WHERE row ONCE (charging its operatorEvals, like an aggregate operand) and append the
+      // value at flat slot inputWidth + k, so a master grouping-key index pointing there reads it.
+      // Done before the (possibly multi-) grouping-set loop so each row is extended once and the
+      // values are shared across sets. A plain column GROUP BY appends nothing. Detach from the
+      // (possibly shared) stored row before appending — the scan yields references to the page
+      // store's own arrays, so appending in place would corrupt them across statements (the
+      // materializeOrderExprs / applyWindowStage precedent).
+      if (plan.groupExprs.length > 0) {
+        for (let ri = 0; ri < rows.length; ri++) {
+          meter.guard();
+          const row = rows[ri]!.slice();
+          for (const ge of plan.groupExprs) row.push(evalExpr(ge, row, env, meter));
+          rows[ri] = row;
+        }
+      }
       let groupRows: Value[][] = [];
       for (const gset of plan.groupSets) {
         const index = new Map<string, number>();
@@ -12107,6 +12160,116 @@ function expandGroupBy(items: GroupItem[]): Expr[][] {
   return acc;
 }
 
+// GroupKeyResolved is the resolution of one GROUP BY grouping term (aggregates.md §15): either an
+// input COLUMN at a flat row index, or a general EXPRESSION to materialize (its resolved node + type
+// + canonical AST). Mirrors Rust's GroupKeyResolved enum.
+type GroupKeyResolved =
+  | { kind: "column"; index: number }
+  | { kind: "expr"; node: RExpr; ty: ResolvedType; canon: Expr };
+
+// resolveGroupTerm resolves one GROUP BY grouping term to a column or a materialized expression
+// (aggregates.md §15). Classifies the term: a bare integer literal is a select-list ORDINAL (1-based;
+// out of range 42P10) whose target select item is then resolved as a term; otherwise it is a column
+// / alias / general expression (resolveGroupNamed).
+function resolveGroupTerm(
+  scope: Scope,
+  term: Expr,
+  items: SelectItems,
+  params: ParamTypes,
+): GroupKeyResolved {
+  // Only a *bare* integer literal is an ordinal — `GROUP BY 1`; `GROUP BY 1 + 1` is a constant
+  // expression (PG). The parser folds a unary minus into the value, so a negative is just out of
+  // range. The select list fixes the position count: `*` expands to the scope width.
+  if (term.kind === "literal" && term.literal.kind === "int") {
+    const n = term.literal.int;
+    const ncols = items.kind === "all" ? BigInt(scope.width()) : BigInt(items.items.length);
+    if (n < 1n || n > ncols) {
+      throw engineError(
+        "invalid_column_reference",
+        `GROUP BY position ${n} is not in select list`,
+      );
+    }
+    const pos = Number(n - 1n);
+    if (items.kind === "all") {
+      // `SELECT *` — the ordinal names the column at that scope position directly.
+      return { kind: "column", index: pos };
+    }
+    return resolveGroupExpr(scope, items.items[pos]!.expr, params);
+  }
+  return resolveGroupNamed(scope, term, items, params);
+}
+
+// resolveGroupNamed resolves a non-ordinal grouping term: a bare/qualified column, an output alias,
+// or a general expression (aggregates.md §15). A bare name resolves an INPUT column FIRST, then —
+// only if there is no such column — an output alias (PG's rule, the opposite of ORDER BY's
+// output-first rule).
+function resolveGroupNamed(
+  scope: Scope,
+  term: Expr,
+  items: SelectItems,
+  params: ParamTypes,
+): GroupKeyResolved {
+  if (term.kind === "column") {
+    let r: Resolved;
+    try {
+      r = scope.resolveBare(term.name);
+    } catch (e) {
+      // No input column of this name: try an output alias (`SELECT a+b AS s … GROUP BY s`). If none
+      // matches either, propagate the original 42703.
+      if (e instanceof EngineError && e.state === "undefined_column") {
+        const aexpr = orderAliasMatch(items, term.name, scope);
+        if (aexpr !== null) return resolveGroupExpr(scope, aexpr, params);
+      }
+      throw e;
+    }
+    if (r.level !== 0) {
+      throw engineError("feature_not_supported", "GROUP BY may not reference an outer query column");
+    }
+    return { kind: "column", index: r.index };
+  }
+  if (term.kind === "qualifiedColumn") {
+    const r = scope.resolveQualified(term.qualifier, term.name);
+    if (r.level !== 0) {
+      throw engineError("feature_not_supported", "GROUP BY may not reference an outer query column");
+    }
+    return { kind: "column", index: r.index };
+  }
+  return resolveGroupExpr(scope, term, params);
+}
+
+// resolveGroupExpr resolves a grouping expression (the target of an ordinal/alias, or a general
+// `GROUP BY a+b`). A plain column expression stays a COLUMN key (so the projection's bare-column path
+// matches it); anything else is MATERIALIZED — resolved against the input row with aggregates
+// forbidden (an aggregate in GROUP BY is 42803), its canonical AST kept for projection matching
+// (aggregates.md §15).
+function resolveGroupExpr(scope: Scope, e: Expr, params: ParamTypes): GroupKeyResolved {
+  if (e.kind === "column") {
+    const r = scope.resolveBare(e.name);
+    if (r.level === 0) return { kind: "column", index: r.index };
+  } else if (e.kind === "qualifiedColumn") {
+    const r = scope.resolveQualified(e.qualifier, e.name);
+    if (r.level === 0) return { kind: "column", index: r.index };
+  }
+  const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  const { node, type } = resolve(scope, e, null, sub, params);
+  return { kind: "expr", node, ty: type, canon: e };
+}
+
+// matchGroupExpr returns the synthetic key slot (master position) and resolved type if e structurally
+// matches a general-expression GROUP BY key in this aggregate context (aggregates.md §15). Only fires
+// in a collecting context with groupKeyExprs; an aggregate operand / FILTER resolves under Forbidden
+// (no groupKeyExprs), so a grouping expression there is correctly NOT remapped (it is a per-row
+// value, not the group key).
+function matchGroupExpr(ag: AggCtx, e: Expr): { slot: number; ty: ResolvedType } | null {
+  const gke = ag.groupKeyExprs;
+  if (gke === undefined) return null;
+  for (let p = 0; p < gke.length; p++) {
+    const gk = gke[p];
+    if (gk !== null && gk !== undefined && exprEqual(gk.canon, e)) return { slot: p, ty: gk.ty };
+  }
+  return null;
+}
+
 // groupingValue computes a GROUPING(args) result for a group from the grouping set whose mask is
 // given: bit (k-1-j) of the result is bit positions[j] of mask (spec/design/aggregates.md §12).
 function groupingValue(positions: number[], mask: bigint): bigint {
@@ -13647,6 +13810,12 @@ type SelectPlan = {
   filter: RExpr | null;
   isAgg: boolean;
   groupKeys: number[];
+  // groupExprs is the materialized general-expression GROUP BY keys (`GROUP BY a + b`,
+  // aggregates.md §15), in synthetic-slot order. Before bucketing, each post-WHERE row evaluates
+  // these and appends the values at flat slots inputWidth + k, so a master grouping key index in
+  // groupKeys / groupSets may point at one — the whole-row bucket machinery stays slot-based. Empty
+  // when every grouping key is a plain column (the common case, byte-identical to before).
+  groupExprs: RExpr[];
   // groupSets are the grouping sets to compute (spec/design/aggregates.md §12). A plain GROUP BY
   // (and the whole-table aggregate) is a single set; ROLLUP/CUBE/GROUPING SETS produce several.
   groupSets: GroupSet[];
@@ -13931,9 +14100,20 @@ type AggSpec = {
 // base + windowIndex, where base is the input row's flat width — the window stage appends each
 // function's result after the input columns. S0 narrows window + aggregate/GROUP BY to 0A000 (so
 // `collecting` and `window` are never both set), and an aggregate in a window context is 42803.
+// GroupKeyExpr records a general-expression GROUP BY key (`GROUP BY a + b`, aggregates.md §15): its
+// canonical AST (so a matching projection / HAVING / ORDER BY expression resolves to its synthetic
+// slot) and its resolved type.
+type GroupKeyExpr = { canon: Expr; ty: ResolvedType };
+
 type AggCtx = {
   collecting: boolean;
   groupKeys: number[];
+  // groupKeyExprs is parallel to groupKeys: for each master grouping key, a non-null GroupKeyExpr
+  // (canonical AST + resolved type) if it is a general EXPRESSION key (`GROUP BY a + b`,
+  // aggregates.md §15) — so a projection / HAVING / ORDER BY expression that structurally matches it
+  // resolves to that group's synthetic slot — or null for a plain COLUMN key (matched by the column
+  // path instead). Undefined in a Forbidden context (no grouping-expression remapping there).
+  groupKeyExprs?: (GroupKeyExpr | null)[];
   specs: AggSpec[];
   // window collects window functions (windowSpecs) and the materialized window-key expressions
   // (windowKeys — a non-column PARTITION BY / ORDER BY key, `PARTITION BY a + b`). A window result
@@ -15459,7 +15639,7 @@ function resolveWindowCall(
   // also map the window's PARTITION BY / ORDER BY columns to grouped-row slots.
   const grouped = ag.collecting;
   const sub: AggCtx = grouped
-    ? { collecting: true, groupKeys: ag.groupKeys, specs: ag.specs }
+    ? { collecting: true, groupKeys: ag.groupKeys, groupKeyExprs: ag.groupKeyExprs, specs: ag.specs }
     : { collecting: false, groupKeys: [], specs: [] };
   if (lname in noArgI64) {
     if (e.star || e.args.length !== 0) {
@@ -18960,6 +19140,15 @@ function resolve(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
+  // GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
+  // matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT a+b
+  // … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own path
+  // (matched by index); an aggregate operand / FILTER resolves under the Forbidden mode (no
+  // groupKeyExprs), so this is correctly inert there (its `a+b` is a per-row value, not the group key).
+  if (e.kind !== "column" && e.kind !== "qualifiedColumn") {
+    const m = matchGroupExpr(ag, e);
+    if (m !== null) return { node: { kind: "column", index: m.slot }, type: m.ty };
+  }
   switch (e.kind) {
     case "row": {
       // A ROW(...) constructor (spec/design/composite.md §1): resolve each field with no type

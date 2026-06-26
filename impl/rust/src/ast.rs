@@ -742,10 +742,11 @@ pub enum SelectItems {
     Items(Vec<SelectItem>),
 }
 
-/// A `GROUP BY` grouping term (grammar.md §18, spec/design/aggregates.md §12). Most queries use
-/// only `Set` with one column each (plain `GROUP BY a, b` parses as `[Set([a]), Set([b])]`); the
+/// A `GROUP BY` grouping term (grammar.md §18, spec/design/aggregates.md §12/§15). Most queries use
+/// only `Set` with one term each (plain `GROUP BY a, b` parses as `[Set([a]), Set([b])]`); the
 /// `ROLLUP`/`CUBE`/`GROUPING SETS` forms produce *multiple* grouping sets the resolver expands and
-/// cross-products. Each `Expr` inside is a bare/qualified `Column` (the parser enforces it).
+/// cross-products. Each `Expr` inside is a general grouping term — a bare/qualified column, a
+/// select-list ordinal (a bare integer literal), an output alias, or any expression (§15).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum GroupItem {
     /// A single grouping set's column list: a bare column `a` (`Set([a])`), a parenthesized group

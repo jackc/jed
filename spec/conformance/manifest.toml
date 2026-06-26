@@ -337,6 +337,10 @@ id = "query.group_by"
 description = "GROUP BY <column,...>: one result row per distinct grouping-key combination; NULL is its own group; decimal keys bucket value-canonically; first-occurrence group order (ORDER BY over a grouping column overrides); a non-aggregated SELECT/ORDER BY column not in GROUP BY is 42803; GROUP BY over an empty table yields zero rows (spec/design/aggregates.md §5-6, grammar.md §18)"
 
 [[capability]]
+id = "query.group_by_expr"
+description = "GROUP BY by a select-list ORDINAL (GROUP BY 1 — 1-based position, out of range 42P10; only a bare integer literal, 1+1 is a constant expression), an output ALIAS (GROUP BY s — a bare name resolves an INPUT column FIRST, then an output alias/derived name, PG's rule opposite ORDER BY), or a general EXPRESSION (GROUP BY a + b), not just a bare column (aggregates.md §15). An expression key is materialized (evaluated per row into a synthetic column) and a select-list / HAVING / ORDER BY expression that structurally matches it resolves to the group value; an aggregate operand stays per-row (sum(a+b) under GROUP BY a+b is the per-row a+b). Composes with ROLLUP/CUBE/GROUPING SETS. A non-grouped column is still 42803. Builds on query.group_by"
+
+[[capability]]
 id = "query.grouping_sets"
 description = "GROUP BY GROUPING SETS / ROLLUP / CUBE and the GROUPING() function: several grouping sets in one GROUP BY (ROLLUP(a,b)={(a,b),(a),()}, CUBE(a,b)=every subset; a plain term cross-products with these); a column not grouped in a row's set projects NULL; a select column must be in the union of all sets else 42803; GROUPING(c1,...,ck) -> integer bitmask (1 = grouped away), its args must be grouping columns else 42803; columns only; combined with window functions or over MAX_GROUPING_SETS is deferred/limited (54001) (spec/design/aggregates.md §12, grammar.md §18)"
 
