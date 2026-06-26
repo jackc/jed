@@ -11448,7 +11448,17 @@ impl Database {
                             None => Value::Null,
                         });
                     }
-                    for acc in accs {
+                    for (si, mut acc) in accs.into_iter().enumerate() {
+                        // An ordered-set aggregate's percentile fraction (the direct argument) is
+                        // evaluated PER GROUP here, against the synthetic row's grouping-key values
+                        // (aggregates.md §13/§17) — so it may reference grouping columns. Unmetered
+                        // (the finalize step, like the sort), via a scratch meter. `mode` has none.
+                        if let Acc::OrderedSet { frac, .. } = &mut acc
+                            && let Some(osa) = &plan.agg_specs[si].osa
+                            && let Some(fe) = &osa.frac
+                        {
+                            *frac = Some(fe.eval(&srow, &env, &mut Meter::new())?);
+                        }
                         srow.push(acc.finalize()?);
                     }
                     for positions in &plan.grouping_specs {
@@ -17153,13 +17163,14 @@ enum AggPlan {
 }
 
 /// The resolve-time parameters of an ordered-set aggregate (spec/design/aggregates.md §13), kept
-/// off `AggPlan` (which is `Copy`/`Eq` and so cannot hold an `f64`). `desc` is the `WITHIN GROUP`
-/// sort direction; `frac` is the constant percentile fraction (`None` = a NULL fraction → NULL
-/// result; unused for `mode`).
-#[derive(Clone, Copy)]
+/// off `AggPlan` (which is `Copy`/`Eq`). `desc` is the `WITHIN GROUP` sort direction; `frac` is the
+/// resolved **direct argument** (the percentile fraction) — resolved in the grouped context so it
+/// references grouping columns by their synthetic key slots (a non-grouped column is `42803`,
+/// matching PG's *"direct arguments … must use only grouped columns"*) and is evaluated **per group**
+/// at finalize against the synthetic row. `None` for `mode` (no direct argument).
 struct OsaParams {
     desc: bool,
-    frac: Option<f64>,
+    frac: Option<RExpr>,
 }
 
 /// One resolved aggregate: its plan and its resolved argument expression (evaluated per
@@ -17236,13 +17247,16 @@ enum Acc {
     },
     /// An ordered-set aggregate (`mode`/`percentile_disc`/`percentile_cont` — aggregates.md §13):
     /// buffer every non-NULL operand value, then sort + compute at finalize. `kind` selects the
-    /// computation, `desc` the `WITHIN GROUP` direction, `frac` the constant fraction. For
-    /// `percentile_cont` the inputs are widened to f64 into `floats`; `mode`/`percentile_disc`
-    /// buffer the original `Value`s into `vals`.
+    /// computation, `desc` the `WITHIN GROUP` direction. `frac` is the **evaluated** percentile
+    /// fraction for this group (the direct argument is evaluated per group against the synthetic row
+    /// just before finalize — aggregates.md §13): `Some(Value)` for `percentile_*` (the value may be
+    /// `Value::Null` → NULL result, or an array → one percentile per element), `None` for `mode`. For
+    /// `percentile_cont` the inputs are widened to f64 into `floats`; `mode`/`percentile_disc` buffer
+    /// the original `Value`s into `vals`.
     OrderedSet {
         kind: AggPlan,
         desc: bool,
-        frac: Option<f64>,
+        frac: Option<Value>,
         vals: Vec<Value>,
         floats: Vec<f64>,
     },
@@ -17257,11 +17271,16 @@ impl Acc {
     fn from_spec(s: &AggSpec) -> Acc {
         match s.plan {
             AggPlan::OrderedSetMode | AggPlan::OrderedSetDisc | AggPlan::OrderedSetCont => {
-                let osa = s.osa.expect("an ordered-set plan carries its OSA params");
+                let osa = s
+                    .osa
+                    .as_ref()
+                    .expect("an ordered-set plan carries its OSA params");
                 Acc::OrderedSet {
                     kind: s.plan,
                     desc: osa.desc,
-                    frac: osa.frac,
+                    // The per-group fraction is filled in just before finalize (the direct argument
+                    // evaluated against the synthetic row); `mode` keeps `None`.
+                    frac: None,
                     vals: Vec::new(),
                     floats: Vec::new(),
                 }
@@ -17613,7 +17632,7 @@ impl Acc {
                 frac,
                 vals,
                 floats,
-            } => finalize_ordered_set(kind, desc, frac, vals, floats)?,
+            } => finalize_ordered_set(kind, desc, frac.as_ref(), vals, floats)?,
         })
     }
 }
@@ -17626,7 +17645,7 @@ impl Acc {
 fn finalize_ordered_set(
     kind: AggPlan,
     desc: bool,
-    frac: Option<f64>,
+    frac: Option<&Value>,
     mut vals: Vec<Value>,
     mut floats: Vec<f64>,
 ) -> Result<Value> {
@@ -17655,23 +17674,20 @@ fn finalize_ordered_set(
             Ok(vals.swap_remove(best_idx))
         }
         AggPlan::OrderedSetDisc => {
-            let Some(p) = frac else {
-                return Ok(Value::Null); // a NULL fraction → NULL (checked before the range check)
+            // The per-group fraction (the direct argument, aggregates.md §13/§17). A NULL fraction
+            // → NULL (checked before the range check); out of [0,1]/NaN → 22003.
+            let Some(p) = fraction_to_f64(frac)? else {
+                return Ok(Value::Null);
             };
             check_percentile_fraction(p)?;
             if vals.is_empty() {
                 return Ok(Value::Null);
             }
             vals.sort_by(|a, b| dir_cmp(value_cmp(a, b), desc));
-            let n = vals.len();
-            // PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
-            let rownum = (p * n as f64).ceil() as i64;
-            let idx = if rownum < 1 { 0 } else { (rownum - 1) as usize };
-            let idx = idx.min(n - 1);
-            Ok(vals.swap_remove(idx))
+            Ok(percentile_disc_at(&mut vals, p))
         }
         AggPlan::OrderedSetCont => {
-            let Some(p) = frac else {
+            let Some(p) = fraction_to_f64(frac)? else {
                 return Ok(Value::Null);
             };
             check_percentile_fraction(p)?;
@@ -17679,23 +17695,58 @@ fn finalize_ordered_set(
                 return Ok(Value::Null);
             }
             floats.sort_by(|a, b| dir_cmp(crate::value::total_cmp_f64(*a, *b), desc));
-            let n = floats.len();
-            // PG percentile_cont (orderedsetaggs.c): interpolate between the bracketing rows, in
-            // f64 with PG's exact operation order — bit-identical across cores and to PG.
-            let pos = p * ((n - 1) as f64);
-            let first = pos.floor() as usize;
-            let second = pos.ceil() as usize;
-            let result = if first == second {
-                floats[first]
-            } else {
-                let lo = floats[first];
-                let hi = floats[second];
-                let proportion = pos - first as f64;
-                lo + (proportion * (hi - lo))
-            };
-            Ok(Value::Float64(result))
+            Ok(Value::Float64(percentile_cont_at(&floats, p)))
         }
         _ => unreachable!("finalize_ordered_set is only called for the ordered-set plans"),
+    }
+}
+
+/// Convert an evaluated percentile fraction (the direct argument, evaluated per group) to `f64`
+/// (aggregates.md §13/§17). `None` / `Value::Null` → `None` (a NULL fraction yields NULL). A numeric
+/// value (the resolver restricts the fraction to a numeric family) widens via the IEEE / correctly-
+/// rounded decimal cast. The range check (`22003`) is applied by the caller after this.
+fn fraction_to_f64(frac: Option<&Value>) -> Result<Option<f64>> {
+    Ok(match frac {
+        None | Some(Value::Null) => None,
+        Some(Value::Float64(f)) => Some(*f),
+        Some(Value::Float32(f)) => Some(*f as f64),
+        Some(Value::Int(n)) => Some(*n as f64),
+        Some(Value::Decimal(d)) => match decimal_to_float(d, ScalarType::Float64)? {
+            Value::Float64(f) => Some(f),
+            _ => unreachable!("decimal_to_float(_, Float64) yields a Float64"),
+        },
+        Some(other) => {
+            unreachable!("a non-numeric percentile fraction is rejected at resolve: {other:?}")
+        }
+    })
+}
+
+/// `percentile_disc` over the already-sorted group values: the value at row `ceil(p·N)` (1-based),
+/// i.e. the smallest `K` with `K/N ≥ p` (PG `orderedsetaggs.c`). Caller guarantees non-empty + the
+/// fraction in range. spec/design/aggregates.md §13.
+fn percentile_disc_at(vals: &mut Vec<Value>, p: f64) -> Value {
+    let n = vals.len();
+    let rownum = (p * n as f64).ceil() as i64;
+    let idx = if rownum < 1 { 0 } else { (rownum - 1) as usize };
+    let idx = idx.min(n - 1);
+    vals.swap_remove(idx)
+}
+
+/// `percentile_cont` over the already-sorted f64 group values: interpolate between the two bracketing
+/// rows, in f64 with PG's exact operation order — bit-identical across cores and to PG
+/// (spec/design/aggregates.md §13). Caller guarantees non-empty + the fraction in range.
+fn percentile_cont_at(floats: &[f64], p: f64) -> f64 {
+    let n = floats.len();
+    let pos = p * ((n - 1) as f64);
+    let first = pos.floor() as usize;
+    let second = pos.ceil() as usize;
+    if first == second {
+        floats[first]
+    } else {
+        let lo = floats[first];
+        let hi = floats[second];
+        let proportion = pos - first as f64;
+        lo + (proportion * (hi - lo))
     }
 }
 
@@ -20252,8 +20303,8 @@ fn resolve_ordered_set_aggregate(
             (AggPlan::OrderedSetMode, None, optype.clone())
         }
         "percentile_disc" => {
-            let frac = resolve_osa_fraction(scope, &lname, args, params)?;
-            (AggPlan::OrderedSetDisc, frac, optype.clone())
+            let frac = resolve_osa_fraction(scope, &lname, args, agg, params)?;
+            (AggPlan::OrderedSetDisc, Some(frac), optype.clone())
         }
         "percentile_cont" => {
             // percentile_cont interpolates, so the aggregated input must be numeric (interval is a
@@ -20264,10 +20315,10 @@ fn resolve_ordered_set_aggregate(
             ) {
                 return Err(no_agg_overload(&lname));
             }
-            let frac = resolve_osa_fraction(scope, &lname, args, params)?;
+            let frac = resolve_osa_fraction(scope, &lname, args, agg, params)?;
             (
                 AggPlan::OrderedSetCont,
-                frac,
+                Some(frac),
                 ResolvedType::Float(ScalarType::Float64),
             )
         }
@@ -20332,42 +20383,37 @@ fn resolve_ordered_set_aggregate(
 }
 
 /// Resolve an ordered-set aggregate's direct argument — the percentile fraction (aggregates.md
-/// §13). It must be a numeric **constant** (a column reference / param / non-folded expression is
-/// the deferred non-constant form, 0A000); resolved with a float context so a numeric literal
-/// folds to an `f64`. Returns `None` for a NULL fraction (→ NULL result). A non-numeric fraction
-/// or a wrong argument count matches no overload (42883).
+/// §13/§17). The fraction is evaluated **once per group**, so it may be any expression over
+/// **grouping columns** (resolved here in the grouped `agg` context, so a grouping column binds its
+/// synthetic key slot and a non-grouped column is `42803` — PG's *"direct arguments … must use only
+/// grouped columns"*); a constant folds the usual way. An aggregate inside the fraction is `42803`
+/// (PG forbids nesting). Resolved with a float hint so a bare numeric literal folds to `f64`. The
+/// returned node is stored and evaluated per group at finalize. A non-numeric fraction or a wrong
+/// argument count matches no overload (`42883`); a NULL fraction yields a NULL result at finalize.
 fn resolve_osa_fraction(
     scope: &Scope,
     name: &str,
     args: &[Expr],
+    agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<Option<f64>> {
+) -> Result<RExpr> {
     let [arg] = args else {
         return Err(no_agg_overload(name)); // wrong argument count
     };
-    if expr_reads_columns(arg) {
+    // The fraction is evaluated before the fold (it is a direct argument, not an aggregate operand),
+    // so a nested aggregate is illegal — 42803, matching PG.
+    if expr_has_aggregate(arg) {
         return Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            "the fraction argument of an ordered-set aggregate must be a constant",
+            SqlState::GroupingError,
+            "aggregate function calls cannot be nested",
         ));
     }
-    let mut sub = AggCtx::Forbidden;
-    let (rarg, rtype) = resolve(scope, arg, Some(ScalarType::Float64), &mut sub, params)?;
+    let (rarg, rtype) = resolve(scope, arg, Some(ScalarType::Float64), agg, params)?;
     match rtype {
-        ResolvedType::Null => Ok(None),
-        ResolvedType::Float(_) | ResolvedType::Int(_) | ResolvedType::Decimal => match rarg {
-            RExpr::ConstFloat64(f) => Ok(Some(f)),
-            RExpr::ConstFloat32(f) => Ok(Some(f as f64)),
-            RExpr::ConstInt(n) => Ok(Some(n as f64)),
-            RExpr::ConstDecimal(d) => match decimal_to_float(&d, ScalarType::Float64)? {
-                Value::Float64(f) => Ok(Some(f)),
-                _ => unreachable!("decimal_to_float(_, Float64) yields a Float64"),
-            },
-            _ => Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "the fraction argument of an ordered-set aggregate must be a constant",
-            )),
-        },
+        ResolvedType::Null
+        | ResolvedType::Float(_)
+        | ResolvedType::Int(_)
+        | ResolvedType::Decimal => Ok(rarg),
         _ => Err(no_agg_overload(name)), // a non-numeric fraction matches no overload
     }
 }

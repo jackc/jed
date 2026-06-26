@@ -368,11 +368,12 @@ for all three (PG: a second key produces *"function mode(…, …) does not exis
 **`42883`**. An **aggregate** nested in the order key is **`42803`** (aggregates cannot be nested).
 
 **The direct argument vs. the aggregated argument.** A `percentile_*` call has **two** argument
-lists. The parenthesized **direct argument** (the fraction) is a per-group **constant**, evaluated
-**once** — jed resolves it in an empty (no-column) scope and folds it to an `f64` at plan time (a
-column reference in the direct argument is the deferred non-constant form). The **aggregated
-argument** is the `WITHIN GROUP` `ORDER BY` key — a column or a general expression — evaluated **per
-row** (it is the aggregate's operand). `mode()` has no direct argument.
+lists. The parenthesized **direct argument** (the fraction) is evaluated **once per group** (§17): it
+may be any numeric expression over the **grouping columns** (a literal is the common case), resolved
+in the grouped context — so a non-grouped column in it is `42803` — and evaluated against the group's
+key values at finalize. The **aggregated argument** is the `WITHIN GROUP` `ORDER BY` key — a column
+or a general expression — evaluated **per row** (it is the aggregate's operand). `mode()` has no
+direct argument.
 
 **NULL handling.** NULL aggregated values are **skipped**, exactly as for the §7 aggregates: a group
 whose every input is NULL (or that is empty) yields **`NULL`** for all three. A **NULL fraction**
@@ -520,3 +521,23 @@ partition as by `[pk…]` alone. This makes them ordinary grouping-key slots, so
 `HAVING` / `ORDER BY` resolve them through the normal column path with no new machinery. A CTE /
 derived table / SRF has no real PK (a synthetic key), so only base tables contribute. New capability
 `query.group_by_functional_dependency`.
+
+## 17. A non-constant ordered-set-aggregate fraction
+
+§13's first slice required the `percentile_*` direct argument (the fraction) to be a **constant**,
+folded to an `f64` at plan time. PostgreSQL allows it to be any expression over the **grouping
+columns** — evaluated **once per group** (a direct argument, *not* a per-row operand). jed matches:
+
+- The fraction is resolved in the **grouped context** (like the projection), so a grouping column
+  binds its synthetic key slot and a **non-grouped column is `42803`** (PG: *"direct arguments of an
+  ordered-set aggregate must use only grouped columns"*). An **aggregate** inside the fraction is
+  `42803` (PG forbids nesting). A non-numeric fraction is still `42883` (no overload).
+- At **finalize** the fraction expression is evaluated against the group's synthetic row (its
+  grouping-key values), yielding this group's fraction — so `percentile_cont(p) WITHIN GROUP (ORDER
+  BY v) … GROUP BY p` uses each group's own `p`. A **constant** fraction is just the degenerate case
+  (the expression ignores the row). The per-group `NULL → NULL` and out-of-range `→ 22003` rules
+  (§13) are unchanged, now applied to the evaluated value.
+- **Cost.** The fraction evaluation is part of the **unmetered** finalize (like the sort), so the
+  metered cost is unchanged from a constant fraction — deterministic and cross-core identical.
+
+New capability `query.ordered_set_nonconstant_fraction`.

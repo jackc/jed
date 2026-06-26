@@ -362,6 +362,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.ordered_set_aggregate",
   // A general-expression WITHIN GROUP order key (ORDER BY a + b), not just a bare column.
   "query.within_group_expr",
+  // A non-constant ordered-set aggregate fraction — percentile_cont(expr) / percentile_disc(expr)
+  // where expr references grouping columns, evaluated per group (spec/design/aggregates.md §17).
+  "query.ordered_set_nonconstant_fraction",
   // Window functions — OVER (PARTITION BY / ORDER BY), the window stage, row_number() (S0,
   // spec/design/window.md).
   "query.window",

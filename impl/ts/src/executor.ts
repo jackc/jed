@@ -9891,7 +9891,20 @@ export class Database {
         for (const g of groups) {
           const srow: Value[] = [];
           for (const src of gset.slotSrc) srow.push(src < 0 ? nullValue() : g.keys[src]!);
-          for (const a of g.accs) srow.push(finalizeAcc(a));
+          for (let si = 0; si < g.accs.length; si++) {
+            const a = g.accs[si]!;
+            // An ordered-set aggregate's percentile fraction (the direct argument) is evaluated PER
+            // GROUP here, against the synthetic row's grouping-key values (aggregates.md §13/§17) — so
+            // it may reference grouping columns. Unmetered (the finalize step, like the sort), via a
+            // scratch meter. mode has none.
+            if (a.plan === "percentileDisc" || a.plan === "percentileCont") {
+              const fe = plan.aggSpecs[si]!.osaFrac;
+              if (fe !== undefined && fe !== null) {
+                a.osaFrac = evalExpr(fe, srow, env, new Meter());
+              }
+            }
+            srow.push(finalizeAcc(a));
+          }
           for (const positions of plan.groupingSpecs) {
             srow.push(intValue(groupingValue(positions, gset.mask)));
           }
@@ -14106,11 +14119,14 @@ type AggSpec = {
   // For the "jsonObjectAgg" plan (B4): unique → error 22030 on a duplicate key. asJson rides on
   // jsonAsJson above (json vs jsonb render). Fixed at resolve.
   jsonUnique?: boolean;
-  // Ordered-set aggregate parameters (mode/percentile_* — aggregates.md §13), set only for the
-  // mode/percentileDisc/percentileCont plans: the WITHIN GROUP sort direction and the constant
-  // percentile fraction (null = a NULL fraction → NULL result; unused for mode).
+  // Ordered-set aggregate parameters (mode/percentile_* — aggregates.md §13/§17), set only for the
+  // mode/percentileDisc/percentileCont plans. osaDesc is the WITHIN GROUP sort direction; osaFrac is
+  // the resolved **direct argument** (the percentile fraction) — resolved in the grouped context so
+  // it references grouping columns by their synthetic key slots (a non-grouped column is 42803,
+  // matching PG's "direct arguments … must use only grouped columns") and is evaluated **per group**
+  // at finalize against the synthetic row. null for mode (no direct argument).
   osaDesc?: boolean;
-  osaFrac?: number | null;
+  osaFrac?: RExpr | null;
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -14254,10 +14270,13 @@ type Acc = {
   jsonPairs: [string, Value][];
   jsonUnique: boolean;
   // Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
-  // fraction, plus the collected non-NULL values (percentileCont widens to f64 into osaFloats;
-  // mode/percentileDisc keep the Value in osaVals). Sorted + computed at finalize.
+  // the **evaluated** percentile fraction for this group, plus the collected non-NULL values
+  // (percentileCont widens to f64 into osaFloats; mode/percentileDisc keep the Value in osaVals).
+  // osaFrac is the per-group fraction Value — the direct argument is evaluated per group against the
+  // synthetic row just before finalize (aggregates.md §13/§17): a Value for percentile_* (it may be
+  // NULL → NULL result, or numeric), null for mode. Sorted + computed at finalize.
   osaDesc?: boolean;
-  osaFrac?: number | null;
+  osaFrac?: Value | null;
   osaVals?: Value[];
   osaFloats?: number[];
 };
@@ -14295,7 +14314,8 @@ function newAccFromSpec(s: AggSpec): Acc {
   if (s.plan === "mode" || s.plan === "percentileDisc" || s.plan === "percentileCont") {
     const a = newAcc(s.plan);
     a.osaDesc = s.osaDesc;
-    a.osaFrac = s.osaFrac;
+    // The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
+    // evaluated against the synthetic row); mode keeps it null/undefined.
     a.osaVals = [];
     a.osaFloats = [];
     return a;
@@ -14561,42 +14581,71 @@ function finalizeOrderedSet(a: Acc): Value {
     return vals[bestIdx]!;
   }
   if (a.plan === "percentileDisc") {
-    if (a.osaFrac === null || a.osaFrac === undefined) return nullValue(); // NULL fraction → NULL
-    const p = a.osaFrac;
+    // The per-group fraction (the direct argument, aggregates.md §13/§17). A NULL fraction → NULL
+    // (checked before the range check); out of [0,1]/NaN → 22003.
+    const p = fractionToF64(a.osaFrac);
+    if (p === null) return nullValue();
     checkPercentileFraction(p);
     const vals = a.osaVals!;
     if (vals.length === 0) return nullValue();
     vals.sort((x, y) => dirCmp(valueCmp(x, y), desc));
-    const n = vals.length;
-    // PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
-    const rownum = Math.ceil(p * n);
-    let idx = rownum >= 1 ? rownum - 1 : 0;
-    if (idx > n - 1) idx = n - 1;
-    return vals[idx]!;
+    return percentileDiscAt(vals, p);
   }
   // percentileCont
-  if (a.osaFrac === null || a.osaFrac === undefined) return nullValue();
-  const p = a.osaFrac;
+  const p = fractionToF64(a.osaFrac);
+  if (p === null) return nullValue();
   checkPercentileFraction(p);
   const fs = a.osaFloats!;
   if (fs.length === 0) return nullValue();
   fs.sort((x, y) => dirCmp(floatTotalCmp(x, y), desc));
-  const n = fs.length;
-  // PG percentile_cont (orderedsetaggs.c): interpolate between the bracketing rows, in f64 with PG's
-  // exact operation order — bit-identical across cores and to PG.
+  return float64Value(percentileContAt(fs, p));
+}
+
+// fractionToF64 converts an evaluated percentile fraction (the direct argument, evaluated per group)
+// to f64 (aggregates.md §13/§17). null / a NULL Value → null (a NULL fraction yields NULL). A numeric
+// value (the resolver restricts the fraction to a numeric family) widens via the IEEE / correctly-
+// rounded decimal cast. The range check (22003) is applied by the caller after this.
+function fractionToF64(frac: Value | null | undefined): number | null {
+  if (frac === null || frac === undefined || frac.kind === "null") return null;
+  switch (frac.kind) {
+    case "f64":
+    case "f32":
+      return frac.value;
+    case "int":
+      return Number(frac.int);
+    case "decimal":
+      return Number(frac.dec.render());
+    default:
+      throw new Error("a non-numeric percentile fraction is rejected at resolve");
+  }
+}
+
+// percentileDiscAt computes percentile_disc over the already-sorted group values: the value at row
+// ceil(p·N) (1-based), i.e. the smallest K with K/N ≥ p (PG orderedsetaggs.c). Caller guarantees
+// non-empty + the fraction in range. spec/design/aggregates.md §13.
+function percentileDiscAt(vals: Value[], p: number): Value {
+  const n = vals.length;
+  // PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
+  const rownum = Math.ceil(p * n);
+  let idx = rownum >= 1 ? rownum - 1 : 0;
+  if (idx > n - 1) idx = n - 1;
+  return vals[idx]!;
+}
+
+// percentileContAt computes percentile_cont over the already-sorted f64 group values: interpolate
+// between the two bracketing rows, in f64 with PG's exact operation order — bit-identical across
+// cores and to PG (spec/design/aggregates.md §13). Caller guarantees non-empty + the fraction in
+// range.
+function percentileContAt(floats: number[], p: number): number {
+  const n = floats.length;
   const pos = p * (n - 1);
   const first = Math.floor(pos);
   const second = Math.ceil(pos);
-  let result: number;
-  if (first === second) {
-    result = fs[first]!;
-  } else {
-    const lo = fs[first]!;
-    const hi = fs[second]!;
-    const proportion = pos - first;
-    result = lo + proportion * (hi - lo);
-  }
-  return float64Value(result);
+  if (first === second) return floats[first]!;
+  const lo = floats[first]!;
+  const hi = floats[second]!;
+  const proportion = pos - first;
+  return lo + proportion * (hi - lo);
 }
 
 // dirCmp applies a WITHIN GROUP sort direction to a comparison result (DESC reverses).
@@ -15471,7 +15520,7 @@ function resolveOrderedSetAggregate(
   const optype = r.type;
 
   let plan: AggPlan;
-  let frac: number | null;
+  let frac: RExpr | null;
   let result: ResolvedType;
   if (name === "mode") {
     // mode() takes no direct argument; mode(x) matches no overload (42883).
@@ -15480,7 +15529,7 @@ function resolveOrderedSetAggregate(
     frac = null;
     result = optype;
   } else if (name === "percentile_disc") {
-    frac = resolveOsaFraction(scope, name, e.args, params);
+    frac = resolveOsaFraction(scope, name, e.args, ag, params);
     plan = "percentileDisc";
     result = optype;
   } else {
@@ -15489,7 +15538,7 @@ function resolveOrderedSetAggregate(
     if (optype.kind !== "int" && optype.kind !== "decimal" && optype.kind !== "float") {
       throw noAggOverload(name);
     }
-    frac = resolveOsaFraction(scope, name, e.args, params);
+    frac = resolveOsaFraction(scope, name, e.args, ag, params);
     plan = "percentileCont";
     result = { kind: "float", ty: "f64" };
   }
@@ -15512,35 +15561,34 @@ function resolveOrderedSetAggregate(
 }
 
 // resolveOsaFraction resolves an ordered-set aggregate's direct argument — the percentile fraction
-// (aggregates.md §13). It must be a numeric constant (a column reference / param / non-folded
-// expression is the deferred non-constant form, 0A000); resolved with a float context so a numeric
-// literal folds to an f64. Returns null for a NULL fraction (→ NULL result). A non-numeric fraction
-// or a wrong argument count matches no overload (42883).
+// (aggregates.md §13/§17). The fraction is evaluated **once per group**, so it may be any expression
+// over **grouping columns** (resolved here in the grouped agg context, so a grouping column binds its
+// synthetic key slot and a non-grouped column is 42803 — PG's "direct arguments … must use only
+// grouped columns"; a constant folds the usual way). An aggregate inside the fraction is 42803 (PG
+// forbids nesting). Resolved with a float hint so a bare numeric literal folds to f64. The returned
+// node is stored and evaluated per group at finalize. A non-numeric fraction or a wrong argument
+// count matches no overload (42883); a NULL fraction yields a NULL result at finalize.
 function resolveOsaFraction(
   scope: Scope,
   name: string,
   args: Expr[],
+  ag: AggCtx,
   params: ParamTypes,
-): number | null {
+): RExpr {
   if (args.length !== 1) throw noAggOverload(name); // wrong argument count
-  if (exprReadsColumns(args[0]!)) {
-    throw engineError(
-      "feature_not_supported",
-      "the fraction argument of an ordered-set aggregate must be a constant",
-    );
+  // The fraction is evaluated before the fold (it is a direct argument, not an aggregate operand),
+  // so a nested aggregate is illegal — 42803, matching PG.
+  if (exprHasAggregate(args[0]!)) {
+    throw engineError("grouping_error", "aggregate function calls cannot be nested");
   }
-  const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-  const r = resolve(scope, args[0]!, "f64", sub, params);
-  if (r.type.kind === "null") return null;
-  if (r.type.kind === "float" || r.type.kind === "int" || r.type.kind === "decimal") {
-    const node = r.node;
-    if (node.kind === "constFloat") return node.value;
-    if (node.kind === "constInt") return Number(node.value);
-    if (node.kind === "constDecimal") return Number(node.value.render());
-    throw engineError(
-      "feature_not_supported",
-      "the fraction argument of an ordered-set aggregate must be a constant",
-    );
+  const r = resolve(scope, args[0]!, "f64", ag, params);
+  if (
+    r.type.kind === "null" ||
+    r.type.kind === "float" ||
+    r.type.kind === "int" ||
+    r.type.kind === "decimal"
+  ) {
+    return r.node;
   }
   throw noAggOverload(name); // a non-numeric fraction matches no overload
 }

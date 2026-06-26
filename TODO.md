@@ -242,8 +242,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate, and the
         ordered-set follow-ons (hypothetical-set aggregates `rank`/`dense_rank`/`percent_rank`/
         `cume_dist` `WITHIN GROUP`, the array-valued `percentile_*` fraction, interval input to
-        `percentile_cont`, a general-expression / collated `WITHIN GROUP` key, a non-constant
-        fraction).
+        `percentile_cont`, a collated `WITHIN GROUP` key).
+  - [x] **Non-constant ordered-set fraction** — `percentile_cont(expr)` / `percentile_disc(expr)`
+        where `expr` references grouping columns, evaluated per group (a non-grouped column is `42803`).
+        New capability `query.ordered_set_nonconstant_fraction`. → aggregates.md §17
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
       optimization.** Per-row values folded over a related row set in a dedicated **window stage**
       (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/

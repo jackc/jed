@@ -4387,15 +4387,6 @@ fn syntax(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::SyntaxError, msg.into())
 }
 
-/// Build a bare or qualified column-reference `Expr` from a parsed `column_ref` (the GROUP BY
-/// grouping terms are columns only — spec/design/aggregates.md §12).
-fn column_ref_expr(qualifier: Option<String>, name: String) -> Expr {
-    match qualifier {
-        Some(qualifier) => Expr::QualifiedColumn { qualifier, name },
-        None => Expr::Column(name),
-    }
-}
-
 /// Whether `kw` (already lower-cased) is a keyword that may legally follow a `table_ref`,
 /// and so must NOT be swallowed as an implicit table alias: a trailing clause keyword
 /// (`where`/`order`/`limit`/`offset`) or any join-machinery keyword
