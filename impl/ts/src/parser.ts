@@ -87,6 +87,9 @@ function isTableRefStopKeyword(kw: string): boolean {
     case "full":
     case "outer":
     case "on":
+    // USING introduces a join condition after the right table_ref (`JOIN b USING (k)`), so it
+    // must not be swallowed as the right table's implicit alias (grammar.md §15).
+    case "using":
     case "as":
     // set operators end a SELECT core — they must not be swallowed as an implicit table alias
     // (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.
@@ -2365,12 +2368,27 @@ class Parser {
         return null;
     }
     const table = this.parseTableRef();
+    // A non-CROSS join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15). USING is not
+    // reserved (§3): it is the join condition only as the keyword immediately following the right
+    // table_ref. The column list has one or more names; an empty list is a 42601.
     let on: Expr | null = null;
-    if (!isCross) {
+    let using: string[] | undefined;
+    if (isCross) {
+      // no condition
+    } else if (this.peekKeyword() === "using") {
+      this.advance();
+      this.expect("lparen");
+      using = [this.expectIdentifier()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        using.push(this.expectIdentifier());
+      }
+      this.expect("rparen");
+    } else {
       this.expectKeyword("on");
       on = this.parseExpr();
     }
-    return { kind, table, on };
+    return { kind, table, on, using };
   }
 
   // parseColumnRef parses `column_ref ::= identifier ("." identifier)?` — a bare column name, or

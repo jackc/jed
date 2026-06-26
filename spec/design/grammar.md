@@ -105,9 +105,10 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   Before the joins slice the only `AS` in the surface was inside `CAST(expr AS type)` and a
   select-item alias; `table_ref` now adds the optional `AS` of a **table** alias (§15).
 - **Single-table `UPDATE` / `DELETE`** — those two still take one table (no `JOIN`, no `USING`).
-  `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON`, `CROSS JOIN`, and the
-  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family all execute. **Subqueries** (derived tables,
-  `IN`/`EXISTS`, correlated) and **`USING`/`NATURAL`** join forms remain deferred.
+  `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON`, `CROSS JOIN`, the
+  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family, comma-`FROM`, and `JOIN ... USING (cols)` all execute
+  (subqueries / derived tables / `IN` / `EXISTS` / correlated landed too). Only **`NATURAL`** and
+  `FULL JOIN USING` remain deferred join forms.
 - **`INSERT` values are *literals only*** (not general expressions; see the `literal`
   production) — but the `DEFAULT` keyword is now also a value slot, and an explicit **column
   list** (`INSERT INTO t (a, c) VALUES ...`) landed alongside `DEFAULT` (§12, §16).
@@ -642,13 +643,36 @@ whole-row expansion `(expr).*` (a postfix on a parenthesized base — composite.
 a *relation*, `(c).*` a *composite value*; the bare-identifier shape selects the relation reading.
 
 **The join operators.** `join_clause ::= "CROSS" "JOIN" table_ref | join_type? "JOIN" table_ref
-"ON" expr`. A bare `JOIN` is `INNER` (the keyword optional). The `ON` predicate is a general
-expression that **must resolve to boolean** — a non-boolean `ON` is `42804`, the same rule WHERE
-takes — and is evaluated **at the join** over the combined (left-concatenated-with-right) row;
-only a **TRUE** result keeps the pair (three-valued, so a `NULL` join key never matches, matching
-PostgreSQL inner-join semantics). `CROSS JOIN` is the Cartesian product (no `ON`). An `INNER`/bare
-`JOIN` with **no `ON`** is `42601` (this slice requires it; `USING`/`NATURAL` are deferred), and a
-`CROSS JOIN ... ON ...` is likewise `42601`.
+("ON" expr | "USING" "(" identifier ("," identifier)* ")")`. A bare `JOIN` is `INNER` (the keyword
+optional). The `ON` predicate is a general expression that **must resolve to boolean** — a
+non-boolean `ON` is `42804`, the same rule WHERE takes — and is evaluated **at the join** over the
+combined (left-concatenated-with-right) row; only a **TRUE** result keeps the pair (three-valued, so
+a `NULL` join key never matches, matching PostgreSQL inner-join semantics). `CROSS JOIN` is the
+Cartesian product (no condition). An `INNER`/bare `JOIN` with **neither `ON` nor `USING`** is
+`42601`, and a `CROSS JOIN ... ON/USING ...` is likewise `42601`.
+
+**`USING (col, …)` — the column-merge join condition.** `a JOIN b USING (k)` is an **equi-join on
+the named columns** that **merges** each into a single output column (PostgreSQL — grammar.md §15).
+Equivalent to `a JOIN b ON a.k = b.k`, *except* the output carries **one** `k`, not two. The merge
+shows up in three places: (1) `SELECT *` lists the merged columns **first** (in `USING` order), then
+the left relation's other columns, then the right's — so `SELECT * FROM a JOIN b USING(k)` is
+`k, <a's rest>, <b's rest>`; (2) a **bare** `k` resolves to the merged column, never the `42702`
+ambiguity the two underlying copies would otherwise raise; (3) the qualified `a.k` / `b.k` still
+reach each side directly. The merge value is the **surviving side**: the **left** column for
+`INNER`/`LEFT` (always present for a left-preserved row), the **right** column for `RIGHT` — both
+exactly `COALESCE(a.k, b.k)` for those kinds, since the surviving side is the non-NULL one. Only
+`FULL JOIN USING`, whose merge is a genuine `COALESCE` of two possibly-NULL sides, is **not** a
+single column; it is a deferred **`0A000`** narrowing (the single-flat-index merge model carries
+one column, not a coalesce). Each `USING` column must exist in **both** sides (else `42703`), and a
+type-mismatched pair reaches jed's **strict comparison** (`42804`, a documented divergence from PG's
+`42883`). `USING` composes with multi-column lists, the outer kinds (INNER/LEFT/RIGHT), and a
+**chain** (`a JOIN b USING(k) JOIN c USING(k)` keeps one `k`). Implementation: the planner
+synthesizes the `left.col = right.col` predicate and records each merge as `(name → surviving flat
+index)` on the scope, with both underlying copies marked **hidden** so `*` and bare resolution skip
+them; this is computed **before** GROUP BY / DISTINCT / projection so every clause sees the merge.
+`USING` is non-reserved (§3) — it is the join condition only as the keyword immediately following the
+right `table_ref`, joining the implicit-alias stop set so `JOIN b USING (…)` never reads `using` as
+`b`'s alias.
 
 Evaluating each `ON` **at its own join node** (not folding all `ON`s into the trailing WHERE) is
 deliberate: for INNER it is observationally identical to a WHERE, but it is the executor shape the
@@ -726,9 +750,11 @@ explicit `JOIN` syntax — [../../TODO.md](../../TODO.md)).
 
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
-- **No `USING` / `NATURAL`** join forms (they need column-name matching / merge semantics), **no
-  parenthesized-join FROM** (`FROM (a JOIN b ON …)`). A **derived table** (`FROM (SELECT …) AS t`)
-  *is* now supported — see §42; the **`t.*`** qualified star has landed (above).
+- **No `NATURAL`** join form (it derives a `USING` list from the common column names — a follow-on
+  on the now-landed `USING` machinery), **no parenthesized-join FROM** (`FROM (a JOIN b ON …)`), and
+  **no `FULL JOIN ... USING`** (its `COALESCE` merge — above). A **derived table**
+  (`FROM (SELECT …) AS t`) *is* supported — see §42; the **`t.*`** qualified star and **`USING`** have
+  landed (above).
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
   (though a qualified `WHERE t.a = 1` referencing their sole table now resolves, harmlessly).
 

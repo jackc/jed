@@ -9974,7 +9974,90 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx})
 		offset += len(t.Columns)
 	}
-	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+
+	// USING/NATURAL merged columns + every join's resolved predicate (grammar.md §15) — computed
+	// BEFORE the scope so GROUP BY / DISTINCT / projection / WHERE all see the merge columns; a plain
+	// ON join resolves here too. Joins are processed left-to-right so a later join's left side sees
+	// the merges introduced by earlier ones (a USING chain). For each USING column the synthesized
+	// predicate is `left.col = right.col` (3-valued, like any ON); the SURVIVING side becomes the
+	// single merge column — the left for INNER/LEFT, the right for RIGHT (FULL JOIN USING, a COALESCE,
+	// is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
+	var merges []mergeCol
+	var hidden []int
+	joinPreds := make([]*rExpr, len(sel.Joins))
+	for k := range sel.Joins {
+		j := &sel.Joins[k]
+		seg := k + 1
+		for seg >= 1 && !sel.Joins[seg-1].Comma {
+			seg--
+		}
+		segOff := rels[seg].offset
+		var segMerges []mergeCol
+		for _, m := range merges {
+			if m.index >= segOff {
+				segMerges = append(segMerges, m)
+			}
+		}
+		var segHidden []int
+		for _, i := range hidden {
+			if i >= segOff {
+				segHidden = append(segHidden, i)
+			}
+		}
+		switch {
+		case j.Using != nil:
+			if j.Kind == JoinFull {
+				return nil, NewError(FeatureNotSupported, "FULL JOIN with USING is not supported yet")
+			}
+			left := &scope{rels: rels[seg : k+1], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
+			var predAST *Expr
+			for _, name := range j.Using {
+				lr, lerr := left.resolveBare(name)
+				if lerr != nil || lr.level != 0 {
+					return nil, NewError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in left table")
+				}
+				li := lr.index
+				llabel, lname := relOfIndex(rels, li)
+				rightRel := &rels[k+1]
+				rl := rightRel.table.ColumnIndex(name)
+				if rl < 0 {
+					return nil, NewError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in right table")
+				}
+				ri := rightRel.offset + rl
+				eq := binaryExpr(OpEq,
+					Expr{Kind: ExprQualifiedColumn, Qualifier: llabel, Column: lname},
+					Expr{Kind: ExprQualifiedColumn, Qualifier: rightRel.label, Column: name})
+				if predAST == nil {
+					predAST = &eq
+				} else {
+					a := binaryExpr(OpAnd, *predAST, eq)
+					predAST = &a
+				}
+				mi := li
+				if j.Kind == JoinRight {
+					mi = ri
+				}
+				merges = slices.DeleteFunc(merges, func(m mergeCol) bool { return strings.EqualFold(m.name, name) })
+				merges = append(merges, mergeCol{name: strings.ToLower(name), index: mi})
+				hidden = append(hidden, li, ri)
+			}
+			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
+			pred, perr := resolveBooleanFilter(partial, predAST, ptypes)
+			if perr != nil {
+				return nil, perr
+			}
+			joinPreds[k] = pred
+		case j.On != nil:
+			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
+			pred, perr := resolveBooleanFilter(partial, j.On, ptypes)
+			if perr != nil {
+				return nil, perr
+			}
+			joinPreds[k] = pred
+		}
+	}
+
+	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: merges, hidden: hidden}
 
 	// Resolve projections (paired with output names — §8), the optional WHERE (must be
 	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
@@ -10600,33 +10683,12 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		}
 	}
 
-	// Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
-	// relations joined so far — rels[segStart:k+2]), so a forward reference to a not-yet-joined
-	// table is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER
-	// and the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
-	// changes how unmatched rows are handled in the loop below (§15). The partial scope keeps the
-	// same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
-	//
-	// Comma-FROM (grammar.md §15): the comma binds looser than JOIN, so a join's ON may reference
-	// only relations in its OWN comma item, not an earlier one. segStart is that item's first
-	// relation — the most recent comma-introduced relation at or before k+1 (the Comma flag marks
-	// each) — so `FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a` exactly as PostgreSQL rejects
-	// it. With no commas every join's segment starts at rel 0.
+	// The join predicates were resolved above (alongside the USING/NATURAL merges, which the scope
+	// now carries). Pair each with its join kind — the kind only changes how unmatched rows are
+	// handled in the executor loop, not the predicate (grammar.md §15).
 	joins := make([]planJoin, len(sel.Joins))
 	for k, j := range sel.Joins {
-		var on *rExpr
-		if j.On != nil {
-			segStart := k + 1
-			for segStart >= 1 && !sel.Joins[segStart-1].Comma {
-				segStart--
-			}
-			partial := &scope{rels: s.rels[segStart : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
-			on, err = resolveBooleanFilter(partial, j.On, ptypes)
-			if err != nil {
-				return nil, err
-			}
-		}
-		joins[k] = planJoin{kind: j.Kind, on: on}
+		joins[k] = planJoin{kind: j.Kind, on: joinPreds[k]}
 	}
 
 	// Assemble the owned plan (table NAMES + offsets/widths replace the scope's *Table, so the
@@ -23269,6 +23331,22 @@ type scope struct {
 	// DIRECTLY down into nested scopes (a subquery sees the same ctes), NOT via the parent chain —
 	// so CTE lookup never counts as a correlation level. Empty for every non-WITH statement.
 	ctes []*cteBinding
+	// merges are the USING/NATURAL merged columns (spec/design/grammar.md §15) — a bare reference
+	// to a merge name resolves to its index (checked before the per-relation search, so it is never
+	// the underlying copies' 42702 ambiguity). Empty except in a SELECT whose FROM has a USING join.
+	merges []mergeCol
+	// hidden is the flat indices SUPERSEDED by a merge — the underlying left+right copies, omitted
+	// from `*` expansion (still reachable qualified). Empty unless merges is non-empty.
+	hidden []int
+}
+
+// mergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): name is the (lowercased)
+// join column and index the flat row index a bare reference resolves to — the surviving side (the
+// left column for INNER/LEFT, the right for RIGHT; FULL JOIN USING, a COALESCE, is deferred 0A000).
+// Both underlying copies are recorded in the scope's hidden set.
+type mergeCol struct {
+	name  string
+	index int
 }
 
 // singleScope is a one-relation scope with no parent (the single-table UPDATE / DELETE case).
@@ -23343,7 +23421,17 @@ func outerOf(r resolved) resolved {
 // A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no new
 // ambiguity (grammar.md §32).
 func (s *scope) resolveBare(name string) (resolved, error) {
+	// A USING/NATURAL MERGE column resolves to its surviving side (grammar.md §15), seeded here so
+	// the bare name binds the merged column rather than its two (hidden) underlying copies — which
+	// is why such a join column is unambiguous. A non-hidden column elsewhere with the same name
+	// still makes the reference ambiguous (a third relation sharing the name).
 	found := -1
+	for _, m := range s.merges {
+		if strings.EqualFold(m.name, name) {
+			found = m.index
+			break
+		}
+	}
 	for _, r := range s.rels {
 		if r.qualifierOnly {
 			continue
@@ -23354,11 +23442,16 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 		// Base tables have unique column names, so this only ever fires for a duplicate-output-name
 		// synthetic relation.
 		for local, c := range r.table.Columns {
+			idx := r.offset + local
+			// A merge's underlying copies are superseded by the merge above — skip them.
+			if slices.Contains(s.hidden, idx) {
+				continue
+			}
 			if strings.EqualFold(c.Name, name) {
 				if found >= 0 {
 					return resolved{}, ambiguousColumn(name)
 				}
-				found = r.offset + local
+				found = idx
 			}
 		}
 	}
@@ -23419,6 +23512,20 @@ func (s *scope) columnAt(flat int) *Column {
 		}
 	}
 	panic("a resolved flat column index is always in range")
+}
+
+// relOfIndex returns the (label, column-name) of the relation owning a flat row index — used to
+// synthesize a USING/NATURAL join predicate's qualified column references (grammar.md §15). The
+// index is known valid (resolution produced it), so the scan always finds an owner.
+func relOfIndex(rels []scopeRel, idx int) (string, string) {
+	for i := range rels {
+		r := rels[i]
+		n := len(r.table.Columns)
+		if idx >= r.offset && idx < r.offset+n {
+			return r.label, r.table.Columns[idx-r.offset].Name
+		}
+	}
+	panic("USING merge index out of range")
 }
 
 // ancestor returns the scope `level` hops outward (1 = immediate parent).
@@ -23630,6 +23737,16 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 		var ps []*rExpr
 		var names []string
 		var types []resolvedType
+		// USING/NATURAL merged columns come FIRST, in join order (PostgreSQL — grammar.md §15):
+		// `SELECT * FROM a JOIN b USING(k)` is `k, <a's other cols>, <b's other cols>`. Each merge
+		// emits its surviving-side column; its underlying copies are in hidden and so are skipped by
+		// the per-relation loop below (otherwise the plain `*` expansion).
+		for _, m := range s.merges {
+			c := s.columnAt(m.index)
+			ps = append(ps, &rExpr{kind: reColumn, index: m.index})
+			names = append(names, c.Name)
+			types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
+		}
 		// The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
 		// relations' columns exactly as before (grammar.md §32).
 		for _, r := range s.rels {
@@ -23637,7 +23754,11 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 				continue
 			}
 			for i := range r.table.Columns {
-				ps = append(ps, &rExpr{kind: reColumn, index: r.offset + i})
+				idx := r.offset + i
+				if slices.Contains(s.hidden, idx) {
+					continue
+				}
+				ps = append(ps, &rExpr{kind: reColumn, index: idx})
 				names = append(names, r.table.Columns[i].Name)
 				types = append(types, resolvedTypeOfCol(r.table.Columns[i].Type, s.catalog.readSnap()))
 			}

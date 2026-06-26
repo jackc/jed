@@ -3016,8 +3016,36 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 	if err != nil {
 		return JoinClause{}, false, err
 	}
+	// A non-CROSS join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15). USING is not
+	// reserved (§3): it is the join condition only as the keyword immediately following the right
+	// table_ref. The column list has one or more names; an empty list is a 42601.
 	var on *Expr
-	if !isCross {
+	var using []string
+	switch {
+	case isCross:
+		// no condition
+	case p.peekKeyword() == "using":
+		p.advance()
+		if err := p.expect(TokLParen); err != nil {
+			return JoinClause{}, false, err
+		}
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return JoinClause{}, false, err
+		}
+		using = []string{name}
+		for p.peek().Kind == TokComma {
+			p.advance()
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return JoinClause{}, false, err
+			}
+			using = append(using, name)
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return JoinClause{}, false, err
+		}
+	default:
 		if err := p.expectKeyword("on"); err != nil {
 			return JoinClause{}, false, err
 		}
@@ -3027,7 +3055,7 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 		}
 		on = &e
 	}
-	return JoinClause{Kind: kind, Table: table, On: on}, true, nil
+	return JoinClause{Kind: kind, Table: table, On: on, Using: using}, true, nil
 }
 
 // isTableRefStopKeyword reports whether kw (already lower-cased) is a keyword that may legally
@@ -3039,6 +3067,9 @@ func isTableRefStopKeyword(kw string) bool {
 	switch kw {
 	case "where", "group", "having", "order", "limit", "offset",
 		"join", "inner", "cross", "left", "right", "full", "outer", "on", "as",
+		// USING introduces a join condition after the right table_ref (`JOIN b USING (k)`), so it
+		// must not be swallowed as `b`'s implicit alias (grammar.md §15).
+		"using",
 		// set operators end a SELECT core — they must not be swallowed as an implicit table
 		// alias (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.
 		"union", "intersect", "except",

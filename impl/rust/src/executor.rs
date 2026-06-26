@@ -8244,6 +8244,8 @@ impl Database {
             catalog: self,
             allow_subquery: true,
             ctes,
+            merges: Vec::new(),
+            hidden: Vec::new(),
         };
         let mut resolved_rows: Vec<Vec<RExpr>> = Vec::with_capacity(rows.len());
         let mut col_types: Vec<ResolvedType> = Vec::with_capacity(arity);
@@ -8627,12 +8629,140 @@ impl Database {
                 },
             })
             .collect();
+
+        // USING / NATURAL merged columns + every join's resolved predicate (spec/design/grammar.md
+        // §15). Computed BEFORE the Scope so GROUP BY / DISTINCT / projection / WHERE all see the
+        // merge columns; a plain `ON` join resolves its predicate here too. Joins are processed
+        // left-to-right so a later join's left side sees the merges introduced by earlier ones (a
+        // `USING` chain). For each `USING` column the synthesized predicate is `left.col = right.col`
+        // (3-valued, like any ON); the SURVIVING side becomes the single merge column — the left for
+        // INNER/LEFT, the right for RIGHT (`FULL JOIN USING`, whose merge is a COALESCE, is 0A000).
+        // Both underlying copies are hidden from `*`. Merges/predicates respect the comma SEGMENT
+        // (commit-1): a join sees only its own comma item, and an earlier item's merge is out of scope.
+        let mut merges: Vec<MergeCol> = Vec::new();
+        let mut hidden: Vec<usize> = Vec::new();
+        let mut join_preds: Vec<Option<RExpr>> = Vec::with_capacity(sel.joins.len());
+        for (k, j) in sel.joins.iter().enumerate() {
+            let mut seg = k + 1;
+            while seg >= 1 && !sel.joins[seg - 1].comma {
+                seg -= 1;
+            }
+            let seg_off = rels[seg].offset;
+            let seg_merges: Vec<MergeCol> = merges
+                .iter()
+                .filter(|m| m.index >= seg_off)
+                .cloned()
+                .collect();
+            let seg_hidden: Vec<usize> = hidden.iter().copied().filter(|&i| i >= seg_off).collect();
+            let pred = if let Some(cols) = &j.using {
+                if matches!(j.kind, JoinKind::Full) {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "FULL JOIN with USING is not supported yet",
+                    ));
+                }
+                // The left side is the relations of this comma item to the left of the join; resolving
+                // a USING name there yields its merge (a chain) or its single column.
+                let left = Scope {
+                    rels: rels[seg..=k].to_vec(),
+                    parent,
+                    catalog: self,
+                    allow_subquery: true,
+                    ctes,
+                    merges: seg_merges.clone(),
+                    hidden: seg_hidden.clone(),
+                };
+                let mut pred_ast: Option<Expr> = None;
+                for name in cols {
+                    let li = match left.resolve_bare(name) {
+                        Ok(Resolved::Local(i)) => i,
+                        _ => {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedColumn,
+                                format!(
+                                    "column \"{name}\" specified in USING clause does not exist in left table"
+                                ),
+                            ));
+                        }
+                    };
+                    let (llabel, lname) = rel_of_index(&rels, li);
+                    let right_rel = &rels[k + 1];
+                    let rl = right_rel.table.column_index(name).ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedColumn,
+                            format!(
+                                "column \"{name}\" specified in USING clause does not exist in right table"
+                            ),
+                        )
+                    })?;
+                    let ri = right_rel.offset + rl;
+                    let eq = binary_expr(
+                        BinaryOp::Eq,
+                        Expr::QualifiedColumn {
+                            qualifier: llabel,
+                            name: lname,
+                        },
+                        Expr::QualifiedColumn {
+                            qualifier: right_rel.label.clone(),
+                            name: name.clone(),
+                        },
+                    );
+                    pred_ast = Some(match pred_ast {
+                        None => eq,
+                        Some(p) => binary_expr(BinaryOp::And, p, eq),
+                    });
+                    let mi = if matches!(j.kind, JoinKind::Right) {
+                        ri
+                    } else {
+                        li
+                    };
+                    merges.retain(|m| !m.name.eq_ignore_ascii_case(name));
+                    merges.push(MergeCol {
+                        name: name.to_ascii_lowercase(),
+                        index: mi,
+                    });
+                    hidden.push(li);
+                    hidden.push(ri);
+                }
+                let partial = Scope {
+                    rels: rels[seg..=k + 1].to_vec(),
+                    parent,
+                    catalog: self,
+                    allow_subquery: true,
+                    ctes,
+                    merges: seg_merges.clone(),
+                    hidden: seg_hidden.clone(),
+                };
+                Some(resolve_boolean_filter(
+                    &partial,
+                    pred_ast.as_ref().expect("USING has >= 1 column"),
+                    ptypes,
+                )?)
+            } else if let Some(on_expr) = &j.on {
+                let partial = Scope {
+                    rels: rels[seg..=k + 1].to_vec(),
+                    parent,
+                    catalog: self,
+                    allow_subquery: true,
+                    ctes,
+                    merges: seg_merges,
+                    hidden: seg_hidden,
+                };
+                Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
+            } else {
+                None
+            };
+            join_preds.push(pred);
+        }
+
         let scope = Scope {
             rels,
             parent,
             catalog: self,
             allow_subquery: true,
             ctes,
+            merges,
+            hidden,
         };
 
         // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,
@@ -9344,40 +9474,14 @@ impl Database {
             }
         }
 
-        // Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
-        // relations joined so far — scope.rels[seg_start..=k+1]), so a forward reference to a
-        // not-yet-joined table is a clean 42P01/42703 instead of an out-of-range row index.
-        // CROSS has no ON; INNER and the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the
-        // same way — the join kind only changes how unmatched rows are handled in the loop below
-        // (spec/design/grammar.md §15). The partial scope keeps the same `parent` chain, so a
-        // correlated reference in an ON predicate resolves outward (§26).
-        //
-        // Comma-FROM (grammar.md §15): the comma binds looser than `JOIN`, so a join's `ON` may
-        // reference only relations in its OWN comma item, not an earlier one. `seg_start` is that
-        // item's first relation — the most recent comma-introduced relation at or before `k+1`
-        // (the `comma` flag marks each one) — so `FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a`
-        // exactly as PostgreSQL rejects it. With no commas every join's segment starts at rel 0.
-        let mut joins: Vec<PlanJoin> = Vec::with_capacity(sel.joins.len());
-        for (k, j) in sel.joins.iter().enumerate() {
-            let on = match &j.on {
-                None => None,
-                Some(on_expr) => {
-                    let mut seg_start = k + 1;
-                    while seg_start >= 1 && !sel.joins[seg_start - 1].comma {
-                        seg_start -= 1;
-                    }
-                    let partial = Scope {
-                        rels: scope.rels[seg_start..=k + 1].to_vec(),
-                        parent,
-                        catalog: self,
-                        allow_subquery: true,
-                        ctes,
-                    };
-                    Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
-                }
-            };
-            joins.push(PlanJoin { kind: j.kind, on });
-        }
+        // The join predicates were resolved above (alongside the USING/NATURAL merges, which the
+        // scope now carries). Pair each with its join kind — the kind only changes how unmatched
+        // rows are handled in the executor loop, not the predicate (spec/design/grammar.md §15).
+        let joins: Vec<PlanJoin> = join_preds
+            .into_iter()
+            .zip(sel.joins.iter())
+            .map(|(on, j)| PlanJoin { kind: j.kind, on })
+            .collect();
 
         // Assemble the owned plan (table NAMES + offsets/widths replace the scope's `&Table`s,
         // so the plan outlives the scope and a correlated subquery can re-execute it per row).
@@ -9631,6 +9735,8 @@ impl Database {
             catalog: self,
             allow_subquery: true,
             ctes,
+            merges: Vec::new(),
+            hidden: Vec::new(),
         };
         // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
         // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
@@ -10027,6 +10133,8 @@ impl Database {
             catalog: self,
             allow_subquery: true,
             ctes,
+            merges: Vec::new(),
+            hidden: Vec::new(),
         };
         // The context item (json / jsonb / text, coerced to a jsonb document at eval).
         let (rctx, ctx_ty) = resolve(
@@ -12563,6 +12671,8 @@ fn build_prefix_scope<'s>(
         catalog,
         allow_subquery: true,
         ctes,
+        merges: Vec::new(),
+        hidden: Vec::new(),
     }
 }
 
@@ -12628,6 +12738,17 @@ enum Resolved {
     Outer { level: usize, index: usize },
 }
 
+/// A `USING` / `NATURAL` **merged column** (spec/design/grammar.md §15): `name` is the (lowercased)
+/// join column and `index` the flat row index a bare reference to it resolves to — the **surviving
+/// side**: the left column for `INNER`/`LEFT`, the right column for `RIGHT`. (`FULL JOIN ... USING`,
+/// whose merge is `COALESCE(left, right)` and so is not a single column, is a deferred `0A000`
+/// narrowing.) Both underlying copies are recorded in the scope's `hidden` set.
+#[derive(Clone)]
+struct MergeCol {
+    name: String,
+    index: usize,
+}
+
 /// The relations a query's FROM clause puts in scope, in FROM order, plus the enclosing
 /// scope chain (for correlated references — grammar.md §26) and the catalog (so resolving a
 /// subquery can look up its own FROM tables).
@@ -12644,6 +12765,14 @@ struct Scope<'a> {
     /// into nested scopes (a subquery sees the same `ctes`), NOT via the `parent` chain — so CTE
     /// lookup never counts as a correlation level. Empty for every non-`WITH` statement.
     ctes: &'a [CteBinding],
+    /// `USING` / `NATURAL` merged columns (spec/design/grammar.md §15) — a bare reference to a merge
+    /// name resolves to its `index` (checked before the per-relation search, so it is never the
+    /// underlying copies' `42702` ambiguity). Empty for every scope except a SELECT whose FROM has a
+    /// `USING`/`NATURAL` join.
+    merges: Vec<MergeCol>,
+    /// Flat indices SUPERSEDED by a merge — the underlying left+right copies, omitted from `*`
+    /// expansion (still reachable qualified). Empty unless `merges` is non-empty.
+    hidden: Vec<usize>,
 }
 
 impl<'a> Scope<'a> {
@@ -12664,6 +12793,8 @@ impl<'a> Scope<'a> {
             catalog,
             allow_subquery: true,
             ctes: &[],
+            merges: Vec::new(),
+            hidden: Vec::new(),
         }
     }
 
@@ -12678,6 +12809,8 @@ impl<'a> Scope<'a> {
             catalog,
             allow_subquery: false,
             ctes: &[],
+            merges: Vec::new(),
+            hidden: Vec::new(),
         }
     }
 
@@ -12718,6 +12851,8 @@ impl<'a> Scope<'a> {
             catalog,
             allow_subquery: true,
             ctes: &[],
+            merges: Vec::new(),
+            hidden: Vec::new(),
         }
     }
 
@@ -12752,6 +12887,8 @@ impl<'a> Scope<'a> {
             catalog,
             allow_subquery: true,
             ctes: &[],
+            merges: Vec::new(),
+            hidden: Vec::new(),
         }
     }
 
@@ -12762,7 +12899,15 @@ impl<'a> Scope<'a> {
     /// only if no scope in the chain has it. A qualifier-only rel (the RETURNING `old`/`new`
     /// pseudo-relations) is invisible here — no new ambiguity (grammar.md §32).
     fn resolve_bare(&self, name: &str) -> Result<Resolved> {
-        let mut found: Option<usize> = None;
+        // A USING/NATURAL MERGE column resolves to its surviving side (grammar.md §15), seeded here
+        // so the bare name binds the merged column rather than its two (hidden) underlying copies —
+        // which is why such a join column is unambiguous. A *non-hidden* column elsewhere with the
+        // same name still makes the reference ambiguous (a third relation sharing the name).
+        let mut found: Option<usize> = self
+            .merges
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name))
+            .map(|m| m.index);
         for r in &self.rels {
             if r.qualifier_only {
                 continue;
@@ -12773,11 +12918,16 @@ impl<'a> Scope<'a> {
             // grammar.md §42). Base tables have unique column names, so this only ever fires for a
             // duplicate-output-name synthetic relation.
             for (local, c) in r.table.columns.iter().enumerate() {
+                let idx = r.offset + local;
+                // A merge's underlying copies are superseded by the merge above — skip them.
+                if self.hidden.contains(&idx) {
+                    continue;
+                }
                 if c.name.eq_ignore_ascii_case(name) {
                     if found.is_some() {
                         return Err(ambiguous_column(name));
                     }
-                    found = Some(r.offset + local);
+                    found = Some(idx);
                 }
             }
         }
@@ -19801,6 +19951,22 @@ fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
     }
 }
 
+/// The `(label, column-name)` of the relation owning a flat row index — used to synthesize a
+/// `USING`/`NATURAL` join predicate's qualified column references (spec/design/grammar.md §15).
+/// The index is known valid (resolution produced it), so the scan always finds an owner.
+fn rel_of_index(rels: &[ScopeRel], idx: usize) -> (String, String) {
+    for r in rels {
+        let n = r.table.columns.len();
+        if idx >= r.offset && idx < r.offset + n {
+            return (
+                r.label.clone(),
+                r.table.columns[idx - r.offset].name.clone(),
+            );
+        }
+    }
+    unreachable!("USING merge index out of range")
+}
+
 // === Function registry (spec/design/extensibility.md §5) ============================
 // Resolution for the named scalar functions and the aggregates is DATA-DRIVEN: instead of
 // re-encoding the name set in hand-written `match`es (the old known-name gate + result-type
@@ -22729,11 +22895,25 @@ fn resolve_projections(
             let mut nodes = Vec::new();
             let mut names = Vec::new();
             let mut types = Vec::new();
+            // USING/NATURAL merged columns come FIRST, in join order (PostgreSQL — grammar.md §15):
+            // `SELECT * FROM a JOIN b USING(k)` is `k, <a's other cols>, <b's other cols>`. Each
+            // merge emits its surviving-side column; its underlying copies are in `hidden` and so are
+            // skipped by the per-relation loop below (which is otherwise the plain `*` expansion).
+            for m in &scope.merges {
+                let c = scope.column_at(m.index);
+                nodes.push(RExpr::Column(m.index));
+                names.push(c.name.clone());
+                types.push(resolved_type_of_col(&c.ty, scope.catalog));
+            }
             // The RETURNING `old`/`new` pseudo-relations are qualifier-only: `*` expands the
             // real relations' columns exactly as before (grammar.md §32).
             for rel in scope.rels.iter().filter(|r| !r.qualifier_only) {
                 for (i, c) in rel.table.columns.iter().enumerate() {
-                    nodes.push(RExpr::Column(rel.offset + i));
+                    let idx = rel.offset + i;
+                    if scope.hidden.contains(&idx) {
+                        continue;
+                    }
+                    nodes.push(RExpr::Column(idx));
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
                 }

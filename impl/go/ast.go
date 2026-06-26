@@ -588,6 +588,12 @@ type JoinClause struct {
 	Kind  JoinKind
 	Table TableRef
 	On    *Expr
+	// Using is the `USING (col, …)` column list (spec/design/grammar.md §15), mutually exclusive
+	// with On (a join has exactly one of ON/USING, or neither for CROSS/comma). Each named column
+	// must exist in BOTH sides; the join matches on their equality and the output MERGES them into a
+	// single column (FULL JOIN ... USING is a deferred 0A000). Non-nil only for a USING / NATURAL
+	// join (NATURAL, commit 4, derives the common-column list at resolution).
+	Using []string
 	// Comma is true when this is the implicit CROSS JOIN synthesized from a comma in the FROM
 	// list (`FROM a, b`). The comma binds LOOSER than JOIN, so each comma-separated FROM item is
 	// its own ON-resolution segment: a later join's ON may not reference an earlier comma item

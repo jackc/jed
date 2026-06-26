@@ -872,7 +872,17 @@ export type JoinKind = "inner" | "cross" | "left" | "right" | "full";
 // in the FROM list (`FROM a, b`): the comma binds LOOSER than JOIN, so each comma-separated
 // FROM item is its own ON-resolution segment (a later join's ON may not reference an earlier
 // comma item — matching PostgreSQL). See spec/design/grammar.md §15.
-export type JoinClause = { kind: JoinKind; table: TableRef; on: Expr | null; comma?: boolean };
+// `using` is the `USING (col, …)` column list (spec/design/grammar.md §15), mutually exclusive with
+// `on` (a join has exactly one of ON/USING, or neither for CROSS/comma). Each named column must
+// exist in BOTH sides; the join matches on their equality and the output MERGES them into a single
+// column (FULL JOIN ... USING is a deferred 0A000). Defined only for a USING / NATURAL join.
+export type JoinClause = {
+  kind: JoinKind;
+  table: TableRef;
+  on: Expr | null;
+  using?: string[];
+  comma?: boolean;
+};
 
 // GroupItem is one GROUP BY grouping term (spec/design/aggregates.md §12). Most queries use only
 // "set" with one column each (plain `GROUP BY a, b` → two "set" items); the ROLLUP/CUBE/GROUPING SETS

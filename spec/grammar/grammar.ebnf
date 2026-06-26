@@ -619,18 +619,21 @@ derived_alias  ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
 
 table_function ::= identifier "(" expr ("," expr)* ")"
 
-/* A join_clause is INNER JOIN ... ON <expr> (the "INNER" keyword is optional — a bare
- * "JOIN" is INNER) or CROSS JOIN (a Cartesian product, no "ON"). The "ON" predicate is a
- * general expression that must resolve to boolean (42804 otherwise), exactly like WHERE,
- * evaluated at the join (../design/grammar.md §15). An "INNER"/"JOIN" with no "ON" is a
- * 42601 syntax error; "CROSS JOIN ... ON ..." is likewise 42601.
- *   join_type is parsed for the OUTER family too (LEFT/RIGHT/FULL [OUTER]) so the grammar
- * carries the full shape, but executing an outer join is a documented 0A000 narrowing this
- * slice (only INNER and CROSS run — ../design/grammar.md §15, the text-PK/deferred-cast
- * deferral pattern). The join keywords are NOT reserved (§3): a column or table may be
- * named "join"/"inner"/"cross"/"on"/"left"/..., disambiguated positionally by the parser. */
+/* A join_clause is INNER/OUTER JOIN ... (ON <expr> | USING (cols)) (the "INNER" keyword is
+ * optional — a bare "JOIN" is INNER) or CROSS JOIN (a Cartesian product, no condition). The
+ * condition is either an "ON" predicate — a general expression that must resolve to boolean
+ * (42804 otherwise), evaluated at the join like WHERE — or a "USING (col, …)" list: an equi-join
+ * on the named columns that MERGES each into a single output column (../design/grammar.md §15).
+ * A USING column must exist in BOTH sides (42703); the output places the merged columns FIRST, a
+ * bare reference resolves to the merge (never the 42702 ambiguity), and the merge is the surviving
+ * side (left for INNER/LEFT, right for RIGHT — FULL JOIN USING is 0A000). An "INNER"/"JOIN" with
+ * neither ON nor USING is a 42601 syntax error; "CROSS JOIN ... ON/USING ..." is likewise 42601.
+ *   join_type covers the OUTER family (LEFT/RIGHT/FULL [OUTER]); all of INNER/CROSS/LEFT/RIGHT/FULL
+ * execute (../design/grammar.md §15). The join keywords — including "USING" — are NOT reserved (§3):
+ * a column or table may be named "join"/"using"/"on"/..., disambiguated positionally by the parser
+ * (USING is the join condition only as the keyword immediately following the right table_ref). */
 join_clause    ::= "CROSS" "JOIN" table_ref
-                 | join_type? "JOIN" table_ref "ON" expr
+                 | join_type? "JOIN" table_ref ("ON" expr | "USING" "(" identifier ("," identifier)* ")")
 
 join_type      ::= "INNER"
                  | ("LEFT" | "RIGHT" | "FULL") "OUTER"?

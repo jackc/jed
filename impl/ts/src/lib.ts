@@ -337,6 +337,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.join_inner",
   "query.cross_join",
   "query.comma_from",
+  "query.join_using",
   "query.join_left",
   "query.join_right",
   "query.join_full",

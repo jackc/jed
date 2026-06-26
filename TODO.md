@@ -389,7 +389,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`JOIN` — multi-table FROM + `INNER`/`CROSS` + outer (`LEFT`/`RIGHT`/`FULL`)** — left-deep
       nested-loop executor, table aliases, qualified column refs, a flat-index scope resolver; the outer
       NULL-extension branch + WHERE-downgrades-to-inner. → [grammar.md §15](spec/design/grammar.md)
-  - [ ] _follow-on:_ `USING` / `NATURAL`.
+  - [ ] _follow-on:_ `NATURAL`; `FULL JOIN ... USING` (its `COALESCE` merge).
+    - [x] **`USING (cols)`** (an equi-join that MERGES each named column into one output column —
+          merged first in `*`, bare ref unambiguous, qualified sides still reach; merge = surviving
+          side (left for INNER/LEFT, right for RIGHT); multi-col + chains + LEFT/RIGHT; missing col
+          `42703`; `FULL JOIN USING` `0A000`, type-mismatch `42804`). → [grammar.md §15](spec/design/grammar.md)
     - [x] **comma-`FROM`** (`FROM a, b` = implicit `CROSS JOIN`; comma binds looser than `JOIN`, so
           each comma item is its own ON-resolution segment — a join's `ON` may not reach an earlier
           comma item (`42P01`); `LATERAL` still crosses the comma, so `FROM t, LATERAL (…)` now

@@ -1049,3 +1049,16 @@ reason = "jed: a qualified star `t.*` takes no `AS` alias — 42601 (grammar.md 
 file = "joins/qualified_star.test"
 sql = "SELECT id FROM a WHERE a.* = 1"
 reason = "jed: `t.*` is a select-list/RETURNING construct only; in a scalar expression position the parser rejects it 42601 (grammar.md §15 — jed has no row-valued `t.*`). PostgreSQL parses `a.*` as a whole-row value and reaches type resolution, reporting 42883 'operator does not exist: a = integer'. Same rejection (jed never supports row-valued `t.*` in an expression), different stage/SQLSTATE."
+
+# --- JOIN ... USING divergences (grammar.md §15). jed's merge column is a single flat index (the
+# surviving side), so FULL JOIN USING — whose merge is COALESCE(left, right) — is deferred; and a
+# type-mismatched USING column reaches jed's strict comparison rather than PG's operator lookup.
+[[override]]
+file = "joins/using.test"
+sql = "SELECT * FROM a FULL JOIN b USING(k)"
+reason = "jed: FULL JOIN ... USING is 0A000 (grammar.md §15). The merged column of a FULL join is COALESCE(left.k, right.k) — a value, not a single column — which jed's single-flat-index merge model does not carry; INNER/LEFT (merge = left) and RIGHT (merge = right) are supported. PostgreSQL supports FULL JOIN USING and returns the coalesced merge. A deliberate, relaxable narrowing."
+
+[[override]]
+file = "joins/using.test"
+sql = "SELECT * FROM a JOIN tt USING(k)"
+reason = "jed: a USING column whose two sides have different types reaches jed's strict comparison, which rejects a mixed i32 = text pair as 42804 (types.md §4 — no implicit cast). PostgreSQL instead reports 42883 'operator does not exist: integer = text'. Same rejection (the join key types are incompatible), different SQLSTATE — jed's strict static type system is the documented default divergence (CLAUDE.md §4/§8)."

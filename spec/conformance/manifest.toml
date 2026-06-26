@@ -297,6 +297,10 @@ id = "query.cross_join"
 description = "CROSS JOIN — the Cartesian product of two tables (no ON)"
 
 [[capability]]
+id = "query.join_using"
+description = "JOIN ... USING (col, …) — an equi-join on the named columns that MERGES each into a single output column (spec/design/grammar.md §15). `a JOIN b USING(k)` matches on `a.k = b.k` (3-valued) and the output carries ONE `k`, placed FIRST (before a's other columns, then b's — PostgreSQL `*` order). A bare `k` resolves to the merged column (never the 42702 ambiguity of the two underlying copies); qualified `a.k`/`b.k` still reach each side. The merge is the SURVIVING side: the left for INNER/LEFT, the right for RIGHT. Composes with LEFT/RIGHT joins, multi-column USING, and a USING chain. A USING column absent from either side is 42703. Deliberate divergences (oracle_overrides.toml): FULL JOIN USING is 0A000 (its merge is a COALESCE the single-index model does not carry), and a type-mismatched USING column is jed's strict-comparison 42804 (PG 42883)."
+
+[[capability]]
 id = "query.comma_from"
 description = "Comma-separated FROM — `FROM a, b` is an implicit CROSS JOIN (the Cartesian product), identical in result to `a CROSS JOIN b` (spec/design/grammar.md §15). The comma binds LOOSER than JOIN, so each comma-separated FROM item is its own join sub-chain and its own ON-resolution segment: a later join's ON may reference only relations within its own comma item — `FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a` (matching PostgreSQL). Composes with `FROM t, LATERAL (…)` (a lateral item still sees earlier comma items). More than two comma items chain left-deep."
 

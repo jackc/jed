@@ -2272,6 +2272,7 @@ impl Parser {
                     kind: JoinKind::Cross,
                     table,
                     on: None,
+                    using: None,
                     comma: true,
                 });
                 continue;
@@ -2675,16 +2676,31 @@ impl Parser {
             _ => return Ok(None),
         };
         let table = self.parse_table_ref()?;
-        let on = if is_cross {
-            None
+        // A non-CROSS join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15). USING is
+        // not reserved (§3): it is the join condition only as the keyword immediately following the
+        // right table_ref (a bare `JOIN b ON …` / `JOIN b USING (…)`). The column list has one or
+        // more names; an empty list is a 42601.
+        let (on, using) = if is_cross {
+            (None, None)
+        } else if self.peek_keyword().as_deref() == Some("using") {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let mut cols = vec![self.expect_identifier()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                cols.push(self.expect_identifier()?);
+            }
+            self.expect(&Token::RParen)?;
+            (None, Some(cols))
         } else {
             self.expect_keyword("on")?;
-            Some(self.parse_expr()?)
+            (Some(self.parse_expr()?), None)
         };
         Ok(Some(JoinClause {
             kind,
             table,
             on,
+            using,
             comma: false,
         }))
     }
@@ -4456,6 +4472,9 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
             | "full"
             | "outer"
             | "on"
+            // USING introduces a join condition after the right table_ref (`JOIN b USING (k)`), so
+            // it must not be swallowed as `b`'s implicit alias (grammar.md §15).
+            | "using"
             | "as"
             // set operators end a SELECT core — they must not be swallowed as an implicit table
             // alias (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.

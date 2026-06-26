@@ -7727,7 +7727,86 @@ export class Database {
       lateralFlags.push(lateral);
       offset += t.columns.length;
     }
+
+    // USING/NATURAL merged columns + every join's resolved predicate (grammar.md §15) — computed
+    // BEFORE the scope so GROUP BY / DISTINCT / projection / WHERE all see the merge columns; a plain
+    // ON join resolves here too. Joins are processed left-to-right so a later join's left side sees
+    // the merges introduced by earlier ones (a USING chain). For each USING column the synthesized
+    // predicate is `left.col = right.col` (3-valued, like any ON); the SURVIVING side becomes the
+    // single merge column — the left for INNER/LEFT, the right for RIGHT (FULL JOIN USING, a COALESCE,
+    // is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
+    const merges: MergeCol[] = [];
+    const hidden: number[] = [];
+    const joinPreds: (RExpr | null)[] = [];
+    for (let k = 0; k < sel.joins.length; k++) {
+      const j = sel.joins[k]!;
+      let seg = k + 1;
+      while (seg >= 1 && !sel.joins[seg - 1]!.comma) seg--;
+      const segOff = rels[seg]!.offset;
+      const segMerges = merges.filter((m) => m.index >= segOff);
+      const segHidden = hidden.filter((i) => i >= segOff);
+      const mkScope = (lo: number, hi: number): Scope => {
+        const s = new Scope(rels.slice(lo, hi + 1), this, parent, true, ctes);
+        s.merges = segMerges;
+        s.hidden = segHidden;
+        return s;
+      };
+      if (j.using !== undefined) {
+        if (j.kind === "full") {
+          throw engineError("feature_not_supported", "FULL JOIN with USING is not supported yet");
+        }
+        const left = mkScope(seg, k);
+        let predAst: Expr | null = null;
+        for (const name of j.using) {
+          let li = -1;
+          try {
+            const lr = left.resolveBare(name);
+            if (lr.level === 0) li = lr.index;
+          } catch {
+            // fall through to the USING-specific error below
+          }
+          if (li < 0) {
+            throw engineError(
+              "undefined_column",
+              `column "${name}" specified in USING clause does not exist in left table`,
+            );
+          }
+          const [llabel, lname] = relOfIndex(rels, li);
+          const rightRel = rels[k + 1]!;
+          const rl = columnIndex(rightRel.table, name);
+          if (rl < 0) {
+            throw engineError(
+              "undefined_column",
+              `column "${name}" specified in USING clause does not exist in right table`,
+            );
+          }
+          const ri = rightRel.offset + rl;
+          const eq: Expr = {
+            kind: "binary",
+            op: "eq",
+            lhs: { kind: "qualifiedColumn", qualifier: llabel, name: lname },
+            rhs: { kind: "qualifiedColumn", qualifier: rightRel.label, name },
+          };
+          predAst = predAst === null ? eq : { kind: "binary", op: "and", lhs: predAst, rhs: eq };
+          const mi = j.kind === "right" ? ri : li;
+          const ex = merges.findIndex((m) => m.name === name.toLowerCase());
+          if (ex >= 0) merges.splice(ex, 1);
+          merges.push({ name: name.toLowerCase(), index: mi });
+          hidden.push(li, ri);
+        }
+        const partial = mkScope(seg, k + 1);
+        joinPreds.push(resolveBooleanFilter(partial, predAst!, ptypes));
+      } else if (j.on !== null) {
+        const partial = mkScope(seg, k + 1);
+        joinPreds.push(resolveBooleanFilter(partial, j.on, ptypes));
+      } else {
+        joinPreds.push(null);
+      }
+    }
+
     const scope = new Scope(rels, this, parent, true, ctes);
+    scope.merges = merges;
+    scope.hidden = hidden;
 
     // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets, resolve
     // each set's columns to flat row indices, and build the master grouping-column list (groupKeys) —
@@ -8219,25 +8298,10 @@ export class Database {
       }
     }
 
-    // Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
-    // relations joined so far — rels[segStart..k+1]), so a forward reference to a not-yet-joined
-    // table is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER
-    // and the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
-    // changes how unmatched rows are handled in the loop below (§15). The partial scope keeps the
-    // same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
-    //
-    // Comma-FROM (grammar.md §15): the comma binds looser than JOIN, so a join's ON may reference
-    // only relations in its OWN comma item, not an earlier one. segStart is that item's first
-    // relation — the most recent comma-introduced relation at or before k+1 (the comma flag marks
-    // each) — so `FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a` exactly as PostgreSQL rejects
-    // it. With no commas every join's segment starts at rel 0.
-    const joins: PlanJoin[] = sel.joins.map((j, k) => {
-      if (j.on === null) return { kind: j.kind, on: null };
-      let segStart = k + 1;
-      while (segStart >= 1 && !sel.joins[segStart - 1]!.comma) segStart--;
-      const partial = new Scope(scope.rels.slice(segStart, k + 2), this, parent, true, ctes);
-      return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
-    });
+    // The join predicates were resolved above (alongside the USING/NATURAL merges, which the scope
+    // now carries). Pair each with its join kind — the kind only changes how unmatched rows are
+    // handled in the executor loop, not the predicate (grammar.md §15).
+    const joins: PlanJoin[] = sel.joins.map((j, k) => ({ kind: j.kind, on: joinPreds[k]! }));
 
     // Primary-key predicate pushdown, per base relation: detect WHERE conjuncts that bound that
     // relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree (cost.md
@@ -18064,9 +18128,26 @@ type ScopeRel = {
 // index within that ancestor's row).
 type Resolved = { level: number; index: number };
 
+// MergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): `name` is the (lowercased)
+// join column and `index` the flat row index a bare reference resolves to — the surviving side (the
+// left column for INNER/LEFT, the right for RIGHT; FULL JOIN USING, a COALESCE, is deferred 0A000).
+// Both underlying copies are recorded in the scope's `hidden` set.
+type MergeCol = { name: string; index: number };
+
 // outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
 function outerOf(r: Resolved): Resolved {
   return { level: r.level + 1, index: r.index };
+}
+
+// relOfIndex returns the [label, column-name] of the relation owning a flat row index — used to
+// synthesize a USING/NATURAL join predicate's qualified column references (spec/design/grammar.md
+// §15). The index is known valid (resolution produced it), so the scan always finds an owner.
+function relOfIndex(rels: ScopeRel[], idx: number): [string, string] {
+  for (const r of rels) {
+    const n = r.table.columns.length;
+    if (idx >= r.offset && idx < r.offset + n) return [r.label, r.table.columns[idx - r.offset]!.name];
+  }
+  throw new Error("USING merge index out of range");
 }
 
 class Scope {
@@ -18082,6 +18163,13 @@ class Scope {
   // nested scopes (a subquery sees the same `ctes`), NOT via the `parent` chain — so CTE lookup
   // never counts as a correlation level. Empty for every non-WITH statement.
   ctes: CteBinding[];
+  // USING/NATURAL merged columns (spec/design/grammar.md §15) — a bare reference to a merge name
+  // resolves to its index (checked before the per-relation search, so it is never the underlying
+  // copies' 42702 ambiguity). Empty except in a SELECT whose FROM has a USING join.
+  merges: MergeCol[] = [];
+  // Flat indices SUPERSEDED by a merge — the underlying left+right copies, omitted from `*`
+  // expansion (still reachable qualified). Empty unless `merges` is non-empty.
+  hidden: number[] = [];
   constructor(
     rels: ScopeRel[],
     catalog: Database,
@@ -18171,18 +18259,31 @@ class Scope {
   // A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no
   // new ambiguity (grammar.md §32).
   resolveBare(name: string): Resolved {
+    const lower = name.toLowerCase();
+    // A USING/NATURAL MERGE column resolves to its surviving side (grammar.md §15), seeded here so
+    // the bare name binds the merged column rather than its two (hidden) underlying copies — which is
+    // why such a join column is unambiguous. A non-hidden column elsewhere with the same name still
+    // makes the reference ambiguous (a third relation sharing the name).
     let found = -1;
+    for (const m of this.merges) {
+      if (m.name === lower) {
+        found = m.index;
+        break;
+      }
+    }
     for (const r of this.rels) {
       if (r.qualifierOnly) continue;
       // Count EVERY matching column, not just the first per relation: a synthetic relation (a CTE or
       // derived table) may carry two columns of the same name, and a bare reference to that name is
       // ambiguous (42702) exactly as a match across two relations is (cte.md §2, grammar.md §42).
       // Base tables have unique column names, so this only fires for a duplicate-output-name relation.
-      const lower = name.toLowerCase();
       for (let local = 0; local < r.table.columns.length; local++) {
+        const idx = r.offset + local;
+        // A merge's underlying copies are superseded by the merge above — skip them.
+        if (this.hidden.includes(idx)) continue;
         if (r.table.columns[local]!.name.toLowerCase() === lower) {
           if (found >= 0) throw ambiguousColumn(name);
-          found = r.offset + local;
+          found = idx;
         }
       }
     }
@@ -19779,12 +19880,24 @@ function resolveProjections(
     const nodes: RExpr[] = [];
     const names: string[] = [];
     const types: ResolvedType[] = [];
+    // USING/NATURAL merged columns come FIRST, in join order (PostgreSQL — grammar.md §15):
+    // `SELECT * FROM a JOIN b USING(k)` is `k, <a's other cols>, <b's other cols>`. Each merge emits
+    // its surviving-side column; its underlying copies are in `hidden` and so are skipped by the
+    // per-relation loop below (otherwise the plain `*` expansion).
+    for (const m of scope.merges) {
+      const c = scope.columnAt(m.index);
+      nodes.push({ kind: "column", index: m.index });
+      names.push(c.name);
+      types.push(resolvedTypeOfCol(c.type, scope.catalog));
+    }
     // The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
     // relations' columns exactly as before (grammar.md §32).
     for (const r of scope.rels) {
       if (r.qualifierOnly) continue;
       r.table.columns.forEach((c, i) => {
-        nodes.push({ kind: "column", index: r.offset + i });
+        const idx = r.offset + i;
+        if (scope.hidden.includes(idx)) return;
+        nodes.push({ kind: "column", index: idx });
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
       });
