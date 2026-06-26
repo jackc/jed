@@ -15926,6 +15926,9 @@ const (
 	sfLeft
 	// right(text, n) → text — the last n characters; a negative n drops the first |n| (§3).
 	sfRight
+	// lpad(text, length[, fill]) → text — left-pad to `length` chars with `fill` (default space);
+	// a longer string truncates; an over-large length traps 54000 (§3).
+	sfLpad
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19511,6 +19514,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfLeft
 	case "right":
 		return sfRight
+	case "lpad":
+		return sfLpad
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24042,6 +24047,44 @@ func satAdd1(n int64) int64 {
 
 // === string / text function kernels (spec/design/string-functions.md) ===============
 
+// maxResultChars is the character-count cap for the result-amplifying string functions (lpad /
+// rpad / repeat): PostgreSQL's MaxAllocSize (0x3FFFFFFF). A requested length above it traps 54000
+// (program_limit_exceeded), bounding the allocation an untrusted query can request (CLAUDE.md §13).
+const maxResultChars int64 = 0x3FFFFFFF
+
+// padChars is lpad/rpad over CODE POINTS (string-functions.md §3): pad s to length characters with
+// fill (cyclically), on the left if left else the right; a string longer than length is truncated
+// to its first length characters; an empty fill cannot pad (returns the truncated string); a
+// length ≤ 0 is empty. A length above maxResultChars traps 54000. Matches PostgreSQL's lpad/rpad.
+func padChars(s string, length int64, fill string, left bool) (string, error) {
+	if length > maxResultChars {
+		return "", NewError(ProgramLimitExceeded, "requested length too large")
+	}
+	if length <= 0 {
+		return "", nil
+	}
+	runes := []rune(s)
+	slen := int64(len(runes))
+	if slen >= length {
+		return string(runes[:length]), nil
+	}
+	frunes := []rune(fill)
+	if len(frunes) == 0 {
+		return s, nil
+	}
+	need := int(length - slen)
+	flen := len(frunes)
+	var b strings.Builder
+	for i := 0; i < need; i++ {
+		b.WriteRune(frunes[i%flen])
+	}
+	pad := b.String()
+	if left {
+		return pad + s, nil
+	}
+	return s + pad, nil
+}
+
 // satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
 // used, the right operand being non-negative).
 func satAddInt64(a, b int64) int64 {
@@ -27351,6 +27394,17 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfRight:
 			// right(text, n) → text — the last n characters (negative n drops the first |n|).
 			return TextValue(rightChars(vals[0].Str, vals[1].Int)), nil
+		case sfLpad:
+			// lpad(text, length[, fill]) → text — pad/truncate on the LEFT (default fill a space).
+			fill := " "
+			if len(vals) > 2 {
+				fill = vals[2].Str
+			}
+			r, err := padChars(vals[0].Str, vals[1].Int, fill, true)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(r), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

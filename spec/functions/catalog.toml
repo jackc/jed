@@ -3203,6 +3203,31 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# lpad(text, length int[, fill text]) → text — pad on the LEFT to `length` characters (code points)
+# using `fill` (cyclically; default a single space); if the string is longer than `length` it is
+# TRUNCATED to the first `length` characters. lpad('hi',5,'xy') = 'xyxhi', lpad('hi',1) = 'h'. A
+# length ≤ 0 yields ''; an empty fill cannot pad (returns the truncated string); a pathological
+# length traps 54000 (program_limit_exceeded, "requested length too large", as PG). NULL args propagate.
+[[operator]]
+name           = "lpad"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["54000"]
+
+[[operator]]
+name           = "lpad"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "integer", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["54000"]
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

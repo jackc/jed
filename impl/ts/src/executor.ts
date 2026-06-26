@@ -427,6 +427,31 @@ function utf8ByteLength(s: string): number {
 
 // === string / text function kernels (spec/design/string-functions.md) ===============
 
+// MAX_RESULT_CHARS is the character-count cap for the result-amplifying string functions (lpad /
+// rpad / repeat): PostgreSQL's MaxAllocSize (0x3FFFFFFF). A requested length above it traps 54000
+// (program_limit_exceeded), bounding the allocation an untrusted query can request (CLAUDE.md §13).
+const MAX_RESULT_CHARS = 0x3fffffffn;
+
+// padChars is lpad/rpad over CODE POINTS (string-functions.md §3): pad s to `length` characters with
+// `fill` (cyclically), on the left if `left` else the right; a string longer than `length` is
+// truncated to its first `length` characters; an empty fill cannot pad (returns the truncated
+// string); a length ≤ 0 is empty. A length above MAX_RESULT_CHARS traps 54000. Matches PG lpad/rpad.
+function padChars(s: string, length: bigint, fill: string, left: boolean): string {
+  if (length > MAX_RESULT_CHARS)
+    throw engineError("program_limit_exceeded", "requested length too large");
+  if (length <= 0n) return "";
+  const chars = [...s];
+  const slen = BigInt(chars.length);
+  if (slen >= length) return chars.slice(0, Number(length)).join("");
+  const fchars = [...fill];
+  if (fchars.length === 0) return s;
+  const need = Number(length - slen);
+  const flen = fchars.length;
+  let pad = "";
+  for (let i = 0; i < need; i++) pad += fchars[i % flen];
+  return left ? pad + s : s + pad;
+}
+
 // substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
@@ -12589,7 +12614,10 @@ type ScalarFuncName =
   // left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
   | "left"
   // right(text, n) → text — the last n characters; a negative n drops the first |n| (§3).
-  | "right";
+  | "right"
+  // lpad(text, length[, fill]) → text — left-pad to `length` chars with `fill` (default space);
+  // a longer string truncates; an over-large length traps 54000 (§3).
+  | "lpad";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24400,6 +24428,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // right(text, n) → text — the last n characters (negative n drops the first |n|).
         const s = (vals[0] as { text: string }).text;
         return textValue(rightChars(s, (vals[1] as { int: bigint }).int));
+      }
+      if (e.func === "lpad") {
+        // lpad(text, length[, fill]) → text — pad/truncate on the LEFT (default fill a space).
+        const s = (vals[0] as { text: string }).text;
+        const length = (vals[1] as { int: bigint }).int;
+        const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
+        return textValue(padChars(s, length, fill, true));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

@@ -238,3 +238,44 @@ SELECT right(NULL::text, 2), right('abc', NULL::int)
 ----
 NULL
 NULL
+
+# === lpad(text, length[, fill]) → text: left-pad / truncate ============================
+
+# explicit fill, cyclically applied (no edge whitespace to confuse the harness)
+query T
+SELECT lpad('hi', 5, 'xy')
+----
+xyxhi
+
+# default fill is a space; assert via equality so the spaces ride inside the SQL literal, not the
+# (whitespace-trimmed) expected block
+query B
+SELECT lpad('hi', 5) = '   hi', lpad('héllo', 7, '-') = '--héllo'
+----
+true
+true
+
+# a string longer than length truncates to its first `length` characters
+query T
+SELECT lpad('hello', 3)
+----
+hel
+
+# length ≤ 0 is empty; an empty fill cannot pad (returns the unchanged short string)
+query B
+SELECT lpad('hi', 0) = '', lpad('hi', -1) = '', lpad('hi', 5, '') = 'hi'
+----
+true
+true
+true
+
+# a pathologically large length traps 54000 (program_limit_exceeded)
+statement error 54000
+SELECT lpad('x', 2000000000)
+
+query T
+SELECT lpad(NULL::text, 5), lpad('hi', NULL::int), lpad('hi', 5, NULL::text)
+----
+NULL
+NULL
+NULL

@@ -113,3 +113,17 @@ the first `|n|`: `right('abcde', 2) = 'de'`, `right('abcde', -2) = 'cde'`, `righ
 `right('abcde', -10) = ''`. The kernel takes `chars[start..]` where
 `start = clamp(n < 0 ? |n| : len-n, 0, len)` (`checked_neg` guards `i64::MIN` so the magnitude
 cannot overflow). NULL args propagate.
+
+### `lpad(text, length [, fill]) → text`
+
+Pad on the **left** to `length` characters (code points) using `fill` (taken cyclically; default a
+single space), truncating a longer string to its first `length` characters:
+`lpad('hi', 5) = '   hi'`, `lpad('hi', 5, 'xy') = 'xyxhi'`, `lpad('hi', 1) = 'h'`,
+`lpad('hi', 0) = ''`, `lpad('hi', 5, '') = 'hi'` (an empty fill cannot pad). NULL args propagate.
+
+**Resource bound (CLAUDE.md §13).** `lpad`/`rpad` (and `repeat`) *amplify* — a small input can
+request a huge output — so a `length` above `MAX_RESULT_CHARS` (PostgreSQL's `MaxAllocSize`,
+`0x3FFFFFFF`) traps **`54000`** (`program_limit_exceeded`, *"requested length too large"*), exactly
+PostgreSQL's behavior, bounding the allocation an untrusted query can demand. (Per-character cost
+metering so the `max_cost` ceiling also bounds a sub-cap-but-still-large pad is a deferred follow-on;
+the hard cap is the backstop.)

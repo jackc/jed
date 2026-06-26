@@ -13045,6 +13045,9 @@ enum ScalarFunc {
     Left,
     /// right(text, n) → text — the last n characters; a negative n drops the first |n| (§3).
     Right,
+    /// lpad(text, length[, fill]) → text — left-pad to `length` chars with `fill` (default space);
+    /// a longer string truncates; an over-large length traps 54000 (§3).
+    Lpad,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19072,6 +19075,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "substr" => ScalarFunc::Substr,
         "left" => ScalarFunc::Left,
         "right" => ScalarFunc::Right,
+        "lpad" => ScalarFunc::Lpad,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30382,6 +30386,20 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Text(right_chars(s, int_value(&vals[1])))),
                         _ => unreachable!("resolver restricts right to text"),
                     },
+                    // lpad(text, length[, fill]) → text — pad/truncate on the LEFT.
+                    ScalarFunc::Lpad => {
+                        let s = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts lpad to text"),
+                        };
+                        let len = int_value(&vals[1]);
+                        let fill = match vals.get(2) {
+                            Some(Value::Text(f)) => f.as_str(),
+                            Some(_) => unreachable!("resolver restricts lpad fill to text"),
+                            None => " ",
+                        };
+                        Ok(Value::Text(pad_chars(s, len, fill, true)?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31255,7 +31273,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::BitLength
         | ScalarFunc::Substr
         | ScalarFunc::Left
-        | ScalarFunc::Right => {
+        | ScalarFunc::Right
+        | ScalarFunc::Lpad => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31275,6 +31294,11 @@ fn to_decimal(v: Value) -> Decimal {
 
 // === string / text function kernels (spec/design/string-functions.md) ===============
 
+/// The character-count cap for the result-amplifying string functions (lpad / rpad / repeat):
+/// PostgreSQL's `MaxAllocSize` (0x3FFFFFFF). A requested length above it traps `54000`
+/// (program_limit_exceeded), bounding the allocation an untrusted query can request (CLAUDE.md §13).
+const MAX_RESULT_CHARS: i64 = 0x3FFF_FFFF;
+
 /// The i64 of an integer Value (every int width is stored as `Value::Int`). For the string
 /// functions' integer arguments (start / count / pad length / field number).
 fn int_value(v: &Value) -> i64 {
@@ -31282,6 +31306,43 @@ fn int_value(v: &Value) -> i64 {
         Value::Int(n) => *n,
         _ => unreachable!("resolver guarantees an integer operand here"),
     }
+}
+
+/// `lpad`/`rpad` over CODE POINTS (string-functions.md §3): pad `s` to `len` characters with `fill`
+/// (cyclically), on the left if `left` else the right; a string longer than `len` is truncated to
+/// its first `len` characters; an empty `fill` cannot pad (returns the truncated string); `len ≤ 0`
+/// is empty. A `len` above `MAX_RESULT_CHARS` traps `54000`. Matches PostgreSQL's lpad/rpad.
+fn pad_chars(s: &str, len: i64, fill: &str, left: bool) -> Result<String> {
+    if len > MAX_RESULT_CHARS {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "requested length too large",
+        ));
+    }
+    if len <= 0 {
+        return Ok(String::new());
+    }
+    let schars: Vec<char> = s.chars().collect();
+    let slen = schars.len() as i64;
+    if slen >= len {
+        // longer (or equal) string truncates to its first `len` characters
+        return Ok(schars[..len as usize].iter().collect());
+    }
+    let fchars: Vec<char> = fill.chars().collect();
+    if fchars.is_empty() {
+        // empty fill cannot pad — return the string unchanged (it is shorter than len)
+        return Ok(s.to_string());
+    }
+    let need = (len - slen) as usize;
+    let mut pad = String::with_capacity(need);
+    for i in 0..need {
+        pad.push(fchars[i % fchars.len()]);
+    }
+    Ok(if left {
+        format!("{pad}{s}")
+    } else {
+        format!("{s}{pad}")
+    })
 }
 
 /// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window
