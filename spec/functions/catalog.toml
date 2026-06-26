@@ -3250,6 +3250,30 @@ result         = "text"
 null           = "propagates"
 errors         = ["54000"]
 
+# btrim(text[, characters text]) → text — remove from BOTH ends the longest run of characters that
+# each appear in the `characters` SET (a set of code points, not a substring; default a single
+# space). btrim('xxhixx','x') = 'hi', btrim('  hi  ') = 'hi'. The function form of TRIM(BOTH …).
+# NULL args propagate.
+[[operator]]
+name           = "btrim"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "btrim"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
 #  - regexp_replace(source, pattern, replacement [, flags]) → text: replace the FIRST match (or ALL

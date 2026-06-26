@@ -452,6 +452,19 @@ function padChars(s: string, length: bigint, fill: string, left: boolean): strin
   return left ? pad + s : s + pad;
 }
 
+// trimChars is btrim/ltrim/rtrim over CODE POINTS (string-functions.md §3): remove from the chosen
+// end(s) the longest run of characters each present in the set (a SET of code points, not a
+// substring; default a single space). An empty set trims nothing. Matches PostgreSQL's *trim.
+function trimChars(s: string, set: string, doLeft: boolean, doRight: boolean): string {
+  const inSet = new Set([...set]);
+  const chars = [...s];
+  let start = 0;
+  let end = chars.length;
+  if (doLeft) while (start < end && inSet.has(chars[start]!)) start++;
+  if (doRight) while (end > start && inSet.has(chars[end - 1]!)) end--;
+  return chars.slice(start, end).join("");
+}
+
 // substrChars is substr(s, start[, count]) over CODE POINTS (string-functions.md §3): 1-based; the
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
@@ -12619,7 +12632,9 @@ type ScalarFuncName =
   // a longer string truncates; an over-large length traps 54000 (§3).
   | "lpad"
   // rpad(text, length[, fill]) → text — the right-hand mirror of lpad (§3).
-  | "rpad";
+  | "rpad"
+  // btrim(text[, chars]) → text — trim characters in the `chars` set from both ends (§3).
+  | "btrim";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24444,6 +24459,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const length = (vals[1] as { int: bigint }).int;
         const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
         return textValue(padChars(s, length, fill, false));
+      }
+      if (e.func === "btrim") {
+        // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
+        const s = (vals[0] as { text: string }).text;
+        const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
+        return textValue(trimChars(s, set, true, true));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

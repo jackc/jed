@@ -302,3 +302,36 @@ SELECT rpad(NULL::text, 5), rpad('hi', NULL::int)
 ----
 NULL
 NULL
+
+# === btrim(text[, characters]) → text: trim a character SET from both ends =============
+
+# the `characters` argument is a SET of code points, trimmed from both ends
+query T
+SELECT btrim('xxhixx', 'x')
+----
+hi
+
+# default trims spaces from both ends
+query T
+SELECT btrim('  hi  ')
+----
+hi
+
+# the set is matched per-character (not as a substring); code-point based
+query T
+SELECT btrim('héllo', 'ho')
+----
+éll
+
+# all characters in the set → empty; an empty set trims nothing
+query B
+SELECT btrim('xyzzyx', 'xyz') = '', btrim('abc', '') = 'abc'
+----
+true
+true
+
+query T
+SELECT btrim(NULL::text), btrim('abc', NULL::text)
+----
+NULL
+NULL

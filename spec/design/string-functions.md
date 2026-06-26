@@ -133,3 +133,12 @@ the hard cap is the backstop.)
 The right-hand mirror of `lpad`: pad/truncate on the **right**. `rpad('hi', 5) = 'hi   '`,
 `rpad('hi', 5, 'xy') = 'hixyx'`, `rpad('hello', 3) = 'hel'`. Shares the `pad_chars` kernel
 (`left = false`) and the same `54000` length cap. NULL args propagate.
+
+### `btrim(text [, characters]) → text`
+
+The **function** spelling of `TRIM(BOTH characters FROM text)`: remove from **both** ends the
+longest run of characters that each appear in the `characters` **set** (a set of code points, *not*
+a substring; default a single space). `btrim('xxhixx', 'x') = 'hi'`, `btrim('  hi  ') = 'hi'`,
+`btrim('héllo', 'ho') = 'éll'`, `btrim('abc', '') = 'abc'` (an empty set trims nothing). The shared
+`trim_chars` kernel builds a code-point set and walks each chosen end; `ltrim`/`rtrim` reuse it with
+one side disabled. NULL args propagate.

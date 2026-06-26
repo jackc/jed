@@ -13050,6 +13050,8 @@ enum ScalarFunc {
     Lpad,
     /// rpad(text, length[, fill]) → text — the right-hand mirror of lpad (§3).
     Rpad,
+    /// btrim(text[, chars]) → text — trim characters in the `chars` set from both ends (§3).
+    Btrim,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19079,6 +19081,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "right" => ScalarFunc::Right,
         "lpad" => ScalarFunc::Lpad,
         "rpad" => ScalarFunc::Rpad,
+        "btrim" => ScalarFunc::Btrim,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30417,6 +30420,19 @@ impl RExpr {
                         };
                         Ok(Value::Text(pad_chars(s, len, fill, false)?))
                     }
+                    // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
+                    ScalarFunc::Btrim => {
+                        let s = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts btrim to text"),
+                        };
+                        let set = match vals.get(1) {
+                            Some(Value::Text(c)) => c.as_str(),
+                            Some(_) => unreachable!("resolver restricts btrim chars to text"),
+                            None => " ",
+                        };
+                        Ok(Value::Text(trim_chars(s, set, true, true)))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31292,7 +31308,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Left
         | ScalarFunc::Right
         | ScalarFunc::Lpad
-        | ScalarFunc::Rpad => {
+        | ScalarFunc::Rpad
+        | ScalarFunc::Btrim => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31361,6 +31378,27 @@ fn pad_chars(s: &str, len: i64, fill: &str, left: bool) -> Result<String> {
     } else {
         format!("{s}{pad}")
     })
+}
+
+/// `btrim`/`ltrim`/`rtrim` over CODE POINTS (string-functions.md §3): remove from the chosen end(s)
+/// the longest run of characters each present in the `set` (a *set* of code points, not a substring;
+/// default a single space). An empty `set` trims nothing. Matches PostgreSQL's btrim/ltrim/rtrim.
+fn trim_chars(s: &str, set: &str, do_left: bool, do_right: bool) -> String {
+    let set: std::collections::HashSet<char> = set.chars().collect();
+    let chars: Vec<char> = s.chars().collect();
+    let mut start = 0;
+    let mut end = chars.len();
+    if do_left {
+        while start < end && set.contains(&chars[start]) {
+            start += 1;
+        }
+    }
+    if do_right {
+        while end > start && set.contains(&chars[end - 1]) {
+            end -= 1;
+        }
+    }
+    chars[start..end].iter().collect()
 }
 
 /// `substr(s, start[, count])` over CODE POINTS (string-functions.md §3): 1-based; the window

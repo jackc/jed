@@ -15931,6 +15931,8 @@ const (
 	sfLpad
 	// rpad(text, length[, fill]) → text — the right-hand mirror of lpad (§3).
 	sfRpad
+	// btrim(text[, chars]) → text — trim characters in the `chars` set from both ends (§3).
+	sfBtrim
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19520,6 +19522,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfLpad
 	case "rpad":
 		return sfRpad
+	case "btrim":
+		return sfBtrim
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24089,6 +24093,35 @@ func padChars(s string, length int64, fill string, left bool) (string, error) {
 	return s + pad, nil
 }
 
+// trimChars is btrim/ltrim/rtrim over CODE POINTS (string-functions.md §3): remove from the chosen
+// end(s) the longest run of characters each present in the set (a SET of code points, not a
+// substring; default a single space). An empty set trims nothing. Matches PostgreSQL's *trim.
+func trimChars(s, set string, doLeft, doRight bool) string {
+	inSet := make(map[rune]struct{})
+	for _, r := range set {
+		inSet[r] = struct{}{}
+	}
+	runes := []rune(s)
+	start, end := 0, len(runes)
+	if doLeft {
+		for start < end {
+			if _, ok := inSet[runes[start]]; !ok {
+				break
+			}
+			start++
+		}
+	}
+	if doRight {
+		for end > start {
+			if _, ok := inSet[runes[end-1]]; !ok {
+				break
+			}
+			end--
+		}
+	}
+	return string(runes[start:end])
+}
+
 // satAddInt64 is a + b saturated to the int64 range (only positive overflow can arise where it is
 // used, the right operand being non-negative).
 func satAddInt64(a, b int64) int64 {
@@ -27420,6 +27453,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
+		case sfBtrim:
+			// btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
+			set := " "
+			if len(vals) > 1 {
+				set = vals[1].Str
+			}
+			return TextValue(trimChars(vals[0].Str, set, true, true)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
