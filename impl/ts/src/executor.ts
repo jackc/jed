@@ -12636,7 +12636,9 @@ type ScalarFuncName =
   // btrim(text[, chars]) → text — trim characters in the `chars` set from both ends (§3).
   | "btrim"
   // ltrim(text[, chars]) → text — trim the `chars` set from the LEADING end only (§3).
-  | "ltrim";
+  | "ltrim"
+  // rtrim(text[, chars]) → text — trim the `chars` set from the TRAILING end only (§3).
+  | "rtrim";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24473,6 +24475,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const s = (vals[0] as { text: string }).text;
         const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
         return textValue(trimChars(s, set, true, false));
+      }
+      if (e.func === "rtrim") {
+        // rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
+        const s = (vals[0] as { text: string }).text;
+        const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
+        return textValue(trimChars(s, set, false, true));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

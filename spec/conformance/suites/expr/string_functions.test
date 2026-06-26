@@ -354,3 +354,22 @@ SELECT ltrim(NULL::text), ltrim('abc', NULL::text)
 ----
 NULL
 NULL
+
+# === rtrim(text[, characters]) → text: trim from the TRAILING end only ================
+
+query T
+SELECT rtrim('xxhixx', 'x')
+----
+xxhi
+
+# default trims trailing spaces only (leading remain — asserted via equality)
+query B
+SELECT rtrim('  hi  ') = '  hi'
+----
+true
+
+query T
+SELECT rtrim(NULL::text), rtrim('abc', NULL::text)
+----
+NULL
+NULL

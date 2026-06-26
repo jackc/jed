@@ -13054,6 +13054,8 @@ enum ScalarFunc {
     Btrim,
     /// ltrim(text[, chars]) → text — trim the `chars` set from the LEADING end only (§3).
     Ltrim,
+    /// rtrim(text[, chars]) → text — trim the `chars` set from the TRAILING end only (§3).
+    Rtrim,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19085,6 +19087,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "rpad" => ScalarFunc::Rpad,
         "btrim" => ScalarFunc::Btrim,
         "ltrim" => ScalarFunc::Ltrim,
+        "rtrim" => ScalarFunc::Rtrim,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30449,6 +30452,19 @@ impl RExpr {
                         };
                         Ok(Value::Text(trim_chars(s, set, true, false)))
                     }
+                    // rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
+                    ScalarFunc::Rtrim => {
+                        let s = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts rtrim to text"),
+                        };
+                        let set = match vals.get(1) {
+                            Some(Value::Text(c)) => c.as_str(),
+                            Some(_) => unreachable!("resolver restricts rtrim chars to text"),
+                            None => " ",
+                        };
+                        Ok(Value::Text(trim_chars(s, set, false, true)))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31326,7 +31342,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Lpad
         | ScalarFunc::Rpad
         | ScalarFunc::Btrim
-        | ScalarFunc::Ltrim => {
+        | ScalarFunc::Ltrim
+        | ScalarFunc::Rtrim => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

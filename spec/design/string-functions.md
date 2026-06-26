@@ -148,3 +148,9 @@ one side disabled. NULL args propagate.
 Like `btrim` but trims only the **leading** (left) run — the function form of
 `TRIM(LEADING characters FROM text)`. `ltrim('xxhixx', 'x') = 'hixx'`, `ltrim('  hi  ') = 'hi  '`.
 Reuses `trim_chars` with `do_right = false`. NULL args propagate.
+
+### `rtrim(text [, characters]) → text`
+
+Like `btrim` but trims only the **trailing** (right) run — the function form of
+`TRIM(TRAILING characters FROM text)`. `rtrim('xxhixx', 'x') = 'xxhi'`, `rtrim('  hi  ') = '  hi'`.
+Reuses `trim_chars` with `do_left = false`. NULL args propagate.
