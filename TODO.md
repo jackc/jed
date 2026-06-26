@@ -49,16 +49,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 - [x] **Backfill the EBNF grammar** — the shared contract the hand-written parsers conform to.
       → [grammar.ebnf](spec/grammar/grammar.ebnf), [grammar.md](spec/design/grammar.md)
-- [x] **Author the function / operator catalog** — operator result types + NULL behavior as
-      data, family-based schema + coherence checker. → [catalog.toml](spec/functions/catalog.toml),
+- [x] **Author the function / operator catalog** — operator result types + NULL behavior as data,
+      a family-based schema + coherence checker. → [catalog.toml](spec/functions/catalog.toml),
       [functions.md](spec/design/functions.md)
 - [x] **Codegen "middle path"** — catalog → per-language operator descriptor tables (data only;
       parser/executor/evaluator stay hand-written), drift-gated by `rake verify`.
       → [gen_catalog.rb](scripts/gen_catalog.rb), [codegen.md](spec/design/codegen.md)
   - [ ] _follow-on:_ extend the generator to types/errors.
     - [x] **errors** — `SqlState` enum + code mapping + `ERRORS` table generated per core from
-          [registry.toml](spec/errors/registry.toml); hand-written `EngineError` scaffolding
-          consumes it. Drift-gated by `rake verify`. → [gen_errors.rb](scripts/gen_errors.rb)
+          [registry.toml](spec/errors/registry.toml), drift-gated by `rake verify`.
+          → [gen_errors.rb](scripts/gen_errors.rb)
     - [ ] **types** — scalars (ragged fields + enum identity threaded through the codec) remain.
 - [x] **Resolve integer-literal typing** — context-adaptive untyped constants (adapt to the
       column/CAST target, trap `22003` out of range, default i64). → [types.md §6](spec/design/types.md)
@@ -72,20 +72,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`IS [NOT] DISTINCT FROM`** — NULL-safe equality (`null = "null_safe"`).
       → [functions.md §3](spec/design/functions.md)
 - [x] **Cost-accounting seam** — a deterministic `Meter` threading the executor / evaluator /
-      storage reads, a data-defined unit schedule, the `# cost:` corpus directive asserting
-      byte-identical accrued cost cross-core. Ceiling+abort (`54P01`) and a real `page_read` unit
-      have since landed. → [cost.md](spec/design/cost.md), [schedule.toml](spec/cost/schedule.toml) _(§13)_
+      storage reads, a data-defined unit schedule, the `# cost:` directive; ceiling+abort (`54P01`)
+      and a real `page_read` unit have since landed. → [cost.md](spec/design/cost.md),
+      [schedule.toml](spec/cost/schedule.toml) _(§13)_
   - [x] _follow-on:_ per-operator `cost` weights — the optional `cost` field in
-        [catalog.toml](spec/functions/catalog.toml) is codegen'd into `OperatorDesc` and read by the
-        evaluator (`operator_cost`, the arithmetic/comparison/logical arms): an operator charges its
-        own static `cost` base if authored, else the uniform `operator_eval`. Name-level + size-
-        independent (argument-size cost is the size-scaled units). No built-in overrides it, so cost
-        is unchanged; tuning a base is a pure data change. → [functions.md §8](spec/design/functions.md),
-        [cost.md §3](spec/design/cost.md)
-    - [x] **`varlen_compare` unit** — text/bytea comparison work scales with the SHORTER operand's
-          length (code points / bytes), the `decimal_work` analog, so a join/correlated re-scan
-          comparing long values is metered, not flat. Complements `collate`. →
-          [cost.md §3](spec/design/cost.md), [schedule.toml](spec/cost/schedule.toml)
+        [catalog.toml](spec/functions/catalog.toml) is codegen'd into `OperatorDesc`; no built-in
+        overrides it, so cost is unchanged. → [cost.md §3](spec/design/cost.md)
+    - [x] **`varlen_compare` unit** — text/bytea comparison work scales with the shorter operand's
+          length, the `decimal_work` analog. → [cost.md §3](spec/design/cost.md)
 
 ---
 
@@ -99,203 +93,114 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `2201W`/`2201X`), applied after ORDER BY before projection. → [grammar.md §9](spec/design/grammar.md)
 - [x] **Richer `ORDER BY`** — multiple keys, per-key `ASC`/`DESC`, `NULLS FIRST|LAST` (PG
       NULL-largest default). → [grammar.md §10](spec/design/grammar.md)
-  - [x] **Output-column ordinal** (`ORDER BY 1`) — 1-based select-list position, incl. the set-op
-        `ORDER BY`; out of range `42P10`; an ordinal pointing at a non-column projection is `0A000`;
-        `WITHIN GROUP` stays column-only (`query.order_by_ordinal`). → [grammar.md §10](spec/design/grammar.md)
-  - [x] **General-expression sort keys** (`ORDER BY a + 1`, `ORDER BY b % 2`, `ORDER BY abs(b)`,
-        and `ORDER BY sum(b)` in a grouped query) — evaluated per row and sorted by the computed
-        value (materialized like a window key — window.md §5.1; metered per node). An ordinal that
-        points at a computed select-list item now sorts by that value too (the old `0A000` lifted),
-        and `ORDER BY 1 + 1` is a constant no-op (PG). DISTINCT requires the key to match a
-        select-list expression (`42P10`); a non-orderable result is `42883`
+  - [x] **Output-column ordinal** (`ORDER BY 1`) — 1-based select-list position incl. the set-op
+        `ORDER BY`; out of range `42P10` (`query.order_by_ordinal`). → [grammar.md §10](spec/design/grammar.md)
+  - [x] **General-expression sort keys** (`ORDER BY a + 1`, `ORDER BY sum(b)`) — evaluated per row
+        and sorted by the computed value; DISTINCT requires the key to match a select-list expression
         (`query.order_by_expr`). → [grammar.md §10](spec/design/grammar.md)
   - [x] **Output-alias sort keys** (`SELECT a + b AS s ... ORDER BY s`) — a bare name resolves an
-        OUTPUT column (an `AS` alias or item's derived name) BEFORE an input column (PG's SQL92 rule,
-        the opposite of `GROUP BY`); shadows a same-named input column; a matched plain column keeps
-        the PK-scan fast path, a computed item is materialized. Binds only a whole bare-name key
-        (`ORDER BY s + 1` → `42703`); same-name items with different exprs are `42702`
+        OUTPUT column before an input column (PG's SQL92 rule, the opposite of `GROUP BY`)
         (`query.order_by_alias`). → [grammar.md §10](spec/design/grammar.md)
-  - [x] **General-expression `WITHIN GROUP` order key** (`percentile_cont(0.5) WITHIN GROUP (ORDER BY
-        a + b)`, `mode() WITHIN GROUP (ORDER BY abs(x))`) — the ordered-set-aggregate order key may be
-        any expression, evaluated per row and sorted by the computed value (`query.within_group_expr`).
-        A bare integer there is a **constant**, not an ordinal (PG divergence from the query `ORDER
-        BY`); a nested aggregate is `42803`. → [aggregates.md §13](spec/design/aggregates.md)
-  - [x] **Correlated `ORDER BY` key** (`SELECT a, (SELECT b FROM u ORDER BY t.a LIMIT 1) FROM t`) — an
-        `ORDER BY` inside a subquery referencing an enclosing-query column (`query.order_by_correlated`).
-        The outer column is a per-evaluation constant (a degenerate leading sort key); it is materialized
-        as an `OuterColumn` expression evaluated per outer row, and a subquery correlated only through its
-        `ORDER BY` re-executes per outer row (the correlation detector inspects the order expressions).
-        Skip-level (grandparent) refs work; the `GROUP BY`-outer-key case stays `0A000`.
+  - [x] **General-expression `WITHIN GROUP` order key** — the ordered-set-aggregate order key may be
+        any expression, sorted by the computed value (`query.within_group_expr`).
+        → [aggregates.md §13](spec/design/aggregates.md)
+  - [x] **Correlated `ORDER BY` key** — an `ORDER BY` inside a subquery referencing an enclosing-query
+        column, materialized per outer row (`query.order_by_correlated`). → [grammar.md §10](spec/design/grammar.md)
+  - [x] **Window function / `GROUPING()` inside an `ORDER BY` key** — the key resolves in the same
+        window / group context as the projection (`query.order_by_window`, `query.order_by_grouping`).
         → [grammar.md §10](spec/design/grammar.md)
-  - [x] **Window function / `GROUPING()` inside an `ORDER BY` key** (`ORDER BY row_number() OVER
-        (ORDER BY b)`, `ORDER BY rank() OVER (...) % 2`; `GROUP BY ROLLUP (a) ORDER BY GROUPING(a), a`)
-        — the key resolves in the same window / group context as the projection, collecting into the
-        shared window-spec / grouping-spec list; the placeholder rebases run after ORDER BY resolution
-        so an order-introduced spec shifts every slot consistently. A query whose only `OVER` is in the
-        `ORDER BY` still sets up the window stage, and sorting by a window value via its output alias now
-        works (`query.order_by_window`, `query.order_by_grouping`). → [grammar.md §10](spec/design/grammar.md)
-  - [x] **Expression key in a grouped+window query** (`SELECT g, sum(v), rank() OVER (ORDER BY sum(v))
-        FROM t GROUP BY g ORDER BY sum(v) + 1`; `ORDER BY rank() OVER (ORDER BY sum(v)) DESC`) — an
-        expression key in a query that BOTH groups and has window functions, resolved in the grouped+window
-        context (aggregates + window specs at once) and materialized over the grouped rows after the window
-        stage extends them (`query.order_by_grouped_window`). → [grammar.md §10](spec/design/grammar.md)
-    _(Two remaining `0A000`s are deliberate non-features, not follow-ons: a general-expression key in a
-    **set-operation** `ORDER BY` — PostgreSQL itself rejects it with `0A000` and jed already matches that
-    code + message; and **GROUPING SETS + window functions**, an orthogonal grouping/window deferral.)_
-- [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table, non-aggregate,
-      non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK columns (sorting by each
-      column's stored key order) elides the sort and streams the scan; with a `LIMIT` it
-      short-circuits a top-N (`storage_row_read` drops to the rows read). Composes with a PK range
-      bound; a collated PK is stored in collation order, so a collated `ORDER BY` is satisfied with
-      no in-memory re-sort and no `collate` units. Capability `query.order_by_pk_scan`.
+  - [x] **Expression key in a grouped+window query** — resolved in the grouped+window context and
+        materialized after the window stage (`query.order_by_grouped_window`). → [grammar.md §10](spec/design/grammar.md)
+    _(Two remaining `0A000`s are deliberate non-features: a general-expression key in a
+    **set-operation** `ORDER BY` (PG itself rejects it `0A000`), and **GROUPING SETS + window functions**.)_
+- [x] **`ORDER BY` satisfied by primary-key scan order** — a single-table non-aggregate
+      non-`DISTINCT` `SELECT` whose `ORDER BY` is an `ASC` prefix of the PK elides the sort and
+      streams the scan; with a `LIMIT` it short-circuits a top-N (`query.order_by_pk_scan`).
       → [cost.md §3](spec/design/cost.md), [grammar.md §10](spec/design/grammar.md)
   - [x] _follow-on:_ **`DESC` (reverse scan)** — an `ORDER BY` over the **full PK** all-`DESC` is
-        served by a reverse tree walk (the eager stable sort tie-breaks ascending, so a strict-prefix
-        DESC keeps the eager path). With a `LIMIT` it short-circuits a top-N from the high end; a
-        collated PK reverse-scans in reverse-collation order with no `collate` units.
-  - [x] _follow-on:_ **secondary-index order** — when the PK scan does not satisfy an `ORDER BY` but a
-        B-tree index's columns do (exactly), and there is a `LIMIT`, walk that index in key order +
-        point-look-up each row (a top-N); the general non-PK collated-`ORDER BY` payoff. The PK suffix
-        is peeled off the END of each index entry key (the fixed-width key-suffix skip), so the indexed
-        column may be variable-width / collated. Capability `query.order_by_index_scan`.
-  - [x] _follow-on:_ **`DISTINCT`** — a `DISTINCT` whose `ORDER BY` is satisfied by the PK scan order
-        dedups **streaming** in scan order (the sort elided), so with a `LIMIT` it short-circuits a
-        top-N (projection + `storage_row_read` drop to the scanned rows). Composes with the reverse
-        (`DESC`) scan. A no-`ORDER-BY` `DISTINCT` keeps the eager project-all-then-dedup path.
+        served by a reverse tree walk; with a `LIMIT` it short-circuits a top-N from the high end.
+  - [x] _follow-on:_ **secondary-index order** — a B-tree index whose columns satisfy the `ORDER BY`
+        (with a `LIMIT`) is walked in key order + point-look-up per row, a top-N
+        (`query.order_by_index_scan`).
+  - [x] _follow-on:_ **`DISTINCT`** — a `DISTINCT` whose `ORDER BY` is PK-scan-satisfied dedups
+        **streaming** in scan order, so with a `LIMIT` it short-circuits a top-N.
   - [x] _follow-on:_ **multi-table joins** — a two-table INNER/CROSS join whose `ORDER BY` is a prefix
-        of the OUTER relation's PK (and which has a `LIMIT`) is served by the nested loop in
-        `(outer PK, inner key)` order: the sort is elided and the loop short-circuits a top-N, so the
-        `ON`/WHERE evals + `row_produced` drop to the combinations examined (both tables still
-        materialized in full). Capability `query.order_by_join_scan`. _(Sub-follow-ons: `DESC` reverse
-        outer scan; >2 relations; outer-table non-PK bound; `LEFT`/`RIGHT`/`FULL`; `DISTINCT`; and the
-        index-order sub-follow-ons — `WHERE` pushdown bound, `DESC` reverse unique-index walk,
-        strict-prefix-of-a-multi-column-index `ORDER BY`, index-order under `DISTINCT`.)_
+        of the OUTER relation's PK (with a `LIMIT`) is served by the nested loop in scan order, eliding
+        the sort and short-circuiting a top-N (`query.order_by_join_scan`). _(Sub-follow-ons: `DESC`
+        reverse outer scan; >2 relations; outer non-PK bound; `LEFT`/`RIGHT`/`FULL`; `DISTINCT`; and the
+        index-order sub-follow-ons.)_
 - [x] **`DISTINCT`** — NULL-safe dedup of projected rows, after ORDER BY before LIMIT; PG
       restriction on ORDER BY keys (`42P10`). → [grammar.md §11](spec/design/grammar.md)
 - [x] **FROM-less `SELECT`** — `SELECT 1` over one virtual zero-column row.
       → [grammar.md §34](spec/design/grammar.md)
-- [x] **Predicate forms — `IN (list)`, `BETWEEN`, `LIKE`, `CASE`** — IN/BETWEEN desugar to
-      `=`/`OR`/`AND`/`NOT`; LIKE is a code-point matcher (`%`/`_`, `\` escape, `22025`); CASE is
-      the engine's first lazy expression. → grammar.md §20–§23
+- [x] **Predicate forms — `IN (list)`, `BETWEEN`, `LIKE`, `CASE`** — IN/BETWEEN desugar; LIKE is a
+      code-point matcher (`%`/`_`, `\` escape, `22025`); CASE is the engine's first lazy expression.
+      → grammar.md §20–§23
   - [x] **`ILIKE`** — case-insensitive `LIKE` (landed with collation Slice 3e).
-  - [x] **Regular expressions** — `~` `~*` `!~` `!~*` operators + `regexp_replace` / `regexp_match`
-        functions, jed's own RE2-able flavor (a hand-written linear-time **Pike VM**, ReDoS-immune,
-        NOT PostgreSQL-flavor-compatible). Code-point matching; `2201B` malformed / `54001`
-        over-large program (`MAX_REGEX_PROGRAM`); `regex_compile`/`regex_step` cost units; cross-core
-        program/match-vector fixtures. All three cores byte-identical, oracle-clean on the PG-agreeing
-        subset. → [regex.md](spec/design/regex.md)
+  - [x] **Regular expressions** — `~` `~*` `!~` `!~*` operators + `regexp_replace` / `regexp_match`,
+        jed's own RE2-able flavor (a hand-written linear-time **Pike VM**, ReDoS-immune).
+        → [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ LIKE `ESCAPE 'c'`; `SIMILAR TO` (deliberately excluded — the SQL-standard
         surface); set-returning `regexp_matches` / `regexp_split_to_table`; the Oracle-compat
         `regexp_count`/`instr`/`substr`/`like`; Unicode-property char classes (`\p{…}`),
         backreferences + lookaround (permanently out — they would break the linear-time guarantee).
-- [x] **Aggregates `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` + `GROUP BY` + `HAVING`** — first
-      function-call syntax, whole-table + grouped aggregation, PG widening (SUM int→i64/decimal,
-      AVG→decimal), grouping-error `42803`. → [aggregates.md](spec/design/aggregates.md)
-  - [x] **`COUNT(DISTINCT x)` / aggregate `DISTINCT`** — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX(DISTINCT x)`
-        fold only the distinct non-NULL argument values, deduplicated value-canonically (the same
-        Eq/Hash as group-key bucketing, so `1.5 == 1.50` / `-0.0 == 0.0`), first occurrence in scan
-        order; composes with GROUP BY. `DISTINCT` on a window function is `0A000`, on a scalar
-        function `42809`; `agg(DISTINCT *)` / `agg(DISTINCT)` are `42601`. New capability
-        `query.aggregate_distinct`; cost unchanged (dedup is unmetered). → aggregates.md §5
-  - [x] **`FILTER (WHERE cond)`** — `agg(args) FILTER (WHERE cond)` folds only the input rows for
-        which `cond` is TRUE (FALSE/NULL excludes), per aggregate; composes with GROUP BY, HAVING,
-        and DISTINCT (filter first, then dedup). A non-boolean cond is `42804`, an aggregate inside
-        it `42803`, `FILTER` on a scalar function `42809`, on a window function `0A000` (the pure
-        non-aggregate case matches PG; window-aggregate FILTER is a deferred follow-on). New
-        capability `query.aggregate_filter`; the filter is metered per row, accumulate only for
-        passing rows. → aggregates.md §11
+- [x] **Aggregates `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` + `GROUP BY` + `HAVING`** — first function-call
+      syntax, whole-table + grouped aggregation, PG widening (SUM int→i64/decimal, AVG→decimal),
+      grouping-error `42803`. → [aggregates.md](spec/design/aggregates.md)
+  - [x] **`COUNT(DISTINCT x)` / aggregate `DISTINCT`** — fold only the distinct non-NULL argument
+        values, deduplicated value-canonically; composes with GROUP BY (`query.aggregate_distinct`).
+        → aggregates.md §5
+  - [x] **`FILTER (WHERE cond)`** — `agg(args) FILTER (WHERE cond)` folds only the rows where `cond`
+        is TRUE; composes with GROUP BY/HAVING/DISTINCT (`query.aggregate_filter`). → aggregates.md §11
   - [x] **`GROUPING SETS` / `ROLLUP` / `CUBE` + `GROUPING()`** — one GROUP BY names several grouping
-        sets at once: `GROUPING SETS ((a),(b),())`, `ROLLUP(a,b)`={(a,b),(a),()}, `CUBE(a,b)`=every
-        subset; a plain term cross-products, nesting allowed. A column not in a row's set projects
-        NULL; a select column must be in the union of all sets else `42803`. `GROUPING(c1,…,ck)` →
-        integer bitmask (1 = grouped away), args must be grouping columns else `42803`; `GROUPING(*)`/
-        `GROUPING()`/`GROUPING()…OVER` are `42601`. Columns only. New capability
-        `query.grouping_sets`; scan once, accumulate per (set×row×agg); total sets capped at 4096
-        (`54001`, divergence from PG's per-construct 54011); window-combined deferred `0A000`. →
-        aggregates.md §12
+        sets at once; an absent column projects NULL; `GROUPING()` → integer bitmask; total sets
+        capped at 4096 (`54001`) (`query.grouping_sets`). → aggregates.md §12
   - [x] **Ordered-set aggregates** — `mode()` / `percentile_cont(f)` / `percentile_disc(f)`
-        `WITHIN GROUP (ORDER BY col)`: the result is defined by the rows sorted by the WITHIN GROUP
-        key (one bare/qualified column, ASC/DESC/NULLS — the column-only query-ORDER-BY narrowing).
-        `mode` → the most frequent value (tie → sort order), input-type result; `percentile_cont` →
-        the interpolated **f64** percentile (numeric input, PG's `orderedsetaggs.c` formula,
-        bit-identical to PG); `percentile_disc` → an actual value at row `ceil(f·N)`, input-type
-        result. Fraction is a per-group constant f64 (NULL → NULL; out of `[0,1]`/NaN → `22003`).
-        Composes with GROUP BY/HAVING/FILTER. `DISTINCT` → `42601`; `OVER` → `0A000` (PG matches); a
-        second key / `WITHIN GROUP` on a non-ordered-set fn / no `WITHIN GROUP` → `42883`. New
-        capability `query.ordered_set_aggregate`; cost = an ordinary aggregate's (sort + finalize
-        unmetered). → aggregates.md §13
-  - [x] **`SELECT DISTINCT` in an aggregate query** — dedups the projected grouped output rows by
-        equality (first occurrence), then LIMIT/OFFSET — the same project->dedup->window pipeline as
-        the non-aggregate DISTINCT. The DISTINCT ORDER BY restriction applies (each key a select-list
-        item, else `42P10`). New capability `query.aggregate_select_distinct`. → aggregates.md §14
+        `WITHIN GROUP (ORDER BY col)`; `percentile_cont` is the interpolated **f64** percentile
+        (PG-bit-identical), fraction a per-group constant f64 (`query.ordered_set_aggregate`).
+        → aggregates.md §13
+  - [x] **`SELECT DISTINCT` in an aggregate query** — dedups the projected grouped output rows, then
+        LIMIT/OFFSET; the DISTINCT ORDER BY restriction applies (`query.aggregate_select_distinct`).
+        → aggregates.md §14
   - [x] **`GROUP BY` by ordinal / output alias / general expression** — a grouping key may be a
-        select-list ordinal (`GROUP BY 1`, out of range `42P10`; only a bare int literal), an output
-        alias (`GROUP BY s`, input-column-first then alias — opposite of ORDER BY), or a general
-        expression (`GROUP BY a+b`, materialized; a matching select/HAVING/ORDER BY expr resolves to
-        the group value; an aggregate operand stays per-row). Composes with ROLLUP/CUBE/GROUPING SETS.
-        New capability `query.group_by_expr`. → aggregates.md §15
-  - [x] **Functional-dependency grouping** — `GROUP BY` a base table's full primary key lets any
-        column of that table (and expressions over them) appear ungrouped, since the PK determines it;
-        holds across a join, requires the whole composite PK, single grouping set only. New capability
-        `query.group_by_functional_dependency`. → aggregates.md §16
+        select-list ordinal (`42P10`), an output alias, or a general expression; composes with
+        ROLLUP/CUBE/GROUPING SETS (`query.group_by_expr`). → aggregates.md §15
+  - [x] **Functional-dependency grouping** — `GROUP BY` a base table's full PK lets its other columns
+        appear ungrouped; whole composite PK, single grouping set (`query.group_by_functional_dependency`).
+        → aggregates.md §16
   - [x] **`FILTER` on a window aggregate** — `agg(x) FILTER (WHERE cond) OVER (...)` folds only the
-        frame rows where `cond` is TRUE (default/explicit frames, EXCLUDE, PARTITION BY); a FILTER
-        disables the sliding-frame optimization (naive re-fold). A non-aggregate window function with
-        FILTER stays `0A000`. New capability `query.window_aggregate_filter`. → aggregates.md §20
+        frame rows where `cond` is TRUE; a non-aggregate window function with FILTER stays `0A000`
+        (`query.window_aggregate_filter`). → aggregates.md §20
   - [x] **`GROUPING SETS` combined with window functions** — the window stage runs over the unioned
-        grouping-set rows; `GROUPING()` and window functions coexist (the grouped row is `[master,
-        agg, GROUPING, window keys, window results]`, the placeholder rebases bounded per base). New
-        capability `query.grouping_sets_window`. → aggregates.md §21
-  - [x] **Non-constant ordered-set fraction** — `percentile_cont(expr)` / `percentile_disc(expr)`
-        where `expr` references grouping columns, evaluated per group (a non-grouped column is `42803`).
-        New capability `query.ordered_set_nonconstant_fraction`. → aggregates.md §17
-  - [x] **Interval input to `percentile_cont`** — interpolated in the interval domain (PG
-        `interval_lerp`/`interval_mul`, byte-identical incl. `rint` ties-to-even), result `interval`.
-        New capability `query.ordered_set_interval`. → aggregates.md §13
-  - [x] **Array-valued `percentile_*` fraction** — `percentile_cont(ARRAY[…])` /
-        `percentile_disc(ARRAY[…])` computes one percentile per element, result an array (NULL element
-        → NULL element; range-check before empty; empty group → NULL). New capability
-        `query.ordered_set_array_fraction`. → aggregates.md §18
-  - [x] **Collated `WITHIN GROUP` key** — `mode`/`percentile_disc` honor an explicit `COLLATE` (or a
-        text column's frozen collation) in the WITHIN GROUP sort; default byte (`C`) order; `COLLATE`
-        on a non-text key is `42804`. New capability `query.ordered_set_collation`. → aggregates.md §13
+        grouping-set rows; `GROUPING()` and window functions coexist (`query.grouping_sets_window`).
+        → aggregates.md §21
+  - [x] **Non-constant ordered-set fraction** — `percentile_*(expr)` over grouping columns, evaluated
+        per group (a non-grouped column is `42803`) (`query.ordered_set_nonconstant_fraction`).
+        → aggregates.md §17
+  - [x] **Interval input to `percentile_cont`** — interpolated in the interval domain (PG-byte-identical),
+        result `interval` (`query.ordered_set_interval`). → aggregates.md §13
+  - [x] **Array-valued `percentile_*` fraction** — computes one percentile per element, result an array
+        (`query.ordered_set_array_fraction`). → aggregates.md §18
+  - [x] **Collated `WITHIN GROUP` key** — `mode`/`percentile_disc` honor an explicit/column `COLLATE`
+        in the sort; default byte (`C`) order (`query.ordered_set_collation`). → aggregates.md §13
   - [x] **Hypothetical-set aggregates** — `rank`/`dense_rank`/`percent_rank`/`cume_dist`
-        `WITHIN GROUP (ORDER BY keys)`: the rank the hypothetical direct-arg row would have. Direct-arg
-        count must match the ordering columns (`42883`); per-key ASC/DESC/COLLATE + NULLS honored;
-        FILTER composes; `DISTINCT` `42601`, `OVER` `0A000`. New capability
-        `query.hypothetical_set_aggregate`. → aggregates.md §19
+        `WITHIN GROUP (ORDER BY keys)`: the rank the hypothetical direct-arg row would have
+        (`query.hypothetical_set_aggregate`). → aggregates.md §19
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
-      optimization.** Per-row values folded over a related row set in a dedicated **window stage**
-      (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/
-      cume_dist/ntile, lag/lead, the aggregates as window functions (running + explicit
-      ROWS/RANGE/GROUPS frames + value offsets + EXCLUDE), first_value/last_value/nth_value, the
-      `WINDOW` named-window clause + `OVER name` + base-window extension, combination with GROUP
-      BY/aggregates, a collation-honoring `ORDER BY`, and **general-expression `PARTITION BY`/`ORDER BY`
-      keys** (`PARTITION BY a + b`, `ORDER BY a % 2`, and an aggregate as a key `ORDER BY sum(x)` in a
-      grouped query — resolved against the grouped row like a projection, a non-grouping column 42803;
-      a compound key is materialized into a synthetic window-key column before the window stage). The
-      window stage **shares one partition/sort pass** across specs with an identical definition and
-      **slides** a no-EXCLUDE aggregate's frame accumulator (expanding = fold-once for every aggregate;
-      moving `count` = un-fold the left edge) — cost-lowering only, lowering
-      `window_frame_step`/`operator_eval` cross-core-identically (a NoREC `window` relation + the
-      `window_running_sum`/`window_moving_count` benchmarks guard it). New codes 42P20/22013/22014/22016;
-      cost units `window_result`/`window_frame_step`; the `[[window]]` catalog array. Divergences:
-      within-partition order fully resolved (D1), percent_rank/cume_dist → f64 (PG's float8 — D2
-      RESOLVED, the in-contract correctly-rounded division), float-keyed RANGE frames → f64 (PG's
-      in_range_float*_float8 — D3 RESOLVED, bit-identical to PG), correlated window keys 0A000.
-      Deferred follow-ons: prefix-compatible (not just identical) sort sharing, a safely-invertible
-      moving `sum`/`avg`/`min`/`max`/float slide, RANGE offsets over a timestamp / date key (D4), a
-      correlated window key, `FILTER`/`WITHIN GROUP`, `IGNORE NULLS`. → [window.md](spec/design/window.md)
+      optimization.** Per-row values folded over a related row set in a dedicated window stage:
+      ranking/offset/aggregate window functions, ROWS/RANGE/GROUPS frames + value offsets + EXCLUDE,
+      the `WINDOW` named clause + base-window extension, general-expression `PARTITION BY`/`ORDER BY`
+      keys, a shared partition/sort pass + frame sliding. Divergences D1/D2/D3 resolved; correlated
+      window keys `0A000`. Deferred: prefix-compatible sort sharing, invertible moving slide, RANGE
+      offsets over a ts/date key (D4), `FILTER`/`WITHIN GROUP`, `IGNORE NULLS`. → [window.md](spec/design/window.md)
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions (`kind = "function"`).
       → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ `ceil`/`floor`/`mod`/`sign`, text `length`/`lower`/`upper`, a general implicit
         argument-coercion pass.
 - [x] **Scalar string / text functions** — PG's string functions (manual §9.4) as `kind="function"`
-      built-ins reusing the scalar mold, code-point semantics (the UTF-16 cross-core trap, §2):
-      `length`/`char_length`/`character_length`/`octet_length`/`bit_length`, `substr`, `left`/`right`,
-      `lpad`/`rpad`, `btrim`/`ltrim`/`rtrim`, `replace`, `translate`, `repeat`, `reverse`, `strpos`,
-      `split_part`, `starts_with`, `ascii`, `chr`, `initcap`, `to_hex`, `encode`/`decode`,
-      `quote_literal`/`quote_ident`/`quote_nullable`. → [string-functions.md](spec/design/string-functions.md)
+      built-ins with code-point semantics (`length`/`substr`/`lpad`/`btrim`/`replace`/`translate`/
+      `repeat`/`strpos`/`split_part`/`encode`/`decode`/`quote_*`/…).
+      → [string-functions.md](spec/design/string-functions.md)
   - [ ] _follow-on:_ full-Unicode `initcap` word classification + non-ASCII titlecasing; keyword-aware
         `quote_ident`; a `text::bytea` cast + `length`/`octet_length`/`bit_length` `bytea` overloads;
         per-character cost metering for `lpad`/`rpad`/`repeat` (the §13 cost-ceiling path; the 54000
@@ -323,19 +228,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > and the JSON `0A000` follow-ons remain.
 
 - [x] **Storable `boolean` column type** — on-disk type code 5, `bool-byte` codec, comparison +
-      ORDER BY (false < true, NULLs last); boolean in a `PRIMARY KEY`/index (`bool-byte` key
-      encoding) and explicit `boolean⇄i32` casts (i32 only; `bool⇄i16`/`i64` a forbidden `42804`)
-      both landed. → [types.md §9](spec/design/types.md), [casts.toml](spec/types/casts.toml)
-- [x] **`text` + ONE collation (`C`)** — UTF-8 byte/code-point order, on-disk type code 4, first
-      operator overload (the UTF-8-vs-UTF-16 ordering trap handled in TS); text in a `PRIMARY KEY`/
-      index/UNIQUE via the `text-terminated-escape` key encoding (oversized text key `0A000`).
+      ORDER BY (false < true, NULLs last), boolean in a PK/index, and `boolean⇄i32` casts.
+      → [types.md §9](spec/design/types.md), [casts.toml](spec/types/casts.toml)
+- [x] **`text` + ONE collation (`C`)** — UTF-8 byte/code-point order, on-disk type code 4, the first
+      operator overload, text in a PK/index/UNIQUE via the `text-terminated-escape` key encoding.
       → [types.md §11](spec/design/types.md), [encoding.md §2.4](spec/design/encoding.md)
   - [ ] _follow-on:_ `varchar(n)` length limits (`22001`); runtime non-literal text→T casts;
         string functions (`||`, `length`, `lower`/`upper`, `substring`).
-  - [x] _follow-on:_ **linguistic collation (`COLLATE` / per-column / per-db default / UCA)** — ✅
-        slice 1 (a–e) landed: jed-owned UCA executor + compiler, `COLLATE` expr/`ORDER BY`,
-        per-column + per-db default, collated keys; deterministic collations only.
-        → [collation.md](spec/design/collation.md)
+  - [x] _follow-on:_ **linguistic collation (`COLLATE` / per-column / per-db default / UCA)** —
+        slice 1 (a–e) landed: jed-owned UCA executor + compiler, `COLLATE`, per-column + per-db
+        default, collated keys; deterministic collations only. → [collation.md](spec/design/collation.md)
         - [ ] **slice 2 — reference-only / vendored-tier pivot** (design revised, **not yet built**):
               flip from "vendor nothing, bake into the file by default" to **vendor the compiled
               tables into each core** at an embedder-chosen footprint tier (`C`-only / non-CJK /
@@ -360,61 +262,48 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
               collations, `LIKE` under non-`C`, CLDR `shifted`, CJK tier-3 data) — **possibilities,
               not scheduled work**, collation.md §14.
 - [x] **Exact `decimal`** — *the* headline type: hand-rolled sign+coefficient+scale, round-half-away
-      (settles the §8 rounding hotspot), PG result scales, first parameterized + first cross-family
-      promotion; finite-only (documented PG divergence); decimal in a `PRIMARY KEY`/ordered index/
-      UNIQUE via the scale-independent `decimal-order-preserving` encoding (`1.5` and `1.50` index as
-      one). → [decimal.md](spec/design/decimal.md), [encoding.md §2.5](spec/design/encoding.md)
+      (settles the §8 rounding hotspot), PG result scales, finite-only (documented PG divergence),
+      decimal in a PK/ordered index/UNIQUE via the scale-independent `decimal-order-preserving`
+      encoding. → [decimal.md](spec/design/decimal.md), [encoding.md §2.5](spec/design/encoding.md)
   - [ ] _follow-on:_ negative / `s>p` scale typmods; `round(x,n)` and other decimal functions.
 - [x] **`timestamp` / `timestamptz`** — PG instant model, i64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
-  - [x] **time-zone database + `AT TIME ZONE` (host-loaded `JTZ` bundle)** — ✅ LANDED (Slice 1; copies
-        collation's host-load model): a host loads IANA tzdata as a **`JTZ` bundle** (manifest + per-zone
-        **RFC 8536 TZif** sections + alias links) via a privileged bytes/reader **`db.LoadTimeZoneData`**;
-        the bare binary carries no tz data (`UTC` + fixed `±HH:MM` offsets built-in, the `C` analogue).
-        Each core has a TZif reader (`(zone, instant) → (offset, abbrev, dst)`, incl. the POSIX footer);
-        the **`AT TIME ZONE` consumer** (both directions; unknown zone `22023`, non-text zone `42883`).
-        **No `format_version` bump** — `timestamptz` is UTC, so plain indexes are tz-immune; the
-        collation-style version-skew machinery stays **latent** until tz-derived stored keys exist
-        (timezones.md §8 → compatibility.md then). Cost unit `timezone`, corpus directive
-        `# load-timezone:`. → [timezones.md](spec/design/timezones.md), [tz/README.md](spec/tz/README.md).
-  - [x] **the tz conversion surface (Slice 2)** — ✅ LANDED: `date_trunc(unit, src)` (2-arg ts/tstz/
-        interval + 3-arg `date_trunc(unit, tstz, zone)`), `EXTRACT(field FROM src)` → `numeric` (ts/tstz/
-        date/interval; field-validity matrix matches PG, `0A000`/`22023`), the cross-family `timestamp`/
-        `timestamptz`/`date` **casts in a zone**, and the now-observable **session `TimeZone` slot** (the
-        zone a `timestamptz` decomposes in). Session zone drives *computation*, not yet *rendering*
-        (timezones.md §9.5). → [timezones.md §9](spec/design/timezones.md), [grammar.md §50](spec/design/grammar.md).
+  - [x] **time-zone database + `AT TIME ZONE` (host-loaded `JTZ` bundle)** — Slice 1 (copies
+        collation's host-load model): a host loads IANA tzdata as a `JTZ` bundle via `db.LoadTimeZoneData`
+        (bare binary = `UTC` + fixed offsets); a per-core TZif reader + the `AT TIME ZONE` consumer. No
+        `format_version` bump (`timestamptz` is UTC). → [timezones.md](spec/design/timezones.md), [tz/README.md](spec/tz/README.md)
+  - [x] **the tz conversion surface (Slice 2)** — `date_trunc(unit, src[, zone])`,
+        `EXTRACT(field FROM src)` → `numeric`, cross-family `timestamp`/`timestamptz`/`date` casts in a
+        zone, and the observable session `TimeZone` slot (computation, not yet rendering).
+        → [timezones.md §9](spec/design/timezones.md), [grammar.md §50](spec/design/grammar.md)
   - [ ] _further follow-on:_ `date_part` (float8 — needs `float`), `make_timestamptz`, `to_char`/
         `to_timestamp`, `age`, `EXTRACT(julian …)`; separate `time` type; **text⇄datetime casts** + the
         **session-zone rendering** of `timestamptz`; `timestamp(p)` precision typmods (timezones.md §9).
-- [x] **`date`** — a calendar date (i32 days since 1970-01-01, reusing timestamp's calendar core):
-      strict ISO `YYYY-MM-DD` literals (string-adapt + `DATE '…'`) with BC era + `±infinity`, a date
-      `PRIMARY KEY` (key encoding = i32; on-disk type code 16, no format bump); a **strict island** —
-      no compare/cast to timestamp this slice (a documented PG divergence). → [date.md](spec/design/date.md)
+- [x] **`date`** — a calendar date (i32 days since 1970-01-01), strict ISO `YYYY-MM-DD` literals with
+      BC era + `±infinity`, a date PK (on-disk type code 16, no format bump); a **strict island** — no
+      compare/cast to timestamp this slice (a documented PG divergence). → [date.md](spec/design/date.md)
   - [ ] _follow-on:_ **date arithmetic** (`date ± int` → date, `date - date` → int, `date ± interval`
         → timestamp, `date + time` → timestamp); **casts** (text↔date, date↔timestamp — the latter
         unblocks cross-family `date < timestamp`); **clock-relative literals** (`today`/`tomorrow`/
         `yesterday`/`now`/`epoch`, on the entropy/clock seam); **date functions** (`make_date`,
         `EXTRACT`/`date_part`, `date_trunc`, `current_date`). → [date.md §6](spec/design/date.md)
-- [x] **Typed string literals + string-literal casts (`type 'string'`)** — one generalized
-      production = `CAST('string' AS type)`; literal-only coercion preserves strictness.
-      → [grammar.md §36](spec/design/grammar.md)
+- [x] **Typed string literals + string-literal casts (`type 'string'`)** — one generalized production
+      = `CAST('string' AS type)`; literal-only coercion preserves strictness. → [grammar.md §36](spec/design/grammar.md)
   - [ ] _follow-on:_ runtime text→T cast on a non-literal text expression (shared with the text follow-on).
 - [x] **`::` cast operator** (`expr :: type`) — desugars to the `Cast` node; binds tighter than
       unary minus; a bind-param operand takes the cast target as its type. → [grammar.md §37](spec/design/grammar.md)
 - [x] **`interval`** — PG three-field span (months/days/micros), calendar-aware arithmetic, the
-      engine's first timestamp arithmetic; on-disk type code 11; interval PK/index/UNIQUE/FK/GIN via
-      the 16-byte `interval-span-i128` span key (span-equal values share a key).
-      → [interval.md](spec/design/interval.md), [encoding.md §2.10](spec/design/encoding.md)
+      engine's first timestamp arithmetic; on-disk type code 11; interval PK/index/UNIQUE/FK/GIN via the
+      16-byte `interval-span-i128` span key. → [interval.md](spec/design/interval.md), [encoding.md §2.10](spec/design/encoding.md)
   - [ ] _follow-on:_ CAST to/from interval; ISO-8601 `P…` + SQL-standard
         input; field qualifiers (`YEAR TO MONTH`) + `interval(p)`; `justify_*`/`EXTRACT`/`age`.
-- [x] **`bytea`** — variable-width bytes, unsigned byte order, `\x`-hex literals (`22P02` on bad
-      hex), on-disk type code 7; bytea PK/index/UNIQUE via the `bytea-terminated-escape` key
-      encoding. → [types.md §13](spec/design/types.md), [encoding.md §2.6](spec/design/encoding.md)
+- [x] **`bytea`** — variable-width bytes, unsigned byte order, `\x`-hex literals (`22P02` on bad hex),
+      on-disk type code 7; bytea PK/index/UNIQUE via the `bytea-terminated-escape` key encoding.
+      → [types.md §13](spec/design/types.md), [encoding.md §2.6](spec/design/encoding.md)
   - [ ] _follow-on:_ traditional escape input (`\nnn`); bytea⇄other casts; binary functions
         (`length`, `||`, `substring`, `encode`/`decode`, `get_byte`).
-- [x] **`uuid`** — fixed 16 bytes, PG-flexible input, canonical lowercase output, on-disk type code
-      8; the **first non-integer `PRIMARY KEY`** (exercises `uuid-raw16` key encoding).
-      → [types.md §14](spec/design/types.md)
+- [x] **`uuid`** — fixed 16 bytes, PG-flexible input, canonical lowercase output, on-disk type code 8;
+      the **first non-integer `PRIMARY KEY`** (`uuid-raw16` key encoding). → [types.md §14](spec/design/types.md)
   - [ ] _follow-on:_ uuid⇄other casts (`text ⇄ uuid`, `bytea ⇄ uuid`).
 - [x] **uuid extractor functions** — `uuid_extract_version` / `uuid_extract_timestamp` (immutable);
       landed the catalog `volatility` field. → [functions.md §12](spec/design/functions.md)
@@ -422,30 +311,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       entropy+clock seam (splitmix64 PRNG). → [entropy.md](spec/design/entropy.md)
 - [x] **Current-time functions** — `now()` (STABLE) / `current_timestamp` (sugar) /
       `clock_timestamp()` (VOLATILE) on the clock seam. → [functions.md §12](spec/design/functions.md)
-- [x] **`f32` + `f64` (IEEE 754)** — two-width promotion tower; the first types **narrowly**
-      exempted from cross-core byte-identity (only transcendental *values* + render *layout*, via the
-      `R` tag's tolerant compare); established the determinism framework + exception ledger; NaN
-      canonicalized on store. On-disk type code 12. → [float.md](spec/design/float.md),
+- [x] **`f32` + `f64` (IEEE 754)** — two-width promotion tower; the first types **narrowly** exempted
+      from cross-core byte-identity (via the `R` tag's tolerant compare); established the determinism
+      framework + exception ledger; on-disk type code 12. → [float.md](spec/design/float.md),
       [determinism.md](spec/design/determinism.md)
   - [ ] _follow-on:_ float in a PRIMARY KEY/index (`0A000`); key rule authored, unexercised.
   - [x] **math functions** — the [float.md §8](spec/design/float.md) follow-ons, all three cores,
-        oracle-clean (`expr/float_math_more.test`, `expr/numeric_functions.test`): `cbrt`, `pi()`,
-        `radians`/`degrees` (in-contract — one shared-constant IEEE op), `asin`/`acos`/`atan`/`atan2`/
-        `cot` + the hyperbolics `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh` (transcendental, shared
-        ledger entry), `power` (float `pow` alias); and the EXACT numerics `sign`, `mod()`, `div()`,
-        `gcd`/`lcm` (integer + numeric), `factorial` (metered loop), `width_bucket` (numeric + float,
-        new SQLSTATE `2201G`), `scale`/`min_scale`/`trim_scale`.
+        oracle-clean: `cbrt`/`pi()`/`radians`/`degrees`, the inverse + hyperbolic trig, `power`; and
+        the EXACT numerics `sign`/`mod()`/`div()`/`gcd`/`lcm`/`factorial`/`width_bucket` (new `2201G`)/
+        `scale`/`min_scale`/`trim_scale`.
     - [ ] _deferred:_ the **exact-numeric** transcendentals `power(numeric,numeric)`, `log(numeric)`,
           `log(b, x)` — must be byte-identical cross-core (decimal is in-contract, no ULP exemption),
           so they need a PG-faithful arbitrary-precision `ln`/`exp`/`power` port (numeric.c). Also the
           `width_bucket(value, thresholds[])` array-threshold variant.
 - [x] **`json` / `jsonb` + SQL/JSON** — ✅ the committed XL headline feature (§1, §4): **all
-      non-deferred slices landed** across all three cores, oracle-clean. Designed spec-first across
-      four docs ([json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md),
+      non-deferred slices landed** across all three cores, oracle-clean. Designed spec-first across four
+      docs ([json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md),
       [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md));
-      stable type codes 18/19/20, one `format_version` bump (v18→v19) at J1. Delivered along the critical
-      path **J0 → {J1,J2,J3} → C0 → P1 → {P2,S2} → {R1,T1}** (B-series parallel off J0/C0). _(size: XL —
-      done; the deferred `0A000` follow-ons are the one open bullet below.)_
+      stable type codes 18/19/20, one `format_version` bump (v18→v19) at J1.
   - [ ] _follow-ons (deferred `0A000`, hoisted from the done slices):_ the string-**dictionary builder**
         (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index (exercise
         [encoding.md §2.13](spec/design/encoding.md)); GIN **`jsonb_ops`** opclass for `@>`/`?` (the
@@ -469,13 +352,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         (`0A000`, encoding authored §8); runtime text→array, `array::text`, and element-wise
         array→array casts. (The subquery quantifier form `op ANY/ALL(SELECT …)` has landed — §11.6.)
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
-      **second container axis** that turns the *closed* type enum into an *open*, user-defined type
-      system: `Type { Scalar | Composite(catalog-ref) }` threaded through parser/resolver/evaluator/
-      codec/comparator/catalog in all three cores; `CREATE`/`DROP TYPE`, nested + recursive types, a
-      storable composite **column** + recursive value codec (`format_version` 9), `ROW(…)`
-      construction, field access `(expr).field`/`(expr).*`, element-wise compare/`ORDER BY`/
-      DISTINCT/GROUP BY, the non-recursive all-fields `IS NULL` rule, and PG-exact `record_in`/
-      `record_out`. Named composites only. → [composite.md](spec/design/composite.md)
+      **second container axis** turning the *closed* type enum into an *open* one: `Type { Scalar |
+      Composite(catalog-ref) }` threaded through all three cores; `CREATE`/`DROP TYPE`, nested +
+      recursive types, a storable composite column + recursive value codec (`format_version` 9), `ROW(…)`
+      construction, field access, element-wise compare/ORDER BY/DISTINCT/GROUP BY. Named composites only.
+      → [composite.md](spec/design/composite.md)
   - [ ] _still narrowed (relaxable later):_ `INSERT … SELECT` / `UPDATE` of a composite column;
         composite `PRIMARY KEY`/index/`UNIQUE` (`0A000` — key encoding authored, unexercised);
         `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` +
@@ -488,15 +369,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The meaty planner/executor work and the rest of the integrity story.
 
 - [x] **`JOIN` — multi-table FROM + `INNER`/`CROSS` + outer (`LEFT`/`RIGHT`/`FULL`)** — left-deep
-      nested-loop executor, table aliases, qualified column refs, a flat-index scope resolver;
-      ambiguity `42702`, dup alias `42712`; the outer NULL-extension branch + WHERE-downgrades-to-
-      inner. → [grammar.md §15](spec/design/grammar.md)
+      nested-loop executor, table aliases, qualified column refs, a flat-index scope resolver; the outer
+      NULL-extension branch + WHERE-downgrades-to-inner. → [grammar.md §15](spec/design/grammar.md)
   - [ ] _follow-on:_ `USING` / `NATURAL` / comma-`FROM` / `t.*`.
-- [x] **Subqueries** — uncorrelated scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS`
-      (plan-time folding; `21000`/`42601`); **correlated** (resolve/execute split + scope chain);
-      subqueries in `UPDATE`/`DELETE`; `$N` inside a subquery (`42P18` for the lone undetermined
-      case); **derived tables** `FROM (SELECT …) AS t`; a `VALUES` body `FROM (VALUES …) AS v(x)`;
-      **`LATERAL`** (dependent join, SRFs implicitly lateral); and `x op ANY/ALL(SELECT …)`.
+- [x] **Subqueries** — uncorrelated scalar, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS`, **correlated**,
+      subqueries in `UPDATE`/`DELETE`, `$N` inside a subquery, **derived tables**, a `VALUES` body,
+      **`LATERAL`**, and `x op ANY/ALL(SELECT …)`.
       → [grammar.md §26/§42/§44](spec/design/grammar.md), [array-functions.md §11.6](spec/design/array-functions.md)
   - [ ] _follow-on:_ a correlated `GROUP BY` / `ORDER BY` key (`0A000`, degenerate).
   - [ ] _follow-on:_ a **parenthesized-join FROM** (`FROM (a JOIN b ON …)`); a trailing **`ORDER
@@ -505,58 +383,50 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **Subqueries — remaining seams:** subqueries in an **`INSERT ... VALUES`** slot (blocked on
         VALUES holding a general expression); **row-valued** subqueries. _(size: S)_
 - [x] **Set operations — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`** — a query-expression
-      precedence tree (INTERSECT binds tighter), full-PG per-column type unification, NULL-safe
-      multiset semantics, trailing ORDER BY by output-column name or ordinal. → [grammar.md §25](spec/design/grammar.md)
+      precedence tree (INTERSECT binds tighter), full-PG per-column type unification, NULL-safe multiset
+      semantics, trailing ORDER BY by output-column name or ordinal. → [grammar.md §25](spec/design/grammar.md)
   - [ ] _follow-on:_ parenthesized operands `(SELECT …) UNION …`; ORDER BY/LIMIT inside an operand;
         ORDER BY ordinals; a set op in an `INSERT … SELECT` source.
-- [x] **Common table expressions (`WITH`)** — `WITH name [(cols)] AS [NOT] MATERIALIZED (query)
-      [, …]`: named derived tables in FROM (forward-only visibility; PG hybrid inline/materialize
-      rule, the `cte_scan_row` cost unit; `42712`/`42P01`/`42P10`). Plus **`WITH RECURSIVE`**
-      (iterate-to-fixpoint working-table executor, `42P19`, cost-ceiling termination), **data-
-      modifying (writable) CTEs** (one pre-statement snapshot, lexical order, all-or-nothing), and
-      **nested `WITH`** inside a subquery/derived table/CTE body. → [cte.md](spec/design/cte.md), [recursive-cte.md](spec/design/recursive-cte.md), [writable-cte.md](spec/design/writable-cte.md)
+- [x] **Common table expressions (`WITH`)** — named derived tables in FROM (PG hybrid
+      inline/materialize rule), plus **`WITH RECURSIVE`** (iterate-to-fixpoint), **data-modifying
+      (writable) CTEs** (one pre-statement snapshot, all-or-nothing), and **nested `WITH`**.
+      → [cte.md](spec/design/cte.md), [recursive-cte.md](spec/design/recursive-cte.md), [writable-cte.md](spec/design/writable-cte.md)
   - [ ] _follow-on:_ a nested `WITH` **inheriting enclosing CTEs** (the residual visibility divergence
         above); recursive-CTE deferrals (`SEARCH`/`CYCLE`, a set-op / `FROM`-subquery recursive term,
         mutual recursion).
 - [x] **Set-returning functions** — `generate_series(start, stop [, step])` in FROM position, a
-      synthetic one-column relation, a new `generated_row` cost unit; integer variants (timestamp
-      waits on interval composition). → [functions.md §10](spec/design/functions.md)
+      synthetic one-column relation, a `generated_row` cost unit; integer variants. → [functions.md §10](spec/design/functions.md)
   - [ ] _follow-on:_ the column-alias-list `AS g(c)`. (`LATERAL` ✅ landed — an SRF is implicitly
         lateral, [grammar.md §44](spec/design/grammar.md); `unnest(array)` ✅ landed — AF3.)
 - [x] **`NOT NULL`** — explicit column constraint; storing NULL → `23502`.
       → [constraints.md §1](spec/design/constraints.md)
 - [x] **`DEFAULT` (literal)** — evaluated + coerced once at CREATE TABLE; landed with the INSERT
       column list + the `DEFAULT` value keyword. → [constraints.md §2](spec/design/constraints.md)
-- [x] **`DEFAULT` (expression)** — non-constant `DEFAULT <expr>` (e.g. `uuidv7()`, `1 + 1`) stored
-      as expression text + evaluated per row at INSERT through the entropy/clock seam; `format_version`
-      8. → [constraints.md §2](spec/design/constraints.md)
+- [x] **`DEFAULT` (expression)** — non-constant `DEFAULT <expr>` (e.g. `uuidv7()`, `1 + 1`) stored as
+      expression text + evaluated per row at INSERT through the entropy/clock seam; `format_version` 8.
+      → [constraints.md §2](spec/design/constraints.md)
   - [ ] _follow-on:_ `UPDATE ... SET x = DEFAULT` and `INSERT ... DEFAULT VALUES`.
 - [x] **Composite `PRIMARY KEY`** — table-level `PRIMARY KEY (a, b, …)`; key bytes = members'
-      concatenated encodings; the secondary-index catalog reshape (`format_version` 5) lifted the
-      declaration-order narrowing. → [constraints.md §3](spec/design/constraints.md)
+      concatenated encodings. → [constraints.md §3](spec/design/constraints.md)
   - [ ] _follow-on:_ composite point-lookup / prefix pushdown (a composite-PK table full-scans today
         — an optimization slice with its NoREC obligation).
-- [x] **`CHECK` constraints** — column- + table-level `[CONSTRAINT name] CHECK (expr)`, enforced
-      per candidate row inside the two-phase pass (`23514`), PG auto-naming; persisted as
-      `(name, expression-text)` under `format_version` 4. → [constraints.md §4](spec/design/constraints.md)
+- [x] **`CHECK` constraints** — column- + table-level `[CONSTRAINT name] CHECK (expr)`, enforced per
+      candidate row inside the two-phase pass (`23514`), PG auto-naming; `format_version` 4.
+      → [constraints.md §4](spec/design/constraints.md)
 - [x] **`UNIQUE` constraints + unique indexes** — column-/table-level `UNIQUE` and `CREATE UNIQUE
-      INDEX`; a UNIQUE constraint **is** its backing unique index; NULLS-distinct enforcement;
-      `format_version` 6 (per-index flags byte). Unlocks `ON CONFLICT`.
+      INDEX`; a UNIQUE constraint **is** its backing unique index; NULLS-distinct; `format_version` 6.
       → [constraints.md §5](spec/design/constraints.md), [indexes.md §8](spec/design/indexes.md)
-- [x] **`FOREIGN KEY` constraints** — column-level `REFERENCES` + table-level `[CONSTRAINT name]
-      FOREIGN KEY (cols) REFERENCES parent (cols) [ON DELETE/UPDATE …]`; composite + self-reference;
+- [x] **`FOREIGN KEY` constraints** — column- + table-level `REFERENCES`; composite + self-reference;
       referenced columns must be the parent PK or a UNIQUE set (`42830`), same-type pairing (`42804`,
-      stricter than PG); MATCH SIMPLE; enforced at four write sites (`23503`) in the two-phase pass,
-      batch-end-state-aware; `DROP TABLE` of a referenced table is `2BP01`; persisted under
+      stricter than PG); MATCH SIMPLE; enforced at four write sites (`23503`) in the two-phase pass;
       `format_version` **11**. → [constraints.md §6](spec/design/constraints.md), [grammar.md §43](spec/design/grammar.md)
   - [ ] _follow-on:_ the referential **actions** `ON DELETE/UPDATE CASCADE | SET NULL | SET DEFAULT`
         (parse but `0A000` today — they write the child during a parent mutation); `MATCH FULL`;
         a **backing index** on the child FK columns (the parent-side check full-scans children today);
         FK type pairing relaxed to PG's comparable-types; `ALTER TABLE … ADD/DROP CONSTRAINT`.
 - [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — non-unique on-disk B-trees of
-      empty-payload records, maintained in the two-phase pass; the planner index-bounds a SELECT
-      base scan on a first-column equality; `format_version` 5 catalog reshape; DROP code `42809`.
-      → [indexes.md](spec/design/indexes.md)
+      empty-payload records, maintained in the two-phase pass; the planner index-bounds a SELECT base
+      scan on a first-column equality; `format_version` 5 catalog reshape. → [indexes.md](spec/design/indexes.md)
   - [ ] _follow-on (each its own slice + NoREC obligation):_ index ranges / multi-column prefixes;
         index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination;
         the lone not-yet-key-encodable index type (`float` keys — boolean, text, bytea, decimal, and
@@ -577,79 +447,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         **ordered-index** equality bound for UPDATE/DELETE (mutations use PK+GIN but not the ordered
         index yet); the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`**
         opclass (the lossy-recheck path the seam already seats) and a future object/document opclass.
-- [x] **GiST index access method → `EXCLUDE` constraints** ✅ **DONE** (GX0–GX3 all landed, all three
-      cores + Ruby golden, byte-identical) — a **third index *kind*** beside the
-      ordered B-tree (`index_kind = 0`) and GIN (`index_kind = 1`): the reserved `index_kind = 2`
-      ([format.md](spec/fileformat/format.md) *Catalog*, currently `XX001`; [gin.md §7](spec/design/gin.md)),
-      whose payoff is **PostgreSQL exclusion constraints** — `EXCLUDE USING gist (during WITH &&)`: no
-      two rows may make the WITH operators TRUE pairwise (`UNIQUE` is the degenerate all-`=` case). GiST
-      is the access method PG's overlap/containment queries and every non-`=` exclusion ride on; jed's
-      first and primary beneficiary is the **`range` type** — the [ranges.md §10](spec/design/ranges.md)
-      deferred follow-on, finally built (arrays already have GIN; jed has no geometric types, so range +
-      scalars are the realistic opclasses). _(size: XL; deps: ranges R0–R4 (done), the GIN index-kind +
-      opclass seam (done); §4)_
-  - [x] **GX0 — spec + the determinism decision (the §8 pre-coding hotspot).** ✅ **DONE.** Author
-        `spec/design/gist.md`. The load-bearing call: PG's GiST is a **lossy bounding-predicate balanced
-        tree whose shape is insertion-order- and heuristic-dependent** (`penalty`/`picksplit`), which
-        **cannot** be cross-core byte-identical as written (§2/§8). Decision — jed's GiST is an
-        **operation-deterministic** R-tree-style structure: `union`/`penalty`/`picksplit`/`same` are
-        **pure deterministic functions** (canonical bounding-key-byte tiebreaks; split = sort the entry
-        bounding keys by their order-preserving encoding + split at the median), so the identical
-        mutation sequence every core replays builds the **byte-identical** tree (the
-        content-deterministic-split precedent, [gin.md §8](spec/design/gin.md)). A deliberate
-        **structural** divergence from PG — *which rows match* is identical (behavior tracks PG, §1); the
-        tree shape, plan/cost, and on-disk bytes are jed's own and ledgered. Defines the **opclass seam**
-        (the GiST analogue of GIN's three-function seam — the only type-specific part; the tree machinery
-        is shared). The seam is designed **general from day one** so it does not foreclose the opclasses
-        jed is likely to want next (the follow-on below) — `multirange_ops`, an `hstore`/dictionary-type
-        opclass, a `pg_trgm`-style trigram `text` opclass, and an `intarray`-style signature opclass over
-        array columns; GX0 must keep `union`/`consistent`/`penalty`/`picksplit` typed over an abstract
-        bounding key, never hard-wired to a range. Registers **`23P01 exclusion_violation`**
-        ([registry.toml](spec/errors/registry.toml)) and reserves the `format_version` bump for
-        `index_kind = 2`. _(size: M; spec-only)_
-  - [x] **GX1 — the GiST index kind + `range_ops` opclass (acceleration; no constraint yet).**
-        ✅ **DONE** (all three cores + the Ruby golden, byte-identical). `CREATE INDEX … USING gist
-        (range_col)` over a range column. The on-disk form is the persisted R-tree (pages 5/6); the
-        in-memory form is the flat leaf store (GIN `term ‖ skey` reuse) + a **resident R-tree rebuilt
-        canonically** at each mutating statement (content-deterministic, gist.md §4.1). The planner
-        pushdown seam gains a GiST **consistent-descent gather** accelerating **`&&` and `@>`** (the
-        positional / `<@` / `=` operators stay full-scan this slice — gist.md §5) for SELECT and
-        GiST-bounded UPDATE/DELETE — same rows as the full-scan residual, lower cost; the `gist_descent`
-        cost unit. `format_version` 20 (writes `index_kind = 2`); the `gist_range_table.jed` golden
-        (`rust == go == ts == ruby`); `CREATE UNIQUE INDEX … USING gist` / multi-column / a temp-table
-        GiST are `0A000`. Capability `ddl.gist_index` + `query.gist_scan`; the oracle-clean
-        `query/gist_scan.test` corpus + the `gist` NoREC relation. Realizes
-        [ranges.md §10](spec/design/ranges.md). _(size: XL; ×3 cores)_
-  - [x] **GX2 — GiST `=` over the keyable scalars (the `btree_gist` equivalent).** ✅ **DONE** (all
-        three cores + the Ruby golden, byte-identical). Generalized the tree core to an **opclass seam**
-        (`range_ops` + scalar `=`, the only type-specific part) and added the scalar `=` opclass over the
-        **FIXED-WIDTH** keyables (integers / `boolean` / `uuid` / `date` / `timestamp` / `timestamptz`)
-        whose bounding key is `[min,max]` over the value's existing order-preserving key encoding,
-        compared / unioned / descended as **raw bytes** (no decode, no comparator, no collation). The
-        planner `=` gather is the **fallback bound** (a PK / B-tree column wins; ordered-index pushdown
-        skips a GiST index). Persisted within v20's pages 5/6 — **no format bump** (the bound flavor is
-        keyed off the indexed column's catalog type) + the `gist_scalar_table.jed` golden. PG needs the
-        `btree_gist` extension; jed ships it in-core (§1). The VARIABLE-width / collation-sensitive
-        keyables (`text` / `bytea` / `decimal` / `interval`) are deferred `0A000` (the GIN element-staging
-        precedent, gist.md §6/§11); a no-opclass type is `42704`. This is what lets a **multi-column**
-        GiST index carry a `=` column beside a `&&` range column — the canonical exclusion shape (GX3).
-        Capabilities `ddl.gist_scalar_index` / `query.gist_scalar_scan`; the `query/gist_scalar_scan.test`
-        corpus + the `gist_scalar` NoREC relation. _(size: L; ×3 cores)_
-  - [x] **GX3 — `EXCLUDE` constraints.** ✅ **DONE** (all three cores + the Ruby golden reference,
-        byte-identical). `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])`: the constraint
-        **is** its backing **multi-column** GiST index (the UNIQUE-is-its-index model,
-        [constraints.md §5](spec/design/constraints.md), generalized to N `(column, operator)` pairs — the
-        tree core was generalized to a **tuple bound**, the per-column components concatenated, so a
-        single-column GX1/GX2 index stays byte-unchanged). Enforced inside the two-phase / all-or-nothing
-        pass at INSERT/**UPDATE** via a conjunction probe (the backing tree's leaf recheck IS the full
-        conjunction, so a hit is a conflict) + an in-batch pairwise check → **`23P01`**; the NULL rule
-        (a NULL in any WITH operand, or an empty range under `&&`, exempts the row) and **end-state**
-        semantics (a swap succeeds where PG fails the per-row transient). `&&`/`=` operators (others
-        `0A000`); backing-index `DROP INDEX` → `2BP01`; EXCLUDE-on-temp `0A000`. Persists a per-table
-        exclusion list (`(column_ordinal, operator_strategy)` per element + backing-index name) after the
-        FK list — **`format_version` 21** + the `gist_exclude_table.jed` golden. Columns-only WITH exprs.
-        Capability `ddl.exclusion_constraint`; the `ddl/exclusion_constraint.test` corpus (the multi-column
-        form is a jed in-core divergence — PG needs `btree_gist`).
+- [x] **GiST index access method → `EXCLUDE` constraints** ✅ **DONE** (GX0–GX3, all three cores +
+      Ruby golden, byte-identical) — a **third index *kind*** (`index_kind = 2`) beside the ordered
+      B-tree and GIN, whose payoff is **PostgreSQL exclusion constraints** (`EXCLUDE USING gist (col
+      WITH op)`, `23P01`). jed's GiST is an operation-deterministic R-tree (a structural divergence
+      from PG — same rows match, jed's own tree bytes); the `range_ops` + fixed-width scalar-`=`
+      opclasses; multi-column GiST; `format_version` 21. → [gist.md](spec/design/gist.md), [constraints.md §5](spec/design/constraints.md)
   - [ ] _follow-on (each its own slice + NoREC/oracle obligation):_ the `EXCLUDE … WHERE (predicate)`
         partial form; `DEFERRABLE` / `INITIALLY DEFERRED` (jed has no deferred-constraint machinery yet —
         its own axis); `EXCLUDE USING btree (a WITH =)` lowering an all-`=` exclude onto an ordered unique
@@ -668,37 +471,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `array_ops`), alongside the extra intarray query operators. Each is "build it when its type /
         operator surface exists"; none is foreclosed by the GiST seam.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
-      rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
-      the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.
-      → [grammar.md §32](spec/design/grammar.md)
+      rows, evaluated after validation before any write; the PG-18 `old.`/`new.` row-version qualifiers
+      landed as a follow-on. → [grammar.md §32](spec/design/grammar.md)
   - [ ] _follow-on:_ the `WITH (OLD AS o, NEW AS n)` aliasing form; `old.*`/`new.*`.
-- [x] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — ✅ **landed (S0–S6).** A
-      PostgreSQL sequence object as a third catalog-object kind: a named, persisted, monotonic i64
-      generator (`entry_kind = 2`, `format_version` 12, a `sequence_advance` cost unit), with
-      `nextval`/`currval`/`setval`/`lastval`, `serial`/`bigserial`/`smallserial` + `GENERATED AS
-      IDENTITY` owned-sequence columns (`format_version` 14/15), the `AS {smallint|integer|bigint}`
-      data type, and the `ALTER SEQUENCE` option set + `RENAME TO`. **The defining decision —
-      `nextval` is TRANSACTIONAL** (rolls back with the txn), a deliberate PG divergence mandated by
-      [determinism.md §5](spec/design/determinism.md). → [sequences.md](spec/design/sequences.md)
+- [x] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — ✅ **landed (S0–S6):** a persisted
+      monotonic i64 generator (`entry_kind = 2`, `format_version` 12), `nextval`/`currval`/`setval`/
+      `lastval`, `serial`/IDENTITY owned-sequence columns (`format_version` 14/15), `ALTER SEQUENCE`.
+      **The defining decision — `nextval` is TRANSACTIONAL** (a deliberate PG divergence, determinism.md
+      §5). → [sequences.md](spec/design/sequences.md)
 - [x] **`UPSERT` / `ON CONFLICT`** — `INSERT … ON CONFLICT [target] { DO NOTHING | DO UPDATE SET …
-      [WHERE …] }`: a candidate row that would violate a UNIQUE/PK constraint takes the conflict
-      action instead of `23505`; the proposed row is the qualifier-only `excluded` pseudo-relation;
-      arbiter = a column SET or `ON CONSTRAINT name` (`42P10`/`42704`/`42601`); two-phase /
-      all-or-nothing; RETURNING projects inserted + updated rows. No new error code, no format change.
-      → [upsert.md](spec/design/upsert.md), [grammar.md §46](spec/design/grammar.md)
+      [WHERE …] }`: a candidate row that would violate a UNIQUE/PK constraint takes the conflict action
+      instead of `23505`; the `excluded` pseudo-relation; column-SET or `ON CONSTRAINT name` arbiter;
+      two-phase / all-or-nothing. → [upsert.md](spec/design/upsert.md), [grammar.md §46](spec/design/grammar.md)
   - [ ] _follow-on:_ `DO UPDATE SET col = DEFAULT` (with the `UPDATE` `SET = DEFAULT` follow-on);
         `INSERT INTO t AS alias` (the existing row is referenced by the table name today); the
         partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing
         the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed,
         but the conflict-path re-key (the existing row moves) is still deferred. → [upsert.md §10](spec/design/upsert.md)
-- [x] **Relax the UPDATE narrowings** — assigning a `PRIMARY KEY` column now **re-keys** the row:
-      its storage key is recomputed and the row moves (secondary-index entries follow). The new
-      keys are validated against the statement's end state, so a collision traps `23505` and a
-      re-key that strands a child (incl. a self-reference) traps `23503`; an end-state-valid
-      swap/cascade succeeds where PG fails the per-row transient (the `UNIQUE` end-state
-      divergence, constraints.md §6.5). Two-pass phase 2 (vacate old keys, then place at new) so a
-      key chain/swap never transiently collides. All three cores; no `format_version` bump; the DO
-      UPDATE conflict-path equivalent remains a deferred `0A000` follow-on (above). (§11 step 6.)
+- [x] **Relax the UPDATE narrowings** — assigning a `PRIMARY KEY` column now **re-keys** the row (it
+      moves, secondary-index entries follow); end-state validation traps `23505`/`23503`, an
+      end-state-valid swap/cascade succeeds where PG fails the per-row transient. No `format_version`
+      bump; the DO UPDATE conflict-path equivalent remains a deferred `0A000` follow-on. (§11 step 6.)
 - [ ] **Temporary tables** — `CREATE [SHARED] [TEMP|TEMPORARY] TABLE` (+ `DROP`): relations that make
       **zero writes to the database file** (held outside the serialized `Snapshot`, so no
       `format_version` bump), bounded by a deterministic storage budget so they keep the
@@ -733,24 +526,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **P5.0 — transaction model spec** — authored transactions.md; reconciled storage.md / api.md /
       CLAUDE.md §9; registered class-25 errors `25001`/`25006`/`25P02`.
 - [x] **P5.1 — persistent ordered map + the snapshot refactor** — `pmap` CoW B-tree (O(1)
-      structurally-shared clone), `TableStore` wrap, autocommit through the single `persist`
-      chokepoint (rollback-on-error), `close` no longer drops committed work.
-- [x] **P5.2 — explicit transactions** — SQL `BEGIN`/`COMMIT`/`ROLLBACK` (+ `READ ONLY|WRITE`) and
-      the `Transaction` API (`db.begin`/`view`/`update`); a current-transaction state machine, class-25
-      errors, failed-block abort + commit-as-rollback. → [grammar.md §27](spec/design/grammar.md),
-      [api.md §6](spec/design/api.md)
-- [x] **P5.3 — reader/writer concurrency + the watermark** — immutable `Snapshot` + `Database{committed,
-      tx}` split (P5.3a); a `SharedDb` handle realizing concurrent readers + a single writer with the
-      live-reader registry (`oldest_live_txid`, the Phase-6 free-list gate) (P5.3b). Rust/Go give true
-      OS-thread parallelism, TS snapshot isolation; tested per-core (Go under `-race`).
-      → [transactions.md §8/§10](spec/design/transactions.md), [api.md §2.5](spec/design/api.md)
-- [x] **P5.4 — cross-core concurrency conformance** — the `# format: concurrency` schedule (an
-      explicit total order over named sessions on one `SharedDb`, deterministic by commit order +
-      pin-points): **Layer 1** the schedule format + caps `txn.shared`/`txn.read_handle`/`txn.watermark`;
-      **Layer 2** the write-gate `blocks` annotation (`txn.gate_blocking`); **Layer 3** the
-      `stress/*.stress.toml` parallelism-stress format (`rake stress`, outside `rake ci`, invariant-
-      + checksum-checked). Stepped-sequential everywhere; Go + Rust also run stepped-threaded under
-      `-race`. → [concurrency-testing.md](spec/design/concurrency-testing.md)
+      structurally-shared clone), `TableStore` wrap, autocommit through the single `persist` chokepoint.
+- [x] **P5.2 — explicit transactions** — SQL `BEGIN`/`COMMIT`/`ROLLBACK` (+ `READ ONLY|WRITE`) and the
+      `Transaction` API; a current-transaction state machine, class-25 errors.
+      → [grammar.md §27](spec/design/grammar.md), [api.md §6](spec/design/api.md)
+- [x] **P5.3 — reader/writer concurrency + the watermark** — immutable `Snapshot` + a `SharedDb` handle
+      realizing concurrent readers + a single writer with the live-reader registry (`oldest_live_txid`,
+      the Phase-6 free-list gate). → [transactions.md §8/§10](spec/design/transactions.md), [api.md §2.5](spec/design/api.md)
+- [x] **P5.4 — cross-core concurrency conformance** — the `# format: concurrency` schedule (Layer 1),
+      the write-gate `blocks` annotation (Layer 2), and the `stress/*.stress.toml` parallelism-stress
+      format (Layer 3, `rake stress`, outside `rake ci`). → [concurrency-testing.md](spec/design/concurrency-testing.md)
 
 ---
 
@@ -763,15 +548,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > hard limit — present work must not foreclose >>RAM operation (no full-residency assumption
 > above the storage seam; no operator that requires its whole input/output in RAM).
 
-- [x] **P6.1 — incremental COW commit = page-backed B-tree** _(merged "incremental COW commit" +
-      "B-tree interior pages")_ — whole-image serialize replaced by dirty-page-only writes + meta-slot
-      root swap; `format_version` 2 byte contract (page-backed B-tree, size-driven fan-out,
-      delete-rebalance), 15 goldens byte-exact `rust==go==ts==ruby`; dropped pages leak (reclamation
-      is P6.2). → [storage.md §4/§6](spec/design/storage.md)
+- [x] **P6.1 — incremental COW commit = page-backed B-tree** — whole-image serialize replaced by
+      dirty-page-only writes + meta-slot root swap; `format_version` 2 byte contract, 15 goldens
+      byte-exact `rust==go==ts==ruby`. → [storage.md §4/§6](spec/design/storage.md)
 - [x] **P6.2 — free-list / page reclamation** _(reconstruct-on-open form)_ — the free-list is rebuilt
-      on open (`[2, page_count)` minus reachable pages) and the commit allocator reuses it lowest-index
-      first; torn-write-safe, gated on the oldest-live watermark. Byte format unchanged.
-      → [transactions.md §8](spec/design/transactions.md)
+      on open and the commit allocator reuses it lowest-index first; torn-write-safe, gated on the
+      oldest-live watermark; byte format unchanged. → [transactions.md §8](spec/design/transactions.md)
   - [ ] _follow-on (where the watermark does real work):_ continuous *within-session* reclamation
         (return a commit's orphans immediately, paired with file-backed reader sharing); on-disk
         free-list persistence (claim meta offset 28 to skip the open-time reachable-set walk).
@@ -789,14 +571,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       SQLite-`incremental_vacuum` flavor) stays open as a cheaper *partial* complement. Recorded in
       [storage.md §6](spec/design/storage.md). _(size: M–L; deps: P6.2; §9)_
 - [x] **P6.3 — `page_read` cost unit + corpus cost re-baseline** — a distinct logical `page_read`
-      unit (per B-tree node visited, structural node count — a future buffer pool stays invisible);
-      re-baselined atomically across all three cores, byte format untouched.
-      → [cost.md §3](spec/design/cost.md), [schedule.toml](spec/cost/schedule.toml)
+      unit (structural node count — a future buffer pool stays invisible), re-baselined atomically
+      across all three cores. → [cost.md §3](spec/design/cost.md), [schedule.toml](spec/cost/schedule.toml)
 - [x] **P6.4 — buffer pool / demand paging** — the resident set is now a bounded cache of **leaf**
-      pages with CLOCK eviction (the interior skeleton stays resident, so `page_read` stays
-      structural + cost byte-identical to P6.3). Handle-level `cache_pages` budget (default 1024).
-      Sub-slices P6.4a (pager seam) / P6.4b (lazy leaves + bounded pool) / P6.4c (budget config) all
-      landed. → [pager.md](spec/design/pager.md), [api.md §2.1](spec/design/api.md)
+      pages with CLOCK eviction (interior skeleton stays resident, so `page_read` stays structural); a
+      handle-level `cache_pages` budget (default 1024). → [pager.md](spec/design/pager.md), [api.md §2.1](spec/design/api.md)
 - [ ] **Streaming + spill-to-disk operators** — bound blocking operators (`ORDER BY`, hash
       `JOIN`, `GROUP BY`/aggregate, `DISTINCT`) by a memory budget and **spill to disk** when
       exceeded (external merge sort, grace hash join), so a query over larger-than-RAM data
@@ -804,7 +583,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       [spill.md](spec/design/spill.md). _(size: XL; deps: paged storage; §9/§13)_
   - [x] **External merge sort for `ORDER BY`** — a `Sorter` bounded by `work_mem` (default 256 MiB)
         spills sorted runs + k-way merges, reproducing the in-memory stable sort byte-for-byte;
-        result- and cost-invariant; the single-table path fuses scan→filter→Sorter.
+        result- and cost-invariant.
   - [ ] **Spilling hash aggregate / `DISTINCT` / hash JOIN** — the remaining blocking operators
         (spill.md §7). Each needs a *different* algorithm: a partitioned (grace) hash that preserves
         first-occurrence order for aggregate/DISTINCT, and — for hash JOIN — a hash-join operator
@@ -827,20 +606,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         clones every row into a materialized buffer before aggregating. Streaming aggregation over
         the scan visitor is the contained first step; the full fix is the spill item above. _(size: M–L)_
       - [x] **Durable-commit sync cost** — pager preallocates file growth in 1 MiB chunks +
-            `fsync`→`fdatasync`, so steady-state commits overwrite already-allocated space metadata-
-            free: ~9.0ms → ~2.5–3.1ms p50 (~2.7×), identical cross-core checksums. → [pager.md §7](spec/design/pager.md)
+            `fsync`→`fdatasync`, so steady-state commits overwrite already-allocated space: ~9.0ms →
+            ~2.5–3.1ms p50 (~2.7×), identical cross-core checksums. → [pager.md §7](spec/design/pager.md)
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/
-      `decimal`/future `json` pushed out-of-line onto overflow-page chains (Slice A, `format_version`
-      3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (Slice B,
-      no third-party dependency — a library fails §8 byte-identity). Plus the touched-column cost
-      contract + physical lazy read-on-touch storage. Unblocked decimal's raised cap and `json`/`array`.
+      `decimal`/`json` pushed out-of-line onto overflow-page chains (Slice A, `format_version` 3),
+      optionally LZ4-compressed first via a deterministic hand-rolled block codec (Slice B, no
+      third-party dependency — a library fails §8 byte-identity).
       → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)
   - [ ] _follow-on:_ chain sharing on rewrite (let a rewritten record keep an unchanged value's
         existing chain — a byte-layout change, lands in all cores + incremental tests together).
-- [x] **Crash-recovery hardening** — a pager fault-injection seam (armed at `BodyWrite`/`MetaWrite`/
-      `Sync`, optional torn page) + a cross-core recovery matrix proving a crash *anywhere* recovers
-      to a valid snapshot, never corrupt; free-list reconstruction stays correct. WAL stays deferred
-      (COW + root-swap gives atomicity without one). → [storage.md §7](spec/design/storage.md)
+- [x] **Crash-recovery hardening** — a pager fault-injection seam + a cross-core recovery matrix
+      proving a crash *anywhere* recovers to a valid snapshot, never corrupt; WAL stays deferred (COW +
+      root-swap gives atomicity without one). → [storage.md §7](spec/design/storage.md)
 
 ---
 
@@ -850,8 +627,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > landed; the browser/OPFS host remains. Parallelizable with most feature work.
 
 - [x] **Formal public API** — `create`/`open`, crash-safe explicit `commit` / `close`, `prepare`,
-      execute, a `Rows` cursor, structured errors (+ class-58 host codes); same shape across all
-      three cores. → [api.md](spec/design/api.md)
+      execute, a `Rows` cursor, structured errors; same shape across all three cores.
+      → [api.md](spec/design/api.md)
 - [x] **Parameterized queries (`$1`)** end-to-end — lexed/parsed, context-typed at resolve (`42P18`
       if indeterminate), bound two-phase before any scan; tested per-core (corpus stays literal-only).
 - [ ] **Storage hosts** — formal interface authored in [hosts.md](spec/design/hosts.md): the
@@ -861,13 +638,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity
       vs goldens, gated Playwright e2e). Deferred: OPFS disk-spill, the e2e in CI. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **Cost ceiling (`max_cost`) + deterministic abort** — a handle `max_cost` aborts a statement
-      with `54P01` the instant accrued cost reaches it (`Meter::guard()` at the unbounded-work
-      points; the `# max_cost:` directive). Plus a fixed `MAX_EXPR_DEPTH = 256` parser nesting bound
-      (`54001 statement_too_complex`) closing the native-stack-overflow gap the cost ceiling can't
-      catch. → [cost.md §6/§7](spec/design/cost.md)
-- [x] **The `jed` CLI** — a full-screen TUI client (Rust + ratatui/crossterm/tui-textarea, the
-      §14-approved deps) + a plain script mode (`-c`/`-f`/stdin; aligned/csv/json). A host program,
-      not a core. → [cli.md](spec/design/cli.md)
+      with `54P01` the instant accrued cost reaches it; plus a fixed `MAX_EXPR_DEPTH = 256` parser
+      nesting bound (`54001`) closing the native-stack-overflow gap. → [cost.md §6/§7](spec/design/cost.md)
+- [x] **The `jed` CLI** — a full-screen TUI client (Rust + ratatui/crossterm/tui-textarea) + a plain
+      script mode (`-c`/`-f`/stdin; aligned/csv/json). A host program, not a core. → [cli.md](spec/design/cli.md)
 - [x] **Affected-row counts in `Outcome`** — DML without RETURNING reports rows touched (PG command
       tags), an additive `Outcome` field in all 3 cores. → [api.md §4](spec/design/api.md)
 - [x] **CLI follow-ons** — editor autocomplete + syntax highlighting, CSV import/export, `--dump`
@@ -881,11 +655,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **S5 — session variables (v1)** — a string→string GUC map, host get/set + `current_setting()`
         read; namespaced custom vars; `# set:` directive. (`SET LOCAL` / full SQL `SET`/`SHOW` /
         `set_config()` deferred.) Capability `session.variables`. _(size: M; §6.1)_
-  - [x] **S6 — session time zone slot** — ✅ LANDED with the tz conversion slice: the built-in
-        `time_zone` var (default **`UTC`**; `UTC` + fixed offsets + **named loaded zones**, else `22023`),
-        injected not OS-read (determinism, §6); the `# timezone:` directive; host-API set/validate. The
-        consumers (`date_trunc`/`EXTRACT`/cross-family casts) landed too (timezones.md §9). Capability
-        `session.timezone`. _(§6.2)_
+  - [x] **S6 — session time zone slot** — the built-in `time_zone` var (default **`UTC`**; named loaded
+        zones else `22023`), injected not OS-read; the `# timezone:` directive; the consumers
+        (`date_trunc`/`EXTRACT`/cross-family casts) landed too (`session.timezone`). _(§6.2)_
 - [ ] **(Open question, not scheduled)** low-level direct access API beneath SQL
       (`getValue("table", key)`) — keep the seam open, don't build yet (§9). _(size: —)_
 
@@ -970,47 +742,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       ([spec/fileformat/verify.rb](spec/fileformat/verify.rb), the independent fourth
       encoder/decoder behind the golden tests, `rust == go == ts == ruby`) — that stays a
       reference reader/writer; this is a shippable gem over the whole engine.
-  - [x] **Slice 1 — the gem + the FFI seam.** A standalone `cdylib` crate (`impl/ruby/ext`, the
-        `cli/` precedent — path-dep on the core, FFI concerns confined, core stays hermetic)
-        exposing an 8-function C ABI (`open_memory`/`create`/`open`/`execute`/`commit`/`close`/
-        `free`/`abi_version`) with a single self-describing little-endian result buffer; the
-        **only `unsafe` in the product path**, `catch_unwind`-guarded at every entry. A pure-Ruby
-        gem (`impl/ruby/lib`) loads it through stdlib **`fiddle`** (no third-party dep — §14):
-        idiomatic `Jed::Database`/`Result`/`Row`/`Error` (sqlstate-bearing), autocommit + explicit
-        `BEGIN`/`ROLLBACK` through one handle, cells rendered via `Value::render()` (the corpus
-        text contract) with NULL→`nil` and native coercion for `i16`/`i32`/`i64`/`f32`/`f64`/
-        `boolean`. `rake ruby:build`/`ruby:test` (minitest **seam** tests — marshalling/lifecycle/
-        coercion/errors/persistence, what the corpus can't express §10), folded into `rake test`.
-        → [ruby.md](spec/design/ruby.md)
+  - [x] **Slice 1 — the gem + the FFI seam.** A standalone `cdylib` crate (`impl/ruby/ext`) exposing
+        an 8-function C ABI (the **only `unsafe` in the product path**, `catch_unwind`-guarded); a
+        pure-Ruby gem (`impl/ruby/lib`) loads it through stdlib **`fiddle`** (no third-party dep) as
+        idiomatic `Jed::Database`/`Result`/`Row`/`Error`. → [ruby.md](spec/design/ruby.md)
   - [x] **Slice 2 — `$N` bind parameters.** `execute(sql, *params)`/`query(sql, *params)` marshal
-        Ruby scalars (`nil`/`Integer`/`Float`/`true`/`false`/`String`) into a length-delimited param
-        buffer (ABI v2; ruby.md §3a) decoded to `Value`s; the engine context-types + coerces each
-        `$N` two-phase (an `i16` overflow `22003`, NULL-into-`NOT NULL` `23502`, indeterminate
-        `42P18` all surface as `Jed::Error`). Gem-side `ArgumentError` guards for an unsupported type
-        or an out-of-i64 `Integer` (`pack("q<")` silently wraps, so the range is checked). Corpus
-        stays literal-only (params are host-API; api.md §5). → [ruby.md §3a](spec/design/ruby.md)
+        Ruby scalars into a length-delimited param buffer (ABI v2); the engine context-types + coerces
+        each `$N` two-phase. → [ruby.md §3a](spec/design/ruby.md)
   - [x] **Slice 3 — richer typed values (AR-style, always-on).** `decimal`⇄`BigDecimal`,
-        `date`⇄`Date`, `timestamp`/`timestamptz`⇄`Time` (UTC), both read and bind (ABI v3, tags
-        DECIMAL/DATE/TSTZ). Mirrors ActiveRecord's PostgreSQL adapter, incl. **`±infinity` →
-        `±Float::INFINITY`** (which `Date`/`Time` can't hold — so a date/timestamp column is
-        `Date|Float` / `Time|Float`) and BC via astronomical years. Always-on, not opt-in: the rule
-        is **totality** — coerce iff Ruby has a faithful total type (jed `decimal` is finite-only ⇒
-        `BigDecimal` is total; the ±infinity sentinel is the one gap, handled AR's way). Adds the
-        **`bigdecimal`** gemspec dependency (a Ruby *bundled* stdlib gem — the `pg` gem declares it
-        too; `date` stays a default gem). → [ruby.md §3](spec/design/ruby.md)
+        `date`⇄`Date`, `timestamp`/`timestamptz`⇄`Time` (UTC), read + bind (ABI v3), mirroring
+        ActiveRecord (incl. `±infinity` → `±Float::INFINITY`); adds the **`bigdecimal`** gemspec dep
+        (a Ruby bundled stdlib gem). → [ruby.md §3](spec/design/ruby.md)
   - [x] **Slice 4 — host-loaded bundles.** `Jed.load_unicode_data(bytes)` /
-        `Jed.load_time_zone_data(bytes)` over the engine-global `load_unicode_data` /
-        `load_time_zone_data` seams (ABI v4): the bare engine ships `C` + `UTC`/fixed offsets only;
-        loading a JUCD/JTZ byte bundle (process-global, the SQLite model) adds `COLLATE "unicode"`/
-        ILIKE/case-folding and named zones (`AT TIME ZONE 'America/New_York'`, `date_trunc(…, zone)`).
-        Malformed bundle → `Jed::Error` (`XX001`). The ABI check moved ahead of symbol binding so a
-        stale cdylib gives a clear version error. → [ruby.md §5a](spec/design/ruby.md)
+        `Jed.load_time_zone_data(bytes)` over the engine-global seams (ABI v4): loading a JUCD/JTZ
+        byte bundle adds `COLLATE "unicode"`/ILIKE/case-folding and named zones. → [ruby.md §5a](spec/design/ruby.md)
   - [x] **Binding-overhead benchmark** (`bench/ruby`, `jed/ruby/wrap`) — runs the shared corpus
-        through the gem; its `ns_per_op` delta vs `jed/rust/core` (same engine) is the wrapper tax
-        (FFI + marshalling + coercion + per-call parse). Reuses the splitmix64 PRNG + FNV-1a
-        checksum (cross-engine checksum = correctness gate; pinned vectors); also reports
-        allocations/op. No new dep. Caveat: includes per-call parse (no gem prepared-stmt API yet).
-        → [benchmarks.md §7.1](spec/design/benchmarks.md)
+        through the gem; its `ns_per_op` delta vs `jed/rust/core` is the wrapper tax; reuses the
+        splitmix64 PRNG + FNV-1a checksum, also reports allocations/op. → [benchmarks.md §7.1](spec/design/benchmarks.md)
   - [ ] _follow-on (each its own slice):_ **gem prepared-statement API** (isolates the pure FFI tax
         from the per-call parse the overhead bench currently includes); **`interval`/`uuid`/`bytea`
         typed coercion** (left as String — no single obvious native target); **distributable packaging**
@@ -1022,8 +770,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         host-function API** below. _(size: L wrap; §2/§13)_
 - [x] **Runtime function registry — the §5 dispatch foundation** — resolution for built-in named
       scalar functions + aggregates is now data-driven over the generated catalog tables (one
-      `(name, arg_families)` lookup); the per-row kernel still reached by id, hand-written per core.
-      → [extensibility.md §5](spec/design/extensibility.md)
+      `(name, arg_families)` lookup). → [extensibility.md §5](spec/design/extensibility.md)
   - [ ] _follow-on:_ built-in type-vtable dogfood (Fork A) and host registration into the table.
 - [ ] **Design the host-function API vectorized/batched** up front — the single decision
       that keeps wrapping viable for any of the above (amortizes the per-row FFI upcall).
