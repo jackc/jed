@@ -11419,6 +11419,21 @@ impl Database {
                             continue;
                         }
                         meter.charge(COSTS.aggregate_accumulate);
+                        // A hypothetical-set aggregate (rank/dense_rank/… — aggregates.md §19) buffers
+                        // the row's WITHIN GROUP key TUPLE (no NULL-skip — every row counts, sorted by
+                        // NULLS FIRST/LAST). The hypothetical row itself is evaluated per group at
+                        // finalize. No DISTINCT (rejected at resolve).
+                        if let Some(hp) = &spec.hypo {
+                            let tuple = hp
+                                .keys
+                                .iter()
+                                .map(|k| k.eval(row, &env, &mut meter))
+                                .collect::<Result<Vec<Value>>>()?;
+                            if let Acc::Hypothetical { rows, .. } = &mut groups[gi].1[si] {
+                                rows.push(tuple);
+                            }
+                            continue;
+                        }
                         let v = match &spec.operand {
                             Some(op) => op.eval(row, &env, &mut meter)?,
                             None => Value::Null, // COUNT(*) ignores the value
@@ -11459,7 +11474,25 @@ impl Database {
                         {
                             *frac = Some(fe.eval(&srow, &env, &mut Meter::new())?);
                         }
-                        srow.push(acc.finalize()?);
+                        // A hypothetical-set aggregate is finalized here (not via `Acc::finalize`)
+                        // because it needs the spec's per-key sort specs: evaluate the hypothetical
+                        // row's direct args per group (against the synthetic row, like a fraction),
+                        // then count its rank among the buffered key tuples (aggregates.md §19).
+                        let result = if let Acc::Hypothetical { kind, rows, .. } = &acc {
+                            let hp = plan.agg_specs[si]
+                                .hypo
+                                .as_ref()
+                                .expect("a hypothetical plan carries its HypoParams");
+                            let hyp = hp
+                                .args
+                                .iter()
+                                .map(|a| a.eval(&srow, &env, &mut Meter::new()))
+                                .collect::<Result<Vec<Value>>>()?;
+                            finalize_hypothetical(*kind, rows, &hyp, &hp.sorts)?
+                        } else {
+                            acc.finalize()?
+                        };
+                        srow.push(result);
                     }
                     for positions in &plan.grouping_specs {
                         srow.push(Value::Int(grouping_value(positions, gset.mask)));
@@ -17164,6 +17197,16 @@ enum AggPlan {
     /// percentile interpolated in the interval domain (`lo + (hi-lo)·pct`, PG `interval_lerp`);
     /// result `interval` (spec/design/aggregates.md §13). Values buffered as `Value::Interval`.
     OrderedSetContInterval,
+    /// `rank(args) WITHIN GROUP (ORDER BY keys)` — the **hypothetical-set** rank: 1 + the number of
+    /// group rows that sort strictly before the hypothetical row `args` (result `i64`, §19).
+    HypoRank,
+    /// `dense_rank(args) WITHIN GROUP (ORDER BY keys)` — 1 + the number of DISTINCT group values that
+    /// sort strictly before the hypothetical row (result `i64`, §19).
+    HypoDenseRank,
+    /// `percent_rank(args) WITHIN GROUP (ORDER BY keys)` — `(rank − 1) / N` (result `f64`, §19).
+    HypoPercentRank,
+    /// `cume_dist(args) WITHIN GROUP (ORDER BY keys)` — `(#rows ≤ hyp + 1) / (N + 1)` (`f64`, §19).
+    HypoCumeDist,
 }
 
 /// The resolve-time parameters of an ordered-set aggregate (spec/design/aggregates.md §13), kept
@@ -17197,6 +17240,30 @@ struct AggSpec {
     /// `Some` for an ordered-set aggregate (`mode`/`percentile_*` — aggregates.md §13): the
     /// `WITHIN GROUP` sort direction + the constant fraction. `None` for every ordinary aggregate.
     osa: Option<OsaParams>,
+    /// `Some` for a hypothetical-set aggregate (`rank`/`dense_rank`/`percent_rank`/`cume_dist`
+    /// `WITHIN GROUP` — aggregates.md §19): the hypothetical-row direct args + the `WITHIN GROUP`
+    /// key operands + per-key sort specs. `None` otherwise. (`operand` is `None` here — the keys
+    /// are buffered as a tuple per row from `hypo.keys`.)
+    hypo: Option<HypoParams>,
+}
+
+/// A single `WITHIN GROUP` ordering-key sort spec (aggregates.md §13/§19): direction, NULL
+/// placement, and optional collation (text keys only).
+struct KeySort {
+    desc: bool,
+    nulls_first: bool,
+    collation: Option<std::sync::Arc<Collation>>,
+}
+
+/// The resolve-time parameters of a hypothetical-set aggregate (aggregates.md §19). `args` are the
+/// hypothetical-row direct arguments (evaluated **per group** at finalize, like an OSA fraction —
+/// they may reference grouping columns); `keys` are the `WITHIN GROUP` key operands (evaluated **per
+/// row** during the fold and buffered as a tuple); `sorts` is the per-key ordering spec. The three
+/// vectors have equal length (the arity check at resolve).
+struct HypoParams {
+    args: Vec<RExpr>,
+    keys: Vec<RExpr>,
+    sorts: Vec<KeySort>,
 }
 
 /// A running aggregate accumulator (one per AggSpec), folded per input row then finalized.
@@ -17271,6 +17338,14 @@ enum Acc {
         vals: Vec<Value>,
         floats: Vec<f64>,
     },
+    /// A hypothetical-set aggregate (`rank`/`dense_rank`/`percent_rank`/`cume_dist` — aggregates.md
+    /// §19): buffer every row's `WITHIN GROUP` key tuple; at finalize (in the group-emission loop,
+    /// where the per-group hypothetical row + the spec's sort specs are available) count how that
+    /// hypothetical row would rank. `kind` selects the result formula.
+    Hypothetical {
+        kind: AggPlan,
+        rows: Vec<Vec<Value>>,
+    },
 }
 
 impl Acc {
@@ -17300,6 +17375,13 @@ impl Acc {
                     floats: Vec::new(),
                 }
             }
+            AggPlan::HypoRank
+            | AggPlan::HypoDenseRank
+            | AggPlan::HypoPercentRank
+            | AggPlan::HypoCumeDist => Acc::Hypothetical {
+                kind: s.plan,
+                rows: Vec::new(),
+            },
             _ => Acc::new(s.plan),
         }
     }
@@ -17361,9 +17443,13 @@ impl Acc {
             AggPlan::OrderedSetMode
             | AggPlan::OrderedSetDisc
             | AggPlan::OrderedSetCont
-            | AggPlan::OrderedSetContInterval => {
+            | AggPlan::OrderedSetContInterval
+            | AggPlan::HypoRank
+            | AggPlan::HypoDenseRank
+            | AggPlan::HypoPercentRank
+            | AggPlan::HypoCumeDist => {
                 unreachable!(
-                    "ordered-set accumulators are built via Acc::from_spec, never the window stage"
+                    "ordered-set / hypothetical-set accumulators are built via Acc::from_spec, never the window stage"
                 )
             }
         }
@@ -17527,6 +17613,11 @@ impl Acc {
                     }
                 }
             }
+            // A hypothetical-set aggregate buffers its key tuple in the fold LOOP (which has the row),
+            // not through `Acc::fold` (aggregates.md §19), so this is never reached.
+            Acc::Hypothetical { .. } => {
+                unreachable!("a hypothetical-set accumulator buffers tuples in the fold loop")
+            }
         }
         Ok(())
     }
@@ -17659,6 +17750,13 @@ impl Acc {
                 vals,
                 floats,
             )?,
+            // A hypothetical-set aggregate is finalized in the group-emission loop (it needs the
+            // spec's per-key sort specs), never through `Acc::finalize` (aggregates.md §19).
+            Acc::Hypothetical { .. } => {
+                unreachable!(
+                    "a hypothetical-set accumulator is finalized in the group-emission loop"
+                )
+            }
         })
     }
 }
@@ -17872,6 +17970,96 @@ fn interval_mul(span: crate::interval::Interval, factor: f64) -> Result<crate::i
     })
 }
 
+/// Compute a hypothetical-set aggregate's value (aggregates.md §19): given the buffered group key
+/// tuples `rows`, the per-group hypothetical row `hyp`, and the `WITHIN GROUP` per-key sort specs,
+/// count where `hyp` would rank. `rank` = 1 + rows strictly before `hyp`; `dense_rank` = 1 + distinct
+/// values strictly before; `percent_rank` = `(rank-1)/N`; `cume_dist` = `(#rows ≤ hyp + 1)/(N+1)` —
+/// PG's `orderedsetaggs.c` formulas exactly. Over an empty group: rank/dense_rank 1, percent_rank 0,
+/// cume_dist 1.
+fn finalize_hypothetical(
+    kind: AggPlan,
+    rows: &[Vec<Value>],
+    hyp: &[Value],
+    sorts: &[KeySort],
+) -> Result<Value> {
+    use std::cmp::Ordering;
+    let n = rows.len();
+    if n == 0 {
+        return Ok(match kind {
+            AggPlan::HypoRank | AggPlan::HypoDenseRank => Value::Int(1),
+            AggPlan::HypoPercentRank => Value::Float64(0.0),
+            AggPlan::HypoCumeDist => Value::Float64(1.0),
+            _ => unreachable!("finalize_hypothetical only for the hypothetical-set plans"),
+        });
+    }
+    let mut strictly_before = 0i64;
+    let mut le = 0i64; // rows that sort ≤ hyp (for cume_dist's rank with flag +1)
+    // The distinct strictly-before key tuples (for dense_rank), value-canonical (the group-key Eq).
+    let mut distinct: HashSet<&Vec<Value>> = HashSet::new();
+    for r in rows {
+        match hypo_cmp(r, hyp, sorts)? {
+            Ordering::Less => {
+                strictly_before += 1;
+                le += 1;
+                distinct.insert(r);
+            }
+            Ordering::Equal => le += 1,
+            Ordering::Greater => {}
+        }
+    }
+    Ok(match kind {
+        AggPlan::HypoRank => Value::Int(strictly_before + 1),
+        AggPlan::HypoDenseRank => Value::Int(distinct.len() as i64 + 1),
+        AggPlan::HypoPercentRank => Value::Float64(strictly_before as f64 / n as f64),
+        AggPlan::HypoCumeDist => Value::Float64((le + 1) as f64 / (n + 1) as f64),
+        _ => unreachable!("finalize_hypothetical only for the hypothetical-set plans"),
+    })
+}
+
+/// Compare a buffered key tuple `a` to the hypothetical row `b` by the `WITHIN GROUP` order
+/// (aggregates.md §19): the first key whose comparison is non-equal decides. Each key honors its
+/// NULL placement, direction, and collation (a collated text key can fail `0A000`).
+fn hypo_cmp(a: &[Value], b: &[Value], sorts: &[KeySort]) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    for (i, ks) in sorts.iter().enumerate() {
+        let ord = compare_hypo_key(&a[i], &b[i], ks)?;
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Compare one `WITHIN GROUP` key pair under its sort spec (NULL placement + direction + collation),
+/// mirroring `key_cmp` plus the collated-text path (aggregates.md §19).
+fn compare_hypo_key(a: &Value, b: &Value, ks: &KeySort) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    Ok(match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => {
+            if ks.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (_, Value::Null) => {
+            if ks.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        _ => {
+            let base = match (&ks.collation, a, b) {
+                (Some(c), Value::Text(x), Value::Text(y)) => collated_cmp(c, x, y)?,
+                _ => value_cmp(a, b),
+            };
+            if ks.desc { base.reverse() } else { base }
+        }
+    })
+}
+
 /// Convert an evaluated percentile fraction (the direct argument, evaluated per group) to `f64`
 /// (aggregates.md §13/§17). `None` / `Value::Null` → `None` (a NULL fraction yields NULL). A numeric
 /// value (the resolver restricts the fraction to a numeric family) widens via the IEEE / correctly-
@@ -18031,14 +18219,17 @@ fn expr_has_aggregate(e: &Expr) -> bool {
             args,
             over,
             over_name,
+            within_group,
             ..
         } => {
             // An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW
             // function, not a bare aggregate (S3/S5, spec/design/window.md §5.1) — so it does not
             // make the query an aggregate query. (Detection runs before the OVER-name desugar.) But an
             // aggregate INSIDE its inline window definition's keys (`rank() OVER (ORDER BY sum(x))`)
-            // does — those keys resolve against the grouped row (§5.1).
+            // does — those keys resolve against the grouped row (§5.1). A hypothetical-set name with a
+            // WITHIN GROUP clause (`rank(x) WITHIN GROUP (…)`) is an aggregate (aggregates.md §19).
             (over.is_none() && over_name.is_none() && is_aggregate_name(name))
+                || (within_group.is_some() && is_hypothetical_set_name(name))
                 || args.iter().any(expr_has_aggregate)
                 || over.as_deref().is_some_and(window_def_has_aggregate)
         }
@@ -20326,6 +20517,7 @@ fn resolve_aggregate(
                     distinct: false,
                     filter: None,
                     osa: None,
+                    hypo: None,
                 });
                 Ok((RExpr::Column(slot), result))
             }
@@ -20341,6 +20533,7 @@ fn resolve_aggregate(
                     distinct: false,
                     filter: None,
                     osa: None,
+                    hypo: None,
                 });
                 Ok((RExpr::Column(slot), result))
             }
@@ -20412,6 +20605,7 @@ fn resolve_aggregate(
                 distinct,
                 filter: rfilter,
                 osa: None,
+                hypo: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -20427,6 +20621,7 @@ fn resolve_aggregate(
                 distinct,
                 filter: rfilter,
                 osa: None,
+                hypo: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -20592,6 +20787,7 @@ fn resolve_ordered_set_aggregate(
                 distinct: false,
                 filter: rfilter,
                 osa: Some(osa),
+                hypo: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -20607,11 +20803,214 @@ fn resolve_ordered_set_aggregate(
                 distinct: false,
                 filter: rfilter,
                 osa: Some(osa),
+                hypo: None,
             });
             Ok((RExpr::Column(slot), result))
         }
         _ => unreachable!("the non-collecting context is rejected above"),
     }
+}
+
+/// Whether `name` is a hypothetical-set aggregate surface — `rank`/`dense_rank`/`percent_rank`/
+/// `cume_dist` used with `WITHIN GROUP` (spec/design/aggregates.md §19). These names are *also*
+/// window functions; the `WITHIN GROUP` clause routes them here instead of the window path.
+fn is_hypothetical_set_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "rank" | "dense_rank" | "percent_rank" | "cume_dist"
+    )
+}
+
+/// Resolve a hypothetical-set aggregate `f(direct_args) WITHIN GROUP (ORDER BY keys)` — `rank`,
+/// `dense_rank`, `percent_rank`, `cume_dist` (spec/design/aggregates.md §19). The direct args are the
+/// hypothetical row; the `WITHIN GROUP` keys are the sort columns. Their counts must match (else
+/// `42883`). Each key operand is buffered per row; each direct arg is evaluated per group (it may
+/// reference grouping columns) and coerced to the key's type. Like the other ordered-set aggregates,
+/// `OVER` is `0A000`, `DISTINCT` is `42601`, and it is valid only in a collecting context.
+#[allow(clippy::too_many_arguments)]
+fn resolve_hypothetical_set_aggregate(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    keys: &[OrderKey],
+    distinct: bool,
+    filter: Option<&Expr>,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if !matches!(agg, AggCtx::Collect { .. } | AggCtx::GroupedWindow { .. }) {
+        return Err(EngineError::new(
+            SqlState::GroupingError,
+            "aggregate functions are not allowed here",
+        ));
+    }
+    if distinct {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "DISTINCT is not allowed with ordered-set aggregates",
+        ));
+    }
+    let lname = name.to_ascii_lowercase();
+    // The number of hypothetical direct arguments must match the number of ordering columns (PG
+    // models a mismatch as a missing overload → 42883).
+    if args.is_empty() || args.len() != keys.len() {
+        return Err(no_agg_overload(&lname));
+    }
+    // Resolve each WITHIN GROUP key operand (per row, aggregates forbidden) + its sort spec, then the
+    // matching direct argument (per group, in the grouped context so it may reference grouping
+    // columns) coerced to the key's type.
+    let mut key_nodes: Vec<RExpr> = Vec::with_capacity(keys.len());
+    let mut sorts: Vec<KeySort> = Vec::with_capacity(keys.len());
+    let mut arg_nodes: Vec<RExpr> = Vec::with_capacity(args.len());
+    for (key, arg) in keys.iter().zip(args.iter()) {
+        // A nested aggregate in the key is 42803.
+        let mut sub = AggCtx::Forbidden;
+        let (knode, ktype) = match &key.expr {
+            Some(e) => resolve(scope, e, None, &mut sub, params)?,
+            None => {
+                let key_expr = match &key.qualifier {
+                    Some(q) => Expr::QualifiedColumn {
+                        qualifier: q.clone(),
+                        name: key.column.clone(),
+                    },
+                    None => Expr::Column(key.column.clone()),
+                };
+                resolve(scope, &key_expr, None, &mut sub, params)?
+            }
+        };
+        // The key's collation (explicit COLLATE — text only — or a column's frozen collation), §13.
+        let collation: Option<std::sync::Arc<Collation>> = match &key.collation {
+            Some(cn) => {
+                if !matches!(ktype, ResolvedType::Text) {
+                    return Err(type_error(format!(
+                        "collations are not supported by type {}",
+                        ktype.type_name()
+                    )));
+                }
+                resolve_collation_name(scope.catalog, cn)?
+            }
+            None => match (&key.expr, &key.qualifier, &key.column) {
+                (None, q, col) => {
+                    let r = match q {
+                        Some(q) => scope.resolve_qualified(q, col)?,
+                        None => scope.resolve_bare(col)?,
+                    };
+                    match &scope.column_of(r).collation {
+                        Some(cn) => resolve_collation_name(scope.catalog, cn)?,
+                        None => None,
+                    }
+                }
+                _ => None,
+            },
+        };
+        // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
+        // key's scalar type via the hint. Its type must match the key's family (else 42883).
+        let hint = match type_from_resolved(&ktype) {
+            Ok(Type::Scalar(s)) => Some(s),
+            _ => None,
+        };
+        let (anode, atype) = resolve(scope, arg, hint, agg, params)?;
+        if !hypo_arg_compatible(&atype, &ktype) {
+            return Err(no_agg_overload(&lname));
+        }
+        key_nodes.push(knode);
+        sorts.push(KeySort {
+            desc: key.descending,
+            nulls_first: key.nulls_first,
+            collation,
+        });
+        arg_nodes.push(anode);
+    }
+
+    // FILTER (WHERE cond): per-input-row predicate (aggregates forbidden); restricts buffered rows.
+    let rfilter = match filter {
+        Some(f) => {
+            let mut fsub = AggCtx::Forbidden;
+            let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
+            match ft {
+                ResolvedType::Bool | ResolvedType::Null => Some(rf),
+                _ => return Err(type_error("argument of FILTER must be type boolean")),
+            }
+        }
+        None => None,
+    };
+
+    let (plan, result) = match lname.as_str() {
+        "rank" => (AggPlan::HypoRank, ResolvedType::Int(ScalarType::Int64)),
+        "dense_rank" => (AggPlan::HypoDenseRank, ResolvedType::Int(ScalarType::Int64)),
+        "percent_rank" => (
+            AggPlan::HypoPercentRank,
+            ResolvedType::Float(ScalarType::Float64),
+        ),
+        "cume_dist" => (
+            AggPlan::HypoCumeDist,
+            ResolvedType::Float(ScalarType::Float64),
+        ),
+        _ => unreachable!("is_hypothetical_set_name gates the four names above"),
+    };
+    let hypo = HypoParams {
+        args: arg_nodes,
+        keys: key_nodes,
+        sorts,
+    };
+    match agg {
+        AggCtx::Collect {
+            group_keys, specs, ..
+        } => {
+            let slot = group_keys.len() + specs.len();
+            specs.push(AggSpec {
+                plan,
+                operand: None,
+                distinct: false,
+                filter: rfilter,
+                osa: None,
+                hypo: Some(hypo),
+            });
+            Ok((RExpr::Column(slot), result))
+        }
+        AggCtx::GroupedWindow {
+            group_keys,
+            agg_specs,
+            ..
+        } => {
+            let slot = group_keys.len() + agg_specs.len();
+            agg_specs.push(AggSpec {
+                plan,
+                operand: None,
+                distinct: false,
+                filter: rfilter,
+                osa: None,
+                hypo: Some(hypo),
+            });
+            Ok((RExpr::Column(slot), result))
+        }
+        _ => unreachable!("the non-collecting context is rejected above"),
+    }
+}
+
+/// Whether a hypothetical direct argument of type `arg` is comparable with the `WITHIN GROUP` key of
+/// type `key` (aggregates.md §19). A `NULL` arg is always allowed; otherwise the two must be the same
+/// scalar family (numeric `Int`/`Decimal`/`Float` interconvert, since the value comparator orders
+/// them by value), so the buffered key tuple and the hypothetical row compare meaningfully.
+fn hypo_arg_compatible(arg: &ResolvedType, key: &ResolvedType) -> bool {
+    use ResolvedType::*;
+    if matches!(arg, Null) {
+        return true;
+    }
+    matches!(
+        (arg, key),
+        (Int(_), Int(_))
+            | (Decimal, Decimal)
+            | (Float(_), Float(_))
+            | (Text, Text)
+            | (Bool, Bool)
+            | (Bytea, Bytea)
+            | (Uuid, Uuid)
+            | (Timestamp, Timestamp)
+            | (Timestamptz, Timestamptz)
+            | (Date, Date)
+            | (Interval, Interval)
+    )
 }
 
 /// Resolve an ordered-set aggregate's direct argument — the percentile fraction (aggregates.md
@@ -23495,6 +23894,32 @@ fn resolve(
             over_name: _, // desugared to `over` before resolution (window.md §5)
             within_group,
         } => {
+            // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md
+            // §19) is one of these window-function names used WITH a WITHIN GROUP clause; that clause
+            // routes it here instead of the window path. OVER + WITHIN GROUP together is 0A000.
+            if is_hypothetical_set_name(name)
+                && let Some(keys) = within_group.as_deref()
+            {
+                if over.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "OVER is not supported for hypothetical-set aggregate {}",
+                            name.to_ascii_lowercase()
+                        ),
+                    ));
+                }
+                return resolve_hypothetical_set_aggregate(
+                    scope,
+                    name,
+                    args,
+                    keys,
+                    *distinct,
+                    filter.as_deref(),
+                    agg,
+                    params,
+                );
+            }
             // An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13)
             // carries WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself
             // does not support an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP

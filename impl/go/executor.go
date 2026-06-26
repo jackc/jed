@@ -14174,6 +14174,23 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 						}
 					}
 					meter.Charge(Costs.AggregateAccumulate)
+					// A hypothetical-set aggregate (rank/dense_rank/… — aggregates.md §19) buffers the
+					// row's WITHIN GROUP key TUPLE (no NULL-skip — every row counts, sorted by NULLS
+					// FIRST/LAST). The hypothetical row itself is evaluated per group at finalize. No
+					// DISTINCT (rejected at resolve).
+					if spec.hypo != nil {
+						tuple := make([]Value, len(spec.hypo.keys))
+						for ki, k := range spec.hypo.keys {
+							kv, kerr := k.eval(row, env, meter)
+							if kerr != nil {
+								return selectResult{}, kerr
+							}
+							tuple[ki] = kv
+						}
+						a := groups[gi].accs[i]
+						a.hypoRows = append(a.hypoRows, tuple)
+						continue
+					}
 					v := NullValue() // COUNT(*) ignores the value
 					if spec.operand != nil {
 						var verr error
@@ -14223,6 +14240,26 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 							return selectResult{}, ferr
 						}
 						a.osaFrac = &fv
+					}
+					// A hypothetical-set aggregate is finalized INLINE here (not via acc.finalize)
+					// because it needs the spec's per-key sort specs: evaluate the hypothetical row's
+					// direct args per group (against the synthetic row, like a fraction — unmetered
+					// scratch meter), then count its rank among the buffered key tuples (aggregates.md §19).
+					if hp := plan.aggSpecs[si].hypo; hp != nil {
+						hyp := make([]Value, len(hp.args))
+						for ai, arg := range hp.args {
+							av, aerr := arg.eval(srow, env, &Meter{})
+							if aerr != nil {
+								return selectResult{}, aerr
+							}
+							hyp[ai] = av
+						}
+						v, ferr := finalizeHypothetical(a.plan, a.hypoRows, hyp, hp.sorts)
+						if ferr != nil {
+							return selectResult{}, ferr
+						}
+						srow = append(srow, v)
+						continue
 					}
 					v, ferr := a.finalize()
 					if ferr != nil {
@@ -17125,6 +17162,14 @@ const (
 	// interval domain (lo + (hi-lo)·pct, PG interval_lerp); result interval (aggregates.md §13).
 	// Values buffered as ValInterval in osaVals (the non-cont branch).
 	planPercentileContInterval
+	// Hypothetical-set aggregates (spec/design/aggregates.md §19): rank/dense_rank/percent_rank/
+	// cume_dist used WITH a WITHIN GROUP clause (these names are ALSO window functions; the WITHIN
+	// GROUP clause routes them here). The hypothetical-row direct args + the WITHIN GROUP key
+	// operands + per-key sort specs live on the aggSpec's hypo field, not the plan.
+	planHypoRank        // rank(args) — 1 + the number of group rows that sort strictly before; result i64
+	planHypoDenseRank   // dense_rank(args) — 1 + the number of DISTINCT values strictly before; result i64
+	planHypoPercentRank // percent_rank(args) — (rank − 1) / N; result f64
+	planHypoCumeDist    // cume_dist(args) — (#rows ≤ hyp + 1) / (N + 1); result f64
 )
 
 // aggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
@@ -17153,6 +17198,29 @@ type aggSpec struct {
 	// COLLATE on the key or a column's frozen non-C collation, nil for the default byte (C) order. The
 	// finalize sort applies it to the buffered text values.
 	osaCollation *Collation
+	// hypo is the hypothetical-set aggregate parameters (rank/dense_rank/percent_rank/cume_dist
+	// WITHIN GROUP — aggregates.md §19), set only for the planHypo* plans, nil otherwise. (operand
+	// is nil here — the keys are buffered as a tuple per row from hypo.keys.)
+	hypo *hypoParams
+}
+
+// keySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
+// placement, and an optional collation (text keys only).
+type keySort struct {
+	desc       bool
+	nullsFirst bool
+	collation  *Collation
+}
+
+// hypoParams are the resolve-time parameters of a hypothetical-set aggregate (aggregates.md §19).
+// args are the hypothetical-row direct arguments (evaluated PER GROUP at finalize, like an OSA
+// fraction — they may reference grouping columns); keys are the WITHIN GROUP key operands
+// (evaluated PER ROW during the fold and buffered as a tuple); sorts is the per-key ordering spec.
+// The three slices have equal length (the arity check at resolve).
+type hypoParams struct {
+	args  []*rExpr
+	keys  []*rExpr
+	sorts []keySort
 }
 
 // acc is a running aggregate accumulator (one per aggSpec), folded per input row then finalized.
@@ -17193,6 +17261,12 @@ type acc struct {
 	osaCollation *Collation
 	osaVals      []Value
 	osaFloats    []float64
+	// hypoRows buffers every row's WITHIN GROUP key TUPLE for a hypothetical-set aggregate
+	// (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19). The fold loop appends each tuple
+	// (no NULL-skip — every row counts); at finalize (in the group-emission loop, where the per-group
+	// hypothetical row + the spec's sort specs are available) finalizeHypothetical counts how that
+	// hypothetical row would rank. plan selects the result formula.
+	hypoRows [][]Value
 }
 
 // objAggPair is one (key, value) pair accumulated by json[b]_object_agg (the key already coerced to
@@ -17242,6 +17316,10 @@ func newAccFromSpec(s aggSpec) *acc {
 		// The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
 		// evaluated against the synthetic row); mode keeps it nil.
 		return &acc{plan: s.plan, osaDesc: s.osaDesc, osaCollation: s.osaCollation}
+	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:
+		// A hypothetical-set aggregate buffers each row's WITHIN GROUP key tuple (aggregates.md §19);
+		// it is finalized inline in the group-emission loop (it needs the spec's sort specs).
+		return &acc{plan: s.plan}
 	default:
 		return newAcc(s.plan)
 	}
@@ -17277,6 +17355,14 @@ func (a *acc) clone() *acc {
 	}
 	if a.osaFloats != nil {
 		c.osaFloats = append([]float64(nil), a.osaFloats...)
+	}
+	// Hypothetical-set accumulators are never windowed (clone is the window-stage snapshot), but
+	// deep-copy the buffered tuples anyway so a clone never aliases the original.
+	if a.hypoRows != nil {
+		c.hypoRows = make([][]Value, len(a.hypoRows))
+		for i := range a.hypoRows {
+			c.hypoRows[i] = append([]Value(nil), a.hypoRows[i]...)
+		}
 	}
 	return &c
 }
@@ -17412,6 +17498,10 @@ func (a *acc) fold(v Value, m *Meter) error {
 				a.osaVals = append(a.osaVals, v)
 			}
 		}
+	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:
+		// A hypothetical-set aggregate buffers its key tuple in the fold LOOP (which has the row),
+		// not through acc.fold (aggregates.md §19), so this is never reached.
+		panic("a hypothetical-set accumulator buffers tuples in the fold loop")
 	}
 	return nil
 }
@@ -17539,6 +17629,10 @@ func (a *acc) finalize() (Value, error) {
 		return JsonbValue(makeObject(members)), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
+	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:
+		// A hypothetical-set aggregate is finalized in the group-emission loop (it needs the spec's
+		// per-key sort specs), never through acc.finalize (aggregates.md §19).
+		panic("a hypothetical-set accumulator is finalized in the group-emission loop")
 	default: // planMin, planMax
 		if a.hasCur {
 			return a.cur, nil
@@ -17881,6 +17975,107 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 	return nil
 }
 
+// finalizeHypothetical computes a hypothetical-set aggregate's value (aggregates.md §19): given the
+// buffered group key tuples rows, the per-group hypothetical row hyp, and the WITHIN GROUP per-key
+// sort specs, count where hyp would rank. rank = 1 + rows strictly before hyp; dense_rank = 1 +
+// distinct values strictly before; percent_rank = (rank-1)/N; cume_dist = (#rows ≤ hyp + 1)/(N+1) —
+// PG's orderedsetaggs.c formulas exactly. Over an empty group: rank/dense_rank 1, percent_rank 0,
+// cume_dist 1.
+func finalizeHypothetical(plan aggPlan, rows [][]Value, hyp []Value, sorts []keySort) (Value, error) {
+	n := len(rows)
+	if n == 0 {
+		switch plan {
+		case planHypoRank, planHypoDenseRank:
+			return IntValue(1), nil
+		case planHypoPercentRank:
+			return Float64Value(0.0), nil
+		case planHypoCumeDist:
+			return Float64Value(1.0), nil
+		default:
+			panic("finalizeHypothetical only for the hypothetical-set plans")
+		}
+	}
+	var strictlyBefore int64
+	var le int64 // rows that sort ≤ hyp (for cume_dist's rank with flag +1)
+	// The distinct strictly-before key tuples (for dense_rank), value-canonical (the group-key
+	// distinctRowKey, the same form the GROUP BY bucketing uses — collapses 1.5/1.50, NULL with NULL).
+	distinct := make(map[string]bool)
+	for _, r := range rows {
+		ord, err := hypoCmp(r, hyp, sorts)
+		if err != nil {
+			return NullValue(), err
+		}
+		switch {
+		case ord < 0:
+			strictlyBefore++
+			le++
+			distinct[distinctRowKey(r)] = true
+		case ord == 0:
+			le++
+		}
+	}
+	switch plan {
+	case planHypoRank:
+		return IntValue(strictlyBefore + 1), nil
+	case planHypoDenseRank:
+		return IntValue(int64(len(distinct)) + 1), nil
+	case planHypoPercentRank:
+		return Float64Value(float64(strictlyBefore) / float64(n)), nil
+	case planHypoCumeDist:
+		return Float64Value(float64(le+1) / float64(n+1)), nil
+	default:
+		panic("finalizeHypothetical only for the hypothetical-set plans")
+	}
+}
+
+// hypoCmp compares a buffered key tuple a to the hypothetical row b by the WITHIN GROUP order
+// (aggregates.md §19): the first key whose comparison is non-equal decides. Each key honors its NULL
+// placement, direction, and collation (a collated text key can fail 0A000).
+func hypoCmp(a, b []Value, sorts []keySort) (int, error) {
+	for i, ks := range sorts {
+		ord, err := compareHypoKey(a[i], b[i], ks)
+		if err != nil {
+			return 0, err
+		}
+		if ord != 0 {
+			return ord, nil
+		}
+	}
+	return 0, nil
+}
+
+// compareHypoKey compares one WITHIN GROUP key pair under its sort spec (NULL placement + direction +
+// collation), mirroring the query ORDER BY key comparison plus the collated-text path (aggregates.md
+// §19).
+func compareHypoKey(a, b Value, ks keySort) (int, error) {
+	switch {
+	case a.IsNull() && b.IsNull():
+		return 0, nil
+	case a.IsNull():
+		if ks.nullsFirst {
+			return -1, nil
+		}
+		return 1, nil
+	case b.IsNull():
+		if ks.nullsFirst {
+			return 1, nil
+		}
+		return -1, nil
+	default:
+		var base int
+		if ks.collation != nil && a.Kind == ValText && b.Kind == ValText {
+			c, err := collatedCmp(ks.collation, a.Str, b.Str)
+			if err != nil {
+				return 0, err
+			}
+			base = c
+		} else {
+			base = valueCmp(a, b)
+		}
+		return dirCmp(base, ks.desc), nil
+	}
+}
+
 // checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
 // NaN is 22003 (numeric_value_out_of_range), matching PG's "percentile value … is not between 0 and
 // 1". Called per group at finalize, after the NULL-fraction check.
@@ -17982,6 +18177,18 @@ func isOrderedSetAggregateName(name string) bool {
 	return false
 }
 
+// isHypotheticalSetName reports whether name is a hypothetical-set aggregate surface — rank /
+// dense_rank / percent_rank / cume_dist used with WITHIN GROUP (spec/design/aggregates.md §19).
+// These names are ALSO window functions; the WITHIN GROUP clause routes them here instead of the
+// window path.
+func isHypotheticalSetName(name string) bool {
+	switch toLowerASCII(name) {
+	case "rank", "dense_rank", "percent_rank", "cume_dist":
+		return true
+	}
+	return false
+}
+
 // objectAggClassify classifies a json[b]_object_agg[_unique] name → (plan, ok). These 2-argument
 // aggregates are hand-resolved (the single-operand aggregate catalog can't express a key/value
 // pair), like jsonb_set among the scalar functions (json-sql-functions.md §4).
@@ -18042,6 +18249,12 @@ func exprHasAggregate(e Expr) bool {
 		// is_aggregate_name(name)) || any arg has an aggregate. (Detection runs before the
 		// OVER-name desugar.)
 		if e.FuncCall.Over == nil && e.FuncCall.OverName == "" && isAggregateName(e.FuncCall.Name) {
+			return true
+		}
+		// A hypothetical-set name with a WITHIN GROUP clause (`rank(x) WITHIN GROUP (…)`) is an
+		// aggregate (aggregates.md §19), so the query is an aggregate query. Mirrors Rust's
+		// (within_group.is_some() && is_hypothetical_set_name(name)).
+		if e.FuncCall.WithinGroup != nil && isHypotheticalSetName(e.FuncCall.Name) {
 			return true
 		}
 		for _, a := range e.FuncCall.Args {
@@ -19258,6 +19471,156 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 	slot := len(ag.groupKeys) + len(ag.specs)
 	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: false, filter: filter, osaDesc: key.Descending, osaFrac: frac, osaCollation: collation})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// resolveHypotheticalSetAggregate resolves a hypothetical-set aggregate f(direct_args) WITHIN GROUP
+// (ORDER BY keys) — rank, dense_rank, percent_rank, cume_dist (spec/design/aggregates.md §19). The
+// direct args are the hypothetical row; the WITHIN GROUP keys are the sort columns. Their counts
+// must match (else 42883). Each key operand is buffered per row; each direct arg is evaluated per
+// group (it may reference grouping columns) and coerced to the key's type. Like the other
+// ordered-set aggregates, OVER is 0A000, DISTINCT is 42601, and it is valid only in a collecting
+// context.
+func resolveHypotheticalSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if !ag.collecting {
+		return nil, resolvedType{}, NewError(GroupingError, "aggregate functions are not allowed here")
+	}
+	if fc.Distinct {
+		return nil, resolvedType{}, NewError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
+	}
+	name := toLowerASCII(fc.Name)
+	// The number of hypothetical direct arguments must match the number of ordering columns (PG
+	// models a mismatch as a missing overload → 42883).
+	if len(fc.Args) == 0 || len(fc.Args) != len(fc.WithinGroup) {
+		return nil, resolvedType{}, noAggOverload(name)
+	}
+	// Resolve each WITHIN GROUP key operand (per row, aggregates forbidden) + its sort spec, then the
+	// matching direct argument (per group, in the grouped context so it may reference grouping
+	// columns) coerced to the key's type.
+	keyNodes := make([]*rExpr, 0, len(fc.WithinGroup))
+	sorts := make([]keySort, 0, len(fc.WithinGroup))
+	argNodes := make([]*rExpr, 0, len(fc.Args))
+	for i := range fc.WithinGroup {
+		key := fc.WithinGroup[i]
+		arg := fc.Args[i]
+		// The WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN (a nested aggregate is
+		// 42803). A general-expression key carries Expr; a bare/qualified column key carries Column.
+		var keyExpr Expr
+		if key.Expr != nil {
+			keyExpr = *key.Expr
+		} else if key.Qualifier != "" {
+			keyExpr = Expr{Kind: ExprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
+		} else {
+			keyExpr = Expr{Kind: ExprColumn, Column: key.Column}
+		}
+		sub := &aggCtx{collecting: false}
+		knode, ktype, err := resolve(s, keyExpr, nil, sub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		// The key's collation (explicit COLLATE — text only — or a bare/qualified column's frozen
+		// collation), §13. An unknown name is 42704; a COLLATE on a non-text key is 42804.
+		var collation *Collation
+		if key.Collation != "" {
+			if ktype.kind != rtText && ktype.kind != rtNull {
+				return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ktype)))
+			}
+			if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+				return nil, resolvedType{}, err
+			}
+		} else if key.Expr == nil {
+			var r resolved
+			if key.Qualifier != "" {
+				r, err = s.resolveQualified(key.Qualifier, key.Column)
+			} else {
+				r, err = s.resolveBare(key.Column)
+			}
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if cn := s.columnOf(r).Collation; cn != "" {
+				if collation, err = resolveCollationName(s.catalog, cn); err != nil {
+					return nil, resolvedType{}, err
+				}
+			}
+		}
+		// The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
+		// key's scalar type via the hint. Its type must match the key's family (else 42883).
+		var hint *ScalarType
+		if t, err := typeFromResolved(ktype); err == nil && t.Comp == nil && t.Array == nil && t.Range == nil {
+			st := t.Scalar
+			hint = &st
+		}
+		anode, atype, err := resolve(s, *arg, hint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if !hypoArgCompatible(atype, ktype) {
+			return nil, resolvedType{}, noAggOverload(name)
+		}
+		keyNodes = append(keyNodes, knode)
+		sorts = append(sorts, keySort{desc: key.Descending, nullsFirst: key.NullsFirst, collation: collation})
+		argNodes = append(argNodes, anode)
+	}
+
+	// FILTER (WHERE cond): per-input-row predicate (aggregates forbidden); restricts buffered rows.
+	var filter *rExpr
+	if fc.Filter != nil {
+		fsub := &aggCtx{collecting: false}
+		rf, ft, err := resolve(s, *fc.Filter, nil, fsub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if ft.kind != rtBool && ft.kind != rtNull {
+			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
+		}
+		filter = rf
+	}
+
+	var (
+		plan   aggPlan
+		result resolvedType
+	)
+	switch name {
+	case "rank":
+		plan, result = planHypoRank, resolvedType{kind: rtInt, intTy: Int64}
+	case "dense_rank":
+		plan, result = planHypoDenseRank, resolvedType{kind: rtInt, intTy: Int64}
+	case "percent_rank":
+		plan, result = planHypoPercentRank, resolvedType{kind: rtFloat64}
+	case "cume_dist":
+		plan, result = planHypoCumeDist, resolvedType{kind: rtFloat64}
+	default:
+		panic("isHypotheticalSetName gates the four names above")
+	}
+	slot := len(ag.groupKeys) + len(ag.specs)
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: nil, distinct: false, filter: filter, hypo: &hypoParams{args: argNodes, keys: keyNodes, sorts: sorts}})
+	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// hypoArgCompatible reports whether a hypothetical direct argument of type arg is comparable with the
+// WITHIN GROUP key of type key (aggregates.md §19). A NULL arg is always allowed; otherwise the two
+// must be the same scalar family (numeric Int/Decimal/Float each only match themselves, exactly as
+// the value comparator orders them), so the buffered key tuple and the hypothetical row compare
+// meaningfully.
+func hypoArgCompatible(arg, key resolvedType) bool {
+	if arg.kind == rtNull {
+		return true
+	}
+	switch {
+	case arg.kind == rtInt && key.kind == rtInt,
+		arg.kind == rtDecimal && key.kind == rtDecimal,
+		isFloatKind(arg.kind) && isFloatKind(key.kind),
+		arg.kind == rtText && key.kind == rtText,
+		arg.kind == rtBool && key.kind == rtBool,
+		arg.kind == rtBytea && key.kind == rtBytea,
+		arg.kind == rtUuid && key.kind == rtUuid,
+		arg.kind == rtTimestamp && key.kind == rtTimestamp,
+		arg.kind == rtTimestamptz && key.kind == rtTimestamptz,
+		arg.kind == rtDate && key.kind == rtDate,
+		arg.kind == rtInterval && key.kind == rtInterval:
+		return true
+	}
+	return false
 }
 
 // resolveOsaFraction resolves an ordered-set aggregate's direct argument — the percentile fraction
@@ -23387,6 +23750,16 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &common}, nil
 	case ExprFuncCall:
+		// A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19) is
+		// one of these window-function names used WITH a WITHIN GROUP clause; that clause routes it
+		// here instead of the window path. OVER + WITHIN GROUP together is 0A000.
+		if isHypotheticalSetName(e.FuncCall.Name) && e.FuncCall.WithinGroup != nil {
+			if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					fmt.Sprintf("OVER is not supported for hypothetical-set aggregate %s", toLowerASCII(e.FuncCall.Name)))
+			}
+			return resolveHypotheticalSetAggregate(s, e.FuncCall, ag, params)
+		}
 		// An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13)
 		// carries WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself does
 		// not support an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP it is

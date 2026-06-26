@@ -9872,6 +9872,15 @@ export class Database {
               if (!isTrue(evalExpr(spec.filter, row, env, meter))) return;
             }
             meter.charge(COSTS.aggregateAccumulate);
+            // A hypothetical-set aggregate (rank/dense_rank/… — aggregates.md §19) buffers the row's
+            // WITHIN GROUP key TUPLE (no NULL-skip — every row counts, sorted by NULLS FIRST/LAST). The
+            // hypothetical row itself is evaluated per group at finalize. No DISTINCT (rejected at resolve).
+            if (spec.hypo !== undefined && spec.hypo !== null) {
+              const hp = spec.hypo;
+              const tuple = hp.keys.map((k) => evalExpr(k, row, env, meter));
+              accs[i]!.hypoRows!.push(tuple);
+              return;
+            }
             const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
             // DISTINCT: skip a NULL (never folded by any aggregate) and any value already folded into
             // this group — the FIRST occurrence in scan order wins, so the set of folded values (and
@@ -9907,6 +9916,16 @@ export class Database {
               if (fe !== undefined && fe !== null) {
                 a.osaFrac = evalExpr(fe, srow, env, new Meter());
               }
+            }
+            // A hypothetical-set aggregate is finalized INLINE here (not via finalizeAcc) because it
+            // needs the spec's per-key sort specs: evaluate the hypothetical row's direct args per group
+            // (against the synthetic row, like a fraction — unmetered scratch meter), then count its rank
+            // among the buffered key tuples (aggregates.md §19).
+            const hp = plan.aggSpecs[si]!.hypo;
+            if (hp !== undefined && hp !== null) {
+              const hyp = hp.args.map((arg) => evalExpr(arg, srow, env, new Meter()));
+              srow.push(finalizeHypothetical(a.plan, a.hypoRows!, hyp, hp.sorts));
+              continue;
             }
             srow.push(finalizeAcc(a));
           }
@@ -14105,7 +14124,18 @@ type AggPlan =
   // percentile_cont(f) over an INTERVAL input — the continuous percentile interpolated in the
   // interval domain (lo + (hi−lo)·pct, PG interval_lerp); result interval (spec/design/aggregates.md
   // §13). Values are buffered as Value::Interval (in osaVals), NOT widened to f64.
-  | "orderedSetContInterval";
+  | "orderedSetContInterval"
+  // Hypothetical-set aggregates (spec/design/aggregates.md §19): rank/dense_rank/percent_rank/
+  // cume_dist used WITH a WITHIN GROUP clause. They share the four window-function names but the
+  // WITHIN GROUP clause routes them here. Each buffers every group row's WITHIN GROUP key TUPLE
+  // (on the Acc's hypoRows); at finalize the per-group hypothetical row (the direct args) is
+  // counted against the buffered tuples by the spec's per-key sort specs (it needs them, so it is
+  // finalized inline in the group-emission loop, not via finalizeAcc). The result formula is per
+  // kind.
+  | "hypoRank" // rank(args) — 1 + the number of group rows that sort strictly before; result i64
+  | "hypoDenseRank" // dense_rank(args) — 1 + the number of DISTINCT values strictly before; result i64
+  | "hypoPercentRank" // percent_rank(args) — (rank − 1) / N; result f64
+  | "hypoCumeDist"; // cume_dist(args) — (#rows ≤ hyp + 1) / (N + 1); result f64
 
 // AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
 // row against the real row). operand is null for COUNT(*). distinct (COUNT(DISTINCT x),
@@ -14140,6 +14170,31 @@ type AggSpec = {
   // or a column's frozen non-C collation, null/undefined for the default byte (C) order. The
   // finalize sort applies it to the buffered text values.
   osaCollation?: Collation | null;
+  // Set for a hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist WITHIN GROUP —
+  // aggregates.md §19): the hypothetical-row direct args (evaluated PER GROUP at finalize, like an
+  // OSA fraction — they may reference grouping columns), the WITHIN GROUP key operands (evaluated PER
+  // ROW during the fold and buffered as a tuple on the Acc), and the per-key sort specs. Null/undefined
+  // otherwise. (operand is null here — the keys are buffered as a tuple from hypo.keys.)
+  hypo?: HypoParams | null;
+};
+
+// KeySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
+// placement, and optional collation (text keys only).
+type KeySort = {
+  desc: boolean;
+  nullsFirst: boolean;
+  collation: Collation | null;
+};
+
+// HypoParams are the resolve-time parameters of a hypothetical-set aggregate (aggregates.md §19).
+// args are the hypothetical-row direct arguments (evaluated PER GROUP at finalize, so they may
+// reference grouping columns); keys are the WITHIN GROUP key operands (evaluated PER ROW during the
+// fold and buffered as a tuple); sorts is the per-key ordering spec. The three arrays have equal
+// length (the arity check at resolve).
+type HypoParams = {
+  args: RExpr[];
+  keys: RExpr[];
+  sorts: KeySort[];
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -14295,6 +14350,11 @@ type Acc = {
   osaCollation?: Collation | null;
   osaVals?: Value[];
   osaFloats?: number[];
+  // Hypothetical-set state (spec/design/aggregates.md §19): every group row's buffered WITHIN GROUP
+  // key TUPLE (no NULL-skip — every row counts). At finalize (in the group-emission loop, where the
+  // per-group hypothetical row + the spec's sort specs are available) finalizeHypothetical counts how
+  // that hypothetical row would rank. Undefined for every non-hypothetical plan.
+  hypoRows?: Value[][];
 };
 
 function newAcc(
@@ -14342,6 +14402,18 @@ function newAccFromSpec(s: AggSpec): Acc {
     a.osaFloats = [];
     return a;
   }
+  if (
+    s.plan === "hypoRank" ||
+    s.plan === "hypoDenseRank" ||
+    s.plan === "hypoPercentRank" ||
+    s.plan === "hypoCumeDist"
+  ) {
+    // A hypothetical-set aggregate (aggregates.md §19): buffer every row's WITHIN GROUP key tuple in
+    // hypoRows; the per-key sort specs ride on the spec (hypo.sorts) and are read at finalize.
+    const a = newAcc(s.plan);
+    a.hypoRows = [];
+    return a;
+  }
   // Pass the json[b]_agg / object_agg flags through (the json plans ride them on the Acc, B4).
   return newAcc(
     s.plan,
@@ -14366,6 +14438,7 @@ function cloneAcc(a: Acc): Acc {
     jsonPairs: a.jsonPairs.slice(),
     osaVals: a.osaVals ? a.osaVals.slice() : undefined,
     osaFloats: a.osaFloats ? a.osaFloats.slice() : undefined,
+    hypoRows: a.hypoRows ? a.hypoRows.map((r) => r.slice()) : undefined,
   };
 }
 
@@ -14485,6 +14558,13 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
         else a.osaVals!.push(v);
       }
       break;
+    case "hypoRank":
+    case "hypoDenseRank":
+    case "hypoPercentRank":
+    case "hypoCumeDist":
+      // A hypothetical-set aggregate buffers its key tuple in the fold LOOP (which has the row), not
+      // through foldAcc (aggregates.md §19), so this is never reached.
+      throw new Error("a hypothetical-set accumulator buffers tuples in the fold loop");
   }
 }
 
@@ -14573,6 +14653,13 @@ function finalizeAcc(a: Acc): Value {
     case "percentileCont":
     case "orderedSetContInterval":
       return finalizeOrderedSet(a);
+    case "hypoRank":
+    case "hypoDenseRank":
+    case "hypoPercentRank":
+    case "hypoCumeDist":
+      // A hypothetical-set aggregate is finalized in the group-emission loop (it needs the spec's
+      // per-key sort specs), never through finalizeAcc (aggregates.md §19).
+      throw new Error("a hypothetical-set accumulator is finalized in the group-emission loop");
   }
 }
 
@@ -14760,6 +14847,88 @@ function sortOsaVals(vals: Value[], collation: Collation | null, desc: boolean):
   for (let i = 0; i < deco.length; i++) vals[i] = deco[i]!.val;
 }
 
+// finalizeHypothetical computes a hypothetical-set aggregate's value (aggregates.md §19): given the
+// buffered group key tuples rows, the per-group hypothetical row hyp, and the WITHIN GROUP per-key
+// sort specs, count where hyp would rank. rank = 1 + rows strictly before hyp; dense_rank = 1 +
+// distinct values strictly before; percent_rank = (rank-1)/N; cume_dist = (#rows ≤ hyp + 1)/(N+1) —
+// PG's orderedsetaggs.c formulas exactly. Over an empty group: rank/dense_rank 1, percent_rank 0,
+// cume_dist 1.
+function finalizeHypothetical(
+  plan: AggPlan,
+  rows: Value[][],
+  hyp: Value[],
+  sorts: KeySort[],
+): Value {
+  const n = rows.length;
+  if (n === 0) {
+    switch (plan) {
+      case "hypoRank":
+      case "hypoDenseRank":
+        return intValue(1n);
+      case "hypoPercentRank":
+        return float64Value(0.0);
+      case "hypoCumeDist":
+        return float64Value(1.0);
+      default:
+        throw new Error("finalizeHypothetical only for the hypothetical-set plans");
+    }
+  }
+  let strictlyBefore = 0n;
+  let le = 0n; // rows that sort ≤ hyp (for cume_dist's rank with flag +1)
+  // The distinct strictly-before key tuples (for dense_rank), value-canonical (the group-key
+  // distinctRowKey, the same form the GROUP BY bucketing uses — collapses 1.5/1.50, NULL with NULL).
+  const distinct = new Set<string>();
+  for (const r of rows) {
+    const ord = hypoCmp(r, hyp, sorts);
+    if (ord < 0) {
+      strictlyBefore += 1n;
+      le += 1n;
+      distinct.add(distinctRowKey(r));
+    } else if (ord === 0) {
+      le += 1n;
+    }
+  }
+  switch (plan) {
+    case "hypoRank":
+      return intValue(strictlyBefore + 1n);
+    case "hypoDenseRank":
+      return intValue(BigInt(distinct.size) + 1n);
+    case "hypoPercentRank":
+      return float64Value(Number(strictlyBefore) / n);
+    case "hypoCumeDist":
+      return float64Value(Number(le + 1n) / (n + 1));
+    default:
+      throw new Error("finalizeHypothetical only for the hypothetical-set plans");
+  }
+}
+
+// hypoCmp compares a buffered key tuple a to the hypothetical row b by the WITHIN GROUP order
+// (aggregates.md §19): the first key whose comparison is non-equal decides. Each key honors its NULL
+// placement, direction, and collation (a collated text key can fail 0A000).
+function hypoCmp(a: Value[], b: Value[], sorts: KeySort[]): number {
+  for (let i = 0; i < sorts.length; i++) {
+    const ord = compareHypoKey(a[i]!, b[i]!, sorts[i]!);
+    if (ord !== 0) return ord;
+  }
+  return 0;
+}
+
+// compareHypoKey compares one WITHIN GROUP key pair under its sort spec (NULL placement + direction +
+// collation), mirroring the query ORDER BY key comparison plus the collated-text path (aggregates.md
+// §19).
+function compareHypoKey(a: Value, b: Value, ks: KeySort): number {
+  if (a.kind === "null" && b.kind === "null") return 0;
+  if (a.kind === "null") return ks.nullsFirst ? -1 : 1;
+  if (b.kind === "null") return ks.nullsFirst ? 1 : -1;
+  let base: number;
+  if (ks.collation !== null && a.kind === "text" && b.kind === "text") {
+    base = collatedCmp(ks.collation, a.text, b.text);
+  } else {
+    base = valueCmp(a, b);
+  }
+  return dirCmp(base, ks.desc);
+}
+
 // checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
 // NaN is 22003 (numeric_value_out_of_range), matching PG's "percentile value … is not between 0 and
 // 1". Called per group at finalize, after the NULL-fraction check.
@@ -14909,8 +15078,11 @@ function exprHasAggregate(e: Expr): boolean {
       // arguments are still walked for nested aggregates. (Detection runs before the OVER-name desugar.)
       // An aggregate INSIDE the inline window definition's keys (`rank() OVER (ORDER BY sum(x))`)
       // also makes the query an aggregate query — those keys resolve against the grouped row (§5.1).
+      // A hypothetical-set name with a WITHIN GROUP clause (`rank(x) WITHIN GROUP (…)`) is an
+      // aggregate (aggregates.md §19).
       return (
         (e.over == null && e.overName == null && isAggregateName(e.name)) ||
+        (e.withinGroup != null && isHypotheticalSetName(e.name)) ||
         e.args.some(exprHasAggregate) ||
         (e.over != null && windowDefHasAggregate(e.over))
       );
@@ -15744,6 +15916,166 @@ function resolveOsaFraction(
 // direct argument is an array vs. a scalar fraction (aggregates.md §18).
 function arrayIf(t: ResolvedType, isArray: boolean): ResolvedType {
   return isArray ? { kind: "array", elem: t } : t;
+}
+
+// isHypotheticalSetName reports whether name is a hypothetical-set aggregate surface — rank /
+// dense_rank / percent_rank / cume_dist used with WITHIN GROUP (spec/design/aggregates.md §19).
+// These names are ALSO window functions; the WITHIN GROUP clause routes them here instead of the
+// window path.
+function isHypotheticalSetName(name: string): boolean {
+  const lname = name.toLowerCase();
+  return (
+    lname === "rank" ||
+    lname === "dense_rank" ||
+    lname === "percent_rank" ||
+    lname === "cume_dist"
+  );
+}
+
+// resolveHypotheticalSetAggregate resolves a hypothetical-set aggregate f(direct_args) WITHIN GROUP
+// (ORDER BY keys) — rank, dense_rank, percent_rank, cume_dist (spec/design/aggregates.md §19). The
+// direct args are the hypothetical row; the WITHIN GROUP keys are the sort columns. Their counts must
+// match (else 42883). Each key operand is buffered per row; each direct arg is evaluated per group
+// (it may reference grouping columns) and coerced to the key's type. Like the other ordered-set
+// aggregates, OVER is 0A000, DISTINCT is 42601, and it is valid only in a collecting context.
+function resolveHypotheticalSetAggregate(
+  scope: Scope,
+  e: {
+    name: string;
+    args: Expr[];
+    distinct: boolean;
+    filter?: Expr | null;
+    withinGroup?: OrderKey[] | null;
+  },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (!ag.collecting) {
+    throw engineError("grouping_error", "aggregate functions are not allowed here");
+  }
+  if (e.distinct) {
+    throw engineError("syntax_error", "DISTINCT is not allowed with ordered-set aggregates");
+  }
+  const name = e.name.toLowerCase();
+  const keys = e.withinGroup ?? [];
+  // The number of hypothetical direct arguments must match the number of ordering columns (PG models
+  // a mismatch as a missing overload → 42883).
+  if (e.args.length === 0 || e.args.length !== keys.length) {
+    throw noAggOverload(name);
+  }
+  // Resolve each WITHIN GROUP key operand (per row, aggregates forbidden) + its sort spec, then the
+  // matching direct argument (per group, in the grouped context so it may reference grouping columns)
+  // coerced to the key's type.
+  const keyNodes: RExpr[] = [];
+  const sorts: KeySort[] = [];
+  const argNodes: RExpr[] = [];
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]!;
+    const arg = e.args[i]!;
+    // The WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN (a nested aggregate is
+    // 42803). A general-expression key carries expr; a bare/qualified column key carries column.
+    const keyExpr: Expr =
+      key.expr !== null && key.expr !== undefined
+        ? key.expr
+        : key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
+          ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column }
+          : { kind: "column", name: key.column };
+    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const r = resolve(scope, keyExpr, null, sub, params);
+    const ktype = r.type;
+    // The key's collation (explicit COLLATE — text only — or a bare/qualified column's frozen
+    // collation), §13. An unknown name is 42704; a COLLATE on a non-text key is 42804.
+    let collation: Collation | null = null;
+    if (key.collation !== null && key.collation !== undefined) {
+      if (ktype.kind !== "text" && ktype.kind !== "null") {
+        throw typeError(`collations are not supported by type ${rtName(ktype)}`);
+      }
+      collation = resolveCollationName(scope.catalog, key.collation);
+    } else if (key.expr === null || key.expr === undefined) {
+      const res =
+        key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
+          ? scope.resolveQualified(key.qualifier, key.column)
+          : scope.resolveBare(key.column);
+      const cn = scope.columnOf(res).collation;
+      if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
+    }
+    // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
+    // key's scalar type via the hint. Its type must match the key's family (else 42883).
+    const kt = typeFromResolved(ktype);
+    const hint: ScalarType | null = kt.kind === "scalar" ? kt.scalar : null;
+    const ar = resolve(scope, arg, hint, ag, params);
+    if (!hypoArgCompatible(ar.type, ktype)) {
+      throw noAggOverload(name);
+    }
+    keyNodes.push(r.node);
+    sorts.push({ desc: key.descending, nullsFirst: key.nullsFirst, collation });
+    argNodes.push(ar.node);
+  }
+
+  // FILTER (WHERE cond): per-input-row predicate (aggregates forbidden); restricts buffered rows.
+  let filter: RExpr | null = null;
+  if (e.filter !== undefined && e.filter !== null) {
+    const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const rf = resolve(scope, e.filter, null, fsub, params);
+    if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
+      throw typeError("argument of FILTER must be type boolean");
+    }
+    filter = rf.node;
+  }
+
+  let plan: AggPlan;
+  let result: ResolvedType;
+  switch (name) {
+    case "rank":
+      plan = "hypoRank";
+      result = { kind: "int", ty: "i64" };
+      break;
+    case "dense_rank":
+      plan = "hypoDenseRank";
+      result = { kind: "int", ty: "i64" };
+      break;
+    case "percent_rank":
+      plan = "hypoPercentRank";
+      result = { kind: "float", ty: "f64" };
+      break;
+    case "cume_dist":
+      plan = "hypoCumeDist";
+      result = { kind: "float", ty: "f64" };
+      break;
+    default:
+      throw new Error("isHypotheticalSetName gates the four names above");
+  }
+  const slot = ag.groupKeys.length + ag.specs.length;
+  ag.specs.push({
+    plan,
+    operand: null,
+    distinct: false,
+    filter,
+    hypo: { args: argNodes, keys: keyNodes, sorts },
+  });
+  return { node: { kind: "column", index: slot }, type: result };
+}
+
+// hypoArgCompatible reports whether a hypothetical direct argument of type arg is comparable with the
+// WITHIN GROUP key of type key (aggregates.md §19). A NULL arg is always allowed; otherwise the two
+// must be the same scalar family (numeric Int/Decimal/Float each only match themselves — both float
+// kinds match each other since the value comparator orders them — so the buffered key tuple and the
+// hypothetical row compare meaningfully).
+function hypoArgCompatible(arg: ResolvedType, key: ResolvedType): boolean {
+  if (arg.kind === "null") return true;
+  return (
+    (arg.kind === "int" && key.kind === "int") ||
+    (arg.kind === "decimal" && key.kind === "decimal") ||
+    (arg.kind === "float" && key.kind === "float") ||
+    (arg.kind === "text" && key.kind === "text") ||
+    (arg.kind === "bool" && key.kind === "bool") ||
+    (arg.kind === "bytea" && key.kind === "bytea") ||
+    (arg.kind === "uuid" && key.kind === "uuid") ||
+    (arg.kind === "timestamp" && key.kind === "timestamp") ||
+    (arg.kind === "timestamptz" && key.kind === "timestamptz") ||
+    (arg.kind === "date" && key.kind === "date") ||
+    (arg.kind === "interval" && key.kind === "interval")
+  );
 }
 
 // resolveGrouping resolves GROUPING(c1, …, ck) (spec/design/aggregates.md §12) — the grouping-sets
@@ -19504,6 +19836,21 @@ function resolve(
       return { node: { kind: "param", index: idx0 }, type };
     }
     case "funcCall": {
+      // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19) is
+      // one of these window-function names used WITH a WITHIN GROUP clause; that clause routes it here
+      // instead of the window path. OVER + WITHIN GROUP together is 0A000.
+      if (isHypotheticalSetName(e.name) && e.withinGroup !== undefined && e.withinGroup !== null) {
+        if (
+          (e.over !== undefined && e.over !== null) ||
+          (e.overName !== undefined && e.overName !== null)
+        ) {
+          throw engineError(
+            "feature_not_supported",
+            `OVER is not supported for hypothetical-set aggregate ${e.name.toLowerCase()}`,
+          );
+        }
+        return resolveHypotheticalSetAggregate(scope, e, ag, params);
+      }
       // An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13) carries
       // WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself does not support
       // an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP it is 42883 (PG:

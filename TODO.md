@@ -239,9 +239,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         holds across a join, requires the whole composite PK, single grouping set only. New capability
         `query.group_by_functional_dependency`. → aggregates.md §16
   - [ ] _follow-on:_
-        `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate, and the
-        ordered-set follow-ons (hypothetical-set aggregates `rank`/`dense_rank`/`percent_rank`/
-        `cume_dist` `WITHIN GROUP`).
+        `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate.
   - [x] **Non-constant ordered-set fraction** — `percentile_cont(expr)` / `percentile_disc(expr)`
         where `expr` references grouping columns, evaluated per group (a non-grouped column is `42803`).
         New capability `query.ordered_set_nonconstant_fraction`. → aggregates.md §17
@@ -255,6 +253,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] **Collated `WITHIN GROUP` key** — `mode`/`percentile_disc` honor an explicit `COLLATE` (or a
         text column's frozen collation) in the WITHIN GROUP sort; default byte (`C`) order; `COLLATE`
         on a non-text key is `42804`. New capability `query.ordered_set_collation`. → aggregates.md §13
+  - [x] **Hypothetical-set aggregates** — `rank`/`dense_rank`/`percent_rank`/`cume_dist`
+        `WITHIN GROUP (ORDER BY keys)`: the rank the hypothetical direct-arg row would have. Direct-arg
+        count must match the ordering columns (`42883`); per-key ASC/DESC/COLLATE + NULLS honored;
+        FILTER composes; `DISTINCT` `42601`, `OVER` `0A000`. New capability
+        `query.hypothetical_set_aggregate`. → aggregates.md §19
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
       optimization.** Per-row values folded over a related row set in a dedicated **window stage**
       (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/

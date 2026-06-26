@@ -568,3 +568,37 @@ The array fraction reuses the §17 per-group evaluation (the direct argument is 
 group's key values) and the same `percentile_disc` / `percentile_cont` / `interval_lerp` kernels, so
 it composes with the non-constant fraction and the interval input. New capability
 `query.ordered_set_array_fraction`.
+
+## 19. Hypothetical-set aggregates (`rank` / `dense_rank` / `percent_rank` / `cume_dist`)
+
+PostgreSQL's four **hypothetical-set** aggregates answer: *if this hypothetical row were inserted
+into the group, what rank would it have?* They share the names of the window ranking functions, but
+with a `WITHIN GROUP (ORDER BY …)` clause (and direct-argument values) they are ordered-set
+aggregates, routed here rather than to the window path. jed matches:
+
+| Aggregate | Result | Definition over the group sorted by `WITHIN GROUP` |
+|---|---|---|
+| `rank(args)` | `i64` | `1 +` rows that sort **strictly before** the hypothetical row |
+| `dense_rank(args)` | `i64` | `1 +` **distinct** values strictly before |
+| `percent_rank(args)` | `f64` | `(rank − 1) / N` |
+| `cume_dist(args)` | `f64` | `(#rows ≤ hyp + 1) / (N + 1)` |
+
+`N` is the group's row count (PG's `orderedsetaggs.c` formulas, exactly). Over an **empty** group:
+`rank`/`dense_rank` are `1`, `percent_rank` is `0`, `cume_dist` is `1`.
+
+- **Direct args ↔ ordering columns.** The hypothetical row is the parenthesized **direct
+  arguments**; their count must equal the number of `WITHIN GROUP` ordering columns, else `42883`
+  (PG models it as a missing overload, naming a flag-inflated arg count). Each direct arg is
+  evaluated **per group** (like a percentile fraction — §17, so it may reference grouping columns)
+  and **coerced to its key's type** (a literal adapts; an incompatible family is `42883`).
+- **Ordering.** Each key's `ASC`/`DESC`, `NULLS FIRST|LAST`, and `COLLATE` (§13) are honored when
+  comparing a group row's key tuple to the hypothetical row; the first non-equal key decides. NULL
+  key values and a NULL hypothetical arg participate via the NULLS placement (no NULL-skip — every
+  row counts toward `N`). `dense_rank`'s distinct count is value-canonical (the group-key equality).
+- **Composition.** Works whole-table and per `GROUP BY` group, and with `FILTER (WHERE …)` (which
+  restricts the counted rows). `DISTINCT` is `42601`; `OVER` (with `WITHIN GROUP`) is `0A000`.
+
+**Cost** (the cross-core contract, §8). Each group row's key tuple is evaluated + buffered
+(`aggregate_accumulate` per row, plus the key `operator_eval`s); the per-group hypothetical-row
+evaluation, sort comparisons, and rank count are part of the **unmetered** finalize (like the OSA
+sort). Deterministic and cross-core identical. New capability `query.hypothetical_set_aggregate`.

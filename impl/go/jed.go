@@ -282,6 +282,9 @@ var SupportedCapabilities = []string{
 	// A collated WITHIN GROUP key — mode/percentile_disc honor an explicit COLLATE (or a column's
 	// frozen collation) in the WITHIN GROUP sort (spec/design/aggregates.md §13).
 	"query.ordered_set_collation",
+	// Hypothetical-set aggregates rank/dense_rank/percent_rank/cume_dist WITHIN GROUP — the rank the
+	// hypothetical direct-arg row would have in the group (spec/design/aggregates.md §19).
+	"query.hypothetical_set_aggregate",
 	// Window functions (OVER) — the window stage + row_number() (spec/design/window.md, S0). A
 	// window-only function without OVER is 42809; a window function in WHERE/HAVING is 42P20.
 	"query.window",
