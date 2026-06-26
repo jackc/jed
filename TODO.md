@@ -257,14 +257,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ `ceil`/`floor`/`mod`/`sign`, text `length`/`lower`/`upper`, a general implicit
         argument-coercion pass.
-- [ ] **Scalar string / text functions** — PG's string functions (manual §9.4) as `kind="function"`
-      built-ins reusing the scalar mold, code-point semantics (the UTF-16 cross-core trap, §2). One
-      commit per function. → [string-functions.md](spec/design/string-functions.md)
-  - [x] _landed:_ `length(text)`.
-  - [ ] `char_length`/`character_length`, `octet_length`, `bit_length`, `substr`, `left`/`right`,
-        `lpad`/`rpad`, `btrim`/`ltrim`/`rtrim`, `replace`, `translate`, `repeat`, `reverse`, `strpos`,
-        `split_part`, `starts_with`, `ascii`, `chr`, `initcap`, `to_hex`, `encode`/`decode`,
-        `quote_literal`/`quote_ident`/`quote_nullable`.
+- [x] **Scalar string / text functions** — PG's string functions (manual §9.4) as `kind="function"`
+      built-ins reusing the scalar mold, code-point semantics (the UTF-16 cross-core trap, §2):
+      `length`/`char_length`/`character_length`/`octet_length`/`bit_length`, `substr`, `left`/`right`,
+      `lpad`/`rpad`, `btrim`/`ltrim`/`rtrim`, `replace`, `translate`, `repeat`, `reverse`, `strpos`,
+      `split_part`, `starts_with`, `ascii`, `chr`, `initcap`, `to_hex`, `encode`/`decode`,
+      `quote_literal`/`quote_ident`/`quote_nullable`. → [string-functions.md](spec/design/string-functions.md)
+  - [ ] _follow-on:_ full-Unicode `initcap` word classification + non-ASCII titlecasing; keyword-aware
+        `quote_ident`; a `text::bytea` cast + `length`/`octet_length`/`bit_length` `bytea` overloads;
+        per-character cost metering for `lpad`/`rpad`/`repeat` (the §13 cost-ceiling path; the 54000
+        hard cap is the current backstop).
 - [x] **Named + optional (DEFAULT) function arguments** — PG named notation (`f(name => value)`) +
       DEFAULT params, driven by `make_interval`. → [functions.md §11](spec/design/functions.md)
   - [ ] _follow-on:_ `make_timestamp`/`make_timestamptz`; general non-integer/UDF defaults;
