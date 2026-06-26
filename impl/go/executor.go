@@ -15851,6 +15851,9 @@ const (
 	sfWidthBucket
 	// sfScale is scale(numeric) → i32 — the decimal's display (fractional-digit) scale (decimal.md).
 	sfScale
+	// sfMinScale is min_scale(numeric) → i32 — the smallest scale that represents the value exactly
+	// (trailing fractional zeros dropped); zero has min_scale 0 (decimal.md).
+	sfMinScale
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
@@ -19419,6 +19422,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfFactorial
 	case "scale":
 		return sfScale
+	case "min_scale":
+		return sfMinScale
 	case "make_interval":
 		return sfMakeInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
@@ -24005,6 +24010,21 @@ func widthBucketErr(detail string) error {
 	return NewError(InvalidArgumentForWidthBucketFunction, detail)
 }
 
+// minScaleOf is the minimum scale that represents d exactly — its display scale minus trailing
+// fractional zeros (decimal.md, the shared engine of min_scale/trim_scale). RoundToScale(t-1)
+// equals the value iff the digit at scale t is zero (otherwise it rounds, changing the value), so
+// the loop stops at the first non-zero fractional digit. Zero → 0.
+func minScaleOf(d Decimal) uint32 {
+	if d.IsZero() {
+		return 0
+	}
+	t := d.Scale
+	for t > 0 && d.RoundToScale(t-1).CmpValue(d) == 0 {
+		t--
+	}
+	return t
+}
+
 // widthBucketNumeric is width_bucket over numerics: floor((operand−low)·count/(high−low)) + 1, with
 // 0 below low / count+1 at-or-above high, and the reversed (low > high) range. The bucket is an EXACT
 // truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw index (the
@@ -27311,6 +27331,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfScale:
 			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
 			return IntValue(int64(vals[0].Dec.Scale)), nil
+		case sfMinScale:
+			// min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
+			return IntValue(int64(minScaleOf(*vals[0].Dec))), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

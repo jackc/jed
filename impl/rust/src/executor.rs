@@ -12965,6 +12965,9 @@ enum ScalarFunc {
     WidthBucket,
     /// scale(numeric) → i32 — the decimal's display (fractional-digit) scale (decimal.md).
     Scale,
+    /// min_scale(numeric) → i32 — the smallest scale that represents the value exactly (trailing
+    /// fractional zeros dropped); zero has min_scale 0 (decimal.md).
+    MinScale,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
@@ -19011,6 +19014,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "sign" => ScalarFunc::Sign,
         "factorial" => ScalarFunc::Factorial,
         "scale" => ScalarFunc::Scale,
+        "min_scale" => ScalarFunc::MinScale,
         "make_interval" => ScalarFunc::MakeInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
@@ -25559,6 +25563,21 @@ fn width_bucket_err(detail: &str) -> EngineError {
     EngineError::new(SqlState::InvalidArgumentForWidthBucketFunction, detail)
 }
 
+/// The MINIMUM scale that represents `d` exactly — its display scale minus trailing fractional zeros
+/// (decimal.md, the shared engine of min_scale/trim_scale). Reduces the scale one step at a time:
+/// round_to_scale(t-1) equals the value iff the digit at scale t is zero (otherwise it rounds,
+/// changing the value), so the loop stops at the first non-zero fractional digit. Zero → 0.
+fn min_scale_of(d: &Decimal) -> u32 {
+    if d.is_zero() {
+        return 0;
+    }
+    let mut t = d.scale();
+    while t > 0 && d.round_to_scale(t - 1).cmp_value(d) == std::cmp::Ordering::Equal {
+        t -= 1;
+    }
+    t
+}
+
 /// width_bucket over numerics (spec/functions/catalog.toml): floor((operand−low)·count/(high−low))
 /// + 1, with 0 below low / count+1 at-or-above high, and the reversed (low > high) range. The bucket
 /// is an EXACT truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw
@@ -30011,6 +30030,11 @@ impl RExpr {
                         Value::Decimal(d) => Ok(Value::Int(d.scale() as i64)),
                         _ => unreachable!("resolver restricts scale to a decimal operand"),
                     },
+                    // min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
+                    ScalarFunc::MinScale => match &vals[0] {
+                        Value::Decimal(d) => Ok(Value::Int(min_scale_of(d) as i64)),
+                        _ => unreachable!("resolver restricts min_scale to a decimal operand"),
+                    },
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
@@ -31130,6 +31154,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Factorial
         | ScalarFunc::WidthBucket
         | ScalarFunc::Scale
+        | ScalarFunc::MinScale
         | ScalarFunc::MakeInterval
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp

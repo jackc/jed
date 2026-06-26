@@ -281,3 +281,30 @@ query I nosort
 SELECT scale(d) FROM nm WHERE id = 4
 ----
 NULL
+
+# --- min_scale(numeric): the smallest scale that represents the value exactly ----------
+query I nosort
+SELECT min_scale(1.50)
+----
+1
+
+query I nosort
+SELECT min_scale(1.00)
+----
+0
+
+query I nosort
+SELECT min_scale(0.0)
+----
+0
+
+query I nosort
+SELECT min_scale(120.0)
+----
+0
+
+# a value with no trailing zeros keeps its scale
+query I nosort
+SELECT min_scale(1.23)
+----
+2

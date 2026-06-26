@@ -12463,6 +12463,9 @@ type ScalarFuncName =
   | "width_bucket"
   // scale(numeric) → i32 — the decimal's display (fractional-digit) scale (decimal.md).
   | "scale"
+  // min_scale(numeric) → i32 — the smallest scale that represents the value exactly (trailing
+  // fractional zeros dropped); zero has min_scale 0 (decimal.md).
+  | "min_scale"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
@@ -20999,6 +21002,17 @@ function widthBucketErr(detail: string): EngineError {
   return engineError("invalid_argument_for_width_bucket_function", detail);
 }
 
+// minScaleOf is the minimum scale that represents d exactly — its display scale minus trailing
+// fractional zeros (decimal.md, the shared engine of min_scale/trim_scale). roundToScale(t-1)
+// equals the value iff the digit at scale t is zero (otherwise it rounds, changing the value), so
+// the loop stops at the first non-zero fractional digit. Zero → 0.
+function minScaleOf(d: Decimal): number {
+  if (d.isZero()) return 0;
+  let t = d.scale;
+  while (t > 0 && d.roundToScale(t - 1).cmpValue(d) === 0) t--;
+  return t;
+}
+
 // widthBucketNumeric is width_bucket over numerics: floor((operand−low)·count/(high−low)) + 1, with
 // 0 below low / count+1 at-or-above high, and the reversed (low > high) range. The bucket is an EXACT
 // truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw index (the
@@ -24364,6 +24378,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "scale") {
         // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
         return intValue(BigInt((vals[0] as { dec: Decimal }).dec.scale));
+      }
+      if (e.func === "min_scale") {
+        // min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
+        return intValue(BigInt(minScaleOf((vals[0] as { dec: Decimal }).dec)));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

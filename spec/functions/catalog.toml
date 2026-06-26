@@ -2290,6 +2290,16 @@ result         = "i32"
 null           = "propagates"
 errors         = []
 
+[[operator]]
+name           = "min_scale"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
 # width_bucket(operand, low, high, count) — the bucket index (1..count) of `operand` in an equi-width
 # histogram over [low, high) with `count` buckets; 0 below low, count+1 at/above high; handles a
 # reversed (low > high) range. RESOLVER-ROUTED (like gcd/lcm) so the three value operands reconcile
