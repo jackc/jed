@@ -14281,6 +14281,8 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         | Expr::Param(_) => 0,
         Expr::Row(items) | Expr::Array(items) => items.iter().map(sub).sum(),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => sub(base),
+        // `t.*` is a leaf (a relation name, no sub-expression) — no sublink to recurse into.
+        Expr::QualifiedStar { .. } => 0,
         Expr::Subscript { base, subscripts } => {
             sub(base)
                 + subscripts
@@ -18380,6 +18382,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         }
         Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_aggregate),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_aggregate(base),
+        Expr::QualifiedStar { .. } => false,
         Expr::Subscript { base, subscripts } => {
             expr_has_aggregate(base)
                 || subscripts
@@ -18463,6 +18466,7 @@ fn expr_has_window(e: &Expr) -> bool {
         }
         Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_window),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_window(base),
+        Expr::QualifiedStar { .. } => false,
         Expr::Subscript { base, subscripts } => {
             expr_has_window(base)
                 || subscripts
@@ -18729,6 +18733,9 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         }
         Expr::Row(items) | Expr::Array(items) => items.iter().try_for_each(reject_check_structure),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_check_structure(base),
+        // `t.*` cannot syntactically reach a CHECK expression (it is a select-item-only shape —
+        // `CHECK (t.*)` is a 42601 in the parser); accept it structurally for exhaustiveness.
+        Expr::QualifiedStar { .. } => Ok(()),
         Expr::Subscript { base, subscripts } => {
             reject_check_structure(base)?;
             subscripts
@@ -18827,6 +18834,9 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             items.iter().try_for_each(reject_default_structure)
         }
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_default_structure(base),
+        // `t.*` cannot syntactically reach a DEFAULT expression (select-item-only); accept
+        // structurally for exhaustiveness.
+        Expr::QualifiedStar { .. } => Ok(()),
         Expr::Subscript { base, subscripts } => {
             reject_default_structure(base)?;
             subscripts
@@ -18940,6 +18950,8 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
                 }
             }
             Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => walk(base, columns, out),
+            // `t.*` cannot appear in a CHECK expression (select-item-only); no columns to note.
+            Expr::QualifiedStar { .. } => {}
             Expr::Subscript { base, subscripts } => {
                 walk(base, columns, out);
                 for e in subscripts.iter().flat_map(subscript_spec_exprs) {
@@ -22733,6 +22745,24 @@ fn resolve_projections(
             let mut names = Vec::new();
             let mut types = Vec::new();
             for it in items {
+                // `t.*` expands the FROM relation labeled `qualifier` into one output column per
+                // column, in catalog order (grammar.md §15) — like bare `*` but for one named
+                // relation and mixable with other items. Resolved against the LOCAL scope only
+                // (like bare `*`); an unknown label is 42P01, exactly as a qualified column ref.
+                if let Expr::QualifiedStar { qualifier } = &it.expr {
+                    let want = qualifier.to_ascii_lowercase();
+                    let rel = scope
+                        .rels
+                        .iter()
+                        .find(|r| r.label == want)
+                        .ok_or_else(|| missing_from_entry(qualifier))?;
+                    for (i, c) in rel.table.columns.iter().enumerate() {
+                        nodes.push(RExpr::Column(rel.offset + i));
+                        names.push(c.name.clone());
+                        types.push(resolved_type_of_col(&c.ty, scope.catalog));
+                    }
+                    continue;
+                }
                 // `(expr).*` expands a composite base into one output column per field, in
                 // declaration order (spec/design/composite.md §S4). The base AST is re-resolved
                 // per field (Expr is Clone, RExpr is not) — deterministic, since resolution is
@@ -23328,6 +23358,7 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
         | Expr::Param(_) => false,
         Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_calls_seq_mutator),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_calls_seq_mutator(base),
+        Expr::QualifiedStar { .. } => false,
         Expr::Subscript { base, subscripts } => {
             expr_calls_seq_mutator(base)
                 || subscripts.iter().any(|s| match s {
@@ -23624,6 +23655,9 @@ fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => {
             collect_expr_privs(base, req, locals)
         }
+        // `t.*` names a relation already in FROM — its SELECT privilege is required by the FROM
+        // clause itself, so the star adds no new function/table privilege here.
+        Expr::QualifiedStar { .. } => {}
         Expr::Subscript { base, subscripts } => {
             collect_expr_privs(base, req, locals);
             for s in subscripts {
@@ -23710,6 +23744,8 @@ fn expr_reads_columns(e: &Expr) -> bool {
         Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => false,
         Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_reads_columns),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_reads_columns(base),
+        // `t.*` reads the relation's columns (e.g. `RETURNING t.*`).
+        Expr::QualifiedStar { .. } => true,
         Expr::Subscript { base, subscripts } => {
             expr_reads_columns(base)
                 || subscripts.iter().any(|s| match s {
@@ -24095,6 +24131,13 @@ fn resolve(
         Expr::FieldStar { .. } => Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "row expansion (.*) is not supported in this context",
+        )),
+        // `t.*` is likewise projection-list only — resolve_projections expands it before ever
+        // calling resolve(); reaching here means it appeared in a scalar position (`WHERE t.*`,
+        // `t.* + 1`), which is a syntax error (PG rejects a bare `t.*` outside the select list).
+        Expr::QualifiedStar { .. } => Err(EngineError::new(
+            SqlState::SyntaxError,
+            "t.* is only allowed in a select list",
         )),
         Expr::Param(n1) => {
             // A bind parameter is an adaptable operand (like an integer/string literal): it

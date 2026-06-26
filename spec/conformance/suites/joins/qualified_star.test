@@ -1,0 +1,121 @@
+# Qualified-star select item `t.*` (spec/design/grammar.md §15): expands the FROM relation labeled
+# `t` into one output column per column, in catalog order. Like bare `*` but for a single named
+# relation, and (unlike bare `*`) MIXABLE with other select items (`SELECT t.*, u.x`). The qualifier
+# resolves against the local FROM scope (an unknown label is 42P01). It takes no `AS` alias and is a
+# select-list construct only — both narrowings are deliberate divergences from PostgreSQL (which
+# accepts `t.* AS x` and treats a scalar `t.*` as a row value), documented in oracle_overrides.toml.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.order_by_keys, query.qualified_star, query.qualified_column, query.join_inner, query.table_alias, query.derived_table, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, w i32, label text)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO b VALUES (1, 100, 'x'), (2, 200, 'y')
+
+# `a.*` over a single relation expands all of a's columns in catalog order (id, k).
+# names: id, k
+# cost: 5
+query II nosort
+SELECT a.* FROM a ORDER BY a.id
+----
+1
+10
+2
+20
+
+# `b.*` in a join expands only b's columns (id, w, label) — the other relation is untouched.
+# names: id, w, label
+# cost: 12
+query IIT nosort
+SELECT b.* FROM a JOIN b ON a.id = b.id ORDER BY a.id
+----
+1
+100
+x
+2
+200
+y
+
+# A qualified star is MIXABLE with ordinary select items (unlike bare `*`): `a.*, b.label`.
+# names: id, k, label
+# cost: 12
+query IIT nosort
+SELECT a.*, b.label FROM a JOIN b ON a.id = b.id ORDER BY a.id
+----
+1
+10
+x
+2
+20
+y
+
+# Two qualified stars expand each relation in turn, in catalog order: a(id, k) then b(id, w, label).
+# names: id, k, id, w, label
+# cost: 12
+query IIIIT nosort
+SELECT a.*, b.* FROM a JOIN b ON a.id = b.id ORDER BY a.id
+----
+1
+10
+1
+100
+x
+2
+20
+2
+200
+y
+
+# A star need not be the first item — `b.label, a.*` expands a after the bare column.
+# names: label, id, k
+# cost: 12
+query TII nosort
+SELECT b.label, a.* FROM a JOIN b ON a.id = b.id ORDER BY a.id
+----
+x
+1
+10
+y
+2
+20
+
+# `t.*` resolves the qualifier against the relation's LABEL, so a table alias works: `x.*`.
+# names: id, k
+# cost: 5
+query II nosort
+SELECT x.* FROM a AS x ORDER BY x.id
+----
+1
+10
+2
+20
+
+# A derived table's alias is also a relation label, so `d.*` expands its output columns.
+# names: id, k
+# cost: 7
+query II nosort
+SELECT d.* FROM (SELECT id, k FROM a) AS d ORDER BY d.id
+----
+1
+10
+2
+20
+
+# An unknown qualifier is 42P01 — the same code a qualified column ref raises (matching PostgreSQL).
+statement error 42P01
+SELECT z.* FROM a
+
+# A qualified star takes no `AS` alias — 42601 (a deliberate narrowing; PostgreSQL accepts it).
+statement error 42601
+SELECT a.* AS x FROM a
+
+# `t.*` is a select-list construct only; in a scalar position it is 42601 (a deliberate narrowing;
+# PostgreSQL treats `a.*` as a row value and reports 42883 "operator does not exist: a = integer").
+statement error 42601
+SELECT id FROM a WHERE a.* = 1

@@ -645,21 +645,27 @@ join_type      ::= "INNER"
  * distinct FROM t" is the modifier applied over a column named distinct. The rule is
  * a CLAUDE.md §8 determinism surface — it must be byte-identical across cores. */
 
-/* A select item is a general expression with an optional output-name alias. The
- * "*" glob is a STANDALONE alternative — it is the whole select list, never mixed
- * with other items ("SELECT *, a" is not accepted; "SELECT t.*" has no qualified
- * form). Aliasing requires the explicit "AS" keyword; there is no implicit alias
- * ("SELECT a b"). The alias is an OUTPUT LABEL only: it names the result column and
- * is invisible to WHERE and ORDER BY resolution (those still resolve against table
- * columns). "AS" is not reserved (a column may be named "as"); the parser takes it
- * as an alias marker only after a complete expr, exactly as CAST consumes its own
- * inner "AS". The output name of an item with no alias is the column's canonical
- * name for a bare column reference, and the fixed literal "?column?" for any other
- * expression (see ../design/grammar.md §8). */
+/* A select item is a general expression with an optional output-name alias, OR a
+ * QUALIFIED STAR "t.*" (../design/grammar.md §15). The bare "*" glob is a STANDALONE
+ * alternative — it is the whole select list, never mixed with other items ("SELECT *, a"
+ * is not accepted). A qualified star "t.*" expands the FROM relation labeled "t" into one
+ * column per column (catalog order); UNLIKE bare "*" it MAY be mixed with other items
+ * ("SELECT t.*, u.x"). It is recognized by the three-token shape identifier "." "*" before
+ * the general expr parser, so "t.col" and "a * b" are untouched, and it takes NO "AS" alias
+ * (a deliberate 42601 narrowing; an unknown qualifier is 42P01). It is distinct from the
+ * composite whole-row expansion "(expr).*" (a postfix on a parenthesized base, §S4).
+ *   Aliasing an ordinary item requires the explicit "AS" keyword; there is no implicit alias
+ * ("SELECT a b"). The alias is an OUTPUT LABEL only: it names the result column and is
+ * invisible to WHERE and ORDER BY resolution (those still resolve against table columns).
+ * "AS" is not reserved (a column may be named "as"); the parser takes it as an alias marker
+ * only after a complete expr, exactly as CAST consumes its own inner "AS". The output name of
+ * an item with no alias is the column's canonical name for a bare column reference, and the
+ * fixed literal "?column?" for any other expression (see ../design/grammar.md §8). */
 select_items   ::= "*"
                  | select_item ("," select_item)*
 
-select_item    ::= expr ("AS" identifier)?
+select_item    ::= identifier "." "*"
+                 | expr ("AS" identifier)?
 
 /* ORDER BY is one or more sort terms, applied left to right (the first term is
  * primary, ties broken by the next, and a full tie keeps the primary-key scan
@@ -1034,7 +1040,8 @@ frame_exclusion ::= "EXCLUDE" ("CURRENT" "ROW" | "GROUP" | "TIES" | "NO" "OTHERS
  * match in two or more relations is 42702 ambiguous_column, exactly one match resolves. A
  * qualified name names exactly one relation (an unknown label is 42P01, a label with no
  * such column is 42703) and is never ambiguous (../design/grammar.md §15). The "." is the
- * `Dot` token (see the lexical layer); there is no "rel.*" qualified-star this slice. */
+ * `Dot` token (see the lexical layer). The "rel.*" QUALIFIED STAR is a select-item form,
+ * not a column_ref (see select_item). */
 column_ref     ::= identifier ("." identifier)?
 
 /* INSERT takes literals only (no expressions, no columns). A leading "-" before

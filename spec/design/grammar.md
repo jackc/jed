@@ -624,7 +624,22 @@ offset)`):
 
 `SELECT *` expands across **all** relations in FROM order, each relation's columns in catalog
 order (PostgreSQL behaviour); duplicate output names across tables are allowed (the `# names:`
-directive asserts them positionally). There is **no `t.*`** qualified-star this slice.
+directive asserts them positionally).
+
+**Qualified star `t.*`.** A select item may be `t.*` — the columns of the FROM relation labeled
+`t` alone, in catalog order — the per-relation counterpart of bare `*`. Unlike bare `*` (a
+standalone select list), `t.*` is an ordinary item and **may be mixed** with others
+(`SELECT t.*, u.x`, `SELECT b.label, a.*`); two qualified stars expand each relation in turn. The
+parser recognizes it by the three-token shape `identifier "." "*"` *before* the general expression
+parser, so `t.col` (Dot then a word) and `a * b` (no Dot) are unaffected, and a bare `*` is still
+the standalone form. The qualifier resolves against the **local** FROM scope by label exactly as a
+qualified column does — an unknown label is `42P01`. Two deliberate narrowings diverge from
+PostgreSQL (both `42601`, recorded in `oracle_overrides.toml`): `t.*` takes **no `AS` alias**
+(`t.* AS x` is rejected; PG accepts it), and it is a **select-list / RETURNING construct only** —
+in a scalar position (`WHERE t.*`, `t.* + 1`, `count(t.*)`) the parser rejects it, where PG would
+treat `t.*` as a whole-row value (jed has no row-valued `t.*`). It is distinct from the composite
+whole-row expansion `(expr).*` (a postfix on a parenthesized base — composite.md §S4): `t.*` names
+a *relation*, `(c).*` a *composite value*; the bare-identifier shape selects the relation reading.
 
 **The join operators.** `join_clause ::= "CROSS" "JOIN" table_ref | join_type? "JOIN" table_ref
 "ON" expr`. A bare `JOIN` is `INNER` (the keyword optional). The `ON` predicate is a general
@@ -712,8 +727,8 @@ explicit `JOIN` syntax — [../../TODO.md](../../TODO.md)).
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
 - **No `USING` / `NATURAL`** join forms (they need column-name matching / merge semantics), **no
-  `t.*`** qualified-star, **no parenthesized-join FROM** (`FROM (a JOIN b ON …)`). A **derived table**
-  (`FROM (SELECT …) AS t`) *is* now supported — see §42.
+  parenthesized-join FROM** (`FROM (a JOIN b ON …)`). A **derived table** (`FROM (SELECT …) AS t`)
+  *is* now supported — see §42; the **`t.*`** qualified star has landed (above).
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
   (though a qualified `WHERE t.a = 1` referencing their sole table now resolves, harmlessly).
 
@@ -1660,7 +1675,9 @@ probed: `RETURNING (SELECT old.v + s.a FROM s ...)`). Resolution rules:
   slice; [../../TODO.md](../../TODO.md)).
 - An unknown column under a qualifier is `42703`; **bare** `old`/`new` are ordinary column
   references (a column may be named either — they resolve normally, never to a row
-  version); `old.*`/`new.*` follow the standing no-qualified-star narrowing (§15).
+  version). `old.*`/`new.*` are **qualified stars** (§15) — they expand that row version's
+  columns (`new.*` = the produced row, `old.*` = the opposite version, all-NULL under
+  `INSERT`), matching PostgreSQL 18.
 - **Output names** follow §8 unchanged: `RETURNING old.v` names the column `v` (the
   qualifier never leaks — matches PostgreSQL).
 

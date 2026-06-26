@@ -1036,3 +1036,16 @@ reason = "jed: a regexp flag other than `i` is 2201B (jed's RE2 flavor owns a sm
 file = "expr/regexp_oracle_functions.test"
 sql = "SELECT regexp_count('abc', 'a', 1, 'g') FROM one"
 reason = "jed: the `g` (global) flag is regexp_replace-only, so on regexp_count it is 2201B (regex.md §8b). PostgreSQL raises 22023 'regexp_count() does not support the global option'. Same rejection, different SQLSTATE/message — jed's RE2 flag set is narrower and uniform across the regexp_* family."
+
+# --- qualified star `t.*` parser narrowings (grammar.md §15). jed's `t.*` is a select-list
+# construct only, recognized by the identifier-dot-star token shape; two deliberate narrowings
+# diverge from PostgreSQL, both 42601 at parse time.
+[[override]]
+file = "joins/qualified_star.test"
+sql = "SELECT a.* AS x FROM a"
+reason = "jed: a qualified star `t.*` takes no `AS` alias — 42601 (grammar.md §15). PostgreSQL accepts `a.* AS x` (the alias names the row/last expansion) and runs it. A deliberate, documented surface narrowing: jed parses `t.*` only as the bare identifier-dot-star select item, never `t.* AS name`."
+
+[[override]]
+file = "joins/qualified_star.test"
+sql = "SELECT id FROM a WHERE a.* = 1"
+reason = "jed: `t.*` is a select-list/RETURNING construct only; in a scalar expression position the parser rejects it 42601 (grammar.md §15 — jed has no row-valued `t.*`). PostgreSQL parses `a.*` as a whole-row value and reaches type resolution, reporting 42883 'operator does not exist: a = integer'. Same rejection (jed never supports row-valued `t.*` in an expression), different stage/SQLSTATE."

@@ -3496,6 +3496,24 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 	}
 	var items []SelectItem
 	for {
+		// `t.*` — a qualified star (all columns of the relation labeled `t`), a select-list /
+		// RETURNING item MIXABLE with other items (grammar.md §15). Recognized by the three-token
+		// shape `identifier "." "*"` before the general expr parser, so `t.col` (Dot then a word)
+		// and `a * b` (no Dot) are untouched, and a bare `*` was already handled above. No `AS` alias.
+		if p.peek().Kind == TokWord && p.peekKindAt(1) == TokDot && p.peekKindAt(2) == TokStar {
+			qualifier, err := p.expectIdentifier()
+			if err != nil {
+				return SelectItems{}, err
+			}
+			p.advance() // .
+			p.advance() // *
+			items = append(items, SelectItem{Expr: Expr{Kind: ExprQualifiedStar, Qualifier: qualifier}})
+			if p.peek().Kind == TokComma {
+				p.advance()
+				continue
+			}
+			break
+		}
 		e, err := p.parseExpr()
 		if err != nil {
 			return SelectItems{}, err

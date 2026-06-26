@@ -321,6 +321,10 @@ id = "query.qualified_column"
 description = "Qualified column references `rel.col` — resolved against the named relation; a bare column ambiguous across relations is 42702, unknown relation is 42P01 (spec/design/grammar.md §15)"
 
 [[capability]]
+id = "query.qualified_star"
+description = "Qualified-star select item `t.*` — expands the FROM relation labeled `t` into one output column per column, in catalog order (spec/design/grammar.md §15). Like bare `*` but for a single named relation, and (unlike bare `*`) MIXABLE with other select items (`SELECT t.*, u.x`). The qualifier resolves against the local FROM scope; an unknown label is 42P01. It takes no `AS` alias (42601), and is a select-list / RETURNING construct only — in a scalar position (`WHERE t.*`, `t.* + 1`) it is 42601. Recognized by the identifier-dot-star token shape, so `t.col` and `a * b` are unaffected. Distinct from the composite `(expr).*` whole-row expansion."
+
+[[capability]]
 id = "query.aggregates"
 description = "Scalar aggregate functions COUNT/SUM/MIN/MAX/AVG over the whole table (no GROUP BY): single-row result; COUNT(*) counts rows, COUNT(expr)/SUM/AVG/MIN/MAX skip NULL; COUNT->0 and SUM/AVG/MIN/MAX->NULL over empty/all-NULL; PG widening (SUM i16/i32->i64, i64->decimal, decimal->decimal; AVG->decimal; MIN/MAX->input type); overflow 22003; aggregate in WHERE/nested is 42803; unknown function 42883; DISTINCT-in-aggregate is query.aggregate_distinct, FILTER-in-aggregate is query.aggregate_filter (spec/design/aggregates.md)"
 

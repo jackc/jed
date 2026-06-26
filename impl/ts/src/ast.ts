@@ -323,6 +323,12 @@ export type Expr =
   // one output column per field, in declaration order. Valid only in a SELECT/RETURNING projection
   // list (where `*` expands); in any scalar expression position it is 0A000.
   | { kind: "fieldStar"; base: Expr }
+  // Whole-relation expansion `t.*` (spec/design/grammar.md §15) — expands the FROM relation labeled
+  // `qualifier` into one output column per column, in catalog order. Like bare `*` but for a single
+  // named relation, and (unlike bare `*`) MIXABLE with other select items (`SELECT t.*, u.x`). Valid
+  // only in a SELECT/RETURNING projection list; in a scalar position it is 42601. An unknown qualifier
+  // is 42P01. Distinct from the composite `(expr).*` (fieldStar): `t.*` names a relation.
+  | { kind: "qualifiedStar"; qualifier: string }
   // Array subscript `base[..][..]` (spec/design/array.md §6) — one or more bracketed specs applied
   // to an array `base`. Each spec is an index `[i]` or a slice `[m:n]` (with optionally-omitted
   // bounds). All-index access reads a single 1-based element (the element type); if any spec is a

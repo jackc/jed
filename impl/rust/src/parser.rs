@@ -3002,6 +3002,28 @@ impl Parser {
         }
         let mut items = Vec::new();
         loop {
+            // `t.*` — a qualified star (all columns of the relation labeled `t`), a select-list /
+            // RETURNING item MIXABLE with other items (grammar.md §15). Recognized by the
+            // three-token shape `identifier "." "*"` before the general expr parser, so `t.col`
+            // (Dot then a word) and `a * b` (no Dot) are untouched, and a bare `*` was already
+            // handled above. It takes no `AS` alias (PG rejects one).
+            if matches!(self.peek(), Token::Word(_))
+                && matches!(self.peek_at(1), Token::Dot)
+                && matches!(self.peek_at(2), Token::Star)
+            {
+                let qualifier = self.expect_identifier()?;
+                self.advance(); // .
+                self.advance(); // *
+                items.push(SelectItem {
+                    expr: Expr::QualifiedStar { qualifier },
+                    alias: None,
+                });
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             let expr = self.parse_expr()?;
             // Optional `AS alias` output label. `AS` is not reserved, so it is taken as
             // an alias marker only here, after a complete expr (spec/grammar/grammar.ebnf

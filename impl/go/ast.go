@@ -903,6 +903,13 @@ const (
 	// SELECT/RETURNING projection list (where `*` expands); in any scalar expression position it is
 	// 0A000.
 	ExprFieldStar
+	// ExprQualifiedStar is whole-relation expansion `t.*` (spec/design/grammar.md §15) — expands the
+	// FROM relation labeled Qualifier into one output column per column, in catalog order. Like bare
+	// `*` but for a single named relation, and (unlike bare `*`) MIXABLE with other select items
+	// (`SELECT t.*, u.x`). Valid only in a SELECT/RETURNING projection list; in a scalar position it
+	// is 42601. An unknown qualifier is 42P01. Qualifier holds the relation label; Base is unused
+	// (distinct from the composite `(expr).*` ExprFieldStar — `t.*` names a relation, `(c).*` a value).
+	ExprQualifiedStar
 	// ExprSubscript is array subscript `Base[..][..]` (spec/design/array.md §6) — one or more
 	// bracketed specs (Subscripts) applied to an array Base. Each spec is an index `[i]` or a slice
 	// `[m:n]` (with optionally-omitted bounds). All-index access reads a single 1-based element (the

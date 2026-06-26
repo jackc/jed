@@ -342,6 +342,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.join_full",
   "query.table_alias",
   "query.qualified_column",
+  "query.qualified_star",
   // Scalar aggregates COUNT/SUM/MIN/MAX/AVG over the whole table (spec/design/aggregates.md).
   "query.aggregates",
   // DISTINCT inside an aggregate — COUNT(DISTINCT x), SUM/AVG/MIN/MAX(DISTINCT x): fold only the

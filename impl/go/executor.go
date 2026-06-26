@@ -2657,6 +2657,9 @@ func exprCallsSeqMutator(e *Expr) bool {
 		return false
 	case ExprFieldAccess, ExprFieldStar:
 		return exprCallsSeqMutator(e.Base)
+	case ExprQualifiedStar:
+		return false // `t.*` is a leaf relation reference — no sub-expression
+
 	case ExprSubscript:
 		if exprCallsSeqMutator(e.Base) {
 			return true
@@ -3103,6 +3106,9 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 		}
 	case ExprFieldAccess, ExprFieldStar:
 		collectExprPrivs(e.Base, req, locals)
+	case ExprQualifiedStar:
+		// `t.*` names a relation already in FROM — its SELECT privilege is required by the FROM
+		// clause itself, so the star adds no new function/table privilege here.
 	case ExprSubscript:
 		collectExprPrivs(e.Base, req, locals)
 		for i := range e.Subscripts {
@@ -3206,6 +3212,9 @@ func exprReadsColumns(e *Expr) bool {
 		return false
 	case ExprFieldAccess, ExprFieldStar:
 		return exprReadsColumns(e.Base)
+	case ExprQualifiedStar:
+		return true // `t.*` reads the relation's columns (e.g. `RETURNING t.*`)
+
 	case ExprSubscript:
 		if exprReadsColumns(e.Base) {
 			return true
@@ -8824,6 +8833,9 @@ func countSelfRefsExpr(e Expr, name string) int {
 		return n
 	case ExprFieldAccess, ExprFieldStar:
 		return countSelfRefsExpr(*e.Base, name)
+	case ExprQualifiedStar:
+		return 0 // a leaf relation reference — no sublink to recurse into
+
 	case ExprSubscript:
 		n := countSelfRefsExpr(*e.Base, name)
 		for _, sp := range e.Subscripts {
@@ -18383,6 +18395,8 @@ func exprHasAggregate(e Expr) bool {
 		// Field selection `(expr).field` / `(expr).*` recurses into the composite base
 		// (spec/design/composite.md §S4) — an aggregate hidden in the base must surface.
 		return exprHasAggregate(*e.Base)
+	case ExprQualifiedStar:
+		return false // `t.*` is a leaf relation reference — no aggregate
 	case ExprSubscript:
 		// `base[..]` — an aggregate hidden in the base array or any subscript bound must surface.
 		if exprHasAggregate(*e.Base) {
@@ -18506,6 +18520,9 @@ func exprHasWindow(e Expr) bool {
 		return e.Case.Els != nil && exprHasWindow(*e.Case.Els)
 	case ExprFieldAccess, ExprFieldStar:
 		return exprHasWindow(*e.Base)
+	case ExprQualifiedStar:
+		return false // `t.*` is a leaf relation reference — no window function
+
 	case ExprSubscript:
 		if exprHasWindow(*e.Base) {
 			return true
@@ -18899,6 +18916,8 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.RowItems = items
 		return ne, nil
+	case ExprQualifiedStar:
+		return e, nil // a leaf relation reference — no named window to desugar
 	case ExprFieldAccess, ExprFieldStar:
 		base, err := desugarNamedWindows(*e.Base, windows)
 		if err != nil {
@@ -19057,6 +19076,8 @@ func rejectCheckStructure(e Expr) error {
 		// Recurse into the composite base (spec/design/composite.md §S4) so a forbidden
 		// subquery/aggregate/parameter hidden there is still rejected.
 		return rejectCheckStructure(*e.Base)
+	case ExprQualifiedStar:
+		return nil // cannot syntactically reach a CHECK (select-item-only); accept structurally
 	case ExprSubscript:
 		// Recurse into the array base and every subscript bound.
 		if err := rejectCheckStructure(*e.Base); err != nil {
@@ -19193,6 +19214,8 @@ func rejectDefaultStructure(e Expr) error {
 	case ExprFieldAccess, ExprFieldStar:
 		// Recurse into the composite base (spec/design/composite.md §S4).
 		return rejectDefaultStructure(*e.Base)
+	case ExprQualifiedStar:
+		return nil // cannot syntactically reach a DEFAULT (select-item-only); accept structurally
 	case ExprSubscript:
 		// Recurse into the array base and every subscript bound.
 		if err := rejectDefaultStructure(*e.Base); err != nil {
@@ -19300,6 +19323,8 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 		case ExprFieldAccess, ExprFieldStar:
 			// Field selection recurses into the composite base (spec/design/composite.md §S4).
 			walk(*e.Base)
+		case ExprQualifiedStar:
+			// `t.*` cannot appear in a CHECK expression (select-item-only); no columns to note.
 		case ExprSubscript:
 			// `base[..]` recurses into the array base and every subscript bound.
 			walk(*e.Base)
@@ -23623,6 +23648,29 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 	names := make([]string, 0, len(items.Items))
 	types := make([]resolvedType, 0, len(items.Items))
 	for _, it := range items.Items {
+		// `t.*` expands the FROM relation labeled Qualifier into one output column per column, in
+		// catalog order (grammar.md §15) — like bare `*` but for one named relation and mixable with
+		// other items. Resolved against the LOCAL scope only (like bare `*`); an unknown label is
+		// 42P01, exactly as a qualified column ref.
+		if it.Expr.Kind == ExprQualifiedStar {
+			want := toLowerASCII(it.Expr.Qualifier)
+			var found *scopeRel
+			for i := range s.rels {
+				if s.rels[i].label == want {
+					found = &s.rels[i]
+					break
+				}
+			}
+			if found == nil {
+				return nil, nil, nil, NewError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
+			}
+			for i := range found.table.Columns {
+				ps = append(ps, &rExpr{kind: reColumn, index: found.offset + i})
+				names = append(names, found.table.Columns[i].Name)
+				types = append(types, resolvedTypeOfCol(found.table.Columns[i].Type, s.catalog.readSnap()))
+			}
+			continue
+		}
 		// `(expr).*` expands a composite base into one output column per field, in declaration
 		// order (spec/design/composite.md §S4). The base is resolved once and each output column is
 		// a reField node over a shared base node — the base is pure, so sharing the resolved node is
@@ -23852,6 +23900,11 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// expression position it is unsupported (PG rejects row expansion here — 0A000).
 		return nil, resolvedType{}, NewError(FeatureNotSupported,
 			"row expansion (.*) is not supported in this context")
+	case ExprQualifiedStar:
+		// `t.*` is likewise projection-list only — resolveProjections expands it before ever
+		// calling resolve(); reaching here means it appeared in a scalar position (which the parser
+		// already rejects as 42601). Defensive parity with the FieldStar arm.
+		return nil, resolvedType{}, NewError(SyntaxError, "t.* is only allowed in a select list")
 	case ExprSubscript:
 		// `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array
 		// (else 42804). Each subscript bound is an integer (a literal adapts; a non-integer is

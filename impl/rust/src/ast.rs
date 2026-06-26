@@ -840,6 +840,16 @@ pub enum Expr {
     FieldStar {
         base: Box<Expr>,
     },
+    /// Whole-relation expansion `t.*` (spec/design/grammar.md §15) — expands the FROM relation
+    /// labeled `qualifier` into one output column per column, in catalog order. Like bare `*` but
+    /// for a single named relation, and (unlike bare `*`) MIXABLE with other select items
+    /// (`SELECT t.*, u.x`). Valid only in a SELECT/RETURNING projection list; in any scalar
+    /// expression position it is 42601. An unknown qualifier is 42P01. Distinct from the composite
+    /// `(expr).*` (`FieldStar`): `t.*` names a relation, `(c).*` a composite value — the parser
+    /// produces this only for the bare `identifier "." "*"` shape.
+    QualifiedStar {
+        qualifier: String,
+    },
     /// Array subscript `base[..][..]` (spec/design/array.md §6) — one or more bracketed specs
     /// applied to an array `base`. Each spec is an index `[i]` or a slice `[m:n]` (with optionally-
     /// omitted bounds: `[:n]`, `[m:]`, `[:]`). All-index access reads a single **1-based** element

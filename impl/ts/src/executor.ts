@@ -15242,6 +15242,8 @@ function exprHasAggregate(e: Expr): boolean {
     case "fieldAccess":
     case "fieldStar":
       return exprHasAggregate(e.base);
+    case "qualifiedStar":
+      return false; // `t.*` is a leaf relation reference — no aggregate
     case "subscript":
       return exprHasAggregate(e.base) || astSubscriptExprs(e.subscripts).some(exprHasAggregate);
     case "quantified":
@@ -15313,6 +15315,8 @@ function exprHasWindow(e: Expr): boolean {
     case "fieldAccess":
     case "fieldStar":
       return exprHasWindow(e.base);
+    case "qualifiedStar":
+      return false; // `t.*` is a leaf relation reference — no window function
     case "subscript":
       return exprHasWindow(e.base) || astSubscriptExprs(e.subscripts).some(exprHasWindow);
     case "quantified":
@@ -15468,6 +15472,8 @@ function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
     case "fieldStar":
       desugarNamedWindows(e.base, windows);
       return;
+    case "qualifiedStar":
+      return; // a leaf relation reference — no named window to desugar
     case "case":
       if (e.operand !== null) desugarNamedWindows(e.operand, windows);
       for (const w of e.whens) {
@@ -15578,6 +15584,8 @@ function rejectCheckStructure(e: Expr): void {
     case "fieldAccess":
     case "fieldStar":
       return rejectCheckStructure(e.base);
+    case "qualifiedStar":
+      return; // cannot syntactically reach a CHECK (select-item-only); accept structurally
     case "subscript":
       rejectCheckStructure(e.base);
       for (const x of astSubscriptExprs(e.subscripts)) rejectCheckStructure(x);
@@ -15668,6 +15676,8 @@ function rejectDefaultStructure(e: Expr): void {
     case "fieldAccess":
     case "fieldStar":
       return rejectDefaultStructure(e.base);
+    case "qualifiedStar":
+      return; // cannot syntactically reach a DEFAULT (select-item-only); accept structurally
     case "subscript":
       rejectDefaultStructure(e.base);
       for (const x of astSubscriptExprs(e.subscripts)) rejectDefaultStructure(x);
@@ -15749,6 +15759,8 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
       case "fieldAccess":
       case "fieldStar":
         return walk(e.base);
+      case "qualifiedStar":
+        return; // `t.*` cannot appear in a CHECK expression (select-item-only); no columns to note
       case "subscript":
         walk(e.base);
         for (const x of astSubscriptExprs(e.subscripts)) walk(x);
@@ -18678,6 +18690,8 @@ function countSelfRefsExpr(e: Expr, name: string): number {
     case "fieldAccess":
     case "fieldStar":
       return countSelfRefsExpr(e.base, name);
+    case "qualifiedStar":
+      return 0; // a leaf relation reference — no sublink to recurse into
     case "subscript":
       return (
         countSelfRefsExpr(e.base, name) +
@@ -19277,6 +19291,8 @@ function exprCallsSeqMutator(e: Expr): boolean {
     case "fieldAccess":
     case "fieldStar":
       return exprCallsSeqMutator(e.base);
+    case "qualifiedStar":
+      return false; // a leaf relation reference — no sequence-mutating call
     case "subscript":
       return (
         exprCallsSeqMutator(e.base) ||
@@ -19532,6 +19548,10 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
     case "fieldStar":
       collectExprPrivs(e.base, req, locals);
       break;
+    case "qualifiedStar":
+      // `t.*` names a relation already in FROM — its SELECT privilege is required by the FROM
+      // clause itself, so the star adds no new function/table privilege here.
+      break;
     case "subscript":
       collectExprPrivs(e.base, req, locals);
       for (const s of e.subscripts) {
@@ -19626,6 +19646,8 @@ function exprReadsColumns(e: Expr): boolean {
     case "fieldAccess":
     case "fieldStar":
       return exprReadsColumns(e.base);
+    case "qualifiedStar":
+      return true; // `t.*` reads the relation's columns (e.g. `RETURNING t.*`)
     case "subscript":
       return (
         exprReadsColumns(e.base) ||
@@ -19773,6 +19795,26 @@ function resolveProjections(
   const names: string[] = [];
   const types: ResolvedType[] = [];
   for (const it of items.items) {
+    // `t.*` expands the FROM relation labeled `qualifier` into one output column per column, in
+    // catalog order (grammar.md §15) — like bare `*` but for one named relation and mixable with
+    // other items. Resolved against the LOCAL scope only (like bare `*`); an unknown label is 42P01,
+    // exactly as a qualified column ref.
+    if (it.expr.kind === "qualifiedStar") {
+      const want = it.expr.qualifier.toLowerCase();
+      const rel = scope.rels.find((r) => r.label === want);
+      if (rel === undefined) {
+        throw engineError(
+          "undefined_table",
+          "missing FROM-clause entry for table " + it.expr.qualifier,
+        );
+      }
+      rel.table.columns.forEach((c, i) => {
+        nodes.push({ kind: "column", index: rel.offset + i });
+        names.push(c.name);
+        types.push(resolvedTypeOfCol(c.type, scope.catalog));
+      });
+      continue;
+    }
     // `(expr).*` expands a composite base into one output column per field, in declaration order
     // (spec/design/composite.md §S4). The base AST is re-resolved per field (Expr is plain data,
     // resolution is pure) — deterministic. A non-composite base is 42809.
@@ -20036,6 +20078,11 @@ function resolve(
         "feature_not_supported",
         "row expansion (.*) is not supported in this context",
       );
+    case "qualifiedStar":
+      // `t.*` is likewise projection-list only — resolveProjections expands it before ever calling
+      // resolve(); reaching here means it appeared in a scalar position (which the parser already
+      // rejects as 42601). Defensive parity with the fieldStar arm.
+      throw engineError("syntax_error", "t.* is only allowed in a select list");
     case "subscript": {
       // `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array (else
       // 42804). Each subscript bound is an integer (a literal adapts; a non-integer is 42804). If any

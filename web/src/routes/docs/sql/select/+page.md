@@ -278,6 +278,10 @@ binds looser than `JOIN`, so each comma-separated item is its own join group: a 
 reference only relations inside its own group (`FROM a, b JOIN c ON a.x = c.x` is an error), matching
 PostgreSQL.
 
+To select all columns of **one** relation in a join, use a qualified star `t.*` — the per-table
+counterpart of `*`. Unlike bare `*`, it can be mixed with other items: `SELECT a.*, b.label FROM a
+JOIN b ON …` expands all of `a`'s columns followed by `b.label`.
+
 ## Set-returning functions in `FROM`
 
 A `FROM` item can be a set-returning function — a computed row source instead of a stored table.

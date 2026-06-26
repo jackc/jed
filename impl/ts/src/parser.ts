@@ -2566,6 +2566,25 @@ class Parser {
     }
     const items: SelectItem[] = [];
     for (;;) {
+      // `t.*` — a qualified star (all columns of the relation labeled `t`), a select-list /
+      // RETURNING item MIXABLE with other items (grammar.md §15). Recognized by the three-token
+      // shape `identifier "." "*"` before the general expr parser, so `t.col` (Dot then a word)
+      // and `a * b` (no Dot) are untouched, and a bare `*` was already handled above. No `AS` alias.
+      if (
+        this.peek().kind === "word" &&
+        this.peekKindAt(1) === "dot" &&
+        this.peekKindAt(2) === "star"
+      ) {
+        const qualifier = this.expectIdentifier();
+        this.advance(); // .
+        this.advance(); // *
+        items.push({ expr: { kind: "qualifiedStar", qualifier }, alias: null });
+        if (this.peek().kind === "comma") {
+          this.advance();
+          continue;
+        }
+        break;
+      }
       const expr = this.parseExpr();
       // Optional `AS alias` output label. `AS` is not reserved, so it is taken as an
       // alias marker only here, after a complete expr (spec/grammar/grammar.ebnf

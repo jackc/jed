@@ -389,11 +389,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`JOIN` — multi-table FROM + `INNER`/`CROSS` + outer (`LEFT`/`RIGHT`/`FULL`)** — left-deep
       nested-loop executor, table aliases, qualified column refs, a flat-index scope resolver; the outer
       NULL-extension branch + WHERE-downgrades-to-inner. → [grammar.md §15](spec/design/grammar.md)
-  - [ ] _follow-on:_ `USING` / `NATURAL` / `t.*`.
+  - [ ] _follow-on:_ `USING` / `NATURAL`.
     - [x] **comma-`FROM`** (`FROM a, b` = implicit `CROSS JOIN`; comma binds looser than `JOIN`, so
           each comma item is its own ON-resolution segment — a join's `ON` may not reach an earlier
           comma item (`42P01`); `LATERAL` still crosses the comma, so `FROM t, LATERAL (…)` now
           works). → [grammar.md §15](spec/design/grammar.md)
+    - [x] **`t.*` qualified star** (a select item expanding one named relation's columns, mixable
+          with other items; `t.* AS x` and a scalar `t.*` are deliberate `42601` narrowings; enables
+          `RETURNING new.*`/`old.*`). → [grammar.md §15](spec/design/grammar.md)
 - [x] **Subqueries** — uncorrelated scalar, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS`, **correlated**,
       subqueries in `UPDATE`/`DELETE`, `$N` inside a subquery, **derived tables**, a `VALUES` body,
       **`LATERAL`**, and `x op ANY/ALL(SELECT …)`.
