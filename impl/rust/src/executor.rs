@@ -13082,6 +13082,8 @@ enum ScalarFunc {
     Encode,
     /// decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
     Decode,
+    /// quote_literal(text) → text — wrap as a SQL string literal (§3).
+    QuoteLiteral,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19127,6 +19129,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "to_hex" => ScalarFunc::ToHex,
         "encode" => ScalarFunc::Encode,
         "decode" => ScalarFunc::Decode,
+        "quote_literal" => ScalarFunc::QuoteLiteral,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30599,6 +30602,11 @@ impl RExpr {
                         };
                         Ok(Value::Bytea(decode_text(s, fmt)?))
                     }
+                    // quote_literal(text) → text — wrap as a SQL string literal.
+                    ScalarFunc::QuoteLiteral => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Text(quote_literal_text(s))),
+                        _ => unreachable!("resolver restricts quote_literal to text"),
+                    },
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31490,7 +31498,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Initcap
         | ScalarFunc::ToHex
         | ScalarFunc::Encode
-        | ScalarFunc::Decode => {
+        | ScalarFunc::Decode
+        | ScalarFunc::QuoteLiteral => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )
@@ -31739,6 +31748,26 @@ fn base64_encode_wrapped(bytes: &[u8]) -> String {
         out.push(c as char);
     }
     out
+}
+
+/// `quote_literal(s)` (string-functions.md §3): wrap `s` as a SQL string literal — single-quoted,
+/// each internal `'` doubled; if `s` contains a backslash, each `\` is doubled and the literal is
+/// `E`-prefixed (matching PostgreSQL). Shared by `quote_literal` and `quote_nullable`.
+fn quote_literal_text(s: &str) -> String {
+    let has_backslash = s.contains('\\');
+    let mut inner = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\'' => inner.push_str("''"),
+            '\\' => inner.push_str("\\\\"),
+            _ => inner.push(c),
+        }
+    }
+    if has_backslash {
+        format!("E'{inner}'")
+    } else {
+        format!("'{inner}'")
+    }
 }
 
 /// `decode(s, format)` (string-functions.md §3): the inverse of `encode`. `hex` and `base64` ignore

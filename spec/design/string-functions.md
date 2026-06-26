@@ -311,3 +311,26 @@ hex/base64 string traps `22023`. `escape` decodes over the input's UTF-8 bytes (
 escape codec. The corpus exercises decode through `encode(decode(…), …)` round-trips (decode returns
 `bytea`, which jed renders `\x…`). NULL args propagate. (jed has no `text::bytea` cast yet, so
 `decode` is the way to construct a `bytea` from text.)
+
+### `quote_literal(text) → text`, `quote_ident(text) → text`, `quote_nullable(text) → text`
+
+The PostgreSQL quoting helpers for building SQL text.
+
+- **`quote_literal(s)`** wraps `s` as a SQL **string literal**: surrounded by single quotes, each
+  internal `'` doubled; if `s` contains a backslash, each `\` is doubled and the literal is
+  `E`-prefixed. `quote_literal('abc') = '''abc'''`, `quote_literal("O'Reilly") = '''O''''Reilly'''`,
+  `quote_literal('a\b') = 'E''a\\b'''`. STRICT — `quote_literal(NULL) = NULL`.
+- **`quote_nullable(s)`** is `quote_literal` except it is **non-strict**: `quote_nullable(NULL)`
+  returns the four-character text `NULL` (not a SQL NULL). It is the one string function with the
+  `none` NULL discipline — the eval does **not** short-circuit a NULL argument, so the kernel sees it.
+- **`quote_ident(s)`** wraps `s` as a SQL **identifier**: returned unchanged if it is already a safe
+  unquoted identifier (`^[a-z_][a-z0-9_]*$`), otherwise double-quoted with each internal `"` doubled.
+  `quote_ident('foo') = 'foo'`, `quote_ident('Foo') = '"Foo"'`, `quote_ident('foo bar') = '"foo bar"'`,
+  `quote_ident('a"b') = '"a""b"'`. STRICT.
+
+  **Deliberate divergence — no reserved-keyword quoting.** PostgreSQL *also* double-quotes an
+  identifier that is a reserved keyword (`quote_ident('select') = '"select"'`). jed has no
+  enumerated reserved-keyword set (its hand-written parsers match keywords contextually, not from a
+  central list — grammar.md), so jed quotes only by the **lexical** safety pattern: `quote_ident
+  ('select') = 'select'`. The oracle corpus exercises the non-keyword cases (which match
+  PostgreSQL); keyword-aware quoting is a deferred refinement, recorded here.

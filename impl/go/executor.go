@@ -15963,6 +15963,8 @@ const (
 	sfEncode
 	// decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
 	sfDecode
+	// quote_literal(text) → text — wrap as a SQL string literal (§3).
+	sfQuoteLiteral
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19584,6 +19586,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfEncode
 	case "decode":
 		return sfDecode
+	case "quote_literal":
+		return sfQuoteLiteral
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -24347,6 +24351,28 @@ func base64EncodeWrapped(bytes []byte) string {
 	return out.String()
 }
 
+// quoteLiteralText is quote_literal(s) (string-functions.md §3): wrap s as a SQL string literal —
+// single-quoted, each internal ' doubled; if s contains a backslash, each \ is doubled and the
+// literal is E-prefixed (matching PostgreSQL). Shared by quote_literal and quote_nullable.
+func quoteLiteralText(s string) string {
+	hasBackslash := strings.ContainsRune(s, '\\')
+	var inner strings.Builder
+	for _, c := range s {
+		switch c {
+		case '\'':
+			inner.WriteString("''")
+		case '\\':
+			inner.WriteString("\\\\")
+		default:
+			inner.WriteRune(c)
+		}
+	}
+	if hasBackslash {
+		return "E'" + inner.String() + "'"
+	}
+	return "'" + inner.String() + "'"
+}
+
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
 // ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
 // 22P02 (PostgreSQL's split). An unrecognized format traps 22023.
@@ -27952,6 +27978,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return ByteaValue(r), nil
+		case sfQuoteLiteral:
+			// quote_literal(text) → text — wrap as a SQL string literal.
+			return TextValue(quoteLiteralText(vals[0].Str)), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

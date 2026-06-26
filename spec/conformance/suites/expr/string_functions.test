@@ -759,3 +759,25 @@ SELECT encode(decode(NULL::text, 'hex'), 'hex'), encode(decode('00', NULL::text)
 ----
 NULL
 NULL
+
+# === quote_literal(text) → text: wrap as a SQL string literal =========================
+
+# wraps in single quotes, doubling each internal quote
+query T
+SELECT quote_literal('abc'), quote_literal('O''Reilly')
+----
+'abc'
+'O''Reilly'
+
+# a backslash → doubled, with an E-string prefix (PG); jed string literals have no escapes, so
+# 'a\b' is the three chars a, backslash, b
+query T
+SELECT quote_literal('a\b')
+----
+E'a\\b'
+
+# STRICT: NULL → NULL (distinct from quote_nullable)
+query T
+SELECT quote_literal(NULL::text)
+----
+NULL

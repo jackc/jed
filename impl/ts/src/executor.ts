@@ -572,6 +572,20 @@ function base64EncodeWrapped(bytes: Uint8Array): string {
   return out;
 }
 
+// quoteLiteralText is quote_literal(s) (string-functions.md §3): wrap s as a SQL string literal —
+// single-quoted, each internal ' doubled; if s contains a backslash, each \ is doubled and the
+// literal is E-prefixed (matching PostgreSQL). Shared by quote_literal and quote_nullable.
+function quoteLiteralText(s: string): string {
+  const hasBackslash = s.includes("\\");
+  let inner = "";
+  for (const c of s) {
+    if (c === "'") inner += "''";
+    else if (c === "\\") inner += "\\\\";
+    else inner += c;
+  }
+  return hasBackslash ? `E'${inner}'` : `'${inner}'`;
+}
+
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
 // ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
 // 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
@@ -12903,7 +12917,9 @@ type ScalarFuncName =
   // encode(bytea, format) → text — render bytes as hex / base64 / escape (§3).
   | "encode"
   // decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
-  | "decode";
+  | "decode"
+  // quote_literal(text) → text — wrap as a SQL string literal (§3).
+  | "quote_literal";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24825,6 +24841,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const s = (vals[0] as { text: string }).text;
         const fmt = (vals[1] as { text: string }).text;
         return byteaValue(decodeText(s, fmt));
+      }
+      if (e.func === "quote_literal") {
+        // quote_literal(text) → text — wrap as a SQL string literal.
+        return textValue(quoteLiteralText((vals[0] as { text: string }).text));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64
