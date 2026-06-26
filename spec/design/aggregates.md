@@ -230,10 +230,9 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   collect into the same synthetic row) and grouping keys; a non-grouped column is `42803`,
   non-boolean is `42804`. Allowed with no `GROUP BY` (filters the single whole-table group),
   and HAVING alone makes a query an aggregate query ([grammar.md](grammar.md) §19).
-- **`FILTER (WHERE cond)`** (landed) — restricts which input rows feed an aggregate (§11). On a
-  **window** aggregate it is deferred (`0A000`): a pure non-aggregate window function with `FILTER`
-  matches PG's own `0A000`, and a window aggregate with `FILTER` (which PG allows) is deferred here
-  to a follow-on, a documented divergence.
+- **`FILTER (WHERE cond)`** (landed) — restricts which input rows feed an aggregate (§11), including
+  on a **window** aggregate (§20, the passing frame rows fold); a pure non-aggregate window function
+  with `FILTER` is `0A000` (PG's own).
 - **`GROUPING SETS` / `ROLLUP` / `CUBE`** (landed) — one `GROUP BY` computes several grouping sets
   at once, and the `GROUPING()` function reports which columns a row was grouped by (§12).
 - **Ordered-set aggregates** (landed) — `mode`, `percentile_cont`, `percentile_disc`, computed over
@@ -242,10 +241,10 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   ordinal, an output alias, or a general expression, not just a column (§15).
 - **Functional-dependency grouping** (landed) — `GROUP BY` a base table's full primary key lets any
   column of that table appear ungrouped (§16).
-- **Deferred / out of scope**: **`FILTER` on
-  a window aggregate**; **`GROUPING SETS` combined with window functions**; **hypothetical-set
-  aggregates** (`rank`/`dense_rank`/`percent_rank`/`cume_dist` `WITHIN GROUP`); and the
-  **array-valued** `percentile_cont`/`percentile_disc` fraction form. Each is an additive later
+- **`FILTER` on a window aggregate** (landed) — folds only the passing frame rows (§20).
+- **Hypothetical-set aggregates** (landed) — `rank`/`dense_rank`/`percent_rank`/`cume_dist`
+  `WITHIN GROUP` (§19).
+- **Deferred / out of scope**: **`GROUPING SETS` combined with window functions**. An additive later
   feature ([../../TODO.md](../../TODO.md)).
 
 ## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
@@ -602,3 +601,23 @@ aggregates, routed here rather than to the window path. jed matches:
 (`aggregate_accumulate` per row, plus the key `operator_eval`s); the per-group hypothetical-row
 evaluation, sort comparisons, and rank count are part of the **unmetered** finalize (like the OSA
 sort). Deterministic and cross-core identical. New capability `query.hypothetical_set_aggregate`.
+
+## 20. `FILTER (WHERE cond)` on a window aggregate
+
+§11's `FILTER` landed for the non-window aggregate paths; on a window function it was deferred. It now
+works for a window **aggregate**: `agg(x) FILTER (WHERE cond) OVER (…)` folds only the **frame rows
+for which `cond` is TRUE** into that window aggregate. A `FALSE`/`NULL` `cond` excludes the row, so a
+frame with no passing row yields `COUNT` `0` and `SUM`/`AVG`/`MIN`/`MAX` `NULL` (like an empty frame).
+
+`cond` is an ordinary boolean over the **input** row (a non-boolean is `42804`, a nested aggregate
+`42803` — the §11 rule), evaluated **per frame row**. It composes with the default frame, explicit
+`ROWS`/`RANGE`/`GROUPS` frames, `EXCLUDE`, and `PARTITION BY`. **`FILTER` on a non-aggregate window
+function stays `0A000`** ("FILTER is not implemented for non-aggregate window functions" — PG's own).
+
+**Cost / implementation.** A `FILTER` **disables the sliding-frame optimization** ([window.md](window.md)
+§5.2) — a filtered-out row cannot be cleanly un-folded — so a filtered window aggregate always
+**re-folds** each frame (the default-frame running pass keeps its peer-snapshot, simply skipping a
+non-passing row; an explicit frame takes the naive per-row re-fold path, the same one `EXCLUDE` uses).
+`window_frame_step` is charged per **visited** frame row and the filter's own `operator_eval`s per
+row; only a passing row folds. Deterministic and cross-core identical. New capability
+`query.window_aggregate_filter`.

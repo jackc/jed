@@ -4,9 +4,9 @@
 # row is filtered out is COUNT 0 and SUM/AVG/MIN/MAX NULL, exactly like an empty group. FILTER
 # works whole-table and per GROUP, in HAVING, and composes with DISTINCT (the filter applies
 # first, then the dedup). cond is an ordinary boolean expression over the input row: a non-boolean
-# cond is 42804, an aggregate inside it is 42803. FILTER on a scalar function is 42809; on a window
-# function 0A000.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.aggregate_distinct, query.aggregate_filter, query.window, types.i32, types.decimal, resource.cost_metering
+# cond is 42804, an aggregate inside it is 42803. FILTER on a scalar function is 42809; on a
+# non-aggregate window function 0A000; on a window aggregate it folds the passing frame rows (§20).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.aggregate_distinct, query.aggregate_filter, query.window, query.window_aggregate_filter, types.i32, types.decimal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
@@ -113,6 +113,22 @@ SELECT abs(b) FILTER (WHERE a = 1) FROM t
 statement error 0A000
 SELECT row_number() FILTER (WHERE a = 1) OVER () FROM t
 
-# FILTER on a window aggregate is 0A000 here (PG allows it; deferred to a follow-on — aggregates.md §11).
-statement error 0A000
-SELECT SUM(b) FILTER (WHERE a = 1) OVER () FROM t
+# FILTER on a WINDOW aggregate is supported (aggregates.md §20, window/aggregate_filter.test): the
+# window aggregate folds only the frame rows for which cond is TRUE. OVER () is the whole partition,
+# so SUM(b) FILTER (WHERE a = 1) over rows with a=1 (b = 10, 20) is 30 for every row.
+# names: id, sum
+query II nosort
+SELECT id, SUM(b) FILTER (WHERE a = 1) OVER () FROM t ORDER BY id
+----
+1
+30
+2
+30
+3
+30
+4
+30
+5
+30
+6
+30

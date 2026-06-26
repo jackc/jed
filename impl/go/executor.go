@@ -17054,6 +17054,11 @@ type windowSpec struct {
 	// TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6). Mirrors Rust's
 	// WindowSpec.frame.
 	frame *resolvedFrame
+	// filter is agg(x) FILTER (WHERE cond) OVER (…) — a per-frame-row boolean restricting which frame
+	// rows fold into the window aggregate (aggregates.md §20). Non-nil only for an aggregate window
+	// function (a non-aggregate window function with FILTER is 0A000). A FILTER disables the
+	// sliding-frame optimization (a filtered row can't be cleanly un-folded) — every frame re-folds.
+	filter *rExpr
 }
 
 // resolvedFrame is a resolved window frame (spec/design/window.md §6). ROWS physical offsets,
@@ -19738,7 +19743,7 @@ func resolveGrouping(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedTy
 // (spec/design/window.md §5.1). Valid only in a window query's projection (ag.windowing); anywhere
 // else (WHERE / JOIN ON / HAVING / an aggregate query) it is 42P20. The call collects into a
 // windowSpec and resolves to the synthetic slot windowBase+window_index. S0: only row_number().
-func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	name := toLowerASCII(fc.Name)
 	// The plan + result type from the function name. S0: only row_number(); an aggregate name with
 	// OVER (a window aggregate, S3) resolves to planAgg carrying the aggregate plan in wagg; any
@@ -19931,6 +19936,21 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
+	// FILTER (WHERE cond) on a window aggregate (aggregates.md §20): a per-frame-row boolean over the
+	// INPUT row, resolved with aggregates forbidden (a nested aggregate is 42803, a non-boolean 42804)
+	// — exactly the non-window FILTER rule (§11). The window stage folds only the frame rows it keeps.
+	var rfilter *rExpr
+	if filter != nil {
+		fsub := &aggCtx{collecting: false}
+		rf, ft, ferr := resolve(s, *filter, nil, fsub, params)
+		if ferr != nil {
+			return nil, resolvedType{}, ferr
+		}
+		if ft.kind != rtBool && ft.kind != rtNull {
+			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
+		}
+		rfilter = rf
+	}
 	// A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
 	// HAVING / an aggregate-only query ag is not windowing → 42P20 (window.md §7).
 	if !ag.windowing {
@@ -19943,7 +19963,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		ag.specs = sub.specs
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
-	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame})
+	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame, filter: rfilter})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -23792,18 +23812,15 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				return nil, resolvedType{}, NewError(FeatureNotSupported,
 					"DISTINCT is not implemented for window functions")
 			}
-			// FILTER over a window function is deferred (aggregates.md §11). A pure (non-aggregate)
-			// window function with FILTER is PG's own 0A000; a window AGGREGATE with FILTER is allowed
-			// by PG but deferred here to a follow-on (a documented jed divergence) — both 0A000.
-			if e.FuncCall.Filter != nil {
-				if isAggregateName(e.FuncCall.Name) {
-					return nil, resolvedType{}, NewError(FeatureNotSupported,
-						"FILTER is not yet supported for window aggregate functions")
-				}
+			// FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the
+			// frame rows for which the filter is TRUE; a pure (non-aggregate) window function with
+			// FILTER is PG's own 0A000 ("FILTER is not implemented for non-aggregate window
+			// functions"). The filter is threaded into the windowSpec and applied in the window stage.
+			if e.FuncCall.Filter != nil && !isAggregateName(e.FuncCall.Name) {
 				return nil, resolvedType{}, NewError(FeatureNotSupported,
 					"FILTER is not implemented for non-aggregate window functions")
 			}
-			return resolveWindowCall(s, e.FuncCall, ag, params)
+			return resolveWindowCall(s, e.FuncCall, e.FuncCall.Filter, ag, params)
 		}
 		// A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's wrong_object_type,
 		// not the windowing_error 42P20 it uses for a window in WHERE — window.md §7, oracle-verified).
@@ -30712,6 +30729,20 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 					}
 					return NullValue(), nil
 				}
+				// filterPass evaluates the FILTER (WHERE cond) at sorted position k: a frame row whose
+				// filter is not TRUE does not fold into the window aggregate (aggregates.md §20). Charged
+				// per visited frame row (its operator_evals); a nil filter keeps every row. A FILTER forces
+				// the naive re-fold path for explicit frames (a filtered row cannot be cleanly un-folded).
+				filterPass := func(k int) (bool, error) {
+					if spec.filter == nil {
+						return true, nil
+					}
+					v, err := spec.filter.eval(rows[ordered[k]], env, meter)
+					if err != nil {
+						return false, err
+					}
+					return v.IsTrue(), nil
+				}
 				if spec.frame == nil {
 					// DEFAULT frame (window.md §6): RANGE UNBOUNDED PRECEDING TO CURRENT ROW with a
 					// window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the current peer
@@ -30736,6 +30767,13 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 							// The frame fold work (window.md §8) — metered so a running aggregate over
 							// a large partition stays cost-bounded.
 							meter.Charge(Costs.WindowFrameStep)
+							pass, err := filterPass(k)
+							if err != nil {
+								return err
+							}
+							if !pass {
+								continue // FILTER excludes this row from the running fold
+							}
 							v, err := opval(k)
 							if err != nil {
 								return err
@@ -30790,9 +30828,10 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 						}
 						return vals[k], nil
 					}
-					if exclude != FrameExcludeNoOthers {
-						// EXCLUDE breaks the clean add/remove model → naive per-row re-fold (dropped
-						// rows are neither metered nor counted), over the cached operand.
+					if exclude != FrameExcludeNoOthers || spec.filter != nil {
+						// EXCLUDE or FILTER breaks the clean add/remove model → naive per-row re-fold
+						// (dropped rows are neither metered nor counted), over the cached operand. A
+						// FILTER additionally skips a non-TRUE frame row.
 						for pos := 0; pos < np; pos++ {
 							lo, hi, err := ctx.bounds(pos, spec.frame)
 							if err != nil {
@@ -30804,6 +30843,13 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 									continue
 								}
 								meter.Charge(Costs.WindowFrameStep)
+								pass, err := filterPass(k)
+								if err != nil {
+									return err
+								}
+								if !pass {
+									continue
+								}
 								v, err := evalAt(k)
 								if err != nil {
 									return err

@@ -14260,6 +14260,11 @@ type WindowSpec = {
   // The resolved explicit frame (S4, ROWS mode); undefined/null is the default frame (RANGE
   // UNBOUNDED PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
   frame?: ResolvedFrame | null;
+  // `agg(x) FILTER (WHERE cond) OVER (…)` — a per-frame-row boolean restricting which frame rows fold
+  // into the window aggregate (aggregates.md §20). Non-null only for an aggregate window function (a
+  // non-aggregate window function with FILTER is 0A000). A FILTER disables the sliding-frame
+  // optimization (a filtered row can't be cleanly un-folded) — every frame re-folds.
+  filter?: RExpr | null;
 };
 
 // ResolvedFrame is a resolved window frame (spec/design/window.md §6): ROWS physical offsets,
@@ -16166,7 +16171,7 @@ function isWindowOnlyName(name: string): boolean {
 // into a WindowSpec and resolves to the synthetic slot base + windowIndex. S0: only row_number().
 function resolveWindowCall(
   scope: Scope,
-  e: { name: string; args: Expr[]; star: boolean; over: WindowDef },
+  e: { name: string; args: Expr[]; star: boolean; over: WindowDef; filter?: Expr | null },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -16293,6 +16298,18 @@ function resolveWindowCall(
       ag.window?.windowKeys ?? [],
       params,
     );
+    // FILTER (WHERE cond) on a window aggregate (aggregates.md §20): a per-frame-row boolean over the
+    // INPUT row, resolved with aggregates forbidden (a nested aggregate is 42803, a non-boolean 42804)
+    // — exactly the non-window FILTER rule (§11). The window stage folds only the frame rows it keeps.
+    let rfilter: RExpr | null = null;
+    if (e.filter !== undefined && e.filter !== null) {
+      const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+      const rf = resolve(scope, e.filter, null, fsub, params);
+      if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
+        throw typeError("argument of FILTER must be type boolean");
+      }
+      rfilter = rf.node;
+    }
     if (ag.window === undefined) {
       throw engineError("windowing_error", "window functions are not allowed here");
     }
@@ -16307,6 +16324,7 @@ function resolveWindowCall(
       aggJsonAsJson: aggJsonFlags?.asJson,
       aggJsonStrict: aggJsonFlags?.strict,
       frame,
+      filter: rfilter,
     });
     return { node: { kind: "column", index: slot }, type: result };
   } else if (lname === "first_value" || lname === "last_value" || lname === "nth_value") {
@@ -19890,20 +19908,19 @@ function resolve(
             "DISTINCT is not implemented for window functions",
           );
         }
-        // FILTER over a window function is deferred (aggregates.md §11). A pure (non-aggregate)
-        // window function with FILTER is PG's own 0A000; a window AGGREGATE with FILTER is allowed by
-        // PG but deferred here to a follow-on (a documented jed divergence) — both 0A000.
-        if (e.filter !== undefined && e.filter !== null) {
+        // FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the frame
+        // rows for which the filter is TRUE; a pure (non-aggregate) window function with FILTER is
+        // PG's own 0A000 ("FILTER is not implemented for non-aggregate window functions"). The filter
+        // is threaded into the WindowSpec and applied in the window stage.
+        if (e.filter !== undefined && e.filter !== null && !isAggregateName(e.name)) {
           throw engineError(
             "feature_not_supported",
-            isAggregateName(e.name)
-              ? "FILTER is not yet supported for window aggregate functions"
-              : "FILTER is not implemented for non-aggregate window functions",
+            "FILTER is not implemented for non-aggregate window functions",
           );
         }
         return resolveWindowCall(
           scope,
-          { name: e.name, args: e.args, star: e.star, over: e.over },
+          { name: e.name, args: e.args, star: e.star, over: e.over, filter: e.filter },
           ag,
           params,
         );
@@ -27277,6 +27294,12 @@ function applyWindowStage(
         case "agg": {
           const np = ordered.length;
           const hasOperand = spec.args.length > 0; // COUNT(*) has no operand
+          // FILTER (WHERE cond): a frame row whose filter is not TRUE does not fold into the window
+          // aggregate (aggregates.md §20). Evaluated per visited frame row (charging its
+          // operatorEvals); a null filter keeps every row. A FILTER forces the naive re-fold path for
+          // explicit frames (a filtered row cannot be cleanly un-folded).
+          const filterPass = (k: number): boolean =>
+            spec.filter == null ? true : isTrue(evalExpr(spec.filter, rows[ordered[k]!]!, env, meter));
           if (spec.frame === null || spec.frame === undefined) {
             // DEFAULT frame: a single running pass, snapshotting the accumulator at each peer-group
             // boundary (window.md §6) — O(n).
@@ -27300,6 +27323,7 @@ function applyWindowStage(
                 // The frame fold work (window.md §8) — metered so a running aggregate over a large
                 // partition stays cost-bounded.
                 meter.charge(COSTS.windowFrameStep);
+                if (!filterPass(k)) continue; // FILTER excludes this row from the running fold
                 const v = hasOperand
                   ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
                   : nullValue();
@@ -27340,9 +27364,10 @@ function applyWindowStage(
               }
               return vals[k]!;
             };
-            if (exclude !== "noOthers") {
-              // EXCLUDE breaks the clean add/remove model → naive per-row re-fold (dropped rows are
-              // neither metered nor counted), over the cached operand.
+            if (exclude !== "noOthers" || spec.filter != null) {
+              // EXCLUDE or FILTER breaks the clean add/remove model → naive per-row re-fold (dropped
+              // rows are neither metered nor counted), over the cached operand. A FILTER additionally
+              // skips a non-TRUE frame row.
               for (let pos = 0; pos < np; pos++) {
                 const [lo, hi] = ctx.bounds(pos, spec.frame);
                 const acc = newAcc(
@@ -27354,6 +27379,7 @@ function applyWindowStage(
                 for (let k = lo; k < hi; k++) {
                   if (ctx.isExcluded(pos, k, exclude)) continue;
                   meter.charge(COSTS.windowFrameStep);
+                  if (!filterPass(k)) continue;
                   foldAcc(acc, evalAt(k), meter);
                 }
                 meter.guard();

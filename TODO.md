@@ -238,8 +238,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         column of that table (and expressions over them) appear ungrouped, since the PK determines it;
         holds across a join, requires the whole composite PK, single grouping set only. New capability
         `query.group_by_functional_dependency`. → aggregates.md §16
+  - [x] **`FILTER` on a window aggregate** — `agg(x) FILTER (WHERE cond) OVER (...)` folds only the
+        frame rows where `cond` is TRUE (default/explicit frames, EXCLUDE, PARTITION BY); a FILTER
+        disables the sliding-frame optimization (naive re-fold). A non-aggregate window function with
+        FILTER stays `0A000`. New capability `query.window_aggregate_filter`. → aggregates.md §20
   - [ ] _follow-on:_
-        `GROUPING SETS` combined with window functions, `FILTER` on a **window** aggregate.
+        `GROUPING SETS` combined with window functions.
   - [x] **Non-constant ordered-set fraction** — `percentile_cont(expr)` / `percentile_disc(expr)`
         where `expr` references grouping columns, evaluated per group (a non-grouped column is `42803`).
         New capability `query.ordered_set_nonconstant_fraction`. → aggregates.md §17

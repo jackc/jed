@@ -543,9 +543,10 @@ Deliberate divergences from PostgreSQL, each registered in
 
 ## 11. Deferred / out of scope
 
-- **`FILTER (WHERE …)`** on an aggregate window, and `WITHIN GROUP` ordered-set/hypothetical-set
-  window functions (`rank() WITHIN GROUP`, `percentile_cont`) — additive later features (the
-  aggregate `FILTER` follow-on, [aggregates.md](aggregates.md) §10).
+- **`FILTER (WHERE …)`** on an aggregate window function — ✅ **landed** ([aggregates.md](aggregates.md)
+  §20): the window aggregate folds only the passing frame rows (a non-aggregate window function with
+  `FILTER` stays `0A000`). Ordered-set / hypothetical-set aggregates with `WITHIN GROUP` are
+  aggregate-stage features (`OVER` on one is `0A000` — aggregates.md §13/§19), not window functions.
 - **General-expression `PARTITION BY`/`ORDER BY`** — ✅ **landed (S11).** `PARTITION BY a + b`,
   `ORDER BY a % 2`, and — in a grouped query — an aggregate *as* a window key (`ORDER BY sum(x)`),
   resolved against the grouped row like a projection (§5.1). The one remaining piece is a **correlated**

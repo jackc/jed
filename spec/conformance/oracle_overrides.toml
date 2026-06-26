@@ -53,11 +53,6 @@ sql = "SELECT k, (SELECT row_number() OVER (PARTITION BY we.a + outert.k) FROM w
 reason = "jed: a window PARTITION BY / ORDER BY key may not reference an enclosing-query column (a CORRELATED window) — the deferred general-expression-key follow-on stops at the current query level, so it is 0A000 (window.md §5.1/§11). PostgreSQL supports a correlated window inside a subquery and returns rows (k=1->1, k=2->1). A documented narrowing, not a semantic disagreement on the supported surface."
 
 [[override]]
-file = "aggregates/filter.test"
-sql = "SELECT SUM(b) FILTER (WHERE a = 1) OVER () FROM t"
-reason = "jed: FILTER on a window AGGREGATE is deferred 0A000 (aggregates.md §11/§10). PostgreSQL allows it and returns rows. FILTER on aggregates landed for the non-window paths (whole-table / GROUP BY / HAVING); the window-aggregate frame fold is a deferred follow-on (the window subsystem already defers FILTER). A pure non-aggregate window function with FILTER is PG's own 0A000 (no override needed for that case). A documented narrowing, not a semantic disagreement on the supported surface."
-
-[[override]]
 file = "aggregates/grouping_sets.test"
 sql = "SELECT a, COUNT(*), row_number() OVER () FROM gt GROUP BY GROUPING SETS ((a), (b))"
 reason = "jed: GROUPING SETS / GROUPING() combined with a window function is deferred 0A000 (aggregates.md §12) — both want the grouped row's trailing synthetic slots, and the combination is a follow-on. PostgreSQL runs the window stage over the unioned grouping-set rows and returns rows. A documented narrowing, not a semantic disagreement on the supported surface; a single-grouping-set GROUP BY + window works."

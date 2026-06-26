@@ -17090,6 +17090,11 @@ struct WindowSpec {
     /// The resolved explicit frame; `None` is the default frame (RANGE UNBOUNDED PRECEDING TO
     /// CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
     frame: Option<ResolvedFrame>,
+    /// `agg(x) FILTER (WHERE cond) OVER (…)` — a per-frame-row boolean restricting which frame rows
+    /// fold into the window aggregate (aggregates.md §20). `Some` only for an aggregate window
+    /// function (a non-aggregate window function with `FILTER` is `0A000`). A `FILTER` disables the
+    /// sliding-frame optimization (a filtered row can't be cleanly un-folded) — every frame re-folds.
+    filter: Option<RExpr>,
 }
 
 /// A resolved window frame (spec/design/window.md §6). `ROWS` physical offsets, `GROUPS` peer-group
@@ -21231,12 +21236,14 @@ fn is_window_only_name(name: &str) -> bool {
 /// Valid only in a window query's projection (`AggCtx::Window`); anywhere else (WHERE / JOIN ON /
 /// HAVING / an aggregate query) it is 42P20. The call collects into a `WindowSpec` and resolves to
 /// the synthetic slot `base + window_index`. S0: only `row_number()`.
+#[allow(clippy::too_many_arguments)]
 fn resolve_window_call(
     scope: &Scope,
     name: &str,
     args: &[Expr],
     star: bool,
     wd: &WindowDef,
+    filter: Option<&Expr>,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
@@ -21424,12 +21431,27 @@ fn resolve_window_call(
     // §5.1.
     let (partition, order, frame) =
         resolve_window_def(scope, wd, &mut sub, &mut window_keys, params)?;
+    // FILTER (WHERE cond) on a window aggregate (aggregates.md §20): a per-frame-row boolean over the
+    // INPUT row, resolved with aggregates forbidden (a nested aggregate is 42803, a non-boolean 42804)
+    // — exactly the non-window FILTER rule (§11). The window stage folds only the frame rows it keeps.
+    let rfilter = match filter {
+        Some(f) => {
+            let mut fsub = AggCtx::Forbidden;
+            let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
+            match ft {
+                ResolvedType::Bool | ResolvedType::Null => Some(rf),
+                _ => return Err(type_error("argument of FILTER must be type boolean")),
+            }
+        }
+        None => None,
+    };
     let spec = WindowSpec {
         plan,
         partition,
         order,
         args: wargs,
         frame,
+        filter: rfilter,
     };
     // Append the spec and resolve the result slot (the PLACEHOLDER `WINDOW_RESULT_BASE + w`, rebased to
     // its real slot after the row layout is final — window.md §5.1). Restore the borrowed `agg_specs`
@@ -23971,21 +23993,26 @@ fn resolve(
                         "DISTINCT is not implemented for window functions",
                     ));
                 }
-                // FILTER over a window function is deferred (aggregates.md §11). A pure (non-aggregate)
-                // window function with FILTER is PG's own 0A000 ("FILTER is not implemented for
-                // non-aggregate window functions"); a window AGGREGATE with FILTER is allowed by PG but
-                // deferred here to a follow-on (a documented jed divergence) — both 0A000.
-                if filter.is_some() {
+                // FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the
+                // frame rows for which the filter is TRUE; a pure (non-aggregate) window function with
+                // FILTER is PG's own 0A000 ("FILTER is not implemented for non-aggregate window
+                // functions"). The filter is threaded into the WindowSpec and applied in the window stage.
+                if filter.is_some() && !is_aggregate_name(name) {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
-                        if is_aggregate_name(name) {
-                            "FILTER is not yet supported for window aggregate functions"
-                        } else {
-                            "FILTER is not implemented for non-aggregate window functions"
-                        },
+                        "FILTER is not implemented for non-aggregate window functions",
                     ));
                 }
-                return resolve_window_call(scope, name, args, *star, wd, agg, params);
+                return resolve_window_call(
+                    scope,
+                    name,
+                    args,
+                    *star,
+                    wd,
+                    filter.as_deref(),
+                    agg,
+                    params,
+                );
             }
             // A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's
             // wrong_object_type, not the windowing_error 42P20 it uses for a window in WHERE —
@@ -33759,6 +33786,16 @@ fn apply_window_stage(
                             Ok(Value::Null)
                         }
                     };
+                    // FILTER (WHERE cond): a frame row whose filter is not TRUE does not fold into the
+                    // window aggregate (aggregates.md §20). Evaluated per visited frame row (charging
+                    // its operator_evals); `None` keeps every row. A FILTER forces the naive re-fold
+                    // path for explicit frames (a filtered row cannot be cleanly un-folded).
+                    let filter_pass = |k: usize, m: &mut Meter| -> Result<bool> {
+                        match &spec.filter {
+                            Some(f) => Ok(f.eval(&rows[ordered[k]], env, m)?.is_true()),
+                            None => Ok(true),
+                        }
+                    };
                     if spec.frame.is_none() {
                         // DEFAULT frame: a single running pass, snapshotting the accumulator at each
                         // peer-group boundary (window.md §6) — O(n).
@@ -33784,6 +33821,9 @@ fn apply_window_stage(
                         for &(start, end) in &groups {
                             for k in start..end {
                                 meter.charge(COSTS.window_frame_step);
+                                if !filter_pass(k, meter)? {
+                                    continue; // FILTER excludes this row from the running fold
+                                }
                                 let v = opval(k, meter)?;
                                 acc.fold(v, meter)?;
                             }
@@ -33829,9 +33869,11 @@ fn apply_window_stage(
                             }
                             Ok(vals[k].as_ref().unwrap().clone())
                         };
-                        if exclude != crate::ast::FrameExclusion::NoOthers {
-                            // EXCLUDE breaks the clean add/remove model → naive per-row re-fold (the
-                            // dropped rows are neither metered nor counted), over the cached operand.
+                        if exclude != crate::ast::FrameExclusion::NoOthers || spec.filter.is_some()
+                        {
+                            // EXCLUDE or FILTER breaks the clean add/remove model → naive per-row
+                            // re-fold (the dropped rows are neither metered nor counted), over the
+                            // cached operand. A FILTER additionally skips a non-TRUE frame row.
                             for pos in 0..np {
                                 let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
                                 let mut acc = Acc::new(aggplan);
@@ -33840,6 +33882,9 @@ fn apply_window_stage(
                                         continue;
                                     }
                                     meter.charge(COSTS.window_frame_step);
+                                    if !filter_pass(k, meter)? {
+                                        continue;
+                                    }
                                     let v = eval_at(k, meter, &mut vals)?;
                                     acc.fold(v, meter)?;
                                 }
