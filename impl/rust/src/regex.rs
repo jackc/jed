@@ -1006,6 +1006,55 @@ impl Program {
         out.extend(orig_input[pos..].iter());
         Ok(out)
     }
+
+    /// Count the non-overlapping matches at or after code-point position `start` (`regexp_count`,
+    /// regex.md §8b). The non-overlapping advance is `regexp_replace`'s global rule: after a match
+    /// `[s,e)` continue at `e`, or at `e+1` for an EMPTY match so a nullable pattern terminates.
+    /// `start` may be up to `len` (a match of the empty string at the very end still counts);
+    /// `start > len` (the caller clamps it to `len+1`) yields 0.
+    pub fn regexp_count(&self, input: &[char], start: usize, m: &mut Meter) -> Result<i64> {
+        let len = input.len();
+        let mut pos = start;
+        let mut count = 0i64;
+        while pos <= len {
+            let Some(saves) = self.search(input, pos, m)? else {
+                break;
+            };
+            count += 1;
+            let s = saves[0] as usize;
+            let e = saves[1] as usize;
+            pos = if e > s { e } else { e + 1 };
+        }
+        Ok(count)
+    }
+
+    /// The capture slots of the N-th (1-based) non-overlapping match at or after `start`
+    /// (`regexp_substr` / `regexp_instr`, regex.md §8b), or `None` when fewer than N matches exist.
+    /// Same non-overlapping advance as [`regexp_count`](Self::regexp_count).
+    pub fn nth_match(
+        &self,
+        input: &[char],
+        start: usize,
+        n: i64,
+        m: &mut Meter,
+    ) -> Result<Option<Vec<i64>>> {
+        let len = input.len();
+        let mut pos = start;
+        let mut count = 0i64;
+        while pos <= len {
+            let Some(saves) = self.search(input, pos, m)? else {
+                break;
+            };
+            count += 1;
+            if count == n {
+                return Ok(Some(saves));
+            }
+            let s = saves[0] as usize;
+            let e = saves[1] as usize;
+            pos = if e > s { e } else { e + 1 };
+        }
+        Ok(None)
+    }
 }
 
 /// Slice `orig[start..end]` to an owned `String`, or `None` for an unset (`-1`) group.

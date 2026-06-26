@@ -341,6 +341,8 @@ import {
   regexNinst,
   regexpMatch,
   regexpReplace,
+  regexpCount,
+  regexpNthMatch,
 } from "./regex.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
@@ -12867,7 +12869,7 @@ type RExpr =
   // the one-shot flag charging its regex_compile cost once per execution.
   | {
       kind: "regexFunc";
-      func: "replace" | "match";
+      func: "replace" | "match" | "like" | "count" | "substr" | "instr";
       args: RExpr[];
       program: RegexProgram | null;
       compileCharged: boolean;
@@ -16943,9 +16945,16 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveRangeCtor(scope, e, ag, params);
   }
-  // The regex scalar functions (regex.md §8) are kind === "function" too, but return text / text[]
-  // via a dedicated regexFunc node, so they are intercepted before the generic scalar path.
-  if (lname === "regexp_replace" || lname === "regexp_match") {
+  // The regex scalar functions (regex.md §8 / §8b) are kind === "function" too, but return via a
+  // dedicated regexFunc node, so they are intercepted before the generic scalar path.
+  if (
+    lname === "regexp_replace" ||
+    lname === "regexp_match" ||
+    lname === "regexp_like" ||
+    lname === "regexp_count" ||
+    lname === "regexp_substr" ||
+    lname === "regexp_instr"
+  ) {
     rejectNamed(lname, e.argNames);
     return resolveRegexFunc(scope, e, ag, params);
   }
@@ -17021,23 +17030,77 @@ function resolveRegexFunc(
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const name = e.name.toLowerCase();
-  let func: "replace" | "match";
+  let func: "replace" | "match" | "like" | "count" | "substr" | "instr";
   let flagsIdx = -1;
-  if (name === "regexp_replace" && e.args.length === 3) func = "replace";
-  else if (name === "regexp_replace" && e.args.length === 4) {
+  // intPositions are the integer-typed argument indices; source(0) and pattern(1) are always text.
+  let intPositions: number[] = [];
+  const n = e.args.length;
+  if (name === "regexp_replace" && n === 3) func = "replace";
+  else if (name === "regexp_replace" && n === 4) {
     func = "replace";
     flagsIdx = 3;
-  } else if (name === "regexp_match" && e.args.length === 2) func = "match";
-  else if (name === "regexp_match" && e.args.length === 3) {
+  } else if (name === "regexp_match" && n === 2) func = "match";
+  else if (name === "regexp_match" && n === 3) {
     func = "match";
     flagsIdx = 2;
+  } else if (name === "regexp_like" && n === 2) func = "like";
+  else if (name === "regexp_like" && n === 3) {
+    func = "like";
+    flagsIdx = 2;
+  } else if (name === "regexp_count" && n === 2) func = "count";
+  else if (name === "regexp_count" && n === 3) {
+    func = "count";
+    intPositions = [2];
+  } else if (name === "regexp_count" && n === 4) {
+    func = "count";
+    flagsIdx = 3;
+    intPositions = [2];
+  } else if (name === "regexp_substr" && n === 2) func = "substr";
+  else if (name === "regexp_substr" && n === 3) {
+    func = "substr";
+    intPositions = [2];
+  } else if (name === "regexp_substr" && n === 4) {
+    func = "substr";
+    intPositions = [2, 3];
+  } else if (name === "regexp_substr" && n === 5) {
+    func = "substr";
+    flagsIdx = 4;
+    intPositions = [2, 3];
+  } else if (name === "regexp_substr" && n === 6) {
+    func = "substr";
+    flagsIdx = 4;
+    intPositions = [2, 3, 5];
+  } else if (name === "regexp_instr" && n === 2) func = "instr";
+  else if (name === "regexp_instr" && n === 3) {
+    func = "instr";
+    intPositions = [2];
+  } else if (name === "regexp_instr" && n === 4) {
+    func = "instr";
+    intPositions = [2, 3];
+  } else if (name === "regexp_instr" && n === 5) {
+    func = "instr";
+    intPositions = [2, 3, 4];
+  } else if (name === "regexp_instr" && n === 6) {
+    func = "instr";
+    flagsIdx = 5;
+    intPositions = [2, 3, 4];
+  } else if (name === "regexp_instr" && n === 7) {
+    func = "instr";
+    flagsIdx = 5;
+    intPositions = [2, 3, 4, 6];
   } else throw noFuncOverload(name);
 
   const rargs: RExpr[] = [];
-  for (const a of e.args) {
-    const r = resolve(scope, a, "text", ag, params);
-    requireTextOrNull(r.type);
-    rargs.push(r.node);
+  for (let i = 0; i < e.args.length; i++) {
+    if (intPositions.includes(i)) {
+      const r = resolve(scope, e.args[i], "i64", ag, params);
+      if (r.type.kind !== "int" && r.type.kind !== "null") throw noFuncOverload(name);
+      rargs.push(r.node);
+    } else {
+      const r = resolve(scope, e.args[i], "text", ag, params);
+      requireTextOrNull(r.type);
+      rargs.push(r.node);
+    }
   }
   // Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
   let insensitive: boolean | null = false;
@@ -17050,8 +17113,11 @@ function resolveRegexFunc(
     const pat = insensitive ? foldLowerSimple(rargs[1].value, loadedProperty()) : rargs[1].value;
     program = compileRegex(pat);
   }
-  const type: ResolvedType =
-    func === "replace" ? { kind: "text" } : { kind: "array", elem: { kind: "text" } };
+  let type: ResolvedType;
+  if (func === "replace" || func === "substr") type = { kind: "text" };
+  else if (func === "match") type = { kind: "array", elem: { kind: "text" } };
+  else if (func === "like") type = { kind: "bool" };
+  else type = { kind: "int", ty: "i32" }; // count, instr
   return { node: { kind: "regexFunc", func, args: rargs, program, compileCharged: false }, type };
 }
 
@@ -25219,12 +25285,62 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           throw new Error("unreachable: resolver requires text regexp_* operands");
         return v.text;
       };
+      const int = (v: Value): number => {
+        if (v.kind !== "int")
+          throw new Error("unreachable: resolver requires integer regexp_* operands");
+        return Number(v.int);
+      };
       const source = text(vals[0]);
       const pattern = text(vals[1]);
-      const replacement = e.func === "replace" ? text(vals[2]) : "";
-      const flags =
-        e.func === "replace" ? (vals[3] ? text(vals[3]) : "") : vals[2] ? text(vals[2]) : "";
-      // Validate flags: `i` (both), `g` (replace only); anything else is 2201B.
+      // Per-function argument layout (regex.md §8 / §8b); the numeric defaults match PG.
+      let replacement = "";
+      let flags = "";
+      let start = 1;
+      let nth = 1;
+      let endoption = 0;
+      let subexpr = 0;
+      switch (e.func) {
+        case "replace":
+          replacement = text(vals[2]);
+          if (vals[3]) flags = text(vals[3]);
+          break;
+        case "match":
+        case "like":
+          if (vals[2]) flags = text(vals[2]);
+          break;
+        case "count":
+          if (vals[2]) start = int(vals[2]);
+          if (vals[3]) flags = text(vals[3]);
+          break;
+        case "substr":
+          if (vals[2]) start = int(vals[2]);
+          if (vals[3]) nth = int(vals[3]);
+          if (vals[4]) flags = text(vals[4]);
+          if (vals[5]) subexpr = int(vals[5]);
+          break;
+        case "instr":
+          if (vals[2]) start = int(vals[2]);
+          if (vals[3]) nth = int(vals[3]);
+          if (vals[4]) endoption = int(vals[4]);
+          if (vals[5]) flags = text(vals[5]);
+          if (vals[6]) subexpr = int(vals[6]);
+          break;
+      }
+      // Numeric argument validation (regex.md §8b), BEFORE the pattern compiles (PG order: a bad
+      // `start` beats a bad pattern). 22023 names the offending parameter.
+      const badParam = (p: string, v: number): EngineError =>
+        engineError("invalid_parameter_value", `invalid value for parameter "${p}": ${v}`);
+      if (e.func === "count" || e.func === "substr" || e.func === "instr") {
+        if (start < 1) throw badParam("start", start);
+      }
+      if (e.func === "substr" || e.func === "instr") {
+        if (nth < 1) throw badParam("n", nth);
+      }
+      if (e.func === "instr" && endoption !== 0 && endoption !== 1)
+        throw badParam("endoption", endoption);
+      if ((e.func === "substr" || e.func === "instr") && subexpr < 0)
+        throw badParam("subexpr", subexpr);
+      // Validate flags: `i` (all), `g` (replace only); anything else is 2201B.
       for (const c of flags) {
         if (!(c === "i" || (c === "g" && e.func === "replace"))) {
           throw engineError(
@@ -25256,13 +25372,45 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
         m.guard();
       }
-      if (e.func === "replace") {
-        const repl = Array.from(replacement, (ch) => ch.codePointAt(0) as number);
-        return { kind: "text", text: regexpReplace(prog, matchCps, origCps, repl, global, m) };
+      // 0-based search start; clamp to len+1 (a start past len+1 never enters the iteration loop →
+      // 0 / NULL, the PG rule, regex.md §8b).
+      const start0 = Math.min(start - 1, matchCps.length + 1);
+      switch (e.func) {
+        case "replace": {
+          const repl = Array.from(replacement, (ch) => ch.codePointAt(0) as number);
+          return { kind: "text", text: regexpReplace(prog, matchCps, origCps, repl, global, m) };
+        }
+        case "match": {
+          const groups = regexpMatch(prog, matchCps, origCps, m);
+          if (groups === null) return nullValue();
+          return arrayValue(
+            groups.map((g) => (g === null ? nullValue() : { kind: "text", text: g })),
+          );
+        }
+        case "like":
+          return boolValue(regexIsMatch(prog, matchCps, m));
+        case "count":
+          return intValue(BigInt(regexpCount(prog, matchCps, start0, m)));
+        default: {
+          // substr / instr — both find the N-th match's subexpr span.
+          const saves = regexpNthMatch(prog, matchCps, start0, nth, m);
+          const noMatch = (): Value => (e.func === "substr" ? nullValue() : intValue(0n));
+          if (saves === null) return noMatch();
+          // `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
+          // or a non-participating group (-1) → NULL / 0.
+          const ng = saves.length / 2 - 1;
+          if (subexpr > ng) return noMatch();
+          const si = 2 * subexpr;
+          const s2 = saves[si];
+          const e2 = saves[si + 1];
+          if (s2 < 0 || e2 < 0) return noMatch();
+          if (e.func === "substr") {
+            return { kind: "text", text: String.fromCodePoint(...origCps.slice(s2, e2)) };
+          }
+          // endoption 0 → first-char position, 1 → after-last-char (1-based).
+          return intValue(BigInt(endoption === 0 ? s2 + 1 : e2 + 1));
+        }
       }
-      const groups = regexpMatch(prog, matchCps, origCps, m);
-      if (groups === null) return nullValue();
-      return arrayValue(groups.map((g) => (g === null ? nullValue() : { kind: "text", text: g })));
     }
     case "casing": {
       m.charge(COSTS.operatorEval);

@@ -992,6 +992,63 @@ func (p *regexProgram) regexpReplace(matchInput, origInput, replacement []rune, 
 	return string(out), nil
 }
 
+// regexpCount counts the non-overlapping matches at or after code-point position `start`
+// (regexp_count, regex.md §8b). The advance is regexpReplace's global rule: after a match [s,e)
+// continue at e, or at e+1 for an EMPTY match so a nullable pattern terminates. `start` may be up to
+// len (an empty match at the very end still counts); start > len (clamped to len+1 by the caller)
+// yields 0.
+func (p *regexProgram) regexpCount(input []rune, start int, m *Meter) (int64, error) {
+	length := len(input)
+	pos := start
+	var count int64
+	for pos <= length {
+		saves, err := p.search(input, pos, m)
+		if err != nil {
+			return 0, err
+		}
+		if saves == nil {
+			break
+		}
+		count++
+		s, e := int(saves[0]), int(saves[1])
+		if e > s {
+			pos = e
+		} else {
+			pos = e + 1
+		}
+	}
+	return count, nil
+}
+
+// nthMatch returns the capture slots of the N-th (1-based) non-overlapping match at or after `start`
+// (regexp_substr / regexp_instr, regex.md §8b), or nil when fewer than N matches exist. Same
+// non-overlapping advance as regexpCount.
+func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *Meter) ([]int64, error) {
+	length := len(input)
+	pos := start
+	var count int64
+	for pos <= length {
+		saves, err := p.search(input, pos, m)
+		if err != nil {
+			return nil, err
+		}
+		if saves == nil {
+			break
+		}
+		count++
+		if count == n {
+			return saves, nil
+		}
+		s, e := int(saves[0]), int(saves[1])
+		if e > s {
+			pos = e
+		} else {
+			pos = e + 1
+		}
+	}
+	return nil, nil
+}
+
 // sliceGroup slices orig[start:end] to a string pointer, or nil for an unset (-1) group.
 func sliceGroup(orig []rune, start, end int64) *string {
 	if start < 0 || end < 0 {

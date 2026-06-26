@@ -16332,6 +16332,10 @@ type regexFunc int
 const (
 	rxReplace regexFunc = iota // regexp_replace(source, pattern, replacement [, flags]) → text
 	rxMatch                    // regexp_match(source, pattern [, flags]) → text[]
+	rxLike                     // regexp_like(string, pattern [, flags]) → boolean (regex.md §8b)
+	rxCount                    // regexp_count(string, pattern [, start [, flags]]) → integer
+	rxSubstr                   // regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text
+	rxInstr                    // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer
 )
 
 // rangeOp selects a range BOOLEAN operator (spec/design/range-functions.md §3, RF3). Each is a binary
@@ -20915,10 +20919,12 @@ func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	return &rExpr{kind: reArrayFunc, afunc: arrayFuncID(name), sargs: rargs}, result, nil
 }
 
-// resolveRegexFunc resolves regexp_replace/regexp_match (regex.md §8) → a reRegexFunc node whose
-// result type (text / text[]) lives in the surrounding resolvedType. Both are STRICT (text args,
-// NULL propagates). A constant pattern is precompiled once here (regex.md §5) — but only when the
-// case-insensitive `i` flag is statically known (the flags arg absent or a constant).
+// resolveRegexFunc resolves regexp_replace/regexp_match (regex.md §8) and the Oracle-compat
+// regexp_like/regexp_count/regexp_substr/regexp_instr (regex.md §8b) → a reRegexFunc node whose
+// result type lives in the surrounding resolvedType. All are STRICT (NULL arg propagates). The text
+// slots (source, pattern, flags) require text-or-null; the numeric slots (start/N/endoption/subexpr)
+// require integer-or-null (a non-integer is 42883). A constant pattern is precompiled once here
+// (regex.md §5) — but only when the case-insensitive `i` flag is statically known.
 func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
 		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
@@ -20926,6 +20932,8 @@ func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	name := toLowerASCII(fc.Name)
 	var rfn regexFunc
 	flagsIdx := -1
+	// intPositions are the integer-typed argument indices; source(0) and pattern(1) are always text.
+	var intPositions []int
 	switch {
 	case name == "regexp_replace" && len(fc.Args) == 3:
 		rfn = rxReplace
@@ -20935,12 +20943,63 @@ func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		rfn = rxMatch
 	case name == "regexp_match" && len(fc.Args) == 3:
 		rfn, flagsIdx = rxMatch, 2
+	case name == "regexp_like" && len(fc.Args) == 2:
+		rfn = rxLike
+	case name == "regexp_like" && len(fc.Args) == 3:
+		rfn, flagsIdx = rxLike, 2
+	case name == "regexp_count" && len(fc.Args) == 2:
+		rfn = rxCount
+	case name == "regexp_count" && len(fc.Args) == 3:
+		rfn, intPositions = rxCount, []int{2}
+	case name == "regexp_count" && len(fc.Args) == 4:
+		rfn, flagsIdx, intPositions = rxCount, 3, []int{2}
+	case name == "regexp_substr" && len(fc.Args) == 2:
+		rfn = rxSubstr
+	case name == "regexp_substr" && len(fc.Args) == 3:
+		rfn, intPositions = rxSubstr, []int{2}
+	case name == "regexp_substr" && len(fc.Args) == 4:
+		rfn, intPositions = rxSubstr, []int{2, 3}
+	case name == "regexp_substr" && len(fc.Args) == 5:
+		rfn, flagsIdx, intPositions = rxSubstr, 4, []int{2, 3}
+	case name == "regexp_substr" && len(fc.Args) == 6:
+		rfn, flagsIdx, intPositions = rxSubstr, 4, []int{2, 3, 5}
+	case name == "regexp_instr" && len(fc.Args) == 2:
+		rfn = rxInstr
+	case name == "regexp_instr" && len(fc.Args) == 3:
+		rfn, intPositions = rxInstr, []int{2}
+	case name == "regexp_instr" && len(fc.Args) == 4:
+		rfn, intPositions = rxInstr, []int{2, 3}
+	case name == "regexp_instr" && len(fc.Args) == 5:
+		rfn, intPositions = rxInstr, []int{2, 3, 4}
+	case name == "regexp_instr" && len(fc.Args) == 6:
+		rfn, flagsIdx, intPositions = rxInstr, 5, []int{2, 3, 4}
+	case name == "regexp_instr" && len(fc.Args) == 7:
+		rfn, flagsIdx, intPositions = rxInstr, 5, []int{2, 3, 4, 6}
 	default:
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
-	textHint := Text
+	isInt := func(i int) bool {
+		for _, p := range intPositions {
+			if p == i {
+				return true
+			}
+		}
+		return false
+	}
+	textHint, intHint := Text, Int64
 	rargs := make([]*rExpr, len(fc.Args))
 	for i := range fc.Args {
+		if isInt(i) {
+			r, t, err := resolve(s, *fc.Args[i], &intHint, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if t.kind != rtInt && t.kind != rtNull {
+				return nil, resolvedType{}, noFuncOverload(name)
+			}
+			rargs[i] = r
+			continue
+		}
 		r, t, err := resolve(s, *fc.Args[i], &textHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -20972,11 +21031,16 @@ func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		}
 	}
 	var result resolvedType
-	if rfn == rxReplace {
+	switch rfn {
+	case rxReplace, rxSubstr:
 		result = resolvedType{kind: rtText}
-	} else {
+	case rxMatch:
 		elem := resolvedType{kind: rtText}
 		result = resolvedType{kind: rtArray, elem: &elem}
+	case rxLike:
+		result = resolvedType{kind: rtBool}
+	default: // rxCount, rxInstr
+		result = resolvedType{kind: rtInt, intTy: Int32}
 	}
 	return &rExpr{kind: reRegexFunc, rxFunc: rfn, sargs: rargs, rxProgram: prog}, result, nil
 }
@@ -22598,9 +22662,10 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveRangeCtor(s, fc, ag, params)
 	}
-	// The regex scalar functions (regex.md §8) are Kind=="function" too, but return text / text[] via
-	// a dedicated reRegexFunc node, so they are intercepted before the generic scalar path.
-	if name == "regexp_replace" || name == "regexp_match" {
+	// The regex scalar functions (regex.md §8 / §8b) are Kind=="function" too, but return via a
+	// dedicated reRegexFunc node, so they are intercepted before the generic scalar path.
+	switch name {
+	case "regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr":
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -28351,16 +28416,92 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			vals[i] = v
 		}
 		source, pattern := vals[0].Str, vals[1].Str
+		// Per-function argument layout (regex.md §8 / §8b); the numeric defaults match PG.
 		var replacement, flags string
-		if e.rxFunc == rxReplace {
+		start, nth, endoption, subexpr := int64(1), int64(1), int64(0), int64(0)
+		switch e.rxFunc {
+		case rxReplace:
 			replacement = vals[2].Str
 			if len(vals) > 3 {
 				flags = vals[3].Str
 			}
-		} else if len(vals) > 2 {
-			flags = vals[2].Str
+		case rxMatch, rxLike:
+			if len(vals) > 2 {
+				flags = vals[2].Str
+			}
+		case rxCount:
+			if len(vals) > 2 {
+				start = vals[2].Int
+			}
+			if len(vals) > 3 {
+				flags = vals[3].Str
+			}
+		case rxSubstr:
+			if len(vals) > 2 {
+				start = vals[2].Int
+			}
+			if len(vals) > 3 {
+				nth = vals[3].Int
+			}
+			if len(vals) > 4 {
+				flags = vals[4].Str
+			}
+			if len(vals) > 5 {
+				subexpr = vals[5].Int
+			}
+		case rxInstr:
+			if len(vals) > 2 {
+				start = vals[2].Int
+			}
+			if len(vals) > 3 {
+				nth = vals[3].Int
+			}
+			if len(vals) > 4 {
+				endoption = vals[4].Int
+			}
+			if len(vals) > 5 {
+				flags = vals[5].Str
+			}
+			if len(vals) > 6 {
+				subexpr = vals[6].Int
+			}
 		}
-		// Validate flags: `i` (both), `g` (replace only); anything else is 2201B.
+		// Numeric argument validation (regex.md §8b), BEFORE the pattern compiles (PG order: a bad
+		// `start` beats a bad pattern). 22023 names the offending parameter.
+		badParam := func(p string, v int64) error {
+			return NewError(InvalidParameterValue,
+				fmt.Sprintf("invalid value for parameter %q: %d", p, v))
+		}
+		switch e.rxFunc {
+		case rxCount:
+			if start < 1 {
+				return Value{}, badParam("start", start)
+			}
+		case rxSubstr:
+			if start < 1 {
+				return Value{}, badParam("start", start)
+			}
+			if nth < 1 {
+				return Value{}, badParam("n", nth)
+			}
+			if subexpr < 0 {
+				return Value{}, badParam("subexpr", subexpr)
+			}
+		case rxInstr:
+			if start < 1 {
+				return Value{}, badParam("start", start)
+			}
+			if nth < 1 {
+				return Value{}, badParam("n", nth)
+			}
+			if endoption != 0 && endoption != 1 {
+				return Value{}, badParam("endoption", endoption)
+			}
+			if subexpr < 0 {
+				return Value{}, badParam("subexpr", subexpr)
+			}
+		}
+		// Validate flags: `i` (all), `g` (replace only); anything else is 2201B.
 		for _, c := range flags {
 			if !(c == 'i' || (c == 'g' && e.rxFunc == rxReplace)) {
 				return Value{}, NewError(InvalidRegularExpression,
@@ -28403,29 +28544,83 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 		}
-		if e.rxFunc == rxReplace {
+		// 0-based search start; clamp to len+1 (a start past len+1 never enters the iteration loop →
+		// 0 / NULL, the PG rule, regex.md §8b).
+		length := int64(len(matchRunes))
+		start0 := start - 1
+		if start0 > length+1 {
+			start0 = length + 1
+		}
+		switch e.rxFunc {
+		case rxReplace:
 			out, err := prog.regexpReplace(matchRunes, origRunes, []rune(replacement), global, m)
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(out), nil
-		}
-		groups, ok, err := prog.regexpMatch(matchRunes, origRunes, m)
-		if err != nil {
-			return Value{}, err
-		}
-		if !ok {
-			return NullValue(), nil
-		}
-		elems := make([]Value, len(groups))
-		for i, g := range groups {
-			if g == nil {
-				elems[i] = NullValue()
-			} else {
-				elems[i] = TextValue(*g)
+		case rxMatch:
+			groups, ok, err := prog.regexpMatch(matchRunes, origRunes, m)
+			if err != nil {
+				return Value{}, err
 			}
+			if !ok {
+				return NullValue(), nil
+			}
+			elems := make([]Value, len(groups))
+			for i, g := range groups {
+				if g == nil {
+					elems[i] = NullValue()
+				} else {
+					elems[i] = TextValue(*g)
+				}
+			}
+			return ArrayValue(elems), nil
+		case rxLike:
+			matched, err := prog.isMatch(matchRunes, m)
+			if err != nil {
+				return Value{}, err
+			}
+			return BoolValue(matched), nil
+		case rxCount:
+			cnt, err := prog.regexpCount(matchRunes, int(start0), m)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(cnt), nil
+		default: // rxSubstr, rxInstr — both find the N-th match's subexpr span.
+			saves, err := prog.nthMatch(matchRunes, int(start0), nth, m)
+			if err != nil {
+				return Value{}, err
+			}
+			noMatch := func() Value {
+				if e.rxFunc == rxSubstr {
+					return NullValue()
+				}
+				return IntValue(0)
+			}
+			if saves == nil {
+				return noMatch(), nil
+			}
+			// `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
+			// or a non-participating group (-1) → NULL / 0.
+			ng := int64(len(saves)/2 - 1)
+			if subexpr > ng {
+				return noMatch(), nil
+			}
+			si := 2 * subexpr
+			s2, e2 := saves[si], saves[si+1]
+			if s2 < 0 || e2 < 0 {
+				return noMatch(), nil
+			}
+			if e.rxFunc == rxSubstr {
+				return TextValue(string(origRunes[s2:e2])), nil
+			}
+			// endoption 0 → first-char position, 1 → after-last-char (1-based).
+			if endoption == 0 {
+				return IntValue(s2 + 1), nil
+			}
+			return IntValue(e2 + 1), nil
 		}
-		return ArrayValue(elems), nil
 	case reCasing:
 		m.Charge(Costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)

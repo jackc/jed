@@ -13345,6 +13345,15 @@ enum RegexFunc {
     Replace,
     /// regexp_match(source, pattern [, flags]) → text[].
     Match,
+    /// regexp_like(string, pattern [, flags]) → boolean (regex.md §8b).
+    Like,
+    /// regexp_count(string, pattern [, start [, flags]]) → integer (regex.md §8b).
+    Count,
+    /// regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text (regex.md §8b).
+    Substr,
+    /// regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer
+    /// (regex.md §8b).
+    Instr,
 }
 
 /// The range BOOLEAN operators (spec/design/range-functions.md §3, RF3). Each is a binary infix
@@ -21961,7 +21970,15 @@ fn resolve_func_call(
     // The regex scalar functions (regex.md §8) are kind="function" too, but return text / text[] via
     // a dedicated RegexFunc node — the scalar-result path cannot carry the array result — so they are
     // intercepted before it, like the array/range functions above.
-    if lname == "regexp_replace" || lname == "regexp_match" {
+    if matches!(
+        lname.as_str(),
+        "regexp_replace"
+            | "regexp_match"
+            | "regexp_like"
+            | "regexp_count"
+            | "regexp_substr"
+            | "regexp_instr"
+    ) {
         reject_named(&lname, arg_names)?;
         if star {
             return Err(EngineError::new(
@@ -22102,11 +22119,13 @@ fn resolve_func_call(
     ))
 }
 
-/// Resolve `regexp_replace`/`regexp_match` (regex.md §8) → a [`RExpr::RegexFunc`] whose result type
-/// (text / text[]) lives in the surrounding [`ResolvedType`]. Both are STRICT (text args, NULL
-/// propagates). A constant pattern is precompiled once here (the precompilation contract, regex.md
-/// §5) — but only when the case-insensitive `i` flag is statically known (the flags arg absent or a
-/// constant), since `i` folds the pattern at compile time.
+/// Resolve `regexp_replace`/`regexp_match` (regex.md §8) and the Oracle-compat `regexp_like`/
+/// `regexp_count`/`regexp_substr`/`regexp_instr` (regex.md §8b) → a [`RExpr::RegexFunc`] whose result
+/// type lives in the surrounding [`ResolvedType`]. All are STRICT (NULL arg propagates). The text
+/// slots (source, pattern, flags) require text-or-null; the numeric slots (start/N/endoption/subexpr)
+/// require integer-or-null (a non-integer is 42883, jed's strict-typing stance). A constant pattern
+/// is precompiled once here (the precompilation contract, regex.md §5) — but only when the
+/// case-insensitive `i` flag is statically known (the flags arg absent or a constant).
 fn resolve_regex_func(
     scope: &Scope,
     name: &str, // already lowercased
@@ -22114,18 +22133,43 @@ fn resolve_regex_func(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    let (func, flags_idx) = match name {
-        "regexp_replace" if args.len() == 3 => (RegexFunc::Replace, None),
-        "regexp_replace" if args.len() == 4 => (RegexFunc::Replace, Some(3)),
-        "regexp_match" if args.len() == 2 => (RegexFunc::Match, None),
-        "regexp_match" if args.len() == 3 => (RegexFunc::Match, Some(2)),
-        _ => return Err(no_func_overload(name)),
-    };
+    // (func, flags arg index, the integer-typed argument positions) per name + arity. Source(0) and
+    // pattern(1) are always text; everything else is an integer except the flags slot (regex.md §8b).
+    let (func, flags_idx, int_positions): (RegexFunc, Option<usize>, &[usize]) =
+        match (name, args.len()) {
+            ("regexp_replace", 3) => (RegexFunc::Replace, None, &[]),
+            ("regexp_replace", 4) => (RegexFunc::Replace, Some(3), &[]),
+            ("regexp_match", 2) => (RegexFunc::Match, None, &[]),
+            ("regexp_match", 3) => (RegexFunc::Match, Some(2), &[]),
+            ("regexp_like", 2) => (RegexFunc::Like, None, &[]),
+            ("regexp_like", 3) => (RegexFunc::Like, Some(2), &[]),
+            ("regexp_count", 2) => (RegexFunc::Count, None, &[]),
+            ("regexp_count", 3) => (RegexFunc::Count, None, &[2]),
+            ("regexp_count", 4) => (RegexFunc::Count, Some(3), &[2]),
+            ("regexp_substr", 2) => (RegexFunc::Substr, None, &[]),
+            ("regexp_substr", 3) => (RegexFunc::Substr, None, &[2]),
+            ("regexp_substr", 4) => (RegexFunc::Substr, None, &[2, 3]),
+            ("regexp_substr", 5) => (RegexFunc::Substr, Some(4), &[2, 3]),
+            ("regexp_substr", 6) => (RegexFunc::Substr, Some(4), &[2, 3, 5]),
+            ("regexp_instr", 2) => (RegexFunc::Instr, None, &[]),
+            ("regexp_instr", 3) => (RegexFunc::Instr, None, &[2]),
+            ("regexp_instr", 4) => (RegexFunc::Instr, None, &[2, 3]),
+            ("regexp_instr", 5) => (RegexFunc::Instr, None, &[2, 3, 4]),
+            ("regexp_instr", 6) => (RegexFunc::Instr, Some(5), &[2, 3, 4]),
+            ("regexp_instr", 7) => (RegexFunc::Instr, Some(5), &[2, 3, 4, 6]),
+            _ => return Err(no_func_overload(name)),
+        };
     let mut rargs = Vec::with_capacity(args.len());
-    for a in args {
-        let (r, t) = resolve(scope, a, Some(ScalarType::Text), agg, params)?;
-        require_text_or_null(&t)?;
-        rargs.push(r);
+    for (i, a) in args.iter().enumerate() {
+        if int_positions.contains(&i) {
+            let (r, t) = resolve(scope, a, Some(ScalarType::Int64), agg, params)?;
+            require_int_or_null(&t, name)?;
+            rargs.push(r);
+        } else {
+            let (r, t) = resolve(scope, a, Some(ScalarType::Text), agg, params)?;
+            require_text_or_null(&t)?;
+            rargs.push(r);
+        }
     }
     // Precompile a constant pattern (rargs[1]) once, folding it for a statically-constant `i` flag.
     let insensitive = match flags_idx.map(|i| &rargs[i]) {
@@ -22146,8 +22190,10 @@ fn resolve_regex_func(
         _ => None,
     };
     let result = match func {
-        RegexFunc::Replace => ResolvedType::Text,
+        RegexFunc::Replace | RegexFunc::Substr => ResolvedType::Text,
         RegexFunc::Match => ResolvedType::Array(Box::new(ResolvedType::Text)),
+        RegexFunc::Like => ResolvedType::Bool,
+        RegexFunc::Count | RegexFunc::Instr => ResolvedType::Int(ScalarType::Int32),
     };
     Ok((
         RExpr::RegexFunc {
@@ -22158,6 +22204,16 @@ fn resolve_regex_func(
         },
         result,
     ))
+}
+
+/// A numeric regexp_* argument (start/N/endoption/subexpr, regex.md §8b) must be an integer type, or
+/// a bare NULL literal (which short-circuits the whole call to NULL at eval). A non-integer operand
+/// is 42883 — jed's strict-typing stance rather than PG's implicit text→int cast.
+fn require_int_or_null(ty: &ResolvedType, name: &str) -> Result<()> {
+    match ty {
+        ResolvedType::Int(_) | ResolvedType::Null => Ok(()),
+        _ => Err(no_func_overload(name)),
+    }
 }
 
 /// Named notation is only valid for a function that declares parameter names. Reject it on any
@@ -30731,14 +30787,115 @@ impl RExpr {
                         _ => unreachable!("resolver requires text regexp_* operands"),
                     }
                 };
+                let int = |v: &Value| -> i64 {
+                    match v {
+                        Value::Int(n) => *n,
+                        _ => unreachable!("resolver requires integer regexp_* operands"),
+                    }
+                };
                 let source = text(&vals[0]);
                 let pattern = text(&vals[1]);
-                let (replacement, flags) = match func {
-                    RegexFunc::Replace => (Some(text(&vals[2])), vals.get(3).map(text)),
-                    RegexFunc::Match => (None, vals.get(2).map(text)),
+                // Per-function argument layout (regex.md §8 / §8b); the numeric defaults match PG.
+                let mut start = 1i64;
+                let mut nth = 1i64;
+                let mut endoption = 0i64;
+                let mut subexpr = 0i64;
+                let mut replacement: Option<String> = None;
+                let mut flags = String::new();
+                match func {
+                    RegexFunc::Replace => {
+                        replacement = Some(text(&vals[2]));
+                        if let Some(v) = vals.get(3) {
+                            flags = text(v);
+                        }
+                    }
+                    RegexFunc::Match | RegexFunc::Like => {
+                        if let Some(v) = vals.get(2) {
+                            flags = text(v);
+                        }
+                    }
+                    RegexFunc::Count => {
+                        if let Some(v) = vals.get(2) {
+                            start = int(v);
+                        }
+                        if let Some(v) = vals.get(3) {
+                            flags = text(v);
+                        }
+                    }
+                    RegexFunc::Substr => {
+                        if let Some(v) = vals.get(2) {
+                            start = int(v);
+                        }
+                        if let Some(v) = vals.get(3) {
+                            nth = int(v);
+                        }
+                        if let Some(v) = vals.get(4) {
+                            flags = text(v);
+                        }
+                        if let Some(v) = vals.get(5) {
+                            subexpr = int(v);
+                        }
+                    }
+                    RegexFunc::Instr => {
+                        if let Some(v) = vals.get(2) {
+                            start = int(v);
+                        }
+                        if let Some(v) = vals.get(3) {
+                            nth = int(v);
+                        }
+                        if let Some(v) = vals.get(4) {
+                            endoption = int(v);
+                        }
+                        if let Some(v) = vals.get(5) {
+                            flags = text(v);
+                        }
+                        if let Some(v) = vals.get(6) {
+                            subexpr = int(v);
+                        }
+                    }
+                }
+                // Numeric argument validation (regex.md §8b), BEFORE the pattern compiles (PG order:
+                // a bad `start` beats a bad pattern). 22023 names the offending parameter.
+                let bad_param = |p: &str, v: i64| {
+                    EngineError::new(
+                        SqlState::InvalidParameterValue,
+                        format!("invalid value for parameter \"{p}\": {v}"),
+                    )
                 };
-                let flags = flags.unwrap_or_default();
-                // Validate flags: `i` (both), `g` (replace only); anything else is 2201B.
+                match func {
+                    RegexFunc::Count => {
+                        if start < 1 {
+                            return Err(bad_param("start", start));
+                        }
+                    }
+                    RegexFunc::Substr => {
+                        if start < 1 {
+                            return Err(bad_param("start", start));
+                        }
+                        if nth < 1 {
+                            return Err(bad_param("n", nth));
+                        }
+                        if subexpr < 0 {
+                            return Err(bad_param("subexpr", subexpr));
+                        }
+                    }
+                    RegexFunc::Instr => {
+                        if start < 1 {
+                            return Err(bad_param("start", start));
+                        }
+                        if nth < 1 {
+                            return Err(bad_param("n", nth));
+                        }
+                        if endoption != 0 && endoption != 1 {
+                            return Err(bad_param("endoption", endoption));
+                        }
+                        if subexpr < 0 {
+                            return Err(bad_param("subexpr", subexpr));
+                        }
+                    }
+                    RegexFunc::Replace | RegexFunc::Match | RegexFunc::Like => {}
+                }
+                // Validate flags: `i` (all), `g` (replace only); anything else is 2201B.
                 for c in flags.chars() {
                     let ok = c == 'i' || (c == 'g' && *func == RegexFunc::Replace);
                     if !ok {
@@ -30789,6 +30946,10 @@ impl RExpr {
                         &owned_prog
                     }
                 };
+                let len = match_chars.len();
+                // 0-based search start; clamp to len+1 (wasm-safe, and a start past len+1 simply
+                // never enters the iteration loop → 0 / NULL, the PG rule, regex.md §8b).
+                let start0 = (start - 1).min(len as i64 + 1) as usize;
                 match func {
                     RegexFunc::Replace => {
                         let repl: Vec<char> = replacement.unwrap().chars().collect();
@@ -30804,6 +30965,45 @@ impl RExpr {
                                 .map(|g| g.map_or(Value::Null, Value::Text))
                                 .collect();
                             Ok(Value::Array(ArrayVal::one_dim(elems)))
+                        }
+                    },
+                    RegexFunc::Like => Ok(Value::Bool(prog.is_match(&match_chars, m)?)),
+                    RegexFunc::Count => {
+                        Ok(Value::Int(prog.regexp_count(&match_chars, start0, m)?))
+                    }
+                    RegexFunc::Substr => match prog.nth_match(&match_chars, start0, nth, m)? {
+                        None => Ok(Value::Null),
+                        Some(saves) => {
+                            // `subexpr` selects the whole match (0) or a capture group; out of range
+                            // (> group count) or a non-participating group (-1) → NULL.
+                            let ng = (saves.len() / 2 - 1) as i64;
+                            if subexpr > ng {
+                                return Ok(Value::Null);
+                            }
+                            let si = 2 * subexpr as usize;
+                            let (s2, e2) = (saves[si], saves[si + 1]);
+                            if s2 < 0 || e2 < 0 {
+                                return Ok(Value::Null);
+                            }
+                            Ok(Value::Text(
+                                orig_chars[s2 as usize..e2 as usize].iter().collect(),
+                            ))
+                        }
+                    },
+                    RegexFunc::Instr => match prog.nth_match(&match_chars, start0, nth, m)? {
+                        None => Ok(Value::Int(0)),
+                        Some(saves) => {
+                            let ng = (saves.len() / 2 - 1) as i64;
+                            if subexpr > ng {
+                                return Ok(Value::Int(0));
+                            }
+                            let si = 2 * subexpr as usize;
+                            let (s2, e2) = (saves[si], saves[si + 1]);
+                            if s2 < 0 || e2 < 0 {
+                                return Ok(Value::Int(0));
+                            }
+                            // endoption 0 → first-char position, 1 → after-last-char (1-based).
+                            Ok(Value::Int(if endoption == 0 { s2 + 1 } else { e2 + 1 }))
                         }
                     },
                 }
@@ -34397,10 +34597,18 @@ mod registry_tests {
                 );
                 continue;
             }
-            if o.name == "regexp_replace" || o.name == "regexp_match" {
-                // A regex scalar function (regex.md §8): no scalar kernel id — the kernel is the
-                // `RExpr::RegexFunc` eval, reached from `resolve_regex_func`. Its result is text or a
-                // concrete text[] code.
+            if matches!(
+                o.name,
+                "regexp_replace"
+                    | "regexp_match"
+                    | "regexp_like"
+                    | "regexp_count"
+                    | "regexp_substr"
+                    | "regexp_instr"
+            ) {
+                // A regex scalar function (regex.md §8 / §8b): no scalar kernel id — the kernel is the
+                // `RExpr::RegexFunc` eval, reached from `resolve_regex_func`. Its result is a scalar
+                // (text / boolean / i32) or a concrete text[] code.
                 let concrete_array = o
                     .result
                     .strip_suffix("[]")

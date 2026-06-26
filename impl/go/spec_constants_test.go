@@ -526,9 +526,11 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			}
 			continue
 		}
-		if o.Name == "regexp_replace" || o.Name == "regexp_match" {
-			// A regex scalar function (regex.md §8): no scalar kernel id — the kernel is the reRegexFunc
-			// eval, reached from resolveRegexFunc. Its result is text / a concrete text[] code.
+		switch o.Name {
+		case "regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr":
+			// A regex scalar function (regex.md §8 / §8b): no scalar kernel id — the kernel is the
+			// reRegexFunc eval, reached from resolveRegexFunc. Its result is a scalar (text / boolean /
+			// i32) or a concrete text[] code.
 			concreteArray := false
 			if base, ok := strings.CutSuffix(o.Result, "[]"); ok {
 				_, concreteArray = ScalarTypeFromName(base)

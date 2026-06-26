@@ -1010,3 +1010,19 @@ reason = "jed: a set operation with COLLATE in the trailing ORDER BY -- PostgreS
 file = "expr/numeric_functions.test"
 sql = "SELECT sign(2)"
 reason = "jed: sign has decimal + float overloads with arg_resolution = none (catalog), and an integer literal does not implicitly promote to either family, so 42883. PostgreSQL resolves sign(int) to float8 (its preferred numeric type) and returns 1. The strict type system (§4): cross-family int -> decimal/float is explicit-cast-only, the same divergence sqrt(int) carries."
+
+# --- regexp_* flag set: jed's RE2-able flavor (regex.md §1/§8b) accepts only the `i` flag (and `g`
+# for regexp_replace), unlike PostgreSQL's larger c/g/m/n/p/q/s/t/w/x set. A flag other than `i` is
+# 2201B (invalid_regular_expression) across ALL of jed's regexp functions — consistent with the
+# existing regexp_replace/regexp_match. PostgreSQL accepts `q` (quote) and so RETURNS a row, and uses
+# 22023 (with a different message) for `z`/`g`, so these statement-error records diverge. A deliberate,
+# documented flavor narrowing, not a semantic disagreement on the supported (`i`) surface.
+[[override]]
+file = "expr/regexp_oracle_functions.test"
+sql = "SELECT regexp_like('abc', 'a', 'z') FROM one"
+reason = "jed: a regexp flag other than `i` is 2201B (jed's RE2 flavor owns a smaller flag set than PG — regex.md §1/§8b, consistent with regexp_replace/regexp_match). PostgreSQL knows the `z` option and raises 22023 'invalid regular expression option: z'. The codes differ (jed folds an unknown option into invalid_regular_expression); a documented flavor narrowing."
+
+[[override]]
+file = "expr/regexp_oracle_functions.test"
+sql = "SELECT regexp_count('abc', 'a', 1, 'g') FROM one"
+reason = "jed: the `g` (global) flag is regexp_replace-only, so on regexp_count it is 2201B (regex.md §8b). PostgreSQL raises 22023 'regexp_count() does not support the global option'. Same rejection, different SQLSTATE/message — jed's RE2 flag set is narrower and uniform across the regexp_* family."

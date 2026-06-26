@@ -1,0 +1,284 @@
+# Oracle-compatibility regex scalar functions regexp_like / regexp_count / regexp_substr /
+# regexp_instr (spec/design/regex.md §8b, Slice 3). Same hand-written Pike VM as the `~` operators
+# and the Slice-2 functions, but with INTEGER positional arguments. The BASIC subset tested here
+# AGREES with PostgreSQL (it is the RE2 subset that overlaps PG), so these rows oracle-check.
+# Verified against PostgreSQL 18.
+#   - regexp_like(string, pattern [, flags]) → boolean: TRUE iff pattern matches (= `string ~ pattern`).
+#   - regexp_count(string, pattern [, start [, flags]]) → integer: # non-overlapping matches at/after
+#     the 1-based `start` (default 1). NOTE the 3-arg form's 3rd arg is `start`, NOT flags.
+#   - regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text: the N-th match's
+#     substring (subexpr 0 = whole match, k = group k); no match / out-of-range subexpr / unset → NULL.
+#   - regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer: the
+#     1-based position of the N-th match's subexpr span (endoption 0 = first char, 1 = after last);
+#     no match / out-of-range subexpr / unset → 0.
+# All STRICT (a NULL arg → NULL). start<1/N<1/subexpr<0/endoption∉{0,1} → 22023. A flag other than
+# `i` (incl. `g`) → 2201B (jed's RE2 flavor uses a smaller flag set than PG — a documented divergence,
+# overridden in oracle_overrides.toml; PG uses 22023 there).
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, func.regexp_like, func.regexp_count, func.regexp_substr, func.regexp_instr, expr.regex_match, types.i32, types.text, types.boolean, types.array, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# ---------------------------------------------------------------------------
+# regexp_like — boolean, exactly `string ~ pattern`.
+# ---------------------------------------------------------------------------
+
+# Match anywhere (unanchored), and a non-match.
+query BB nosort
+SELECT regexp_like('abc', 'b'), regexp_like('abc', 'x') FROM one
+----
+true
+false
+
+# The `i` flag matches case-insensitively.
+query BB nosort
+SELECT regexp_like('ABC', 'b', 'i'), regexp_like('ABC', 'b') FROM one
+----
+true
+false
+
+# Anchors apply to the whole subject.
+query BBB nosort
+SELECT regexp_like('abc', '^a'), regexp_like('abc', '^b'), regexp_like('abc', 'c$') FROM one
+----
+true
+false
+true
+
+# A regex with quantifier + group. Cost (cost.md §3) = operatorEval + regex_compile (the 'o+b'
+# program, once) + regex_step (one match over 'foobar') + 1 scanned + 1 page + 1 produced — pinned
+# to lock the boolean kernel's cost identical across the three cores.
+# names: regexp_like
+# cost: 43
+query B nosort
+SELECT regexp_like('foobar', 'o+b') FROM one
+----
+true
+
+# STRICT: a NULL argument (any position) → NULL.
+query BBB nosort
+SELECT regexp_like(NULL, 'a'), regexp_like('a', NULL), regexp_like('a', 'a', NULL) FROM one
+----
+NULL
+NULL
+NULL
+
+# ---------------------------------------------------------------------------
+# regexp_count — integer count of non-overlapping matches.
+# ---------------------------------------------------------------------------
+
+# Basic counts; matches are non-overlapping ('aa' in 'aaa' once).
+query III nosort
+SELECT regexp_count('abab', 'ab'), regexp_count('aaa', 'a'), regexp_count('aaa', 'aa') FROM one
+----
+2
+3
+1
+
+# An empty-capable pattern matches the empty string at every gap (before a, b, c, and at end).
+query II nosort
+SELECT regexp_count('abc', 'x*'), regexp_count('', 'x*') FROM one
+----
+4
+1
+
+# `start` (1-based) skips earlier matches; a class pattern.
+query II nosort
+SELECT regexp_count('abcabc', 'bc', 3), regexp_count('a1b2c3', '\d') FROM one
+----
+1
+3
+
+# The 4-argument form's 4th argument is `flags`; `i` folds case. Cost = operatorEval + regex_compile
+# + the non-overlapping match loop's regex_step (the 'bc' pattern is searched across the folded
+# subject until exhausted) + scan/page/produce — pinned to lock the count loop's cost cross-core.
+# names: regexp_count
+# cost: 60
+query I nosort
+SELECT regexp_count('ABCabc', 'bc', 1, 'i') FROM one
+----
+2
+
+# `start` at or past the end behaves like PG: at len+1 an empty match still counts, beyond → 0.
+query III nosort
+SELECT regexp_count('abc', 'x*', 4), regexp_count('abc', 'x*', 5), regexp_count('abc', 'a', 10) FROM one
+----
+1
+0
+0
+
+# STRICT: a NULL argument → NULL.
+query II nosort
+SELECT regexp_count(NULL, 'a'), regexp_count('abc', NULL) FROM one
+----
+NULL
+NULL
+
+# ---------------------------------------------------------------------------
+# regexp_substr — text of the N-th match (or a capture subexpression).
+# ---------------------------------------------------------------------------
+
+# The whole match (subexpr defaults to 0), with or without a capture group in the pattern.
+query TT nosort
+SELECT regexp_substr('foobarbaz', 'b..'), regexp_substr('foobarbaz', 'b(..)') FROM one
+----
+bar
+bar
+
+# subexpr 1 selects capture group 1 within the match. Cost = operatorEval + regex_compile + the
+# nth-match loop's regex_step (one search reaching the 1st match) + scan/page/produce — pinned to
+# lock the nth-match kernel's cost cross-core.
+# names: regexp_substr
+# cost: 55
+query T nosort
+SELECT regexp_substr('foobarbaz', 'b(..)', 1, 1, '', 1) FROM one
+----
+ar
+
+# `start` and `N` select a later match.
+query TT nosort
+SELECT regexp_substr('foobarbaz', 'b..', 5), regexp_substr('a1b2c3', '[0-9]', 1, 2) FROM one
+----
+baz
+2
+
+# The 5th argument is `flags`; `i` folds case but the returned text keeps its ORIGINAL case.
+query T nosort
+SELECT regexp_substr('FOObar', 'o+', 1, 1, 'i') FROM one
+----
+OO
+
+# No match → NULL.
+query T nosort
+SELECT regexp_substr('abc', 'x') FROM one
+----
+NULL
+
+# An empty match → the empty STRING (length 0), distinct from a no-match NULL — checked via length()
+# because the corpus format cannot spell an empty-string cell directly.
+query II nosort
+SELECT length(regexp_substr('abc', 'x')), length(regexp_substr('abc', 'x*')) FROM one
+----
+NULL
+0
+
+# A non-participating group (alternation) and an out-of-range subexpr both → NULL.
+query TTT nosort
+SELECT regexp_substr('xbc', '(a)|(b)', 1, 1, '', 1), regexp_substr('xbc', '(a)|(b)', 1, 1, '', 2), regexp_substr('abc', '(a)', 1, 1, '', 5) FROM one
+----
+NULL
+b
+NULL
+
+# STRICT: a NULL argument → NULL.
+query TT nosort
+SELECT regexp_substr(NULL, 'a'), regexp_substr('abc', NULL) FROM one
+----
+NULL
+NULL
+
+# ---------------------------------------------------------------------------
+# regexp_instr — integer position of the N-th match (or a capture subexpression).
+# ---------------------------------------------------------------------------
+
+# Default: 1-based position of the first character of the first match.
+query II nosort
+SELECT regexp_instr('foobarbaz', 'b..'), regexp_instr('abc', 'x') FROM one
+----
+4
+0
+
+# `N` selects a later match; `endoption` 1 returns the position FOLLOWING the match.
+query II nosort
+SELECT regexp_instr('foobarbaz', 'b..', 1, 2), regexp_instr('foobarbaz', 'bar', 1, 1, 1) FROM one
+----
+7
+7
+
+# subexpr 1 returns the position of capture group 1 within the match. Same engine as regexp_substr
+# over the same subject/pattern, so the same cost (55) — only the result projection (position vs.
+# substring) differs. Pinned to lock the nth-match kernel's cost cross-core.
+# names: regexp_instr
+# cost: 55
+query I nosort
+SELECT regexp_instr('foobarbaz', 'b(..)', 1, 1, 0, '', 1) FROM one
+----
+5
+
+# A non-participating group → 0; a participating one → its position; an empty match → its position.
+query III nosort
+SELECT regexp_instr('xbc', '(a)|(b)', 1, 1, 0, '', 1), regexp_instr('xbc', '(a)|(b)', 1, 1, 0, '', 2), regexp_instr('abc', 'x*') FROM one
+----
+0
+2
+1
+
+# An out-of-range subexpr → 0.
+query I nosort
+SELECT regexp_instr('abc', '(a)', 1, 1, 0, '', 5) FROM one
+----
+0
+
+# STRICT: a NULL argument → NULL.
+query II nosort
+SELECT regexp_instr(NULL, 'a'), regexp_instr('abc', NULL) FROM one
+----
+NULL
+NULL
+
+# ---------------------------------------------------------------------------
+# Argument validation — 22023 (invalid_parameter_value), named after the bad parameter; agrees
+# with PostgreSQL (both code and message).
+# ---------------------------------------------------------------------------
+
+statement error 22023
+SELECT regexp_count('abc', 'a', 0) FROM one
+
+statement error 22023
+SELECT regexp_count('abc', 'a', -1) FROM one
+
+statement error 22023
+SELECT regexp_substr('abc', 'a', 0) FROM one
+
+statement error 22023
+SELECT regexp_substr('abc', 'a', 1, 0) FROM one
+
+statement error 22023
+SELECT regexp_substr('abc', '(a)', 1, 1, '', -1) FROM one
+
+statement error 22023
+SELECT regexp_instr('abc', 'a', 0) FROM one
+
+statement error 22023
+SELECT regexp_instr('abc', 'a', 1, 0) FROM one
+
+statement error 22023
+SELECT regexp_instr('abc', 'a', 1, 1, 2) FROM one
+
+statement error 22023
+SELECT regexp_instr('abc', '(a)', 1, 1, 0, '', -1) FROM one
+
+# ---------------------------------------------------------------------------
+# Malformed pattern — 2201B, surfaced when the pattern compiles (agrees with PostgreSQL).
+# ---------------------------------------------------------------------------
+
+statement error 2201B
+SELECT regexp_like('a', '(') FROM one
+
+statement error 2201B
+SELECT regexp_count('a', 'a{2,1}') FROM one
+
+statement error 2201B
+SELECT regexp_substr('a', '[') FROM one
+
+# A flag other than `i` is 2201B in jed (jed's RE2 flavor owns a smaller flag set; PG raises 22023
+# with a different message). A documented divergence — see oracle_overrides.toml.
+statement error 2201B
+SELECT regexp_like('abc', 'a', 'z') FROM one
+
+statement error 2201B
+SELECT regexp_count('abc', 'a', 1, 'g') FROM one

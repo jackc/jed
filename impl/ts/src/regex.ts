@@ -840,6 +840,51 @@ export function regexpReplace(
   return String.fromCodePoint(...out);
 }
 
+// regexpCount counts the non-overlapping matches at or after code-point position `start`
+// (regexp_count, regex.md §8b). The advance is regexpReplace's global rule: after a match [s,e)
+// continue at e, or at e+1 for an EMPTY match so a nullable pattern terminates. `start` may be up to
+// len (an empty match at the very end still counts); start > len (clamped to len+1 by the caller)
+// yields 0.
+export function regexpCount(p: RegexProgram, input: number[], start: number, m: Meter): number {
+  const len = input.length;
+  let pos = start;
+  let count = 0;
+  while (pos <= len) {
+    const saves = regexSearch(p, input, pos, m);
+    if (saves === null) break;
+    count++;
+    const s = saves[0];
+    const e = saves[1];
+    pos = e > s ? e : e + 1;
+  }
+  return count;
+}
+
+// regexpNthMatch returns the capture slots of the N-th (1-based) non-overlapping match at or after
+// `start` (regexp_substr / regexp_instr, regex.md §8b), or null when fewer than N matches exist.
+// Same non-overlapping advance as regexpCount.
+export function regexpNthMatch(
+  p: RegexProgram,
+  input: number[],
+  start: number,
+  n: number,
+  m: Meter,
+): number[] | null {
+  const len = input.length;
+  let pos = start;
+  let count = 0;
+  while (pos <= len) {
+    const saves = regexSearch(p, input, pos, m);
+    if (saves === null) break;
+    count++;
+    if (count === n) return saves;
+    const s = saves[0];
+    const e = saves[1];
+    pos = e > s ? e : e + 1;
+  }
+  return null;
+}
+
 // sliceGroup slices orig[start..end] to a string, or null for an unset (-1) group.
 function sliceGroup(orig: number[], start: number, end: number): string | null {
   if (start < 0 || end < 0) return null;

@@ -3589,6 +3589,196 @@ null           = "propagates"
 errors         = ["2201B"]
 volatility     = "immutable"
 
+# Oracle-compatibility regex scalar functions (../design/regex.md §8b, Slice 3). Same Pike VM and
+# RExpr::RegexFunc node as Slice 2, but with INTEGER positional arguments. STRICT (a NULL arg → NULL).
+#  - regexp_like(string, pattern [, flags]) → boolean: TRUE iff pattern matches (= `string ~ pattern`).
+#  - regexp_count(string, pattern [, start [, flags]]) → integer: number of non-overlapping matches at
+#    or after the 1-based `start` (default 1). NOTE the 3-arg form's 3rd arg is `start`, NOT flags.
+#  - regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text: the N-th match's
+#    substring (subexpr 0 = whole match, k = group k); no match / out-of-range subexpr / unset group →
+#    NULL.
+#  - regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer: the
+#    1-based position of the N-th match's subexpr span (endoption 0 = first char, 1 = after last char);
+#    no match / out-of-range subexpr / unset group → 0.
+# Argument validation (before the pattern compiles): start<1, N<1, subexpr<0, endoption∉{0,1} → 22023.
+# Only the `i` flag is meaningful; any other (incl. `g`) → 2201B (jed's RE2 flavor, a documented
+# divergence). Resolved via resolveRegexFunc, not the scalar-result path.
+[[operator]]
+name           = "regexp_like"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_like"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_count"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_count"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "integer"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_count"
+kind           = "function"
+arity          = 4
+arg_families   = ["text", "text", "integer", "text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_substr"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_substr"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_substr"
+kind           = "function"
+arity          = 4
+arg_families   = ["text", "text", "integer", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_substr"
+kind           = "function"
+arity          = 5
+arg_families   = ["text", "text", "integer", "integer", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_substr"
+kind           = "function"
+arity          = 6
+arg_families   = ["text", "text", "integer", "integer", "text", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_instr"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_instr"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "integer"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_instr"
+kind           = "function"
+arity          = 4
+arg_families   = ["text", "text", "integer", "integer"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_instr"
+kind           = "function"
+arity          = 5
+arg_families   = ["text", "text", "integer", "integer", "integer"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_instr"
+kind           = "function"
+arity          = 6
+arg_families   = ["text", "text", "integer", "integer", "integer", "text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_instr"
+kind           = "function"
+arity          = 7
+arg_families   = ["text", "text", "integer", "integer", "integer", "text", "integer"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
 [[operator]]
 name           = "isempty"
 kind           = "function"

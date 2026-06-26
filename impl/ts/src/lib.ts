@@ -190,6 +190,12 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // same Pike VM as the operators; the first text- and text[]-returning scalar functions.
   "func.regexp_replace",
   "func.regexp_match",
+  // Oracle-compat regex scalar functions (regex.md §8b): regexp_like → boolean, regexp_count →
+  // integer, regexp_substr → text, regexp_instr → integer, over the same Pike VM.
+  "func.regexp_like",
+  "func.regexp_count",
+  "func.regexp_substr",
+  "func.regexp_instr",
   // Array function surface AF3 (array-functions.md §9): the polymorphic SRF unnest(anyarray) — a
   // FROM-clause row source expanding an array into one row per element (functions.md §10).
   "func.unnest",

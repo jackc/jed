@@ -1,9 +1,11 @@
 # Regular expressions — design
 
 > Status: **Slice 1 (this doc)** — the engine + the four match operators `~ ~* !~ !~*`.
-> **Slice 2** — the scalar functions `regexp_replace` / `regexp_match`. Set-returning
-> functions (`regexp_matches`, `regexp_split_to_table`) and the rest of PG's `regexp_*` family
-> are **deferred** (§10). Stores nothing on disk → **no `format_version` bump**.
+> **Slice 2** — the scalar functions `regexp_replace` / `regexp_match`. **Slice 3** — the
+> Oracle-compat scalar functions `regexp_count` / `regexp_instr` / `regexp_substr` /
+> `regexp_like` (§8b). Set-returning functions (`regexp_matches`, `regexp_split_to_table`) and
+> the rest of PG's `regexp_*` family are **deferred** (§10). Stores nothing on disk → **no
+> `format_version` bump**.
 
 jed adds POSIX-style regular-expression matching with PostgreSQL's core operators (`~ ~* !~ !~*`)
 and a small function set. **The flavor deliberately does NOT track PostgreSQL** (CLAUDE.md §1):
@@ -388,6 +390,54 @@ metered).
 
 ---
 
+## 8b. Slice 3 — `regexp_count` / `regexp_instr` / `regexp_substr` / `regexp_like`
+
+PostgreSQL's four **Oracle-compatibility** scalar functions (PG 15+), over the same Pike VM and the
+same `RExpr::RegexFunc` node. Each is STRICT (a NULL argument → NULL). Unlike Slice 2 these take
+**integer** positional arguments alongside the text ones; the BASIC subset **agrees with PostgreSQL**
+(it is the RE2 subset that overlaps PG), so the corpus rows oracle-check.
+
+The shared kernel is **non-overlapping match iteration** from a code-point start position — the same
+advance rule the global `regexp_replace` already uses (after a match `[s,e)`, continue at `e`; an
+**empty** match `s==e` advances at `e+1` so a nullable pattern can't loop). `regexp_count` runs it to
+exhaustion; `regexp_substr`/`regexp_instr` stop at the **N-th** match.
+
+- **`regexp_like(string, pattern [, flags])` → boolean.** TRUE iff `pattern` matches somewhere in
+  `string` — exactly `string ~ pattern` (or `~*` with `'i'`). The simplest of the four; reuses the
+  boolean `is_match` directly (no start parameter).
+- **`regexp_count(string, pattern [, start [, flags]])` → integer.** The number of non-overlapping
+  matches at or after the 1-based `start` (default 1). An empty-capable pattern matches the empty
+  string at each gap (`regexp_count('abc', 'x*')` = 4: before `a`, `b`, `c`, and at end). `start`
+  past the end → 0. **Note** the 3-argument overload's 3rd argument is `start` (an integer), **not**
+  `flags`; `flags` appears only in the 4-argument form (the PG overload set).
+- **`regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])` → text.** The substring
+  matched by the **N-th** match (1-based `N`, default 1) at or after `start`. `subexpr` (default 0)
+  selects a parenthesized capture group within that match — 0 = the whole match, *k* = group *k*.
+  No N-th match, an out-of-range `subexpr` (> the pattern's group count), or a group that did not
+  participate → **NULL**.
+- **`regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]])` → integer.**
+  The 1-based position of the **N-th** match's `subexpr` span. `endoption` (default 0) picks **0** =
+  the position of the first character of the span, **1** = the position *following* the last
+  character. No N-th match, out-of-range `subexpr`, or a non-participating group → **0**.
+
+**Argument validation** (before the pattern compiles, matching PG's order — a bad `start` beats a bad
+pattern): `start` < 1, `N` < 1, `subexpr` < 0, and `endoption` ∉ {0, 1} each raise **`22023`**
+(`invalid_parameter_value`) with the offending parameter named (`invalid value for parameter
+"start": 0`). *Caveat:* a **constant** pattern is precompiled at resolve (§5), so a malformed
+constant pattern surfaces its `2201B` before any per-row argument check — a deliberate, narrow
+ordering divergence from PG for the (pattern-invalid **and** argument-invalid) case only; every
+single-error case agrees.
+
+**Flags.** Only `'i'` (case-insensitive) is meaningful here; `'g'` is `regexp_replace`-only, so any
+flag other than `'i'` — including `'g'` — is `2201B` (jed's RE2 flavor owns a smaller flag set than
+PG, regex.md §1; PG accepts `c/g/m/n/p/q/s/t/w/x` and rejects `'g'` on these with a different message
+— a documented flavor divergence). The numeric arguments are **strictly typed** integers: a non-integer
+in a numeric slot is `42883` (no matching overload), jed's strict-typing stance rather than PG's
+implicit text→int cast. Cost is unchanged from Slice 2: `operator_eval` + `regex_compile` (once for a
+constant pattern) + `regex_step` per match step explored across the iteration.
+
+---
+
 ## 9. Cross-core fixtures
 
 Two TOML fixture families in [`spec/regex/`](../regex/) (the `spec/encoding/` precedent), the
@@ -410,8 +460,8 @@ corpus (§11).
 **Deferred follow-ons** (each a later slice; `0A000` if attempted before then):
 - Set-returning `regexp_matches` (setof text[]), `regexp_split_to_table` (setof text) — feasible on
   the existing SRF machinery, just out of this scope.
-- `regexp_split_to_array`, `regexp_count`, `regexp_instr`, `regexp_substr`, `regexp_like` (PG's
-  Oracle-compat additions).
+- `regexp_split_to_array` (PG's other Oracle-compat addition). The scalar Oracle-compat functions
+  `regexp_count` / `regexp_instr` / `regexp_substr` / `regexp_like` **landed in Slice 3** (§8b).
 - `\b` word boundary, POSIX `[[:class:]]`, numeric escapes `\xHH`/`\x{…}`, Unicode-property classes
   `\p{…}` (ties into the collation Unicode-property work), the `s`/`m`/`x` flags and inline `(?i)`.
 - A lazy-DFA fast path (perf only — same semantics); regex-driven index acceleration (anchored
@@ -427,10 +477,11 @@ backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups. And
 
 - Capabilities ([manifest.toml](../conformance/manifest.toml)): `expr.regex_match` (`~`/`!~`),
   `expr.regex_imatch` (`~*`/`!~*`, builds on `expr.regex_match`), `resource.regex_program_limit`;
-  Slice 2 adds `func.regexp_replace`, `func.regexp_match`.
+  Slice 2 adds `func.regexp_replace`, `func.regexp_match`; Slice 3 adds `func.regexp_count`,
+  `func.regexp_instr`, `func.regexp_substr`, `func.regexp_like`.
 - Corpus: `suites/expr/regex.test` (operators, NULL/42804/2201B, code-point/astral, `# cost:` pins),
   `suites/resource/regex_program_limit.test` (`54001` boundary, jed-specific — not oracle-checked),
-  `suites/expr/regexp_functions.test` (Slice 2).
+  `suites/expr/regexp_functions.test` (Slice 2), `suites/expr/regexp_oracle_functions.test` (Slice 3).
 - **Oracle divergence** (§7 conformance): jed's flavor is the RE2 subset, so only the **PG-agreeing
   subset** is oracle-checkable (`rake corpus:check`); flavor-divergent cases (a pattern PG accepts
   via a backref, greedy-edge differences) get **hand-authored expected output + an
