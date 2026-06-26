@@ -12680,7 +12680,9 @@ type ScalarFuncName =
   // repeat(text, n) → text — the string concatenated n times; over-large result traps 54000 (§3).
   | "repeat"
   // reverse(text) → text — the code points in reverse order (§3).
-  | "reverse";
+  | "reverse"
+  // strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
+  | "strpos";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -24549,6 +24551,15 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // (not UTF-16 unit), so an astral character stays intact (string-functions.md §2).
         const s = (vals[0] as { text: string }).text;
         return textValue([...s].reverse().join(""));
+      }
+      if (e.func === "strpos") {
+        // strpos(text, substring) → i32 — 1-based code-point position, else 0. indexOf gives a
+        // UTF-16-unit offset; the match begins at a code-point boundary, so the code-point
+        // position is the code-point count of the prefix + 1 (empty sub → 1, string-functions.md §3).
+        const s = (vals[0] as { text: string }).text;
+        const sub = (vals[1] as { text: string }).text;
+        const idx = s.indexOf(sub);
+        return intValue(idx < 0 ? 0n : BigInt([...s.slice(0, idx)].length + 1));
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

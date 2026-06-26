@@ -190,3 +190,12 @@ The characters (code points) in reverse order: `reverse('abc') = 'cba'`, `revers
 Reverses the **code-point** sequence, not the bytes nor the UTF-16 units — so an astral character
 stays intact (`reverse('a😀b') = 'b😀a'`; a naïve TS `s.split('').reverse()` would break the
 surrogate pair, the §2 trap). NULL args propagate.
+
+### `strpos(text, substring) → int`
+
+The function spelling of `POSITION(substring IN string)`: the 1-based **character** (code-point)
+position of the first occurrence of `substring`, or `0` if absent; an empty substring is `1`.
+`strpos('high', 'ig') = 2`, `strpos('héllo', 'llo') = 3`, `strpos('abc', 'x') = 0`. Each core finds
+the match's **byte** (or UTF-16-unit, in TS) offset with its native search, then converts to a
+code-point position by counting the code points in the prefix — so the result is the same character
+position cross-core regardless of the encoding the search uses. NULL args propagate.

@@ -493,3 +493,30 @@ query T
 SELECT reverse(NULL::text)
 ----
 NULL
+
+# === strpos(text, substring) → int: 1-based code-point position (POSITION) =============
+
+query I
+SELECT strpos('high', 'ig')
+----
+2
+
+# code-point position, not byte: 'llo' starts at character 3 of 'héllo'
+query I
+SELECT strpos('héllo', 'llo')
+----
+3
+
+# not found → 0; an empty substring → 1; multiple occurrences → the first
+query I
+SELECT strpos('abc', 'x'), strpos('abc', ''), strpos('aXbXc', 'X')
+----
+0
+1
+2
+
+query I
+SELECT strpos(NULL::text, 'a'), strpos('abc', NULL::text)
+----
+NULL
+NULL

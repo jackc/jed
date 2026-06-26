@@ -13064,6 +13064,8 @@ enum ScalarFunc {
     Repeat,
     /// reverse(text) → text — the code points in reverse order (§3).
     Reverse,
+    /// strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
+    Strpos,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -19100,6 +19102,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "translate" => ScalarFunc::Translate,
         "repeat" => ScalarFunc::Repeat,
         "reverse" => ScalarFunc::Reverse,
+        "strpos" => ScalarFunc::Strpos,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -30512,6 +30515,19 @@ impl RExpr {
                         Value::Text(s) => Ok(Value::Text(s.chars().rev().collect())),
                         _ => unreachable!("resolver restricts reverse to text"),
                     },
+                    // strpos(text, substring) → i32 — 1-based code-point position, else 0.
+                    ScalarFunc::Strpos => {
+                        let (s, sub) = match (&vals[0], &vals[1]) {
+                            (Value::Text(s), Value::Text(sub)) => (s, sub),
+                            _ => unreachable!("resolver restricts strpos to text"),
+                        };
+                        // find returns a BYTE offset; convert to a 1-based CODE-POINT position by
+                        // counting the code points in the prefix (empty substring → byte 0 → 1).
+                        Ok(Value::Int(match s.find(sub.as_str()) {
+                            Some(b) => s[..b].chars().count() as i64 + 1,
+                            None => 0,
+                        }))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -31394,7 +31410,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Replace
         | ScalarFunc::Translate
         | ScalarFunc::Repeat
-        | ScalarFunc::Reverse => {
+        | ScalarFunc::Reverse
+        | ScalarFunc::Strpos => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

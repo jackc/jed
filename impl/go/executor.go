@@ -15945,6 +15945,8 @@ const (
 	sfRepeat
 	// reverse(text) → text — the code points in reverse order (§3).
 	sfReverse
+	// strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
+	sfStrpos
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -19548,6 +19550,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfRepeat
 	case "reverse":
 		return sfReverse
+	case "strpos":
+		return sfStrpos
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -27569,6 +27573,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				runes[i], runes[j] = runes[j], runes[i]
 			}
 			return TextValue(string(runes)), nil
+		case sfStrpos:
+			// strpos(text, substring) → i32 — 1-based code-point position, else 0. strings.Index
+			// gives a BYTE offset; convert by counting code points in the prefix (empty sub → 1).
+			idx := strings.Index(vals[0].Str, vals[1].Str)
+			if idx < 0 {
+				return IntValue(0), nil
+			}
+			return IntValue(int64(utf8.RuneCountInString(vals[0].Str[:idx])) + 1), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
