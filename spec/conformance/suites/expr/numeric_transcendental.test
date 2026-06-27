@@ -1,0 +1,289 @@
+# EXACT-numeric transcendentals over decimal/numeric — sqrt / ln / exp / log / log10 / power
+# (spec/design/decimal.md §8, spec/functions/catalog.toml). A hand-rolled PG-faithful
+# arbitrary-precision port of PostgreSQL numeric.c (sqrt_var / ln_var / exp_var / log_var /
+# power_var). Unlike the FLOAT transcendentals (float.md §8, R-tag ULP exemption) these are
+# IN-CONTRACT: byte-identical cross-core by construction (every step is exact-decimal limb
+# arithmetic; the result scale is chosen deterministically with NO libm transcendental on the
+# value path), so they carry the exact `D` render tag — not `R`. The result scale follows PG
+# (≥ 16 significant digits, never below the input scale). arg_resolution = `none`: a bare
+# INTEGER does NOT promote (sqrt(2) → 42883, a documented jed strictness vs PG's int→float8),
+# but a decimal literal/value does. Domain errors: sqrt-of-negative / power domain → 2201F,
+# ln/log of a non-positive → 2201E, exp/power overflow → 22003. PostgreSQL-oracle-checked.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i16, types.i32, types.i64, types.decimal, cast.operator, cast.explicit, expr.numeric_transcendental
+
+statement ok
+CREATE TABLE nt (id i32 PRIMARY KEY, d numeric)
+
+statement ok
+INSERT INTO nt VALUES
+  (1, 2.0),
+  (2, 0.5),
+  (3, 144),
+  (4, 2.718281828459045),
+  (5, 1000),
+  (6, NULL)
+
+# --- over a stored numeric column ---
+query D nosort
+SELECT sqrt(d) FROM nt WHERE id = 1
+----
+1.414213562373095
+
+query D nosort
+SELECT sqrt(d) FROM nt WHERE id = 2
+----
+0.70710678118654752
+
+query D nosort
+SELECT sqrt(d) FROM nt WHERE id = 3
+----
+12.000000000000000
+
+query D nosort
+SELECT ln(d) FROM nt WHERE id = 1
+----
+0.6931471805599453
+
+query D nosort
+SELECT ln(d) FROM nt WHERE id = 4
+----
+0.9999999999999999
+
+query D nosort
+SELECT exp(d) FROM nt WHERE id = 2
+----
+1.6487212707001281
+
+query D nosort
+SELECT log(d) FROM nt WHERE id = 5
+----
+3.0000000000000000
+
+query D nosort
+SELECT log10(d) FROM nt WHERE id = 5
+----
+3.0000000000000000
+
+query D nosort
+SELECT power(d, 2.0) FROM nt WHERE id = 1
+----
+4.0000000000000000
+
+# --- NULL propagates ---
+query D nosort
+SELECT sqrt(d) FROM nt WHERE id = 6
+----
+NULL
+
+query D nosort
+SELECT ln(d) FROM nt WHERE id = 6
+----
+NULL
+
+query D nosort
+SELECT power(d, 2.0) FROM nt WHERE id = 6
+----
+NULL
+
+# --- literal-driven value queries ---
+query D nosort
+SELECT sqrt(2.0::numeric)
+----
+1.414213562373095
+
+query D nosort
+SELECT sqrt(0.5::numeric)
+----
+0.70710678118654752
+
+query D nosort
+SELECT sqrt(100::numeric)
+----
+10.000000000000000
+
+query D nosort
+SELECT sqrt(2.25::numeric)
+----
+1.500000000000000
+
+query D nosort
+SELECT sqrt(0::numeric)
+----
+0.000000000000000
+
+query D nosort
+SELECT sqrt(1::numeric)
+----
+1.000000000000000
+
+query D nosort
+SELECT ln(1.0::numeric)
+----
+0.0000000000000000
+
+query D nosort
+SELECT ln(2.0::numeric)
+----
+0.6931471805599453
+
+query D nosort
+SELECT ln(10::numeric)
+----
+2.3025850929940457
+
+query D nosort
+SELECT ln(0.5::numeric)
+----
+-0.6931471805599453
+
+query D nosort
+SELECT ln(100::numeric)
+----
+4.6051701859880914
+
+query D nosort
+SELECT exp(0::numeric)
+----
+1.0000000000000000
+
+query D nosort
+SELECT exp(1::numeric)
+----
+2.7182818284590452
+
+query D nosort
+SELECT exp(2.5::numeric)
+----
+12.182493960703473
+
+query D nosort
+SELECT exp(-1::numeric)
+----
+0.3678794411714423
+
+query D nosort
+SELECT log(100::numeric)
+----
+2.0000000000000000
+
+query D nosort
+SELECT log(2.0::numeric)
+----
+0.3010299956639812
+
+query D nosort
+SELECT log10(1000::numeric)
+----
+3.0000000000000000
+
+query D nosort
+SELECT log10(0.001::numeric)
+----
+-3.0000000000000000
+
+query D nosort
+SELECT log(2::numeric, 8::numeric)
+----
+3.0000000000000000
+
+query D nosort
+SELECT log(10::numeric, 1000::numeric)
+----
+3.0000000000000000
+
+query D nosort
+SELECT log(3::numeric, 27::numeric)
+----
+3.0000000000000000
+
+query D nosort
+SELECT power(2::numeric, 10::numeric)
+----
+1024.0000000000000
+
+query D nosort
+SELECT power(2.5::numeric, 3::numeric)
+----
+15.625000000000000
+
+query D nosort
+SELECT power(10::numeric, -2::numeric)
+----
+0.010000000000000000
+
+query D nosort
+SELECT power(2::numeric, 0.5::numeric)
+----
+1.4142135623730950
+
+query D nosort
+SELECT power(-2::numeric, 3::numeric)
+----
+-8.0000000000000000
+
+query D nosort
+SELECT power(-2::numeric, 2::numeric)
+----
+4.0000000000000000
+
+query D nosort
+SELECT power(9::numeric, 0.5::numeric)
+----
+3.0000000000000000
+
+query D nosort
+SELECT power(2::numeric, 0::numeric)
+----
+1.0000000000000000
+
+query D nosort
+SELECT power(0::numeric, 5::numeric)
+----
+0.0000000000000000
+
+query D nosort
+SELECT power(2::numeric, -1::numeric)
+----
+0.5000000000000000
+
+query D nosort
+SELECT pow(2::numeric, 3::numeric)
+----
+8.0000000000000000
+
+# --- domain errors (2201E/2201F) + no bare-integer promotion (42883) ---
+statement error 2201F
+SELECT sqrt(-1::numeric)
+
+statement error 2201F
+SELECT sqrt(-0.5::numeric)
+
+statement error 2201E
+SELECT ln(0::numeric)
+
+statement error 2201E
+SELECT ln(-2::numeric)
+
+statement error 2201E
+SELECT log(0::numeric)
+
+statement error 2201E
+SELECT log(-5::numeric)
+
+statement error 2201E
+SELECT log(2::numeric, 0::numeric)
+
+statement error 2201F
+SELECT power(0::numeric, -1::numeric)
+
+statement error 2201F
+SELECT power(-2::numeric, 0.5::numeric)
+
+statement error 42883
+SELECT sqrt(2)
+
+statement error 42883
+SELECT ln(2)
+
+statement error 42883
+SELECT power(2, 10)

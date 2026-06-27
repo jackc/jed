@@ -96,6 +96,25 @@ name = "invalid_argument_for_width_bucket_function"
 class = "data exception"
 template = "{detail}"
 
+# The exact-numeric logarithm functions reject a zero or negative argument (ln/log over numeric —
+# spec/design/decimal.md §8). PostgreSQL's ERRCODE_INVALID_ARGUMENT_FOR_LOG; {detail} carries
+# whether it was zero or a negative number.
+[[error]]
+code = "2201E"
+name = "invalid_argument_for_log"
+class = "data exception"
+template = "{detail}"
+
+# The exact-numeric power/sqrt functions reject an out-of-domain argument: sqrt of a negative,
+# zero raised to a negative power, or a negative base raised to a non-integer power (power/sqrt
+# over numeric — spec/design/decimal.md §8). PostgreSQL's ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION;
+# {detail} carries which condition failed.
+[[error]]
+code = "2201F"
+name = "invalid_argument_for_power_function"
+class = "data exception"
+template = "{detail}"
+
 # A window frame PRECEDING/FOLLOWING offset must not be negative (spec/design/window.md §6). PG's code.
 [[error]]
 code = "22013"

@@ -13335,6 +13335,9 @@ enum ScalarFunc {
     Ln,
     Log10,
     Pow,
+    /// log — base-10 (1-arg) / arbitrary-base (2-arg) logarithm over decimal (decimal.md §8).
+    /// Decimal-only (no float `log` overload); the EXACT-numeric kernel, IN-CONTRACT.
+    Log,
     Sin,
     Cos,
     Tan,
@@ -20175,6 +20178,8 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "sqrt" => ScalarFunc::Sqrt,
         "exp" => ScalarFunc::Exp,
         "ln" => ScalarFunc::Ln,
+        // `log` is decimal-only (1-arg base-10 / 2-arg arbitrary-base); `log10` keeps its own id.
+        "log" => ScalarFunc::Log,
         "log10" => ScalarFunc::Log10,
         // `power` is PG's name for `pow` (the documented name gap) — same kernel.
         "pow" | "power" => ScalarFunc::Pow,
@@ -32334,6 +32339,60 @@ impl RExpr {
                         };
                         Ok(Value::Decimal(d.trunc_places(places)))
                     }
+                    // EXACT-numeric transcendentals over decimal (decimal.md §8): sqrt / exp / ln /
+                    // log / log10 / power. A hand-rolled PG-faithful arbitrary-precision port —
+                    // byte-identical across cores by construction (unlike the libm float arms below,
+                    // which ride the `R`-tag ULP exemption). Guarded on a Decimal operand so the
+                    // float overloads still reach the libm arm. Domain errors: sqrt of a negative and
+                    // the power domain errors → 2201F; ln/log of a non-positive → 2201E; exp/power
+                    // overflow → 22003.
+                    ScalarFunc::Sqrt if matches!(&vals[0], Value::Decimal(_)) => {
+                        let Value::Decimal(d) = &vals[0] else {
+                            unreachable!()
+                        };
+                        Ok(Value::Decimal(d.dec_sqrt()?))
+                    }
+                    ScalarFunc::Exp if matches!(&vals[0], Value::Decimal(_)) => {
+                        let Value::Decimal(d) = &vals[0] else {
+                            unreachable!()
+                        };
+                        Ok(Value::Decimal(d.dec_exp()?))
+                    }
+                    ScalarFunc::Ln if matches!(&vals[0], Value::Decimal(_)) => {
+                        let Value::Decimal(d) = &vals[0] else {
+                            unreachable!()
+                        };
+                        Ok(Value::Decimal(d.dec_ln()?))
+                    }
+                    ScalarFunc::Log10 if matches!(&vals[0], Value::Decimal(_)) => {
+                        let Value::Decimal(d) = &vals[0] else {
+                            unreachable!()
+                        };
+                        Ok(Value::Decimal(d.dec_log10()?))
+                    }
+                    // `log` is decimal-only (no float `log` in the catalog): 1-arg = base-10 log,
+                    // 2-arg = log(base, num) in an arbitrary base.
+                    ScalarFunc::Log => {
+                        let Value::Decimal(a) = &vals[0] else {
+                            unreachable!("resolver restricts log to decimal operands")
+                        };
+                        match vals.get(1) {
+                            None => Ok(Value::Decimal(a.dec_log10()?)),
+                            Some(Value::Decimal(num)) => {
+                                Ok(Value::Decimal(Decimal::dec_log(a, num)?))
+                            }
+                            Some(_) => unreachable!("resolver restricts log's args to decimal"),
+                        }
+                    }
+                    ScalarFunc::Pow if matches!(&vals[0], Value::Decimal(_)) => {
+                        let Value::Decimal(base) = &vals[0] else {
+                            unreachable!()
+                        };
+                        let Value::Decimal(exp) = &vals[1] else {
+                            unreachable!("resolver restricts power's args to decimal")
+                        };
+                        Ok(Value::Decimal(Decimal::dec_power(base, exp)?))
+                    }
                     // pi() — the constant π, no operand (float.md §8). In-contract: the same f64
                     // literal in every core.
                     ScalarFunc::Pi => Ok(Value::Float64(std::f64::consts::PI)),
@@ -33630,6 +33689,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Abs
         | ScalarFunc::Round
         | ScalarFunc::Pi
+        | ScalarFunc::Log
         | ScalarFunc::Sign
         | ScalarFunc::Div
         | ScalarFunc::Gcd

@@ -154,13 +154,12 @@ SELECT exp(x) FROM big
 statement error 22003
 SELECT pow(a, b) FROM g WHERE id = 2
 
-# --- argument resolution is `none`: a bare integer/decimal literal does NOT promote ---
-# to float (an explicit f64 is required), so there is no matching overload → 42883 -
+# --- argument resolution is `none`: a bare INTEGER literal does NOT promote to float ---
+# (an explicit f64 is required), so there is no matching float overload → 42883. (A bare
+# DECIMAL literal like `sqrt(4.0)` now resolves to the EXACT-numeric kernel — decimal.md §8,
+# suites/expr/numeric_transcendental.test — so it is no longer tested here.) ----------
 statement error 42883
 SELECT sqrt(4)
-
-statement error 42883
-SELECT sqrt(4.0)
 
 # --- wrong arity / unknown name → 42883 -----------------------------------------------
 statement error 42883

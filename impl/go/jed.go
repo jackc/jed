@@ -457,6 +457,9 @@ var SupportedCapabilities = []string{
 	// (encoding.md §2.5).
 	"types.decimal",
 	"expr.decimal_arithmetic",
+	// exact-numeric transcendentals over decimal/numeric — sqrt/ln/exp/log/log10/power, a
+	// PG-faithful arbitrary-precision port (numeric.c), byte-identical cross-core (decimal.md §8).
+	"expr.numeric_transcendental",
 	// bytea scalar type (variable-width raw bytes): storage, hex-input literals, and
 	// unsigned-byte comparison/ordering. bytea is ALSO a key type — a bytea PRIMARY KEY / index /
 	// UNIQUE uses the variable-width bytea-terminated-escape key encoding (encoding.md §2.6).

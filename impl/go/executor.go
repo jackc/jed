@@ -16350,6 +16350,9 @@ const (
 	sfLn
 	sfLog10
 	sfPow
+	// sfLog — base-10 (1-arg) / arbitrary-base (2-arg) logarithm over decimal (decimal.md §8).
+	// Decimal-only (no float `log`); the EXACT-numeric kernel, IN-CONTRACT.
+	sfLog
 	sfSin
 	sfCos
 	sfTan
@@ -20679,6 +20682,9 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfLn
 	case "log10":
 		return sfLog10
+	case "log":
+		// `log` is decimal-only (1-arg base-10 / 2-arg arbitrary-base); `log10` keeps its own id.
+		return sfLog
 	case "pow", "power":
 		// `power` is PG's name for `pow` (the documented name gap) — same kernel.
 		return sfPow
@@ -30001,6 +30007,47 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				}
 				return DecimalValue(d.TruncPlaces(places)), nil
 			}
+		case sfSqrt, sfExp, sfLn, sfLog10, sfPow:
+			// EXACT-numeric transcendentals over decimal (decimal.md §8): a float operand falls to
+			// the libm path; a decimal operand computes exactly via the PG-faithful kernel —
+			// byte-identical across cores (unlike the float arms). Domain errors: sqrt of a negative
+			// and the power domain errors → 2201F; ln of a non-positive → 2201E; overflow → 22003.
+			if vals[0].Kind != ValDecimal {
+				return evalFloatFunc(e.sfunc, vals, e.result)
+			}
+			a := *vals[0].Dec
+			var r Decimal
+			var err error
+			switch e.sfunc {
+			case sfSqrt:
+				r, err = a.DecSqrt()
+			case sfExp:
+				r, err = a.DecExp()
+			case sfLn:
+				r, err = a.DecLn()
+			case sfLog10:
+				r, err = a.DecLog10()
+			default: // sfPow
+				r, err = DecPower(a, *vals[1].Dec)
+			}
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(r), nil
+		case sfLog:
+			// `log` is decimal-only: 1-arg = base-10 log, 2-arg = log(base, num) in any base.
+			a := *vals[0].Dec
+			var r Decimal
+			var err error
+			if len(vals) > 1 {
+				r, err = DecLog(a, *vals[1].Dec)
+			} else {
+				r, err = a.DecLog10()
+			}
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(r), nil
 		case sfScale:
 			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
 			return IntValue(int64(vals[0].Dec.Scale)), nil

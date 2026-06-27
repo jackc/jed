@@ -32,6 +32,20 @@ export const MAX_SCALE = 16383;
 // (spec/design/grammar.md §14). Callers clamp the exponent magnitude to ±EXP_LIMIT while scanning.
 export const EXP_LIMIT = MAX_INT_DIGITS + MAX_SCALE + 2;
 
+// PG numeric.c constants for the exact-numeric transcendentals (spec/design/decimal.md §8).
+const MIN_SIG_DIGITS = 16; // PG NUMERIC_MIN_SIG_DIGITS
+const DEC_DIGITS = 4; // PG DEC_DIGITS — base-10⁴ group size
+const MAX_DISPLAY_SCALE = MAX_PRECISION; // PG NUMERIC_MAX_DISPLAY_SCALE (1000)
+const MAX_RESULT_SCALE = MAX_PRECISION * 2; // PG NUMERIC_MAX_RESULT_SCALE (2000)
+const NUMERIC_WEIGHT_MAX = 32767; // PG NUMERIC_WEIGHT_MAX (PG_INT16_MAX)
+
+function logZero(): EngineError {
+  return engineError("invalid_argument_for_log", "cannot take logarithm of zero");
+}
+function logNegative(): EngineError {
+  return engineError("invalid_argument_for_log", "cannot take logarithm of a negative number");
+}
+
 // decimalFromParts is the canonical [coefficient digits, scale] for a decimal literal, from its
 // mantissa (intPart+frac) and an optional scientific exponent (already clamped to ±EXP_LIMIT by the
 // caller's scanner; null means no exponent). The display scale is max(0, fracLen-exp); when the
@@ -366,6 +380,380 @@ export class Decimal {
     const signed = r.neg ? -v : v;
     if (signed < -9223372036854775808n || signed > 9223372036854775807n) return null;
     return signed;
+  }
+
+  // ── EXACT-numeric transcendentals — sqrt / ln / exp / log / power over decimal
+  // (spec/design/decimal.md §8). A hand-rolled, byte-exact port of PostgreSQL's
+  // arbitrary-precision numeric.c, identical to the Rust and Go cores by construction (every step
+  // is exact-decimal limb arithmetic; the scale estimates use no libm transcendental — only the
+  // correctly-rounded string→f64 path PG keeps). Integer math uses Math.trunc/Math.floor to match
+  // the cores' i64 semantics; the bit shifts use >>> to stay in uint32. ───────────────────────────
+
+  // nbaseWeight is PG NumericVar `weight`: floor((precision−1−scale)/4) (the MSD's decimal exponent
+  // floored into base-10⁴ groups). Zero → 0. Value-derived ⇒ identical across cores.
+  nbaseWeight(): number {
+    if (this.isZero()) return 0;
+    return Math.floor((this.precision() - 1 - this.scale) / 4);
+  }
+
+  // toF64Estimate is PG numericvar_to_double_no_overflow = strtod(render()): the correctly-rounded
+  // nearest f64 (deterministic across cores). Used ONLY by the scale estimates. ±Inf on overflow.
+  toF64Estimate(): number {
+    return Number(this.render());
+  }
+
+  // mulExact is the exact product (scale s1+s2), NO cap check (PG mul_var; make_result caps later).
+  mulExact(o: Decimal): Decimal {
+    return Decimal.fromParts(this.neg !== o.neg, this.scale + o.scale, magMul(this.limbs, o.limbs));
+  }
+
+  // mulVar is PG mul_var(a, b, rscale): exact product rounded half-away to `rscale` digits, result
+  // scale exactly `rscale` (rscale ≥ 0 in every kernel use).
+  mulVar(o: Decimal, rscale: number): Decimal {
+    return this.mulExact(o).roundVar(rscale);
+  }
+
+  // roundVar is PG round_var(var, rscale): round half-away to `rscale` digits, uncapped. rscale ≥ 0
+  // → result scale exactly rscale; rscale < 0 → round to a multiple of 10^(−rscale), result scale 0
+  // (jed represents PG's transient negative dscale as the equal value at scale 0).
+  roundVar(rscale: number): Decimal {
+    if (rscale >= 0) return this.roundToScale(rscale);
+    const k = -rscale;
+    const pow = magPow10(this.scale + k);
+    let [q, r] = magDivMod(this.limbs, pow);
+    if (magCmp(magAdd(r, r), pow) >= 0) q = magAdd(q, [1]);
+    return Decimal.fromParts(this.neg, 0, magMulPow10(q, k));
+  }
+
+  // divVar is PG div_var(a, b, rscale, round=true): a/b to exactly `rscale` digits, half-away.
+  // rscale ≥ 0. Throws 22012 on a zero divisor. Uncapped.
+  divVar(o: Decimal, rscale: number): Decimal {
+    if (o.isZero()) throw divByZero();
+    if (this.isZero()) return Decimal.zero(Math.max(rscale, 0));
+    const e = rscale + o.scale - this.scale;
+    let numer: number[];
+    let denom: number[];
+    if (e >= 0) {
+      numer = magMulPow10(this.limbs, e);
+      denom = o.limbs;
+    } else {
+      numer = this.limbs;
+      denom = magMulPow10(o.limbs, -e);
+    }
+    let [q, r] = magDivMod(numer, denom);
+    if (magCmp(magAdd(r, r), denom) >= 0) q = magAdd(q, [1]);
+    return Decimal.fromParts(this.neg !== o.neg, Math.max(rscale, 0), q);
+  }
+
+  // divVarInt is PG div_var_int(a, ival, 0, rscale, round=true).
+  divVarInt(ival: number, rscale: number): Decimal {
+    return this.divVar(Decimal.fromBigInt(BigInt(ival)), rscale);
+  }
+
+  // subUncapped is the uncapped subtraction (x − o), the kernels' running form.
+  subUncapped(o: Decimal): Decimal {
+    return this.addUncapped(o.negate());
+  }
+
+  // toI32IfInteger returns the value as an i32 if it is an exact integer fitting int32, else null.
+  toI32IfInteger(): number | null {
+    if (this.truncToScale(0).cmpValue(this) !== 0) return null;
+    const v = this.toBigIntRound();
+    if (v === null || v < -2147483648n || v > 2147483647n) return null;
+    return Number(v);
+  }
+
+  // sqrtVar is PG sqrt_var(arg, rscale): √self rounded half-away to `rscale` digits (rscale may be
+  // negative). Throws 2201F on a negative operand.
+  sqrtVar(rscale: number): Decimal {
+    if (this.isZero()) return Decimal.zero(Math.max(rscale, 0));
+    if (this.neg)
+      throw engineError(
+        "invalid_argument_for_power_function",
+        "cannot take square root of a negative number",
+      );
+    const s = this.scale;
+    let kc = Math.max(rscale, 0) + 1;
+    if (2 * kc < s) kc = Math.trunc((s + 1) / 2) + 1; // ensure E = 2·kc − s ≥ 0
+    const e = 2 * kc - s;
+    const g = magIsqrt(magMulPow10(this.limbs, e));
+    return Decimal.fromParts(false, kc, g).roundVar(rscale);
+  }
+
+  // decSqrt is sqrt(numeric) (PG numeric_sqrt): choose rscale for ≥ 16 significant digits.
+  decSqrt(): Decimal {
+    const sweight = Math.trunc((this.nbaseWeight() * DEC_DIGITS) / 2) + 1;
+    let rscale = MIN_SIG_DIGITS - sweight;
+    rscale = Math.min(Math.max(Math.max(rscale, this.scale), 0), MAX_DISPLAY_SCALE);
+    return this.sqrtVar(rscale).checkCap();
+  }
+
+  // expVar is PG exp_var(arg, rscale): e^self to `rscale` digits via a range-reduced Taylor series.
+  // Throws 22003 on overflow.
+  expVar(rscale: number): Decimal {
+    let x: Decimal = this;
+    let val = this.toF64Estimate();
+    if (Math.abs(val) >= MAX_RESULT_SCALE * 3) {
+      if (val > 0) throw overflow();
+      return Decimal.zero(Math.max(rscale, 0));
+    }
+    const dweight = Math.trunc(val * 0.434294481903252);
+    let ndiv2 = 0;
+    if (Math.abs(val) > 0.01) {
+      let n = 1;
+      val /= 2;
+      while (Math.abs(val) > 0.01) {
+        n++;
+        val /= 2;
+      }
+      ndiv2 = n;
+      const localRscale = x.scale + ndiv2;
+      x = x.divVarInt(2 ** ndiv2, localRscale);
+    }
+    let sigDigits = 1 + dweight + rscale + Math.trunc(ndiv2 * 0.301029995663981);
+    sigDigits = Math.max(sigDigits, 0) + 8;
+    const localRscale = sigDigits - 1;
+    let result = Decimal.fromBigInt(1n).addUncapped(x);
+    let elem = x.mulVar(x, localRscale);
+    let ni = 2;
+    elem = elem.divVarInt(ni, localRscale);
+    while (!elem.isZero()) {
+      result = result.addUncapped(elem);
+      elem = elem.mulVar(x, localRscale);
+      ni++;
+      elem = elem.divVarInt(ni, localRscale);
+    }
+    for (let k = ndiv2; k > 0; k--) {
+      const lr = Math.max(sigDigits - result.nbaseWeight() * 2 * DEC_DIGITS, 0);
+      result = result.mulVar(result, lr);
+    }
+    return result.roundVar(rscale);
+  }
+
+  // decExp is exp(numeric) (PG numeric_exp): choose rscale, then expVar.
+  decExp(): Decimal {
+    let val = this.toF64Estimate() * 0.434294481903252;
+    val = Math.max(-MAX_RESULT_SCALE, Math.min(MAX_RESULT_SCALE, val));
+    let rscale = MIN_SIG_DIGITS - Math.trunc(val);
+    rscale = Math.min(Math.max(Math.max(rscale, this.scale), 0), MAX_DISPLAY_SCALE);
+    return this.expVar(rscale).checkCap();
+  }
+
+  // lnVar is PG ln_var(arg, rscale): the natural log of self (> 0) to `rscale` digits via sqrt
+  // range reduction + the atanh series. The caller guarantees self > 0.
+  lnVar(rscale: number): Decimal {
+    const nineTenths = Decimal.fromDigitsScale(false, "9", 1); // 0.9
+    const elevenTenths = Decimal.fromDigitsScale(false, "11", 1); // 1.1
+    const two = Decimal.fromBigInt(2n);
+    const one = Decimal.fromBigInt(1n);
+    let x: Decimal = this;
+    let fact = two;
+    let nsqrt = 0;
+    while (x.cmpValue(nineTenths) <= 0) {
+      const localRscale = rscale - Math.trunc((x.nbaseWeight() * DEC_DIGITS) / 2) + 8;
+      x = x.sqrtVar(localRscale); // self > 0 ⇒ never throws
+      fact = fact.mulVar(two, 0);
+      nsqrt++;
+    }
+    while (x.cmpValue(elevenTenths) >= 0) {
+      const localRscale = rscale - Math.trunc((x.nbaseWeight() * DEC_DIGITS) / 2) + 8;
+      x = x.sqrtVar(localRscale);
+      fact = fact.mulVar(two, 0);
+      nsqrt++;
+    }
+    const localRscale = rscale + Math.trunc((nsqrt + 1) * 0.301029995663981) + 8;
+    let result = x.subUncapped(one).divVar(x.addUncapped(one), localRscale);
+    let xx = result;
+    const zsq = result.mulVar(result, localRscale);
+    let ni = 1;
+    for (;;) {
+      ni += 2;
+      xx = xx.mulVar(zsq, localRscale);
+      const elem = xx.divVarInt(ni, localRscale);
+      if (elem.isZero()) break;
+      result = result.addUncapped(elem);
+      if (elem.nbaseWeight() < result.nbaseWeight() - Math.trunc((localRscale * 2) / DEC_DIGITS))
+        break;
+    }
+    return result.mulVar(fact, rscale);
+  }
+
+  // estimateLnDweight is the deterministic PG estimate_ln_dweight(var) — an estimate of
+  // trunc(log10(|ln(var)|)) (PG truncates toward zero via (int)), computed WITHOUT libm. var > 0.
+  estimateLnDweight(): number {
+    if (this.isZero() || this.neg) return 0;
+    const nineTenths = Decimal.fromDigitsScale(false, "9", 1);
+    const elevenTenths = Decimal.fromDigitsScale(false, "11", 1);
+    if (this.cmpValue(nineTenths) >= 0 && this.cmpValue(elevenTenths) <= 0) {
+      const x = this.subUncapped(Decimal.fromBigInt(1n));
+      if (x.isZero()) return 0;
+      return x.precision() - 1 - x.scale; // floor(log10(|var−1|))
+    }
+    const t = this.lnVar(20);
+    if (t.isZero()) return 0;
+    const dw = t.precision() - 1 - t.scale; // floor(log10(|ln(var)|))
+    return dw < 0 ? dw + 1 : dw;
+  }
+
+  // decLn is ln(numeric) (PG numeric_ln).
+  decLn(): Decimal {
+    if (this.isZero()) throw logZero();
+    if (this.neg) throw logNegative();
+    const lnDweight = this.estimateLnDweight();
+    let rscale = MIN_SIG_DIGITS - lnDweight;
+    rscale = Math.min(Math.max(Math.max(rscale, this.scale), 0), MAX_DISPLAY_SCALE);
+    return this.lnVar(rscale).checkCap();
+  }
+
+  // decLog is log(base, num) (PG numeric_log / log_var): ln(num)/ln(base). Both > 0 (else 2201E).
+  static decLog(base: Decimal, num: Decimal): Decimal {
+    for (const v of [base, num]) {
+      if (v.isZero()) throw logZero();
+      if (v.neg) throw logNegative();
+    }
+    const lnBaseDweight = base.estimateLnDweight();
+    const lnNumDweight = num.estimateLnDweight();
+    const resultDweight = lnNumDweight - lnBaseDweight;
+    let rscale = MIN_SIG_DIGITS - resultDweight;
+    rscale = Math.min(
+      Math.max(Math.max(Math.max(rscale, base.scale), num.scale), 0),
+      MAX_DISPLAY_SCALE,
+    );
+    const lnBaseRscale = Math.max(rscale + resultDweight - lnBaseDweight + 8, 0);
+    const lnNumRscale = Math.max(rscale + resultDweight - lnNumDweight + 8, 0);
+    const lnBase = base.lnVar(lnBaseRscale);
+    const lnNum = num.lnVar(lnNumRscale);
+    return lnNum.divVar(lnBase, rscale).checkCap();
+  }
+
+  // decLog10 is log(numeric)/log10(numeric) — base-10 logarithm (PG one-arg log = log(10, x)).
+  decLog10(): Decimal {
+    return Decimal.decLog(Decimal.fromBigInt(10n), this);
+  }
+
+  // log10Estimate is log10(self) = ln(self)/ln(10) to a ~30-digit guard — the deterministic
+  // libm-free replacement for power_var_int's log10(double) weight estimate. self > 0.
+  log10Estimate(): Decimal {
+    const guard = 30;
+    return this.lnVar(guard).divVar(Decimal.fromBigInt(10n).lnVar(guard), guard);
+  }
+
+  // powerVarInt is PG power_var_int(base, exp, exp_dscale): base^exp for an integer exp.
+  static powerVarInt(base: Decimal, exp: number, expDscale: number): Decimal {
+    let f = 0;
+    if (!base.isZero()) {
+      f = base
+        .abs()
+        .log10Estimate()
+        .mulExact(Decimal.fromBigInt(BigInt(exp)))
+        .toF64Estimate();
+    }
+    if (f > (NUMERIC_WEIGHT_MAX + 1) * DEC_DIGITS) throw overflow();
+    if (f + 1 < -MAX_DISPLAY_SCALE) return Decimal.zero(MAX_DISPLAY_SCALE);
+    const fi = Math.trunc(f);
+    let rscale = MIN_SIG_DIGITS - fi;
+    rscale = Math.min(
+      Math.max(Math.max(Math.max(rscale, base.scale), expDscale), 0),
+      MAX_DISPLAY_SCALE,
+    );
+    switch (exp) {
+      case 0:
+        return Decimal.fromBigInt(1n).roundVar(rscale);
+      case 1:
+        return base.roundVar(rscale);
+      case -1:
+        return Decimal.fromBigInt(1n).divVar(base, rscale).checkCap();
+      case 2:
+        return base.mulVar(base, rscale).checkCap();
+    }
+    if (base.isZero()) {
+      if (exp < 0) throw divByZero();
+      return Decimal.zero(rscale);
+    }
+    let sigDigits = 1 + rscale + fi;
+    let mask = exp < 0 ? -exp : exp; // |exp|, ≤ 2^31 (fits uint32 for >>> )
+    sigDigits += intLnFloor(mask) + 8;
+    const neg = exp < 0;
+    let baseProd = base;
+    let result = mask & 1 ? base : Decimal.fromBigInt(1n);
+    let overflowed = false;
+    for (;;) {
+      mask = mask >>> 1;
+      if (mask === 0) break;
+      const lr = Math.max(
+        Math.min(sigDigits - 2 * baseProd.nbaseWeight() * DEC_DIGITS, 2 * baseProd.scale),
+        0,
+      );
+      baseProd = baseProd.mulVar(baseProd, lr);
+      if (mask & 1) {
+        const lr2 = Math.max(
+          Math.min(
+            sigDigits - (baseProd.nbaseWeight() + result.nbaseWeight()) * DEC_DIGITS,
+            baseProd.scale + result.scale,
+          ),
+          0,
+        );
+        result = baseProd.mulVar(result, lr2);
+      }
+      if (
+        baseProd.nbaseWeight() > NUMERIC_WEIGHT_MAX ||
+        result.nbaseWeight() > NUMERIC_WEIGHT_MAX
+      ) {
+        if (!neg) throw overflow();
+        result = Decimal.zero(0);
+        overflowed = true;
+        break;
+      }
+    }
+    if (neg && !overflowed) {
+      return Decimal.fromBigInt(1n).divVar(result, rscale).checkCap();
+    }
+    return result.roundVar(rscale).checkCap();
+  }
+
+  // powerVar is PG power_var(base, exp): base^exp for a general exponent.
+  static powerVar(base: Decimal, exp: Decimal): Decimal {
+    const iexp = exp.toI32IfInteger();
+    if (iexp !== null) return Decimal.powerVarInt(base, iexp, exp.scale);
+    if (base.isZero()) return Decimal.zero(MIN_SIG_DIGITS);
+    if (base.neg)
+      throw engineError(
+        "invalid_argument_for_power_function",
+        "a negative number raised to a non-integer power yields a complex result",
+      );
+    const lnDweight = base.estimateLnDweight();
+    let localRscale = Math.max(8 - lnDweight, 0);
+    let lnBase = base.lnVar(localRscale);
+    let lnNum = lnBase.mulVar(exp, localRscale);
+    let val = lnNum.toF64Estimate();
+    if (Math.abs(val) > MAX_RESULT_SCALE * 3.01) {
+      if (val > 0) throw overflow();
+      return Decimal.zero(MAX_DISPLAY_SCALE);
+    }
+    val *= 0.434294481903252;
+    const vi = Math.trunc(val);
+    let rscale = MIN_SIG_DIGITS - vi;
+    rscale = Math.min(
+      Math.max(Math.max(Math.max(rscale, base.scale), exp.scale), 0),
+      MAX_DISPLAY_SCALE,
+    );
+    const sigDigits = Math.max(rscale + vi, 0);
+    localRscale = Math.max(sigDigits - lnDweight + 8, 0);
+    lnBase = base.lnVar(localRscale);
+    lnNum = lnBase.mulVar(exp, localRscale);
+    return lnNum.expVar(rscale).checkCap();
+  }
+
+  // decPower is power(base, exp) over numeric (PG numeric_power, finite path). 0 ^ negative → 2201F.
+  static decPower(base: Decimal, exp: Decimal): Decimal {
+    const sign1 = base.isZero() ? 0 : base.neg ? -1 : 1;
+    const sign2 = exp.isZero() ? 0 : exp.neg ? -1 : 1;
+    if (sign1 === 0 && sign2 < 0)
+      throw engineError(
+        "invalid_argument_for_power_function",
+        "zero raised to a negative power is undefined",
+      );
+    return Decimal.powerVar(base, exp);
   }
 
   // toCodec returns [neg, scale, base-10^4 coefficient groups MS-first] for the value codec.
@@ -707,4 +1095,27 @@ function magDivMod(num: number[], den: number[]): [number[], number[]] {
     rem = magSub(rem, magMulSmall(den, lo));
   }
   return [magTrim(quo), rem];
+}
+
+// magIsqrt is floor(√n) for a magnitude n (LSB-first), via Newton's method on big integers
+// (x ← (x + n/x)/2 from x₀ = 10^⌈digits/2⌉ ≥ √n). The exact integer square root underlying
+// sqrtVar — deterministic, no float seed (spec/design/decimal.md §8).
+function magIsqrt(n: number[]): number[] {
+  if (n.length === 0) return [];
+  const half = Math.floor((magDigitCount(n) + 1) / 2); // ⌈digits/2⌉
+  let x = magPow10(half); // ≥ √n
+  for (;;) {
+    const [nDivX] = magDivMod(n, x);
+    const [y] = magDivMod(magAdd(x, nDivX), [2]); // (x + n/x) / 2
+    if (magCmp(y, x) >= 0) return x;
+    x = y;
+  }
+}
+
+// intLnFloor is floor(ln(n)) for n ≥ 1, computed deterministically via the exact ln (no libm) —
+// PG's (int)log(fabs(exp)) guard term in power_var_int.
+function intLnFloor(n: number): number {
+  if (n <= 1) return 0;
+  const v = Decimal.fromBigInt(BigInt(n)).lnVar(12).truncToScale(0).toBigIntRound();
+  return v === null ? 0 : Number(v);
 }

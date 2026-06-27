@@ -561,6 +561,10 @@ id = "expr.decimal_arithmetic"
 description = "Decimal arithmetic operators + - * / % and unary - with PostgreSQL result-scale rules and half-away-from-zero rounding (spec/design/decimal.md §4)"
 
 [[capability]]
+id = "expr.numeric_transcendental"
+description = "Exact-numeric transcendentals over decimal/numeric — sqrt, ln, exp, log/log10 (base 10), log(base, x), power(base, exp) — a hand-rolled PG-faithful arbitrary-precision port of numeric.c (sqrt_var/ln_var/exp_var/log_var/power_var). IN-CONTRACT (byte-identical cross-core, no determinism-ledger entry): every step is exact-decimal limb arithmetic and the result scale is chosen deterministically with no libm transcendental on the value path. Result scale ≥ NUMERIC_MIN_SIG_DIGITS (16) significant digits, never below the input scale. Domain errors: sqrt-of-negative / power domain → 2201F, ln/log of a non-positive → 2201E, exp/power overflow → 22003. arg_resolution none — a bare integer does NOT promote (sqrt(2) → 42883), a decimal literal does (sqrt(4.0) → numeric). (spec/design/decimal.md §8)"
+
+[[capability]]
 id = "types.bytea"
 description = "bytea scalar type (variable-width raw bytes): storage, hex-input literals, and unsigned-byte comparison/ordering. bytea is ALSO a KEY type — a bytea PRIMARY KEY / composite-key member / secondary index / UNIQUE uses the variable-width bytea-terminated-escape key encoding (encoding.md §2.6; the embedded-0x00 escape is routinely exercised), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key; an oversized bytea key is 0A000 (spec/design/types.md §13)"
 

@@ -13269,6 +13269,9 @@ type ScalarFuncName =
   | "exp"
   | "ln"
   | "log10"
+  // log — base-10 (1-arg) / arbitrary-base (2-arg) logarithm over decimal (decimal.md §8).
+  // Decimal-only (no float `log`); the EXACT-numeric kernel, IN-CONTRACT.
+  | "log"
   | "pow"
   | "sin"
   | "cos"
@@ -17517,14 +17520,9 @@ function resolveScalarFunc(
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   let name = e.name.toLowerCase() as ScalarFuncName;
-  // `power(x, y)` is PG's name for jed's pow (the documented name gap, float.md §8) — alias it to
-  // the pow kernel here so the overload lookup, the (float, float) promote, and eval all reuse pow.
-  if ((name as string) === "power") name = "pow";
-  // `ceiling` is PG's alias of `ceil` (functions.md §9) — alias to the ceil kernel so the overload
-  // lookup and eval (both the float and the decimal/integer paths) reuse ceil.
-  if ((name as string) === "ceiling") name = "ceil";
-  // char_length / character_length are SQL-standard aliases of length (string-functions.md) — alias
-  // them to the length kernel so the eval reuses the one code-point-count arm.
+  // char_length / character_length are SQL-standard aliases of length (string-functions.md) with NO
+  // catalog row of their own, so rewrite them to length BEFORE the lookup (unlike power/ceiling,
+  // which DO have their own catalog rows and are looked up by the spelled name — matching Rust/Go).
   if ((name as string) === "char_length" || (name as string) === "character_length") name = "length";
   const rargs: RExpr[] = [];
   const tys: ResolvedType[] = [];
@@ -17534,15 +17532,22 @@ function resolveScalarFunc(
     tys.push(r.type);
   }
   // Pick the overload by argument families and its result type by the catalog `result` code
-  // (extensibility.md §5) — replacing the old hand-written chain of (name, arg-types) checks.
+  // (extensibility.md §5) — by the SPELLED name, so `power(numeric,numeric)` and `power(float,float)`
+  // both resolve (the decimal `power` row has no `pow` alias, matching Rust/Go).
   const desc = lookupScalarOverload(name, tys);
   if (!desc) throw noFuncOverload(name);
+  // Eval-kernel aliases that share a backing kernel id: `power(x, y)` is PG's name for jed's pow (the
+  // name gap, float.md §8); `ceiling` is PG's alias of `ceil` (functions.md §9). The catalog lookup
+  // above used the spelled name (both have catalog rows); the kernel reuses pow/ceil.
+  let func: ScalarFuncName = name;
+  if ((func as string) === "power") func = "pow";
+  if ((func as string) === "ceiling") func = "ceil";
   // Every float function computes at the operand's float width (argWidth), so a f32 operand
   // rounds at binary32 even where the catalog's result is f64; abs(float) also keeps that width
   // as its result. Non-float args carry no width. pow is the one (float, float) function — it
   // promotes its mixed-width pair to a common width and widens both arguments to it.
   let argWidth: ScalarType | undefined;
-  if (name === "pow" && tys[0].kind === "float" && tys[1].kind === "float") {
+  if (func === "pow" && tys[0].kind === "float" && tys[1].kind === "float") {
     argWidth = promoteFloat(tys[0].ty, tys[1].ty);
     rargs[0] = widenFloatTo(rargs[0]!, tys[0].ty, argWidth);
     rargs[1] = widenFloatTo(rargs[1]!, tys[1].ty, argWidth);
@@ -17550,7 +17555,7 @@ function resolveScalarFunc(
     argWidth = tys[0].ty;
   }
   const result = scalarResultType(desc.result, tys);
-  return scalarFuncNode(name, rargs, result, argWidth);
+  return scalarFuncNode(func, rargs, result, argWidth);
 }
 
 // scalarFuncNode builds a resolved scalar-function node + its public type.
@@ -26630,6 +26635,39 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         if (e.func === "floor") return decimalValue(dd.floor());
         const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
         return decimalValue(dd.truncPlaces(places));
+      }
+      if (
+        e.func === "sqrt" ||
+        e.func === "exp" ||
+        e.func === "ln" ||
+        e.func === "log10" ||
+        e.func === "log" ||
+        e.func === "pow"
+      ) {
+        // EXACT-numeric transcendentals over decimal (decimal.md §8). Float operands returned
+        // above; here the operand is decimal — a PG-faithful arbitrary-precision kernel,
+        // byte-identical across cores. Domain errors: sqrt of a negative and the power domain
+        // errors → 2201F; ln/log of a non-positive → 2201E; exp/power overflow → 22003.
+        const a = (v0 as { dec: Decimal }).dec;
+        switch (e.func) {
+          case "sqrt":
+            return decimalValue(a.decSqrt());
+          case "exp":
+            return decimalValue(a.decExp());
+          case "ln":
+            return decimalValue(a.decLn());
+          case "log10":
+            return decimalValue(a.decLog10());
+          case "log": {
+            const num = vals.length > 1 ? (vals[1] as { dec: Decimal }).dec : null;
+            return decimalValue(num ? Decimal.decLog(a, num) : a.decLog10());
+          }
+          default: {
+            // pow (the catalog `power(decimal,decimal)`, renamed to "pow" at resolve)
+            const exp = (vals[1] as { dec: Decimal }).dec;
+            return decimalValue(Decimal.decPower(a, exp));
+          }
+        }
       }
       // round
       const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;

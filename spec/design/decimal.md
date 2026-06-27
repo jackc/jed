@@ -260,3 +260,76 @@ comparison with NULL treated as a comparable value (always definite).
     counts in base-10⁴ groups ([cost.md](cost.md) §3), never from a core's internal limb
     count (Rust/Go hold base-10⁹ limbs, TS base-10⁴ — limb counts differ, group counts do
     not); division's W uses the same `select_div_scale` as its result.
+
+## 8. Transcendentals — `sqrt` / `ln` / `exp` / `log` / `power` (exact, in-contract)
+
+The exact-numeric transcendentals over `decimal`/`numeric` — `sqrt(x)`, `ln(x)`, `exp(x)`,
+`log(x)` / `log10(x)` (base 10), `log(base, x)` (arbitrary base), and `power(base, exp)` /
+`pow(base, exp)` (`pow` is PG's alias) — are the deferred follow-on named in
+[float.md §8](float.md). They are the **opposite** of the *float* transcendentals: the float
+ones (`exp`/`ln`/`pow`/…) ride the `R`-tag ULP exemption (each core's libm differs by an ULP),
+but `decimal` is **in-contract** — it cannot ride that exemption (CLAUDE.md §8). So these are a
+**hand-rolled, byte-exact port of PostgreSQL `numeric.c`** (`sqrt_var` / `ln_var` / `exp_var` /
+`log_var` / `power_var` / `power_var_int`), computed entirely in the §1 limb arithmetic, and the
+three cores agree **byte-for-byte** by construction (`expr.numeric_transcendental`,
+[../conformance/suites/expr/numeric_transcendental.test](../conformance/suites/expr/numeric_transcendental.test)).
+The function/operator rows are in [../functions/catalog.toml](../functions/catalog.toml);
+the kernels are the irreducibly-per-language code §5 forbids codegenning, so they live hand-written
+in each core's decimal module.
+
+**Algorithms (PG-faithful).** `sqrt_var` is an exact big-integer square root (a hand-rolled
+Newton `isqrt` over the limb magnitude — jed's own routine, not PG's Karatsuba, since only the
+*result* (`floor(√n)` to the chosen guard) is a contract, not the path) then a half-away round.
+`exp_var` is the range-reduced Taylor series `1 + x + x²/2! + …` (halve `x` into ≈[−0.01, 0.01],
+sum, then re-square). `ln_var` reduces `x` into (0.9, 1.1) by repeated `sqrt`, then sums the
+`atanh` series `2·(z + z³/3 + z⁵/5 + …)` with `z = (x−1)/(x+1)`. `log_var(base, num)` is
+`ln(num)/ln(base)`; one-arg `log`/`log10` is `log(10, x)`. `power_var` routes an integer exponent
+to `power_var_int` (binary exponentiation) and a non-integer to `exp(exp·ln(base))`.
+
+**Result scale.** As in PG, the result targets at least **`NUMERIC_MIN_SIG_DIGITS` = 16**
+significant digits and never falls below the input's display scale, clamped to
+`NUMERIC_MAX_DISPLAY_SCALE` = 1000 (`max_precision`). So `sqrt(2.0)` → `1.414213562373095`
+(15 fractional digits), `ln(2.0)` → `0.6931471805599453` (16), `power(2, 10)` →
+`1024.0000000000000` (13). The intermediate computations carry guard digits (PG's `local_rscale`
+formulas, reproduced exactly) and the final result is rounded half-away (§3) to the chosen scale,
+then cap-checked (§2).
+
+**Determinism — no libm on the value path (the load-bearing decision).** PG's `numeric.c` uses
+floating-point `log`/`log10` *inside its scale estimates* (`estimate_ln_dweight`,
+`power_var_int`). Those libm calls are **not** cross-core deterministic (Rust's, Go's, and V8's
+`ln`/`log10` differ in the last ULP), and an `(int)`-truncated estimate near a boundary could pick
+a *different result scale* in different cores — a cross-core divergence in an in-contract type. So
+jed **removes every libm transcendental from the estimates**:
+
+- The `dweight` estimate (`estimate_ln_dweight`) is computed **exactly** — branch 1 (0.9 ≤ x ≤ 1.1)
+  is the decimal weight of `x − 1`; branch 2 is the decimal weight of a low-precision **exact** `ln`,
+  adjusted from floor to PG's trunc-toward-zero (`dweight + 1` when negative). `power_var_int`'s
+  `log10(base)` weight estimate is computed as `ln(base)/ln(10)` in exact decimal.
+- The estimates PG derives from a *plain* `decimal → double` conversion
+  (`numericvar_to_double_no_overflow`) are **kept** as f64, because that conversion is
+  `strtod`(canonical-decimal-string), which is **correctly rounded** — and therefore identical in
+  every core (Rust `parse::<f64>`, Go `strconv.ParseFloat`, JS `Number`). One correctly-rounded
+  multiply (`× log10(e)`) and the `(int)` truncation are deterministic too.
+
+The payoff: jed's chosen scale **matches PG** in the overwhelming majority of inputs *and* is
+cross-core byte-identical **always**. A rare boundary where the *true* floor differs from PG's f64
+estimate is a documented divergence (handled by an override, never a cross-core break); the
+conformance corpus avoids such boundaries, and a broad randomized oracle sweep (sqrt/ln/log near
+`e^k` and near 1, exp/power across magnitudes, negative bases) finds **zero** divergences.
+
+**Domain errors (PG-exact).** `sqrt` of a negative, `0 ^ (negative)`, and a negative base to a
+non-integer power trap **`2201F`** (`invalid_argument_for_power_function`); `ln`/`log` of zero or a
+negative trap **`2201E`** (`invalid_argument_for_log`); an `exp`/`power` result outside the numeric
+format traps **`22003`**. Like `decimal` generally (§2), these are **finite-only** — there is no NaN
+or ±Infinity to produce.
+
+**Argument resolution — `arg_resolution = "none"` (a documented strictness vs PG).** A bare
+*integer* literal does **not** promote (`sqrt(2)` → `42883`), matching the existing float-root /
+`sign` behavior — PostgreSQL instead casts `int → double precision` and returns a float8 value
+(ledgered in `oracle_overrides.toml`). A *decimal* literal **does** resolve to the numeric kernel
+(`sqrt(4.0)` → `2.0000000000000000`, matching PG). Mixed integer/decimal arguments
+(`power(2.0, 3)`) need an explicit cast — a deferred follow-on.
+
+**Cost.** Each call charges one `operator_eval` (like the other scalar functions), structural and
+cross-core. The internal work is bounded by the chosen result scale; finer per-work metering is a
+deferred follow-on.

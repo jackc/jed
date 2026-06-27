@@ -37,6 +37,10 @@ const (
 	SubstringError
 	// InvalidArgumentForWidthBucketFunction is 2201G — {detail}.
 	InvalidArgumentForWidthBucketFunction
+	// InvalidArgumentForLog is 2201E — {detail}.
+	InvalidArgumentForLog
+	// InvalidArgumentForPowerFunction is 2201F — {detail}.
+	InvalidArgumentForPowerFunction
 	// InvalidPrecedingOrFollowingSize is 22013 — frame starting or ending offset must not be negative.
 	InvalidPrecedingOrFollowingSize
 	// SequenceGeneratorLimitExceeded is 2200H — nextval: reached {bound} value of sequence {sequence}.
@@ -194,6 +198,10 @@ func (s SqlState) Code() string {
 		return "22011"
 	case InvalidArgumentForWidthBucketFunction:
 		return "2201G"
+	case InvalidArgumentForLog:
+		return "2201E"
+	case InvalidArgumentForPowerFunction:
+		return "2201F"
 	case InvalidPrecedingOrFollowingSize:
 		return "22013"
 	case SequenceGeneratorLimitExceeded:
@@ -351,6 +359,8 @@ var Errors = []ErrorDesc{
 	{Code: "22016", Name: "invalid_argument_for_nth_value", Class: "data exception"},
 	{Code: "22011", Name: "substring_error", Class: "data exception"},
 	{Code: "2201G", Name: "invalid_argument_for_width_bucket_function", Class: "data exception"},
+	{Code: "2201E", Name: "invalid_argument_for_log", Class: "data exception"},
+	{Code: "2201F", Name: "invalid_argument_for_power_function", Class: "data exception"},
 	{Code: "22013", Name: "invalid_preceding_or_following_size", Class: "data exception"},
 	{Code: "2200H", Name: "sequence_generator_limit_exceeded", Class: "data exception"},
 	{Code: "2201W", Name: "invalid_row_count_in_limit_clause", Class: "data exception"},

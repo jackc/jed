@@ -367,12 +367,27 @@ reason = "jed: mutual recursion surfaces via forward-only visibility as 42P01 (r
 [[override]]
 file = "expr/float_math.test"
 sql = "SELECT sqrt(4)"
-reason = "jed: sqrt takes the float family with arg_resolution = none (catalog), and an integer literal does not implicitly promote to float, so 42883. PostgreSQL casts int -> double precision and returns 2. The strict type system (§4): int<->float is explicit-cast-only (float.md)."
+reason = "jed: sqrt takes the float family with arg_resolution = none (catalog), and an integer literal does not implicitly promote to float, so 42883. PostgreSQL casts int -> double precision and returns 2. The strict type system (§4): int<->float is explicit-cast-only (float.md). (A bare DECIMAL literal like sqrt(4.0) now resolves to the EXACT-numeric kernel — decimal.md §8 — and matches PG; only the bare INTEGER stays 42883.)"
+
+# --- exact-numeric transcendentals: argument resolution is `none` (catalog), so a bare INTEGER
+# does NOT promote. PostgreSQL resolves sqrt/ln/power(int...) by casting int -> double precision and
+# returns a float8 value; jed rejects 42883 (no int->numeric/float promotion for these — the same
+# strict-typing divergence the float-math functions carry). decimal.md §8. (A bare DECIMAL literal
+# DOES resolve to the numeric kernel and matches PG, so only the bare-integer forms diverge.)
+[[override]]
+file = "expr/numeric_transcendental.test"
+sql = "SELECT sqrt(2)"
+reason = "jed: sqrt's numeric overload is arg_resolution = none, and a bare integer does not implicitly promote to decimal (nor float), so 42883. PostgreSQL casts int -> double precision and returns 1.4142135623730951. The strict type system (§4): int<->decimal/float for these functions is explicit-cast-only (decimal.md §8)."
 
 [[override]]
-file = "expr/float_math.test"
-sql = "SELECT sqrt(4.0)"
-reason = "jed: sqrt takes the float family with arg_resolution = none (catalog), and a decimal literal does not implicitly promote to float, so 42883. PostgreSQL casts numeric -> double precision and returns 2. The strict type system (§4): decimal<->float is explicit-cast-only (float.md)."
+file = "expr/numeric_transcendental.test"
+sql = "SELECT ln(2)"
+reason = "jed: ln's numeric overload is arg_resolution = none, and a bare integer does not implicitly promote, so 42883. PostgreSQL casts int -> double precision and returns a value. Explicit-cast-only for these functions (decimal.md §8)."
+
+[[override]]
+file = "expr/numeric_transcendental.test"
+sql = "SELECT power(2, 10)"
+reason = "jed: power's numeric overload is arg_resolution = none over (decimal, decimal); two bare integers do not promote, so 42883. PostgreSQL casts int -> double precision and returns 1024. Explicit-cast-only for these functions (decimal.md §8). (`pow(numeric, numeric)` is a PG alias of power and matches jed, so it needs no override.)"
 
 # --- the `%` (modulo) operator over floats is a jed extension (IEEE fmod, float.md §4).
 # PostgreSQL ships no `%` operator for double precision / real (only mod() over numeric/int), so

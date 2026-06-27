@@ -2225,6 +2225,109 @@ result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
+# ── EXACT-numeric transcendentals over `decimal`/`numeric` (../design/decimal.md §8) ──────────
+# sqrt / ln / exp / power / log over numeric. Unlike the FLOAT transcendentals above (which ride
+# the `R`-tag ULP exemption, float.md §8), these are IN-CONTRACT: byte-identical across cores by
+# construction — a hand-rolled PG-faithful arbitrary-precision port (PostgreSQL numeric.c
+# sqrt_var/ln_var/exp_var/log_var/power_var) computed entirely in the exact-decimal limb arithmetic,
+# with NO libm transcendental on the value path (the result scale is chosen deterministically, never
+# from a platform `log`/`log10`). Result is an unconstrained `numeric`; the result SCALE follows PG's
+# rule (≥ NUMERIC_MIN_SIG_DIGITS = 16 significant digits, never below the input's scale).
+# arg_resolution = "none", like the float roots and `sign`: a bare INTEGER does NOT promote (`sqrt(2)`
+# → 42883, a documented jed strictness vs PG's int→float8), but a decimal literal/value does
+# (`sqrt(4.0)` → numeric 2.0000000000000000, matching PG). Mixed integer/decimal arguments need an
+# explicit cast (a deferred follow-on). Domain errors match PG: sqrt of a negative and the power
+# domain errors trap 2201F; ln/log of a non-positive trap 2201E; exp/power overflow traps 22003.
+
+[[operator]]
+name           = "sqrt"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["2201F"]
+
+[[operator]]
+name           = "exp"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "ln"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["2201E"]
+
+# log(numeric) and log10(numeric) are base-10 logarithms (PG defines the one-arg `log` as
+# log(10, x)); both reuse the two-arg log kernel with base 10.
+[[operator]]
+name           = "log"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["2201E"]
+
+[[operator]]
+name           = "log10"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["2201E"]
+
+# log(base, x) — logarithm of x in an arbitrary base (PG numeric_log): ln(x) / ln(base).
+[[operator]]
+name           = "log"
+kind           = "function"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["2201E"]
+
+# power(base, exp) over numeric — the exact-numeric x^y (PG numeric_power). Integer exponents use
+# the binary-exponentiation path (power_var_int); a negative base demands an integer exponent
+# (else 2201F); 0 ^ (negative) traps 2201F; a finite result over the numeric format cap traps 22003.
+# `pow` is PG's alias of `power` for numeric too (both `pow(numeric,numeric)` and
+# `power(numeric,numeric)` exist), so jed ships both names over the same kernel — mirroring the
+# existing float `pow`/`power` pair.
+[[operator]]
+name           = "power"
+kind           = "function"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["2201F", "22003"]
+
+[[operator]]
+name           = "pow"
+kind           = "function"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = ["2201F", "22003"]
+
 [[operator]]
 name           = "sin"
 kind           = "function"

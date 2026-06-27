@@ -278,9 +278,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         (round-toward-bound siblings of round; integer overloads return numeric like round, a
         documented PG result-type divergence). gcd/lcm/width_bucket already landed. → catalog.toml,
         [functions.md §9](spec/design/functions.md), [decimal.md §6](spec/design/decimal.md)
-  - [ ] _follow-on:_ negative / `s>p` scale typmods; the EXACT-numeric *transcendentals*
-        (`power`/`log`/`ln`/`exp`/`sqrt` over numeric) — deferred, need a PG-faithful
-        arbitrary-precision ln/exp port (float.md §8).
+  - [x] _follow-on:_ the EXACT-numeric **transcendentals** `sqrt`/`ln`/`exp`/`log`/`log10`/`log(b,x)`/
+        `power`/`pow` over numeric — a hand-rolled PG-faithful arbitrary-precision port of numeric.c
+        (`sqrt_var`/`ln_var`/`exp_var`/`log_var`/`power_var`), byte-identical cross-core with NO libm
+        on the value path (the result scale is chosen deterministically), oracle-clean; `2201E`/`2201F`
+        domain errors, bare-int args stay `42883`. Cap `expr.numeric_transcendental`.
+        → [decimal.md §8](spec/design/decimal.md)
+  - [ ] _follow-on:_ negative / `s>p` scale typmods; mixed integer/decimal transcendental arguments
+        (`power(2.0, 3)` needs an explicit cast today); per-work cost metering for the transcendentals
+        (one `operator_eval` per call today).
 - [x] **`timestamp` / `timestamptz`** — PG instant model, i64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
   - [x] **time-zone database + `AT TIME ZONE` (host-loaded `JTZ` bundle)** — Slice 1 (copies
@@ -349,10 +355,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         oracle-clean: `cbrt`/`pi()`/`radians`/`degrees`, the inverse + hyperbolic trig, `power`; and
         the EXACT numerics `sign`/`mod()`/`div()`/`gcd`/`lcm`/`factorial`/`width_bucket` (new `2201G`)/
         `scale`/`min_scale`/`trim_scale`.
-    - [ ] _deferred:_ the **exact-numeric** transcendentals `power(numeric,numeric)`, `log(numeric)`,
-          `log(b, x)` — must be byte-identical cross-core (decimal is in-contract, no ULP exemption),
-          so they need a PG-faithful arbitrary-precision `ln`/`exp`/`power` port (numeric.c). Also the
-          `width_bucket(value, thresholds[])` array-threshold variant.
+    - [x] the **exact-numeric** transcendentals `sqrt`/`ln`/`exp`/`power(numeric,numeric)`/
+          `log(numeric)`/`log10`/`log(b, x)` — byte-identical cross-core (decimal is in-contract, no ULP
+          exemption) via a hand-rolled PG-faithful arbitrary-precision `numeric.c` port with NO libm on
+          the value path. → [decimal.md §8](spec/design/decimal.md)
+    - [ ] _deferred:_ the `width_bucket(value, thresholds[])` array-threshold variant.
 - [x] **`json` / `jsonb` + SQL/JSON** — ✅ the committed XL headline feature (§1, §4): **all
       non-deferred slices landed** across all three cores, oracle-clean. Designed spec-first across four
       docs ([json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md),

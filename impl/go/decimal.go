@@ -660,6 +660,532 @@ func WorkMod(a, b Decimal) int64 {
 }
 
 // ============================================================================
+// Exact-numeric transcendentals — sqrt / ln / exp / log / power over decimal
+// (spec/design/decimal.md §8). A hand-rolled, byte-exact port of PostgreSQL's
+// arbitrary-precision numeric.c (sqrt_var / ln_var / exp_var / log_var /
+// power_var / power_var_int), identical to the Rust and TS cores by construction
+// (every step is exact-decimal limb arithmetic; the scale estimates use no libm
+// transcendental — only the correctly-rounded string→f64 path PG keeps).
+// ============================================================================
+
+const (
+	minSigDigits    = int64(16)               // PG NUMERIC_MIN_SIG_DIGITS
+	decDigits       = int64(4)                // PG DEC_DIGITS — base-10⁴ group size
+	maxDisplayScale = int64(MaxPrecision)     // PG NUMERIC_MAX_DISPLAY_SCALE (1000)
+	maxResultScale  = int64(MaxPrecision) * 2 // PG NUMERIC_MAX_RESULT_SCALE (2000)
+	numericWeightMx = int64(32767)            // PG NUMERIC_WEIGHT_MAX (PG_INT16_MAX)
+)
+
+func logZero() error {
+	return NewError(InvalidArgumentForLog, "cannot take logarithm of zero")
+}
+
+func logNegative() error {
+	return NewError(InvalidArgumentForLog, "cannot take logarithm of a negative number")
+}
+
+// nbaseWeight is PG NumericVar `weight`: the base-10⁴ weight of the MSD = floor((precision−1−scale)/4)
+// (the decimal exponent of the MSD floored into base-10⁴ groups). Zero → 0. Value-derived, so
+// identical across cores regardless of internal limb base (decimal.md §7 #11).
+func (d Decimal) nbaseWeight() int64 {
+	if d.IsZero() {
+		return 0
+	}
+	return floorDiv4(int64(d.Precision()) - 1 - int64(d.Scale))
+}
+
+// toF64Estimate is PG `numericvar_to_double_no_overflow` = strtod(get_str_from_var()): the
+// correctly-rounded nearest f64, deterministic across cores. Used ONLY by the scale estimates.
+func (d Decimal) toF64Estimate() float64 {
+	f, _ := strconv.ParseFloat(d.Render(), 64) // ±Inf on range error, as PG ignores ERANGE
+	return f
+}
+
+// mulExact is the exact product (scale s1+s2), NO cap check (PG mul_var; make_result caps later).
+func (d Decimal) mulExact(o Decimal) Decimal {
+	return newDecimal(d.Neg != o.Neg, d.Scale+o.Scale, magMul(d.Limbs, o.Limbs))
+}
+
+// mulVar is PG `mul_var(a, b, result, rscale)`: exact product rounded half-away to `rscale`
+// fractional digits, result scale exactly `rscale`. rscale ≥ 0.
+func (d Decimal) mulVar(o Decimal, rscale int64) Decimal {
+	return d.mulExact(o).roundVar(rscale)
+}
+
+// roundVar is PG `round_var(var, rscale)`: round half-away to `rscale` fractional digits, uncapped.
+// rscale ≥ 0 → result scale exactly rscale; rscale < 0 → round to a multiple of 10^(−rscale),
+// result scale 0 (jed represents PG's transient negative dscale as the equal value at scale 0).
+func (d Decimal) roundVar(rscale int64) Decimal {
+	if rscale >= 0 {
+		return d.RoundToScale(uint32(rscale))
+	}
+	k := uint32(-rscale)
+	pow := magPow10(d.Scale + k)
+	q, r := magDivMod(d.Limbs, pow)
+	if magCmp(magAdd(r, r), pow) >= 0 {
+		q = magAdd(q, []uint32{1})
+	}
+	return newDecimal(d.Neg, 0, magMulPow10(q, k))
+}
+
+// divVar is PG `div_var(a, b, result, rscale, round=true)`: a/b to exactly `rscale` fractional
+// digits, half-away. rscale ≥ 0. Traps 22012 on a zero divisor. Uncapped.
+func (d Decimal) divVar(o Decimal, rscale int64) (Decimal, error) {
+	if o.IsZero() {
+		return Decimal{}, decimalDivByZero()
+	}
+	if d.IsZero() {
+		return DecimalZero(uint32(maxI64(rscale, 0))), nil
+	}
+	e := rscale + int64(o.Scale) - int64(d.Scale)
+	var numer, denom []uint32
+	if e >= 0 {
+		numer, denom = magMulPow10(d.Limbs, uint32(e)), o.Limbs
+	} else {
+		numer, denom = d.Limbs, magMulPow10(o.Limbs, uint32(-e))
+	}
+	q, r := magDivMod(numer, denom)
+	if magCmp(magAdd(r, r), denom) >= 0 {
+		q = magAdd(q, []uint32{1})
+	}
+	return newDecimal(d.Neg != o.Neg, uint32(maxI64(rscale, 0)), q), nil
+}
+
+// divVarInt is PG `div_var_int(a, ival, 0, result, rscale, round=true)`.
+func (d Decimal) divVarInt(ival int64, rscale int64) (Decimal, error) {
+	return d.divVar(DecimalFromInt64(ival), rscale)
+}
+
+// toI32IfInteger reports whether the value is an exact integer fitting int32 (PG's power_var_int
+// gate). ok=false otherwise.
+func (d Decimal) toI32IfInteger() (int32, bool) {
+	if d.TruncToScale(0).CmpValue(d) != 0 {
+		return 0, false
+	}
+	v, ok := d.ToInt64Round()
+	if !ok || v < math.MinInt32 || v > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(v), true
+}
+
+func maxI64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// sqrtVar is PG `sqrt_var(arg, result, rscale)`: √self rounded half-away to `rscale` fractional
+// digits (rscale may be negative). Traps 2201F on a negative operand.
+func (d Decimal) sqrtVar(rscale int64) (Decimal, error) {
+	if d.IsZero() {
+		return DecimalZero(uint32(maxI64(rscale, 0))), nil
+	}
+	if d.Neg {
+		return Decimal{}, NewError(InvalidArgumentForPowerFunction,
+			"cannot take square root of a negative number")
+	}
+	s := int64(d.Scale)
+	kc := maxI64(rscale, 0) + 1
+	if 2*kc < s {
+		kc = (s+1)/2 + 1 // ensure E = 2·kc − scale ≥ 0; extra guard never changes the rounded result
+	}
+	e := 2*kc - s
+	n := magMulPow10(d.Limbs, uint32(e))
+	g := magIsqrt(n)
+	atGuard := newDecimal(false, uint32(kc), g)
+	return atGuard.roundVar(rscale), nil
+}
+
+// DecSqrt is sqrt(numeric) (PG numeric_sqrt): choose rscale for ≥ minSigDigits significant digits.
+func (d Decimal) DecSqrt() (Decimal, error) {
+	sweight := d.nbaseWeight()*decDigits/2 + 1
+	rscale := minSigDigits - sweight
+	rscale = minI64(maxI64(maxI64(rscale, int64(d.Scale)), 0), maxDisplayScale)
+	r, err := d.sqrtVar(rscale)
+	if err != nil {
+		return Decimal{}, err
+	}
+	return r.CheckCap()
+}
+
+func minI64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// expVar is PG `exp_var(arg, result, rscale)`: e^self to `rscale` digits via a range-reduced
+// Taylor series. Traps 22003 on overflow.
+func (d Decimal) expVar(rscale int64) (Decimal, error) {
+	x := d
+	val := d.toF64Estimate()
+	if math.Abs(val) >= float64(maxResultScale*3) {
+		if val > 0 {
+			return Decimal{}, decimalOverflow()
+		}
+		return DecimalZero(uint32(maxI64(rscale, 0))), nil
+	}
+	dweight := int64(val * 0.434294481903252)
+	var ndiv2 int64
+	if math.Abs(val) > 0.01 {
+		n := int64(1)
+		val /= 2
+		for math.Abs(val) > 0.01 {
+			n++
+			val /= 2
+		}
+		ndiv2 = n
+		localRscale := int64(x.Scale) + ndiv2
+		var err error
+		x, err = x.divVarInt(int64(1)<<uint(ndiv2), localRscale)
+		if err != nil {
+			return Decimal{}, err
+		}
+	}
+	sigDigits := 1 + dweight + rscale + int64(float64(ndiv2)*0.301029995663981)
+	sigDigits = maxI64(sigDigits, 0) + 8
+	localRscale := sigDigits - 1
+	result := DecimalFromInt64(1).AddUncapped(x)
+	elem := x.mulVar(x, localRscale)
+	ni := int64(2)
+	var err error
+	elem, err = elem.divVarInt(ni, localRscale)
+	if err != nil {
+		return Decimal{}, err
+	}
+	for !elem.IsZero() {
+		result = result.AddUncapped(elem)
+		elem = elem.mulVar(x, localRscale)
+		ni++
+		elem, err = elem.divVarInt(ni, localRscale)
+		if err != nil {
+			return Decimal{}, err
+		}
+	}
+	for k := ndiv2; k > 0; k-- {
+		lr := maxI64(sigDigits-result.nbaseWeight()*2*decDigits, 0)
+		result = result.mulVar(result, lr)
+	}
+	return result.roundVar(rscale), nil
+}
+
+// DecExp is exp(numeric) (PG numeric_exp): choose rscale, then expVar.
+func (d Decimal) DecExp() (Decimal, error) {
+	val := d.toF64Estimate() * 0.434294481903252
+	if val < float64(-maxResultScale) {
+		val = float64(-maxResultScale)
+	}
+	if val > float64(maxResultScale) {
+		val = float64(maxResultScale)
+	}
+	rscale := minSigDigits - int64(val)
+	rscale = minI64(maxI64(maxI64(rscale, int64(d.Scale)), 0), maxDisplayScale)
+	r, err := d.expVar(rscale)
+	if err != nil {
+		return Decimal{}, err
+	}
+	return r.CheckCap()
+}
+
+// lnVar is PG `ln_var(arg, result, rscale)`: the natural log of self (> 0) to `rscale` digits via
+// sqrt range reduction + the atanh series. The caller guarantees self > 0.
+func (d Decimal) lnVar(rscale int64) Decimal {
+	nineTenths := DecimalFromDigitsScale(false, "9", 1)    // 0.9
+	elevenTenths := DecimalFromDigitsScale(false, "11", 1) // 1.1
+	two := DecimalFromInt64(2)
+	one := DecimalFromInt64(1)
+	x := d
+	fact := two
+	nsqrt := int64(0)
+	for x.CmpValue(nineTenths) <= 0 {
+		localRscale := rscale - x.nbaseWeight()*decDigits/2 + 8
+		x, _ = x.sqrtVar(localRscale) // self > 0, never errors
+		fact = fact.mulVar(two, 0)
+		nsqrt++
+	}
+	for x.CmpValue(elevenTenths) >= 0 {
+		localRscale := rscale - x.nbaseWeight()*decDigits/2 + 8
+		x, _ = x.sqrtVar(localRscale)
+		fact = fact.mulVar(two, 0)
+		nsqrt++
+	}
+	localRscale := rscale + int64(float64(nsqrt+1)*0.301029995663981) + 8
+	result, _ := x.sub(one).divVar(x.AddUncapped(one), localRscale)
+	xx := result
+	zsq := result.mulVar(result, localRscale)
+	ni := int64(1)
+	for {
+		ni += 2
+		xx = xx.mulVar(zsq, localRscale)
+		elem, _ := xx.divVarInt(ni, localRscale)
+		if elem.IsZero() {
+			break
+		}
+		result = result.AddUncapped(elem)
+		if elem.nbaseWeight() < result.nbaseWeight()-localRscale*2/decDigits {
+			break
+		}
+	}
+	return result.mulVar(fact, rscale)
+}
+
+// sub is the uncapped subtraction (x − o), the kernels' running form.
+func (d Decimal) sub(o Decimal) Decimal { return d.AddUncapped(o.Negate()) }
+
+// estimateLnDweight is the deterministic PG `estimate_ln_dweight(var)` — an estimate of
+// trunc(log10(|ln(var)|)) (PG truncates toward zero via (int)), computed WITHOUT libm. var > 0.
+func (d Decimal) estimateLnDweight() int64 {
+	if d.IsZero() || d.Neg {
+		return 0
+	}
+	nineTenths := DecimalFromDigitsScale(false, "9", 1)
+	elevenTenths := DecimalFromDigitsScale(false, "11", 1)
+	if d.CmpValue(nineTenths) >= 0 && d.CmpValue(elevenTenths) <= 0 {
+		x := d.sub(DecimalFromInt64(1))
+		if x.IsZero() {
+			return 0
+		}
+		return int64(x.Precision()) - 1 - int64(x.Scale) // floor(log10(|var−1|))
+	}
+	t := d.lnVar(20)
+	if t.IsZero() {
+		return 0
+	}
+	dw := int64(t.Precision()) - 1 - int64(t.Scale) // floor(log10(|ln(var)|))
+	if dw < 0 {
+		return dw + 1
+	}
+	return dw
+}
+
+// DecLn is ln(numeric) (PG numeric_ln).
+func (d Decimal) DecLn() (Decimal, error) {
+	if d.IsZero() {
+		return Decimal{}, logZero()
+	}
+	if d.Neg {
+		return Decimal{}, logNegative()
+	}
+	lnDweight := d.estimateLnDweight()
+	rscale := minSigDigits - lnDweight
+	rscale = minI64(maxI64(maxI64(rscale, int64(d.Scale)), 0), maxDisplayScale)
+	return d.lnVar(rscale).CheckCap()
+}
+
+// DecLog is log(base, num) (PG numeric_log / log_var): ln(num)/ln(base). Both > 0 (else 2201E).
+func DecLog(base, num Decimal) (Decimal, error) {
+	for _, v := range []Decimal{base, num} {
+		if v.IsZero() {
+			return Decimal{}, logZero()
+		}
+		if v.Neg {
+			return Decimal{}, logNegative()
+		}
+	}
+	lnBaseDweight := base.estimateLnDweight()
+	lnNumDweight := num.estimateLnDweight()
+	resultDweight := lnNumDweight - lnBaseDweight
+	rscale := minSigDigits - resultDweight
+	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.Scale)), int64(num.Scale)), 0), maxDisplayScale)
+	lnBaseRscale := maxI64(rscale+resultDweight-lnBaseDweight+8, 0)
+	lnNumRscale := maxI64(rscale+resultDweight-lnNumDweight+8, 0)
+	lnBase := base.lnVar(lnBaseRscale)
+	lnNum := num.lnVar(lnNumRscale)
+	r, err := lnNum.divVar(lnBase, rscale)
+	if err != nil {
+		return Decimal{}, err
+	}
+	return r.CheckCap()
+}
+
+// DecLog10 is log(numeric)/log10(numeric) — base-10 logarithm (PG one-arg log = log(10, x)).
+func (d Decimal) DecLog10() (Decimal, error) {
+	return DecLog(DecimalFromInt64(10), d)
+}
+
+// log10Estimate is log10(self) = ln(self)/ln(10) to a ~30-digit guard — the deterministic
+// libm-free replacement for power_var_int's log10(double) weight estimate. self > 0.
+func (d Decimal) log10Estimate() Decimal {
+	guard := int64(30)
+	lnSelf := d.lnVar(guard)
+	lnTen := DecimalFromInt64(10).lnVar(guard)
+	r, _ := lnSelf.divVar(lnTen, guard)
+	return r
+}
+
+// powerVarInt is PG `power_var_int(base, exp, exp_dscale)`: base^exp for an integer exp.
+func powerVarInt(base Decimal, exp int32, expDscale uint32) (Decimal, error) {
+	var f float64
+	if !base.IsZero() {
+		f = base.Abs().log10Estimate().mulExact(DecimalFromInt64(int64(exp))).toF64Estimate()
+	}
+	if f > float64(numericWeightMx+1)*float64(decDigits) {
+		return Decimal{}, decimalOverflow()
+	}
+	if f+1 < float64(-maxDisplayScale) {
+		return DecimalZero(uint32(maxDisplayScale)), nil
+	}
+	fi := int64(f)
+	rscale := minSigDigits - fi
+	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.Scale)), int64(expDscale)), 0), maxDisplayScale)
+	switch exp {
+	case 0:
+		return DecimalFromInt64(1).roundVar(rscale), nil
+	case 1:
+		return base.roundVar(rscale), nil
+	case -1:
+		r, err := DecimalFromInt64(1).divVar(base, rscale)
+		if err != nil {
+			return Decimal{}, err
+		}
+		return r.CheckCap()
+	case 2:
+		return base.mulVar(base, rscale).CheckCap()
+	}
+	if base.IsZero() {
+		if exp < 0 {
+			return Decimal{}, decimalDivByZero()
+		}
+		return DecimalZero(uint32(rscale)), nil
+	}
+	sigDigits := 1 + rscale + fi
+	mask := uint32(exp)
+	if exp < 0 {
+		mask = uint32(-int64(exp))
+	}
+	sigDigits += intLnFloor(uint64(mask)) + 8
+	neg := exp < 0
+	baseProd := base
+	var result Decimal
+	if mask&1 == 1 {
+		result = base
+	} else {
+		result = DecimalFromInt64(1)
+	}
+	overflowed := false
+	for {
+		mask >>= 1
+		if mask == 0 {
+			break
+		}
+		lr := maxI64(minI64(sigDigits-2*baseProd.nbaseWeight()*decDigits, 2*int64(baseProd.Scale)), 0)
+		baseProd = baseProd.mulVar(baseProd, lr)
+		if mask&1 == 1 {
+			lr2 := maxI64(minI64(sigDigits-(baseProd.nbaseWeight()+result.nbaseWeight())*decDigits,
+				int64(baseProd.Scale)+int64(result.Scale)), 0)
+			result = baseProd.mulVar(result, lr2)
+		}
+		if baseProd.nbaseWeight() > numericWeightMx || result.nbaseWeight() > numericWeightMx {
+			if !neg {
+				return Decimal{}, decimalOverflow()
+			}
+			result = DecimalZero(0)
+			overflowed = true
+			break
+		}
+	}
+	if neg && !overflowed {
+		r, err := DecimalFromInt64(1).divVar(result, rscale)
+		if err != nil {
+			return Decimal{}, err
+		}
+		return r.CheckCap()
+	}
+	return result.roundVar(rscale).CheckCap()
+}
+
+// powerVar is PG `power_var(base, exp, result)`: base^exp for a general exponent.
+func powerVar(base, exp Decimal) (Decimal, error) {
+	if iexp, ok := exp.toI32IfInteger(); ok {
+		return powerVarInt(base, iexp, exp.Scale)
+	}
+	if base.IsZero() {
+		return DecimalZero(uint32(minSigDigits)), nil
+	}
+	if base.Neg {
+		return Decimal{}, NewError(InvalidArgumentForPowerFunction,
+			"a negative number raised to a non-integer power yields a complex result")
+	}
+	lnDweight := base.estimateLnDweight()
+	localRscale := maxI64(8-lnDweight, 0)
+	lnBase := base.lnVar(localRscale)
+	lnNum := lnBase.mulVar(exp, localRscale)
+	val := lnNum.toF64Estimate()
+	if math.Abs(val) > float64(maxResultScale)*3.01 {
+		if val > 0 {
+			return Decimal{}, decimalOverflow()
+		}
+		return DecimalZero(uint32(maxDisplayScale)), nil
+	}
+	val *= 0.434294481903252
+	vi := int64(val)
+	rscale := minSigDigits - vi
+	rscale = minI64(maxI64(maxI64(maxI64(rscale, int64(base.Scale)), int64(exp.Scale)), 0), maxDisplayScale)
+	sigDigits := maxI64(rscale+vi, 0)
+	localRscale = maxI64(sigDigits-lnDweight+8, 0)
+	lnBase = base.lnVar(localRscale)
+	lnNum = lnBase.mulVar(exp, localRscale)
+	r, err := lnNum.expVar(rscale)
+	if err != nil {
+		return Decimal{}, err
+	}
+	return r.CheckCap()
+}
+
+// DecPower is power(base, exp) over numeric (PG numeric_power, finite path). 0 ^ negative → 2201F.
+func DecPower(base, exp Decimal) (Decimal, error) {
+	sign1 := 1
+	if base.IsZero() {
+		sign1 = 0
+	} else if base.Neg {
+		sign1 = -1
+	}
+	sign2 := 1
+	if exp.IsZero() {
+		sign2 = 0
+	} else if exp.Neg {
+		sign2 = -1
+	}
+	if sign1 == 0 && sign2 < 0 {
+		return Decimal{}, NewError(InvalidArgumentForPowerFunction,
+			"zero raised to a negative power is undefined")
+	}
+	return powerVar(base, exp)
+}
+
+// intLnFloor is floor(ln(n)) for n ≥ 1, computed deterministically via the exact ln (no libm) —
+// PG's (int)log(fabs(exp)) guard in power_var_int.
+func intLnFloor(n uint64) int64 {
+	if n <= 1 {
+		return 0
+	}
+	v, _ := DecimalFromInt64(int64(n)).lnVar(12).TruncToScale(0).ToInt64Round()
+	return v
+}
+
+// magIsqrt is floor(√n) for a magnitude n (base-10⁹ LSB-first), via Newton's method on big
+// integers (x ← (x + n/x)/2 from x₀ = 10^⌈digits/2⌉ ≥ √n).
+func magIsqrt(n []uint32) []uint32 {
+	if len(n) == 0 {
+		return nil
+	}
+	half := (magDigitCount(n) + 1) / 2
+	x := magPow10(half)
+	for {
+		nDivX, _ := magDivMod(n, x)
+		sum := magAdd(x, nDivX)
+		y, _ := magDivMod(sum, []uint32{2})
+		if magCmp(y, x) >= 0 {
+			return x
+		}
+		x = y
+	}
+}
+
+// ============================================================================
 // Magnitude helpers — base 10^9, LSB-first, normalized (no high zero limbs).
 // ============================================================================
 

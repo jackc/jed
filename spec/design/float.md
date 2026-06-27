@@ -287,11 +287,14 @@ NaN, keeping NaN an *input-only* value (§3) — while `cot(0)` and `atanh(±1)`
 (PG-faithful, admissible since the result is in the exempted column), and a NaN *operand*
 propagates. `sinh`/`cosh` overflow to `±Infinity` with NO trap (a PG quirk, unlike `exp`/`pow`).
 
-**Numeric transcendentals are DEFERRED.** PostgreSQL also offers `power(numeric,numeric)`,
-`log(numeric)`, and `log(b, x)` (numeric — PG has no float two-arg `log`). These must be
-**byte-identical across cores** (decimal is in-contract, §5 — they cannot ride the ULP exemption
-above), so they need a PG-faithful arbitrary-precision `ln`/`exp`/`power` port (numeric.c). That
-is a future slice; `power` ships now as the **float** alias only, and `log` is not yet added.
+**Numeric transcendentals have LANDED** ([decimal.md §8](decimal.md)). PostgreSQL also offers
+`sqrt`/`ln`/`exp`/`power(numeric,numeric)`/`log(numeric)`/`log(b, x)` over `numeric` (PG has no
+float two-arg `log`). These must be **byte-identical across cores** (decimal is in-contract, §5 —
+they cannot ride the ULP exemption above), so they are a hand-rolled PG-faithful arbitrary-precision
+port of `numeric.c` (`sqrt_var`/`ln_var`/`exp_var`/`log_var`/`power_var`), computed entirely in the
+exact-decimal limb arithmetic with **no libm transcendental on the value path** (the result scale is
+chosen deterministically — decimal.md §8). The float `power`/`pow` and the numeric
+`power`/`pow`/`log` now coexist as disjoint overloads (the `f` prefix keeps the families apart).
 
 The transcendental list is a generous starting set; further FLOAT functions are easy additive
 follow-ons (each one operator-catalog row + a line on the shared ledger entry). The EXACT numeric
