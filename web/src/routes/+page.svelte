@@ -75,6 +75,13 @@ ORDER BY score DESC;`;
       >Open the database tool</a
     >
   </div>
+  <p class="mx-auto mt-5 max-w-2xl text-sm text-jed-muted">
+    <span class="font-semibold text-jed-ink">0.x preview.</span> Heavily tested, but not yet proven
+    by real-world use — and the on-disk format may still change.
+    <a class="text-jed-accent hover:underline" href="{base}/docs/status/"
+      >Read the preview status →</a
+    >
+  </p>
 </section>
 
 <section class="mt-4">
