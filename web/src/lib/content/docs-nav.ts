@@ -9,7 +9,11 @@ export type DocSection = { title: string; links: DocLink[] };
 export const DOCS_NAV: readonly DocSection[] = [
   {
     title: 'Getting started',
-    links: [{ title: 'Introduction', href: '/docs/' }]
+    links: [
+      { title: 'Introduction', href: '/docs/' },
+      { title: 'Installation', href: '/docs/install/' },
+      { title: 'Preview status', href: '/docs/status/' }
+    ]
   },
   {
     title: 'Embedding API',

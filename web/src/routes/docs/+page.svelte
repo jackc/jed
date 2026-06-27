@@ -18,7 +18,9 @@
   jed's documentation comes in two parts, because there are two different questions: <em
     >how do I call jed from my program?</em
   >
-  and <em>what does the SQL do?</em>
+  and <em>what does the SQL do?</em> New here? Start with
+  <a href="{base}/docs/install/">Installation</a>, and read the
+  <a href="{base}/docs/status/">preview status</a> for what to expect from a 0.x release.
 </p>
 
 <h2>Embedding API</h2>
