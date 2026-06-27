@@ -1,8 +1,9 @@
 # DROP TABLE — remove a table (its definition and all its rows) from the catalog. The
-# inverse of CREATE TABLE: a missing table is 42P01 (or a no-op under IF EXISTS), single
-# table, no CASCADE/RESTRICT (grammar.md §13). After a drop the name is free to re-create
-# from empty. Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_if_exists, ddl.secondary_index, dml.insert, dml.update, dml.delete, query.select, query.order_by, types.i16, types.i32, types.i64
+# inverse of CREATE TABLE: a missing table is 42P01 (or a no-op under IF EXISTS). A comma list
+# drops several tables two-phase / all-or-nothing; the trailing CASCADE/RESTRICT keyword picks
+# the FK-dependency mode (grammar.md §13). After a drop the name is free to re-create from empty.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_if_exists, ddl.drop_table_multi, ddl.foreign_key, ddl.secondary_index, dml.insert, dml.update, dml.delete, query.select, query.order_by, types.i16, types.i32, types.i64
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i16)
@@ -158,3 +159,181 @@ DROP TABLE IF
 # syntax: IF EXISTS with no following table name is a syntax error (42601)
 statement error 42601
 DROP TABLE IF EXISTS
+
+# ---------------------------------------------------------------------------
+# Multi-table DROP TABLE — `DROP TABLE a, b` (two-phase / all-or-nothing, grammar.md §13)
+# ---------------------------------------------------------------------------
+
+# a comma list removes several tables in one statement
+statement ok
+CREATE TABLE dtm_m1 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE dtm_m2 (id i32 PRIMARY KEY)
+
+statement ok
+DROP TABLE dtm_m1, dtm_m2
+
+statement error 42P01
+SELECT id FROM dtm_m1
+
+statement error 42P01
+SELECT id FROM dtm_m2
+
+# two-phase / all-or-nothing: a missing name anywhere in the list drops NOTHING (42P01); every
+# name is validated before any is removed, so the surviving table is untouched
+statement ok
+CREATE TABLE dtm_keep (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO dtm_keep VALUES (1)
+
+statement error 42P01
+DROP TABLE dtm_keep, dtm_never
+
+query I nosort
+SELECT id FROM dtm_keep
+----
+1
+
+# a repeated name is deduplicated: `DROP TABLE dtm_keep, dtm_keep` drops it once and succeeds
+# (PG collects the targets into a set, so the second mention is not a missing-table error)
+statement ok
+DROP TABLE dtm_keep, dtm_keep
+
+statement error 42P01
+SELECT id FROM dtm_keep
+
+# once the name is gone, the same duplicate drop is the ordinary missing-table 42P01
+statement error 42P01
+DROP TABLE dtm_keep, dtm_keep
+
+# IF EXISTS applies across the whole list: a present table is dropped, a missing one skipped
+statement ok
+CREATE TABLE dtm_ie1 (id i32 PRIMARY KEY)
+
+statement ok
+DROP TABLE IF EXISTS dtm_ie1, dtm_never
+
+statement error 42P01
+SELECT id FROM dtm_ie1
+
+# a non-table relation (a secondary index) anywhere in the list is 42809 (wrong_object_type) —
+# being two-phase, the refusal leaves the whole list intact
+statement ok
+CREATE TABLE dtm_h (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE INDEX dtm_h_k_idx ON dtm_h (k)
+
+statement error 42809
+DROP TABLE dtm_h, dtm_h_k_idx
+
+# the table (and its index) survive the refused drop
+statement ok
+INSERT INTO dtm_h VALUES (1, 5)
+
+query I nosort
+SELECT id FROM dtm_h
+----
+1
+
+statement ok
+DROP TABLE dtm_h
+
+# ---------------------------------------------------------------------------
+# DROP TABLE … CASCADE / RESTRICT — the FK-dependency mode (grammar.md §13)
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE dtm_parent (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE dtm_child (id i32 PRIMARY KEY, p i32 REFERENCES dtm_parent (id))
+
+statement ok
+INSERT INTO dtm_parent VALUES (1)
+
+statement ok
+INSERT INTO dtm_child VALUES (10, 1)
+
+# RESTRICT is the default: a table another table's FOREIGN KEY references cannot be dropped (2BP01)
+statement error 2BP01
+DROP TABLE dtm_parent
+
+# the explicit RESTRICT keyword is the same refusal
+statement error 2BP01
+DROP TABLE dtm_parent RESTRICT
+
+# both tables survive the refused drop
+query I nosort
+SELECT p FROM dtm_child ORDER BY id
+----
+1
+
+# CASCADE drops the parent AND the now-dangling FK constraint on the child; the child and its
+# rows survive
+statement ok
+DROP TABLE dtm_parent CASCADE
+
+query I nosort
+SELECT id FROM dtm_child ORDER BY id
+----
+10
+
+# the child's FK is gone, so a row whose value has no parent now inserts cleanly (it would have
+# trapped 23503 while the FK stood)
+statement ok
+INSERT INTO dtm_child VALUES (11, 999)
+
+query II nosort
+SELECT id, p FROM dtm_child ORDER BY id
+----
+10
+1
+11
+999
+
+statement ok
+DROP TABLE dtm_child
+
+# a FOREIGN KEY between two tables BOTH named in the same statement never blocks — dropping the
+# child removes the dependency, so `DROP TABLE parent, child` succeeds even under the default
+# RESTRICT
+statement ok
+CREATE TABLE dtm_pp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE dtm_cc (id i32 PRIMARY KEY, p i32 REFERENCES dtm_pp (id))
+
+statement ok
+DROP TABLE dtm_pp, dtm_cc
+
+statement error 42P01
+SELECT id FROM dtm_pp
+
+statement error 42P01
+SELECT id FROM dtm_cc
+
+# order within the list does not matter: child-then-parent drops both too
+statement ok
+CREATE TABLE dtm_pp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE dtm_cc (id i32 PRIMARY KEY, p i32 REFERENCES dtm_pp (id))
+
+statement ok
+DROP TABLE dtm_cc, dtm_pp
+
+statement error 42P01
+SELECT id FROM dtm_cc
+
+# RESTRICT on a table with no dependents is an ordinary successful drop
+statement ok
+CREATE TABLE dtm_solo (id i32 PRIMARY KEY)
+
+statement ok
+DROP TABLE dtm_solo RESTRICT
+
+statement error 42P01
+SELECT id FROM dtm_solo

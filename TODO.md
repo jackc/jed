@@ -218,7 +218,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] **`DROP TABLE IF EXISTS`** — missing table is a no-op success instead of `42P01`
         (a non-table relation is still `42809`); two-token `IF EXISTS` lookahead so a lone
         `if` stays an identifier (PG-faithful). Cap `ddl.drop_table_if_exists`.
-  - [ ] _follow-on:_ multi-table `DROP TABLE a, b`, `CASCADE`/`RESTRICT`.
+  - [x] **multi-table `DROP TABLE a, b` + `CASCADE` / `RESTRICT`** — a comma list drops several
+        tables two-phase / all-or-nothing (validate every name — missing `42P01` unless `IF EXISTS`,
+        non-table `42809`, external FK dependent `2BP01` under `RESTRICT` — before removing any), a
+        repeated name deduplicated; `RESTRICT` (default) refuses an FK-referenced table, `CASCADE`
+        drops the dependent FK constraints with it; a FK within the drop set never blocks. Cap
+        `ddl.drop_table_multi`. → [grammar.md §13](spec/design/grammar.md)
 
 ---
 

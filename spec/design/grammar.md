@@ -521,16 +521,34 @@ statement dispatch uses), so a lone `if` stays an ordinary non-reserved identifi
 `IF EXISTS` selects the idempotent form. The symmetric `CREATE TABLE IF NOT EXISTS` is still
 deferred and can land later ([../../TODO.md](../../TODO.md)).
 
-**Deliberate narrowings (each relaxable later, §5).** As with the rest of the surface, the
-form is minimal:
+**Multi-table drop.** `DROP TABLE a, b, c` removes several tables in one statement. It is
+**two-phase / all-or-nothing** (the discipline §12 uses for multi-row work): every name is
+resolved and validated *first* — a missing one is `42P01` (unless `IF EXISTS`, which skips
+just that name), a non-table relation is `42809` — and only if the whole list checks out is
+*anything* removed. So `DROP TABLE a, missing` drops nothing and raises `42P01`; `a` survives.
+A name **repeated** in the list is deduplicated (`DROP TABLE a, a` drops `a` once and
+succeeds), matching PostgreSQL, which collects the targets into a set.
 
-- **One table per statement** — no `DROP TABLE a, b, c`. (When multi-table drop lands it
-  inherits the two-phase / all-or-nothing discipline §12 uses for multi-row work: validate
-  every name exists before removing any.)
-- **No `CASCADE` / `RESTRICT`** — there are no dependent objects yet (no views, foreign
-  keys, or secondary indexes), so PostgreSQL's default `RESTRICT` is vacuous and the
-  keywords are simply not part of the surface. They become meaningful only once
-  dependencies exist (Phase 4, [../../TODO.md](../../TODO.md)).
+**`CASCADE` / `RESTRICT`.** Now that foreign keys exist (`format_version` 11,
+[constraints.md](constraints.md) §6), a table can have a dependent — another table's `FOREIGN
+KEY` that references it — so the trailing keyword is meaningful:
+
+- **`RESTRICT`** (the default, and the behavior of the bare form) refuses the drop if a table
+  *outside the statement's drop set* references it, raising `2BP01`
+  (`dependent_objects_still_exist`). This is the existing single-table FK-parent check.
+- **`CASCADE`** drops those dependent `FOREIGN KEY` constraints along with the table: the
+  referencing table and its rows survive, only its now-dangling FK constraint is removed.
+  (Secondary indexes and owned `serial` sequences are *internal* dependents — `DROP TABLE`
+  always removes them regardless of mode, §6/sequences.md §12 — so the keyword governs only
+  cross-table FK dependents.)
+
+A foreign key **between two tables both named in the same statement** never blocks, under
+either mode: dropping the referencing table removes the dependency, so `DROP TABLE parent,
+child` (or `child, parent`) succeeds even under `RESTRICT`. The drop-set exclusion — a
+dependent that is *itself* being dropped does not count — is what the two-phase resolve buys.
+
+**Still narrowed (relaxable later, §5).** `CASCADE` reaches only FK dependents (the one
+cross-table dependency kind today); views and other dependency classes do not exist yet.
 
 **Cost is zero.** Like `CREATE TABLE`, a drop reads no rows and evaluates no expression
 tree — it is a pure catalog edit — so it accrues zero cost ([cost.md](cost.md)). Removing a

@@ -522,30 +522,74 @@ func (s *Snapshot) compositeDependent(name string) (string, bool) {
 	return "", false
 }
 
-// foreignKeyDependent reports whether any OTHER table's FOREIGN KEY references the table name
-// (case-insensitive) — the DROP TABLE dependency check (2BP01 — spec/design/constraints.md
-// §6.10). A self-reference does NOT block the drop (a table's own FK on itself disappears with
-// it). Returns the first dependent's description, scanning in ascending lowercased table-name
-// order for determinism (within a table, ForeignKeys is already in name order).
-func (s *Snapshot) foreignKeyDependent(name string) (string, bool) {
-	key := strings.ToLower(name)
+// fkDependent is one FOREIGN KEY dependent surfaced by a multi-table DROP TABLE's dependency scan
+// (spec/design/grammar.md §13): an FK on a table that survives the drop, referencing a table being
+// dropped. RESTRICT formats refTableName/fkName/droppedName into its 2BP01 detail; CASCADE uses
+// refTableKey/fkName to remove the now-dangling constraint.
+type fkDependent struct {
+	refTableKey  string // lowercased key of the (surviving) referencing table — for the CASCADE removal
+	fkName       string // the FK constraint's name
+	refTableName string // canonical referencing-table name — for the RESTRICT detail
+	droppedName  string // canonical name of the dropped table the FK references — for the RESTRICT detail
+}
+
+// foreignKeyDependentsExcluding returns every FK on a table NOT in dropping (a set of lowercased
+// table keys) that references a table that IS in dropping — the dependency scan for a multi-table
+// DROP TABLE (spec/design/grammar.md §13, constraints.md §6.10). A dependent whose referencing
+// table is itself being dropped does not count (the drop-set exclusion), so a FK between two tables
+// both named in the same statement never blocks. Referencing tables are scanned in ascending
+// lowercased key order (each table's ForeignKeys is already name-ordered) for determinism (§8).
+// RESTRICT raises 2BP01 on the first entry; CASCADE removes every entry's FK.
+func (s *Snapshot) foreignKeyDependentsExcluding(dropping map[string]bool) []fkDependent {
 	tableKeys := make([]string, 0, len(s.tables))
 	for k := range s.tables {
 		tableKeys = append(tableKeys, k)
 	}
 	sort.Strings(tableKeys)
+	var out []fkDependent
 	for _, tk := range tableKeys {
-		t := s.tables[tk]
-		if strings.EqualFold(t.Name, key) {
-			continue // a self-reference does not block the drop
+		if dropping[tk] {
+			continue // the referencing table is itself being dropped — no dependency
 		}
+		t := s.tables[tk]
 		for _, fk := range t.ForeignKeys {
-			if strings.EqualFold(fk.RefTable, key) {
-				return "constraint " + fk.Name + " on table " + t.Name, true
+			refKey := strings.ToLower(fk.RefTable)
+			if dropping[refKey] {
+				droppedName := fk.RefTable
+				if d, ok := s.tables[refKey]; ok {
+					droppedName = d.Name
+				}
+				out = append(out, fkDependent{
+					refTableKey:  tk,
+					fkName:       fk.Name,
+					refTableName: t.Name,
+					droppedName:  droppedName,
+				})
 			}
 		}
 	}
-	return "", false
+	return out
+}
+
+// removeForeignKey removes the named FK constraint from tableKey in place — a copy-on-write of the
+// table + its ForeignKeys slice so the committed snapshot is untouched — preserving the table's
+// store and rows. DROP TABLE … CASCADE's removal of a dependent FK on a table that survives the
+// drop (spec/design/grammar.md §13). An FK owns no B-tree (constraints.md §6), so only the catalog
+// list changes.
+func (s *Snapshot) removeForeignKey(tableKey, fkName string) {
+	old, ok := s.tables[tableKey]
+	if !ok {
+		return
+	}
+	kept := make([]ForeignKey, 0, len(old.ForeignKeys))
+	for _, fk := range old.ForeignKeys {
+		if !strings.EqualFold(fk.Name, fkName) {
+			kept = append(kept, fk)
+		}
+	}
+	t := *old
+	t.ForeignKeys = kept
+	s.tables[tableKey] = &t
 }
 
 // validateCompositeTypes validates the loaded composite-type catalog (the on-disk two-pass load —
@@ -1420,6 +1464,28 @@ func (db *Database) anyTempSequence(names []string) bool {
 func (db *Database) anySharedTempSequence(names []string) bool {
 	for _, n := range names {
 		if db.isSharedTempSequence(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyTempTable / anySharedTempTable report whether any name in a multi-table DROP TABLE resolves to
+// a session-local / database-wide-shared temp table — the DDL capability gate's classification of a
+// mixed list (temp-tables.md §5): if any target is temp-scoped the whole statement is gated by the
+// matching temp-DDL grant (shared checked before session-local, the resolution-walk order).
+func (db *Database) anyTempTable(names []string) bool {
+	for _, n := range names {
+		if db.isTempTable(n) {
+			return true
+		}
+	}
+	return false
+}
+
+func (db *Database) anySharedTempTable(names []string) bool {
+	for _, n := range names {
+		if db.isSharedTempTable(n) {
 			return true
 		}
 	}
@@ -2855,14 +2921,14 @@ func (db *Database) checkPrivileges(stmt Statement) error {
 		var allowed bool
 		switch {
 		case req.isSharedTempDDL ||
-			(stmt.DropTable != nil && db.isSharedTempTable(stmt.DropTable.Name)) ||
+			(stmt.DropTable != nil && db.anySharedTempTable(stmt.DropTable.Names)) ||
 			(stmt.CreateIndex != nil && db.isSharedTempTable(stmt.CreateIndex.Table)) ||
 			(stmt.DropIndex != nil && db.isSharedTempIndex(stmt.DropIndex.Name)) ||
 			(stmt.DropSequence != nil && db.anySharedTempSequence(stmt.DropSequence.Names)) ||
 			(stmt.AlterSequence != nil && db.isSharedTempSequence(stmt.AlterSequence.Name)):
 			allowed = db.session.allowSharedTempDDL
 		case req.isTempDDL ||
-			(stmt.DropTable != nil && db.isTempTable(stmt.DropTable.Name)) ||
+			(stmt.DropTable != nil && db.anyTempTable(stmt.DropTable.Names)) ||
 			(stmt.CreateIndex != nil && db.isTempTable(stmt.CreateIndex.Table)) ||
 			(stmt.DropIndex != nil && db.isTempIndex(stmt.DropIndex.Name)) ||
 			(stmt.DropSequence != nil && db.anyTempSequence(stmt.DropSequence.Names)) ||
@@ -4436,68 +4502,119 @@ func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, met
 	return nil
 }
 
-// executeDropTable runs a DROP TABLE [IF EXISTS]: remove the table's definition and its
-// row store from the catalog (both keyed by the lower-cased name). A missing table without
-// IF EXISTS is the same 42P01 the DML paths raise; with IF EXISTS it is a no-op success
-// (spec/design/grammar.md §13). Like CREATE TABLE it touches no rows and evaluates no
-// expression tree (the store is discarded wholesale), so it accrues zero cost.
+// dropScope is the scope a resolved DROP TABLE target lives in (temp-tables.md §3) — it governs
+// which working snapshot the removal routes to.
+type dropScope int
+
+const (
+	dropTemp dropScope = iota
+	dropSharedTemp
+	dropPersistent
+)
+
+type dropTarget struct {
+	key   string // lowercased catalog key
+	scope dropScope
+}
+
+// executeDropTable runs a DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]: remove each named
+// table's definition and row store from the catalog (keyed by lower-cased name). Two-phase /
+// all-or-nothing (spec/design/grammar.md §13): every name is resolved and validated first — a
+// missing table is 42P01 (unless IF EXISTS skips just that name), a non-table relation is 42809,
+// and an external FK dependent is 2BP01 under RESTRICT — and only if the whole list checks out is
+// anything removed. A repeated name is deduplicated; a FK between two tables both in the drop set
+// never blocks; CASCADE drops the surviving tables' now-dangling FK constraints. Like CREATE TABLE
+// it touches no rows and evaluates no expression tree, so it accrues zero cost.
 func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
-	// A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never the
-	// main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never an FK
-	// parent, §8), but it DOES auto-drop every sequence OWNED BY the table — a serial/IDENTITY temp
-	// column's owned temp sequence (spec/design/sequences.md §12, temp-tables.md §8) — from the SAME
-	// temp snapshot. The temp-DDL capability gate already ran at dispatch (§5). Session-local first,
-	// then shared.
-	if db.isTempTable(dt.Name) {
-		db.session.tx.tempDirty = true
-		ts := db.tempSnap()
-		for _, sk := range ts.sequencesOwnedBy(dt.Name) {
-			ts.removeSequence(sk)
+	// ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
+	// repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
+	// `a` once and succeeds); seen is the set of lowercased keys actually being dropped.
+	var targets []dropTarget
+	seen := map[string]bool{}
+	for _, name := range dt.Names {
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue // already resolved this exact target (deduplicated)
 		}
-		ts.removeTable(strings.ToLower(dt.Name))
-		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		// Resolution walk: session-local temp → shared temp → persistent. Preclude-overlaps keeps a
+		// name in at most one scope, so this is just "where it lives" (temp-tables.md §3).
+		var scope dropScope
+		switch {
+		case db.isTempTable(name):
+			scope = dropTemp
+		case db.isSharedTempTable(name):
+			scope = dropSharedTemp
+		default:
+			if _, ok := db.readSnap().table(name); ok {
+				scope = dropPersistent
+			} else {
+				// Not a table in any scope. An index's name is the wrong object kind (42809 —
+				// indexes.md §2); IF EXISTS does NOT suppress this. Otherwise a missing table is
+				// 42P01, unless IF EXISTS makes it a no-op for just this name.
+				if _, _, ok := db.findIndex(name); ok {
+					return Outcome{}, NewError(WrongObjectType, name+" is not a table")
+				}
+				if dt.IfExists {
+					continue
+				}
+				return Outcome{}, NewError(UndefinedTable, "table does not exist: "+name)
+			}
+		}
+		seen[key] = true
+		targets = append(targets, dropTarget{key: key, scope: scope})
 	}
-	if db.isSharedTempTable(dt.Name) {
-		db.session.tx.sharedTempDirty = true
-		ts := db.sharedTempSnap()
-		for _, sk := range ts.sequencesOwnedBy(dt.Name) {
-			ts.removeSequence(sk)
-		}
-		ts.removeTable(strings.ToLower(dt.Name))
-		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
-	}
-	if _, ok := db.Table(dt.Name); !ok {
-		// An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
-		// IF EXISTS does NOT suppress this (PG keeps the wrong-object-type error).
-		if _, _, ok := db.findIndex(dt.Name); ok {
-			return Outcome{}, NewError(WrongObjectType, dt.Name+" is not a table")
-		}
-		// DROP TABLE IF EXISTS <missing> is a no-op success (PG turns the missing-table
-		// error into a notice); the bare form raises the 42P01 the DML paths raise.
-		if dt.IfExists {
-			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
-		}
-		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+dt.Name)
-	}
-	// A table referenced by ANOTHER table's FOREIGN KEY cannot be dropped (2BP01 — there is no
-	// DROP TABLE … CASCADE; a self-reference does not block — spec/design/constraints.md §6.10).
-	if detail, ok := db.readSnap().foreignKeyDependent(dt.Name); ok {
-		canonical := dt.Name
-		if t, ok := db.Table(dt.Name); ok {
-			canonical = t.Name
-		}
+	// ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). Only a persistent
+	// table can be an FK parent (a temp table never is, §8), so the scan runs over the persistent
+	// snapshot; a dependent whose referencing table is itself in the drop set does not count (the
+	// drop-set exclusion is the whole seen set, so `DROP TABLE parent, child` succeeds even under
+	// RESTRICT).
+	deps := db.readSnap().foreignKeyDependentsExcluding(seen)
+	var cascadeRemovals []fkDependent
+	if dt.Cascade {
+		cascadeRemovals = deps
+	} else if len(deps) > 0 {
+		// RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks the
+		// drop with 2BP01 — the same message the single-table check produced.
+		d := deps[0]
 		return Outcome{}, NewError(DependentObjectsStillExist,
-			"cannot drop table "+canonical+" because other objects depend on it: "+detail)
+			"cannot drop table "+d.droppedName+" because other objects depend on it: constraint "+
+				d.fkName+" on table "+d.refTableName)
 	}
-	// Auto-drop every sequence OWNED BY this table — the serial columns' sequences
-	// (spec/design/sequences.md §12). An owned sequence is never an FK dependent, so the check
-	// above never blocked on it; the sequences are removed alongside the table.
-	ownedSeqs := db.readSnap().sequencesOwnedBy(dt.Name)
-	w := db.working()
-	for _, sk := range ownedSeqs {
-		w.removeSequence(sk)
+	// ---- Phase 3: apply. CASCADE first drops each surviving table's now-dangling FK constraint (in
+	// place, preserving its rows). A FK only ever lives on a persistent table (temp tables reject FKs
+	// at CREATE), so the removal routes to the main working snapshot.
+	for _, d := range cascadeRemovals {
+		db.working().removeForeignKey(d.refTableKey, d.fkName)
 	}
-	w.removeTable(strings.ToLower(dt.Name))
+	// Then remove every target from its own scope, auto-dropping the sequences it owns — a
+	// serial/IDENTITY column's owned sequence (spec/design/sequences.md §12; an owned sequence is
+	// never an FK dependent, so the phase-2 check never blocked on it). A temp drop touches only its
+	// temp snapshot, never the main image, so it makes zero file writes.
+	for _, tgt := range targets {
+		switch tgt.scope {
+		case dropTemp:
+			db.session.tx.tempDirty = true
+			ts := db.tempSnap()
+			for _, sk := range ts.sequencesOwnedBy(tgt.key) {
+				ts.removeSequence(sk)
+			}
+			ts.removeTable(tgt.key)
+		case dropSharedTemp:
+			db.session.tx.sharedTempDirty = true
+			ts := db.sharedTempSnap()
+			for _, sk := range ts.sequencesOwnedBy(tgt.key) {
+				ts.removeSequence(sk)
+			}
+			ts.removeTable(tgt.key)
+		case dropPersistent:
+			ownedSeqs := db.readSnap().sequencesOwnedBy(tgt.key)
+			w := db.working()
+			for _, sk := range ownedSeqs {
+				w.removeSequence(sk)
+			}
+			w.removeTable(tgt.key)
+		}
+	}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 

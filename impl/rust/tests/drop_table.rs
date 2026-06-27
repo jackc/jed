@@ -1,7 +1,9 @@
 //! DROP TABLE — remove a table (its definition + all its rows) from the catalog. The
-//! inverse of CREATE TABLE: a missing table is 42P01 (or a no-op under IF EXISTS); single
-//! table, no CASCADE/RESTRICT (spec/design/grammar.md §13). The IF EXISTS behavior lives in
-//! the corpus (suites/ddl/drop_table.test — it agrees with PostgreSQL).
+//! inverse of CREATE TABLE: a missing table is 42P01 (or a no-op under IF EXISTS)
+//! (spec/design/grammar.md §13). These cover the single-table internals (catalog/row-store
+//! removal, re-create-after-drop, case-insensitivity); the IF EXISTS, multi-table
+//! (`DROP TABLE a, b`), and CASCADE/RESTRICT behaviors all agree with PostgreSQL and live in
+//! the corpus (suites/ddl/drop_table.test).
 
 use jed::{Database, Outcome, execute};
 

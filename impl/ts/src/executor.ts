@@ -813,6 +813,17 @@ export type CollationInfo = {
   verdict: CollationVerdict;
 };
 
+// FkDependent is one FOREIGN KEY dependent surfaced by a multi-table DROP TABLE's dependency scan
+// (spec/design/grammar.md §13): an FK on a table that survives the drop, referencing a table being
+// dropped. RESTRICT formats refTableName/fkName/droppedName into its 2BP01 detail; CASCADE uses
+// refTableKey/fkName to remove the now-dangling constraint.
+type FkDependent = {
+  refTableKey: string; // lowercased key of the (surviving) referencing table — for the CASCADE removal
+  fkName: string; // the FK constraint's name
+  refTableName: string; // canonical referencing-table name — for the RESTRICT detail
+  droppedName: string; // canonical name of the dropped table the FK references — for the RESTRICT detail
+};
+
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
 // table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
 // of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
@@ -1141,24 +1152,45 @@ export class Snapshot {
     return null;
   }
 
-  // fkDependent reports whether any OTHER table's FOREIGN KEY references the table `name`
-  // (case-insensitive) — the DROP TABLE dependency check (2BP01 — spec/design/constraints.md
-  // §6.10). A self-reference does NOT block the drop (a table's own FK on itself disappears with
-  // it). Returns the first dependent's description, scanning in ascending lowercased table-name
-  // order for determinism (within a table, fks is already in name order), or null.
-  fkDependent(name: string): string | null {
-    const key = name.toLowerCase();
+  // fkDependentsExcluding returns every FK on a table NOT in `dropping` (a set of lowercased table
+  // keys) that references a table that IS in `dropping` — the dependency scan for a multi-table
+  // DROP TABLE (spec/design/grammar.md §13, constraints.md §6.10). A dependent whose referencing
+  // table is itself being dropped does not count (the drop-set exclusion), so a FK between two
+  // tables both named in the same statement never blocks. Referencing tables are scanned in
+  // ascending lowercased key order (each table's fks is already name-ordered) for determinism (§8).
+  // RESTRICT raises 2BP01 on the first entry; CASCADE removes every entry's FK.
+  fkDependentsExcluding(dropping: Set<string>): FkDependent[] {
+    const out: FkDependent[] = [];
     const tkeys = [...this.tables.keys()].sort();
     for (const tk of tkeys) {
+      if (dropping.has(tk)) continue; // the referencing table is itself being dropped — no dependency
       const t = this.tables.get(tk)!;
-      if (t.name.toLowerCase() === key) continue; // a self-reference does not block the drop
       for (const fk of t.fks) {
-        if (fk.refTable.toLowerCase() === key) {
-          return `constraint ${fk.name} on table ${t.name}`;
+        const refKey = fk.refTable.toLowerCase();
+        if (dropping.has(refKey)) {
+          const droppedName = this.tables.get(refKey)?.name ?? fk.refTable;
+          out.push({
+            refTableKey: tk,
+            fkName: fk.name,
+            refTableName: t.name,
+            droppedName,
+          });
         }
       }
     }
-    return null;
+    return out;
+  }
+
+  // removeForeignKey removes the named FK constraint from `tableKey` in place — re-allocating the
+  // Table + its fks array (catalog Tables are never mutated in place, snapshots share them) so the
+  // committed snapshot is untouched, preserving the table's store and rows. DROP TABLE … CASCADE's
+  // removal of a dependent FK on a table that survives the drop (spec/design/grammar.md §13). An FK
+  // owns no B-tree (constraints.md §6), so only the catalog list changes.
+  removeForeignKey(tableKey: string, fkName: string): void {
+    const old = this.tables.get(tableKey);
+    if (old === undefined) return;
+    const fks = old.fks.filter((fk) => fk.name.toLowerCase() !== fkName.toLowerCase());
+    this.tables.set(tableKey, { ...old, fks });
   }
 
   // validateCompositeTypes validates the loaded composite-type catalog (the on-disk two-pass load —
@@ -2978,7 +3010,7 @@ export class Database {
       let allowed: boolean;
       if (
         req.isSharedTempDdl ||
-        (stmt.kind === "dropTable" && this.isSharedTempTable(stmt.name)) ||
+        (stmt.kind === "dropTable" && stmt.names.some((n) => this.isSharedTempTable(n))) ||
         (stmt.kind === "createIndex" && this.isSharedTempTable(stmt.table)) ||
         (stmt.kind === "dropIndex" && this.isSharedTempIndex(stmt.name)) ||
         (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isSharedTempSequence(n))) ||
@@ -2987,7 +3019,7 @@ export class Database {
         allowed = this.session.allowSharedTempDdl;
       } else if (
         req.isTempDdl ||
-        (stmt.kind === "dropTable" && this.isTempTable(stmt.name)) ||
+        (stmt.kind === "dropTable" && stmt.names.some((n) => this.isTempTable(n))) ||
         (stmt.kind === "createIndex" && this.isTempTable(stmt.table)) ||
         (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name)) ||
         (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isTempSequence(n))) ||
@@ -4051,62 +4083,97 @@ export class Database {
     return evalExpr(defaultRExpr, [], env, meter);
   }
 
-  // executeDropTable removes the table's definition and its row store from the catalog
-  // (both keyed by the lower-cased name). A missing table without IF EXISTS is the same
-  // 42P01 the DML paths raise; with IF EXISTS it is a no-op success (spec/design/grammar.md
-  // §13). Like CREATE TABLE it touches no rows and evaluates no expression tree (the store
-  // is discarded wholesale), so it accrues zero cost.
+  // executeDropTable runs a DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]: remove each named
+  // table's definition and row store from the catalog (keyed by lower-cased name). Two-phase /
+  // all-or-nothing (spec/design/grammar.md §13): every name is resolved and validated first — a
+  // missing table is 42P01 (unless IF EXISTS skips just that name), a non-table relation is 42809,
+  // and an external FK dependent is 2BP01 under RESTRICT — and only if the whole list checks out is
+  // anything removed. A repeated name is deduplicated; a FK between two tables both in the drop set
+  // never blocks; CASCADE drops the surviving tables' now-dangling FK constraints. Like CREATE TABLE
+  // it touches no rows and evaluates no expression tree, so it accrues zero cost.
   private executeDropTable(dt: DropTable): Outcome {
-    // A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never the
-    // main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never an FK
-    // parent, §8), but it DOES auto-drop every sequence OWNED BY the table — a serial/IDENTITY temp
-    // column's owned temp sequence (spec/design/sequences.md §12, temp-tables.md §8) — from the SAME
-    // temp snapshot. The temp-DDL capability gate already ran at dispatch (§5). Session-local first,
-    // then shared.
-    if (this.isTempTable(dt.name)) {
-      this.session.tx!.tempDirty = true;
-      const ts = this.tempSnap();
-      for (const sk of ts.sequencesOwnedBy(dt.name)) ts.removeSequence(sk);
-      ts.removeTable(dt.name.toLowerCase());
-      return { kind: "statement", cost: 0n, rowsAffected: null };
-    }
-    if (this.isSharedTempTable(dt.name)) {
-      this.session.tx!.sharedTempDirty = true;
-      const ts = this.sharedTempSnap();
-      for (const sk of ts.sequencesOwnedBy(dt.name)) ts.removeSequence(sk);
-      ts.removeTable(dt.name.toLowerCase());
-      return { kind: "statement", cost: 0n, rowsAffected: null };
-    }
-    if (!this.table(dt.name)) {
-      // An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
-      // IF EXISTS does NOT suppress this (PG keeps the wrong-object-type error).
-      if (this.findIndex(dt.name)) {
-        throw engineError("wrong_object_type", dt.name + " is not a table");
+    // ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
+    // repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
+    // `a` once and succeeds); `seen` is the set of lowercased keys actually being dropped.
+    type Scope = "temp" | "sharedTemp" | "persistent";
+    const targets: { key: string; scope: Scope }[] = [];
+    const seen = new Set<string>();
+    for (const name of dt.names) {
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue; // already resolved this exact target (deduplicated)
+      // Resolution walk: session-local temp → shared temp → persistent. Preclude-overlaps keeps a
+      // name in at most one scope, so this is just "where it lives" (temp-tables.md §3).
+      let scope: Scope;
+      if (this.isTempTable(name)) {
+        scope = "temp";
+      } else if (this.isSharedTempTable(name)) {
+        scope = "sharedTemp";
+      } else if (this.readSnap().table(name)) {
+        scope = "persistent";
+      } else {
+        // Not a table in any scope. An index's name is the wrong object kind (42809 — indexes.md
+        // §2); IF EXISTS does NOT suppress this. Otherwise a missing table is 42P01, unless IF
+        // EXISTS makes it a no-op for just this name (PG turns the missing-table error into a notice).
+        if (this.findIndex(name)) {
+          throw engineError("wrong_object_type", name + " is not a table");
+        }
+        if (dt.ifExists) continue;
+        throw engineError("undefined_table", "table does not exist: " + name);
       }
-      // DROP TABLE IF EXISTS <missing> is a no-op success (PG turns the missing-table error
-      // into a notice); the bare form raises the 42P01 the DML paths raise.
-      if (dt.ifExists) {
-        return { kind: "statement", cost: 0n, rowsAffected: null };
-      }
-      throw engineError("undefined_table", "table does not exist: " + dt.name);
+      seen.add(key);
+      targets.push({ key, scope });
     }
-    // A table referenced by ANOTHER table's FOREIGN KEY cannot be dropped (2BP01 — there is no
-    // DROP TABLE … CASCADE; a self-reference does not block — spec/design/constraints.md §6.10).
-    const detail = this.readSnap().fkDependent(dt.name);
-    if (detail !== null) {
-      const canonical = this.table(dt.name)?.name ?? dt.name;
+    // ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). Only a persistent
+    // table can be an FK parent (a temp table never is, §8), so the scan runs over the persistent
+    // snapshot; a dependent whose referencing table is itself in the drop set does not count (the
+    // drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child` succeeds even under
+    // RESTRICT).
+    const deps = this.readSnap().fkDependentsExcluding(seen);
+    let cascadeRemovals: FkDependent[] = [];
+    if (dt.cascade) {
+      cascadeRemovals = deps;
+    } else if (deps.length > 0) {
+      // RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks the
+      // drop with 2BP01 — the same message the single-table check produced.
+      const d = deps[0];
       throw engineError(
         "dependent_objects_still_exist",
-        "cannot drop table " + canonical + " because other objects depend on it: " + detail,
+        "cannot drop table " +
+          d.droppedName +
+          " because other objects depend on it: constraint " +
+          d.fkName +
+          " on table " +
+          d.refTableName,
       );
     }
-    // Auto-drop every sequence OWNED BY this table — the serial columns' sequences
-    // (spec/design/sequences.md §12). An owned sequence is never an FK dependent, so the check
-    // above never blocked on it; the sequences are removed alongside the table.
-    const ownedSeqs = this.readSnap().sequencesOwnedBy(dt.name);
-    const w = this.working();
-    for (const sk of ownedSeqs) w.removeSequence(sk);
-    w.removeTable(dt.name.toLowerCase());
+    // ---- Phase 3: apply. CASCADE first drops each surviving table's now-dangling FK constraint (in
+    // place, preserving its rows). A FK only ever lives on a persistent table (temp tables reject FKs
+    // at CREATE), so the removal routes to the main working snapshot.
+    for (const d of cascadeRemovals) {
+      this.working().removeForeignKey(d.refTableKey, d.fkName);
+    }
+    // Then remove every target from its own scope, auto-dropping the sequences it owns — a
+    // serial/IDENTITY column's owned sequence (spec/design/sequences.md §12; an owned sequence is
+    // never an FK dependent, so the phase-2 check never blocked on it). A temp drop touches only its
+    // temp snapshot, never the main image, so it makes zero file writes.
+    for (const tgt of targets) {
+      if (tgt.scope === "temp") {
+        this.session.tx!.tempDirty = true;
+        const ts = this.tempSnap();
+        for (const sk of ts.sequencesOwnedBy(tgt.key)) ts.removeSequence(sk);
+        ts.removeTable(tgt.key);
+      } else if (tgt.scope === "sharedTemp") {
+        this.session.tx!.sharedTempDirty = true;
+        const ts = this.sharedTempSnap();
+        for (const sk of ts.sequencesOwnedBy(tgt.key)) ts.removeSequence(sk);
+        ts.removeTable(tgt.key);
+      } else {
+        const ownedSeqs = this.readSnap().sequencesOwnedBy(tgt.key);
+        const w = this.working();
+        for (const sk of ownedSeqs) w.removeSequence(sk);
+        w.removeTable(tgt.key);
+      }
+    }
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 

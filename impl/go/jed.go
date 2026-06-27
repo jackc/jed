@@ -22,6 +22,10 @@ var SupportedCapabilities = []string{
 	// DROP TABLE IF EXISTS — the idempotent form: a missing table is a no-op success rather
 	// than 42P01 (a non-table relation is still the 42809 wrong-object-type) (grammar.md §13).
 	"ddl.drop_table_if_exists",
+	// DROP TABLE a, b [CASCADE | RESTRICT] — multi-table (two-phase / all-or-nothing, repeated name
+	// deduplicated) + the FK-dependency mode: RESTRICT (default) refuses an external FK dependent
+	// (2BP01), CASCADE drops it; a FK within the drop set never blocks (grammar.md §13).
+	"ddl.drop_table_multi",
 	// CREATE [TEMP|TEMPORARY] TABLE + DROP — session-local temporary tables that make zero writes to
 	// the database file (held in a per-session temp snapshot outside the serialized catalog, no
 	// format_version change). Full CRUD + PK/UNIQUE/CHECK/NOT NULL/DEFAULT, dropped at session close,

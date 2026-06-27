@@ -193,14 +193,18 @@ references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)*
 referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"
 
 /* DROP TABLE removes a table — its definition and all its rows — from the
- * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE
- * table (no "DROP TABLE a, b") and no "CASCADE" / "RESTRICT" (there are no
- * dependent objects yet) — each relaxable later (../../TODO.md). "IF EXISTS"
- * makes a missing table a no-op success instead of the 42P01 undefined_table the
- * bare form raises (a non-table relation is still 42809); recognized by a
- * two-token lookahead, so a lone "if" stays an identifier and "DROP TABLE if"
- * drops a table named "if" (PG-faithful). */
-drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier
+ * catalog (../design/grammar.md §13). A comma list drops several tables in one
+ * two-phase / all-or-nothing statement (validate every name before removing any);
+ * a name repeated in the list is deduplicated (PG-faithful). The trailing
+ * "CASCADE" / "RESTRICT" selects the dependency mode: "RESTRICT" (the default)
+ * refuses to drop a table another table's FOREIGN KEY references (2BP01); "CASCADE"
+ * drops those dependent FK constraints with it. A FK between two tables both named
+ * in the same statement never blocks. "IF EXISTS" makes a missing table a no-op
+ * success instead of the 42P01 undefined_table the bare form raises (a non-table
+ * relation is still 42809); recognized by a two-token lookahead, so a lone "if"
+ * stays an identifier and "DROP TABLE if" drops a table named "if" (PG-faithful). */
+drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
+                   ("CASCADE" | "RESTRICT")?
 
 /* CREATE INDEX declares a secondary index over one or more named columns of one table
  * (../design/indexes.md). "CREATE UNIQUE INDEX" makes it a UNIQUE index: building it over

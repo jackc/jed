@@ -164,17 +164,21 @@ pub struct DefaultDef {
     pub text: String,
 }
 
-/// `DROP TABLE [IF EXISTS] <name>`. Removes a table — its definition and all its rows —
-/// from the catalog. A missing table without `IF EXISTS` is an error (42P01); with
+/// `DROP TABLE [IF EXISTS] <name> [, …] [CASCADE | RESTRICT]`. Removes one or more tables —
+/// their definitions and all their rows — from the catalog. A comma list is dropped
+/// two-phase / all-or-nothing (validate every name, then remove); a repeated name is
+/// deduplicated (PG-faithful). A missing table without `IF EXISTS` is an error (42P01); with
 /// `IF EXISTS` it is a no-op success (PostgreSQL turns the missing-table error into a
 /// notice). `IF EXISTS` suppresses only the missing-table error — a name that resolves to
-/// a non-table relation (an index) is still the 42809 wrong-object-type error. Single
-/// table only; no `CASCADE` / `RESTRICT` (no dependent objects exist yet). See
-/// spec/design/grammar.md §13.
+/// a non-table relation (an index) is still the 42809 wrong-object-type error. The trailing
+/// keyword picks the FK-dependency mode: `RESTRICT` (default) refuses to drop a table another
+/// table's FK references (2BP01); `CASCADE` drops those dependent FK constraints with it. A
+/// FK between two tables both in the same statement never blocks. See spec/design/grammar.md §13.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DropTable {
-    pub name: String,
+    pub names: Vec<String>,
     pub if_exists: bool,
+    pub cascade: bool,
 }
 
 /// `CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* )` — a secondary index

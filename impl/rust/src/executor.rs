@@ -240,6 +240,21 @@ pub struct Snapshot {
     gist_trees: HashMap<String, std::sync::Arc<crate::gist::GistTree>>,
 }
 
+/// One FOREIGN KEY dependent surfaced by a multi-table `DROP TABLE`'s dependency scan
+/// (spec/design/grammar.md §13): an FK on a table that *survives* the drop, referencing a table
+/// being dropped. `RESTRICT` formats `ref_table_name`/`fk_name`/`dropped_name` into its 2BP01
+/// detail; `CASCADE` uses `ref_table_key`/`fk_name` to remove the now-dangling constraint.
+pub(crate) struct FkDependent {
+    /// Lowercased catalog key of the (surviving) referencing table — for the CASCADE removal.
+    pub ref_table_key: String,
+    /// The FK constraint's name.
+    pub fk_name: String,
+    /// Canonical name of the referencing table — for the RESTRICT detail.
+    pub ref_table_name: String,
+    /// Canonical name of the dropped table the FK references — for the RESTRICT detail.
+    pub dropped_name: String,
+}
+
 impl Snapshot {
     /// Look up a table definition by name (case-insensitive).
     pub fn table(&self, name: &str) -> Option<&Table> {
@@ -557,27 +572,54 @@ impl Snapshot {
         None
     }
 
-    /// Whether any OTHER table's FOREIGN KEY references the table `name` (case-insensitive) — the
-    /// `DROP TABLE` dependency check (2BP01 — spec/design/constraints.md §6.10). A self-reference
-    /// does NOT block the drop (a table's own FK on itself disappears with it). Returns the first
-    /// dependent's description, scanning in ascending lowercased table-name order for determinism
-    /// (within a table, `foreign_keys` is already in name order).
-    pub(crate) fn foreign_key_dependent(&self, name: &str) -> Option<String> {
-        let key = name.to_ascii_lowercase();
+    /// Every FK on a table **not** in `dropping` (a set of lowercased table keys) that references
+    /// a table that **is** in `dropping` — the dependency scan for a multi-table `DROP TABLE`
+    /// (spec/design/grammar.md §13, constraints.md §6.10). A dependent whose referencing table is
+    /// itself being dropped does not count (the drop-set exclusion), so a FK between two tables
+    /// both named in the same statement never blocks. Referencing tables are scanned in ascending
+    /// lowercased key order (each table's `foreign_keys` is already name-ordered) for determinism
+    /// (§8). `RESTRICT` raises 2BP01 on the first entry; `CASCADE` removes every entry's FK.
+    pub(crate) fn foreign_key_dependents_excluding(
+        &self,
+        dropping: &BTreeSet<String>,
+    ) -> Vec<FkDependent> {
+        let mut out = Vec::new();
         let mut tkeys: Vec<&String> = self.tables.keys().collect();
         tkeys.sort();
         for tk in tkeys {
-            let t = &self.tables[tk];
-            if t.name.eq_ignore_ascii_case(&key) {
-                continue; // a self-reference does not block the drop
+            if dropping.contains(tk) {
+                continue; // the referencing table is itself being dropped — no dependency
             }
+            let t = &self.tables[tk];
             for fk in &t.foreign_keys {
-                if fk.ref_table.eq_ignore_ascii_case(&key) {
-                    return Some(format!("constraint {} on table {}", fk.name, t.name));
+                let ref_key = fk.ref_table.to_ascii_lowercase();
+                if dropping.contains(&ref_key) {
+                    let dropped_name = self
+                        .tables
+                        .get(&ref_key)
+                        .map_or_else(|| fk.ref_table.clone(), |d| d.name.clone());
+                    out.push(FkDependent {
+                        ref_table_key: tk.clone(),
+                        fk_name: fk.name.clone(),
+                        ref_table_name: t.name.clone(),
+                        dropped_name,
+                    });
                 }
             }
         }
-        None
+        out
+    }
+
+    /// Remove the named FK constraint from `table_key` in place, preserving the table's store and
+    /// rows — `DROP TABLE … CASCADE`'s removal of a dependent FK on a table that *survives* the
+    /// drop (spec/design/grammar.md §13). Only the catalog `foreign_keys` list changes; an FK
+    /// owns no B-tree (constraints.md §6), so there is nothing else to remove.
+    pub(crate) fn remove_foreign_key(&mut self, table_key: &str, fk_name: &str) {
+        if let Some(table) = self.tables.get_mut(table_key) {
+            table
+                .foreign_keys
+                .retain(|fk| !fk.name.eq_ignore_ascii_case(fk_name));
+        }
     }
 
     /// Validate the loaded composite-type catalog (the on-disk two-pass load —
@@ -2876,7 +2918,7 @@ impl Database {
             // INDEX by the index — shared before session-local, the resolution-walk order (preclude-
             // overlaps keeps a name in at most one scope, so the order never decides a real conflict).
             let allowed = if req.is_shared_temp_ddl
-                || matches!(stmt, Statement::DropTable(dt) if self.is_shared_temp_table(&dt.name))
+                || matches!(stmt, Statement::DropTable(dt) if dt.names.iter().any(|n| self.is_shared_temp_table(n)))
                 || matches!(stmt, Statement::CreateIndex(ci) if self.is_shared_temp_table(&ci.table))
                 || matches!(stmt, Statement::DropIndex(di) if self.is_shared_temp_index(&di.name))
                 || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_shared_temp_sequence(n)))
@@ -2884,7 +2926,7 @@ impl Database {
             {
                 self.session.allow_shared_temp_ddl
             } else if req.is_temp_ddl
-                || matches!(stmt, Statement::DropTable(dt) if self.is_temp_table(&dt.name))
+                || matches!(stmt, Statement::DropTable(dt) if dt.names.iter().any(|n| self.is_temp_table(n)))
                 || matches!(stmt, Statement::CreateIndex(ci) if self.is_temp_table(&ci.table))
                 || matches!(stmt, Statement::DropIndex(di) if self.is_temp_index(&di.name))
                 || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_temp_sequence(n)))
@@ -4191,89 +4233,124 @@ impl Database {
         }
     }
 
-    /// Run a DROP TABLE: remove the table's definition and its row store from the
-    /// catalog (both keyed by the lower-cased name). A table that does not exist is the
-    /// same 42P01 the DML paths raise — there is no `IF EXISTS` this slice
-    /// (spec/design/grammar.md §13). Like CREATE TABLE it touches no rows and evaluates
-    /// no expression tree (the store is discarded wholesale), so it accrues zero cost.
+    /// Run a `DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]`: remove each named table's
+    /// definition and row store from the catalog (keyed by lower-cased name). Two-phase /
+    /// all-or-nothing (spec/design/grammar.md §13): every name is resolved and validated first
+    /// — a missing table is 42P01 (unless `IF EXISTS` skips just that name), a non-table relation
+    /// is 42809, and an external FK dependent is 2BP01 under `RESTRICT` — and only if the whole
+    /// list checks out is anything removed. A repeated name is deduplicated; a FK between two
+    /// tables both in the drop set never blocks; `CASCADE` drops the surviving tables' now-dangling
+    /// FK constraints. Like CREATE TABLE it touches no rows and evaluates no expression tree, so it
+    /// accrues zero cost.
     fn execute_drop_table(&mut self, dt: DropTable) -> Result<Outcome> {
-        if self.table(&dt.name).is_none() {
-            // An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
-            // `IF EXISTS` does NOT suppress this (PG keeps the wrong-object-type error).
-            if self.find_index(&dt.name).is_some() {
+        // The scope a resolved target lives in (temp-tables.md §3) — it governs which working
+        // snapshot the removal routes to in phase 3.
+        enum Scope {
+            Temp,
+            SharedTemp,
+            Persistent,
+        }
+        // ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet.
+        // A repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a`
+        // drops `a` once and succeeds); `seen` is the set of lowercased keys actually being dropped.
+        let mut targets: Vec<(String, Scope)> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for name in &dt.names {
+            let key = name.to_ascii_lowercase();
+            if seen.contains(&key) {
+                continue; // already resolved this exact target (deduplicated)
+            }
+            // Resolution walk: session-local temp → shared temp → persistent. Preclude-overlaps keeps
+            // a name in at most one scope, so this is just "where it lives" (temp-tables.md §3).
+            let scope = if self.is_temp_table(name) {
+                Scope::Temp
+            } else if self.is_shared_temp_table(name) {
+                Scope::SharedTemp
+            } else if self.read_snap().table(name).is_some() {
+                Scope::Persistent
+            } else {
+                // Not a table in any scope. An index's name is the wrong object kind (42809 —
+                // indexes.md §2); `IF EXISTS` does NOT suppress this. Otherwise a missing table is
+                // 42P01, unless `IF EXISTS` makes it a no-op for just this name (PG turns the
+                // missing-table error into a notice).
+                if self.find_index(name).is_some() {
+                    return Err(EngineError::new(
+                        SqlState::WrongObjectType,
+                        format!("{name} is not a table"),
+                    ));
+                }
+                if dt.if_exists {
+                    continue;
+                }
                 return Err(EngineError::new(
-                    SqlState::WrongObjectType,
-                    format!("{} is not a table", dt.name),
+                    SqlState::UndefinedTable,
+                    format!("table does not exist: {name}"),
+                ));
+            };
+            seen.insert(key.clone());
+            targets.push((key, scope));
+        }
+        // ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). Only a
+        // persistent table can be an FK parent (a temp table never is, §8), so the scan runs over the
+        // persistent snapshot; a dependent whose referencing table is itself in the drop set does not
+        // count (the drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child`
+        // succeeds even under RESTRICT).
+        let deps = self.read_snap().foreign_key_dependents_excluding(&seen);
+        let cascade_removals = if dt.cascade {
+            deps
+        } else {
+            // RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks
+            // the drop with 2BP01 — the same message the single-table check produced.
+            if let Some(d) = deps.first() {
+                return Err(EngineError::new(
+                    SqlState::DependentObjectsStillExist,
+                    format!(
+                        "cannot drop table {} because other objects depend on it: constraint {} on table {}",
+                        d.dropped_name, d.fk_name, d.ref_table_name
+                    ),
                 ));
             }
-            // `DROP TABLE IF EXISTS <missing>` is a no-op success (PG turns the missing-table
-            // error into a notice); the bare form raises the 42P01 the DML paths raise.
-            if dt.if_exists {
-                return Ok(Outcome::Statement {
-                    cost: 0,
-                    rows_affected: None,
-                });
+            Vec::new()
+        };
+        // ---- Phase 3: apply. CASCADE first drops each surviving table's now-dangling FK constraint
+        // (in place, preserving its rows). A FK only ever lives on a persistent table (temp tables
+        // reject FKs at CREATE), so the removal routes to the main working snapshot.
+        for d in &cascade_removals {
+            self.working_mut()
+                .remove_foreign_key(&d.ref_table_key, &d.fk_name);
+        }
+        // Then remove every target from its own scope, auto-dropping the sequences it owns — a
+        // `serial`/IDENTITY column's owned sequence (spec/design/sequences.md §12; an owned sequence
+        // is never an FK dependent, so the phase-2 check never blocked on it). A temp drop touches
+        // only its temp snapshot, never the main image, so it makes zero file writes.
+        for (key, scope) in &targets {
+            match scope {
+                Scope::Temp => {
+                    let owned = self.temp_read_snap().sequences_owned_by(key);
+                    let w = self.temp_working_mut();
+                    for sk in &owned {
+                        w.remove_sequence(sk);
+                    }
+                    w.remove_table(key);
+                }
+                Scope::SharedTemp => {
+                    let owned = self.shared_temp_read_snap().sequences_owned_by(key);
+                    let w = self.shared_temp_working_mut();
+                    for sk in &owned {
+                        w.remove_sequence(sk);
+                    }
+                    w.remove_table(key);
+                }
+                Scope::Persistent => {
+                    let owned = self.read_snap().sequences_owned_by(key);
+                    let w = self.working_mut();
+                    for sk in &owned {
+                        w.remove_sequence(sk);
+                    }
+                    w.remove_table(key);
+                }
             }
-            return Err(EngineError::new(
-                SqlState::UndefinedTable,
-                format!("table does not exist: {}", dt.name),
-            ));
         }
-        // A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never
-        // the main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never
-        // an FK parent, §8), but it DOES auto-drop every sequence OWNED BY the table — a `serial`/
-        // IDENTITY temp column's owned temp sequence (spec/design/sequences.md §12, temp-tables.md §8)
-        // — from the SAME temp snapshot. The temp-DDL capability gate already ran at dispatch (§5).
-        // Session-local first, then shared.
-        if self.is_temp_table(&dt.name) {
-            let owned = self.temp_read_snap().sequences_owned_by(&dt.name);
-            let key = dt.name.to_ascii_lowercase();
-            let w = self.temp_working_mut();
-            for sk in &owned {
-                w.remove_sequence(sk);
-            }
-            w.remove_table(&key);
-            return Ok(Outcome::Statement {
-                cost: 0,
-                rows_affected: None,
-            });
-        }
-        if self.is_shared_temp_table(&dt.name) {
-            let owned = self.shared_temp_read_snap().sequences_owned_by(&dt.name);
-            let key = dt.name.to_ascii_lowercase();
-            let w = self.shared_temp_working_mut();
-            for sk in &owned {
-                w.remove_sequence(sk);
-            }
-            w.remove_table(&key);
-            return Ok(Outcome::Statement {
-                cost: 0,
-                rows_affected: None,
-            });
-        }
-        // A table referenced by ANOTHER table's FOREIGN KEY cannot be dropped (2BP01 — there is no
-        // DROP TABLE … CASCADE; a self-reference does not block — spec/design/constraints.md §6.10).
-        if let Some(detail) = self.read_snap().foreign_key_dependent(&dt.name) {
-            let canonical = self
-                .table(&dt.name)
-                .map_or(dt.name.clone(), |t| t.name.clone());
-            return Err(EngineError::new(
-                SqlState::DependentObjectsStillExist,
-                format!(
-                    "cannot drop table {canonical} because other objects depend on it: {detail}"
-                ),
-            ));
-        }
-        // Auto-drop every sequence OWNED BY this table — the `serial` columns' sequences
-        // (spec/design/sequences.md §12). An owned sequence is never an FK dependent, so the check
-        // above never blocked on it; the sequences are removed alongside the table.
-        let owned_seqs = self.read_snap().sequences_owned_by(&dt.name);
-        let key = dt.name.to_ascii_lowercase();
-        let w = self.working_mut();
-        for sk in &owned_seqs {
-            w.remove_sequence(sk);
-        }
-        w.remove_table(&key);
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,

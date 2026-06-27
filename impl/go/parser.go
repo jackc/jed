@@ -923,12 +923,13 @@ func (p *Parser) expectTypmodInt() (uint64, error) {
 	return t.Int, nil
 }
 
-// parseDropTable parses `DROP TABLE [IF EXISTS] <name>`. A missing table is rejected at
-// execution time (42P01 — or a no-op when IF EXISTS is present), not here. Single table;
-// no CASCADE/RESTRICT this slice (spec/design/grammar.md §13). IF EXISTS is recognized only
-// when the next two keywords are exactly IF EXISTS (the two-token lookahead the statement
-// dispatch uses) — a lone `if` is an ordinary non-reserved identifier, so `DROP TABLE if`
-// drops a table named `if` (PG-faithful, §1).
+// parseDropTable parses `DROP TABLE [IF EXISTS] <name> [, …] [CASCADE | RESTRICT]`.
+// Existence/dependency are resolved at execution time (42P01 — or a no-op when IF EXISTS is
+// present — and 2BP01), not here. A comma list collects several names; the trailing
+// CASCADE/RESTRICT keyword sets the FK-dependency mode (RESTRICT is the default)
+// (spec/design/grammar.md §13). IF EXISTS is recognized only when the next two keywords are
+// exactly IF EXISTS (the two-token lookahead the statement dispatch uses) — a lone `if` is an
+// ordinary non-reserved identifier, so `DROP TABLE if` drops a table named `if` (PG-faithful, §1).
 func (p *Parser) parseDropTable() (*DropTable, error) {
 	if err := p.expectKeyword("drop"); err != nil {
 		return nil, err
@@ -945,7 +946,27 @@ func (p *Parser) parseDropTable() (*DropTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DropTable{Name: name, IfExists: ifExists}, nil
+	names := []string{name}
+	for p.peek().Kind == TokComma {
+		p.advance()
+		n, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	// The trailing dependency mode is optional; RESTRICT is the default (and the only mode the
+	// bare form ever had). Anything else after the name list is trailing input (the dispatch's
+	// end-of-statement check raises 42601).
+	cascade := false
+	switch p.peekKeyword() {
+	case "cascade":
+		p.advance()
+		cascade = true
+	case "restrict":
+		p.advance()
+	}
+	return &DropTable{Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
 // parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`
