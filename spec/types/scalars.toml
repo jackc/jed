@@ -45,7 +45,11 @@ schema_version = 1
 #               value's RAW bytes (no UTF-8 / collation framing — ../design/encoding.md
 #               §2.6); "decimal-order-preserving" = sign/class byte + order-preserving
 #               exponent + big-endian base-100 mantissa pairs + terminator (CockroachDB
-#               style — ../design/encoding.md §2.5); "interval-span-i128" = the canonical
+#               style — ../design/encoding.md §2.5); "float-order-preserving" = the IEEE
+#               bits (canonicalized: -0 → +0, every NaN → one quiet pattern) as a big-endian
+#               unsigned integer, then if the sign bit is set flip ALL bits else flip just the
+#               sign bit — maps the binary64/binary32 TOTAL order monotonically onto unsigned
+#               byte order (../design/encoding.md §2.8); "interval-span-i128" = the canonical
 #               128-bit span ((months*30 + days)*86_400_000_000 + micros) as int-be-signflip
 #               at i128 width (bias 2^127, 16-byte big-endian) — span-equal intervals share a
 #               key (../design/encoding.md §2.10); "uuid-raw16" = the 16 raw bytes of
@@ -56,12 +60,14 @@ schema_version = 1
 #               byte-for-byte identically to logical order. width_bytes is omitted for the
 #               variable-width types (text, bytea, decimal) AND for interval (whose key is the
 #               derived 128-bit span, not the multi-field value body) but PRESENT for the
-#               fixed-width non-integer keys uuid (16) and boolean (1). Exercised non-integer keys:
-#               uuid, boolean, the i64/i32-backed timestamp/timestamptz/date, the variable-width
-#               text/bytea (their terminated-escape encoding self-delimits), decimal
-#               (decimal-order-preserving §2.5, scale-independent), and interval
-#               (interval-span-i128 §2.10, span-canonical); only float remains a non-key scalar
-#               (the principled determinism carve-out — ../design/encoding.md §2.8).
+#               fixed-width non-integer keys uuid (16), boolean (1), and float (f64 → 8, f32 → 4).
+#               Exercised non-integer keys: uuid, boolean, the i64/i32-backed
+#               timestamp/timestamptz/date, the variable-width text/bytea (their terminated-escape
+#               encoding self-delimits), decimal (decimal-order-preserving §2.5, scale-independent),
+#               interval (interval-span-i128 §2.10, span-canonical), and float
+#               (float-order-preserving §2.8 — a float value AT REST is in-contract / cross-core
+#               byte-identical, so a float key is deterministic; ../design/determinism.md §4). EVERY
+#               scalar is now keyable; only the recursive `composite` container remains a 0A000 key.
 # max_precision for decimal only: the maximum DECLARABLE precision p of numeric(p,s) —
 #               1000, PG's NUMERIC_MAX_PRECISION — and (as in PG) the display-scale clamp
 #               on a division result (../design/decimal.md §4). NOT a cap on what an
@@ -338,11 +344,17 @@ encoding = { method = "interval-span-i128" }
 # FIRST-CLASS values (unlike decimal, which excludes them): they enter only via literals/
 # casts/stored values and propagate; FINITE arithmetic that would produce them TRAPS
 # instead (overflow 22003, x/0 22012), the PG trap model. The order-preserving KEY
-# encoding (float-order-preserving — ../design/encoding.md §2.8) is AUTHORED but
-# UNEXERCISED: a f64 PRIMARY KEY is rejected 0A000 (the text/decimal/bytea/interval
-# precedent, reinforced by the determinism.md §4 contamination rule — float stays out of
-# stored order). No bits/min/max/rank (not the integer family); no collation. overflow =
-# "trap" (finite-overflow 22003, the §3 rule). width_bytes present (fixed 8).
+# encoding (float-order-preserving — ../design/encoding.md §2.8) is EXERCISED: a f64/f32
+# PRIMARY KEY / ordered secondary index / UNIQUE / FK target is SUPPORTED (and so is a
+# float-element array key, f64[]/f32[] — §2.14). A float value AT REST is in-contract /
+# cross-core byte-identical (storage + total order + key bytes are all deterministic,
+# ../design/float.md §1), so a float key sorts identically in every core; the only
+# determinism cost is that a TAINTED float (a transcendental result) stored into a key can
+# reach STORED order — a bounded widening of the existing float-transcendental exemption's
+# blast radius, ../design/determinism.md §4. -0 = +0 and all NaNs collapse to one key
+# (canonicalized), so a UNIQUE float key treats them as one. No bits/min/max/rank (not the
+# integer family); no collation. overflow = "trap" (finite-overflow 22003, the §3 rule).
+# width_bytes present (f64 → 8, f32 → 4).
 [[type]]
 id = "f32"
 aliases = ["real", "float4"]

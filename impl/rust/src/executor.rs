@@ -3205,14 +3205,15 @@ impl Database {
                 // interval (`interval-span-i128` — the 16-byte span key, encoding.md §2.10) — plus
                 // the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md §2.4/§2.6) and
                 // `decimal` (`decimal-order-preserving` §2.5), all self-delimiting so they compose in
-                // composite keys / index suffixes — plus the `range` container (`range-bounds` §2.11,
+                // composite keys / index suffixes — plus `float` (`float-order-preserving` §2.8 — the
+                // last scalar to become keyable, so EVERY scalar is now keyable; a float at rest is
+                // in-contract, determinism.md §4) — plus the `range` container (`range-bounds` §2.11,
                 // the first container key) and the `array` container (`array-elements-terminated`
                 // §2.14, the second container key — keyable when its element is a key-encodable scalar,
-                // `is_array_keyable`). Still rejected `0A000`: `float` (the principled determinism
-                // carve-out — determinism.md §4), a `float`/composite-element array, and the recursive
-                // composite container. An oversized text/bytea/decimal/range/array key (one that can't
-                // fit a node) trips the existing RECORD_MAX oversized-item 0A000, mirroring PG's btree
-                // key-size limit.
+                // INCLUDING a `float` element, `is_array_keyable`). Still rejected `0A000`: only a
+                // composite-element array and the recursive composite container. An oversized
+                // text/bytea/decimal/range/array key (one that can't fit a node) trips the existing
+                // RECORD_MAX oversized-item 0A000, mirroring PG's btree key-size limit.
                 if !ty.is_integer()
                     && !ty.is_bool()
                     && !ty.is_text()
@@ -3223,6 +3224,7 @@ impl Database {
                     && !ty.is_timestamptz()
                     && !ty.is_date()
                     && !ty.is_interval()
+                    && !ty.is_float()
                     && !ty.is_range()
                     && !is_array_keyable(&ty)
                 {
@@ -3479,6 +3481,7 @@ impl Database {
                     && !ty.is_timestamptz()
                     && !ty.is_date()
                     && !ty.is_interval()
+                    && !ty.is_float()
                     && !ty.is_range()
                     && !is_array_keyable(ty)
                 {
@@ -3533,6 +3536,7 @@ impl Database {
                     && !ty.is_timestamptz()
                     && !ty.is_date()
                     && !ty.is_interval()
+                    && !ty.is_float()
                     && !ty.is_range()
                     && !is_array_keyable(ty)
                 {
@@ -4421,6 +4425,7 @@ impl Database {
                         && !ty.is_timestamptz()
                         && !ty.is_date()
                         && !ty.is_interval()
+                        && !ty.is_float()
                         && !ty.is_range()
                         && !is_array_keyable(ty)
                     {
@@ -16832,8 +16837,29 @@ fn encode_key_value(ty: ScalarType, value: &Value, coll: Option<&Collation>) -> 
         Value::Bytea(b) => encode_terminated(b),
         Value::Decimal(d) => d.encode_key(),
         Value::Interval(iv) => iv.encode_key(),
+        Value::Float64(f) => encode_f64_key(*f),
+        Value::Float32(f) => encode_f32_key(*f),
         _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
     })
+}
+
+/// The `float-order-preserving` key body for an `f64` (encoding.md §2.8): canonicalize via
+/// [`canon_f64_bits`] (`-0 → +0`, every NaN → one quiet pattern), take the bits big-endian, then
+/// **if the sign bit is set flip all 64 bits, else flip just the sign bit** — mapping the binary64
+/// total order (§3, `-Inf < finite < +Inf < NaN`) onto unsigned byte order. Fixed 8 bytes, so
+/// self-delimiting by width (no escape/terminator). `-0`/`+0` and any two NaNs canonicalize to one
+/// key, so a `UNIQUE` float key treats them as one. Infallible.
+fn encode_f64_key(f: f64) -> Vec<u8> {
+    let mut bits = crate::value::canon_f64_bits(f);
+    bits ^= if bits >> 63 == 1 { u64::MAX } else { 1 << 63 };
+    bits.to_be_bytes().to_vec()
+}
+
+/// As [`encode_f64_key`], for `f32` (binary32, 4 bytes — the `float-order-preserving` rule §2.8).
+fn encode_f32_key(f: f32) -> Vec<u8> {
+    let mut bits = crate::value::canon_f32_bits(f);
+    bits ^= if bits >> 31 == 1 { u32::MAX } else { 1 << 31 };
+    bits.to_be_bytes().to_vec()
 }
 
 /// The order-preserving key bytes for one keyable value given its column **`Type`** — the
@@ -16865,15 +16891,18 @@ fn encode_typed_key(ty: &Type, value: &Value, coll: Option<&Collation>) -> Resul
 
 /// Whether `ty` is an **array** whose element is a key-encodable scalar — so the array is a valid
 /// `PRIMARY KEY` / index / `UNIQUE` / FK key (encoding.md §2.14, the `array-elements-terminated` rule).
-/// A `float`-element array (the §2.8 determinism carve-out) or a composite-element array (composite is
-/// not yet keyable) is NOT keyable, the same narrowing the bare `float` / composite scalar key carries.
+/// A `float`-element array (`f64[]`/`f32[]`) IS keyable (the §2.8 narrowing lifted — a float at rest is
+/// in-contract); only a composite-element array (composite is not yet keyable) is NOT keyable, the same
+/// narrowing the bare composite scalar key carries.
 fn is_array_keyable(ty: &Type) -> bool {
     ty.array_element().is_some_and(is_keyable_scalar)
 }
 
-/// Whether `ty` is a key-encodable **scalar** (every keyable scalar except `float`, the §2.8 carve-out)
-/// — the element-type gate for [`is_array_keyable`]. Mirrors the inline scalar gate the PK/UNIQUE/index
-/// resolvers apply directly.
+/// Whether `ty` is a key-encodable **scalar** — the element-type gate for [`is_array_keyable`].
+/// Mirrors the inline scalar gate the PK/UNIQUE/index resolvers apply directly. With `float` keys
+/// exercised (§2.8) every scalar is keyable, so this is the full keyable-scalar set; only the
+/// recursive `composite` container is excluded (it has no value-kind here — a composite element
+/// would arrive as `Type::Composite`, which none of these predicates match).
 fn is_keyable_scalar(ty: &Type) -> bool {
     ty.is_integer()
         || ty.is_bool()
@@ -16885,6 +16914,7 @@ fn is_keyable_scalar(ty: &Type) -> bool {
         || ty.is_timestamptz()
         || ty.is_date()
         || ty.is_interval()
+        || ty.is_float()
 }
 
 /// The order-preserving `array-elements-terminated` key for an array value (encoding.md §2.14) — the
@@ -16893,9 +16923,10 @@ fn is_keyable_scalar(ty: &Type) -> bool {
 /// (`0x01` present ‖ the element key, `0x02` NULL) so present sorts before NULL and a shorter list
 /// reaches the `0x00` terminator first; then the shape suffix (`ndim`, then per dimension a `u32` BE
 /// length and the `i32` `int-be-signflip` lower bound) breaks ties among equal-element-prefix,
-/// equal-count arrays. The element is a key-encodable **scalar** (the DDL gate rejects a `float` /
-/// composite element `0A000`), so the per-element key is [`encode_key_value`]; an array element key
-/// uses the `C` byte order (a collated array-element key is not a feature this slice).
+/// equal-count arrays. The element is a key-encodable **scalar** (`float` elements included since the
+/// §2.8 lift; the DDL gate rejects only a composite element `0A000`), so the per-element key is
+/// [`encode_key_value`]; an array element key uses the `C` byte order (a collated array-element key is
+/// not a feature this slice).
 fn encode_array_key(elem_ty: &Type, a: &ArrayVal) -> Result<Vec<u8>> {
     let elem = elem_ty.scalar();
     let mut out = Vec::new();

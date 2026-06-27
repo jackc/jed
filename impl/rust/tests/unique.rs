@@ -147,12 +147,9 @@ fn ddl_errors_match_postgres() {
         err_code(&mut db, "CREATE TABLE e1 (a i32, UNIQUE (a, a))"),
         "42701"
     );
-    // f64 is not key-encodable (the determinism carve-out, determinism.md §4); text/bytea ARE
-    // now valid UNIQUE members (encoding.md §2.4/§2.6, covered in ddl/unique.test).
-    assert_eq!(
-        err_code(&mut db, "CREATE TABLE e6 (a i32, s f64 UNIQUE)"),
-        "0A000"
-    );
+    // f64 IS now a valid UNIQUE member (the float-order-preserving key, encoding.md §2.8 — every
+    // scalar is keyable; text/bytea covered in ddl/unique.test).
+    run(&mut db, "CREATE TABLE e6 (a i32, s f64 UNIQUE)");
     // UNIQUE members resolve BEFORE any CHECK validates (PG: z1/z2), in either order.
     assert_eq!(
         err_code(

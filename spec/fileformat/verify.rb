@@ -469,8 +469,9 @@ DATE_TABLE = {
 # Covers a positive fraction, a negative value, +0 and -0 (the sign bit is preserved on disk —
 # distinct bytes 0x0000…/0x8000…), +Infinity, -Infinity, a canonicalized NaN (stored as the single
 # quiet pattern 0x7FF8…000 regardless of source — float.md §10), a NULL, and Float::MAX (a full
-# mantissa, bits 0x7FEFFFFFFFFFFFFF). The PK is an i32 (float is not allowed in a key this slice
-# — a float PRIMARY KEY traps 0A000). Values are the exact f64 the cores compute from the literals.
+# mantissa, bits 0x7FEFFFFFFFFFFFFF). The PK is an i32 so this fixture exercises the float VALUE
+# codec in a nullable, non-key column (the float PRIMARY KEY form is the separate float64_pk_table.jed
+# golden, §2.8). Values are the exact f64 the cores compute from the literals.
 FLOAT64_TABLE = {
   name: "t",
   columns: [col("id", "i32", pk: true), col("d", "f64")],
@@ -481,12 +482,35 @@ FLOAT64_TABLE = {
 # A table with a f32 column (type code 13): the 4-byte IEEE branch. Same special-value coverage
 # as FLOAT64_TABLE (+0/-0 distinct on disk, ±Infinity, a canonicalized NaN → 0x7FC00000, NULL) plus
 # 100.25 (exactly representable in binary32, bits 0x42C88000). Values are exactly representable in
-# binary32 so the f64 fixture value equals the f32-widened decode. PK is i32 (no float key).
+# binary32 so the f64 fixture value equals the f32-widened decode. PK is i32 (the float PRIMARY KEY
+# form is float32_pk_table.jed).
 FLOAT32_TABLE = {
   name: "t",
   columns: [col("id", "i32", pk: true), col("r", "f32")],
   rows: [[1, 1.5], [2, -2.5], [3, 0.0], [4, -0.0], [5, Float::INFINITY],
          [6, -Float::INFINITY], [7, Float::NAN], [8, nil], [9, 100.25]]
+}.freeze
+
+# A table with a f64 PRIMARY KEY (the float-order-preserving key, ../design/encoding.md §2.8): the
+# B-tree iterates float keys in the float TOTAL order (-Inf < finite < +Inf < NaN; -0 = +0). Pins
+# that the executor encodes a float PK to the §2.8 bytes (canonicalized IEEE bits + the sign/all
+# bit-flip), cross-core byte-identical. In-contract LITERAL values only (no transcendentals), so the
+# image is deterministic across cores; the rows are listed out of key order to prove the generator
+# sorts by the encoded float key. A PK is NOT NULL, so the key is the bare body (no presence tag).
+FLOAT64_PK_TABLE = {
+  name: "fk",
+  columns: [col("k", "f64", pk: true), col("v", "i32")],
+  rows: [[1.5, 1], [-Float::INFINITY, 2], [0.0, 3], [Float::NAN, 4],
+         [-1.5, 5], [Float::INFINITY, 6]]
+}.freeze
+
+# A table with a f32 PRIMARY KEY (the 4-byte float-order-preserving key, §2.8). Same coverage as
+# FLOAT64_PK_TABLE at single precision; values exactly representable in binary32.
+FLOAT32_PK_TABLE = {
+  name: "fk",
+  columns: [col("k", "f32", pk: true), col("v", "i32")],
+  rows: [[1.5, 1], [-Float::INFINITY, 2], [0.0, 3], [Float::NAN, 4],
+         [-1.5, 5], [Float::INFINITY, 6]]
 }.freeze
 
 # Incompressible filler (format.md "Fixtures"): xorshift32(seed "JEDB") mapped to a 64-char
@@ -1057,6 +1081,8 @@ FIXTURES = [
   { file: "interval_pk_table.jed", page_size: 256, tables: [INTERVAL_PK_TABLE] },
   { file: "float64_table.jed",     page_size: 256, tables: [FLOAT64_TABLE] },
   { file: "float32_table.jed",     page_size: 256, tables: [FLOAT32_TABLE] },
+  { file: "float64_pk_table.jed",  page_size: 256, tables: [FLOAT64_PK_TABLE] },
+  { file: "float32_pk_table.jed",  page_size: 256, tables: [FLOAT32_PK_TABLE] },
   { file: "date_table.jed",        page_size: 256, tables: [DATE_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "i16"), col("b", "i64")],
@@ -1271,7 +1297,26 @@ def key_body(type, v, collation = nil)
   when "bytea" then enc_terminated(v.b)
   when "decimal" then encode_decimal_key(v)
   when "interval" then encode_interval_key(v)
+  when "f64", "f32" then encode_float_key(type, v)
   else encode_int(WIDTH.fetch(type), v)
+  end
+end
+
+# float-order-preserving (encoding.md §2.8): canonicalize the Ruby Float (-0 → +0, every NaN → one
+# quiet pattern), take the IEEE bits as a big-endian unsigned integer, then if the sign bit is set
+# flip ALL bits else flip just the sign bit — mapping the float TOTAL order onto unsigned byte
+# order. f64 = 8 bytes, f32 = 4 (pack("g") rounds the value to binary32 first). This is the KEY
+# form; the stored VALUE codec (encode_float64/encode_float32) preserves the bits verbatim (only
+# NaN canonicalized) since a value never sorts.
+def encode_float_key(type, f)
+  if type == "f64"
+    bits = f.nan? ? 0x7FF8000000000000 : (f == 0.0 ? 0 : [f].pack("G").unpack1("Q>"))
+    bits ^= (bits >> 63) == 1 ? 0xFFFFFFFFFFFFFFFF : 0x8000000000000000
+    [bits].pack("Q>")
+  else # f32
+    bits = f.nan? ? 0x7FC00000 : (f == 0.0 ? 0 : [f].pack("g").unpack1("N"))
+    bits ^= (bits >> 31) == 1 ? 0xFFFFFFFF : 0x80000000
+    [bits].pack("N")
   end
 end
 

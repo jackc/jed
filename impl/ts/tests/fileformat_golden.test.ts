@@ -608,7 +608,8 @@ function intervalPkTableDB(): Database {
 // infinities, a canonicalized NaN (stored as the single quiet pattern 0x7FF8…000), a NULL, and
 // Float64 max (a full mantissa). Finite values enter via bare numeric literals (decimal adaptation);
 // the specials enter via typed literals in INSERT ... SELECT (a VALUES slot takes only bare literals
-// this slice — float.md). PK is i32 (no float key this slice — float PK → 0A000).
+// this slice — float.md). PK is i32 here so this exercises the float VALUE codec in a non-key column
+// (the float PRIMARY KEY form is float64PkTableDB).
 function float64TableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)");
@@ -626,7 +627,7 @@ function float64TableDB(): Database {
 
 // float32TableDB exercises the value codec's 4-byte IEEE branch (type code 13): the same
 // special-value coverage as float64TableDB (canonicalized NaN → 0x7FC00000) plus 100.25 (exactly
-// representable in binary32). PK is i32 (no float key this slice).
+// representable in binary32). PK is i32 (the float PRIMARY KEY form is float32PkTableDB).
 function float32TableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, r f32)");
@@ -639,6 +640,35 @@ function float32TableDB(): Database {
   run(db, "INSERT INTO t SELECT 7, f32 'NaN'");
   run(db, "INSERT INTO t VALUES (8, NULL)");
   run(db, "INSERT INTO t VALUES (9, 100.25)");
+  return db;
+}
+
+// float64PkTableDB exercises a f64 PRIMARY KEY (the float-order-preserving key, encoding.md §2.8):
+// the B-tree iterates float keys in the float total order (-Inf < finite < +Inf < NaN; -0 = +0).
+// In-contract literal values only, so the image is cross-core byte-identical; the row set matches
+// FLOAT64_PK_TABLE in spec/fileformat/verify.rb (insertion order is irrelevant — the PK store sorts).
+function float64PkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE fk (k f64 PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO fk VALUES (1.5, 1)");
+  run(db, "INSERT INTO fk SELECT f64 '-Infinity', 2");
+  run(db, "INSERT INTO fk VALUES (0.0, 3)");
+  run(db, "INSERT INTO fk SELECT f64 'NaN', 4");
+  run(db, "INSERT INTO fk VALUES (-1.5, 5)");
+  run(db, "INSERT INTO fk SELECT f64 'Infinity', 6");
+  return db;
+}
+
+// float32PkTableDB is float64PkTableDB at binary32 width (the 4-byte float-order-preserving key §2.8).
+function float32PkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE fk (k f32 PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO fk VALUES (1.5, 1)");
+  run(db, "INSERT INTO fk SELECT f32 '-Infinity', 2");
+  run(db, "INSERT INTO fk VALUES (0.0, 3)");
+  run(db, "INSERT INTO fk SELECT f32 'NaN', 4");
+  run(db, "INSERT INTO fk VALUES (-1.5, 5)");
+  run(db, "INSERT INTO fk SELECT f32 'Infinity', 6");
   return db;
 }
 
@@ -846,6 +876,8 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "interval_pk_table.jed", build: intervalPkTableDB },
     { name: "float64_table.jed", build: float64TableDB },
     { name: "float32_table.jed", build: float32TableDB },
+    { name: "float64_pk_table.jed", build: float64PkTableDB },
+    { name: "float32_pk_table.jed", build: float32PkTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
     { name: "composite_pk_table.jed", build: compositePKTableDB },
     { name: "check_table.jed", build: checkTableDB },
@@ -911,6 +943,8 @@ test("read goldens reproduces rows", () => {
     { name: "interval_pk_table.jed", build: intervalPkTableDB, table: "t" },
     { name: "float64_table.jed", build: float64TableDB, table: "t" },
     { name: "float32_table.jed", build: float32TableDB, table: "t" },
+    { name: "float64_pk_table.jed", build: float64PkTableDB, table: "fk" },
+    { name: "float32_pk_table.jed", build: float32PkTableDB, table: "fk" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "composite_pk_table.jed", build: compositePKTableDB, table: "t" },
     { name: "check_table.jed", build: checkTableDB, table: "t" },

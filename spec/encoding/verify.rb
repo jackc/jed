@@ -208,6 +208,69 @@ def range_label(c)
   c["label"] || "{range}"
 end
 
+# Parse a float fixture's string `value` the way a core's float input does: the special words
+# Infinity/-Infinity/NaN (case as written), else a decimal / e-notation literal.
+def parse_float_str(s)
+  case s
+  when "Infinity", "+Infinity", "inf" then Float::INFINITY
+  when "-Infinity", "-inf" then -Float::INFINITY
+  when "NaN" then Float::NAN
+  else Float(s)
+  end
+end
+
+# float-order-preserving (encoding.md §2.8): canonicalize (-0 → +0, every NaN → one quiet pattern),
+# take the IEEE bits as a big-endian unsigned integer, then if the sign bit is set flip ALL bits
+# else flip just the sign bit. Fixed-width: f64 = 8 bytes, f32 = 4. `pack("g")` rounds the f64
+# fixture value to binary32 before reading its bits (the fixtures use f32-representable values).
+def enc_float(type, s)
+  f = parse_float_str(s)
+  if type == "f64"
+    bits = f.nan? ? 0x7FF8000000000000 : (f == 0.0 ? 0 : [f].pack("G").unpack1("Q>"))
+    bits ^= (bits >> 63) == 1 ? 0xFFFFFFFFFFFFFFFF : 0x8000000000000000
+    [bits].pack("Q>")
+  else # f32
+    bits = f.nan? ? 0x7FC00000 : (f == 0.0 ? 0 : [f].pack("g").unpack1("N"))
+    bits ^= (bits >> 31) == 1 ? 0xFFFFFFFF : 0x80000000
+    [bits].pack("N")
+  end
+end
+
+def enc_float_nullable(type, c)
+  return [0x01].pack("C") if c["null"]
+
+  [0x00].pack("C") + enc_float(type, c["value"])
+end
+
+def float_label(c) = c["null"] ? "NULL" : c["value"]
+
+# Verify spec/encoding/float.toml: the float-order-preserving KEY encoding (§2.8) — the same three
+# invariants as the decimal/interval paths (byte-exact + strict order, minus round-trip: a key is
+# never decoded back to a value). The bare body is the fixed-width transformed bits; nullable
+# prepends the §2.2 tag; descending inverts the whole component (and the file lists descending cases
+# already in ascending-byte order, so the order walk holds).
+def check_float_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+  [["bare", ->(type, c) { enc_float(type, c["value"]) }],
+   ["nullable", ->(type, c) { enc_float_nullable(type, c) }],
+   ["descending", ->(type, c) { invert(enc_float_nullable(type, c)) }]].each do |kind, enc|
+    (data[kind] || []).each do |group|
+      type = group["type"]
+      rows = []
+      group["cases"].each do |c|
+        want = c["bytes"]
+        got = hex(enc.call(type, c))
+        fail!("#{kind} #{type} #{float_label(c)}: encode=#{got} want=#{want}") unless got == want
+        rows << [float_label(c), [want].pack("H*").b]
+        checked += 1
+      end
+      check_order("#{kind} #{type}", rows)
+    end
+  end
+  checked
+end
+
 # Verify spec/encoding/range.toml: the range-bounds KEY encoding (§2.11) — the same three invariants
 # as the decimal/interval paths (byte-exact + strict order, minus round-trip: a key is never decoded
 # back to a value). Each group names its element type (`elem`); the bare body is the container key,
@@ -412,6 +475,11 @@ def main
   # Range: the range-bounds container rule (§2.11) — the first container key, recursing into the
   # element key with empty/±∞/inclusivity framing. Its own file: a bound-shape per case, not a scalar.
   checked += check_range_file("range.toml")
+
+  # Float: the float-order-preserving rule (§2.8) — fixed-width (f64 = 8, f32 = 4), the canonicalized
+  # IEEE bits with the sign-bit / all-bits flip. Its own file: the value is a float string (incl
+  # Infinity/-Infinity/NaN), not a fixed-WIDTH integer scalar.
+  checked += check_float_file("float.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

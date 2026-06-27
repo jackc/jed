@@ -58,8 +58,11 @@ So the stance (determinism.md §6, class **A**):
   layout differences and a transcendental's last-ULP divergence never fail a test.
 - **Float-gated control flow** — a query whose *row multiset* depends on an exempted value
   (a transcendental result near a `WHERE`/`ORDER BY … LIMIT` boundary) is cross-core
-  unspecified (the §4 contamination rule of determinism.md). Bounded by keeping float **out
-  of keys** (§10).
+  unspecified (the §4 contamination rule of determinism.md). A float **is** keyable (§10), so a
+  *tainted* float stored into a key can also reach *stored* order — the same bounded
+  contamination, now ledgered as a widening of the `float-transcendental` blast radius rather
+  than prevented by a key narrowing (determinism.md §4). A float at rest is in-contract, so this
+  bites only a tainted-float key, never an ordinary one.
 
 Net: a float query that does not call a transcendental is, in practice, cross-core identical;
 the exemption bites only at transcendentals, the PG oracle, and the rendering layout the
@@ -342,15 +345,24 @@ compare; the tolerance exists for the exempted surface and the oracle. `# cost:`
   does **not** collapse `-0 → +0`, since both zeros are already cross-core identical.) Byte-exact
   goldens `float32_table.jed` / `float64_table.jed` (`rust == go == ts == ruby`), the cross-core
   round-trip every type ships.
-- **Key encoding** — `float-order-preserving` ([encoding.md](encoding.md) §2.8, to author):
-  canonicalize `-0 → +0` and all NaNs to one pattern, take the IEEE bits as a big-endian u64,
-  and **if the sign bit is set (negative) flip all 64 bits, else flip just the sign bit** — the
-  standard transform that maps the binary64 total order (§3) monotonically onto unsigned byte
-  order, with NaN's canonical pattern landing above `+Inf`. **Authored but unexercised this
-  slice**: a `f64 PRIMARY KEY`/index is rejected **`0A000`** (the text/decimal/bytea/
-  interval precedent — and the determinism.md §4 contamination argument: keeping float out of
-  keys bounds an exempted value to *query-time* order, never *stored* order). Lifting it adds
-  the byte-vector fixtures + the executor key path.
+- **Key encoding** — `float-order-preserving` ([encoding.md](encoding.md) §2.8):
+  canonicalize `-0 → +0` and all NaNs to one pattern, take the IEEE bits as a big-endian u64/u32,
+  and **if the sign bit is set (negative) flip all bits, else flip just the sign bit** — the
+  standard transform that maps the float total order (§3) monotonically onto unsigned byte
+  order, with NaN's canonical pattern landing above `+Inf`. **EXERCISED**: a `f32`/`f64`
+  `PRIMARY KEY` / ordered secondary index / `UNIQUE` key / FK target is **supported**, and so is a
+  `float`-element **array** key (`f64[]`/`f32[]`, encoding.md §2.14) — float is the *last* scalar
+  to become keyable, so every scalar is now keyable (only the recursive `composite` container
+  stays `0A000`). This **reverses** the prior "permanent" narrowing: a float **at rest** is fully
+  in-contract (§1 — storage, the total order, and the key bytes are all deterministic and cross-core
+  byte-identical), so a float key built from in-contract values sorts identically in every core.
+  The only determinism cost is that a **tainted** float (a transcendental result) stored into a key
+  reaches *stored* order — a **bounded widening of the existing `float-transcendental` exemption's
+  blast radius** (query-time → stored order), not a new exemption ([determinism.md](determinism.md)
+  §4), and PG-faithful (PostgreSQL admits `float8`/`float4` btree keys). Because `-0 = +0` and all
+  NaNs canonicalize to one key, a `UNIQUE` float key treats them as one. The `(value → bytes)`
+  fixtures are [../encoding/float.toml](../encoding/float.toml) and the on-disk images are pinned by
+  the `float64_pk_table.jed` / `float32_pk_table.jed` goldens.
 - **Cost** — arithmetic and function nodes charge the uniform `operator_eval`; aggregates
   charge `aggregate_accumulate` per row (§7). All structural ⇒ deterministic and cross-core
   ([cost.md](cost.md)); float queries carry `# cost:` like any other.

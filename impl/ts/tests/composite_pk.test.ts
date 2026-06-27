@@ -78,15 +78,23 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
     ["CREATE TABLE t (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"],
     // 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
     ["CREATE TABLE t (a i32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"],
-    // Narrowing: every member must be key-encodable (f64 is not — the determinism carve-out,
-    // determinism.md §4; text/bytea ARE now keyable, encoding.md §2.4/§2.6).
-    ["CREATE TABLE t (a i32, s f64, PRIMARY KEY (a, s))", "0A000"],
   ];
   for (const [sql, want] of cases) {
     assert.equal(
       errCode(() => execute(new Database(), sql)),
       want,
       sql,
+    );
+  }
+  // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
+  // scalar is keyable); only the recursive composite container is NOT (composite.md §6).
+  {
+    const db = new Database();
+    execute(db, "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))");
+    execute(db, "CREATE TYPE addr AS (street text, zip i32)");
+    assert.equal(
+      errCode(() => execute(db, "CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))")),
+      "0A000",
     );
   }
   // The list order is the KEY order — it may differ from declaration order (the original

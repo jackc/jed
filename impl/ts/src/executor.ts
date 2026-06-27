@@ -244,6 +244,8 @@ import {
   parseArrayLiteral,
   decimalValue,
   eq3,
+  encodeFloat32Key,
+  encodeFloat64Key,
   float32Value,
   float64Value,
   floatTotalCmp,
@@ -3276,10 +3278,12 @@ export class Database {
         // §2.5) are also allowed — their variable-width key encodings are self-delimiting, so they
         // compose in composite keys / index suffixes; an oversized one trips the RECORD_MAX
         // oversized-item 0A000 (PG's btree key limit). interval is the fixed 16-byte span key
-        // (interval-span-i128, §2.10), and range the first container key (range-bounds, §2.11 —
-        // recursing into the element key with empty/±∞/inclusivity framing). Still rejected 0A000:
-        // float (the determinism carve-out, determinism.md §4) and the recursive composite/array
-        // containers. timestamp / timestamptz / date share the i64/i32 int-be-signflip key (timestamp.md §6).
+        // (interval-span-i128, §2.10), range the first container key (range-bounds, §2.11), the array
+        // the second (array-elements-terminated, §2.14 — keyable when its element is keyable,
+        // INCLUDING float), and float the fixed-width float-order-preserving key (§2.8 — the last
+        // scalar to become keyable, so EVERY scalar is now keyable). Still rejected 0A000: only the
+        // recursive composite container. timestamp / timestamptz / date share the i64/i32 int-be-signflip
+        // key (timestamp.md §6).
         if (
           !typeIsInteger(colType) &&
           !typeIsBoolean(colType) &&
@@ -3291,6 +3295,7 @@ export class Database {
           !typeIsTimestamptz(colType) &&
           !typeIsDate(colType) &&
           !typeIsInterval(colType) &&
+          !typeIsFloat(colType) &&
           !typeIsRange(colType) &&
           !typeIsArrayKeyable(colType)
         ) {
@@ -3492,6 +3497,7 @@ export class Database {
           !typeIsTimestamptz(ty) &&
           !typeIsDate(ty) &&
           !typeIsInterval(ty) &&
+          !typeIsFloat(ty) &&
           !typeIsRange(ty) &&
           !typeIsArrayKeyable(ty)
         ) {
@@ -3543,6 +3549,7 @@ export class Database {
           !typeIsTimestamptz(ty) &&
           !typeIsDate(ty) &&
           !typeIsInterval(ty) &&
+          !typeIsFloat(ty) &&
           !typeIsRange(ty) &&
           !typeIsArrayKeyable(ty)
         ) {
@@ -4363,6 +4370,7 @@ export class Database {
         !typeIsTimestamptz(ty) &&
         !typeIsDate(ty) &&
         !typeIsInterval(ty) &&
+        !typeIsFloat(ty) &&
         !typeIsRange(ty) &&
         !typeIsArrayKeyable(ty)
       ) {
@@ -11040,6 +11048,11 @@ function indexEntryKey(
       parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
     } else if (v.kind === "interval") {
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
+    } else if (v.kind === "f64") {
+      // float: the fixed-width float-order-preserving key (encoding.md §2.8).
+      parts.push(Uint8Array.of(0x00), encodeFloat64Key(v.value));
+    } else if (v.kind === "f32") {
+      parts.push(Uint8Array.of(0x00), encodeFloat32Key(v.value));
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
       parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
@@ -11351,6 +11364,11 @@ function encodePkKey(
       parts.push(pkv.dec.encodeKey());
     } else if (pkv.kind === "interval") {
       parts.push(intervalEncodeKey(pkv.iv));
+    } else if (pkv.kind === "f64") {
+      // float: the fixed-width float-order-preserving key (encoding.md §2.8) — NOT the int codec.
+      parts.push(encodeFloat64Key(pkv.value));
+    } else if (pkv.kind === "f32") {
+      parts.push(encodeFloat32Key(pkv.value));
     } else if (pkv.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11, the first container key)
       parts.push(encodeTypedKey(table.columns[i]!.type, pkv, null));
@@ -11360,7 +11378,7 @@ function encodePkKey(
     } else {
       throw engineError(
         "data_corrupted",
-        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, range, array, or timestamp value",
+        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, float, range, array, or timestamp value",
       );
     }
   }
@@ -11481,6 +11499,11 @@ function indexPrefixKey(
       parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
     } else if (v.kind === "interval") {
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
+    } else if (v.kind === "f64") {
+      // float: the fixed-width float-order-preserving key (encoding.md §2.8).
+      parts.push(Uint8Array.of(0x00), encodeFloat64Key(v.value));
+    } else if (v.kind === "f32") {
+      parts.push(Uint8Array.of(0x00), encodeFloat32Key(v.value));
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
       parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
@@ -11535,6 +11558,8 @@ function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | null): U
   if (value.kind === "bytea") return encodeTerminated(value.bytes);
   if (value.kind === "decimal") return value.dec.encodeKey();
   if (value.kind === "interval") return intervalEncodeKey(value.iv);
+  if (value.kind === "f64") return encodeFloat64Key(value.value);
+  if (value.kind === "f32") return encodeFloat32Key(value.value);
   throw new Error("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)");
 }
 
@@ -11566,9 +11591,10 @@ function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Ar
 // Reproduces the in-memory array total order (array.md §5) under memcmp: per flattened (row-major)
 // element a marker (0x01 present ‖ the element key, 0x02 NULL) so present sorts before NULL and a
 // shorter list reaches the 0x00 terminator first; then the shape suffix (ndim, then per dimension a
-// u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (the
-// DDL gate rejects a float/composite element 0A000), so the per-element key is encodeKeyValue with
-// the C byte order (a collated array-element key is not a feature this slice).
+// u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (float
+// elements included since the §2.8 lift; the DDL gate rejects only a composite element 0A000), so the
+// per-element key is encodeKeyValue with the C byte order (a collated array-element key is not a
+// feature this slice).
 function encodeArrayKey(
   elem: ScalarType,
   a: { dims: number[]; lbounds: number[]; elements: Value[] },
@@ -11592,8 +11618,9 @@ function encodeArrayKey(
   return Uint8Array.from(out);
 }
 
-// typeIsKeyableScalar reports whether a Type is a key-encodable scalar — every keyable scalar except
-// float (the §2.8 determinism carve-out). The element-type gate for typeIsArrayKeyable.
+// typeIsKeyableScalar reports whether a Type is a key-encodable scalar — the element-type gate for
+// typeIsArrayKeyable. With float keys exercised (§2.8) every scalar is keyable; only the recursive
+// composite container is excluded (it is not a scalar Type).
 function typeIsKeyableScalar(t: Type): boolean {
   return (
     typeIsInteger(t) ||
@@ -11605,14 +11632,15 @@ function typeIsKeyableScalar(t: Type): boolean {
     typeIsTimestamp(t) ||
     typeIsTimestamptz(t) ||
     typeIsDate(t) ||
-    typeIsInterval(t)
+    typeIsInterval(t) ||
+    typeIsFloat(t)
   );
 }
 
 // typeIsArrayKeyable reports whether t is an array whose element is a key-encodable scalar — so the
 // array is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated).
-// A float-element or composite-element array is NOT keyable (the same narrowing the bare float/
-// composite scalar key carries).
+// A float-element array (f64[]/f32[]) IS keyable (the §2.8 lift); only a composite-element array is
+// NOT keyable (composite is not yet keyable).
 function typeIsArrayKeyable(t: Type): boolean {
   return t.kind === "array" && typeIsKeyableScalar(t.elem);
 }

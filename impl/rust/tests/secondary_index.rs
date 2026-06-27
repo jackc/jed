@@ -107,9 +107,9 @@ fn ddl_errors_match_postgres() {
     // Column existence next — before the name-collision check (PG's order).
     run(&mut db, "CREATE INDEX taken ON t (a)");
     assert_eq!(err_code(&mut db, "CREATE INDEX taken ON t (nope)"), "42703");
-    // An unindexable column type is the 0A000 narrowing (f64 is not key-encodable — the
-    // determinism carve-out; text/bytea ARE now indexable, encoding.md §2.4/§2.6).
-    assert_eq!(err_code(&mut db, "CREATE INDEX i ON t (s)"), "0A000");
+    // f64 IS now a valid index column (the float-order-preserving key, encoding.md §2.8 — every
+    // scalar is keyable; text/bytea covered in ddl/create_index.test).
+    run(&mut db, "CREATE INDEX i ON t (s)");
     // Name collisions across the shared relation namespace: vs an index, vs a table,
     // and CREATE TABLE vs an index name.
     assert_eq!(err_code(&mut db, "CREATE INDEX taken ON t (a)"), "42P07");

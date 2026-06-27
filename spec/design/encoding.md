@@ -276,7 +276,7 @@ is NOT NULL, so no presence tag). A stored uuid *value* reuses the same 16 bytes
 value-codec presence tag ([../fileformat/format.md](../fileformat/format.md)); for uuid the key
 and value bodies coincide (both the raw 16 bytes), the simplest case of the §3 key/value seam.
 
-### 2.8 Float (`f32` / `f64`) — `float-order-preserving` (authored; unexercised this slice)
+### 2.8 Float (`f32` / `f64`) — `float-order-preserving`
 
 Both binary floats are fixed-width (`f64` = 8 bytes, `f32` = 4 bytes) but, unlike the
 integers, the IEEE 754 bit pattern does **not** sort by `memcmp` in numeric order: negatives have
@@ -294,19 +294,51 @@ sort later (backwards). The standard transform maps the type's **total order**
    `+Infinity`, lands last — matching `−Inf < finite < +Inf < NaN`.
 
 This composes with the §2.2 nullable presence tag (`0x00` present ‖ the 8 bytes, or `0x01` NULL)
-and the §2.3 descending inversion unchanged.
+and the §2.3 descending inversion unchanged. Because the canonicalization maps `-0.0` and `+0.0`
+to the **same** bytes (and all NaNs to one pattern), two values equal under the §3 total order
+encode identically — so a `UNIQUE` float key treats `-0` and `+0` (and any two NaNs) as one, the
+float analogue of decimal's scale-independence (§2.5). Worked bytes (`f64`):
 
-**Status — authored, not yet exercised.** A `f32`/`f64` `PRIMARY KEY`/index is rejected
-`0A000` — unlike text/decimal/bytea/interval (whose narrowings have all since lifted), float's
-rejection is **permanent**, reinforced by the
-**contamination** rule ([determinism.md](determinism.md) §4): keeping an exempted-value type out
-of *keys* bounds float non-determinism to *query-time* order, never *stored* order. With interval
-keyable (§2.10), `float` is now the **lone** non-keyable scalar — the only one whose key narrowing
-is principled (the determinism carve-out) rather than merely pending. Stored float
-*values* use the simpler fixed value codec ([../fileformat/format.md](../fileformat/format.md),
-type code 12 for `f64` / 13 for `f32`), which preserves the bits verbatim (no
-canonicalization) because a stored value never needs to sort.
-Lifting the narrowing adds the `(value → bytes)` fixtures and the executor key path then.
+| value | encoded key bytes |
+|---|---|
+| `-Infinity` | `00 0f ff ff ff ff ff ff` |
+| `-1.5` | `40 07 ff ff ff ff ff ff` |
+| `-0.0` = `+0.0` | `80 00 00 00 00 00 00 00` |
+| `1.5` | `bf f8 00 00 00 00 00 00` |
+| `+Infinity` | `ff f0 00 00 00 00 00 00` |
+| `NaN` (canonical, largest) | `ff f8 00 00 00 00 00 00` |
+
+`memcmp` then yields `−Inf < −1.5 < ±0 < 1.5 < +Inf < NaN` — the §3 total order. Negatives sort
+below positives because the flip-all maps them into `[0x000…, 0x7FF…]` while a positive's
+flip-sign lands in `[0x800…, 0xFFF…]`; within negatives, "more negative" sorts first.
+
+**Status — EXERCISED.** A `f32`/`f64` is a valid `PRIMARY KEY` / ordered secondary index /
+`UNIQUE` key / FK target — the last scalar to become keyable, so with float lifted **every scalar
+is keyable** and only the recursive `composite` container remains a `0A000` key. A float PK stores
+the bare fixed-width body (a PK is NOT NULL, so no presence tag); an index entry / composite member
+wraps it in the §2.2 nullable slot; a `float`-element **array** (`f64[]`/`f32[]`) is keyable too
+(§2.14). The `(value → bytes)` vectors are in [../encoding/float.toml](../encoding/float.toml) and
+the on-disk image is pinned by the `float64_pk_table.jed` / `float32_pk_table.jed` goldens
+([../fileformat/format.md](../fileformat/format.md)).
+
+**Why lifting the narrowing is sound (the determinism reversal).** This narrowing was originally
+held **permanent** on a contamination argument ([determinism.md](determinism.md) §4): keep the
+exempted-value type out of *keys* so float non-determinism is bounded to *query-time* order, never
+*stored* order. The reversal rests on the fact that a float **at rest** is fully in-contract
+([float.md](float.md) §1): its **storage** bytes, its **total order** (§3), and its
+**`float-order-preserving` key bytes** above are all deterministic and cross-core byte-identical.
+So a float key built from in-contract values (literals, sensor data, the `+ − * / sqrt` kernel,
+the exact-sum aggregates) sorts identically in every core — there is no G2 break. The *only*
+residual cost is the narrow case of storing a **tainted** float (a transcendental result, ±1 ULP
+cross-core) into a key column: that extends the existing `float-transcendental` exemption's blast
+radius from query-time order to *stored* order. This is a **bounded widening of an existing
+ledger entry**, not a new exemption — and it is PG-faithful (PostgreSQL admits `float8`/`float4`
+in btree keys, CLAUDE.md §1). The goldens above deliberately store only in-contract literals, so
+they stay byte-identical `rust == go == ts == ruby`. Stored float *values* still use the simpler
+fixed value codec ([../fileformat/format.md](../fileformat/format.md), type code 12 for `f64` / 13
+for `f32`), which preserves the bits verbatim (only NaN canonicalized) because a stored value never
+needs to sort — the §3 key/value seam diverging as it does for `decimal` (§2.5) and `interval`
+(§2.10).
 
 ### 2.9 Boolean — `bool-byte` (the second EXERCISED non-integer key)
 
@@ -462,8 +494,8 @@ framing). Point-lookup pushdown stays **deferred** for ranges (a range PK/index 
 full-scans + residual-filters — correct, just unindexed — matching the container precedent), and a
 range is **not** a GIN element. The `(value → bytes)` vectors are in
 [../encoding/range.toml](../encoding/range.toml); the on-disk image is pinned by the
-`range_pk_table.jed` golden. With range exercised, only `float` (the determinism carve-out §2.8) and
-the recursive **composite/array** containers remain `0A000` keys.
+`range_pk_table.jed` golden. (Array §2.14 and float §2.8 have since landed too, so the recursive
+**composite** container is now the only remaining `0A000` key.)
 
 ### 2.12 Collated text — `text-collated-sortkey` (a key *form*, not a new type)
 
@@ -542,8 +574,9 @@ key/value seam diverging exactly as it does for `decimal` (§2.5) and `interval`
 
 `jsonb` has a total btree order ([json.md §5](json.md)) but is **not** a key type in the first
 JSON slices (`0A000`, the staged-key narrowing text/decimal/bytea/array all carried). The
-order-preserving encoding is authored here ahead of use — the float-§2.8 precedent — and a
-follow-on slice exercises it ([json.md §12](json.md)). The rule recurses over the node tree,
+order-preserving encoding is authored here ahead of use — as the float §2.8 and range §2.11 rules
+were authored before they landed — and a follow-on slice exercises it ([json.md §12](json.md)). The
+rule recurses over the node tree,
 mirroring the §2.11 range-bounds container recursion:
 
 1. A leading **type-rank discriminator byte** encoding the §5 order `Null < String < Number <
@@ -558,8 +591,9 @@ mirroring the §2.11 range-bounds container recursion:
    Count-first framing reproduces the §5 "fewer elements/members sort first" rule.
 
 This composes with the §2.2 nullable slot and §2.3 descending inversion unchanged. **Status —
-AUTHORED, UNEXERCISED.** Like float (§2.8) it is written but not yet a live key; `json` (never
-comparable) and `jsonpath` get no key rule at all.
+AUTHORED, UNEXERCISED.** It is written but not yet a live key — the way the float (§2.8) and range
+(§2.11) rules were authored before they landed; `json` (never comparable) and `jsonpath` get no key
+rule at all.
 
 ### 2.14 Array — `array-elements-terminated` (the second container key)
 
@@ -600,10 +634,12 @@ shape suffix:
 2. **Element key = the element's own order-preserving key.** After the `0x01` present marker comes the
    element scalar's order-preserving key — the bare integer (§2.1), `text`/`bytea`-terminated-escape
    (§2.4/§2.6), `decimal-order-preserving` (§2.5), `uuid-raw16` (§2.7), `bool-byte` (§2.9), the i64/i32
-   timestamp/date rule, or `interval-span-i128` (§2.10) — each self-delimiting, so the next marker (or
-   the terminator) follows unambiguously under `memcmp`. The element is a **key-encodable scalar**; a
-   `float` element (the §2.8 carve-out) or a composite element (composite is not yet keyable) makes the
-   whole array `0A000` at the DDL gate, never reaching this rule. Array-of-array does not exist
+   timestamp/date rule, `interval-span-i128` (§2.10), or `float-order-preserving` (§2.8) — each
+   self-delimiting (fixed-width or `0x00`-terminated), so the next marker (or the terminator) follows
+   unambiguously under `memcmp`. The element is a **key-encodable scalar**; a composite element
+   (composite is not yet keyable) makes the whole array `0A000` at the DDL gate, never reaching this
+   rule. A `float` element **is** keyable (the §2.8 narrowing lifted — a float at rest is in-contract,
+   so a `f64[]`/`f32[]` key sorts identically in every core). Array-of-array does not exist
    ([array.md §2](array.md)).
 3. **Shape suffix breaks ties among equal-element-prefix, equal-count arrays.** After the terminator,
    `ndim` then, per dimension, `len_d` (`u32` BE — lengths are ≥ 1, so unsigned big-endian orders them)
@@ -629,8 +665,8 @@ ruby`, via `spec/fileformat/verify.rb`'s independent `encode_array_key`). **Stat
 valid `PRIMARY KEY` / ordered secondary index / `UNIQUE` key / FK target ([array.md §8](array.md)); like
 the other container keys, point-lookup pushdown stays deferred (an array PK/index `WHERE k = …`
 full-scans + residual-filters) and an array is not a GIN *key* (the separate GIN element index is
-unrelated). The lone remaining non-integer scalar `float` (§2.8) and the recursive `composite`
-container stay `0A000` keys.
+unrelated). With `float` keys now exercised (§2.8 — including `float`-element arrays), the recursive
+`composite` container is the only remaining `0A000` key.
 
 ## 3. Where this is used today
 
@@ -663,9 +699,10 @@ keys** (the recursive, variable-arity `array-elements-terminated` rule §2.14, `
 the **second container key**, and the first whose key length varies with the value's element count). A
 **non-`C` collated `text` key** (the `text-collated-sortkey` *form* §2.12) has since landed too — the
 same `text` key type, but its body is the column collation's baked UCA sort key rather than the raw
-UTF-8, pinned by the `collation_pk_table.jed` golden. The lone remaining non-integer scalar, `float`,
-adds its own §2 key path only if the determinism carve-out (§2.8) ever lifts; the recursive
-`composite` container stays a `0A000` key.
+UTF-8, pinned by the `collation_pk_table.jed` golden. `float` keys (the `float-order-preserving`
+rule §2.8, `float64_pk_table.jed` / `float32_pk_table.jed`) have since landed too — the last scalar
+to become keyable — so **every scalar is now keyable** and only the recursive `composite` container
+stays a `0A000` key.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

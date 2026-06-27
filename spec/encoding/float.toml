@@ -1,0 +1,114 @@
+# Order-preserving key-encoding vectors for `f32` / `f64` — method `float-order-preserving`
+# (../design/encoding.md §2.8). The value is canonicalized (-0.0 → +0.0; every NaN → one quiet
+# pattern), its IEEE bits taken as a big-endian unsigned integer, then: if the sign bit is set
+# (negative) ALL bits are flipped, else just the sign bit — the standard transform mapping the
+# float TOTAL order (-Inf < finite < +Inf < NaN; -0 = +0, NaN = NaN — float.md §3) monotonically
+# onto unsigned byte order. Fixed-width (f64 = 8 bytes, f32 = 4), so self-delimiting by width with
+# NO escape/terminator (like uuid/timestamp). A float PRIMARY KEY stores the BARE body (NOT NULL,
+# no presence tag); an index slot wraps it in the §2.2 nullable tag; descending inverts the whole
+# component. Verified by verify.rb (round-trip-free: a key is never decoded back to a value, so
+# only encode + byte-exactness + strict order are checked).
+#
+# The encoding is INDEPENDENT of zero sign and NaN payload: -0.0 and +0.0 encode identically, and
+# every NaN encodes to the one canonical key — so a UNIQUE float key treats -0/+0 (and any two
+# NaNs) as one. That equal-key property is NOT exercised here (the ordered lists below carry only
+# distinct values, like decimal.toml's 1.5/1.50); it is pinned by the per-core unit tests and the
+# UNIQUE cases in suites/types/float_key.test.
+#
+# Each `value` is a string parsed by the core's float input (Infinity / -Infinity / NaN, or a
+# decimal/e-notation literal). Groups are in ascending logical (= byte) order, so the order
+# invariant is a walk of the list.
+
+schema_version = 1
+
+# ===== f64 (binary64, 8-byte body) =====
+
+# --- bare f64 key body (the PRIMARY KEY form): a full ascending spread across the sign boundary,
+# through zero, to ±MAX, ±Infinity, and the canonical NaN (the largest value). ----------------
+[[bare]]
+type = "f64"
+cases = [
+  { value = "-Infinity", bytes = "000fffffffffffff" },
+  { value = "-1.7976931348623157e308", bytes = "0010000000000000" },  # -f64::MAX
+  { value = "-1.5", bytes = "4007ffffffffffff" },
+  { value = "0.0", bytes = "8000000000000000" },                      # -0.0 encodes identically
+  { value = "1.5", bytes = "bff8000000000000" },
+  { value = "1.7976931348623157e308", bytes = "ffefffffffffffff" },   # f64::MAX (finite, < +Inf)
+  { value = "Infinity", bytes = "fff0000000000000" },
+  { value = "NaN", bytes = "fff8000000000000" },                      # canonical NaN, the largest
+]
+
+# --- nullable f64 slot (an index entry / composite member): §2.2 presence tag (0x00 present, 0x01
+# NULL). Present sorts before NULL, so NULLs sort last ascending. ------------------------------
+[[nullable]]
+type = "f64"
+cases = [
+  { value = "-Infinity", bytes = "00000fffffffffffff" },
+  { value = "-1.7976931348623157e308", bytes = "000010000000000000" },
+  { value = "-1.5", bytes = "004007ffffffffffff" },
+  { value = "0.0", bytes = "008000000000000000" },
+  { value = "1.5", bytes = "00bff8000000000000" },
+  { value = "1.7976931348623157e308", bytes = "00ffefffffffffffff" },
+  { value = "Infinity", bytes = "00fff0000000000000" },
+  { value = "NaN", bytes = "00fff8000000000000" },
+  { null = true, bytes = "01" },
+]
+
+# --- descending f64 = bitwise inversion of the nullable slot (§2.3): mirrors the order, lifting
+# NULL to first. -------------------------------------------------------------------------------
+[[descending]]
+type = "f64"
+cases = [
+  { null = true, bytes = "fe" },
+  { value = "NaN", bytes = "ff0007ffffffffffff" },
+  { value = "Infinity", bytes = "ff000fffffffffffff" },
+  { value = "1.7976931348623157e308", bytes = "ff0010000000000000" },
+  { value = "1.5", bytes = "ff4007ffffffffffff" },
+  { value = "0.0", bytes = "ff7fffffffffffffff" },
+  { value = "-1.5", bytes = "ffbff8000000000000" },
+  { value = "-1.7976931348623157e308", bytes = "ffffefffffffffffff" },
+  { value = "-Infinity", bytes = "fffff0000000000000" },
+]
+
+# ===== f32 (binary32, 4-byte body) =====
+
+[[bare]]
+type = "f32"
+cases = [
+  { value = "-Infinity", bytes = "007fffff" },
+  { value = "-3.4028234663852886e38", bytes = "00800000" },           # -f32::MAX
+  { value = "-1.5", bytes = "403fffff" },
+  { value = "0.0", bytes = "80000000" },
+  { value = "1.5", bytes = "bfc00000" },
+  { value = "3.4028234663852886e38", bytes = "ff7fffff" },            # f32::MAX (finite, < +Inf)
+  { value = "Infinity", bytes = "ff800000" },
+  { value = "NaN", bytes = "ffc00000" },
+]
+
+[[nullable]]
+type = "f32"
+cases = [
+  { value = "-Infinity", bytes = "00007fffff" },
+  { value = "-3.4028234663852886e38", bytes = "0000800000" },
+  { value = "-1.5", bytes = "00403fffff" },
+  { value = "0.0", bytes = "0080000000" },
+  { value = "1.5", bytes = "00bfc00000" },
+  { value = "3.4028234663852886e38", bytes = "00ff7fffff" },
+  { value = "Infinity", bytes = "00ff800000" },
+  { value = "NaN", bytes = "00ffc00000" },
+  { null = true, bytes = "01" },
+]
+
+[[descending]]
+type = "f32"
+cases = [
+  { null = true, bytes = "fe" },
+  { value = "NaN", bytes = "ff003fffff" },
+  { value = "Infinity", bytes = "ff007fffff" },
+  { value = "3.4028234663852886e38", bytes = "ff00800000" },
+  { value = "1.5", bytes = "ff403fffff" },
+  { value = "0.0", bytes = "ff7fffffff" },
+  { value = "-1.5", bytes = "ffbfc00000" },
+  { value = "-3.4028234663852886e38", bytes = "ffff7fffff" },
+  { value = "-Infinity", bytes = "ffff800000" },
+]

@@ -3640,19 +3640,20 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// compose in composite keys / index suffixes — plus the range container (range-bounds
 			// §2.11, the first container key) and the array container (array-elements-terminated
 			// §2.14, the second container key — keyable when its element is a key-encodable scalar,
-			// isArrayKeyable). Still 0A000: float (the determinism carve-out — §4), a float/composite-
-			// element array, and the recursive composite container.
+			// isArrayKeyable, INCLUDING a float element since the §2.8 lift) — plus float itself
+			// (float-order-preserving §2.8, the last scalar to become keyable). Still 0A000: only a
+			// composite-element array and the recursive composite container.
 			if isComposite || (isArray && !isArrayKeyable(colType)) {
 				// A composite PRIMARY KEY (composite.md §6) or a non-keyable array PRIMARY KEY (a
-				// float/composite element) is rejected 0A000. colType.CanonicalName() gives the
-				// canonical type name (e.g. f64[], even when declared with an alias).
+				// composite element) is rejected 0A000. colType.CanonicalName() gives the
+				// canonical type name (e.g. addr[], even when declared with an alias).
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
 			// A range / keyable array is a container key (encoding.md §2.11/§2.14); every other
 			// keyable column is a scalar, gated here.
 			if !isRange && !isArray {
-				if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
+				if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() {
 					return Outcome{}, NewError(FeatureNotSupported,
 						"a "+ty.CanonicalName()+" primary key is not supported yet")
 				}
@@ -3848,7 +3849,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() && !isArrayKeyable(ty) {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -3892,7 +3893,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() && !isArrayKeyable(ty) {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -4938,7 +4939,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		ty := columns[idx].Type
 		switch kind {
 		case IndexBtree:
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() && !isArrayKeyable(ty) {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}
@@ -5415,6 +5416,13 @@ func indexEntryKey(columns []Column, colls []*Collation, def IndexDef, storageKe
 		case ValInterval:
 			out = append(out, 0x00)
 			out = append(out, v.Iv.EncodeKey()...)
+		case ValFloat64:
+			// float: the fixed-width float-order-preserving key (encoding.md §2.8).
+			out = append(out, 0x00)
+			out = append(out, encodeFloat64Key(uint64(v.Int))...)
+		case ValFloat32:
+			out = append(out, 0x00)
+			out = append(out, encodeFloat32Key(uint32(v.Int))...)
 		case ValRange:
 			// the recursive range-bounds container key (encoding.md §2.11)
 			out = append(out, 0x00)
@@ -5682,6 +5690,13 @@ func indexPrefixKey(columns []Column, colls []*Collation, def IndexDef, row Row)
 		case ValInterval:
 			out = append(out, 0x00)
 			out = append(out, v.Iv.EncodeKey()...)
+		case ValFloat64:
+			// float: the fixed-width float-order-preserving key (encoding.md §2.8).
+			out = append(out, 0x00)
+			out = append(out, encodeFloat64Key(uint64(v.Int))...)
+		case ValFloat32:
+			out = append(out, 0x00)
+			out = append(out, encodeFloat32Key(uint32(v.Int))...)
 		case ValRange:
 			// the recursive range-bounds container key (encoding.md §2.11)
 			out = append(out, 0x00)
@@ -5766,6 +5781,14 @@ func encodePkKey(table *Table, pk []int, colls []*Collation, row Row) ([]byte, e
 				return nil, err
 			}
 			key = append(key, b...)
+		case table.Columns[i].Type.IsFloat():
+			// float: the fixed-width float-order-preserving key (encoding.md §2.8) — NOT the integer
+			// codec (the float bits do not sort numerically as an int).
+			if table.Columns[i].Type.ScalarTy() == Float32 {
+				key = append(key, encodeFloat32Key(uint32(row[i].Int))...)
+			} else {
+				key = append(key, encodeFloat64Key(uint64(row[i].Int))...)
+			}
 		default:
 			// integers / timestamp / timestamptz / date: the fixed-width key codec.
 			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
@@ -13336,6 +13359,10 @@ func encodeValueKey(pkType ScalarType, v Value, coll *Collation) (key []byte, is
 			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
 		}
 		return v.Iv.EncodeKey(), false, true
+	case pkType.IsFloat():
+		// A float PK does NOT push down this slice (full-scan + residual filter, like the container
+		// keys) — drop the half-bound (sound widening), matching Rust encode_value_key's OutOfRange.
+		return nil, false, false
 	case pkType.IsInteger():
 		if !pkType.InRange(v.Int) {
 			return nil, false, false
@@ -33339,6 +33366,10 @@ func encodeKeyValue(ty ScalarType, value Value, coll *Collation) ([]byte, error)
 		return value.Dec.EncodeKey(), nil
 	case ValInterval:
 		return value.Iv.EncodeKey(), nil
+	case ValFloat64:
+		return encodeFloat64Key(uint64(value.Int)), nil
+	case ValFloat32:
+		return encodeFloat32Key(uint32(value.Int)), nil
 	default:
 		panic("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)")
 	}
@@ -33372,9 +33403,10 @@ func encodeTypedKey(ty Type, value Value, coll *Collation) ([]byte, error) {
 // Reproduces the in-memory arrayTotalCmp order (array.md §5) under memcmp: per flattened (row-major)
 // element a marker (0x01 present ‖ the element key, 0x02 NULL) so present sorts before NULL and a
 // shorter list reaches the 0x00 terminator first; then the shape suffix (ndim, then per dimension a
-// u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (the
-// DDL gate rejects a float/composite element 0A000), so the per-element key is encodeKeyValue with
-// the C byte order (a collated array-element key is not a feature this slice).
+// u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (float
+// elements included since the §2.8 lift; the DDL gate rejects only a composite element 0A000), so the
+// per-element key is encodeKeyValue with the C byte order (a collated array-element key is not a
+// feature this slice).
 func encodeArrayKey(elem ScalarType, a *ArrayVal) ([]byte, error) {
 	var out []byte
 	for _, e := range a.Elements {
@@ -33399,17 +33431,19 @@ func encodeArrayKey(elem ScalarType, a *ArrayVal) ([]byte, error) {
 	return out, nil
 }
 
-// isKeyableScalarType reports whether a scalar is key-encodable — every keyable scalar except float
-// (the §2.8 determinism carve-out). The element-type gate for isArrayKeyable.
+// isKeyableScalarType reports whether a scalar is key-encodable — the element-type gate for
+// isArrayKeyable. With float keys exercised (§2.8) every scalar is keyable; only the recursive
+// composite container is excluded (it is not a ScalarType).
 func isKeyableScalarType(s ScalarType) bool {
 	return s.IsInteger() || s.IsBool() || s.IsText() || s.IsBytea() || s.IsDecimal() ||
-		s.IsUuid() || s.IsTimestamp() || s.IsTimestamptz() || s.IsDate() || s.IsInterval()
+		s.IsUuid() || s.IsTimestamp() || s.IsTimestamptz() || s.IsDate() || s.IsInterval() ||
+		s.IsFloat()
 }
 
 // isArrayKeyable reports whether ty is an array whose element is a key-encodable scalar — so the array
 // is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated). A
-// float-element or composite-element array is NOT keyable (the same narrowing the bare float/composite
-// scalar key carries).
+// float-element array (f64[]/f32[]) IS keyable (the §2.8 lift); only a composite-element array is NOT
+// keyable (composite is not yet keyable).
 func isArrayKeyable(ty Type) bool {
 	return ty.Array != nil && ty.Array.isScalar() && isKeyableScalarType(ty.Array.Scalar)
 }

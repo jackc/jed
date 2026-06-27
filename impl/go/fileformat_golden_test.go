@@ -656,6 +656,35 @@ func float32TableDB(t *testing.T) *Database {
 	return db
 }
 
+// float64PKTableDB exercises a f64 PRIMARY KEY (the float-order-preserving key, encoding.md §2.8):
+// the B-tree iterates float keys in the float total order (-Inf < finite < +Inf < NaN; -0 = +0).
+// In-contract literal values only, so the image is cross-core byte-identical; the row set matches
+// FLOAT64_PK_TABLE in spec/fileformat/verify.rb (insertion order is irrelevant — the PK store sorts).
+func float64PKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE fk (k f64 PRIMARY KEY, v i32)")
+	run(t, db, "INSERT INTO fk VALUES (1.5, 1)")
+	run(t, db, "INSERT INTO fk SELECT f64 '-Infinity', 2")
+	run(t, db, "INSERT INTO fk VALUES (0.0, 3)")
+	run(t, db, "INSERT INTO fk SELECT f64 'NaN', 4")
+	run(t, db, "INSERT INTO fk VALUES (-1.5, 5)")
+	run(t, db, "INSERT INTO fk SELECT f64 'Infinity', 6")
+	return db
+}
+
+// float32PKTableDB is float64PKTableDB at binary32 width (the 4-byte float-order-preserving key §2.8).
+func float32PKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE fk (k f32 PRIMARY KEY, v i32)")
+	run(t, db, "INSERT INTO fk VALUES (1.5, 1)")
+	run(t, db, "INSERT INTO fk SELECT f32 '-Infinity', 2")
+	run(t, db, "INSERT INTO fk VALUES (0.0, 3)")
+	run(t, db, "INSERT INTO fk SELECT f32 'NaN', 4")
+	run(t, db, "INSERT INTO fk VALUES (-1.5, 5)")
+	run(t, db, "INSERT INTO fk SELECT f32 'Infinity', 6")
+	return db
+}
+
 // dateTableDB exercises the value codec's date branch (type code 16): the 4-byte i32 day-count
 // body (same int-be-signflip codec as i32). A positive date, a pre-1970 negative one, a BC-era
 // one, the −infinity/+infinity sentinels (i32 min/max), and a NULL. The bare-string literals adapt
@@ -836,6 +865,8 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"interval_pk_table.jed", intervalPKTableDB},
 		{"float64_table.jed", float64TableDB},
 		{"float32_table.jed", float32TableDB},
+		{"float64_pk_table.jed", float64PKTableDB},
+		{"float32_pk_table.jed", float32PKTableDB},
 		{"date_table.jed", dateTableDB},
 		{"nopk_table.jed", nopkTableDB},
 		{"composite_pk_table.jed", compositePKTableDB},
@@ -906,6 +937,8 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"interval_pk_table.jed", intervalPKTableDB, "t"},
 		{"float64_table.jed", float64TableDB, "t"},
 		{"float32_table.jed", float32TableDB, "t"},
+		{"float64_pk_table.jed", float64PKTableDB, "fk"},
+		{"float32_pk_table.jed", float32PKTableDB, "fk"},
 		{"date_table.jed", dateTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"composite_pk_table.jed", compositePKTableDB, "t"},

@@ -357,7 +357,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       from cross-core byte-identity (via the `R` tag's tolerant compare); established the determinism
       framework + exception ledger; on-disk type code 12. → [float.md](spec/design/float.md),
       [determinism.md](spec/design/determinism.md)
-  - [ ] _follow-on:_ float in a PRIMARY KEY/index (`0A000`); key rule authored, unexercised.
+  - [x] _follow-on:_ **float in a PRIMARY KEY/index** — the `float-order-preserving` key rule
+        (encoding.md §2.8) is now EXERCISED: `f32`/`f64` is a valid `PRIMARY KEY` / ordered secondary
+        index / `UNIQUE` / FK target, and a `float`-element array (`f64[]`/`f32[]`) is keyable too
+        (§2.14). float was the last non-key scalar, so **every scalar is now keyable** (only the
+        recursive `composite` container stays `0A000`). Reverses the prior "permanent" narrowing — a
+        float AT REST is in-contract / cross-core byte-identical, so a float key is deterministic;
+        only a tainted (transcendental) float stored into a key widens the `float-transcendental`
+        blast radius to stored order, ledgered (determinism.md §4). PG-faithful. Cap
+        `types.float_key`; goldens `float64_pk_table.jed`/`float32_pk_table.jed`;
+        `types/float_key.test`. (`float[]` GIN + `float` GiST/`EXCLUDE` stay their own follow-ons.)
   - [x] **math functions** — the [float.md §8](spec/design/float.md) follow-ons, all three cores,
         oracle-clean: `cbrt`/`pi()`/`radians`/`degrees`, the inverse + hyperbolic trig, `power`; and
         the EXACT numerics `sign`/`mod()`/`div()`/`gcd`/`lcm`/`factorial`/`width_bucket` (new `2201G`)/
@@ -395,8 +404,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       element-wise array→array; no format bump); and **arrays-in-keys** (the `array-elements-terminated`
       key, encoding.md §2.14 — an array of a key-encodable scalar element is a valid `PRIMARY KEY` /
       ordered secondary index / `UNIQUE` / FK target, the **second container key**; `array_pk_table.jed`
-      golden, `types/array_key.test`; a `float`/composite-element array key stays `0A000`; no format
-      bump). **Every array follow-on has landed.** → [array.md](spec/design/array.md), [array-functions.md](spec/design/array-functions.md)
+      golden, `types/array_key.test`; a composite-element array key stays `0A000`; a `float`-element
+      array key (`f64[]`/`f32[]`) has since LANDED with the float-key slice — `types.float_key`; no
+      format bump). **Every array follow-on has landed.** → [array.md](spec/design/array.md), [array-functions.md](spec/design/array-functions.md)
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis** turning the *closed* type enum into an *open* one: `Type { Scalar |
       Composite(catalog-ref) }` threaded through all three cores; `CREATE`/`DROP TYPE`, nested +
@@ -491,8 +501,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       scan on a first-column equality; `format_version` 5 catalog reshape. → [indexes.md](spec/design/indexes.md)
   - [ ] _follow-on (each its own slice + NoREC obligation):_ index ranges / multi-column prefixes;
         index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination;
-        the lone not-yet-key-encodable index type (`float` keys — boolean, text, bytea, decimal, and
-        interval have since landed); expression/ordered/partial keys; `IF NOT EXISTS`.
+        expression/ordered/partial keys; `IF NOT EXISTS`. (**All scalar key types are now
+        encodable** — `float` keys landed, joining boolean/text/bytea/decimal/interval; only the
+        recursive `composite` container stays a `0A000` key.)
 - [ ] **GIN inverted indexes** (`CREATE INDEX … USING gin`) — a second index *kind* beside the
       ordered B-tree, via a type-generic operator-class seam. **Landed (G0–G2 + follow-ons):** the
       **`array_ops`** opclass over array columns (one entry per distinct non-NULL element, empty
@@ -503,9 +514,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the
         index recording empty/NULL-array rows) / `IN` over a scalar list; the **remaining** element
         types — the VARIABLE-width keyables (`text[]`, `bytea[]`, `decimal[]`) need GIN term framing
-        (a term carries no length/terminator), and `float[]` needs its key encoding to lift first;
-        `interval[]` is now UNBLOCKED (its fixed-width 16-byte span key landed, encoding.md §2.10) but
-        its GIN element support is its own slice — plus composite-element arrays; multi-column GIN; correlated / array-column query operands; the
+        (a term carries no length/terminator); `float[]` is now UNBLOCKED (the `float-order-preserving`
+        key encoding landed, and float is fixed-width — encoding.md §2.8) but its GIN element support
+        is its own slice; `interval[]` is likewise UNBLOCKED (its fixed-width 16-byte span key landed,
+        encoding.md §2.10) but its GIN element support is its own slice — plus composite-element arrays; multi-column GIN; correlated / array-column query operands; the
         **ordered-index** equality bound for UPDATE/DELETE (mutations use PK+GIN but not the ordered
         index yet); the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`**
         opclass (the lossy-recheck path the seam already seats) and a future object/document opclass.

@@ -758,7 +758,8 @@ fn interval_table_db() -> Database {
 /// infinities, a canonicalized NaN (stored as the single quiet pattern `0x7FF8…000`), a NULL, and
 /// `f64::MAX` (a full mantissa). Finite values enter via bare numeric literals (decimal adaptation);
 /// the specials enter via typed literals in `INSERT ... SELECT` (a VALUES slot takes only bare
-/// literals this slice — float.md). PK stays i32 (float PK → 0A000).
+/// literals this slice — float.md). PK stays i32 here so this exercises the float VALUE codec in a
+/// nullable non-key column (the float PRIMARY KEY form is `float64_pk_table_db`).
 fn float64_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)");
@@ -792,6 +793,37 @@ fn float32_table_db() -> Database {
     run(&mut db, "INSERT INTO t SELECT 7, f32 'NaN'");
     run(&mut db, "INSERT INTO t VALUES (8, NULL)");
     run(&mut db, "INSERT INTO t VALUES (9, 100.25)");
+    db
+}
+
+/// A table with a `f64` PRIMARY KEY (the `float-order-preserving` key, encoding.md §2.8): the B-tree
+/// iterates float keys in the float total order (`-Inf < finite < +Inf < NaN`; `-0 = +0`). In-contract
+/// literal values only (no transcendentals), so the image is cross-core byte-identical. Specials enter
+/// via `INSERT … SELECT` typed literals (a VALUES slot takes only bare literals this slice). The row
+/// set matches `FLOAT64_PK_TABLE` in spec/fileformat/verify.rb; insertion order is irrelevant (the PK
+/// store sorts by encoded key).
+fn float64_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE fk (k f64 PRIMARY KEY, v i32)");
+    run(&mut db, "INSERT INTO fk VALUES (1.5, 1)");
+    run(&mut db, "INSERT INTO fk SELECT f64 '-Infinity', 2");
+    run(&mut db, "INSERT INTO fk VALUES (0.0, 3)");
+    run(&mut db, "INSERT INTO fk SELECT f64 'NaN', 4");
+    run(&mut db, "INSERT INTO fk VALUES (-1.5, 5)");
+    run(&mut db, "INSERT INTO fk SELECT f64 'Infinity', 6");
+    db
+}
+
+/// As `float64_pk_table_db`, for a `f32` PRIMARY KEY (the 4-byte `float-order-preserving` key §2.8).
+fn float32_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE fk (k f32 PRIMARY KEY, v i32)");
+    run(&mut db, "INSERT INTO fk VALUES (1.5, 1)");
+    run(&mut db, "INSERT INTO fk SELECT f32 '-Infinity', 2");
+    run(&mut db, "INSERT INTO fk VALUES (0.0, 3)");
+    run(&mut db, "INSERT INTO fk SELECT f32 'NaN', 4");
+    run(&mut db, "INSERT INTO fk VALUES (-1.5, 5)");
+    run(&mut db, "INSERT INTO fk SELECT f32 'Infinity', 6");
     db
 }
 
@@ -993,6 +1025,8 @@ fn write_matches_goldens() {
         ("interval_pk_table.jed", interval_pk_table_db),
         ("float64_table.jed", float64_table_db),
         ("float32_table.jed", float32_table_db),
+        ("float64_pk_table.jed", float64_pk_table_db),
+        ("float32_pk_table.jed", float32_pk_table_db),
         ("date_table.jed", date_table_db),
         ("nopk_table.jed", nopk_table_db),
         ("composite_pk_table.jed", composite_pk_table_db),
@@ -1058,6 +1092,8 @@ fn read_goldens_reproduces_rows() {
         ("interval_pk_table.jed", interval_pk_table_db, "t"),
         ("float64_table.jed", float64_table_db, "t"),
         ("float32_table.jed", float32_table_db, "t"),
+        ("float64_pk_table.jed", float64_pk_table_db, "fk"),
+        ("float32_pk_table.jed", float32_pk_table_db, "fk"),
         ("date_table.jed", date_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("composite_pk_table.jed", composite_pk_table_db, "t"),

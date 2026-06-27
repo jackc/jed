@@ -5,8 +5,9 @@
 # surface stays exact & cross-core: storage, the TOTAL ORDER (-0=+0, NaN=NaN, NaN is the LARGEST
 # value), the trapping +-*/ kernel, casts (float->decimal yields an exact `D` value), and the
 # order-independent canonical-fold SUM/AVG. The two widths form a promotion tower (f32 widens
-# to f64, lossless). Non-key column only (a float PRIMARY KEY -> 0A000). float vs int/decimal
-# is 42804 (strict — an explicit cast is required). Format: ../../../design/conformance.md.
+# to f64, lossless). float IS keyable (the float-order-preserving key, §2.8 — the full PK/index/
+# UNIQUE/FK surface is in types/float_key.test). float vs int/decimal is 42804 (strict — an explicit
+# cast is required). Format: ../../../design/conformance.md.
 # requires: ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.aggregates, cast.explicit, types.i32, types.i64, types.decimal, types.f32, types.f64
 
 # --- storage: both widths, NULL, and the special values (NaN / ±Infinity / -0) round-trip ---
@@ -158,7 +159,7 @@ SELECT CAST(f32 '0.1' AS f64)
 ----
 0.10000000149011612
 
-# --- a f64 / f32 PRIMARY KEY is rejected this slice (the float-order-preserving key
-# encoding is authored but unexercised — encoding.md §2.8) ---
-statement error 0A000
-CREATE TABLE bad (k f64 PRIMARY KEY)
+# --- a f64 / f32 PRIMARY KEY is now SUPPORTED (the float-order-preserving key, encoding.md §2.8 —
+# the full key surface is exercised in types/float_key.test) ---
+statement ok
+CREATE TABLE okpk (k f64 PRIMARY KEY)

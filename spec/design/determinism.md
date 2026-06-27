@@ -126,10 +126,23 @@ binding invariant:
 > deterministic and cross-core identical (G1–G3).** A query that does use one degrades only
 > the columns/rows the taint reaches, bounded by the entry's stated blast radius.
 
-Concretely this argues for keeping exempt values **out of keys and order-determining
-positions** wherever possible — e.g. float out of `PRIMARY KEY`/index (the standing
-narrowing every non-integer type already takes — [encoding.md](encoding.md)), so a tainted
-value can at worst reorder a query result, never the *stored* order.
+Concretely this argues for keeping exempt values **out of order-determining positions** wherever
+the value carrying the taint is itself non-deterministic. The subtlety is *which* float values are
+exempt: a float **at rest** — a literal, stored sensor data, the output of the in-contract
+`+ − * / sqrt` kernel or the exact-sum aggregates — is **fully in-contract** (G1–G3:
+cross-core-byte-identical storage, total order, and `float-order-preserving` key bytes,
+[float.md](float.md) §1). Only a **computed transcendental** (and float-gated control flow) is
+exempt. So `float` keys (`PRIMARY KEY`/index/`UNIQUE`/FK — [encoding.md](encoding.md) §2.8) are
+**allowed**: an ordinary float key sorts identically in every core, and the *only* contamination
+path is the narrow case of storing a **tainted** (transcendental-derived) float into a key, which
+extends that value's existing exemption from *query-time* order to *stored* order. That is a
+**bounded widening of the `float-transcendental` blast radius** (§6/§9), recorded in the ledger —
+not a new exemption, and not a reason to forbid the common, fully-deterministic case. (This
+reverses an earlier stance that held float out of keys *permanently*; the reversal is sound because
+the taint lives on the *transcendental*, not on *float-as-a-key-type*, and it is PG-faithful — PG
+admits `float8`/`float4` btree keys. The golden on-disk fixtures store only in-contract float
+literals, so they stay byte-identical across cores.) The composite container stays out of keys for
+the *separate* reason that its key encoding is not yet exercised, not a determinism one.
 
 ---
 

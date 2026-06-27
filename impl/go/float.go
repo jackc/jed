@@ -75,6 +75,48 @@ func canonicalizeFloat64(f float64) float64 {
 	return f
 }
 
+// --- order-preserving key encoding (spec/design/encoding.md §2.8) -------------------------
+//
+// encodeFloat64Key is the float-order-preserving KEY body for an f64: canonicalize (-0 → +0, every
+// NaN → the one quiet pattern 0x7FF8…000), take the bits big-endian, then if the sign bit is set flip
+// ALL 64 bits else flip just the sign bit — mapping the binary64 TOTAL order (§3, -Inf < finite <
+// +Inf < NaN) onto unsigned byte order. Fixed 8 bytes (self-delimiting by width). -0/+0 and any two
+// NaNs collapse to one key, so a UNIQUE float key treats them as one. (The stored VALUE codec keeps
+// the bits verbatim — only a NaN is canonicalized — since a value never sorts; format.go.)
+func encodeFloat64Key(bits uint64) []byte {
+	switch f := math.Float64frombits(bits); {
+	case math.IsNaN(f):
+		bits = canonicalNaN64Bits
+	case f == 0:
+		bits = 0 // both -0 and +0
+	}
+	if bits>>63 == 1 {
+		bits ^= 0xFFFFFFFFFFFFFFFF
+	} else {
+		bits ^= 0x8000000000000000
+	}
+	return []byte{
+		byte(bits >> 56), byte(bits >> 48), byte(bits >> 40), byte(bits >> 32),
+		byte(bits >> 24), byte(bits >> 16), byte(bits >> 8), byte(bits),
+	}
+}
+
+// encodeFloat32Key is encodeFloat64Key at binary32 width (4 bytes; canonical NaN 0x7FC00000).
+func encodeFloat32Key(bits uint32) []byte {
+	switch f := math.Float32frombits(bits); {
+	case math.IsNaN(float64(f)):
+		bits = 0x7FC00000
+	case f == 0:
+		bits = 0
+	}
+	if bits>>31 == 1 {
+		bits ^= 0xFFFFFFFF
+	} else {
+		bits ^= 0x80000000
+	}
+	return []byte{byte(bits >> 24), byte(bits >> 16), byte(bits >> 8), byte(bits)}
+}
+
 // --- rendering (spec/design/float.md §9) --------------------------------------------------
 //
 // Each core uses its NATIVE shortest-round-trip formatter; the `R` tag absorbs layout

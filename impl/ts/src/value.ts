@@ -166,6 +166,33 @@ export function canonFloat(n: number): number {
   return Object.is(n, -0) ? 0 : n;
 }
 
+// encodeFloat64Key is the float-order-preserving KEY body for an f64 (spec/design/encoding.md §2.8):
+// canonicalize (-0 → +0, every NaN → the one quiet pattern 0x7FF8…000), take the bits big-endian,
+// then if the sign bit is set flip ALL 64 bits else flip just the sign bit — mapping the binary64
+// TOTAL order (§3, -Inf < finite < +Inf < NaN) onto unsigned byte order. Fixed 8 bytes. -0/+0 and any
+// two NaNs collapse to one key, so a UNIQUE float key treats them as one. (The stored VALUE codec
+// keeps the bits verbatim — only a NaN is canonicalized — since a value never sorts; format.ts.)
+export function encodeFloat64Key(n: number): Uint8Array {
+  const dv = new DataView(new ArrayBuffer(8));
+  if (Number.isNaN(n)) dv.setBigUint64(0, 0x7ff8000000000000n, false);
+  else dv.setFloat64(0, canonFloat(n), false); // canonFloat maps -0 → +0
+  let bits = dv.getBigUint64(0, false);
+  bits ^= bits >> 63n === 1n ? 0xffffffffffffffffn : 0x8000000000000000n;
+  dv.setBigUint64(0, bits, false);
+  return new Uint8Array(dv.buffer);
+}
+
+// encodeFloat32Key is encodeFloat64Key at binary32 width (4 bytes; canonical NaN 0x7FC00000).
+export function encodeFloat32Key(n: number): Uint8Array {
+  const dv = new DataView(new ArrayBuffer(4));
+  if (Number.isNaN(n)) dv.setUint32(0, 0x7fc00000, false);
+  else dv.setFloat32(0, canonFloat(n), false);
+  let bits = dv.getUint32(0, false);
+  bits = (bits >>> 31 === 1 ? bits ^ 0xffffffff : bits ^ 0x80000000) >>> 0;
+  dv.setUint32(0, bits, false);
+  return new Uint8Array(dv.buffer);
+}
+
 // floatTotalCmp is the float TOTAL order (PostgreSQL's float8 btree order — spec/design/float.md
 // §3), NOT raw IEEE: -Infinity < (finite) < +Infinity < NaN, with -0 == +0 and NaN == NaN (all
 // NaNs one equivalence class). Returns <0, 0, >0. Raw JS `<`/`===` are wrong here (NaN!==NaN, NaN

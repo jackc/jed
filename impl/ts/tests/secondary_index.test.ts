@@ -96,12 +96,9 @@ test("DDL errors match PostgreSQL", () => {
     errCode(() => run(db, "CREATE INDEX taken ON t (nope)")),
     "42703",
   );
-  // f64 is not key-encodable (the determinism carve-out, determinism.md §4); text/bytea ARE
-  // now valid index columns (encoding.md §2.4/§2.6, covered in ddl/create_index.test).
-  assert.equal(
-    errCode(() => run(db, "CREATE INDEX i ON t (s)")),
-    "0A000",
-  );
+  // f64 IS now a valid index column (the float-order-preserving key, encoding.md §2.8 — every
+  // scalar is keyable; text/bytea covered in ddl/create_index.test).
+  run(db, "CREATE INDEX i ON t (s)");
   assert.equal(
     errCode(() => run(db, "CREATE INDEX taken ON t (a)")),
     "42P07",

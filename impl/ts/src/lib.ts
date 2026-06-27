@@ -572,6 +572,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // SUM/AVG; exempt from cross-core identity for computed/rendered values (R tag). float.md.
   "types.f64",
   "types.f32",
+  // float (f32/f64) as a KEY: PK / ordered index / UNIQUE / FK target + float-element array
+  // keys, via the float-order-preserving encoding (encoding.md §2.8). float_key.test.
+  "types.float_key",
   // date scalar type (a calendar date — i32 days since 1970-01-01): ISO literals, BC era,
   // infinity sentinels, comparison/ordering, a date PRIMARY KEY (key encoding = i32). A
   // strict island — no compare/cast to timestamp this slice. spec/design/date.md.

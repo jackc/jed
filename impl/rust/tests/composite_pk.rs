@@ -133,10 +133,21 @@ fn ddl_errors_match_postgres_and_narrowings() {
         "stored order is the (b, a) tuple order"
     );
     execute(&mut db, "DROP TABLE t").unwrap();
-    // Narrowing: every member must be key-encodable (f64 is not — the determinism carve-out,
-    // determinism.md §4; text/bytea ARE now keyable, encoding.md §2.4/§2.6).
+    // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
+    // scalar is keyable): a composite PK with a float member succeeds.
+    execute(
+        &mut db,
+        "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))",
+    )
+    .unwrap();
+    // The recursive composite container is NOT keyable (composite.md §6), so a composite PK member
+    // is still the 0A000 narrowing.
+    execute(&mut db, "CREATE TYPE addr AS (street text, zip i32)").unwrap();
     assert_eq!(
-        err_code(&mut db, "CREATE TABLE t (a i32, s f64, PRIMARY KEY (a, s))"),
+        err_code(
+            &mut db,
+            "CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))"
+        ),
         "0A000"
     );
     // A single-column table constraint is the column-level form's equivalent.

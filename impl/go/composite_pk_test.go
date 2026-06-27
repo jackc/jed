@@ -95,6 +95,9 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 // (0A000): out-of-declaration-order list, non-keyable member type.
 func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	db := NewDatabase()
+	if _, err := Execute(db, "CREATE TYPE addr AS (street text, zip i32)"); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		sql, want string
 	}{
@@ -104,14 +107,19 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 		{"CREATE TABLE t (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"},
 		// 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
 		{"CREATE TABLE t (a i32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"},
-		// Narrowing: every member must be key-encodable (f64 is not — the determinism
-		// carve-out, determinism.md §4; text/bytea ARE now keyable, encoding.md §2.4/§2.6).
-		{"CREATE TABLE t (a i32, s f64, PRIMARY KEY (a, s))", "0A000"},
+		// Narrowing: every member must be key-encodable. f64 IS now keyable (encoding.md §2.8);
+		// the recursive composite container is NOT (composite.md §6), so a composite member is 0A000.
+		{"CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))", "0A000"},
 	}
 	for _, c := range cases {
 		if code := compositeErrCode(t, db, c.sql); code != c.want {
 			t.Fatalf("%q: got %s, want %s", c.sql, code, c.want)
 		}
+	}
+	// f64 IS now a key-encodable PK member (the float-order-preserving key lifted the narrowing,
+	// encoding.md §2.8): a composite PK with a float member succeeds.
+	if _, err := Execute(db, "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))"); err != nil {
+		t.Fatalf("composite PK with f64 member: %v", err)
 	}
 	// The list order is the KEY order — it may differ from declaration order (the original
 	// 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
