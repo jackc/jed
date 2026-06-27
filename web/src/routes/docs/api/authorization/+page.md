@@ -15,7 +15,7 @@ enforces it mechanically: any operation the envelope withholds fails with **`425
 resolution, before it runs.
 
 This is the concrete form of jed's "untrusted SQL is safe to run" guarantee — pair it with the
-[resource limits](/docs/api/resource-limits/) (`max_cost` and `lifetime_max_cost`) and you can hand an
+[resource limits](../resource-limits/) (`max_cost` and `lifetime_max_cost`) and you can hand an
 adversary a query surface.
 
 ## The model

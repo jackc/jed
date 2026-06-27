@@ -217,7 +217,7 @@ against the rows the previous step produced until it yields none:
 `UNION ALL` keeps every row; `UNION` drops rows that duplicate one already produced (which is what
 makes a cyclic graph walk terminate). The column types are fixed by the non-recursive term. A
 recursion with no stopping condition runs until it hits the statement's
-[cost ceiling](/docs/api/resource-limits) — set one when running untrusted queries. `SEARCH` /
+[cost ceiling](../../api/resource-limits/) — set one when running untrusted queries. `SEARCH` /
 `CYCLE` clauses and mutual recursion are not yet supported.
 
 ### Nested `WITH`

@@ -9,14 +9,14 @@
 # Installing & running jed
 
 > ⚠️ jed is a **0.x preview**. Expect changes to behavior and to the on-disk file format between
-> releases — see [Preview status](/docs/status/) before you store anything you can't reproduce.
+> releases — see [Preview status](../status/) before you store anything you can't reproduce.
 
 ## Try it without installing anything
 
-The fastest way to see jed is the **[live playground](/tool/)**. The engine compiles to run entirely
+The fastest way to see jed is the **[live playground](../../tool/)**. The engine compiles to run entirely
 in your browser — a native TypeScript core in a Web Worker, with databases in memory or in your
 browser's origin-private file system (OPFS) — so nothing is sent to a server. Every example on the
-[SQL docs](/docs/sql/types/) pages is editable and runnable the same way.
+[SQL docs](../sql/types/) pages is editable and runnable the same way.
 
 ## Embed it in Go
 
@@ -33,8 +33,8 @@ import jed "github.com/jackc/jed/impl/go"
 ```
 
 From there, open or create a single-file database, run SQL, and commit. See
-**[Opening a database](/docs/api/opening-a-database/)** for the full, runnable example, and the rest
-of the [Embedding API](/docs/api/transactions/) pages for transactions, scripts, authorization, and
+**[Opening a database](../api/opening-a-database/)** for the full, runnable example, and the rest
+of the [Embedding API](../api/transactions/) pages for transactions, scripts, authorization, and
 resource limits.
 
 ## The other cores

@@ -24,7 +24,7 @@ stable release.
   preview database as reproducible or disposable, not as a system of record.
 - **Limited distribution.** This release ships the **Go module** (`go get`) and the
   **website/playground**. The Rust crate, the `jed` CLI, the npm package, and the Ruby gem build
-  from source but are not yet published. See [Installation](/docs/install/).
+  from source but are not yet published. See [Installation](../install/).
 - **Performance is not yet tuned.** Some features are implemented but unoptimized — a query can run
   noticeably slower than on a mature database (for example, a pattern that currently falls back to a
   full table scan, or a large sort materialized before its `LIMIT`). Correctness and cross-core

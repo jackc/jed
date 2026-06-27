@@ -11,7 +11,7 @@
 
 jed meters the **execution cost** of every query deterministically — the same query against the same
 database always costs the same, on every core. Two ceilings turn that meter into the resource half of
-the "untrusted SQL is safe to run" guarantee (the [Authorization](/docs/api/authorization/) page is
+the "untrusted SQL is safe to run" guarantee (the [Authorization](../authorization/) page is
 the privilege half). Pair them and you can hand an adversary a query surface.
 
 ## Two ceilings
