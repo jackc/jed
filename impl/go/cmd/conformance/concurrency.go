@@ -26,7 +26,7 @@ import (
 	"strconv"
 	"strings"
 
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 )
 
 // isConcurrencyFormat reports whether text opts into the schedule format via a

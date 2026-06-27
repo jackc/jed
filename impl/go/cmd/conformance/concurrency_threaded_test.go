@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 )
 
 func TestConcurrencySchedulesThreaded(t *testing.T) {

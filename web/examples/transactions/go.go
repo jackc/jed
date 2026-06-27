@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 )
 
 func main() {

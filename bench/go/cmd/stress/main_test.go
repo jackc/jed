@@ -7,7 +7,7 @@ package main
 // and a confluent workload's final checksum is mode-independent (sequential == threaded).
 
 import (
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 	"testing"
 )
 

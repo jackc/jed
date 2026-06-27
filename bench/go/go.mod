@@ -6,7 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mattn/go-sqlite3 v1.14.45
-	jed v0.0.0
+	github.com/jackc/jed/impl/go v0.0.0
 	modernc.org/sqlite v1.52.0
 )
 
@@ -25,4 +25,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace jed => ../../impl/go
+replace github.com/jackc/jed/impl/go => ../../impl/go

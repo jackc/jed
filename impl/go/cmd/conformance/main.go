@@ -19,7 +19,7 @@ import (
 	"strconv"
 	"strings"
 
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 )
 
 func main() {

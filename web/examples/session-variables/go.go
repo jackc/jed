@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 )
 
 func main() {

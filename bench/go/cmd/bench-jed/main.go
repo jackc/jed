@@ -3,7 +3,7 @@ package main
 
 import (
 	"fmt"
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 	"os"
 	"path/filepath"
 

@@ -21,7 +21,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 	"os"
 	"path/filepath"
 	"sort"

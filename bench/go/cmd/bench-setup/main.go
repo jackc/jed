@@ -10,7 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"jed"
+	jed "github.com/jackc/jed/impl/go"
 	"os"
 	"path/filepath"
 	"strconv"
