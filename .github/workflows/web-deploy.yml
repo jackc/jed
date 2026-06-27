@@ -6,14 +6,13 @@
 
 name: Deploy website
 
+# Deploy only when a GitHub Release is published (a deliberate, tagged release — NOT every push to
+# master), plus a manual escape hatch. To deploy on a bare tag push instead, swap this for:
+#   push:
+#     tags: ['v*']
 on:
-  push:
-    branches: [master]
-    paths:
-      - 'web/**'
-      - 'impl/ts/**'
-      - 'spec/**'
-      - '.github/workflows/web-deploy.yml'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
