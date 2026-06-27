@@ -188,7 +188,13 @@ import {
   widthBytes,
   isFixedWidth,
 } from "./types.ts";
-import { NEG_INFINITY, parseTimestamp, parseTimestamptz, POS_INFINITY } from "./timestamp.ts";
+import {
+  makeTimestamp,
+  NEG_INFINITY,
+  parseTimestamp,
+  parseTimestamptz,
+  POS_INFINITY,
+} from "./timestamp.ts";
 import { DATE_NEG_INFINITY, DATE_POS_INFINITY, parseDate } from "./date.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import { type ClockFunc, type RandomFill, Seam, StmtRng } from "./seam.ts";
@@ -13343,6 +13349,9 @@ type ScalarFuncName =
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
+  // make_timestamp/make_timestamptz — the make_interval siblings (named, un-defaulted) §11.
+  | "make_timestamp"
+  | "make_timestamptz"
   // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
   // uuid_extract_version → i16 (NULL off-RFC-variant); uuid_extract_timestamp → timestamptz
   // (the embedded instant for v1/v7, else NULL).
@@ -17108,6 +17117,12 @@ function resolveFuncCall(
   }
   // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
   if (lname === "make_interval") return resolveMakeInterval(scope, e, ag, params);
+  // make_timestamp / make_timestamptz are its named (un-defaulted) siblings (§11); make_timestamptz
+  // is overloaded on arity (a session-zone 6-arg form + an explicit-zone 7-arg form). Their own
+  // resolver picks the overload and normalizes named notation.
+  if (lname === "make_timestamp" || lname === "make_timestamptz") {
+    return resolveMakeTimestamp(scope, lname, e, ag, params);
+  }
   // lower/upper are overloaded across the range accessors (range → element) and the text casing
   // functions (text → text, collation.md §16). Resolve the single argument once and branch on its
   // type, BEFORE the by-name kind dispatch (which would force the range path for both). functions.md §9
@@ -17399,12 +17414,21 @@ function scalarFuncDesc(name: string): OperatorDesc | undefined {
   return OPERATORS.find((o) => o.kind === "function" && o.name === name);
 }
 
+// scalarFuncDescArity is scalarFuncDesc restricted to a given arity — for a named function
+// overloaded on arity (make_timestamptz: a 6-arg session-zone form + a 7-arg explicit-zone form),
+// so named-notation resolution reads the right slot list (functions.md §11).
+function scalarFuncDescArity(name: string, arity: number): OperatorDesc | undefined {
+  return OPERATORS.find((o) => o.kind === "function" && o.name === name && o.arity === arity);
+}
+
 // familyHint is the type context offered to an untyped literal in a function-argument slot of the
 // given family, so it adapts (functions.md §11): an integer slot offers i64, a float slot offers
-// f64 (so a bare 0/1.5 becomes f64 for secs). Other families offer no hint (null).
+// f64 (so a bare 0/1.5 becomes f64 for secs), a text slot offers text (so a bare 'UTC' adapts to
+// the make_timestamptz timezone slot). Other families offer no hint (null).
 function familyHint(family: string): ScalarType | null {
   if (family === "integer") return "i64";
   if (family === "float") return "f64";
+  if (family === "text") return "text";
   return null;
 }
 
@@ -17492,6 +17516,59 @@ function resolveMakeInterval(
     rargs.push(r.node);
   }
   return scalarFuncNode("make_interval", rargs, "interval", undefined);
+}
+
+// resolveMakeTimestamp resolves make_timestamp(year, month, mday, hour, min, sec) /
+// make_timestamptz(…[, timezone]) — the named (but un-defaulted) make_interval siblings
+// (functions.md §11). make_timestamptz is overloaded on arity: a 6-arg form (interpret in the
+// session zone) and a 7-arg form (an explicit timezone text). The right overload is chosen by
+// whether the call supplies a 7th positional argument or names the timezone parameter; the chosen
+// catalog row then drives named-notation normalization. Each slot resolves with its declared family
+// as the type hint (a bare numeric literal adapts to the f64 sec slot, a bare string to the text
+// timezone slot); a wrong family in a slot is 42883.
+function resolveMakeTimestamp(
+  scope: Scope,
+  name: string, // "make_timestamp" | "make_timestamptz"
+  e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const isTz = name === "make_timestamptz";
+  // Pick the overload: the 7-arg explicit-zone form is selected by a 7th positional argument or a
+  // named timezone; otherwise the 6-arg form. make_timestamp has only the 6-arg form.
+  let arity = 6;
+  if (isTz) {
+    const namesEmpty = e.argNames.length === 0;
+    let positional = 0;
+    let namesTimezone = false;
+    for (let i = 0; i < e.args.length; i++) {
+      const nm = namesEmpty ? null : e.argNames[i];
+      if (nm === null || nm === undefined) positional++;
+      else if (nm.toLowerCase() === "timezone") namesTimezone = true;
+    }
+    if (positional > 6 || namesTimezone) arity = 7;
+  }
+  const desc = scalarFuncDescArity(name, arity);
+  if (desc === undefined) throw noFuncOverload(name);
+  const positional = normalizeNamedArgs(desc, e.args, e.argNames);
+  const rargs: RExpr[] = [];
+  for (let i = 0; i < positional.length; i++) {
+    const fam = desc.argFamilies[i]!;
+    const r = resolve(scope, positional[i]!, familyHint(fam), ag, params);
+    // Type-check against the declared family. A NULL adapts (NULL propagates); a f32 sec is read at
+    // eval and widened losslessly to f64 (no cast node — cost matches the cores).
+    const ok =
+      r.type.kind === "null" ||
+      (fam === "integer" && r.type.kind === "int") ||
+      (fam === "float" && r.type.kind === "float") ||
+      (fam === "text" && r.type.kind === "text");
+    if (!ok) throw noFuncOverload(name);
+    rargs.push(r.node);
+  }
+  return isTz
+    ? scalarFuncNode("make_timestamptz", rargs, "timestamptz", undefined)
+    : scalarFuncNode("make_timestamp", rargs, "timestamp", undefined);
 }
 
 // f64ToMicros converts make_interval's secs (double precision) to a microsecond count: one
@@ -26197,6 +26274,36 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         return intervalValue(
           makeInterval(geti(0), geti(1), geti(2), geti(3), geti(4), geti(5), secMicros),
         );
+      }
+      if (e.func === "make_timestamp" || e.func === "make_timestamptz") {
+        // make_timestamp / make_timestamptz — the make_interval siblings (functions.md §11).
+        // Assemble the wall clock from the five integer fields + the f64 sec (an out-of-range field
+        // traps 22008). make_timestamptz then interprets that wall clock in a zone (the session zone
+        // for the 6-arg form, the trailing timezone text for the 7-arg form), charging one timezone
+        // unit like AT TIME ZONE; an unrecognized explicit zone is 22023. A f32 sec reads as its
+        // exact f64 value (.value holds the binary64 of either width).
+        const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
+        const wall = makeTimestamp(
+          geti(0),
+          geti(1),
+          geti(2),
+          geti(3),
+          geti(4),
+          (vals[5] as { value: number }).value,
+        );
+        if (e.func === "make_timestamp") return timestampValue(wall);
+        // make_timestamptz: interpret the wall clock in a zone → a UTC instant.
+        m.charge(COSTS.timezone);
+        m.guard();
+        if (vals.length === 7) {
+          const zoneStr = (vals[6] as { text: string }).text;
+          const z = resolveZone(zoneStr);
+          if (z === undefined) {
+            throw engineError("invalid_parameter_value", `time zone "${zoneStr}" not recognized`);
+          }
+          return timestamptzValue(localToInstantMicros(z, wall));
+        }
+        return timestamptzValue(localToInstantMicros(env.exec.session.timeZone, wall));
       }
       // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
       // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is

@@ -13413,6 +13413,13 @@ enum ScalarFunc {
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
+    /// make_timestamp(year, month, mday, hour, min, sec) → timestamp — the make_interval sibling
+    /// (§11): every parameter named (none defaulted), the wall clock assembled from the fields.
+    MakeTimestamp,
+    /// make_timestamptz(year, month, mday, hour, min, sec[, timezone]) → timestamptz (§11) — as
+    /// make_timestamp, then interprets the wall clock in the session zone (6-arg) or the explicit
+    /// `timezone` text (7-arg), charging one `timezone` unit.
+    MakeTimestamptz,
     /// uuid_extract_version(uuid) → i16 — the version nibble, NULL off-RFC-variant (§12).
     UuidExtractVersion,
     /// uuid_extract_timestamp(uuid) → timestamptz — the embedded instant for v1/v7, else NULL (§12).
@@ -20207,6 +20214,10 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "min_scale" => ScalarFunc::MinScale,
         "trim_scale" => ScalarFunc::TrimScale,
         "make_interval" => ScalarFunc::MakeInterval,
+        // make_timestamp / make_timestamptz resolve on their own named/un-defaulted path (§11), like
+        // make_interval; the name→kernel mapping is kept for the registry-coverage invariant.
+        "make_timestamp" => ScalarFunc::MakeTimestamp,
+        "make_timestamptz" => ScalarFunc::MakeTimestamptz,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
         "uuid_extract_version" => ScalarFunc::UuidExtractVersion,
@@ -22252,6 +22263,12 @@ fn resolve_func_call(
     if lname == "make_interval" {
         return resolve_make_interval(scope, args, arg_names, star, agg, params);
     }
+    // make_timestamp / make_timestamptz are its named (un-defaulted) siblings (§11); make_timestamptz
+    // is overloaded on arity (a session-zone 6-arg form + an explicit-zone 7-arg form). Their own
+    // resolver picks the overload and normalizes named notation.
+    if lname == "make_timestamp" || lname == "make_timestamptz" {
+        return resolve_make_timestamp(scope, &lname, args, arg_names, star, agg, params);
+    }
     // lower/upper are overloaded across TWO families: the range accessors (range → element,
     // range-functions.md §1) and the text casing functions (text → text, collation.md §16). Resolve
     // the single argument once and branch on its type, BEFORE the by-name kind dispatch (which would
@@ -22665,14 +22682,25 @@ fn scalar_func_desc(name: &str) -> Option<&'static OperatorDesc> {
         .find(|o| o.kind == "function" && o.name == name)
 }
 
+/// The scalar-function catalog row of this `name` with the given `arity` — for a named function
+/// overloaded on arity (make_timestamptz: a 6-arg session-zone form + a 7-arg explicit-zone form),
+/// so named-notation resolution reads the right slot list (functions.md §11).
+fn scalar_func_desc_arity(name: &str, arity: usize) -> Option<&'static OperatorDesc> {
+    OPERATORS
+        .iter()
+        .find(|o| o.kind == "function" && o.name == name && o.arity as usize == arity)
+}
+
 /// The type context offered to an untyped literal in a function-argument slot of `family`, so it
 /// adapts (functions.md §11): an integer slot offers i64, a float slot offers f64 (so a
-/// bare `0`/`1.5` becomes f64 for `secs`). Other families offer no hint (the literal keeps
-/// its default family, and the slot type-check catches a mismatch).
+/// bare `0`/`1.5` becomes f64 for `secs`), a text slot offers text (so a bare `'UTC'` adapts to the
+/// `make_timestamptz` `timezone` slot). Other families offer no hint (the literal keeps its default
+/// family, and the slot type-check catches a mismatch).
 fn family_hint(family: &str) -> Option<ScalarType> {
     match family {
         "integer" => Some(ScalarType::Int64),
         "float" => Some(ScalarType::Float64),
+        "text" => Some(ScalarType::Text),
         _ => None,
     }
 }
@@ -22793,6 +22821,85 @@ fn resolve_make_interval(
             result: ScalarType::Interval,
         },
         ResolvedType::Interval,
+    ))
+}
+
+/// Resolve `make_timestamp(year, month, mday, hour, min, sec)` /
+/// `make_timestamptz(…[, timezone])` — the named (but un-defaulted) make_interval siblings
+/// (functions.md §11). `make_timestamptz` is overloaded on arity: a 6-arg form (interpret in the
+/// session zone) and a 7-arg form (an explicit `timezone` text). The right overload is chosen by
+/// whether the call supplies a 7th positional argument or names the `timezone` parameter; the
+/// chosen catalog row then drives named-notation normalization (unknown name / too many / missing
+/// required → 42883, a positional-after-named or duplicate → 42601). Each slot resolves with its
+/// declared family as the type hint (a bare numeric literal adapts to the `f64` `sec` slot, a bare
+/// string to the `text` `timezone` slot); a wrong family in a slot is 42883.
+fn resolve_make_timestamp(
+    scope: &Scope,
+    name: &str, // "make_timestamp" | "make_timestamptz" (already lowercased)
+    args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
+    star: bool,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if star {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "* is only valid as the argument of COUNT",
+        ));
+    }
+    let is_tz = name == "make_timestamptz";
+    // Pick the overload: the 7-arg explicit-zone form is selected by a 7th positional argument or a
+    // named `timezone`; otherwise the 6-arg form. make_timestamp has only the 6-arg form.
+    let arity = if is_tz {
+        let positional = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| arg_names.and_then(|ns| ns[*i].as_ref()).is_none())
+            .count();
+        let names_timezone = arg_names.is_some_and(|ns| {
+            ns.iter()
+                .flatten()
+                .any(|n| n.eq_ignore_ascii_case("timezone"))
+        });
+        if positional > 6 || names_timezone {
+            7
+        } else {
+            6
+        }
+    } else {
+        6
+    };
+    let desc = scalar_func_desc_arity(name, arity).ok_or_else(|| no_func_overload(name))?;
+    let positional = normalize_named_args(desc, args, arg_names)?;
+    let mut rargs = Vec::with_capacity(positional.len());
+    for (i, e) in positional.iter().enumerate() {
+        let fam = desc.arg_families[i];
+        let (r, t) = resolve(scope, e, family_hint(fam), agg, params)?;
+        // Type-check the resolved arg against its declared family. A NULL adapts (propagates). A
+        // f32 `sec` is read at its own width and widened losslessly to f64 at eval (no Cast node, so
+        // the cost matches the f64 case and the Go/TS cores).
+        let ok = matches!(t, ResolvedType::Null)
+            || (fam == "integer" && matches!(t, ResolvedType::Int(_)))
+            || (fam == "float" && matches!(t, ResolvedType::Float(_)))
+            || (fam == "text" && matches!(t, ResolvedType::Text));
+        if !ok {
+            return Err(no_func_overload(name));
+        }
+        rargs.push(r);
+    }
+    let (func, result) = if is_tz {
+        (ScalarFunc::MakeTimestamptz, ScalarType::Timestamptz)
+    } else {
+        (ScalarFunc::MakeTimestamp, ScalarType::Timestamp)
+    };
+    Ok((
+        RExpr::ScalarFunc {
+            func,
+            args: rargs,
+            result,
+        },
+        resolved_type_of(result),
     ))
 }
 
@@ -32462,6 +32569,57 @@ impl RExpr {
                         )?;
                         Ok(Value::Interval(iv))
                     }
+                    // make_timestamp / make_timestamptz — the make_interval siblings (functions.md
+                    // §11). Assemble the wall clock from the five integer fields + the f64 `sec`
+                    // (an out-of-range field traps 22008). make_timestamptz then interprets that
+                    // wall clock in a zone (session zone for the 6-arg form, the trailing `timezone`
+                    // text for the 7-arg form), charging one `timezone` unit like AT TIME ZONE; an
+                    // unrecognized explicit zone is 22023.
+                    ScalarFunc::MakeTimestamp | ScalarFunc::MakeTimestamptz => {
+                        let geti = |k: usize| match &vals[k] {
+                            Value::Int(n) => *n,
+                            _ => unreachable!(
+                                "resolver restricts make_timestamp's date/time fields to integers"
+                            ),
+                        };
+                        let sec = match &vals[5] {
+                            Value::Float64(f) => *f,
+                            // f32 widens losslessly to f64 (every binary32 is an exact binary64).
+                            Value::Float32(f) => *f as f64,
+                            _ => unreachable!("resolver restricts make_timestamp's sec to a float"),
+                        };
+                        let wall = crate::timestamp::make_timestamp(
+                            geti(0),
+                            geti(1),
+                            geti(2),
+                            geti(3),
+                            geti(4),
+                            sec,
+                        )?;
+                        if matches!(func, ScalarFunc::MakeTimestamp) {
+                            return Ok(Value::Timestamp(wall));
+                        }
+                        // make_timestamptz: interpret the wall clock in a zone → a UTC instant.
+                        m.charge(COSTS.timezone);
+                        m.guard()?;
+                        let instant = if vals.len() == 7 {
+                            let zone_str = match &vals[6] {
+                                Value::Text(s) => s.as_str(),
+                                _ => unreachable!("resolver restricts the timezone arg to text"),
+                            };
+                            let zr = crate::timezone::resolve_zone(zone_str).ok_or_else(|| {
+                                EngineError::new(
+                                    SqlState::InvalidParameterValue,
+                                    format!("time zone \"{zone_str}\" not recognized"),
+                                )
+                            })?;
+                            crate::timezone::local_to_instant_micros(&zr, wall)
+                        } else {
+                            let zr = env.exec.session.time_zone.clone();
+                            crate::timezone::local_to_instant_micros(&zr, wall)
+                        };
+                        Ok(Value::Timestamptz(instant))
+                    }
                     // uuid extractors (spec/design/functions.md §12): pure bit inspection. Both
                     // return NULL (Value::Null) for a non-RFC variant; the timestamp also for any
                     // version other than 1/7. The NULL-input case is already handled above.
@@ -33700,6 +33858,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::MinScale
         | ScalarFunc::TrimScale
         | ScalarFunc::MakeInterval
+        | ScalarFunc::MakeTimestamp
+        | ScalarFunc::MakeTimestamptz
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp
         | ScalarFunc::Uuidv4

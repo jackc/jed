@@ -2,6 +2,7 @@ package jed
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -412,6 +413,62 @@ func ParseTimestamp(s string) (int64, error) { return parseDatetime(s, false, "t
 
 // ParseTimestamptz parses a timestamptz literal: a trailing offset normalizes the value to UTC.
 func ParseTimestamptz(s string) (int64, error) { return parseDatetime(s, true, "timestamptz") }
+
+// MakeTimestamp builds a zoneless timestamp (µs since the 1970 epoch) from calendar fields — the
+// workhorse for make_timestamp / make_timestamptz (functions.md §11; PG make_timestamp_internal). A
+// negative year denotes BC (PG). Field validation mirrors the timestamp parser and traps 22008: the
+// year magnitude in 1..999999 (no year zero), month 1..12, day valid for the month, and the
+// assembled time of day not past 24:00:00 — PG allows hour = 24 or sec = 60 so long as the whole
+// time of day stays within a day, enforced here by one total-of-day check. sec (double precision)
+// folds to micros by one correctly-rounded multiply + half-away round (the engine's one mode —
+// float.md §6); it differs from PG's rint only at an exact half-microsecond tie, which realistic
+// input never hits.
+func MakeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, error) {
+	// Date fields (22008). A negative year is BC; year 0 has no AD/BC representation.
+	if year == 0 {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	bc := year < 0
+	mag := year // |year|; the displayed magnitude
+	if bc {
+		mag = -year
+	}
+	if mag > 999_999 {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	if month < 1 || month > 12 {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	astro := mag
+	if bc {
+		astro = 1 - mag
+	}
+	if day < 1 || day > daysInMonth(astro, month) {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	// Time fields (22008), matching PG float_time_overflows: hour 0..24, minute 0..59, sec rounded
+	// to micros in [0, 60_000_000] (so sec = 60 is allowed), and the whole time of day ≤ 24:00:00.
+	if hour < 0 || hour > 24 || minute < 0 || minute > 59 {
+		return 0, datetimeFieldOverflow("time field value out of range")
+	}
+	secMicros := math.Round(sec * float64(microsPerSec)) // round-half-away (math.Round)
+	if math.IsNaN(secMicros) || math.IsInf(secMicros, 0) || secMicros < 0 || secMicros > 60_000_000 {
+		return 0, datetimeFieldOverflow("time field value out of range")
+	}
+	todMicros := ((hour*60+minute)*60)*microsPerSec + int64(secMicros) // ≤ 9e10, no i64 overflow
+	if todMicros > secsPerDay*microsPerSec {
+		return 0, datetimeFieldOverflow("time field value out of range")
+	}
+	// Compose the instant in checked i64 arithmetic; any overflow is a range error.
+	micros, ok := mulAdd(daysFromCivil(astro, month, day), secsPerDay*microsPerSec, todMicros)
+	if !ok {
+		return 0, datetimeFieldOverflow("timestamp out of range")
+	}
+	if micros == NegInfinity || micros == PosInfinity {
+		return 0, datetimeFieldOverflow("timestamp out of range") // reserved for ±infinity
+	}
+	return micros, nil
+}
 
 // --- rendering ---------------------------------------------------------------
 

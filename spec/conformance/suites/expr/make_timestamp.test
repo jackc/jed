@@ -1,0 +1,183 @@
+# make_timestamp / make_timestamptz — the make_interval siblings (spec/design/functions.md §11).
+# make_timestamp(year, month, mday, hour, min, sec) builds a zoneless `timestamp`;
+# make_timestamptz(year, month, mday, hour, min, sec[, timezone]) builds a `timestamptz`. Every
+# parameter is NAMED but (unlike make_interval) NONE is defaulted — so a call may be positional,
+# named (name => value), or mixed (positional then named), but every parameter must be supplied.
+# year/month/mday/hour/min are the integer family; `sec` is double precision (f64), folded to micros
+# by a correctly-rounded multiply + half-away round (in-contract). A negative year is BC. NULL in any
+# argument propagates. make_timestamptz interprets the assembled wall clock in the SESSION zone
+# (6-arg) or an explicit text `timezone` (7-arg). Errors: a field out of range is 22008, an
+# unrecognized explicit zone is 22023; an unknown parameter name / a named arg on a nameless function
+# / too many arguments is 42883; a positional arg after a named one is 42601. make_timestamp charges
+# one operator_eval + one row_produced (cost 2); make_timestamptz adds one timezone unit (cost 3).
+# A timestamptz OUTPUT renders in UTC (jed renders a timestamptz in UTC regardless of session — the
+# rendering follow-on); a session-zone case is normalized via AT TIME ZONE 'UTC' for the oracle.
+# PostgreSQL-oracle-verified (postgres:18).
+# requires: query.select, query.select_no_from, types.i32, types.i64, types.f64, types.timestamp, types.timestamptz, func.make_timestamp, expr.at_time_zone, session.timezone, resource.cost_metering
+
+# The IANA tz data is host-loaded (the production model — timezones.md §11). UTC + fixed offsets are
+# built in; a named zone must be loaded first.
+# load-timezone: America/New_York
+
+# --- make_timestamp: positional, named, mixed --------------------------------------------
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, 7, 15, 8, 15, 23.5)
+----
+2013-07-15 08:15:23.5
+
+# cost: 2
+query T nosort
+SELECT make_timestamp(year => 2013, month => 7, mday => 15, hour => 8, min => 15, sec => 23.5)
+----
+2013-07-15 08:15:23.5
+
+# mixed positional-then-named (year/month/mday positional, the time fields named)
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, 7, 15, hour => 8, min => 15, sec => 23.5)
+----
+2013-07-15 08:15:23.5
+
+# --- `sec` adapts: a bare integer literal in the f64 slot ---------------------------------
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, 1, 1, 0, 0, 23)
+----
+2013-01-01 00:00:23
+
+# fractional seconds fold to micros exactly
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, 1, 1, 0, 0, 0.123456)
+----
+2013-01-01 00:00:00.123456
+
+# --- a negative year is BC (PG) ----------------------------------------------------------
+# cost: 2
+query T nosort
+SELECT make_timestamp(-44, 3, 15, 12, 0, 0)
+----
+0044-03-15 12:00:00 BC
+
+# --- PG allows hour = 24 and sec = 60 so long as the day of time stays within 24:00:00 ----
+# hour 24 (with zero min/sec) rolls into the next day's midnight
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, 1, 1, 24, 0, 0)
+----
+2013-01-02 00:00:00
+
+# sec 60 rolls into the next minute
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, 1, 1, 12, 30, 60)
+----
+2013-01-01 12:31:00
+
+# --- NULL in any argument propagates -----------------------------------------------------
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, NULL, 15, 8, 15, 23.5)
+----
+NULL
+
+# cost: 2
+query T nosort
+SELECT make_timestamp(2013, 7, 15, 8, 15, NULL)
+----
+NULL
+
+# --- make_timestamptz: the 6-arg form interprets the wall clock in the session zone -------
+# the default session zone is UTC, so the wall clock IS the UTC instant
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2013, 7, 15, 8, 15, 23.5)
+----
+2013-07-15 08:15:23.5+00
+
+# named notation
+# cost: 3
+query T nosort
+SELECT make_timestamptz(year => 2013, month => 7, mday => 15, hour => 8, min => 15, sec => 23.5)
+----
+2013-07-15 08:15:23.5+00
+
+# --- make_timestamptz: the 7-arg form interprets the wall clock in an explicit zone -------
+# 8:15 in America/New_York summer (EDT, −04) is 12:15 UTC
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2013, 7, 15, 8, 15, 23.5, 'America/New_York')
+----
+2013-07-15 12:15:23.5+00
+
+# winter (EST, −05): 8:15 NY is 13:15 UTC
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2013, 1, 15, 8, 15, 0, 'America/New_York')
+----
+2013-01-15 13:15:00+00
+
+# the explicit zone may be named (the timezone parameter)
+# cost: 3
+query T nosort
+SELECT make_timestamptz(year => 2013, month => 7, mday => 15, hour => 8, min => 15, sec => 23.5, timezone => 'America/New_York')
+----
+2013-07-15 12:15:23.5+00
+
+# a UTC zone string round-trips the wall clock unchanged
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2013, 7, 15, 8, 15, 23.5, 'UTC')
+----
+2013-07-15 08:15:23.5+00
+
+# --- the 6-arg form honors a non-UTC SESSION zone (normalized via AT TIME ZONE 'UTC') -----
+# under an America/New_York session, 8:15 wall (EDT −04) → 12:15 UTC
+# timezone: America/New_York
+query T nosort
+SELECT make_timestamptz(2013, 7, 15, 8, 15, 23.5) AT TIME ZONE 'UTC'
+----
+2013-07-15 12:15:23.5
+
+# --- errors: field out of range is 22008 -------------------------------------------------
+statement error 22008
+SELECT make_timestamp(2013, 13, 15, 8, 15, 23.5)
+
+statement error 22008
+SELECT make_timestamp(2013, 1, 32, 8, 15, 23.5)
+
+statement error 22008
+SELECT make_timestamp(2013, 2, 29, 8, 15, 23.5)
+
+statement error 22008
+SELECT make_timestamp(2013, 1, 1, 25, 0, 0)
+
+statement error 22008
+SELECT make_timestamp(2013, 1, 1, 0, 60, 0)
+
+statement error 22008
+SELECT make_timestamp(2013, 1, 1, 0, 0, -1)
+
+# there is no year zero (AD/BC)
+statement error 22008
+SELECT make_timestamp(0, 1, 1, 0, 0, 0)
+
+# --- errors: an unrecognized explicit zone is 22023 --------------------------------------
+statement error 22023
+SELECT make_timestamptz(2013, 1, 1, 0, 0, 0, 'Nowhere/Land')
+
+# --- errors: an unknown parameter name / too many arguments is 42883 ----------------------
+statement error 42883
+SELECT make_timestamp(2013, 7, 15, 8, 15, 23.5, 99)
+
+statement error 42883
+SELECT make_timestamp(yr => 2013, month => 7, mday => 15, hour => 8, min => 15, sec => 23.5)
+
+# the timezone parameter belongs to make_timestamptz, not make_timestamp
+statement error 42883
+SELECT make_timestamp(2013, 7, 15, 8, 15, 23.5, timezone => 'UTC')
+
+# --- errors: a positional argument after a named one is 42601 ----------------------------
+statement error 42601
+SELECT make_timestamp(year => 2013, 7, 15, 8, 15, 23.5)

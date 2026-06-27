@@ -2672,6 +2672,60 @@ result         = "interval"
 null           = "propagates"
 errors         = ["22008"]
 
+# --- timestamp constructors (make_timestamp / make_timestamptz) --------------
+# PostgreSQL's timestamp builders, the make_interval siblings (../design/functions.md §11) — every
+# parameter NAMED (year, month, mday, hour, min, sec), but NONE defaulted (all are required, unlike
+# make_interval's all-defaulted seven). Callable positionally, by named notation
+# (make_timestamp(year => 2013, month => 7, …)), or mixed. year/month/mday/hour/min are the `integer`
+# family; `sec` is `double precision` (the `float` family), folded to micros by one correctly-rounded
+# multiply + half-away round (in-contract, like make_interval's secs — ../design/float.md §8). A
+# negative year is BC (PG). Field validation traps 22008 (date/time field value out of range): the
+# year magnitude in 1..999999 (no year zero, matching the timestamp parser), month 1..12, day valid
+# for the month, and the assembled time of day not past 24:00:00 (PG allows hour = 24 / sec = 60 as
+# long as the whole time stays within a day). NULL in any argument propagates.
+#
+# make_timestamp → a zoneless `timestamp`. volatility = immutable.
+[[operator]]
+name           = "make_timestamp"
+kind           = "function"
+arity          = 6
+arg_families   = ["integer", "integer", "integer", "integer", "integer", "float"]
+arg_names      = ["year", "month", "mday", "hour", "min", "sec"]
+arg_resolution = "none"
+result         = "timestamp"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "immutable"
+
+# make_timestamptz → a `timestamptz`, interpreting the assembled wall clock in a time zone. Two
+# overloads (PG): the 6-arg form interprets the wall clock in the SESSION time zone; the 7-arg form
+# takes an explicit `timezone` text argument (an unrecognized zone is 22023). The zone conversion
+# charges one `timezone` cost unit beyond the call's operator_eval (like AT TIME ZONE). volatility =
+# stable (the 6-arg form reads the session zone; PG marks both overloads stable).
+[[operator]]
+name           = "make_timestamptz"
+kind           = "function"
+arity          = 6
+arg_families   = ["integer", "integer", "integer", "integer", "integer", "float"]
+arg_names      = ["year", "month", "mday", "hour", "min", "sec"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "stable"
+
+[[operator]]
+name           = "make_timestamptz"
+kind           = "function"
+arity          = 7
+arg_families   = ["integer", "integer", "integer", "integer", "integer", "float", "text"]
+arg_names      = ["year", "month", "mday", "hour", "min", "sec", "timezone"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+errors         = ["22008", "22023"]
+volatility     = "stable"
+
 # --- uuid functions (extractors) ---------------------------------------------
 # PURE inspectors of a uuid's bits (../design/functions.md §12), oracle-checked against
 # PostgreSQL 18. Both gate on the RFC 4122 variant ((b[8] & 0xC0) == 0x80) and return NULL on

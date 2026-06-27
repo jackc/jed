@@ -26,7 +26,7 @@ The catalog now lists:
 | `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
-| `function` (scalar) | `abs` `round` (§9), `make_interval` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12), `num_nulls`/`num_nonnulls` (VARIADIC, array-functions.md §12) | per-function |
+| `function` (scalar) | `abs` `round` (§9), `make_interval`/`make_timestamp`/`make_timestamptz` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12), `num_nulls`/`num_nonnulls` (VARIADIC, array-functions.md §12) | per-function |
 | `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `i64` / `decimal` / widened (§8) |
 | `set_returning` | `generate_series`, `unnest` (§10, array-functions.md §9) | a row **set** (§10) |
 
@@ -211,7 +211,8 @@ Reserved values and kinds still to be authored spec-first with their own executo
 ([../../TODO.md](../../TODO.md)):
 
 - The `function` kind is now **substantially authored**: `abs`/`round` (§9), `make_interval`
-  with named + `DEFAULT` arguments (§11), the uuid extractors/generators + clock functions
+  with named + `DEFAULT` arguments (+ the un-defaulted siblings `make_timestamp`/`make_timestamptz`,
+  §11), the uuid extractors/generators + clock functions
   (§12), and the text casing functions **`lower(text)`/`upper(text)`** (collation Slice 3e) all
   landed as `[[operator]]` rows with `kind = "function"`, plus `generate_series` as a
   `set_returning` row (§10). `lower`/`upper` are **overloaded** — the same names are the range
@@ -389,7 +390,7 @@ PostgreSQL, plus the exact cross-core `# cost:`) are the coverage. Should the pl
 gain an SRF-specific optimization (e.g. a streaming `LIMIT` short-circuit over a generated
 series), *that* would owe a NoREC relation.
 
-## 11. Named + optional (DEFAULT) arguments — `make_interval`
+## 11. Named + optional (DEFAULT) arguments — `make_interval` / `make_timestamp` / `make_timestamptz`
 
 PostgreSQL lets a call use **named notation** (`f(b => 2, a => 1)`) and lets a function
 declare **DEFAULT** values so trailing arguments may be omitted. jed had neither at the call
@@ -458,10 +459,27 @@ feature is **resolution-only**: the executor, the type system, and the **cost** 
 a named call charges exactly what its positional twin does (one `operator_eval` + the
 arguments' own costs), asserted in the corpus (`# cost:`).
 
+**The siblings — `make_timestamp` / `make_timestamptz` (landed).** The timestamp constructors
+reuse this exact mold — every parameter **named** (`year`, `month`, `mday`, `hour`, `min`, `sec`),
+the `sec` slot `f64` (the float family, folded to micros by the same correctly-rounded multiply +
+half-away round, in-contract) — but **none defaulted**: all fields are required (a missing one is
+`42883`, no overload), unlike `make_interval`'s all-defaulted seven. They are catalog rows with
+`arg_names` but no `arg_defaults`, resolved by the shared `normalize_named_args` + a dedicated
+`make_timestamp` resolver (the `make_interval` precedent). A negative `year` is **BC**; field
+validation traps `22008` (year magnitude `1..999999` — no year zero, matching the timestamp
+parser; `month` 1..12; `day` valid for the month; and the assembled time of day not past 24:00:00,
+so `hour = 24` / `sec = 60` are accepted within a day, exactly PG's `make_timestamp_internal`).
+`make_timestamptz` is **overloaded on arity**: the 6-arg form interprets the assembled wall clock in
+the **session** zone, the 7-arg form in an explicit `timezone` text (an unrecognized zone is
+`22023`); both charge one `timezone` unit beyond the call's `operator_eval`, like `AT TIME ZONE`.
+The 6-arg form's session-zone dependence makes it `stable` (PG's class); `make_timestamp` is
+`immutable`. (`make_timestamptz`'s overload-on-arity is the first time `normalize_named_args` runs
+against an arity-selected catalog row — the 7th positional argument or a named `timezone` selects
+the 7-arg overload.)
+
 **Deferred (sequenced follow-ons).** General DEFAULT values for *arbitrary* (non-integer)
 literals and user-defined functions are not built (jed has no UDFs; built-ins use overloads or
-`make_interval`-style 0-defaults). The sibling constructors `make_timestamp` /
-`make_timestamptz` reuse this exact mold (their `sec` is also `f64`). **`VARIADIC`** was blocked
+`make_interval`-style 0-defaults). **`VARIADIC`** was blocked
 on the `array` type; that has since landed (array.md), so `VARIADIC` **landed** as **AF6** in the
 array function surface ([array-functions.md §12](array-functions.md)) — a `VARIADIC` keyword before a
 call's final argument plus variadic overload resolution, spent on the engine's first VARIADIC

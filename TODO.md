@@ -207,8 +207,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         hard cap is the current backstop).
 - [x] **Named + optional (DEFAULT) function arguments** — PG named notation (`f(name => value)`) +
       DEFAULT params, driven by `make_interval`. → [functions.md §11](spec/design/functions.md)
-  - [ ] _follow-on:_ `make_timestamp`/`make_timestamptz`; general non-integer/UDF defaults;
-        `VARIADIC` (blocked on the array type).
+  - [x] **`make_timestamp` / `make_timestamptz`** — the named (un-defaulted) `make_interval` siblings:
+        every field named, none defaulted; a negative year is BC; field overflow `22008`.
+        `make_timestamptz` is overloaded on arity — a 6-arg session-zone form + a 7-arg explicit
+        `timezone` text form (unrecognized zone `22023`), charging one `timezone` unit.
+        Cap `func.make_timestamp`. → [functions.md §11](spec/design/functions.md)
+  - [x] **`VARIADIC`** — landed as **AF6** (`num_nulls`/`num_nonnulls`) once the array type landed.
+        → [array-functions.md §12](spec/design/array-functions.md)
+  - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads
+        or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
 - [x] **Multi-row `INSERT`** (`VALUES (..),(..)`) — two-phase / all-or-nothing.
       → [grammar.md §12](spec/design/grammar.md)
 - [x] **`INSERT ... SELECT`** — query rows through the same two-phase validation; arity `42601` /

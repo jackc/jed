@@ -316,6 +316,64 @@ pub fn parse_timestamptz(s: &str) -> Result<i64> {
     parse(s, true, "timestamptz")
 }
 
+/// Build a zoneless `timestamp` (µs since the 1970 epoch) from calendar fields — the workhorse for
+/// `make_timestamp` / `make_timestamptz` (functions.md §11; PostgreSQL `make_timestamp_internal`).
+/// A negative `year` denotes BC (PG). Field validation mirrors the timestamp parser and traps 22008:
+/// the year magnitude in `1..=999_999` (no year zero), `month` 1..=12, `day` valid for the month,
+/// and the assembled time of day not past 24:00:00 — PG allows `hour = 24` or `sec = 60` so long as
+/// the whole time of day stays within a day, enforced here by one total-of-day check. `sec` (double
+/// precision) folds to micros by one correctly-rounded multiply + half-away round (the engine's one
+/// mode — float.md §6); it differs from PG's `rint` only at an exact half-microsecond tie, which
+/// realistic input never hits, so the result stays oracle-positive.
+pub fn make_timestamp(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    sec: f64,
+) -> Result<i64> {
+    // Date fields (22008). A negative year is BC; year 0 has no AD/BC representation.
+    if year == 0 {
+        return Err(field_overflow("date field value out of range"));
+    }
+    let bc = year < 0;
+    let mag = year.unsigned_abs() as i64; // |year|; the displayed magnitude
+    if mag > 999_999 {
+        return Err(field_overflow("date field value out of range"));
+    }
+    if !(1..=12).contains(&month) {
+        return Err(field_overflow("date field value out of range"));
+    }
+    let astro = if bc { 1 - mag } else { mag };
+    if day < 1 || day > days_in_month(astro, month as u32) as i64 {
+        return Err(field_overflow("date field value out of range"));
+    }
+    // Time fields (22008), matching PG `float_time_overflows`: hour 0..=24, minute 0..=59, `sec`
+    // rounded to micros in [0, 60_000_000] (so sec = 60 is allowed), and the whole time of day
+    // (hours:mins:secs) ≤ 24:00:00.
+    if !(0..=24).contains(&hour) || !(0..=59).contains(&minute) {
+        return Err(field_overflow("time field value out of range"));
+    }
+    let sec_micros = (sec * MICROS_PER_SEC as f64).round(); // round-half-away (f64::round)
+    if !sec_micros.is_finite() || !(0.0..=60_000_000.0).contains(&sec_micros) {
+        return Err(field_overflow("time field value out of range"));
+    }
+    let tod_micros = ((hour * 60 + minute) * 60) * MICROS_PER_SEC + sec_micros as i64; // ≤ 9e10, no i64 overflow
+    if tod_micros > SECS_PER_DAY * MICROS_PER_SEC {
+        return Err(field_overflow("time field value out of range"));
+    }
+    // Compose the instant in checked i64 arithmetic; any overflow is a range error.
+    let micros = days_from_civil(astro, month, day)
+        .checked_mul(SECS_PER_DAY * MICROS_PER_SEC)
+        .and_then(|d| d.checked_add(tod_micros))
+        .ok_or_else(|| field_overflow("timestamp out of range"))?;
+    if micros == NEG_INFINITY || micros == POS_INFINITY {
+        return Err(field_overflow("timestamp out of range")); // reserved for ±infinity
+    }
+    Ok(micros)
+}
+
 // --- rendering ---------------------------------------------------------------
 
 fn render(micros: i64, is_tz: bool) -> String {

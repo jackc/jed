@@ -269,6 +269,59 @@ export function parseTimestamptz(s: string): bigint {
   return parseDatetime(s, true, "timestamptz");
 }
 
+// makeTimestamp builds a zoneless timestamp (µs since the 1970 epoch) from calendar fields — the
+// workhorse for make_timestamp / make_timestamptz (functions.md §11; PG make_timestamp_internal). A
+// negative year denotes BC (PG). Field validation mirrors the timestamp parser and traps 22008: the
+// year magnitude in 1..999999 (no year zero), month 1..12, day valid for the month, and the
+// assembled time of day not past 24:00:00 — PG allows hour = 24 or sec = 60 so long as the whole
+// time of day stays within a day, enforced here by one total-of-day check. sec (double precision)
+// folds to micros by one correctly-rounded multiply + half-away round (the engine's one mode —
+// float.md §6); it differs from PG's rint only at an exact half-microsecond tie, which realistic
+// input never hits.
+export function makeTimestamp(
+  year: bigint,
+  month: bigint,
+  day: bigint,
+  hour: bigint,
+  minute: bigint,
+  sec: number,
+): bigint {
+  // Date fields (22008). A negative year is BC; year 0 has no AD/BC representation.
+  if (year === 0n) throw fieldOverflow("date field value out of range");
+  const bc = year < 0n;
+  const mag = bc ? -year : year; // |year|; the displayed magnitude
+  if (mag > 999_999n) throw fieldOverflow("date field value out of range");
+  if (month < 1n || month > 12n) throw fieldOverflow("date field value out of range");
+  const astro = bc ? 1n - mag : mag;
+  if (day < 1n || day > daysInMonth(astro, month)) {
+    throw fieldOverflow("date field value out of range");
+  }
+  // Time fields (22008), matching PG float_time_overflows: hour 0..24, minute 0..59, sec rounded to
+  // micros in [0, 60_000_000] (so sec = 60 is allowed), and the whole time of day ≤ 24:00:00.
+  if (hour < 0n || hour > 24n || minute < 0n || minute > 59n) {
+    throw fieldOverflow("time field value out of range");
+  }
+  const secProduct = sec * 1_000_000;
+  if (!Number.isFinite(secProduct)) throw fieldOverflow("time field value out of range");
+  // round half-away-from-zero (the engine's one mode — float.md §6), matching Rust f64::round /
+  // Go math.Round; JS Math.round is half-UP, so the sign is handled explicitly.
+  const secMicros = BigInt(secProduct < 0 ? -Math.round(-secProduct) : Math.round(secProduct));
+  if (secMicros < 0n || secMicros > 60_000_000n) {
+    throw fieldOverflow("time field value out of range");
+  }
+  const todMicros = (hour * 60n + minute) * 60n * MICROS_PER_SEC + secMicros; // ≤ 9e10
+  if (todMicros > SECS_PER_DAY * MICROS_PER_SEC) {
+    throw fieldOverflow("time field value out of range");
+  }
+  // bigint is arbitrary-precision; range-check against i64 explicitly after composing.
+  const micros = daysFromCivil(astro, month, day) * (SECS_PER_DAY * MICROS_PER_SEC) + todMicros;
+  if (micros < NEG_INFINITY || micros > POS_INFINITY) throw fieldOverflow("timestamp out of range");
+  if (micros === NEG_INFINITY || micros === POS_INFINITY) {
+    throw fieldOverflow("timestamp out of range"); // reserved for ±infinity
+  }
+  return micros;
+}
+
 // --- rendering ---------------------------------------------------------------
 
 function pad(n: bigint, width: number): string {

@@ -472,6 +472,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.casing",
     // Named-argument notation + DEFAULT parameter values, via make_interval — functions.md §11.
     "func.named_arguments",
+    // Timestamp constructors make_timestamp/make_timestamptz (named, un-defaulted) — functions.md §11.
+    "func.make_timestamp",
     // Pure uuid extractors (uuid_extract_version/_timestamp) — functions.md §12.
     "func.uuid_extract",
     // Volatile uuid generators (uuidv4/uuidv7) on the entropy+clock seam — entropy.md.

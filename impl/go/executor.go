@@ -16425,6 +16425,12 @@ const (
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
+	// sfMakeTimestamp builds a zoneless timestamp from the named (un-defaulted) date/time fields
+	// plus the f64 sec — the make_interval sibling (spec/design/functions.md §11).
+	sfMakeTimestamp
+	// sfMakeTimestamptz builds a timestamptz: as sfMakeTimestamp, then interprets the wall clock in
+	// the session zone (6-arg) or the explicit timezone text (7-arg), charging one timezone unit (§11).
+	sfMakeTimestamptz
 	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
 	// sfUuidExtractVersion → i16 (NULL off-RFC-variant); sfUuidExtractTimestamp → timestamptz
 	// (the embedded instant for v1/v7, else NULL).
@@ -20736,6 +20742,12 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfTrimScale
 	case "make_interval":
 		return sfMakeInterval
+	// make_timestamp / make_timestamptz resolve on their own named/un-defaulted path (§11), like
+	// make_interval; the name→kernel mapping is kept for the registry-coverage invariant.
+	case "make_timestamp":
+		return sfMakeTimestamp
+	case "make_timestamptz":
+		return sfMakeTimestamptz
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
 	// (drawn from the entropy seam at eval); the kernel id is still the name.
 	case "uuid_extract_version":
@@ -22862,6 +22874,12 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 	if name == "make_interval" {
 		return resolveMakeInterval(s, fc, ag, params)
 	}
+	// make_timestamp / make_timestamptz are its named (un-defaulted) siblings (§11); make_timestamptz
+	// is overloaded on arity (a session-zone 6-arg form + an explicit-zone 7-arg form). Their own
+	// resolver picks the overload and normalizes named notation.
+	if name == "make_timestamp" || name == "make_timestamptz" {
+		return resolveMakeTimestamp(s, name, fc, ag, params)
+	}
 	// lower/upper are overloaded across the range accessors (range → element) and the text casing
 	// functions (text → text, collation.md §16). Resolve the single argument once and branch on its
 	// type, BEFORE the by-name kind dispatch (which would force the range path for both). functions.md §9
@@ -23121,9 +23139,22 @@ func scalarFuncDesc(name string) *OperatorDesc {
 	return nil
 }
 
+// scalarFuncDescArity is scalarFuncDesc restricted to a given arity — for a named function
+// overloaded on arity (make_timestamptz: a 6-arg session-zone form + a 7-arg explicit-zone form),
+// so named-notation resolution reads the right slot list (functions.md §11).
+func scalarFuncDescArity(name string, arity int) *OperatorDesc {
+	for i := range Operators {
+		if Operators[i].Kind == "function" && Operators[i].Name == name && Operators[i].Arity == arity {
+			return &Operators[i]
+		}
+	}
+	return nil
+}
+
 // familyHint is the type context offered to an untyped literal in a function-argument slot of the
 // given family, so it adapts (functions.md §11): an integer slot offers i64, a float slot offers
-// f64 (so a bare 0/1.5 becomes f64 for secs). Other families offer no hint (nil).
+// f64 (so a bare 0/1.5 becomes f64 for secs), a text slot offers text (so a bare 'UTC' adapts to
+// the make_timestamptz timezone slot). Other families offer no hint (nil).
 func familyHint(family string) *ScalarType {
 	switch family {
 	case "integer":
@@ -23131,6 +23162,9 @@ func familyHint(family string) *ScalarType {
 		return &t
 	case "float":
 		t := Float64
+		return &t
+	case "text":
+		t := Text
 		return &t
 	default:
 		return nil
@@ -23240,6 +23274,74 @@ func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 	}
 	return &rExpr{kind: reScalarFunc, sfunc: sfMakeInterval, sargs: rargs, result: IntervalType},
 		resolvedTypeOf(IntervalType), nil
+}
+
+// resolveMakeTimestamp resolves make_timestamp(year, month, mday, hour, min, sec) /
+// make_timestamptz(…[, timezone]) — the named (but un-defaulted) make_interval siblings
+// (functions.md §11). make_timestamptz is overloaded on arity: a 6-arg form (interpret in the
+// session zone) and a 7-arg form (an explicit timezone text). The right overload is chosen by
+// whether the call supplies a 7th positional argument or names the timezone parameter; the chosen
+// catalog row then drives named-notation normalization. Each slot resolves with its declared family
+// as the type hint (a bare numeric literal adapts to the f64 sec slot, a bare string to the text
+// timezone slot); a wrong family in a slot is 42883.
+func resolveMakeTimestamp(s *scope, name string, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	isTz := name == "make_timestamptz"
+	// Pick the overload: the 7-arg explicit-zone form is selected by a 7th positional argument or a
+	// named timezone; otherwise the 6-arg form. make_timestamp has only the 6-arg form.
+	arity := 6
+	if isTz {
+		positional := 0
+		namesTimezone := false
+		for i := range fc.Args {
+			var nm *string
+			if fc.ArgNames != nil {
+				nm = fc.ArgNames[i]
+			}
+			if nm == nil {
+				positional++
+			} else if strings.EqualFold(*nm, "timezone") {
+				namesTimezone = true
+			}
+		}
+		if positional > 6 || namesTimezone {
+			arity = 7
+		}
+	}
+	desc := scalarFuncDescArity(name, arity)
+	if desc == nil {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	positional, err := normalizeNamedArgs(desc, fc.Args, fc.ArgNames)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	rargs := make([]*rExpr, 0, len(positional))
+	for i, e := range positional {
+		fam := desc.ArgFamilies[i]
+		r, t, err := resolve(s, *e, familyHint(fam), ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		// Type-check against the declared family. A NULL adapts (NULL propagates); a f32 sec is
+		// read at eval and widened losslessly to f64 (no Cast node — cost matches the cores).
+		ok := t.kind == rtNull ||
+			(fam == "integer" && t.kind == rtInt) ||
+			(fam == "float" && isFloatKind(t.kind)) ||
+			(fam == "text" && t.kind == rtText)
+		if !ok {
+			return nil, resolvedType{}, noFuncOverload(name)
+		}
+		rargs = append(rargs, r)
+	}
+	sf, result := sfMakeTimestamp, Timestamp
+	if isTz {
+		sf, result = sfMakeTimestamptz, Timestamptz
+	}
+	return &rExpr{kind: reScalarFunc, sfunc: sf, sargs: rargs, result: result},
+		resolvedTypeOf(result), nil
 }
 
 // f64ToMicros converts make_interval's secs (double precision) to a microsecond count: one
@@ -29509,6 +29611,36 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return IntervalValue(iv), nil
+		case sfMakeTimestamp, sfMakeTimestamptz:
+			// make_timestamp / make_timestamptz — the make_interval siblings (functions.md §11).
+			// Assemble the wall clock from the five integer fields + the f64 sec (an out-of-range
+			// field traps 22008). make_timestamptz then interprets that wall clock in a zone (the
+			// session zone for the 6-arg form, the trailing timezone text for the 7-arg form),
+			// charging one timezone unit like AT TIME ZONE; an unrecognized explicit zone is 22023.
+			wall, err := MakeTimestamp(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].asF64())
+			if err != nil {
+				return Value{}, err
+			}
+			if e.sfunc == sfMakeTimestamp {
+				return TimestampValue(wall), nil
+			}
+			// make_timestamptz: interpret the wall clock in a zone → a UTC instant.
+			m.Charge(Costs.Timezone)
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+			var zr ZoneRef
+			if len(vals) == 7 {
+				z, ok := ResolveZone(vals[6].Str)
+				if !ok {
+					return Value{}, NewError(InvalidParameterValue,
+						fmt.Sprintf("time zone %q not recognized", vals[6].Str))
+				}
+				zr = z
+			} else {
+				zr = env.exec.session.timeZone
+			}
+			return TimestamptzValue(LocalToInstantMicros(zr, wall)), nil
 		case sfUuidExtractVersion:
 			// uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a
 			// non-RFC variant (and, for the timestamp, any version other than 1/7). The
