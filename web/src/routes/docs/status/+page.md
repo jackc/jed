@@ -8,9 +8,11 @@
 
 # Preview status & limitations
 
-jed is in a **public preview**. It is feature-rich and extensively tested — three independent cores
-(Rust, Go, and TypeScript) agree byte-for-byte on every query result and on the on-disk format, and
-a large conformance corpus is checked against PostgreSQL as an oracle — but it has not yet reached a
+jed is in a **public preview**. It is feature-rich and heavily exercised by its **test suites**:
+three independent cores (Rust, Go, and TypeScript) agree byte-for-byte on every query result and on
+the on-disk format, and a large conformance corpus is checked against PostgreSQL as an oracle. But
+automated testing is not the same as real-world mileage — jed has **not** been proven in production
+use, and bugs that only surface under real workloads should be expected. It has not yet reached a
 stable release.
 
 ## What "0.x preview" means
