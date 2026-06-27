@@ -7,6 +7,17 @@
 # self-certified by the two cores that also read/write them (CLAUDE.md S8). Pure
 # Ruby, ASCII-only, no gem dependency; test-time only (CLAUDE.md S5).
 #
+# DO NOT retire this in favor of "let a core author the fixtures" without reading
+# spec/design/conformance.md (the `# fixture:` section). Beyond cross-checking the
+# goldens (a diminishing-returns 4th voice now that Rust+Go+TS agree), this file has
+# a SECOND, irreplaceable role the cores cannot take over: it FORGES on-disk images
+# the engine refuses to produce by invariant — e.g. collation_skew_corrupt.jed (a
+# bogus 9999.0.0 collation pin + an index keyed in the WRONG collation). A core could
+# only author that with invariant-violating, test-only seams (decoupling an index's
+# key collation from its column; letting a recorded version diverge from the loaded
+# bundle), i.e. polluting the engine to serve a test. So full removal is off the table
+# while the negative-path fixtures exist (decision evaluated 2026-06-27).
+#
 #   ruby spec/fileformat/verify.rb              # verify fixtures/ match the reference
 #   ruby spec/fileformat/verify.rb --generate   # (re)write fixtures/ from the reference
 #   (or: rake verify)

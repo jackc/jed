@@ -105,6 +105,24 @@ Conventions, fixed here so every implementation renders identically:
   the collation version-skew read-safety regression `suites/collation/skew.test` /
   `skew_full.test` ([collation.md](collation.md) §12/§14).
 
+  - **Why [verify.rb](../fileformat/verify.rb) is kept, not retired in favor of a core authoring
+    the goldens.** This forging is the file-format reference's *distinctive, irreplaceable* value,
+    and it is the reason `verify.rb` is **not** merely a redundant fourth byte-encoder. The two
+    roles are separable: (a) re-encode/decode the byte-pinned goldens as an independent voice
+    cross-checking the three cores — diminishing returns now that Rust + Go + TS already agree by
+    construction (CLAUDE.md §8); and (b) **forge on-disk images the engine refuses to produce by
+    invariant** — e.g. `collation_skew_corrupt.jed`, whose `unicode` pin is a bogus `9999.0.0` and
+    whose index is deliberately keyed in the *wrong* collation. Role (b) cannot move into any core:
+    "the engine always pins the loaded collation version and always builds a correct index" is a
+    standing safety invariant, so making a core author that fixture would require **invariant-
+    violating, test-only seams in the engine** (decouple an index's key collation from its column;
+    let a recorded version diverge from the loaded bundle) — pollution of the core to serve a test.
+    Verdict (evaluated 2026-06-27): full removal is **off the table** while the negative-path
+    fixtures exist. A *partial* retirement (Rust authors the ~53 engine-producible fixtures; a
+    small forge produces only the un-constructable ones) is possible but trades away the role-(a)
+    cross-core assurance and still leaves a format-aware forge to maintain, so it is worth doing
+    **only if** the per-format-bump update cost of the full reference becomes the binding pain.
+
 - **`# upgrade-collations:` action** — a file-level `# upgrade-collations:` comment that runs the
   **COLLATION UPGRADE migration** (`db.upgrade_collations()`) on the running database mid-file — the
   privileged host op that clears a version-skew by rebuilding the skewed collated keys against the
