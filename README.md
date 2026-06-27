@@ -1,10 +1,13 @@
 # jed
 
-An **embeddable, strictly-typed SQL database** — one file, no server, runs anywhere. The
-product is a strict, static type system: a value is never silently reinterpreted at runtime.
-Storage is a single in-process file (in the spirit of SQLite), and the observable semantics
-(NULL logic, comparisons, ordering, exact numerics, errors) follow PostgreSQL closely — the
-standing rule is **match PostgreSQL unless there's an overriding reason** ([CLAUDE.md §1](CLAUDE.md)).
+**Embeddable. Capable. Safe for untrusted SQL.**
+One file, no server — types and behavior modeled on PostgreSQL.
+
+jed is an in-process SQL database you link into your program — one database is one file on
+disk, in the spirit of SQLite. It pairs a broad SQL feature set and a rich type system with
+observable semantics (NULL logic, comparisons, ordering, exact numerics, errors) modeled on
+PostgreSQL — the standing rule is **match PostgreSQL unless there's an overriding reason**
+([CLAUDE.md §1](CLAUDE.md)).
 
 > ⚠️ **Status: 0.x public preview.** jed is pre-1.0. Any release may change behavior or
 > the **on-disk file format** — there are **no stability or compatibility guarantees yet**,
@@ -70,9 +73,9 @@ are **not yet published** to their registries.)
 
 ## What makes jed different
 
-- **SQLite's deployment model, PostgreSQL's behavior, a real type system.** Embeddable
-  single-file storage like SQLite, observable semantics like PostgreSQL, and a deliberate
-  strict, static type system that is stricter than either.
+- **SQLite's deployment model, PostgreSQL's behavior, a full SQL engine.** Embeddable
+  single-file storage like SQLite, observable semantics modeled on PostgreSQL, and a broad
+  SQL feature set with a rich, strict type system.
 - **Untrusted SQL is safe to run** ([CLAUDE.md §13](CLAUDE.md)). A query supplied by an
   adversary cannot corrupt memory (every core is memory-safe), cannot reach the host (no
   built-in does I/O or escapes the engine), and cannot exhaust resources (a deterministic

@@ -26,19 +26,19 @@ ORDER BY score DESC;`;
     },
     {
       title: 'Single file',
-      body: 'One database is one file on disk. Copy it, back it up, ship it. Durable on SSDs.'
+      body: 'One database is one file on disk. Copy it, back it up, ship it. Commits are atomic and crash-safe.'
     },
     {
-      title: 'A real type system',
-      body: 'Strict, static column types — a value is never silently reinterpreted at runtime. This is the point of the project.'
+      title: 'Rich type system',
+      body: 'Exact decimals, timestamps, UUID, JSON/JSONB, arrays, ranges, and composite types — and a value is never silently reinterpreted at runtime.'
     },
     {
-      title: 'Predictable semantics',
-      body: 'Three-valued NULL logic, exact decimal arithmetic, well-defined comparisons and ordering — semantics that follow PostgreSQL closely.'
+      title: 'PostgreSQL-modeled behavior',
+      body: 'Modeled on PostgreSQL — not just the syntax it accepts, but the semantics a query actually observes. The everyday SQL you already write behaves the same.'
     },
     {
-      title: 'Deterministic cost',
-      body: 'Every query accrues a deterministic cost with a caller-set ceiling — safe to run untrusted SQL.'
+      title: 'Safe for untrusted SQL',
+      body: 'Safe by design — memory-safe cores, a pure built-in surface with no host access, and a deterministic cost ceiling on every query.'
     },
     {
       title: 'Many native cores',
@@ -48,19 +48,20 @@ ORDER BY score DESC;`;
 </script>
 
 <svelte:head>
-  <title>jed — an embeddable, strictly-typed SQL database</title>
+  <title>jed — embeddable, capable, safe for untrusted SQL</title>
   <meta
     name="description"
-    content="jed is an embeddable, strictly-typed SQL database: one file, no server, runs anywhere. Try it live in your browser."
+    content="jed is an embeddable SQL database: one file, no server, safe to run untrusted queries, with types and behavior modeled on PostgreSQL. Try it live in your browser."
   />
 </svelte:head>
 
 <section class="py-6 text-center">
   <h1 class="text-4xl font-bold tracking-tight text-jed-ink sm:text-5xl">jed</h1>
-  <p class="mx-auto mt-4 max-w-2xl text-lg text-slate-600">
-    An embeddable, <strong class="text-jed-ink">strictly-typed</strong> SQL database —
-    <strong class="text-jed-ink">one file</strong>, <strong class="text-jed-ink">no server</strong>,
-    runs anywhere.
+  <p class="mx-auto mt-4 max-w-2xl text-xl font-semibold text-jed-ink sm:text-2xl">
+    Embeddable. Capable. <span class="text-jed-accent">Safe for untrusted SQL.</span>
+  </p>
+  <p class="mx-auto mt-2 max-w-2xl text-base text-slate-600">
+    One file, no server — types and behavior modeled on PostgreSQL.
   </p>
   <div class="mt-6 flex justify-center gap-3">
     <a
@@ -94,6 +95,33 @@ ORDER BY score DESC;`;
         <p class="mt-1 text-sm text-slate-600">{f.body}</p>
       </div>
     {/each}
+  </div>
+</section>
+
+<section class="mt-10">
+  <h2 class="mb-2 text-sm font-semibold tracking-wide text-jed-muted uppercase">Built for</h2>
+  <div class="grid gap-4 sm:grid-cols-3">
+    <div class="rounded-lg border border-slate-200 bg-white p-4">
+      <h3 class="font-semibold text-jed-ink">Running untrusted SQL</h3>
+      <p class="mt-1 text-sm text-slate-600">
+        Let your users write and run their own queries. An adversarial query still cannot corrupt
+        memory, reach the host, or exhaust resources.
+      </p>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-4">
+      <h3 class="font-semibold text-jed-ink">Local dev &amp; test</h3>
+      <p class="mt-1 text-sm text-slate-600">
+        When production is PostgreSQL, run your test suite and local development against an embedded
+        database — no server to provision, behavior you can rely on.
+      </p>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-4">
+      <h3 class="font-semibold text-jed-ink">An embedded PostgreSQL companion</h3>
+      <p class="mt-1 text-sm text-slate-600">
+        Embed jed at small scale, and scale up to PostgreSQL with the same SQL. One codebase, two
+        footprints.
+      </p>
+    </div>
   </div>
 </section>
 
