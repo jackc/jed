@@ -23,6 +23,10 @@ stable release.
 - **Limited distribution.** This release ships the **Go module** (`go get`) and the
   **website/playground**. The Rust crate, the `jed` CLI, the npm package, and the Ruby gem build
   from source but are not yet published. See [Installation](/docs/install/).
+- **Performance is not yet tuned.** Some features are implemented but unoptimized — a query can run
+  noticeably slower than on a mature database (for example, a pattern that currently falls back to a
+  full table scan, or a large sort materialized before its `LIMIT`). Correctness and cross-core
+  byte-identity come first during the preview; performance work is ongoing.
 
 ## Deliberate differences from PostgreSQL
 
@@ -50,8 +54,9 @@ Each intentional divergence is recorded in the relevant design doc in the
 
 jed implements a broad surface, but notable gaps remain. As representative (not exhaustive) examples:
 
-- Foreign-key referential **actions** (`ON DELETE CASCADE`, `SET NULL`, …) parse but are not yet
-  enforced.
+- Foreign-key referential **actions** beyond the default — `ON DELETE`/`ON UPDATE` with `CASCADE`,
+  `SET NULL`, or `SET DEFAULT` — are rejected at `CREATE TABLE` (`0A000`); `NO ACTION` (the default)
+  and `RESTRICT` are supported.
 - Some date/time surface is pending — `to_char` / `to_timestamp`, `date_part`, `age`, and a separate
   `time` type.
 - Spill-to-disk covers `ORDER BY`; the spilling hash join, aggregate, and `DISTINCT` are still in
