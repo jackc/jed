@@ -5,20 +5,90 @@ product is a strict, static type system: a value is never silently reinterpreted
 Storage is a single in-process file (in the spirit of SQLite), and the observable semantics
 (NULL logic, comparisons, ordering, exact numerics, errors) follow PostgreSQL closely — the
 standing rule is **match PostgreSQL unless there's an overriding reason** ([CLAUDE.md §1](CLAUDE.md)).
-A fundamental requirement is that **untrusted SQL is safe to run** — it cannot corrupt memory,
-reach the host (no built-in does I/O or escapes the engine), or exhaust resources
-([CLAUDE.md §13](CLAUDE.md)). Implemented natively in multiple languages in lockstep with
-**no reference implementation**.
 
-## Read this first
+> ⚠️ **Status: 0.x public preview.** jed is pre-1.0. Any release may change behavior or
+> the **on-disk file format** — there are **no stability or compatibility guarantees yet**,
+> and a database file is only guaranteed readable by the jed version that wrote it. See
+> [CHANGELOG.md](CHANGELOG.md).
 
-- **[CLAUDE.md](CLAUDE.md)** — the Project Design Brief. The standing, load-bearing
-  record of every architectural decision. Read it before making changes; when a decision
-  changes, update it in the same change.
+## Try it
+
+A live, in-browser SQL playground (the engine runs entirely client-side in a Web Worker —
+nothing is sent to a server) and the docs are at **<https://jackc.github.io/jed/>**.
+
+## Use it from Go
+
+The Go core is pure Go — no cgo, no FFI — so it installs with no native toolchain:
+
+```sh
+go get github.com/jackc/jed/impl/go@latest
+```
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	jed "github.com/jackc/jed/impl/go"
+)
+
+func main() {
+	// A path creates a single-file database on disk; jed.NewDatabase() is a transient
+	// in-memory one. Writes accumulate until an explicit Commit (Close discards uncommitted
+	// changes).
+	db, err := jed.Create("people.jed", jed.DatabaseOptions{PageSize: jed.DefaultPageSize})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecuteSQL("CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)", nil); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.ExecuteSQL("INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')", nil); err != nil {
+		log.Fatal(err)
+	}
+	if err := db.Commit(); err != nil {
+		log.Fatal(err)
+	}
+
+	rows, err := db.QuerySQL("SELECT name FROM person ORDER BY id", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for rows.Next() {
+		fmt.Println(rows.Row()[0].Render())
+	}
+}
+```
+
+(The import path's last element is `go`, so Go imports it under an alias — `jed` above. The
+Rust core, the `jed` CLI, the npm package, and the Ruby gem are built in this repository but
+are **not yet published** to their registries.)
+
+## What makes jed different
+
+- **SQLite's deployment model, PostgreSQL's behavior, a real type system.** Embeddable
+  single-file storage like SQLite, observable semantics like PostgreSQL, and a deliberate
+  strict, static type system that is stricter than either.
+- **Untrusted SQL is safe to run** ([CLAUDE.md §13](CLAUDE.md)). A query supplied by an
+  adversary cannot corrupt memory (every core is memory-safe), cannot reach the host (no
+  built-in does I/O or escapes the engine), and cannot exhaust resources (a deterministic
+  cost meter + ceiling, a per-session cost budget, and a parser depth limit bound the work).
+- **No reference implementation.** jed is implemented natively in multiple languages **in
+  lockstep**, so every spec ambiguity becomes a failing cross-core test the day it is
+  written. The honesty mechanism is divergence under a shared contract, not implementation
+  count.
+
+## Design & internals
+
+- **[CLAUDE.md](CLAUDE.md)** — the Project Design Brief: the standing, load-bearing record
+  of every architectural decision.
 - **[spec/](spec/)** — the **canonical** language-neutral specification and conformance
   corpus. This, not any implementation, is the source of truth (CLAUDE.md §2).
-
-## Repository shape
+- **[TODO.md](TODO.md)** — the forward-work backlog.
 
 ```
 spec/        CANONICAL source of truth — design docs + data tables + conformance corpus
@@ -26,59 +96,15 @@ impl/        native cores, one per language, each a downstream consumer of spec/
   rust/      first core — manual ownership, no GC
   go/        second core — pure Go, no cgo/FFI
   ts/        third core — native TypeScript on modern Node (type-stripping, no build step)
+web/         the website: static docs + the live in-browser playground
 ```
 
 All three cores agree byte-for-byte (CLAUDE.md §8): the on-disk format round-trip is
-`rust == go == ts == ruby`. The TS core is native (not a Rust→WASM wrapper) precisely to
-stress the spec on dimensions the systems cores hide — exact i64 (`bigint`), UTF-8 names,
-big-endian bytes.
+`rust == go == ts == ruby`, and every query result, value, type, error, and execution cost is
+identical across cores. The TS core is native (not a Rust→WASM wrapper) precisely to stress
+the spec on dimensions the systems cores hide — exact i64 (`bigint`), UTF-8 names, big-endian
+bytes.
 
-## Build order & current status (CLAUDE.md §11)
+## License
 
-1. ✅ **Scaffold** the repo around `spec/`.
-2. ✅ **Type-system spec** — scalar set + comparison/coercion matrix as data. *Step-1
-   scope: signed integers only* (`i16`/`i32`/`i64`). See [spec/types/](spec/types/)
-   and [spec/design/types.md](spec/design/types.md).
-3. ✅ **Conformance harness format + first corpus** — sqllogictest-style format, three-axis
-   taxonomy (suites / capabilities / profiles), integer corpus. See
-   [spec/conformance/](spec/conformance/) and [spec/design/conformance.md](spec/design/conformance.md).
-4. ✅ **Storage seam + key-encoding fixtures** — the block-device seam + root-swap commit
-   model ([spec/design/storage.md](spec/design/storage.md)); byte-exact integer key-encoding
-   vectors ([spec/encoding/](spec/encoding/)). On-disk byte *format* is authored with step 5.
-5. ✅ **First vertical slice — "it's alive"** — `CREATE TABLE` / `INSERT` /
-   `SELECT ... WHERE pk =` (+ `ORDER BY`, `IS [NOT] NULL`, three-valued logic, `CAST`,
-   overflow trap), integer columns only, driven through **both** the Rust
-   ([impl/rust/](impl/rust/)) and Go ([impl/go/](impl/go/)) cores against the shared
-   corpus — `core`/`casts`/`comparison` profiles green in both.
-5b. ✅ **On-disk format + Rust↔Go round-trip** — the single-file byte format
-   ([spec/fileformat/format.md](spec/fileformat/format.md)) with byte-exact golden fixtures.
-   Both cores read every golden and write byte-identical output — the load-bearing
-   cross-core honesty test ([CLAUDE.md §8](CLAUDE.md)), with an independent Ruby reference
-   ([spec/fileformat/verify.rb](spec/fileformat/verify.rb)) pinning the goldens. Whole-image
-   form for now; incremental commit deferred.
-6. ✅ **Row mutation — `UPDATE` / `DELETE`** — integer columns, both cores, against a
-   `mutation` conformance profile. `UPDATE` is two-phase (all-or-nothing: every matching row
-   is type-checked before any write); assigning a `PRIMARY KEY` column **re-keys** the row
-   (its storage key is recomputed and it moves), validated against the statement's end state,
-   so a collision traps `23505`. No-PK rows use a monotonic rowid (reconstructed on load), so
-   `DELETE` then `INSERT` never collides.
-
-### Beyond the first six steps
-
-The six steps above are CLAUDE.md §11's "it's alive" bootstrap. Substantial work has landed
-since across **all three cores** (Rust, Go, TS) — forward work is tracked in
-**[TODO.md](TODO.md)**. Highlights:
-
-- **Type system** — the full scalar set: `decimal`/`numeric` (exact), `f32`/`f64`,
-  `text`, `boolean`, `bytea`, `uuid`, `timestamp`/`timestamptz`, `interval`; arithmetic, `CAST`
-  and `::`, typed string literals.
-- **Query surface** — `JOIN` (inner/cross/left/right/full), `GROUP BY`/`HAVING`, aggregates,
-  `UNION`/`INTERSECT`/`EXCEPT`, subqueries (scalar/`IN`/`EXISTS`, correlated), `IN`/`BETWEEN`/
-  `LIKE`/`CASE`, `LIMIT`/`OFFSET`/`DISTINCT`, set-returning `generate_series`, scalar functions.
-- **Schema/DML** — `NOT NULL`/`DEFAULT` (constant + expression)/`CHECK`/`UNIQUE`/composite PK,
-  secondary indexes (`CREATE`/`DROP INDEX`), `INSERT` column list / multi-row / `INSERT … SELECT`,
-  `RETURNING`, explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`).
-- **Storage** — a page-backed copy-on-write B-tree with incremental commit, page reclamation,
-  a bounded buffer pool, large values (overflow chains + LZ4), and per-page checksums
-  (`format_version` 8). Plus deterministic cost metering + a `max_cost` ceiling, a `jed` CLI,
-  and a benchmark harness vs. PostgreSQL and SQLite.
+[MIT](LICENSE) © 2026 Jack Christensen.

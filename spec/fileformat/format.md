@@ -39,7 +39,7 @@ post-order, so the tree is a pure function of the indexed row set — byte-ident
 catalog index entry is otherwise unchanged (`index_root_page` points at the R-tree root, `0` for an
 empty index). A file with no GiST index moves to v20 only by its version byte + meta CRC.
 
-The current on-disk version is **`format_version` 19** — **storable `json` / `jsonb` columns**
+`format_version` **19** — **storable `json` / `jsonb` columns**
 ([../design/json.md](../design/json.md), slices J1/J1b). A column type can now be **`json`**
 (`type_code` 18) or **`jsonb`** (`type_code` 19) — both **plain scalar** catalog entries with **no
 extra descriptor** (like `text`/`uuid`; the reserved `has_jsonb_dict` door — json.md §3.2 — stays
@@ -321,7 +321,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`15`** |
+| 4  | 2 | `format_version` (u16) — current = **`21`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
