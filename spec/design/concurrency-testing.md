@@ -79,13 +79,13 @@ all row rendering, sorting and comparison code is shared with the sequential har
 Operations are scoped to a named **session**; control and assertion directives are new.
 
 ```
-open  <sid> read | write     # read → db.read() pins the committed version; write → db.write() takes the gate
+open  <sid> read | write     # read → db.read_session() pins the committed version; write → db.write_session()
 on    <sid> <record>          # run a sqllogictest record (statement|query) against session <sid>
-commit   <sid>                # WriteHandle.Commit — publish + release the gate
-rollback <sid>                # WriteHandle.Rollback — discard + release the gate
-close    <sid>                # ReadHandle.Close — deregister, advancing the watermark
-expect version     <n>        # SharedDB.Version() — the published committed version
-expect oldest_live <n>        # SharedDB.OldestLiveTxid() — the reclamation watermark
+commit   <sid>                # session.commit() — publish + release the gate
+rollback <sid>                # session.rollback() — discard + release the gate
+close    <sid>                # session.close() — deregister, advancing the watermark
+expect version     <n>        # db.version() — the published committed version
+expect oldest_live <n>        # db.oldest_live_txid() — the reclamation watermark
 ```
 
 The text after `on <sid>` is parsed by the existing record parser. A `read` session may only
@@ -148,7 +148,7 @@ The same file runs two ways:
   a step to its session, waits for the reply — and, for an end step, joins the thread — then
   advances; each session creates and ends its handle on its own thread). Same schedule, same
   deterministic result — but it drives the **real concurrent code paths under the race detector**
-  (`go test -race`; Rust's `Send`/`Sync`, proven by moving `SharedDb` into each worker, + the
+  (`go test -race`; Rust's `Send`/`Sync`, proven by moving the `Database` into each worker, + the
   threaded run, with a TSan run optional), catching memory races that sequential stepping cannot.
 
 Layer 1 thus yields a deterministic cross-core result *and*, on the threaded cores, optional
@@ -243,11 +243,11 @@ cross_core_checksum = true  # final committed image byte-identical across cores
 ```
 
 A **writer** worker runs `iterations` transactions; each takes the single-writer gate
-(`SharedDb.write()` — which **blocks** on a held gate in Go/Rust, real contention), runs `op`,
+(`db.write_session()` — which **blocks** on a held gate in Go/Rust, real contention), runs `op`,
 and commits. `op`'s `BEGIN`/`COMMIT` are the transaction *markers*: the runner maps them onto the
-handle's open/commit (it strips bare `BEGIN`/`COMMIT`/`ROLLBACK` and runs the inner statements in
-the one write transaction). A **reader** worker runs `iterations` snapshots; each opens a read
-handle (`SharedDb.read()` — never blocks), runs `invariant_query`, asserts it renders
+session's open/commit (it strips bare `BEGIN`/`COMMIT`/`ROLLBACK` and runs the inner statements in
+the one write transaction). A **reader** worker runs `iterations` snapshots; each opens a read-only
+session (`db.read_session()` — never blocks), runs `invariant_query`, asserts it renders
 `invariant_expect`, and closes (advancing the watermark). Both kinds render integer columns
 (the value/checksum surface Layer 3 needs today; the bench FNV-1a answer checksum, benchmarks.md
 §6, folds them).
@@ -337,8 +337,8 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
 
 | id | meaning |
 |---|---|
-| `txn.shared` | the goroutine/thread-safe `SharedDb` handle — concurrent readers + a single writer (transactions.md §10) |
-| `txn.read_handle` | a `ReadHandle` pins a consistent committed snapshot for its life; a write through it is `25006`; `close` deregisters it |
+| `txn.shared` | the goroutine/thread-safe `Database` core — concurrent reader/writer **sessions** (transactions.md §10; flag name retained from the pre-convergence `SharedDb`) |
+| `txn.read_handle` | a read-only session pins a consistent committed snapshot for its life; a write through it is `25006`; `close` deregisters it (flag name retained from the pre-convergence `ReadHandle`) |
 | `txn.watermark` | `oldest_live_txid` tracks the minimum version any live reader pins (the Phase-6 reclamation gate, transactions.md §8) |
 | `txn.gate_blocking` | the Layer 2 `open <sid> write blocks` annotation — a writer-open on the held single-writer gate, queued until the holder releases it (the equivalent serial order, §5) |
 

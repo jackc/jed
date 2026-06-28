@@ -270,7 +270,7 @@ value on rollback); jed has no such observable to preserve. Any future transacti
 (e.g. an `IDENTITY`/sequence, if ever added) would have to decide burn-vs-restore explicitly;
 the internal rowid restores.
 
-## 8. The reader-liveness watermark (realized in the shared handle; forward hook for Phase 6)
+## 8. The reader-liveness watermark (realized on the `Database` core; gates file-backed reclamation)
 
 Every `Snapshot` carries its `txid` (its **version**). The **oldest live version** is the
 minimum version any still-open reader has pinned, or the committed version when no reader is
@@ -292,16 +292,23 @@ the deferred follow-on — *continuous* within-session reclamation paired with f
 sharing — where a just-orphaned page (last referenced by version `T`) must stay out of the
 free-list until `oldest_live_txid > T`.
 
-**P5.3b realizes the watermark in the shared handle (§10).** A single-handle `Database` has only
-one live snapshot at a time (`committed`, or an open tx's `working`), so its `oldest_live_txid`
-is trivially the committed version. The interesting case is the **shared handle**: it owns a
-**live-reader registry** — a multiset of pinned versions (`version → refcount`, several readers
-may pin the same version). A read handle, on open, pins the committed snapshot and registers its
-version; on close/drop it deregisters. `oldest_live_txid` is the registry's minimum, or the
-committed version when the registry is empty. The minimum is order-independent, so no hash-map
-iteration order leaks into it (CLAUDE.md §8). This is the exact structure Phase 6's free-list
-will consult before reusing a page; the per-core tests already assert it tracks pinned readers
-(a reader pinning an old version holds the watermark back; closing it lets the watermark advance).
+**The watermark lives on the `Database` core (§10).** A lone `Engine` (the single-threaded handle a
+session owns privately) has only one live snapshot at a time (`committed`, or an open tx's
+`working`), so its `oldest_live_txid` is trivially the committed version. The interesting case is the
+shared **`Database`**: it owns a **live-reader registry** — a multiset of pinned versions
+(`version → refcount`, several readers may pin the same version). A read-only session, on open, pins
+the committed snapshot and registers its version; on close/drop it deregisters. `oldest_live_txid` is
+the registry's minimum, or the committed version when the registry is empty. The minimum is
+order-independent, so no hash-map iteration order leaks into it (CLAUDE.md §8). The per-core tests
+assert it tracks pinned readers (a reader pinning an old version holds the watermark back; closing it
+lets the watermark advance).
+
+**The convergence makes it load-bearing for file-backed reclamation** ([session.md §2.4](session.md),
+§10 slice 7c). With concurrent file-backed sessions, the free-list gate above stops holding trivially:
+a page orphaned at commit `T` must stay out of the free-list until `oldest_live_txid > T`, or a
+still-open reader on an older snapshot would observe a recycled page. So the commit allocator consults
+this registry before reusing a page — the "continuous within-session reclamation paired with
+file-backed reader sharing" the P6.2 follow-on (above) anticipated.
 
 ## 9. Durability: the `synchronous` setting, this slice vs. Phase 6
 
@@ -348,24 +355,28 @@ byte- and cost-neutral (the slack is trailing zeros past the high-water).
   at most one writer exists at a time (§3). Concurrency between cores' hosts is the host's
   problem (CLAUDE.md §3), now mediated by snapshots + this one lock.
 
-- **The shared handle (P5.3b) makes that real, not just describable.** The single-handle
-  `Database` is fast and simple but **not safe to share across threads**: its reads borrow the
-  handle while a write mutates it, so one handle cannot serve a reader thread and a writer thread
-  at once. Real parallelism — readers running *concurrently with* an in-flight writer — needs the
-  committed state behind a **thread-safe cell decoupled from any one thread's handle**. So each
-  core adds a **shared handle** with exactly the §3 shape:
+- **`Database` is the shared core; a `Session` is the per-caller handle** (the converged shape,
+  [session.md §2.4](session.md) — was a separate `SharedDb` minting `ReadHandle`/`WriteHandle`).
+  A single-threaded **`Engine`** (the renamed executor handle a session owns privately) is fast and
+  simple but **not safe to share across threads**: its reads borrow the engine while a write mutates
+  it, so one engine cannot serve a reader thread and a writer thread at once. Real parallelism —
+  readers running *concurrently with* an in-flight writer — needs the committed state behind a
+  **thread-safe cell decoupled from any one engine**. So **`Database` holds** exactly the §3 shape,
+  and is cheap to clone/share across threads:
   - a **committed cell** holding the published snapshot — a reader pins it with a single cheap
     read (an `Arc` clone under a momentary read lock in Rust; a lock-free `atomic.Pointer` load in
     Go), a writer publishes a new one with a single swap (the §3 short commit window);
   - a **single-writer gate** — a writer **blocks** until the prior writer ends (a `Mutex`/condvar
     in Rust, a held `sync.Mutex` in Go), so at most one writer is ever open;
   - the **live-reader registry** of §8.
-  A read handle pins the committed snapshot, registers its version, serves reads from that
-  immutable snapshot (a write through it is `25006`), and deregisters on drop/close. A write
-  handle captures the committed snapshot as a private working set (a `Database` with an open READ
-  WRITE block) and, on commit, publishes it at the next version. Isolation is free from the
-  persistent stores (§3): a pinned snapshot shares structure with later versions and is never
-  mutated, so pinning is a pointer copy, not a deep copy.
+  A **read-only session** (`db.read_session()`) pins the committed snapshot, registers its version,
+  serves reads from that immutable snapshot (a write through it is `25006`), and deregisters on
+  drop/close. A **writable session** (`db.session()`/`write_session()`) acquires the gate **only to
+  write** (the unified lazy-gate rule, session.md §2.4): an autocommit write takes the gate, captures
+  committed as a working set, publishes at the next version, and releases; an explicit `BEGIN` holds
+  it from the block's first write until commit/rollback. Isolation is free from the persistent stores
+  (§3): a pinned snapshot shares structure with later versions and is never mutated, so pinning is a
+  pointer copy, not a deep copy.
 
 - **Per-core reality differs, and that is expected (CLAUDE.md §2 — best experience per language,
   not uniform parallelism).** Rust and Go get **true OS-thread parallelism**: reader threads run
@@ -373,9 +384,10 @@ byte- and cost-neutral (the slack is trailing zeros past the high-water).
   so it offers the *other* half of the model — snapshot **isolation** across async interleavings
   (a pinned reader sees one stable version even as a writer commits between its calls) — via the
   same machinery, minus the parallelism (and a second open writer is **rejected** rather than
-  blocked, since JS cannot block its one thread). This slice's shared handle is **in-memory**;
-  file-backed sharing reuses the same publish point plus the §9 persist chokepoint and is wired
-  when it lands (the concurrency mechanism and durability are orthogonal axes).
+  blocked, since JS cannot block its one thread). Concurrent sessions work for both **in-memory and
+  file-backed** databases; the file-backed case additionally requires a thread-safe pager and
+  **watermark-gated page reclamation** (§8), reusing the same publish point plus the §9 persist
+  chokepoint (the concurrency mechanism and durability are orthogonal axes).
 
 - **Testing splits along the determinism line:**
   - **Logical transaction semantics → the shared conformance corpus.** A

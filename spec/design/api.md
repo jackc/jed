@@ -192,30 +192,44 @@ commit. `close` is idempotent.
   prepare-then-run (autocommit). The pre-API free function `execute(db, sql)` is kept unchanged
   (zero parameters) — the conformance harnesses depend on it.
 
-### 2.5 Shared handle: parallel readers + a single writer (P5.3b)
+### 2.5 Concurrent sessions: parallel readers + a single writer
 
-The handle of §2.1–§2.4 is single-threaded: it is the simple, fast path and is **not** safe to
-share across threads. For **concurrent readers running alongside a writer** there is a separate
-**shared handle** (`SharedDb` — Rust/Go/TS), the faithful realization of the §3 model
-(transactions.md §10). It is cheap to clone/share, and mints two kinds of per-caller handle:
+> **Converged by [session.md §2.4](session.md).** The first design (P5.3b) made this a *separate*
+> `SharedDb` handle minting `ReadHandle`/`WriteHandle`. Those fold into `Database` + `Session`: the
+> `Database` of §2.1 **is** the shared core, and an additional `Session` **is** the per-caller
+> concurrency handle. The shape below is the converged surface; `SharedDb`/`ReadHandle`/`WriteHandle`
+> no longer exist as types.
 
-- **`db.read() -> ReadHandle`** pins the committed snapshot *now* and serves reads from that one
-  stable, immutable version for its life — never blocked by, and never blocking, a writer. A
-  write attempted through it is `25006`. It registers in the live-reader set (transactions.md §8);
-  **`read.close()`** (Go/TS — no destructor) / dropping it (Rust) deregisters, advancing the
-  watermark. `db.oldest_live_txid()` reports the oldest version any open reader still pins.
-- **`db.write() -> WriteHandle`** opens the single writer: it captures the committed snapshot as a
-  private working set, runs statements with full transaction semantics (read-your-writes, failed-
-  block poisoning), and **`commit()`** publishes the working set at the next version (the §3
-  commit window) / **`rollback()`** discards it. At most one writer is open at a time — a second
-  `write()` **blocks** until the first ends (Rust/Go) or is **rejected `25001`** (TS, which cannot
-  block its one thread).
+`Database` (returned by `new`/`open`/`create`, §2.1) is **cheap to clone and safe to share across
+threads** — it holds the committed-roots cell, the single-writer gate, and the live-reader watermark
+(transactions.md §8/§10). Its **default session** (§2.4) is the simple, fast single-handle path.
+For **concurrent readers running alongside a writer**, a host mints **additional sessions**:
 
-**Per-core reality** (CLAUDE.md §2 — best experience per language): Rust and Go give true
-OS-thread parallelism (reader threads run while a writer commits); TS gives snapshot **isolation**
-across async interleavings (no shared-memory threads). This slice's shared handle is **in-memory**;
-file-backed sharing reuses the §3 publish point + the §9 persist chokepoint and is wired later.
-The single-handle surface (§2.1–§2.4) is unchanged and remains the default.
+- **`db.read_session(opts) -> Session`** opens a **READ ONLY** session: it pins the committed
+  snapshot *now* and serves reads from that one stable, immutable version for its life — never
+  blocked by, and never blocking, the writer. A write through it is `25006`. It registers in the
+  live-reader set (transactions.md §8); **`session.close()`** (Go/TS — no destructor) / dropping it
+  (Rust) deregisters, advancing the watermark. `db.oldest_live_txid()` reports the oldest version
+  any open reader still pins.
+- **`db.write_session(opts)` / `db.session(opts)` -> Session** opens a **READ WRITE** session. It
+  does **not** hold the writer gate idle (the unified lazy-gate rule, session.md §2.4): an autocommit
+  write acquires the gate, applies, publishes at the next version (the §3 commit window), and
+  releases it; an explicit `BEGIN` pins one snapshot and acquires the gate on its first write,
+  holding it until `commit()`/`rollback()`. At most one writer holds the gate at a time — a second
+  writer **blocks** until it releases (Rust/Go) or is **rejected `25001`** (TS, which cannot block
+  its one thread). Statements run with full transaction semantics (read-your-writes, failed-block
+  poisoning).
+
+All three are the **same `Session` type** (session.md §2/§3) — they differ only in access mode and
+in `opts` (the `SessionOptions` envelope). The default session and these additional sessions share
+the one `Database`'s committed state.
+
+**Per-core reality** (CLAUDE.md §2 — best experience per language): Rust and Go give true OS-thread
+parallelism (reader threads run while a writer commits); TS gives snapshot **isolation** across
+async interleavings (no shared-memory threads), with a second writer rejected `25001`. Concurrent
+sessions work for both **in-memory and file-backed** databases (the file-backed case adds a
+thread-safe pager + watermark-gated reclamation, session.md §2.4); the single-handle surface
+(§2.1–§2.4) is unchanged and remains the default.
 
 ## 3. Persistence & durability
 

@@ -24,7 +24,8 @@ is thus also a small differential test.
 Non-goals: micro-benchmarks of internal functions (use `cargo bench`/`testing.B` ad hoc
 if needed), benchmarking the deterministic *cost* units (cost is asserted exactly in the
 conformance corpus — `spec/design/cost.md`), and *wall-clock* load/concurrency testing
-(a backfill candidate once `SharedDb` is file-backed — §11). **Correctness**-under-concurrency
+(a backfill candidate once file-backed concurrent sessions land — session.md §2.4/§10 slice 7c).
+**Correctness**-under-concurrency
 *is* covered, by a sibling bench-family harness: the Layer 3 stress runner
 (`spec/design/concurrency-testing.md` §6) shares these modules' machinery (the splitmix64 PRNG,
 the FNV-1a answer checksum) via a `stress` binary per core, run by `rake stress` — see §2.
@@ -455,7 +456,7 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 - a join benchmark (needs a second dataset table → `generator_version` bump);
 - GROUP BY aggregate; UPDATE / DELETE throughput; miss-heavy point lookups;
 - text-heavy / large-value rows (exercise the overflow + LZ4 path);
-- `SharedDb` concurrent-reader throughput (once file-backed); cold-open time;
+- `Database` concurrent-reader throughput (concurrent sessions, once file-backed); cold-open time;
 - durable-commit batch-size sweep (1 vs 100 vs 1000 rows per commit).
 
 **Standing obligation** (CLAUDE.md §10): a perf-relevant feature lands with a benchmark

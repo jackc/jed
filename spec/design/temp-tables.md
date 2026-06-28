@@ -78,8 +78,8 @@ Two never-serialized stores, by kind:
   `temp_index_stores` + `temp_sequences`), alongside the session's existing per-session state
   ([session.md §2](session.md): `vars`, `session_seq`, privileges). Born empty with the session,
   dropped wholesale at session close.
-- **Shared temp catalog** — a second *committed* in-memory structure on the `Database` / `SharedDb`
-  handle (a "temp snapshot"), published by the same commit discipline as the file snapshot but
+- **Shared temp catalog** — a second *committed* in-memory structure on the `Database` core
+  (a "temp snapshot"), published by the same commit discipline as the file snapshot but
   **never fsynced and never serialized** (§5). Born empty when the `Database` is opened, gone when
   it is closed.
 
@@ -228,8 +228,8 @@ cost meter (the same way the depth gate is independent of the cost gate):
   setting** in the family of `work_mem` / `max_cost` / `cache_bytes` (api.md §8): not stored in the
   file, never changes the contents, host-settable on an open handle. `0` means unlimited (a trusted
   host). Default modest (proposed 32 MiB; final tuning is a slice-1 detail).
-- **`shared_temp_mem`** — a **global** byte budget for all shared temp storage, a `Database` /
-  `SharedDb`-level setting (shared temp data is global, so its budget must be too), charged across
+- **`shared_temp_mem`** — a **global** byte budget for all shared temp storage, a `Database`-level
+  setting (shared temp data is global, so its budget must be too), charged across
   sessions. `0` = unlimited. Default modest.
 
 **Determinism is the load-bearing requirement** (CLAUDE.md §8/§10, §13). The budget is measured in
@@ -389,10 +389,10 @@ and memory-only per the design decision:
   capability (§5), the `Database`-level temp snapshot, the two-root commit (§5), `shared_temp_mem`, and
   the cross-session visibility tests — which need the **concurrency schedule format**
   (`# format: concurrency`, concurrency-testing.md), since cross-session visibility is exactly what
-  the single-handle sqllogictest corpus can't express. The shared-temp snapshot is held on the shared
-  handle (`SharedDb`/`Shared` in the Rust core, and the per-core equivalent) under **one lock with the
+  the single-handle sqllogictest corpus can't express. The shared-temp snapshot is held on the
+  `Database` core (the shared roots cell, and the per-core equivalent) under **one lock with the
   file-snapshot root**, so a reader pins both atomically (no torn pin) and a writer publishes both in
-  one swap. On a single (non-shared) handle the shared-temp snapshot is a plain field on the handle,
+  one swap. On a lone `Engine` (a session's private handle) the shared-temp snapshot is a plain field,
   visible to every session minted from it. Same constructs and 0A000 narrowings as slice 1.
 - **Slice 3 — spill-to-disk.** The temp `BlockStore` + the resident→paged flip (§6), the memory→disk
   budget split, the disk ceiling. Out-of-contract spill file (§10).

@@ -87,9 +87,13 @@ State ownership splits cleanly — the load-bearing rule:
   — the counter is *transactional* and rolls back, a documented PG divergence; the "have I called
   `nextval` this session" state that raises `55000` is session-local.)
 
-Because the default session is single-threaded and stateful, a plain `Database` is **not** safe to
-share across threads (unchanged from [api.md §2.5](api.md)); true-concurrent sessions are the
-`SharedDb` convergence (§2.3, §10).
+The default session is stateful, so a host that drives it across calls drives it from **one**
+caller at a time (it carries an open `BEGIN` block, the time zone, the cost meters). For **genuine
+concurrency** — many readers running alongside a writer — a host mints **additional sessions**
+(`db.session(opts)` / `db.read_session()` / `db.write_session()`), each an independently-usable
+per-caller handle over the one shared `Database`. This is the **converged** shape (§2.4): a
+`Session` *is* the configured concurrency handle, so there is no separate `SharedDb`/`ReadHandle`/
+`WriteHandle` surface — the session is both the envelope and the handle.
 
 ### 2.2 The transaction state machine
 
@@ -138,11 +142,92 @@ already `Open` simply joins that transaction.
 [api.md §2.3](api.md)); the underlying `Database` and other sessions over it are unaffected.
 Idempotent. Closing the default session closes the `Database`.
 
-The `SharedDb` / `ReadHandle` / `WriteHandle` concurrency surface ([api.md §2.5](api.md)) and the
-session are **convergent**: a read-only session is the configured form of a `ReadHandle`, a writable
-session of the `WriteHandle`. This refinement specifies the settings/state layer; folding it into
-the per-caller handles is future work (§10). What binds now: settings that affect results (§6) are
-deterministic and cross-core whichever handle ultimately carries them.
+The earlier refinement specified the settings/state layer separately from the `SharedDb` /
+`ReadHandle` / `WriteHandle` concurrency surface ([api.md §2.5](api.md)). §2.4 **converges** the
+two: a `Session` *is* the per-caller concurrency handle, so a read-only session is what a
+`ReadHandle` was and a writable session what a `WriteHandle` was — one type, one surface.
+
+### 2.4 Convergence: `Database` is the shared core, `Session` is the concurrent handle
+
+The first concurrency surface (api.md §2.5) was a *separate* `SharedDb` that minted `ReadHandle` /
+`WriteHandle`, each wrapping a private single-threaded `Database`, while `Session` (the envelope
+above) ran by **swapping** into a `Database`'s one default-session slot — two parallel surfaces for
+what is conceptually one thing: *a configured, isolated, per-caller handle.* They **converge into
+two types**, eliminating the third:
+
+```
+Database ─ THE SHARED CORE (cheap to clone/share across threads):
+  │          committed cell (file + shared-temp roots) · single-writer gate · reader watermark
+  │          · storage identity (path · page_size · pager/buffer-pool)
+  │ owns one default Session (back-compat)      db.session/read_session/write_session(opts)
+  ▼                                                          │ mint additional
+default Session ──────────────── Session ◀──────────────────┘
+   a per-caller handle = the envelope (§3) + a private Engine (committed snapshot / working set /
+   open tx) + an access mode. Independently usable; readers run concurrently with the one writer.
+```
+
+- **`Database` absorbs the shared core.** It *is* what `SharedDb` was — the committed-roots cell
+  (the file `Snapshot` + the shared-temp `Snapshot`, published together, transactions.md §8/§10),
+  the single-writer gate, and the live-reader watermark — fused with the **storage identity** (§1:
+  `path`, `page_size`, the pager/buffer-pool). It is **cheap to clone and safe to share across
+  threads**, and it is what `new` / `open` / `create` return ([api.md §2.1/§2.5](api.md)). The
+  old single-threaded executor handle named `Database` is **renamed `Engine`** — an internal type a
+  `Session` owns privately; it is never the host surface.
+- **`Session` absorbs the per-caller handle.** A session owns a private `Engine` (its committed
+  snapshot / working set / open transaction) plus the §3 envelope plus an **access mode**. Because
+  each session runs on its *own* `Engine`, the `activate`/swap mechanism **is deleted** — additional
+  sessions no longer run sequentially by borrowing one slot; they are genuinely independent. A
+  read-only session pins an immutable snapshot and is never blocked by, nor blocks, the writer; a
+  writable session takes the single-writer gate (below). This is the `ReadHandle`/`WriteHandle`
+  fold-in the prior refinement deferred.
+
+**The lazy-gate lifecycle (the unified, PG-like rule).** A session does not hold the write gate for
+its life; it acquires it only to write, mirroring a PostgreSQL backend:
+
+- **Autocommit read** — pins the *latest* committed snapshot for that one statement; no gate. (Each
+  autocommit statement sees the newest committed state, PG-faithful.)
+- **Autocommit write** — acquires the gate → captures committed as a working set → applies →
+  publishes at the next version (the §3 commit window) → **releases** the gate. Per-statement, so an
+  idle writable session holds nothing and never starves other writers.
+- **`BEGIN`** — pins one snapshot for the block and registers it in the watermark; acquires the gate
+  **lazily on the block's first write** (or eagerly at `BEGIN READ WRITE`), holding it until
+  `COMMIT`/`ROLLBACK`. A long-held writable block starves other writers — exactly the case
+  `idle_in_transaction_timeout` (§3) guards.
+- **`db.read_session()` (READ ONLY)** — pins a stable snapshot for its life, registers in the
+  watermark, **never** takes the gate; a write through it is `25006`. `db.write_session()` /
+  `db.session()` default to READ WRITE (lazy gate as above). The access mode is the §3 read-only
+  property, now carried by the session.
+- **Second concurrent writer** — **blocks** until the holder releases (Rust/Go true threads) or is
+  rejected **`25001`** (TS, which cannot block its one thread). Unchanged from api.md §2.5.
+
+**The default session is the back-compat bridge.** `Database` owns one long-lived default session
+and `db.execute`/`db.query`/`db.begin`/`db.status`/`db.execute_script` delegate to it (§2.1), so the
+single-handle surface — and every conformance harness, example, and the web worker bridge that uses
+it — is **unchanged**. The default session is a writable session under the lazy-gate rule, so its
+autocommit writes take the gate per statement and coexist with additional sessions. The two former
+surfaces are now one: today's "bare `Database` + its default session" *is* the single-handle path;
+today's `SharedDb.read()/write()` *are* `db.read_session()/write_session()`.
+
+**File-backed sessions add two correctness requirements** absent in-memory (where snapshots are pure
+COW structure-sharing): (a) the **pager/buffer-pool must be safe under concurrent reader page-faults
+running alongside a committing writer** (the gate serializes writers, but readers fault pages
+concurrently); (b) **page reclamation must be watermark-gated** — the commit allocator must not reuse
+a free-list page still referenced by a live reader's pinned snapshot (transactions.md §8 earmarked
+the watermark for exactly this; it goes live here). TS is unaffected by (a) — no threads.
+
+**Per-core reality differs, by design** (CLAUDE.md §2 — best experience per language, not uniform
+parallelism): Rust and Go give true OS-thread parallelism (reader threads run while a writer
+commits); TS gives snapshot **isolation** across async interleavings (a pinned reader sees one stable
+version even as a writer commits between its calls), minus the parallelism, with a second writer
+**rejected `25001`** rather than blocked.
+
+**Testing is unchanged in kind** (transactions.md §10): logical transaction/visibility semantics stay
+in the **shared corpus** (the `# format: concurrency` schedules run byte-identically over the new
+API); the scheduling-dependent mechanism — reader-doesn't-block, writer-exclusive, watermark
+tracking, `25006`/`25001` — stays in **per-core tests** (Rust/Go fan out real threads under the race
+detector; TS asserts isolation across interleaved calls). The corpus and its results do **not**
+change; only the harness *driver*'s API calls migrate (`SharedDb`→`Database`, `read()/write()`→
+`read_session()/write_session()`).
 
 ## 3. The two buckets — what a session carries
 
@@ -589,6 +674,26 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    + **named loaded zones**, `22023` otherwise), the `# timezone:` directive. Capability
    `session.timezone`. The consumers (`date_trunc` / `EXTRACT` / cross-family casts) landed with the tz
    conversion slice ([timezones.md §9](timezones.md)): the slot is the zone a `timestamptz` decomposes in.
+7. **Convergence with the shared handle** (§2.4) — fold `SharedDb`/`ReadHandle`/`WriteHandle` into
+   `Database` + `Session` so a session *is* the configured concurrency handle. Decided shape (this
+   doc): **full rename** (`SharedDb`→`Database`, the old executor handle→`Engine`), **unified
+   PG-like sessions** (one writable session, lazy gate on first write), **file-backed included**.
+   Sub-slices, all three cores in lockstep, the rename landed as its own commit so the semantic diff
+   is reviewable:
+   - **7a — rename only.** `Database`→`Engine`, `SharedDb`→`Database`, no semantic change; green ×3.
+   - **7b — in-memory convergence.** Fuse the handles + envelope into `Session`; delete the
+     `activate`/swap; add the default-session delegators and the lazy-gate logic; migrate the
+     concurrency conformance driver, the stress harness, and the `shared`/`session` per-core tests to
+     the new API. Corpus + results byte-identical.
+   - **7c — file-backed sessions.** Thread-safe pager/buffer-pool under concurrent reader faults, and
+     **watermark-gated page reclamation** (transactions.md §8); `open`/`create` return the shared
+     `Database`. Add the `Database` concurrent-reader bench ([../../TODO.md](../../TODO.md)).
+   - **7d — docs.** `web/src/routes/docs/api/*`, `web/examples/*`; the worker bridge keeps the
+     single-handle path via the delegators.
+
+   No new capability flags (the concurrency corpus suites and their results are unchanged). The
+   simple/fast single-handle path stays cheap (an autocommit read is one snapshot pin; an autocommit
+   write is one uncontended gate acquire) — guarded by the new concurrent-reader bench.
 
 ## 11. Open / deferred (none foreclosed)
 
@@ -611,9 +716,6 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
   `time_zone` built-in; the general SQL surface is a follow-on (§6.1).
 - **Named time zones + a tz database** — v1 accepts `UTC` and fixed offsets only (§6.2); named
   zones (`America/New_York`) need a tz database (a separate, large feature).
-- **Convergence with the shared handle (api.md §2.5)** — folding `Session` into the per-caller
-  `ReadHandle`/`WriteHandle` so a session *is* the configured concurrency handle (§2); kept
-  separate this refinement.
 - **Column-level privileges + a CREATE/ownership privilege** — PG has per-*column* `GRANT` and
   models DDL via `CREATE`-on-schema + ownership; v1 gates whole base-table + named-function names
   and folds all DDL under one `allow_ddl` boolean (§5.3).
