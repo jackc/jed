@@ -7,10 +7,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute } from "../src/lib.ts";
+import { Engine, EngineError, execute } from "../src/lib.ts";
 
-function rowTable(n: number): Database {
-  const db = new Database();
+function rowTable(n: number): Engine {
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
@@ -18,17 +18,17 @@ function rowTable(n: number): Database {
   return db;
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
-function rowCount(db: Database, sql: string): number {
+function rowCount(db: Engine, sql: string): number {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.length;
 }
 
-function assertAborts(db: Database, sql: string): void {
+function assertAborts(db: Engine, sql: string): void {
   assert.throws(
     () => execute(db, sql),
     (e: unknown) => e instanceof EngineError && e.code() === "54P01",

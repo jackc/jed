@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute, executeParams, intValue, nullValue } from "../src/lib.ts";
+import { Engine, EngineError, execute, executeParams, intValue, nullValue } from "../src/lib.ts";
 import type { Value } from "../src/lib.ts";
 import { dbWith } from "./util.ts";
 
@@ -12,13 +12,13 @@ function text(s: string): Value {
   return { kind: "text", text: s };
 }
 
-function rows(db: Database, sql: string, params: Value[]): Value[][] {
+function rows(db: Engine, sql: string, params: Value[]): Value[][] {
   const o = executeParams(db, sql, params);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows;
 }
 
-function paramErrCode(db: Database, sql: string, params: Value[]): string {
+function paramErrCode(db: Engine, sql: string, params: Value[]): string {
   try {
     executeParams(db, sql, params);
   } catch (e) {
@@ -145,7 +145,7 @@ test("param in IN list", () => {
 });
 
 test("DDL with params traps 42601", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(paramErrCode(db, "CREATE TABLE t (id i32 PRIMARY KEY)", [intValue(1n)]), "42601");
 });
 

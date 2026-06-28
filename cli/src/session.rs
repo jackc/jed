@@ -1,10 +1,10 @@
 //! The shared execution core (spec/design/cli.md): script mode and the TUI both drive a
-//! `Session`, so their behavior cannot drift. A session wraps one `Database` handle and
+//! `Session`, so their behavior cannot drift. A session wraps one `Engine` handle and
 //! tracks the one piece of state the engine does not expose directly — whether the open
 //! transaction has FAILED (a statement errored inside it, so everything but
 //! COMMIT/ROLLBACK now answers 25P02).
 
-use jed::{Database, EngineError, Outcome, Value};
+use jed::{Engine, EngineError, Outcome, Value};
 
 /// One statement's result, shaped for display.
 #[derive(Debug)]
@@ -47,14 +47,14 @@ pub enum TxState {
 }
 
 pub struct Session {
-    pub db: Database,
+    pub db: Engine,
     /// Display name: the file path, or "memory" for an in-memory database.
     pub source: String,
     tx_failed: bool,
 }
 
 impl Session {
-    pub fn new(db: Database, source: String) -> Session {
+    pub fn new(db: Engine, source: String) -> Session {
         Session {
             db,
             source,
@@ -166,7 +166,7 @@ mod tests {
     use super::*;
 
     fn mem() -> Session {
-        Session::new(Database::new(), "memory".to_string())
+        Session::new(Engine::new(), "memory".to_string())
     }
 
     #[test]

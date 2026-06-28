@@ -25,7 +25,7 @@ use crate::collation::Collation;
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{Database, Snapshot};
+use crate::executor::{Engine, Snapshot};
 use crate::interval::Interval;
 use crate::json::JsonNode;
 use crate::pager::Pager;
@@ -1548,18 +1548,18 @@ fn serialize_dirty(
     Ok(index)
 }
 
-impl Database {
+impl Engine {
     /// Serialize the whole committed state to a single on-disk image (spec/fileformat/format.md).
     /// A thin wrapper over [`Snapshot::to_image`] for the committed snapshot — `txid` is written
     /// into both meta slots. (The writer's working snapshot is serialized directly via
-    /// `Snapshot::to_image` at commit; this serves callers/tests holding a `Database`.)
+    /// `Snapshot::to_image` at commit; this serves callers/tests holding a `Engine`.)
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
         self.committed().to_image(page_size, txid)
     }
 
     /// Reconstruct a database from an on-disk image (inverse of `to_image`). Returns
     /// a structured `data_corrupted` (XX001) error for any malformed input.
-    pub fn from_image(image: &[u8]) -> Result<Database> {
+    pub fn from_image(image: &[u8]) -> Result<Engine> {
         if image.len() < 12 {
             return Err(corrupt("image smaller than a meta header"));
         }
@@ -1678,7 +1678,7 @@ impl Database {
         snap.validate_composite_types()?;
         // Build each GiST index's resident R-tree from its now-loaded leaf store (gist.md §4.1).
         snap.rebuild_gist_trees()?;
-        let mut db = Database::new();
+        let mut db = Engine::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count; // the on-disk high-water for the next incremental commit
         // The free-list: every body page `[2, page_count)` the committed root does not reach
@@ -1699,7 +1699,7 @@ impl Database {
     /// the free-list), then discards it — memory stays bounded (only the skeleton is retained), but
     /// open is O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a
     /// deferred follow-on, pager.md §6); the residency win — a bounded *resident* set — already holds.
-    pub(crate) fn open_paged(pager: Pager, capacity: usize) -> Result<Database> {
+    pub(crate) fn open_paged(pager: Pager, capacity: usize) -> Result<Engine> {
         let page_size = pager.page_size() as usize;
         if !page_size_valid(page_size) {
             return Err(corrupt("invalid page size"));
@@ -1846,7 +1846,7 @@ impl Database {
         snap.validate_composite_types()?;
         // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
         snap.rebuild_gist_trees()?;
-        let mut db = Database::new();
+        let mut db = Engine::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count;
         db.free_pages = (ROOT_PAGE..meta.page_count)
@@ -3862,7 +3862,7 @@ mod tests {
     /// round-trip path) preserves both finite and special values.
     #[test]
     fn float_table_in_memory_round_trip() {
-        let mut db = Database::new();
+        let mut db = Engine::new();
         for s in [
             "CREATE TABLE t (id i32 PRIMARY KEY, f f64, g f32)",
             "INSERT INTO t VALUES (1, 1.5, 2.5)",
@@ -3876,7 +3876,7 @@ mod tests {
             execute(&mut db, s).expect("setup");
         }
         let image = db.to_image(8192, 1).unwrap();
-        let mut db2 = Database::from_image(&image).expect("re-open");
+        let mut db2 = Engine::from_image(&image).expect("re-open");
         let out = execute(&mut db2, "SELECT id, f, g FROM t ORDER BY id").expect("query");
         let rows = match out {
             Outcome::Query { rows, .. } => rows,
@@ -3889,8 +3889,8 @@ mod tests {
         assert_eq!(rows[2][1].render(), "NaN");
     }
 
-    fn sample_db() -> Database {
-        let mut db = Database::new();
+    fn sample_db() -> Engine {
+        let mut db = Engine::new();
         for s in [
             "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
             "INSERT INTO t VALUES (1, 10)",
@@ -3914,7 +3914,7 @@ mod tests {
     fn in_memory_round_trip() {
         let db = sample_db();
         let image = db.to_image(8192, 1).unwrap();
-        let loaded = Database::from_image(&image).unwrap();
+        let loaded = Engine::from_image(&image).unwrap();
         assert_eq!(loaded.to_image(8192, 1).unwrap(), image);
         assert_eq!(
             loaded.rows_in_key_order("t"),
@@ -3946,8 +3946,8 @@ mod tests {
         // Smash both meta magics.
         image[0] ^= 0xFF;
         image[8192] ^= 0xFF;
-        // (Database has no Debug impl, so match the error rather than unwrap_err.)
-        match Database::from_image(&image) {
+        // (Engine has no Debug impl, so match the error rather than unwrap_err.)
+        match Engine::from_image(&image) {
             Err(e) => assert_eq!(e.code(), "XX001"),
             Ok(_) => panic!("expected a data_corrupted error"),
         }
@@ -3984,8 +3984,8 @@ mod tests {
     /// page size, plus a small inline value. The big value (1250 bytes) far exceeds `RECORD_MAX`
     /// at `ps=256` (`= (256-16-12)/2 = 114`) and `cap` (`= 240`), so it spans **several**
     /// overflow pages.
-    fn big_value_db() -> Database {
-        let mut db = Database::new();
+    fn big_value_db() -> Engine {
+        let mut db = Engine::new();
         let big = filler_text(1250);
         for s in [
             "CREATE TABLE t (id i32 PRIMARY KEY, body text)".to_string(),
@@ -4009,7 +4009,7 @@ mod tests {
         );
         // It reconstructs exactly, and re-serialization is byte-identical (deterministic spill +
         // chain allocation).
-        let loaded = Database::from_image(&image).unwrap();
+        let loaded = Engine::from_image(&image).unwrap();
         assert_eq!(
             loaded.rows_in_key_order("t"),
             db.rows_in_key_order("t"),
@@ -4036,7 +4036,7 @@ mod tests {
         // reconstructed free-list (else a later commit would reuse a still-referenced page).
         let db = big_value_db();
         let ps = 256u32;
-        let loaded = Database::from_image(&db.to_image(ps, 1).unwrap()).unwrap();
+        let loaded = Engine::from_image(&db.to_image(ps, 1).unwrap()).unwrap();
         let ovf_pages =
             count_page_type(&loaded.to_image(ps, 1).unwrap(), ps as usize, PAGE_OVERFLOW);
         assert!(ovf_pages >= 2);

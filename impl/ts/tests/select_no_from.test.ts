@@ -9,15 +9,15 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute, executeParams, intValue } from "../src/lib.ts";
+import { Engine, EngineError, execute, executeParams, intValue } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
 test("SELECT 1 returns one row costing one row_produced", () => {
-  const db = new Database();
+  const db = new Engine();
   const out = execute(db, "SELECT 1");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
@@ -28,14 +28,14 @@ test("SELECT 1 returns one row costing one row_produced", () => {
 });
 
 test("an expression select charges its operator_evals", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.deepStrictEqual(query(db, "SELECT 1 + 2"), [["3"]]);
   // 1 operator_eval (the `+` node) + 1 row_produced.
   assert.equal(cost(db, "SELECT 1 + 2"), 2n);
 });
 
 test("WHERE filters the virtual row", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.deepStrictEqual(query(db, "SELECT 1 WHERE false"), []);
   // The constant filter is a leaf (no operator_eval) and no row is produced.
   assert.equal(cost(db, "SELECT 1 WHERE false"), 0n);
@@ -44,7 +44,7 @@ test("WHERE filters the virtual row", () => {
 });
 
 test("aggregates fold the single group", () => {
-  const db = new Database();
+  const db = new Engine();
   // The virtual row is the one input row of the whole-table group (aggregates.md §4).
   assert.deepStrictEqual(query(db, "SELECT count(*)"), [["1"]]);
   assert.equal(cost(db, "SELECT count(*)"), 2n); // 1 aggregate_accumulate + 1 row_produced
@@ -57,14 +57,14 @@ test("aggregates fold the single group", () => {
 });
 
 test("DISTINCT and the LIMIT/OFFSET window apply to the single row", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.deepStrictEqual(query(db, "SELECT DISTINCT 1"), [["1"]]);
   assert.deepStrictEqual(query(db, "SELECT 1 LIMIT 0"), []);
   assert.deepStrictEqual(query(db, "SELECT 1 OFFSET 1"), []);
 });
 
 test("set operation operands", () => {
-  const db = new Database();
+  const db = new Engine();
   const rows = query(db, "SELECT 1 UNION SELECT 2")
     .map((r) => r[0]!)
     .sort();
@@ -93,7 +93,7 @@ test("INSERT ... SELECT source", () => {
 });
 
 test("SELECT * with no tables is 42601 with PostgreSQL's message", () => {
-  const db = new Database();
+  const db = new Engine();
   try {
     execute(db, "SELECT *");
     assert.fail("SELECT *: expected an error");
@@ -106,7 +106,7 @@ test("SELECT * with no tables is 42601 with PostgreSQL's message", () => {
 });
 
 test("bare columns resolve nothing", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     errCode(() => execute(db, "SELECT nope")),
     "42703",
@@ -133,7 +133,7 @@ test("bare columns resolve nothing", () => {
 });
 
 test("an untyped $1 is 42P18; a sibling operand types it", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     errCode(() => executeParams(db, "SELECT $1", [intValue(7n)])),
     "42P18",

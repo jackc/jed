@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute, PrivilegeSet } from "../src/lib.ts";
+import { Engine, EngineError, execute, PrivilegeSet } from "../src/lib.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -20,7 +20,7 @@ function code(fn: () => unknown): string {
 }
 
 test("default session is fully permissive", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(db.allowDdl(), true);
   assert.equal(db.privileges().isPermissive(), true);
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
@@ -30,7 +30,7 @@ test("default session is fully permissive", () => {
 });
 
 test("setDefaultPrivileges makes a read-only session", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   execute(db, "INSERT INTO t VALUES (1, 10)");
   db.setDefaultPrivileges(PrivilegeSet.empty().with("select"));
@@ -50,7 +50,7 @@ test("setDefaultPrivileges makes a read-only session", () => {
 });
 
 test("grant adds and revoke wins", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
 
   db.setDefaultPrivileges(PrivilegeSet.empty());
@@ -67,7 +67,7 @@ test("grant adds and revoke wins", () => {
 });
 
 test("allow_ddl gate is independent of table privileges", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.setAllowDdl(false);
   assert.equal(
@@ -82,7 +82,7 @@ test("allow_ddl gate is independent of table privileges", () => {
 });
 
 test("function EXECUTE is revocable", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(db.privileges().allowsFunction("abs"), true);
   execute(db, "SELECT abs(-5)");
   db.revoke(PrivilegeSet.empty().with("execute"), "abs");
@@ -95,7 +95,7 @@ test("function EXECUTE is revocable", () => {
 });
 
 test("an additional session carries its own envelope", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
 
   const restricted = db.newSession({ defaultPrivileges: PrivilegeSet.empty().with("select") });
@@ -114,7 +114,7 @@ test("an additional session carries its own envelope", () => {
 });
 
 test("a missing object is 42P01, not authorization", () => {
-  const db = new Database();
+  const db = new Engine();
   db.setDefaultPrivileges(PrivilegeSet.empty());
   assert.equal(
     code(() => execute(db, "SELECT * FROM does_not_exist")),

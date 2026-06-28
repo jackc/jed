@@ -693,7 +693,7 @@ func OpenCollation(bytes []byte) (*Collation, error) {
 // model). All collations arrive at runtime: a host hands the engine a JUCD bundle's bytes via
 // LoadUnicodeData (db.LoadUnicodeData), the engine merges its root + per-locale deltas (§5.1) and
 // adds the resulting collations here. This set is PROCESS-GLOBAL — a property of the running engine,
-// not of one Database handle (the spec's "loaded set available to any database on this handle",
+// not of one Engine handle (the spec's "loaded set available to any database on this handle",
 // §4.2). Global is what lets a file REFERENCING a collation be opened after the bundle is loaded:
 // open resolves the referenced table from here (format.go), and open mints the handle, so the data
 // cannot live on the handle. "C" is never here (table-free, built in).
@@ -786,7 +786,7 @@ func VersionSkew(name, fileUnicode, fileCldr string) (loadedUnicode, loadedCldr 
 
 // loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
 // with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
-// Database.LoadedCollations method (executor.go).
+// Engine.LoadedCollations method (executor.go).
 func loadedCollationTables() []*Collation {
 	loadedMu.RLock()
 	defer loadedMu.RUnlock()

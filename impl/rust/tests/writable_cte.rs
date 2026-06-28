@@ -7,17 +7,17 @@
 //! (§7). Mirrored in impl/go/writable_cte_test.go and impl/ts/tests/writable_cte.test.ts.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn run(db: &mut Database, sql: &str) -> Outcome {
+fn run(db: &mut Engine, sql: &str) -> Outcome {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
-fn exec(db: &mut Database, sql: &str) {
+fn exec(db: &mut Engine, sql: &str) {
     run(db, sql);
 }
 
-fn rows(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match run(db, sql) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
@@ -25,7 +25,7 @@ fn rows(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 /// The affected-row count of a statement-shaped outcome (`None` for a query result).
-fn affected(db: &mut Database, sql: &str) -> Option<i64> {
+fn affected(db: &mut Engine, sql: &str) -> Option<i64> {
     match run(db, sql) {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement result for {sql:?}"),
@@ -44,7 +44,7 @@ fn i32s(rows: Vec<Vec<Value>>) -> Vec<i64> {
     v
 }
 
-fn setup(db: &mut Database) {
+fn setup(db: &mut Engine) {
     exec(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     exec(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
 }
@@ -53,7 +53,7 @@ fn setup(db: &mut Database) {
 
 #[test]
 fn with_on_insert_primary_no_returning_reports_affected_count() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     setup(&mut db);
     exec(&mut db, "CREATE TABLE dst (x i32)");
     // A WITH feeding an INSERT primary with no RETURNING is a STATEMENT whose count is the
@@ -68,7 +68,7 @@ fn with_on_insert_primary_no_returning_reports_affected_count() {
 
 #[test]
 fn with_on_delete_primary_no_returning_reports_affected_count() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     setup(&mut db);
     let n = affected(
         &mut db,
@@ -80,7 +80,7 @@ fn with_on_delete_primary_no_returning_reports_affected_count() {
 
 #[test]
 fn with_on_update_primary_no_returning_reports_affected_count() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     setup(&mut db);
     let n = affected(
         &mut db,
@@ -91,7 +91,7 @@ fn with_on_update_primary_no_returning_reports_affected_count() {
 
 #[test]
 fn data_modifying_cte_count_not_surfaced_under_select_primary() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     setup(&mut db);
     // The data-modifying CTE inserts 1 row, but the SELECT primary's result is what is returned —
     // and it reads the PRE-statement table (the pin, §2), so count is 3, not 4.
@@ -111,7 +111,7 @@ fn data_modifying_cte_count_not_surfaced_under_select_primary() {
 
 #[test]
 fn same_row_two_updates_last_write_wins() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     setup(&mut db);
     // Two CTEs update id=1. Each reads the PIN (pre-statement v=10) and returns its own new value,
     // so BOTH return a row; the writes apply in lexical order, last-write-wins, so the table ends
@@ -137,7 +137,7 @@ fn same_row_two_updates_last_write_wins() {
 
 #[test]
 fn same_row_update_then_delete_delete_wins() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     setup(&mut db);
     // CTE a updates id=1 to 100; CTE b deletes id=1. Both read the pin (the pre-statement row), so
     // a returns 100 and b returns the pre-statement old value 10; b's delete applies after a's
@@ -148,7 +148,7 @@ fn same_row_update_then_delete_delete_wins() {
     ));
     assert_eq!(upd, vec![100]);
     // Reset and run the combined conflict.
-    let mut db = Database::new();
+    let mut db = Engine::new();
     setup(&mut db);
     let r = i32s(rows(
         &mut db,

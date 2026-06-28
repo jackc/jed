@@ -5,7 +5,7 @@ package jed
 
 import "testing"
 
-func setupDelete(t *testing.T) *Database {
+func setupDelete(t *testing.T) *Engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
@@ -17,7 +17,7 @@ func setupDelete(t *testing.T) *Database {
 }
 
 func TestDeleteMissingTable(t *testing.T) {
-	wantErr(t, NewDatabase(), "DELETE FROM nope", "42P01")
+	wantErr(t, NewEngine(), "DELETE FROM nope", "42P01")
 }
 
 func TestDeleteUnknownColumn(t *testing.T) {

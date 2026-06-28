@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Database, execute, executeParams, intValue, render } from "../src/lib.ts";
+import { type Engine, execute, executeParams, intValue, render } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function setup() {
@@ -18,14 +18,14 @@ function setup() {
 }
 
 // rows runs sql (which must yield a query result) and renders its rows as strings.
-function rows(db: Database, sql: string): string[][] {
+function rows(db: Engine, sql: string): string[][] {
   const o = execute(db, sql);
   assert.equal(o.kind, "query", `expected a query result for ${sql}`);
   if (o.kind !== "query") throw new Error("unreachable");
   return o.rows.map((r) => r.map(render));
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 

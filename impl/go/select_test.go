@@ -6,7 +6,7 @@ package jed
 
 import "testing"
 
-func query(t *testing.T, db *Database, sql string) [][]Value {
+func query(t *testing.T, db *Engine, sql string) [][]Value {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {
@@ -18,7 +18,7 @@ func query(t *testing.T, db *Database, sql string) [][]Value {
 	return out.Rows
 }
 
-func queryIDs(t *testing.T, db *Database, sql string) []int64 {
+func queryIDs(t *testing.T, db *Engine, sql string) []int64 {
 	t.Helper()
 	rows := query(t, db, sql)
 	out := make([]int64, len(rows))
@@ -28,7 +28,7 @@ func queryIDs(t *testing.T, db *Database, sql string) []int64 {
 	return out
 }
 
-func setupT(t *testing.T) *Database {
+func setupT(t *testing.T) *Engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
@@ -44,7 +44,7 @@ func TestUnknownColumnTraps(t *testing.T) {
 	wantErr(t, db, "SELECT id FROM t WHERE nope = 1", "42703")
 }
 
-func limitDB(t *testing.T) *Database {
+func limitDB(t *testing.T) *Engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",

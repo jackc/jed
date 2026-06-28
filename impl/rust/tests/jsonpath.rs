@@ -4,9 +4,9 @@
 //! The agreeing behavior (the canonical render, malformed → 42601) is oracle-clean in
 //! suites/json/jsonpath_literal.test.
 
-use jed::{Database, execute};
+use jed::{Engine, execute};
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
@@ -21,7 +21,7 @@ fn err(db: &mut Database, sql: &str) -> String {
 /// and jsonpath_query.test.
 #[test]
 fn jsonpath_p1b_constructs_are_0a000() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     for path in [
         "$.a.size()",            // item method
         "$.a + 2",               // arithmetic
@@ -42,7 +42,7 @@ fn jsonpath_p1b_constructs_are_0a000() {
 /// opclass). A documented contract (jsonpath.md §1); only `IS [NOT] NULL` applies.
 #[test]
 fn jsonpath_is_not_comparable() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         err(&mut db, "SELECT '$.a'::jsonpath = '$.a'::jsonpath"),
         "42883"
@@ -57,7 +57,7 @@ fn jsonpath_is_not_comparable() {
 /// column). PostgreSQL allows a jsonpath column, so this is a documented divergence.
 #[test]
 fn jsonpath_column_is_unsupported() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(err(&mut db, "CREATE TABLE t (p jsonpath)"), "0A000");
 }
 
@@ -68,7 +68,7 @@ fn jsonpath_column_is_unsupported() {
 /// filter + query + match behavior is oracle-clean in suites/json/jsonpath_query.test.
 #[test]
 fn jsonpath_deferred_constructs_are_0a000() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // An item method.
     assert_eq!(
         err(
@@ -100,7 +100,7 @@ fn jsonpath_deferred_constructs_are_0a000() {
 /// distinction against the 0A000 ones above.)
 #[test]
 fn malformed_jsonpath_is_42601() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(err(&mut db, "SELECT '$.'::jsonpath"), "42601");
     assert_eq!(err(&mut db, "SELECT '$['::jsonpath"), "42601");
     assert_eq!(err(&mut db, "SELECT '$[1 to'::jsonpath"), "42601");

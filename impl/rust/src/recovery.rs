@@ -9,7 +9,7 @@
 //! and TS (`crash_recovery_test.go`, `crash_recovery.test.ts`).
 
 use crate::pager::{Fault, FaultPoint};
-use crate::{Database, DatabaseOptions, Outcome, Result, Value, execute};
+use crate::{DatabaseOptions, Engine, Outcome, Result, Value, execute};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -18,9 +18,9 @@ fn tmp(name: &str) -> std::path::PathBuf {
 /// A fresh file-backed `t(id i32 PRIMARY KEY)` seeded with rows `1..=2`, returned with the prior
 /// committed `txid`. Each autocommit `INSERT` persists durably, so the file holds a real two-row
 /// commit before any fault is armed.
-fn seeded(path: &std::path::Path) -> (Database, u64) {
+fn seeded(path: &std::path::Path) -> (Engine, u64) {
     let _ = std::fs::remove_file(path);
-    let mut db = Database::create(path, DatabaseOptions::default()).unwrap();
+    let mut db = Engine::create(path, DatabaseOptions::default()).unwrap();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (2)").unwrap();
@@ -29,7 +29,7 @@ fn seeded(path: &std::path::Path) -> (Database, u64) {
 }
 
 /// The `t.id`s of a database, in primary-key order.
-fn ids(db: &Database) -> Vec<i64> {
+fn ids(db: &Engine) -> Vec<i64> {
     db.rows_in_key_order("t")
         .unwrap()
         .iter()
@@ -41,7 +41,7 @@ fn ids(db: &Database) -> Vec<i64> {
 }
 
 /// Arm `fault`, then run an autocommit `INSERT (3)` that drives `persist` into it — which must fail.
-fn insert_with_fault(db: &mut Database, fault: Fault) -> Result<Outcome> {
+fn insert_with_fault(db: &mut Engine, fault: Fault) -> Result<Outcome> {
     db.arm_commit_fault(fault);
     execute(db, "INSERT INTO t VALUES (3)")
 }
@@ -56,7 +56,7 @@ fn crash_mid_body_recovers_prior() {
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::BodyWrite(1), None)).is_err());
     db.close().unwrap();
 
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     assert_eq!(db.txid(), prior, "fell back to the prior snapshot");
     assert_eq!(ids(&db), vec![1, 2], "the prior snapshot is intact");
     db.close().unwrap();
@@ -72,7 +72,7 @@ fn torn_body_page_recovers_prior() {
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::BodyWrite(1), Some(64))).is_err());
     db.close().unwrap();
 
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     assert_eq!(db.txid(), prior, "the torn body page is never referenced");
     assert_eq!(ids(&db), vec![1, 2]);
     db.close().unwrap();
@@ -87,7 +87,7 @@ fn crash_before_body_sync_recovers_prior() {
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::Sync(1), None)).is_err());
     db.close().unwrap();
 
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     assert_eq!(db.txid(), prior);
     assert_eq!(ids(&db), vec![1, 2]);
     db.close().unwrap();
@@ -104,7 +104,7 @@ fn crash_between_syncs_recovers_prior() {
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::MetaWrite, None)).is_err());
     db.close().unwrap();
 
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     assert_eq!(
         db.txid(),
         prior,
@@ -126,7 +126,7 @@ fn torn_meta_write_falls_back_to_prior() {
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::MetaWrite, Some(20))).is_err());
     db.close().unwrap();
 
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     assert_eq!(
         db.txid(),
         prior,
@@ -147,7 +147,7 @@ fn crash_before_meta_sync_is_atomic() {
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::Sync(2), None)).is_err());
     db.close().unwrap();
 
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     let got = ids(&db);
     if db.txid() == prior {
         assert_eq!(got, vec![1, 2], "prior snapshot (meta lost)");
@@ -169,7 +169,7 @@ fn recovery_then_free_list_reuse_stays_consistent() {
     // Crash between the syncs → reopen at the prior two-row snapshot.
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::MetaWrite, None)).is_err());
     db.close().unwrap();
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert_eq!(db.txid(), prior);
     assert_eq!(ids(&db), vec![1, 2]);
 
@@ -182,7 +182,7 @@ fn recovery_then_free_list_reuse_stays_consistent() {
     let page_count_after = db.page_count;
     db.close().unwrap();
 
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert_eq!(
         ids(&db),
         vec![2, 3, 4, 5],
@@ -193,7 +193,7 @@ fn recovery_then_free_list_reuse_stays_consistent() {
     execute(&mut db, "DELETE FROM t WHERE id = 2").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (6)").unwrap();
     db.close().unwrap();
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     assert_eq!(ids(&db), vec![3, 4, 5, 6]);
     assert!(
         db.page_count <= page_count_after + 4,

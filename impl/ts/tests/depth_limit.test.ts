@@ -8,18 +8,18 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute, parseSQL } from "../src/lib.ts";
+import { Engine, EngineError, execute, parseSQL } from "../src/lib.ts";
 import { MAX_EXPR_DEPTH } from "../src/parser.ts";
 
-function depthDB(): Database {
-  const db = new Database();
+function depthDB(): Engine {
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   execute(db, "INSERT INTO t VALUES (1, 1)");
   return db;
 }
 
 // codeOf returns the SQLSTATE of running sql, or "ok" if it succeeded.
-function codeOf(db: Database, sql: string): string {
+function codeOf(db: Engine, sql: string): string {
   try {
     execute(db, sql);
     return "ok";

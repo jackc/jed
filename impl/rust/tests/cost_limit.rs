@@ -6,11 +6,11 @@
 //! primary-key lookup survives a ceiling a full scan would blow, and that the abort threads through
 //! SELECT / DELETE / UPDATE and a pathological expression.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
 /// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id).
-fn table(n: i64) -> Database {
-    let mut db = Database::new();
+fn table(n: i64) -> Engine {
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
@@ -23,7 +23,7 @@ fn table(n: i64) -> Database {
     db
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
@@ -31,7 +31,7 @@ fn cost(db: &mut Database, sql: &str) -> i64 {
 }
 
 /// Assert running `sql` aborts with `54P01` (cost limit exceeded).
-fn assert_aborts(db: &mut Database, sql: &str) {
+fn assert_aborts(db: &mut Engine, sql: &str) {
     match execute(db, sql) {
         Err(e) => assert_eq!(
             e.code(),

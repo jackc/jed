@@ -64,11 +64,11 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 	if err != nil {
 		tb.Fatal(err)
 	}
-	rdb, err := LoadDatabasePaged(p, cacheLeaves(DefaultCacheBytes, p.pageSize))
+	rdb, err := LoadEnginePaged(p, cacheLeaves(DefaultCacheBytes, p.pageSize))
 	if err != nil {
 		tb.Fatal(err)
 	}
-	// LoadDatabasePaged alone leaves db.path empty; the real Open path sets it, and commitTx gates the
+	// LoadEnginePaged alone leaves db.path empty; the real Open path sets it, and commitTx gates the
 	// txid increment + meta-slot alternation on db.path != "" (executor.go). Set it so this commit
 	// behaves EXACTLY like a reopen-then-write: txid advances and the new meta lands in the OTHER slot,
 	// preserving the prior snapshot — the property under test. (Writes still go through the recording

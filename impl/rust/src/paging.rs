@@ -78,7 +78,7 @@ impl SharedPaging {
     }
 
     /// The number of leaf pages currently resident in the pool — the gauge the public
-    /// [`crate::Database::resident_leaves`] reports and the `cache_pages` budget bounds (P6.4c,
+    /// [`crate::Engine::resident_leaves`] reports and the `cache_pages` budget bounds (P6.4c,
     /// spec/design/pager.md §3).
     pub(crate) fn resident_leaves(&self) -> usize {
         self.pool

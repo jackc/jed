@@ -740,8 +740,8 @@ func appendI64(b []byte, v int64) []byte {
 // ToImage serializes the whole committed state to one on-disk image (format.md). A thin wrapper
 // over Snapshot.ToImage for the committed snapshot — txid is written into both meta slots. (The
 // writer's working snapshot is serialized directly via Snapshot.ToImage at commit; this serves
-// callers/tests holding a *Database.)
-func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+// callers/tests holding a *Engine.)
+func (db *Engine) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	return db.committed.ToImage(pageSize, txid)
 }
 
@@ -1223,9 +1223,9 @@ func serializeDirty(n *pnode, colTypes []ColType, capacity, ps int, alloc *pageA
 	return index, nil
 }
 
-// LoadDatabase reconstructs a database from an on-disk image (inverse of ToImage).
+// LoadEngine reconstructs a database from an on-disk image (inverse of ToImage).
 // Returns a structured data_corrupted (XX001) error for malformed input.
-func LoadDatabase(image []byte) (*Database, error) {
+func LoadEngine(image []byte) (*Engine, error) {
 	if len(image) < 12 {
 		return nil, NewError(DataCorrupted, "image smaller than a meta header")
 	}
@@ -1372,7 +1372,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 	if err := snap.rebuildGistTrees(); err != nil {
 		return nil, err
 	}
-	db := NewDatabase()
+	db := NewEngine()
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount // the on-disk high-water for the next incremental commit
 	// The free-list: every body page [2, pageCount) the committed root does not reach (P6.2).
@@ -1386,7 +1386,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 	return db, nil
 }
 
-// LoadDatabasePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
+// LoadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
 // only the interior B-tree skeleton resident, leaving each leaf an OnDisk page faulted through the
 // bounded buffer pool on access — so the resident set is bounded by the pool, not the file size. The
 // inverse of an incremental commit, reading pages through pgr instead of a whole image.
@@ -1395,7 +1395,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 // free-list), then discards it — memory stays bounded (only the skeleton is retained), but open is
 // O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a deferred follow-on,
 // pager.md §6); the residency win — a bounded resident set — already holds.
-func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
+func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
 	pageSize := int(pgr.pageSize)
 	if !pageSizeValid(pageSize) {
 		return nil, NewError(DataCorrupted, "invalid page size")
@@ -1571,7 +1571,7 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 	if err := snap.rebuildGistTrees(); err != nil {
 		return nil, err
 	}
-	db := NewDatabase()
+	db := NewEngine()
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount
 	for p := rootPage; p < mt.pageCount; p++ {
@@ -1779,7 +1779,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached 
 				return nil, 0, err
 			}
 			// The in-memory load is fully resident (no pager to fault from); the demand-paged file
-			// load (LoadDatabasePaged) is a separate path that leaves leaf children OnDisk.
+			// load (LoadEnginePaged) is a separate path that leaves leaf children OnDisk.
 			children = append(children, residentRef(child))
 			total += clen
 		}

@@ -6,9 +6,9 @@
 //! jed types a bare integer literal / `ARRAY[…]` constructor as `i64`, so the bare cases use
 //! `i64`; column adaptation (`i32` column vs a bare `ARRAY[…]`) is exercised via a table.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
@@ -17,7 +17,7 @@ fn err(db: &mut Database, sql: &str) -> String {
 }
 
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL").
-fn val(db: &mut Database, sql: &str) -> String {
+fn val(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
@@ -30,7 +30,7 @@ fn val(db: &mut Database, sql: &str) -> String {
 
 #[test]
 fn any_equality_is_in() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // x = ANY(arr) is x IN (the elements).
     assert_eq!(val(&mut db, "SELECT 1 = ANY(ARRAY[1,2,3])"), "true");
     assert_eq!(val(&mut db, "SELECT 5 = ANY(ARRAY[1,2,3])"), "false");
@@ -45,7 +45,7 @@ fn any_equality_is_in() {
 
 #[test]
 fn all_universal() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(val(&mut db, "SELECT 3 = ALL(ARRAY[3,3,3])"), "true");
     assert_eq!(val(&mut db, "SELECT 3 = ALL(ARRAY[3,3,4])"), "false");
     // A FALSE element dominates a NULL element → FALSE; otherwise a NULL → NULL.
@@ -59,7 +59,7 @@ fn all_universal() {
 
 #[test]
 fn ordering_operators() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(val(&mut db, "SELECT 5 < ANY(ARRAY[1,2,10])"), "true");
     assert_eq!(val(&mut db, "SELECT 5 > ALL(ARRAY[1,2,3])"), "true");
     assert_eq!(val(&mut db, "SELECT 5 <= ALL(ARRAY[5,6,7])"), "true");
@@ -69,7 +69,7 @@ fn ordering_operators() {
 
 #[test]
 fn flattens_multidim_and_custom_lbounds() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // The comparison is over the FLATTENED element multiset (any dimensionality).
     assert_eq!(
         val(&mut db, "SELECT 3 = ANY(ARRAY[ARRAY[1,2],ARRAY[3,4]])"),
@@ -88,14 +88,14 @@ fn flattens_multidim_and_custom_lbounds() {
 
 #[test]
 fn text_elements() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(val(&mut db, "SELECT 'b' = ANY(ARRAY['a','b','c'])"), "true");
     assert_eq!(val(&mut db, "SELECT 'z' = ALL(ARRAY['z','z'])"), "true");
 }
 
 #[test]
 fn column_literal_adaptation() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])").unwrap();
     execute(
         &mut db,
@@ -120,7 +120,7 @@ fn column_literal_adaptation() {
 
 #[test]
 fn errors() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // A non-array right side is 42809 (op ANY/ALL (array) requires array on right side).
     assert_eq!(err(&mut db, "SELECT 1 = ANY(5)"), "42809");
     // An incomparable element type is 42883 (operator does not exist).

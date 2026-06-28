@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func compositeErrCode(t *testing.T, db *Database, sql string) string {
+func compositeErrCode(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	_, err := Execute(db, sql)
 	if err == nil {
@@ -94,7 +94,7 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 // 42701, more than one primary key across both forms 42P16 — plus the jed narrowings
 // (0A000): out-of-declaration-order list, non-keyable member type.
 func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	if _, err := Execute(db, "CREATE TYPE addr AS (street text, zip i32)"); err != nil {
 		t.Fatal(err)
 	}
@@ -214,9 +214,9 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
-	loaded, err := LoadDatabase(image)
+	loaded, err := LoadEngine(image)
 	if err != nil {
-		t.Fatalf("LoadDatabase: %v", err)
+		t.Fatalf("LoadEngine: %v", err)
 	}
 
 	tab, _ := loaded.Table("t")

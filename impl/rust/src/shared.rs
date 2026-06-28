@@ -1,7 +1,7 @@
 //! Thread-safe shared database handle (CLAUDE.md §3, spec/design/transactions.md §8/§10).
 //!
-//! The single-handle [`Database`] is fast and simple but `!Sync`: its reads borrow `&self`
-//! while a write needs `&mut self`, so one `Database` cannot serve a reader thread and a writer
+//! The single-handle [`Engine`] is fast and simple but `!Sync`: its reads borrow `&self`
+//! while a write needs `&mut self`, so one `Engine` cannot serve a reader thread and a writer
 //! thread at once. Real parallelism — many readers running *concurrently with* an in-flight
 //! writer, never blocking it or each other — needs the committed state behind a thread-safe cell
 //! that is decoupled from any single thread's handle. That is exactly the §3 model: one committed
@@ -9,7 +9,7 @@
 //! readers that pin the committed snapshot and run lock-free against it.
 //!
 //! Shape (the faithful §8 design):
-//! - [`SharedDb`] is a cheap clonable handle (`Arc<Shared>`); clones share one [`Shared`] core.
+//! - [`Database`] is a cheap clonable handle (`Arc<Shared>`); clones share one [`Shared`] core.
 //!   It is `Send + Sync`, so every thread holds its own clone.
 //! - [`Shared`] holds the published committed roots — the file `Snapshot` **and** the database-wide
 //!   shared-temp `Snapshot` (temp-tables.md §5) — as two `Arc<Snapshot>`s behind ONE `RwLock` (so a
@@ -23,7 +23,7 @@
 //!   the pinned one, so the reader is stable for its life and a write through it is rejected
 //!   (`25006`). `Drop` deregisters, advancing the watermark.
 //! - [`WriteHandle`] acquires the writer gate (blocking until free), captures the committed
-//!   snapshot as its working set (an open READ WRITE block over a private [`Database`]), and on
+//!   snapshot as its working set (an open READ WRITE block over a private [`Engine`]), and on
 //!   `commit` publishes the working snapshot into the cell with the next version (the §3 commit
 //!   window: a single pointer swap). `Drop` without `commit` rolls back.
 //!
@@ -38,7 +38,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::api::Rows;
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{Database, Outcome, Snapshot, stmt_is_write};
+use crate::executor::{Engine, Outcome, Snapshot, stmt_is_write};
 use crate::value::Value;
 
 /// The live-reader registry: a multiset of pinned snapshot versions (transactions.md §8). Each
@@ -85,7 +85,7 @@ struct Roots {
     shared_temp: Arc<Snapshot>,
 }
 
-/// The thread-safe core shared by every [`SharedDb`] clone (CLAUDE.md §3). Holds the published
+/// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
 /// committed roots, the single-writer gate, and the live-reader registry.
 struct Shared {
     /// The published committed roots (file + shared-temp). A reader pins both by cloning the two
@@ -150,18 +150,18 @@ impl Shared {
 /// A thread-safe, cheaply-clonable database handle (CLAUDE.md §3). Every thread holds its own
 /// clone of the same `Shared` core; `read()` and `write()` mint independent per-thread handles.
 #[derive(Clone)]
-pub struct SharedDb(Arc<Shared>);
+pub struct Database(Arc<Shared>);
 
-impl Default for SharedDb {
+impl Default for Database {
     fn default() -> Self {
         Self::new_in_memory()
     }
 }
 
-impl SharedDb {
+impl Database {
     /// A fresh, empty in-memory shared database (committed version 0).
-    pub fn new_in_memory() -> SharedDb {
-        SharedDb(Arc::new(Shared {
+    pub fn new_in_memory() -> Database {
+        Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(Snapshot::default()),
                 shared_temp: Arc::new(Snapshot::default()),
@@ -199,7 +199,7 @@ impl SharedDb {
             .lock()
             .expect("live lock not poisoned")
             .register(version);
-        let mut db = Database::from_snapshot((*snap).clone());
+        let mut db = Engine::from_snapshot((*snap).clone());
         // Seed the handle with the pinned shared-temp snapshot (temp-tables.md §5): the reader sees the
         // shared temp tables committed as of its pinned version, consistent with its file snapshot.
         db.shared_temp_committed = (*shared_temp).clone();
@@ -218,7 +218,7 @@ impl SharedDb {
         self.0.acquire_writer();
         let (base, shared_temp) = self.0.pin();
         let base_version = base.txid;
-        let mut db = Database::from_snapshot((*base).clone());
+        let mut db = Engine::from_snapshot((*base).clone());
         // Seed the handle with the pinned shared-temp snapshot before opening the block, so its
         // `shared_temp_working` (cloned at begin_tx) is the latest committed shared temp (temp-tables.md §5).
         db.shared_temp_committed = (*shared_temp).clone();
@@ -242,7 +242,7 @@ pub struct ReadHandle {
     /// A private in-memory handle whose committed state is the pinned snapshot (no open
     /// transaction — reads hit `committed`). Owning the snapshot keeps its structurally-shared
     /// pages alive even after the writer publishes a newer version.
-    db: Database,
+    db: Engine,
 }
 
 impl ReadHandle {
@@ -293,7 +293,7 @@ impl Drop for ReadHandle {
 pub struct WriteHandle {
     shared: Arc<Shared>,
     /// A private handle with an open READ WRITE block; its working set is the staging buffer (§3).
-    db: Database,
+    db: Engine,
     /// The committed version captured at `write()`; the published version is `base_version + 1`.
     base_version: u64,
     done: bool,

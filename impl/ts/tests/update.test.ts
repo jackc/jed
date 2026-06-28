@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function setup() {
@@ -19,7 +19,7 @@ function setup() {
 }
 
 // The (id, a, b) rows of t in storage-key order as "id/a/b" strings, for end-state asserts.
-function idsABC(db: Database): string[] {
+function idsABC(db: Engine): string[] {
   return db.rowsInKeyOrder("t").map((r) =>
     r
       .map((c) => {
@@ -36,7 +36,7 @@ test("unknown column traps 42703; missing table traps 42P01", () => {
     "42703",
   );
   assert.equal(
-    errCode(() => execute(new Database(), "UPDATE nope SET a = 1")),
+    errCode(() => execute(new Engine(), "UPDATE nope SET a = 1")),
     "42P01",
   );
 });

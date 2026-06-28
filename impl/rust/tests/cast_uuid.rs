@@ -6,16 +6,16 @@
 //! checks here run alongside (CLAUDE.md §10 — the per-core test covers only what the corpus cannot).
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn err_code(db: &mut Database, sql: &str) -> String {
+fn err_code(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
 }
 
-fn one(db: &mut Database, sql: &str) -> Value {
+fn one(db: &mut Engine, sql: &str) -> Value {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => rows[0][0].clone(),
         other => panic!("expected query, got {other:?}"),
@@ -30,7 +30,7 @@ const UUID16: [u8; 16] = [
 /// uuid → bytea is the 16 raw bytes (PG: 42846 — jed adds this cast).
 #[test]
 fn uuid_to_bytea_is_the_16_bytes() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         one(
             &mut db,
@@ -44,7 +44,7 @@ fn uuid_to_bytea_is_the_16_bytes() {
 /// hyphen-less hex; the result renders as the canonical lowercase uuid.
 #[test]
 fn bytea_to_uuid_is_the_16_bytes() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         one(
             &mut db,
@@ -58,7 +58,7 @@ fn bytea_to_uuid_is_the_16_bytes() {
 /// there is no PG code to match, so jed reuses invalid_text_representation).
 #[test]
 fn bytea_to_uuid_wrong_length_traps_22p02() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(err_code(&mut db, "SELECT '\\xabcd'::bytea::uuid"), "22P02"); // 2 bytes
     assert_eq!(err_code(&mut db, "SELECT '\\x'::bytea::uuid"), "22P02"); // empty (0 bytes)
     // 17 bytes (one too many)
@@ -75,7 +75,7 @@ fn bytea_to_uuid_wrong_length_traps_22p02() {
 /// equals the bytea column, and the bytea column → uuid equals the uuid column. NULL adapts.
 #[test]
 fn uuid_bytea_round_trip_through_columns() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)",
@@ -110,7 +110,7 @@ fn uuid_bytea_round_trip_through_columns() {
 /// runtime text→uuid parses PG-flexibly (22P02 on malformed), uuid→text renders canonical lowercase.
 #[test]
 fn text_uuid_smoke() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)",

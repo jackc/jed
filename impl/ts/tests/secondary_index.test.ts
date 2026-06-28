@@ -12,24 +12,24 @@ import { test } from "node:test";
 import {
   close,
   create,
-  Database,
+  Engine,
   EngineError,
   execute,
-  loadDatabase,
+  loadEngine,
   open,
   toImage,
 } from "../src/lib.ts";
 import { pkIndices } from "../src/catalog.ts";
 
-function run(db: Database, sql: string) {
+function run(db: Engine, sql: string) {
   return execute(db, sql);
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return run(db, sql).cost;
 }
 
-function ids(db: Database, sql: string): bigint[] {
+function ids(db: Engine, sql: string): bigint[] {
   const o = run(db, sql);
   assert.equal(o.kind, "query", sql);
   return (o.kind === "query" ? o.rows : []).map((r) => {
@@ -50,8 +50,8 @@ function errCode(fn: () => unknown): string {
 
 // The 20-row fixture the planner/cost tests run against: v = i % 5 gives 4 rows per
 // value, so an equality admits 4 of 20.
-function db20(): Database {
-  const db = new Database();
+function db20(): Engine {
+  const db = new Engine();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
@@ -63,7 +63,7 @@ test("auto-naming matches PostgreSQL", () => {
   // Lowercased <table>_<cols>_idx + the smallest free suffix (oracle-probed, indexes.md
   // §2); duplicates in the column list are allowed and named through; an explicit name
   // round-trips as written. The catalog holds indexes in ascending lowercased-name order.
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx1
@@ -85,7 +85,7 @@ test("DDL errors match PostgreSQL", () => {
   // Validation order is table → columns (list order) → name collision (oracle-probed,
   // indexes.md §2); the relation namespace is shared with tables; DROP mismatches are
   // 42704/42809.
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
   assert.equal(
     errCode(() => run(db, "CREATE INDEX i ON nosuch (nope)")),
@@ -177,7 +177,7 @@ test("round-trips through the on-disk image", () => {
   run(db, "CREATE INDEX t_v_idx ON t (v)");
   run(db, "INSERT INTO t VALUES (100, NULL, 0)");
   const img = toImage(db, 8192, 1n);
-  const loaded = loadDatabase(img);
+  const loaded = loadEngine(img);
   assert.deepEqual(toImage(loaded, 8192, 1n), img, "byte-stable reload");
   const t = loaded.table("t")!;
   assert.equal(t.indexes.length, 1);

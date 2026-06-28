@@ -14,7 +14,7 @@ import (
 )
 
 // rowTable builds a table of n rows (id i32 PRIMARY KEY, v i32; v == id).
-func rowTable(t *testing.T, n int) *Database {
+func rowTable(t *testing.T, n int) *Engine {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("INSERT INTO t VALUES ")
@@ -27,7 +27,7 @@ func rowTable(t *testing.T, n int) *Database {
 	return dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", b.String())
 }
 
-func mustCost(t *testing.T, db *Database, sql string) int64 {
+func mustCost(t *testing.T, db *Engine, sql string) int64 {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {
@@ -36,7 +36,7 @@ func mustCost(t *testing.T, db *Database, sql string) int64 {
 	return out.Cost
 }
 
-func assertAborts(t *testing.T, db *Database, sql string) {
+func assertAborts(t *testing.T, db *Engine, sql string) {
 	t.Helper()
 	_, err := Execute(db, sql)
 	if err == nil {

@@ -5,10 +5,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Database, execute } from "../src/lib.ts";
+import { type Engine, execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-function setup(): Database {
+function setup(): Engine {
   return dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)",
     "INSERT INTO t VALUES (1, 10, '--x /*y*/')",
@@ -16,7 +16,7 @@ function setup(): Database {
 }
 
 // one runs a query expected to produce exactly one value; returns it rendered.
-function one(db: Database, sql: string): string {
+function one(db: Engine, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);

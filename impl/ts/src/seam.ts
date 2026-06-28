@@ -23,7 +23,7 @@ export type RandomFill = (buf: Uint8Array) => void;
 // A host clock source: returns micros since the Unix epoch (a host may inject an advancing clock).
 export type ClockFunc = () => bigint;
 
-// Seam is the host seam carried on the Database handle (spec/design/api.md §10): the injected random
+// Seam is the host seam carried on the Engine handle (spec/design/api.md §10): the injected random
 // + clock functions, each undefined ⇒ the platform default. Only the volatile uuid generators touch
 // it; every other expression ignores it.
 export class Seam {

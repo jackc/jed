@@ -117,7 +117,7 @@ func (m *PMap) Len() int { return m.length }
 // root exposes the root node to the serializer (format.go). nil for an empty map.
 func (m *PMap) rootNode() *pnode { return m.root }
 
-// fromLoaded reconstructs a map from a loaded root (format.go LoadDatabase).
+// fromLoaded reconstructs a map from a loaded root (format.go LoadEngine).
 func fromLoaded(root *pnode, length int) PMap { return PMap{root: root, length: length} }
 
 // Get looks up the row at key. src faults an OnDisk leaf on the descent (nil for a fully-resident

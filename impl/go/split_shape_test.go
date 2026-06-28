@@ -19,7 +19,7 @@ import (
 // splitShapeDB is a 121-row table at the fixture page size (256): id bigint pk, v
 // integer = id % 7. Ascending inserts pks 0..120 in order; shuffled inserts the
 // permutation (i*37) mod 121 — deterministic, identical in every core.
-func splitShapeDB(t *testing.T, shuffled bool) *Database {
+func splitShapeDB(t *testing.T, shuffled bool) *Engine {
 	t.Helper()
 	db, err := Create(filepath.Join(t.TempDir(), "t.jed"), DatabaseOptions{PageSize: 256})
 	if err != nil {
@@ -37,7 +37,7 @@ func splitShapeDB(t *testing.T, shuffled bool) *Database {
 }
 
 func TestSplitShapeCostsArePinned(t *testing.T) {
-	pin := func(db *Database, sql string, want int64) {
+	pin := func(db *Engine, sql string, want int64) {
 		t.Helper()
 		if got := siCost(t, db, sql); got != want {
 			t.Fatalf("%q cost = %d, want %d", sql, got, want)

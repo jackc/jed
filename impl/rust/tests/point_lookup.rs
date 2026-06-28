@@ -5,11 +5,11 @@
 //! node_count) is an in-crate unit test in `pmap.rs`.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
 /// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id), wide enough to span several leaves.
-fn big_table(n: i64) -> Database {
-    let mut db = Database::new();
+fn big_table(n: i64) -> Engine {
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
@@ -22,14 +22,14 @@ fn big_table(n: i64) -> Database {
     db
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
-fn ids(db: &mut Database, sql: &str) -> Vec<i64> {
+fn ids(db: &mut Engine, sql: &str) -> Vec<i64> {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()
@@ -105,7 +105,7 @@ fn limit_short_circuit_is_sublinear() {
 
     // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
     // reached under a LIMIT that excludes it (matches the eager window-before-project).
-    let mut dz = Database::new();
+    let mut dz = Engine::new();
     execute(&mut dz, "CREATE TABLE z (id i32 PRIMARY KEY, c i32)").unwrap();
     execute(&mut dz, "INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)").unwrap();
     assert_eq!(ids(&mut dz, "SELECT 100 / c FROM z LIMIT 1"), vec![20]);

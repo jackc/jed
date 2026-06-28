@@ -320,10 +320,10 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::{Database, execute};
+    use jed::{Engine, execute};
 
     fn app() -> App {
-        let mut db = Database::new();
+        let mut db = Engine::new();
         execute(
             &mut db,
             "CREATE TABLE Users (id i32 PRIMARY KEY, score i32)",

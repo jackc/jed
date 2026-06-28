@@ -7,13 +7,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import type { Value } from "../src/value.ts";
 
 // `a` is n rows (id i32 PRIMARY KEY, k i32; k == id) wide enough to span several leaves; `b` is
 // three small rows whose k-values exist as a's k-values, so the join matches.
-function joinTables(n: number): Database {
-  const db = new Database();
+function joinTables(n: number): Engine {
+  const db = new Engine();
   execute(db, "CREATE TABLE a (id i32 PRIMARY KEY, k i32)");
   execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)");
   const parts: string[] = [];
@@ -23,7 +23,7 @@ function joinTables(n: number): Database {
   return db;
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
@@ -32,7 +32,7 @@ function intOf(v: Value): number {
   return Number(v.int);
 }
 
-function ids(db: Database, sql: string): number[] {
+function ids(db: Engine, sql: string): number[] {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.map((r) => intOf(r[0]!));

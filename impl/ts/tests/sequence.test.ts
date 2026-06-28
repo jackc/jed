@@ -10,10 +10,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, commit, create, Database, EngineError, execute, open } from "../src/lib.ts";
+import { close, commit, create, Engine, EngineError, execute, open } from "../src/lib.ts";
 
 // oneInt runs a single-column SELECT and returns its one int value, or null for a NULL value.
-function oneInt(db: Database, sql: string): bigint | null {
+function oneInt(db: Engine, sql: string): bigint | null {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query, got ${o.kind}`);
   const v = o.rows[0]![0]!;
@@ -23,7 +23,7 @@ function oneInt(db: Database, sql: string): bigint | null {
 }
 
 // errCode runs sql and returns the SQLSTATE of the EngineError it throws.
-function errCode(db: Database, sql: string): string {
+function errCode(db: Engine, sql: string): string {
   try {
     execute(db, sql);
   } catch (e) {
@@ -36,7 +36,7 @@ function errCode(db: Database, sql: string): string {
 // THE headline divergence (§5): a nextval advance inside a transaction is discarded by ROLLBACK
 // (PostgreSQL keeps it — its sequences are non-transactional). jed is deterministic instead.
 test("nextval rolls back with its transaction", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s");
   assert.equal(oneInt(db, "SELECT nextval('s')"), 1n); // committed: last_value 1
 
@@ -58,7 +58,7 @@ test("nextval rolls back with its transaction", () => {
 
 // A failed autocommit statement does not advance the sequence either (the per-statement rollback).
 test("failed statement does not advance", () => {
-  const db = new Database();
+  const db = new Engine();
   // A two-value [1, 2] sequence (MINVALUE == MAXVALUE is rejected, matching PG — §15.2).
   execute(db, "CREATE SEQUENCE s MAXVALUE 2");
   assert.equal(oneInt(db, "SELECT nextval('s')"), 1n);
@@ -72,7 +72,7 @@ test("failed statement does not advance", () => {
 // nextval is a write, so a READ ONLY transaction rejects it with 25006; currval (a pure read) is
 // allowed there (spec/design/sequences.md §4/§6).
 test("nextval in read-only transaction is 25006", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s");
   oneInt(db, "SELECT nextval('s')"); // 1, defines the session value
 
@@ -89,7 +89,7 @@ test("nextval in read-only transaction is 25006", () => {
 
 // currval is session-local and 55000 before the first nextval.
 test("currval session state and 55000", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s");
   assert.equal(errCode(db, "SELECT currval('s')"), "55000");
   oneInt(db, "SELECT nextval('s')");
@@ -103,7 +103,7 @@ test("currval session state and 55000", () => {
 // A setval is transactional too (the §5 divergence): an advance inside a rolled-back transaction is
 // discarded — PostgreSQL would keep it.
 test("setval rolls back with its transaction", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s START 1");
   assert.equal(oneInt(db, "SELECT nextval('s')"), 1n); // committed last_value 1
 
@@ -117,7 +117,7 @@ test("setval rolls back with its transaction", () => {
 
 // An ALTER SEQUENCE … RESTART is transactional as well (the same §5 divergence).
 test("ALTER SEQUENCE RESTART rolls back", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s START 10");
   assert.equal(oneInt(db, "SELECT nextval('s')"), 10n);
 
@@ -135,7 +135,7 @@ test("ALTER SEQUENCE RESTART rolls back", () => {
 // — tracking the most recent nextval, reflecting a setval on that same sequence — live in the oracle
 // corpus; this asserts only the rollback, which the corpus cannot.)
 test("lastval rolls back with its transaction", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE a START 100");
   execute(db, "CREATE SEQUENCE b START 200");
   oneInt(db, "SELECT nextval('a')"); // committed: lastval → a's 100
@@ -155,7 +155,7 @@ test("lastval rolls back with its transaction", () => {
 // value type is not persisted (§14.4); OWNED BY / OWNER TO / SET … have no jed concept. (The option
 // set INCREMENT/MINVALUE/… and RENAME TO are now supported — see ddl/alter_sequence.test.)
 test("unsupported ALTER SEQUENCE actions are 0A000", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s");
   assert.equal(errCode(db, "ALTER SEQUENCE s AS bigint"), "0A000");
   assert.equal(errCode(db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
@@ -169,7 +169,7 @@ test("unsupported ALTER SEQUENCE actions are 0A000", () => {
 // (the §5 divergence applies to every ALTER action, not just RESTART). A jed-vs-PG divergence, so a
 // per-core unit test, not corpus.
 test("ALTER SEQUENCE options roll back", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s INCREMENT 1");
   execute(db, "BEGIN");
   execute(db, "ALTER SEQUENCE s INCREMENT BY 100");
@@ -182,7 +182,7 @@ test("ALTER SEQUENCE options roll back", () => {
 // setval/ALTER … RESTART are writes — a READ ONLY transaction rejects each with 25006 (each in its
 // own block, since the error poisons the block). lastval/currval (pure reads) are allowed.
 test("setval/ALTER in read-only transaction is 25006", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE s");
   oneInt(db, "SELECT nextval('s')"); // 1, defines session state
 
@@ -207,7 +207,7 @@ test("setval/ALTER in read-only transaction is 25006", () => {
 // surface lives in suites/ddl/serial.test. Mirrors impl/rust/tests/sequence.rs.
 
 // queryRows runs sql and returns its rows' int cells (throwing on a NULL/non-int cell).
-function queryRows(db: Database, sql: string): bigint[][] {
+function queryRows(db: Engine, sql: string): bigint[][] {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query, got ${o.kind}`);
   return o.rows.map((r) =>
@@ -219,7 +219,7 @@ function queryRows(db: Database, sql: string): bigint[][] {
 }
 
 test("serial desugars to an owned sequence and auto-numbers from 1", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)");
   const rows = queryRows(db, "INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, b, s");
   assert.deepEqual(rows, [
@@ -233,7 +233,7 @@ test("serial desugars to an owned sequence and auto-numbers from 1", () => {
 });
 
 test("serial column is NOT NULL; an explicit value overrides the default without advancing", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id serial PRIMARY KEY, v text)");
   assert.equal(errCode(db, "INSERT INTO t (id, v) VALUES (NULL, 'x')"), "23502");
   execute(db, "INSERT INTO t (id, v) VALUES (100, 'y')"); // sequence untouched
@@ -241,12 +241,12 @@ test("serial column is NOT NULL; an explicit value overrides the default without
 });
 
 test("an explicit DEFAULT on a serial column is 42601", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(errCode(db, "CREATE TABLE t (id serial DEFAULT 5)"), "42601");
 });
 
 test("the serial auto-name collision-resolves with a numeric suffix", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE SEQUENCE t_id_seq");
   execute(db, "CREATE TABLE t (id serial)");
   execute(db, "INSERT INTO t (id) VALUES (DEFAULT)");
@@ -256,7 +256,7 @@ test("the serial auto-name collision-resolves with a numeric suffix", () => {
 });
 
 test("DROP SEQUENCE of an owned sequence is 2BP01; DROP TABLE auto-drops it", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id serial PRIMARY KEY)");
   assert.equal(errCode(db, "DROP SEQUENCE t_id_seq"), "2BP01");
   execute(db, "DROP TABLE t");
@@ -286,6 +286,6 @@ test("the owned-by link persists (format_version 13) — auto-drop survives a re
 });
 
 test("serial is recognized only in a column-type position — a CAST to it is undefined", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(errCode(db, "SELECT 1::serial"), "42704");
 });

@@ -13,9 +13,9 @@ import (
 	"testing"
 )
 
-func fkSetup(t *testing.T, sql ...string) *Database {
+func fkSetup(t *testing.T, sql ...string) *Engine {
 	t.Helper()
-	db := NewDatabase()
+	db := NewEngine()
 	for _, s := range sql {
 		if _, err := Execute(db, s); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
@@ -24,7 +24,7 @@ func fkSetup(t *testing.T, sql ...string) *Database {
 	return db
 }
 
-func fkErr(t *testing.T, db *Database, sql string) string {
+func fkErr(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	_, err := Execute(db, sql)
 	if err == nil {
@@ -33,7 +33,7 @@ func fkErr(t *testing.T, db *Database, sql string) string {
 	return err.(*EngineError).Code()
 }
 
-func fkNames(t *testing.T, db *Database, table string) []string {
+func fkNames(t *testing.T, db *Engine, table string) []string {
 	t.Helper()
 	tab, ok := db.Table(table)
 	if !ok {

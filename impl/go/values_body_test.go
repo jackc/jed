@@ -11,7 +11,7 @@ package jed
 
 import "testing"
 
-func valuesNames(t *testing.T, db *Database, sql string) []string {
+func valuesNames(t *testing.T, db *Engine, sql string) []string {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {
@@ -23,7 +23,7 @@ func valuesNames(t *testing.T, db *Database, sql string) []string {
 	return out.ColumnNames
 }
 
-func valuesTypes(t *testing.T, db *Database, sql string) []string {
+func valuesTypes(t *testing.T, db *Engine, sql string) []string {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {
@@ -32,7 +32,7 @@ func valuesTypes(t *testing.T, db *Database, sql string) []string {
 	return out.ColumnTypes
 }
 
-func valuesCost(t *testing.T, db *Database, sql string) int64 {
+func valuesCost(t *testing.T, db *Engine, sql string) int64 {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {

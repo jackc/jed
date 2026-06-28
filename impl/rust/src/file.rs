@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::blockstore::FileBlockStore;
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{DEFAULT_PAGE_SIZE, Database, Snapshot};
+use crate::executor::{DEFAULT_PAGE_SIZE, Engine, Snapshot};
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
 
@@ -65,11 +65,11 @@ impl Default for OpenOptions {
     }
 }
 
-impl Database {
+impl Engine {
     /// Create a **new** file-backed database at `path` with `opts` (the page size is locked into
     /// the file). The path must not already exist — `58P02` otherwise. An initial empty image is
     /// written durably immediately, so the file exists with its page size fixed (api.md §2).
-    pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Database> {
+    pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Engine> {
         let path = path.as_ref();
         if path.exists() {
             return Err(EngineError::new(
@@ -77,7 +77,7 @@ impl Database {
                 format!("database file already exists: {}", path.display()),
             ));
         }
-        let mut db = Database::new();
+        let mut db = Engine::new();
         db.path = Some(path.to_path_buf());
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
@@ -100,9 +100,9 @@ impl Database {
 
     /// Open an **existing** file-backed database at `path` with default open settings — the buffer-pool
     /// budget defaults to [`DEFAULT_CACHE_BYTES`](crate::paging) (256 MiB). See
-    /// [`open_with_options`](Database::open_with_options) to set the budget.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
-        Database::open_with_options(path, OpenOptions::default())
+    /// [`open_with_options`](Engine::open_with_options) to set the budget.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Engine> {
+        Engine::open_with_options(path, OpenOptions::default())
     }
 
     /// Open an **existing** file-backed database at `path` with explicit open settings (the memory
@@ -115,7 +115,7 @@ impl Database {
     /// file size (P6.4b, spec/design/pager.md). The byte budget is converted to a leaf-page capacity by
     /// the file's page size (`cache_leaves`). The budget is a **handle** setting, not stored in the file
     /// (§3). Later commits write through the same pager kept open for the handle's life.
-    pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
+    pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Engine> {
         let path = path.as_ref();
         // A read-only open never writes the file, so it is not opened for writing at all —
         // the OS enforces what the executor's 25006 guards promise (api.md §2.1).
@@ -138,7 +138,7 @@ impl Database {
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
-        let mut db = Database::open_paged(pager, capacity)?;
+        let mut db = Engine::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
         db.read_only = opts.read_only;
         db.session.work_mem = opts.work_mem;
@@ -310,7 +310,7 @@ mod tests {
 
         // Build a multi-level tree at a small page size, so a few hundred rows span many pages.
         {
-            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
             execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap(); // one commit, not 600
             for k in 0..n {
@@ -321,7 +321,7 @@ mod tests {
         }
 
         // Reopen demand-paged with a 3-leaf budget.
-        let db = Database::open_with_options(
+        let db = Engine::open_with_options(
             &path,
             OpenOptions {
                 cache_bytes: CAP * 256,
@@ -354,7 +354,7 @@ mod tests {
 
         // Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
         {
-            let mut db = Database::open_with_options(
+            let mut db = Engine::open_with_options(
                 &path,
                 OpenOptions {
                     cache_bytes: CAP * 256,
@@ -371,7 +371,7 @@ mod tests {
             );
             db.close().unwrap(); // autocommit already persisted each statement
         }
-        let db = Database::open_with_options(
+        let db = Engine::open_with_options(
             &path,
             OpenOptions {
                 cache_bytes: CAP * 256,
@@ -406,7 +406,7 @@ mod tests {
         const CAP: usize = 4;
 
         {
-            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
             execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap();
             for k in 0..n {
@@ -416,7 +416,7 @@ mod tests {
             db.close().unwrap();
         }
 
-        let mut db = Database::open_with_options(
+        let mut db = Engine::open_with_options(
             &path,
             OpenOptions {
                 cache_bytes: CAP * 256,
@@ -463,7 +463,7 @@ mod tests {
         let n = 400i64;
 
         {
-            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
             execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap();
             for k in 0..n {
@@ -475,7 +475,7 @@ mod tests {
 
         // A 1-byte budget is far below the 256-byte page size: it must clamp to one resident leaf,
         // not zero (zero would be unable to walk a root→leaf path).
-        let db = Database::open_with_options(
+        let db = Engine::open_with_options(
             &path,
             OpenOptions {
                 cache_bytes: 1,
@@ -504,7 +504,7 @@ mod tests {
     fn create_rejects_oversized_page_size() {
         let path = tmp("jed_p64c_huge_page.jed");
         let _ = std::fs::remove_file(&path);
-        let err = Database::create(&path, DatabaseOptions { page_size: 1 << 20 })
+        let err = Engine::create(&path, DatabaseOptions { page_size: 1 << 20 })
             .err()
             .expect("oversized page size must be rejected");
         assert_eq!(err.state, SqlState::FeatureNotSupported);
@@ -527,7 +527,7 @@ mod tests {
         let mut image = vec![0u8; 200];
         image[0..4].copy_from_slice(b"JEDB");
         image[8..12].copy_from_slice(&70000u32.to_be_bytes());
-        let err = Database::from_image(&image)
+        let err = Engine::from_image(&image)
             .err()
             .expect("an out-of-range page size must be rejected");
         assert_eq!(err.state, SqlState::DataCorrupted);
@@ -542,7 +542,7 @@ mod tests {
         // create: 1000 is within [256, 65536] but not a power of two.
         let path = tmp("jed_pow2_create.jed");
         let _ = std::fs::remove_file(&path);
-        let err = Database::create(&path, DatabaseOptions { page_size: 1000 })
+        let err = Engine::create(&path, DatabaseOptions { page_size: 1000 })
             .err()
             .expect("a non-power-of-two page size must be rejected");
         assert_eq!(err.state, SqlState::FeatureNotSupported);
@@ -558,7 +558,7 @@ mod tests {
         let mut image = vec![0u8; 4096];
         image[0..4].copy_from_slice(b"JEDB");
         image[8..12].copy_from_slice(&1000u32.to_be_bytes());
-        let err = Database::from_image(&image)
+        let err = Engine::from_image(&image)
             .err()
             .expect("a non-power-of-two page size must be rejected on open");
         assert_eq!(err.state, SqlState::DataCorrupted);
@@ -571,7 +571,7 @@ mod tests {
     fn rejects_page_size_below_floor() {
         let path = tmp("jed_pow2_floor.jed");
         let _ = std::fs::remove_file(&path);
-        let err = Database::create(&path, DatabaseOptions { page_size: 128 })
+        let err = Engine::create(&path, DatabaseOptions { page_size: 128 })
             .err()
             .expect("a sub-256 page size must be rejected");
         assert_eq!(err.state, SqlState::FeatureNotSupported);
@@ -606,7 +606,7 @@ mod tests {
         };
 
         {
-            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
             execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
             execute(&mut db, &format!("INSERT INTO t VALUES (1, '{big}')")).unwrap();
             execute(&mut db, "INSERT INTO t VALUES (2, 'small')").unwrap();
@@ -616,7 +616,7 @@ mod tests {
         // Reopen demand-paged (the default `open`): the big value reconstructs exactly through the
         // pager-backed chain read.
         {
-            let db = Database::open(&path).unwrap();
+            let db = Engine::open(&path).unwrap();
             let rows = db.rows_in_key_order("t").unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0][1], Value::Text(big.clone()));
@@ -626,7 +626,7 @@ mod tests {
 
         // Delete the big row; its overflow chain is orphaned (leaked this session).
         {
-            let mut db = Database::open(&path).unwrap();
+            let mut db = Engine::open(&path).unwrap();
             execute(&mut db, "DELETE FROM t WHERE id = 1").unwrap();
             db.close().unwrap();
         }
@@ -635,7 +635,7 @@ mod tests {
         // are now free. Re-inserting a large value reuses them — the high-water grows by a handful of
         // pages, not by a whole fresh chain (~7 pages).
         let (before, after) = {
-            let mut db = Database::open(&path).unwrap();
+            let mut db = Engine::open(&path).unwrap();
             let before = db.page_count;
             execute(&mut db, &format!("INSERT INTO t VALUES (3, '{big}')")).unwrap();
             let after = db.page_count;
@@ -649,7 +649,7 @@ mod tests {
 
         // Final correctness through the paged path.
         {
-            let db = Database::open(&path).unwrap();
+            let db = Engine::open(&path).unwrap();
             let rows = db.rows_in_key_order("t").unwrap();
             assert_eq!(rows.len(), 2);
             let r3 = rows
@@ -676,7 +676,7 @@ mod tests {
 
         // A from-scratch image is just the empty catalog — far below one chunk — so the file starts
         // un-aligned (create writes exactly page_count pages, no preallocation).
-        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+        let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
         execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
 
         // One commit big enough to push the tree past a chunk: ~400 rows of a ~3.5 KiB pad ≈ 1.4 MiB
@@ -704,7 +704,7 @@ mod tests {
 
         // The committed image round-trips exactly through the preallocated file (trailing slack is
         // inert zeros past the high-water).
-        let mut db = Database::open(&path).unwrap();
+        let mut db = Engine::open(&path).unwrap();
         let physical_before = std::fs::metadata(&path).unwrap().len();
         assert_eq!(db.rows_in_key_order("t").unwrap().len(), 400);
 
@@ -719,7 +719,7 @@ mod tests {
         db.close().unwrap();
 
         // And the extra row is durable.
-        let db = Database::open(&path).unwrap();
+        let db = Engine::open(&path).unwrap();
         let rows = db.rows_in_key_order("t").unwrap();
         assert_eq!(rows.len(), 401);
         assert!(rows.iter().any(|r| r[0] == Value::Int(1000)));

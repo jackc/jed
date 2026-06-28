@@ -9,9 +9,9 @@
 //!       `f64[]`/`f32[]`), while a composite-element array key is still rejected `0A000` (composite is
 //!       not yet keyable).
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn rows(db: &mut Database, sql: &str) -> Vec<String> {
+fn rows(db: &mut Engine, sql: &str) -> Vec<String> {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -21,7 +21,7 @@ fn rows(db: &mut Database, sql: &str) -> Vec<String> {
     }
 }
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql) {
         Err(e) => e.code().to_string(),
         Ok(o) => panic!("expected error for {sql}, got {o:?}"),
@@ -32,7 +32,7 @@ fn err(db: &mut Database, sql: &str) -> String {
 
 #[test]
 fn multidim_and_lower_bound_key_order() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE m (k i32[] PRIMARY KEY)").unwrap();
     // Same flattened elements / count but different shape, plus a custom lower bound. jed's array key
     // reproduces array_cmp: equal element prefix → fewer elements → smaller ndim → smaller lower
@@ -60,7 +60,7 @@ fn float_element_array_key_is_keyable() {
     // A f64[] PRIMARY KEY is now allowed (the §2.8 float-key lift): the array key recurses into the
     // float-order-preserving element key, so the store iterates in array_cmp order — element-wise by
     // the float total order (-0=+0, NaN largest), shorter-prefix first.
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE m (k f64[] PRIMARY KEY)").unwrap();
     // The '{…}' array literal coerces each element through f64 input, so the specials (NaN/Infinity)
     // arrive without an INSERT ... SELECT (which is 0A000 into an array column this slice).
@@ -84,7 +84,7 @@ fn float_element_array_multidim_key_order() {
     // Multidim/lower-bound float-element array key tiebreak (jed's array_cmp, NOT PG's ORDER BY —
     // the abbreviated-key artifact §2.14/array.md §5). Same finite f64 element prefix → fewer elements
     // → smaller ndim → smaller lower bound, identical to the i32 case (a) but over float elements.
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE m (k f64[] PRIMARY KEY)").unwrap();
     for v in [
         "{1.5,2.5,3.5,4.5}",
@@ -107,7 +107,7 @@ fn float_element_array_multidim_key_order() {
 
 #[test]
 fn composite_element_array_keys_are_rejected() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // A composite-element array key is 0A000 (composite is not yet keyable — composite.md §6).
     execute(&mut db, "CREATE TYPE addr AS (street text, zip i32)").unwrap();
     assert_eq!(

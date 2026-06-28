@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import { fillerText } from "./util.ts";
 
 const PAGE_SIZE = 256;
@@ -18,20 +18,20 @@ const PAGE_SIZE = 256;
 const SLABS_600 = 3n;
 const SLABS_400 = 2n;
 
-function smallPageDb(): Database {
-  const db = new Database();
+function smallPageDb(): Engine {
+  const db = new Engine();
   db.pageSize = PAGE_SIZE;
   return db;
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
 // `comp` row 1 carries a 600-char "x" run → 0x03 inline-compressed (LZ4 shrinks it far under
 // RECORD_MAX, so no chain); `control` is the same shape fully inline-plain. Row 2 is inline in
 // both. Same tree shape (one leaf each), so cost deltas isolate the compression units.
-function twoTables(): Database {
+function twoTables(): Engine {
   const db = smallPageDb();
   execute(db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO comp VALUES (1, '${"x".repeat(600)}'), (2, 'small')`);

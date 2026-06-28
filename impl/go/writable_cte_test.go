@@ -14,7 +14,7 @@ import (
 )
 
 // wcRun executes sql and returns its outcome, failing the test on error.
-func wcRun(t *testing.T, db *Database, sql string) Outcome {
+func wcRun(t *testing.T, db *Engine, sql string) Outcome {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {
@@ -24,7 +24,7 @@ func wcRun(t *testing.T, db *Database, sql string) Outcome {
 }
 
 // wcRows executes sql and returns its result rows, failing if it is not a query result.
-func wcRows(t *testing.T, db *Database, sql string) []Row {
+func wcRows(t *testing.T, db *Engine, sql string) []Row {
 	t.Helper()
 	out := wcRun(t, db, sql)
 	if out.Kind != OutcomeQuery {
@@ -39,7 +39,7 @@ func wcRows(t *testing.T, db *Database, sql string) []Row {
 
 // wcAffected executes sql and returns its statement-shaped affected-row count, failing if it is not
 // a statement result.
-func wcAffected(t *testing.T, db *Database, sql string) int64 {
+func wcAffected(t *testing.T, db *Engine, sql string) int64 {
 	t.Helper()
 	out := wcRun(t, db, sql)
 	if out.Kind != OutcomeStatement || !out.HasRowsAffected {
@@ -58,7 +58,7 @@ func wcInts(rows []Row) []int64 {
 	return v
 }
 
-func wcSetup(t *testing.T) *Database {
+func wcSetup(t *testing.T) *Engine {
 	t.Helper()
 	return dbWith(
 		t,

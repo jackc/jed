@@ -37,7 +37,7 @@ func TestMultidimAndLowerBoundKeyOrder(t *testing.T) {
 }
 
 // firstColRows runs a SELECT and returns the rendered first-column values.
-func firstColRows(t *testing.T, db *Database, sql string) []string {
+func firstColRows(t *testing.T, db *Engine, sql string) []string {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {
@@ -91,7 +91,7 @@ func TestFloatElementArrayMultidimKeyOrder(t *testing.T) {
 // TestCompositeElementArrayKeysRejected: a composite-element array key is still 0A000 (composite not
 // yet keyable), while float-element arrays are accepted everywhere a key is taken.
 func TestCompositeElementArrayKeysRejected(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	if _, err := Execute(db, "CREATE TYPE addr AS (street text, zip i32)"); err != nil {
 		t.Fatal(err)
 	}

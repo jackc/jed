@@ -2,10 +2,10 @@
 //! (spec/design/decimal.md). Assertions are on the **rendered** output — the cross-core
 //! contract — since decimal value-equality (1.5 == 1.50) is intentionally scale-insensitive.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
@@ -13,7 +13,7 @@ fn db_with(stmts: &[&str]) -> Database {
 }
 
 /// Run a query and render every cell to its canonical string (row-major).
-fn rendered(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
+fn rendered(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -24,7 +24,7 @@ fn rendered(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
 }
 
 /// A single-cell query result, rendered.
-fn one(db: &mut Database, sql: &str) -> String {
+fn one(db: &mut Engine, sql: &str) -> String {
     let rows = rendered(db, sql);
     assert_eq!(rows.len(), 1, "{sql:?} should return one row");
     assert_eq!(rows[0].len(), 1, "{sql:?} should return one column");
@@ -48,7 +48,7 @@ fn on_disk_round_trip_preserves_decimals_and_typmod() {
         "INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
     ]);
     let image = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&image).unwrap();
+    let mut loaded = Engine::from_image(&image).unwrap();
     // values survive byte-for-byte (re-serialization is identical)
     assert_eq!(loaded.to_image(8192, 1).unwrap(), image);
     // and the reloaded numeric(10,2) typmod still coerces a new insert

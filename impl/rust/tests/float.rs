@@ -3,17 +3,17 @@
 //! tag tolerates layout, but these finite values render identically), the total order, the trap
 //! model, strict-island coercion, the casts, the canonical-order-fold SUM/AVG, and a transcendental.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn rendered(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
+fn rendered(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -23,21 +23,21 @@ fn rendered(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
     }
 }
 
-fn one(db: &mut Database, sql: &str) -> String {
+fn one(db: &mut Engine, sql: &str) -> String {
     let rows = rendered(db, sql);
     assert_eq!(rows.len(), 1, "{sql:?} should return one row");
     assert_eq!(rows[0].len(), 1, "{sql:?} should return one column");
     rows[0][0].clone()
 }
 
-fn col_types(db: &mut Database, sql: &str) -> Vec<String> {
+fn col_types(db: &mut Engine, sql: &str) -> Vec<String> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { column_types, .. } => column_types,
         Outcome::Statement { .. } => panic!("expected a query for {sql:?}"),
     }
 }
 
-fn err_code(db: &mut Database, sql: &str) -> String {
+fn err_code(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql:?} should have failed"))
@@ -116,7 +116,7 @@ fn distinct_and_group_by_collapse_neg_zero_and_nan() {
 
 #[test]
 fn rendering_of_special_values() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(one(&mut db, "SELECT float 'Infinity'"), "Infinity");
     assert_eq!(one(&mut db, "SELECT float '-Infinity'"), "-Infinity");
     assert_eq!(one(&mut db, "SELECT float 'NaN'"), "NaN");

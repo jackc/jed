@@ -13,7 +13,7 @@ import {
   create,
   EngineError,
   execute,
-  loadDatabase,
+  loadEngine,
   open,
   residentLeaves,
 } from "../src/lib.ts";
@@ -194,7 +194,7 @@ test("page-size hardening: load rejects an oversized page_size", () => {
   new DataView(image.buffer).setUint32(8, 70000, false);
   let code = "";
   try {
-    loadDatabase(image);
+    loadEngine(image);
   } catch (e) {
     if (e instanceof EngineError) code = e.code();
   }
@@ -226,7 +226,7 @@ test("page-size hardening: rejects a non-power-of-two page size", () => {
     new DataView(image.buffer).setUint32(8, 1000, false);
     let readCode = "";
     try {
-      loadDatabase(image);
+      loadEngine(image);
     } catch (e) {
       if (e instanceof EngineError) readCode = e.code();
     }

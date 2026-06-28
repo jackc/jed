@@ -6,13 +6,13 @@
 //! and (b) finer assertions on the composite-specific NULL rules. Every expected value is pinned
 //! against PostgreSQL 18.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn run(db: &mut Database, sql: &str) {
+fn run(db: &mut Engine, sql: &str) {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
@@ -21,7 +21,7 @@ fn err(db: &mut Database, sql: &str) -> String {
 }
 
 /// One-column, one-row query → the rendered value ("NULL" for SQL-NULL).
-fn val(db: &mut Database, sql: &str) -> String {
+fn val(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
@@ -33,15 +33,15 @@ fn val(db: &mut Database, sql: &str) -> String {
 }
 
 /// A multi-row, one-column query → the rendered values.
-fn col(db: &mut Database, sql: &str) -> Vec<String> {
+fn col(db: &mut Engine, sql: &str) -> Vec<String> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows.iter().map(|r| r[0].render()).collect(),
         other => panic!("{sql}: expected a query result, got {other:?}"),
     }
 }
 
-fn addr_db() -> Database {
-    let mut db = Database::new();
+fn addr_db() -> Engine {
+    let mut db = Engine::new();
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     db
 }

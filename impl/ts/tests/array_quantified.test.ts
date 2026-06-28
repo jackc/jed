@@ -8,11 +8,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import { errCode, query } from "./util.ts";
 
 // val runs a one-column, one-row scalar query and returns the rendered value.
-function val(db: Database, sql: string): string {
+function val(db: Engine, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -20,7 +20,7 @@ function val(db: Database, sql: string): string {
 }
 
 test("ANY equality is IN", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT 1 = ANY(ARRAY[1,2,3])", "true"],
     ["SELECT 5 = ANY(ARRAY[1,2,3])", "false"],
@@ -34,7 +34,7 @@ test("ANY equality is IN", () => {
 });
 
 test("ALL is the universal dual", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT 3 = ALL(ARRAY[3,3,3])", "true"],
     ["SELECT 3 = ALL(ARRAY[3,3,4])", "false"],
@@ -48,7 +48,7 @@ test("ALL is the universal dual", () => {
 });
 
 test("ordering operators, shape, and text elements", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT 5 < ANY(ARRAY[1,2,10])", "true"],
     ["SELECT 5 > ALL(ARRAY[1,2,3])", "true"],
@@ -66,7 +66,7 @@ test("ordering operators, shape, and text elements", () => {
 });
 
 test("column / literal adaptation", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])");
   execute(db, "INSERT INTO t VALUES (1, ARRAY[10,20,30]), (2, ARRAY[40,50])");
   const cases: [string, string][] = [
@@ -78,7 +78,7 @@ test("column / literal adaptation", () => {
 });
 
 test("errors", () => {
-  const db = new Database();
+  const db = new Engine();
   // A non-array right side is 42809.
   assert.equal(
     errCode(() => execute(db, "SELECT 1 = ANY(5)")),

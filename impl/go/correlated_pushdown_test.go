@@ -16,7 +16,7 @@ import (
 
 // correlatedTables builds `o` (five outer rows whose k-values all exist as inner ids) and `inr` (n
 // rows id i32 PRIMARY KEY, v i32; v == id) large enough to span several leaves.
-func correlatedTables(t *testing.T, n int) *Database {
+func correlatedTables(t *testing.T, n int) *Engine {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("INSERT INTO inr VALUES ")
@@ -35,7 +35,7 @@ func correlatedTables(t *testing.T, n int) *Database {
 	)
 }
 
-func mustIds(t *testing.T, db *Database, sql string) []int64 {
+func mustIds(t *testing.T, db *Engine, sql string) []int64 {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {

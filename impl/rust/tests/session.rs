@@ -1,4 +1,4 @@
-//! S1 session surface (spec/design/session.md §2): the `Database`-owned **stateful default
+//! S1 session surface (spec/design/session.md §2): the `Engine`-owned **stateful default
 //! session**, **additional** sessions minted by `db.session(opts)` (shared committed storage,
 //! independent settings + transaction state, run sequentially via the swap), the relocated
 //! settings, and the explicit `Idle`/`Open`/`Failed` transaction state machine. These are per-core
@@ -6,7 +6,7 @@
 //! §10), so they live here.
 
 use jed::value::Value;
-use jed::{Database, Outcome, SessionOptions, TxStatus};
+use jed::{Engine, Outcome, SessionOptions, TxStatus};
 
 fn rows(o: Outcome) -> Vec<Vec<Value>> {
     match o {
@@ -17,9 +17,9 @@ fn rows(o: Outcome) -> Vec<Vec<Value>> {
 
 #[test]
 fn default_session_is_stateful_across_calls() {
-    // The Database-owned default session holds an open BEGIN block across *separate* calls
+    // The Engine-owned default session holds an open BEGIN block across *separate* calls
     // (the PG/SQLite connection model, §2.1), and `db.status()` exposes the explicit state machine.
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(db.status(), TxStatus::Idle);
 
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
@@ -41,7 +41,7 @@ fn default_session_is_stateful_across_calls() {
 fn failed_block_is_the_failed_state() {
     // A statement error inside a block poisons it: status is `Failed`, every later statement but
     // ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-    let mut db = Database::new();
+    let mut db = Engine::new();
     db.execute("BEGIN", &[]).unwrap();
     assert_eq!(
         db.execute("SELECT * FROM missing", &[])
@@ -58,7 +58,7 @@ fn failed_block_is_the_failed_state() {
 
 #[test]
 fn additional_session_shares_storage_with_independent_settings() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)", &[]).unwrap();
@@ -94,7 +94,7 @@ fn additional_session_shares_storage_with_independent_settings() {
 fn additional_session_cost_ceiling_is_enforced_via_swap() {
     // Proves the swap installs the additional session's *settings* into the execution path:
     // a tiny ceiling aborts the scan with 54P01, while the unlimited default runs it fine.
-    let mut db = Database::new();
+    let mut db = Engine::new();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
@@ -121,7 +121,7 @@ fn additional_session_cost_ceiling_is_enforced_via_swap() {
 
 #[test]
 fn additional_session_update_closure_commits_to_shared_storage() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 

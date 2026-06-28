@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import { fillerBytesHex, fillerText } from "./util.ts";
 
 // page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
@@ -20,19 +20,19 @@ const PAGE_SIZE = 256;
 const TEXT_CHAIN_PAGES = 3n;
 const BYTEA_CHAIN_PAGES = 2n;
 
-function smallPageDb(): Database {
-  const db = new Database();
+function smallPageDb(): Engine {
+  const db = new Engine();
   db.pageSize = PAGE_SIZE;
   return db;
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
 // Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain), `control`
 // keeps every value inline. Row 2 is inline in both.
-function overflowTables(): Database {
+function overflowTables(): Engine {
   const db = smallPageDb();
   const big = fillerText(600);
   execute(db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text)");

@@ -60,7 +60,7 @@ export class SharedPaging {
   }
 
   // readBlock reads one page through the pager — the demand-paged loader reads the meta, catalog, and
-  // interior skeleton this way (format.ts loadDatabasePaged).
+  // interior skeleton this way (format.ts loadEnginePaged).
   readBlock(index: number): Uint8Array {
     return this.pager.readBlock(index);
   }

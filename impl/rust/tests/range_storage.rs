@@ -11,13 +11,13 @@
 //! `IS NULL`, the range_cmp total order (=/</ORDER BY/DISTINCT), 22000/22P02/22003/42704 — lives in
 //! types/range.test (oracle-clean), not here.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn run(db: &mut Database, sql: &str) {
+fn run(db: &mut Engine, sql: &str) {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
@@ -25,7 +25,7 @@ fn err(db: &mut Database, sql: &str) -> String {
         .to_string()
 }
 
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
+fn query(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -41,7 +41,7 @@ fn query(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
 /// the behavioral round-trip.
 #[test]
 fn range_image_roundtrip() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)",
@@ -52,7 +52,7 @@ fn range_image_roundtrip() {
     run(&mut db, "INSERT INTO t VALUES (4, '(,)', '(5,)')"); // canonical [6,)
     run(&mut db, "INSERT INTO t VALUES (5, NULL, '[1,1]')"); // canonical [1,2)
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image).expect("load image");
+    let mut loaded = Engine::from_image(&image).expect("load image");
     assert_eq!(
         query(&mut loaded, "SELECT id, r, br FROM t ORDER BY id"),
         vec![
@@ -71,7 +71,7 @@ fn range_image_roundtrip() {
 /// `int4range`) appears in a jed message.
 #[test]
 fn canonical_name_and_aliases() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // The PG alias is accepted on the column; the value renders the same as the canonical spelling.
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r int4range)");
     run(&mut db, "INSERT INTO t VALUES (1, '[1,5)')");
@@ -79,14 +79,14 @@ fn canonical_name_and_aliases() {
     // A range PRIMARY KEY now WORKS even when declared with the PG alias, and the value behaves as a
     // key: `[1,4]` canonicalizes to `[1,5)`, so re-inserting it is a duplicate key (23505). Range is
     // keyable since R4 (encoding.md §2.11).
-    let mut db2 = Database::new();
+    let mut db2 = Engine::new();
     run(&mut db2, "CREATE TABLE k (r int4range PRIMARY KEY, n i32)");
     run(&mut db2, "INSERT INTO k VALUES ('[1,5)', 1)");
     assert_eq!(err(&mut db2, "INSERT INTO k VALUES ('[1,4]', 2)"), "23505");
     // A still-rejected path reports the canonical i32range even when declared with the alias: GIN needs
     // an array/jsonb opclass, so GIN over a plain range column is 42704 and names the canonical type
     // (PG agrees a range has no gin opclass but reports int4range — the naming divergence, per-core).
-    let mut db3 = Database::new();
+    let mut db3 = Engine::new();
     run(&mut db3, "CREATE TABLE u (id i32 PRIMARY KEY, r int4range)");
     let msg = execute(&mut db3, "CREATE INDEX ON u USING gin (r)")
         .expect_err("a gin index over a plain range column is rejected")
@@ -101,7 +101,7 @@ fn canonical_name_and_aliases() {
 /// jed-stricter, so they cannot live in the oracle-clean corpus.
 #[test]
 fn range_narrowings_are_0a000() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         err(
             &mut db,
@@ -126,7 +126,7 @@ fn range_narrowings_are_0a000() {
 /// re-key) and the 42804 type errors live in types/range.test.
 #[test]
 fn range_update_deferrals_are_0a000() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
     run(&mut db, "INSERT INTO t VALUES (1, '[1,5)')");
     assert_eq!(err(&mut db, "UPDATE t SET r = $1 WHERE id = 1"), "0A000");
@@ -153,7 +153,7 @@ fn range_update_deferrals_are_0a000() {
 /// The agreeing same-element comparison (=/</ORDER BY) is covered by types/range.test.
 #[test]
 fn cross_element_comparison_is_42804() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // A range over i32 vs a range over i64 — different element types, no implicit cross-range cast.
     assert_eq!(
         err(&mut db, "SELECT '[1,5)'::i32range = '[1,5)'::i64range"),
@@ -171,7 +171,7 @@ fn cross_element_comparison_is_42804() {
 /// slice. The type name IS known, so it is `0A000`, not the `42704` an unknown type would give.
 #[test]
 fn composite_range_field_is_0a000() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         err(&mut db, "CREATE TYPE rec AS (lo i32, span i32range)"),
         "0A000",
@@ -185,7 +185,7 @@ fn composite_range_field_is_0a000() {
 /// expr/range_constructors.test.
 #[test]
 fn range_constructor_divergences() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
     // int4range/int8range). The result is identical to the PG-spelled alias.
     assert_eq!(query(&mut db, "SELECT i32range(1, 5)"), vec![vec!["[1,5)"]]);
@@ -222,7 +222,7 @@ fn range_constructor_divergences() {
 /// §3). The agreeing value behavior of all eight operators lives in expr/range_operators.test.
 #[test]
 fn range_operator_divergences() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // THE divergence: jed has no integer bit-shift, so the `<<` / `>>` tokens are RANGE-only. An
     // integer `<<` / `>>` is "operator does not exist" (42883) — PostgreSQL would compute a bit shift
     // (5 << 2 = 20). A documented divergence (jed owns its surface), so it cannot live in the corpus.

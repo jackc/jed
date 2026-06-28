@@ -521,7 +521,7 @@ export function openCollation(bytes: Uint8Array): Collation {
 // model). All collations arrive at runtime: a host hands the engine a JUCD bundle's bytes via
 // loadUnicodeData (db.loadUnicodeData), the engine merges its root + per-locale deltas (§5.1) and
 // adds the resulting collations here. This set is PROCESS-GLOBAL (module-scoped) — a property of the
-// running engine, not of one Database handle (the spec's "loaded set available to any database on
+// running engine, not of one Engine handle (the spec's "loaded set available to any database on
 // this handle", §4.2). Global is what lets a file REFERENCING a collation be opened after the bundle
 // is loaded: open resolves the referenced table from here (format.ts), and open mints the handle, so
 // the data cannot live on the handle. "C" is never here (table-free, built in).
@@ -596,7 +596,7 @@ export function versionSkew(
 
 // loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
 // with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
-// Database.loadedCollations method (executor.ts).
+// Engine.loadedCollations method (executor.ts).
 export function loadedCollationTables(): Collation[] {
   return [...loadedColl.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }

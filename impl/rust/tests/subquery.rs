@@ -8,23 +8,23 @@
 //! (21000 / 42601 / 0A000). See spec/design/grammar.md §26.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute, execute_params};
+use jed::{Engine, Outcome, execute, execute_params};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     execute(db, sql)
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
-fn ab() -> Database {
+fn ab() -> Engine {
     db_with(&[
         "CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
         "CREATE TABLE b (id i32 PRIMARY KEY, k i32)",
@@ -33,14 +33,14 @@ fn ab() -> Database {
     ])
 }
 
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn ints(db: &mut Database, sql: &str) -> Vec<i64> {
+fn ints(db: &mut Engine, sql: &str) -> Vec<i64> {
     query(db, sql)
         .into_iter()
         .map(|r| match r[0] {
@@ -138,7 +138,7 @@ fn delete_correlated_subquery_cost_is_per_row() {
 fn param_inside_subquery_inner_context() {
     let mut db = ab();
     let i = |v: i64| Value::Int(v);
-    let run = |db: &mut Database, sql: &str, p: &[Value]| -> Vec<i64> {
+    let run = |db: &mut Engine, sql: &str, p: &[Value]| -> Vec<i64> {
         match execute_params(db, sql, p).unwrap() {
             Outcome::Query { rows, .. } => rows
                 .into_iter()

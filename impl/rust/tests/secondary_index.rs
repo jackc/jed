@@ -7,24 +7,24 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, execute};
+use jed::{DatabaseOptions, Engine, Outcome, execute};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
 }
 
-fn run(db: &mut Database, sql: &str) -> Outcome {
+fn run(db: &mut Engine, sql: &str) -> Outcome {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match run(db, sql) {
         Outcome::Statement { cost, .. } => cost,
         Outcome::Query { cost, .. } => cost,
     }
 }
 
-fn ids(db: &mut Database, sql: &str) -> Vec<i64> {
+fn ids(db: &mut Engine, sql: &str) -> Vec<i64> {
     match run(db, sql) {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -37,7 +37,7 @@ fn ids(db: &mut Database, sql: &str) -> Vec<i64> {
     }
 }
 
-fn err_code(db: &mut Database, sql: &str) -> String {
+fn err_code(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
@@ -46,8 +46,8 @@ fn err_code(db: &mut Database, sql: &str) -> String {
 
 /// The 20-row fixture the planner/cost tests run against: `v = i % 5` gives 4 rows per
 /// value, so an equality admits 4 of 20.
-fn db20() -> Database {
-    let mut db = Database::new();
+fn db20() -> Engine {
+    let mut db = Engine::new();
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
@@ -64,7 +64,7 @@ fn db20() -> Database {
 /// indexes in ascending lowercased-name order.
 #[test]
 fn auto_naming_matches_postgres() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx1
@@ -97,7 +97,7 @@ fn auto_naming_matches_postgres() {
 /// tables; DROP mismatches are 42704/42809.
 #[test]
 fn ddl_errors_match_postgres() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
     // Table existence first (even with a bad column).
     assert_eq!(
@@ -188,7 +188,7 @@ fn round_trips_through_the_on_disk_image() {
     run(&mut db, "CREATE INDEX t_v_idx ON t (v)");
     run(&mut db, "INSERT INTO t VALUES (100, NULL, 0)");
     let img = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&img).unwrap();
+    let mut loaded = Engine::from_image(&img).unwrap();
     assert_eq!(loaded.to_image(8192, 1).unwrap(), img, "byte-stable reload");
     let t = loaded.table("t").unwrap();
     assert_eq!(t.indexes.len(), 1);
@@ -228,7 +228,7 @@ fn index_ddl_is_transactional() {
 fn file_backed_paged_reopen_uses_the_index() {
     let path = tmp("secondary_index_paged.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+    let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
@@ -240,7 +240,7 @@ fn file_backed_paged_reopen_uses_the_index() {
     let in_memory_cost = cost(&mut db, "SELECT id FROM t WHERE v = 3");
     db.close().unwrap();
 
-    let mut reopened = Database::open(&path).unwrap();
+    let mut reopened = Engine::open(&path).unwrap();
     // The paged open reads the index tree as a skeleton; the logical cost is unchanged.
     assert_eq!(
         cost(&mut reopened, "SELECT id FROM t WHERE v = 3"),
@@ -254,7 +254,7 @@ fn file_backed_paged_reopen_uses_the_index() {
     run(&mut reopened, "UPDATE t SET v = 3 WHERE id = 4");
     run(&mut reopened, "DELETE FROM t WHERE id = 13");
     reopened.close().unwrap();
-    let mut again = Database::open(&path).unwrap();
+    let mut again = Engine::open(&path).unwrap();
     assert_eq!(
         ids(&mut again, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
         vec![3, 4, 8, 18]

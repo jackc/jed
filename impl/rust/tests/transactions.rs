@@ -5,10 +5,10 @@
 //! not exercise: `db.begin(writable)`, the `db.view`/`db.update` closure wrappers, the Drop
 //! rollback safety net, and `db.commit`/`db.rollback` as the same mechanism.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn db_with(sql: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(sql: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in sql {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
@@ -16,7 +16,7 @@ fn db_with(sql: &[&str]) -> Database {
 }
 
 /// Count rows of `SELECT * FROM t` against the committed/visible state.
-fn count(db: &mut Database, table: &str) -> usize {
+fn count(db: &mut Engine, table: &str) -> usize {
     match execute(db, &format!("SELECT * FROM {table}")).unwrap() {
         Outcome::Query { rows, .. } => rows.len(),
         _ => panic!("expected a query result"),

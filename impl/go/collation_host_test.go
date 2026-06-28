@@ -48,7 +48,7 @@ func TestLoadedCollationsIsTheRealSet(t *testing.T) {
 	// bundle, the real version-pinned set (es, unicode), ascending by name, no IsDefault (an engine
 	// property, not a per-db one). C is built in and never listed. The pin is UCA/UCD 17.0.0.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	v := db.LoadedCollations()
 	names := make([]string, len(v))
 	for i, c := range v {
@@ -78,7 +78,7 @@ func TestLoadedCollationUsedInAnExpression(t *testing.T) {
 	// the root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
 	// does not make the database REFERENCE the collation, so db.Collations() stays empty.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	if n := len(db.Collations()); n != 0 {
 		t.Fatalf("fresh db references %d collations, want 0", n)
 	}
@@ -92,7 +92,7 @@ func TestEsOrdersEnyeAsADistinctLetter(t *testing.T) {
 	// The es tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
 	// whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	if rows := query(t, db, `SELECT 'nz' < 'ña' COLLATE "es"`); len(rows) != 1 || rows[0][0] != BoolValue(true) {
 		t.Fatalf("es 'nz' < 'ña': got %v, want [[true]]", rows)
 	}
@@ -104,7 +104,7 @@ func TestEsOrdersEnyeAsADistinctLetter(t *testing.T) {
 func TestUnknownCollationIs42704(t *testing.T) {
 	// A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	if _, err := Execute(db, `SELECT 'x' COLLATE "no-such-collation"`); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("want 42704, got %v", err)
 	}
@@ -115,7 +115,7 @@ func TestPerColumnCollationOrdersImplicitlyAndIsReferenced(t *testing.T) {
 	// COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references unicode,
 	// db.Collations() (the per-file view) lists exactly it.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode")`)
 	run(t, db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`)
 	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "ä", "z"}) {
@@ -135,7 +135,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 	// Two columns with DIFFERENT implicit (loaded) collations compared with no explicit COLLATE →
 	// 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	run(t, db, `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`)
 	run(t, db, `INSERT INTO t VALUES ('a','z','b')`)
 	for _, sql := range []string{`SELECT a < b FROM t`, `SELECT a < c FROM t`} {
@@ -160,7 +160,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 
 func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	if _, err := Execute(db, `CREATE TABLE t (a i32 COLLATE "unicode")`); err == nil || err.(*EngineError).Code() != "42804" {
 		t.Fatalf("non-text COLLATE: want 42804, got %v", err)
 	}
@@ -175,7 +175,7 @@ func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
 	// SetDefaultCollation moves the per-database default to a LOADED collation (no import); an
 	// un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	if db.DefaultCollation() != "C" {
 		t.Fatalf("fresh default: got %q", db.DefaultCollation())
 	}
@@ -206,7 +206,7 @@ func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
 
 func TestSetDefaultUnknownIs42704(t *testing.T) {
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	if err := db.SetDefaultCollation("nope"); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("set default unknown: want 42704, got %v", err)
 	}
@@ -222,7 +222,7 @@ func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
 	// physically iterates in COLLATION order. unicode (loaded, no import): a < A < b < Z; C bytes:
 	// A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	run(t, db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY)`)
 	run(t, db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`)
 	if got := texts(t, query(t, db, `SELECT name FROM t`)); !eqStrings(got, []string{"a", "A", "b", "Z"}) {
@@ -239,7 +239,7 @@ func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
 	// A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
 	// DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)`)
 	run(t, db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`)
 	if _, err := Execute(db, `INSERT INTO t VALUES (4,'a')`); err == nil || err.(*EngineError).Code() != "23505" {
@@ -331,7 +331,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 	// bundle), the table degrades to read-only: reads still return the rows (the heap-scan fallback),
 	// every write raises XX002, and the skew is legible via db.Collations.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	for _, sql := range []string{
 		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
 		`INSERT INTO t VALUES ('b'), ('a')`,
@@ -400,7 +400,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	// (suites/collation/collation_upgrade.test) cannot read — the verdict-flip + the re-pin count —
 	// plus idempotence. The skew injection mirrors TestSkewedCollationBlocksWrites.
 	loadFixtureBundle(t)
-	db := NewDatabase()
+	db := NewEngine()
 	for _, sql := range []string{
 		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
 		`INSERT INTO t VALUES ('b'), ('a')`,

@@ -1,6 +1,6 @@
 //! bench-jed benchmarks the Rust jed core (spec/design/benchmarks.md §6/§7).
 
-use jed::{Database, DatabaseOptions, PreparedStatement, Value};
+use jed::{DatabaseOptions, Engine as JedDb, PreparedStatement, Value};
 use jed_bench::{Arg, BoxResult, Checksum, Config, Engine, main_with, read_sidecar};
 
 fn main() {
@@ -13,7 +13,7 @@ fn main() {
 }
 
 struct JedEngine {
-    db: Database,
+    db: JedDb,
     stmt: Option<PreparedStatement>,
     data_dir: String,
     dataset: String,
@@ -24,7 +24,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
     if dataset == "scratch" {
         let dir = format!("{data_dir}/scratch-rust-{}", std::process::id());
         std::fs::create_dir_all(&dir)?;
-        let db = Database::create(format!("{dir}/scratch.jed"), DatabaseOptions::default())
+        let db = JedDb::create(format!("{dir}/scratch.jed"), DatabaseOptions::default())
             .map_err(|e| e.to_string())?;
         return Ok(Box::new(JedEngine {
             db,
@@ -34,7 +34,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
             scratch: Some(dir),
         }));
     }
-    let db = Database::open(format!("{data_dir}/{dataset}.jed")).map_err(|e| e.to_string())?;
+    let db = JedDb::open(format!("{data_dir}/{dataset}.jed")).map_err(|e| e.to_string())?;
     Ok(Box::new(JedEngine {
         db,
         stmt: None,

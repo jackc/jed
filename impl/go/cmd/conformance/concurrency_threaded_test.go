@@ -3,7 +3,7 @@ package main
 // The stepped-THREADED mode of the concurrency schedule runner (spec/design/concurrency-testing.md
 // §4.3): run every `# format: concurrency` suite file with one goroutine per session, the schedule
 // order enforced by a turn token. The point is `go test -race ./cmd/conformance` — real
-// concurrent-path coverage of the SharedDb implementation (the actual atomics, the writer gate, the
+// concurrent-path coverage of the Database implementation (the actual atomics, the writer gate, the
 // live-reader registry under multiple goroutines) that the single-goroutine sequential walk in the
 // binary cannot give. The asserted result is identical to the sequential mode (the schedule is
 // timing-free, §2), so a divergence — or a race the detector flags — is a genuine concurrency bug.

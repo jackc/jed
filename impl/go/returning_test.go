@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-func retRun(t *testing.T, db *Database, sql string) Outcome {
+func retRun(t *testing.T, db *Engine, sql string) Outcome {
 	t.Helper()
 	o, err := Execute(db, sql)
 	if err != nil {
@@ -23,12 +23,12 @@ func retRun(t *testing.T, db *Database, sql string) Outcome {
 	return o
 }
 
-func retCost(t *testing.T, db *Database, sql string) int64 {
+func retCost(t *testing.T, db *Engine, sql string) int64 {
 	t.Helper()
 	return retRun(t, db, sql).Cost
 }
 
-func retRows(t *testing.T, db *Database, sql string) [][]Value {
+func retRows(t *testing.T, db *Engine, sql string) [][]Value {
 	t.Helper()
 	o := retRun(t, db, sql)
 	if o.Kind != OutcomeQuery {
@@ -37,7 +37,7 @@ func retRows(t *testing.T, db *Database, sql string) [][]Value {
 	return o.Rows
 }
 
-func retErrCode(t *testing.T, db *Database, sql string) string {
+func retErrCode(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	_, err := Execute(db, sql)
 	if err == nil {
@@ -63,9 +63,9 @@ func retGrid(rows [][]Value) string {
 	return strings.Join(parts, "|")
 }
 
-func retSetup(t *testing.T) *Database {
+func retSetup(t *testing.T) *Engine {
 	t.Helper()
-	db := NewDatabase()
+	db := NewEngine()
 	for _, s := range []string{
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
 		"INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
@@ -284,8 +284,8 @@ func TestReturningGrowsTheTouchedSet(t *testing.T) {
 	// (the §32 touched-set rule). 100_000 raw bytes at page_size 8192 (C = 8180):
 	// ceil(100000/8180) = 13 slabs.
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
-	fresh := func() *Database {
-		db := NewDatabase()
+	fresh := func() *Engine {
+		db := NewEngine()
 		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db
@@ -378,7 +378,7 @@ func TestOldNewNamingAndStar(t *testing.T) {
 func TestOldNewShadowedByTableName(t *testing.T) {
 	// A target table literally named old (or new) keeps the ordinary table-qualified
 	// meaning — the row-version pseudo-relation is suppressed (PG-probed).
-	db := NewDatabase()
+	db := NewEngine()
 	retRun(t, db, "CREATE TABLE old (x i32)")
 	if g := retGrid(retRows(t, db, "INSERT INTO old VALUES (1) RETURNING old.x")); g != "1" {
 		t.Fatalf("got %s", g) // the inserted value, NOT the NULL old side
@@ -423,8 +423,8 @@ func TestOldNewTouchedSet(t *testing.T) {
 	// column is assigned; a DELETE's new.col is the constant NULL row and reads nothing.
 	// Compressed 100k text at page_size 8192 = 13 slabs.
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
-	fresh := func() *Database {
-		db := NewDatabase()
+	fresh := func() *Engine {
+		db := NewEngine()
 		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db

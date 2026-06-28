@@ -6,24 +6,24 @@
 //! is the corpus's job. Mirrored in impl/go/on_conflict_test.go and
 //! impl/ts/tests/on_conflict.test.ts.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn db_with(sql: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(sql: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in sql {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
 }
 
-fn affected(db: &mut Database, sql: &str) -> Option<i64> {
+fn affected(db: &mut Engine, sql: &str) -> Option<i64> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement outcome from {sql:?}"),

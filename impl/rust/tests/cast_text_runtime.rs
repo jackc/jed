@@ -9,11 +9,11 @@
 //! COLUMN), so it exercises the per-row `evalCast` path, not the resolve-time literal fold.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
 /// Build a one-column text table `t(id i32 pk, s text)` seeded with `rows` (id = 1.., s = each str).
-fn seeded(rows: &[&str]) -> Database {
-    let mut db = Database::new();
+fn seeded(rows: &[&str]) -> Engine {
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)").unwrap();
     for (i, s) in rows.iter().enumerate() {
         execute(
@@ -26,7 +26,7 @@ fn seeded(rows: &[&str]) -> Database {
 }
 
 /// The scalar value of `SELECT <expr> FROM t WHERE id = <id>`.
-fn at(db: &mut Database, expr: &str, id: usize) -> Value {
+fn at(db: &mut Engine, expr: &str, id: usize) -> Value {
     match execute(db, &format!("SELECT {expr} FROM t WHERE id = {id}")).unwrap() {
         Outcome::Query { rows, .. } => rows[0][0].clone(),
         other => panic!("expected query, got {other:?}"),
@@ -34,7 +34,7 @@ fn at(db: &mut Database, expr: &str, id: usize) -> Value {
 }
 
 /// The SQLSTATE of a query expected to error per row.
-fn err_at(db: &mut Database, expr: &str, id: usize) -> String {
+fn err_at(db: &mut Engine, expr: &str, id: usize) -> String {
     match execute(db, &format!("SELECT {expr} FROM t WHERE id = {id}")) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {expr} (id {id})"),
@@ -113,7 +113,7 @@ fn text_to_float_overflow_and_malformed() {
 
 #[test]
 fn text_to_float_null_propagates() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1, NULL)").unwrap();
     assert_eq!(at(&mut db, "s :: float8", 1), Value::Null);

@@ -12,7 +12,7 @@ import {
   close,
   commit,
   create,
-  Database,
+  Engine,
   EngineError,
   execute,
   intValue,
@@ -125,7 +125,7 @@ test("autocommit persists each write across close", () => {
 
 test("commit and rollback are no-ops under autocommit", () => {
   // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
   commit(db);
@@ -139,7 +139,7 @@ test("commit and rollback are no-ops under autocommit", () => {
 });
 
 test("prepare → execute → query with params, iterating rows", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const insert = prepare(db, "INSERT INTO t VALUES ($1, $2)");
   insert.execute([intValue(1n), intValue(100n)]);
@@ -156,7 +156,7 @@ test("prepare → execute → query with params, iterating rows", () => {
 });
 
 test("one-shot query iterates rows", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1), (2), (3)");
   const ids: bigint[] = [];
@@ -167,12 +167,12 @@ test("one-shot query iterates rows", () => {
 });
 
 test("query on a non-query statement throws", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.throws(() => query(db, "CREATE TABLE t (id i32 PRIMARY KEY)"));
 });
 
 test("errors surface with SQLSTATE", () => {
-  const db = new Database();
+  const db = new Engine();
   let code = "";
   try {
     prepare(db, "SELCT 1");
@@ -183,7 +183,7 @@ test("errors surface with SQLSTATE", () => {
 });
 
 test("commit on in-memory db is a no-op success", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   commit(db); // no path -> no-op, not an error
   assert.equal(db.txid, 0n);
@@ -193,7 +193,7 @@ test("commit on in-memory db is a no-op success", () => {
 test("tableNames lists tables sorted by lowercased name, excluding indexes", () => {
   // The catalog-read surface (api.md §6): canonical names, sorted ascending by
   // lowercased name; secondary indexes are relations but not tables.
-  const db = new Database();
+  const db = new Engine();
   assert.deepStrictEqual(db.tableNames(), []);
   execute(db, "CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)");
   execute(db, "CREATE TABLE apple (id i32 PRIMARY KEY)");
@@ -213,7 +213,7 @@ test("rowsAffected reports DML counts", () => {
   // how many rows they touched (PostgreSQL's command-tag count); a DML statement that
   // matched nothing reports 0; DDL and transaction control report null; DML with
   // RETURNING is a query outcome (its row count is the result's length).
-  const db = new Database();
+  const db = new Engine();
   const affected = (sql: string): number | null => {
     const out = execute(db, sql);
     assert.equal(out.kind, "statement", sql);

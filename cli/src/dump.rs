@@ -7,14 +7,14 @@
 
 use std::io::{self, Write};
 
-use jed::Database;
+use jed::Engine;
 use jed::catalog::Table;
 use jed::value::Value;
 
 /// Write the whole database as SQL. Tables come out in the catalog's standing order
 /// (sorted by lowercased name — api.md §6); rows in primary-key order via `ORDER BY`
 /// (a no-PK table dumps in storage order, which replays into the same rowid order).
-pub fn dump(db: &mut Database, out: &mut dyn Write) -> io::Result<()> {
+pub fn dump(db: &mut Engine, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "BEGIN;")?;
     let names = db.table_names();
     for name in &names {
@@ -126,14 +126,14 @@ mod tests {
     use super::*;
     use jed::execute;
 
-    fn dump_to_string(db: &mut Database) -> String {
+    fn dump_to_string(db: &mut Engine) -> String {
         let mut buf = Vec::new();
         dump(db, &mut buf).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
-    fn rich_db() -> Database {
-        let mut db = Database::new();
+    fn rich_db() -> Engine {
+        let mut db = Engine::new();
         for sql in [
             "CREATE TABLE users (
                 id i32,
@@ -189,7 +189,7 @@ mod tests {
     fn dump_replays_to_an_identical_dump() {
         let mut db = rich_db();
         let first = dump_to_string(&mut db);
-        let mut replayed = Database::new();
+        let mut replayed = Engine::new();
         for stmt in crate::splitter::split(&first).unwrap() {
             execute(&mut replayed, &stmt.sql).unwrap();
         }
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn empty_database_dumps_an_empty_transaction() {
-        let mut db = Database::new();
+        let mut db = Engine::new();
         assert_eq!(dump_to_string(&mut db), "BEGIN;\nCOMMIT;\n");
     }
 }

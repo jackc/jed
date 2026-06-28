@@ -8,14 +8,14 @@
 
 use jed::types::ScalarType;
 use jed::value::Value;
-use jed::{Database, execute};
+use jed::{Engine, execute};
 use std::path::PathBuf;
 
 /// The page size the goldens are authored at (small, so the hex stays reviewable).
 const GOLDEN_PAGE_SIZE: u32 = 256;
 
 /// A function that builds one of the sample databases the goldens correspond to.
-type Builder = fn() -> Database;
+type Builder = fn() -> Engine;
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -34,14 +34,14 @@ fn load_unicode() {
     jed::load_unicode_data(&bytes).expect("load unicode.jucd");
 }
 
-fn run(db: &mut Database, sql: &str) {
+fn run(db: &mut Engine, sql: &str) {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
 }
 
 /// `CREATE TABLE t (id i32 PRIMARY KEY, v i16)` with 20 rows (id 3 has a NULL
 /// value) — enough rows to span more than one data page at page_size 256.
-fn pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
     for i in 1..=20i64 {
         let v = if i == 3 {
@@ -54,8 +54,8 @@ fn pk_table_db() -> Database {
     db
 }
 
-fn one_table_empty_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn one_table_empty_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
     db
 }
@@ -64,8 +64,8 @@ fn one_table_empty_db() -> Database {
 /// concatenation of the members' encodings (4-byte i32 ‖ 2-byte i16, encoding.md §2.3).
 /// Rows insert in ascending tuple order (the tree shape is order-sensitive), with a negative
 /// first component and first-component ties broken by the second.
-fn composite_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn composite_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))",
@@ -90,8 +90,8 @@ fn composite_pk_table_db() -> Database {
 /// check whose persisted text exercises the token rendering (string literal with a doubled
 /// quote, decimal literals, `>=`/`<=`), stored in name order
 /// (price_range < t_b_check < t_note_check).
-fn check_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn check_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), \
@@ -111,8 +111,8 @@ fn check_table_db() -> Database {
 /// composite-PK narrowing); `i_u` covers a nullable uuid column holding a NULL (the
 /// encoding.md §2.2 presence tag in stored index order — NULL last), and the unnamed
 /// index auto-names to `t_a_b_idx`. Index records have empty payloads (key only).
-fn index_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn index_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a))",
@@ -130,8 +130,8 @@ fn index_table_db() -> Database {
 /// (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs (NULLS
 /// DISTINCT — both stored), the named two-column constraint `wv`, a CREATE UNIQUE INDEX
 /// `uq`, and the plain index `nu` (flags 0 beside flags 1).
-fn unique_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn unique_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32, UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))",
@@ -151,8 +151,8 @@ fn unique_table_db() -> Database {
 /// to the PK (`c_mgr_fkey`), an auto-named FK to the PK (`c_pid_fkey`), and an auto-named COMPOSITE
 /// FK to the two-column UNIQUE with ON DELETE RESTRICT (`c_x_y_fkey`, the lone non-zero actions
 /// byte). Must match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
-fn fk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn fk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))",
@@ -181,8 +181,8 @@ fn fk_table_db() -> Database {
 /// `i32[]` (fixed-width elements: no per-element length prefix) and a `text[]`; row 2 has an EMPTY
 /// array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
 /// lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
-fn array_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn array_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])",
@@ -212,8 +212,8 @@ fn array_table_db() -> Database {
 /// inclusive-upper literal that canonicalizes (`[1,5]` → `[1,6)`), the EMPTY range, infinite bounds
 /// (lower-only, both), a NULL range, an exclusive-lower literal with infinite upper (`(5,)` →
 /// `[6,)`), and a singleton (`[1,1]` → `[1,2)`). Pins range_table.jed cross-core.
-fn range_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn range_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)",
@@ -230,8 +230,8 @@ fn range_table_db() -> Database {
 /// range-bounds key (empty/±∞/inclusivity framing around the i32 element key) lands in the key slot.
 /// Rows are inserted in ASCENDING range_total_cmp order (empty, unbounded-lower, fully-unbounded,
 /// then finite-bound) to match verify.rb's ascending-key tree builder.
-fn range_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn range_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (k i32range PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO t VALUES ('empty', 0)");
     run(&mut db, "INSERT INTO t VALUES ('(,5)', 1)");
@@ -247,8 +247,8 @@ fn range_pk_table_db() -> Database {
 /// terminator + shape suffix) lands in the key slot. Rows are inserted in ASCENDING array_total_cmp
 /// order (empty, shorter-prefix, element-wise, NULL element last) to match verify.rb's ascending-key
 /// tree builder. Pins array_pk_table.jed cross-core.
-fn array_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn array_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE k (key i32[] PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO k VALUES ('{}', 40)");
     run(&mut db, "INSERT INTO k VALUES ('{1,2}', 20)");
@@ -261,8 +261,8 @@ fn array_pk_table_db() -> Database {
 /// A table with a `json` column (verbatim text body, type_code 18 — spec/design/json.md §4). The
 /// stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
 /// length-prefixed text-shaped json body. Pins json_table.jed cross-core.
-fn json_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn json_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
     run(&mut db, "INSERT INTO t VALUES (1, '{\"a\": 1}')");
     run(&mut db, "INSERT INTO t VALUES (2, '[1, 2, 3]')");
@@ -274,8 +274,8 @@ fn json_table_db() -> Database {
 /// spec/design/json.md §2). The rows exercise every node tag: an object (NTAG_OBJECT) with a
 /// number (NTAG_NUMBER), a nested array (NTAG_ARRAY) of a boolean (NTAG_TRUE) and JSON null
 /// (NTAG_NULL); a bare string (NTAG_STRING); a bare number; and a SQL NULL. Pins jsonb_table.jed.
-fn jsonb_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn jsonb_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)");
     run(
         &mut db,
@@ -287,8 +287,8 @@ fn jsonb_table_db() -> Database {
     db
 }
 
-fn gin_array_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn gin_array_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)",
@@ -308,8 +308,8 @@ fn gin_array_table_db() -> Database {
 /// GIN index serializes byte-identically across cores. Rows mirror `gin_array_table_db`: term DEDUP
 /// (row 2's duplicate bb), an EMPTY and a NULL whole-value array (rows 3/4 → no entries), and a NULL
 /// element (row 5). An ordinary ordered index `i_n` sits beside it (kind 0).
-fn gin_uuid_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn gin_uuid_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, tags uuid[], n i32)",
@@ -333,8 +333,8 @@ fn gin_uuid_table_db() -> Database {
 /// empty range force a median split at `GIST_FANOUT = 4`, so the on-disk tree is two levels (an
 /// interior root over two leaves), exercising both page types + post-order page allocation. Row 8's
 /// NULL range is not indexed. Mirrors the Ruby reference's `GIST_RANGE_TABLE`.
-fn gist_range_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn gist_range_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
     run(
         &mut db,
@@ -351,8 +351,8 @@ fn gist_range_table_db() -> Database {
 /// duplicate room numbers force a median split at `GIST_FANOUT = 4`, so the on-disk tree is two
 /// levels, exercising both page types + post-order allocation with the scalar bound codec. Row 9's
 /// NULL is not indexed. Mirrors the Ruby reference's `GIST_SCALAR_TABLE`.
-fn gist_scalar_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn gist_scalar_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)");
     run(
         &mut db,
@@ -369,8 +369,8 @@ fn gist_scalar_table_db() -> Database {
 /// scalar `[min,max]` component concatenated with a range component). 7 rows force a median split at
 /// `GIST_FANOUT = 4`, so the backing R-tree is two levels. Row 8's NULL room is exempt (not indexed).
 /// Mirrors the Ruby reference's `GIST_EXCLUDE_TABLE`.
-fn gist_exclude_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn gist_exclude_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, \
@@ -386,8 +386,8 @@ fn gist_exclude_table_db() -> Database {
 }
 
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
-fn nopk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn nopk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE r (a i16, b i64)");
     for (a, b) in [(7, 70), (8, 80), (9, 90)] {
         run(&mut db, &format!("INSERT INTO r VALUES ({a}, {b})"));
@@ -398,8 +398,8 @@ fn nopk_table_db() -> Database {
 /// 18 rows whose wide text padding forces a HEIGHT-2 tree (an interior node whose children are
 /// themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
 /// post-order page allocation across a deeper tree (spec/fileformat/format.md).
-fn tall_tree_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn tall_tree_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
     for i in 1..=18i64 {
         let pad = format!("row-{i:02}-{}", "x".repeat(48));
@@ -411,8 +411,8 @@ fn tall_tree_db() -> Database {
 /// A table with a text column — exercises the value codec's text branch (u16 length +
 /// UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text
 /// value, and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
-fn text_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn text_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)");
     run(&mut db, "INSERT INTO t VALUES (1, 'alice')");
     run(&mut db, "INSERT INTO t VALUES (2, '')");
@@ -426,8 +426,8 @@ fn text_table_db() -> Database {
 /// A table with a boolean column — exercises the value codec's boolean branch (a single
 /// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 /// PRIMARY KEY case is `bool_pk_table_db`).
-fn bool_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn bool_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)");
     run(&mut db, "INSERT INTO t VALUES (1, TRUE)");
     run(&mut db, "INSERT INTO t VALUES (2, FALSE)");
@@ -440,8 +440,8 @@ fn bool_table_db() -> Database {
 /// since a PK is NOT NULL, spec/design/encoding.md §2.9), plus a nullable boolean value column.
 /// Rows go in via INSERT and the store sorts them into key (byte) order: false (0x00) then true
 /// (0x01). Must match spec/fileformat/verify.rb's BOOL_PK_TABLE.
-fn bool_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn bool_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY, v boolean)");
     run(&mut db, "INSERT INTO t VALUES (FALSE, TRUE)");
     run(&mut db, "INSERT INTO t VALUES (TRUE, NULL)");
@@ -452,8 +452,8 @@ fn bool_pk_table_db() -> Database {
 /// key) — the `text-terminated-escape` key encoding (encoding.md §2.4). Rows go in via INSERT and
 /// the store sorts them into key (code-point / byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) <
 /// "banana"(0x62) < "é"(0xC3). Must match spec/fileformat/verify.rb's TEXT_PK_TABLE.
-fn text_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn text_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (k text PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO t VALUES ('', 4)");
     run(&mut db, "INSERT INTO t VALUES ('Zeta', NULL)");
@@ -467,8 +467,8 @@ fn text_pk_table_db() -> Database {
 /// — like text but over raw bytes, so the embedded-0x00 escape is exercised. The store sorts into
 /// unsigned-byte (key) order: '' < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. Must match
 /// spec/fileformat/verify.rb's BYTEA_PK_TABLE.
-fn bytea_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn bytea_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (k bytea PRIMARY KEY, v i32)");
     run(&mut db, r"INSERT INTO t VALUES ('\x', 5)");
     run(&mut db, r"INSERT INTO t VALUES ('\x00', 6)");
@@ -483,8 +483,8 @@ fn bytea_pk_table_db() -> Database {
 /// encoding, encoding.md §2.5) — the first variable-width SIGNED key. The store sorts into numeric
 /// (= key) order: -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50; "100.50" stores scale 2 in its value
 /// body but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
-fn decimal_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn decimal_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (k decimal PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO t VALUES (-2.5, 6)");
     run(&mut db, "INSERT INTO t VALUES (-0.5, 5)");
@@ -502,8 +502,8 @@ fn decimal_pk_table_db() -> Database {
 /// (span-equal intervals would collide on the span key). Inserted in ascending key order — the
 /// builder splits a node by inserting ascending (verify.rb `build_tree`), so the core must match
 /// that order for byte-identical pages; the out-of-order-insert proof lives in the conformance test.
-fn interval_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn interval_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (k interval PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO t VALUES ('-1 mon', 6)");
     run(&mut db, "INSERT INTO t VALUES ('-1 day', 5)");
@@ -519,8 +519,8 @@ fn interval_pk_table_db() -> Database {
 /// scale + u16 ndigits + base-10⁴ groups) and the catalog typmod: an unconstrained `numeric`
 /// column `d` and a constrained `numeric(10,2)` column `m` (values already at scale 2, so a
 /// no-op coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
-fn decimal_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn decimal_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, d numeric, m numeric(10,2))",
@@ -537,8 +537,8 @@ fn decimal_table_db() -> Database {
 /// bytes): a multi-byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high
 /// byte (0xFF), a NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice).
 /// Literals are the `\x` hex input form, adapting to the bytea column (types.md §6).
-fn bytea_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn bytea_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, b bytea)");
     run(&mut db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
     run(&mut db, "INSERT INTO t VALUES (2, '\\x')");
@@ -588,8 +588,8 @@ fn filler_bytes_hex(n: usize) -> String {
 /// the record holds a 0x02 pointer and the raw bytes live in a page_type-4 chain. Row 1 spills
 /// both columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL. Must match the Ruby
 /// reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
-fn overflow_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn overflow_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)",
@@ -612,8 +612,8 @@ fn overflow_table_db() -> Database {
 /// inline-compressed; row 2's half-filler/half-run text compresses to ~200 B — smaller than plain
 /// but still over RECORD_MAX → 0x04 external-compressed (a chain carrying the COMPRESSED block);
 /// row 3 stays inline-plain; row 4 is NULL/NULL. Must match the Ruby reference's COMPRESSED_TABLE.
-fn compressed_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn compressed_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)",
@@ -644,8 +644,8 @@ fn compressed_table_db() -> Database {
 /// codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
 /// a present and a NULL uuid value, and the nil/max boundary UUIDs. Rows go in via INSERT and
 /// the store sorts them into key (byte) order. Must match spec/fileformat/verify.rb's UUID_TABLE.
-fn uuid_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn uuid_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)");
     run(
         &mut db,
@@ -662,8 +662,8 @@ fn uuid_table_db() -> Database {
 /// pre-evaluated default value (written after the typmod). Covers an int default, a text
 /// default, a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to
 /// numeric(6,2), and a plain no-default column. Row 1 takes every default; row 2 provides all.
-fn default_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn default_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, n i32 DEFAULT 0, note text DEFAULT 'none', \
@@ -682,8 +682,8 @@ fn default_table_db() -> Database {
 /// expr-text written after the typmod: a `uuid DEFAULT uuidv7()`, an `i32 DEFAULT 1 + 1`, a
 /// CONSTANT default beside them (bit2), and a plain no-default column. EMPTY table — the catalog
 /// encoding is the cross-core proof; the per-row evaluation is covered by the conformance corpus.
-fn default_expr_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn default_expr_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n i32 DEFAULT 1 + 1, \
@@ -696,8 +696,8 @@ fn default_expr_table_db() -> Database {
 /// code 8): a positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels,
 /// and a NULL. The literals parse to the same micros the golden stores. The PK stays i32 (a
 /// timestamp PK is supported, but the value-codec branch is the point here).
-fn timestamp_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn timestamp_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp)");
     run(&mut db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')");
     run(&mut db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')");
@@ -713,8 +713,8 @@ fn timestamp_table_db() -> Database {
 
 /// A table with a timestamptz column (type code 9) — the same 8-byte branch; the `+05` literal
 /// normalizes to UTC before storage.
-fn timestamptz_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn timestamptz_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)",
@@ -741,8 +741,8 @@ fn timestamptz_table_db() -> Database {
 /// (i32 months ‖ i32 days ‖ i64 micros). A positive multi-field value, a negative value, the
 /// zero interval, a months-only `'1 mon'` vs a span-equal-but-byte-distinct `'30 days'`, and a
 /// NULL. The bare-string literals adapt to the interval column. PK stays i32.
-fn interval_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn interval_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d interval)");
     run(&mut db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')");
     run(&mut db, "INSERT INTO t VALUES (2, '-1 day')");
@@ -760,8 +760,8 @@ fn interval_table_db() -> Database {
 /// the specials enter via typed literals in `INSERT ... SELECT` (a VALUES slot takes only bare
 /// literals this slice — float.md). PK stays i32 here so this exercises the float VALUE codec in a
 /// nullable non-key column (the float PRIMARY KEY form is `float64_pk_table_db`).
-fn float64_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn float64_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)");
     run(&mut db, "INSERT INTO t VALUES (1, 1.5)");
     run(&mut db, "INSERT INTO t VALUES (2, -2.5)");
@@ -781,8 +781,8 @@ fn float64_table_db() -> Database {
 /// A table with a f32 column (type code 13) — the 4-byte IEEE branch. The same special-value
 /// coverage as `float64_table_db` (canonicalized NaN → `0x7FC00000`) plus 100.25 (exactly
 /// representable in binary32). PK stays i32.
-fn float32_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn float32_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r f32)");
     run(&mut db, "INSERT INTO t VALUES (1, 1.5)");
     run(&mut db, "INSERT INTO t VALUES (2, -2.5)");
@@ -802,8 +802,8 @@ fn float32_table_db() -> Database {
 /// via `INSERT … SELECT` typed literals (a VALUES slot takes only bare literals this slice). The row
 /// set matches `FLOAT64_PK_TABLE` in spec/fileformat/verify.rb; insertion order is irrelevant (the PK
 /// store sorts by encoded key).
-fn float64_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn float64_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE fk (k f64 PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO fk VALUES (1.5, 1)");
     run(&mut db, "INSERT INTO fk SELECT f64 '-Infinity', 2");
@@ -815,8 +815,8 @@ fn float64_pk_table_db() -> Database {
 }
 
 /// As `float64_pk_table_db`, for a `f32` PRIMARY KEY (the 4-byte `float-order-preserving` key §2.8).
-fn float32_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn float32_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE fk (k f32 PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO fk VALUES (1.5, 1)");
     run(&mut db, "INSERT INTO fk SELECT f32 '-Infinity', 2");
@@ -831,8 +831,8 @@ fn float32_pk_table_db() -> Database {
 /// same int-be-signflip body as i32). A positive date, a pre-1970 negative one, a BC-era one,
 /// the −infinity/+infinity sentinels (i32::MIN/MAX), and a NULL. The bare-string literals adapt to
 /// the date column. PK stays i32. (spec/design/date.md)
-fn date_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn date_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d date)");
     run(&mut db, "INSERT INTO t VALUES (1, '2024-01-15')");
     run(&mut db, "INSERT INTO t VALUES (2, '1969-12-31')");
@@ -846,8 +846,8 @@ fn date_table_db() -> Database {
 /// A composite TYPE defined + persisted (v9) AND used by a column with stored values (S3): pins
 /// the recursive value codec — the null bitmap, a present-field body, and a NULL field's
 /// zero-byte omission (row 2's `zip`) — spec/design/composite.md §4.
-fn composite_type_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn composite_type_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TYPE addr AS (street text NOT NULL, zip i32)",
@@ -863,8 +863,8 @@ fn composite_type_table_db() -> Database {
 /// "addr") and the value body recurses (an array body whose elements are composite bodies). Row 2's
 /// element has a NULL `zip` field (the composite null-bitmap inside an element); row 3 mixes a
 /// present composite element with a NULL element (the array HAS_NULLS bitmap).
-fn array_composite_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn array_composite_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TYPE addr AS (street text NOT NULL, zip i32)",
@@ -885,8 +885,8 @@ fn array_composite_table_db() -> Database {
 /// the catalog composite-type entry carries a code-15 array field (`element_type_code` 2 = i32)
 /// and the value body recurses (a composite body whose `pts` field is an array body). Row 2 has an
 /// empty array field `{}` (ndim 0); row 3 a NULL array field (the composite null-bitmap).
-fn composite_array_field_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn composite_array_field_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
     run(&mut db, "INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))");
@@ -900,8 +900,8 @@ fn composite_array_field_table_db() -> Database {
 /// the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
 /// references, so the two-pass load (collect all, then resolve) is exercised; the row pins the
 /// recursive value codec descending through a composite field.
-fn nested_composite_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn nested_composite_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)",
@@ -918,8 +918,8 @@ fn nested_composite_table_db() -> Database {
 /// Sequences (v12): two sequences — `s1` ascending, advanced 3 times (is_called, last_value 3),
 /// `s2` descending/fresh with non-default cache + cycle — plus a one-row table, pinning the
 /// sequence catalog entry (entry_kind 2) and the catalog emission order (sequences before tables).
-fn sequence_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn sequence_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE SEQUENCE s1");
     run(&mut db, "SELECT nextval('s1')");
     run(&mut db, "SELECT nextval('s1')");
@@ -938,8 +938,8 @@ fn sequence_table_db() -> Database {
 /// PK) with an expression DEFAULT nextval('t_id_seq'), and an OWNED sequence t_id_seq created
 /// alongside; one INSERT advances it once. Must match the Ruby reference's SERIAL_TABLE
 /// (spec/fileformat/verify.rb), spec/design/sequences.md §12.
-fn serial_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn serial_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id serial PRIMARY KEY, v text)");
     run(&mut db, "INSERT INTO t (v) VALUES ('hello')");
     db
@@ -950,8 +950,8 @@ fn serial_table_db() -> Database {
 /// (flags bit1+bit3+bit4+bit5), `n` is GENERATED BY DEFAULT (flags bit1+bit3+bit4); each gets an
 /// owned default-i64 sequence + an expression DEFAULT nextval('<seq>'). One INSERT advances both.
 /// Must match the Ruby reference's IDENTITY_TABLE (spec/fileformat/verify.rb), sequences.md §13.
-fn identity_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn identity_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
@@ -968,8 +968,8 @@ fn identity_table_db() -> Database {
 /// `COLLATE "C"` column (no collation, bit6 clear). `unicode` is NOT imported — it is vendored, and
 /// its metadata entry is emitted because the schema references it. Must match the Ruby reference's
 /// COLLATION_TABLE (spec/fileformat/verify.rb), spec/design/collation.md §5.
-fn collation_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn collation_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     db.set_default_collation("unicode").unwrap(); // vendored — no import
     run(
         &mut db,
@@ -985,8 +985,8 @@ fn collation_table_db() -> Database {
 /// store the `unicode` UCA sort key, so the B-tree iterates in collation order. `unicode` is vendored
 /// (not the default; its entry is emitted because the columns reference it). Must match the Ruby
 /// reference's COLLATION_PK_TABLE.
-fn collation_pk_table_db() -> Database {
-    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+fn collation_pk_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (name text COLLATE \"unicode\" PRIMARY KEY, tag text COLLATE \"unicode\")",
@@ -1003,7 +1003,7 @@ fn collation_pk_table_db() -> Database {
 fn write_matches_goldens() {
     load_unicode(); // the unicode-collated goldens need the bundle loaded (collation.md §4)
     let cases: &[(&str, Builder)] = &[
-        ("empty_db.jed", Database::new),
+        ("empty_db.jed", Engine::new),
         ("overflow_table.jed", overflow_table_db),
         ("compressed_table.jed", compressed_table_db),
         ("one_table_empty.jed", one_table_empty_db),
@@ -1129,7 +1129,7 @@ fn read_goldens_reproduces_rows() {
         ("torn_meta_slot1.jed", pk_table_db, "t"),
     ];
     for (name, build, table) in cases {
-        let loaded = Database::from_image(&fixture(name))
+        let loaded = Engine::from_image(&fixture(name))
             .unwrap_or_else(|e| panic!("load {name}: {}", e.message));
         let expected = build();
         assert_eq!(
@@ -1140,7 +1140,7 @@ fn read_goldens_reproduces_rows() {
     }
 
     // Empty database: zero tables, and a missing table reads as None.
-    let empty = Database::from_image(&fixture("empty_db.jed")).unwrap();
+    let empty = Engine::from_image(&fixture("empty_db.jed")).unwrap();
     assert!(empty.table("t").is_none());
 }
 
@@ -1148,7 +1148,7 @@ fn read_goldens_reproduces_rows() {
 /// bug in an unexercised flag would otherwise slip past a rows-only check).
 #[test]
 fn read_golden_reconstructs_catalog() {
-    let loaded = Database::from_image(&fixture("pk_table.jed")).unwrap();
+    let loaded = Engine::from_image(&fixture("pk_table.jed")).unwrap();
     let t = loaded.table("t").expect("table t");
     assert_eq!(t.name, "t");
     assert_eq!(t.columns.len(), 2);
@@ -1173,7 +1173,7 @@ fn read_golden_reconstructs_catalog() {
 /// (not just its byte length) round-trips through the catalog (constraints.md §2).
 #[test]
 fn default_survives_load() {
-    let mut loaded = Database::from_image(&fixture("default_table.jed")).unwrap();
+    let mut loaded = Engine::from_image(&fixture("default_table.jed")).unwrap();
     run(&mut loaded, "INSERT INTO t (id) VALUES (3)");
     let rows = loaded.rows_in_key_order("t").unwrap();
     let last = rows.last().expect("a row");
@@ -1193,7 +1193,7 @@ fn default_survives_load() {
 fn rowid_counter_survives_serialize_and_load() {
     let db = nopk_table_db(); // existing rows take rowids 0, 1, 2 (built at GOLDEN_PAGE_SIZE)
     let image = db.to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
-    let mut loaded = Database::from_image(&image).unwrap();
+    let mut loaded = Engine::from_image(&image).unwrap();
     // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
     execute(&mut loaded, "INSERT INTO r VALUES (10, 100)").expect("insert after load");
     assert_eq!(loaded.rows_in_key_order("r").unwrap().len(), 4);
@@ -1204,7 +1204,7 @@ fn rowid_counter_survives_serialize_and_load() {
 /// page-backed B-tree's fan-out tracks the page size — spec/fileformat/format.md).
 #[test]
 fn round_trip_at_default_page_size() {
-    let mut db = Database::with_page_size(8192);
+    let mut db = Engine::with_page_size(8192);
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
     for i in 1..=20i64 {
         let v = if i == 3 {
@@ -1215,7 +1215,7 @@ fn round_trip_at_default_page_size() {
         run(&mut db, &format!("INSERT INTO t VALUES ({i}, {v})"));
     }
     let image = db.to_image(8192, 1).unwrap();
-    let loaded = Database::from_image(&image).unwrap();
+    let loaded = Engine::from_image(&image).unwrap();
     assert_eq!(
         loaded.rows_in_key_order("t"),
         db.rows_in_key_order("t"),

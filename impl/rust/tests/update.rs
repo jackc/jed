@@ -4,10 +4,10 @@
 //! end-state-valid key swap / cascade that PG rejects on the per-row transient) live here
 //! rather than the oracle corpus, the same divergence UNIQUE carries (indexes.md §8).
 
-use jed::{Database, Value, execute};
+use jed::{Engine, Value, execute};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
@@ -15,7 +15,7 @@ fn db_with(stmts: &[&str]) -> Database {
 }
 
 /// The (id, a, b) i32/i16 rows in storage-key order, as i64s, for end-state assertions.
-fn ids_abs(db: &Database) -> Vec<(i64, i64, i64)> {
+fn ids_abs(db: &Engine) -> Vec<(i64, i64, i64)> {
     db.rows_in_key_order("t")
         .unwrap()
         .iter()
@@ -26,7 +26,7 @@ fn ids_abs(db: &Database) -> Vec<(i64, i64, i64)> {
         .collect()
 }
 
-fn setup() -> Database {
+fn setup() -> Engine {
     db_with(&[
         "CREATE TABLE t (id i32 PRIMARY KEY, a i16, b i16)",
         "INSERT INTO t VALUES (1, 10, 11)",
@@ -37,7 +37,7 @@ fn setup() -> Database {
 
 #[test]
 fn update_missing_table_traps() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         execute(&mut db, "UPDATE nope SET a = 1")
             .unwrap_err()

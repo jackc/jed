@@ -17,9 +17,9 @@ import {
 import { dirname } from "node:path";
 
 import { FileBlockStore } from "./fileblockstore.ts";
-import { DEFAULT_PAGE_SIZE, Database } from "./executor.ts";
+import { DEFAULT_PAGE_SIZE, Engine } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import { loadDatabasePaged, toImage } from "./format.ts";
+import { loadEnginePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
@@ -32,11 +32,11 @@ export type DatabaseOptions = { pageSize?: number };
 // create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
 // durably immediately, so the file exists with its page size fixed (api.md §2).
-export function create(path: string, opts: DatabaseOptions = {}): Database {
+export function create(path: string, opts: DatabaseOptions = {}): Engine {
   if (existsSync(path)) {
     throw engineError("duplicate_file", "database file already exists: " + path);
   }
-  const db = new Database();
+  const db = new Engine();
   db.path = path;
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
@@ -63,7 +63,7 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persistImpl).
-function writeFullImage(db: Database): void {
+function writeFullImage(db: Engine): void {
   if (db.path === null) return;
   const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
   writeAtomic(db.path, bytes);
@@ -96,7 +96,7 @@ export type OpenOptions = { cacheBytes?: number; readOnly?: boolean; workMem?: n
 // (P6.4b). The byte budget is converted to a leaf-page capacity by the file's page size (cacheLeaves).
 // The budget is a handle setting, not stored in the file (§3). Later commits write through the same
 // pager kept open for the handle's life.
-export function open(path: string, opts: OpenOptions = {}): Database {
+export function open(path: string, opts: OpenOptions = {}): Engine {
   if (!existsSync(path)) {
     throw engineError("undefined_file", "database file does not exist: " + path);
   }
@@ -115,7 +115,7 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
     // page_size = 0 cannot divide by zero before that check runs).
     const pager = Pager.fromStore(new FileBlockStore(fd));
-    const db = loadDatabasePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
+    const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
@@ -132,7 +132,7 @@ export function open(path: string, opts: OpenOptions = {}): Database {
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
 // in-memory database (it is fully resident, nothing to page). The read-only gauge the
 // OpenOptions.cacheBytes budget bounds (≤ cacheBytes / pageSize by construction; spec/design/pager.md §3).
-export function residentLeaves(db: Database): number {
+export function residentLeaves(db: Engine): number {
   return db.paging === null ? 0 : db.paging.residentLeaves();
 }
 
@@ -140,14 +140,14 @@ export function residentLeaves(db: Database): number {
 // Publishes the open explicit block durably (per synchronous, via the persistHook); a commit with
 // no open block is a lenient no-op success (under autocommit each statement already committed).
 // Drives the same mechanism as SQL COMMIT.
-export function commit(db: Database): void {
+export function commit(db: Engine): void {
   db.commitTx();
 }
 
 // rollback rolls back the current transaction (spec/design/api.md §2.2, transactions.md §4.2).
 // Discards the open explicit block's working set; a rollback with no open block is a no-op
 // success. Drives the same mechanism as SQL ROLLBACK.
-export function rollback(db: Database): void {
+export function rollback(db: Engine): void {
   db.rollbackTx();
 }
 
@@ -155,7 +155,7 @@ export function rollback(db: Database): void {
 // (its in-progress work is discarded) and does not commit one. Under autocommit every prior
 // statement is already durable, so — unlike the original model — close does NOT drop committed
 // work; durability is never hidden in a destructor. Idempotent.
-export function close(db: Database): void {
+export function close(db: Engine): void {
   db.rollbackTx();
   db.path = null;
   if (db.paging !== null) {

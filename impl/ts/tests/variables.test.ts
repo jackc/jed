@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute } from "../src/lib.ts";
+import { Engine, EngineError, execute } from "../src/lib.ts";
 import type { Value } from "../src/value.ts";
 
 function code(fn: () => unknown): string {
@@ -23,7 +23,7 @@ function code(fn: () => unknown): string {
 }
 
 // scalar runs a single-row, single-column query and returns the lone value.
-function scalar(db: Database, sql: string): Value {
+function scalar(db: Engine, sql: string): Value {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   assert.equal(o.rows.length, 1, sql);
@@ -38,7 +38,7 @@ function assertText(v: Value, want: string): void {
 
 test("host set and read round trip", () => {
   // setVar stores; var reads it back through the host API; current_setting reads it in SQL.
-  const db = new Database();
+  const db = new Engine();
   assert.equal(db.var("myapp.tenant"), undefined); // unset
   db.setVar("myapp.tenant", "acme");
   assert.equal(db.var("myapp.tenant"), "acme");
@@ -48,7 +48,7 @@ test("host set and read round trip", () => {
 test("set and reset reject a non-dotted name", () => {
   // A variable must be namespaced (dotted) — a non-dotted name is a built-in setting name, and v1
   // exposes none through this map (the time_zone built-in is its own slice), so it is 42704.
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     code(() => db.setVar("bogus", "x")),
     "42704",
@@ -62,7 +62,7 @@ test("set and reset reject a non-dotted name", () => {
 });
 
 test("reset removes and is idempotent", () => {
-  const db = new Database();
+  const db = new Engine();
   db.setVar("myapp.k", "v");
   db.resetVar("myapp.k");
   assert.equal(db.var("myapp.k"), undefined);
@@ -77,7 +77,7 @@ test("reset removes and is idempotent", () => {
 
 test("names are case-insensitive but values are verbatim", () => {
   // The NAME folds to lowercase (PG GUC names are case-insensitive); the VALUE is preserved exactly.
-  const db = new Database();
+  const db = new Engine();
   db.setVar("myApp.Tenant", "AcmeCorp");
   assert.equal(db.var("myapp.tenant"), "AcmeCorp");
   assert.equal(db.var("MYAPP.TENANT"), "AcmeCorp");
@@ -85,7 +85,7 @@ test("names are case-insensitive but values are verbatim", () => {
 });
 
 test("missing_ok turns the unset error into NULL", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     code(() => execute(db, "SELECT current_setting('myapp.unset')")),
     "42704",
@@ -101,7 +101,7 @@ test("missing_ok turns the unset error into NULL", () => {
 test("a NULL name propagates to NULL", () => {
   // null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
   // a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, n text)");
   execute(db, "INSERT INTO t VALUES (1, NULL)");
   db.setVar("myapp.x", "set");
@@ -111,7 +111,7 @@ test("a NULL name propagates to NULL", () => {
 test("variables are session state, not snapshot state", () => {
   // Variables are SESSION state, not snapshot state (§6.1): a ROLLBACK undoes DATA but never a
   // session variable (PG SET SESSION). Set one outside, one inside a block, roll back — both survive.
-  const db = new Database();
+  const db = new Engine();
   db.setVar("myapp.outer", "a");
   execute(db, "BEGIN");
   db.setVar("myapp.inner", "b");
@@ -124,7 +124,7 @@ test("variables are session state, not snapshot state", () => {
 test("an additional session has independent variables", () => {
   // db.newSession(opts) mints an independent session (§2.1): its variable map is its own — a variable
   // set on it is invisible to the default session and vice versa.
-  const db = new Database();
+  const db = new Engine();
   db.setVar("myapp.who", "default");
 
   const other = db.newSession({});
@@ -143,7 +143,7 @@ test("an additional session has independent variables", () => {
 
 test("resetVars clears every variable", () => {
   // resetVars is PG RESET ALL for the variable map.
-  const db = new Database();
+  const db = new Engine();
   db.setVar("myapp.a", "1");
   db.setVar("myapp.b", "2");
   db.resetVars();

@@ -17,7 +17,7 @@ import (
 )
 
 // armCommitFault arms a one-shot commit fault on db's backing pager (storage.md §7). Testing only.
-func armCommitFault(t *testing.T, db *Database, f commitFault) {
+func armCommitFault(t *testing.T, db *Engine, f commitFault) {
 	t.Helper()
 	if err := db.paging.withPager(func(p *pager) error { p.armFault(f); return nil }); err != nil {
 		t.Fatal(err)
@@ -26,7 +26,7 @@ func armCommitFault(t *testing.T, db *Database, f commitFault) {
 
 // seeded returns a fresh file-backed t(id i32 PRIMARY KEY) holding rows 1,2 (each INSERT autocommits
 // durably) and the prior committed txid.
-func seedTwoRows(t *testing.T, path string) (*Database, uint64) {
+func seedTwoRows(t *testing.T, path string) (*Engine, uint64) {
 	t.Helper()
 	db, err := Create(path, DefaultDatabaseOptions())
 	if err != nil {
@@ -39,7 +39,7 @@ func seedTwoRows(t *testing.T, path string) (*Database, uint64) {
 }
 
 // sortedIDs returns t's ids ascending (the B-tree scan is key-ordered, but sort to be order-robust).
-func sortedIDs(t *testing.T, db *Database) []int64 {
+func sortedIDs(t *testing.T, db *Engine) []int64 {
 	t.Helper()
 	ids := selectIDs(t, db)
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
@@ -60,7 +60,7 @@ func equalIDs(a, b []int64) bool {
 
 // insertWithFault arms f, then runs an autocommit INSERT (3) that drives persist into it — which must
 // fail. Closes db (a clean close rolls back, no further writes) so the file is left in its crash state.
-func insertWithFault(t *testing.T, db *Database, f commitFault) {
+func insertWithFault(t *testing.T, db *Engine, f commitFault) {
 	t.Helper()
 	armCommitFault(t, db, f)
 	if _, err := Execute(db, "INSERT INTO t VALUES (3)"); err == nil {
@@ -71,7 +71,7 @@ func insertWithFault(t *testing.T, db *Database, f commitFault) {
 	}
 }
 
-func reopen(t *testing.T, path string) *Database {
+func reopen(t *testing.T, path string) *Engine {
 	t.Helper()
 	db, err := Open(path)
 	if err != nil {

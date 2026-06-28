@@ -80,8 +80,8 @@ const DefaultTempBuffers = 32 << 20
 
 // DefaultSharedTempMem is the default GLOBAL storage budget for DATABASE-WIDE shared temporary tables,
 // in BYTES (spec/design/temp-tables.md §7). The shared-temp analogue of DefaultTempBuffers: shared
-// temp data is global (one set of rows across every session of the open Database), so its budget is a
-// Database-level setting (sharedTempMem) rather than per-session. An over-budget shared write aborts
+// temp data is global (one set of rows across every session of the open Engine), so its budget is a
+// Engine-level setting (sharedTempMem) rather than per-session. An over-budget shared write aborts
 // the same 54P03. 0 ⇒ unlimited; measured identically (deterministic on-disk record bytes), so the
 // abort point is part of the cross-core contract.
 const DefaultSharedTempMem = 32 << 20
@@ -906,17 +906,17 @@ func (s *Snapshot) findIndex(name string) (string, IndexDef, bool) {
 	return "", IndexDef{}, false
 }
 
-// Database is the database handle: the last committed Snapshot plus, while a transaction is open,
+// Engine is the database handle: the last committed Snapshot plus, while a transaction is open,
 // the writer's working snapshot (CLAUDE.md §3, transactions.md §2). Reads run against the visible
 // snapshot — the open transaction's working if any, else committed; a write mutates working and
 // commit swaps committed := working (rollback drops working, since committed was never touched).
 // Every write — autocommit included — runs as a transaction, which unifies the two paths.
-type Database struct {
+type Engine struct {
 	committed *Snapshot
 	// session is the DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this
 	// handle runs statements through — the open transaction (the Idle/Open/Failed machine, §2.2),
 	// the relocated settings (maxCost/maxSQLLength/workMem, the entropy/clock seam), and the
-	// currval/lastval session state. A bare Database IS committed storage + this one long-lived
+	// currval/lastval session state. A bare Engine IS committed storage + this one long-lived
 	// stateful default session; the convenience methods operate on it. NewSession mints additional
 	// independent sessions (run sequentially on this single-threaded handle by swapping in here).
 	session Session
@@ -951,19 +951,19 @@ type Database struct {
 	// sharedTempCommitted is the DATABASE-WIDE shared temporary-table snapshot (temp-tables.md §4):
 	// the committed rows of every SHARED temp table, held in memory and NEVER serialized — the shared
 	// analogue of session.tempCommitted, but on the handle (visible to every session minted from this
-	// Database) rather than per-session. On a single handle this is just a field; for the shared layer
+	// Engine) rather than per-session. On a single handle this is just a field; for the shared layer
 	// (shared.go) it is pinned from / published to the shared roots alongside committed (the two-root
 	// commit, §5). Born empty, gone at close — never recovered (divergence D5).
 	sharedTempCommitted *Snapshot
 	// sharedTempMem is the GLOBAL byte budget for shared temp storage (shared_temp_mem, §7); 0 ⇒
-	// unlimited. The shared analogue of session.tempBuffers, but Database-level (shared temp is
+	// unlimited. The shared analogue of session.tempBuffers, but Engine-level (shared temp is
 	// global). An over-budget shared write aborts 54P03.
 	sharedTempMem int
 }
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
 // envelope subset landed in S1): the cost ceiling, the input-size limit, and the work-memory
-// budget. Passed to (*Database).NewSession. A zero MaxSQLLength or WorkMem takes its default at
+// budget. Passed to (*Engine).NewSession. A zero MaxSQLLength or WorkMem takes its default at
 // construction (use the setter for the 0 ⇒ unlimited form); a zero MaxCost IS unlimited (the
 // genuine default). The entropy/clock seam is injected via Session.SetRandomSource/SetClockSource.
 type SessionOptions struct {
@@ -1041,10 +1041,10 @@ func txStatusOf(tx *activeTx) TxStatus {
 }
 
 // Session is the per-connection SESSION state (spec/design/session.md §2.1): the configured,
-// stateful context a host runs statements through, un-fused from the committed storage on Database.
+// stateful context a host runs statements through, un-fused from the committed storage on Engine.
 // It owns the open transaction (the Idle/Open/Failed machine), the relocated handle settings, the
-// entropy/clock seam, and the currval/lastval session state. A Database holds one as its long-lived
-// default session; (*Database).NewSession mints additional independent ones that run sequentially
+// entropy/clock seam, and the currval/lastval session state. A Engine holds one as its long-lived
+// default session; (*Engine).NewSession mints additional independent ones that run sequentially
 // on a single-threaded handle (by swapping into the default slot for the duration of a call).
 type Session struct {
 	// tx is the open transaction, or nil under autocommit (transactions.md §4.1); a single-statement
@@ -1115,7 +1115,7 @@ type Session struct {
 	tempBuffers int
 	// tempCommitted is the session-local temporary-table catalog + stores (spec/design/temp-tables.md
 	// §2): a Snapshot holding only this session's temp tables, their stores, and their (UNIQUE) index
-	// stores. NEVER serialized — only Database.committed is written to the file, so a temp table makes
+	// stores. NEVER serialized — only Engine.committed is written to the file, so a temp table makes
 	// ZERO file writes. Private to this Session (it carries across the additional-session swap and is
 	// invisible to other sessions), and dropped wholesale when the session is. Transactional like the
 	// main snapshot: an open transaction clones it into activeTx.tempWorking, which a successful COMMIT
@@ -1247,13 +1247,13 @@ type activeTx struct {
 	// and discarded on ROLLBACK. The temp analogue of working, kept SEPARATE so it is never serialized.
 	tempWorking *Snapshot
 	// sharedTempWorking is the transaction's working copy of the DATABASE-WIDE shared temp-table
-	// snapshot (spec/design/temp-tables.md §5): cloned from Database.sharedTempCommitted at tx open,
+	// snapshot (spec/design/temp-tables.md §5): cloned from Engine.sharedTempCommitted at tx open,
 	// mutated by shared-temp DDL/DML, adopted back on a successful COMMIT and discarded on ROLLBACK.
 	// The shared analogue of tempWorking; for the shared layer the adopted state is then published to
 	// the shared root (the two-root commit, §5).
 	sharedTempWorking *Snapshot
 	// mainDirty is whether this transaction mutated the MAIN (persistent) snapshot — set by
-	// (*Database).workingMut. Drives the commit's persist decision so a transaction that touched ONLY
+	// (*Engine).workingMut. Drives the commit's persist decision so a transaction that touched ONLY
 	// temp tables makes zero file writes (temp-tables.md §2).
 	mainDirty bool
 	// tempDirty is whether this transaction mutated the SESSION-LOCAL TEMP snapshot — set by the temp
@@ -1266,24 +1266,24 @@ type activeTx struct {
 	sharedTempDirty bool
 }
 
-// NewDatabase builds an empty in-memory database.
-func NewDatabase() *Database {
-	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
+// NewEngine builds an empty in-memory database.
+func NewEngine() *Engine {
+	return &Engine{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
 }
 
 // WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
 // fan-out tracks the page size (spec/fileformat/format.md), so the in-memory tree must be built at
 // the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
-// in-memory database uses NewDatabase (the default page size).
-func WithPageSize(pageSize uint32) *Database {
-	return &Database{committed: newSnapshot(), pageSize: pageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
+// in-memory database uses NewEngine (the default page size).
+func WithPageSize(pageSize uint32) *Engine {
+	return &Engine{committed: newSnapshot(), pageSize: pageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
 }
 
 // readSnap is the snapshot a read sees: the read pin if one is set (a data-modifying WITH statement
 // pins the pre-statement snapshot so every sub-statement reads it — writable-cte.md §2), else the
 // open transaction's working (read-your-writes for a writable tx; the pinned snapshot for a
 // read-only tx), else the committed snapshot.
-func (db *Database) readSnap() *Snapshot {
+func (db *Engine) readSnap() *Snapshot {
 	if db.session.readPin != nil {
 		return db.session.readPin
 	}
@@ -1296,7 +1296,7 @@ func (db *Database) readSnap() *Snapshot {
 // columnCollations resolves each column's frozen collation (Column.Collation, the name) to its
 // baked table, indexed by column ordinal — nil for a C / non-text column (the fast path). The key
 // encoders (§2.12) consult colls[ci] to pick a text column's key form.
-func (db *Database) ensureCollationsWritable(columns []Column) error {
+func (db *Engine) ensureCollationsWritable(columns []Column) error {
 	// Refuse a WRITE that would maintain a collated B-tree under a version-skewed collation (the
 	// slice-2d verdict, spec/design/collation.md §12/§14): if any of columns carries a collation the
 	// file pinned to a different (unicode, cldr) than the loaded bundle provides, an
@@ -1321,7 +1321,7 @@ func (db *Database) ensureCollationsWritable(columns []Column) error {
 	return nil
 }
 
-func (db *Database) columnCollations(columns []Column) []*Collation {
+func (db *Engine) columnCollations(columns []Column) []*Collation {
 	snap := db.readSnap()
 	out := make([]*Collation, len(columns))
 	for i := range columns {
@@ -1345,7 +1345,7 @@ func collatedTextKey(coll *Collation, s string) ([]byte, error) {
 
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
 // with a transaction open (autocommit opens one implicitly), so tx is non-nil here.
-func (db *Database) working() *Snapshot {
+func (db *Engine) working() *Snapshot {
 	// Mark the main image dirty so the commit knows to persist it; a temp-only transaction never
 	// reaches here (it writes via the temp funnels) and so makes zero file writes (temp-tables.md §2).
 	db.session.tx.mainDirty = true
@@ -1355,7 +1355,7 @@ func (db *Database) working() *Snapshot {
 // tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
 // transaction's tempWorking, else the session's committed temp state. The temp analogue of readSnap
 // (it does not consult readPin — a writable-CTE pins only the main snapshot).
-func (db *Database) tempSnap() *Snapshot {
+func (db *Engine) tempSnap() *Snapshot {
 	if db.session.tx != nil {
 		return db.session.tx.tempWorking
 	}
@@ -1365,7 +1365,7 @@ func (db *Database) tempSnap() *Snapshot {
 // isTempTable reports whether name resolves to a SESSION-LOCAL temporary table in the visible temp
 // snapshot (spec/design/temp-tables.md §3). Preclude-overlaps guarantees a name is temp XOR
 // persistent, so this is the routing predicate the table/store funnels use.
-func (db *Database) isTempTable(name string) bool {
+func (db *Engine) isTempTable(name string) bool {
 	_, ok := db.tempSnap().table(name)
 	return ok
 }
@@ -1373,7 +1373,7 @@ func (db *Database) isTempTable(name string) bool {
 // sharedTempSnap is the DATABASE-WIDE shared temp-table snapshot for READS (temp-tables.md §4/§5):
 // the open transaction's sharedTempWorking, else the handle's sharedTempCommitted. The shared
 // analogue of tempSnap.
-func (db *Database) sharedTempSnap() *Snapshot {
+func (db *Engine) sharedTempSnap() *Snapshot {
 	if db.session.tx != nil {
 		return db.session.tx.sharedTempWorking
 	}
@@ -1383,7 +1383,7 @@ func (db *Database) sharedTempSnap() *Snapshot {
 // isSharedTempTable reports whether name resolves to a DATABASE-WIDE shared temporary table in the
 // visible shared-temp snapshot (temp-tables.md §3). Checked AFTER session-local in the resolution
 // walk (session-local → shared → persistent); preclude-overlaps keeps a name in at most one scope.
-func (db *Database) isSharedTempTable(name string) bool {
+func (db *Engine) isSharedTempTable(name string) bool {
 	_, ok := db.sharedTempSnap().table(name)
 	return ok
 }
@@ -1396,7 +1396,7 @@ func (db *Database) isSharedTempTable(name string) bool {
 // temp tables plus the shared ones, so the check is scoped to what is visible (another session's
 // private temp table is invisible by design — and its resolved ColType is self-contained, so it keeps
 // working regardless).
-func (db *Database) compositeDependentAny(name string) (string, bool) {
+func (db *Engine) compositeDependentAny(name string) (string, bool) {
 	if dep, ok := db.readSnap().compositeDependent(name); ok {
 		return dep, true
 	}
@@ -1409,7 +1409,7 @@ func (db *Database) compositeDependentAny(name string) (string, bool) {
 // isTempIndex reports whether name is a secondary index on a SESSION-LOCAL temp table
 // (spec/design/temp-tables.md §8) — the index analogue of isTempTable, used to gate (allowTempDDL)
 // and route a DROP INDEX of a temp index. Preclude-overlaps keeps an index name in one scope.
-func (db *Database) isTempIndex(name string) bool {
+func (db *Engine) isTempIndex(name string) bool {
 	_, _, ok := db.tempSnap().findIndex(name)
 	return ok
 }
@@ -1417,7 +1417,7 @@ func (db *Database) isTempIndex(name string) bool {
 // isSharedTempIndex reports whether name is a secondary index on a DATABASE-WIDE shared temp table
 // (temp-tables.md §8) — the index analogue of isSharedTempTable; checked AFTER the session-local
 // index (the resolution walk).
-func (db *Database) isSharedTempIndex(name string) bool {
+func (db *Engine) isSharedTempIndex(name string) bool {
 	_, _, ok := db.sharedTempSnap().findIndex(name)
 	return ok
 }
@@ -1427,7 +1427,7 @@ func (db *Database) isSharedTempIndex(name string) bool {
 // (the shared relation namespace), so this is just "where the sequence lives". Every sequence READ
 // (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a serial/IDENTITY
 // column's OWNED temp sequence resolves exactly like a persistent one.
-func (db *Database) sequence(name string) *SequenceDef {
+func (db *Engine) sequence(name string) *SequenceDef {
 	if s := db.tempSnap().sequence(name); s != nil {
 		return s
 	}
@@ -1440,19 +1440,19 @@ func (db *Database) sequence(name string) *SequenceDef {
 // isTempSequence reports whether name is a sequence in the SESSION-LOCAL temp snapshot
 // (temp-tables.md §8) — the sequence analogue of isTempTable. A temp sequence only ever arises from a
 // serial/IDENTITY temp column (standalone CREATE SEQUENCE is always persistent), so it is always owned.
-func (db *Database) isTempSequence(name string) bool {
+func (db *Engine) isTempSequence(name string) bool {
 	return db.tempSnap().sequence(name) != nil
 }
 
 // isSharedTempSequence reports whether name is a sequence in the DATABASE-WIDE shared temp snapshot
 // (temp-tables.md §8) — checked AFTER session-local (the resolution walk).
-func (db *Database) isSharedTempSequence(name string) bool {
+func (db *Engine) isSharedTempSequence(name string) bool {
 	return db.sharedTempSnap().sequence(name) != nil
 }
 
 // anyTempSequence / anySharedTempSequence report whether any name in a DROP SEQUENCE list is a
 // session-local / shared temp sequence — the gate classifiers for a temp DROP SEQUENCE (§5/§8).
-func (db *Database) anyTempSequence(names []string) bool {
+func (db *Engine) anyTempSequence(names []string) bool {
 	for _, n := range names {
 		if db.isTempSequence(n) {
 			return true
@@ -1461,7 +1461,7 @@ func (db *Database) anyTempSequence(names []string) bool {
 	return false
 }
 
-func (db *Database) anySharedTempSequence(names []string) bool {
+func (db *Engine) anySharedTempSequence(names []string) bool {
 	for _, n := range names {
 		if db.isSharedTempSequence(n) {
 			return true
@@ -1474,7 +1474,7 @@ func (db *Database) anySharedTempSequence(names []string) bool {
 // a session-local / database-wide-shared temp table — the DDL capability gate's classification of a
 // mixed list (temp-tables.md §5): if any target is temp-scoped the whole statement is gated by the
 // matching temp-DDL grant (shared checked before session-local, the resolution-walk order).
-func (db *Database) anyTempTable(names []string) bool {
+func (db *Engine) anyTempTable(names []string) bool {
 	for _, n := range names {
 		if db.isTempTable(n) {
 			return true
@@ -1483,7 +1483,7 @@ func (db *Database) anyTempTable(names []string) bool {
 	return false
 }
 
-func (db *Database) anySharedTempTable(names []string) bool {
+func (db *Engine) anySharedTempTable(names []string) bool {
 	for _, n := range names {
 		if db.isSharedTempTable(n) {
 			return true
@@ -1497,7 +1497,7 @@ func (db *Database) anySharedTempTable(names []string) bool {
 // temp column's owned sequence advances (nextval flush) into its temp snapshot — like the table's rows,
 // zero file writes (temp-tables.md §2); a brand-new persistent sequence is absent from both temp scopes
 // and lands in the main image.
-func (db *Database) putSequenceRouted(def *SequenceDef) {
+func (db *Engine) putSequenceRouted(def *SequenceDef) {
 	if db.isTempSequence(def.Name) {
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.putSequence(def)
@@ -1511,7 +1511,7 @@ func (db *Database) putSequenceRouted(def *SequenceDef) {
 
 // removeSequenceRouted removes a sequence from whichever scope owns its name (the routed analogue of
 // putSequenceRouted). Used by DROP SEQUENCE and DROP TABLE's owned-sequence auto-drop.
-func (db *Database) removeSequenceRouted(name string) {
+func (db *Engine) removeSequenceRouted(name string) {
 	key := strings.ToLower(name)
 	if db.isTempSequence(name) {
 		db.session.tx.tempDirty = true
@@ -1527,7 +1527,7 @@ func (db *Database) removeSequenceRouted(name string) {
 // setColumnDefaultExprRouted rewrites a column's stored DEFAULT expression in whichever scope owns the
 // table — the routed analogue used by ALTER SEQUENCE … RENAME of an owned sequence (temp-tables.md §8),
 // so a renamed owned TEMP sequence's nextval default is rewritten in the temp snapshot.
-func (db *Database) setColumnDefaultExprRouted(tableKey string, column int, de *DefaultExpr) {
+func (db *Engine) setColumnDefaultExprRouted(tableKey string, column int, de *DefaultExpr) {
 	if db.isTempTable(tableKey) {
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.setColumnDefaultExpr(tableKey, column, de)
@@ -1541,7 +1541,7 @@ func (db *Database) setColumnDefaultExprRouted(tableKey string, column int, de *
 
 // lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
 // (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
-func (db *Database) lkpTable(name string) (*Table, bool) {
+func (db *Engine) lkpTable(name string) (*Table, bool) {
 	if t, ok := db.tempSnap().table(name); ok {
 		return t, true
 	}
@@ -1553,7 +1553,7 @@ func (db *Database) lkpTable(name string) (*Table, bool) {
 
 // lkpStore returns a table's store for READS, routing by the resolution walk (session-local temp →
 // shared temp → visible main snapshot — temp-tables.md §2/§4). No dirty flag — reads never persist.
-func (db *Database) lkpStore(name string) *TableStore {
+func (db *Engine) lkpStore(name string) *TableStore {
 	if db.isTempTable(name) {
 		return db.tempSnap().store(name)
 	}
@@ -1567,7 +1567,7 @@ func (db *Database) lkpStore(name string) *TableStore {
 // (flagging tempDirty), a shared temp write to sharedTempWorking (flagging sharedTempDirty), and a
 // persistent write to working (which flags mainDirty) — so a pure-temp transaction leaves the main
 // image untouched (temp-tables.md §2).
-func (db *Database) writeStore(name string) *TableStore {
+func (db *Engine) writeStore(name string) *TableStore {
 	if db.isTempTable(name) {
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.store(name)
@@ -1581,7 +1581,7 @@ func (db *Database) writeStore(name string) *TableStore {
 
 // lkpIndexStore returns a secondary index's store for READS, walking session-local → shared → main
 // (temp-tables.md §8).
-func (db *Database) lkpIndexStore(nameKey string) *TableStore {
+func (db *Engine) lkpIndexStore(nameKey string) *TableStore {
 	if db.tempSnap().hasIndexStore(nameKey) {
 		return db.tempSnap().indexStore(nameKey)
 	}
@@ -1593,7 +1593,7 @@ func (db *Database) lkpIndexStore(nameKey string) *TableStore {
 
 // writeIndexStore returns a secondary index's store for MUTATION, walking session-local → shared →
 // main (flagging the matching dirty bit).
-func (db *Database) writeIndexStore(nameKey string) *TableStore {
+func (db *Engine) writeIndexStore(nameKey string) *TableStore {
 	if db.tempSnap().hasIndexStore(nameKey) {
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.indexStore(nameKey)
@@ -1607,35 +1607,35 @@ func (db *Database) writeIndexStore(nameKey string) *TableStore {
 
 // InTransaction reports whether an explicit transaction block is currently open
 // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
-func (db *Database) InTransaction() bool { return db.session.tx != nil }
+func (db *Engine) InTransaction() bool { return db.session.tx != nil }
 
 // Txid is the monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
-func (db *Database) Txid() uint64 { return db.committed.txid }
+func (db *Engine) Txid() uint64 { return db.committed.txid }
 
 // OldestLiveTxid is the oldest still-live snapshot's txid (spec/design/transactions.md §8) — the
 // Phase-6 free-list reclamation gate. Single-handle (P5.3a) it is trivially the committed txid; the
 // P5.3b shared read snapshots make it meaningful.
-func (db *Database) OldestLiveTxid() uint64 { return db.committed.txid }
+func (db *Engine) OldestLiveTxid() uint64 { return db.committed.txid }
 
 // PageSize is the page size this database serializes with (spec/design/api.md §2).
-func (db *Database) PageSize() uint32 { return db.pageSize }
+func (db *Engine) PageSize() uint32 { return db.pageSize }
 
 // PageCount is the committed logical page high-water — the number of pages the on-disk image
 // references (the count the meta records, format.md), the size an incremental commit extends at
 // (spec/fileformat/format.md *Reclamation*). It is not the physical file length, which the chunked
 // preallocation (pager.go, spec/design/pager.md §7) runs ahead of with trailing zero slack. 0 for a
 // fresh in-memory database.
-func (db *Database) PageCount() uint32 { return db.pageCount }
+func (db *Engine) PageCount() uint32 { return db.pageCount }
 
 // Path is the backing file path, or "" for an in-memory database.
-func (db *Database) Path() string { return db.path }
+func (db *Engine) Path() string { return db.path }
 
 // SetMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
 // spec/design/api.md §8). A positive limit bounds every subsequent statement: it aborts with
 // 54P01 the instant accrued cost reaches limit (spec/design/cost.md §6). limit <= 0 (the default)
 // is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
 // setting, not stored in the file.
-func (db *Database) SetMaxCost(limit int64) { db.session.maxCost = limit }
+func (db *Engine) SetMaxCost(limit int64) { db.session.maxCost = limit }
 
 // SetLifetimeMaxCost sets the PER-SESSION cumulative cost budget on the default session
 // (spec/design/session.md §5.4); limit <= 0 (the default) is unlimited. Where max_cost bounds one
@@ -1643,32 +1643,32 @@ func (db *Database) SetMaxCost(limit int64) { db.session.maxCost = limit }
 // cost reaches limit the in-flight statement aborts 54P02, and once spent every further statement is
 // rejected 54P02 at admission. The multi-tenant / untrusted-host gate atop max_cost; a handle
 // setting, not stored in the file.
-func (db *Database) SetLifetimeMaxCost(limit int64) { db.session.lifetimeMaxCost = limit }
+func (db *Engine) SetLifetimeMaxCost(limit int64) { db.session.lifetimeMaxCost = limit }
 
 // LifetimeMaxCost is the default session's per-session cumulative cost budget (0 ⇒ unlimited).
-func (db *Database) LifetimeMaxCost() int64 { return db.session.lifetimeMaxCost }
+func (db *Engine) LifetimeMaxCost() int64 { return db.session.lifetimeMaxCost }
 
 // LifetimeCost is the default session's running CUMULATIVE execution cost so far
 // (spec/design/session.md §5.4) — the gauge the lifetime_max_cost budget bounds. Tracked even when
 // unlimited; survives a transaction rollback (session state, not snapshot state).
-func (db *Database) LifetimeCost() int64 { return *db.session.lifetimeTotal }
+func (db *Engine) LifetimeCost() int64 { return *db.session.lifetimeTotal }
 
 // SetDefaultPrivileges replaces the default session's default table-privilege set — the
 // GRANT … ON ALL TABLES default (spec/design/session.md §5.3). PrivSetEmpty.With(PrivSelect) makes
 // the session read-only (a write resolves to 42501). A handle setting, not stored in the file.
-func (db *Database) SetDefaultPrivileges(privs PrivilegeSet) {
+func (db *Engine) SetDefaultPrivileges(privs PrivilegeSet) {
 	db.session.privileges.SetDefaultTable(privs)
 }
 
 // Grant grants privs on a specific object (table or function) on the default session, beyond the
 // default (§5.3).
-func (db *Database) Grant(privs PrivilegeSet, object string) {
+func (db *Engine) Grant(privs PrivilegeSet, object string) {
 	db.session.privileges.Grant(privs, object)
 }
 
 // Revoke revokes privs from a specific object on the default session (revoke wins over grant and the
 // default, §5.3).
-func (db *Database) Revoke(privs PrivilegeSet, object string) {
+func (db *Engine) Revoke(privs PrivilegeSet, object string) {
 	db.session.privileges.Revoke(privs, object)
 }
 
@@ -1676,7 +1676,7 @@ func (db *Database) Revoke(privs PrivilegeSet, object string) {
 // table privilege, no per-object delta, DDL allowed (§5.3). The conformance harness calls this before
 // each record so a # default_privileges: / # grant: / # revoke: / # allow_ddl: directive never leaks
 // past the record it decorates.
-func (db *Database) ResetPrivileges() {
+func (db *Engine) ResetPrivileges() {
 	db.session.privileges = newPrivileges()
 	db.session.allowDDL = true
 	// The temp-DDL gates are part of the authorization envelope (temp-tables.md §5); reset them with
@@ -1687,74 +1687,74 @@ func (db *Database) ResetPrivileges() {
 }
 
 // Privileges is read-only access to the default session's authorization envelope (§5.3).
-func (db *Database) Privileges() *Privileges { return &db.session.privileges }
+func (db *Engine) Privileges() *Privileges { return &db.session.privileges }
 
 // SetAllowDDL sets whether DDL is permitted on the default session (§5.3); a denied schema change is
 // 42501.
-func (db *Database) SetAllowDDL(allow bool) { db.session.allowDDL = allow }
+func (db *Engine) SetAllowDDL(allow bool) { db.session.allowDDL = allow }
 
 // AllowDDL reports whether DDL is permitted on the default session.
-func (db *Database) AllowDDL() bool { return db.session.allowDDL }
+func (db *Engine) AllowDDL() bool { return db.session.allowDDL }
 
 // SetAllowTempDDL sets whether session-local temporary-table DDL is permitted on the default session
 // (spec/design/temp-tables.md §5) — the temp-scoped split of AllowDDL; a denied temp DDL is 42501.
-func (db *Database) SetAllowTempDDL(allow bool) { db.session.allowTempDDL = allow }
+func (db *Engine) SetAllowTempDDL(allow bool) { db.session.allowTempDDL = allow }
 
 // AllowTempDDL reports whether session-local temporary-table DDL is permitted on the default session.
-func (db *Database) AllowTempDDL() bool { return db.session.allowTempDDL }
+func (db *Engine) AllowTempDDL() bool { return db.session.allowTempDDL }
 
 // SetAllowSharedTempDDL sets whether DATABASE-WIDE shared temporary-table DDL is permitted on the
 // default session (spec/design/temp-tables.md §5) — the shared-temp split of AllowDDL, the more
 // privileged of the two temp gates; a denied shared-temp DDL is 42501.
-func (db *Database) SetAllowSharedTempDDL(allow bool) { db.session.allowSharedTempDDL = allow }
+func (db *Engine) SetAllowSharedTempDDL(allow bool) { db.session.allowSharedTempDDL = allow }
 
 // AllowSharedTempDDL reports whether shared temporary-table DDL is permitted on the default session.
-func (db *Database) AllowSharedTempDDL() bool { return db.session.allowSharedTempDDL }
+func (db *Engine) AllowSharedTempDDL() bool { return db.session.allowSharedTempDDL }
 
 // SetTempBuffers sets the default session's per-session temp-table storage budget in BYTES
 // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
-func (db *Database) SetTempBuffers(bytes int) { db.session.tempBuffers = bytes }
+func (db *Engine) SetTempBuffers(bytes int) { db.session.tempBuffers = bytes }
 
 // TempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
-func (db *Database) TempBuffers() int { return db.session.tempBuffers }
+func (db *Engine) TempBuffers() int { return db.session.tempBuffers }
 
 // SetSharedTempMem sets the GLOBAL shared-temp storage budget in BYTES (shared_temp_mem,
-// spec/design/temp-tables.md §7); 0 ⇒ unlimited. A Database-level setting (shared temp data is
+// spec/design/temp-tables.md §7); 0 ⇒ unlimited. A Engine-level setting (shared temp data is
 // global); an over-budget shared-temp write aborts 54P03.
-func (db *Database) SetSharedTempMem(bytes int) { db.sharedTempMem = bytes }
+func (db *Engine) SetSharedTempMem(bytes int) { db.sharedTempMem = bytes }
 
 // SharedTempMem reports the handle's shared-temp storage budget (0 ⇒ unlimited).
-func (db *Database) SharedTempMem() int { return db.sharedTempMem }
+func (db *Engine) SharedTempMem() int { return db.sharedTempMem }
 
 // SetVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
 // variables must be namespaced (a dotted name); a non-dotted name is 42704. Read it back in SQL with
 // current_setting('name'[, missing_ok]).
-func (db *Database) SetVar(name, value string) error { return db.session.SetVar(name, value) }
+func (db *Engine) SetVar(name, value string) error { return db.session.SetVar(name, value) }
 
 // ResetVar clears a session variable on the default session (§6.1); a non-dotted name is 42704.
-func (db *Database) ResetVar(name string) error { return db.session.ResetVar(name) }
+func (db *Engine) ResetVar(name string) error { return db.session.ResetVar(name) }
 
 // Var reads a session variable's value on the default session (§6.1); ok is false if it is not set.
-func (db *Database) Var(name string) (string, bool) { return db.session.Var(name) }
+func (db *Engine) Var(name string) (string, bool) { return db.session.Var(name) }
 
 // ResetVars clears every session variable on the default session (§6.1) — PostgreSQL's RESET ALL for
 // the variable map (also the conformance harness # set: reset hook).
-func (db *Database) ResetVars() { db.session.ResetVars() }
+func (db *Engine) ResetVars() { db.session.ResetVars() }
 
 // SetTimeZone sets the time zone on the default session (spec/design/session.md §6.2, timezones.md
 // §9.4): the zone a timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts.
 // Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; else 22023.
-func (db *Database) SetTimeZone(zone string) error { return db.session.SetTimeZone(zone) }
+func (db *Engine) SetTimeZone(zone string) error { return db.session.SetTimeZone(zone) }
 
 // SetMaxSQLLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
 // §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
 // parse entry, before lexing — the §13 input-size gate (cost.md §7). 0 is unlimited (a trusted
 // caller's opt-out); the default is DefaultMaxSQLLength (1 MiB). A handle setting, not stored in
 // the file (mirrors SetMaxCost).
-func (db *Database) SetMaxSQLLength(bytes int) { db.session.maxSQLLength = bytes }
+func (db *Engine) SetMaxSQLLength(bytes int) { db.session.maxSQLLength = bytes }
 
 // MaxSQLLength is the current input-SQL byte limit (0 = unlimited). See SetMaxSQLLength.
-func (db *Database) MaxSQLLength() int { return db.session.maxSQLLength }
+func (db *Engine) MaxSQLLength() int { return db.session.maxSQLLength }
 
 // parse parses one statement from sql, first enforcing this handle's maxSQLLength input-size limit
 // (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an over-limit
@@ -1763,7 +1763,7 @@ func (db *Database) MaxSQLLength() int { return db.session.maxSQLLength }
 // == 0 is unlimited. Every handle-bound parse path routes through here (Execute/ExecuteParams/
 // Prepare/ExecuteSQL/the session handles), so the per-handle limit has no hole. The byte length is
 // len(sql) (Go strings are UTF-8).
-func (db *Database) parse(sql string) (Statement, error) {
+func (db *Engine) parse(sql string) (Statement, error) {
 	if db.session.maxSQLLength > 0 && len(sql) > db.session.maxSQLLength {
 		return Statement{}, NewError(ProgramLimitExceeded, fmt.Sprintf("SQL statement exceeds the maximum length of %d bytes", db.session.maxSQLLength))
 	}
@@ -1773,16 +1773,16 @@ func (db *Database) parse(sql string) (Statement, error) {
 // SetRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) — the
 // deterministic / reproducible path. Pass SeededRandomSource for a byte-identical cross-core stream
 // (the conformance # seed: directive). ClearRandomSource returns to the OS CSPRNG, drawn per value.
-func (db *Database) SetRandomSource(f RandomSource) { db.session.seam.SetRandom(f) }
-func (db *Database) ClearRandomSource()             { db.session.seam.ClearRandom() }
+func (db *Engine) SetRandomSource(f RandomSource) { db.session.seam.SetRandom(f) }
+func (db *Engine) ClearRandomSource()             { db.session.seam.ClearRandom() }
 
 // SetClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. FixedClock (the # clock:
 // directive). ClearClockSource returns to the wall clock.
-func (db *Database) SetClockSource(f ClockSource) { db.session.seam.SetClock(f) }
-func (db *Database) ClearClockSource()            { db.session.seam.ClearClock() }
+func (db *Engine) SetClockSource(f ClockSource) { db.session.seam.SetClock(f) }
+func (db *Engine) ClearClockSource()            { db.session.seam.ClearClock() }
 
 // MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
-func (db *Database) MaxCost() int64 { return db.session.maxCost }
+func (db *Engine) MaxCost() int64 { return db.session.maxCost }
 
 // SetWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
 // (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly
@@ -1790,22 +1790,22 @@ func (db *Database) MaxCost() int64 { return db.session.maxCost }
 // spill). It never changes what a query observes (results + cost are invariant — spill.md §6), only
 // when an operator spills; an in-memory database ignores it. A handle setting, not stored in the
 // file (mirrors SetMaxCost).
-func (db *Database) SetWorkMem(bytes int) { db.session.workMem = bytes }
+func (db *Engine) SetWorkMem(bytes int) { db.session.workMem = bytes }
 
 // WorkMem is the current work-memory budget in bytes (0 ⇒ unlimited). See SetWorkMem.
-func (db *Database) WorkMem() int { return db.session.workMem }
+func (db *Engine) WorkMem() int { return db.session.workMem }
 
 // Status reports the DEFAULT session's transaction status (Idle/Open/Failed, spec/design/session.md
 // §2.2) — the explicit three-state machine the convenience methods drive.
-func (db *Database) Status() TxStatus { return txStatusOf(db.session.tx) }
+func (db *Engine) Status() TxStatus { return txStatusOf(db.session.tx) }
 
 // NewSession mints an ADDITIONAL independent session over this database (spec/design/session.md
 // §2.1), configured from opts. The new session has its own settings, transaction status, and
 // sequence state; the committed storage is shared. On a single-threaded handle, additional sessions
 // run sequentially — a statement is issued through (*Session).ExecuteSQL/QuerySQL/View/Update, which
-// swaps the session into the active slot for the call. The bare Database keeps its long-lived
+// swaps the session into the active slot for the call. The bare Engine keeps its long-lived
 // default session, so this is purely additive.
-func (db *Database) NewSession(opts SessionOptions) *Session {
+func (db *Engine) NewSession(opts SessionOptions) *Session {
 	s := newSessionWithOptions(opts)
 	return &s
 }
@@ -1815,31 +1815,31 @@ func (db *Database) NewSession(opts SessionOptions) *Session {
 // activate installs s as db's active session and returns the restore function — the swap that lets
 // an additional session run on a single-threaded handle. Use as `defer s.activate(db)()`: the swap
 // in happens immediately, the deferred restore runs at return (even on a panic).
-func (s *Session) activate(db *Database) func() {
+func (s *Session) activate(db *Engine) func() {
 	db.session, *s = *s, db.session
 	return func() { db.session, *s = *s, db.session }
 }
 
 // ExecuteSQL runs a (possibly mutating) statement on this session against db, binding $N params.
-func (s *Session) ExecuteSQL(db *Database, sql string, params []Value) (Outcome, error) {
+func (s *Session) ExecuteSQL(db *Engine, sql string, params []Value) (Outcome, error) {
 	defer s.activate(db)()
 	return db.ExecuteSQL(sql, params)
 }
 
 // QuerySQL runs a query on this session against db, returning a row cursor.
-func (s *Session) QuerySQL(db *Database, sql string, params []Value) (*Rows, error) {
+func (s *Session) QuerySQL(db *Engine, sql string, params []Value) (*Rows, error) {
 	defer s.activate(db)()
 	return db.QuerySQL(sql, params)
 }
 
 // View runs fn in a READ ONLY transaction on this session (auto-commit/rollback, §2.2).
-func (s *Session) View(db *Database, fn func(tx *Transaction) error) error {
+func (s *Session) View(db *Engine, fn func(tx *Transaction) error) error {
 	defer s.activate(db)()
 	return db.View(fn)
 }
 
 // Update runs fn in a READ WRITE transaction on this session (auto-commit/rollback, §2.2).
-func (s *Session) Update(db *Database, fn func(tx *Transaction) error) error {
+func (s *Session) Update(db *Engine, fn func(tx *Transaction) error) error {
 	defer s.activate(db)()
 	return db.Update(fn)
 }
@@ -1962,23 +1962,23 @@ func (s *Session) ClearClockSource()            { s.seam.ClearClock() }
 
 // ReadOnly reports whether this handle was opened read-only (spec/design/api.md §2.1): every
 // transaction defaults to READ ONLY, writes are 25006, and the file is never written.
-func (db *Database) ReadOnly() bool { return db.readOnly }
+func (db *Engine) ReadOnly() bool { return db.readOnly }
 
 // Table looks up a table definition by name (case-insensitive) in the visible snapshot.
-func (db *Database) Table(name string) (*Table, bool) {
+func (db *Engine) Table(name string) (*Table, bool) {
 	return db.readSnap().table(name)
 }
 
 // CompositeType looks up a composite type definition by name (case-insensitive) in the visible
 // snapshot (spec/design/composite.md); nil if absent.
-func (db *Database) CompositeType(name string) *CompositeType {
+func (db *Engine) CompositeType(name string) *CompositeType {
 	return db.readSnap().compositeType(name)
 }
 
 // TableNames is the canonical name of every table in the visible snapshot, sorted ascending
 // by lowercased name (the catalog's standing order — no map-iteration order may leak,
 // CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
-func (db *Database) TableNames() []string {
+func (db *Engine) TableNames() []string {
 	snap := db.readSnap()
 	keys := make([]string, 0, len(snap.tables))
 	for k := range snap.tables {
@@ -1994,7 +1994,7 @@ func (db *Database) TableNames() []string {
 
 // putTable registers a new table and its empty store in the working snapshot (DDL is
 // transactional — transactions.md §4.5).
-func (db *Database) putTable(t *Table) {
+func (db *Engine) putTable(t *Table) {
 	db.working().putTable(t, db.pageSize)
 }
 
@@ -2035,11 +2035,11 @@ type CollationInfo struct {
 // LoadUnicodeData loads a JUCD Unicode-data bundle (db.LoadUnicodeData, spec/design/collation.md
 // §4.2): its collations become resolvable by name for COLLATE, per-column collation, and ORDER BY …
 // COLLATE. The loaded set is ENGINE-GLOBAL (§9), so a bundle loaded through any handle is visible
-// everywhere — including to a later Database.Open of a file that REFERENCES one of its collations.
+// everywhere — including to a later Engine.Open of a file that REFERENCES one of its collations.
 // Privileged host op (not SQL-reachable, no path, no engine I/O — §11); ADDITIVE and idempotent for
 // an already-loaded bundle. A malformed bundle is XX001. (Mirrors the package-level LoadUnicodeData,
 // which the host may call before opening any file.)
-func (db *Database) LoadUnicodeData(data []byte) error {
+func (db *Engine) LoadUnicodeData(data []byte) error {
 	return LoadUnicodeData(data)
 }
 
@@ -2049,23 +2049,23 @@ func (db *Database) LoadUnicodeData(data []byte) error {
 // seam, this is a privileged host op (not SQL-reachable, no path, no engine I/O — §10), additive and
 // idempotent, engine-global so it may be called before open. A malformed bundle is XX001. (UTC and
 // fixed offsets are built in and need no load.)
-func (db *Database) LoadTimeZoneData(data []byte) error {
+func (db *Engine) LoadTimeZoneData(data []byte) error {
 	return LoadTimeZoneData(data)
 }
 
 // LoadedTimeZones introspects the engine-global loaded zone set (db.LoadedTimeZones, timezones.md
 // §3.3) — every named zone (and alias) a loaded bundle provides, ascending by name. A property of the
 // running engine, not of this database. UTC and fixed offsets are built in and not listed.
-func (db *Database) LoadedTimeZones() []TimeZoneInfo {
+func (db *Engine) LoadedTimeZones() []TimeZoneInfo {
 	return LoadedTimeZones()
 }
 
 // LoadedCollations introspects the engine-global LOADED collation set (db.LoadedCollations,
 // spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
 // database on this handle, ascending by name. A property of the running ENGINE, not of this database;
-// for the collations this database references, use Database.Collations. IsDefault is always false here
+// for the collations this database references, use Engine.Collations. IsDefault is always false here
 // (that is a per-database property). C is built in and not listed.
-func (db *Database) LoadedCollations() []CollationInfo {
+func (db *Engine) LoadedCollations() []CollationInfo {
 	colls := loadedCollationTables()
 	out := make([]CollationInfo, len(colls))
 	for i, c := range colls {
@@ -2096,7 +2096,7 @@ func (db *Database) LoadedCollations() []CollationInfo {
 // Whole-database + atomic (the rebuild stages in a snapshot clone swapped in only on success);
 // idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit Commit. Returns the
 // number of collations re-pinned.
-func (db *Database) UpgradeCollations() (int, error) {
+func (db *Engine) UpgradeCollations() (int, error) {
 	work := db.committed.clone()
 	n, err := work.upgradeCollations(db.pageSize)
 	if err != nil {
@@ -2108,7 +2108,7 @@ func (db *Database) UpgradeCollations() (int, error) {
 	return n, nil
 }
 
-func (db *Database) SetDefaultCollation(name string) error {
+func (db *Engine) SetDefaultCollation(name string) error {
 	if name == "C" {
 		db.committed.defaultCollation = ""
 		return nil
@@ -2122,7 +2122,7 @@ func (db *Database) SetDefaultCollation(name string) error {
 
 // DefaultCollation returns the per-database default collation name — "C" unless SetDefaultCollation
 // moved it (db.DefaultCollation, spec/design/collation.md §1).
-func (db *Database) DefaultCollation() string {
+func (db *Engine) DefaultCollation() string {
 	if db.committed.defaultCollation == "" {
 		return "C"
 	}
@@ -2132,8 +2132,8 @@ func (db *Database) DefaultCollation() string {
 // Collations introspects the collations THIS DATABASE references (db.Collations,
 // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
 // per-database default), in ascending name order. This is the per-file view; for the engine-global
-// LOADED set, use Database.LoadedCollations. C is built in and not listed.
-func (db *Database) Collations() []CollationInfo {
+// LOADED set, use Engine.LoadedCollations. C is built in and not listed.
+func (db *Engine) Collations() []CollationInfo {
 	// referencedCollations resolves each referenced name (from a loaded bundle).
 	colls, err := db.committed.referencedCollations()
 	if err != nil {
@@ -2161,7 +2161,7 @@ func (db *Database) Collations() []CollationInfo {
 }
 
 // ExecuteStmt executes one parsed statement with no bind parameters.
-func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
+func (db *Engine) ExecuteStmt(stmt Statement) (Outcome, error) {
 	return db.ExecuteStmtParams(stmt, nil)
 }
 
@@ -2185,7 +2185,7 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 //     (synchronous, the single persist chokepoint). Any failure — in the statement or in the
 //     durable write — restores the captured state (rollback-on-error, discarding partial work and
 //     any rowid allocations, §7). For an in-memory database persist is a no-op.
-func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, error) {
+func (db *Engine) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.Begin != nil:
 		return db.beginTx(stmt.Begin.Writable, stmt.Begin.ModeSet)
@@ -2284,7 +2284,7 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 // snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged (read-your-
 // snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.go) and the catalog is shallow.
 // committed is untouched until commit.
-func (db *Database) beginTx(writable, modeSet bool) (Outcome, error) {
+func (db *Engine) beginTx(writable, modeSet bool) (Outcome, error) {
 	if db.session.tx != nil {
 		return Outcome{}, NewError(ActiveSqlTransaction, "there is already a transaction in progress")
 	}
@@ -2302,7 +2302,7 @@ func (db *Database) beginTx(writable, modeSet bool) (Outcome, error) {
 // newTx opens a transaction over a clone of the committed snapshot, capturing the handle's
 // currval/lastval session state so it can be restored if the transaction is discarded (the
 // rollback of any in-block nextval/setval session updates — spec/design/sequences.md §5/§6).
-func (db *Database) newTx(writable bool) *activeTx {
+func (db *Engine) newTx(writable bool) *activeTx {
 	saved := make(map[string]int64, len(db.session.sessionSeq))
 	for k, v := range db.session.sessionSeq {
 		saved[k] = v
@@ -2320,7 +2320,7 @@ func (db *Database) newTx(writable bool) *activeTx {
 // restoreSessionState restores the handle's currval/lastval session state from a discarded
 // transaction's captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block
 // nextval/setval session updates. Called wherever a transaction is dropped without publishing.
-func (db *Database) restoreSessionState(tx *activeTx) {
+func (db *Engine) restoreSessionState(tx *activeTx) {
 	db.session.sessionSeq = tx.savedSessionSeq
 	db.session.sessionLastName = tx.savedSessionLastName
 }
@@ -2331,7 +2331,7 @@ func (db *Database) restoreSessionState(tx *activeTx) {
 // publishes its working snapshot: bump its txid (file-backed only — an in-memory database stays at
 // txid 0), make it durable (the single persist chokepoint, §9), then swap it in as committed. A
 // durable-write failure leaves committed untouched and propagates. Returns to autocommit.
-func (db *Database) commitTx() (Outcome, error) {
+func (db *Engine) commitTx() (Outcome, error) {
 	tx := db.session.tx
 	if tx == nil {
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -2371,7 +2371,7 @@ func (db *Database) commitTx() (Outcome, error) {
 // committed was never mutated, so there is nothing to restore there. The handle's currval/lastval
 // session state, however, was updated in place by in-block nextval/setval, so it is restored from
 // the block's captured copy (sequences.md §5/§6).
-func (db *Database) rollbackTx() (Outcome, error) {
+func (db *Engine) rollbackTx() (Outcome, error) {
 	if db.session.tx != nil {
 		db.restoreSessionState(db.session.tx)
 	}
@@ -2384,7 +2384,7 @@ func (db *Database) rollbackTx() (Outcome, error) {
 // snapshot on first touch this statement, and is flushed into the working snapshot + sessionSeq on
 // statement success (flushPendingSequences). A missing sequence is 42P01; advancing past a bound
 // without CYCLE is 2200H.
-func (db *Database) seqNextval(name string) (int64, error) {
+func (db *Engine) seqNextval(name string) (int64, error) {
 	key := strings.ToLower(name)
 	var def SequenceDef
 	if db.session.pendingSeq != nil {
@@ -2450,7 +2450,7 @@ func (db *Database) seqNextval(name string) (int64, error) {
 // [MinValue, MaxValue] is 22003. LastValue = n, IsCalled = the flag (default true); when isCalled is
 // true the value also defines this session's currval (PG: isCalled=false leaves currval untouched).
 // setval never updates lastval (PG — §6).
-func (db *Database) seqSetval(name string, n int64, isCalled bool) (int64, error) {
+func (db *Engine) seqSetval(name string, n int64, isCalled bool) (int64, error) {
 	key := strings.ToLower(name)
 	var def SequenceDef
 	if d, ok := db.session.pendingSeq[key]; ok {
@@ -2486,7 +2486,7 @@ func (db *Database) seqSetval(name string, n int64, isCalled bool) (int64, error
 // setval(…,true) last produced for this sequence IN THIS SESSION. Resolves the name against the
 // catalog first (42P01 if absent), then reads the running update this statement (pendingCurrval)
 // else the session value (sessionSeq); 55000 if it has not been defined this session.
-func (db *Database) seqCurrval(name string) (int64, error) {
+func (db *Engine) seqCurrval(name string) (int64, error) {
 	if db.sequence(name) == nil {
 		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
 	}
@@ -2506,7 +2506,7 @@ func (db *Database) seqCurrval(name string) (int64, error) {
 // sequence's cached value, so a setval on that same sequence is reflected, while a setval on a
 // different sequence is not. Takes no name argument (no 42P01); 55000 before the first nextval. The
 // effective name and its value both honor the statement's running updates over the session state.
-func (db *Database) seqLastval() (int64, error) {
+func (db *Engine) seqLastval() (int64, error) {
 	key := db.session.pendingLastName
 	if key == "" {
 		key = db.session.sessionLastName
@@ -2532,7 +2532,7 @@ func (db *Database) seqLastval() (int64, error) {
 // currval/lastval see them). Called on the success of a sequence-advancing statement, while a write
 // transaction is open; a no-op when nothing advanced. On statement error the pending state is
 // instead discarded (cleared at the next statement), giving the transactional rollback (§5).
-func (db *Database) flushPendingSequences() {
+func (db *Engine) flushPendingSequences() {
 	for _, def := range db.session.pendingSeq {
 		// Route each advance to its owning scope (temp-tables.md §8): a serial/IDENTITY temp column's
 		// owned sequence flushes into its temp snapshot (zero file writes), a persistent one into main.
@@ -2850,7 +2850,7 @@ func (r *privReq) needFunction(name string) { r.functions = append(r.functions, 
 // already spent (spec/design/session.md §5.4): if a budget is set and the session's cumulative cost
 // has reached it, no further statement may run (it "cannot accrue") — 54P02. A no-op when the budget
 // is unlimited (the default), so the common path pays one comparison.
-func (db *Database) checkLifetimeAdmission() error {
+func (db *Engine) checkLifetimeAdmission() error {
 	limit := db.session.lifetimeMaxCost
 	total := *db.session.lifetimeTotal
 	if limit > 0 && total >= limit {
@@ -2868,7 +2868,7 @@ func (db *Database) checkLifetimeAdmission() error {
 // discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits. tempBuffers
 // 0 ⇒ unlimited; a transaction that did not touch temp cannot have grown it, so the check self-gates on
 // tempDirty and is a no-op for ordinary (persistent) statements. The WITHIN-statement bound is maxCost.
-func (db *Database) checkTempBudget() error {
+func (db *Engine) checkTempBudget() error {
 	limit := db.session.tempBuffers
 	if limit == 0 {
 		return nil
@@ -2886,9 +2886,9 @@ func (db *Database) checkTempBudget() error {
 
 // checkSharedTempBudget enforces the GLOBAL shared-temp storage budget (shared_temp_mem,
 // spec/design/temp-tables.md §7) — the shared analogue of checkTempBudget, charged against the
-// Database-level budget over the shared-temp footprint. Self-gates on sharedTempDirty (a no-op for any
+// Engine-level budget over the shared-temp footprint. Self-gates on sharedTempDirty (a no-op for any
 // statement that did not write shared temp). The over-budget write is staged, so the abort rolls it back.
-func (db *Database) checkSharedTempBudget() error {
+func (db *Engine) checkSharedTempBudget() error {
 	limit := db.sharedTempMem
 	if limit == 0 {
 		return nil
@@ -2904,7 +2904,7 @@ func (db *Database) checkSharedTempBudget() error {
 	return nil
 }
 
-func (db *Database) checkPrivileges(stmt Statement) error {
+func (db *Engine) checkPrivileges(stmt Statement) error {
 	// Fast path: a session that allows ALL DDL (persistent + both temp kinds) and grants every
 	// privilege pays nothing. All three gates must be on, since temp DDL now has its own gates (§5).
 	if db.session.allowDDL && db.session.allowTempDDL && db.session.allowSharedTempDDL && db.session.privileges.IsPermissive() {
@@ -3400,7 +3400,7 @@ func stmtKind(stmt Statement) string {
 
 // dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
 // (capture / durable commit / rollback-on-error) lives in ExecuteStmtParams.
-func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error) {
+func (db *Engine) dispatchStmt(stmt Statement, params []Value) (Outcome, error) {
 	// Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
 	// reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
 	// checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
@@ -3434,14 +3434,14 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 // statement's own working() writes): a read or a temp-only write leaves it unset, so this is a no-op
 // and never forces a spurious main-image persist (the temp-no-file-write invariant). GiST on a temp
 // table is 0A000 this slice, so only the main working snapshot is refreshed.
-func (db *Database) rebuildMainGistTreesIfDirty() error {
+func (db *Engine) rebuildMainGistTreesIfDirty() error {
 	if db.session.tx != nil && db.session.tx.mainDirty {
 		return db.session.tx.working.rebuildGistTrees()
 	}
 	return nil
 }
 
-func (db *Database) dispatchStmtBody(stmt Statement, params []Value) (Outcome, error) {
+func (db *Engine) dispatchStmtBody(stmt Statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
@@ -3522,7 +3522,7 @@ func rejectParamsForDDL(params []Value) error {
 // a second primary key traps 42P16 before its members resolve; members resolve
 // left to right (unknown 42703, repeated 42701); then the jed narrowings — the
 // declaration-order rule and the per-member key-type gate — trap 0A000.
-func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
+func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
 	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
 	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
@@ -4423,7 +4423,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 // expression against a one-relation scope, in the catalog's (evaluation/name) order.
 // Cannot fail for a catalog produced by CREATE TABLE or a well-formed file (both
 // validated); a hand-corrupted expression surfaces its natural resolve error.
-func (db *Database) resolveChecks(table *Table) ([]namedCheck, error) {
+func (db *Engine) resolveChecks(table *Table) ([]namedCheck, error) {
 	if len(table.Checks) == 0 {
 		return nil, nil
 	}
@@ -4445,7 +4445,7 @@ func (db *Database) resolveChecks(table *Table) ([]namedCheck, error) {
 // table.Columns): a non-nil node for an expression default, nil for a column with a constant
 // default or no default. The default resolves against an EMPTY scope (no columns; a column
 // reference was rejected 0A000 at CREATE TABLE) with the column's type as the operand hint.
-func (db *Database) resolveDefaultExprs(table *Table) ([]*rExpr, error) {
+func (db *Engine) resolveDefaultExprs(table *Table) ([]*rExpr, error) {
 	out := make([]*rExpr, len(table.Columns))
 	for i := range table.Columns {
 		de := table.Columns[i].DefaultExpr
@@ -4468,7 +4468,7 @@ func (db *Database) resolveDefaultExprs(table *Table) ([]*rExpr, error) {
 // per-statement seam/clock (rng) and metered (operator_eval per node). Reused by the VALUES
 // materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
 // so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is nil for a constant/no default.
-func (db *Database) evalDefault(col Column, defaultRExpr *rExpr, rng *StmtRng, meter *Meter) (Value, error) {
+func (db *Engine) evalDefault(col Column, defaultRExpr *rExpr, rng *StmtRng, meter *Meter) (Value, error) {
 	if defaultRExpr == nil {
 		return defaultOrNull(col), nil
 	}
@@ -4526,7 +4526,7 @@ type dropTarget struct {
 // anything removed. A repeated name is deduplicated; a FK between two tables both in the drop set
 // never blocks; CASCADE drops the surviving tables' now-dangling FK constraints. Like CREATE TABLE
 // it touches no rows and evaluates no expression tree, so it accrues zero cost.
-func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
+func (db *Engine) executeDropTable(dt *DropTable) (Outcome, error) {
 	// ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
 	// repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
 	// `a` once and succeeds); seen is the set of lowercased keys actually being dropped.
@@ -4624,7 +4624,7 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
 // taken by an existing relation, not equal to the table being created, and not already chosen by an
 // earlier serial column of the same statement (pending). All-lowercase identifier-derived.
-func (db *Database) chooseSerialSeqName(table, column string, pending []*SequenceDef) string {
+func (db *Engine) chooseSerialSeqName(table, column string, pending []*SequenceDef) string {
 	base := strings.ToLower(table) + "_" + strings.ToLower(column) + "_seq"
 	taken := func(c string) bool {
 		if db.relationExists(c) || strings.EqualFold(c, table) {
@@ -4855,13 +4855,13 @@ func serialPseudoType(name string) (ScalarType, bool) {
 
 // findIndex finds the table owning the named index in the visible snapshot
 // (case-insensitive).
-func (db *Database) findIndex(name string) (string, IndexDef, bool) {
+func (db *Engine) findIndex(name string) (string, IndexDef, bool) {
 	return db.readSnap().findIndex(name)
 }
 
 // relationExists reports whether name is taken in the shared relation namespace (a table
 // OR an index — spec/design/indexes.md §2), case-insensitively.
-func (db *Database) relationExists(name string) bool {
+func (db *Engine) relationExists(name string) bool {
 	// Temp tables (session-local AND shared) + their (UNIQUE) index names join the namespace too, so a
 	// name colliding with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md
 	// §3). db.Table is persistent-only, so both temp snapshots are checked explicitly.
@@ -4896,7 +4896,7 @@ func (db *Database) relationExists(name string) bool {
 // the lowercased <table>_<col>..._idx with the smallest free suffix. The index is then
 // built by scanning the table once: page_read per node + storage_row_read per row (the
 // metered build scan — cost.md §3); maintenance thereafter is unmetered.
-func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
+func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	// A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
 	// temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
 	// lkpTable/lkpStore/writeIndexStore funnels route by the resolution walk; the cost meter, UNIQUE
@@ -5112,7 +5112,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 // 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is
 // resolved along the resolution walk (session-local → shared → persistent — temp-tables.md §8) and
 // removed from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
-func (db *Database) executeDropIndex(di *DropIndex) (Outcome, error) {
+func (db *Engine) executeDropIndex(di *DropIndex) (Outcome, error) {
 	// lkpTable covers all three scopes, so DROP INDEX naming a table is 42809 regardless of kind.
 	if _, ok := db.lkpTable(di.Name); ok {
 		return Outcome{}, NewError(WrongObjectType, di.Name+" is not an index")
@@ -5152,7 +5152,7 @@ func (db *Database) executeDropIndex(di *DropIndex) (Outcome, error) {
 // type name (42710), resolve each field's type (a built-in scalar, or a previously-defined
 // composite — 42704 if unknown; no self- or forward-reference), reject a duplicate field name
 // (42701), then register the composite type in the catalog. Named composites only.
-func (db *Database) executeCreateType(ct *CreateType) (Outcome, error) {
+func (db *Engine) executeCreateType(ct *CreateType) (Outcome, error) {
 	if db.readSnap().compositeType(ct.Name) != nil {
 		return Outcome{}, NewError(DuplicateObject, "type "+ct.Name+" already exists")
 	}
@@ -5229,7 +5229,7 @@ func (db *Database) executeCreateType(ct *CreateType) (Outcome, error) {
 // executeDropType analyzes and runs a DROP TYPE (spec/design/composite.md §7). RESTRICT (the only
 // behavior this slice): a missing type is 42704 unless IF EXISTS; if any table column or composite
 // field still references the type, 2BP01; otherwise remove it from the catalog.
-func (db *Database) executeDropType(dt *DropType) (Outcome, error) {
+func (db *Engine) executeDropType(dt *DropType) (Outcome, error) {
 	if db.readSnap().compositeType(dt.Name) == nil {
 		if dt.IfExists {
 			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -5247,7 +5247,7 @@ func (db *Database) executeDropType(dt *DropType) (Outcome, error) {
 // executeCreateSequence analyzes and runs a CREATE SEQUENCE (spec/design/sequences.md). Resolve
 // the option overrides against the INCREMENT sign's type defaults, validate the set (22023),
 // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
-func (db *Database) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
+func (db *Engine) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
 	if db.relationExists(cs.Name) {
 		if cs.IfNotExists {
 			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -5265,7 +5265,7 @@ func (db *Database) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
 // executeDropSequence analyzes and runs a DROP SEQUENCE (spec/design/sequences.md §1).
 // RESTRICT-only: a missing sequence is 42P01 unless IF EXISTS. No dependency tracking this slice
 // (a plain DEFAULT nextval('s') creates none — PG). Multiple names are dropped left to right.
-func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
+func (db *Engine) executeDropSequence(ds *DropSequence) (Outcome, error) {
 	for _, name := range ds.Names {
 		// Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
 		// column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
@@ -5305,7 +5305,7 @@ func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 // The option form re-edits the definition (PG init_params, isInit=false — only written options
 // change, the counter preserved unless RESTART); RENAME TO moves the catalog key. Touches no session
 // state (currval/lastval unchanged). A catalog write (the write path, transactional, §5).
-func (db *Database) executeAlterSequence(as *AlterSequence) (Outcome, error) {
+func (db *Engine) executeAlterSequence(as *AlterSequence) (Outcome, error) {
 	snapDef := db.sequence(as.Name)
 	if snapDef == nil {
 		if as.IfExists {
@@ -5338,7 +5338,7 @@ func (db *Database) executeAlterSequence(as *AlterSequence) (Outcome, error) {
 // key. For an OWNED sequence, the owning column's DEFAULT nextval('s') text is rewritten in place to
 // nextval('s2') (the rows survive — not via putTable) so a later INSERT still advances the renamed
 // sequence (jed resolves the sequence by name, unlike PG's OID reference).
-func (db *Database) alterSequenceRename(existing *SequenceDef, newName string) error {
+func (db *Engine) alterSequenceRename(existing *SequenceDef, newName string) error {
 	if db.relationExists(newName) {
 		return NewError(DuplicateTable, "relation already exists: "+newName)
 	}
@@ -5893,7 +5893,7 @@ func arbiterKey(arb *arbiter, table *Table, pk []int, colls []*Collation, row Ro
 // conflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
 // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
 // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
-func (db *Database) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramTypes) (*conflictPlan, error) {
+func (db *Engine) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramTypes) (*conflictPlan, error) {
 	arb, err := resolveArbiter(table, oc.Target)
 	if err != nil {
 		return nil, err
@@ -5970,7 +5970,7 @@ func (db *Database) resolveOnConflict(table *Table, oc *OnConflict, ptypes *para
 // arbiterExisting looks up the EXISTING (committed) conflicting row for an arbiter key
 // (spec/design/upsert.md §3): always a committed row (an in-batch row sharing the arbiter key was
 // caught earlier by the proposed-arbiter set). Returns (storageKey, fully-resident row, found).
-func (db *Database) arbiterExisting(arb *arbiter, store *TableStore, table *Table, ak []byte) ([]byte, Row, bool, error) {
+func (db *Engine) arbiterExisting(arb *arbiter, store *TableStore, table *Table, ak []byte) ([]byte, Row, bool, error) {
 	if arb.isPK {
 		row, exists, err := store.Get(ak)
 		if err != nil || !exists {
@@ -6009,7 +6009,7 @@ func (db *Database) arbiterExisting(arb *arbiter, store *TableStore, table *Tabl
 // rowConflictsCommitted reports whether a candidate row conflicts with a COMMITTED row on the
 // primary key or any unique index (the no-target DO NOTHING skip test — spec/design/upsert.md §2).
 // NULLS DISTINCT: a unique tuple with any NULL component never conflicts.
-func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []int, colls []*Collation, row Row) (bool, error) {
+func (db *Engine) rowConflictsCommitted(store *TableStore, table *Table, pk []int, colls []*Collation, row Row) (bool, error) {
 	if len(pk) > 0 {
 		k, err := encodePkKey(table, pk, colls, row)
 		if err != nil {
@@ -6043,7 +6043,7 @@ func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []
 	return false, nil
 }
 
-func (db *Database) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.lkpTable(ins.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
@@ -6382,7 +6382,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outc
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
+func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
 	n := len(table.Columns)
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
 	// mutation; nil everywhere for a C-only / non-text table (the fast path).
@@ -6672,7 +6672,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 
 // foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their
 // cost is added a single time — cost.md §3), exactly as UPDATE folds its assignment/filter.
-func (db *Database) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *int64) error {
+func (db *Engine) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *int64) error {
 	if plan == nil || !plan.doUpdate {
 		return nil
 	}
@@ -6692,7 +6692,7 @@ func (db *Database) foldConflictPlan(plan *conflictPlan, bound []Value, accrued 
 // runInsertRows dispatches the validated candidate rows to the plain or the ON CONFLICT insert
 // path, shared by both INSERT sources. Returns (rows affected, RETURNING rows): a plain insert
 // affects every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
-func (db *Database) runInsertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
+func (db *Engine) runInsertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
 	if conflict != nil {
 		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
 	}
@@ -6709,7 +6709,7 @@ func (db *Database) runInsertRows(table *Table, store *TableStore, pk []int, che
 // inserts + updates are then validated against the statement END STATE (PK / unique / CHECK / FK)
 // before phase 2 writes anything (all-or-nothing). returning projects the AFFECTED rows (inserts
 // with an all-NULL old side, updates with their pre-update existing row).
-func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
+func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
 	n := len(table.Columns)
 	relation := table.Name
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
@@ -7246,7 +7246,7 @@ func defaultOrNull(col Column) Value {
 // The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
 // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
 // baseIsOld true for DELETE).
-func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
+func (db *Engine) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
 	s := returningScope(db, table, baseIsOld)
 	s.ctes = ctes
 	nodes, names, types, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
@@ -7264,7 +7264,7 @@ func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld 
 // The evaluation row is the concatenation [base | other] the RETURNING scope resolved
 // against: others[i] is the row's opposite version (UPDATE's old rows), nil the all-NULL
 // row (INSERT's old side, DELETE's new side).
-func (db *Database) projectReturning(nodes []*rExpr, rows []Row, others []Row, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
+func (db *Engine) projectReturning(nodes []*rExpr, rows []Row, others []Row, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
 	env := &evalEnv{exec: db, params: params, rng: newStmtRng(), ctes: ctes}
 	out := make([][]Value, 0, len(rows))
 	for i, row := range rows {
@@ -7312,7 +7312,7 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 // collect the keys of matching rows (only a TRUE predicate matches — Kleene), then
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
-func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.lkpTable(del.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
@@ -7557,7 +7557,7 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 // writes. Phase 2 applies. Assigning a PRIMARY KEY column traps 0A000 (the storage
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
-func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.lkpTable(upd.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
@@ -8259,7 +8259,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 // or nil if the table does not exist. A test/debug convenience — the SELECT path scans through
 // IterInKeyOrder directly (propagating fault errors); these callers are in-memory, where a scan never
 // faults, so the error is inert and panicking on it surfaces a genuine bug rather than hiding it.
-func (db *Database) RowsInKeyOrder(name string) []Row {
+func (db *Engine) RowsInKeyOrder(name string) []Row {
 	snap := db.readSnap()
 	if db.isTempTable(name) { // temp tables live in the session temp snapshot (temp-tables.md §2)
 		snap = db.tempSnap()
@@ -8295,7 +8295,7 @@ type selectResult struct {
 
 // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query Outcome
 // (the projection types are internal — only INSERT ... SELECT consumes them).
-func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) {
+func (db *Engine) executeSelect(sel *Select, params []Value) (Outcome, error) {
 	r, err := db.runSelect(sel, params)
 	if err != nil {
 		return Outcome{}, err
@@ -8305,7 +8305,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 
 // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
 // Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
+func (db *Engine) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 	r, err := db.runSetOp(so, params)
 	if err != nil {
 		return Outcome{}, err
@@ -8315,7 +8315,7 @@ func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 
 // executeWith runs a WITH query (spec/design/cte.md) — the host-API entry point; runWith does the
 // CTE orchestration.
-func (db *Database) executeWith(wq *WithQuery, params []Value) (Outcome, error) {
+func (db *Engine) executeWith(wq *WithQuery, params []Value) (Outcome, error) {
 	// A WITH containing any data-modifying part (a data-modifying CTE or a data-modifying primary)
 	// runs through the writable-CTE orchestrator (spec/design/writable-cte.md): it pins the
 	// pre-statement snapshot and runs the parts in lexical order, all-or-nothing. A pure-query WITH
@@ -8339,7 +8339,7 @@ func (db *Database) executeWith(wq *WithQuery, params []Value) (Outcome, error) 
 // the recursive UNION shape, so it is always non-recursive. The refs counters are bumped as later
 // query bodies / a query primary reference each binding (a data-modifying part's references are
 // static-counted by the orchestrator, since it is not planned here).
-func (db *Database) planCteBindings(ctes []Cte, recursive bool, ptypes *paramTypes) ([]*cteBinding, error) {
+func (db *Engine) planCteBindings(ctes []Cte, recursive bool, ptypes *paramTypes) ([]*cteBinding, error) {
 	bindings := make([]*cteBinding, 0, len(ctes))
 	for i := range ctes {
 		cte := &ctes[i]
@@ -8417,7 +8417,7 @@ func (db *Database) planCteBindings(ctes []Cte, recursive bool, ptypes *paramTyp
 // the synthetic relation, and capture the statement to execute later. A body with no RETURNING yields
 // a zero-column relation flagged noReturning (a FROM reference to it is 0A000, §5). The target must
 // be a base table — a CTE name / missing table is 42P01 (§1).
-func (db *Database) planDmCte(lname string, body *CteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*Table, *dmCte, error) {
+func (db *Engine) planDmCte(lname string, body *CteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*Table, *dmCte, error) {
 	var tableName string
 	var returning *SelectItems
 	var baseIsOld bool
@@ -8464,7 +8464,7 @@ func (db *Database) planDmCte(lname string, body *CteBody, bindings []*cteBindin
 // reference count + [NOT] MATERIALIZED hint; (4) MATERIALIZE each referenced materialized CTE once,
 // in list order (a later body sees the earlier buffers); (5) fold + EXECUTE the main body with the
 // CTE context. Cost composes like set operations — a sum of the parts.
-func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error) {
+func (db *Engine) runWith(wq *WithQuery, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
 	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
 	if err != nil {
@@ -8510,7 +8510,7 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 // here (the orchestrator runs it for its effect — executeWithDml); its buffer slot is left empty for
 // the orchestrator to fill. Returns the filled buffers + the accrued materialization cost (a later
 // body sees the earlier buffers).
-func (db *Database) materializeCtes(bindings []*cteBinding, modes []cteMode, bound []Value) ([][]Row, int64, error) {
+func (db *Engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound []Value) ([][]Row, int64, error) {
 	var totalCost int64
 	buffers := make([][]Row, 0, len(bindings))
 	for i := range bindings {
@@ -8545,7 +8545,7 @@ func (db *Database) materializeCtes(bindings []*cteBinding, modes []cteMode, bou
 // materialized rows (visible to both terms). totalCost accrues every term evaluation's cost and gates
 // the per-statement ceiling between iterations, so a non-terminating recursion of cheap iterations
 // still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
-func (db *Database) materializeRecursive(ci int, rt *recursiveTerm,
+func (db *Engine) materializeRecursive(ci int, rt *recursiveTerm,
 	modes []cteMode, bindings []*cteBinding, priorBuffers [][]Row, params []Value, totalCost *int64,
 ) ([]Row, error) {
 	anchorPlan := &bindings[ci].plan
@@ -8630,7 +8630,7 @@ func (db *Database) materializeRecursive(ci int, rt *recursiveTerm,
 // crosses only via a CTE's RETURNING buffer), runs the parts in lexical order, and returns the
 // primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or block)
 // wrapper publishes the accumulated working only if this returns nil error (§6).
-func (db *Database) executeWithDml(wq *WithQuery, params []Value) (Outcome, error) {
+func (db *Engine) executeWithDml(wq *WithQuery, params []Value) (Outcome, error) {
 	// Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
 	// opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
 	// every exit path so the next statement reads normally.
@@ -8643,7 +8643,7 @@ func (db *Database) executeWithDml(wq *WithQuery, params []Value) (Outcome, erro
 // runWithDml is the body of executeWithDml, run under the read pin. Plans every CTE binding + the
 // query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
 // primary — every read against the pin, every write into the transaction's working.
-func (db *Database) runWithDml(wq *WithQuery, params []Value) (Outcome, error) {
+func (db *Engine) runWithDml(wq *WithQuery, params []Value) (Outcome, error) {
 	ptypes := &paramTypes{}
 	// (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
 	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
@@ -8759,7 +8759,7 @@ func (db *Database) runWithDml(wq *WithQuery, params []Value) (Outcome, error) {
 // DELETE at binding i for its effect, with the earlier bindings/buffers in scope (so its inner
 // queries may reference an earlier CTE), and return its RETURNING rows (the buffer the later parts
 // scan) + its cost. A body with no RETURNING runs for its effect and buffers no rows.
-func (db *Database) execDmCte(i int, bindings []*cteBinding, params []Value, ctx cteCtx) ([]Row, int64, error) {
+func (db *Engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx cteCtx) ([]Row, int64, error) {
 	dm := bindings[i].dm
 	var outcome Outcome
 	var err error
@@ -9345,7 +9345,7 @@ func typeFromResolved(rt resolvedType) (Type, error) {
 // globally-uncorrelated subquery once and folds it to a constant (preserving the once-only cost),
 // and finally EXECUTE against an empty outer-row environment. Correlated subqueries that survive
 // the fold are re-executed per outer row by the evaluator.
-func (db *Database) runQueryExpr(qe QueryExpr, params []Value) (selectResult, error) {
+func (db *Engine) runQueryExpr(qe QueryExpr, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
 	plan, err := db.planQuery(qe, nil, nil, ptypes)
 	if err != nil {
@@ -9372,12 +9372,12 @@ func (db *Database) runQueryExpr(qe QueryExpr, params []Value) (selectResult, er
 }
 
 // runSelect runs a lone SELECT — the entry point executeSelect and INSERT ... SELECT use.
-func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error) {
+func (db *Engine) runSelect(sel *Select, params []Value) (selectResult, error) {
 	return db.runQueryExpr(QueryExpr{Select: sel}, params)
 }
 
 // runSetOp runs a set operation as a top-level statement.
-func (db *Database) runSetOp(so *SetOp, params []Value) (selectResult, error) {
+func (db *Engine) runSetOp(so *SetOp, params []Value) (selectResult, error) {
 	return db.runQueryExpr(QueryExpr{SetOp: so}, params)
 }
 
@@ -9385,7 +9385,7 @@ func (db *Database) runSetOp(so *SetOp, params []Value) (selectResult, error) {
 // = the enclosing query's scope, nil at top level). ctes are the statement's CTE bindings visible
 // here (spec/design/cte.md §2), empty for a non-WITH statement. A subquery is planned here, once
 // (§26).
-func (db *Database) planQuery(qe QueryExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
+func (db *Engine) planQuery(qe QueryExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
 	if qe.Select != nil {
 		sp, err := db.planSelect(qe.Select, parent, ctes, ptypes)
 		if err != nil {
@@ -9414,7 +9414,7 @@ func (db *Database) planQuery(qe QueryExpr, parent *scope, ctes []*cteBinding, p
 // inner main query keeps the enclosing parent (so a LATERAL derived-table body still correlates to
 // its left siblings), while the CTE bodies stay independent (parent=nil, inside planCteBindings). A
 // data-modifying CTE here is rejected 0A000 — PostgreSQL restricts a DML-WITH to the top level.
-func (db *Database) planWithExpr(we *WithExpr, parent *scope, ptypes *paramTypes) (*withPlan, error) {
+func (db *Engine) planWithExpr(we *WithExpr, parent *scope, ptypes *paramTypes) (*withPlan, error) {
 	for i := range we.Ctes {
 		if we.Ctes[i].Body.IsDataModifying() {
 			return nil, NewError(FeatureNotSupported,
@@ -9435,7 +9435,7 @@ func (db *Database) planWithExpr(we *WithExpr, parent *scope, ptypes *paramTypes
 // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
 // rows, innermost last; nil at top level) and the bound parameters. ctes is the per-statement CTE
 // execution context (spec/design/cte.md §5), the zero cteCtx for a non-WITH statement.
-func (db *Database) execQueryPlan(plan *queryPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *Engine) execQueryPlan(plan *queryPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	if plan.sel != nil {
 		return db.execSelectPlan(plan.sel, outer, params, ctes)
 	}
@@ -9454,7 +9454,7 @@ func (db *Database) execQueryPlan(plan *queryPlan, outer []Row, params []Value, 
 // §7), and run the inner body against it. The body still sees the outer row environment (so a
 // LATERAL nested-WITH derived-table body correlates to its left siblings). The materialization cost
 // folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
-func (db *Database) execWithPlan(wp *withPlan, outer []Row, params []Value) (selectResult, error) {
+func (db *Engine) execWithPlan(wp *withPlan, outer []Row, params []Value) (selectResult, error) {
 	buffers, totalCost, err := db.materializeCtes(wp.bindings, wp.modes, params)
 	if err != nil {
 		return selectResult{}, err
@@ -9471,7 +9471,7 @@ func (db *Database) execWithPlan(wp *withPlan, outer []Row, params []Value) (sel
 // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
 // parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
 // empty operands), and resolve the trailing ORDER BY by output column name.
-func (db *Database) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*setOpPlan, error) {
+func (db *Engine) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*setOpPlan, error) {
 	lhs, err := db.planQuery(so.Lhs, parent, ctes, ptypes)
 	if err != nil {
 		return nil, err
@@ -9527,7 +9527,7 @@ func (db *Database) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptyp
 // execSetOpPlan executes a resolved set operation: run both operands against the outer
 // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
 // rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *Engine) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	left, err := db.execQueryPlan(&plan.lhs, outer, params, ctes)
 	if err != nil {
 		return selectResult{}, err
@@ -9574,7 +9574,7 @@ func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, 
 // its column's unified type (so VALUES (1),($1) types $1 as int); a column with no concrete type —
 // all NULL/param — leaves its $N untyped, surfacing 42P18 at finalize (jed's no-cross-context
 // inference posture, §26).
-func (db *Database) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
+func (db *Engine) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
 	arity := len(rows[0]) // the parser guarantees at least one row, each with at least one value
 	// A constant scope: no local relations. With parent==nil (the usual case) any column reference is
 	// unresolved (the non-LATERAL rule, §42); with a parent (a LATERAL VALUES body, §44) a column
@@ -9637,7 +9637,7 @@ func (db *Database) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding
 // the set-operation rule), and emit the rows. Charges row_produced per row plus each value's
 // operator_eval (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded into the
 // caller's meter via execQueryPlan.
-func (db *Database) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *Engine) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
 	meter := db.session.newMeter()
 	rows := make([][]Value, 0, len(plan.rows))
@@ -9943,7 +9943,7 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 // query's scope, for correlated references — grammar.md §26). The resolve half of the old
 // runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
 // touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
-func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*selectPlan, error) {
+func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*selectPlan, error) {
 	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
 	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
 	// without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -10987,7 +10987,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 // (len(order) >= len(pk)) because a strict DESC prefix of a composite PK would have the eager sort
 // break ties in PK-ascending input order, which a reverse scan inverts — so reverse is restricted
 // to the unique full key, where no ties remain.
-func (db *Database) orderSatisfiedByPK(table *Table, offset int, order []orderSlot) (bool, bool) {
+func (db *Engine) orderSatisfiedByPK(table *Table, offset int, order []orderSlot) (bool, bool) {
 	pk := table.PKIndices()
 	if len(pk) == 0 {
 		return false, false // no PK (synthetic rowid order is not a user-visible column)
@@ -11068,7 +11068,7 @@ type indexOrderPlan struct {
 // match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
-func (db *Database) orderSatisfiedByIndex(table *Table, offset int, order []orderSlot) *indexOrderPlan {
+func (db *Engine) orderSatisfiedByIndex(table *Table, offset int, order []orderSlot) *indexOrderPlan {
 	pkWidth, ok := pkStorageWidth(table)
 	if !ok {
 		return nil
@@ -11121,7 +11121,7 @@ func (db *Database) orderSatisfiedByIndex(table *Table, offset int, order []orde
 // type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows PostgreSQL's
 // single-column function-alias rule: the table alias when one is given (generate_series(1,5) AS g
 // ⇒ column g), else the function name generate_series.
-func (db *Database) resolveSRF(name string, args []*Expr, alias *string, columnDefs []TypeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveSRF(name string, args []*Expr, alias *string, columnDefs []TypeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
 	// inherited so an arg subquery can reference a CTE (cte.md §2).
 	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
@@ -11195,7 +11195,7 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, columnD
 // resolveJSONSrf resolves a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one
 // argument is a json/jsonb value (a bare string literal adapts to the expected document type). The
 // synthetic column's type is fixed (`jsonb`/`text`). A NULL argument yields zero rows at exec.
-func (db *Database) resolveJSONSrf(name string, kind srfKind, colTy Type, jsonb bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveJSONSrf(name string, kind srfKind, colTy Type, jsonb bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload(name)
 	}
@@ -11219,7 +11219,7 @@ func (db *Database) resolveJSONSrf(name string, kind srfKind, colTy Type, jsonb 
 // json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts). The
 // synthetic relation has the fixed columns `key text` and `value <valueTy>` (the C0 multi-column
 // synthetic table). A non-object argument → 22023 at exec; a NULL → zero rows.
-func (db *Database) resolveJSONEach(name string, kind srfKind, valueTy Type, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveJSONEach(name string, kind srfKind, valueTy Type, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload(name)
 	}
@@ -11241,7 +11241,7 @@ func (db *Database) resolveJSONEach(name string, kind srfKind, valueTy Type, arg
 // columns come from the C0 col-def list `AS t(col type, …)` (required — else 42601). The synthetic
 // table's columns are the declared types (a composite/array column type is a deferred 0A000), and
 // the srfPlan carries them as recordCols so the row generator can map members → columns by name.
-func (db *Database) resolveJSONRecord(name string, jsonb, set bool, args []*Expr, alias *string, columnDefs []TypeFieldDef, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveJSONRecord(name string, jsonb, set bool, args []*Expr, alias *string, columnDefs []TypeFieldDef, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload(name)
 	}
@@ -11292,7 +11292,7 @@ func (db *Database) resolveJSONRecord(name string, jsonb, set bool, args []*Expr
 // the output column shape; the SECOND is the json/jsonb document. Reuses the R1 row machinery
 // (srfJSONRecord(set)) — only the column source differs (a composite type vs a col-def list). A
 // non-composite first argument → 42804; an anonymous record base → 0A000.
-func (db *Database) resolveJSONPopulate(name string, jsonb, set bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveJSONPopulate(name string, jsonb, set bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 2 {
 		return nil, nil, noFuncOverload(name)
 	}
@@ -11348,7 +11348,7 @@ func (db *Database) resolveJSONPopulate(name string, jsonb, set bool, args []*Ex
 // synthetic relation (the flattened columns), the `[ctx]` arg, and the resolved jtPlan. The ctx /
 // root path see only params + the lateral prefix (never sibling columns of THIS relation) — an
 // empty-local-rels scope chained to `parent`, exactly like an SRF (grammar.md §44).
-func (db *Database) resolveJSONTable(jt *JsonTable, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveJSONTable(jt *JsonTable, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 	forbidden := &aggCtx{}
 	// The context item (json / jsonb / text, coerced to a jsonb document at eval).
@@ -11396,7 +11396,7 @@ func (db *Database) resolveJSONTable(jt *JsonTable, alias *string, parent *scope
 
 // resolveJtColumns recursively resolves a JSON_TABLE COLUMNS tree, flattening the leaf columns into
 // `outColumns` (pre-order, declaration order) and assigning each its flat output index.
-func (db *Database) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]jtCol, error) {
+func (db *Engine) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]jtCol, error) {
 	resolved := make([]jtCol, 0, len(cols))
 	for _, col := range cols {
 		switch c := col.(type) {
@@ -11473,7 +11473,7 @@ func (db *Database) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]j
 // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
 // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
 // i64.
-func (db *Database) resolveGenerateSeries(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveGenerateSeries(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 2 && len(args) != 3 {
 		return nil, nil, noFuncOverload("generate_series")
 	}
@@ -11514,7 +11514,7 @@ func (db *Database) resolveGenerateSeries(args []*Expr, alias *string, argScope 
 // unnest(composite[])): the synthetic column is typed at the bound element type directly
 // (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
 // has no catalog name → 0A000, not reachable from a typed array).
-func (db *Database) resolveUnnest(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *Engine) resolveUnnest(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload("unnest")
 	}
@@ -11595,7 +11595,7 @@ func srfKindName(kind srfKind) string {
 // an i64 overflow while stepping STOPS the series cleanly (no trap). Each generated element
 // charges one generated_row AT THE SOURCE, guarded so a max_cost ceiling aborts a runaway series
 // (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
-func (db *Database) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *Engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
 	evalInt := func(e *rExpr) (int64, bool, error) {
 		v, err := e.eval(nil, env, m)
 		if err != nil {
@@ -11662,7 +11662,7 @@ func (db *Database) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]R
 // jsonSrfRows generates the rows of a json/jsonb single-column SRF (B2, json-sql-functions.md §3). A
 // NULL argument yields zero rows (empty_on_null). array_elements[_text] over a non-array, or
 // object_keys over a non-object, is 22023. Each produced row charges one generated_row.
-func (db *Database) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
 	arg, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
 		return nil, err
@@ -11961,7 +11961,7 @@ type jtAssign struct {
 // jsonTableRows generates the rows of a JSON_TABLE SRF (T1, json-table.md §3) — the default-plan
 // recursive expansion (parent→child LEFT OUTER, sibling NESTED paths UNIONed). A NULL ctx → zero
 // rows; a structural error evaluating the root path → zero rows.
-func (db *Database) jsonTableRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *Engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
 	plan := sp.jsonTable
 	ctx, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
@@ -12024,7 +12024,7 @@ func jtBehavior(b *JsonOnBehavior, def JsonOnBehavior) JsonOnBehavior {
 
 // jtScalarType resolves a JSON_TABLE column type name → its scalar type + decimal typmod (a composite
 // → 0A000, an unknown name → 42704).
-func jtScalarType(db *Database, typeName string) (ScalarType, *DecimalTypmod, error) {
+func jtScalarType(db *Engine, typeName string) (ScalarType, *DecimalTypmod, error) {
 	if st, ok := ScalarTypeFromName(typeName); ok {
 		return st, nil, nil
 	}
@@ -12203,7 +12203,7 @@ func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
 // flattens; a NULL element is produced as a NULL row). Each produced element charges one generated_row AT
 // THE SOURCE, guarded so a max_cost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like
 // generate_series (CLAUDE.md §13).
-func (db *Database) unnestRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *Engine) unnestRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
 	v, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
 		return nil, err
@@ -12387,7 +12387,7 @@ type indexBoundPlan struct {
 // lowercased-name order — the deterministic tie-break), the first whose FIRST key column
 // has at least one equality conjunct against a type-matched const-source; else nil (full
 // scan).
-func detectScanBound(filter *rExpr, rel scopeRel, db *Database) *scanBound {
+func detectScanBound(filter *rExpr, rel scopeRel, db *Engine) *scanBound {
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
 		// Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
 		// deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
@@ -12483,7 +12483,7 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *Database) *scanBound {
 //     read-safety rule §12; seeking a loaded-version probe in a file-version B-tree would mis-match —
 //     the tripwire suites/collation/skew.test stays green only because this refuses). An
 //     unresolvable collation likewise refuses rather than mis-encoding.
-func (db *Database) keyCollationCtx(col Column) (*Collation, bool) {
+func (db *Engine) keyCollationCtx(col Column) (*Collation, bool) {
 	if col.Collation == "" {
 		return nil, true
 	}
@@ -12743,7 +12743,7 @@ func rexprIsConstant(e *rExpr) bool {
 // feeds the rows through the same scanSource as any bounded scan (page_read block +
 // per-row storage_row_read). A provably empty bound (NULL / contradictory equalities /
 // out-of-range) returns nothing and charges nothing.
-func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []Row, mask []bool) (rows []Row, pages, slabs int, err error) {
+func (db *Engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []Row, mask []bool) (rows []Row, pages, slabs int, err error) {
 	// Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
 	// true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
 	// integer can equal no stored value — all provably empty.
@@ -12812,7 +12812,7 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 // (the candidate set IS the storage keys), with the up-front (page_read nodes, value_decompress
 // slabs) block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
 // (gin.md §6). GinEntry is charged inside (during the gather); the caller charges the block.
-func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
+func (db *Engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
@@ -12964,7 +12964,7 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 // directly. Degenerate constant queries (gist.md §5): a NULL Q and an empty && query match nothing; an
 // empty @> query (col @> 'empty') matches every row → full-scan fallback (the empty bound is invisible
 // to the overlap-descend).
-func (db *Database) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
+func (db *Engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
@@ -13091,7 +13091,7 @@ func prefixSuccessor(p []byte) []byte {
 }
 
 // pkBoundFor detects a single-table mutation's (UPDATE/DELETE) PK pushdown bound; nil ⇒ full scan.
-func (db *Database) pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
+func (db *Engine) pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
 	if filter == nil {
 		return nil
 	}
@@ -13244,7 +13244,7 @@ func flipCompare(op BinaryOp) BinaryOp {
 // sound, scan), never a wrong key.
 // outer carries the enclosing rows (innermost last) so a correlated reOuterColumn source resolves to
 // the current outer row's value; it is nil for a top-level statement.
-func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) (keyBound, bool) {
+func (db *Engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) (keyBound, bool) {
 	b := unboundedBound()
 	for _, t := range bp.terms {
 		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll)
@@ -13431,7 +13431,7 @@ func boundEmpty(b keyBound) bool {
 // short-circuit; only the row reads do. Rows match the eager path exactly: the offset..offset+limit
 // slice of the primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's
 // result — the stored PK order is the requested order).
-func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
+func (db *Engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
@@ -13557,7 +13557,7 @@ func (db *Database) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Met
 // up front as the full block (like the streaming PK scan — only the per-row work short-circuits);
 // each scanned entry then charges its point-lookup's page_read/value_decompress + one
 // storage_row_read, plus row_produced and projection operator_evals per produced row.
-func (db *Database) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *evalEnv, meter *Meter) (selectResult, error) {
+func (db *Engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *evalEnv, meter *Meter) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 	istore := db.lkpIndexStore(io.nameKey)
 	// Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
@@ -13634,7 +13634,7 @@ func (db *Database) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env
 // filter operator_eval, and row_produced per windowed row accrue — only the sort, which is unmetered
 // (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
 // non-DISTINCT, with an ORDER BY and no index bound.
-func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
+func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read + value_decompress
@@ -13821,7 +13821,7 @@ func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Met
 // ON/WHERE operator_evals and row_produced short-circuit. Gated (by the caller / plan.joinPkOrdered)
 // to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
 // ORDER BY.
-func (db *Database) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Meter, params []Value, outer []Row, rng *StmtRng) (selectResult, error) {
+func (db *Engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Meter, params []Value, outer []Row, rng *StmtRng) (selectResult, error) {
 	leftRows, err := db.materializeRel(plan, 0, params, outer, rng, env.ctes, meter)
 	if err != nil {
 		return selectResult{}, err
@@ -13895,7 +13895,7 @@ func (db *Database) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Met
 // newSorterFor builds a sorter for order, bounded by this handle's workMem. Spilling is enabled only
 // for a file-backed database (an in-memory one has nowhere to spill — spill.md §2); spill runs live
 // next to the database file (same filesystem, guaranteed writable).
-func (db *Database) newSorterFor(order []orderSlot) *sorter {
+func (db *Engine) newSorterFor(order []orderSlot) *sorter {
 	spillDir := ""
 	if db.paging != nil {
 		spillDir = filepath.Dir(db.path)
@@ -13921,7 +13921,7 @@ func rowsFromValues(in [][]Value) []Row {
 // body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
 // query's own outer and its parent=nil body simply ignores it (a parent=nil plan holds no
 // outerColumn, so the two are observably identical).
-func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, outer []Row, rng *StmtRng, ctes cteCtx, meter *Meter) ([]Row, error) {
+func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []Row, rng *StmtRng, ctes cteCtx, meter *Meter) ([]Row, error) {
 	rel := plan.rels[ri]
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	// A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
@@ -14074,7 +14074,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 	return tableRows, nil
 }
 
-func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
 	meter := db.session.newMeter()
 
@@ -14703,7 +14703,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 // once-only cost — cost.md §3). A CORRELATED subquery is left in place; the evaluator re-executes
 // it per outer row. So after this pass the only surviving reSubquery nodes are correlated.
 
-func (db *Database) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes cteCtx, cost *int64) error {
+func (db *Engine) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes cteCtx, cost *int64) error {
 	if plan.sel != nil {
 		return db.foldUncorrelatedInSelect(plan.sel, bound, ctes, cost)
 	}
@@ -14733,7 +14733,7 @@ func (db *Database) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes 
 	return db.foldUncorrelatedInPlan(&plan.setop.rhs, bound, ctes, cost)
 }
 
-func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes cteCtx, cost *int64) error {
+func (db *Engine) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes cteCtx, cost *int64) error {
 	for k := range sp.joins {
 		if sp.joins[k].on != nil {
 			if err := db.foldUncorrelatedInRExpr(sp.joins[k].on, bound, ctes, cost); err != nil {
@@ -14779,7 +14779,7 @@ func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes
 
 // foldUncorrelatedInRExpr folds this node if it is an uncorrelated reSubquery, else recurses into
 // its children. A reSubquery is mutated IN PLACE (*e = ...) so every pointer to it sees the fold.
-func (db *Database) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, cost *int64) error {
+func (db *Engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, cost *int64) error {
 	if e.kind == reSubquery {
 		// Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
 		// globally-uncorrelated subquery nested inside it is already a constant before we run it.
@@ -17260,7 +17260,7 @@ type setOpPlan struct {
 // a correlated subquery pushes the current row before running its inner plan, so an reOuterColumn
 // at frame `level` reads outer[len(outer)-level][index].
 type evalEnv struct {
-	exec   *Database
+	exec   *Engine
 	params []Value
 	outer  []Row
 	// The per-statement entropy+clock state (spec/design/entropy.md §5): the uuidv7 monotonic counter
@@ -23590,7 +23590,7 @@ type scope struct {
 	// parent is the enclosing query's scope, for correlated resolution (nil at top level).
 	parent *scope
 	// catalog lets a subquery's inner FROM tables be looked up during planning.
-	catalog *Database
+	catalog *Engine
 	// allowSubquery is true inside a SELECT (and its nested subqueries), false for UPDATE/DELETE
 	// (a subquery there is 0A000 this slice).
 	allowSubquery bool
@@ -23620,7 +23620,7 @@ type mergeCol struct {
 // Subqueries ARE allowed: a correlated reference resolves to the target row via the per-row
 // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
 // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
-func singleScope(catalog *Database, t *Table) *scope {
+func singleScope(catalog *Engine, t *Table) *scope {
 	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
 }
 
@@ -23628,7 +23628,7 @@ func singleScope(catalog *Database, t *Table) *scope {
 // §2): a default may not reference a column (rejected as 0A000 by the structural pre-walk
 // before resolution) and may not contain a subquery, so there are no relations and subqueries
 // are disallowed.
-func emptyScope(catalog *Database) *scope {
+func emptyScope(catalog *Engine) *scope {
 	return &scope{catalog: catalog, allowSubquery: false}
 }
 
@@ -23641,7 +23641,7 @@ func emptyScope(catalog *Database) *scope {
 // A target table literally named old/new SHADOWS that qualifier (the pseudo-relation is
 // suppressed; PostgreSQL's probed rule — its WITH (OLD AS o, ...) aliasing escape stays
 // deferred).
-func returningScope(catalog *Database, t *Table, baseIsOld bool) *scope {
+func returningScope(catalog *Engine, t *Table, baseIsOld bool) *scope {
 	n := len(t.Columns)
 	label := strings.ToLower(t.Name)
 	oldOffset, newOffset := n, 0
@@ -23666,7 +23666,7 @@ func returningScope(catalog *Database, t *Table, baseIsOld bool) *scope {
 // over the combined row [existing | proposed] (excluded.col reads the proposed row). A target
 // table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like the
 // RETURNING old/new qualifiers).
-func onConflictExcludedScope(catalog *Database, t *Table) *scope {
+func onConflictExcludedScope(catalog *Engine, t *Table) *scope {
 	n := len(t.Columns)
 	label := strings.ToLower(t.Name)
 	rels := []scopeRel{{label: label, table: t, offset: 0}}
@@ -25343,7 +25343,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 // built-in byte / code-point order → nil (the unchanged fast path); any other name resolves through
 // the reference-only read path (the database's resolved set, then the binary's vendored set), else
 // 42704.
-func resolveCollationName(catalog *Database, name string) (*Collation, error) {
+func resolveCollationName(catalog *Engine, name string) (*Collation, error) {
 	if name == "C" {
 		return nil, nil
 	}
@@ -25453,7 +25453,7 @@ func combineDeriv(a, b deriv) (deriv, error) {
 // resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. none
 // and C → nil (byte order, the fast path); a loaded name → its table (42704 if it vanished);
 // derivIndeterminate → 42P22 (the collation is required but ambiguous).
-func resolveDeriv(catalog *Database, d deriv) (*Collation, error) {
+func resolveDeriv(catalog *Engine, d deriv) (*Collation, error) {
 	switch d.kind {
 	case derivIndeterminate:
 		return nil, NewError(IndeterminateCollation,
@@ -26823,7 +26823,7 @@ func floatConstFromDecimal(d Decimal, ctx ScalarType) (*rExpr, resolvedType, err
 // (the same string-literal coercion as a typed literal), and a composite field recurses. The folded
 // result is an reRow of the coerced const field nodes, typed as the named composite — the inverse of
 // recordOut.
-func coerceStringToComposite(text string, ct *CompositeType, catalog *Database) (*rExpr, resolvedType, error) {
+func coerceStringToComposite(text string, ct *CompositeType, catalog *Engine) (*rExpr, resolvedType, error) {
 	snap := catalog.readSnap()
 	malformed := func() error {
 		return NewError(InvalidTextRepresentation,
@@ -33206,7 +33206,7 @@ func coerceArrayElementText(tok string, elem ColType) (Value, error) {
 // coerceRecordTextToValue is record_in over a self-contained composite ColType (the inverse of
 // record_out): the token is the composite's own (f1,f2,…) text, tokenized by the shared
 // parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
-// Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Database). A
+// Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Engine). A
 // bad shape / field count is 22P02.
 func coerceRecordTextToValue(text string, ct ColType) (Value, error) {
 	malformed := func() error {
@@ -33526,7 +33526,7 @@ func buildFkProbe(fk *ForeignKey, parent *Table, parentColls []*Collation, row R
 // fkProbeHits reports whether the parent currently holds the key/prefix probe (committed +
 // working state) — the child-side foreign-key existence test (spec/design/constraints.md §6.4).
 // parentTable is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
-func (db *Database) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
+func (db *Engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 	switch probe.kind {
 	case fkProbePk:
 		_, ok, err := db.lkpStore(parentTable).Get(probe.bytes)
@@ -33547,7 +33547,7 @@ func (db *Database) fkProbeHits(probe fkProbe, parentTable string) (bool, error)
 // nothing. Rows whose storage key is in exclude are skipped — the END STATE for a self-reference,
 // whose child IS the table being mutated (so its deleted/updated rows must not count). parent is
 // the referenced table's catalog. Unmetered validation.
-func (db *Database) fkChildReferences(childTable string, fk *ForeignKey, parent *Table, target []byte, exclude map[string]struct{}) (bool, error) {
+func (db *Engine) fkChildReferences(childTable string, fk *ForeignKey, parent *Table, target []byte, exclude map[string]struct{}) (bool, error) {
 	entries, err := db.lkpStore(childTable).EntriesInKeyOrder()
 	if err != nil {
 		return false, err
@@ -33581,7 +33581,7 @@ type fkReferencer struct {
 // DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased child
 // table, FK name) for a deterministic report order; the FK is copied so the caller can probe
 // stores without a snapshot borrow.
-func (db *Database) fkReferencers(parentName string) []fkReferencer {
+func (db *Engine) fkReferencers(parentName string) []fkReferencer {
 	snap := db.readSnap()
 	key := strings.ToLower(parentName)
 	tableKeys := make([]string, 0, len(snap.tables))

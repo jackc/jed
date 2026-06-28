@@ -110,7 +110,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 
 func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 	// With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
-	db := NewDatabase()
+	db := NewEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	if err := db.Commit(); err != nil {
@@ -126,7 +126,7 @@ func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 }
 
 func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	insert, err := db.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -163,14 +163,14 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 }
 
 func TestQueryOnNonQueryStatementErrors(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	if _, err := db.QuerySQL("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestErrorsSurfaceWithSQLState(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	if _, err := db.Prepare("SELCT 1"); err == nil {
 		t.Fatal("expected error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "42601" {
@@ -179,7 +179,7 @@ func TestErrorsSurfaceWithSQLState(t *testing.T) {
 }
 
 func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	if err := db.Commit(); err != nil { // no path -> no-op, not an error
 		t.Fatal(err)
@@ -189,7 +189,7 @@ func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 	}
 }
 
-func mustExec(t *testing.T, db *Database, sql string) {
+func mustExec(t *testing.T, db *Engine, sql string) {
 	t.Helper()
 	if _, err := Execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
@@ -199,7 +199,7 @@ func mustExec(t *testing.T, db *Database, sql string) {
 func TestTableNamesListsTablesSortedExcludingIndexes(t *testing.T) {
 	// The catalog-read surface (api.md §6): canonical names, sorted ascending by
 	// lowercased name; secondary indexes are relations but not tables.
-	db := NewDatabase()
+	db := NewEngine()
 	if got := db.TableNames(); len(got) != 0 {
 		t.Fatalf("empty catalog: got %v", got)
 	}
@@ -228,7 +228,7 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	// how many rows they touched (PostgreSQL's command-tag count); a DML statement that
 	// matched nothing reports (0, true); DDL and transaction control report (0, false);
 	// DML with RETURNING is a query outcome (its row count is the result's length).
-	db := NewDatabase()
+	db := NewEngine()
 	affected := func(sql string) (int64, bool) {
 		t.Helper()
 		out, err := Execute(db, sql)

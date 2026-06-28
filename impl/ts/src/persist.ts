@@ -2,12 +2,12 @@
 // storage.md §4, spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9).
 // Shared by every storage host (file.ts Node `fs`, opfs.ts Browser/OPFS), because the recipe is
 // identical across hosts: the only per-host code is the BlockStore beneath SharedPaging (spec/design/
-// hosts.md §3). Installed as a Database's persistHook by the host bootstrap and called by commitTx with
+// hosts.md §3). Installed as a Engine's persistHook by the host bootstrap and called by commitTx with
 // the working snapshot being published.
 //
 // Browser-clean: imports only host-agnostic core, no `node:*`, so it lands in a browser bundle.
 
-import type { Database, Snapshot } from "./executor.ts";
+import type { Engine, Snapshot } from "./executor.ts";
 import { incrementalImage, metaPage } from "./format.ts";
 
 // persistImpl durably publishes snap to the backing store via an incremental commit: write the dirty
@@ -19,7 +19,7 @@ import { incrementalImage, metaPage } from "./format.ts";
 // freePages advance only after both syncs succeed, so a write failure leaves db, committed, and the
 // file's prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
 // gates here.
-export function persistImpl(db: Database, snap: Snapshot): void {
+export function persistImpl(db: Engine, snap: Snapshot): void {
   if (db.paging === null) return;
   const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging);
   // Preallocate the file ahead of the high-water in chunks, so this commit's body write — and most

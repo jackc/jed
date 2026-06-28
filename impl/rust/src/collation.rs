@@ -43,7 +43,7 @@ impl Ce {
     }
 }
 
-/// A compiled, fully-resolved collation: jed's own table plus its metadata. Database-independent
+/// A compiled, fully-resolved collation: jed's own table plus its metadata. Engine-independent
 /// (the `Collation` value of collation.md §4). The arrays are kept sorted (the §2 contract) so the
 /// serialized bytes are deterministic and no iteration order can leak (CLAUDE.md §8).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -673,7 +673,7 @@ pub fn open_collation(bytes: &[u8]) -> Result<Collation> {
 // SQLite model). All collations arrive at runtime: a host hands the engine a `JUCD` bundle's bytes
 // via [`load_unicode_data`] (`db.LoadUnicodeData`), the engine merges its root + per-locale deltas
 // (§5.1) and adds the resulting collations here. This set is **process-global** — a property of the
-// running engine, not of one `Database` handle (the spec's "loaded set available to any database on
+// running engine, not of one `Engine` handle (the spec's "loaded set available to any database on
 // this handle", §4.2). Global is what lets a file *referencing* a collation be opened after the
 // bundle is loaded: open resolves the referenced table from here (format.rs), and `open` mints the
 // handle, so the data cannot live on the handle. `C` is never here (table-free, built in).

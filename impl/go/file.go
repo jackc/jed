@@ -29,13 +29,13 @@ func DefaultDatabaseOptions() DatabaseOptions {
 // Create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
 // durably immediately, so the file exists with its page size fixed (api.md §2).
-func Create(path string, opts DatabaseOptions) (*Database, error) {
+func Create(path string, opts DatabaseOptions) (*Engine, error) {
 	if _, err := os.Stat(path); err == nil {
 		return nil, NewError(DuplicateFile, "database file already exists: "+path)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, ioError(err)
 	}
-	db := NewDatabase()
+	db := NewEngine()
 	db.path = path
 	db.pageSize = opts.PageSize
 	db.committed.txid = 1                       // the initial empty image is committed as txid 1
@@ -85,7 +85,7 @@ type OpenOptions struct {
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
 // budget defaults to DefaultCacheBytes (256 MiB). See OpenWithOptions to set the budget. The path must
 // exist — 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
-func Open(path string) (*Database, error) {
+func Open(path string) (*Engine, error) {
 	return OpenWithOptions(path, OpenOptions{})
 }
 
@@ -97,7 +97,7 @@ func Open(path string) (*Database, error) {
 // (P6.4b). The byte budget is converted to a leaf-page capacity by the file's page size (cacheLeaves).
 // The budget is a handle setting, not stored in the file (§3). Later commits write through the same
 // pager kept open for the handle's life.
-func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
+func OpenWithOptions(path string, opts OpenOptions) (*Engine, error) {
 	cacheBytes := opts.CacheBytes
 	if cacheBytes <= 0 {
 		cacheBytes = DefaultCacheBytes
@@ -120,10 +120,10 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	// Convert the byte budget to a leaf-page capacity by the file's page size; LoadDatabasePaged
+	// Convert the byte budget to a leaf-page capacity by the file's page size; LoadEnginePaged
 	// rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
 	// pageSize = 0 cannot divide by zero before that check runs).
-	db, err := LoadDatabasePaged(p, cacheLeaves(cacheBytes, p.pageSize))
+	db, err := LoadEnginePaged(p, cacheLeaves(cacheBytes, p.pageSize))
 	if err != nil {
 		_ = f.Close()
 		return nil, err
@@ -140,7 +140,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by Create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persist).
-func (db *Database) writeFullImage() error {
+func (db *Engine) writeFullImage() error {
 	bytes, err := db.committed.ToImage(db.pageSize, db.committed.txid)
 	if err != nil {
 		return err
@@ -163,7 +163,7 @@ func (db *Database) writeFullImage() error {
 // db.freePages advance only after both syncs succeed, so a write failure leaves db, committed, and the
 // file's prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
 // gates here.
-func (db *Database) persist(snap *Snapshot) error {
+func (db *Engine) persist(snap *Snapshot) error {
 	// An in-memory database has no paging context — a no-op success (the committed swap happens in
 	// commitTx after this returns nil).
 	if db.paging == nil {
@@ -206,7 +206,7 @@ func (db *Database) persist(snap *Snapshot) error {
 // ResidentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
 // in-memory database (it is fully resident, nothing to page). The read-only gauge the
 // OpenOptions.CacheBytes budget bounds (≤ CacheBytes / pageSize by construction; spec/design/pager.md §3).
-func (db *Database) ResidentLeaves() int {
+func (db *Engine) ResidentLeaves() int {
 	if db.paging == nil {
 		return 0
 	}
@@ -217,7 +217,7 @@ func (db *Database) ResidentLeaves() int {
 // Publishes the open explicit block durably (per synchronous); a Commit with no open block is a
 // lenient no-op success (under autocommit each statement already committed). Drives the same
 // mechanism as SQL COMMIT.
-func (db *Database) Commit() error {
+func (db *Engine) Commit() error {
 	_, err := db.commitTx()
 	return err
 }
@@ -225,7 +225,7 @@ func (db *Database) Commit() error {
 // Rollback rolls back the current transaction (spec/design/api.md §2.2, transactions.md §4.2).
 // Discards the open explicit block's working set; a Rollback with no open block is a no-op
 // success. Drives the same mechanism as SQL ROLLBACK.
-func (db *Database) Rollback() error {
+func (db *Engine) Rollback() error {
 	_, err := db.rollbackTx()
 	return err
 }
@@ -234,7 +234,7 @@ func (db *Database) Rollback() error {
 // transaction (its in-progress work is discarded) and does not commit one. Under autocommit every
 // prior statement is already durable, so — unlike the original model — Close does NOT drop
 // committed work; durability is never hidden in a destructor. Idempotent.
-func (db *Database) Close() error {
+func (db *Engine) Close() error {
 	_, _ = db.rollbackTx()
 	db.path = ""
 	if db.paging != nil {

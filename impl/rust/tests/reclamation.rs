@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, execute};
+use jed::{DatabaseOptions, Engine, Outcome, execute};
 
 const PS: u64 = 256;
 
@@ -32,7 +32,7 @@ fn slot_txid(bytes: &[u8], slot: usize) -> u64 {
     be64(bytes, slot * ps + 12)
 }
 
-fn ids(db: &mut Database) -> Vec<i64> {
+fn ids(db: &mut Engine) -> Vec<i64> {
     match execute(db, "SELECT id FROM t").unwrap() {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -46,7 +46,7 @@ fn ids(db: &mut Database) -> Vec<i64> {
 }
 
 /// The `pad` text of the row with `id`, or `None` if absent.
-fn pad_of(db: &mut Database, id: i64) -> Option<String> {
+fn pad_of(db: &mut Engine, id: i64) -> Option<String> {
     match execute(db, &format!("SELECT pad FROM t WHERE id = {id}")).unwrap() {
         Outcome::Query { rows, .. } => rows.first().map(|r| match &r[0] {
             Value::Text(s) => s.clone(),
@@ -56,9 +56,9 @@ fn pad_of(db: &mut Database, id: i64) -> Option<String> {
     }
 }
 
-fn setup(path: &PathBuf, rows: i64) -> Database {
+fn setup(path: &PathBuf, rows: i64) -> Engine {
     let _ = std::fs::remove_file(path);
-    let mut db = Database::create(
+    let mut db = Engine::create(
         path,
         DatabaseOptions {
             page_size: PS as u32,
@@ -99,7 +99,7 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     db.close().unwrap();
 
     // Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert_eq!(
         db.page_count(),
         pc_after_churn1,
@@ -140,7 +140,7 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     );
     assert_eq!(ids(&mut db), (1..=30).collect::<Vec<_>>());
     db.close().unwrap();
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert_eq!(
         pad_of(&mut db, 15).as_deref(),
         Some(&format!("b39-{pad}")[..])
@@ -167,7 +167,7 @@ fn heavy_insert_delete_churn_reopens_correctly_with_reuse() {
     db.close().unwrap();
 
     // Reopen (free-list reconstructed) and churn again, now reusing reclaimed pages.
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     for k in 0..40 {
         execute(
             &mut db,
@@ -181,7 +181,7 @@ fn heavy_insert_delete_churn_reopens_correctly_with_reuse() {
     execute(&mut db, &format!("INSERT INTO t VALUES (27, 'q-{pad}')")).unwrap();
     db.close().unwrap();
 
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert_eq!(ids(&mut db), (1..=27).collect::<Vec<_>>());
 }
 
@@ -200,7 +200,7 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     db.close().unwrap();
 
     // Reopen so the free-list holds the churn's dead pages, then do two commits that *reuse* them.
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     execute(
         &mut db,
         &format!("UPDATE t SET pad = 'A-{pad}' WHERE id = 10"),
@@ -229,7 +229,7 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     // The loader falls back to the prior snapshot — intact even though the torn commit reused
     // (overwrote) free pages, because those pages were dead and the prior snapshot never referenced
     // them. Row 11's update vanishes; row 10's prior-commit value and every row survive.
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert_eq!(
         db.txid(),
         prior_txid,

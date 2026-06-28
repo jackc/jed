@@ -7,17 +7,17 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute, loadDatabase, toImage } from "../src/lib.ts";
+import { Engine, EngineError, execute, loadEngine, toImage } from "../src/lib.ts";
 
-function run(db: Database, sql: string) {
+function run(db: Engine, sql: string) {
   return execute(db, sql);
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return run(db, sql).cost;
 }
 
-function ids(db: Database, sql: string): bigint[] {
+function ids(db: Engine, sql: string): bigint[] {
   const o = run(db, sql);
   assert.equal(o.kind, "query", sql);
   return (o.kind === "query" ? o.rows : []).map((r) => {
@@ -37,7 +37,7 @@ function errInfo(fn: () => unknown): { code: string; message: string } {
 }
 
 // names is each index of the table as "name" or "name!" (unique), in catalog order.
-function names(db: Database, table: string): string[] {
+function names(db: Engine, table: string): string[] {
   const t = db.table(table);
   assert.ok(t, `table ${table} missing`);
   return t.indexes.map((ix) => ix.name + (ix.unique ? "!" : ""));
@@ -48,7 +48,7 @@ function names(db: Database, table: string): string[] {
 // relation namespace and the table's check names; an explicit CONSTRAINT name is the
 // index name as written.
 test("constraint naming matches PostgreSQL", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE other (x i32)");
   run(db, "CREATE INDEX walk_a_key ON other (x)"); // occupies the derived base
   run(
@@ -66,7 +66,7 @@ test("constraint naming matches PostgreSQL", () => {
 // member lists fold into one (the first explicitly-named one's name wins); a list
 // identical to the primary key's folds away entirely; a differing ORDER is distinct.
 test("dedup and PK fold match PostgreSQL", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE e3 (a i32 UNIQUE UNIQUE, UNIQUE (a))");
   assert.deepEqual(names(db, "e3"), ["e3_a_key!"]);
   // An unnamed-then-named pair keeps the NAME (PG: p1 kept "named").
@@ -92,7 +92,7 @@ test("dedup and PK fold match PostgreSQL", () => {
 // 42P07 (relation namespace, including the table being created) before 42710 (the
 // table's constraint names).
 test("DDL errors match PostgreSQL", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE other (x i32)");
   assert.equal(errInfo(() => run(db, "CREATE TABLE e2 (a i32, UNIQUE (nosuch))")).code, "42703");
   assert.equal(errInfo(() => run(db, "CREATE TABLE e1 (a i32, UNIQUE (a, a))")).code, "42701");
@@ -148,7 +148,7 @@ test("DDL errors match PostgreSQL", () => {
 // the violation precedence is CHECK before PK before UNIQUE, and among unique indexes
 // the catalog (name) order.
 test("INSERT enforcement", () => {
-  const db = new Database();
+  const db = new Engine();
   run(
     db,
     "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32, " +
@@ -191,7 +191,7 @@ test("INSERT enforcement", () => {
 // documented PG divergence): self-resolving rewrites succeed; genuine conflicts with
 // untouched rows and in-batch collisions trap 23505; nothing is written on failure.
 test("UPDATE enforcement validates the end state", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE m (id i32 PRIMARY KEY, v i32 UNIQUE)");
   run(db, "INSERT INTO m VALUES (1, 1), (2, 2), (3, 30)");
   // PG fails both of these on the transient per-row collision; jed's end state is unique.
@@ -216,7 +216,7 @@ test("UPDATE enforcement validates the end state", () => {
 // duplicate traps 23505 and creates nothing (the name stays free); NULLs are exempt;
 // thereafter it enforces like a constraint-backed index. The auto-name keeps _idx.
 test("CREATE UNIQUE INDEX build verification", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE d (id i32 PRIMARY KEY, a i32, n i32)");
   run(db, "INSERT INTO d VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5)");
   // Build over duplicates fails and registers nothing.
@@ -239,7 +239,7 @@ test("CREATE UNIQUE INDEX build verification", () => {
 // (the documented PG divergence — indexes.md §7: jed has no ALTER TABLE, so the index
 // name is the constraint's only handle).
 test("DROP INDEX drops the constraint", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)");
   run(db, "INSERT INTO t VALUES (1, 10)");
   assert.equal(errInfo(() => run(db, "INSERT INTO t VALUES (2, 10)")).code, "23505");
@@ -252,7 +252,7 @@ test("DROP INDEX drops the constraint", () => {
 // table still costs 0, and a CREATE UNIQUE INDEX build charges exactly the plain build's
 // scan. The planner treats a unique index like any other (the bounded-scan cost).
 test("costs are unchanged by unique", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
@@ -269,12 +269,12 @@ test("costs are unchanged by unique", () => {
 // The v6 round-trip: the unique flag survives serialize -> load (and the reloaded
 // database still enforces), and the image is byte-stable across a second serialize.
 test("round-trip preserves unique", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32)");
   run(db, "CREATE INDEX plain ON t (w)");
   run(db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)");
   const image = toImage(db, 8192, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   assert.deepEqual(names(loaded, "t"), ["plain", "t_v_key!"]);
   assert.equal(errInfo(() => run(loaded, "INSERT INTO t VALUES (3, 10, 1)")).code, "23505");
   run(loaded, "INSERT INTO t VALUES (3, NULL, 1)");
@@ -284,7 +284,7 @@ test("round-trip preserves unique", () => {
 // Transactional DDL: a UNIQUE created inside a rolled-back block leaves no trace — no
 // definition, no store, no enforcement (the §3 snapshot model).
 test("transactional DDL rolls back", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES (1, 10)");
   run(db, "BEGIN");

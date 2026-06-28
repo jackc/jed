@@ -11,7 +11,7 @@
 // `node:*`.
 
 import { EngineError } from "../errors.ts";
-import type { Database, Outcome } from "../executor.ts";
+import type { Engine, Outcome } from "../executor.ts";
 import {
   closeOpfs,
   createOpfs,
@@ -42,9 +42,9 @@ type RunResult =
   | { kind: "statement"; rowsAffected: number | null; cost: string };
 
 // The single open database this worker owns (the exclusive OPFS handle, hosts.md §5). null until open/create.
-let db: Database | null = null;
+let db: Engine | null = null;
 
-function requireDb(): Database {
+function requireDb(): Engine {
   // Protocol misuse (a run/commit before open), not a SQL engine error — a plain Error, which the
   // message loop serializes with the generic XX000 code.
   if (db === null) {

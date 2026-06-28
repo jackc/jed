@@ -330,7 +330,7 @@ export class TableStore {
     return this.colTypes;
   }
 
-  // setTree installs a loaded B-tree as this store's contents (format.ts loadDatabase).
+  // setTree installs a loaded B-tree as this store's contents (format.ts loadEngine).
   setTree(root: PNode | null, length: number): void {
     this.rows = pmapFromLoaded(root, length);
   }

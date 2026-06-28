@@ -6,24 +6,24 @@
 //! 23503 enforcement at every write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the
 //! corpus's job. Mirrored in impl/go/foreign_key_test.go and impl/ts/tests/foreign_key.test.ts.
 
-use jed::{Database, execute};
+use jed::{Engine, execute};
 
-fn db_with(sql: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(sql: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in sql {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
 }
 
-fn fk_names(db: &Database, table: &str) -> Vec<String> {
+fn fk_names(db: &Engine, table: &str) -> Vec<String> {
     db.table(table)
         .unwrap()
         .foreign_keys

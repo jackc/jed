@@ -27,7 +27,7 @@ const (
 
 // overflowTables builds two tables of identical shape: `spill` row 1 carries a 600-char text
 // (3-page chain), `control` keeps every value inline. Row 2 is inline in both.
-func overflowTables(t *testing.T) *Database {
+func overflowTables(t *testing.T) *Engine {
 	t.Helper()
 	db := WithPageSize(overflowPageSize)
 	big := fillerText(overflowBodyLength)

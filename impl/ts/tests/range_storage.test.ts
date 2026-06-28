@@ -14,10 +14,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute, loadDatabase, toImage } from "../src/lib.ts";
+import { Engine, execute, loadEngine, toImage } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-// A range column survives a whole-image serialize + reload (toImage → loadDatabase), exercising
+// A range column survives a whole-image serialize + reload (toImage → loadEngine), exercising
 // encodeRangeBody / readRangeBody (the empty range, infinite bounds, a NULL range, the canonical
 // `[)` storage). The on-disk byte layout is pinned cross-core by range_table.jed; this is the
 // behavioral round-trip.
@@ -30,7 +30,7 @@ test("range image roundtrip", () => {
     "INSERT INTO t VALUES (4, '(,)', '(5,)')", // canonical [6,)
     "INSERT INTO t VALUES (5, NULL, '[1,1]')", // canonical [1,2)
   ]);
-  const loaded = loadDatabase(toImage(db, 4096, 1n));
+  const loaded = loadEngine(toImage(db, 4096, 1n));
   assert.deepEqual(query(loaded, "SELECT id, r, br FROM t ORDER BY id"), [
     ["1", "[1,5)", "[10,20)"],
     ["2", "[1,6)", "NULL"],
@@ -135,7 +135,7 @@ test("range update deferrals are 0A000", () => {
 // ("operator does not exist") — a deliberate divergence, so this cannot live in the oracle corpus.
 // The agreeing same-element comparison (=/</ORDER BY) is covered by types/range.test.
 test("range cross-element comparison is 42804", () => {
-  const db = new Database();
+  const db = new Engine();
   // A range over i32 vs a range over i64 — different element types, no implicit cross-range cast.
   assert.equal(
     errCode(() => execute(db, "SELECT '[1,5)'::i32range = '[1,5)'::i64range")),
@@ -155,7 +155,7 @@ test("range cross-element comparison is 42804", () => {
 // A range-typed composite field is deferred (`0A000`) — only range *columns* are storable this
 // slice. The type name IS known, so it is `0A000`, not the `42704` an unknown type would give.
 test("composite range field is 0A000", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     errCode(() => execute(db, "CREATE TYPE rec AS (lo i32, span i32range)")),
     "0A000",
@@ -167,7 +167,7 @@ test("composite range field is 0A000", () => {
 // integer (range-checked at eval) where PG rejects the overload, and is stricter on the
 // unknown-string corner. The agreeing constructor behavior lives in expr/range_constructors.test.
 test("range constructor divergences", () => {
-  const db = new Database();
+  const db = new Engine();
   // (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
   // int4range/int8range). The result is identical to the PG-spelled alias.
   assert.deepEqual(query(db, "SELECT i32range(1, 5)"), [["[1,5)"]]);
@@ -206,7 +206,7 @@ test("range constructor divergences", () => {
 // value-producing rows) cannot express, plus the one real divergence (spec/design/range-functions.md
 // §3). The agreeing value behavior of all eight operators lives in expr/range_operators.test.
 test("range operator divergences", () => {
-  const db = new Database();
+  const db = new Engine();
   // THE divergence: jed has no integer bit-shift, so the `<<` / `>>` tokens are RANGE-only. An
   // integer `<<` / `>>` is "operator does not exist" (42883) — PostgreSQL would compute a bit shift
   // (5 << 2 = 20). A documented divergence (jed owns its surface), so it cannot live in the corpus.

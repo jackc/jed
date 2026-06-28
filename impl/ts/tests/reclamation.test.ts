@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, type Database, execute, open } from "../src/lib.ts";
+import { close, create, type Engine, execute, open } from "../src/lib.ts";
 
 const PS = 256;
 
@@ -31,11 +31,11 @@ function slotTxid(b: Uint8Array, slot: number): bigint {
 // which directly reports whether a commit extended the high-water or reused a free page. We track
 // this, not the file length: the file is preallocated in chunks ahead of the high-water
 // (spec/design/pager.md §7), so its physical size no longer equals pageCount*pageSize.
-function pageCountOf(db: Database): number {
+function pageCountOf(db: Engine): number {
   return db.pageCount;
 }
 
-function ids(db: Database): bigint[] {
+function ids(db: Engine): bigint[] {
   const o = execute(db, "SELECT id FROM t");
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("expected a query");
@@ -47,7 +47,7 @@ function ids(db: Database): bigint[] {
 }
 
 // padOf returns the pad text of the row with `id`, or null if absent.
-function padOf(db: Database, id: number): string | null {
+function padOf(db: Engine, id: number): string | null {
   const o = execute(db, `SELECT pad FROM t WHERE id = ${id}`);
   assert.equal(o.kind, "query");
   if (o.kind !== "query" || o.rows.length === 0) return null;
@@ -55,7 +55,7 @@ function padOf(db: Database, id: number): string | null {
   return v.kind === "text" ? v.text : null;
 }
 
-function setup(path: string, rows: number): Database {
+function setup(path: string, rows: number): Engine {
   const db = create(path, { pageSize: PS });
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
   const base = "x".repeat(40);

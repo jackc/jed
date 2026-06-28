@@ -8,10 +8,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execute } from "../src/lib.ts";
-import type { Database } from "../src/lib.ts";
+import type { Engine } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
-function affected(db: Database, sql: string): number | null {
+function affected(db: Engine, sql: string): number | null {
   const out = execute(db, sql);
   assert.equal(out.kind, "statement", `expected a statement outcome from ${sql}`);
   return out.kind === "statement" ? out.rowsAffected : null;

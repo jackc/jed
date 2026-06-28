@@ -386,7 +386,7 @@ type SelectResult = {
   cost: bigint;
 };
 
-// Database is the whole database: catalog + per-table in-memory stores. Single
+// Engine is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands later. Names
 // are keyed case-insensitively (lowercased).
 // DEFAULT_PAGE_SIZE is the default serialization page size (8 KiB — spec/design/storage.md §3),
@@ -410,8 +410,8 @@ export const DEFAULT_TEMP_BUFFERS = 32 << 20;
 
 // DEFAULT_SHARED_TEMP_MEM is the default GLOBAL storage budget for DATABASE-WIDE shared temporary
 // tables, in BYTES (spec/design/temp-tables.md §7). The shared-temp analogue of DEFAULT_TEMP_BUFFERS:
-// shared temp data is global (one set of rows across every session of the open Database), so its
-// budget is a Database-level setting (sharedTempMem) rather than per-session. An over-budget shared
+// shared temp data is global (one set of rows across every session of the open Engine), so its
+// budget is a Engine-level setting (sharedTempMem) rather than per-session. An over-budget shared
 // write aborts the same 54P03. 0 ⇒ unlimited; measured identically (deterministic on-disk record
 // bytes), so the abort point is part of the cross-core contract.
 export const DEFAULT_SHARED_TEMP_MEM = 32 << 20;
@@ -1444,7 +1444,7 @@ type ActiveTx = {
   // temp analogue of working, kept SEPARATE so it is never serialized.
   tempWorking: Snapshot;
   // sharedTempWorking is the transaction's working copy of the DATABASE-WIDE shared temp-table
-  // snapshot (spec/design/temp-tables.md §5): cloned from Database.sharedTempCommitted at tx open,
+  // snapshot (spec/design/temp-tables.md §5): cloned from Engine.sharedTempCommitted at tx open,
   // mutated by shared-temp DDL/DML, adopted back on a successful COMMIT and discarded on ROLLBACK. The
   // shared analogue of tempWorking; for the shared layer the adopted state is then published to the
   // shared root (the two-root commit, §5).
@@ -1512,9 +1512,9 @@ function txStatusOf(tx: ActiveTx | null): TxStatus {
 }
 
 // Session is the per-connection SESSION state (spec/design/session.md §2.1): the configured, stateful
-// context a host runs statements through, un-fused from the committed storage on Database. It owns the
+// context a host runs statements through, un-fused from the committed storage on Engine. It owns the
 // open transaction (the Idle/Open/Failed machine), the relocated handle settings, the entropy/clock
-// seam, and the currval/lastval session state. A Database holds one as its long-lived default session;
+// seam, and the currval/lastval session state. A Engine holds one as its long-lived default session;
 // db.newSession mints additional independent ones that run sequentially on a single-threaded handle
 // (by swapping into the default slot for the duration of a call — TS objects swap by reference).
 // requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md
@@ -1586,7 +1586,7 @@ export class Session {
   tempBuffers: number;
   // The session-local TEMPORARY-table catalog + stores (spec/design/temp-tables.md §2): a Snapshot
   // holding only this session's temp tables, their stores, and their (UNIQUE) index stores. NEVER
-  // serialized — only Database.committed is written to the file, so a temp table makes ZERO file
+  // serialized — only Engine.committed is written to the file, so a temp table makes ZERO file
   // writes. Private to this Session (it carries across the by-reference session swap and is invisible
   // to other sessions), dropped wholesale with the session. Transactional like the main snapshot: an
   // open transaction clones it into ActiveTx.tempWorking, adopted on a successful COMMIT, discarded on
@@ -1655,7 +1655,7 @@ export class Session {
   // run installs this session as db's active session, runs fn, and restores the default — the swap
   // that lets an additional session run on a single-threaded handle (spec/design/session.md §2.1).
   // TS swaps by reference (no value copy); the default is restored even if fn throws.
-  private run<T>(db: Database, fn: () => T): T {
+  private run<T>(db: Engine, fn: () => T): T {
     const saved = db.session;
     db.session = this;
     try {
@@ -1669,13 +1669,13 @@ export class Session {
   // SELECT returns the query Outcome (with its rows). Transactions are driven via SQL BEGIN/COMMIT
   // through execute; the view/update closure sugar (Rust/Go) is a TS follow-on (it would import the
   // api.ts Transaction, a module cycle the executor avoids).
-  execute(db: Database, sql: string, params: Value[] = []): Outcome {
+  execute(db: Engine, sql: string, params: Value[] = []): Outcome {
     return this.run(db, () => db.executeStmtParams(db.parse(sql), params));
   }
 
   // executeScript runs a multi-statement script on this ADDITIONAL session against db, sharing
   // committed storage and running sequentially via the swap (spec/design/session.md §2.1/§4.2).
-  executeScript(db: Database, sql: string): ScriptSummary {
+  executeScript(db: Engine, sql: string): ScriptSummary {
     return this.run(db, () => db.executeScript(sql));
   }
 
@@ -1785,13 +1785,13 @@ export class Session {
   }
 }
 
-export class Database {
+export class Engine {
   // The last committed, immutable state — what fresh readers (and autocommit reads) see.
   committed: Snapshot;
   // The DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this handle runs
   // statements through — the open transaction (the Idle/Open/Failed machine, §2.2), the relocated
   // settings (maxCost/maxSqlLength/workMem, the entropy/clock seam), and the currval/lastval session
-  // state. A bare Database IS committed storage + this one long-lived stateful default session; the
+  // state. A bare Engine IS committed storage + this one long-lived stateful default session; the
   // convenience methods operate on it. newSession mints additional independent sessions (run
   // sequentially on this single-threaded handle by swapping into this slot for a call).
   session: Session;
@@ -1815,7 +1815,7 @@ export class Database {
   // incremental commit, persist.ts) — and so the signal that a commit advances txid + persists (used
   // by commitTx). It is called by commitTx with the working snapshot being published (transactions.md
   // §4.1/§9). Injecting it here keeps the executor free of a host-module dependency (no import cycle).
-  persistHook: ((db: Database, snap: Snapshot) => void) | null;
+  persistHook: ((db: Engine, snap: Snapshot) => void) | null;
   // paging is the shared paging context for a file-backed database (spec/design/pager.md): the open
   // pager (kept for the handle's life) + the bounded leaf buffer pool, shared with every table store
   // so reads fault OnDisk leaves through the one pool. The load reads pages through it and every commit
@@ -1837,12 +1837,12 @@ export class Database {
   // sharedTempCommitted is the DATABASE-WIDE shared temporary-table snapshot (temp-tables.md §4): the
   // committed rows of every SHARED temp table, held in memory and NEVER serialized — the shared
   // analogue of session.tempCommitted, but on the handle (visible to every session minted from this
-  // Database) rather than per-session. On a single handle this is just a field; for the shared layer
+  // Engine) rather than per-session. On a single handle this is just a field; for the shared layer
   // (shared.ts) it is pinned from / published to the shared roots alongside committed (the two-root
   // commit, §5). Born empty, gone at close — never recovered (divergence D5).
   sharedTempCommitted: Snapshot;
   // sharedTempMem is the GLOBAL byte budget for shared temp storage (shared_temp_mem, §7); 0 ⇒
-  // unlimited. The shared analogue of session.tempBuffers, but Database-level (shared temp is global).
+  // unlimited. The shared analogue of session.tempBuffers, but Engine-level (shared temp is global).
   // An over-budget shared write aborts 54P03.
   sharedTempMem: number;
 
@@ -1973,7 +1973,7 @@ export class Database {
   }
 
   // setSharedTempMem sets the GLOBAL shared-temp storage budget in BYTES (shared_temp_mem,
-  // spec/design/temp-tables.md §7); 0 ⇒ unlimited. A Database-level setting (shared temp data is
+  // spec/design/temp-tables.md §7); 0 ⇒ unlimited. A Engine-level setting (shared temp data is
   // global); an over-budget shared write aborts 54P03. Read the budget back via the public
   // `sharedTempMem` field (a field, not a method — TS forbids a same-named getter).
   setSharedTempMem(bytes: number): void {
@@ -2521,7 +2521,7 @@ export class Database {
   // §2.1), configured from opts. The new session has its own settings, transaction status, and
   // sequence state; the committed storage is shared. On a single-threaded handle, additional sessions
   // run sequentially — a statement is issued through Session.execute, which swaps the session into the
-  // active slot for the call. The bare Database keeps its long-lived default session.
+  // active slot for the call. The bare Engine keeps its long-lived default session.
   newSession(opts: SessionOptions = {}): Session {
     return new Session(opts);
   }
@@ -2627,7 +2627,7 @@ export class Database {
   // loadUnicodeData loads a JUCD Unicode-data bundle (db.loadUnicodeData, spec/design/collation.md
   // §4.2): its collations become resolvable by name for COLLATE, per-column collation, and ORDER BY …
   // COLLATE. The loaded set is ENGINE-GLOBAL (§9), so a bundle loaded through any handle is visible
-  // everywhere — including to a later Database.open of a file that REFERENCES one of its collations.
+  // everywhere — including to a later Engine.open of a file that REFERENCES one of its collations.
   // Privileged host op (not SQL-reachable, no path, no engine I/O — §11); ADDITIVE and idempotent for
   // an already-loaded bundle. Browser-safe (Uint8Array, no node:fs). A malformed bundle is XX001.
   // (Mirrors the free loadUnicodeData, which the host may call before opening any file.)
@@ -2655,7 +2655,7 @@ export class Database {
   // loadedCollations introspects the engine-global LOADED collation set (db.loadedCollations,
   // spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
   // database on this handle, ascending by name. A property of the running ENGINE, not of this
-  // database; for the collations this database references, use Database.collations. isDefault is
+  // database; for the collations this database references, use Engine.collations. isDefault is
   // always false here (that is a per-database property). C is built in and not listed.
   loadedCollations(): CollationInfo[] {
     return loadedCollationTables().map((c) => ({
@@ -2710,7 +2710,7 @@ export class Database {
   // collations introspects the collations THIS DATABASE references (db.collations,
   // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
   // per-database default), in ascending name order. This is the per-file view; for the engine-global
-  // LOADED set, use Database.loadedCollations. C is built in and not listed.
+  // LOADED set, use Engine.loadedCollations. C is built in and not listed.
   collations(): CollationInfo[] {
     const dflt = this.committed.defaultCollation;
     // referencedCollations resolves each referenced name (from a loaded bundle).
@@ -2974,7 +2974,7 @@ export class Database {
   }
 
   // checkSharedTempBudget enforces the GLOBAL shared-temp storage budget (sharedTempMem, spec/design/
-  // temp-tables.md §7) — the shared analogue of checkTempBudget, charged against the Database-level
+  // temp-tables.md §7) — the shared analogue of checkTempBudget, charged against the Engine-level
   // budget over the shared-temp footprint. Self-gates on sharedTempDirty (a no-op for any statement
   // that did not write shared temp). The over-budget write is staged, so the abort rolls it back.
   private checkSharedTempBudget(): void {
@@ -13979,7 +13979,7 @@ function jtColumn(name: string, ty: ScalarType, decimal: DecimalTypmod | null): 
 
 // jtScalarType resolves a `JSON_TABLE` column type name → its scalar type (a composite → 0A000, an
 // unknown name → 42704). Port of impl/rust/src/executor.rs `jt_scalar_type`.
-function jtScalarType(db: Database, typeName: string): ScalarType {
+function jtScalarType(db: Engine, typeName: string): ScalarType {
   const st = scalarTypeFromName(typeName);
   if (st !== undefined) return st;
   if (db.compositeType(typeName) !== undefined) {
@@ -14361,17 +14361,17 @@ type EvalEnv = {
   outer: Row[];
   runSubquery(plan: QueryPlan, outer: Row[]): SelectResult;
   // The entropy+clock seam (spec/design/entropy.md §5): `seam` is the handle's injected random/clock
-  // functions (a reference to the Database's Seam — handle-scoped); `rng` is the per-statement
+  // functions (a reference to the Engine's Seam — handle-scoped); `rng` is the per-statement
   // uuidv7 counter + once-resolved clock. Only the volatile uuid generators touch either.
   seam: Seam;
   rng: StmtRng;
   // The statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at any
   // nesting depth delivers a CTE's rows. EMPTY_CTE_CTX for every non-WITH statement.
   ctes: CteCtx;
-  // The executing Database handle, so the sequence value functions (nextval/currval — sequences.md
+  // The executing Engine handle, so the sequence value functions (nextval/currval — sequences.md
   // §4/§6) can resolve a name to a catalog sequence and advance/read it (mirrors Rust's env.exec —
   // the same access the clock seam already uses). Only nextval/currval touch it.
-  exec: Database;
+  exec: Engine;
 };
 
 // ============================================================================
@@ -18373,7 +18373,7 @@ class Scope {
   // parent is the enclosing query's scope, for correlated resolution (null at top level).
   parent: Scope | null;
   // catalog lets a subquery's inner FROM tables be looked up during planning.
-  catalog: Database;
+  catalog: Engine;
   // allowSubquery is true inside a SELECT (and its nested subqueries), false for UPDATE/DELETE
   // (a subquery there is 0A000 this slice).
   allowSubquery: boolean;
@@ -18390,7 +18390,7 @@ class Scope {
   hidden: number[] = [];
   constructor(
     rels: ScopeRel[],
-    catalog: Database,
+    catalog: Engine,
     parent: Scope | null,
     allowSubquery: boolean,
     ctes: CteBinding[] = [],
@@ -18406,7 +18406,7 @@ class Scope {
   // Subqueries ARE allowed: a correlated reference resolves to the target row via the per-row
   // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
   // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
-  static single(catalog: Database, t: Table): Scope {
+  static single(catalog: Engine, t: Table): Scope {
     return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
   }
 
@@ -18414,7 +18414,7 @@ class Scope {
   // default may not reference a column (rejected as 0A000 by the structural pre-walk before
   // resolution) and may not contain a subquery, so there are no relations and subqueries are
   // disallowed.
-  static empty(catalog: Database): Scope {
+  static empty(catalog: Engine): Scope {
     return new Scope([], catalog, null, false);
   }
 
@@ -18427,7 +18427,7 @@ class Scope {
   // caller appends. A target table literally named old/new SHADOWS that qualifier (the
   // pseudo-relation is suppressed; PostgreSQL's probed rule — its WITH (OLD AS o, ...)
   // aliasing escape stays deferred).
-  static returning(catalog: Database, t: Table, baseIsOld: boolean): Scope {
+  static returning(catalog: Engine, t: Table, baseIsOld: boolean): Scope {
     const n = t.columns.length;
     const label = t.name.toLowerCase();
     const oldOffset = baseIsOld ? 0 : n;
@@ -18455,7 +18455,7 @@ class Scope {
   // over the combined row [existing | proposed] (excluded.col reads the proposed row). A target
   // table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like the
   // RETURNING old/new qualifiers).
-  static onConflictExcluded(catalog: Database, t: Table): Scope {
+  static onConflictExcluded(catalog: Engine, t: Table): Scope {
     const n = t.columns.length;
     const label = t.name.toLowerCase();
     const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
@@ -18592,7 +18592,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
 // resolvedTypeOf, or a composite resolved to a CompositeRType (its name + the resolved field types,
 // recursing) against the database's composite-type catalog (spec/design/composite.md §5). The
 // composite reference is guaranteed to resolve (CREATE TYPE / the two-pass load validated it).
-function resolvedTypeOfCol(ty: Type, db: Database): ResolvedType {
+function resolvedTypeOfCol(ty: Type, db: Engine): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
   if (ty.kind === "array") return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
   if (ty.kind === "range") return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
@@ -21531,7 +21531,7 @@ function resolve(
 // built-in byte / code-point order → null (the unchanged fast path); any other name resolves through
 // the reference-only read path (the database's resolved set, then the binary's vendored set), else
 // 42704.
-function resolveCollationName(catalog: Database, name: string): Collation | null {
+function resolveCollationName(catalog: Engine, name: string): Collation | null {
   if (name === "C") return null;
   const c = catalog.resolveCollationByName(name);
   if (c === undefined) {
@@ -21607,7 +21607,7 @@ function combineDeriv(a: Deriv, b: Deriv): Deriv {
 // resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. "none"
 // and C → null (byte order, the fast path); a loaded name → its table (42704 if it vanished);
 // "indeterminate" → 42P22 (the collation is required but ambiguous).
-function resolveDeriv(catalog: Database, d: Deriv): Collation | null {
+function resolveDeriv(catalog: Engine, d: Deriv): Collation | null {
   if (d.kind === "indeterminate") {
     throw engineError(
       "indeterminate_collation",
@@ -23463,7 +23463,7 @@ function coerceStringLiteral(
 function coerceStringToComposite(
   text: string,
   ct: CompositeType,
-  db: Database,
+  db: Engine,
 ): { node: RExpr; type: ResolvedType } {
   const malformed = (): Error =>
     engineError(
@@ -25221,7 +25221,7 @@ function coerceArrayElementText(tok: string, elem: ColType): Value {
 // coerceRecordTextToValue is record_in over a self-contained composite ColType (the inverse of
 // record_out): the token is the composite's own `(f1,f2,…)` text, tokenized by the shared
 // parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
-// Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Database). A
+// Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Engine). A
 // bad shape / field count is 22P02.
 function coerceRecordTextToValue(
   text: string,

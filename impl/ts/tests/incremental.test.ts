@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, type Database, execute, open, toImage } from "../src/lib.ts";
+import { close, create, type Engine, execute, open, toImage } from "../src/lib.ts";
 
 function tmpDir(): string {
   return mkdtempSync(join(tmpdir(), "jed-"));
@@ -24,7 +24,7 @@ function slotTxid(b: Uint8Array, slot: number): bigint {
   return dv.getBigUint64(slot * ps + 12, false);
 }
 
-function ids(db: Database): bigint[] {
+function ids(db: Engine): bigint[] {
   const o = execute(db, "SELECT id FROM t");
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("expected a query");

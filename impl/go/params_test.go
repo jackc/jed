@@ -7,7 +7,7 @@ package jed
 import "testing"
 
 // queryRows runs a parameterized query and returns its rows; t.Fatal on error.
-func queryRows(t *testing.T, db *Database, sql string, params ...Value) [][]Value {
+func queryRows(t *testing.T, db *Engine, sql string, params ...Value) [][]Value {
 	t.Helper()
 	out, err := ExecuteParams(db, sql, params)
 	if err != nil {
@@ -20,7 +20,7 @@ func queryRows(t *testing.T, db *Database, sql string, params ...Value) [][]Valu
 }
 
 // paramErrCode runs a parameterized statement expected to fail and returns its SQLSTATE.
-func paramErrCode(t *testing.T, db *Database, sql string, params ...Value) string {
+func paramErrCode(t *testing.T, db *Engine, sql string, params ...Value) string {
 	t.Helper()
 	_, err := ExecuteParams(db, sql, params)
 	if err == nil {
@@ -187,7 +187,7 @@ func TestParamInInList(t *testing.T) {
 }
 
 func TestDDLWithParamsTraps42601(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	if c := paramErrCode(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)", IntValue(1)); c != "42601" {
 		t.Fatalf("code = %s want 42601", c)
 	}

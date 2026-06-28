@@ -2,9 +2,9 @@
 //! concatenation operator and the search/edit functions `array_remove`, `array_replace`,
 //! `array_position`, `array_positions`. Every expected value is pinned against PostgreSQL 18.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
@@ -13,7 +13,7 @@ fn err(db: &mut Database, sql: &str) -> String {
 }
 
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL").
-fn val(db: &mut Database, sql: &str) -> String {
+fn val(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
@@ -26,7 +26,7 @@ fn val(db: &mut Database, sql: &str) -> String {
 
 #[test]
 fn concat_three_forms() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // array || array → array_cat; array || element → array_append; element || array → array_prepend.
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || ARRAY[3,4]"), "{1,2,3,4}");
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || 3"), "{1,2,3}");
@@ -48,7 +48,7 @@ fn concat_three_forms() {
 
 #[test]
 fn concat_null_prefers_cat() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // A BARE untyped NULL operand resolves to array_cat (the NULL array is the identity) — PG.
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || NULL"), "{1,2}");
     assert_eq!(val(&mut db, "SELECT NULL || ARRAY[1,2]"), "{1,2}");
@@ -62,7 +62,7 @@ fn concat_null_prefers_cat() {
 
 #[test]
 fn concat_errors() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // Element-type conflict / non-array / text||text — no overload (42883).
     assert_eq!(err(&mut db, "SELECT ARRAY[1,2] || ARRAY['a','b']"), "42883");
     assert_eq!(err(&mut db, "SELECT 5 || ARRAY['a','b']"), "42883");
@@ -81,7 +81,7 @@ fn concat_errors() {
 
 #[test]
 fn array_remove_kernel() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         val(&mut db, "SELECT array_remove(ARRAY[1,2,3,2], 2)"),
         "{1,3}"
@@ -127,7 +127,7 @@ fn array_remove_kernel() {
 
 #[test]
 fn array_replace_kernel() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         val(&mut db, "SELECT array_replace(ARRAY[1,2,3,2], 2, 9)"),
         "{1,9,3,9}"
@@ -169,7 +169,7 @@ fn array_replace_kernel() {
 
 #[test]
 fn array_position_kernel() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         val(&mut db, "SELECT array_position(ARRAY[10,20,30,20], 20)"),
         "2"
@@ -234,7 +234,7 @@ fn array_position_kernel() {
 
 #[test]
 fn array_positions_kernel() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         val(&mut db, "SELECT array_positions(ARRAY[10,20,30,20], 20)"),
         "{2,4}"

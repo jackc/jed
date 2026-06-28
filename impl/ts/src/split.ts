@@ -1,5 +1,5 @@
 // Library-level multi-statement splitter (spec/design/session.md §4.1). A pure, streaming statement
-// scanner that depends on NEITHER Session nor Database — a top-level core export, conceptually part
+// scanner that depends on NEITHER Session nor Engine — a top-level core export, conceptually part
 // of the lexer surface (CLAUDE.md §5: parsers are per-language, not codegen'd), callable before any
 // database is opened. It yields one statement's source text at a time, lazily (a generator),
 // buffering nothing across statements (an O(n) scan, no parse tree).

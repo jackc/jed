@@ -5,16 +5,16 @@
 //! (tests/fileformat_golden.rs); these are the behavioral checks.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn err_code(db: &mut Database, sql: &str) -> String {
+fn err_code(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
 }
 
-fn rows(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => rows,
         other => panic!("expected query, got {other:?}"),
@@ -24,7 +24,7 @@ fn rows(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
 /// A boolean PRIMARY KEY is accepted (the gate lifted) and CRUD works.
 #[test]
 fn boolean_primary_key_crud() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)").unwrap();
 
@@ -48,7 +48,7 @@ fn boolean_primary_key_crud() {
 /// A boolean member of a COMPOSITE primary key concatenates with the other component.
 #[test]
 fn boolean_composite_primary_key() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(
         &mut db,
         "CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
@@ -78,7 +78,7 @@ fn boolean_composite_primary_key() {
 /// A secondary index on a (nullable) boolean column is accepted and serves equality.
 #[test]
 fn boolean_secondary_index() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)").unwrap();
     execute(
         &mut db,

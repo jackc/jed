@@ -158,7 +158,7 @@ pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 /// cost.md §7). The §13 input-size gate's default ceiling: generous for hand-written / ORM SQL,
 /// yet bounds the parse tree to a few MB so unbounded untrusted input cannot exhaust memory. A
 /// caller raises it (trusted bulk loads) or sets `0` for unlimited via
-/// [`Database::set_max_sql_length`]. Identical across cores (§8).
+/// [`Engine::set_max_sql_length`]. Identical across cores (§8).
 pub const DEFAULT_MAX_SQL_LENGTH: usize = 1 << 20;
 
 /// The default per-session storage budget for SESSION-LOCAL temporary tables, in **bytes**
@@ -172,8 +172,8 @@ pub const DEFAULT_TEMP_BUFFERS: usize = 32 << 20;
 
 /// The default GLOBAL storage budget for DATABASE-WIDE shared temporary tables, in **bytes**
 /// (spec/design/temp-tables.md §7). The shared-temp analogue of [`DEFAULT_TEMP_BUFFERS`]: shared temp
-/// data is global (one set of rows across every session of the open `Database`), so its budget is a
-/// `Database`-level setting (`shared_temp_mem`) rather than a per-session one. An over-budget shared
+/// data is global (one set of rows across every session of the open `Engine`), so its budget is a
+/// `Engine`-level setting (`shared_temp_mem`) rather than a per-session one. An over-budget shared
 /// write aborts the same `54P03`. `0` ⇒ unlimited; measured identically (deterministic on-disk record
 /// bytes), so the abort point is part of the cross-core contract.
 pub const DEFAULT_SHARED_TEMP_MEM: usize = 32 << 20;
@@ -985,13 +985,13 @@ impl Snapshot {
 /// `working` and commit swaps `committed := working` (rollback just drops `working`, since
 /// `committed` was never touched). Every write — autocommit included — runs as a transaction, which
 /// unifies the two paths.
-pub struct Database {
+pub struct Engine {
     /// The last committed, immutable state — what fresh readers (and autocommit reads) see.
     pub(crate) committed: Snapshot,
     /// The **default session** (spec/design/session.md §2.1): the per-connection state this handle
     /// runs statements through — the open transaction (the `Idle`/`Open`/`Failed` machine, §2.2),
     /// the relocated settings (`max_cost`, `max_sql_length`, `work_mem`, the entropy/clock seam),
-    /// and the `currval`/`lastval` session state. A bare `Database` IS committed storage + this one
+    /// and the `currval`/`lastval` session state. A bare `Engine` IS committed storage + this one
     /// long-lived stateful default session; the convenience methods (`execute`/`begin`/
     /// `set_max_cost`/…) operate on it. `db.session(opts)` mints additional, independent sessions
     /// (run sequentially on this single-threaded handle by swapping into this slot).
@@ -1029,20 +1029,20 @@ pub struct Database {
     /// The DATABASE-WIDE shared temporary-table snapshot (spec/design/temp-tables.md §4): the
     /// committed rows of every `SHARED` temp table, held in memory and NEVER serialized — the shared
     /// analogue of `Session::temp_committed`, but on the handle (so it is visible to every session
-    /// minted from this `Database`) rather than per-session. On a single handle this is just a field;
+    /// minted from this `Engine`) rather than per-session. On a single handle this is just a field;
     /// for the thread-safe shared layer ([`crate::shared`]) it is pinned from / published to the
     /// shared `Snapshot` root alongside `committed` (the two-root commit, §5). Born empty, gone when
     /// the handle/database closes — never recovered (divergence D5).
     pub(crate) shared_temp_committed: Snapshot,
     /// The GLOBAL byte budget for shared temp storage (`shared_temp_mem`, temp-tables.md §7); `0` ⇒
-    /// unlimited. The shared-temp analogue of `Session::temp_buffers`, but `Database`-level (shared
+    /// unlimited. The shared-temp analogue of `Session::temp_buffers`, but `Engine`-level (shared
     /// temp data is global). An over-budget shared-temp write aborts `54P03`.
     pub(crate) shared_temp_mem: usize,
 }
 
 /// The relocatable session settings (spec/design/session.md §3 — the bucket-A envelope subset that
 /// has landed in S1): the per-statement cost ceiling, the input-size limit, and the work-memory
-/// budget. Passed to [`Database::session`] to mint an additional session; an absent field takes its
+/// budget. Passed to [`Engine::session`] to mint an additional session; an absent field takes its
 /// default. (The entropy/clock seam is injected via [`Session::set_random_source`] /
 /// [`Session::set_clock_source`], not here.)
 #[derive(Clone, Debug)]
@@ -1132,10 +1132,10 @@ impl TxStatus {
 }
 
 /// The per-connection **session** state (spec/design/session.md §2.1): the configured, stateful
-/// context a host runs statements through, un-fused from the committed storage on [`Database`]. It
+/// context a host runs statements through, un-fused from the committed storage on [`Engine`]. It
 /// owns the open transaction (the `Idle`/`Open`/`Failed` machine), the relocated handle settings,
-/// the entropy/clock seam, and the `currval`/`lastval` session state. A [`Database`] holds one as
-/// its long-lived default session; [`Database::session`] mints additional independent ones that run
+/// the entropy/clock seam, and the `currval`/`lastval` session state. A [`Engine`] holds one as
+/// its long-lived default session; [`Engine::session`] mints additional independent ones that run
 /// sequentially on a single-threaded handle (by swapping into the default slot for a call).
 pub struct Session {
     /// The open transaction, if any. `None` is autocommit between statements (transactions.md
@@ -1159,7 +1159,7 @@ pub struct Session {
     pub(crate) lifetime_total: std::rc::Rc<std::cell::Cell<i64>>,
     /// The maximum input SQL length, in **bytes**, accepted on this session (CLAUDE.md §13; api.md
     /// §8, cost.md §7). `0` ⇒ **unlimited**; default [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB). An
-    /// over-limit statement is rejected `54000` at [`parse`](Database::parse), before lexing.
+    /// over-limit statement is rejected `54000` at [`parse`](Engine::parse), before lexing.
     pub(crate) max_sql_length: usize,
     /// The work-memory budget in **bytes** (spec/design/spill.md §2): the memory a blocking operator
     /// (the `ORDER BY` external merge sort) holds resident before it spills. `0` ⇒ unlimited (never
@@ -1179,7 +1179,7 @@ pub struct Session {
     /// recent `nextval` (of any sequence) ran on — `None` before the first `nextval`.
     pub(crate) session_last_name: Option<String>,
     /// Per-**statement** running sequence advances (sequences.md §4), behind a `RefCell` for interior
-    /// mutability (`EvalEnv` borrows `&Database`). Flushed into the working snapshot on statement
+    /// mutability (`EvalEnv` borrows `&Engine`). Flushed into the working snapshot on statement
     /// success; discarded on error (the transactional rollback of the advance, §5).
     pub(crate) pending_seq: std::cell::RefCell<HashMap<String, SequenceDef>>,
     /// Per-**statement** running `currval` updates → flushed into `session_seq` on success.
@@ -1220,7 +1220,7 @@ pub struct Session {
     pub(crate) time_zone: crate::timezone::ZoneRef,
     /// The session-local **temporary-table** catalog + stores (spec/design/temp-tables.md §2): a
     /// `Snapshot` holding only this session's temp tables, their stores, and their (UNIQUE) index
-    /// stores. **Never serialized** — only [`Database::committed`] is written to the file, so a temp
+    /// stores. **Never serialized** — only [`Engine::committed`] is written to the file, so a temp
     /// table makes ZERO file writes (§2). Private to this `Session` (so it carries across the
     /// additional-session swap and is invisible to other sessions — the [[session-design]] privacy),
     /// and dropped wholesale when the session is. Transactional like the main snapshot: an open
@@ -1232,7 +1232,7 @@ pub struct Session {
     /// primary cannot observe each other's table writes (their writes still accumulate into the
     /// transaction's `working`). Set by the writable-CTE orchestrator before the first sub-statement
     /// runs and cleared when it finishes (success or error); `None` for every other statement, where
-    /// reads fall through to `working`/`committed` as usual ([`Database::read_snap`]).
+    /// reads fall through to `working`/`committed` as usual ([`Engine::read_snap`]).
     pub(crate) read_pin: Option<Snapshot>,
 }
 
@@ -1320,10 +1320,10 @@ impl Session {
     }
 
     /// Run `f` with this session installed as `db`'s active session — the swap mechanism that lets an
-    /// additional session run sequentially on a single-threaded [`Database`] (spec/design/session.md
+    /// additional session run sequentially on a single-threaded [`Engine`] (spec/design/session.md
     /// §2.1): swap this session into the default slot, run, swap back so this session carries forward
     /// its mutated state and the default is restored.
-    fn run<R>(&mut self, db: &mut Database, f: impl FnOnce(&mut Database) -> R) -> R {
+    fn run<R>(&mut self, db: &mut Engine, f: impl FnOnce(&mut Engine) -> R) -> R {
         std::mem::swap(&mut db.session, self);
         let r = f(db);
         std::mem::swap(&mut db.session, self);
@@ -1331,14 +1331,14 @@ impl Session {
     }
 
     /// Run a (possibly mutating) statement on this session against `db`, binding `$N` params.
-    pub fn execute(&mut self, db: &mut Database, sql: &str, params: &[Value]) -> Result<Outcome> {
+    pub fn execute(&mut self, db: &mut Engine, sql: &str, params: &[Value]) -> Result<Outcome> {
         self.run(db, |db| db.execute(sql, params))
     }
 
     /// Run a **query** on this session against `db`, returning a row cursor.
     pub fn query(
         &mut self,
-        db: &mut Database,
+        db: &mut Engine,
         sql: &str,
         params: &[Value],
     ) -> Result<crate::api::Rows> {
@@ -1348,7 +1348,7 @@ impl Session {
     /// Run `f` in a READ ONLY transaction on this session (auto-commit/rollback, §2.2).
     pub fn view<R>(
         &mut self,
-        db: &mut Database,
+        db: &mut Engine,
         f: impl FnOnce(&mut crate::api::Transaction) -> Result<R>,
     ) -> Result<R> {
         self.run(db, |db| db.view(f))
@@ -1357,7 +1357,7 @@ impl Session {
     /// Run `f` in a READ WRITE transaction on this session (auto-commit/rollback, §2.2).
     pub fn update<R>(
         &mut self,
-        db: &mut Database,
+        db: &mut Engine,
         f: impl FnOnce(&mut crate::api::Transaction) -> Result<R>,
     ) -> Result<R> {
         self.run(db, |db| db.update(f))
@@ -1367,7 +1367,7 @@ impl Session {
     /// it, run each statement in order, discard result rows, and return the `O(1)` [`ScriptSummary`].
     /// When this session is `Idle` the whole run is one implicit transaction (all-or-nothing); when
     /// it is `Open` the run joins that transaction. In-script transaction control is `0A000`.
-    pub fn execute_script(&mut self, db: &mut Database, sql: &str) -> Result<ScriptSummary> {
+    pub fn execute_script(&mut self, db: &mut Engine, sql: &str) -> Result<ScriptSummary> {
         self.run(db, |db| db.execute_script(sql))
     }
 
@@ -1552,43 +1552,43 @@ pub(crate) struct ActiveTx {
     /// it is never serialized.
     temp_working: Snapshot,
     /// The transaction's working copy of the DATABASE-WIDE shared temp-table snapshot
-    /// (spec/design/temp-tables.md §5): cloned from [`Database::shared_temp_committed`] at tx open,
+    /// (spec/design/temp-tables.md §5): cloned from [`Engine::shared_temp_committed`] at tx open,
     /// mutated by shared-temp DDL/DML, adopted back into `shared_temp_committed` on a successful COMMIT
     /// and discarded on ROLLBACK. The shared analogue of `temp_working`; for the thread-safe shared
     /// layer the adopted state is then published to the shared root (the two-root commit, §5).
     shared_temp_working: Snapshot,
     /// Whether this transaction mutated the **main** (persistent) snapshot — set by
-    /// [`Database::working_mut`]. Drives the commit's persist decision so a transaction that touched
+    /// [`Engine::working_mut`]. Drives the commit's persist decision so a transaction that touched
     /// ONLY temp tables makes zero file writes (temp-tables.md §2).
     main_dirty: bool,
     /// Whether this transaction mutated the **session-local temp** snapshot — set by
-    /// [`Database::temp_working_mut`]. With `main_dirty`/`shared_temp_dirty` it decides whether COMMIT
+    /// [`Engine::temp_working_mut`]. With `main_dirty`/`shared_temp_dirty` it decides whether COMMIT
     /// persists the main image (a pure-temp commit skips it; an empty block still persists, preserving
     /// prior behavior).
     temp_dirty: bool,
     /// Whether this transaction mutated the **shared temp** snapshot — set by
-    /// [`Database::shared_temp_working_mut`]. Like `temp_dirty`, a shared-temp-only commit makes zero
+    /// [`Engine::shared_temp_working_mut`]. Like `temp_dirty`, a shared-temp-only commit makes zero
     /// file writes; it also charges the global `shared_temp_mem` budget.
     shared_temp_dirty: bool,
 }
 
-impl Default for Database {
+impl Default for Engine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Database {
+impl Engine {
     pub fn new() -> Self {
-        Database::with_page_size(DEFAULT_PAGE_SIZE)
+        Engine::with_page_size(DEFAULT_PAGE_SIZE)
     }
 
     /// An in-memory handle that serializes at `page_size`. The page-backed B-tree's fan-out tracks
     /// the page size (spec/fileformat/format.md), so the in-memory tree must be built at the size it
     /// will serialize to — this builds fixtures / tests a non-default page size; a normal in-memory
-    /// database uses [`Database::new`] (the default page size).
+    /// database uses [`Engine::new`] (the default page size).
     pub fn with_page_size(page_size: u32) -> Self {
-        Database {
+        Engine {
             committed: Snapshot::default(),
             path: None,
             page_size,
@@ -1608,7 +1608,7 @@ impl Database {
     /// with no open transaction (reads hit `committed` = the pinned snapshot); a write handle keeps
     /// one with an open READ WRITE block and publishes its working set back to the shared cell.
     pub(crate) fn from_snapshot(snap: Snapshot) -> Self {
-        Database {
+        Engine {
             committed: snap,
             path: None,
             page_size: DEFAULT_PAGE_SIZE,
@@ -1710,7 +1710,7 @@ impl Database {
 
     /// The session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
     /// transaction's `temp_working`, else the session's committed temp state. The temp analogue of
-    /// [`read_snap`](Database::read_snap) (it does not consult `read_pin` — a writable-CTE pins only
+    /// [`read_snap`](Engine::read_snap) (it does not consult `read_pin` — a writable-CTE pins only
     /// the main snapshot).
     fn temp_read_snap(&self) -> &Snapshot {
         match &self.session.tx {
@@ -1741,7 +1741,7 @@ impl Database {
 
     /// The DATABASE-WIDE shared temp snapshot for READS (spec/design/temp-tables.md §4/§5): the open
     /// transaction's `shared_temp_working`, else the handle's `shared_temp_committed`. The shared
-    /// analogue of [`temp_read_snap`](Database::temp_read_snap).
+    /// analogue of [`temp_read_snap`](Engine::temp_read_snap).
     fn shared_temp_read_snap(&self) -> &Snapshot {
         match &self.session.tx {
             Some(tx) => &tx.shared_temp_working,
@@ -1785,14 +1785,14 @@ impl Database {
     }
 
     /// Whether `name` is a secondary index on a SESSION-LOCAL temp table (spec/design/temp-tables.md §8)
-    /// — the index analogue of [`is_temp_table`](Database::is_temp_table), used to gate (`allow_temp_ddl`)
+    /// — the index analogue of [`is_temp_table`](Engine::is_temp_table), used to gate (`allow_temp_ddl`)
     /// and route a `DROP INDEX` of a temp index. Preclude-overlaps keeps an index name in one scope.
     fn is_temp_index(&self, name: &str) -> bool {
         self.temp_read_snap().find_index(name).is_some()
     }
 
     /// Whether `name` is a secondary index on a DATABASE-WIDE shared temp table (temp-tables.md §8) — the
-    /// index analogue of [`is_shared_temp_table`](Database::is_shared_temp_table); checked AFTER the
+    /// index analogue of [`is_shared_temp_table`](Engine::is_shared_temp_table); checked AFTER the
     /// session-local index (the resolution walk).
     fn is_shared_temp_index(&self, name: &str) -> bool {
         self.shared_temp_read_snap().find_index(name).is_some()
@@ -1814,7 +1814,7 @@ impl Database {
     }
 
     /// Whether `name` is a sequence in the SESSION-LOCAL temp snapshot (temp-tables.md §8) — the
-    /// sequence analogue of [`is_temp_table`](Database::is_temp_table). A temp sequence only ever
+    /// sequence analogue of [`is_temp_table`](Engine::is_temp_table). A temp sequence only ever
     /// arises from a `serial`/IDENTITY temp column (standalone CREATE SEQUENCE is always persistent),
     /// so it is always owned. Routes a sequence write/gate to the session-local scope.
     fn is_temp_sequence(&self, name: &str) -> bool {
@@ -1843,7 +1843,7 @@ impl Database {
     }
 
     /// Remove a sequence from whichever scope owns its name (the routed analogue of
-    /// [`put_sequence_routed`](Database::put_sequence_routed)). Used by `DROP SEQUENCE` and
+    /// [`put_sequence_routed`](Engine::put_sequence_routed)). Used by `DROP SEQUENCE` and
     /// `DROP TABLE`'s owned-sequence auto-drop.
     fn remove_sequence_routed(&mut self, name: &str) {
         let key = name.to_ascii_lowercase();
@@ -1899,8 +1899,8 @@ impl Database {
     }
 
     /// Enforce the GLOBAL shared-temp storage budget (`shared_temp_mem`, spec/design/temp-tables.md
-    /// §7) — the shared analogue of [`check_temp_budget`](Database::check_temp_budget), but charged
-    /// against the `Database`-level budget over the shared-temp footprint. Self-gates on
+    /// §7) — the shared analogue of [`check_temp_budget`](Engine::check_temp_budget), but charged
+    /// against the `Engine`-level budget over the shared-temp footprint. Self-gates on
     /// `shared_temp_dirty`, so it is a no-op for any statement that did not write shared temp. The
     /// over-budget write is staged in `shared_temp_working`, so the abort rolls it back. `0` ⇒ unlimited.
     fn check_shared_temp_budget(&self) -> Result<()> {
@@ -1933,7 +1933,7 @@ impl Database {
     }
 
     /// `nextval('name')` (spec/design/sequences.md §4): advance the named sequence and return the
-    /// new value. Interior-mutable (the evaluator borrows `&Database`): the running state lives in
+    /// new value. Interior-mutable (the evaluator borrows `&Engine`): the running state lives in
     /// `pending_seq`, seeded from the working snapshot on first touch this statement, and is flushed
     /// into the working snapshot + `session_seq` on statement success ([`flush_pending_sequences`]).
     /// A missing sequence is 42P01; advancing past a bound without CYCLE is 2200H.
@@ -2139,7 +2139,7 @@ impl Database {
     /// sequence state; the committed storage is shared. On a single-threaded handle, additional
     /// sessions run **sequentially** — a statement is issued through [`Session::execute`] /
     /// [`Session::query`] (which swaps the session into the active slot for the call). The bare
-    /// `Database` keeps its long-lived default session, so this is purely additive.
+    /// `Engine` keeps its long-lived default session, so this is purely additive.
     pub fn session(&self, opts: SessionOptions) -> Session {
         let _ = self;
         Session::with_options(opts)
@@ -2193,7 +2193,7 @@ impl Database {
     }
 
     /// The default session's per-session cumulative cost budget (`0` ⇒ unlimited).
-    /// See [`set_lifetime_max_cost`](Database::set_lifetime_max_cost).
+    /// See [`set_lifetime_max_cost`](Engine::set_lifetime_max_cost).
     pub fn lifetime_max_cost(&self) -> i64 {
         self.session.lifetime_max_cost
     }
@@ -2291,7 +2291,7 @@ impl Database {
     }
 
     /// Set the GLOBAL shared-temp storage budget in **bytes** (`shared_temp_mem`,
-    /// spec/design/temp-tables.md §7); `0` ⇒ unlimited. A `Database`-level setting (shared temp data
+    /// spec/design/temp-tables.md §7); `0` ⇒ unlimited. A `Engine`-level setting (shared temp data
     /// is global); an over-budget shared-temp write aborts `54P03`. Not stored in the file.
     pub fn set_shared_temp_mem(&mut self, bytes: usize) {
         self.shared_temp_mem = bytes;
@@ -2342,7 +2342,7 @@ impl Database {
         self.session.max_sql_length = bytes;
     }
 
-    /// The current input-SQL byte limit (`0` ⇒ unlimited). See [`set_max_sql_length`](Database::set_max_sql_length).
+    /// The current input-SQL byte limit (`0` ⇒ unlimited). See [`set_max_sql_length`](Engine::set_max_sql_length).
     pub fn max_sql_length(&self) -> usize {
         self.session.max_sql_length
     }
@@ -2353,7 +2353,7 @@ impl Database {
         self.read_only
     }
 
-    /// The current execution-cost ceiling (`0` ⇒ unlimited). See [`set_max_cost`](Database::set_max_cost).
+    /// The current execution-cost ceiling (`0` ⇒ unlimited). See [`set_max_cost`](Engine::set_max_cost).
     pub fn max_cost(&self) -> i64 {
         self.session.max_cost
     }
@@ -2394,7 +2394,7 @@ impl Database {
         self.session.work_mem = bytes;
     }
 
-    /// The current work-memory budget in bytes (`0` ⇒ unlimited). See [`set_work_mem`](Database::set_work_mem).
+    /// The current work-memory budget in bytes (`0` ⇒ unlimited). See [`set_work_mem`](Engine::set_work_mem).
     pub fn work_mem(&self) -> usize {
         self.session.work_mem
     }
@@ -2466,7 +2466,7 @@ impl Database {
     /// Load a `JUCD` Unicode-data bundle (`db.LoadUnicodeData`, spec/design/collation.md §4.2): its
     /// collations become resolvable by name for `COLLATE`, per-column collation, and `ORDER BY …
     /// COLLATE`. The loaded set is **engine-global** (§9), so a bundle loaded through any handle is
-    /// visible everywhere — including to a later `Database::open` of a file that *references* one of
+    /// visible everywhere — including to a later `Engine::open` of a file that *references* one of
     /// its collations. Privileged host op (not SQL-reachable, no path, no engine I/O — §11);
     /// **additive** and idempotent for an already-loaded bundle. A malformed bundle is `XX001`.
     /// (Mirrors the engine-global [`crate::collation::load_unicode_data`], which the host may call
@@ -2497,7 +2497,7 @@ impl Database {
     /// spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
     /// database on this handle, each as `(name, unicode_version, cldr_version, content_hash,
     /// description, is_default)`, ascending by name. A property of the running *engine*, not of this
-    /// database; for the collations this database *references*, use [`Database::collations`].
+    /// database; for the collations this database *references*, use [`Engine::collations`].
     /// `is_default` is always `false` here (that is a per-database property). `C` is built in and not
     /// listed.
     pub fn loaded_collations(&self) -> Vec<CollationInfo> {
@@ -2538,13 +2538,13 @@ impl Database {
 
     /// Adopt a newly-loaded Unicode version for this database's skewed collations
     /// (`db.UpgradeCollations` — the REINDEX / COLLATION UPGRADE migration, spec/design/collation.md
-    /// §12). A **privileged host op** like [`Database::set_default_collation`] — **not** SQL-reachable,
+    /// §12). A **privileged host op** like [`Engine::set_default_collation`] — **not** SQL-reachable,
     /// so an untrusted query can never trigger it (CLAUDE.md §13). For every collation whose file pin
     /// differs from the loaded bundle (`Skewed`), it rebuilds the collated keys (PK + indexes) under
     /// the loaded table and re-pins the stamp, clearing the skew so the affected tables are read-write
     /// again and regain collated-index pushdown. Whole-database + atomic (the rebuild stages in a
     /// snapshot clone swapped in only on success); idempotent (no skew ⇒ a no-op returning `0`). The
-    /// change is persisted by the next explicit [`Database::commit`]. Returns the number of collations
+    /// change is persisted by the next explicit [`Engine::commit`]. Returns the number of collations
     /// re-pinned.
     pub fn upgrade_collations(&mut self) -> Result<usize> {
         let mut work = self.committed.clone();
@@ -2568,7 +2568,7 @@ impl Database {
     /// spec/design/collation.md §4.2) — every collation its schema uses (a column's `COLLATE`, or the
     /// per-database default), each as `(name, unicode_version, cldr_version, content_hash,
     /// description, is_default)`, in ascending name order. This is the *per-file* view; for the
-    /// engine-global **loaded** set, use [`Database::loaded_collations`]. `C` is built in and not
+    /// engine-global **loaded** set, use [`Engine::loaded_collations`]. `C` is built in and not
     /// listed.
     pub fn collations(&self) -> Vec<CollationInfo> {
         let default = self.committed.default_collation();
@@ -12756,7 +12756,7 @@ fn build_prefix_scope<'s>(
     finalized: &'s [FinalRel<'s>],
     synthetic: &'s [Box<Table>],
     parent: Option<&'s Scope<'s>>,
-    catalog: &'s Database,
+    catalog: &'s Engine,
     ctes: &'s [CteBinding],
 ) -> Scope<'s> {
     Scope {
@@ -12862,7 +12862,7 @@ struct Scope<'a> {
     /// The enclosing query's scope, for correlated-reference resolution (None at top level).
     parent: Option<&'a Scope<'a>>,
     /// The catalog, so a subquery's inner FROM tables can be resolved during planning.
-    catalog: &'a Database,
+    catalog: &'a Engine,
     /// Whether a subquery is allowed in this scope's expressions: true inside a SELECT (and
     /// its nested subqueries), false for UPDATE/DELETE (a subquery there is 0A000 this slice).
     allow_subquery: bool,
@@ -12885,7 +12885,7 @@ impl<'a> Scope<'a> {
     /// ARE allowed: a correlated reference resolves to the target row via the per-row outer
     /// environment (the subquery's parent is this scope), an uncorrelated one folds once
     /// (spec/design/grammar.md §26). SELECT builds its own scope in `plan_select`.
-    fn single(catalog: &'a Database, table: &'a Table) -> Scope<'a> {
+    fn single(catalog: &'a Engine, table: &'a Table) -> Scope<'a> {
         Scope {
             rels: vec![ScopeRel {
                 label: table.name.to_ascii_lowercase(),
@@ -12907,7 +12907,7 @@ impl<'a> Scope<'a> {
     /// (constraints.md §2): a default may not reference a column (rejected as 0A000 by the
     /// structural pre-walk before resolution) and may not contain a subquery, so there are no
     /// relations and subqueries are disallowed.
-    fn empty(catalog: &'a Database) -> Scope<'a> {
+    fn empty(catalog: &'a Engine) -> Scope<'a> {
         Scope {
             rels: Vec::new(),
             parent: None,
@@ -12928,7 +12928,7 @@ impl<'a> Scope<'a> {
     /// row the caller appends. A target table literally named `old`/`new` SHADOWS that
     /// qualifier (the pseudo-relation is suppressed; PostgreSQL's probed rule — its
     /// `WITH (OLD AS o, ...)` aliasing escape stays deferred).
-    fn returning(catalog: &'a Database, table: &'a Table, base_is_old: bool) -> Scope<'a> {
+    fn returning(catalog: &'a Engine, table: &'a Table, base_is_old: bool) -> Scope<'a> {
         let n = table.columns.len();
         let label = table.name.to_ascii_lowercase();
         let (old_offset, new_offset) = if base_is_old { (0, n) } else { (n, 0) };
@@ -12967,7 +12967,7 @@ impl<'a> Scope<'a> {
     /// combined row `[existing | proposed]` (`excluded.col` reads the proposed row). A target
     /// table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like
     /// the RETURNING `old`/`new` qualifiers, §32).
-    fn on_conflict_excluded(catalog: &'a Database, table: &'a Table) -> Scope<'a> {
+    fn on_conflict_excluded(catalog: &'a Engine, table: &'a Table) -> Scope<'a> {
         let n = table.columns.len();
         let label = table.name.to_ascii_lowercase();
         let mut rels = vec![ScopeRel {
@@ -14589,7 +14589,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
 /// Whether a `WITH` statement contains any data-modifying part — a data-modifying CTE body or a
 /// data-modifying primary (spec/design/writable-cte.md). Such a statement runs through the
 /// writable-CTE orchestrator (the read pin + lexical-order, all-or-nothing execution); a pure-query
-/// `WITH` keeps the [`Database::run_with`] path.
+/// `WITH` keeps the [`Engine::run_with`] path.
 fn with_has_dml(wq: &WithQuery) -> bool {
     wq.body.is_data_modifying() || wq.ctes.iter().any(|c| c.body.is_data_modifying())
 }
@@ -15425,7 +15425,7 @@ fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmod>) -> Colu
 
 /// Resolve a `JSON_TABLE` column type name → its scalar type (a composite → `0A000`, an unknown
 /// name → `42704`).
-fn jt_scalar_type(db: &Database, type_name: &str) -> Result<ScalarType> {
+fn jt_scalar_type(db: &Engine, type_name: &str) -> Result<ScalarType> {
     if let Some(st) = ScalarType::from_name(type_name) {
         Ok(st)
     } else if db.composite_type(type_name).is_some() {
@@ -15906,7 +15906,7 @@ enum BoundKey {
 /// relation's indexes (held in ascending lowercased-name order — the deterministic
 /// tie-break), the first whose FIRST key column has at least one equality conjunct against
 /// a type-matched const-source; else `None` (full scan).
-fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Database) -> Option<ScanBound> {
+fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Engine) -> Option<ScanBound> {
     if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
         // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
         // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
@@ -16004,10 +16004,7 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Database) -> Opti
 ///                          file-version B-tree would mis-match — the regression tripwire
 ///                          suites/collation/skew.test stays green only because this refuses). An
 ///                          unresolvable collation likewise refuses rather than mis-encoding.
-fn key_collation_ctx(
-    catalog: &Database,
-    col: &Column,
-) -> Option<Option<std::sync::Arc<Collation>>> {
+fn key_collation_ctx(catalog: &Engine, col: &Column) -> Option<Option<std::sync::Arc<Collation>>> {
     match &col.collation {
         None => Some(None),
         Some(name) => {
@@ -16048,7 +16045,7 @@ fn order_satisfied_by_pk(
     table: &Table,
     offset: usize,
     order: &[crate::spill::SortKey],
-    catalog: &Database,
+    catalog: &Engine,
 ) -> Option<bool> {
     let pk = table.pk_indices();
     if pk.is_empty() {
@@ -16137,7 +16134,7 @@ fn order_satisfied_by_index(
     table: &Table,
     offset: usize,
     order: &[crate::spill::SortKey],
-    catalog: &Database,
+    catalog: &Engine,
 ) -> Option<IndexOrder> {
     let pk_width = pk_storage_width(table)?;
     for idx in &table.indexes {
@@ -19267,7 +19264,7 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
 /// level; a correlated subquery pushes the current row before running its inner plan, so an
 /// `OuterColumn { level, index }` reads `outer[outer.len() - level][index]`.
 struct EvalEnv<'a> {
-    exec: &'a Database,
+    exec: &'a Engine,
     params: &'a [Value],
     outer: &'a [&'a [Value]],
     /// The per-statement entropy+clock state (spec/design/entropy.md §5): the uuidv7 monotonic
@@ -24264,7 +24261,7 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
 /// The resolved (static) type of a column of (possibly composite) declared type `ty`, resolving a
 /// composite reference against the database's type catalog (spec/design/composite.md §5). Recurses
 /// for nested composites; the lookup always succeeds (`validate_composite_types` proved it).
-fn resolved_type_of_col(ty: &Type, db: &Database) -> ResolvedType {
+fn resolved_type_of_col(ty: &Type, db: &Engine) -> ResolvedType {
     match ty {
         Type::Scalar(s) => resolved_type_of(*s),
         Type::Composite(r) => {
@@ -25912,7 +25909,7 @@ fn resolve(
 /// byte / code-point order → `None` (the unchanged fast path); any other name must be loaded
 /// (`db.import_collation`), else 42704.
 fn resolve_collation_name(
-    catalog: &Database,
+    catalog: &Engine,
     name: &str,
 ) -> Result<Option<std::sync::Arc<Collation>>> {
     if name == "C" {
@@ -26009,7 +26006,7 @@ fn combine_deriv(a: Deriv, b: Deriv) -> Result<Deriv> {
 /// Resolve a derivation to the concrete collation a comparison / ORDER BY uses (spec/design/
 /// collation.md §1/§7). `None` and `C` ⇒ `None` (byte order, the fast path); a loaded name ⇒ its
 /// table (42704 if it vanished); `Indeterminate` ⇒ 42P22 (the collation is required but ambiguous).
-fn resolve_deriv(catalog: &Database, d: Deriv) -> Result<Option<std::sync::Arc<Collation>>> {
+fn resolve_deriv(catalog: &Engine, d: Deriv) -> Result<Option<std::sync::Arc<Collation>>> {
     match d {
         Deriv::None => Ok(None),
         Deriv::Implicit(name) | Deriv::Explicit(name) => resolve_collation_name(catalog, &name),
@@ -29284,7 +29281,7 @@ fn decode_uuid_literal(s: &str) -> Result<[u8; 16]> {
 fn coerce_string_to_composite(
     text: &str,
     ct: &CompositeType,
-    catalog: &Database,
+    catalog: &Engine,
 ) -> Result<(RExpr, ResolvedType)> {
     let malformed = || {
         EngineError::new(
@@ -30539,7 +30536,7 @@ fn coerce_array_element_text(tok: &str, elem: &ColType) -> Result<Value> {
 /// `record_in` over a self-contained composite `ColType` (the inverse of `record_out`): the token is
 /// the composite's own `(f1,f2,…)` text, tokenized by the shared `value::parse_record_tokens` and
 /// recursively coerced per field. Mirrors [`coerce_string_to_composite`] but produces a `Value`
-/// directly and walks `ColType` (so it needs no `Database`). A bad shape / field count is `22P02`.
+/// directly and walks `ColType` (so it needs no `Engine`). A bad shape / field count is `22P02`.
 fn coerce_record_text(
     text: &str,
     name: &str,
@@ -35939,7 +35936,7 @@ mod skew_tests {
     #[test]
     fn skewed_collation_blocks_writes_reads_ok() {
         load_bundle();
-        let mut db = Database::new();
+        let mut db = Engine::new();
         crate::execute(
             &mut db,
             "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",
@@ -35956,7 +35953,7 @@ mod skew_tests {
         );
 
         // Inject skew: the file pinned `unicode` to an older version than the loaded bundle. This is
-        // exactly the catalog state `Database::open` produces for a file built under a prior bundle —
+        // exactly the catalog state `Engine::open` produces for a file built under a prior bundle —
         // a catalog-local collation whose pin differs from the loaded set (collation.md §5/§12).
         let loaded = crate::collation::loaded_collation("unicode").unwrap();
         let mut skewed = (*loaded).clone();
@@ -35998,7 +35995,7 @@ mod skew_tests {
     #[test]
     fn upgrade_clears_skew() {
         load_bundle();
-        let mut db = Database::new();
+        let mut db = Engine::new();
         crate::execute(
             &mut db,
             "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",

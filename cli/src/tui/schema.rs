@@ -1,7 +1,7 @@
 //! The schema sidebar: a flat, selectable rendering of the catalog via the host
 //! introspection surface — `table_names()` + `table(name)` (api.md §6; cli.md §6).
 
-use jed::Database;
+use jed::Engine;
 
 pub struct SchemaLine {
     pub text: String,
@@ -18,7 +18,7 @@ pub struct SchemaPane {
 
 impl SchemaPane {
     /// Rebuild from the visible catalog (called after every successful statement batch).
-    pub fn refresh(&mut self, db: &Database) {
+    pub fn refresh(&mut self, db: &Engine) {
         self.lines.clear();
         for name in db.table_names() {
             let Some(t) = db.table(&name) else { continue };

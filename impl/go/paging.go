@@ -87,7 +87,7 @@ func (s *sharedPaging) withPager(fn func(*pager) error) error {
 	return fn(s.pgr)
 }
 
-// close closes the backing file (Database.Close).
+// close closes the backing file (Engine.Close).
 func (s *sharedPaging) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

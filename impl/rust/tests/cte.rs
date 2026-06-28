@@ -6,24 +6,24 @@
 //! cost-ceiling termination of a non-terminating recursion (`54P01`, a host-API `max_cost`) and the
 //! inert materialization hint.
 
-use jed::{Database, execute};
+use jed::{Engine, execute};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     execute(db, sql)
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
 /// A 3-row, single-node table `t(id, n)` = {(1,10),(2,20),(3,30)}.
-fn t3() -> Database {
+fn t3() -> Engine {
     db_with(&[
         "CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
         "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
@@ -59,7 +59,7 @@ fn materialized_hint_forces_buffering() {
 /// doing real work. A per-iteration meter would never fire here, so the corpus cannot express it.
 #[test]
 fn recursive_unbounded_aborts_at_cost_ceiling() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     db.set_max_cost(1000);
     let err = execute(
         &mut db,
@@ -73,7 +73,7 @@ fn recursive_unbounded_aborts_at_cost_ceiling() {
 /// *actual* accrued cost, not a per-iteration figure).
 #[test]
 fn recursive_under_ceiling_succeeds() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // The 5-row counter accrues 29 (the corpus cost contract); a ceiling above it lets it through.
     db.set_max_cost(1000);
     let r = execute(
@@ -88,7 +88,7 @@ fn recursive_under_ceiling_succeeds() {
 /// single-reference recursive CTE still iterates to a fixpoint rather than inlining its body.
 #[test]
 fn recursive_hint_is_inert() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     for hint in ["", "MATERIALIZED ", "NOT MATERIALIZED "] {
         let sql = format!(
             "WITH RECURSIVE c(n) AS {hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"

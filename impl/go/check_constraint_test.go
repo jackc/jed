@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-func checkErr(t *testing.T, db *Database, sql string) (string, string) {
+func checkErr(t *testing.T, db *Engine, sql string) (string, string) {
 	t.Helper()
 	_, err := Execute(db, sql)
 	if err == nil {
@@ -24,7 +24,7 @@ func checkErr(t *testing.T, db *Database, sql string) (string, string) {
 	return ee.Code(), ee.Message
 }
 
-func checkNames(t *testing.T, db *Database, table string) []string {
+func checkNames(t *testing.T, db *Engine, table string) []string {
 	t.Helper()
 	tab, ok := db.Table(table)
 	if !ok {
@@ -144,7 +144,7 @@ func TestCheckDDLErrorsMatchPostgres(t *testing.T) {
 	mustExecCheck(t, db, "INSERT INTO odd VALUES (1, 2)")
 }
 
-func mustExecCheck(t *testing.T, db *Database, sql string) {
+func mustExecCheck(t *testing.T, db *Engine, sql string) {
 	t.Helper()
 	if _, err := Execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
@@ -313,9 +313,9 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
-	loaded, err := LoadDatabase(image)
+	loaded, err := LoadEngine(image)
 	if err != nil {
-		t.Fatalf("LoadDatabase: %v", err)
+		t.Fatalf("LoadEngine: %v", err)
 	}
 	tab, _ := loaded.Table("t")
 	wantNames := []string{"price_range", "t_b_check", "t_note_check"}
@@ -346,9 +346,9 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToImage 2: %v", err)
 	}
-	reloaded, err := LoadDatabase(image2)
+	reloaded, err := LoadEngine(image2)
 	if err != nil {
-		t.Fatalf("LoadDatabase 2: %v", err)
+		t.Fatalf("LoadEngine 2: %v", err)
 	}
 	if got := checkNames(t, reloaded, "t"); !slices.Equal(got, wantNames) {
 		t.Fatalf("second generation names = %v", got)
@@ -362,7 +362,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	}
 	corrupt := bytes.Clone(image)
 	corrupt[at+4] = '('
-	if _, err := LoadDatabase(corrupt); err == nil || err.(*EngineError).Code() != "XX001" {
+	if _, err := LoadEngine(corrupt); err == nil || err.(*EngineError).Code() != "XX001" {
 		t.Fatalf("corrupt check text = %v, want XX001", err)
 	}
 }

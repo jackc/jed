@@ -8,8 +8,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError } from "../src/errors.ts";
-import { type Database, execute } from "../src/lib.ts";
-import { loadDatabase, toImage } from "../src/format.ts";
+import { type Engine, execute } from "../src/lib.ts";
+import { loadEngine, toImage } from "../src/format.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function errInfo(fn: () => void): { code: string; message: string } {
@@ -26,7 +26,7 @@ function errInfo(fn: () => void): { code: string; message: string } {
   throw new Error("expected an EngineError, but no error was thrown");
 }
 
-function checkNames(db: Database, table: string): string[] {
+function checkNames(db: Engine, table: string): string[] {
   return db.table(table)!.checks.map((c) => c.name);
 }
 
@@ -266,7 +266,7 @@ test("round-trips through the on-disk image", () => {
     "INSERT INTO t VALUES (1, 5, 1.00, 'ok'), (2, NULL, 9999.99, 'a''b'), (3, 100, 0.50, 'ok')",
   ]);
   const image = toImage(db, 256, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   assert.deepEqual(
     loaded.table("t")!.checks.map((c) => [c.name, c.exprText]),
     [
@@ -290,7 +290,7 @@ test("round-trips through the on-disk image", () => {
   execute(loaded, "INSERT INTO t VALUES (4, 1, 1.00, 'a''b')");
   // A second generation (load → image → load) is byte-stable: the text is written back
   // verbatim.
-  const reloaded = loadDatabase(toImage(loaded, 256, 1n));
+  const reloaded = loadEngine(toImage(loaded, 256, 1n));
   assert.deepEqual(checkNames(reloaded, "t"), ["price_range", "t_b_check", "t_note_check"]);
 
   // A stored expression that no longer parses is XX001 (the file lied): patch the text
@@ -308,7 +308,7 @@ test("round-trips through the on-disk image", () => {
   const corrupt = image.slice();
   corrupt[at + 4] = "(".charCodeAt(0);
   assert.equal(
-    errCode(() => loadDatabase(corrupt)),
+    errCode(() => loadEngine(corrupt)),
     "XX001",
   );
 });

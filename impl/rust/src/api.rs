@@ -4,13 +4,13 @@
 
 use crate::ast::Statement;
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{Database, Outcome};
+use crate::executor::{Engine, Outcome};
 use crate::parser::Parser;
 use crate::value::Value;
 
 /// A parsed, reusable statement (spec/design/api.md §2.4). It owns only the parsed AST — the
-/// database is supplied at execute/query time, so a `PreparedStatement` never holds a `Database`
-/// borrow (sidestepping the `&Database` / `&mut Database` aliasing problem; api.md §6).
+/// database is supplied at execute/query time, so a `PreparedStatement` never holds a `Engine`
+/// borrow (sidestepping the `&Engine` / `&mut Engine` aliasing problem; api.md §6).
 pub struct PreparedStatement {
     ast: Statement,
 }
@@ -18,13 +18,13 @@ pub struct PreparedStatement {
 impl PreparedStatement {
     /// Run this statement against `db`, binding `params` to its `$N` placeholders (empty when it
     /// has none), returning the materialized outcome.
-    pub fn execute(&self, db: &mut Database, params: &[Value]) -> Result<Outcome> {
+    pub fn execute(&self, db: &mut Engine, params: &[Value]) -> Result<Outcome> {
         db.execute_stmt_params(self.ast.clone(), params)
     }
 
     /// Run this **query** statement against `db`, returning a row cursor. A non-query statement
     /// is a `42601` (use `execute`).
-    pub fn query(&self, db: &mut Database, params: &[Value]) -> Result<Rows> {
+    pub fn query(&self, db: &mut Engine, params: &[Value]) -> Result<Rows> {
         Rows::from_outcome(self.execute(db, params)?)
     }
 }
@@ -79,11 +79,11 @@ impl Iterator for Rows {
 }
 
 /// An open explicit transaction (spec/design/api.md §2.2, transactions.md §4.4). Borrows the
-/// `Database` for the transaction's life; statements run through `execute`/`query`, and
+/// `Engine` for the transaction's life; statements run through `execute`/`query`, and
 /// `commit`/`rollback` end it. Dropping it without an explicit end **rolls back** — an unfinished
 /// transaction never silently commits its work (the bbolt safety net).
 pub struct Transaction<'a> {
-    db: &'a mut Database,
+    db: &'a mut Engine,
     done: bool,
 }
 
@@ -122,7 +122,7 @@ impl Drop for Transaction<'_> {
     }
 }
 
-impl Database {
+impl Engine {
     /// Open an explicit transaction (spec/design/api.md §2.2). `writable` false is READ ONLY (a
     /// write inside → `25006`); true is READ WRITE — `25006` on a read-only handle (§2.1). A
     /// nested `begin` (a transaction is already open) is `25001`. Prefer `view`/`update`, which
@@ -203,7 +203,7 @@ impl Database {
 
     /// One-shot: parse + run a **query** `sql`, binding `params`, returning a row cursor.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
-        Rows::from_outcome(Database::execute(self, sql, params)?)
+        Rows::from_outcome(Engine::execute(self, sql, params)?)
     }
 
     /// Run a multi-statement `sql` **script** on the default session (spec/design/session.md §4.2):
@@ -243,7 +243,7 @@ impl Database {
         }
     }
 
-    /// The body of [`execute_script`](Database::execute_script): split, then run each statement on
+    /// The body of [`execute_script`](Engine::execute_script): split, then run each statement on
     /// the current transaction. Separated so the wrapper's commit/rollback in `execute_script` runs
     /// on either the `Ok` or the `Err` path with no duplication.
     fn run_script_body(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {

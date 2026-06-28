@@ -16,12 +16,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadedCollation, versionSkew } from "../src/collation.ts";
-import { close, commit, create, Database, execute, loadUnicodeData, open } from "../src/lib.ts";
+import { close, commit, create, Engine, execute, loadUnicodeData, open } from "../src/lib.ts";
 import { specPath } from "./tomlmini.ts";
 import { errCode, query } from "./util.ts";
 
 // exec runs a statement (DDL / INSERT) whose outcome is not a query result.
-function exec(db: Database, sql: string): void {
+function exec(db: Engine, sql: string): void {
   execute(db, sql);
 }
 
@@ -39,7 +39,7 @@ test("loadedCollations is the real set", () => {
   // bundle, the real version-pinned set (es, unicode), ascending by name, no isDefault (an engine
   // property, not a per-db one). C is built in and never listed. The pin is UCA/UCD 17.0.0.
   loadFixtureBundle();
-  const v = new Database().loadedCollations();
+  const v = new Engine().loadedCollations();
   assert.deepEqual(
     v.map((c) => c.name),
     ["es", "unicode"],
@@ -59,7 +59,7 @@ test("loaded collation used in an expression", () => {
   // the root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
   // does not make the database REFERENCE the collation, so db.collations() stays empty.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   assert.equal(db.collations().length, 0);
   assert.deepEqual(query(db, `SELECT 'ä' < 'z' COLLATE "unicode"`), [["true"]]);
 });
@@ -68,7 +68,7 @@ test("es orders ñ as a distinct letter", () => {
   // The es tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
   // whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   assert.deepEqual(query(db, `SELECT 'nz' < 'ña' COLLATE "es"`), [["true"]]);
   assert.deepEqual(query(db, `SELECT 'nz' < 'ña' COLLATE "unicode"`), [["false"]]);
 });
@@ -76,7 +76,7 @@ test("es orders ñ as a distinct letter", () => {
 test("unknown collation is 42704", () => {
   // A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     errCode(() => query(db, `SELECT 'x' COLLATE "no-such-collation"`)),
     "42704",
@@ -88,7 +88,7 @@ test("per-column collation orders implicitly and is referenced", () => {
   // COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references unicode,
   // db.collations() (the per-file view) lists exactly it.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode")`);
   exec(db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`);
   assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
@@ -108,7 +108,7 @@ test("implicit conflict is 42P22", () => {
   // Two columns with DIFFERENT implicit (loaded) collations compared with no explicit COLLATE →
   // 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   exec(db, `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`);
   exec(db, `INSERT INTO t VALUES ('a','z','b')`);
   assert.equal(
@@ -130,7 +130,7 @@ test("implicit conflict is 42P22", () => {
 
 test("COLLATE column errors (non-text 42804, unknown 42704)", () => {
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     errCode(() => exec(db, `CREATE TABLE t (a i32 COLLATE "unicode")`)),
     "42804",
@@ -147,7 +147,7 @@ test("default collation inherited by unannotated column", () => {
   // setDefaultCollation moves the per-database default to a LOADED collation (no import); an
   // un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   assert.equal(db.defaultCollation(), "C");
   exec(db, `CREATE TABLE before (id i32 PRIMARY KEY, name text)`);
   db.setDefaultCollation("unicode");
@@ -167,7 +167,7 @@ test("default collation inherited by unannotated column", () => {
 
 test("set default unknown is 42704", () => {
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     errCode(() => db.setDefaultCollation("nope")),
     "42704",
@@ -182,7 +182,7 @@ test("collated primary key stored in collation order", () => {
   // physically iterates in COLLATION order. unicode (loaded, no import): a < A < b < Z; C bytes:
   // A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   exec(db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY)`);
   exec(db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`);
   assert.deepEqual(query(db, `SELECT name FROM t`), [["a"], ["A"], ["b"], ["Z"]]);
@@ -195,7 +195,7 @@ test("collated unique dedups by byte identity", () => {
   // A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
   // DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)`);
   exec(db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`);
   assert.equal(
@@ -268,14 +268,14 @@ test("a version-skewed collation blocks writes but reads still work", () => {
   // bundle), the table degrades to read-only: reads still return the rows (the heap-scan fallback),
   // every write raises XX002, and the skew is legible via db.collations().
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   exec(db, `CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`);
   exec(db, `INSERT INTO t VALUES ('b'), ('a')`);
   exec(db, `INSERT INTO t VALUES ('c')`); // Full → succeeds
   assert.ok(db.collations().every((c) => c.verdict === "full"));
 
   // Inject skew: the file pinned unicode to an older version than the loaded bundle. This is exactly
-  // the catalog state Database.open produces for a file built under a prior bundle (collation.md
+  // the catalog state Engine.open produces for a file built under a prior bundle (collation.md
   // §5/§12). collations is a public Snapshot field; we clone so the engine-global loaded set is intact.
   const loaded = loadedCollation("unicode")!;
   db.committed.collations.set("unicode", { ...loaded, unicodeVersion: "0.0.0" });
@@ -311,7 +311,7 @@ test("upgradeCollations clears the skew", () => {
   // (suites/collation/collation_upgrade.test) cannot read — the verdict-flip + the re-pin count —
   // plus idempotence. The skew injection mirrors the test above.
   loadFixtureBundle();
-  const db = new Database();
+  const db = new Engine();
   exec(db, `CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`);
   exec(db, `INSERT INTO t VALUES ('b'), ('a')`);
   const loaded = loadedCollation("unicode")!;

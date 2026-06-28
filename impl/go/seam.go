@@ -26,7 +26,7 @@ type RandomSource func(buf []byte)
 // ClockSource returns micros since the Unix epoch (a host may inject an advancing/simulated clock).
 type ClockSource func() int64
 
-// Seam is the host seam carried on the Database handle (spec/design/api.md §10): the injected random
+// Seam is the host seam carried on the Engine handle (spec/design/api.md §10): the injected random
 // + clock functions, each nil ⇒ the platform default. Only the volatile uuid generators touch it;
 // every other expression ignores it.
 type Seam struct {

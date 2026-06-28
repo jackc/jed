@@ -565,7 +565,9 @@ fn run_one(
 fn insert_table(sql: &str) -> String {
     let fields: Vec<&str> = sql.split_whitespace().collect();
     for (i, f) in fields.iter().enumerate() {
-        if (f.eq_ignore_ascii_case("INTO") || f.eq_ignore_ascii_case("FROM")) && i + 1 < fields.len() {
+        if (f.eq_ignore_ascii_case("INTO") || f.eq_ignore_ascii_case("FROM"))
+            && i + 1 < fields.len()
+        {
             return fields[i + 1].split('(').next().unwrap().to_string();
         }
     }

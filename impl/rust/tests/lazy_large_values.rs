@@ -8,7 +8,7 @@
 //! spilled column is touched. Mirrored in Go (lazy_large_values_test.go) and TS
 //! (tests/lazy_large_values.test.ts).
 
-use jed::{Database, DatabaseOptions, Outcome, execute};
+use jed::{DatabaseOptions, Engine, Outcome, execute};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -31,14 +31,14 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
-fn query_rows(db: &mut Database, sql: &str) -> Vec<Vec<jed::Value>> {
+fn query_rows(db: &mut Engine, sql: &str) -> Vec<Vec<jed::Value>> {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => rows,
         _ => panic!("expected a query result"),
@@ -49,7 +49,7 @@ fn query_rows(db: &mut Database, sql: &str) -> Vec<Vec<jed::Value>> {
 /// (incompressible 600-char filler → a 3-page chain), id 2 external-compressed (half
 /// filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 /// inline-compressed (a 600-char run), id 4 plain inline.
-fn seed(db: &mut Database) {
+fn seed(db: &mut Engine) {
     execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
     let plain = filler_text(600);
     let extc = format!("{}{}", filler_text(200), "y".repeat(200));
@@ -109,7 +109,7 @@ fn chains_are_read_only_when_touched() {
     let path = tmp("jed_lazy_touch.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
+        let mut db = Engine::create(
             &path,
             DatabaseOptions {
                 page_size: PAGE_SIZE,
@@ -122,7 +122,7 @@ fn chains_are_read_only_when_touched() {
     corrupt_overflow_payloads(&path);
 
     // Open walks live chains by headers only — corrupt payloads are invisible.
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
 
     // Untouching queries never read a chain or decompress a block.
     let ids = query_rows(&mut db, "SELECT id FROM t");
@@ -154,7 +154,7 @@ fn lazy_values_round_trip_exactly() {
     let path = tmp("jed_lazy_roundtrip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
+        let mut db = Engine::create(
             &path,
             DatabaseOptions {
                 page_size: PAGE_SIZE,
@@ -164,7 +164,7 @@ fn lazy_values_round_trip_exactly() {
         seed(&mut db);
         db.close().unwrap();
     }
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     let rows = query_rows(&mut db, "SELECT body FROM t");
     let got: Vec<String> = rows.iter().map(|r| r[0].render()).collect();
     assert_eq!(
@@ -190,7 +190,7 @@ fn update_of_other_columns_preserves_spilled_values() {
     let _ = std::fs::remove_file(&path);
     let big = filler_text(600);
     {
-        let mut db = Database::create(
+        let mut db = Engine::create(
             &path,
             DatabaseOptions {
                 page_size: PAGE_SIZE,
@@ -210,7 +210,7 @@ fn update_of_other_columns_preserves_spilled_values() {
         db.close().unwrap();
     }
     {
-        let mut db = Database::open(&path).unwrap();
+        let mut db = Engine::open(&path).unwrap();
         // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's
         // rewrite resolves nothing, row 1 resolves at commit.
         execute(&mut db, "UPDATE t SET n = 99 WHERE id = 2").unwrap();
@@ -218,7 +218,7 @@ fn update_of_other_columns_preserves_spilled_values() {
         execute(&mut db, "UPDATE t SET n = 11 WHERE id = 1").unwrap();
         db.close().unwrap();
     }
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     let rows = query_rows(&mut db, "SELECT body, n FROM t");
     assert_eq!(rows[0][0].render(), big);
     assert_eq!(rows[0][1].render(), "11");
@@ -235,10 +235,10 @@ fn update_of_other_columns_preserves_spilled_values() {
 fn paged_and_resident_costs_match() {
     let path = tmp("jed_lazy_cost.jed");
     let _ = std::fs::remove_file(&path);
-    let mut mem = Database::with_page_size(PAGE_SIZE);
+    let mut mem = Engine::with_page_size(PAGE_SIZE);
     seed(&mut mem);
     {
-        let mut db = Database::create(
+        let mut db = Engine::create(
             &path,
             DatabaseOptions {
                 page_size: PAGE_SIZE,
@@ -248,7 +248,7 @@ fn paged_and_resident_costs_match() {
         seed(&mut db);
         db.close().unwrap();
     }
-    let mut paged = Database::open(&path).unwrap();
+    let mut paged = Engine::open(&path).unwrap();
     for sql in [
         "SELECT * FROM t",
         "SELECT id FROM t",

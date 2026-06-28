@@ -7,18 +7,18 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute } from "../src/lib.ts";
+import { Engine, EngineError, execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // A 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
-function t3(): Database {
+function t3(): Engine {
   return dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
     "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
   ]);
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
@@ -46,7 +46,7 @@ test("MATERIALIZED / NOT MATERIALIZED hints force the mode", () => {
 // cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism doing real
 // work. A per-iteration meter would never fire here, so the corpus cannot express it.
 test("WITH RECURSIVE unbounded recursion aborts at the cost ceiling", () => {
-  const db = new Database();
+  const db = new Engine();
   db.setMaxCost(1000n);
   assert.throws(
     () =>
@@ -62,7 +62,7 @@ test("WITH RECURSIVE unbounded recursion aborts at the cost ceiling", () => {
 // A recursion whose total cost fits under the ceiling runs to completion (the ceiling bounds the
 // actual accrued cost); the 5-row counter accrues 29 (the corpus cost contract).
 test("WITH RECURSIVE under the ceiling succeeds", () => {
-  const db = new Database();
+  const db = new Engine();
   db.setMaxCost(1000n);
   assert.strictEqual(
     cost(
@@ -76,7 +76,7 @@ test("WITH RECURSIVE under the ceiling succeeds", () => {
 // A recursive CTE is ALWAYS materialized — NOT MATERIALIZED is inert (recursive-cte.md §1), so a
 // single-reference recursive CTE still iterates to a fixpoint (3 rows, cost 17) rather than inlining.
 test("WITH RECURSIVE materialization hint is inert", () => {
-  const db = new Database();
+  const db = new Engine();
   for (const hint of ["", "MATERIALIZED ", "NOT MATERIALIZED "]) {
     const r = execute(
       db,

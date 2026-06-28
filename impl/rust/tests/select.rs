@@ -3,10 +3,10 @@
 //! conformance corpus with finer-grained per-feature assertions.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
@@ -14,14 +14,14 @@ fn db_with(stmts: &[&str]) -> Database {
 }
 
 /// Run a query and return its rows as nested Value vectors.
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn setup() -> Database {
+fn setup() -> Engine {
     db_with(&[
         "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
         "INSERT INTO t VALUES (1, 10)",

@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, type Database, execute, open } from "../src/lib.ts";
+import { close, create, type Engine, execute, open } from "../src/lib.ts";
 import type { CommitFault } from "../src/pager.ts";
 
 function tmpDir(): string {
@@ -21,7 +21,7 @@ function tmpDir(): string {
 }
 
 // idsSorted returns t's ids ascending (the B-tree scan is key-ordered, but sort to be order-robust).
-function idsSorted(db: Database): bigint[] {
+function idsSorted(db: Engine): bigint[] {
   const o = execute(db, "SELECT id FROM t");
   if (o.kind !== "query") throw new Error("expected a query");
   const out = o.rows.map((r) => {
@@ -34,7 +34,7 @@ function idsSorted(db: Database): bigint[] {
 
 // seed returns a fresh file-backed t(id i32 PRIMARY KEY) holding rows 1,2 (each INSERT autocommits
 // durably) and the prior committed txid.
-function seed(path: string): { db: Database; prior: bigint } {
+function seed(path: string): { db: Engine; prior: bigint } {
   const db = create(path);
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
@@ -44,7 +44,7 @@ function seed(path: string): { db: Database; prior: bigint } {
 
 // insertWithFault arms f, then runs an autocommit INSERT (3) that drives persistImpl into it — which
 // must throw. Closes db (a clean close rolls back, no further writes) so the file is left crash-state.
-function insertWithFault(db: Database, f: CommitFault): void {
+function insertWithFault(db: Engine, f: CommitFault): void {
   if (db.paging === null) throw new Error("expected a file-backed database");
   db.paging.armFault(f);
   assert.throws(

@@ -64,7 +64,7 @@ type CreateTable struct {
 	Temp bool
 	// Shared is whether `SHARED` preceded `TEMP`/`TEMPORARY` — a DATABASE-WIDE shared temporary table
 	// (temp-tables.md §4): one set of rows visible to and writable by every session of the open
-	// Database, still never written to the file. Shared==true always has Temp==true (the parser
+	// Engine, still never written to the file. Shared==true always has Temp==true (the parser
 	// rejects SHARED not followed by TEMP/TEMPORARY as 42601); when false (and Temp), the table is
 	// session-local.
 	Shared  bool

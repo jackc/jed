@@ -6,17 +6,17 @@
 //! impl/go/composite_pk_test.go and impl/ts/tests/composite_pk.test.ts.
 
 use jed::value::Value;
-use jed::{Database, execute};
+use jed::{Engine, execute};
 
-fn db_with(sql: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(sql: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in sql {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn err_code(db: &mut Database, sql: &str) -> String {
+fn err_code(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
@@ -82,7 +82,7 @@ fn uniqueness_is_the_whole_tuple() {
 /// (0A000): out-of-declaration-order list, non-keyable member type.
 #[test]
 fn ddl_errors_match_postgres_and_narrowings() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         err_code(&mut db, "CREATE TABLE t (a i32, PRIMARY KEY (a, nosuch))"),
         "42703"
@@ -220,7 +220,7 @@ fn round_trips_through_the_on_disk_image() {
         "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image).unwrap();
+    let mut loaded = Engine::from_image(&image).unwrap();
 
     let t = loaded.table("t").unwrap();
     assert_eq!(t.pk_indices(), vec![0, 1]);

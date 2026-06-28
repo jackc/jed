@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, Database, execute, open } from "../src/lib.ts";
+import { close, create, Engine, execute, open } from "../src/lib.ts";
 import { render } from "../src/value.ts";
 import { errCode, fillerText } from "./util.ts";
 
@@ -23,7 +23,7 @@ const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12
 // (incompressible 600-char filler → a 3-page chain), id 2 external-compressed (half filler /
 // half run → the ~212-byte block spills to a 1-page chain), id 3 inline-compressed (a
 // 600-char run), id 4 plain inline.
-function seed(db: Database): void {
+function seed(db: Engine): void {
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   const plain = fillerText(600);
   const extc = fillerText(200) + "y".repeat(200);
@@ -72,13 +72,13 @@ function corruptOverflowPayloads(path: string): void {
   writeFileSync(path, bytes);
 }
 
-function rowsOf(db: Database, sql: string) {
+function rowsOf(db: Engine, sql: string) {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;
 }
 
-function costOf(db: Database, sql: string): bigint {
+function costOf(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
@@ -176,7 +176,7 @@ test("lazy: paged and resident costs match", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "cost.jed");
   try {
-    const mem = new Database();
+    const mem = new Engine();
     mem.pageSize = PAGE_SIZE;
     seed(mem);
     const filedb = create(path, { pageSize: PAGE_SIZE });

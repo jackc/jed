@@ -3,10 +3,10 @@
 //! `1--2` is `1`); `/* */` block comments NEST per PG / the SQL standard; an
 //! unterminated block is 42601; comment openers inside a string literal are text.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> Engine {
+    let mut db = Engine::new();
     execute(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)",
@@ -17,7 +17,7 @@ fn setup() -> Database {
 }
 
 /// Run a query expected to produce exactly one value; return it rendered.
-fn one(db: &mut Database, sql: &str) -> String {
+fn one(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}");

@@ -8,7 +8,7 @@ package jed
 // Statements run through Execute/Query; Commit/Rollback end it. Go has no destructor, so a raw
 // Begin caller must end it explicitly — View/Update do that automatically (and are preferred).
 type Transaction struct {
-	db   *Database
+	db   *Engine
 	done bool
 }
 
@@ -47,7 +47,7 @@ func (tx *Transaction) Rollback() error {
 // Begin opens an explicit transaction (spec/design/api.md §2.2). writable false is READ ONLY (a
 // write inside → 25006); true is READ WRITE. A nested Begin (a transaction is already open) is
 // 25001. Prefer View/Update, which cannot forget to end the transaction.
-func (db *Database) Begin(writable bool) (*Transaction, error) {
+func (db *Engine) Begin(writable bool) (*Transaction, error) {
 	if _, err := db.beginTx(writable, true); err != nil {
 		return nil, err
 	}
@@ -56,17 +56,17 @@ func (db *Database) Begin(writable bool) (*Transaction, error) {
 
 // View runs fn in a READ ONLY transaction (bbolt-style): open it, run fn(tx), then auto-commit on
 // success / auto-rollback on error or panic. A write inside is 25006.
-func (db *Database) View(fn func(tx *Transaction) error) error {
+func (db *Engine) View(fn func(tx *Transaction) error) error {
 	return db.withTx(false, fn)
 }
 
 // Update runs fn in a READ WRITE transaction (bbolt-style): open it, run fn(tx), then auto-commit
 // on success / auto-rollback on error or panic — the safe default over a raw Begin.
-func (db *Database) Update(fn func(tx *Transaction) error) error {
+func (db *Engine) Update(fn func(tx *Transaction) error) error {
 	return db.withTx(true, fn)
 }
 
-func (db *Database) withTx(writable bool, fn func(tx *Transaction) error) error {
+func (db *Engine) withTx(writable bool, fn func(tx *Transaction) error) error {
 	tx, err := db.Begin(writable)
 	if err != nil {
 		return err
@@ -83,13 +83,13 @@ func (db *Database) withTx(writable bool, fn func(tx *Transaction) error) error 
 // parsed AST and a back-pointer to the database it was prepared against (Go is GC'd, so binding
 // the database at prepare is safe — unlike Rust's borrow model, api.md §6).
 type PreparedStatement struct {
-	db  *Database
+	db  *Engine
 	ast Statement
 }
 
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
 // errors (42601, …) surface here.
-func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
+func (db *Engine) Prepare(sql string) (*PreparedStatement, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return nil, err
@@ -115,12 +115,12 @@ func (s *PreparedStatement) Query(params []Value) (*Rows, error) {
 
 // ExecuteSQL is a one-shot: parse + execute sql, binding params, returning the outcome. (The
 // package function Execute(db, sql) is the zero-parameter convenience kept for back-compat.)
-func (db *Database) ExecuteSQL(sql string, params []Value) (Outcome, error) {
+func (db *Engine) ExecuteSQL(sql string, params []Value) (Outcome, error) {
 	return ExecuteParams(db, sql, params)
 }
 
 // QuerySQL is a one-shot: parse + run a query sql, binding params, returning a row cursor.
-func (db *Database) QuerySQL(sql string, params []Value) (*Rows, error) {
+func (db *Engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 	out, err := ExecuteParams(db, sql, params)
 	if err != nil {
 		return nil, err

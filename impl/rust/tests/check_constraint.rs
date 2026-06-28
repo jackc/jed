@@ -6,22 +6,22 @@
 //! impl/go/check_constraint_test.go and impl/ts/tests/check_constraint.test.ts.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn db_with(sql: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(sql: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in sql {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn err(db: &mut Database, sql: &str) -> (String, String) {
+fn err(db: &mut Engine, sql: &str) -> (String, String) {
     let e = execute(db, sql).expect_err(&format!("expected an error from {sql:?}"));
     (e.code().to_string(), e.message)
 }
 
-fn check_names(db: &Database, table: &str) -> Vec<String> {
+fn check_names(db: &Engine, table: &str) -> Vec<String> {
     db.table(table)
         .unwrap()
         .checks
@@ -315,7 +315,7 @@ fn round_trips_through_the_on_disk_image() {
          (3, 100, 0.50, 'ok')",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image).unwrap();
+    let mut loaded = Engine::from_image(&image).unwrap();
 
     let t = loaded.table("t").unwrap();
     let stored: Vec<(&str, &str)> = t
@@ -350,7 +350,7 @@ fn round_trips_through_the_on_disk_image() {
     // A second generation (load → image → load) is byte-stable: the text is written back
     // verbatim.
     let image2 = loaded.to_image(256, 1).unwrap();
-    let reloaded = Database::from_image(&image2).unwrap();
+    let reloaded = Engine::from_image(&image2).unwrap();
     assert_eq!(
         check_names(&reloaded, "t"),
         vec!["price_range", "t_b_check", "t_note_check"]
@@ -365,7 +365,7 @@ fn round_trips_through_the_on_disk_image() {
         .expect("stored check text in image");
     let mut corrupt = image.clone();
     corrupt[at + 4] = b'(';
-    let e = match Database::from_image(&corrupt) {
+    let e = match Engine::from_image(&corrupt) {
         Err(e) => e,
         Ok(_) => panic!("corrupt check text must fail to load"),
     };

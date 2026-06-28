@@ -256,7 +256,7 @@ func TestReadRejectsOversizedPageSize(t *testing.T) {
 	image := make([]byte, 200)
 	copy(image[0:4], "JEDB")
 	binary.BigEndian.PutUint32(image[8:12], 70000)
-	_, err := LoadDatabase(image)
+	_, err := LoadEngine(image)
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "XX001" {
 		t.Fatalf("want XX001 data_corrupted, got %v", err)
@@ -282,7 +282,7 @@ func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 	image := make([]byte, 4096)
 	copy(image[0:4], "JEDB")
 	binary.BigEndian.PutUint32(image[8:12], 1000)
-	_, err = LoadDatabase(image)
+	_, err = LoadEngine(image)
 	ee, ok = err.(*EngineError)
 	if !ok || ee.Code() != "XX001" {
 		t.Fatalf("want XX001 data_corrupted, got %v", err)

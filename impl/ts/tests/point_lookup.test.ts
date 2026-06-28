@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute, intValue } from "../src/lib.ts";
+import { Engine, execute, intValue } from "../src/lib.ts";
 import { PMap, unboundedBound } from "../src/pmap.ts";
 import type { KeyBound } from "../src/pmap.ts";
 import type { Row } from "../src/storage.ts";
@@ -56,8 +56,8 @@ test("bounded range + overlap over a multi-leaf tree", () => {
 
 // --- end-to-end (public API): correctness across leaves + sublinear cost ---
 
-function bigTable(n: number): Database {
-  const db = new Database();
+function bigTable(n: number): Engine {
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
@@ -65,7 +65,7 @@ function bigTable(n: number): Database {
   return db;
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
@@ -74,7 +74,7 @@ function intOf(v: Value): number {
   return Number(v.int);
 }
 
-function ids(db: Database, sql: string): number[] {
+function ids(db: Engine, sql: string): number[] {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.map((r) => intOf(r[0]));
@@ -121,7 +121,7 @@ test("LIMIT short-circuit is sublinear", () => {
 
   // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
   // reached under a LIMIT that excludes it.
-  const dz = new Database();
+  const dz = new Engine();
   execute(dz, "CREATE TABLE z (id i32 PRIMARY KEY, c i32)");
   execute(dz, "INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)");
   assert.deepStrictEqual(ids(dz, "SELECT 100 / c FROM z LIMIT 1"), [20]);

@@ -13,16 +13,16 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { type Database, create, execute } from "../src/lib.ts";
+import { type Engine, create, execute } from "../src/lib.ts";
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
 // A 121-row table at the fixture page size (256): id bigint pk, v integer = id % 7.
 // Ascending inserts pks 0..120 in order; shuffled inserts the permutation (i*37) mod
 // 121 — deterministic, identical in every core.
-function splitShapeDb(shuffled: boolean): Database {
+function splitShapeDb(shuffled: boolean): Engine {
   const dir = mkdtempSync(join(tmpdir(), "split-shape-"));
   const db = create(join(dir, "t.jed"), { pageSize: 256 });
   execute(db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)");

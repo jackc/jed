@@ -8,15 +8,15 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Database, execute } from "../src/lib.ts";
+import { type Engine, execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-function addrDb(): Database {
+function addrDb(): Engine {
   return dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
 }
 
 // val runs a one-row, one-column query and returns the rendered value ("NULL" for SQL-NULL).
-function val(db: Database, sql: string): string {
+function val(db: Engine, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -24,14 +24,14 @@ function val(db: Database, sql: string): string {
 }
 
 // col runs a one-column query and returns the rendered values.
-function col(db: Database, sql: string): string[] {
+function col(db: Engine, sql: string): string[] {
   return query(db, sql).map((r) => {
     assert.equal(r.length, 1, sql);
     return r[0]!;
   });
 }
 
-function qOut(db: Database, sql: string) {
+function qOut(db: Engine, sql: string) {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o;

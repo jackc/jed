@@ -9,15 +9,15 @@ package jed
 
 import "testing"
 
-func addrDB(t *testing.T) *Database {
+func addrDB(t *testing.T) *Engine {
 	t.Helper()
-	db := NewDatabase()
+	db := NewEngine()
 	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	return db
 }
 
 // val1 runs a one-row, one-column query and returns the rendered value ("NULL" for SQL-NULL).
-func val1(t *testing.T, db *Database, sql string) string {
+func val1(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	rows := queryRendered(t, db, sql)
 	if len(rows) != 1 || len(rows[0]) != 1 {
@@ -27,7 +27,7 @@ func val1(t *testing.T, db *Database, sql string) string {
 }
 
 // col1 runs a one-column query and returns the rendered values.
-func col1(t *testing.T, db *Database, sql string) []string {
+func col1(t *testing.T, db *Engine, sql string) []string {
 	t.Helper()
 	rows := queryRendered(t, db, sql)
 	out := make([]string, len(rows))

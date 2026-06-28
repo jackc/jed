@@ -7,7 +7,7 @@ import (
 
 // split.go — the library-level multi-statement splitter (spec/design/session.md §4.1) plus the
 // session-level ExecuteScript convenience (§4.2). The splitter depends on NEITHER Session nor
-// Database — a top-level core export, conceptually part of the lexer surface (CLAUDE.md §5).
+// Engine — a top-level core export, conceptually part of the lexer surface (CLAUDE.md §5).
 
 // StatementSpan is one statement carved out of a multi-statement string (spec/design/session.md
 // §4.1). Text is the statement's source — feed it to ExecuteSQL/QuerySQL/Prepare — and Offset is
@@ -20,7 +20,7 @@ type StatementSpan struct {
 // SplitStatements returns a lazy iterator over the statements in sql (spec/design/session.md §4.1),
 // splitting on top-level `;` while respecting string literals, dollar-quoted strings, and
 // line/block comments — a `;` inside any of those is never a boundary. It is pure and total (no
-// Session/Database, never an error: a lone `!` is just a byte to the splitter — the parse error is
+// Session/Engine, never an error: a lone `!` is just a byte to the splitter — the parse error is
 // the host's when it runs the span). Empty spans (a leading/standalone `;`, or whitespace/comment-
 // only text between separators) are skipped, so every yielded span has significant content; the
 // text has leading/trailing whitespace and comments trimmed (interior comments kept). It buffers
@@ -182,7 +182,7 @@ type ScriptSummary struct {
 //   - In-script transaction control (BEGIN/COMMIT/ROLLBACK) is 0A000 — the implicit wrapper owns the
 //     boundary (partitioning is deferred, session.md §11). A host that needs self-managed
 //     transactions writes its own SplitStatements loop instead.
-func (db *Database) ExecuteScript(sql string) (ScriptSummary, error) {
+func (db *Engine) ExecuteScript(sql string) (ScriptSummary, error) {
 	ownsWrapper := !db.InTransaction()
 	if ownsWrapper {
 		// The implicit wrapper honors the handle's read-only mode (modeSet=false ⇒ READ ONLY on a
@@ -208,7 +208,7 @@ func (db *Database) ExecuteScript(sql string) (ScriptSummary, error) {
 
 // runScriptBody splits sql and runs each statement on the current transaction, accumulating the
 // ScriptSummary. Separated so ExecuteScript's wrapper commit/rollback runs once on either path.
-func (db *Database) runScriptBody(sql string) (ScriptSummary, error) {
+func (db *Engine) runScriptBody(sql string) (ScriptSummary, error) {
 	var summary ScriptSummary
 	for span := range SplitStatements(sql) {
 		ast, err := db.parse(span.Text)
@@ -237,7 +237,7 @@ func (db *Database) runScriptBody(sql string) (ScriptSummary, error) {
 
 // ExecuteScript runs a multi-statement script on this ADDITIONAL session against db, sharing
 // committed storage and running sequentially via the swap (spec/design/session.md §2.1/§4.2).
-func (s *Session) ExecuteScript(db *Database, sql string) (ScriptSummary, error) {
+func (s *Session) ExecuteScript(db *Engine, sql string) (ScriptSummary, error) {
 	defer s.activate(db)()
 	return db.ExecuteScript(sql)
 }

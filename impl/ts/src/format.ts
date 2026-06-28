@@ -35,7 +35,7 @@ import { type Collation, loadedCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
-import { Database, Snapshot } from "./executor.ts";
+import { Engine, Snapshot } from "./executor.ts";
 import {
   buildGistFromLeafKeys,
   GIST_SCALAR_OPCLASS,
@@ -1554,9 +1554,9 @@ function pack(sizes: number[], capacity: number): number[][] {
 
 // toImage serializes a snapshot's whole state to one on-disk image (format.md). pageSize is
 // recorded in the meta page; txid is written into both meta slots. Accepts a Snapshot directly
-// (the writer's working snapshot at commit) or a Database (serializing its committed snapshot —
-// the form callers/tests holding a Database use).
-export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint): Uint8Array {
+// (the writer's working snapshot at commit) or a Engine (serializing its committed snapshot —
+// the form callers/tests holding a Engine use).
+export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint): Uint8Array {
   const snap = src instanceof Snapshot ? src : src.committed;
   const ps = pageSize;
   if (ps < MIN_PAGE_SIZE) {
@@ -2024,9 +2024,9 @@ function serializeDirty(
   return index;
 }
 
-// loadDatabase reconstructs a database from an on-disk image (inverse of toImage).
+// loadEngine reconstructs a database from an on-disk image (inverse of toImage).
 // Throws a structured data_corrupted (XX001) error for malformed input.
-export function loadDatabase(image: Uint8Array): Database {
+export function loadEngine(image: Uint8Array): Engine {
   if (image.length < 12) {
     throw engineError("data_corrupted", "image smaller than a meta header");
   }
@@ -2126,7 +2126,7 @@ export function loadDatabase(image: Uint8Array): Database {
   snap.validateCompositeTypes();
   // Build each GiST index's resident R-tree from its now-loaded leaf store (gist.md §4.1).
   snap.rebuildGistTrees();
-  const db = new Database();
+  const db = new Engine();
   db.pageSize = pageSize;
   db.pageCount = mt.pageCount; // the on-disk high-water for the next incremental commit
   // The free-list: every body page [2, pageCount) the committed root does not reach (P6.2). Ascending
@@ -2182,13 +2182,13 @@ function collectLeafOverflow(
   throw engineError("data_corrupted", "expected a B-tree node page");
 }
 
-// loadDatabasePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
+// loadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
 // only the interior B-tree skeleton resident, leaving each leaf an OnDisk page faulted through the
 // bounded buffer pool on access — so the resident set is bounded by the pool, not the file size. The
 // inverse of an incremental commit, reading pages through the pager instead of a whole image. (This
 // slice reads every leaf page once to count its rows for length; an O(skeleton) open needs a
 // per-subtree row count in the format — a deferred follow-on, pager.md §6. Memory is already bounded.)
-export function loadDatabasePaged(paging: SharedPaging): Database {
+export function loadEnginePaged(paging: SharedPaging): Engine {
   const pageSize = paging.pageSize();
   if (!pageSizeValid(pageSize)) {
     throw engineError("data_corrupted", "invalid page size");
@@ -2297,7 +2297,7 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
   // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
   snap.rebuildGistTrees();
 
-  const db = new Database();
+  const db = new Engine();
   db.pageSize = pageSize;
   db.pageCount = mt.pageCount;
   for (let p = ROOT_PAGE; p < mt.pageCount; p++) {
@@ -2408,7 +2408,7 @@ function readTree(
       const cp = readU32(pg.payload, cur);
       const r = readTree(image, dv, ps, cp, colTypes, reached);
       // The in-memory load is fully resident (no pager to fault from); the demand-paged file load
-      // (loadDatabasePaged) is a separate path that leaves leaf children OnDisk.
+      // (loadEnginePaged) is a separate path that leaves leaf children OnDisk.
       children.push(residentRef(r.node));
       total += r.length;
     }

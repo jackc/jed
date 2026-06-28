@@ -356,7 +356,7 @@ func (s *TableStore) EntriesInKeyOrder() ([]Entry, error) {
 // (spec/fileformat/format.md). nil for an empty table.
 func (s *TableStore) treeRoot() *pnode { return s.rows.rootNode() }
 
-// setTree installs a loaded B-tree as this store's contents (format.go LoadDatabase).
+// setTree installs a loaded B-tree as this store's contents (format.go LoadEngine).
 func (s *TableStore) setTree(root *pnode, length int) { s.rows = fromLoaded(root, length) }
 
 // Len returns the row count.

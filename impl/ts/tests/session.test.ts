@@ -1,4 +1,4 @@
-// S1 session surface (spec/design/session.md §2): the Database-owned STATEFUL default session,
+// S1 session surface (spec/design/session.md §2): the Engine-owned STATEFUL default session,
 // ADDITIONAL sessions minted by db.newSession (shared committed storage, independent settings +
 // transaction state, run sequentially via the swap), the relocated settings, and the explicit
 // Idle/Open/Failed transaction state machine. Per-core API behaviors the shared corpus cannot
@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute, intValue } from "../src/lib.ts";
+import { Engine, EngineError, execute, intValue } from "../src/lib.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -26,9 +26,9 @@ function queryRows(o: ReturnType<typeof execute>) {
 }
 
 test("default session is stateful across calls", () => {
-  // The Database-owned default session holds an open BEGIN block across separate calls (the
+  // The Engine-owned default session holds an open BEGIN block across separate calls (the
   // PG/SQLite connection model, §2.1); db.status() exposes the explicit state machine.
-  const db = new Database();
+  const db = new Engine();
   assert.strictEqual(db.status(), "Idle");
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "BEGIN");
@@ -42,7 +42,7 @@ test("default session is stateful across calls", () => {
 test("failed block is the Failed state", () => {
   // A statement error inside a block poisons it: status is Failed, every later statement but
   // ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-  const db = new Database();
+  const db = new Engine();
   execute(db, "BEGIN");
   assert.strictEqual(
     code(() => execute(db, "SELECT * FROM missing")),
@@ -58,7 +58,7 @@ test("failed block is the Failed state", () => {
 });
 
 test("additional session shares storage with independent settings", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   execute(db, "INSERT INTO t VALUES (1, 10)");
 
@@ -87,7 +87,7 @@ test("additional session shares storage with independent settings", () => {
 test("additional session cost ceiling is enforced via swap", () => {
   // Proves the swap installs the additional session's settings into the execution path: a tiny
   // ceiling aborts the scan with 54P01, while the unlimited default runs it fine.
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1), (2), (3)");
   execute(db, "SELECT * FROM t"); // default: unlimited

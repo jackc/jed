@@ -5,9 +5,9 @@ package jed
 
 import "testing"
 
-func dbWith(t *testing.T, stmts ...string) *Database {
+func dbWith(t *testing.T, stmts ...string) *Engine {
 	t.Helper()
-	db := NewDatabase()
+	db := NewEngine()
 	for _, s := range stmts {
 		if _, err := Execute(db, s); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
@@ -61,7 +61,7 @@ func TestBoundaryValuesRoundTrip(t *testing.T) {
 }
 
 func TestInsertIntoMissingTableTraps(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	wantErr(t, db, "INSERT INTO nope VALUES (1)", "42P01")
 }
 

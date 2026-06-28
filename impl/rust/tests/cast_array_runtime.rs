@@ -11,10 +11,10 @@
 //!       is in the determinism-exception ledger.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
 /// The rendered scalar of `SELECT <expr>` (single row, single column).
-fn scalar(db: &mut Database, expr: &str) -> String {
+fn scalar(db: &mut Engine, expr: &str) -> String {
     match execute(db, &format!("SELECT {expr}")).unwrap() {
         Outcome::Query { rows, .. } => rows[0][0].render(),
         other => panic!("expected query, got {other:?}"),
@@ -22,7 +22,7 @@ fn scalar(db: &mut Database, expr: &str) -> String {
 }
 
 /// The SQLSTATE of a statement expected to error.
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql) {
         Err(e) => e.code().to_string(),
         Ok(o) => panic!("expected error for {sql}, got {o:?}"),
@@ -37,7 +37,7 @@ fn err(db: &mut Database, sql: &str) -> String {
 
 #[test]
 fn array_to_text_is_explicit_only() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, label text)").unwrap();
     // Assignment context: an array value into a text column is a datatype mismatch, NOT a silent
     // array_out (PG would assignment-cast it).
@@ -59,7 +59,7 @@ fn array_to_text_is_explicit_only() {
 
 #[test]
 fn uuid_array_to_bytea_array_and_back() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // uuid[] → bytea[]: each element is its 16 raw bytes; bytea[] → uuid[] reverses it. PG has no
     // bytea⇄uuid cast at all (42846), so this whole round-trip is jed-only.
     let round = scalar(
@@ -81,7 +81,7 @@ fn uuid_array_to_bytea_array_and_back() {
 
 #[test]
 fn forbidden_element_pairs() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // A scalar element pair with no cast between the element types → 42804 (jed's strict-matrix
     // convention; PG reports 42846). i32 → timestamp has no cast.
     assert_eq!(
@@ -105,7 +105,7 @@ fn forbidden_element_pairs() {
 
 #[test]
 fn runtime_text_to_float_arrays() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')").unwrap();
     // text → f64[] (binary64-exact values render exactly).

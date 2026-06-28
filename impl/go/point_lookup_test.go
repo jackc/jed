@@ -13,7 +13,7 @@ import (
 
 // bigTable builds a table of n rows (id i32 PRIMARY KEY, v i32; v == id) large enough to span
 // several B-tree leaves at the default page size.
-func bigTable(t *testing.T, n int) *Database {
+func bigTable(t *testing.T, n int) *Engine {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("INSERT INTO t VALUES ")

@@ -1,10 +1,10 @@
 // Shared test helpers (not a `*.test.ts` file, so the runner does not execute it).
 
-import { Database, EngineError, execute, render } from "../src/lib.ts";
+import { Engine, EngineError, execute, render } from "../src/lib.ts";
 
 // dbWith builds a database and runs the given setup statements, failing loudly.
-export function dbWith(stmts: string[]): Database {
-  const db = new Database();
+export function dbWith(stmts: string[]): Engine {
+  const db = new Engine();
   for (const s of stmts) {
     try {
       execute(db, s);
@@ -16,7 +16,7 @@ export function dbWith(stmts: string[]): Database {
 }
 
 // query runs a SELECT and returns its rows rendered as strings (NULL → "NULL").
-export function query(db: Database, sql: string): string[][] {
+export function query(db: Engine, sql: string): string[][] {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows.map((r) => r.map(render));

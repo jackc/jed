@@ -7,7 +7,7 @@
 //! inline — the cost delta is exactly the chain pages. Mirrored in Go
 //! (overflow_cost_test.go) and TS (tests/overflow_cost.test.ts).
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
 // page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
 // ceil(600/240) = 3 overflow pages; a 300-byte bytea into ceil(300/240) = 2. Payloads are
@@ -49,7 +49,7 @@ fn filler_bytes_hex(n: usize) -> String {
     out
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
@@ -58,8 +58,8 @@ fn cost(db: &mut Database, sql: &str) -> i64 {
 
 /// Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain),
 /// `control` keeps every value inline. Row 2 is inline in both.
-fn two_tables() -> Database {
-    let mut db = Database::with_page_size(PAGE_SIZE);
+fn two_tables() -> Engine {
+    let mut db = Engine::with_page_size(PAGE_SIZE);
     let big = filler_text(600);
     execute(
         &mut db,
@@ -111,7 +111,7 @@ fn limit_does_not_lower_the_block() {
     // The spilled record is row 2, so LIMIT 1 emits only the inline row 1 — yet the page_read
     // block (which never short-circuits — cost.md §3 "LIMIT short-circuit") still counts the
     // bound's chain pages.
-    let mut db = Database::with_page_size(PAGE_SIZE);
+    let mut db = Engine::with_page_size(PAGE_SIZE);
     let big = filler_text(600);
     execute(
         &mut db,
@@ -179,7 +179,7 @@ fn untouched_columns_charge_nothing() {
 #[test]
 fn multiple_chains_sum() {
     // One record with two externalized values charges the sum of both chains: 3 + 2 = 5.
-    let mut db = Database::with_page_size(PAGE_SIZE);
+    let mut db = Engine::with_page_size(PAGE_SIZE);
     let big_text = filler_text(600);
     let big_hex = filler_bytes_hex(300);
     execute(

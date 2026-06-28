@@ -14,7 +14,7 @@ mod tui;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use jed::{Database, DatabaseOptions, OpenOptions};
+use jed::{DatabaseOptions, Engine, OpenOptions};
 
 use args::Source;
 use session::Session;
@@ -124,17 +124,17 @@ fn run() -> u8 {
     }
 }
 
-fn open_database(a: &args::Args) -> Result<(Database, String), u8> {
+fn open_database(a: &args::Args) -> Result<(Engine, String), u8> {
     let Some(path) = &a.db_path else {
-        return Ok((Database::new(), "memory".to_string()));
+        return Ok((Engine::new(), "memory".to_string()));
     };
     let result = if a.create {
         let opts = DatabaseOptions {
             page_size: a.page_size.unwrap_or(jed::DEFAULT_PAGE_SIZE),
         };
-        Database::create(path, opts)
+        Engine::create(path, opts)
     } else if a.readonly {
-        Database::open_with_options(
+        Engine::open_with_options(
             path,
             OpenOptions {
                 read_only: true,
@@ -142,7 +142,7 @@ fn open_database(a: &args::Args) -> Result<(Database, String), u8> {
             },
         )
     } else {
-        Database::open(path)
+        Engine::open(path)
     };
     match result {
         Ok(db) => {

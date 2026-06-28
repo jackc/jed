@@ -23,12 +23,12 @@ const reclaimPS = int64(256)
 // records, which directly reports whether a commit extended the high-water or reused a free page. We
 // track this, not the file length: the file is preallocated in chunks ahead of the high-water
 // (spec/design/pager.md §7), so its physical size no longer equals pageCount*pageSize.
-func reclaimPageCount(db *Database) int64 {
+func reclaimPageCount(db *Engine) int64 {
 	return int64(db.PageCount())
 }
 
 // padOf returns the pad text of the row with id, and whether it exists.
-func padOf(t *testing.T, db *Database, id int64) (string, bool) {
+func padOf(t *testing.T, db *Engine, id int64) (string, bool) {
 	rows := queryRows(t, db, fmt.Sprintf("SELECT pad FROM t WHERE id = %d", id))
 	if len(rows) == 0 {
 		return "", false
@@ -36,7 +36,7 @@ func padOf(t *testing.T, db *Database, id int64) (string, bool) {
 	return rows[0][0].Str, true
 }
 
-func reclaimSetup(t *testing.T, path string, rows int) *Database {
+func reclaimSetup(t *testing.T, path string, rows int) *Engine {
 	db, err := Create(path, DatabaseOptions{PageSize: uint32(reclaimPS)})
 	if err != nil {
 		t.Fatal(err)

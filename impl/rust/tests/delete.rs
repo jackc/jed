@@ -1,17 +1,17 @@
 //! Step 6: DELETE — predicate-matched removal, no-WHERE clears, three-valued logic,
 //! and the no-PK monotonic-rowid regression (DELETE then INSERT must not collide).
 
-use jed::{Database, execute};
+use jed::{Engine, execute};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn setup() -> Database {
+fn setup() -> Engine {
     db_with(&[
         "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
         "INSERT INTO t VALUES (1, 10)",
@@ -23,7 +23,7 @@ fn setup() -> Database {
 
 #[test]
 fn delete_from_missing_table_traps() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         execute(&mut db, "DELETE FROM nope").unwrap_err().code(),
         "42P01"

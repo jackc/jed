@@ -2,7 +2,7 @@
 //
 // Walks spec/conformance/suites, and for each .test file whose `# requires:`
 // capabilities are all in this core's SupportedCapabilities, runs the
-// sqllogictest-style records against a fresh Database and compares output. Files
+// sqllogictest-style records against a fresh Engine and compares output. Files
 // needing a capability the core does not declare are SKIPPED (not failed), so an
 // incomplete engine reads as "fewer tests run" (spec/design/conformance.md §3).
 //
@@ -66,7 +66,7 @@ func run() int {
 		}
 
 		// A `# format: concurrency` file is an explicit multi-session schedule run against a
-		// SharedDb (spec/design/concurrency-testing.md §4); everything else is the sequential
+		// Database (spec/design/concurrency-testing.md §4); everything else is the sequential
 		// single-handle runner. Both share the result grammar; only the driver differs.
 		runErr := runFile
 		if isConcurrencyFormat(text) {
@@ -238,10 +238,10 @@ func parseUpgradeCollationsDirective(line string) bool {
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
 // spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
 // referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
-// is the point), then reconstructs the database in memory via LoadDatabase. The handle is read-WRITE
+// is the point), then reconstructs the database in memory via LoadEngine. The handle is read-WRITE
 // so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 // read-only-handle error.
-func openFixture(rel string) (*jed.Database, error) {
+func openFixture(rel string) (*jed.Engine, error) {
 	bundle := filepath.Join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd")
 	if data, err := os.ReadFile(bundle); err == nil {
 		_ = jed.LoadUnicodeData(data) // idempotent: the loaded set is engine-global
@@ -251,7 +251,7 @@ func openFixture(rel string) (*jed.Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fixture: read %s: %w", path, err)
 	}
-	db, err := jed.LoadDatabase(data)
+	db, err := jed.LoadEngine(data)
 	if err != nil {
 		return nil, fmt.Errorf("fixture: open %s: %w", rel, err)
 	}
@@ -310,7 +310,7 @@ func parseMaxCostDirective(line string) (int64, bool) {
 // parseLifetimeMaxCostDirective parses a `# lifetime_max_cost: N` directive line. Returns the
 // per-SESSION cumulative cost budget and true, or (0, false) if not one. Unlike `# max_cost:`
 // (per-record, reset after each record), this is STICKY: it sets the session budget for the rest of
-// the file (the cumulative cost builds across records on the one Database the file runs against), so
+// the file (the cumulative cost builds across records on the one Engine the file runs against), so
 // an ordered statement sequence can drive the session to its budget and assert the 54P02 abort —
 // what the per-record `# cost:` directive cannot express (spec/design/session.md §5.4).
 func parseLifetimeMaxCostDirective(line string) (int64, bool) {
@@ -644,7 +644,7 @@ func assertTypes(expected []string, actual []string, sql string) error {
 
 // runFile runs all records in one .test file against a fresh database.
 func runFile(text string) error {
-	db := jed.NewDatabase()
+	db := jed.NewEngine()
 	lines := strings.Split(text, "\n")
 	i := 0
 	// A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -696,7 +696,7 @@ func runFile(text string) error {
 				i++
 				continue
 			}
-			// `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh NewDatabase()
+			// `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh NewEngine()
 			// above — appears in the header before any record (spec/design/conformance.md).
 			if rel, ok := parseFixtureDirective(line); ok {
 				fixtureDB, err := openFixture(rel)

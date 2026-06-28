@@ -3,24 +3,24 @@
 //! context and supplied values are coerced two-phase before any row is touched.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute, execute_params};
+use jed::{Engine, Outcome, execute, execute_params};
 
-fn db_with(sql: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(sql: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in sql {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn rows(db: &mut Database, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+fn rows(db: &mut Engine, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
     match execute_params(db, sql, params).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         _ => panic!("expected a query result"),
     }
 }
 
-fn err_code(db: &mut Database, sql: &str, params: &[Value]) -> String {
+fn err_code(db: &mut Engine, sql: &str, params: &[Value]) -> String {
     execute_params(db, sql, params)
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
@@ -225,7 +225,7 @@ fn param_in_in_list() {
 
 #[test]
 fn ddl_with_params_traps_42601() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         err_code(
             &mut db,

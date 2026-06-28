@@ -197,7 +197,7 @@ fn literal(ty: &ScalarType, field: &Field) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::{Database, execute};
+    use jed::{Engine, execute};
 
     fn f(value: &str) -> Field {
         Field {
@@ -229,8 +229,8 @@ mod tests {
         assert!(parse("a,b\"c").is_err());
     }
 
-    fn demo_table() -> Database {
-        let mut db = Database::new();
+    fn demo_table() -> Engine {
+        let mut db = Engine::new();
         execute(
             &mut db,
             "CREATE TABLE t (id i32 PRIMARY KEY, name text, score numeric(5,2), ok boolean DEFAULT true)",

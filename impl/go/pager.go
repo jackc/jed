@@ -216,7 +216,7 @@ func injectedCrash() error {
 	return NewError(IoError, "injected commit crash (fault injection)")
 }
 
-// close releases the backing store (Database.Close).
+// close releases the backing store (Engine.Close).
 func (p *pager) close() error {
 	return p.store.close()
 }

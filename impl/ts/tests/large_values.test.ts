@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, Database, execute, loadDatabase, open, toImage } from "../src/lib.ts";
+import { close, create, Engine, execute, loadEngine, open, toImage } from "../src/lib.ts";
 import { fillerText } from "./util.ts";
 
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
@@ -24,7 +24,7 @@ function countPageType(image: Uint8Array, ps: number, ty: number): number {
 }
 
 // rowsOf runs a SELECT and returns the rows (asserting it is a query).
-function rowsOf(db: Database, sql: string) {
+function rowsOf(db: Engine, sql: string) {
   const o = execute(db, sql);
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("expected a query");
@@ -38,8 +38,8 @@ function textOf(v: { kind: string; text?: string } | undefined): string | null {
 // A ~1250-byte text value forces a multi-page overflow chain at page 256 (RECORD_MAX = 114, cap = 240).
 const BIG = fillerText(1250); // incompressible, so Slice B keeps it external-plain
 
-function bigValueDB(): Database {
-  const db = new Database();
+function bigValueDB(): Engine {
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO t VALUES (1, '${BIG}')`);
   execute(db, "INSERT INTO t VALUES (2, 'tiny')");
@@ -54,7 +54,7 @@ test("external value spans an overflow chain and round-trips byte-identically", 
     "a large value spans several overflow pages",
   );
 
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   // Re-serialization is byte-identical (deterministic spill + chain allocation).
   assert.deepEqual(toImage(loaded, 256, 1n), image);
   const rows = rowsOf(loaded, "SELECT id, body FROM t ORDER BY id");
@@ -64,7 +64,7 @@ test("external value spans an overflow chain and round-trips byte-identically", 
 });
 
 test("small values never spill", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   execute(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
   const image = toImage(db, 256, 1n);
@@ -77,7 +77,7 @@ test("small values never spill", () => {
 
 test("load reclaims only dead overflow pages", () => {
   const image = toImage(bigValueDB(), 256, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   const ovf = countPageType(image, 256, PAGE_OVERFLOW);
   assert.ok(ovf >= 2);
   // Live chain pages are reachable, so they are NOT on the free-list (else a later commit would

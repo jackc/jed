@@ -1,6 +1,6 @@
 package jed
 
-// S1 session surface (spec/design/session.md §2): the Database-owned STATEFUL default session,
+// S1 session surface (spec/design/session.md §2): the Engine-owned STATEFUL default session,
 // ADDITIONAL sessions minted by db.NewSession (shared committed storage, independent settings +
 // transaction state, run sequentially via the swap), the relocated settings, and the explicit
 // Idle/Open/Failed transaction state machine. Per-core API behaviors the shared corpus cannot
@@ -8,7 +8,7 @@ package jed
 
 import "testing"
 
-func sessExec(t *testing.T, db *Database, sql string) {
+func sessExec(t *testing.T, db *Engine, sql string) {
 	t.Helper()
 	if _, err := Execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
@@ -24,9 +24,9 @@ func sessCode(t *testing.T, err error) string {
 }
 
 func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
-	// The Database-owned default session holds an open BEGIN block across *separate* calls (the
+	// The Engine-owned default session holds an open BEGIN block across *separate* calls (the
 	// PG/SQLite connection model, §2.1); db.Status() exposes the explicit state machine.
-	db := NewDatabase()
+	db := NewEngine()
 	if db.Status() != TxIdle {
 		t.Fatalf("fresh db: want Idle, got %v", db.Status())
 	}
@@ -48,7 +48,7 @@ func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
 func TestFailedBlockIsTheFailedState(t *testing.T) {
 	// A statement error inside a block poisons it: status is Failed, every later statement but
 	// ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-	db := NewDatabase()
+	db := NewEngine()
 	sessExec(t, db, "BEGIN")
 	_, err := Execute(db, "SELECT * FROM missing")
 	if got := sessCode(t, err); got != "42P01" {
@@ -68,7 +68,7 @@ func TestFailedBlockIsTheFailedState(t *testing.T) {
 }
 
 func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 
@@ -111,7 +111,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 func TestAdditionalSessionCostCeilingEnforcedViaSwap(t *testing.T) {
 	// Proves the swap installs the additional session's settings into the execution path: a tiny
 	// ceiling aborts the scan with 54P01, while the unlimited default runs it fine.
-	db := NewDatabase()
+	db := NewEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	sessExec(t, db, "INSERT INTO t VALUES (1), (2), (3)")
 	sessExec(t, db, "SELECT * FROM t") // default: unlimited
@@ -129,7 +129,7 @@ func TestAdditionalSessionCostCeilingEnforcedViaSwap(t *testing.T) {
 }
 
 func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 
 	s := db.NewSession(SessionOptions{})

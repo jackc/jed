@@ -5,16 +5,16 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute, loadDatabase, toImage } from "../src/lib.ts";
+import { Engine, execute, loadEngine, toImage } from "../src/lib.ts";
 import { arrayT, compositeT, scalarT } from "../src/types.ts";
 import { errCode, query } from "./util.ts";
 
-function run(db: Database, sql: string): void {
+function run(db: Engine, sql: string): void {
   execute(db, sql);
 }
 
 test("CREATE TYPE registers fields", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)");
   const ct = db.compositeType("addr");
   assert.ok(ct, "type addr");
@@ -30,7 +30,7 @@ test("CREATE TYPE registers fields", () => {
 });
 
 test("DROP TYPE removes it", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (a i32)");
   run(db, "DROP TYPE addr");
   assert.equal(db.compositeType("addr"), undefined);
@@ -38,7 +38,7 @@ test("DROP TYPE removes it", () => {
 
 // A nested composite value round-trips and renders with the inner record quoted.
 test("nested composite value round-trip", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE point AS (x i32, y i32)");
   run(db, "CREATE TYPE seg AS (a point, b point)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, s seg)");
@@ -48,13 +48,13 @@ test("nested composite value round-trip", () => {
 
 // Composite values survive a serialize → load round-trip (the v9 recursive value codec).
 test("composite values persist through the on-disk image", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO p VALUES (1, ROW('Main', 90210))");
   run(db, "INSERT INTO p VALUES (2, ROW('Oak', NULL))");
   const image = toImage(db, 256, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   assert.deepStrictEqual(query(loaded, "SELECT id, home FROM p ORDER BY id"), [
     ["1", "(Main,90210)"],
     ["2", "(Oak,)"],
@@ -62,7 +62,7 @@ test("composite values persist through the on-disk image", () => {
 });
 
 test("DROP TYPE ... CASCADE is 0A000", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (a i32)");
   assert.equal(
     errCode(() => run(db, "DROP TYPE addr CASCADE")),
@@ -71,7 +71,7 @@ test("DROP TYPE ... CASCADE is 0A000", () => {
 });
 
 test("nested type self- or forward-reference is 42704", () => {
-  const db = new Database();
+  const db = new Engine();
   // Forward reference (point not yet defined) — and self-reference — are unknown types.
   assert.equal(
     errCode(() => run(db, "CREATE TYPE line AS (a point)")),
@@ -86,14 +86,14 @@ test("nested type self- or forward-reference is 42704", () => {
 // Round-trip through the on-disk image: a composite type (and a nested one) survives serialize →
 // load, byte-backed by the v9 catalog type-definition section.
 test("types persist through the on-disk image", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)");
   run(db, "CREATE TYPE line AS (a point, b point)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, n i32)");
   run(db, "INSERT INTO t VALUES (1, 10)");
 
   const image = toImage(db, 256, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
 
   const point = loaded.compositeType("point");
   assert.ok(point, "point persists");
@@ -112,7 +112,7 @@ test("types persist through the on-disk image", () => {
 // S4: `(expr).field` selects one field; the output column is named after the field. Works on a
 // parenthesized column, a ROW(…) literal, and chains through a nested composite.
 test("field access selects a field", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE person (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO person VALUES (1, ROW('Main', 90210))");
@@ -127,7 +127,7 @@ test("field access selects a field", () => {
 // S5: composite equality is element-wise 3VL (PG row comparison). `=` is FALSE if any field is
 // FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE.
 test("composite equality 3VL", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE rec AS (a i32, b i32)");
   // Equal rows.
   assert.deepStrictEqual(query(db, "SELECT ROW(1, 2) = ROW(1, 2)"), [["true"]]);
@@ -142,7 +142,7 @@ test("composite equality 3VL", () => {
 // S5: a composite column compares against a ROW(…) value in WHERE (element-wise), and ORDER BY
 // over the composite column sorts lexicographically.
 test("composite column compare and order", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO p VALUES (1, ROW('Oak', 30))");
@@ -158,7 +158,7 @@ test("composite column compare and order", () => {
 // behavior — the differential oracle). A composite-valued field is a non-NULL value, so it counts
 // as PRESENT: a nested all-NULL row is therefore `IS NULL` = FALSE and `IS NOT NULL` = TRUE.
 test("composite IS NULL non recursive", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE point AS (x i32, y i32)");
   run(db, "CREATE TYPE seg AS (a point, b point)");
   // The two inner rows are non-null values → the outer row is NOT all-(SQL-)null → IS NULL false,
@@ -183,7 +183,7 @@ test("composite IS NULL non recursive", () => {
 // element descriptor; the value codec / comparison / text-I/O all recurse. Mirrors the Rust tests. ---
 
 test("CREATE TYPE with an array field registers it", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE poly AS (name text, pts i32[])");
   const ct = db.compositeType("poly");
   assert.ok(ct);
@@ -193,13 +193,13 @@ test("CREATE TYPE with an array field registers it", () => {
 });
 
 test("composite with an array field persists through the on-disk image", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE poly AS (name text, pts i32[])");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
   run(db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2, 3]))");
   run(db, "INSERT INTO t VALUES (2, ROW('b', NULL))");
   const image = toImage(db, 256, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   const ct = loaded.compositeType("poly");
   assert.ok(ct);
   assert.deepStrictEqual(ct!.fields[1]!.type, arrayT(scalarT("i32")));
@@ -210,20 +210,20 @@ test("composite with an array field persists through the on-disk image", () => {
 });
 
 test("composite with an array-of-composite field (homes addr[])", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TYPE person AS (name text, homes addr[])");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, who person)");
   run(db, `INSERT INTO t VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))`);
   const image = toImage(db, 256, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   assert.deepStrictEqual(query(loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"), [
     ["(Main,1)"],
   ]);
 });
 
 test("DROP TYPE is blocked by an array-typed field dependent", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TYPE person AS (name text, homes addr[])");
   assert.equal(
@@ -235,7 +235,7 @@ test("DROP TYPE is blocked by an array-typed field dependent", () => {
 });
 
 test("DROP TYPE is blocked by an array-typed column dependent", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   assert.equal(
@@ -245,7 +245,7 @@ test("DROP TYPE is blocked by an array-typed column dependent", () => {
 });
 
 test("array field errors: typmod 0A000, unknown element 42704", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.equal(
     errCode(() => run(db, "CREATE TYPE t AS (xs decimal(10,2)[])")),
     "0A000",

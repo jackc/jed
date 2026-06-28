@@ -4,10 +4,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute, executeParams, intValue } from "../src/lib.ts";
+import { Engine, execute, executeParams, intValue } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-function nums(): Database {
+function nums(): Engine {
   return dbWith(["CREATE TABLE nums (id i32 PRIMARY KEY, small i16, big i64)"]);
 }
 
@@ -30,7 +30,7 @@ test("no-PK table accepts repeated rows (synthetic rowid)", () => {
 
 test("insert into a missing table traps 42P01", () => {
   assert.equal(
-    errCode(() => execute(new Database(), "INSERT INTO nope VALUES (1)")),
+    errCode(() => execute(new Engine(), "INSERT INTO nope VALUES (1)")),
     "42P01",
   );
 });

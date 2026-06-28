@@ -1,15 +1,15 @@
 // GiST indexes (spec/design/gist.md) — GX1: CREATE INDEX … USING gist over a range column, its
 // maintenance, the planner &&/@> gather (descending the resident R-tree), and whole-image
-// persistence (the page-5/6 R-tree, format_version 20, the toImage→loadDatabase round-trip). Covers
+// persistence (the page-5/6 R-tree, format_version 20, the toImage→loadEngine round-trip). Covers
 // what the corpus cannot: the deliberate divergences (UNIQUE/multi-column/temp → 0A000), the
 // unknown-method / non-range 42704s, and the on-disk round-trip. Lockstep peer of the Rust/Go tests.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute, loadDatabase, toImage } from "../src/lib.ts";
+import { Engine, execute, loadEngine, toImage } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-function rangesDb(): Database {
+function rangesDb(): Engine {
   return dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
     "CREATE INDEX t_r_gist ON t USING gist (r)",
@@ -80,7 +80,7 @@ test("gist whole-image roundtrip persists the R-tree", () => {
     "CREATE INDEX t_r_gist ON t USING gist (r)",
     "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), (5, '[50,60)'), (6, '[15,25)'), (7, 'empty'), (8, NULL)",
   ]);
-  const loaded = loadDatabase(toImage(db, 256, 1n));
+  const loaded = loadEngine(toImage(db, 256, 1n));
   // The persisted R-tree loads, the resident tree is rebuilt, the gather still works.
   assert.deepEqual(query(loaded, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"), [
     ["1"],
@@ -92,7 +92,7 @@ test("gist whole-image roundtrip persists the R-tree", () => {
   ]);
   // Maintenance after reload, then a second round-trip.
   execute(loaded, "INSERT INTO t VALUES (9, '[5,7)')");
-  const loaded2 = loadDatabase(toImage(loaded, 256, 1n));
+  const loaded2 = loadEngine(toImage(loaded, 256, 1n));
   assert.deepEqual(query(loaded2, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"), [
     ["3"],
     ["9"],
@@ -142,7 +142,7 @@ test("scalar gist whole-image roundtrip persists the R-tree", () => {
     "CREATE INDEX t_room_gist ON t USING gist (room)",
     "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), (8, 50)",
   ]);
-  const loaded = loadDatabase(toImage(db, 256, 1n));
+  const loaded = loadEngine(toImage(db, 256, 1n));
   assert.deepEqual(query(loaded, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [
     ["1"],
     ["3"],
@@ -150,7 +150,7 @@ test("scalar gist whole-image roundtrip persists the R-tree", () => {
   ]);
   assert.deepEqual(query(loaded, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [["2"], ["5"]]);
   execute(loaded, "INSERT INTO t VALUES (9, 20)");
-  const loaded2 = loadDatabase(toImage(loaded, 256, 1n));
+  const loaded2 = loadEngine(toImage(loaded, 256, 1n));
   assert.deepEqual(query(loaded2, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [
     ["2"],
     ["5"],
@@ -160,7 +160,7 @@ test("scalar gist whole-image roundtrip persists the R-tree", () => {
 
 // ---- GX3: EXCLUDE constraints (spec/design/gist.md §7) -----------------------------------------
 
-function bookingDb(): Database {
+function bookingDb(): Engine {
   return dbWith([
     "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, " +
       "EXCLUDE USING gist (room WITH =, during WITH &&))",
@@ -309,7 +309,7 @@ test("exclude whole-image roundtrip persists the constraint", () => {
       "EXCLUDE USING gist (room WITH =, during WITH &&))",
     "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), (3, 102, '[10,20)')",
   ]);
-  const loaded = loadDatabase(toImage(db, 256, 1n));
+  const loaded = loadEngine(toImage(db, 256, 1n));
   assert.equal(
     errCode(() => execute(loaded, "INSERT INTO booking VALUES (4, 101, '[15,25)')")),
     "23P01",

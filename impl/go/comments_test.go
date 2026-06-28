@@ -9,16 +9,16 @@ package jed
 
 import "testing"
 
-func commentsSetup(t *testing.T) *Database {
+func commentsSetup(t *testing.T) *Engine {
 	t.Helper()
-	db := NewDatabase()
+	db := NewEngine()
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10, '--x /*y*/')")
 	return db
 }
 
 // oneValue runs a query expected to produce exactly one value; returns it rendered.
-func oneValue(t *testing.T, db *Database, sql string) string {
+func oneValue(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	out := mustCreate(t, db, sql)
 	if out.Kind != OutcomeQuery || len(out.Rows) != 1 || len(out.Rows[0]) != 1 {

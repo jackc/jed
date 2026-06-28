@@ -11,8 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Decimal } from "../src/decimal.ts";
-import { loadDatabase, toImage } from "../src/format.ts";
-import { create, Database, execute } from "../src/lib.ts";
+import { loadEngine, toImage } from "../src/format.ts";
+import { create, Engine, execute } from "../src/lib.ts";
 import {
   canonFloat,
   float32Value,
@@ -123,15 +123,15 @@ test("f32 big-endian on-disk bytes (cross-core byte contract)", () => {
   assert.equal(hex, "3fc00000");
 });
 
-// --- end-to-end value codec via toImage/loadDatabase (finite, both widths) ---
+// --- end-to-end value codec via toImage/loadEngine (finite, both widths) ---
 
-test("finite float rows survive an on-disk round-trip (toImage → loadDatabase)", () => {
+test("finite float rows survive an on-disk round-trip (toImage → loadEngine)", () => {
   const db = dbWith([
     "CREATE TABLE t (id int PRIMARY KEY, a f64, b f32)",
     "INSERT INTO t VALUES (1, 1.5, 0.1), (2, -2.25, -3.5), (3, 100000.5, 1.0)",
   ]);
   const image = toImage(db, GOLDEN_PAGE_SIZE, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   // f32 0.1 frounds to 0.10000000149011612 — its shortest binary32 form.
   assert.deepEqual(query(loaded, "SELECT a, b FROM t ORDER BY id"), [
     ["1.5", "0.10000000149011612"],
@@ -143,7 +143,7 @@ test("finite float rows survive an on-disk round-trip (toImage → loadDatabase)
 // --- literals + the f32 Math.fround discipline --------------------------
 
 test("f32 0.1 differs from f64 0.1 (Math.fround applied)", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.deepEqual(query(db, "SELECT CAST('0.1' AS f32), CAST('0.1' AS f64)"), [
     ["0.10000000149011612", "0.1"],
   ]);
@@ -153,7 +153,7 @@ test("f32 0.1 differs from f64 0.1 (Math.fround applied)", () => {
 });
 
 test("typed-literal float parse: e-notation, signs, specials; reject junk/range", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.deepEqual(query(db, "SELECT float '1.5e3', float '-3E-2', float '.5', float '7.'"), [
     ["1500", "-0.03", "0.5", "7"],
   ]);
@@ -195,7 +195,7 @@ test("decimal/integer literal adapts to a float context", () => {
 // --- arithmetic: kernel, promotion, traps -----------------------------------
 
 test("float arithmetic: one op per node, width promotion, fround", () => {
-  const db = new Database();
+  const db = new Engine();
   assert.deepEqual(query(db, "SELECT float '1.5' + float '2.5'"), [["4"]]);
   assert.deepEqual(query(db, "SELECT float '10.0' / float '4.0'"), [["2.5"]]);
   assert.deepEqual(query(db, "SELECT float '7.0' % float '3.0'"), [["1"]]);
@@ -227,13 +227,13 @@ test("float→decimal is the EXACT decimal expansion (matches Go exactDecimalFro
   // Exact value of the binary64 0.1 = 0.1000000000000000055511151231257827021181583404541015625
   // (Go: exactDecimalFromFloat64(0.1).Render()). A shortest-round-trip route would give "0.1".
   const exact01 = "0.1000000000000000055511151231257827021181583404541015625";
-  assert.deepEqual(query(new Database(), "SELECT CAST(f64 '0.1' AS numeric(60,55))"), [[exact01]]);
+  assert.deepEqual(query(new Engine(), "SELECT CAST(f64 '0.1' AS numeric(60,55))"), [[exact01]]);
   // Values that are exactly representable in binary expand to themselves: 0.5, 2.5, 1e20.
   assert.deepEqual(
-    query(new Database(), "SELECT CAST(f64 '0.5' AS decimal), CAST(f64 '2.5' AS decimal)"),
+    query(new Engine(), "SELECT CAST(f64 '0.5' AS decimal), CAST(f64 '2.5' AS decimal)"),
     [["0.5", "2.5"]],
   );
-  assert.deepEqual(query(new Database(), "SELECT CAST(f64 '1e20' AS decimal)"), [
+  assert.deepEqual(query(new Engine(), "SELECT CAST(f64 '1e20' AS decimal)"), [
     ["100000000000000000000"],
   ]);
   // Direct Decimal API parity with Go (the underlying exact-expansion path).
@@ -243,12 +243,12 @@ test("float→decimal is the EXACT decimal expansion (matches Go exactDecimalFro
   assert.equal(Decimal.exactFromFloat64(1e20).render(), "100000000000000000000");
   // typmod scale coercion (round HALF AWAY) over the exact value: numeric(5,1) rounds 0.1000…0555…
   // down to 0.1 (the 2nd fractional digit is 0).
-  assert.deepEqual(query(new Database(), "SELECT CAST(f64 '0.1' AS numeric(5,1))"), [["0.1"]]);
+  assert.deepEqual(query(new Engine(), "SELECT CAST(f64 '0.1' AS numeric(5,1))"), [["0.1"]]);
   // f32: the EXACT decimal of the binary32 value (Math.fround(0.1) = 0.10000000149011612),
   // identical whether taken from the binary32 bits directly or widened to binary64 first (the path
   // Go uses): 0.100000001490116119384765625 (scale 27; padded to 30 here).
   const exact01f32 = "0.100000001490116119384765625";
-  assert.deepEqual(query(new Database(), "SELECT CAST(f32 '0.1' AS numeric(40,30))"), [
+  assert.deepEqual(query(new Engine(), "SELECT CAST(f32 '0.1' AS numeric(40,30))"), [
     [exact01f32 + "000"],
   ]);
   assert.equal(Decimal.exactFromFloat32(Math.fround(0.1)).render(), exact01f32);
@@ -300,7 +300,7 @@ test("float column round-trips through the spill-to-disk sort (per-core codec)",
   const dir = mkdtempSync(join(tmpdir(), "jed-float-spill-"));
   try {
     // In-memory (never spills) is the source of truth; a file-backed DB with a tiny workMem spills.
-    const mem = new Database();
+    const mem = new Engine();
     const db = create(join(dir, "float_spill.jed"), {});
     for (const d of [mem, db]) {
       execute(d, "CREATE TABLE t (id int PRIMARY KEY, a f64, b f32)");

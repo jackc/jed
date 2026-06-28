@@ -37,8 +37,8 @@ var SupportedCapabilities = []string{
 	// session.allow_temp_ddl; storage budget resource.temp_budget.
 	"ddl.temp_table",
 	// CREATE SHARED [TEMP|TEMPORARY] TABLE — database-wide shared temporary tables (visible to every
-	// session of the open Database, sharing one set of rows), still making zero file writes (held in
-	// the Database-level shared-temp snapshot; the two-root commit, temp-tables.md §4/§5). Same feature
+	// session of the open Engine, sharing one set of rows), still making zero file writes (held in
+	// the Engine-level shared-temp snapshot; the two-root commit, temp-tables.md §4/§5). Same feature
 	// set + 0A000 narrowings as ddl.temp_table; cross-session visibility tested via the concurrency
 	// schedule format. Gate session.allow_shared_temp_ddl; budget resource.shared_temp_budget.
 	"ddl.shared_temp_table",
@@ -587,8 +587,8 @@ var SupportedCapabilities = []string{
 	"txn.explicit",
 	"txn.read_only",
 	"txn.failed_state",
-	// Shared-handle concurrency — the SharedDb schedule format (spec/design/concurrency-testing.md
-	// §4). Declared because this core implements SharedDb/ReadHandle/WriteHandle + the watermark
+	// Shared-handle concurrency — the Database schedule format (spec/design/concurrency-testing.md
+	// §4). Declared because this core implements Database/ReadHandle/WriteHandle + the watermark
 	// (shared.go); a core lacking them skips suites/concurrency files via the capability gate.
 	"txn.shared",
 	"txn.read_handle",
@@ -601,7 +601,7 @@ var SupportedCapabilities = []string{
 	// The conformance harness can run a file against a PRE-BUILT database image named by a file-level
 	// `# fixture:` directive (instead of a fresh DB), so the corpus can exercise on-disk state SQL
 	// cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
-	// §12/§14, spec/design/conformance.md). Reconstructed in memory via LoadDatabase.
+	// §12/§14, spec/design/conformance.md). Reconstructed in memory via LoadEngine.
 	"harness.fixture_open",
 	// The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
 	// (db.UpgradeCollations) on the running DB — clears a version-skew so a corpus test can drive
@@ -694,7 +694,7 @@ var SupportedCapabilities = []string{
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).
-func Execute(db *Database, sql string) (Outcome, error) {
+func Execute(db *Engine, sql string) (Outcome, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return Outcome{}, err
@@ -706,7 +706,7 @@ func Execute(db *Database, sql string) (Outcome, error) {
 // placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type
 // cannot be inferred is 42P18; a bound value out of range / of the wrong family fails like a
 // literal (22003/42804/…).
-func ExecuteParams(db *Database, sql string, params []Value) (Outcome, error) {
+func ExecuteParams(db *Engine, sql string, params []Value) (Outcome, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return Outcome{}, err

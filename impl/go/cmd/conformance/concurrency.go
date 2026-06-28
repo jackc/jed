@@ -2,7 +2,7 @@ package main
 
 // The concurrency schedule runner (spec/design/concurrency-testing.md §4). A `.test` file carrying
 // a `# format: concurrency` header is an explicit total order over named read/write SESSIONS opened
-// on one SharedDb. Because jed read results depend only on the logical order of commits and
+// on one Database. Because jed read results depend only on the logical order of commits and
 // pin-points — never on timing (concurrency-testing.md §2) — executing the listed order yields the
 // canonical, deterministic result every core must produce. Two execution modes share ONE parse:
 //
@@ -309,7 +309,7 @@ func runConcurrencyFile(text string) error {
 // threaded run consistent with the schedule must produce. `gateHolder` is the live writer's sid (the
 // single-writer gate), and `blockedSid` is the at-most-one writer queued on it.
 func runScheduleSequential(steps []cStep) error {
-	db := jed.NewSharedDB()
+	db := jed.NewDatabase()
 	sessions := map[string]*cSession{}
 	gateHolder := "" // the live writer holding the single-writer gate, "" if free
 	blockedSid := "" // a writer queued on the gate (Layer 2 `blocks`), "" if none
@@ -393,8 +393,8 @@ func runScheduleSequential(steps []cStep) error {
 	return nil
 }
 
-// expectValue reads the SharedDb state a `expect <kind>` directive asserts.
-func expectValue(db *jed.SharedDB, kind string) uint64 {
+// expectValue reads the Database state a `expect <kind>` directive asserts.
+func expectValue(db *jed.Database, kind string) uint64 {
 	if kind == "oldest_live" {
 		return db.OldestLiveTxid()
 	}
@@ -434,7 +434,7 @@ type cWorker struct {
 
 // readWorker is a read session's goroutine: it pins a snapshot, runs records against it, and on
 // `close` (or a closed command channel during teardown) deregisters by closing the handle.
-func readWorker(db *jed.SharedDB, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
+func readWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
 	defer close(done)
 	s := &cSession{read: db.Read()}
 	reply <- nil // ack the open: the snapshot is pinned + registered
@@ -456,7 +456,7 @@ func readWorker(db *jed.SharedDB, sid string, cmd chan cCmd, reply chan error, d
 
 // writeWorker is a write session's goroutine: it acquires the writer gate, runs records against the
 // working set, and on `commit`/`rollback` (or teardown) ends the transaction, releasing the gate.
-func writeWorker(db *jed.SharedDB, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
+func writeWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
 	defer close(done)
 	s := &cSession{write: db.Write()}
 	reply <- nil // ack the open: the writer gate is held, the working set captured
@@ -495,7 +495,7 @@ type blockedWorker struct {
 // cDriver holds the threaded-mode state: the live (open-acked) workers, the gate holder, and the
 // at-most-one writer queued on the gate. Methods drive one step / tear the schedule down.
 type cDriver struct {
-	db         *jed.SharedDB
+	db         *jed.Database
 	workers    map[string]*cWorker
 	gateHolder string         // the live writer holding the single-writer gate, "" if free
 	blocked    *blockedWorker // a writer queued on the gate (Layer 2), nil if none
@@ -510,7 +510,7 @@ type cDriver struct {
 // stays parked inside Write() on the held gate (its open ack deferred) until the holder releases it,
 // the one concurrency path the sequential walk never exercises (§5).
 func runScheduleThreaded(steps []cStep) error {
-	d := &cDriver{db: jed.NewSharedDB(), workers: map[string]*cWorker{}}
+	d := &cDriver{db: jed.NewDatabase(), workers: map[string]*cWorker{}}
 	var result error
 	for _, st := range steps {
 		if err := d.step(st); err != nil {
@@ -526,7 +526,7 @@ func runScheduleThreaded(steps []cStep) error {
 }
 
 // step runs one schedule step in threaded mode (spawn/dispatch to the session's goroutine, queue or
-// hand off a blocked writer, or read the SharedDb state for an `expect`).
+// hand off a blocked writer, or read the Database state for an `expect`).
 func (d *cDriver) step(st cStep) error {
 	switch st.kind {
 	case "open":

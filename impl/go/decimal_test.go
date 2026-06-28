@@ -193,16 +193,16 @@ func TestDecimalBigMultiplicationExact(t *testing.T) {
 
 // --- end-to-end through Execute ---------------------------------------------
 
-func decExec(t *testing.T, db *Database, sql string) {
+func decExec(t *testing.T, db *Engine, sql string) {
 	t.Helper()
 	if _, err := Execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
 
-func decDB(t *testing.T, stmts ...string) *Database {
+func decDB(t *testing.T, stmts ...string) *Engine {
 	t.Helper()
-	db := NewDatabase()
+	db := NewEngine()
 	for _, s := range stmts {
 		decExec(t, db, s)
 	}
@@ -210,7 +210,7 @@ func decDB(t *testing.T, stmts ...string) *Database {
 }
 
 // decOne runs a query expected to return a single cell, rendered.
-func decOne(t *testing.T, db *Database, sql string) string {
+func decOne(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	rows := query(t, db, sql)
 	if len(rows) != 1 || len(rows[0]) != 1 {
@@ -229,7 +229,7 @@ func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadDatabase(image)
+	loaded, err := LoadEngine(image)
 	if err != nil {
 		t.Fatal(err)
 	}

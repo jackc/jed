@@ -10,7 +10,7 @@
 //! `XX001` or the byte-identical correct result — corruption is **caught or inert, never silent**.
 //! Mirrored in Go (checksum_test.go) and TS (tests/checksum.test.ts).
 
-use jed::{Database, DatabaseOptions, Outcome, Result, execute};
+use jed::{DatabaseOptions, Engine, Outcome, Result, execute};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -36,7 +36,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 
 /// The full scan result as rendered strings, or the error if any page read failed.
 fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
-    let mut db = Database::open(path)?;
+    let mut db = Engine::open(path)?;
     let out = match execute(&mut db, "SELECT id, body FROM t ORDER BY id")? {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -51,7 +51,7 @@ fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
 /// Seed a file whose tree spans every body-page kind at `page_size = 256`: a multi-leaf B-tree
 /// (interior root) of ~30 rows, with row 1 a 600-char incompressible body that spills out-of-line.
 fn seed(path: &std::path::Path) {
-    let mut db = Database::create(
+    let mut db = Engine::create(
         path,
         DatabaseOptions {
             page_size: PAGE_SIZE,

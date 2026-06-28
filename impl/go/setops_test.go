@@ -6,7 +6,7 @@ package jed
 
 import "testing"
 
-func setopAB(t *testing.T) *Database {
+func setopAB(t *testing.T) *Engine {
 	return dbWith(
 		t,
 		"CREATE TABLE a (id i32 PRIMARY KEY, k i32)",

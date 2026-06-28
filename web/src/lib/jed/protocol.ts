@@ -11,7 +11,7 @@
 
 export type DbMode = 'memory' | 'opfs';
 
-// OpenSpec opens or creates a database under a caller-chosen id. For 'memory' a fresh Database; for
+// OpenSpec opens or creates a database under a caller-chosen id. For 'memory' a fresh Engine; for
 // 'opfs' an OPFS-backed file named `name` (create => 58P02 if it exists; else open => 58P01 if
 // absent). maxCost/workMem are applied to the handle (untrusted-query ceiling, CLAUDE.md §13).
 export type OpenSpec = {
@@ -64,7 +64,7 @@ export type Req =
   | { rid: number; op: 'run'; id: string; sql: string }
   | { rid: number; op: 'commit'; id: string }
   | { rid: number; op: 'rollback'; id: string }
-  | { rid: number; op: 'reset'; id: string } // memory only: replace with a fresh Database
+  | { rid: number; op: 'reset'; id: string } // memory only: replace with a fresh Engine
   | { rid: number; op: 'setMaxCost'; id: string; value: string } // i64 ceiling as decimal string
   | { rid: number; op: 'schema'; id: string }
   | { rid: number; op: 'close'; id: string }

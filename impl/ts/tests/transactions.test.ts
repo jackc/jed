@@ -7,10 +7,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { begin, Database, EngineError, execute, update, view } from "../src/lib.ts";
+import { begin, Engine, EngineError, execute, update, view } from "../src/lib.ts";
 
 // rowCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
-function rowCount(db: Database, table: string): number {
+function rowCount(db: Engine, table: string): number {
   const o = execute(db, `SELECT * FROM ${table}`);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.length;
@@ -27,7 +27,7 @@ function codeOf(fn: () => void): string {
 }
 
 test("begin → execute → commit is visible", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   const tx = begin(db, true);
   tx.execute("INSERT INTO t VALUES (1)");
@@ -42,7 +42,7 @@ test("begin → execute → commit is visible", () => {
 });
 
 test("begin → execute → rollback discards", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
   const tx = begin(db, true);
@@ -53,7 +53,7 @@ test("begin → execute → rollback discards", () => {
 });
 
 test("update closure commits on success", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   const n = update(db, (tx) => {
     tx.execute("INSERT INTO t VALUES (1)");
@@ -66,7 +66,7 @@ test("update closure commits on success", () => {
 });
 
 test("update closure rolls back on a thrown error", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
   const code = codeOf(() =>
@@ -83,7 +83,7 @@ test("update closure rolls back on a thrown error", () => {
 });
 
 test("view is read-only", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1), (2)");
   // a read inside a view works and returns its value
@@ -100,7 +100,7 @@ test("view is read-only", () => {
 });
 
 test("nested begin is 25001", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   const tx = begin(db, true);
   tx.execute("INSERT INTO t VALUES (1)");
@@ -114,7 +114,7 @@ test("nested begin is 25001", () => {
 });
 
 test("commit and rollback are no-ops in autocommit", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   // no open transaction: both are lenient no-op successes (transactions.md §4.2)
   db.commitTx();

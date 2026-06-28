@@ -25,7 +25,7 @@ const lazyPageSize = 256
 // external-plain (incompressible 600-char filler → a 3-page chain), id 2 external-compressed
 // (half filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 // inline-compressed (a 600-char run), id 4 plain inline.
-func lazySeed(t *testing.T, db *Database) {
+func lazySeed(t *testing.T, db *Engine) {
 	t.Helper()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	plain := fillerText(600)

@@ -8,12 +8,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { pkIndices, primaryKeyIndex } from "../src/catalog.ts";
-import { Database, execute } from "../src/lib.ts";
-import { loadDatabase, toImage } from "../src/format.ts";
+import { Engine, execute } from "../src/lib.ts";
+import { loadEngine, toImage } from "../src/format.ts";
 import { dbWith, errCode } from "./util.ts";
 
 // The visible tuple (first two columns) of each row, in stored key order.
-function tuples(db: Database, table: string): [bigint, bigint][] {
+function tuples(db: Engine, table: string): [bigint, bigint][] {
   return db.rowsInKeyOrder(table).map((r) => {
     const a = r[0]!;
     const b = r[1]!;
@@ -81,7 +81,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   ];
   for (const [sql, want] of cases) {
     assert.equal(
-      errCode(() => execute(new Database(), sql)),
+      errCode(() => execute(new Engine(), sql)),
       want,
       sql,
     );
@@ -89,7 +89,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
   // scalar is keyable); only the recursive composite container is NOT (composite.md §6).
   {
-    const db = new Database();
+    const db = new Engine();
     execute(db, "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))");
     execute(db, "CREATE TYPE addr AS (street text, zip i32)");
     assert.equal(
@@ -101,7 +101,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
   // keys by (b, a), so the stored scan order is b-major.
   {
-    const rev = new Database();
+    const rev = new Engine();
     execute(rev, "CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))");
     assert.deepEqual(pkIndices(rev.table("rev")!), [1, 0]);
     execute(rev, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)");
@@ -110,7 +110,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   }
 
   // A single-column table constraint is the column-level form's equivalent.
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))");
   const t = db.table("ok")!;
   assert.equal(primaryKeyIndex(t), 0);
@@ -167,7 +167,7 @@ test("round-trips through the on-disk image as a keyed table", () => {
     "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
   ]);
   const image = toImage(db, 256, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
 
   const t = loaded.table("t")!;
   assert.deepEqual(pkIndices(t), [0, 1]);

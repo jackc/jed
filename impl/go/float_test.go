@@ -77,7 +77,7 @@ func TestFloatImageRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db2, err := LoadDatabase(img)
+	db2, err := LoadEngine(img)
 	if err != nil {
 		t.Fatal(err)
 	}

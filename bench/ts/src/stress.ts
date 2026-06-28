@@ -19,7 +19,7 @@ import { join } from "node:path";
 
 import { parse as parseToml } from "smol-toml";
 
-import { type ReadHandle, SharedDb, type WriteHandle, render } from "../../../impl/ts/src/lib.ts";
+import { type ReadHandle, Database, type WriteHandle, render } from "../../../impl/ts/src/lib.ts";
 
 import { Checksum, Prng } from "./lib.ts";
 
@@ -113,7 +113,7 @@ function queryScalar(rh: ReadHandle, sql: string): string {
 
 // --- setup + the final check -----------------------------------------------------------------
 
-function setup(db: SharedDb, sql: string[]): void {
+function setup(db: Database, sql: string[]): void {
   const wh = db.write();
   try {
     for (const s of sql) wh.execute(s, []);
@@ -124,7 +124,7 @@ function setup(db: SharedDb, sql: string[]): void {
   }
 }
 
-function checkFinal(db: SharedDb, f: StressFile): { checksum: string; ok: boolean } {
+function checkFinal(db: Database, f: StressFile): { checksum: string; ok: boolean } {
   if (f.finalQuery === null) return { checksum: "", ok: true };
   const rh = db.read();
   try {
@@ -192,7 +192,7 @@ interface State {
   checks: number;
 }
 
-function stepSeq(db: SharedDb, w: SeqWorker, st: State): void {
+function stepSeq(db: Database, w: SeqWorker, st: State): void {
   if (w.kind === "writer") {
     if (w.op === 0) {
       w.wh = db.write(); // gate is free (guaranteed by runnable) — never throws 25001 here
@@ -229,7 +229,7 @@ function stepSeq(db: SharedDb, w: SeqWorker, st: State): void {
   }
 }
 
-function runSequential(db: SharedDb, f: StressFile): number {
+function runSequential(db: Database, f: StressFile): number {
   const workers: SeqWorker[] = [];
   for (const wk of f.workers) {
     for (let c = 0; c < wk.count; c++) {
@@ -304,7 +304,7 @@ function runFile(path: string, forceSequential: boolean): StressResult {
   res.mode = sequential ? "sequential" : "threaded";
 
   try {
-    const db = SharedDb.newInMemory();
+    const db = Database.newInMemory();
     setup(db, f.setup);
     res.invariant_checks = runSequential(db, f);
     res.duration_ms = Math.round(performance.now() - start);

@@ -27,7 +27,7 @@ const (
 // inline-compressed (LZ4 shrinks it far under RECORD_MAX, so no chain), and `control` of the
 // same shape fully inline-plain. Row 2 is inline in both. Same tree shape (one leaf each), so
 // cost deltas isolate the compression units.
-func compressedTables(t *testing.T) *Database {
+func compressedTables(t *testing.T) *Engine {
 	t.Helper()
 	db := WithPageSize(compressedPageSize)
 	run600 := strings.Repeat("x", 600)

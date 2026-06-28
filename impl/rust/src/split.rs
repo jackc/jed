@@ -1,5 +1,5 @@
 //! Library-level multi-statement splitter (spec/design/session.md §4.1). A pure, streaming
-//! statement scanner that depends on **neither `Session` nor `Database`** — a top-level core export,
+//! statement scanner that depends on **neither `Session` nor `Engine`** — a top-level core export,
 //! conceptually part of the lexer surface (CLAUDE.md §5: parsers are per-language, not codegen'd),
 //! callable before any database is opened. It yields one statement's source text at a time, lazily,
 //! buffering nothing across statements (an O(n) scan, no parse tree).
@@ -46,7 +46,7 @@ pub struct SplitStatements<'a> {
 /// Split `sql` into its top-level statements, lazily (spec/design/session.md §4.1). The returned
 /// iterator yields one [`StatementSpan`] per non-empty statement, splitting on top-level `;` while
 /// respecting string literals, dollar-quoted strings, and line/block comments. Pure and total — no
-/// `Session`/`Database`, never an error.
+/// `Session`/`Engine`, never an error.
 pub fn split_statements(sql: &str) -> SplitStatements<'_> {
     SplitStatements {
         src: sql,

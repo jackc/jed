@@ -14,7 +14,7 @@
 use crate::error::{EngineError, Result, SqlState};
 use std::cell::RefCell;
 
-/// A host random source: fills `buf` with `buf.len()` random bytes. `+ Send` keeps [`Database`]
+/// A host random source: fills `buf` with `buf.len()` random bytes. `+ Send` keeps [`Engine`]
 /// `Send` (the shared read/write handles move across threads — `crate::shared`). `FnMut` because a
 /// deterministic source (e.g. [`seeded_random_source`]) advances its own captured state per call.
 pub type RandomSource = Box<dyn FnMut(&mut [u8]) + Send>;
@@ -23,10 +23,10 @@ pub type RandomSource = Box<dyn FnMut(&mut [u8]) + Send>;
 /// [`RandomSource`] (a host may inject an advancing/simulated clock).
 pub type ClockSource = Box<dyn FnMut() -> i64 + Send>;
 
-/// The host seam carried on the [`Database`](crate::executor::Database) handle (spec/design/api.md
+/// The host seam carried on the [`Engine`](crate::executor::Engine) handle (spec/design/api.md
 /// §10): the injected random + clock functions, each `None` ⇒ the platform default. Behind
 /// `RefCell` so the `FnMut`s can be called through the `&`-shared handle (the evaluator reaches the
-/// seam via `&Database`; the draw order is fixed by eval order regardless). Only the volatile uuid
+/// seam via `&Engine`; the draw order is fixed by eval order regardless). Only the volatile uuid
 /// generators touch it; every other expression ignores it.
 #[derive(Default)]
 pub struct Seam {

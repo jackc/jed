@@ -1,10 +1,10 @@
 // Host API surface for the TS core (spec/design/api.md §1): prepare a statement, execute or
 // query it (with optional $N bind parameters), and iterate result rows. Free functions taking a
-// Database (mirroring the existing `execute(db, sql)` style — and avoiding an executor.ts↔api.ts
+// Engine (mirroring the existing `execute(db, sql)` style — and avoiding an executor.ts↔api.ts
 // import cycle). Thin wrappers over the parser + executor — the conformance contract still binds.
 
 import type { Statement } from "./ast.ts";
-import type { Database, Outcome } from "./executor.ts";
+import type { Engine, Outcome } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
 
@@ -12,10 +12,10 @@ import type { Value } from "./value.ts";
 // parsed AST and a reference to the database it was prepared against (JS is GC'd, so binding the
 // database at prepare is safe — unlike Rust's borrow model, api.md §6).
 export class PreparedStatement {
-  private readonly db: Database;
+  private readonly db: Engine;
   private readonly ast: Statement;
 
-  constructor(db: Database, ast: Statement) {
+  constructor(db: Engine, ast: Statement) {
     this.db = db;
     this.ast = ast;
   }
@@ -73,12 +73,12 @@ export function rowsFromOutcome(out: Outcome): Rows {
 
 // prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
 // errors (42601, …) surface here.
-export function prepare(db: Database, sql: string): PreparedStatement {
+export function prepare(db: Engine, sql: string): PreparedStatement {
   return new PreparedStatement(db, db.parse(sql));
 }
 
 // query is a one-shot: parse + run a query sql, binding params, returning a row cursor.
-export function query(db: Database, sql: string, params: Value[] = []): Rows {
+export function query(db: Engine, sql: string, params: Value[] = []): Rows {
   return rowsFromOutcome(db.executeStmtParams(db.parse(sql), params));
 }
 
@@ -89,10 +89,10 @@ export const querySql = query;
 // Statements run through execute/query; commit/rollback end it. JS has no destructor, so a raw
 // `begin` caller must end it explicitly — `view`/`update` do that automatically (and are preferred).
 export class Transaction {
-  private readonly db: Database;
+  private readonly db: Engine;
   private done: boolean;
 
-  constructor(db: Database) {
+  constructor(db: Engine) {
     this.db = db;
     this.done = false;
   }
@@ -130,24 +130,24 @@ export class Transaction {
 // write inside → 25006); true is READ WRITE — 25006 on a read-only handle (§2.1). A nested begin
 // (a transaction is already open) is 25001. Prefer view/update, which cannot forget to end the
 // transaction.
-export function begin(db: Database, writable: boolean): Transaction {
+export function begin(db: Engine, writable: boolean): Transaction {
   db.beginTx(writable);
   return new Transaction(db);
 }
 
 // view runs fn in a READ ONLY transaction (bbolt-style): open it, run fn(tx), then auto-commit on
 // success / auto-rollback on a thrown error. A write inside is 25006.
-export function view<R>(db: Database, fn: (tx: Transaction) => R): R {
+export function view<R>(db: Engine, fn: (tx: Transaction) => R): R {
   return withTx(db, false, fn);
 }
 
 // update runs fn in a READ WRITE transaction (bbolt-style): open it, run fn(tx), then auto-commit
 // on success / auto-rollback on a thrown error — the safe default over a raw begin.
-export function update<R>(db: Database, fn: (tx: Transaction) => R): R {
+export function update<R>(db: Engine, fn: (tx: Transaction) => R): R {
   return withTx(db, true, fn);
 }
 
-function withTx<R>(db: Database, writable: boolean, fn: (tx: Transaction) => R): R {
+function withTx<R>(db: Engine, writable: boolean, fn: (tx: Transaction) => R): R {
   const tx = begin(db, writable);
   let result: R;
   try {

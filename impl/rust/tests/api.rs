@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, OpenOptions, Outcome, execute};
+use jed::{DatabaseOptions, Engine, OpenOptions, Outcome, execute};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -16,7 +16,7 @@ fn create_commit_reopen_round_trips() {
     let path = tmp("round_trip.jed");
     let _ = std::fs::remove_file(&path);
 
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
     assert_eq!(db.txid(), 1); // the initial empty image is committed at create
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
@@ -24,7 +24,7 @@ fn create_commit_reopen_round_trips() {
     let after_commit = db.txid();
     db.close().unwrap();
 
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert_eq!(db.txid(), after_commit);
     match execute(&mut db, "SELECT id, v FROM t").unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(
@@ -42,16 +42,16 @@ fn create_commit_reopen_round_trips() {
 fn open_missing_file_is_58p01() {
     let path = tmp("does_not_exist.jed");
     let _ = std::fs::remove_file(&path);
-    assert_eq!(Database::open(&path).err().unwrap().code(), "58P01");
+    assert_eq!(Engine::open(&path).err().unwrap().code(), "58P01");
 }
 
 #[test]
 fn create_over_existing_file_is_58p02() {
     let path = tmp("already_here.jed");
     let _ = std::fs::remove_file(&path);
-    Database::create(&path, DatabaseOptions::default()).unwrap();
+    Engine::create(&path, DatabaseOptions::default()).unwrap();
     assert_eq!(
-        Database::create(&path, DatabaseOptions::default())
+        Engine::create(&path, DatabaseOptions::default())
             .err()
             .unwrap()
             .code(),
@@ -63,14 +63,14 @@ fn create_over_existing_file_is_58p02() {
 fn create_with_custom_page_size_round_trips() {
     let path = tmp("page256.jed");
     let _ = std::fs::remove_file(&path);
-    let db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+    let db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
     assert_eq!(db.page_size(), 256);
     db.close().unwrap();
 
     // The file's recorded page size survives reopen, and the on-disk u32 at offset 8 is 256.
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 256);
-    let db = Database::open(&path).unwrap();
+    let db = Engine::open(&path).unwrap();
     assert_eq!(db.page_size(), 256);
 }
 
@@ -81,12 +81,12 @@ fn autocommit_persists_each_write_across_close() {
     // original "no autocommit" model this test used to assert.
     let path = tmp("autocommit.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap(); // autocommitted, no explicit commit
     db.close().unwrap();
 
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     match execute(&mut db, "SELECT id FROM t").unwrap() {
         Outcome::Query { rows, .. } => {
             assert_eq!(
@@ -102,7 +102,7 @@ fn autocommit_persists_each_write_across_close() {
 #[test]
 fn commit_and_rollback_are_noops_under_autocommit() {
     // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
     db.commit().unwrap();
@@ -115,7 +115,7 @@ fn commit_and_rollback_are_noops_under_autocommit() {
 
 #[test]
 fn prepare_execute_and_query_with_params() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     let insert = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     insert
@@ -135,7 +135,7 @@ fn prepare_execute_and_query_with_params() {
 
 #[test]
 fn one_shot_query_iterates_rows() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1), (2), (3)").unwrap();
     let ids: Vec<Value> = db
@@ -148,7 +148,7 @@ fn one_shot_query_iterates_rows() {
 
 #[test]
 fn query_on_non_query_statement_errors() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert!(
         db.query("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
             .is_err()
@@ -157,13 +157,13 @@ fn query_on_non_query_statement_errors() {
 
 #[test]
 fn errors_surface_with_sqlstate() {
-    let db = Database::new();
+    let db = Engine::new();
     assert_eq!(db.prepare("SELCT 1").err().unwrap().code(), "42601");
 }
 
 #[test]
 fn commit_on_in_memory_is_noop_success() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     db.commit().unwrap(); // no path -> no-op, not an error
     assert_eq!(db.txid(), 0);
@@ -179,14 +179,14 @@ fn incremental_commit_round_trips_to_canonical_image() {
     // db's, byte-for-byte (spec/fileformat/format.md, *Allocation & incremental commit*).
     let path = tmp("incremental_canonical.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (5, 50)").unwrap();
     db.commit().unwrap();
     let canonical = db.to_image(db.page_size(), db.txid()).unwrap();
     db.close().unwrap();
 
-    let reopened = Database::open(&path).unwrap();
+    let reopened = Engine::open(&path).unwrap();
     assert_eq!(
         reopened
             .to_image(reopened.page_size(), reopened.txid())
@@ -203,13 +203,13 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     // 25006, and the file bytes are never touched.
     let path = tmp("readonly.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
     execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
     db.close().unwrap();
     let before = std::fs::read(&path).unwrap();
 
-    let mut db = Database::open_with_options(
+    let mut db = Engine::open_with_options(
         &path,
         OpenOptions {
             read_only: true,
@@ -267,7 +267,7 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
 
     // A normal reopen is writable again.
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Engine::open(&path).unwrap();
     assert!(!db.read_only());
     execute(&mut db, "INSERT INTO t VALUES (2)").unwrap();
 }
@@ -278,7 +278,7 @@ fn rows_affected_reports_dml_counts() {
     // how many rows they touched (PostgreSQL's command-tag count); a DML statement that
     // matched nothing reports Some(0); DDL and transaction control report None; DML with
     // RETURNING is a query outcome (its row count is the result's length).
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let affected = |out: Outcome| match out {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement outcome"),
@@ -313,7 +313,7 @@ fn rows_affected_reports_dml_counts() {
 fn table_names_lists_tables_sorted_excluding_indexes() {
     // The catalog-read surface (api.md §6): canonical names, sorted ascending by
     // lowercased name; secondary indexes are relations but not tables.
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(db.table_names(), Vec::<String>::new());
     execute(&mut db, "CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "CREATE TABLE apple (id i32 PRIMARY KEY)").unwrap();

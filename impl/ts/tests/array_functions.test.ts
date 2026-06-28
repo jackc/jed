@@ -5,11 +5,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import { errCode, query } from "./util.ts";
 
 // val runs a one-column, one-row scalar query and returns the rendered value.
-function val(db: Database, sql: string): string {
+function val(db: Engine, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -17,7 +17,7 @@ function val(db: Database, sql: string): string {
 }
 
 test("introspection over multidim + custom lower bounds", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)", "2"],
     ["SELECT array_upper('[2:4]={7,8,9}'::i32[], 1)", "4"],
@@ -31,7 +31,7 @@ test("introspection over multidim + custom lower bounds", () => {
 });
 
 test("error cases", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT array_append(ARRAY[ARRAY[1,2],ARRAY[3,4]], 9)", "22000"],
     ["SELECT array_prepend(9, ARRAY[ARRAY[1,2],ARRAY[3,4]])", "22000"],

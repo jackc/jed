@@ -4,20 +4,20 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute, loadDatabase, toImage } from "../src/lib.ts";
+import { Engine, execute, loadEngine, toImage } from "../src/lib.ts";
 import { errCode, query } from "./util.ts";
 
-function run(db: Database, sql: string): void {
+function run(db: Engine, sql: string): void {
   execute(db, sql);
 }
 
 test("array column survives a whole-image round-trip", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])");
   run(db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])");
   run(db, "INSERT INTO t VALUES (2, ARRAY[1, NULL, 3], '{}')");
   run(db, "INSERT INTO t VALUES (3, NULL, NULL)");
-  const loaded = loadDatabase(toImage(db, 4096, 1n));
+  const loaded = loadEngine(toImage(db, 4096, 1n));
   assert.deepStrictEqual(query(loaded, "SELECT id, xs, tags FROM t ORDER BY id"), [
     ["1", "{10,20,30}", "{a,b}"],
     ["2", "{1,NULL,3}", "{}"],
@@ -28,7 +28,7 @@ test("array column survives a whole-image round-trip", () => {
 // --- AC1: array-of-composite element types (spec/design/array.md §12) -----------------------------
 
 test("AC1: composite-element array round-trips literal + ARRAY[ROW(…)] constructor; access works", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   // The text-literal construction path (array_in → record_in per element).
@@ -50,13 +50,13 @@ test("AC1: composite-element array round-trips literal + ARRAY[ROW(…)] constru
 });
 
 test("AC1: an addr[] column survives a whole-image round-trip", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   run(db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`);
   run(db, `INSERT INTO t VALUES (2, '{"(Main,)",NULL}')`);
   run(db, "INSERT INTO t VALUES (3, NULL)");
-  const loaded = loadDatabase(toImage(db, 4096, 1n));
+  const loaded = loadEngine(toImage(db, 4096, 1n));
   assert.deepStrictEqual(query(loaded, "SELECT id, items FROM t ORDER BY id"), [
     ["1", `{"(Main,90210)","(Side,5)"}`],
     ["2", `{"(Main,)",NULL}`],
@@ -65,7 +65,7 @@ test("AC1: an addr[] column survives a whole-image round-trip", () => {
 });
 
 test("AC1: composite element NULL-field ordering operators are definite (the total-order fix)", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   // Equal arrays with a NULL composite field: definite, never UNKNOWN.
   assert.deepStrictEqual(
@@ -88,7 +88,7 @@ test("AC1: composite element NULL-field ordering operators are definite (the tot
 });
 
 test("AC1: a composite-element array is still never keyable (0A000)", () => {
-  const db = new Database();
+  const db = new Engine();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   assert.strictEqual(
     errCode(() => run(db, "CREATE TABLE t (items addr[] PRIMARY KEY)")),

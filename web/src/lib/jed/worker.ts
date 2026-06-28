@@ -10,7 +10,7 @@
 // which pull `node:fs` and cannot load in a browser bundle.
 
 import { EngineError } from '$jed/errors.ts';
-import { Database, type Outcome } from '$jed/executor.ts';
+import { Engine, type Outcome } from '$jed/executor.ts';
 import { createOpfs, openOpfs, closeOpfs } from '$jed/opfs.ts';
 import { parseSQL } from '$jed/parser.ts';
 import type { Statement } from '$jed/ast.ts';
@@ -27,15 +27,15 @@ import type {
 } from './protocol.ts';
 
 // Every open database this worker owns, keyed by the caller's id (an in-memory or OPFS-backed
-// Database). One worker, many databases — but at most one OPFS handle per distinct file (the
+// Engine). One worker, many databases — but at most one OPFS handle per distinct file (the
 // exclusive single-writer guarantee, CLAUDE.md §3, enforced by refusing a second open of a name).
-const dbs = new Map<string, Database>();
+const dbs = new Map<string, Engine>();
 // The OPFS file names currently held open (exclusive sync handles), so we can reject a double-open.
 const openOpfsNames = new Set<string>();
 // The OPFS file name backing each open db id (so close() can release its name reservation).
 const opfsNameOf = new Map<string, string>();
 
-function requireDb(id: string): Database {
+function requireDb(id: string): Engine {
   const db = dbs.get(id);
   if (db === undefined) throw new Error(`no database is open for id ${id}`);
   return db;
@@ -44,7 +44,7 @@ function requireDb(id: string): Database {
 // applyHandleSettings applies the per-handle untrusted-query guards (CLAUDE.md §13): a cost ceiling
 // and the work-memory budget. A default maxCost keeps a runaway live example (e.g. a huge
 // generate_series) returning a clean 54P01 instead of hanging the worker.
-function applyHandleSettings(db: Database, spec: OpenSpec): void {
+function applyHandleSettings(db: Engine, spec: OpenSpec): void {
   if (spec.maxCost !== undefined) db.setMaxCost(BigInt(spec.maxCost));
   if (spec.workMem !== undefined) db.setWorkMem(spec.workMem);
 }
@@ -152,7 +152,7 @@ function schemaOf(id: string): SchemaResult {
 // schemaTypes lists the user-defined composite types in the visible snapshot. The committed snapshot
 // is the read-side source; we read it via the public catalog by probing known names is not possible,
 // so we reach the snapshot's sorted composite list directly through the read snapshot.
-function schemaTypes(db: Database): SchemaResult['types'] {
+function schemaTypes(db: Engine): SchemaResult['types'] {
   // committed is the public snapshot; under an open tx the working snapshot is what reads see, but
   // for the sidebar the committed view is sufficient and avoids reaching private state.
   const snap = db.committed;
@@ -238,7 +238,7 @@ function opfsSupported(): boolean {
 async function openDb(spec: OpenSpec): Promise<null> {
   if (dbs.has(spec.id)) throw new Error(`a database is already open for id ${spec.id}`);
   if (spec.mode === 'memory') {
-    const db = new Database();
+    const db = new Engine();
     applyHandleSettings(db, spec);
     dbs.set(spec.id, db);
     return null;
@@ -292,7 +292,7 @@ async function handle(req: Req): Promise<unknown> {
       // In-memory re-seed: drop the db and create a fresh one under the same id (cheaper UX than
       // close+open for a live example's "reset"). OPFS dbs are not reset this way.
       closeDb(req.id);
-      const db = new Database();
+      const db = new Engine();
       dbs.set(req.id, db);
       return null;
     }

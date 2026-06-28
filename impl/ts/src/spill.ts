@@ -23,7 +23,7 @@ import {
 } from "./value.ts";
 
 // SpillSink is the host backing for spilled runs — the Node `fs` implementation is FileSpillSink
-// (spillfile.ts), injected on the Database handle by a durable host that can spill to disk. null for an
+// (spillfile.ts), injected on the Engine handle by a durable host that can spill to disk. null for an
 // in-memory / OPFS database (never spill — spill.md §2). Keeping it an interface here is what frees
 // spill.ts — and thus the whole executor — of any `node:*` import, so the engine runs in a browser
 // bundle (the OPFS host). The run codec below is a per-core internal format, never the §8 on-disk

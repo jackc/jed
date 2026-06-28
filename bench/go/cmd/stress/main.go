@@ -127,7 +127,7 @@ func queryScalar(r *jed.ReadHandle, sql string) (string, error) {
 // --- setup + the final check (shared by both modes) ------------------------------------------
 
 // setup runs the file's setup SQL as one durable write transaction (committed version 1).
-func setup(db *jed.SharedDB, f *stressFile) error {
+func setup(db *jed.Database, f *stressFile) error {
 	w := db.Write()
 	for _, s := range f.Setup.SQL {
 		if _, err := w.Execute(s, nil); err != nil {
@@ -140,7 +140,7 @@ func setup(db *jed.SharedDB, f *stressFile) error {
 
 // checkFinal runs `[final].query` against the final committed snapshot, folds the rows into the
 // answer checksum, and compares them to `[final].expect` (when present — a confluent workload).
-func checkFinal(db *jed.SharedDB, fin *stressFinal) (checksum string, ok bool, err error) {
+func checkFinal(db *jed.Database, fin *stressFinal) (checksum string, ok bool, err error) {
 	if fin == nil {
 		return "", true, nil
 	}
@@ -197,7 +197,7 @@ func finalEqual(got, want [][]int64) bool {
 
 // runWriter runs one writer worker: `iterations` transactions, each taking the gate (db.Write()
 // blocks while another writer holds it — the real contention path), running `op`, and committing.
-func runWriter(db *jed.SharedDB, stmts []string, iterations int) error {
+func runWriter(db *jed.Database, stmts []string, iterations int) error {
 	for i := 0; i < iterations; i++ {
 		w := db.Write()
 		for _, s := range stmts {
@@ -214,7 +214,7 @@ func runWriter(db *jed.SharedDB, stmts []string, iterations int) error {
 }
 
 // runReader runs one reader worker: `iterations` snapshots, each asserting the invariant.
-func runReader(db *jed.SharedDB, query, expect string, iterations int, checks *int64) error {
+func runReader(db *jed.Database, query, expect string, iterations int, checks *int64) error {
 	for i := 0; i < iterations; i++ {
 		r := db.Read()
 		got, err := queryScalar(r, query)
@@ -231,7 +231,7 @@ func runReader(db *jed.SharedDB, query, expect string, iterations int, checks *i
 }
 
 // runThreaded spawns one goroutine per worker, all concurrent, and waits with a deadlock watchdog.
-func runThreaded(db *jed.SharedDB, f *stressFile) (int64, error) {
+func runThreaded(db *jed.Database, f *stressFile) (int64, error) {
 	var (
 		wg     sync.WaitGroup
 		checks int64
@@ -312,7 +312,7 @@ func (w *seqWorker) runnable(gateFree bool) bool {
 // runSequential walks the workers through the seeded interleaver: at each step the splitmix64
 // stream picks one runnable worker (fixed index order) and advances it one op. Deterministic given
 // the seed; reproduces the logical interleavings without ever truly blocking.
-func runSequential(db *jed.SharedDB, f *stressFile) (int64, error) {
+func runSequential(db *jed.Database, f *stressFile) (int64, error) {
 	var workers []*seqWorker
 	for _, wk := range f.Worker {
 		for c := 0; c < wk.Count; c++ {
@@ -348,7 +348,7 @@ func runSequential(db *jed.SharedDB, f *stressFile) (int64, error) {
 }
 
 // stepSeq advances one worker by one atomic op.
-func stepSeq(db *jed.SharedDB, w *seqWorker, idx int, gateHolder *int, checks *int64) error {
+func stepSeq(db *jed.Database, w *seqWorker, idx int, gateHolder *int, checks *int64) error {
 	switch w.kind {
 	case "writer":
 		switch {
@@ -436,7 +436,7 @@ func runFile(path string, forceSequential bool) result {
 	}
 	res.Mode = map[bool]string{true: "sequential", false: "threaded"}[sequential]
 
-	db := jed.NewSharedDB()
+	db := jed.NewDatabase()
 	if err := setup(db, &f); err != nil {
 		res.Status, res.Error = "fail", err.Error()
 		return res

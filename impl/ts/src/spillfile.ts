@@ -1,7 +1,7 @@
 // The Node `fs` spill backing for the external merge sort (spec/design/spill.md §4). This is the ONE
 // node:fs-using piece of the sort path, lifted out of spill.ts behind the SpillSink seam so spill.ts —
 // and thus the whole executor — imports no `node:*` and lands in a browser bundle (the OPFS host).
-// The Node file host (file.ts) injects a FileSpillSink on the Database handle; an in-memory or OPFS
+// The Node file host (file.ts) injects a FileSpillSink on the Engine handle; an in-memory or OPFS
 // database leaves it null and never spills (sorts stay resident — spill.md §2). Node stdlib I/O only
 // (no dependency — CLAUDE.md §14); the run file's bytes are a per-core internal codec, never the §8
 // on-disk format (spill.md §6).

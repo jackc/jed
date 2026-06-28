@@ -56,7 +56,7 @@ pub struct CreateTable {
     pub temp: bool,
     /// Whether `SHARED` preceded `TEMP`/`TEMPORARY` — a DATABASE-WIDE shared temporary table
     /// (spec/design/temp-tables.md §4): one set of rows visible to and writable by every session of
-    /// the open `Database`, but still never written to the file. `shared = true` always has `temp =
+    /// the open `Engine`, but still never written to the file. `shared = true` always has `temp =
     /// true` (the parser rejects `SHARED` not followed by `TEMP`/`TEMPORARY` as 42601). When `false`
     /// (and `temp = true`) the table is session-local (private to the creating session).
     pub shared: bool,

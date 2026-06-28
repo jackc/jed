@@ -4,11 +4,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import { errCode, query } from "./util.ts";
 
 // val runs a one-column, one-row scalar query and returns the rendered value.
-function val(db: Database, sql: string): string {
+function val(db: Engine, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -16,7 +16,7 @@ function val(db: Database, sql: string): string {
 }
 
 test("|| — the three concatenation forms", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT ARRAY[1,2] || ARRAY[3,4]", "{1,2,3,4}"],
     ["SELECT ARRAY[1,2] || 3", "{1,2,3}"],
@@ -30,7 +30,7 @@ test("|| — the three concatenation forms", () => {
 });
 
 test("|| — a bare NULL operand resolves to array_cat (identity)", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT ARRAY[1,2] || NULL", "{1,2}"],
     ["SELECT NULL || ARRAY[1,2]", "{1,2}"],
@@ -42,7 +42,7 @@ test("|| — a bare NULL operand resolves to array_cat (identity)", () => {
 });
 
 test("|| — errors", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT ARRAY[1,2] || ARRAY['a','b']", "42883"],
     ["SELECT 5 || ARRAY['a','b']", "42883"],
@@ -59,7 +59,7 @@ test("|| — errors", () => {
 });
 
 test("array_remove", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT array_remove(ARRAY[1,2,3,2], 2)", "{1,3}"],
     ["SELECT array_remove(NULL::i32[], 2)", "NULL"],
@@ -78,7 +78,7 @@ test("array_remove", () => {
 });
 
 test("array_replace", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT array_replace(ARRAY[1,2,3,2], 2, 9)", "{1,9,3,9}"],
     ["SELECT array_replace(NULL::i32[], 2, 9)", "NULL"],
@@ -92,7 +92,7 @@ test("array_replace", () => {
 });
 
 test("array_position", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT array_position(ARRAY[10,20,30,20], 20)", "2"],
     ["SELECT array_position(ARRAY[10,20], 99)", "NULL"],
@@ -116,7 +116,7 @@ test("array_position", () => {
 });
 
 test("array_positions", () => {
-  const db = new Database();
+  const db = new Engine();
   const cases: [string, string][] = [
     ["SELECT array_positions(ARRAY[10,20,30,20], 20)", "{2,4}"],
     ["SELECT array_positions(ARRAY[10,20], 99)", "{}"],

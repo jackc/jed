@@ -8,30 +8,30 @@
 //! `SELECT distinct` lookahead consequence — → 42703; an untyped $1 → 42P18).
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute, execute_params};
+use jed::{Engine, Outcome, execute, execute_params};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     execute(db, sql)
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
-fn err_code(db: &mut Database, sql: &str) -> String {
+fn err_code(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
@@ -43,7 +43,7 @@ fn err_code(db: &mut Database, sql: &str) -> String {
 
 #[test]
 fn literal_select_returns_one_row_costing_one_row_produced() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let out = execute(&mut db, "SELECT 1").unwrap();
     match &out {
         Outcome::Query {
@@ -60,7 +60,7 @@ fn literal_select_returns_one_row_costing_one_row_produced() {
 
 #[test]
 fn expression_select_charges_its_operator_evals() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(query(&mut db, "SELECT 1 + 2"), vec![vec![Value::Int(3)]]);
     // 1 operator_eval (the `+` node) + 1 row_produced.
     assert_eq!(cost(&mut db, "SELECT 1 + 2"), 2);
@@ -68,7 +68,7 @@ fn expression_select_charges_its_operator_evals() {
 
 #[test]
 fn where_filters_the_virtual_row() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         query(&mut db, "SELECT 1 WHERE false"),
         Vec::<Vec<Value>>::new()
@@ -84,7 +84,7 @@ fn where_filters_the_virtual_row() {
 
 #[test]
 fn aggregates_fold_the_single_group() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // The virtual row is the one input row of the whole-table group (aggregates.md §4).
     assert_eq!(query(&mut db, "SELECT count(*)"), vec![vec![Value::Int(1)]]);
     assert_eq!(cost(&mut db, "SELECT count(*)"), 2); // 1 aggregate_accumulate + 1 row_produced
@@ -104,7 +104,7 @@ fn aggregates_fold_the_single_group() {
 
 #[test]
 fn distinct_and_limit_apply_to_the_single_row() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         query(&mut db, "SELECT DISTINCT 1"),
         vec![vec![Value::Int(1)]]
@@ -120,7 +120,7 @@ fn distinct_and_limit_apply_to_the_single_row() {
 
 #[test]
 fn set_operation_operands() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let mut got: Vec<i64> = query(&mut db, "SELECT 1 UNION SELECT 2")
         .into_iter()
         .map(|r| match r[0] {
@@ -174,7 +174,7 @@ fn insert_select_source() {
 
 #[test]
 fn star_with_no_tables_is_42601_with_pg_message() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let err = execute(&mut db, "SELECT *").unwrap_err();
     assert_eq!(err.code(), "42601");
     assert_eq!(
@@ -185,7 +185,7 @@ fn star_with_no_tables_is_42601_with_pg_message() {
 
 #[test]
 fn bare_columns_resolve_nothing() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(err_code(&mut db, "SELECT nope"), "42703");
     // The DISTINCT two-token lookahead is unchanged: at end of input the word is a column
     // reference, not the modifier (grammar.md §34 — previously died at the FROM expect).
@@ -198,7 +198,7 @@ fn bare_columns_resolve_nothing() {
 
 #[test]
 fn untyped_param_is_42p18_and_a_sibling_operand_types_it() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let err = execute_params(&mut db, "SELECT $1", &[Value::Int(7)]).unwrap_err();
     assert_eq!(err.code(), "42P18");
     // The sibling-operand rule (grammar.md §5) works without a FROM.

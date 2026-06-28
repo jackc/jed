@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func setupUpdate(t *testing.T) *Database {
+func setupUpdate(t *testing.T) *Engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i16, b i16)",
@@ -22,7 +22,7 @@ func setupUpdate(t *testing.T) *Database {
 }
 
 func TestUpdateMissingTable(t *testing.T) {
-	wantErr(t, NewDatabase(), "UPDATE nope SET a = 1", "42P01")
+	wantErr(t, NewEngine(), "UPDATE nope SET a = 1", "42P01")
 }
 
 func TestUpdateUnknownColumn(t *testing.T) {
@@ -31,7 +31,7 @@ func TestUpdateUnknownColumn(t *testing.T) {
 
 // idsABC is the (id, a, b) rows of t in storage-key order, "id/a/b" strings, for end-state
 // assertions.
-func idsABC(db *Database) []string {
+func idsABC(db *Engine) []string {
 	rows := db.RowsInKeyOrder("t")
 	out := make([]string, len(rows))
 	for i, r := range rows {

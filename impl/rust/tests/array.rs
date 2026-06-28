@@ -4,13 +4,13 @@
 //! scalar elements; multidim values, arrays-in-keys, slices, and the array function surface are
 //! deferred (§12).
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn run(db: &mut Database, sql: &str) {
+fn run(db: &mut Engine, sql: &str) {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
@@ -18,7 +18,7 @@ fn err(db: &mut Database, sql: &str) -> String {
         .to_string()
 }
 
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
+fn query(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -33,7 +33,7 @@ fn query(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
 /// array). The on-disk array body is version-independent (spec/design/array.md §4).
 #[test]
 fn array_image_roundtrip() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])",
@@ -45,7 +45,7 @@ fn array_image_roundtrip() {
     run(&mut db, "INSERT INTO t VALUES (2, ARRAY[1, NULL, 3], '{}')");
     run(&mut db, "INSERT INTO t VALUES (3, NULL, NULL)");
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image).expect("load image");
+    let mut loaded = Engine::from_image(&image).expect("load image");
     assert_eq!(
         query(&mut loaded, "SELECT id, xs, tags FROM t ORDER BY id"),
         vec![
@@ -69,7 +69,7 @@ fn array_image_roundtrip() {
 /// composite, field access reads into it, a slice yields `addr[]`.
 #[test]
 fn array_of_composite_roundtrip_and_access() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     // The text-literal construction path.
@@ -111,7 +111,7 @@ fn array_of_composite_roundtrip_and_access() {
 /// codec — composite element bodies inside the array body; complements the cross-core golden).
 #[test]
 fn array_of_composite_image_roundtrip() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     run(
@@ -121,7 +121,7 @@ fn array_of_composite_image_roundtrip() {
     run(&mut db, "INSERT INTO t VALUES (2, '{\"(Main,)\",NULL}')");
     run(&mut db, "INSERT INTO t VALUES (3, NULL)");
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image).expect("load image");
+    let mut loaded = Engine::from_image(&image).expect("load image");
     assert_eq!(
         query(&mut loaded, "SELECT id, items FROM t ORDER BY id"),
         vec![
@@ -139,7 +139,7 @@ fn array_of_composite_image_roundtrip() {
 /// `<` FALSE; a NULL field sorts AFTER a present field (spec/design/array.md §5, oracle-pinned).
 #[test]
 fn array_of_composite_null_field_ordering_operators() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     // Equal arrays with a NULL composite field: definite, never UNKNOWN.
     assert_eq!(
@@ -166,7 +166,7 @@ fn array_of_composite_null_field_ordering_operators() {
 /// §8) — the new element type does not relax the key gate.
 #[test]
 fn array_of_composite_primary_key_is_0a000() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     assert_eq!(
         err(&mut db, "CREATE TABLE t (items addr[] PRIMARY KEY)"),

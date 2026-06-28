@@ -7,12 +7,12 @@
 //! re-scan), which return the SAME rows because v == id.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
 /// `o` is a handful of outer rows; `inr` is `n` rows (id i32 PRIMARY KEY, v i32; v == id), wide
 /// enough to span several leaves. The outer k-values are all present as inner ids.
-fn tables(n: i64) -> Database {
-    let mut db = Database::new();
+fn tables(n: i64) -> Engine {
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)").unwrap();
     execute(&mut db, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(
@@ -31,14 +31,14 @@ fn tables(n: i64) -> Database {
     db
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
-fn ids(db: &mut Database, sql: &str) -> Vec<i64> {
+fn ids(db: &mut Engine, sql: &str) -> Vec<i64> {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()

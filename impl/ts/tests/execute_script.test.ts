@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, execute, intValue } from "../src/lib.ts";
+import { Engine, EngineError, execute, intValue } from "../src/lib.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -18,14 +18,14 @@ function code(fn: () => unknown): string {
   throw new Error("expected an error, got none");
 }
 
-function countRows(db: Database): unknown {
+function countRows(db: Engine): unknown {
   const out = execute(db, "SELECT count(*) FROM t");
   if (out.kind !== "query") throw new Error("expected a query result");
   return out.rows;
 }
 
 test("script summary counts and commits atomically when Idle", () => {
-  const db = new Database();
+  const db = new Engine();
   const summary = db.executeScript(
     `CREATE TABLE t (id i32 PRIMARY KEY, v i32);
      INSERT INTO t VALUES (1, 10);
@@ -41,7 +41,7 @@ test("script summary counts and commits atomically when Idle", () => {
 });
 
 test("script is all-or-nothing on error", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   assert.strictEqual(
     code(() =>
@@ -56,7 +56,7 @@ test("script is all-or-nothing on error", () => {
 });
 
 test("script SELECT rows are discarded but the statement is counted", () => {
-  const db = new Database();
+  const db = new Engine();
   const summary = db.executeScript(
     `CREATE TABLE t (id i32 PRIMARY KEY);
      INSERT INTO t VALUES (1), (2);
@@ -68,14 +68,14 @@ test("script SELECT rows are discarded but the statement is counted", () => {
 });
 
 test("empty script is a no-op success", () => {
-  const db = new Database();
+  const db = new Engine();
   const summary = db.executeScript("  -- just a comment\n /* and a block */ ;;; ");
   assert.deepStrictEqual(summary, { statementsRun: 0, rowsAffectedTotal: 0, cost: 0n });
   assert.strictEqual(db.status(), "Idle");
 });
 
 test("in-script transaction control is 0A000 and rolls the run back", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   for (const script of [
     "INSERT INTO t VALUES (1); COMMIT; INSERT INTO t VALUES (2)",
@@ -93,7 +93,7 @@ test("in-script transaction control is 0A000 and rolls the run back", () => {
 });
 
 test("script joins an open transaction without committing", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "BEGIN");
   const summary = db.executeScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
@@ -105,7 +105,7 @@ test("script joins an open transaction without committing", () => {
 });
 
 test("script error inside an open transaction leaves it Failed for the caller", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "BEGIN");
   assert.strictEqual(
@@ -118,7 +118,7 @@ test("script error inside an open transaction leaves it Failed for the caller", 
 });
 
 test("additional session runs a script via the swap", () => {
-  const db = new Database();
+  const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   const s = db.newSession();
   const summary = s.executeScript(db, "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");

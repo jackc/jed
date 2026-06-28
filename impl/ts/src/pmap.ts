@@ -458,7 +458,7 @@ export class PMap {
   }
 }
 
-// pmapFromLoaded reconstructs a map from a loaded root (format.ts loadDatabase).
+// pmapFromLoaded reconstructs a map from a loaded root (format.ts loadEngine).
 export function pmapFromLoaded(root: PNode | null, length: number): PMap {
   return new PMap(root, length);
 }

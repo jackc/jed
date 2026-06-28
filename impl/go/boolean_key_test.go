@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func boolKeyErrCode(t *testing.T, db *Database, sql string) string {
+func boolKeyErrCode(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	_, err := Execute(db, sql)
 	if err == nil {

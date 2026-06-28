@@ -8,10 +8,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Database, execute } from "../src/lib.ts";
+import { type Engine, execute } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
-function fkNames(db: Database, table: string): string[] {
+function fkNames(db: Engine, table: string): string[] {
   return db.table(table)!.fks.map((f) => f.name);
 }
 

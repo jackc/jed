@@ -8,13 +8,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/lib.ts";
 import type { Value } from "../src/value.ts";
 
 // `o` is five outer rows whose k-values all exist as inner ids; `inr` is n rows (id i32 PRIMARY KEY,
 // v i32; v == id) wide enough to span several leaves.
-function correlatedTables(n: number): Database {
-  const db = new Database();
+function correlatedTables(n: number): Engine {
+  const db = new Engine();
   execute(db, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)");
   execute(db, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)");
   execute(db, "INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)");
@@ -24,7 +24,7 @@ function correlatedTables(n: number): Database {
   return db;
 }
 
-function cost(db: Database, sql: string): bigint {
+function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
 }
 
@@ -33,7 +33,7 @@ function intOf(v: Value): number {
   return Number(v.int);
 }
 
-function ids(db: Database, sql: string): number[] {
+function ids(db: Engine, sql: string): number[] {
   const o = execute(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.map((r) => intOf(r[0]!));

@@ -11,7 +11,7 @@ package jed
 
 import "testing"
 
-func subqueryAB(t *testing.T) *Database {
+func subqueryAB(t *testing.T) *Engine {
 	return dbWith(
 		t,
 		"CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
@@ -23,7 +23,7 @@ func subqueryAB(t *testing.T) *Database {
 	)
 }
 
-func errCode(t *testing.T, db *Database, sql string) string {
+func errCode(t *testing.T, db *Engine, sql string) string {
 	t.Helper()
 	_, err := Execute(db, sql)
 	if err == nil {

@@ -6,12 +6,12 @@
 //! bounded) vs `WHERE a.k = c` (not the PK, full scan), which return the SAME row because k == id.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
 /// `a` is `n` rows (id i32 PRIMARY KEY, k i32; k == id), wide enough to span several leaves; `b`
 /// is three small rows whose k-values exist as a's k-values, so the join matches.
-fn tables(n: i64) -> Database {
-    let mut db = Database::new();
+fn tables(n: i64) -> Engine {
+    let mut db = Engine::new();
     execute(&mut db, "CREATE TABLE a (id i32 PRIMARY KEY, k i32)").unwrap();
     execute(&mut db, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)").unwrap();
     let mut sql = String::from("INSERT INTO a VALUES ");
@@ -26,14 +26,14 @@ fn tables(n: i64) -> Database {
     db
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
-fn ids(db: &mut Database, sql: &str) -> Vec<i64> {
+fn ids(db: &mut Engine, sql: &str) -> Vec<i64> {
     match execute(db, sql).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()

@@ -3,9 +3,9 @@
 //! `array_lower`/`array_upper`/`cardinality`/`array_dims`) and builder (`array_append`/
 //! `array_prepend`/`array_cat`) functions. Every expected value is pinned against PostgreSQL 18.
 
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn err(db: &mut Database, sql: &str) -> String {
+fn err(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
@@ -14,7 +14,7 @@ fn err(db: &mut Database, sql: &str) -> String {
 }
 
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL" via `render`).
-fn val(db: &mut Database, sql: &str) -> String {
+fn val(db: &mut Engine, sql: &str) -> String {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
@@ -27,7 +27,7 @@ fn val(db: &mut Database, sql: &str) -> String {
 
 #[test]
 fn introspection_custom_lower_bound_and_multidim() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     assert_eq!(
         val(&mut db, "SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)"),
         "2"
@@ -59,7 +59,7 @@ fn introspection_custom_lower_bound_and_multidim() {
 
 #[test]
 fn error_cases() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // array_append/prepend reject a multidimensional array (22000).
     assert_eq!(
         err(
@@ -99,7 +99,7 @@ fn error_cases() {
 
 #[test]
 fn result_types_polymorphic() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // text[] flows through the builders; introspection returns i32/text regardless of element.
     assert_eq!(
         val(&mut db, "SELECT array_append(ARRAY['a','b'], 'c')"),

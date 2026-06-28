@@ -4,10 +4,10 @@
 //! corpus (spec/conformance/suites/expr/) with finer-grained per-feature assertions.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Engine, Outcome, execute};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
+fn db_with(stmts: &[&str]) -> Engine {
+    let mut db = Engine::new();
     for s in stmts {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
@@ -15,7 +15,7 @@ fn db_with(stmts: &[&str]) -> Database {
 }
 
 /// Run a query and return its rows.
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
@@ -23,7 +23,7 @@ fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 /// Run a single-row, single-column query and return the lone value.
-fn scalar(db: &mut Database, sql: &str) -> Value {
+fn scalar(db: &mut Engine, sql: &str) -> Value {
     let rows = query(db, sql);
     assert_eq!(rows.len(), 1, "{sql:?}: expected one row");
     assert_eq!(rows[0].len(), 1, "{sql:?}: expected one column");

@@ -10,7 +10,7 @@
 // writer, and a live-reader registry whose minimum pinned version is the reclamation watermark.
 //
 // Shape (parallel to the Rust/Go cores, so the design stays one shared design):
-//   - SharedDb is the handle; read() and write() mint independent per-caller handles.
+//   - Database is the handle; read() and write() mint independent per-caller handles.
 //   - SharedCore holds the published committed snapshot, the single-writer flag (a second write()
 //     while one is open throws 25001 — JS cannot block the one thread, so the faithful analog of
 //     "one writer at a time" is to reject, not wait), and the live-reader registry (§8).
@@ -19,7 +19,7 @@
 //     it is 25006. close() deregisters (no destructor in JS — the caller calls it), advancing the
 //     watermark.
 //   - WriteHandle holds the writer flag, captures the committed snapshot as a private working set
-//     (an open READ WRITE block over a private Database), and on commit publishes the working
+//     (an open READ WRITE block over a private Engine), and on commit publishes the working
 //     snapshot into the cell at the next version. rollback / leaving it un-ended discards it.
 //
 // In-memory this slice (the isolation mechanism + watermark are the deliverable; durability is the
@@ -27,7 +27,7 @@
 // (pmap.ts): a pinned snapshot is immutable and shares structure with later versions, so pinning is
 // a reference copy, not a deep clone.
 
-import { Database, Snapshot, stmtIsWrite, type Outcome } from "./executor.ts";
+import { Engine, Snapshot, stmtIsWrite, type Outcome } from "./executor.ts";
 import { type Rows, rowsFromOutcome } from "./api.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
@@ -36,14 +36,14 @@ import type { Value } from "./value.ts";
 // snapshot) and `sharedTemp` (the database-wide shared-temp snapshot, temp-tables.md §5) — no file
 // backing. A read handle keeps one with no open transaction (reads hit committed = the pinned
 // snapshot); a write handle keeps one with an open READ WRITE block and publishes its working set.
-function databaseFromSnapshot(snap: Snapshot, sharedTemp: Snapshot): Database {
-  const db = new Database();
+function databaseFromSnapshot(snap: Snapshot, sharedTemp: Snapshot): Engine {
+  const db = new Engine();
   db.committed = snap;
   db.sharedTempCommitted = sharedTemp;
   return db;
 }
 
-// SharedCore is the state shared by every handle minted from one SharedDb: the published committed
+// SharedCore is the state shared by every handle minted from one Database: the published committed
 // roots (the file snapshot AND the database-wide shared-temp snapshot, temp-tables.md §5), the
 // single-writer flag, and the live-reader registry (transactions.md §8). Not exported — only the
 // handles touch it. (TS is single-threaded, so a handle reads both roots in one synchronous step:
@@ -84,9 +84,9 @@ class SharedCore {
   }
 }
 
-// SharedDb is a database handle offering snapshot-isolated readers and a single writer
+// Database is a database handle offering snapshot-isolated readers and a single writer
 // (transactions.md §10). read() and write() mint independent per-caller handles over one core.
-export class SharedDb {
+export class Database {
   private core: SharedCore;
 
   private constructor(core: SharedCore) {
@@ -94,8 +94,8 @@ export class SharedDb {
   }
 
   // newInMemory builds a fresh, empty in-memory shared database (committed version 0).
-  static newInMemory(): SharedDb {
-    return new SharedDb(new SharedCore(new Snapshot(0n)));
+  static newInMemory(): Database {
+    return new Database(new SharedCore(new Snapshot(0n)));
   }
 
   // version is the committed version currently published (the monotonic commit counter,
@@ -137,7 +137,7 @@ export class SharedDb {
 // ReadHandle is a read handle over a pinned, consistent snapshot (transactions.md §10).
 export class ReadHandle {
   private core: SharedCore;
-  private db: Database; // committed = the pinned (immutable) snapshot, no open transaction
+  private db: Engine; // committed = the pinned (immutable) snapshot, no open transaction
   private pinnedVersion: bigint;
   private closed = false;
 
@@ -191,7 +191,7 @@ export class ReadHandle {
 // statements accumulate in a private working set and become visible only at commit.
 export class WriteHandle {
   private core: SharedCore;
-  private db: Database; // an open READ WRITE block; its working set is the staging buffer (§3)
+  private db: Engine; // an open READ WRITE block; its working set is the staging buffer (§3)
   private baseVersion: bigint; // committed version at write(); the published version is baseVersion+1
   private done = false;
 

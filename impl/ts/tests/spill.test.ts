@@ -11,10 +11,10 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { create, Database, execute } from "../src/lib.ts";
+import { create, Engine, execute } from "../src/lib.ts";
 import type { Value } from "../src/lib.ts";
 
-function runQuery(db: Database, sql: string): { rows: Value[][]; cost: bigint } {
+function runQuery(db: Engine, sql: string): { rows: Value[][]; cost: bigint } {
   const out = execute(db, sql);
   if (out.kind !== "query") throw new Error(`not a query: ${sql}`);
   return { rows: out.rows, cost: out.cost };
@@ -23,7 +23,7 @@ function runQuery(db: Database, sql: string): { rows: Value[][]; cost: bigint } 
 // seedSpill populates t(id i32 PK, k i32, s text) with n rows whose k is deliberately unsorted
 // and has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL
 // ordering), and a variable-length s (so a spilled run carries variable-width values).
-function seedSpill(db: Database, n: number): void {
+function seedSpill(db: Engine, n: number): void {
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)");
   for (let id = 0; id < n; id++) {
     const k = id % 7 === 0 ? "NULL" : String((id * 48271) % 100);
@@ -81,7 +81,7 @@ test("spilling sort matches the in-memory rows and cost", () => {
   try {
     // The source of truth: the same data + queries against a pure in-memory database, which never
     // spills (spill.md §2).
-    const mem = new Database();
+    const mem = new Engine();
     seedSpill(mem, 200);
 
     // A file-backed database with a tiny workMem so every shape spills many runs and k-way-merges.

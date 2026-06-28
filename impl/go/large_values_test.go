@@ -27,9 +27,9 @@ func countPageType(image []byte, ps int, ty byte) int {
 
 // bigValueDB builds an in-memory table with a ~1250-byte text value (forces a multi-page overflow
 // chain at page 256: RECORD_MAX = (256-16-12)/2 = 114, cap = 240) plus a small inline value.
-func bigValueDB(t *testing.T) (*Database, string) {
+func bigValueDB(t *testing.T) (*Engine, string) {
 	t.Helper()
-	db := NewDatabase()
+	db := NewEngine()
 	big := fillerText(1250) // incompressible, so Slice B keeps it external-plain
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s')", big))
@@ -46,7 +46,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 	if n := countPageType(image, 256, pageOverflow); n < 2 {
 		t.Fatalf("a large value should span several overflow pages, got %d", n)
 	}
-	loaded, err := LoadDatabase(image)
+	loaded, err := LoadEngine(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 }
 
 func TestSmallValuesNeverSpill(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 	image, err := db.ToImage(256, 1)
@@ -83,7 +83,7 @@ func TestLoadReclaimsOnlyDeadOverflowPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadDatabase(image)
+	loaded, err := LoadEngine(image)
 	if err != nil {
 		t.Fatal(err)
 	}

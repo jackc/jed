@@ -21,9 +21,9 @@
 //     uses node:fs and has no OPFS backing yet, so it is disabled (sorts stay resident, like an
 //     in-memory database — spill.md §2); spilling via OPFS is a later enhancement.
 
-import { Database, DEFAULT_PAGE_SIZE } from "./executor.ts";
+import { Engine, DEFAULT_PAGE_SIZE } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import { loadDatabasePaged, toImage } from "./format.ts";
+import { loadEnginePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
@@ -39,11 +39,8 @@ export type OpenOptions = { cacheBytes?: number; readOnly?: boolean; workMem?: n
 // from-scratch image in place + flush, then adopts the handle as the open pager so later commits write
 // through the seam incrementally (api.md §3, hosts.md §5). toImage validates the page size (0A000 if out
 // of range / not a power of two) BEFORE any write, so an invalid page size leaves the handle untouched.
-export function createOpfsWithHandle(
-  handle: SyncAccessHandle,
-  opts: DatabaseOptions = {},
-): Database {
-  const db = new Database();
+export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOptions = {}): Engine {
+  const db = new Engine();
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
@@ -68,11 +65,11 @@ export function createOpfsWithHandle(
 // the interior skeleton resident and faults leaves through the bounded pool, bounded by cacheBytes
 // (pager.md §1, P6.4b). A malformed file is XX001, a read failure 58030 (api.md §2.1). db.path stays
 // null (spill disabled for OPFS, see header).
-export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions = {}): Database {
+export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions = {}): Engine {
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   const readOnly = opts.readOnly ?? false;
   const pager = Pager.fromStore(new OpfsBlockStore(handle));
-  const db = loadDatabasePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
+  const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.readOnly = readOnly;
   if (opts.workMem !== undefined) db.session.workMem = opts.workMem;
@@ -82,7 +79,7 @@ export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions =
 // closeOpfs releases the handle (spec/design/api.md §2.3): roll back any open explicit transaction (its
 // in-progress work is discarded), then release the OPFS sync access handle (close()). Under autocommit
 // every prior statement is already durable, so close does NOT drop committed work. Idempotent.
-export function closeOpfs(db: Database): void {
+export function closeOpfs(db: Engine): void {
   db.rollbackTx();
   if (db.paging !== null) {
     db.paging.close(); // releases the exclusive sync access handle
@@ -132,7 +129,7 @@ function opfsStorage(): OpfsStorageManager {
 // root. 58P02 duplicate_file if it already exists — create never clobbers (api.md §2.1). Browser/worker
 // only. On a mid-create failure (e.g. an invalid page size from createOpfsWithHandle) the half-created
 // file is rolled back: the handle is released and the entry removed (write-in-place create — hosts.md §5).
-export async function createOpfs(name: string, opts: DatabaseOptions = {}): Promise<Database> {
+export async function createOpfs(name: string, opts: DatabaseOptions = {}): Promise<Engine> {
   const dir = await opfsStorage().getDirectory();
   // create must not clobber: getFileHandle WITHOUT { create } throwing means the file is absent.
   let exists = true;
@@ -166,7 +163,7 @@ export async function createOpfs(name: string, opts: DatabaseOptions = {}): Prom
 // openOpfs opens an existing OPFS-backed database file named `name`. 58P01 undefined_file if absent —
 // open never creates (api.md §2.1). Browser/worker only. A single exclusive sync access handle is held
 // for the database's life (hosts.md §5).
-export async function openOpfs(name: string, opts: OpenOptions = {}): Promise<Database> {
+export async function openOpfs(name: string, opts: OpenOptions = {}): Promise<Engine> {
   const dir = await opfsStorage().getDirectory();
   let fileHandle: OpfsFileHandle;
   try {

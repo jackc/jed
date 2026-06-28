@@ -15,7 +15,7 @@ func main() {
 }
 
 type engine struct {
-	db      *jed.Database
+	db      *jed.Engine
 	dataDir string
 	dataset string
 	scratch string // temp dir holding the scratch file ("" otherwise)

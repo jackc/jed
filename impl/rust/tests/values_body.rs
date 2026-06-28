@@ -8,30 +8,30 @@
 //! cost, and the error / narrowing codes (42601 / 42804 / 42703 / 42803 / 42P18).
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute, execute_params};
+use jed::{Engine, Outcome, execute, execute_params};
 
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn names(db: &mut Database, sql: &str) -> Vec<String> {
+fn names(db: &mut Engine, sql: &str) -> Vec<String> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { column_names, .. } => column_names,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn types(db: &mut Database, sql: &str) -> Vec<String> {
+fn types(db: &mut Engine, sql: &str) -> Vec<String> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { column_types, .. } => column_types,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn ints(db: &mut Database, sql: &str) -> Vec<i64> {
+fn ints(db: &mut Engine, sql: &str) -> Vec<i64> {
     query(db, sql)
         .into_iter()
         .map(|r| match r[0] {
@@ -41,7 +41,7 @@ fn ints(db: &mut Database, sql: &str) -> Vec<i64> {
         .collect()
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     execute(db, sql)
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
@@ -51,7 +51,7 @@ fn cost(db: &mut Database, sql: &str) -> i64 {
 
 #[test]
 fn single_column_rows_default_name() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // Default column name is column1 (PostgreSQL), one row per VALUES row, in body order.
     assert_eq!(
         ints(
@@ -68,7 +68,7 @@ fn single_column_rows_default_name() {
 
 #[test]
 fn multi_column_and_rename_list() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // Two columns -> column1, column2; the rename list renames left-to-right.
     assert_eq!(
         names(&mut db, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v"),
@@ -97,7 +97,7 @@ fn multi_column_and_rename_list() {
 
 #[test]
 fn column_type_unification() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // int + int -> int (widths widen): all bare integer literals are i64 in jed.
     assert_eq!(
         types(&mut db, "SELECT column1 FROM (VALUES (1), (2)) AS v"),
@@ -135,7 +135,7 @@ fn column_type_unification() {
 
 #[test]
 fn params_typed_by_sibling_rows() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // A $1 in a column with a concrete sibling literal is typed by the unified column type.
     match execute_params(
         &mut db,
@@ -155,7 +155,7 @@ fn params_typed_by_sibling_rows() {
 
 #[test]
 fn intrinsic_cost() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     // The VALUES body charges row_produced per row (3); the outer SELECT charges row_produced per
     // output row (3) — its projection is a bare column (no operator_eval). Total 6. Deterministic,
     // cross-core identical (the jed contract; cost.md §3, the inline derived-table path).
@@ -174,7 +174,7 @@ fn intrinsic_cost() {
 
 #[test]
 fn errors() {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let cases: &[(&str, &str)] = &[
         // Rows of differing arity -> 42601.
         ("SELECT * FROM (VALUES (1), (2, 3)) AS v", "42601"),

@@ -3,7 +3,7 @@
 // — no build step. i64 is exact (uniform bigint); the on-disk format is byte-identical
 // to the Rust and Go cores (CLAUDE.md §8).
 
-import type { Database } from "./executor.ts";
+import type { Engine } from "./executor.ts";
 import type { Outcome } from "./executor.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Value } from "./value.ts";
@@ -42,8 +42,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // session.allow_temp_ddl; storage budget resource.temp_budget.
   "ddl.temp_table",
   // CREATE SHARED [TEMP|TEMPORARY] TABLE — database-wide shared temporary tables (visible to every
-  // session of the open Database, sharing one set of rows), still making zero file writes (held in
-  // the Database-level shared-temp snapshot; the two-root commit, temp-tables.md §4/§5). Same feature
+  // session of the open Engine, sharing one set of rows), still making zero file writes (held in
+  // the Engine-level shared-temp snapshot; the two-root commit, temp-tables.md §4/§5). Same feature
   // set + 0A000 narrowings as ddl.temp_table; cross-session visibility tested via the concurrency
   // schedule format. Gate session.allow_shared_temp_ddl; budget resource.shared_temp_budget.
   "ddl.shared_temp_table",
@@ -677,8 +677,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "txn.explicit",
   "txn.read_only",
   "txn.failed_state",
-  // Shared-handle concurrency — the SharedDb schedule format (spec/design/concurrency-testing.md
-  // §4). Declared because this core implements SharedDb/ReadHandle/WriteHandle + the watermark
+  // Shared-handle concurrency — the Database schedule format (spec/design/concurrency-testing.md
+  // §4). Declared because this core implements Database/ReadHandle/WriteHandle + the watermark
   // (shared.ts); a core lacking them skips suites/concurrency files via the capability gate. This
   // core runs the schedule stepped-sequentially only (JS has no shared-memory threads for live
   // objects), which still defines + verifies the canonical, timing-free result (§4.3).
@@ -694,7 +694,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The conformance harness can run a file against a PRE-BUILT database image named by a file-level
   // `# fixture:` directive (instead of a fresh DB), so the corpus can exercise on-disk state SQL
   // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
-  // §12/§14, spec/design/conformance.md). Reconstructed in memory via loadDatabase.
+  // §12/§14, spec/design/conformance.md). Reconstructed in memory via loadEngine.
   "harness.fixture_open",
   // The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
   // (db.upgradeCollations) on the running DB — clears a version-skew so a corpus test can drive
@@ -703,28 +703,28 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
 ];
 
 // execute parses and executes one SQL statement against db (no bind parameters).
-export function execute(db: Database, sql: string): Outcome {
+export function execute(db: Engine, sql: string): Outcome {
   return db.executeStmt(db.parse(sql));
 }
 
 // executeParams parses and executes one SQL statement against db, binding params to its $N
 // placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type cannot
 // be inferred is 42P18; a bound value out of range / of the wrong family fails like a literal.
-export function executeParams(db: Database, sql: string, params: Value[]): Outcome {
+export function executeParams(db: Engine, sql: string, params: Value[]): Outcome {
   return db.executeStmtParams(db.parse(sql), params);
 }
 
 // executeScript runs a multi-statement SQL script against db's default session (spec/design/session.md
 // §4.2): split it, run each statement in order, discard the result rows, and return the O(1)
 // ScriptSummary. All-or-nothing when the session is Idle (the migration/import path).
-export function executeScript(db: Database, sql: string): ScriptSummary {
+export function executeScript(db: Engine, sql: string): ScriptSummary {
   return db.executeScript(sql);
 }
 
 // --- public surface (re-exports) ---
 export { loadUnicodeData } from "./collation.ts";
 export {
-  Database,
+  Engine,
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_PAGE_SIZE,
   Session,
@@ -745,7 +745,7 @@ export { EngineError, sqlStateCode } from "./errors.ts";
 export type { SqlState } from "./errors.ts";
 export { intValue, nullValue, render } from "./value.ts";
 export type { ThreeValued, Value } from "./value.ts";
-export { loadDatabase, toImage } from "./format.ts";
+export { loadEngine, toImage } from "./format.ts";
 export type { Statement } from "./ast.ts";
 export {
   PreparedStatement,
@@ -767,6 +767,6 @@ export {
   residentLeaves,
 } from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
-export { ReadHandle, SharedDb, WriteHandle } from "./shared.ts";
+export { ReadHandle, Database, WriteHandle } from "./shared.ts";
 export { advancingClock, fixedClock, seededRandomSource } from "./seam.ts";
 export type { ClockFunc, RandomFill } from "./seam.ts";

@@ -6,42 +6,42 @@
 //! impl/ts/tests/returning.test.ts.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute, execute_params};
+use jed::{Engine, Outcome, execute, execute_params};
 
-fn run(db: &mut Database, sql: &str) -> Outcome {
+fn run(db: &mut Engine, sql: &str) -> Outcome {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
-fn cost(db: &mut Database, sql: &str) -> i64 {
+fn cost(db: &mut Engine, sql: &str) -> i64 {
     match run(db, sql) {
         Outcome::Statement { cost, .. } => cost,
         Outcome::Query { cost, .. } => cost,
     }
 }
 
-fn rows(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
     match run(db, sql) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn names(db: &mut Database, sql: &str) -> Vec<String> {
+fn names(db: &mut Engine, sql: &str) -> Vec<String> {
     match run(db, sql) {
         Outcome::Query { column_names, .. } => column_names,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn err_code(db: &mut Database, sql: &str) -> String {
+fn err_code(db: &mut Engine, sql: &str) -> String {
     execute(db, sql)
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
 }
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> Engine {
+    let mut db = Engine::new();
     for s in [
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
         "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
@@ -348,7 +348,7 @@ fn returning_grows_the_touched_set() {
     // ceil(100000/8180) = 13 slabs.
     let big = format!("INSERT INTO big VALUES (1, 0, '{}')", "x".repeat(100_000));
     let fresh = || {
-        let mut db = Database::new();
+        let mut db = Engine::new();
         run(
             &mut db,
             "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",
@@ -481,7 +481,7 @@ fn old_new_naming_and_star() {
 fn old_new_shadowed_by_table_name() {
     // A target table literally named old (or new) keeps the ordinary table-qualified
     // meaning — the row-version pseudo-relation is suppressed (PG-probed).
-    let mut db = Database::new();
+    let mut db = Engine::new();
     run(&mut db, "CREATE TABLE old (x i32)");
     assert_eq!(
         rows(&mut db, "INSERT INTO old VALUES (1) RETURNING old.x"),
@@ -541,7 +541,7 @@ fn old_new_touched_set() {
     // nothing. Compressed 100k text at page_size 8192 = 13 slabs.
     let big = format!("INSERT INTO big VALUES (1, 0, '{}')", "x".repeat(100_000));
     let fresh = || {
-        let mut db = Database::new();
+        let mut db = Engine::new();
         run(
             &mut db,
             "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",

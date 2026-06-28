@@ -8,8 +8,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Database, execute, loadUnicodeData } from "../src/lib.ts";
-import { crc32Ieee, loadDatabase, toImage } from "../src/format.ts";
+import { Engine, execute, loadUnicodeData } from "../src/lib.ts";
+import { crc32Ieee, loadEngine, toImage } from "../src/format.ts";
 import { scalarT } from "../src/types.ts";
 import { specPath } from "./tomlmini.ts";
 import { bytesEqual, fillerBytesHex, fillerText } from "./util.ts";
@@ -28,22 +28,22 @@ function loadUnicode(): void {
   loadUnicodeData(new Uint8Array(readFileSync(specPath("collation/fixtures/unicode.jucd"))));
 }
 
-function run(db: Database, sql: string): void {
+function run(db: Engine, sql: string): void {
   execute(db, sql);
 }
 
 // goldenDb is an in-memory handle serializing at the golden page size. The page-backed B-tree's
 // fan-out tracks the page size (spec/fileformat/format.md), so the in-memory tree must be built at
 // the size it will serialize to.
-function goldenDb(): Database {
-  const db = new Database();
+function goldenDb(): Engine {
+  const db = new Engine();
   db.pageSize = GOLDEN_PAGE_SIZE;
   return db;
 }
 
 // pkTableDB: CREATE TABLE t (id i32 PRIMARY KEY, v i16) with 20 rows (id 3's v is
 // NULL) — enough to span more than one data page at page_size 256.
-function pkTableDB(): Database {
+function pkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   for (let i = 1; i <= 20; i++) {
@@ -53,7 +53,7 @@ function pkTableDB(): Database {
   return db;
 }
 
-function oneTableEmptyDB(): Database {
+function oneTableEmptyDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   return db;
@@ -64,7 +64,7 @@ function oneTableEmptyDB(): Database {
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
 // order-sensitive), with a negative first component and first-component ties broken by
 // the second.
-function compositePKTableDB(): Database {
+function compositePKTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))");
   for (const [a, b, v] of [
@@ -87,7 +87,7 @@ function compositePKTableDB(): Database {
 // check whose persisted text exercises the token rendering (string literal with a doubled
 // quote, decimal literals, >=/<=), stored in name order
 // (price_range < t_b_check < t_note_check).
-function checkTableDB(): Database {
+function checkTableDB(): Engine {
   const db = goldenDb();
   run(
     db,
@@ -108,7 +108,7 @@ function checkTableDB(): Database {
 // composite-PK narrowing); i_u covers a nullable uuid column holding a NULL (the
 // encoding.md §2.2 presence tag in stored index order — NULL last), and the unnamed index
 // auto-names to t_a_b_idx. Index records have empty payloads (key only).
-function indexTableDB(): Database {
+function indexTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a))");
   run(db, "CREATE INDEX i_u ON t (u)");
@@ -125,7 +125,7 @@ function indexTableDB(): Database {
 // t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
 // (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
 // INDEX uq, and the plain index nu (flags 0 beside flags 1).
-function uniqueTableDB(): Database {
+function uniqueTableDB(): Engine {
   const db = goldenDb();
   run(
     db,
@@ -144,7 +144,7 @@ function uniqueTableDB(): Database {
 // the PK (c_mgr_fkey), an auto-named FK to the PK (c_pid_fkey), and an auto-named COMPOSITE FK to
 // the two-column UNIQUE with ON DELETE RESTRICT (c_x_y_fkey, the lone non-zero actions byte). Must
 // match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
-function fkTableDB(): Database {
+function fkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))");
   run(db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)");
@@ -165,7 +165,7 @@ function fkTableDB(): Database {
 // i32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
 // array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
 // lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
-function arrayTableDB(): Database {
+function arrayTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])");
   run(db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])");
@@ -183,7 +183,7 @@ function arrayTableDB(): Database {
 // literal that canonicalizes (`[1,5]` → `[1,6)`), the EMPTY range, infinite bounds (lower-only,
 // both), a NULL range, an exclusive-lower literal with infinite upper (`(5,)` → `[6,)`), and a
 // singleton (`[1,1]` → `[1,2)`). Must match the Ruby reference's RANGE_TABLE (spec/fileformat/verify.rb).
-function rangeTableDB(): Database {
+function rangeTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)");
   run(db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')");
@@ -197,7 +197,7 @@ function rangeTableDB(): Database {
 // rangePkTableDB: an i32range PRIMARY KEY — the first CONTAINER key (encoding.md §2.11). The
 // range-bounds key (empty/±∞/inclusivity framing around the i32 element key) lands in the key slot.
 // Rows are inserted in ASCENDING range_total_cmp order to match verify.rb's ascending-key tree builder.
-function rangePkTableDB(): Database {
+function rangePkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (k i32range PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES ('empty', 0)");
@@ -212,7 +212,7 @@ function rangePkTableDB(): Database {
 // arrayPkTableDB: an i32[] PRIMARY KEY — the SECOND container key (encoding.md §2.14), the first
 // whose key length varies with the element count. Rows are inserted in ASCENDING array_total_cmp
 // order (empty, shorter-prefix, element-wise, NULL element last). Pins array_pk_table.jed cross-core.
-function arrayPkTableDB(): Database {
+function arrayPkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE k (key i32[] PRIMARY KEY, v i32)");
   run(db, "INSERT INTO k VALUES ('{}', 40)");
@@ -229,7 +229,7 @@ function arrayPkTableDB(): Database {
 // duplicate 20), an empty and a NULL whole-value array (rows 3/4 → no entries), and a NULL element
 // (row 5). Rows are inserted before the indexes so each builds via the sorted-bulk path, matching
 // the Ruby reference's GIN_ARRAY_TABLE.
-function ginArrayTableDB(): Database {
+function ginArrayTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)");
   run(
@@ -245,7 +245,7 @@ function ginArrayTableDB(): Database {
 // pins the index_kind = 2 byte and the persisted R-tree (page types 5/6). 6 bounded [) ranges + one
 // empty range force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels (an interior
 // root over two leaves). Row 8's NULL range is not indexed. Mirrors the Ruby reference GIST_RANGE_TABLE.
-function gistRangeTableDB(): Database {
+function gistRangeTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
   run(
@@ -261,7 +261,7 @@ function gistRangeTableDB(): Database {
 // encoding, distinguished from a range bound by the column's catalog type). 8 rows with duplicate room
 // numbers force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels. Row 9's NULL is
 // not indexed. Mirrors the Ruby reference GIST_SCALAR_TABLE.
-function gistScalarTableDB(): Database {
+function gistScalarTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)");
   run(
@@ -277,7 +277,7 @@ function gistScalarTableDB(): Database {
 // vector) AND a MULTI-COLUMN GiST index whose leaf bound is a scalar [min,max] room component
 // concatenated with a range during component. 7 indexed rows force a median split at GIST_FANOUT = 4.
 // Row 8's NULL room is exempt (not indexed). Mirrors the Ruby reference GIST_EXCLUDE_TABLE.
-function gistExcludeTableDB(): Database {
+function gistExcludeTableDB(): Engine {
   const db = goldenDb();
   run(
     db,
@@ -298,7 +298,7 @@ function gistExcludeTableDB(): Database {
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
 // dedup (row 2's duplicate bb), an empty and a NULL whole-value array (rows 3/4 → no entries), and a
 // NULL element (row 5). An ordinary ordered index i_n sits beside it (kind 0).
-function ginUuidTableDB(): Database {
+function ginUuidTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, tags uuid[], n i32)");
   run(
@@ -316,7 +316,7 @@ function ginUuidTableDB(): Database {
 }
 
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
-function nopkTableDB(): Database {
+function nopkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE r (a i16, b i64)");
   for (const [a, b] of [
@@ -332,7 +332,7 @@ function nopkTableDB(): Database {
 // tallTreeDB's wide text padding forces a HEIGHT-2 tree (an interior node whose children are
 // themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
 // post-order page allocation across a deeper tree (spec/fileformat/format.md).
-function tallTreeDB(): Database {
+function tallTreeDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
   for (let i = 1; i <= 18; i++) {
@@ -345,7 +345,7 @@ function tallTreeDB(): Database {
 // textTableDB has a text column — exercises the value codec's text branch (u16 length +
 // UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
 // and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
-function textTableDB(): Database {
+function textTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)");
   run(db, "INSERT INTO t VALUES (1, 'alice')");
@@ -360,7 +360,7 @@ function textTableDB(): Database {
 // boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
 // bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 // PRIMARY KEY case is boolPkTableDB).
-function boolTableDB(): Database {
+function boolTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)");
   run(db, "INSERT INTO t VALUES (1, TRUE)");
@@ -374,7 +374,7 @@ function boolTableDB(): Database {
 // tag since a PK is NOT NULL, spec/design/encoding.md §2.9), plus a nullable boolean value
 // column. Rows go in via INSERT and the store sorts them into key (byte) order: false (0x00)
 // then true (0x01). Must match spec/fileformat/verify.rb's BOOL_PK_TABLE.
-function boolPkTableDB(): Database {
+function boolPkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (k boolean PRIMARY KEY, v boolean)");
   run(db, "INSERT INTO t VALUES (FALSE, TRUE)");
@@ -386,7 +386,7 @@ function boolPkTableDB(): Database {
 // text-terminated-escape encoding (encoding.md §2.4). The store sorts rows into key (code-point /
 // byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) < "banana"(0x62) < "é"(0xC3). Must match
 // spec/fileformat/verify.rb's TEXT_PK_TABLE.
-function textPkTableDB(): Database {
+function textPkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (k text PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES ('', 4)");
@@ -400,7 +400,7 @@ function textPkTableDB(): Database {
 // byteaPkTableDB is the bytea-terminated-escape key encoding (encoding.md §2.6) — like text but
 // over raw bytes, so the embedded-0x00 escape is exercised. The store sorts into unsigned-byte
 // (key) order: '' < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. Must match BYTEA_PK_TABLE.
-function byteaPkTableDB(): Database {
+function byteaPkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (k bytea PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES ('\\x', 5)");
@@ -416,7 +416,7 @@ function byteaPkTableDB(): Database {
 // decimal-order-preserving encoding (encoding.md §2.5). The store sorts into numeric (= key)
 // order: -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50; "100.50" stores scale 2 in its value body
 // but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
-function decimalPkTableDB(): Database {
+function decimalPkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (k decimal PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES (-2.5, 6)");
@@ -433,7 +433,7 @@ function decimalPkTableDB(): Database {
 // u16 scale + u16 ndigits + base-10^4 groups) and the catalog typmod: an unconstrained numeric
 // column `d` and a constrained numeric(10,2) column `m` (values already at scale 2, a no-op
 // coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
-function decimalTableDB(): Database {
+function decimalTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric, m numeric(10,2))");
   run(
@@ -448,7 +448,7 @@ function decimalTableDB(): Database {
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
 // hex input form, adapting to the bytea column (spec/design/types.md §6).
-function byteaTableDB(): Database {
+function byteaTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, b bytea)");
   run(db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
@@ -466,7 +466,7 @@ function byteaTableDB(): Database {
 // store-smaller, so the record holds a 0x02 pointer and the raw bytes live in a page_type-4
 // chain. Row 1 spills both columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL.
 // Must match the Ruby reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
-function overflowTableDB(): Database {
+function overflowTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)");
   run(db, `INSERT INTO t VALUES (1, '${fillerText(600)}', '\\x${fillerBytesHex(300)}')`);
@@ -481,7 +481,7 @@ function overflowTableDB(): Database {
 // plain but still over RECORD_MAX → 0x04 external-compressed (a chain carrying the COMPRESSED
 // block); row 3 stays inline-plain; row 4 is NULL/NULL. Must match the Ruby reference's
 // COMPRESSED_TABLE (spec/fileformat/verify.rb).
-function compressedTableDB(): Database {
+function compressedTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)");
   run(db, `INSERT INTO t VALUES (1, '${"x".repeat(600)}', '\\x${"ab".repeat(200)}')`);
@@ -496,7 +496,7 @@ function compressedTableDB(): Database {
 // codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
 // a present and a NULL uuid value, and the nil/max boundary UUIDs. Must match the Ruby
 // reference's UUID_TABLE (spec/fileformat/verify.rb).
-function uuidTableDB(): Database {
+function uuidTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)");
   run(
@@ -514,7 +514,7 @@ function uuidTableDB(): Database {
 // pre-evaluated default value (written after the typmod). Covers an int default, a text default,
 // a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
 // and a plain no-default column. Row 1 takes every default; row 2 provides all values.
-function defaultTableDB(): Database {
+function defaultTableDB(): Engine {
   const db = goldenDb();
   run(
     db,
@@ -531,7 +531,7 @@ function defaultTableDB(): Database {
 // `i32 DEFAULT 1 + 1`, a CONSTANT default beside them (bit2), and a plain no-default column.
 // EMPTY table — the catalog encoding is the cross-core proof; the per-row evaluation is covered
 // by the conformance corpus.
-function defaultExprTableDB(): Database {
+function defaultExprTableDB(): Engine {
   const db = goldenDb();
   run(
     db,
@@ -544,7 +544,7 @@ function defaultExprTableDB(): Database {
 // timestampTableDB exercises the value codec's i64-instant branch (type code 8): a positive
 // instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a NULL. The
 // literals parse to the same micros the golden stores. The PK stays i32.
-function timestampTableDB(): Database {
+function timestampTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')");
@@ -558,7 +558,7 @@ function timestampTableDB(): Database {
 
 // timestamptzTableDB exercises the same 8-byte branch under type code 9; the +05 literal
 // normalizes to UTC before storage.
-function timestamptzTableDB(): Database {
+function timestamptzTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')");
@@ -573,7 +573,7 @@ function timestamptzTableDB(): Database {
 // intervalTableDB exercises the value codec's fixed 16-byte interval branch (type code 11): a
 // positive multi-field value, a negative value, the zero interval, a months-only '1 mon' vs a
 // span-equal-but-byte-distinct '30 days', and a NULL. The bare-string literals adapt.
-function intervalTableDB(): Database {
+function intervalTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d interval)");
   run(db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')");
@@ -590,7 +590,7 @@ function intervalTableDB(): Database {
 // -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years; all spans distinct (span-equal intervals
 // collide on the span key). Inserted in ascending key order to match verify.rb's build_tree (the
 // split shape is order-sensitive); the out-of-order proof is in the conformance test.
-function intervalPkTableDB(): Database {
+function intervalPkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (k interval PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES ('-1 mon', 6)");
@@ -610,7 +610,7 @@ function intervalPkTableDB(): Database {
 // the specials enter via typed literals in INSERT ... SELECT (a VALUES slot takes only bare literals
 // this slice — float.md). PK is i32 here so this exercises the float VALUE codec in a non-key column
 // (the float PRIMARY KEY form is float64PkTableDB).
-function float64TableDB(): Database {
+function float64TableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)");
   run(db, "INSERT INTO t VALUES (1, 1.5)");
@@ -628,7 +628,7 @@ function float64TableDB(): Database {
 // float32TableDB exercises the value codec's 4-byte IEEE branch (type code 13): the same
 // special-value coverage as float64TableDB (canonicalized NaN → 0x7FC00000) plus 100.25 (exactly
 // representable in binary32). PK is i32 (the float PRIMARY KEY form is float32PkTableDB).
-function float32TableDB(): Database {
+function float32TableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, r f32)");
   run(db, "INSERT INTO t VALUES (1, 1.5)");
@@ -647,7 +647,7 @@ function float32TableDB(): Database {
 // the B-tree iterates float keys in the float total order (-Inf < finite < +Inf < NaN; -0 = +0).
 // In-contract literal values only, so the image is cross-core byte-identical; the row set matches
 // FLOAT64_PK_TABLE in spec/fileformat/verify.rb (insertion order is irrelevant — the PK store sorts).
-function float64PkTableDB(): Database {
+function float64PkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE fk (k f64 PRIMARY KEY, v i32)");
   run(db, "INSERT INTO fk VALUES (1.5, 1)");
@@ -660,7 +660,7 @@ function float64PkTableDB(): Database {
 }
 
 // float32PkTableDB is float64PkTableDB at binary32 width (the 4-byte float-order-preserving key §2.8).
-function float32PkTableDB(): Database {
+function float32PkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE fk (k f32 PRIMARY KEY, v i32)");
   run(db, "INSERT INTO fk VALUES (1.5, 1)");
@@ -676,7 +676,7 @@ function float32PkTableDB(): Database {
 // body (same int-be-signflip codec as i32). A positive date, a pre-1970 negative one, a BC-era
 // one, the −infinity/+infinity sentinels (i32 min/max), and a NULL. The bare-string literals adapt
 // to the date column. PK is i32 (spec/design/date.md).
-function dateTableDB(): Database {
+function dateTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d date)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-15')");
@@ -692,7 +692,7 @@ function dateTableDB(): Database {
 // (S3 — the recursive value codec). Exercises the kind-tagged catalog (a composite-type entry, kind
 // 1, before the table entry, kind 0), a composite column (type_code 14), and the value codec's null
 // bitmap + present-field bodies (row 2's NULL zip field).
-function compositeTypeTableDB(): Database {
+function compositeTypeTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)");
@@ -706,7 +706,7 @@ function compositeTypeTableDB(): Database {
 // 14 + "addr") and the value body recurses (an array body whose elements are composite bodies). Row
 // 2's element has a NULL `zip` field (the composite null-bitmap inside an element); row 3 mixes a
 // present composite element with a NULL element (the array HAS_NULLS bitmap).
-function arrayCompositeTableDB(): Database {
+function arrayCompositeTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
@@ -723,7 +723,7 @@ function arrayCompositeTableDB(): Database {
 // (element_type_code 2 = i32) and the value body recurses (a composite body whose `pts` field is an
 // array body). Row 2 has an empty array field {} (ndim 0); row 3 a NULL array field (the composite
 // null-bitmap).
-function compositeArrayFieldTableDB(): Database {
+function compositeArrayFieldTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TYPE poly AS (name text, pts i32[])");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
@@ -738,7 +738,7 @@ function compositeArrayFieldTableDB(): Database {
 // exist), but the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
 // references, so the two-pass load is exercised; the row pins the recursive value codec descending
 // through a composite field.
-function nestedCompositeTableDB(): Database {
+function nestedCompositeTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)");
   run(db, "CREATE TYPE line AS (a point, b point)");
@@ -750,7 +750,7 @@ function nestedCompositeTableDB(): Database {
 // sequenceTableDB: two sequences (v12) — `s1` ascending, advanced 3 times (is_called, last_value 3),
 // `s2` descending/fresh with a non-default cache + cycle — plus a one-row table, pinning the sequence
 // catalog entry (entry_kind 2) and the catalog emission order (sequences before tables).
-function sequenceTableDB(): Database {
+function sequenceTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE SEQUENCE s1");
   run(db, "SELECT nextval('s1')");
@@ -766,7 +766,7 @@ function sequenceTableDB(): Database {
 // column-ordinal tail). The serial column id desugars to an i32 column that is NOT NULL (via the PK)
 // with an expression DEFAULT nextval('t_id_seq'), and an OWNED sequence t_id_seq created alongside;
 // one INSERT advances it once. Must match the Ruby reference's SERIAL_TABLE (spec/design/sequences.md §12).
-function serialTableDB(): Database {
+function serialTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id serial PRIMARY KEY, v text)");
   run(db, "INSERT INTO t (v) VALUES ('hello')");
@@ -778,7 +778,7 @@ function serialTableDB(): Database {
 // bit1+bit3+bit4+bit5), n is GENERATED BY DEFAULT (flags bit1+bit3+bit4); each gets an owned
 // default-i64 sequence + an expression DEFAULT nextval('<seq>'). One INSERT advances both. Must
 // match the Ruby reference's IDENTITY_TABLE (spec/fileformat/verify.rb), spec/design/sequences.md §13.
-function identityTableDB(): Database {
+function identityTableDB(): Engine {
   const db = goldenDb();
   run(
     db,
@@ -795,7 +795,7 @@ function identityTableDB(): Database {
 // bit6 + name), an un-annotated column inheriting the default (bit6 + name), and an explicit
 // COLLATE "C" column (no collation). unicode is NOT imported — it is provided by a loaded bundle, and
 // its metadata entry is emitted because the schema references it. Must match the Ruby COLLATION_TABLE.
-function collationTableDB(): Database {
+function collationTableDB(): Engine {
   const db = goldenDb();
   db.setDefaultCollation("unicode"); // loaded — no import
   run(
@@ -812,7 +812,7 @@ function collationTableDB(): Database {
 // encoding.md §2.12) — both keys store the unicode UCA sort key, so the B-tree iterates in
 // collation order. unicode is loaded (not the default; its entry is emitted because the columns
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
-function collationPKTableDB(): Database {
+function collationPKTableDB(): Engine {
   const db = goldenDb();
   run(db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY, tag text COLLATE "unicode")`);
   run(db, `CREATE INDEX t_tag_idx ON t (tag)`);
@@ -825,7 +825,7 @@ function collationPKTableDB(): Database {
 // jsonTableDB has a json column (verbatim text body, type_code 18 — spec/design/json.md §4). The
 // stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
 // length-prefixed text-shaped json body. Pins json_table.jed cross-core.
-function jsonTableDB(): Database {
+function jsonTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
   run(db, `INSERT INTO t VALUES (1, '{"a": 1}')`);
@@ -839,7 +839,7 @@ function jsonTableDB(): Database {
 // order a,b) with a number (NTAG_NUMBER), a nested array (NTAG_ARRAY) of a boolean TRUE (NTAG_TRUE)
 // and JSON null (NTAG_NULL); a bare string (NTAG_STRING); a bare number; and a SQL NULL (the lone
 // 0x01 presence tag, distinct from a JSON null node). Pins jsonb_table.jed.
-function jsonbTableDB(): Database {
+function jsonbTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)");
   run(db, `INSERT INTO t VALUES (1, '{"a": 1, "b": [true, null]}')`);
@@ -852,7 +852,7 @@ function jsonbTableDB(): Database {
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   loadUnicode(); // the unicode-collated goldens need the bundle loaded (collation.md §4)
-  const cases: { name: string; build: () => Database }[] = [
+  const cases: { name: string; build: () => Engine }[] = [
     { name: "empty_db.jed", build: () => goldenDb() },
     { name: "overflow_table.jed", build: overflowTableDB },
     { name: "compressed_table.jed", build: compressedTableDB },
@@ -920,7 +920,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
 // torn-meta goldens must read through the valid slot to the pk_table content.
 test("read goldens reproduces rows", () => {
   loadUnicode(); // the unicode-collated goldens open via a loaded bundle (collation.md §4)
-  const cases: { name: string; build: () => Database; table: string }[] = [
+  const cases: { name: string; build: () => Engine; table: string }[] = [
     { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
     { name: "overflow_table.jed", build: overflowTableDB, table: "t" },
     { name: "compressed_table.jed", build: compressedTableDB, table: "t" },
@@ -976,7 +976,7 @@ test("read goldens reproduces rows", () => {
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
   ];
   for (const c of cases) {
-    const loaded = loadDatabase(fixture(c.name));
+    const loaded = loadEngine(fixture(c.name));
     assert.deepStrictEqual(
       loaded.rowsInKeyOrder(c.table),
       c.build().rowsInKeyOrder(c.table),
@@ -984,13 +984,13 @@ test("read goldens reproduces rows", () => {
     );
   }
   // Empty database: zero tables, and a missing table reads as absent.
-  const empty = loadDatabase(fixture("empty_db.jed"));
+  const empty = loadEngine(fixture("empty_db.jed"));
   assert.equal(empty.table("t"), undefined, "empty_db should have no tables");
 });
 
 // READ side, catalog detail: column names, types, and flags survive exactly.
 test("read golden reconstructs catalog", () => {
-  const loaded = loadDatabase(fixture("pk_table.jed"));
+  const loaded = loadEngine(fixture("pk_table.jed"));
   const tbl = loaded.table("t");
   assert.ok(tbl, "table t missing");
   assert.equal(tbl!.name, "t");
@@ -1027,7 +1027,7 @@ test("read golden reconstructs catalog", () => {
 // after a load don't collide with persisted rowids (the step-6 mutation fix).
 test("rowid counter survives load", () => {
   const image = toImage(nopkTableDB(), GOLDEN_PAGE_SIZE, 1n); // existing rows take rowids 0, 1, 2
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
   execute(loaded, "INSERT INTO r VALUES (10, 100)");
   assert.equal(loaded.rowsInKeyOrder("r").length, 4);
@@ -1037,7 +1037,7 @@ test("rowid counter survives load", () => {
 // applies the *persisted* defaults — proving the default value (not just its byte length)
 // round-trips through the catalog (constraints.md §2).
 test("default survives load", () => {
-  const loaded = loadDatabase(fixture("default_table.jed"));
+  const loaded = loadEngine(fixture("default_table.jed"));
   run(loaded, "INSERT INTO t (id) VALUES (3)");
   const rows = loaded.rowsInKeyOrder("t")!;
   const last = rows[rows.length - 1]!;
@@ -1053,7 +1053,7 @@ test("default survives load", () => {
 // The default 8 KiB page size also round-trips, and re-serializing is deterministic. Built at 8192
 // so the in-memory tree is sized for it (fan-out tracks the page size — format.md).
 test("round trip at default page size", () => {
-  const db = new Database();
+  const db = new Engine();
   db.pageSize = 8192;
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   for (let i = 1; i <= 20; i++) {
@@ -1061,7 +1061,7 @@ test("round trip at default page size", () => {
     run(db, `INSERT INTO t VALUES (${i}, ${v})`);
   }
   const image = toImage(db, 8192, 1n);
-  const loaded = loadDatabase(image);
+  const loaded = loadEngine(image);
   assert.deepStrictEqual(loaded.rowsInKeyOrder("t"), db.rowsInKeyOrder("t"));
   assert.ok(bytesEqual(toImage(loaded, 8192, 1n), image), "re-serialized bytes differ");
 });
@@ -1080,7 +1080,7 @@ test("corrupt image is rejected with XX001", () => {
   image[0] ^= 0xff; // smash slot 0 magic
   image[GOLDEN_PAGE_SIZE] ^= 0xff; // smash slot 1 magic
   assert.throws(
-    () => loadDatabase(image),
+    () => loadEngine(image),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
 });

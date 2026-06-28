@@ -1,7 +1,7 @@
 // The TypeScript core's conformance harness (CLAUDE.md §7). Mirrors
 // cmd/conformance/main.go: walk spec/conformance/suites, and for each .test file whose
 // `# requires:` capabilities are all in this core's SUPPORTED_CAPABILITIES, run the
-// sqllogictest-style records against a fresh Database and compare output. Files needing
+// sqllogictest-style records against a fresh Engine and compare output. Files needing
 // a capability the core does not declare are SKIPPED (not failed). Needs no TOML.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -11,12 +11,12 @@ import { loadedCollation, loadUnicodeData } from "../collation.ts";
 import { loadTimeZoneData, resolveZone } from "../timezone.ts";
 import {
   advancingClock,
-  Database,
+  Engine,
   DEFAULT_MAX_SQL_LENGTH,
   EngineError,
   execute,
   fixedClock,
-  loadDatabase,
+  loadEngine,
   type Outcome,
   type Privilege,
   PrivilegeSet,
@@ -24,7 +24,7 @@ import {
   type ReadHandle,
   render,
   seededRandomSource,
-  SharedDb,
+  Database,
   SUPPORTED_CAPABILITIES,
   type WriteHandle,
 } from "../lib.ts";
@@ -129,13 +129,13 @@ function parseUpgradeCollationsDirective(line: string): boolean {
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
 // spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
 // referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
-// is the point), then reconstructs the database in memory via loadDatabase. The handle is read-WRITE
+// is the point), then reconstructs the database in memory via loadEngine. The handle is read-WRITE
 // so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 // read-only-handle error.
-function openFixture(rel: string): Database {
+function openFixture(rel: string): Engine {
   const bundle = join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
   if (existsSync(bundle)) loadUnicodeData(readFileSync(bundle)); // idempotent: the set is engine-global
-  return loadDatabase(readFileSync(join(repoRoot(), "spec", rel)));
+  return loadEngine(readFileSync(join(repoRoot(), "spec", rel)));
 }
 
 function parseRequires(text: string): string[] {
@@ -304,7 +304,7 @@ function parseMaxCostDirective(line: string): bigint | null {
 // parseLifetimeMaxCostDirective parses a `# lifetime_max_cost: N` directive line. Returns the
 // per-SESSION cumulative cost budget, or null if not one. Unlike `# max_cost:` (per-record, reset
 // after each record), this is STICKY: it sets the session budget for the rest of the file (the
-// cumulative cost builds across records on the one Database the file runs against), so an ordered
+// cumulative cost builds across records on the one Engine the file runs against), so an ordered
 // statement sequence can drive the session to its budget and assert the 54P02 abort — what the
 // per-record `# cost:` directive cannot express (spec/design/session.md §5.4).
 function parseLifetimeMaxCostDirective(line: string): bigint | null {
@@ -542,7 +542,7 @@ function assertTypes(expected: string[] | null, actual: string[], sql: string): 
 
 // runFile runs all records in one .test file against a fresh database.
 function runFile(text: string): void {
-  let db = new Database();
+  let db = new Engine();
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
   // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -592,7 +592,7 @@ function runFile(text: string): void {
         c.i++;
         continue;
       }
-      // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `new Database()`
+      // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `new Engine()`
       // above — appears in the header before any record (spec/design/conformance.md).
       const fx = parseFixtureDirective(line);
       if (fx !== null) {
@@ -818,7 +818,7 @@ function runFile(text: string): void {
 
 // --- the concurrency schedule runner (spec/design/concurrency-testing.md §4) -----------------
 // A `.test` file carrying a `# format: concurrency` header is an explicit total order over named
-// read/write SESSIONS opened on one SharedDb. Because jed read results depend only on the logical
+// read/write SESSIONS opened on one Database. Because jed read results depend only on the logical
 // order of commits and pin-points — never on timing (§2) — executing the listed order on the single
 // JS thread yields the canonical, deterministic result every core must produce. This core has no
 // stepped-threaded mode (JS has no shared-memory threads for live objects, §4.3); it always runs the
@@ -966,7 +966,7 @@ function endSession(kind: string, s: CSession): void {
   }
 }
 
-// runConcurrencyFile runs one `# format: concurrency` file against a fresh SharedDb.
+// runConcurrencyFile runs one `# format: concurrency` file against a fresh Database.
 //
 // The Layer 2 `blocks` annotation (concurrency-testing.md §5) is modeled here without ever truly
 // blocking — which this single-threaded core could not do anyway (write() while a writer is open
@@ -976,7 +976,7 @@ function endSession(kind: string, s: CSession): void {
 // must produce. `gateHolder` is the live writer's sid (the single-writer gate); `blocked` is the
 // at-most-one writer queued on it.
 function runConcurrencyFile(text: string): void {
-  const db = SharedDb.newInMemory();
+  const db = Database.newInMemory();
   const sessions = new Map<string, CSession>();
   let gateHolder = ""; // the live writer holding the single-writer gate, "" if free
   let blocked = ""; // a writer queued on the gate (Layer 2 `blocks`), "" if none
@@ -1116,7 +1116,7 @@ function main(): number {
       continue;
     }
     try {
-      // A `# format: concurrency` file is an explicit multi-session schedule run against a SharedDb
+      // A `# format: concurrency` file is an explicit multi-session schedule run against a Database
       // (spec/design/concurrency-testing.md §4); everything else is the sequential single-handle
       // runner. Both share the result grammar; only the driver differs.
       if (isConcurrencyFormat(text)) runConcurrencyFile(text);

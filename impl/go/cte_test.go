@@ -10,7 +10,7 @@ package jed
 import "testing"
 
 // cteT3 is a 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
-func cteT3(t *testing.T) *Database {
+func cteT3(t *testing.T) *Engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
@@ -19,7 +19,7 @@ func cteT3(t *testing.T) *Database {
 }
 
 // cteCost runs sql and returns its accrued cost.
-func cteCost(t *testing.T, db *Database, sql string) int64 {
+func cteCost(t *testing.T, db *Engine, sql string) int64 {
 	t.Helper()
 	out, err := Execute(db, sql)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestCteMaterializedHintForcesBuffering(t *testing.T) {
 // cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism doing real
 // work. A per-iteration meter would never fire here, so the corpus cannot express it.
 func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	db.SetMaxCost(1000)
 	_, err := Execute(db, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c")
 	if err == nil {
@@ -76,7 +76,7 @@ func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
 // actual accrued cost, not a per-iteration figure); the 5-row counter accrues 29 (the corpus cost
 // contract).
 func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	db.SetMaxCost(1000)
 	if got := cteCost(t, db,
 		"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c"); got != 29 {
@@ -87,7 +87,7 @@ func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
 // A recursive CTE is ALWAYS materialized — NOT MATERIALIZED is inert (recursive-cte.md §1), so a
 // single-reference recursive CTE still iterates to a fixpoint (3 rows, cost 17) rather than inlining.
 func TestCteRecursiveHintIsInert(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	for _, hint := range []string{"", "MATERIALIZED ", "NOT MATERIALIZED "} {
 		sql := "WITH RECURSIVE c(n) AS " + hint +
 			"(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"

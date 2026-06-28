@@ -37,7 +37,7 @@ func fixture(t *testing.T, name string) []byte {
 	}
 }
 
-func run(t *testing.T, db *Database, sql string) {
+func run(t *testing.T, db *Engine, sql string) {
 	t.Helper()
 	if _, err := Execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
@@ -46,7 +46,7 @@ func run(t *testing.T, db *Database, sql string) {
 
 // pkTableDB is CREATE TABLE t (id i32 PRIMARY KEY, v i16) with 20 rows (id 3's v
 // is NULL) — enough to span more than one data page at page_size 256.
-func pkTableDB(t *testing.T) *Database {
+func pkTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	for i := int64(1); i <= 20; i++ {
@@ -59,7 +59,7 @@ func pkTableDB(t *testing.T) *Database {
 	return db
 }
 
-func oneTableEmptyDB(t *testing.T) *Database {
+func oneTableEmptyDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	return db
@@ -70,7 +70,7 @@ func oneTableEmptyDB(t *testing.T) *Database {
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
 // order-sensitive), with a negative first component and first-component ties broken by
 // the second.
-func compositePKTableDB(t *testing.T) *Database {
+func compositePKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))")
 	for _, abv := range [][3]int64{
@@ -93,7 +93,7 @@ func compositePKTableDB(t *testing.T) *Database {
 // check whose persisted text exercises the token rendering (string literal with a doubled
 // quote, decimal literals, >=/<=), stored in name order
 // (price_range < t_b_check < t_note_check).
-func checkTableDB(t *testing.T) *Database {
+func checkTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), "+
 		"CONSTRAINT price_range CHECK (price >= 0.50 AND price <= 9999.99), note text, "+
@@ -108,7 +108,7 @@ func checkTableDB(t *testing.T) *Database {
 // composite-PK narrowing); i_u covers a nullable uuid column holding a NULL (the
 // encoding.md §2.2 presence tag in stored index order — NULL last), and the unnamed index
 // auto-names to t_a_b_idx. Index records have empty payloads (key only).
-func indexTableDB(t *testing.T) *Database {
+func indexTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a))")
 	run(t, db, "CREATE INDEX i_u ON t (u)")
@@ -122,7 +122,7 @@ func indexTableDB(t *testing.T) *Database {
 // t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
 // (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
 // INDEX uq, and the plain index nu (flags 0 beside flags 1).
-func uniqueTableDB(t *testing.T) *Database {
+func uniqueTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32, "+
 		"UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))")
@@ -137,7 +137,7 @@ func uniqueTableDB(t *testing.T) *Database {
 // reference with ON DELETE RESTRICT, and a self-reference — pinning the catalog foreign-key list
 // (the name + local/ref ordinals + actions byte). Must match the Ruby reference's FK_TABLE
 // (spec/fileformat/verify.rb).
-func fkTableDB(t *testing.T) *Database {
+func fkTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))")
 	run(t, db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)")
@@ -155,7 +155,7 @@ func fkTableDB(t *testing.T) *Database {
 // i32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
 // array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
 // lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
-func arrayTableDB(t *testing.T) *Database {
+func arrayTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])")
 	run(t, db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])")
@@ -171,7 +171,7 @@ func arrayTableDB(t *testing.T) *Database {
 // inclusive-upper literal that canonicalizes ([1,5] → [1,6)), the EMPTY range, infinite bounds
 // (lower-only, both), a NULL range, an exclusive-lower literal with infinite upper ((5,) → [6,)), and
 // a singleton ([1,1] → [1,2)). Pins range_table.jed cross-core.
-func rangeTableDB(t *testing.T) *Database {
+func rangeTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')")
@@ -185,7 +185,7 @@ func rangeTableDB(t *testing.T) *Database {
 // rangePKTableDB: an i32range PRIMARY KEY — the first CONTAINER key (encoding.md §2.11). The
 // range-bounds key (empty/±∞/inclusivity framing around the i32 element key) lands in the key slot.
 // Rows are inserted in ASCENDING range_total_cmp order to match verify.rb's ascending-key tree builder.
-func rangePKTableDB(t *testing.T) *Database {
+func rangePKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (k i32range PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES ('empty', 0)")
@@ -200,7 +200,7 @@ func rangePKTableDB(t *testing.T) *Database {
 // arrayPKTableDB: an i32[] PRIMARY KEY — the SECOND container key (encoding.md §2.14), the first
 // whose key length varies with the element count. Rows are inserted in ASCENDING array_total_cmp
 // order (empty, shorter-prefix, element-wise, NULL element last). Pins array_pk_table.jed cross-core.
-func arrayPKTableDB(t *testing.T) *Database {
+func arrayPKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE k (key i32[] PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO k VALUES ('{}', 40)")
@@ -214,7 +214,7 @@ func arrayPKTableDB(t *testing.T) *Database {
 // jsonTableDB has a json column (verbatim text body, type_code 18 — spec/design/json.md §4). The
 // stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
 // length-prefixed text-shaped json body. Pins json_table.jed cross-core.
-func jsonTableDB(t *testing.T) *Database {
+func jsonTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1}')")
@@ -227,7 +227,7 @@ func jsonTableDB(t *testing.T) *Database {
 // spec/design/json.md §2). The rows exercise every node tag: an object (ntagObject) with a number
 // (ntagNumber), a nested array (ntagArray) of a boolean (ntagTrue) and JSON null (ntagNull); a bare
 // string (ntagString); a bare number; and a SQL NULL. Pins jsonb_table.jed.
-func jsonbTableDB(t *testing.T) *Database {
+func jsonbTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, null]}')")
@@ -243,7 +243,7 @@ func jsonbTableDB(t *testing.T) *Database {
 // duplicate 20), an empty and a NULL whole-value array (rows 3/4 → no entries), and a NULL element
 // (row 5). Rows are inserted before the indexes so each builds via the sorted-bulk path, matching
 // the Ruby reference's GIN_ARRAY_TABLE.
-func ginArrayTableDB(t *testing.T) *Database {
+func ginArrayTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)")
 	run(t, db, "INSERT INTO t VALUES (1, '{10,20,30}', 1), (2, '{20,20,40}', 2), (3, '{}', 3), (4, NULL, 4), (5, '{10,NULL,50}', 5)")
@@ -256,7 +256,7 @@ func ginArrayTableDB(t *testing.T) *Database {
 // pins the index_kind = 2 byte and the persisted R-tree (page types 5/6). 6 bounded [) ranges + one
 // empty range force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels (an interior
 // root over two leaves). Row 8's NULL range is not indexed. Mirrors the Ruby reference GIST_RANGE_TABLE.
-func gistRangeTableDB(t *testing.T) *Database {
+func gistRangeTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), "+
@@ -270,7 +270,7 @@ func gistRangeTableDB(t *testing.T) *Database {
 // key encoding, distinguished from a range bound by the column's catalog type). 8 rows with duplicate
 // room numbers force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels. Row 9's NULL
 // is not indexed. Mirrors the Ruby reference GIST_SCALAR_TABLE.
-func gistScalarTableDB(t *testing.T) *Database {
+func gistScalarTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)")
 	run(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), "+
@@ -284,7 +284,7 @@ func gistScalarTableDB(t *testing.T) *Database {
 // vector) AND a MULTI-COLUMN GiST index whose leaf bound is a scalar [min,max] room component
 // concatenated with a range during component. 7 indexed rows force a median split at GIST_FANOUT = 4.
 // Row 8's NULL room is exempt (not indexed). Mirrors the Ruby reference GIST_EXCLUDE_TABLE.
-func gistExcludeTableDB(t *testing.T) *Database {
+func gistExcludeTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, "+
 		"EXCLUDE USING gist (room WITH =, during WITH &&))")
@@ -299,7 +299,7 @@ func gistExcludeTableDB(t *testing.T) *Database {
 // so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
 // dedup (row 2's duplicate bb), an empty and a NULL whole-value array (rows 3/4 → no entries), and a
 // NULL element (row 5). An ordinary ordered index i_n sits beside it (kind 0).
-func ginUuidTableDB(t *testing.T) *Database {
+func ginUuidTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, tags uuid[], n i32)")
 	run(t, db, "INSERT INTO t VALUES "+
@@ -314,7 +314,7 @@ func ginUuidTableDB(t *testing.T) *Database {
 }
 
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
-func nopkTableDB(t *testing.T) *Database {
+func nopkTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE r (a i16, b i64)")
 	for _, ab := range [][2]int64{{7, 70}, {8, 80}, {9, 90}} {
@@ -326,7 +326,7 @@ func nopkTableDB(t *testing.T) *Database {
 // tallTreeDB's wide text padding forces a HEIGHT-2 tree (an interior node whose children are
 // themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
 // post-order page allocation across a deeper tree (spec/fileformat/format.md).
-func tallTreeDB(t *testing.T) *Database {
+func tallTreeDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	for i := int64(1); i <= 18; i++ {
@@ -338,7 +338,7 @@ func tallTreeDB(t *testing.T) *Database {
 // textTableDB has a text column — exercises the value codec's text branch (u16 length +
 // UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
 // and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
-func textTableDB(t *testing.T) *Database {
+func textTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
 	run(t, db, "INSERT INTO t VALUES (1, 'alice')")
@@ -353,7 +353,7 @@ func textTableDB(t *testing.T) *Database {
 // boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
 // bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 // PRIMARY KEY case is boolPKTableDB).
-func boolTableDB(t *testing.T) *Database {
+func boolTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)")
 	run(t, db, "INSERT INTO t VALUES (1, TRUE)")
@@ -367,7 +367,7 @@ func boolTableDB(t *testing.T) *Database {
 // tag since a PK is NOT NULL, spec/design/encoding.md §2.9), plus a nullable boolean value
 // column. Rows go in via INSERT and the store sorts them into key (byte) order: false (0x00)
 // then true (0x01). Must match spec/fileformat/verify.rb's BOOL_PK_TABLE.
-func boolPKTableDB(t *testing.T) *Database {
+func boolPKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (k boolean PRIMARY KEY, v boolean)")
 	run(t, db, "INSERT INTO t VALUES (FALSE, TRUE)")
@@ -379,7 +379,7 @@ func boolPKTableDB(t *testing.T) *Database {
 // text-terminated-escape encoding (encoding.md §2.4). The store sorts rows into key (code-point /
 // byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) < "banana"(0x62) < "é"(0xC3). Must match
 // spec/fileformat/verify.rb's TEXT_PK_TABLE.
-func textPKTableDB(t *testing.T) *Database {
+func textPKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (k text PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES ('', 4)")
@@ -393,7 +393,7 @@ func textPKTableDB(t *testing.T) *Database {
 // byteaPKTableDB is the bytea-terminated-escape key encoding (encoding.md §2.6) — like text but
 // over raw bytes, so the embedded-0x00 escape is exercised. The store sorts into unsigned-byte
 // (key) order: ” < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. Must match BYTEA_PK_TABLE.
-func byteaPKTableDB(t *testing.T) *Database {
+func byteaPKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (k bytea PRIMARY KEY, v i32)")
 	run(t, db, `INSERT INTO t VALUES ('\x', 5)`)
@@ -409,7 +409,7 @@ func byteaPKTableDB(t *testing.T) *Database {
 // decimal-order-preserving encoding (encoding.md §2.5). The store sorts into numeric (= key)
 // order: -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50; "100.50" stores scale 2 in its value body
 // but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
-func decimalPKTableDB(t *testing.T) *Database {
+func decimalPKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (k decimal PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES (-2.5, 6)")
@@ -427,7 +427,7 @@ func decimalPKTableDB(t *testing.T) *Database {
 // column `d` and a constrained numeric(10,2) column `m` (whose values are already at scale 2,
 // so storing them is a no-op coercion). Covers positive, negative, zero, a multi-group
 // coefficient, and a NULL. The PK stays i32 (no decimal key this slice).
-func decimalTableDB(t *testing.T) *Database {
+func decimalTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric, m numeric(10,2))")
 	run(t, db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), "+
@@ -439,7 +439,7 @@ func decimalTableDB(t *testing.T) *Database {
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
 // hex input form, adapting to the bytea column (spec/design/types.md §6).
-func byteaTableDB(t *testing.T) *Database {
+func byteaTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, b bytea)")
 	run(t, db, `INSERT INTO t VALUES (1, '\xdeadbeef')`)
@@ -489,7 +489,7 @@ func fillerBytesHex(n int) string {
 // store-smaller, so the record holds a 0x02 pointer and the raw bytes live in a page_type-4
 // chain. Row 1 spills both columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL.
 // Must match the Ruby reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
-func overflowTableDB(t *testing.T) *Database {
+func overflowTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)")
 	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", fillerText(600), fillerBytesHex(300)))
@@ -504,7 +504,7 @@ func overflowTableDB(t *testing.T) *Database {
 // plain but still over RECORD_MAX → 0x04 external-compressed (a chain carrying the COMPRESSED
 // block); row 3 stays inline-plain; row 4 is NULL/NULL. Must match the Ruby reference's
 // COMPRESSED_TABLE (spec/fileformat/verify.rb).
-func compressedTableDB(t *testing.T) *Database {
+func compressedTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)")
 	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", strings.Repeat("x", 600), strings.Repeat("ab", 200)))
@@ -519,7 +519,7 @@ func compressedTableDB(t *testing.T) *Database {
 // codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
 // a present and a NULL uuid value, and the nil/max boundary UUIDs. Must match the Ruby
 // reference's UUID_TABLE (spec/fileformat/verify.rb).
-func uuidTableDB(t *testing.T) *Database {
+func uuidTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)")
 	run(t, db, "INSERT INTO t VALUES "+
@@ -534,7 +534,7 @@ func uuidTableDB(t *testing.T) *Database {
 // pre-evaluated default value (written after the typmod). Covers an int default, a text default,
 // a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
 // and a plain no-default column. Row 1 takes every default; row 2 provides all values.
-func defaultTableDB(t *testing.T) *Database {
+func defaultTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, n i32 DEFAULT 0, note text DEFAULT 'none', "+
 		"maybe i32 DEFAULT NULL, req i32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, plain i16)")
@@ -548,7 +548,7 @@ func defaultTableDB(t *testing.T) *Database {
 // `i32 DEFAULT 1 + 1`, a CONSTANT default beside them (bit2), and a plain no-default column.
 // EMPTY table — the catalog encoding is the cross-core proof; the per-row evaluation is covered
 // by the conformance corpus (it is nondeterministic without an injected seed).
-func defaultExprTableDB(t *testing.T) *Database {
+func defaultExprTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n i32 DEFAULT 1 + 1, "+
 		"k i32 DEFAULT 7, plain i16)")
@@ -558,7 +558,7 @@ func defaultExprTableDB(t *testing.T) *Database {
 // timestampTableDB exercises the value codec's i64-instant branch (type code 8): a
 // positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a
 // NULL. The literals parse to the same micros the golden stores. The PK stays i32.
-func timestampTableDB(t *testing.T) *Database {
+func timestampTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')")
@@ -572,7 +572,7 @@ func timestampTableDB(t *testing.T) *Database {
 
 // timestamptzTableDB exercises the same 8-byte branch under type code 9; the +05 literal
 // normalizes to UTC before storage.
-func timestamptzTableDB(t *testing.T) *Database {
+func timestamptzTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')")
@@ -587,7 +587,7 @@ func timestamptzTableDB(t *testing.T) *Database {
 // intervalTableDB exercises the value codec's fixed 16-byte interval branch (type code 11):
 // a positive multi-field value, a negative value, the zero interval, a months-only '1 mon'
 // vs a span-equal-but-byte-distinct '30 days', and a NULL. The bare-string literals adapt.
-func intervalTableDB(t *testing.T) *Database {
+func intervalTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d interval)")
 	run(t, db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')")
@@ -604,7 +604,7 @@ func intervalTableDB(t *testing.T) *Database {
 // -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years; all spans distinct (span-equal
 // intervals collide on the span key). Inserted in ascending key order to match verify.rb's
 // build_tree (the split shape is order-sensitive); the out-of-order proof is in the conformance test.
-func intervalPKTableDB(t *testing.T) *Database {
+func intervalPKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (k interval PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES ('-1 mon', 6)")
@@ -623,7 +623,7 @@ func intervalPKTableDB(t *testing.T) *Database {
 // Float64 max (a full mantissa). Finite values enter via bare numeric literals (decimal
 // adaptation); the specials enter via typed literals in INSERT ... SELECT (a VALUES slot takes only
 // bare literals this slice — float.md). PK is i32 (no float key this slice — float PK → 0A000).
-func float64TableDB(t *testing.T) *Database {
+func float64TableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)")
 	run(t, db, "INSERT INTO t VALUES (1, 1.5)")
@@ -641,7 +641,7 @@ func float64TableDB(t *testing.T) *Database {
 // float32TableDB exercises the value codec's 4-byte IEEE branch (type code 13): the same
 // special-value coverage as float64TableDB (canonicalized NaN → 0x7FC00000) plus 100.25 (exactly
 // representable in binary32). PK is i32 (no float key this slice).
-func float32TableDB(t *testing.T) *Database {
+func float32TableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r f32)")
 	run(t, db, "INSERT INTO t VALUES (1, 1.5)")
@@ -660,7 +660,7 @@ func float32TableDB(t *testing.T) *Database {
 // the B-tree iterates float keys in the float total order (-Inf < finite < +Inf < NaN; -0 = +0).
 // In-contract literal values only, so the image is cross-core byte-identical; the row set matches
 // FLOAT64_PK_TABLE in spec/fileformat/verify.rb (insertion order is irrelevant — the PK store sorts).
-func float64PKTableDB(t *testing.T) *Database {
+func float64PKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE fk (k f64 PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO fk VALUES (1.5, 1)")
@@ -673,7 +673,7 @@ func float64PKTableDB(t *testing.T) *Database {
 }
 
 // float32PKTableDB is float64PKTableDB at binary32 width (the 4-byte float-order-preserving key §2.8).
-func float32PKTableDB(t *testing.T) *Database {
+func float32PKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE fk (k f32 PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO fk VALUES (1.5, 1)")
@@ -689,7 +689,7 @@ func float32PKTableDB(t *testing.T) *Database {
 // body (same int-be-signflip codec as i32). A positive date, a pre-1970 negative one, a BC-era
 // one, the −infinity/+infinity sentinels (i32 min/max), and a NULL. The bare-string literals adapt
 // to the date column. PK is i32 (spec/design/date.md).
-func dateTableDB(t *testing.T) *Database {
+func dateTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d date)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-15')")
@@ -704,7 +704,7 @@ func dateTableDB(t *testing.T) *Database {
 // compositeTypeTableDB has a composite TYPE defined + persisted (v9) AND used by a column with
 // stored values (S3): pins the recursive value codec — the null bitmap, a present-field body, and a
 // NULL field's zero-byte omission (row 2's zip) — spec/design/composite.md §4.
-func compositeTypeTableDB(t *testing.T) *Database {
+func compositeTypeTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)")
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)")
@@ -718,7 +718,7 @@ func compositeTypeTableDB(t *testing.T) *Database {
 // (element_type_code 14 + "addr") and the value body recurses (an array body whose elements are
 // composite bodies). Row 2's element has a NULL `zip` field (the composite null-bitmap inside an
 // element); row 3 mixes a present composite element with a NULL element (the array HAS_NULLS bitmap).
-func arrayCompositeTableDB(t *testing.T) *Database {
+func arrayCompositeTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)")
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
@@ -735,7 +735,7 @@ func arrayCompositeTableDB(t *testing.T) *Database {
 // (element_type_code 2 = i32) and the value body recurses (a composite body whose pts field is an
 // array body). Row 2 has an empty array field {} (ndim 0); row 3 a NULL array field (the composite
 // null-bitmap).
-func compositeArrayFieldTableDB(t *testing.T) *Database {
+func compositeArrayFieldTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TYPE poly AS (name text, pts i32[])")
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)")
@@ -750,7 +750,7 @@ func compositeArrayFieldTableDB(t *testing.T) *Database {
 // must exist), but the on-disk order is name-sorted (line, point) — line sorts BEFORE the point it
 // references, so the two-pass load (collect all, then resolve) is exercised; the row pins the
 // recursive value codec descending through a composite field.
-func nestedCompositeTableDB(t *testing.T) *Database {
+func nestedCompositeTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)")
 	run(t, db, "CREATE TYPE line AS (a point, b point)")
@@ -767,7 +767,7 @@ func nestedCompositeTableDB(t *testing.T) *Database {
 // complement i64 — plus CACHE 5 + CYCLE, exercising both flag bits and the cache field). A one-row
 // table t follows, proving sequences and tables coexist in catalog order. Must match the Ruby
 // reference's SEQUENCE_TABLE (spec/fileformat/verify.rb).
-func sequenceTableDB(t *testing.T) *Database {
+func sequenceTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE SEQUENCE s1")
 	run(t, db, "SELECT nextval('s1')")
@@ -784,7 +784,7 @@ func sequenceTableDB(t *testing.T) *Database {
 // with an expression DEFAULT nextval('t_id_seq'), and an OWNED sequence t_id_seq created alongside;
 // one INSERT advances it once (is_called true, last_value 1). Must match the Ruby reference's
 // SERIAL_TABLE (spec/fileformat/verify.rb), spec/design/sequences.md §12.
-func serialTableDB(t *testing.T) *Database {
+func serialTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id serial PRIMARY KEY, v text)")
 	run(t, db, "INSERT INTO t (v) VALUES ('hello')")
@@ -796,7 +796,7 @@ func serialTableDB(t *testing.T) *Database {
 // (flags bit1+bit3+bit4+bit5), n is GENERATED BY DEFAULT (flags bit1+bit3+bit4); each gets an owned
 // default-i64 sequence + an expression DEFAULT nextval('<seq>'). One INSERT advances both. Must
 // match the Ruby reference's IDENTITY_TABLE (spec/fileformat/verify.rb), spec/design/sequences.md §13.
-func identityTableDB(t *testing.T) *Database {
+func identityTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "+
 		"n int GENERATED BY DEFAULT AS IDENTITY, v text)")
@@ -810,7 +810,7 @@ func identityTableDB(t *testing.T) *Database {
 // bit6 + name), an un-annotated column inheriting the default (bit6 + name), and an explicit
 // COLLATE "C" column (no collation). unicode is NOT imported — it is provided by a loaded bundle, and
 // its metadata entry is emitted because the schema references it. Must match the Ruby COLLATION_TABLE.
-func collationTableDB(t *testing.T) *Database {
+func collationTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	if err := db.SetDefaultCollation("unicode"); err != nil { // loaded — no import
 		t.Fatalf("set default: %v", err)
@@ -826,7 +826,7 @@ func collationTableDB(t *testing.T) *Database {
 // encoding.md §2.12) — both keys store the unicode UCA sort key, so the B-tree iterates in
 // collation order. unicode is loaded (not the default; its entry is emitted because the columns
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
-func collationPKTableDB(t *testing.T) *Database {
+func collationPKTableDB(t *testing.T) *Engine {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY, tag text COLLATE "unicode")`)
 	run(t, db, `CREATE INDEX t_tag_idx ON t (tag)`)
@@ -841,9 +841,9 @@ func TestWriteMatchesGoldens(t *testing.T) {
 	loadFixtureBundle(t) // the unicode-collated goldens need the bundle loaded (collation.md §4)
 	cases := []struct {
 		name  string
-		build func(*testing.T) *Database
+		build func(*testing.T) *Engine
 	}{
-		{"empty_db.jed", func(*testing.T) *Database { return WithPageSize(goldenPageSize) }},
+		{"empty_db.jed", func(*testing.T) *Engine { return WithPageSize(goldenPageSize) }},
 		{"overflow_table.jed", overflowTableDB},
 		{"compressed_table.jed", compressedTableDB},
 		{"one_table_empty.jed", oneTableEmptyDB},
@@ -913,7 +913,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 	loadFixtureBundle(t) // the unicode-collated goldens open via a loaded bundle (collation.md §4)
 	cases := []struct {
 		name  string
-		build func(*testing.T) *Database
+		build func(*testing.T) *Engine
 		table string
 	}{
 		{"one_table_empty.jed", oneTableEmptyDB, "t"},
@@ -971,7 +971,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"torn_meta_slot1.jed", pkTableDB, "t"},
 	}
 	for _, c := range cases {
-		loaded, err := LoadDatabase(fixture(t, c.name))
+		loaded, err := LoadEngine(fixture(t, c.name))
 		if err != nil {
 			t.Fatalf("load %s: %v", c.name, err)
 		}
@@ -983,7 +983,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 	}
 
 	// Empty database: zero tables, and a missing table reads as absent.
-	empty, err := LoadDatabase(fixture(t, "empty_db.jed"))
+	empty, err := LoadEngine(fixture(t, "empty_db.jed"))
 	if err != nil {
 		t.Fatalf("load empty_db: %v", err)
 	}
@@ -995,7 +995,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 // READ side, catalog detail: column names, types, and flags survive exactly (a read
 // bug in an unexercised flag would otherwise slip past a rows-only check).
 func TestReadGoldenReconstructsCatalog(t *testing.T) {
-	loaded, err := LoadDatabase(fixture(t, "pk_table.jed"))
+	loaded, err := LoadEngine(fixture(t, "pk_table.jed"))
 	if err != nil {
 		t.Fatalf("load pk_table: %v", err)
 	}
@@ -1028,7 +1028,7 @@ func TestRowidCounterSurvivesLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := LoadDatabase(image)
+	loaded, err := LoadEngine(image)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -1045,7 +1045,7 @@ func TestRowidCounterSurvivesLoad(t *testing.T) {
 // applies the *persisted* defaults — proving the default value (not just its byte length)
 // round-trips through the catalog (constraints.md §2).
 func TestDefaultSurvivesLoad(t *testing.T) {
-	loaded, err := LoadDatabase(fixture(t, "default_table.jed"))
+	loaded, err := LoadEngine(fixture(t, "default_table.jed"))
 	if err != nil {
 		t.Fatalf("load default_table: %v", err)
 	}
@@ -1076,7 +1076,7 @@ func TestRoundTripAtDefaultPageSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := LoadDatabase(image)
+	loaded, err := LoadEngine(image)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -1129,7 +1129,7 @@ func TestCorruptImageIsRejected(t *testing.T) {
 	image, _ := db.ToImage(goldenPageSize, 1)
 	image[0] ^= 0xFF              // smash slot 0 magic
 	image[goldenPageSize] ^= 0xFF // smash slot 1 magic
-	if _, err := LoadDatabase(image); err == nil {
+	if _, err := LoadEngine(image); err == nil {
 		t.Errorf("expected a data_corrupted error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
 		t.Errorf("expected XX001, got %v", err)

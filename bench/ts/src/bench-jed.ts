@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-  type Database,
+  type Engine as JedDb,
   type PreparedStatement,
   create,
   executeParams,
@@ -19,13 +19,13 @@ import { intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
 import { type Arg, type Checksum, type Engine, mainWith, readSidecar } from "./lib.ts";
 
 class JedEngine implements Engine {
-  private readonly db: Database;
+  private readonly db: JedDb;
   private stmt: PreparedStatement | null = null;
   private readonly dataDir: string;
   private readonly dataset: string;
   private readonly scratch: string | null;
 
-  constructor(db: Database, dataDir: string, dataset: string, scratch: string | null) {
+  constructor(db: JedDb, dataDir: string, dataset: string, scratch: string | null) {
     this.db = db;
     this.dataDir = dataDir;
     this.dataset = dataset;

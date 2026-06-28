@@ -23,7 +23,7 @@ func slotTxid(b []byte, slot int) uint64 {
 	return binary.BigEndian.Uint64(b[slot*ps+12:])
 }
 
-func selectIDs(t *testing.T, db *Database) []int64 {
+func selectIDs(t *testing.T, db *Engine) []int64 {
 	t.Helper()
 	rows := queryRows(t, db, "SELECT id FROM t")
 	out := make([]int64, len(rows))

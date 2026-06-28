@@ -5,7 +5,7 @@
 //! consistent snapshot, runs in parallel with a writer without blocking it or being blocked, and
 //! that the watermark tracks live readers (the Phase-6 reclamation gate).
 
-use jed::{ReadHandle, SharedDb};
+use jed::{Database, ReadHandle};
 
 fn count(r: &mut ReadHandle) -> i64 {
     let rows: Vec<_> = r.query("SELECT count(*) FROM t", &[]).unwrap().collect();
@@ -16,8 +16,8 @@ fn count(r: &mut ReadHandle) -> i64 {
 }
 
 /// Seed a shared db with table `t` holding the given ids, committed via a write handle.
-fn seeded(ids: &[i64]) -> SharedDb {
-    let db = SharedDb::new_in_memory();
+fn seeded(ids: &[i64]) -> Database {
+    let db = Database::new_in_memory();
     let mut w = db.write();
     w.execute("CREATE TABLE t (id bigint PRIMARY KEY)", &[])
         .unwrap();

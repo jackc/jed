@@ -2,7 +2,7 @@
 //!
 //! Walks spec/conformance/suites, and for each `.test` file whose `# requires:`
 //! capabilities are all in this core's `SUPPORTED_CAPABILITIES`, runs the
-//! sqllogictest-style records against a fresh `Database` and compares output.
+//! sqllogictest-style records against a fresh `Engine` and compares output.
 //! Files needing a capability the core does not declare are SKIPPED (not failed),
 //! so an incomplete engine reads as "fewer tests run" (spec/design/conformance.md §3).
 //!
@@ -15,7 +15,7 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{Database, Outcome, ReadHandle, SUPPORTED_CAPABILITIES, SharedDb, Value, WriteHandle};
+use jed::{Database, Engine, Outcome, ReadHandle, SUPPORTED_CAPABILITIES, Value, WriteHandle};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -72,7 +72,7 @@ fn main() -> ExitCode {
         }
 
         // A `# format: concurrency` file is an explicit multi-session schedule run against a
-        // SharedDb (spec/design/concurrency-testing.md §4); everything else is the sequential
+        // Database (spec/design/concurrency-testing.md §4); everything else is the sequential
         // single-handle runner. Both share the result grammar; only the driver differs. The binary
         // always runs the canonical stepped-SEQUENTIAL mode; the stepped-threaded mode is exercised
         // by `cargo test` (the concurrency_threaded_tests below).
@@ -181,7 +181,7 @@ fn parse_timezone_directive(rest: &str) -> Option<String> {
 }
 
 /// Parse a file-level `# fixture: <spec-relative-path>` directive — the corpus's way to run a file
-/// against a PRE-BUILT database image instead of a fresh `Database::new()`, so a test can exercise
+/// against a PRE-BUILT database image instead of a fresh `Engine::new()`, so a test can exercise
 /// on-disk state that SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded
 /// index — the skew read-safety regression, spec/design/collation.md §12/§14). The path is relative
 /// to `spec/`. Gated by the `harness.fixture_open` capability. Returns the path, or None.
@@ -204,7 +204,7 @@ fn parse_upgrade_collations_directive(rest: &str) -> bool {
 /// point), then reconstructs the database in memory via `from_image`. The handle is read-WRITE so a
 /// write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 /// read-only-handle error.
-fn open_fixture(rel: &str) -> std::result::Result<Database, String> {
+fn open_fixture(rel: &str) -> std::result::Result<Engine, String> {
     let bundle =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
     if let Ok(bytes) = std::fs::read(&bundle) {
@@ -215,7 +215,7 @@ fn open_fixture(rel: &str) -> std::result::Result<Database, String> {
         .join(rel);
     let bytes =
         std::fs::read(&path).map_err(|e| format!("fixture: read {}: {e}", path.display()))?;
-    Database::from_image(&bytes).map_err(|e| format!("fixture: open {rel}: {}", e.message))
+    Engine::from_image(&bytes).map_err(|e| format!("fixture: open {rel}: {}", e.message))
 }
 
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -271,7 +271,7 @@ fn parse_max_cost_directive(rest: &str) -> Option<i64> {
 /// Parse a `# lifetime_max_cost: N` directive body. Returns the per-SESSION cumulative cost budget,
 /// or None if this comment is not a lifetime_max_cost directive. Unlike `# max_cost:` (per-record,
 /// reset after each record), this is **sticky**: it sets the session budget for the rest of the file
-/// (the cumulative cost builds across records on the one Database the file runs against), so an
+/// (the cumulative cost builds across records on the one Engine the file runs against), so an
 /// ordered statement sequence can drive the session to its budget and assert the `54P02` abort —
 /// what the per-record `# cost:` directive cannot express (spec/design/session.md §5.4).
 fn parse_lifetime_max_cost_directive(rest: &str) -> Option<i64> {
@@ -520,7 +520,7 @@ fn assert_types(
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
 fn run_file(text: &str) -> std::result::Result<(), String> {
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let mut lines = text.lines().peekable();
     // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
     // next record consumes them.
@@ -565,7 +565,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 load_timezone(&name)?;
                 continue;
             }
-            // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Database::new()`
+            // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Engine::new()`
             // above — appears in the header before any record (spec/design/conformance.md).
             if let Some(rel) = parse_fixture_directive(rest) {
                 db = open_fixture(&rel)?;
@@ -789,7 +789,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
         return None;
     }
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
-    let mut db = Database::new();
+    let mut db = Engine::new();
     let mut pending_cost_line: Option<usize> = None;
     let mut pending_max_cost: Option<i64> = None;
     let mut pending_max_sql_length: Option<usize> = None;
@@ -1059,14 +1059,14 @@ fn apply_sort(mut flat: Vec<String>, cols: usize, sortmode: &str) -> Vec<String>
 // The concurrency schedule runner (spec/design/concurrency-testing.md §4).
 //
 // A `.test` file carrying a `# format: concurrency` header is an explicit total order over named
-// read/write SESSIONS opened on one SharedDb. Because jed read results depend only on the logical
+// read/write SESSIONS opened on one Database. Because jed read results depend only on the logical
 // order of commits and pin-points — never on timing (§2) — executing the listed order yields the
 // canonical, deterministic result every core must produce. Two execution modes share one parse:
 //   - stepped-SEQUENTIAL (the binary's default): walk the steps on one thread — defines canonical output.
 //   - stepped-THREADED (`cargo test`, opt-in): one OS thread per session, the listed order enforced
 //     with a turn token (signal turn → session executes → signal done → advance). Same schedule,
 //     same result, but it drives the real concurrent code paths under the race detector / TSan and
-//     proves SharedDb is `Send + Sync` (it is moved into each worker thread). §4.3.
+//     proves Database is `Send + Sync` (it is moved into each worker thread). §4.3.
 //
 // The result grammar (statement / query, sortmodes, the R float tag) is reused verbatim from the
 // sequential runner above — only the session control + state assertions are new.
@@ -1399,7 +1399,7 @@ fn run_concurrency_file_threaded(text: &str) -> Result<(), String> {
 /// threaded run consistent with the schedule must produce. `gate_holder` is the live writer's sid
 /// (the single-writer gate), and `blocked` is the at-most-one writer queued on it.
 fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
-    let db = SharedDb::new_in_memory();
+    let db = Database::new_in_memory();
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let mut gate_holder: Option<String> = None; // the live writer holding the gate
     let mut blocked: Option<String> = None; // a writer queued on the gate (Layer 2 `blocks`)
@@ -1528,7 +1528,7 @@ struct Worker {
 /// A read session's worker thread: pins a snapshot, runs records against it, and on `close` returns
 /// (dropping the handle, which deregisters → advances the watermark).
 #[cfg(test)]
-fn read_worker(db: SharedDb, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
+fn read_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
     let mut h = db.read();
     let _ = tx.send(Ok(())); // ack the open: the snapshot is pinned + registered
     while let Ok(cmd) = rx.recv() {
@@ -1551,7 +1551,7 @@ fn read_worker(db: SharedDb, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(
 /// A write session's worker thread: acquires the writer gate, runs records against the working set,
 /// and on `commit`/`rollback` ends the transaction (publishing or discarding) then returns.
 #[cfg(test)]
-fn write_worker(db: SharedDb, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
+fn write_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
     let mut h = db.write();
     let _ = tx.send(Ok(())); // ack the open: the writer gate is held, working set captured
     while let Ok(cmd) = rx.recv() {
@@ -1579,7 +1579,7 @@ fn write_worker(db: SharedDb, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<
 /// the gate-releasing step, when its `write()` returns and it sends the deferred ack.
 #[cfg(test)]
 struct Driver {
-    db: SharedDb,
+    db: Database,
     workers: HashMap<String, Worker>,
     gate_holder: Option<String>,
     blocked: Option<(String, Worker)>,
@@ -1589,14 +1589,14 @@ struct Driver {
 impl Driver {
     fn new() -> Self {
         Driver {
-            db: SharedDb::new_in_memory(),
+            db: Database::new_in_memory(),
             workers: HashMap::new(),
             gate_holder: None,
             blocked: None,
         }
     }
 
-    /// Spawn a per-session worker thread. `SharedDb` is `Send + Sync` — proven by moving a clone into
+    /// Spawn a per-session worker thread. `Database` is `Send + Sync` — proven by moving a clone into
     /// the thread, where the handle is created, used, and dropped (only the shared core crosses over).
     fn spawn(&self, mode: &str, sid: &str) -> Result<Worker, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -1856,7 +1856,7 @@ fn recv_reply(rx: &Receiver<Result<(), String>>) -> Result<Result<(), String>, S
 mod concurrency_threaded_tests {
     //! Run every `# format: concurrency` suite file in the stepped-THREADED mode (§4.3): one OS
     //! thread per session, the schedule order enforced by a turn token. The point is `cargo test`
-    //! under the race detector / TSan — real concurrent-path coverage of SharedDb that the
+    //! under the race detector / TSan — real concurrent-path coverage of Database that the
     //! single-threaded sequential walk cannot give. The asserted result is identical to sequential
     //! (the schedule is timing-free, §2), so a divergence here is a genuine concurrency bug.
 

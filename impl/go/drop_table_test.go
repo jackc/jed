@@ -12,7 +12,7 @@ package jed
 import "testing"
 
 func TestDropRemovesTableAndRows(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10), (2, 20)")
 	out := mustCreate(t, db, "DROP TABLE t")
@@ -28,7 +28,7 @@ func TestDropRemovesTableAndRows(t *testing.T) {
 }
 
 func TestNameIsFreeToRecreateAfterDrop(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10)")
 	mustCreate(t, db, "DROP TABLE t")
@@ -44,7 +44,7 @@ func TestNameIsFreeToRecreateAfterDrop(t *testing.T) {
 }
 
 func TestDropIsCaseInsensitive(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	mustCreate(t, db, "create table T (id i32 primary key)")
 	mustCreate(t, db, "DROP TABLE t")
 	if _, ok := db.Table("t"); ok {
@@ -53,7 +53,7 @@ func TestDropIsCaseInsensitive(t *testing.T) {
 }
 
 func TestDropLeavesOtherTablesIntact(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	mustCreate(t, db, "CREATE TABLE a (id i32 PRIMARY KEY)")
 	mustCreate(t, db, "CREATE TABLE b (id i32 PRIMARY KEY)")
 	mustCreate(t, db, "INSERT INTO b VALUES (2)")
@@ -70,7 +70,7 @@ func TestDropLeavesOtherTablesIntact(t *testing.T) {
 }
 
 func TestDropTableSyntaxErrors(t *testing.T) {
-	db := NewDatabase()
+	db := NewEngine()
 	wantErr(t, db, "DROP TABLE", "42601") // no table name
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	wantErr(t, db, "DROP TABLE t extra", "42601") // trailing input
