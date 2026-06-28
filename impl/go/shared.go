@@ -32,11 +32,23 @@ package jed
 //         the latest committed for that one statement (no gate); an autocommit write takes the gate per
 //         statement, publishes, releases; BEGIN/COMMIT/ROLLBACK open and end an explicit block.
 //
-// In-memory this slice (the concurrency mechanism + watermark are the deliverable; durability is
-// the orthogonal §9 axis): file-backed sharing reuses the same publish point plus the §9 persist
-// chokepoint and is wired when it lands (7c). Readers' snapshot isolation comes for free from the
-// persistent (copy-on-write) stores (pmap.go): a pinned snapshot is immutable and shares structure
-// with later versions, so pinning is a pointer Load and readers concurrently reading it race-free.
+// File-backed sharing (7c) reuses the same publish point plus the §9 persist chokepoint: the
+// shared core now carries the storage identity (path / page size / pager+buffer-pool / the mutable
+// page accounting) in a *storage, and a writer's publish routes through sharedCore.persist — the
+// incremental copy-on-write file.go recipe, driven by the shared core under the writer gate (a
+// no-op in-memory). Readers' snapshot isolation comes for free from the persistent (copy-on-write)
+// stores (pmap.go): a pinned snapshot is immutable and shares structure with later versions, so
+// pinning is a pointer Load and readers concurrently reading it race-free, faulting clean pages
+// through the mutex-guarded sharedPaging alongside the committing writer. Page reclamation stays
+// watermark-safe trivially: the free-list is reconstruct-on-open only (every reusable page was dead
+// at the opened version, older than any live reader's pin); continuous within-session reclamation,
+// where the watermark gate becomes load-bearing, is the deferred follow-on (transactions.md §8).
+//
+// The host-facing single handle is *Database (the back-compat bridge — §2.1): the shared core PLUS
+// one long-lived default *Session, whose delegators (Execute/Query/Begin/.../ExecuteScript) drive
+// that default session. NewDatabase / OpenDatabase / CreateDatabase return it; it is also the
+// goroutine-safe core itself (Go needs no Rust-style !Send split), so the same *Database both
+// drives the single-handle path and mints additional concurrent sessions.
 
 import (
 	"sync"
@@ -67,19 +79,144 @@ type sharedCore struct {
 	// Its minimum key is the reclamation watermark (several readers may pin the same version).
 	liveMu sync.Mutex
 	live   map[uint64]int
+	// storage is the storage identity for a file-backed database (spec/design/session.md §2.4); nil is
+	// in-memory (persist is then a no-op). Its mutable page accounting is touched only under the writer
+	// gate, so its own mutex is uncontended; paging itself is goroutine-safe (sharedPaging).
+	storage *storage
 }
 
-// Database is a goroutine-safe, cheaply-shared database handle (CLAUDE.md §3). Every goroutine
-// uses the same *Database; Read() and Write() mint independent per-goroutine handles over it.
+// storage is the storage identity of a file-backed database (spec/design/session.md §2.4): the open
+// pager + leaf buffer pool and the mutable page accounting, shared by every session over the one
+// file. nil on a sharedCore means in-memory. pageCount/freePages are mutated only under the writer
+// gate (so mu is uncontended); paging is itself goroutine-safe, so readers fault pages concurrently
+// with the committing writer.
+type storage struct {
+	mu        sync.Mutex // guards pageCount/freePages (the writer-gate-serialized page accounting)
+	pageSize  uint32     // fixed into the file at creation
+	pageCount uint32     // on-disk high-water; persisted in the meta slot
+	freePages []uint32   // reconstruct-on-open free-list (P6.2) — reused lowest-first, trivially watermark-safe
+	paging    *sharedPaging
+	readOnly  bool // opened read-only (api.md §2.1): every session is then read-only, a write is 25006
+}
+
+// persist durably publishes snap to the backing file via an incremental copy-on-write commit
+// (file.go persist, transactions.md §9) — the file-backed publish chokepoint. In-memory (no storage)
+// is a no-op success. Called from Session.publish under the writer gate, so the pageCount/freePages
+// mutation is single-writer. Writes the dirty pages this commit introduced (reusing reconstruct-on-
+// open free-list pages first), Syncs, publishes the alternate meta slot (snap.txid & 1), Syncs. A
+// crash between the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable
+// from no live snapshot). pageCount/freePages advance only after both syncs succeed.
+func (c *sharedCore) persist(snap *Snapshot) error {
+	st := c.storage
+	if st == nil {
+		return nil // in-memory: the committed swap is the whole commit
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, st.paging)
+	if err != nil {
+		return err
+	}
+	meta := metaPage(st.pageSize, snap.txid, write.rootPage, write.pageCount)
+	if err := st.paging.withPager(func(p *pager) error {
+		// Preallocate ahead of the high-water so the body fdatasync carries no file-growth metadata
+		// journaling (spec/design/pager.md §7).
+		if err := p.reserve(write.pageCount); err != nil {
+			return err
+		}
+		for _, pg := range write.pages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+		}
+		if err := p.sync(); err != nil { // body pages durable before the meta can reference them
+			return err
+		}
+		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
+			return err
+		}
+		return p.sync() // the commit is published
+	}); err != nil {
+		return err
+	}
+	st.pageCount = write.pageCount
+	st.freePages = write.freeRemaining
+	return nil
+}
+
+// readOnlyMode reports whether this core is a read-only file-backed database (a write is 25006).
+func (c *sharedCore) readOnlyMode() bool { return c.storage != nil && c.storage.readOnly }
+
+// sharedCoreFromEngine lifts a freshly opened/created file-backed *Engine (file.go) into a shared
+// core: its committed snapshot becomes the published roots and its storage identity (page size /
+// pager / page accounting) becomes the storage. The committed snapshot's stores already carry the
+// shared paging, so every pinned snapshot faults clean pages through the one pool (pager.md).
+func sharedCoreFromEngine(e *Engine) *sharedCore {
+	c := &sharedCore{live: make(map[uint64]int)}
+	c.roots.Store(&roots{committed: e.committed, sharedTemp: e.sharedTempCommitted})
+	c.storage = &storage{
+		pageSize:  e.pageSize,
+		pageCount: e.pageCount,
+		freePages: e.freePages,
+		paging:    e.paging,
+		readOnly:  e.readOnly,
+	}
+	return c
+}
+
+// Database is the host-facing database handle (spec/design/session.md §2.1/§2.4). It is the
+// goroutine-safe shared core PLUS one long-lived default Session: the bare convenience methods
+// (Execute/Query/Begin/View/Update/ExecuteScript/Status/… and the envelope setters) delegate to that
+// default session, so it is stateful (an open BEGIN block, session variables, the time zone, the cost
+// meters persist across calls) exactly like a PostgreSQL/SQLite connection. The same *Database is
+// also the concurrency core — every goroutine uses it and ReadSession/WriteSession/Session mint
+// independent per-goroutine handles over it (Go needs no Rust-style !Send split). NewDatabase /
+// OpenDatabase / CreateDatabase return it.
 type Database struct {
 	core *sharedCore
+	// def is the long-lived default session the bare delegators drive (§2.1) — a configured autocommit
+	// session over core (the lazy-gate rule), so its writes coexist with additional sessions.
+	def *Session
 }
 
-// NewDatabase builds a fresh, empty in-memory shared database (committed version 0).
+// NewDatabase builds a fresh, empty in-memory database plus its default session (committed version 0).
 func NewDatabase() *Database {
 	c := &sharedCore{live: make(map[uint64]int)}
 	c.roots.Store(&roots{committed: newSnapshot(), sharedTemp: newSnapshot()})
-	return &Database{core: c}
+	return databaseOver(c)
+}
+
+// CreateDatabase makes a new file-backed database at path (spec/design/api.md §2) and returns the
+// host handle with its default session. 58P02 if the path already exists; the page size is locked
+// into the file.
+func CreateDatabase(path string, opts DatabaseOptions) (*Database, error) {
+	e, err := Create(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	return databaseOver(sharedCoreFromEngine(e)), nil
+}
+
+// OpenDatabase opens an existing file-backed database at path with default open settings.
+func OpenDatabase(path string) (*Database, error) {
+	return OpenDatabaseWithOptions(path, OpenOptions{})
+}
+
+// OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
+// (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
+func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
+	e, err := OpenWithOptions(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	return databaseOver(sharedCoreFromEngine(e)), nil
+}
+
+// databaseOver wraps a shared core with a fresh default session (the lazy-gate autocommit session).
+func databaseOver(c *sharedCore) *Database {
+	db := &Database{core: c}
+	db.def = db.Session(SessionOptions{})
+	return db
 }
 
 // Version is the committed version currently published (the monotonic commit counter,
@@ -127,6 +264,11 @@ func (s *Database) ReadSession() *Session {
 // Commit publishes the working set, Rollback / Close discards it and releases the gate. (The old
 // SharedDB.Write().)
 func (s *Database) WriteSession() *Session {
+	if s.core.readOnlyMode() {
+		// A read-only file has no writer (api.md §2.1); a "write" session degrades to a pinned
+		// read-only one — a write through it is 25006, mirroring PostgreSQL hot standby.
+		return s.ReadSession()
+	}
 	s.core.writeMu.Lock()
 	rt := s.core.roots.Load()
 	base := rt.committed
@@ -147,8 +289,92 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	rt := s.core.roots.Load()
 	snap := rt.committed
 	engine := &Engine{committed: snap, pageSize: DefaultPageSize, session: newSessionWithOptions(opts), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
+	// version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
+	if s.core.readOnlyMode() {
+		s.core.liveMu.Lock()
+		s.core.live[snap.txid]++
+		s.core.liveMu.Unlock()
+		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
+	}
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid}
 }
+
+// --- The default-session delegators (the back-compat single-handle bridge, §2.1): each forwards to
+// the long-lived default Session, so the single-handle surface is stateful like a PG/SQLite connection. ---
+
+// Execute runs a (possibly mutating) statement on the default session, binding $N params.
+func (db *Database) Execute(sql string, params []Value) (Outcome, error) {
+	return db.def.Execute(sql, params)
+}
+
+// Query runs a query on the default session, returning a row cursor.
+func (db *Database) Query(sql string, params []Value) (*Rows, error) {
+	return db.def.Query(sql, params)
+}
+
+// ExecuteScript runs a multi-statement script on the default session (spec/design/session.md §4.2).
+func (db *Database) ExecuteScript(sql string) (ScriptSummary, error) {
+	return db.def.ExecuteScript(sql)
+}
+
+// Begin opens an explicit transaction block on the default session (§2.2; the host-API BEGIN).
+func (db *Database) Begin(writable bool) error { return db.def.Begin(writable) }
+
+// Commit commits the default session's open block (publish + release the gate; no-op if none).
+func (db *Database) Commit() error { return db.def.Commit() }
+
+// Rollback rolls back the default session's open block (discard the working set; no-op if none).
+func (db *Database) Rollback() error { return db.def.Rollback() }
+
+// View runs fn in a READ ONLY transaction on the default session (scoped sugar, §2.2).
+func (db *Database) View(fn func(tx *Transaction) error) error { return db.def.View(fn) }
+
+// Update runs fn in a READ WRITE transaction on the default session (scoped sugar, §2.2).
+func (db *Database) Update(fn func(tx *Transaction) error) error { return db.def.Update(fn) }
+
+// Status reports the default session's transaction status (Idle/Open/Failed, §2.2).
+func (db *Database) Status() TxStatus { return db.def.Status() }
+
+// InTransaction reports whether an explicit transaction block is open on the default session.
+func (db *Database) InTransaction() bool { return db.def.InTransaction() }
+
+// Close releases the default session and closes the backing file (file-backed only). Idempotent.
+func (db *Database) Close() error {
+	db.def.Close()
+	if st := db.core.storage; st != nil && st.paging != nil {
+		_ = st.paging.close()
+		st.paging = nil
+	}
+	return nil
+}
+
+// The envelope (spec/design/session.md §3), delegating to the default session.
+func (db *Database) MaxCost() int64                          { return db.def.MaxCost() }
+func (db *Database) SetMaxCost(limit int64)                  { db.def.SetMaxCost(limit) }
+func (db *Database) LifetimeMaxCost() int64                  { return db.def.LifetimeMaxCost() }
+func (db *Database) SetLifetimeMaxCost(limit int64)          { db.def.SetLifetimeMaxCost(limit) }
+func (db *Database) LifetimeCost() int64                     { return db.def.LifetimeCost() }
+func (db *Database) MaxSQLLength() int                       { return db.def.MaxSQLLength() }
+func (db *Database) SetMaxSQLLength(b int)                   { db.def.SetMaxSQLLength(b) }
+func (db *Database) WorkMem() int                            { return db.def.WorkMem() }
+func (db *Database) SetWorkMem(b int)                        { db.def.SetWorkMem(b) }
+func (db *Database) SetDefaultPrivileges(privs PrivilegeSet) { db.def.SetDefaultPrivileges(privs) }
+func (db *Database) Grant(privs PrivilegeSet, object string) { db.def.Grant(privs, object) }
+func (db *Database) Revoke(privs PrivilegeSet, object string) {
+	db.def.Revoke(privs, object)
+}
+func (db *Database) Privileges() *Privileges         { return db.def.Privileges() }
+func (db *Database) AllowDDL() bool                  { return db.def.AllowDDL() }
+func (db *Database) SetAllowDDL(allow bool)          { db.def.SetAllowDDL(allow) }
+func (db *Database) SetVar(name, value string) error { return db.def.SetVar(name, value) }
+func (db *Database) ResetVar(name string) error      { return db.def.ResetVar(name) }
+func (db *Database) Var(name string) (string, bool)  { return db.def.Var(name) }
+func (db *Database) SetTimeZone(zone string) error   { return db.def.SetTimeZone(zone) }
+func (db *Database) SetRandomSource(f RandomSource)  { db.def.SetRandomSource(f) }
+func (db *Database) ClearRandomSource()              { db.def.ClearRandomSource() }
+func (db *Database) SetClockSource(f ClockSource)    { db.def.SetClockSource(f) }
+func (db *Database) ClearClockSource()               { db.def.ClearClockSource() }
 
 // accessMode is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1).
 // Distinct from the privilege envelope (§5.3): accessReadOnly is the coarse snapshot read-only mode
@@ -237,7 +463,8 @@ func (s *Session) dispatch(stmt Statement, params []Value) (Outcome, error) {
 	s.refreshCommitted()
 	out, err := s.engine.ExecuteStmtParams(stmt, params)
 	if err == nil {
-		s.publish()
+		// A persist I/O failure surfaces as the statement's error and publishes nothing.
+		err = s.publish()
 	}
 	s.core.writeMu.Unlock()
 	s.gateHeld = false
@@ -279,7 +506,8 @@ func (s *Session) endBlock(commit bool) (Outcome, error) {
 		failed := s.engine.session.tx != nil && s.engine.session.tx.failed
 		out, err = s.engine.commitTx() // inner in-memory swap: committed := working
 		if err == nil && !failed && s.gateHeld {
-			s.publish()
+			// A clean writable block: persist + publish. A persist failure surfaces here and stores nothing.
+			err = s.publish()
 		}
 	} else {
 		out, err = s.engine.rollbackTx()
@@ -316,13 +544,22 @@ func (s *Session) refreshCommitted() {
 
 // publish stores the engine's committed roots into the shared cell at the next version (the §3 commit
 // window — a single atomic Store of both roots, temp-tables.md §5). Called after a clean autocommit
-// write or an explicit COMMIT of a writable block.
-func (s *Session) publish() {
+// write or an explicit COMMIT of a writable block, under the writer gate.
+//
+// File-backed: the new file snapshot is persisted durably first (sharedCore.persist) and the roots
+// are stored only on success, so a persist I/O failure leaves the shared committed state (and this
+// session's version) unchanged and surfaces the error. In-memory persist is a no-op. The shared-temp
+// root is never serialized — it rides the Store as a pure in-memory pointer (temp-tables.md §2/§5).
+func (s *Session) publish() error {
 	snap := s.engine.committed
 	snap.txid = s.baseVersion + 1 // advance the shared version on every commit
+	if err := s.core.persist(snap); err != nil {
+		return err // durable before publish; nothing is stored on failure
+	}
 	s.engine.committed = snap
 	s.core.roots.Store(&roots{committed: snap, sharedTemp: s.engine.sharedTempCommitted})
 	s.baseVersion++
+	return nil
 }
 
 // Commit commits an open write block / write session (publish + release the gate, §2.4). With no open
@@ -354,6 +591,15 @@ func (s *Session) Close() {
 	} else {
 		s.finishBlock()
 	}
+}
+
+// Begin opens an explicit transaction block on this session (spec/design/session.md §2.2 — the
+// host-API spelling of SQL BEGIN). writable true is READ WRITE (eager gate, the BEGIN READ WRITE
+// form); false is READ ONLY (pins + registers in the watermark, no gate). Statements then run on the
+// session until Commit/Rollback. A nested Begin (a block is already open) is 25001.
+func (s *Session) Begin(writable bool) error {
+	_, err := s.beginBlock(writable, true)
+	return err
 }
 
 // View runs fn in a READ ONLY transaction on this session (bbolt-style auto-commit/rollback, §2.2).
