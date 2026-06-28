@@ -4,7 +4,8 @@
 //! transaction has FAILED (a statement errored inside it, so everything but
 //! COMMIT/ROLLBACK now answers 25P02).
 
-use jed::{Engine, EngineError, Outcome, Value};
+use jed::tooling::Engine;
+use jed::{EngineError, Outcome, Value};
 
 /// One statement's result, shaped for display.
 #[derive(Debug)]

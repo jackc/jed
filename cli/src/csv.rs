@@ -197,7 +197,7 @@ fn literal(ty: &ScalarType, field: &Field) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::{Engine, execute};
+    use jed::tooling::{Engine, execute};
 
     fn f(value: &str) -> Field {
         Field {

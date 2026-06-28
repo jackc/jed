@@ -14,7 +14,8 @@ mod tui;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use jed::{DatabaseOptions, Engine, OpenOptions};
+use jed::tooling::Engine;
+use jed::{DatabaseOptions, OpenOptions};
 
 use args::Source;
 use session::Session;

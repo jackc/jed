@@ -3,7 +3,7 @@
 //! names, and function names of the grammar. Pure candidate logic — the popup state and
 //! key handling live in `app.rs`, the rendering in `draw.rs`.
 
-use jed::Engine;
+use jed::tooling::Engine;
 
 /// The grammar's word list (keywords, canonical type names, aggregate functions) —
 /// completed in the case style of the typed prefix (all-uppercase prefix → uppercase).
@@ -154,7 +154,7 @@ pub fn candidates(db: &Engine, prefix: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::execute;
+    use jed::tooling::execute;
 
     fn db() -> Engine {
         let mut db = Engine::new();

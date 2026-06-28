@@ -320,7 +320,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::{Engine, execute};
+    use jed::tooling::{Engine, execute};
 
     fn app() -> App {
         let mut db = Engine::new();

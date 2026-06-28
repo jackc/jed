@@ -77,9 +77,14 @@ pub use collation::{load_unicode_data, loaded_collation};
 pub use decimal::Decimal;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
-    CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Engine, Outcome, ScriptSummary,
+    CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Outcome, ScriptSummary,
     SessionOptions, TxStatus,
 };
+// The low-level single-threaded `Engine` is NOT part of the public embedding API — the converged
+// §2.4 handles ([`Database`] / [`Session`] / [`SharedCore`]) are. It stays reachable in-crate (the
+// integration tests) under `jed::Engine` via this crate-private re-export, and to the in-repo CLI
+// via the doc-hidden `tooling` seam below. External wraps/benches drive [`Database`] instead.
+pub(crate) use executor::Engine;
 pub use file::{DatabaseOptions, OpenOptions};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{ClockSource, RandomSource, advancing_clock, fixed_clock, seeded_random_source};
@@ -99,6 +104,26 @@ pub mod tooling {
     // The CLI renders query results + dumps schema using these internal types.
     pub use crate::catalog::Table;
     pub use crate::types::{ScalarType, Type};
+
+    // The low-level single-threaded handle + its one-shot conveniences. The in-repo REPL (`cli/`)
+    // drives the engine through these and needs the catalog introspection (`Engine::table` /
+    // `table_names`) the public `Database` deliberately does not expose. NOT the embedding API —
+    // a host links against `Database` / `Session` / `SharedCore`.
+    pub use crate::executor::Engine;
+
+    /// One-shot parse + execute against a low-level [`Engine`] (the zero-parameter convenience).
+    pub fn execute(db: &mut Engine, sql: &str) -> crate::Result<crate::Outcome> {
+        crate::execute(db, sql)
+    }
+
+    /// One-shot parse + execute against a low-level [`Engine`], binding `$N` parameters.
+    pub fn execute_params(
+        db: &mut Engine,
+        sql: &str,
+        params: &[crate::Value],
+    ) -> crate::Result<crate::Outcome> {
+        crate::execute_params(db, sql, params)
+    }
 
     pub mod collation {
         pub use crate::collation::{
@@ -813,17 +838,19 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_object_agg",
 ];
 
-/// Parse and execute one SQL statement against `db` (no bind parameters).
-pub fn execute(db: &mut Engine, sql: &str) -> Result<Outcome> {
+/// Parse and execute one SQL statement against a low-level [`Engine`] (no bind parameters).
+/// Internal — the public one-shot path is [`Database::execute`] / [`Session::execute`]; this stays
+/// for in-crate tests and is re-exported to the in-repo CLI via [`tooling::execute`].
+pub(crate) fn execute(db: &mut Engine, sql: &str) -> Result<Outcome> {
     let stmt = db.parse(sql)?;
     db.execute_stmt(stmt)
 }
 
-/// Parse and execute one SQL statement against `db`, binding `params` to its `$N`
+/// Parse and execute one SQL statement against a low-level [`Engine`], binding `params` to its `$N`
 /// placeholders (spec/design/api.md §5). A count mismatch is `42601`; a parameter whose type
 /// cannot be inferred is `42P18`; a bound value out of range / of the wrong family fails like a
-/// literal (22003/42804/…).
-pub fn execute_params(db: &mut Engine, sql: &str, params: &[Value]) -> Result<Outcome> {
+/// literal (22003/42804/…). Internal — the public path is [`Database::execute_params`].
+pub(crate) fn execute_params(db: &mut Engine, sql: &str, params: &[Value]) -> Result<Outcome> {
     let stmt = db.parse(sql)?;
     db.execute_stmt_params(stmt, params)
 }

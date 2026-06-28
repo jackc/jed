@@ -7,8 +7,8 @@
 
 use std::io::{self, Write};
 
-use jed::Engine;
 use jed::Value;
+use jed::tooling::Engine;
 use jed::tooling::Table;
 
 /// Write the whole database as SQL. Tables come out in the catalog's standing order
@@ -124,7 +124,7 @@ pub fn value_literal(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::execute;
+    use jed::tooling::execute;
 
     fn dump_to_string(db: &mut Engine) -> String {
         let mut buf = Vec::new();

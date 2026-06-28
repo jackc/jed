@@ -60,7 +60,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use crate::api::{Rows, Transaction};
+use crate::api::{PreparedStatement, Rows, Transaction};
 use crate::ast::Statement;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
@@ -320,6 +320,30 @@ impl SharedCore {
         }))
     }
 
+    /// Build an **in-memory** shared core from an existing database image (the bytes a file-backed
+    /// commit would write). Lifts the reconstructed committed snapshot into the published roots with
+    /// no backing file (so a write republishes in memory, never persisting). Used by the conformance
+    /// harness's `# fixture:` path to run records against a pre-built on-disk state that SQL cannot
+    /// construct (the collation version-skew read-safety guard, collation.md §12).
+    fn from_memory_engine(engine: Engine) -> SharedCore {
+        SharedCore(Arc::new(Shared {
+            roots: RwLock::new(Roots {
+                committed: Arc::new(engine.committed),
+                shared_temp: Arc::new(engine.shared_temp_committed),
+            }),
+            writer_active: Mutex::new(false),
+            writer_free: Condvar::new(),
+            live: Mutex::new(LiveRegistry::default()),
+            storage: None,
+        }))
+    }
+
+    /// Reconstruct an **in-memory** shared core from a database image (`XX001` on a malformed image).
+    /// The shared-core analogue of [`Engine::from_image`].
+    pub fn from_image(image: &[u8]) -> Result<SharedCore> {
+        Ok(SharedCore::from_memory_engine(Engine::from_image(image)?))
+    }
+
     /// Create a **new** file-backed shared database at `path` (spec/design/api.md §2). `58P02` if the
     /// path already exists. The page size is locked into the file. (The shared-core analogue of
     /// [`Engine::create`].)
@@ -555,6 +579,13 @@ impl Session {
     /// latest committed; a READ ONLY block pins its snapshot and registers it in the watermark (like
     /// a read session) without the gate.
     fn begin_block(&mut self, writable: Option<bool>) -> Result<Outcome> {
+        // A nested BEGIN (a block is already open) must NOT re-acquire the writer gate / re-pin — a
+        // second `acquire_writer` on the gate this very session already holds would deadlock. Defer to
+        // the executor, which rejects it `25001` against the open transaction (the single-handle Engine
+        // path's behavior). transactions.md §4.2; the Go core carries the identical guard.
+        if self.engine.in_transaction() {
+            return self.engine.begin_tx(writable);
+        }
         let rw = writable.unwrap_or(true);
         if rw {
             self.shared.acquire_writer();
@@ -844,6 +875,77 @@ impl Session {
     pub fn clear_clock_source(&mut self) {
         self.engine.session.clear_clock_source();
     }
+    /// Reset the authorization envelope to fully permissive — every table privilege, no per-object
+    /// delta, DDL (incl. temp DDL) allowed (§5.3).
+    pub fn reset_privileges(&mut self) {
+        self.engine.reset_privileges();
+    }
+    /// Set whether session-local temporary-table DDL is permitted (temp-tables.md §5); a denied
+    /// temp DDL is `42501`.
+    pub fn set_allow_temp_ddl(&mut self, allow: bool) {
+        self.engine.session.set_allow_temp_ddl(allow);
+    }
+    /// Set whether database-wide shared temporary-table DDL is permitted (temp-tables.md §5).
+    pub fn set_allow_shared_temp_ddl(&mut self, allow: bool) {
+        self.engine.session.set_allow_shared_temp_ddl(allow);
+    }
+    /// Set the per-session temporary-table storage budget in bytes; `0` ⇒ unlimited (temp-tables.md §7).
+    pub fn set_temp_buffers(&mut self, bytes: usize) {
+        self.engine.session.set_temp_buffers(bytes);
+    }
+    /// Set the database-wide shared-temp storage budget in bytes; `0` ⇒ unlimited (temp-tables.md §7).
+    pub fn set_shared_temp_mem(&mut self, bytes: usize) {
+        self.engine.set_shared_temp_mem(bytes);
+    }
+    /// Clear every session variable (§6.1).
+    pub fn reset_vars(&mut self) {
+        self.engine.session.reset_vars();
+    }
+    /// Run the COLLATION UPGRADE migration on the live database (collation.md §12) — re-pin every
+    /// catalog collation to the loaded version + rebuild its collated index keys, clearing a version
+    /// skew. Returns the number of re-pinned collations. The privileged host op behind the version-skew
+    /// read-safety guard.
+    ///
+    /// This rebuilds persisted index keys, so it is a **WRITE**: it must publish to the shared core
+    /// (like an autocommit write, §2.4), or the next autocommit read's `refresh_committed` would re-pin
+    /// the pre-upgrade snapshot and the rebuilt index would never become visible (no pushdown). Inside
+    /// an open block it mutates the working set and the block's commit publishes.
+    pub fn upgrade_collations(&mut self) -> Result<usize> {
+        if self.engine.in_transaction() {
+            return self.engine.upgrade_collations();
+        }
+        self.shared.acquire_writer();
+        self.gate_held = true;
+        self.refresh_committed();
+        let result = match self.engine.upgrade_collations() {
+            // Nothing was skewed ⇒ no state change, so there is no new version to publish (mirrors
+            // the executor, which only swaps in the rebuilt snapshot when `n > 0`).
+            Ok(n) if n > 0 => self.publish().map(|()| n),
+            other => other,
+        };
+        self.shared.release_writer();
+        self.gate_held = false;
+        result
+    }
+    /// Parse `sql` once into a reusable [`PreparedStatement`] (spec/design/api.md §2.4); run it with
+    /// [`execute_prepared`](Session::execute_prepared) / [`query_prepared`](Session::query_prepared).
+    /// Parse errors (`42601`, …) and the `54000` input-size limit surface here.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        self.engine.prepare(sql)
+    }
+    /// Run a [`PreparedStatement`] on this session, binding `$N` params — the prepared analogue of
+    /// [`execute`](Session::execute), dispatched through the session's lazy-gate lifecycle (§2.4).
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Outcome> {
+        self.dispatch(stmt.ast().clone(), params)
+    }
+    /// Run a prepared **query** on this session, returning a row cursor.
+    pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
+        Rows::from_outcome(self.execute_prepared(stmt, params)?)
+    }
 }
 
 impl Drop for Session {
@@ -902,6 +1004,12 @@ impl Database {
     /// budget, read-only mode, work-mem).
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
         Ok(Database::over(SharedCore::open_with_options(path, opts)?))
+    }
+
+    /// Reconstruct an **in-memory** database from an existing image (`XX001` if malformed). Its
+    /// default session writes republish in memory and never persist.
+    pub fn from_image(image: &[u8]) -> Result<Database> {
+        Ok(Database::over(SharedCore::from_image(image)?))
     }
 
     /// Wrap a shared core with a fresh default session (the lazy-gate autocommit session of §2.4).
@@ -1079,5 +1187,60 @@ impl Database {
     /// Clear the injected clock source (return to the wall clock).
     pub fn clear_clock_source(&mut self) {
         self.default.clear_clock_source();
+    }
+    /// Reset the default session's authorization envelope to fully permissive (§5.3).
+    pub fn reset_privileges(&mut self) {
+        self.default.reset_privileges();
+    }
+    /// Set whether session-local temporary-table DDL is permitted on the default session
+    /// (temp-tables.md §5).
+    pub fn set_allow_temp_ddl(&mut self, allow: bool) {
+        self.default.set_allow_temp_ddl(allow);
+    }
+    /// Set whether database-wide shared temporary-table DDL is permitted on the default session.
+    pub fn set_allow_shared_temp_ddl(&mut self, allow: bool) {
+        self.default.set_allow_shared_temp_ddl(allow);
+    }
+    /// Set the default session's temporary-table storage budget in bytes; `0` ⇒ unlimited.
+    pub fn set_temp_buffers(&mut self, bytes: usize) {
+        self.default.set_temp_buffers(bytes);
+    }
+    /// Set the database-wide shared-temp storage budget in bytes; `0` ⇒ unlimited.
+    pub fn set_shared_temp_mem(&mut self, bytes: usize) {
+        self.default.set_shared_temp_mem(bytes);
+    }
+    /// Clear every session variable on the default session (§6.1).
+    pub fn reset_vars(&mut self) {
+        self.default.reset_vars();
+    }
+    /// Run the COLLATION UPGRADE migration on the live database (collation.md §12), returning the
+    /// number of re-pinned collations.
+    pub fn upgrade_collations(&mut self) -> Result<usize> {
+        self.default.upgrade_collations()
+    }
+    /// Parse `sql` once into a reusable [`PreparedStatement`] (spec/design/api.md §2.4); run it with
+    /// [`execute_prepared`](Database::execute_prepared) / [`query_prepared`](Database::query_prepared).
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        self.default.prepare(sql)
+    }
+    /// Run a [`PreparedStatement`] on the default session, binding `$N` params (the prepared
+    /// analogue of [`execute`](Database::execute)).
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Outcome> {
+        self.default.execute_prepared(stmt, params)
+    }
+    /// Run a prepared **query** on the default session, returning a row cursor.
+    pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
+        self.default.query_prepared(stmt, params)
+    }
+    /// Release the handle (spec/design/api.md §2.3): roll back any open explicit transaction on the
+    /// default session (its in-progress work is discarded) and drop. Under autocommit every prior
+    /// statement is already durable, so `close` never drops committed work. Idempotent.
+    pub fn close(mut self) -> Result<()> {
+        self.default.close();
+        Ok(())
     }
 }

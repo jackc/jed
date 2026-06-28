@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use jed::{DatabaseOptions, Engine as JedDb, PreparedStatement, Session, SharedCore, Value};
+use jed::{Database, DatabaseOptions, PreparedStatement, Session, SharedCore, Value};
 use jed_bench::{
     Arg, BoxResult, Checksum, ConcurrentOutcome, Config, Engine, main_with, read_sidecar,
 };
@@ -17,7 +17,7 @@ fn main() {
 }
 
 struct JedEngine {
-    db: JedDb,
+    db: Database,
     stmt: Option<PreparedStatement>,
     data_dir: String,
     dataset: String,
@@ -28,7 +28,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
     if dataset == "scratch" {
         let dir = format!("{data_dir}/scratch-rust-{}", std::process::id());
         std::fs::create_dir_all(&dir)?;
-        let db = JedDb::create(format!("{dir}/scratch.jed"), DatabaseOptions::default())
+        let db = Database::create(format!("{dir}/scratch.jed"), DatabaseOptions::default())
             .map_err(|e| e.to_string())?;
         return Ok(Box::new(JedEngine {
             db,
@@ -38,7 +38,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
             scratch: Some(dir),
         }));
     }
-    let db = JedDb::open(format!("{data_dir}/{dataset}.jed")).map_err(|e| e.to_string())?;
+    let db = Database::open(format!("{data_dir}/{dataset}.jed")).map_err(|e| e.to_string())?;
     Ok(Box::new(JedEngine {
         db,
         stmt: None,
@@ -78,11 +78,10 @@ impl Engine for JedEngine {
 
     fn query_prepared(&mut self, args: &[Arg], sum: Option<&mut Checksum>) -> BoxResult<usize> {
         let params = bind_args(args);
+        let stmt = self.stmt.as_ref().expect("prepare first");
         let rows = self
-            .stmt
-            .as_ref()
-            .expect("prepare first")
-            .query(&mut self.db, &params)
+            .db
+            .query_prepared(stmt, &params)
             .map_err(|e| e.to_string())?;
         let mut n = 0;
         match sum {
@@ -113,10 +112,9 @@ impl Engine for JedEngine {
 
     fn exec_prepared(&mut self, args: &[Arg]) -> BoxResult<()> {
         let params = bind_args(args);
-        self.stmt
-            .as_ref()
-            .expect("prepare first")
-            .execute(&mut self.db, &params)
+        let stmt = self.stmt.as_ref().expect("prepare first");
+        self.db
+            .execute_prepared(stmt, &params)
             .map_err(|e| e.to_string())?;
         Ok(())
     }

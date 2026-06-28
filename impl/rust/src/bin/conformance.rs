@@ -15,7 +15,7 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{Engine, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, SharedCore, Value};
+use jed::{Database, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, SharedCore, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -204,7 +204,7 @@ fn parse_upgrade_collations_directive(rest: &str) -> bool {
 /// point), then reconstructs the database in memory via `from_image`. The handle is read-WRITE so a
 /// write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 /// read-only-handle error.
-fn open_fixture(rel: &str) -> std::result::Result<Engine, String> {
+fn open_fixture(rel: &str) -> std::result::Result<Database, String> {
     let bundle =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
     if let Ok(bytes) = std::fs::read(&bundle) {
@@ -215,7 +215,7 @@ fn open_fixture(rel: &str) -> std::result::Result<Engine, String> {
         .join(rel);
     let bytes =
         std::fs::read(&path).map_err(|e| format!("fixture: read {}: {e}", path.display()))?;
-    Engine::from_image(&bytes).map_err(|e| format!("fixture: open {rel}: {}", e.message))
+    Database::from_image(&bytes).map_err(|e| format!("fixture: open {rel}: {}", e.message))
 }
 
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -520,7 +520,7 @@ fn assert_types(
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
 fn run_file(text: &str) -> std::result::Result<(), String> {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory();
     let mut lines = text.lines().peekable();
     // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
     // next record consumes them.
@@ -705,7 +705,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 }
                 let expect = parts.next().unwrap_or("");
                 let sql = take_sql(&mut lines);
-                let result = jed::execute(&mut db, &sql);
+                let result = db.execute(&sql, &[]);
                 match expect {
                     "ok" => match result {
                         Ok(outcome) => assert_cost(expected_cost, outcome.cost(), &sql)?,
@@ -748,7 +748,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                     }
                     expected.push(l.trim().to_string());
                 }
-                let outcome = jed::execute(&mut db, &sql).map_err(|e| {
+                let outcome = db.execute(&sql, &[]).map_err(|e| {
                     format!(
                         "query failed with {}: {}\n  SQL: {sql}",
                         e.code(),
@@ -787,7 +787,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
         return None;
     }
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory();
     let mut pending_cost_line: Option<usize> = None;
     let mut pending_max_cost: Option<i64> = None;
     let mut pending_max_sql_length: Option<usize> = None;
@@ -868,7 +868,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                     sql.push(out[i].clone());
                     i += 1;
                 }
-                let result = jed::execute(&mut db, &sql.join("\n"));
+                let result = db.execute(&sql.join("\n"), &[]);
                 // Only a `statement ok` carries a cost; an error record never does.
                 if expect == "ok" {
                     result.ok().map(|o| o.cost())
@@ -890,9 +890,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 while i < out.len() && !out[i].trim().is_empty() {
                     i += 1;
                 }
-                jed::execute(&mut db, &sql.join("\n"))
-                    .ok()
-                    .map(|o| o.cost())
+                db.execute(&sql.join("\n"), &[]).ok().map(|o| o.cost())
             }
             _ => {
                 i += 1;

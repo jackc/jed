@@ -55,7 +55,7 @@
 // wrapping the safe core (CLAUDE.md §13; ruby.md §4).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use jed::{DatabaseOptions, Engine, OpenOptions, Outcome, Value};
+use jed::{Database, DatabaseOptions, OpenOptions, Outcome, Value};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -129,7 +129,7 @@ fn err_buf(state: &str, msg: &str) -> *mut u8 {
 }
 
 /// Encode a freshly-opened database handle into a HANDLE buffer (its pointer as a u64).
-fn ok_handle(db: Engine) -> *mut u8 {
+fn ok_handle(db: Database) -> *mut u8 {
     let ptr = Box::into_raw(Box::new(db)) as usize as u64;
     let mut b = Buf::new(TAG_HANDLE);
     b.u64(ptr);
@@ -320,10 +320,10 @@ pub extern "C" fn jed_abi_version() -> u32 {
 }
 
 /// Open a new in-memory database. Infallible; returns an opaque handle (null only on an internal
-/// panic, which cannot happen for `Engine::new`).
+/// panic, which cannot happen for `Database::new_in_memory`).
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_open_memory() -> *mut Engine {
-    match catch_unwind(|| Box::into_raw(Box::new(Engine::new()))) {
+pub extern "C" fn jed_open_memory() -> *mut Database {
+    match catch_unwind(|| Box::into_raw(Box::new(Database::new_in_memory()))) {
         Ok(p) => p,
         Err(_) => std::ptr::null_mut(),
     }
@@ -338,7 +338,7 @@ pub extern "C" fn jed_create(path: *const c_char) -> *mut u8 {
             Ok(s) => s,
             Err(b) => return b,
         };
-        match Engine::create(path, DatabaseOptions::default()) {
+        match Database::create(path, DatabaseOptions::default()) {
             Ok(db) => ok_handle(db),
             Err(e) => err_buf(e.code(), &e.message),
         }
@@ -358,7 +358,7 @@ pub extern "C" fn jed_open(path: *const c_char, read_only: u8) -> *mut u8 {
             read_only: read_only != 0,
             ..OpenOptions::default()
         };
-        match Engine::open_with_options(path, opts) {
+        match Database::open_with_options(path, opts) {
             Ok(db) => ok_handle(db),
             Err(e) => err_buf(e.code(), &e.message),
         }
@@ -370,7 +370,7 @@ pub extern "C" fn jed_open(path: *const c_char, read_only: u8) -> *mut u8 {
 /// `SELECT`, a STATEMENT buffer for DDL/DML, or an ERROR buffer. Free the buffer with [`jed_free`].
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_execute(
-    db: *mut Engine,
+    db: *mut Database,
     sql: *const c_char,
     params: *const u8,
     params_len: u32,
@@ -400,7 +400,7 @@ pub extern "C" fn jed_execute(
 /// Commit the database's current (autocommit or explicit) transaction, making prior writes durable
 /// per the `synchronous` setting. Returns a UNIT buffer on success or an ERROR buffer.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_commit(db: *mut Engine) -> *mut u8 {
+pub extern "C" fn jed_commit(db: *mut Database) -> *mut u8 {
     guard(|| {
         if db.is_null() {
             return err_buf("XX000", "null database handle");
@@ -451,7 +451,7 @@ pub extern "C" fn jed_load_time_zone_data(ptr: *const u8, len: u32) -> *mut u8 {
 /// — durability is explicit, api.md §2.3). Idempotent only in the sense that a handle must be closed
 /// exactly once: the gem guards against a double `jed_close`.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_close(db: *mut Engine) {
+pub extern "C" fn jed_close(db: *mut Database) {
     if db.is_null() {
         return;
     }

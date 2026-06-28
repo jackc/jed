@@ -24,7 +24,7 @@
 //!   tag 0 ERROR:     [9..14) 5-byte ascii sqlstate ; u32 msg_len ; msg utf8
 //!   tag 1 STATEMENT: u8 has_rows_affected ; i64 rows_affected
 //!   tag 2 QUERY:     u32 ncols ; u32 nrows ; nrows×ncols×(u8 is_null ; if !null: u32 len + utf8)
-//!   tag 3 HANDLE:    u64 pointer (a *mut Engine or *mut PreparedStatement, as a u64)
+//!   tag 3 HANDLE:    u64 pointer (a *mut Database or *mut PreparedStatement, as a u64)
 //!   tag 4 UNIT:      (no payload)
 //! ```
 //!
@@ -58,7 +58,7 @@
 // sanctioned FFI seam, wrapping the safe core (CLAUDE.md §13).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use jed::{DatabaseOptions, Engine, OpenOptions, Outcome, PreparedStatement, Value};
+use jed::{Database, DatabaseOptions, OpenOptions, Outcome, PreparedStatement, Value};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -125,7 +125,7 @@ fn err_buf(state: &str, msg: &str) -> *mut u8 {
     b.finish()
 }
 
-/// Encode an opaque pointer (Engine / PreparedStatement) into a HANDLE buffer.
+/// Encode an opaque pointer (Database / PreparedStatement) into a HANDLE buffer.
 fn ok_handle(ptr: u64) -> *mut u8 {
     let mut b = Buf::new(TAG_HANDLE);
     b.u64(ptr);
@@ -295,7 +295,7 @@ pub extern "C" fn jed_abi_version() -> u32 {
 /// Open a new in-memory database. Returns a HANDLE buffer (null only on an internal panic).
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_open_memory() -> *mut u8 {
-    guard(|| ok_handle(Box::into_raw(Box::new(Engine::new())) as usize as u64))
+    guard(|| ok_handle(Box::into_raw(Box::new(Database::new_in_memory())) as usize as u64))
 }
 
 /// Create a new file-backed database at `path` (a WASI path under a host preopen). HANDLE or ERROR.
@@ -306,7 +306,7 @@ pub extern "C" fn jed_create(path: *const c_char) -> *mut u8 {
             Ok(s) => s,
             Err(b) => return b,
         };
-        match Engine::create(path, DatabaseOptions::default()) {
+        match Database::create(path, DatabaseOptions::default()) {
             Ok(db) => ok_handle(Box::into_raw(Box::new(db)) as usize as u64),
             Err(e) => err_buf(e.code(), &e.message),
         }
@@ -325,7 +325,7 @@ pub extern "C" fn jed_open(path: *const c_char, read_only: u8) -> *mut u8 {
             read_only: read_only != 0,
             ..OpenOptions::default()
         };
-        match Engine::open_with_options(path, opts) {
+        match Database::open_with_options(path, opts) {
             Ok(db) => ok_handle(Box::into_raw(Box::new(db)) as usize as u64),
             Err(e) => err_buf(e.code(), &e.message),
         }
@@ -334,7 +334,7 @@ pub extern "C" fn jed_open(path: *const c_char, read_only: u8) -> *mut u8 {
 
 /// Close a database handle (rolls back any open transaction). Called exactly once per handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_close(db: *mut Engine) {
+pub extern "C" fn jed_close(db: *mut Database) {
     if db.is_null() {
         return;
     }
@@ -373,7 +373,7 @@ unsafe fn free_buf(ptr: *mut u8) {
 /// Parse + execute one SQL statement against `db` with no bind parameters. Returns a QUERY buffer
 /// for a SELECT, a STATEMENT buffer for DDL/DML, or an ERROR buffer.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_execute(db: *mut Engine, sql: *const c_char) -> *mut u8 {
+pub extern "C" fn jed_execute(db: *mut Database, sql: *const c_char) -> *mut u8 {
     guard(|| {
         if db.is_null() {
             return err_buf("XX000", "null database handle");
@@ -396,7 +396,7 @@ pub extern "C" fn jed_execute(db: *mut Engine, sql: *const c_char) -> *mut u8 {
 /// Parse `sql` into a reusable prepared statement. Returns a HANDLE buffer (a `*mut PreparedStatement`)
 /// or an ERROR buffer. Free the statement with [`jed_stmt_free`].
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_prepare(db: *mut Engine, sql: *const c_char) -> *mut u8 {
+pub extern "C" fn jed_prepare(db: *mut Database, sql: *const c_char) -> *mut u8 {
     guard(|| {
         if db.is_null() {
             return err_buf("XX000", "null database handle");
@@ -418,7 +418,7 @@ pub extern "C" fn jed_prepare(db: *mut Engine, sql: *const c_char) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_stmt_query(
     stmt: *const PreparedStatement,
-    db: *mut Engine,
+    db: *mut Database,
     params: *const u8,
     params_len: u32,
 ) -> *mut u8 {
@@ -427,14 +427,14 @@ pub extern "C" fn jed_stmt_query(
             return err_buf("XX000", "null statement or database handle");
         }
         // SAFETY: `stmt` is a live handle from jed_prepare; `db` a live handle. The PreparedStatement
-        // holds no Engine borrow, so the &PreparedStatement + &mut Engine don't alias.
+        // holds no Database borrow, so the &PreparedStatement + &mut Database don't alias.
         let stmt = unsafe { &*stmt };
         let db = unsafe { &mut *db };
         let params = match decode_params(params, params_len) {
             Ok(v) => v,
             Err(b) => return b,
         };
-        match stmt.query(db, &params) {
+        match db.query_prepared(stmt, &params) {
             Ok(rows) => {
                 let ncols = rows.column_names().len();
                 encode_query(ncols, rows)
@@ -448,7 +448,7 @@ pub extern "C" fn jed_stmt_query(
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_stmt_execute(
     stmt: *const PreparedStatement,
-    db: *mut Engine,
+    db: *mut Database,
     params: *const u8,
     params_len: u32,
 ) -> *mut u8 {
@@ -463,7 +463,7 @@ pub extern "C" fn jed_stmt_execute(
             Ok(v) => v,
             Err(b) => return b,
         };
-        match stmt.execute(db, &params) {
+        match db.execute_prepared(stmt, &params) {
             Ok(outcome) => ok_outcome(outcome),
             Err(e) => err_buf(e.code(), &e.message),
         }

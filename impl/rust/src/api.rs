@@ -16,15 +16,24 @@ pub struct PreparedStatement {
 }
 
 impl PreparedStatement {
-    /// Run this statement against `db`, binding `params` to its `$N` placeholders (empty when it
-    /// has none), returning the materialized outcome.
-    pub fn execute(&self, db: &mut Engine, params: &[Value]) -> Result<Outcome> {
+    /// The parsed statement. The public prepared-execution path is on
+    /// [`Database`](crate::Database) / [`Session`](crate::Session)
+    /// (`prepare` + `execute_prepared` / `query_prepared`), which dispatch this AST through the
+    /// session's lazy-gate lifecycle (spec/design/session.md §2.4); this accessor lets that layer
+    /// reach the AST.
+    pub(crate) fn ast(&self) -> &Statement {
+        &self.ast
+    }
+
+    /// Run this statement against a low-level [`Engine`] handle, binding `params` to its `$N`
+    /// placeholders. Internal: the public path is [`Database::execute_prepared`](crate::Database::execute_prepared).
+    pub(crate) fn execute(&self, db: &mut Engine, params: &[Value]) -> Result<Outcome> {
         db.execute_stmt_params(self.ast.clone(), params)
     }
 
-    /// Run this **query** statement against `db`, returning a row cursor. A non-query statement
-    /// is a `42601` (use `execute`).
-    pub fn query(&self, db: &mut Engine, params: &[Value]) -> Result<Rows> {
+    /// Run this **query** statement against a low-level [`Engine`] handle. Internal: the public
+    /// path is [`Database::query_prepared`](crate::Database::query_prepared).
+    pub(crate) fn query(&self, db: &mut Engine, params: &[Value]) -> Result<Rows> {
         Rows::from_outcome(self.execute(db, params)?)
     }
 }
