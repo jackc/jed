@@ -727,8 +727,20 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
      (not the in-memory default) so the cores stay byte-identical for non-default-page-size files (§8).
      No on-disk format change, no new capability flags. The `Database` concurrent-reader bench lands
      with this slice ([../../TODO.md](../../TODO.md)).
-   - **7d — docs.** `web/src/routes/docs/api/*`, `web/examples/*`; the worker bridge keeps the
-     single-handle path via the delegators.
+   - **7d — docs.** ✅ The website's host/embedding docs now teach the converged surface: the six
+     `web/examples/*` topics (open-database, transactions, scripts, authorization, resource-limits,
+     session-variables) × {Rust, Go, TS} were rewritten to the `Database` handle and its delegators —
+     `Database::create`/`open`/`new_in_memory` (Rust), `jed.CreateDatabase`/`OpenDatabase`/`NewDatabase`
+     (Go), `createDatabase`/`openDatabase`/`Database.newInMemory()` (TS) — running SQL via `db.execute`/
+     `db.query`, minting an untrusted/concurrent **session** with `db.session(opts)` (whose `execute`/
+     `query` no longer take a `db` argument — the session owns its `Engine`), and `tx`/`update`/`view`
+     in Rust/Go (TS drives the block via `begin`/`commit`/`rollback`, having no closure helper). The
+     `web/src/routes/docs/api/*` prose was corrected to match (in-memory constructor names, the
+     update/view-vs-begin split, the `Database` handle intro). Verified by `vite build` (Shiki) +
+     the 42-test Playwright e2e (incl. the language-switcher and OPFS suites). The worker bridge keeps
+     the single-handle path via the delegators. (One surfaced gap, *not* fixed here as it is core
+     surface, not docs: the converged `Database`/`Session` handle does not re-export `reset_vars`
+     (clear-all) — only the internal `Engine` has it — so the docs document `reset_var` only.)
 
    No new capability flags (the concurrency corpus suites and their results are unchanged). The
    simple/fast single-handle path stays cheap (an autocommit read is one snapshot pin; an autocommit

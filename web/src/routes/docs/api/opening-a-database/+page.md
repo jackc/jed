@@ -13,6 +13,11 @@ A jed database is a single file on disk. Open or create one, run SQL against it,
 you're done. Pass a path for a durable file, or open a transient **in-memory** database for tests
 and scratch work.
 
+Opening or creating returns a **`Database`** — the handle you run SQL through. It carries a default
+session, so `execute`, `query`, `commit`, and the transaction calls work directly on it; for
+concurrent readers or an untrusted, locked-down caller, mint a separate **session** from the same
+handle (see [Authorization](/docs/api/authorization) and [Resource limits](/docs/api/resource-limits)).
+
 Use the **language selector** in the top bar to switch this example between Rust, Go, and
 TypeScript.
 
@@ -27,8 +32,8 @@ durable: the new state lands on disk before the call returns.
 ## In-memory databases
 
 Every example on the **SQL** pages of these docs runs against an in-memory database, right in your
-browser — the same engine, no file. Create one with `Database::new()` (Rust), `jed.NewDatabase()`
-(Go), or `new Database()` (TypeScript).
+browser — the same engine, no file. Create one with `Database::new_in_memory()` (Rust),
+`jed.NewDatabase()` (Go), or `Database.newInMemory()` (TypeScript).
 
 ## Running untrusted queries
 

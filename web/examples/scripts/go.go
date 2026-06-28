@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	db, err := jed.Create("app.jed", jed.DatabaseOptions{})
+	db, err := jed.CreateDatabase("app.jed", jed.DatabaseOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func main() {
 	// statement's rows, loop it yourself and run the spans through the normal path — the host owns
 	// the policy (one transaction or autocommit, drain rows or drop them).
 	for stmt := range jed.SplitStatements("SELECT id FROM account; SELECT balance FROM account") {
-		if _, err := db.QuerySQL(stmt.Text, nil); err != nil {
+		if _, err := db.Query(stmt.Text, nil); err != nil {
 			log.Fatal(err)
 		}
 	}

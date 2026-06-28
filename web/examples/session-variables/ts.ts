@@ -1,6 +1,6 @@
-import { close, create, query } from 'jed-ts';
+import { createDatabase } from 'jed-ts';
 
-const db = create('app.jed');
+const db = createDatabase('app.jed');
 
 // Session variables are PostgreSQL's GUC model, scoped to the session: a string→string map the host
 // sets and SQL reads with current_setting(). A custom variable must be NAMESPACED — a dotted name
@@ -11,14 +11,14 @@ db.setVar('myapp.tenant', 'acme');
 console.log('tenant:', db.var('myapp.tenant')); // acme
 
 // ... or in SQL with current_setting(): `SELECT current_setting('myapp.tenant')` -> "acme".
-query(db, "SELECT current_setting('myapp.tenant')");
+db.query("SELECT current_setting('myapp.tenant')");
 
 // An unset name is 42704, unless the two-arg form passes missing_ok = true, which returns NULL:
 //   SELECT current_setting('myapp.unset')        -- 42704
 //   SELECT current_setting('myapp.unset', true)  -- NULL
 
 // Variables are SESSION state, not data — they do NOT roll back with a transaction. resetVar clears
-// one; resetVars() clears them all (PostgreSQL's RESET ALL).
+// one by name.
 db.resetVar('myapp.tenant');
 
-close(db);
+db.close();

@@ -19,9 +19,8 @@ fn main() -> jed::Result<()> {
     //   SELECT current_setting('myapp.unset', true)  -- NULL
 
     // Variables are SESSION state, not data — they do NOT roll back with a transaction. reset_var
-    // clears one; reset_vars() clears them all (PostgreSQL's RESET ALL).
+    // clears one by name.
     db.reset_var("myapp.tenant")?;
 
-    db.close();
     Ok(())
 }

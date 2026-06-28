@@ -38,7 +38,7 @@ Session variables live on the session, not in the database:
 - They are **not** stored in the file, and they do **not** roll back when a transaction rolls back
   (PostgreSQL's `SET SESSION` behavior).
 - Each session has its own independent set — a variable on one session is invisible to another.
-- `reset_var(name)` clears one; `reset_vars()` clears them all (PostgreSQL's `RESET ALL`).
+- `reset_var(name)` clears one variable by name.
 
 > **Scope.** This is the v1 surface — the host API plus the `current_setting()` read. The SQL
 > `SET` / `RESET` / `SHOW` grammar, a built-in `time_zone` setting, and transaction-scoped

@@ -1,16 +1,17 @@
-import { create, execute, query, commit, close, render } from 'jed-ts';
+import { createDatabase, render } from 'jed-ts';
 
-// Open a database. A path creates/opens a single-file database on disk; `new Database()` is a
-// transient in-memory one. Writes accumulate until an explicit commit (close discards uncommitted
-// changes).
-const db = create('people.jed');
+// Open a database. createDatabase/openDatabase return a Database — the handle you run SQL through. A
+// path gives a single-file database on disk; `Database.newInMemory()` is a transient in-memory one.
+// Writes accumulate until an explicit commit (close discards uncommitted changes).
+const db = createDatabase('people.jed');
 
-execute(db, 'CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)');
-execute(db, "INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')");
-commit(db);
+db.execute('CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)');
+db.execute("INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')");
+db.commit();
 
-for (const row of query(db, 'SELECT name FROM person ORDER BY id')) {
+// query() returns a row cursor; execute() is for statements that produce no rows.
+for (const row of db.query('SELECT name FROM person ORDER BY id')) {
   console.log(render(row[0]));
 }
 
-close(db);
+db.close();

@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	db, err := jed.Create("app.jed", jed.DatabaseOptions{})
+	db, err := jed.CreateDatabase("app.jed", jed.DatabaseOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func main() {
 	}
 
 	// ... or in SQL with current_setting(): SELECT current_setting('myapp.tenant') -> "acme".
-	if _, err := db.QuerySQL("SELECT current_setting('myapp.tenant')", nil); err != nil {
+	if _, err := db.Query("SELECT current_setting('myapp.tenant')", nil); err != nil {
 		log.Fatal(err)
 	}
 
@@ -36,7 +36,7 @@ func main() {
 	//   SELECT current_setting('myapp.unset', true)  -- NULL
 
 	// Variables are SESSION state, not data — they do NOT roll back with a transaction. ResetVar
-	// clears one; ResetVars() clears them all (PostgreSQL's RESET ALL).
+	// clears one by name.
 	if err := db.ResetVar("myapp.tenant"); err != nil {
 		log.Fatal(err)
 	}

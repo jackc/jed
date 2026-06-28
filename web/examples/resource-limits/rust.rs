@@ -14,19 +14,19 @@ fn main() -> jed::Result<()> {
     });
 
     // Each statement accrues into the session's running total; read it with lifetime_cost().
-    untrusted.execute(&mut db, "SELECT 1", &[])?; // cost 1 — cumulative 1
-    untrusted.execute(&mut db, "SELECT 1", &[])?; // cost 1 — cumulative 2
+    untrusted.execute("SELECT 1", &[])?; // cost 1 — cumulative 1
+    untrusted.execute("SELECT 1", &[])?; // cost 1 — cumulative 2
 
     // The third drives the cumulative to the budget — the in-flight statement aborts 54P02, and the
     // partial cost still counts, so the session is now spent.
-    let denied = untrusted.execute(&mut db, "SELECT 1", &[]);
+    let denied = untrusted.execute("SELECT 1", &[]);
     assert_eq!(denied.unwrap_err().code(), "54P02");
     assert_eq!(untrusted.lifetime_cost(), 3);
 
     // Once spent, every further statement is rejected at admission — the session is done.
-    let after = untrusted.execute(&mut db, "SELECT 1", &[]);
+    let after = untrusted.execute("SELECT 1", &[]);
     assert_eq!(after.unwrap_err().code(), "54P02");
+    untrusted.close();
 
-    db.close();
     Ok(())
 }

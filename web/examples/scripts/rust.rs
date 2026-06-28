@@ -21,6 +21,5 @@ fn main() -> jed::Result<()> {
         let _rows = db.query(stmt.text(), &[])?;
     }
 
-    db.close();
     Ok(())
 }

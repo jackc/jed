@@ -8,10 +8,10 @@ import (
 )
 
 func main() {
-	// Open a database. A path creates a single-file database on disk; jed.NewDatabase() is a
-	// transient in-memory one. Writes accumulate until an explicit commit (close discards
-	// uncommitted changes).
-	db, err := jed.Create("people.jed", jed.DatabaseOptions{PageSize: jed.DefaultPageSize})
+	// Open a database. CreateDatabase/OpenDatabase return a *Database — the handle you run SQL
+	// through. A path gives a single-file database on disk; jed.NewDatabase() is a transient
+	// in-memory one. Writes accumulate until an explicit commit (Close discards uncommitted changes).
+	db, err := jed.CreateDatabase("people.jed", jed.DatabaseOptions{PageSize: jed.DefaultPageSize})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -23,7 +23,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	rows, err := db.QuerySQL("SELECT name FROM person ORDER BY id", nil)
+	// Query returns a row cursor; Execute is for statements that produce no rows.
+	rows, err := db.Query("SELECT name FROM person ORDER BY id", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -33,7 +34,7 @@ func main() {
 }
 
 func mustExec(db *jed.Database, sql string) {
-	if _, err := db.ExecuteSQL(sql, nil); err != nil {
+	if _, err := db.Execute(sql, nil); err != nil {
 		log.Fatal(err)
 	}
 }

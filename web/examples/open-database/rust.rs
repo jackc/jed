@@ -1,21 +1,19 @@
-use jed::{execute, Database, DatabaseOptions, Outcome};
+use jed::{Database, DatabaseOptions};
 
 fn main() -> jed::Result<()> {
-    // Open a database. A path creates a single-file database on disk; `Database::new()` is a
-    // transient in-memory one. Writes accumulate until an explicit commit (close discards
-    // uncommitted changes).
+    // Open a database. `create`/`open` return a `Database` — the handle you run SQL through. A path
+    // gives a single-file database on disk; `Database::new_in_memory()` is a transient in-memory one.
+    // Writes accumulate until an explicit commit (dropping the handle discards uncommitted changes).
     let mut db = Database::create("people.jed", DatabaseOptions::default())?;
 
-    execute(&mut db, "CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)")?;
-    execute(&mut db, "INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')")?;
+    db.execute("CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)", &[])?;
+    db.execute("INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')", &[])?;
     db.commit()?;
 
-    if let Outcome::Query { rows, .. } = execute(&mut db, "SELECT name FROM person ORDER BY id")? {
-        for row in &rows {
-            println!("{}", row[0].render());
-        }
+    // query() returns a row cursor; execute() is for statements that produce no rows.
+    for row in db.query("SELECT name FROM person ORDER BY id", &[])? {
+        println!("{}", row[0].render());
     }
 
-    db.close();
     Ok(())
 }
