@@ -147,6 +147,17 @@ func (c *sharedCore) persist(snap *Snapshot) error {
 // readOnlyMode reports whether this core is a read-only file-backed database (a write is 25006).
 func (c *sharedCore) readOnlyMode() bool { return c.storage != nil && c.storage.readOnly }
 
+// pageSize is the page size minted sessions serialize/split at: the file's page size for a file-backed
+// core, else the in-memory default. A session's stores must split at the file's page size so they
+// match the physical pages persist writes — and so every core builds byte-identical file-backed
+// databases (CLAUDE.md §8). In-memory this is the default, so it is a no-op there.
+func (c *sharedCore) pageSize() uint32 {
+	if c.storage != nil {
+		return c.storage.pageSize
+	}
+	return DefaultPageSize
+}
+
 // sharedCoreFromEngine lifts a freshly opened/created file-backed *Engine (file.go) into a shared
 // core: its committed snapshot becomes the published roots and its storage identity (page size /
 // pager / page accounting) becomes the storage. The committed snapshot's stores already carry the
@@ -253,7 +264,7 @@ func (s *Database) ReadSession() *Session {
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshots directly — no clone. Both roots are pinned together (temp-tables.md §5),
 	// so the reader sees a consistent file + shared-temp view.
-	engine := &Engine{committed: snap, pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	engine := &Engine{committed: snap, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
 	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
 }
 
@@ -274,7 +285,7 @@ func (s *Database) WriteSession() *Session {
 	base := rt.committed
 	// committed/sharedTemp are the immutable bases (the writer mutates only working / sharedTempWorking,
 	// which beginTx clones off them). Both roots are pinned together (temp-tables.md §5).
-	engine := &Engine{committed: base, pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	engine := &Engine{committed: base, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
 	_, _ = engine.beginTx(true, true)
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid}
 }
@@ -288,7 +299,7 @@ func (s *Database) WriteSession() *Session {
 func (s *Database) Session(opts SessionOptions) *Session {
 	rt := s.core.roots.Load()
 	snap := rt.committed
-	engine := &Engine{committed: snap, pageSize: DefaultPageSize, session: newSessionWithOptions(opts), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	engine := &Engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
 	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
 	// version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
 	if s.core.readOnlyMode() {

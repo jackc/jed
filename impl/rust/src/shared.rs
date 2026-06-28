@@ -200,6 +200,18 @@ impl Shared {
         r.shared_temp = shared_temp;
     }
 
+    /// The page size minted sessions serialize/split at: the file's page size for a file-backed core,
+    /// else the in-memory default. A session's stores must split at the file's page size so they match
+    /// the physical pages `persist` writes — and so every core builds byte-identical file-backed
+    /// databases (CLAUDE.md §8). In-memory this is the default, so it is a no-op there.
+    fn page_size(&self) -> u32 {
+        self.storage
+            .as_ref()
+            .map_or(crate::executor::DEFAULT_PAGE_SIZE, |s| {
+                s.lock().expect("storage lock not poisoned").page_size
+            })
+    }
+
     /// Whether this core is a read-only file-backed database (a write is `25006`). In-memory cores
     /// are always writable.
     fn read_only(&self) -> bool {
@@ -358,6 +370,7 @@ impl SharedCore {
             .expect("live lock not poisoned")
             .register(version);
         let mut engine = Engine::from_snapshot((*snap).clone());
+        engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
         // Seed the engine with the pinned shared-temp snapshot (temp-tables.md §5): the reader sees the
         // shared temp tables committed as of its pinned version, consistent with its file snapshot.
         engine.shared_temp_committed = (*shared_temp).clone();
@@ -387,6 +400,7 @@ impl SharedCore {
         let (base, shared_temp) = self.0.pin();
         let base_version = base.txid;
         let mut engine = Engine::from_snapshot((*base).clone());
+        engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
         // Seed the engine with the pinned shared-temp snapshot before opening the block, so its
         // `shared_temp_working` (cloned at begin_tx) is the latest committed shared temp (temp-tables.md §5).
         engine.shared_temp_committed = (*shared_temp).clone();
@@ -414,6 +428,7 @@ impl SharedCore {
         let (snap, shared_temp) = self.0.pin();
         let version = snap.txid;
         let mut engine = Engine::from_snapshot((*snap).clone());
+        engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
         engine.shared_temp_committed = (*shared_temp).clone();
         engine.session = SessionState::with_options(opts);
         // A read-only file-backed core mints read-only sessions (a write is `25006`); it pins the
