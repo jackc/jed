@@ -93,12 +93,12 @@ def go_file(us)
     package jed
 
     // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
-    type CostSchedule struct {
+    type costSchedule struct {
     #{fields}
     }
 
     // Costs is the canonical cost schedule — weights accrued per unit during query execution.
-    var Costs = CostSchedule{
+    var costs = costSchedule{
     #{values}
     }
   GO

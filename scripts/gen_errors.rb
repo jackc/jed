@@ -158,14 +158,14 @@ def go_file(es)
     // ErrorDesc is one error's metadata, mirroring an [[error]] entry in registry.toml. The enum
     // above is the type-safe code used at raise sites; Errors is the iterable data table the
     // cross-check tests walk against the registry (the enum is not iterable).
-    type ErrorDesc struct {
+    type errorDesc struct {
     \tCode  string
     \tName  string
     \tClass string
     }
 
     // Errors lists every error, in registry order.
-    var Errors = []ErrorDesc{
+    var errorDescs = []errorDesc{
     #{descs}
     }
   GO
