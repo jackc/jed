@@ -8,15 +8,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import {
-  close,
-  create,
-  EngineError,
-  execute,
-  loadEngine,
-  open,
-  residentLeaves,
-} from "../src/lib.ts";
+import { close, create, EngineError, execute, loadEngine, open } from "../src/lib.ts";
+import { residentLeaves } from "../src/file.ts";
 import type { Value } from "../src/lib.ts";
 
 function intOf(v: Value): bigint {

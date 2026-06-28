@@ -702,6 +702,16 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "harness.upgrade_collations",
 ];
 
+// THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface). Everything an
+// embedder needs is re-exported below; the other src/*.ts modules are internal machinery (parser, AST,
+// catalog, executor internals, codecs, storage) and are NOT part of the supported API even though TS
+// cannot language-enforce that — import only from this barrel. (The one sanctioned exception is the
+// browser seam: web/src/lib/jed/worker.ts deep-imports executor.ts/opfs.ts/parser.ts directly to keep
+// Node `fs` out of the bundle — an internal seam, not public API.)
+
+// --- low-level one-shot helpers over the Engine handle (used by the in-repo harness/bench/tests;
+// new embedders use Database/Session below). ---
+
 // execute parses and executes one SQL statement against db (no bind parameters).
 export function execute(db: Engine, sql: string): Outcome {
   return db.executeStmt(db.parse(sql));
@@ -721,31 +731,8 @@ export function executeScript(db: Engine, sql: string): ScriptSummary {
   return db.executeScript(sql);
 }
 
-// --- public surface (re-exports) ---
-export { loadUnicodeData } from "./collation.ts";
-export {
-  Engine,
-  DEFAULT_MAX_SQL_LENGTH,
-  DEFAULT_PAGE_SIZE,
-  Snapshot,
-} from "./executor.ts";
-export type {
-  CollationInfo,
-  Outcome,
-  SessionOptions,
-  TxStatus,
-} from "./executor.ts";
-export { PrivilegeSet, Privileges, privilegeFromName } from "./privileges.ts";
-export type { Privilege } from "./privileges.ts";
-export { splitStatements } from "./split.ts";
-export type { ScriptSummary, StatementSpan } from "./split.ts";
-export { parseSQL } from "./parser.ts";
-export { EngineError, sqlStateCode } from "./errors.ts";
-export type { SqlState } from "./errors.ts";
-export { intValue, nullValue, render } from "./value.ts";
-export type { ThreeValued, Value } from "./value.ts";
-export { loadEngine, toImage } from "./format.ts";
-export type { Statement } from "./ast.ts";
+// --- primary embedding API ---
+export { Database, Session } from "./shared.ts";
 export {
   PreparedStatement,
   Rows,
@@ -765,9 +752,23 @@ export {
   commit,
   rollback,
   close,
-  residentLeaves,
 } from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
-export { Database, Session } from "./shared.ts";
+export type { CollationInfo, Outcome, SessionOptions, TxStatus } from "./executor.ts";
+export { intValue, nullValue, render } from "./value.ts";
+export type { ThreeValued, Value } from "./value.ts";
+export { EngineError, sqlStateCode } from "./errors.ts";
+export type { SqlState } from "./errors.ts";
+export { PrivilegeSet, Privileges, privilegeFromName } from "./privileges.ts";
+export type { Privilege } from "./privileges.ts";
+export { splitStatements } from "./split.ts";
+export type { ScriptSummary, StatementSpan } from "./split.ts";
+export { loadUnicodeData } from "./collation.ts";
 export { advancingClock, fixedClock, seededRandomSource } from "./seam.ts";
 export type { ClockFunc, RandomFill } from "./seam.ts";
+export { DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE } from "./executor.ts";
+
+// --- low-level handle + golden/byte tooling (the in-repo harness/bench/tests; the Engine is also the
+// browser worker's handle). Not the primary embedding surface — prefer Database/Session above. ---
+export { Engine } from "./executor.ts";
+export { loadEngine, toImage } from "./format.ts";
