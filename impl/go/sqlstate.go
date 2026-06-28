@@ -19,6 +19,8 @@ const (
 	CardinalityViolation SqlState = iota
 	// DataException is 22000 — {detail}.
 	DataException
+	// StringDataRightTruncation is 22001 — {detail}.
+	StringDataRightTruncation
 	// NumericValueOutOfRange is 22003 — value out of range for type {type}.
 	NumericValueOutOfRange
 	// NullValueNotAllowed is 22004 — {detail}.
@@ -180,6 +182,8 @@ func (s SqlState) Code() string {
 		return "21000"
 	case DataException:
 		return "22000"
+	case StringDataRightTruncation:
+		return "22001"
 	case NumericValueOutOfRange:
 		return "22003"
 	case NullValueNotAllowed:
@@ -350,6 +354,7 @@ type errorDesc struct {
 var errorDescs = []errorDesc{
 	{Code: "21000", Name: "cardinality_violation", Class: "cardinality violation"},
 	{Code: "22000", Name: "data_exception", Class: "data exception"},
+	{Code: "22001", Name: "string_data_right_truncation", Class: "data exception"},
 	{Code: "22003", Name: "numeric_value_out_of_range", Class: "data exception"},
 	{Code: "22004", Name: "null_value_not_allowed", Class: "data exception"},
 	{Code: "22007", Name: "invalid_datetime_format", Class: "data exception"},

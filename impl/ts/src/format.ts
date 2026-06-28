@@ -96,7 +96,7 @@ import {
 } from "./value.ts";
 import type { JsonNode } from "./json.ts";
 
-const FORMAT_VERSION = 21; // on-disk format version (21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 22; // on-disk format version (22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -1207,6 +1207,11 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
       w.u16(col.decimal ? col.decimal.precision : 0);
       w.u16(col.decimal ? col.decimal.scale : 0);
     }
+    // A text column appends its varchar(n) max length — only for type_code 4 (v22). 0 = unbounded,
+    // so a plain text column carries 0 (spec/design/types.md §15).
+    if (s === "text") {
+      w.u32(col.varcharLen ?? 0);
+    }
     // A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value via
     // the same value codec rows use — AFTER the typmod, presence-gated, so a column without a
     // default is byte-unchanged (format.md). A DEFAULT NULL is one 0x01. An EXPRESSION default
@@ -1353,6 +1358,10 @@ function compositeTypeEntryBytes(ct: CompositeType): Uint8Array {
       w.u16(f.decimal ? f.decimal.precision : 0);
       w.u16(f.decimal ? f.decimal.scale : 0);
     }
+    // A text field appends its varchar(n) max length (v22); 0 = unbounded (types.md §15).
+    if (f.type.kind === "scalar" && f.type.scalar === "text") {
+      w.u32(f.varcharLen ?? 0);
+    }
   }
   return w.toBytes();
 }
@@ -1392,7 +1401,13 @@ function decodeCompositeTypeEntry(buf: Uint8Array, cur: Cursor): CompositeType {
       const scale = readU16(buf, cur);
       if (precision !== 0) decimal = { precision, scale };
     }
-    fields.push({ name: fname, type: fty, decimal, notNull });
+    // A text field carries its varchar(n) max length (v22); 0 = unbounded (types.md §15).
+    let varcharLen: number | null = null;
+    if (fty.kind === "scalar" && fty.scalar === "text") {
+      const n = readU32(buf, cur);
+      if (n !== 0) varcharLen = n;
+    }
+    fields.push({ name: fname, type: fty, decimal, varcharLen, notNull });
   }
   return { name, fields };
 }
@@ -2673,6 +2688,7 @@ function decodeTableEntry(
         name: cname,
         type: compositeT(tname),
         decimal: null,
+        varcharLen: null,
         primaryKey: false,
         notNull: (cflags & 0b10) !== 0,
         default: null,
@@ -2693,6 +2709,7 @@ function decodeTableEntry(
         name: cname,
         type: arrayT(elem),
         decimal: null,
+        varcharLen: null,
         primaryKey: false,
         notNull: (cflags & 0b10) !== 0,
         default: null,
@@ -2714,6 +2731,7 @@ function decodeTableEntry(
         name: cname,
         type: rangeT(elem),
         decimal: null,
+        varcharLen: null,
         primaryKey: false,
         notNull: (cflags & 0b10) !== 0,
         default: null,
@@ -2750,6 +2768,12 @@ function decodeTableEntry(
       const scale = readU16(buf, cur);
       if (precision !== 0) decimal = { precision, scale };
     }
+    // A text column carries its varchar(n) max length (v22); 0 = unbounded (types.md §15).
+    let varcharLen: number | null = null;
+    if (ty === "text") {
+      const n = readU32(buf, cur);
+      if (n !== 0) varcharLen = n;
+    }
     // The default follows the typmod (format.md): a CONSTANT default (flags bit2) is a value via
     // the same value codec rows use — never externalized, so no overflow reader is needed (a
     // 0x02 tag here would be a corrupt catalog). An EXPRESSION default (flags bit3, v8) is
@@ -2783,6 +2807,7 @@ function decodeTableEntry(
       name: cname,
       type: scalarT(ty),
       decimal,
+      varcharLen,
       primaryKey: false, // set from the pk list below
       notNull: (flags & 0b10) !== 0,
       default: colDefault,

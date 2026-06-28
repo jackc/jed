@@ -17,6 +17,10 @@ export type Column = {
   // unconstrained numeric (spec/design/decimal.md §2). A constrained decimal column coerces
   // stored values to this precision/scale.
   decimal: DecimalTypmod | null;
+  // The varchar(n) max-length typmod for a text column, or null for a non-text column OR an
+  // unbounded text (spec/design/types.md §15). n counts code points; an over-length assignment
+  // traps 22001. Persisted as a u32 in the typmod slot (type_code 4, format_version 22).
+  varcharLen: number | null;
   primaryKey: boolean;
   notNull: boolean;
   // The column's CONSTANT DEFAULT value, pre-evaluated and type-coerced at CREATE TABLE, or
@@ -170,6 +174,9 @@ export type CompositeField = {
   type: Type;
   // The decimal numeric(p,s) typmod when type is decimal, else null (mirrors Column).
   decimal: DecimalTypmod | null;
+  // The varchar(n) max-length typmod when type is text, else null (mirrors Column —
+  // spec/design/types.md §15).
+  varcharLen: number | null;
   // Whether the field was declared NOT NULL.
   notNull: boolean;
 };
@@ -308,6 +315,8 @@ export type ColField = {
   name: string;
   type: ColType;
   typmod: DecimalTypmod | null;
+  // The varchar(n) max-length typmod when type is text (spec/design/types.md §15).
+  varcharLen: number | null;
   notNull: boolean;
 };
 
@@ -336,6 +345,7 @@ export function resolveColType(ty: Type, types: Map<string, CompositeType>): Col
       name: f.name,
       type: resolveColType(f.type, types),
       typmod: f.decimal,
+      varcharLen: f.varcharLen,
       notNull: f.notNull,
     })),
   };

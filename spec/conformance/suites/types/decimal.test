@@ -164,7 +164,8 @@ CREATE TABLE bad2 (x numeric(1001))
 statement error 22023
 CREATE TABLE bad3 (x numeric(5,7))
 
-# a type modifier on a non-decimal type is unsupported this slice (varchar(n) etc. deferred): 0A000
+# a type modifier on a type that takes none (an integer) is unsupported: 0A000. (decimal(p,s) and
+# varchar(n) DO take a modifier — see types/varchar.test; an integer typmod stays 0A000.)
 statement error 0A000
 CREATE TABLE bad4 (x i32(5))
 

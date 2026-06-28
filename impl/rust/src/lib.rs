@@ -609,6 +609,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // comparison/ordering. text is ALSO a key type — a text PRIMARY KEY / index / UNIQUE uses the
     // variable-width text-terminated-escape key encoding (encoding.md §2.4).
     "types.text",
+    // varchar(n) / string(n) length limits (the second parameterized type — spec/design/types.md
+    // §15): a text column/field/cast-target carries a max-length typmod (code points). Over-length
+    // assignment traps 22001 (trailing-space exception truncates); an explicit ::varchar(n) cast
+    // truncates. format_version 22 (text column/field u32 varchar_max_len typmod slot).
+    "types.varchar_length",
     // Storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean
     // comparison and ORDER BY. boolean is also keyable — a boolean PRIMARY KEY / index uses the
     // bool-byte key encoding (the second non-integer key after uuid, encoding.md §2.9); casts

@@ -3529,6 +3529,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		serialKind, isSerial := serialPseudoType(def.TypeName)
 		var colType dataType
 		var decimal *decimalTypmod
+		var varcharLen *uint32
 		isComposite := false
 		isArray := false
 		isRange := false
@@ -3566,7 +3567,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			colType = rangeT(scalarT(elementScalar(rdesc)))
 			isRange = true
 		} else if _, ok := scalarTypeFromName(def.TypeName); ok {
-			ty, d, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
+			ty, d, vl, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -3577,6 +3578,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			}
 			colType = scalarT(ty)
 			decimal = d
+			varcharLen = vl
 		} else if ctype := db.readSnap().compositeType(def.TypeName); ctype != nil {
 			if def.TypeMod != nil {
 				return Outcome{}, newError(FeatureNotSupported,
@@ -3716,7 +3718,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		} else if def.Default != nil {
 			ty := colType.Scalar
 			if def.Default.Expr.Kind == exprLiteral {
-				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, false, def.Name)
+				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, varcharLen, false, def.Name)
 				if err != nil {
 					return Outcome{}, err
 				}
@@ -3762,6 +3764,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			Name:       def.Name,
 			Type:       colType,
 			Decimal:    decimal,
+			VarcharLen: varcharLen,
 			PrimaryKey: def.PrimaryKey,
 			// PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
 			NotNull:     def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil,
@@ -5121,6 +5124,7 @@ func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
 		}
 		var fty dataType
 		var fdecimal *decimalTypmod
+		var fvarchar *uint32
 		if base, ok := strings.CutSuffix(f.TypeName, "[]"); ok {
 			// An array-typed field (spec/design/array.md §12 — the mirror of an array-of-composite
 			// element). The element is a scalar or a previously-defined composite (element_type_code
@@ -5138,11 +5142,11 @@ func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
 				return Outcome{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
 		} else if _, ok := scalarTypeFromName(f.TypeName); ok {
-			s, d, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
+			s, d, vl, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
 			if err != nil {
 				return Outcome{}, err
 			}
-			fty, fdecimal = scalarT(s), d
+			fty, fdecimal, fvarchar = scalarT(s), d, vl
 		} else if _, ok := rangeByName(f.TypeName); ok {
 			// A range-typed composite field (a range inside CREATE TYPE) is deferred this slice (only
 			// range *columns* are storable — spec/design/ranges.md §3); the type name IS known, so this
@@ -5158,7 +5162,7 @@ func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
 		} else {
 			return Outcome{}, newError(UndefinedObject, "type does not exist: "+f.TypeName)
 		}
-		fields = append(fields, compositeField{Name: f.Name, Type: fty, Decimal: fdecimal, NotNull: f.NotNull})
+		fields = append(fields, compositeField{Name: f.Name, Type: fty, Decimal: fdecimal, VarcharLen: fvarchar, NotNull: f.NotNull})
 	}
 	// Bound composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A chain of CREATE TYPEs each
 	// nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across many cheap statements —
@@ -5909,7 +5913,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, ptypes *par
 			return nil, err
 		}
 		plans = append(plans, assignPlan{
-			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, notNull: col.NotNull, source: src,
+			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,
 		})
 	}
 	var filter *rExpr
@@ -6381,7 +6385,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, pk []int, check
 			}
 			// The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree),
 			// for composite-aware store coercion (spec/design/composite.md §4).
-			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.NotNull, col.Name)
+			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
 			if err != nil {
 				return nil, err
 			}
@@ -6711,7 +6715,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 				}
 				candidate = dv
 			}
-			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.NotNull, col.Name)
+			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -7578,7 +7582,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 				return Outcome{}, err
 			}
 			plans = append(plans, assignPlan{
-				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, notNull: col.NotNull, source: src,
+				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,
 			})
 		} else {
 			// A range or array column: the RHS adapts (a bare string literal via range_in/array_in,
@@ -11225,11 +11229,11 @@ func (db *engine) resolveJSONRecord(name string, jsonb, set bool, args []*exprNo
 			return nil, nil, newError(FeatureNotSupported,
 				"a composite/array column in a record column-definition list is not supported yet")
 		}
-		st, decimal, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod)
+		st, decimal, varcharLen, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod)
 		if err != nil {
 			return nil, nil, err
 		}
-		columns = append(columns, catColumn{Name: d.Name, Type: scalarT(st), Decimal: decimal})
+		columns = append(columns, catColumn{Name: d.Name, Type: scalarT(st), Decimal: decimal, VarcharLen: varcharLen})
 	}
 	tname := name
 	if alias != nil {
@@ -11272,7 +11276,7 @@ func (db *engine) resolveJSONPopulate(name string, jsonb, set bool, args []*expr
 	}
 	columns := make([]catColumn, 0, len(ctype.Fields))
 	for _, f := range ctype.Fields {
-		columns = append(columns, catColumn{Name: f.Name, Type: f.Type, Decimal: f.Decimal})
+		columns = append(columns, catColumn{Name: f.Name, Type: f.Type, Decimal: f.Decimal, VarcharLen: f.VarcharLen})
 	}
 	// The SECOND argument is the json/jsonb document.
 	want := scalarJson
@@ -11800,7 +11804,7 @@ func coerceJSONMember(node *JsonNode, colTy dataType, decimal *decimalTypmod, en
 		if !ok {
 			return NullValue(), nil
 		}
-		rexpr, _, err := coerceStringLiteral(text, st, decimal)
+		rexpr, _, err := coerceStringLiteral(text, st, decimal, nil)
 		if err != nil {
 			return Value{}, err
 		}
@@ -16670,6 +16674,7 @@ type rExpr struct {
 	op       binaryOp       // reArith, reCompare
 	result   scalarType     // reCast target; reNeg / reArith result type
 	typmod   *decimalTypmod // reCast: a decimal target's numeric(p,s) typmod
+	varchar  *uint32        // reCast: a varchar(n) text target's max length — truncate (types.md §15)
 	castElem *colType       // reArrayCast: the target element ColType (nil ⇒ array → text)
 	lhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
 	rhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
@@ -23896,7 +23901,7 @@ func bindParams(supplied []Value, types []scalarType) ([]Value, error) {
 	}
 	bound := make([]Value, len(types))
 	for i, ty := range types {
-		v, err := storeValue(supplied[i], ty, nil, false, fmt.Sprintf("$%d", i+1))
+		v, err := storeValue(supplied[i], ty, nil, nil, false, fmt.Sprintf("$%d", i+1))
 		if err != nil {
 			return nil, err
 		}
@@ -24564,11 +24569,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		if desc, ok := rangeByName(e.TypeLitName); ok {
 			return coerceStringToRangeExpr(e.TypeLitText, desc)
 		}
-		target, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
+		target, _, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		return coerceStringLiteral(e.TypeLitText, target, nil)
+		return coerceStringLiteral(e.TypeLitText, target, nil, nil)
 	case exprScalarSubquery:
 		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
@@ -24783,16 +24788,17 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 					"casting to a composite type is only supported from a string literal")
 			}
 		}
-		target, typmod, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
+		target, typmod, varcharLen, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		// A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the
 		// same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The
 		// ONLY text→T cast admitted ahead of the general cast slice; a non-literal text operand
-		// still falls through to the deferred 0A000 below.
+		// still falls through to the deferred 0A000 below. A varchar(n) target truncates the literal
+		// to n code points (types.md §15).
 		if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
-			return coerceStringLiteral(in.Literal.Str, target, typmod)
+			return coerceStringLiteral(in.Literal.Str, target, typmod, varcharLen)
 		}
 		// The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
 		// text/json/jsonb expression (a string LITERAL operand was already coerced above by
@@ -24841,13 +24847,20 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				return nil, resolvedType{}, err
 			}
 			switch ity.kind {
-			case rtNull, rtText:
+			case rtNull:
+				return rinner, resolvedType{kind: rtText}, nil
+			case rtText:
+				// text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a
+				// reCast node that silently truncates to n code points at eval (types.md §15).
+				if varcharLen != nil {
+					return &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}, resolvedType{kind: rtText}, nil
+				}
 				return rinner, resolvedType{kind: rtText}, nil
 			// json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
 			// casts.toml/types.md §14: canonical lowercase 8-4-4-4-12). Explicit — stricter than PG's
-			// assignment-cast-to-text (a documented divergence).
+			// assignment-cast-to-text (a documented divergence). A varchar(n) length truncates the result.
 			case rtJson, rtJsonb, rtUuid:
-				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtText}, nil
+				return &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}, resolvedType{kind: rtText}, nil
 			// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit-only,
 			// like uuid/json → text (stricter than PG's assignment cast). Handled by reArrayCast.
 			case rtArray:
@@ -26819,7 +26832,7 @@ func coerceStringToComposite(text string, ct *compositeType, catalog *engine) (*
 			nodes[i] = valueToRExpr(val)
 			fields[i] = compositeRField{name: f.Name, ty: resolvedTypeOfCol(f.Type, snap)}
 		default:
-			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal)
+			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal, f.VarcharLen)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -26966,7 +26979,7 @@ func coerceStringToRange(text string, desc rangeDesc) (*RangeVal, error) {
 	return finalizeRange(desc, lower, upper, parsed.lowerInc, parsed.upperInc)
 }
 
-func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod) (*rExpr, resolvedType, error) {
+func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, varcharLen *uint32) (*rExpr, resolvedType, error) {
 	switch target {
 	case scalarBytea:
 		b, err := decodeByteaLiteral(s)
@@ -27028,8 +27041,14 @@ func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod) (*r
 		}
 		return &rExpr{kind: reConstJsonPath, cText: jp.Render()}, resolvedType{kind: rtJsonPath}, nil
 	case scalarText:
-		// text 'x' is identity — the string IS the value.
-		return &rExpr{kind: reConstText, cText: s}, resolvedType{kind: rtText}, nil
+		// text 'x' is identity — the string IS the value. A varchar(n) 'x' typed literal /
+		// CAST('x' AS varchar(n)) silently truncates to n code points (the explicit-cast rule,
+		// spec/design/types.md §15) — no 22001 at resolve.
+		cText := s
+		if varcharLen != nil {
+			cText = truncateToChars(s, int(*varcharLen))
+		}
+		return &rExpr{kind: reConstText, cText: cText}, resolvedType{kind: rtText}, nil
 	case scalarBool:
 		v, err := parseBoolLiteral(s)
 		if err != nil {
@@ -27585,7 +27604,7 @@ func evalRangeCtor(elem scalarType, vals []Value) (Value, error) {
 // integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
 // non-assignable value is 42804 (the resolver already screened the common 42883 cases).
 func coerceRangeBound(v Value, elem scalarType) (*Value, error) {
-	out, err := storeValue(v, elem, nil, false, "range bound")
+	out, err := storeValue(v, elem, nil, nil, false, "range bound")
 	if err != nil {
 		return nil, err
 	}
@@ -27608,14 +27627,14 @@ func evalRangeOp(op rangeOp, l, r Value, elem scalarType) (Value, error) {
 	switch op {
 	// `range @> element`: l is the range, r the element (coerced to the range's element type).
 	case roContainsElem:
-		e, err := storeValue(r, elem, nil, false, "range element")
+		e, err := storeValue(r, elem, nil, nil, false, "range element")
 		if err != nil {
 			return Value{}, err
 		}
 		result = rangeContainsElem(expectRange(l), e)
 	// `element <@ range`: l is the element, r the range.
 	case roElemContainedBy:
-		e, err := storeValue(l, elem, nil, false, "range element")
+		e, err := storeValue(l, elem, nil, nil, false, "range element")
 		if err != nil {
 			return Value{}, err
 		}
@@ -28217,23 +28236,57 @@ func requireAssignable(t resolvedType, colTy scalarType, col string) error {
 // decimal (validated to numeric(p,s) — 22023); on any other type it is 0A000 (varchar(n) and
 // other parameterized types are deferred — spec/design/grammar.md §14). Type-specific narrowings
 // (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the call site.
-func resolveTypeAndTypmod(name string, tm *typeMod) (scalarType, *decimalTypmod, error) {
+// maxVarcharLen is PostgreSQL's varchar(n) ceiling (spec/design/types.md §15); stored on disk
+// as a u32.
+const maxVarcharLen uint64 = 10485760
+
+// resolveTypeAndTypmod resolves a scalar type name + optional type modifier, returning the type,
+// the decimal typmod (decimal), and the varchar(n) max length (text — spec/design/types.md §15).
+// At most one typmod is ever non-nil (they belong to different types); a typmod on any other type
+// is 0A000.
+func resolveTypeAndTypmod(name string, tm *typeMod) (scalarType, *decimalTypmod, *uint32, error) {
 	ty, ok := scalarTypeFromName(name)
 	if !ok {
-		return 0, nil, newError(UndefinedObject, "type does not exist: "+name)
+		return 0, nil, nil, newError(UndefinedObject, "type does not exist: "+name)
 	}
 	if tm == nil {
-		return ty, nil, nil
+		return ty, nil, nil, nil
 	}
-	if !ty.IsDecimal() {
-		return 0, nil, newError(FeatureNotSupported,
-			"a type modifier is not supported for type "+ty.CanonicalName())
+	if ty.IsDecimal() {
+		typmod, err := validateDecimalTypmod(tm)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		return ty, typmod, nil, nil
 	}
-	typmod, err := validateDecimalTypmod(tm)
-	if err != nil {
-		return 0, nil, err
+	if ty.IsText() {
+		vl, err := validateVarcharTypmod(tm)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		return ty, nil, vl, nil
 	}
-	return ty, typmod, nil
+	return 0, nil, nil, newError(FeatureNotSupported,
+		"a type modifier is not supported for type "+ty.CanonicalName())
+}
+
+// validateVarcharTypmod validates a varchar(n) type modifier: 1 <= n <= 10485760 (PostgreSQL's
+// varchar ceiling), else trap 22023 (spec/design/types.md §15). A scale (varchar(n,m)) is a
+// syntax error — varchar takes a single length argument.
+func validateVarcharTypmod(tm *typeMod) (*uint32, error) {
+	if tm.Scale != nil {
+		return nil, newError(SyntaxError, "varchar takes exactly one type modifier (a length)")
+	}
+	n := tm.Precision
+	if n < 1 {
+		return nil, newError(InvalidParameterValue, "length for type varchar must be at least 1")
+	}
+	if n > maxVarcharLen {
+		return nil, newError(InvalidParameterValue,
+			fmt.Sprintf("length for type varchar cannot exceed %d", maxVarcharLen))
+	}
+	v := uint32(n)
+	return &v, nil
 }
 
 // validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
@@ -28471,7 +28524,16 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
-		return evalCast(v, e.result, e.typmod)
+		out, err := evalCast(v, e.result, e.typmod)
+		if err != nil {
+			return Value{}, err
+		}
+		// A varchar(n) cast target silently truncates the resulting text to n code points (the
+		// explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
+		if e.varchar != nil && out.Kind == ValText {
+			return TextValue(truncateToChars(out.Str, int(*e.varchar))), nil
+		}
+		return out, nil
 	case reArrayCast:
 		// The three array-involving casts (spec/design/array.md §7): array → text (array_out),
 		// runtime text → T[] (array_in per row), and element-wise array → array (each element through
@@ -30839,6 +30901,12 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 	// cast (every other text cast target is resolver-rejected): json validates + stores verbatim
 	// (22P02 on malformed); jsonb parses + canonicalizes.
 	if v.Kind == ValText {
+		// text → text: the identity (a varchar(n) length, if any, truncates at the reCast call
+		// site — types.md §15). The resolver only produces a text→text reCast node when a length is
+		// present, so this arm is unreachable without one.
+		if target.IsText() {
+			return TextValue(v.Str), nil
+		}
 		if target.IsJson() {
 			if err := validateJSON(v.Str); err != nil {
 				return Value{}, err
@@ -32594,8 +32662,11 @@ type assignPlan struct {
 	name    string
 	target  scalarType
 	decimal *decimalTypmod
-	notNull bool
-	source  *rExpr
+	// varcharLen is the varchar(n) length for a text column (spec/design/types.md §15) — UPDATE
+	// re-checks the new value's length exactly like INSERT (over-length 22001, trailing-space truncate).
+	varcharLen *uint32
+	notNull    bool
+	source     *rExpr
 	// colType is the resolved ColType for a NON-scalar (range / array) column — when set, check
 	// stores through coerceForStore (the container codec, ranges.md §4 / array.md §4); nil for a
 	// scalar column, which stays on the storeValue fast path. Composite columns are deferred
@@ -32610,9 +32681,9 @@ type assignPlan struct {
 // is assignable.
 func (p assignPlan) check(v Value) (Value, error) {
 	if p.colType != nil {
-		return coerceForStore(v, *p.colType, p.decimal, p.notNull, p.name)
+		return coerceForStore(v, *p.colType, p.decimal, p.varcharLen, p.notNull, p.name)
 	}
-	return storeValue(v, p.target, p.decimal, p.notNull, p.name)
+	return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name)
 }
 
 // storeValue coerces a value into a column for storage (shared by INSERT and UPDATE). NULL
@@ -32620,7 +32691,7 @@ func (p assignPlan) check(v Value) (Value, error) {
 // integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
 // a decimal column coerces to the typmod (rounds to scale, precision-checks → 22003); a
 // cross-family value (decimal→int, text→int, etc.) is a 42804 (decimal→int is explicit-CAST only).
-func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, notNull bool, colName string) (Value, error) {
+func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
@@ -32680,7 +32751,13 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, notNull bool, 
 		return Value{}, typeError("cannot store a decimal value in " + colTy.CanonicalName() + " column " + colName)
 	case ValText:
 		if colTy.IsText() {
-			return TextValue(v.Str), nil
+			// A varchar(n) column enforces its length on store (assignment semantics): over-length
+			// traps 22001, unless the excess is all spaces (truncate) — spec/design/types.md §15.
+			s, err := coerceVarcharStore(v.Str, varcharLen, colName)
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(s), nil
 		}
 		if colTy.IsBytea() {
 			// A string literal adapts to a bytea column, decoding the hex input form
@@ -32831,7 +32908,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, notNull bool, 
 
 // coerceForStore coerces a value into a column of resolved type ty for storage
 // (spec/design/composite.md §4): a scalar dispatches to storeValue; a composite to storeComposite.
-func coerceForStore(v Value, ty colType, typmod *decimalTypmod, notNull bool, colName string) (Value, error) {
+func coerceForStore(v Value, ty colType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string) (Value, error) {
 	if ty.Elem != nil {
 		return storeArray(v, *ty.Elem, notNull, colName)
 	}
@@ -32841,7 +32918,7 @@ func coerceForStore(v Value, ty colType, typmod *decimalTypmod, notNull bool, co
 	if ty.Composite {
 		return storeComposite(v, ty.Name, ty.Fields, notNull, colName)
 	}
-	return storeValue(v, ty.Scalar, typmod, notNull, colName)
+	return storeValue(v, ty.Scalar, typmod, varcharLen, notNull, colName)
 }
 
 // storeRange coerces a value into a RANGE column (spec/design/ranges.md §4): NULL honours NOT NULL
@@ -32869,7 +32946,7 @@ func storeRange(v Value, elem colType, notNull bool, colName string) (Value, err
 			if b == nil {
 				return nil, nil
 			}
-			cv, err := coerceForStore(*b, elem, nil, false, colName)
+			cv, err := coerceForStore(*b, elem, nil, nil, false, colName)
 			if err != nil {
 				return nil, err
 			}
@@ -32911,8 +32988,8 @@ func storeArray(v Value, elem colType, notNull bool, colName string) (Value, err
 		out := make([]Value, len(a.Elements))
 		for i, el := range a.Elements {
 			// Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[]
-			// is deferred — §12).
-			cv, err := coerceForStore(el, elem, nil, false, colName)
+			// and varchar(n)[] are deferred — §12, types.md §15).
+			cv, err := coerceForStore(el, elem, nil, nil, false, colName)
 			if err != nil {
 				return Value{}, err
 			}
@@ -32945,7 +33022,7 @@ func storeComposite(v Value, typeName string, fields []colField, notNull bool, c
 		}
 		out := make([]Value, len(vals))
 		for i, f := range fields {
-			cv, err := coerceForStore(vals[i], f.Type, f.Typmod, f.NotNull, f.Name)
+			cv, err := coerceForStore(vals[i], f.Type, f.Typmod, f.VarcharLen, f.NotNull, f.Name)
 			if err != nil {
 				return Value{}, err
 			}
@@ -32966,6 +33043,52 @@ func coerceDecimal(d Decimal, typmod *decimalTypmod) (Decimal, error) {
 		return d.CoerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
 	}
 	return d.CheckCap()
+}
+
+// truncateToChars truncates a text value to at most n code points (the explicit varchar(n) cast
+// rule — spec/design/types.md §15). Cuts on a code-point boundary, never mid-byte; a string already
+// within n is returned unchanged.
+func truncateToChars(s string, n int) string {
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
+}
+
+// coerceVarcharStore coerces a text value into a varchar(n) column/field for STORAGE (the
+// assignment rule — spec/design/types.md §15): a value longer than n code points traps 22001,
+// UNLESS every excess code point is a space (U+0020), in which case it is silently truncated to n
+// (the SQL-standard trailing-space exception PostgreSQL implements). A nil varcharLen (an unbounded
+// text column) passes the value through unchanged.
+func coerceVarcharStore(s string, varcharLen *uint32, colName string) (string, error) {
+	if varcharLen == nil {
+		return s, nil
+	}
+	n := int(*varcharLen)
+	// Find the byte offset of the (n+1)-th code point, if any; if there is none the value fits.
+	count := 0
+	cut := -1
+	for i := range s {
+		if count == n {
+			cut = i
+			break
+		}
+		count++
+	}
+	if cut < 0 {
+		return s, nil // within n code points
+	}
+	for _, c := range s[cut:] {
+		if c != ' ' {
+			return "", newError(StringDataRightTruncation,
+				fmt.Sprintf("value too long for type varchar(%d) in column %s", n, colName))
+		}
+	}
+	return s[:cut], nil
 }
 
 // literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
@@ -33192,7 +33315,7 @@ func coerceRecordTextToValue(text string, ct colType) (Value, error) {
 			panic("a composite range field is rejected at CREATE TYPE (R2)")
 		default:
 			var node *rExpr
-			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod)
+			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod, f.VarcharLen)
 			if err == nil {
 				v, err = rExprConstToValue(node)
 			}
@@ -33209,7 +33332,7 @@ func coerceRecordTextToValue(text string, ct colType) (Value, error) {
 // element scalar type, via the same string-literal coercion the typed-literal path uses (22P02 /
 // 22003 on bad input).
 func coerceStringLiteralToValue(s string, target scalarType) (Value, error) {
-	node, _, err := coerceStringLiteral(s, target, nil)
+	node, _, err := coerceStringLiteral(s, target, nil, nil)
 	if err != nil {
 		return Value{}, err
 	}

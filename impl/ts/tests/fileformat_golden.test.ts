@@ -357,6 +357,18 @@ function textTableDB(): Engine {
   return db;
 }
 
+// varcharTableDB has a bounded varchar(5) column beside an unbounded text column — the v22
+// text-column u32 varchar_max_len typmod slot (spec/design/types.md §15). Stored values are within
+// the limit. Must match verify.rb's VARCHAR_TABLE.
+function varcharTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, code varchar(5), note text)");
+  run(db, "INSERT INTO t VALUES (1, 'alice', 'hi')");
+  run(db, "INSERT INTO t VALUES (2, 'ab', NULL)");
+  run(db, "INSERT INTO t VALUES (3, '', 'long note text')");
+  return db;
+}
+
 // boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
 // bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 // PRIMARY KEY case is boolPkTableDB).
@@ -859,6 +871,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
+    { name: "varchar_table.jed", build: varcharTableDB },
     { name: "bool_table.jed", build: boolTableDB },
     { name: "bool_pk_table.jed", build: boolPkTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
@@ -926,6 +939,7 @@ test("read goldens reproduces rows", () => {
     { name: "compressed_table.jed", build: compressedTableDB, table: "t" },
     { name: "pk_table.jed", build: pkTableDB, table: "t" },
     { name: "text_table.jed", build: textTableDB, table: "t" },
+    { name: "varchar_table.jed", build: varcharTableDB, table: "t" },
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
     { name: "bool_pk_table.jed", build: boolPkTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
@@ -1000,6 +1014,7 @@ test("read golden reconstructs catalog", () => {
     name: "id",
     type: scalarT("i32"),
     decimal: null,
+    varcharLen: null,
     primaryKey: true,
     notNull: true,
     default: null,
@@ -1011,6 +1026,7 @@ test("read golden reconstructs catalog", () => {
     name: "v",
     type: scalarT("i16"),
     decimal: null,
+    varcharLen: null,
     primaryKey: false,
     notNull: false,
     default: null,

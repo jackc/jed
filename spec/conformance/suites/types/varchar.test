@@ -1,0 +1,141 @@
+# varchar(n) / string(n) length limits (spec/design/types.md §15) — the second parameterized type
+# after numeric(p,s). A text column/field/cast-target carries a max-length typmod counted in CODE
+# POINTS. Typmod validation 1<=n<=10485760 (else 22023). ASSIGNMENT (INSERT/UPDATE) over-length
+# traps 22001, UNLESS the excess code points are all spaces (truncate to n — the SQL-standard
+# trailing-space exception). An EXPLICIT cast (`::varchar(n)` / CAST) silently truncates, never
+# raising 22001. The type stays `text` (canonical name text, render tag T). All rows oracle-checked
+# against PostgreSQL (character varying). Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.select_no_from, query.where_eq, query.order_by, cast.explicit, cast.string_literal, types.i32, types.text, types.varchar_length
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, code varchar(4))
+
+# within the limit, exactly at the limit, and NULL all store as-is
+statement ok
+INSERT INTO t VALUES (1, 'ab'), (2, 'abcd'), (3, NULL)
+
+# length is counted in CODE POINTS, not bytes: 'café' is 4 code points (5 UTF-8 bytes) and fits
+# varchar(4)
+statement ok
+INSERT INTO t VALUES (4, 'café')
+
+query T nosort
+SELECT code FROM t WHERE id = 1
+----
+ab
+
+query T nosort
+SELECT code FROM t WHERE id = 2
+----
+abcd
+
+query T nosort
+SELECT code FROM t WHERE id = 4
+----
+café
+
+query T nosort
+SELECT code FROM t WHERE id = 3
+----
+NULL
+
+# --- assignment: over-length is 22001 (the excess is NOT all spaces) ---------------------------
+statement error 22001
+INSERT INTO t VALUES (5, 'abcde')
+
+# a single over-the-limit non-space code point still traps
+statement error 22001
+INSERT INTO t VALUES (5, 'caffè')
+
+# --- assignment: the trailing-space exception silently truncates to n -------------------------
+# 'abcd   ' (abcd + 3 spaces, 7 code points) → the excess is all spaces, so it truncates to the
+# first 4 ('abcd'), no error
+statement ok
+INSERT INTO t VALUES (5, 'abcd   ')
+
+query T nosort
+SELECT code FROM t WHERE id = 5
+----
+abcd
+
+# 'ab    ' (ab + 4 spaces, 6 code points) → truncates to 4 code points ('ab' + 2 spaces); the
+# stored length is 4, not 6 (the trailing spaces beyond n are dropped)
+statement ok
+INSERT INTO t VALUES (6, 'ab    ')
+
+query I nosort
+SELECT length(code) FROM t WHERE id = 6
+----
+4
+
+# --- UPDATE re-checks the new value's length exactly like INSERT ------------------------------
+statement error 22001
+UPDATE t SET code = 'wxyz!' WHERE id = 1
+
+# the trailing-space exception applies to UPDATE too
+statement ok
+UPDATE t SET code = 'wxyz   ' WHERE id = 1
+
+query T nosort
+SELECT code FROM t WHERE id = 1
+----
+wxyz
+
+# --- explicit cast: silently truncates, NEVER 22001 (the PostgreSQL explicit-cast rule) -------
+query T nosort
+SELECT 'abcd'::varchar(3)
+----
+abc
+
+# truncation drops non-space characters silently on an explicit cast
+query T nosort
+SELECT 'hello world'::varchar(5)
+----
+hello
+
+# code-point truncation: CAST('héllo' AS varchar(3)) keeps 3 code points (h, é, l)
+query T nosort
+SELECT CAST('héllo' AS varchar(3)) AS c
+----
+hél
+
+# a string literal inside the limit is unchanged
+query T nosort
+SELECT 'ok'::varchar(8)
+----
+ok
+
+# --- typmod validation: 1 <= n <= 10485760, else 22023 ---------------------------------------
+statement error 22023
+CREATE TABLE bad0 (x varchar(0))
+
+statement error 22023
+CREATE TABLE bad_big (x varchar(10485761))
+
+# --- unbounded text is unaffected (no length, the existing behavior) --------------------------
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO u VALUES (1, 'a value far longer than any varchar(4) would ever permit')
+
+query I nosort
+SELECT length(s) FROM u WHERE id = 1
+----
+56
+
+# --- a varchar(n) column is a valid PRIMARY KEY (it IS text — same key encoding) --------------
+statement ok
+CREATE TABLE k (code varchar(8) PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO k VALUES ('alpha', 1), ('beta', 2)
+
+# a duplicate key traps 23505 (the text-terminated-escape key, unchanged by the length limit)
+statement error 23505
+INSERT INTO k VALUES ('alpha', 3)
+
+query I nosort
+SELECT n FROM k WHERE code = 'beta'
+----
+2

@@ -35,6 +35,15 @@ name = "data_exception"
 class = "data exception"
 template = "{detail}"
 
+# A value assigned to a `varchar(n)` column/field is longer than `n` code points and the
+# excess characters are not all spaces (../design/types.md §11). PostgreSQL's code; an
+# explicit `::varchar(n)` cast truncates instead of raising. {detail} carries the message.
+[[error]]
+code = "22001"
+name = "string_data_right_truncation"
+class = "data exception"
+template = "{detail}"
+
 [[error]]
 code = "22003"
 name = "numeric_value_out_of_range"

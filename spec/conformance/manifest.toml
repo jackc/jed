@@ -549,6 +549,10 @@ id = "types.text"
 description = "text scalar type (variable-width UTF-8, collation C): storage, literals, and comparison/ordering. text is ALSO a KEY type — a text PRIMARY KEY / composite-key member / secondary index / UNIQUE uses the variable-width text-terminated-escape key encoding (the first non-fixed-width key; spec/design/encoding.md §2.4), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key; an oversized text key is 0A000 (spec/design/types.md §11)"
 
 [[capability]]
+id = "types.varchar_length"
+description = "varchar(n) / string(n) length limits (the second parameterized type after numeric(p,s) — spec/design/types.md §15): a text column/field/cast-target carries a max-length typmod counted in code points. Typmod validation 1 <= n <= 10485760 else 22023. On ASSIGNMENT (INSERT/UPDATE) an over-length value traps 22001 (string_data_right_truncation), UNLESS every excess code point is a space — then it is silently truncated to n (the SQL-standard trailing-space exception). An EXPLICIT cast (expr::varchar(n) / CAST(expr AS varchar(n)) / the varchar(n) 'literal' typed literal) silently truncates to n code points, never raising 22001. The type stays `text` (canonical name text, the C collation, same value codec / key encoding); only single-word varchar(n)/string(n) this slice (two-word `character varying(n)` and `char(n)` deferred). format_version 22 (text column/field u32 varchar_max_len typmod slot). Builds on types.text"
+
+[[capability]]
 id = "types.boolean_storable"
 description = "storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean comparison and ORDER BY (false < true). boolean is also a KEY type — a boolean PRIMARY KEY / composite-key member / secondary index uses the `bool-byte` key encoding (0x00 false < 0x01 true, the second non-integer key after uuid; spec/design/encoding.md §2.9), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key. boolean⇄integer casts stay deferred (spec/design/types.md §9)"
 

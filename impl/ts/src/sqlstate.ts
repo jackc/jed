@@ -12,6 +12,7 @@
 export type SqlState =
   | "cardinality_violation" // 21000 — more than one row returned by a subquery used as an expression
   | "data_exception" // 22000 — {detail}
+  | "string_data_right_truncation" // 22001 — {detail}
   | "numeric_value_out_of_range" // 22003 — value out of range for type {type}
   | "null_value_not_allowed" // 22004 — {detail}
   | "invalid_datetime_format" // 22007 — invalid input syntax for type {type}: {detail}
@@ -92,6 +93,7 @@ export type SqlState =
 const CODES: Record<SqlState, string> = {
   cardinality_violation: "21000",
   data_exception: "22000",
+  string_data_right_truncation: "22001",
   numeric_value_out_of_range: "22003",
   null_value_not_allowed: "22004",
   invalid_datetime_format: "22007",
@@ -188,6 +190,7 @@ export interface ErrorDesc {
 export const ERRORS: readonly ErrorDesc[] = [
   { code: "21000", name: "cardinality_violation", class: "cardinality violation" },
   { code: "22000", name: "data_exception", class: "data exception" },
+  { code: "22001", name: "string_data_right_truncation", class: "data exception" },
   { code: "22003", name: "numeric_value_out_of_range", class: "data exception" },
   { code: "22004", name: "null_value_not_allowed", class: "data exception" },
   { code: "22007", name: "invalid_datetime_format", class: "data exception" },

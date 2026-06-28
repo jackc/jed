@@ -539,9 +539,12 @@ golden. A text value too large to fit a node (its key cannot spill to overflow) 
 
 **Deferred text sub-features** (relaxable narrowings, each its own follow-up):
 
-- **`varchar(n)` length limits** — `varchar`/`character varying`/`string` are accepted as
-  aliases for **unbounded** `text`; a length parameter `varchar(n)` is not supported yet
-  (rejected `0A000`). When added, an over-length value traps `22001` (string_data_right_truncation).
+- **`varchar(n)` length limits** — ✅ **landed** (§15): a single-word `varchar(n)` / `string(n)`
+  carries a max-length **type modifier** (the second parameterized type after `decimal`), counted
+  in **code points**; an over-length assignment traps `22001` (`string_data_right_truncation`),
+  while an explicit `::varchar(n)` cast silently truncates (the PostgreSQL split). The two-word
+  `character varying(n)` spelling stays deferred under the existing single-word-type-name parser
+  narrowing.
 - **Text ⇄ other casts** (§5), **string functions** (`length`, `lower`/`upper`, `substring`),
   **concatenation `||`**, and **`LIKE`** — separate slices; this slice is comparison + storage
   only (`= < > <= >=`, `IS [NOT] DISTINCT FROM`).
@@ -750,3 +753,51 @@ narrowing the deferred note below originally recorded):
 - **uuid functions** — `gen_random_uuid()` (generation), `uuid_generate_v*`, and any uuid
   accessor functions are deferred; this slice is comparison + storage only (`= < > <= >=`,
   `IS [NOT] DISTINCT FROM`), with values supplied as literals.
+
+## 15. The `varchar(n)` length limit
+
+`varchar(n)` (and the jed alias `string(n)`) is a `text` column/field/cast-target that carries a
+**maximum length** — the **second parameterized type** after `decimal(p,s)` (§12), reusing the same
+`type_name "(" integer ")"` grammar (grammar.md §6/§14). The type is still `text` (canonical name
+`text`, type code 4, the `C` collation, the same value codec, comparison, and key encoding — §11);
+the length is a per-column **type modifier**, not a distinct type. A bare `varchar` / `string` / `text`
+with no `(n)` is **unbounded**, exactly as before.
+
+**Length is counted in code points, not bytes.** `n` bounds the number of Unicode code points (the
+same unit `length`/`char_length` and `substring` use — §11, string-functions.md), so `'café'`
+(4 code points, 5 UTF-8 bytes) fits `varchar(4)`. This matches PostgreSQL, where `character
+varying(n)` is measured in characters.
+
+**Typmod validation (`22023`).** At resolve, `1 ≤ n ≤ 10485760` (PostgreSQL's `varchar` ceiling);
+`varchar(0)` and `varchar(10485761)` each trap `22023` (`invalid_parameter_value`), matching PG. A
+length modifier on a non-`text`, non-`decimal` type stays `0A000` (`i32(5)` etc. — §5, unchanged).
+
+**Two over-length behaviors, split exactly as PostgreSQL does (the §1 default):**
+
+- **Assignment** — storing into a `varchar(n)` column/field (INSERT, UPDATE, a composite field):
+  if the value is longer than `n`, it traps **`22001`** (`string_data_right_truncation`) — *unless*
+  every code point beyond position `n` is a space (U+0020), in which case the value is **silently
+  truncated to `n`** and stored (the SQL-standard trailing-space exception PG implements). So
+  `'ab   '` into `varchar(3)` stores `'ab '`; `'abcd'` into `varchar(3)` is `22001`.
+- **Explicit cast** — `expr::varchar(n)` / `CAST(expr AS varchar(n))` / the `varchar(n) 'literal'`
+  typed literal: the string is **silently truncated** to `n` code points, **never** raising
+  `22001`, even when non-space characters are dropped (`'abcd'::varchar(3)` → `'abc'`). This is
+  PostgreSQL's explicit-cast rule (truncate, don't error). The truncation applies to both a string
+  literal (folded at resolve) and a runtime `text` expression (per row in the evaluator).
+
+**On-disk.** A `text` column entry appends, in the typmod slot (where a `decimal` appends
+precision/scale, §12), a single **`u32` `max_len`** big-endian; `0` = unbounded. A composite type's
+`text` field carries the same `u32`. This is the change behind `format_version` **22**
+([../fileformat/format.md](../fileformat/format.md)); the stored *value* codec is unchanged (the
+value is already truncated/checked before it reaches the codec).
+
+**Deferred sub-features** (relaxable, each its own follow-on):
+
+- **`character varying(n)`** — the two-word PostgreSQL spelling stays deferred under the existing
+  single-word-type-name parser narrowing (§11); `varchar(n)` / `string(n)` are the spellings this
+  slice accepts.
+- **`char(n)` / `character(n)`** — the blank-padded fixed-length string type is out of scope (a
+  different storage/compare model); only `varchar(n)` (variable length, max `n`) is implemented.
+- **`varchar(n)[]`** — an array of length-limited text. A type modifier on an array type stays
+  `0A000` ("a type modifier on an array type is not supported yet"), the **same** narrowing
+  `numeric(p,s)[]` already carries (§12); plain `text[]` is unaffected.

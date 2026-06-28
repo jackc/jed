@@ -18,6 +18,11 @@ pub struct Column {
     /// column OR an unconstrained `numeric` (spec/design/decimal.md §2). A constrained
     /// decimal column coerces stored values to this precision/scale.
     pub decimal: Option<DecimalTypmod>,
+    /// The `varchar(n)` max-length type modifier for a `text` column, or `None` for a
+    /// non-text column OR an unbounded `text` (spec/design/types.md §15). `n` is counted in
+    /// code points; an over-length assignment traps `22001`. Persisted as a `u32` in the
+    /// column entry's typmod slot when `type_code == 4` (format_version 22).
+    pub varchar_len: Option<u32>,
     pub primary_key: bool,
     /// A PRIMARY KEY column is implicitly NOT NULL.
     pub not_null: bool,
@@ -194,6 +199,9 @@ pub struct CompositeField {
     pub ty: Type,
     /// The decimal `numeric(p,s)` typmod when `ty` is `decimal`, else `None` (mirrors `Column`).
     pub decimal: Option<DecimalTypmod>,
+    /// The `varchar(n)` max-length typmod when `ty` is `text`, else `None` (mirrors `Column`,
+    /// spec/design/types.md §15).
+    pub varchar_len: Option<u32>,
     /// Whether the field was declared `NOT NULL`.
     pub not_null: bool,
 }
@@ -360,6 +368,8 @@ pub struct ColField {
     pub name: String,
     pub ty: ColType,
     pub typmod: Option<DecimalTypmod>,
+    /// The `varchar(n)` max-length typmod when `ty` is `text` (spec/design/types.md §15).
+    pub varchar_len: Option<u32>,
     pub not_null: bool,
 }
 
@@ -384,6 +394,7 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
                         name: f.name.clone(),
                         ty: resolve_col_type(&f.ty, types),
                         typmod: f.decimal,
+                        varchar_len: f.varchar_len,
                         not_null: f.not_null,
                     })
                     .collect(),

@@ -3169,6 +3169,7 @@ export class Engine {
       const serialKind = serialPseudoType(def.typeName);
       let colType: Type;
       let decimal: DecimalTypmod | null;
+      let varcharLen: number | null = null;
       const ctype = this.compositeType(def.typeName);
       if (serialKind !== undefined) {
         // A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
@@ -3215,7 +3216,7 @@ export class Engine {
         colType = rangeT(scalarT(elementScalar(rdesc)));
         decimal = null;
       } else if (scalarTypeFromName(def.typeName) !== undefined) {
-        const [s, d] = resolveTypeAndTypmod(def.typeName, def.typeMod);
+        const [s, d, vl] = resolveTypeAndTypmod(def.typeName, def.typeMod);
         // jsonpath is literal-only this slice (P1a) — a jsonpath COLUMN is 0A000, like a J0-stage
         // json column (a storable jsonpath is a follow-on).
         if (s === "jsonpath") {
@@ -3223,6 +3224,7 @@ export class Engine {
         }
         colType = scalarT(s);
         decimal = d;
+        varcharLen = vl;
       } else if (ctype !== undefined) {
         if (def.typeMod !== null) {
           throw engineError(
@@ -3371,6 +3373,7 @@ export class Engine {
             literalToValue(def.default.expr.literal),
             sty,
             decimal,
+            varcharLen,
             false,
             def.name,
           );
@@ -3412,6 +3415,7 @@ export class Engine {
         name: def.name,
         type: colType,
         decimal,
+        varcharLen,
         primaryKey: def.primaryKey,
         // PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
         notNull: def.primaryKey || def.notNull || serialKind !== undefined || def.identity !== null,
@@ -4525,6 +4529,7 @@ export class Engine {
       }
       let fty: Type;
       let fdecimal: DecimalTypmod | null = null;
+      let fvarchar: number | null = null;
       if (f.typeName.endsWith("[]")) {
         // An array-typed field (spec/design/array.md §12 — the mirror of an array-of-composite
         // element). The element is a scalar or a previously-defined composite (element_type_code
@@ -4547,9 +4552,10 @@ export class Engine {
           throw engineError("undefined_object", "type does not exist: " + base);
         }
       } else if (scalarTypeFromName(f.typeName) !== undefined) {
-        const [s, d] = resolveTypeAndTypmod(f.typeName, f.typeMod);
+        const [s, d, vl] = resolveTypeAndTypmod(f.typeName, f.typeMod);
         fty = scalarT(s);
         fdecimal = d;
+        fvarchar = vl;
       } else if (rangeByName(f.typeName) !== undefined) {
         // A range-typed composite field (a range inside CREATE TYPE) is deferred this slice (only
         // range *columns* are storable — spec/design/ranges.md §3); the type name IS known, so this
@@ -4573,6 +4579,7 @@ export class Engine {
         name: f.name,
         type: fty,
         decimal: fdecimal,
+        varcharLen: fvarchar,
         notNull: f.notNull,
       });
     }
@@ -5333,7 +5340,7 @@ export class Engine {
         // free.
         const candidate: Value =
           p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.notNull, col.name);
+        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.varcharLen, col.notNull, col.name);
       }
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
@@ -5604,6 +5611,7 @@ export class Engine {
         name: col.name,
         target: targetScalar,
         decimal: col.decimal,
+        varcharLen: col.varcharLen,
         notNull: col.notNull,
         source: node,
       });
@@ -5794,7 +5802,7 @@ export class Engine {
         const p = provided[i]!;
         const candidate: Value =
           p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.notNull, col.name);
+        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.varcharLen, col.notNull, col.name);
       }
       if (checks.length > 0) {
         meter.guard();
@@ -6398,6 +6406,7 @@ export class Engine {
           name: col.name,
           target: targetScalar,
           decimal: col.decimal,
+          varcharLen: col.varcharLen,
           notNull: col.notNull,
           source: node,
         });
@@ -6417,6 +6426,7 @@ export class Engine {
           name: col.name,
           target: "i32", // unused (colType drives checkAssign)
           decimal: col.decimal,
+          varcharLen: col.varcharLen,
           notNull: col.notNull,
           source: node,
           colType: scope.catalog.colTypeOf(col.type),
@@ -8773,11 +8783,12 @@ export class Engine {
           "a composite/array column in a record column-definition list is not supported yet",
         );
       }
-      const [st, decimal] = resolveTypeAndTypmod(d.typeName, d.typeMod);
+      const [st, decimal, varcharLen] = resolveTypeAndTypmod(d.typeName, d.typeMod);
       columns.push({
         name: d.name,
         type: scalarT(st),
         decimal,
+        varcharLen,
         primaryKey: false,
         notNull: false,
         default: null,
@@ -8838,6 +8849,7 @@ export class Engine {
       name: f.name,
       type: f.type,
       decimal: f.decimal,
+      varcharLen: f.varcharLen,
       primaryKey: false,
       notNull: false,
       default: null,
@@ -12988,6 +13000,9 @@ type RExpr =
       kind: "cast";
       target: ScalarType;
       typmod: DecimalTypmod | null;
+      // A varchar(n) text target's max length — truncate the result to n code points (the
+      // explicit-cast rule, spec/design/types.md §15). null for any non-text / unbounded target.
+      varcharLen: number | null;
       operand: RExpr;
     }
   // A cast that INVOLVES an array type (spec/design/array.md §7), none expressible by the scalar
@@ -13679,6 +13694,7 @@ function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
         name: alias ?? funcName,
         type: colTy,
         decimal: null,
+        varcharLen: null,
         primaryKey: false,
         notNull: false,
         default: null,
@@ -13706,6 +13722,7 @@ function srfTableCols(funcName: string, alias: string | null, cols: [string, Typ
       name,
       type,
       decimal: null,
+      varcharLen: null,
       primaryKey: false,
       notNull: false,
       default: null,
@@ -13765,7 +13782,7 @@ function coerceJsonMember(
   if (st === "json") return jsonValue(jsonbOut(node));
   const text = nodeToText(node);
   if (text === null) return nullValue();
-  const { node: rexpr } = coerceStringLiteral(text, st, decimal);
+  const { node: rexpr } = coerceStringLiteral(text, st, decimal, null);
   return evalExpr(rexpr, [], env, meter);
 }
 
@@ -13935,6 +13952,7 @@ function jtColumn(name: string, ty: ScalarType, decimal: DecimalTypmod | null): 
     name,
     type: scalarT(ty),
     decimal,
+    varcharLen: null,
     primaryKey: false,
     notNull: false,
     default: null,
@@ -19137,6 +19155,7 @@ function cteSyntheticTableCols(
     name: n,
     type: typeFromResolved(bodyTypes[i]!),
     decimal: null,
+    varcharLen: null,
     primaryKey: false,
     notNull: false,
     default: null,
@@ -19250,7 +19269,7 @@ function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
       `bind parameter count mismatch: statement expects ${types.length}, got ${supplied.length}`,
     );
   }
-  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, false, `$${i + 1}`));
+  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, null, false, `$${i + 1}`));
 }
 
 // rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which
@@ -20528,7 +20547,7 @@ function resolve(
       const rdesc = rangeByName(e.typeName);
       if (rdesc !== undefined) return coerceStringToRangeExpr(e.text, rdesc);
       const [target] = resolveTypeAndTypmod(e.typeName, null);
-      return coerceStringLiteral(e.text, target, null);
+      return coerceStringLiteral(e.text, target, null, null);
     }
     case "literal":
       switch (e.literal.kind) {
@@ -20950,13 +20969,14 @@ function resolve(
           "casting to a composite type is only supported from a string literal",
         );
       }
-      const [target, typmod] = resolveTypeAndTypmod(e.typeName, e.typeMod);
+      const [target, typmod, varcharLen] = resolveTypeAndTypmod(e.typeName, e.typeMod);
       // A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the same
       // primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The ONLY
       // text→T cast admitted ahead of the general cast slice; a non-literal text operand still
-      // falls through to the deferred 0A000 below.
+      // falls through to the deferred 0A000 below. A varchar(n) target truncates the literal to n
+      // code points (types.md §15).
       if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-        return coerceStringLiteral(e.inner.literal.text, target, typmod);
+        return coerceStringLiteral(e.inner.literal.text, target, typmod, varcharLen);
       }
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT
       // json/jsonb → text (the JSON cast matrix, json.md §6.1): json → text is the identity on the
@@ -20970,15 +20990,27 @@ function resolve(
         }
         const inner = resolve(scope, e.inner, null, ag, params);
         const ik = inner.type.kind;
-        if (ik === "null" || ik === "text") {
+        // A NULL adapts (NULL → NULL, no truncation needed).
+        if (ik === "null") {
+          return { node: inner.node, type: { kind: "text" } };
+        }
+        // text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a real
+        // cast node that silently truncates to n code points at eval (types.md §15).
+        if (ik === "text") {
+          if (varcharLen !== null) {
+            return {
+              node: { kind: "cast", target, typmod: null, varcharLen, operand: inner.node },
+              type: { kind: "text" },
+            };
+          }
           return { node: inner.node, type: { kind: "text" } };
         }
         // json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
         // casts.toml/types.md §14: canonical lowercase 8-4-4-4-12). Explicit — stricter than PG's
-        // assignment-cast-to-text (a documented divergence).
+        // assignment-cast-to-text (a documented divergence). A varchar(n) length truncates the result.
         if (ik === "json" || ik === "jsonb" || ik === "uuid") {
           return {
-            node: { kind: "cast", target, typmod, operand: inner.node },
+            node: { kind: "cast", target, typmod, varcharLen, operand: inner.node },
             type: { kind: "text" },
           };
         }
@@ -21011,7 +21043,7 @@ function resolve(
         }
         if (ik === "uuid") {
           return {
-            node: { kind: "cast", target, typmod, operand: inner.node },
+            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
             type: { kind: "bytea" },
           };
         }
@@ -21034,7 +21066,7 @@ function resolve(
         }
         if (ik === "text" || ik === "bytea") {
           return {
-            node: { kind: "cast", target, typmod, operand: inner.node },
+            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
             type: { kind: "uuid" },
           };
         }
@@ -21092,7 +21124,7 @@ function resolve(
         const ik = inner.type.kind;
         if (ik === "null") return { node: inner.node, type: toRt };
         if (ik === "text" || ik === "json" || ik === "jsonb") {
-          return { node: { kind: "cast", target, typmod, operand: inner.node }, type: toRt };
+          return { node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node }, type: toRt };
         }
         throw typeError("cannot cast type " + rtName(inner.type) + " to " + canonicalName(target));
       }
@@ -21125,7 +21157,7 @@ function resolve(
           inner.type.kind === "text"
         ) {
           return {
-            node: { kind: "cast", target, typmod, operand: inner.node },
+            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
             type: { kind: "bool" },
           };
         }
@@ -21135,7 +21167,7 @@ function resolve(
         // boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
         if (target === "i32") {
           return {
-            node: { kind: "cast", target, typmod, operand: inner.node },
+            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
             type: { kind: "int", ty: "i32" },
           };
         }
@@ -21196,7 +21228,7 @@ function resolve(
           ? { kind: "float", ty: target }
           : { kind: "int", ty: target };
       return {
-        node: { kind: "cast", target, typmod, operand: inner.node },
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
         type: resultType,
       };
     }
@@ -23318,7 +23350,7 @@ function coerceStringToRange(text: string, desc: RangeDesc): Value {
   const elem = elementScalar(desc);
   const coerceBound = (b: string | null): Value | null => {
     if (b === null) return null;
-    const { node } = coerceStringLiteral(b, elem, null);
+    const { node } = coerceStringLiteral(b, elem, null, null);
     return rexprConstToValue(node);
   };
   const lower = coerceBound(parsed.lower);
@@ -23336,6 +23368,7 @@ function coerceStringLiteral(
   s: string,
   target: ScalarType,
   typmod: DecimalTypmod | null,
+  varcharLen: number | null,
 ): { node: RExpr; type: ResolvedType } {
   switch (target) {
     case "bytea":
@@ -23385,8 +23418,16 @@ function coerceStringLiteral(
         type: { kind: "jsonpath" },
       };
     case "text":
-      // text 'x' is identity — the string IS the value.
-      return { node: { kind: "constText", value: s }, type: { kind: "text" } };
+      // text 'x' is identity — the string IS the value. A varchar(n) 'x' typed literal /
+      // CAST('x' AS varchar(n)) silently truncates to n code points (the explicit-cast rule,
+      // spec/design/types.md §15) — no 22001 at resolve.
+      return {
+        node: {
+          kind: "constText",
+          value: varcharLen !== null ? truncateToChars(s, varcharLen) : s,
+        },
+        type: { kind: "text" },
+      };
     case "boolean":
       return {
         node: { kind: "constBool", value: parseBoolLiteral(s) },
@@ -23468,7 +23509,7 @@ function coerceStringToComposite(
       // storable yet — R2).
       throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
     } else {
-      const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal);
+      const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal, f.varcharLen);
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
     }
@@ -23667,7 +23708,7 @@ function FLOAT_GRAMMAR_OK(t: string): boolean {
 // comparison node sees both sides at one width. Identity when from === to. Implemented as a `cast`
 // RExpr (the evaluator's evalCast handles float→float widening), so no new node kind is needed.
 function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
-  return from === to ? node : { kind: "cast", target: to, typmod: null, operand: node };
+  return from === to ? node : { kind: "cast", target: to, typmod: null, varcharLen: null, operand: node };
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
@@ -23977,7 +24018,7 @@ function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
 // an integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses,
 // and a non-assignable value is 42804 (the resolver already screened the common 42883 cases).
 function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
-  const stored = storeValue(v, elem, null, false, "range bound");
+  const stored = storeValue(v, elem, null, null, false, "range bound");
   return stored.kind === "null" ? null : stored;
 }
 
@@ -23999,13 +24040,13 @@ function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Val
   switch (op) {
     // `range @> element`: l is the range, r the element (coerced to the range's element type).
     case "containsElem": {
-      const e = storeValue(r, elem, null, false, "range element");
+      const e = storeValue(r, elem, null, null, false, "range element");
       result = rangeContainsElem(expectRange(l), e);
       break;
     }
     // `element <@ range`: l is the element, r the range.
     case "elemContainedBy": {
-      const e = storeValue(l, elem, null, false, "range element");
+      const e = storeValue(l, elem, null, null, false, "range element");
       result = rangeContainsElem(expectRange(r), e);
       break;
     }
@@ -24742,22 +24783,49 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
 // decimal (validated to numeric(p,s) — 22023); on any other type it is 0A000 (varchar(n) and
 // other parameterized types are deferred — spec/design/grammar.md §14). Type-specific narrowings
 // (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the call site.
+// MAX_VARCHAR_LEN is PostgreSQL's varchar(n) ceiling (spec/design/types.md §15); stored on disk
+// as a u32.
+const MAX_VARCHAR_LEN = 10485760;
+
+// resolveTypeAndTypmod resolves a scalar type name + optional type modifier, returning the type,
+// the decimal typmod (decimal), and the varchar(n) max length (text — spec/design/types.md §15).
+// At most one typmod is ever non-null (they belong to different types); a typmod on any other type
+// is 0A000.
 function resolveTypeAndTypmod(
   name: string,
   typeMod: TypeMod | null,
-): [ScalarType, DecimalTypmod | null] {
+): [ScalarType, DecimalTypmod | null, number | null] {
   const ty = scalarTypeFromName(name);
   if (ty === undefined) {
     throw engineError("undefined_object", "type does not exist: " + name);
   }
-  if (typeMod === null) return [ty, null];
-  if (!isDecimal(ty)) {
+  if (typeMod === null) return [ty, null, null];
+  if (isDecimal(ty)) return [ty, validateDecimalTypmod(typeMod), null];
+  if (isText(ty)) return [ty, null, validateVarcharTypmod(typeMod)];
+  throw engineError(
+    "feature_not_supported",
+    "a type modifier is not supported for type " + canonicalName(ty),
+  );
+}
+
+// validateVarcharTypmod validates a varchar(n) type modifier: 1 <= n <= 10485760 (PostgreSQL's
+// varchar ceiling), else trap 22023 (spec/design/types.md §15). A scale (varchar(n,m)) is a syntax
+// error — varchar takes a single length argument.
+function validateVarcharTypmod(tm: TypeMod): number {
+  if (tm.scale !== null) {
+    throw engineError("syntax_error", "varchar takes exactly one type modifier (a length)");
+  }
+  const n = tm.precision;
+  if (n < 1n) {
+    throw engineError("invalid_parameter_value", "length for type varchar must be at least 1");
+  }
+  if (n > BigInt(MAX_VARCHAR_LEN)) {
     throw engineError(
-      "feature_not_supported",
-      "a type modifier is not supported for type " + canonicalName(ty),
+      "invalid_parameter_value",
+      `length for type varchar cannot exceed ${MAX_VARCHAR_LEN}`,
     );
   }
-  return [ty, validateDecimalTypmod(typeMod)];
+  return Number(n);
 }
 
 // validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
@@ -24789,6 +24857,7 @@ function storeValue(
   v: Value,
   colTy: ScalarType,
   typmod: DecimalTypmod | null,
+  varcharLen: number | null,
   notNull: boolean,
   colName: string,
 ): Value {
@@ -24838,7 +24907,11 @@ function storeValue(
       if (colTy === "f64") return v;
       throw typeError("cannot store a f64 value in " + canonicalName(colTy) + " column " + colName);
     case "text":
-      if (isText(colTy)) return v;
+      if (isText(colTy)) {
+        // A varchar(n) column enforces its length on store (assignment semantics): over-length
+        // traps 22001, unless the excess is all spaces (truncate) — spec/design/types.md §15.
+        return textValue(coerceVarcharStore(v.text, varcharLen, colName));
+      }
       // A string literal adapts to a bytea column, decoding the hex input (types.md §6/§13);
       // malformed hex traps 22P02.
       if (isBytea(colTy)) return byteaValue(decodeByteaLiteral(v.text));
@@ -24921,6 +24994,34 @@ function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal {
   return typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
 }
 
+// truncateToChars truncates a text value to at most n code points (the explicit varchar(n) cast
+// rule — spec/design/types.md §15). JS strings are UTF-16, so the [...s] code-point iterator is
+// used, NOT s.slice, which would split astral characters mid-surrogate.
+function truncateToChars(s: string, n: number): string {
+  const cps = [...s];
+  return cps.length <= n ? s : cps.slice(0, n).join("");
+}
+
+// coerceVarcharStore coerces a text value into a varchar(n) column/field for STORAGE (the
+// assignment rule — spec/design/types.md §15): a value longer than n code points traps 22001,
+// UNLESS every excess code point is a space (U+0020), in which case it is silently truncated to n
+// (the SQL-standard trailing-space exception PostgreSQL implements). A null varcharLen (an
+// unbounded text column) passes the value through unchanged.
+function coerceVarcharStore(s: string, varcharLen: number | null, colName: string): string {
+  if (varcharLen === null) return s;
+  const cps = [...s];
+  if (cps.length <= varcharLen) return s;
+  for (let i = varcharLen; i < cps.length; i++) {
+    if (cps[i] !== " ") {
+      throw engineError(
+        "string_data_right_truncation",
+        `value too long for type varchar(${varcharLen}) in column ${colName}`,
+      );
+    }
+  }
+  return cps.slice(0, varcharLen).join("");
+}
+
 // literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
 function literalToValue(lit: Literal): Value {
   switch (lit.kind) {
@@ -24944,10 +25045,11 @@ function coerceForStore(
   v: Value,
   ty: ColType,
   typmod: DecimalTypmod | null,
+  varcharLen: number | null,
   notNull: boolean,
   colName: string,
 ): Value {
-  if (ty.kind === "scalar") return storeValue(v, ty.scalar, typmod, notNull, colName);
+  if (ty.kind === "scalar") return storeValue(v, ty.scalar, typmod, varcharLen, notNull, colName);
   if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName);
   if (ty.kind === "range") return storeRange(v, ty.elem, notNull, colName);
   return storeComposite(v, ty.name, ty.fields, notNull, colName);
@@ -24975,7 +25077,7 @@ function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string):
   }
   if (v.empty) return v;
   const coerce = (b: Value | null): Value | null =>
-    b === null ? null : coerceForStore(b, elem, null, false, colName);
+    b === null ? null : coerceForStore(b, elem, null, null, false, colName);
   return rangeValue(coerce(v.lower), coerce(v.upper), v.lowerInc, v.upperInc);
 }
 
@@ -24997,7 +25099,7 @@ function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string):
   }
   // Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[] deferred).
   // The shape (dims/lbounds) is preserved.
-  const out = v.elements.map((el) => coerceForStore(el, elem, null, false, colName));
+  const out = v.elements.map((el) => coerceForStore(el, elem, null, null, false, colName));
   return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements: out };
 }
 
@@ -25039,7 +25141,7 @@ function storeComposite(
   const out: Value[] = new Array(fields.length);
   for (let i = 0; i < fields.length; i++) {
     const f = fields[i]!;
-    out[i] = coerceForStore(v.fields[i]!, f.type, f.typmod, f.notNull, f.name);
+    out[i] = coerceForStore(v.fields[i]!, f.type, f.typmod, f.varcharLen, f.notNull, f.name);
   }
   return compositeValue(out);
 }
@@ -25181,7 +25283,7 @@ function coerceArrayElementText(tok: string, elem: ColType): Value {
   // element ColType is never a range.
   if (elem.kind === "range")
     throw new Error("array-of-range is not a storable type (ranges.md §2)");
-  const { node } = coerceStringLiteral(tok, elem.scalar, null);
+  const { node } = coerceStringLiteral(tok, elem.scalar, null, null);
   return rexprConstToValue(node);
 }
 
@@ -25209,7 +25311,7 @@ function coerceRecordTextToValue(
     // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
     if (f.type.kind === "range")
       throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
-    const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod);
+    const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod, f.varcharLen);
     return rexprConstToValue(node);
   });
   return compositeValue(vals);
@@ -25493,7 +25595,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
-      return evalCast(v, e.target, e.typmod);
+      const out = evalCast(v, e.target, e.typmod);
+      // A varchar(n) cast target silently truncates the resulting text to n code points (the
+      // explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
+      if (e.varcharLen !== null && out.kind === "text") {
+        return textValue(truncateToChars(out.text, e.varcharLen));
+      }
+      return out;
     }
     case "arrayCast": {
       // The three array-involving casts (spec/design/array.md §7): array → text (array_out),
@@ -27462,6 +27570,9 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
   // cast (every other text cast target is resolver-rejected): json validates + stores verbatim
   // (22P02 on malformed); jsonb parses + canonicalizes.
   if (v.kind === "text") {
+    // text → text: the identity (a varchar(n) length, if any, truncates at the cast eval site —
+    // types.md §15). The resolver only produces a text→text cast node when a length is present.
+    if (isText(target)) return v;
     if (isJson(target)) {
       validateJson(v.text);
       return jsonValue(v.text);
@@ -28776,6 +28887,9 @@ type AssignPlan = {
   name: string;
   target: ScalarType;
   decimal: DecimalTypmod | null;
+  // The varchar(n) length for a text column (spec/design/types.md §15) — UPDATE re-checks the new
+  // value's length exactly like INSERT (over-length 22001, trailing-space truncate).
+  varcharLen: number | null;
   notNull: boolean;
   source: RExpr;
   // The resolved ColType for a NON-scalar (range / array) column — when set, checkAssign stores
@@ -28790,6 +28904,7 @@ type AssignPlan = {
 // scale; a boolean into a boolean column is accepted as-is; a range/array re-coerces its
 // elements). The resolver proved the value's family is assignable.
 function checkAssign(p: AssignPlan, v: Value): Value {
-  if (p.colType !== undefined) return coerceForStore(v, p.colType, p.decimal, p.notNull, p.name);
-  return storeValue(v, p.target, p.decimal, p.notNull, p.name);
+  if (p.colType !== undefined)
+    return coerceForStore(v, p.colType, p.decimal, p.varcharLen, p.notNull, p.name);
+  return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name);
 }

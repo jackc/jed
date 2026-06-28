@@ -15,7 +15,12 @@ type catColumn struct {
 	// Decimal is the numeric(p,s) typmod for a decimal column, or nil for a non-decimal column
 	// OR an unconstrained numeric (spec/design/decimal.md §2). A constrained decimal column
 	// coerces stored values to this precision/scale.
-	Decimal    *decimalTypmod
+	Decimal *decimalTypmod
+	// VarcharLen is the varchar(n) max-length typmod for a text column, or nil for a non-text
+	// column OR an unbounded text (spec/design/types.md §15). n counts code points; an
+	// over-length assignment traps 22001. Persisted as a u32 in the typmod slot (type_code 4,
+	// format_version 22).
+	VarcharLen *uint32
 	PrimaryKey bool
 	// NotNull is implied true for a PRIMARY KEY column.
 	NotNull bool
@@ -314,6 +319,9 @@ type compositeField struct {
 	Type dataType
 	// Decimal is the decimal numeric(p,s) typmod when Type is decimal, else nil (mirrors Column).
 	Decimal *decimalTypmod
+	// VarcharLen is the varchar(n) max-length typmod when Type is text, else nil (mirrors Column,
+	// spec/design/types.md §15).
+	VarcharLen *uint32
 	// NotNull is whether the field was declared NOT NULL.
 	NotNull bool
 }
@@ -352,10 +360,12 @@ type colType struct {
 // decimal typmod (when the field is decimal), and declared nullability (mirrors CompositeField, but
 // with the type fully resolved for the codec/coercion path).
 type colField struct {
-	Name    string
-	Type    colType
-	Typmod  *decimalTypmod
-	NotNull bool
+	Name   string
+	Type   colType
+	Typmod *decimalTypmod
+	// VarcharLen is the varchar(n) max-length typmod when Type is text (spec/design/types.md §15).
+	VarcharLen *uint32
+	NotNull    bool
 }
 
 // ScalarColType wraps a scalar type as a (scalar) ColType.
@@ -385,10 +395,11 @@ func resolveColType(ty dataType, types map[string]*compositeType) colType {
 	fields := make([]colField, len(def.Fields))
 	for i, f := range def.Fields {
 		fields[i] = colField{
-			Name:    f.Name,
-			Type:    resolveColType(f.Type, types),
-			Typmod:  f.Decimal,
-			NotNull: f.NotNull,
+			Name:       f.Name,
+			Type:       resolveColType(f.Type, types),
+			Typmod:     f.Decimal,
+			VarcharLen: f.VarcharLen,
+			NotNull:    f.NotNull,
 		}
 	}
 	return colType{Composite: true, Name: def.Name, Fields: fields}

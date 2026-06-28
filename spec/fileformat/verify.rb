@@ -25,7 +25,12 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 21 # format_version 21: EXCLUDE constraints (spec/design/gist.md §7/§8, GX3) — a per-table
+VERSION = 22 # format_version 22: varchar(n) length limits (spec/design/types.md §15) — a text column
+# entry appends a u32 varchar_max_len in the typmod slot (type_code 4): 0 = unbounded, 1…10485760 =
+# the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is
+# unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded
+# still moves to v22 by its version byte + a 0 on each text column/field. format_version 21: EXCLUDE
+# constraints (spec/design/gist.md §7/§8, GX3) — a per-table
 # exclusion list after the foreign-key list: excl_count(u16), then per exclusion the name, the backing
 # GiST index name, and the (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The
 # backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST
@@ -153,17 +158,18 @@ end
 # `identity` is nil (not an identity column), :always (GENERATED ALWAYS), or :by_default (GENERATED
 # BY DEFAULT) — the v15 column flag bits 4 (is_identity) + 5 (identity_always); an identity column
 # also carries not_null + an expression default (the nextval, spec/design/sequences.md §13).
-def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, default: :none,
-        default_expr: nil, identity: nil, collation: nil)
+def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, varchar_len: nil,
+        default: :none, default_expr: nil, identity: nil, collation: nil)
   { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
-    precision: precision, scale: scale, default: default, default_expr: default_expr,
-    identity: identity, collation: collation }
+    precision: precision, scale: scale, varchar_len: varchar_len, default: default,
+    default_expr: default_expr, identity: identity, collation: collation }
 end
 
 # A composite-type field (format.md *Composite-type entry*, v9): a name + type (a scalar string,
-# or a composite type NAME for a nested composite) + NOT NULL flag + decimal typmod.
-def field(name, type, not_null: false, precision: nil, scale: nil)
-  { name: name, type: type, not_null: not_null, precision: precision, scale: scale }
+# or a composite type NAME for a nested composite) + NOT NULL flag + decimal typmod / varchar(n) len.
+def field(name, type, not_null: false, precision: nil, scale: nil, varchar_len: nil)
+  { name: name, type: type, not_null: not_null, precision: precision, scale: scale,
+    varchar_len: varchar_len }
 end
 
 # A composite (row) type definition (`CREATE TYPE name AS (...)`): a name + ordered field list.
@@ -274,6 +280,17 @@ TEXT_TABLE = {
   name: "t",
   columns: [col("id", "i32", pk: true), col("s", "text")],
   rows: [[1, "alice"], [2, ""], [3, "O'Brien"], [4, "caf\u{E9}"], [5, nil], [6, "\u{1F600}"]]
+}.freeze
+
+# A table with a bounded varchar(n) column beside an unbounded text column (v22 — the text-column
+# u32 varchar_max_len typmod slot, spec/design/types.md §15). The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, code varchar(5), note text)
+# Stored values are within the limit (a too-long value is rejected/truncated BEFORE the value codec,
+# so it never reaches a golden); the bounded column pins varchar_max_len = 5, the unbounded one 0.
+VARCHAR_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("code", "text", varchar_len: 5), col("note", "text")],
+  rows: [[1, "alice", "hi"], [2, "ab", nil], [3, "", "long note text"]]
 }.freeze
 
 # A table with a boolean column: exercises the value codec's boolean branch (a single
@@ -1076,6 +1093,7 @@ FIXTURES = [
     tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("v", "i16")], rows: [] }] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
+  { file: "varchar_table.jed",   page_size: 256, tables: [VARCHAR_TABLE] },
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
   { file: "bool_pk_table.jed",   page_size: 256, tables: [BOOL_PK_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
@@ -1688,6 +1706,9 @@ def table_entry_bytes(table, root_data_page, index_roots)
     # A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     # non-decimal entries are byte-unchanged. precision 0 = unconstrained numeric.
     out << u16(c[:precision] || 0) << u16(c[:scale] || 0) if c[:type] == "decimal"
+    # A text column appends its varchar(n) max length (u32) — only for type_code 4 (v22). 0 =
+    # unbounded (spec/design/types.md §15).
+    out << u32(c[:varchar_len] || 0) if c[:type] == "text"
     # A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value via
     # the same value codec rows use — AFTER the typmod, presence-gated. A DEFAULT NULL is one
     # 0x01. An EXPRESSION default (flags bit3, v8) instead appends its expr-text (u16 length +
@@ -1781,6 +1802,8 @@ def composite_type_entry_bytes(ct)
     end
     out << [f[:not_null] ? 1 : 0].pack("C")
     out << u16(f[:precision] || 0) << u16(f[:scale] || 0) if f[:type] == "decimal"
+    # A text field appends its varchar(n) max length (u32, v22); 0 = unbounded (types.md §15).
+    out << u32(f[:varchar_len] || 0) if f[:type] == "text"
   end
   out
 end
@@ -2621,7 +2644,13 @@ def decode_composite_type_entry(buf, pos)
       precision = p.zero? ? nil : p
       scale = p.zero? ? nil : sb.unpack1("n")
     end
-    fields << { name: fname, type: type, not_null: not_null, precision: precision, scale: scale }
+    if type == "text"
+      vb, pos = take(buf, pos, 4)
+      n = vb.unpack1("N")
+      varchar_len = n.zero? ? nil : n
+    end
+    fields << { name: fname, type: type, not_null: not_null, precision: precision, scale: scale,
+                varchar_len: varchar_len }
   end
   [{ name: name, fields: fields }, pos]
 end
@@ -2645,8 +2674,8 @@ def decode_table_entry(buf, pos)
       tnl, pos = take(buf, pos, 2)
       tname, pos = take(buf, pos, tnl.unpack1("n"))
       columns << { name: cname, type: tname, pk: false, not_null: (cf & 0b10) != 0,
-                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil,
-                   collation: nil }
+                   precision: nil, scale: nil, varchar_len: nil, default: :none,
+                   default_expr: nil, identity: nil, collation: nil }
       next
     end
     # An array column (v10, type_code 15): flags, then the element-type descriptor
@@ -2658,8 +2687,8 @@ def decode_table_entry(buf, pos)
 
       elem_type, pos = read_array_element_type(buf, pos)
       columns << { name: cname, type: "#{elem_type}[]", pk: false, not_null: (af & 0b10) != 0,
-                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil,
-                   collation: nil }
+                   precision: nil, scale: nil, varchar_len: nil, default: :none,
+                   default_expr: nil, identity: nil, collation: nil }
       next
     end
     # A range column (v15, type_code 17): flags, then the element-type descriptor — one scalar code
@@ -2673,8 +2702,8 @@ def decode_table_entry(buf, pos)
       elem_type = CODETYPE.fetch(ecb.getbyte(0))
       rname = RANGE_ELEM.key(elem_type) or raise "type code is not a valid range element subtype"
       columns << { name: cname, type: rname, pk: false, not_null: (rf & 0b10) != 0,
-                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil,
-                   collation: nil }
+                   precision: nil, scale: nil, varchar_len: nil, default: :none,
+                   default_expr: nil, identity: nil, collation: nil }
       next
     end
     flags, pos = take(buf, pos, 1)
@@ -2690,12 +2719,19 @@ def decode_table_entry(buf, pos)
     type = CODETYPE.fetch(tc.getbyte(0))
     precision = nil
     scale = nil
+    varchar_len = nil
     if type == "decimal"
       pb, pos = take(buf, pos, 2)
       sb, pos = take(buf, pos, 2)
       p = pb.unpack1("n")
       precision = p.zero? ? nil : p
       scale = p.zero? ? nil : sb.unpack1("n")
+    end
+    # A text column carries its varchar(n) max length (u32, v22); 0 = unbounded (types.md §15).
+    if type == "text"
+      vb, pos = take(buf, pos, 4)
+      n = vb.unpack1("N")
+      varchar_len = n.zero? ? nil : n
     end
     # The default follows the typmod: a CONSTANT default (bit2) is a value via the value codec; an
     # EXPRESSION default (bit3, v8) is the expr-text (u16 length + UTF-8). Mutually exclusive.
@@ -2717,8 +2753,8 @@ def decode_table_entry(buf, pos)
       collation = cb.force_encoding("UTF-8")
     end
     columns << { name: cname, type: type, pk: false, not_null: (f & 0b10) != 0,
-                 precision: precision, scale: scale, default: default, default_expr: default_expr,
-                 identity: identity, collation: collation }
+                 precision: precision, scale: scale, varchar_len: varchar_len, default: default,
+                 default_expr: default_expr, identity: identity, collation: collation }
   end
   # The primary key (v5): member ordinals in KEY order; pk membership marks the columns.
   pk = []
@@ -3291,7 +3327,7 @@ def expected_types(fx)
     { name: t[:name],
       fields: t[:fields].map do |f|
         { name: f[:name], type: f[:type], not_null: f[:not_null] || false,
-          precision: f[:precision], scale: f[:scale] }
+          precision: f[:precision], scale: f[:scale], varchar_len: f[:varchar_len] }
       end }
   end
 end
@@ -3303,8 +3339,9 @@ def expected_tables(fx)
     { name: t[:name],
       columns: t[:columns].map do |c|
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
-          precision: c[:precision], scale: c[:scale], default: c[:default],
-          default_expr: c[:default_expr], identity: c[:identity], collation: c[:collation] }
+          precision: c[:precision], scale: c[:scale], varchar_len: c[:varchar_len],
+          default: c[:default], default_expr: c[:default_expr], identity: c[:identity],
+          collation: c[:collation] }
       end,
       pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },

@@ -16,6 +16,8 @@ pub enum SqlState {
     CardinalityViolation,
     /// 22000 — {detail}
     DataException,
+    /// 22001 — {detail}
+    StringDataRightTruncation,
     /// 22003 — value out of range for type {type}
     NumericValueOutOfRange,
     /// 22004 — {detail}
@@ -176,6 +178,7 @@ impl SqlState {
         match self {
             SqlState::CardinalityViolation => "21000",
             SqlState::DataException => "22000",
+            SqlState::StringDataRightTruncation => "22001",
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::NullValueNotAllowed => "22004",
             SqlState::InvalidDatetimeFormat => "22007",
@@ -270,6 +273,7 @@ pub struct ErrorDesc {
 pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "21000", name: "cardinality_violation", class: "cardinality violation" },
     ErrorDesc { code: "22000", name: "data_exception", class: "data exception" },
+    ErrorDesc { code: "22001", name: "string_data_right_truncation", class: "data exception" },
     ErrorDesc { code: "22003", name: "numeric_value_out_of_range", class: "data exception" },
     ErrorDesc { code: "22004", name: "null_value_not_allowed", class: "data exception" },
     ErrorDesc { code: "22007", name: "invalid_datetime_format", class: "data exception" },

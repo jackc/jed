@@ -37,11 +37,22 @@ test('the types page autoruns the runtime text → number/boolean cast demo', as
   await expect(rows).toContainText('true');
 });
 
+test('the types page autoruns the varchar(n) truncation demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // Fifth panel = the varchar(n) demo: 'hello world'::varchar(5) truncates to 'hello', 'café'
+  // fits varchar(4) by code point, 'ok' is within varchar(8).
+  const varcharPanel = page.getByTestId('live-sql').nth(4);
+  const rows = varcharPanel.getByTestId('result-rows');
+  await expect(rows).toContainText('hello');
+  await expect(rows).toContainText('café');
+  await expect(rows).toContainText('ok');
+});
+
 test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
-  // Fifth panel = the uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea
+  // Sixth panel = the uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea
   // (\x + 16 hex bytes), bytea→uuid (back to the canonical uuid).
-  const uuidCastPanel = page.getByTestId('live-sql').nth(4);
+  const uuidCastPanel = page.getByTestId('live-sql').nth(5);
   const rows = uuidCastPanel.getByTestId('result-rows');
   await expect(rows).toContainText('550e8400-e29b-41d4-a716-446655440000');
   await expect(rows).toContainText('\\x550e8400e29b41d4a716446655440000');
@@ -49,9 +60,9 @@ test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page 
 
 test('the types page autoruns the array cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
-  // Sixth panel = the array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and
+  // Seventh panel = the array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and
   // numeric[]→i32[] element rounding (1.7→2, 2.2→2, -2.5→-3, half away from zero).
-  const arrayCastPanel = page.getByTestId('live-sql').nth(5);
+  const arrayCastPanel = page.getByTestId('live-sql').nth(6);
   const rows = arrayCastPanel.getByTestId('result-rows');
   await expect(rows).toContainText('{1,2,3}');
   await expect(rows).toContainText('{2,2,-3}');

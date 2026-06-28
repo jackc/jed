@@ -350,6 +350,18 @@ func textTableDB(t *testing.T) *engine {
 	return db
 }
 
+// varcharTableDB has a bounded varchar(5) column beside an unbounded text column — the v22
+// text-column u32 varchar_max_len typmod slot (spec/design/types.md §15). Stored values are within
+// the limit (a too-long value never reaches a golden). Must match verify.rb's VARCHAR_TABLE.
+func varcharTableDB(t *testing.T) *engine {
+	db := withPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, code varchar(5), note text)")
+	run(t, db, "INSERT INTO t VALUES (1, 'alice', 'hi')")
+	run(t, db, "INSERT INTO t VALUES (2, 'ab', NULL)")
+	run(t, db, "INSERT INTO t VALUES (3, '', 'long note text')")
+	return db
+}
+
 // boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
 // bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 // PRIMARY KEY case is boolPKTableDB).
@@ -849,6 +861,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"one_table_empty.jed", oneTableEmptyDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
+		{"varchar_table.jed", varcharTableDB},
 		{"bool_table.jed", boolTableDB},
 		{"bool_pk_table.jed", boolPKTableDB},
 		{"decimal_table.jed", decimalTableDB},

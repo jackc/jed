@@ -423,6 +423,21 @@ fn text_table_db() -> Engine {
     db
 }
 
+/// A table with a bounded `varchar(5)` column beside an unbounded `text` column — the v22
+/// text-column `u32 varchar_max_len` typmod slot (spec/design/types.md §15). Stored values are
+/// within the limit. Must match `spec/fileformat/verify.rb`'s `VARCHAR_TABLE`.
+fn varchar_table_db() -> Engine {
+    let mut db = Engine::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, code varchar(5), note text)",
+    );
+    run(&mut db, "INSERT INTO t VALUES (1, 'alice', 'hi')");
+    run(&mut db, "INSERT INTO t VALUES (2, 'ab', NULL)");
+    run(&mut db, "INSERT INTO t VALUES (3, '', 'long note text')");
+    db
+}
+
 /// A table with a boolean column — exercises the value codec's boolean branch (a single
 /// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 /// PRIMARY KEY case is `bool_pk_table_db`).
@@ -1009,6 +1024,7 @@ fn write_matches_goldens() {
         ("one_table_empty.jed", one_table_empty_db),
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
+        ("varchar_table.jed", varchar_table_db),
         ("bool_table.jed", bool_table_db),
         ("bool_pk_table.jed", bool_pk_table_db),
         ("decimal_table.jed", decimal_table_db),

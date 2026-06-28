@@ -20,6 +20,11 @@
   ('3.14159'::text)::numeric(4,2)  AS text_to_numeric,
   ('yes'::text)::boolean           AS text_to_bool;`;
 
+	const varcharDemo = `SELECT
+  'hello world'::varchar(5)  AS truncated,
+  'café'::varchar(4)         AS fits_by_codepoint,
+  'ok'::varchar(8)           AS within_limit;`;
+
 	const uuidCastDemo = `SELECT
   ('550E8400-E29B-41D4-A716-446655440000'::text)::uuid  AS text_to_uuid,
   '550e8400-e29b-41d4-a716-446655440000'::uuid::text    AS uuid_to_text,
@@ -117,6 +122,20 @@ The type must be **named** — a bare string never silently becomes a number, so
 a type error (`42804`). jed uses its own literal grammar, so hex, digit underscores, and `NaN` are
 rejected (`22P02`) where PostgreSQL accepts them. (Parsing a string into a `date` / `timestamp` /
 `interval` / `bytea` is a separate feature — use that type's literal form, e.g. `date '2024-01-15'`.)
+
+## varchar(n) length limits
+
+`varchar(n)` (and the jed alias `string(n)`) is `text` with a **maximum length**, counted in Unicode
+**code points** — so `'café'` (4 code points) fits `varchar(4)`. An explicit `CAST` / `::` silently
+**truncates** to `n`, exactly like PostgreSQL, so `'hello world'::varchar(5)` is `'hello'`:
+
+<LiveSql query={varcharDemo} rows={1} />
+
+Storing into a `varchar(n)` **column** is stricter: an over-length value raises `22001`
+(`string_data_right_truncation`), *unless* the excess characters are all spaces — then it is
+truncated to `n` (the SQL-standard trailing-space rule). `UPDATE` re-checks the length the same way.
+The limit lives on the value, not the type: a `varchar(4)` and an unbounded `text` are the same type
+underneath, with the same collation, comparison, and key encoding.
 
 ## UUID ⇄ text and bytea casts
 

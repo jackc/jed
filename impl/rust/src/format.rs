@@ -81,7 +81,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
 /// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
 /// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
-const FORMAT_VERSION: u16 = 21;
+const FORMAT_VERSION: u16 = 22;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -2294,6 +2294,11 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                     out.extend_from_slice(&precision.to_be_bytes());
                     out.extend_from_slice(&scale.to_be_bytes());
                 }
+                // A text column appends its `varchar(n)` max length — only for type_code 4 (v22).
+                // `0` = unbounded, so a plain `text` column carries `0`. spec/design/types.md §15.
+                if s.is_text() {
+                    out.extend_from_slice(&col.varchar_len.unwrap_or(0).to_be_bytes());
+                }
                 // A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default
                 // value via the value codec rows use — AFTER the typmod, presence-gated. A
                 // `DEFAULT NULL` is one 0x01. An EXPRESSION default (flags bit3, v8) instead
@@ -2696,6 +2701,10 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
                 out.extend_from_slice(&p.to_be_bytes());
                 out.extend_from_slice(&sc.to_be_bytes());
             }
+            // A text field appends its `varchar(n)` max length (v22); `0` = unbounded — §15.
+            if s.is_text() {
+                out.extend_from_slice(&f.varchar_len.unwrap_or(0).to_be_bytes());
+            }
         }
     }
     out
@@ -2731,6 +2740,7 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
             return Err(corrupt("reserved composite field flag set"));
         }
         let not_null = flags & 0b1 != 0;
+        let mut varchar_len: Option<u32> = None;
         if let Type::Scalar(s) = &ty {
             if s.is_decimal() {
                 let precision = read_u16(buf, pos)?;
@@ -2741,11 +2751,17 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
                     Some(DecimalTypmod { precision, scale })
                 };
             }
+            // A text field carries its `varchar(n)` max length (v22); `0` = unbounded — §15.
+            if s.is_text() {
+                let n = read_u32(buf, pos)?;
+                varchar_len = if n == 0 { None } else { Some(n) };
+            }
         }
         fields.push(CompositeField {
             name: fname,
             ty,
             decimal,
+            varchar_len,
             not_null,
         });
     }
@@ -2901,6 +2917,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 name: cname,
                 ty: Type::Composite(crate::types::CompositeRef { name: tname }),
                 decimal: None,
+                varchar_len: None,
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
                 default: None,
@@ -2922,6 +2939,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 name: cname,
                 ty: Type::Array(Box::new(elem)),
                 decimal: None,
+                varchar_len: None,
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
                 default: None,
@@ -2943,6 +2961,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 name: cname,
                 ty: Type::Range(Box::new(elem)),
                 decimal: None,
+                varchar_len: None,
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
                 default: None,
@@ -2988,6 +3007,13 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         } else {
             None
         };
+        // A text column carries its `varchar(n)` max length (v22); 0 = unbounded (types.md §15).
+        let varchar_len = if ty.is_text() {
+            let n = read_u32(buf, pos)?;
+            if n == 0 { None } else { Some(n) }
+        } else {
+            None
+        };
         // The default follows the typmod (spec/fileformat/format.md): a CONSTANT default
         // (flags bit2) is a value via the same value codec rows use — never externalized, so no
         // overflow reader is needed (a `0x02` tag here would be a corrupt catalog). An
@@ -3025,6 +3051,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             name: cname,
             ty: Type::Scalar(ty),
             decimal,
+            varchar_len,
             primary_key: false, // set from the pk list below
             not_null: flags & 0b10 != 0,
             default,

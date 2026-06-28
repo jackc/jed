@@ -3049,92 +3049,95 @@ impl Engine {
             // carries no typmod (the composite's fields carry their own); a type modifier written on
             // a composite column is rejected (0A000). A composite column is storable but never
             // keyable — the PK gate below rejects it 0A000 (§6).
-            let (ty, decimal): (Type, Option<DecimalTypmod>) = if let Some(sk) = serial_kind {
-                // A serial column takes no typmod (`serial(5)` is 42601) and no `[]` (handled by
-                // the array branch). Its type is the underlying integer; everything else below.
-                if def.type_mod.is_some() {
-                    return Err(EngineError::new(
-                        SqlState::SyntaxError,
-                        format!("type modifier is not allowed for type {}", def.type_name),
-                    ));
-                }
-                (Type::Scalar(sk), None)
-            } else if let Some(base) = def.type_name.strip_suffix("[]") {
-                // An array column (spec/design/array.md §3). The element type is a scalar or a
-                // previously-defined composite (array-of-composite, §12 AC1 — `element_type_code`
-                // 14 + name); a nested-array element and an array typmod (`numeric(p,s)[]`) stay
-                // deferred (0A000).
-                if def.type_mod.is_some() {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "a type modifier on an array type is not supported yet".to_string(),
-                    ));
-                }
-                match ScalarType::from_name(base) {
-                    Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None),
-                    None => {
-                        if let Some(ctype) = self.read_snap().composite_type(base) {
-                            (
-                                Type::Array(Box::new(Type::Composite(
-                                    crate::types::CompositeRef {
-                                        name: ctype.name.clone(),
-                                    },
-                                ))),
-                                None,
-                            )
-                        } else {
-                            return Err(EngineError::new(
-                                SqlState::UndefinedObject,
-                                format!("type does not exist: {base}"),
-                            ));
+            let (ty, decimal, varchar_len): (Type, Option<DecimalTypmod>, Option<u32>) =
+                if let Some(sk) = serial_kind {
+                    // A serial column takes no typmod (`serial(5)` is 42601) and no `[]` (handled by
+                    // the array branch). Its type is the underlying integer; everything else below.
+                    if def.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::SyntaxError,
+                            format!("type modifier is not allowed for type {}", def.type_name),
+                        ));
+                    }
+                    (Type::Scalar(sk), None, None)
+                } else if let Some(base) = def.type_name.strip_suffix("[]") {
+                    // An array column (spec/design/array.md §3). The element type is a scalar or a
+                    // previously-defined composite (array-of-composite, §12 AC1 — `element_type_code`
+                    // 14 + name); a nested-array element and an array typmod (`numeric(p,s)[]`) stay
+                    // deferred (0A000).
+                    if def.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "a type modifier on an array type is not supported yet".to_string(),
+                        ));
+                    }
+                    match ScalarType::from_name(base) {
+                        Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None, None),
+                        None => {
+                            if let Some(ctype) = self.read_snap().composite_type(base) {
+                                (
+                                    Type::Array(Box::new(Type::Composite(
+                                        crate::types::CompositeRef {
+                                            name: ctype.name.clone(),
+                                        },
+                                    ))),
+                                    None,
+                                    None,
+                                )
+                            } else {
+                                return Err(EngineError::new(
+                                    SqlState::UndefinedObject,
+                                    format!("type does not exist: {base}"),
+                                ));
+                            }
                         }
                     }
-                }
-            } else if let Some(rdesc) = crate::range::range_by_name(&def.type_name) {
-                // A range column (spec/design/ranges.md §3): structural like array, the element
-                // carried inline. A range takes no typmod (`numrange(10,2)` is not a thing — the
-                // element is the unconstrained subtype), so a type modifier is rejected.
-                if def.type_mod.is_some() {
+                } else if let Some(rdesc) = crate::range::range_by_name(&def.type_name) {
+                    // A range column (spec/design/ranges.md §3): structural like array, the element
+                    // carried inline. A range takes no typmod (`numrange(10,2)` is not a thing — the
+                    // element is the unconstrained subtype), so a type modifier is rejected.
+                    if def.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "a type modifier on a range type is not supported".to_string(),
+                        ));
+                    }
+                    let elem = crate::range::element_scalar(rdesc);
+                    (Type::Range(Box::new(Type::Scalar(elem))), None, None)
+                } else if ScalarType::from_name(&def.type_name).is_some() {
+                    let (s, d, vlen) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                    // `jsonpath` is literal-only this slice (P1a) — a jsonpath COLUMN is `0A000`, like a
+                    // J0-stage json column (a storable jsonpath is a follow-on).
+                    if s == ScalarType::JsonPath {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "a jsonpath column is not supported yet".to_string(),
+                        ));
+                    }
+                    (Type::Scalar(s), d, vlen)
+                } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
+                    if def.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "a type modifier is not supported for composite type {}",
+                                def.type_name
+                            ),
+                        ));
+                    }
+                    (
+                        Type::Composite(crate::types::CompositeRef {
+                            name: ctype.name.clone(),
+                        }),
+                        None,
+                        None,
+                    )
+                } else {
                     return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "a type modifier on a range type is not supported".to_string(),
+                        SqlState::UndefinedObject,
+                        format!("type does not exist: {}", def.type_name),
                     ));
-                }
-                let elem = crate::range::element_scalar(rdesc);
-                (Type::Range(Box::new(Type::Scalar(elem))), None)
-            } else if ScalarType::from_name(&def.type_name).is_some() {
-                let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
-                // `jsonpath` is literal-only this slice (P1a) — a jsonpath COLUMN is `0A000`, like a
-                // J0-stage json column (a storable jsonpath is a follow-on).
-                if s == ScalarType::JsonPath {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "a jsonpath column is not supported yet".to_string(),
-                    ));
-                }
-                (Type::Scalar(s), d)
-            } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
-                if def.type_mod.is_some() {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        format!(
-                            "a type modifier is not supported for composite type {}",
-                            def.type_name
-                        ),
-                    ));
-                }
-                (
-                    Type::Composite(crate::types::CompositeRef {
-                        name: ctype.name.clone(),
-                    }),
-                    None,
-                )
-            } else {
-                return Err(EngineError::new(
-                    SqlState::UndefinedObject,
-                    format!("type does not exist: {}", def.type_name),
-                ));
-            };
+                };
             if def.primary_key {
                 // The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
                 // boolean (`bool-byte` §2.9), uuid (`uuid-raw16` §2.7), timestamp/timestamptz (i64
@@ -3294,6 +3297,7 @@ impl Engine {
                                 literal_to_value_for(lit, sty)?,
                                 sty,
                                 decimal,
+                                varchar_len,
                                 false,
                                 &def.name,
                             )?),
@@ -3356,6 +3360,7 @@ impl Engine {
                 name: def.name.clone(),
                 ty,
                 decimal,
+                varchar_len,
                 primary_key: def.primary_key,
                 // PRIMARY KEY ⇒ NOT NULL; a `serial` or IDENTITY column is NOT NULL too
                 // (sequences.md §12/§13).
@@ -4669,7 +4674,7 @@ impl Engine {
                     format!("attribute {} specified more than once", f.name),
                 ));
             }
-            let (fty, fdecimal): (Type, Option<DecimalTypmod>) =
+            let (fty, fdecimal, fvarchar): (Type, Option<DecimalTypmod>, Option<u32>) =
                 if let Some(base) = f.type_name.strip_suffix("[]") {
                     // An array-typed field (spec/design/array.md §12 — the mirror of an
                     // array-of-composite element). The element is a scalar or a *previously-defined*
@@ -4694,10 +4699,10 @@ impl Engine {
                             format!("type does not exist: {base}"),
                         ));
                     };
-                    (Type::Array(Box::new(elem)), None)
+                    (Type::Array(Box::new(elem)), None, None)
                 } else if ScalarType::from_name(&f.type_name).is_some() {
-                    let (s, d) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
-                    (Type::Scalar(s), d)
+                    let (s, d, vlen) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
+                    (Type::Scalar(s), d, vlen)
                 } else if crate::range::range_by_name(&f.type_name).is_some() {
                     // A range-typed composite field (a `range` inside `CREATE TYPE`) is deferred
                     // this slice (only range *columns* are storable — spec/design/ranges.md §3); the
@@ -4724,6 +4729,7 @@ impl Engine {
                             name: f.type_name.clone(),
                         }),
                         None,
+                        None,
                     )
                 } else {
                     return Err(EngineError::new(
@@ -4735,6 +4741,7 @@ impl Engine {
                 name: f.name.clone(),
                 ty: fty,
                 decimal: fdecimal,
+                varchar_len: fvarchar,
                 not_null: f.not_null,
             });
         }
@@ -5464,6 +5471,7 @@ impl Engine {
                     candidate,
                     &col_types[i],
                     col.decimal,
+                    col.varchar_len,
                     col.not_null,
                     &col.name,
                 )?);
@@ -5802,6 +5810,7 @@ impl Engine {
                         name: col.name.clone(),
                         target: target_scalar,
                         decimal: col.decimal,
+                        varchar_len: col.varchar_len,
                         not_null: col.not_null,
                         source,
                         col_type: None,
@@ -5925,6 +5934,7 @@ impl Engine {
                     candidate,
                     &col_types[i],
                     col.decimal,
+                    col.varchar_len,
                     col.not_null,
                     &col.name,
                 )?);
@@ -6884,6 +6894,7 @@ impl Engine {
                         name: col.name.clone(),
                         target: target_scalar,
                         decimal: col.decimal,
+                        varchar_len: col.varchar_len,
                         not_null: col.not_null,
                         source,
                         col_type: None,
@@ -6906,6 +6917,7 @@ impl Engine {
                         name: col.name.clone(),
                         target: ScalarType::Int32, // unused (col_type drives check)
                         decimal: col.decimal,
+                        varchar_len: col.varchar_len,
                         not_null: col.not_null,
                         source,
                         col_type: Some(ct),
@@ -10046,11 +10058,12 @@ impl Engine {
                     "a composite/array column in a record column-definition list is not supported yet",
                 ));
             }
-            let (st, decimal) = resolve_type_and_typmod(&d.type_name, &d.type_mod)?;
+            let (st, decimal, varchar_len) = resolve_type_and_typmod(&d.type_name, &d.type_mod)?;
             columns.push(Column {
                 name: d.name.clone(),
                 ty: Type::Scalar(st),
                 decimal,
+                varchar_len,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -10118,6 +10131,7 @@ impl Engine {
                 name: f.name.clone(),
                 ty: f.ty.clone(),
                 decimal: f.decimal,
+                varchar_len: f.varchar_len,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -13794,6 +13808,10 @@ enum RExpr {
         target: ScalarType,
         /// For a decimal target, the optional `numeric(p,s)` typmod to coerce to.
         typmod: Option<DecimalTypmod>,
+        /// For a `varchar(n)` target (a `text` cast with a length), the max length to
+        /// **truncate** to — an explicit cast silently truncates, never raising 22001
+        /// (spec/design/types.md §15). `None` for any non-text / unbounded target.
+        varchar_len: Option<u32>,
     },
     /// A cast that *involves* an array type (spec/design/array.md §7) — the three follow-on array
     /// casts, none expressible by the scalar [`RExpr::Cast`] node (whose `target` is a `ScalarType`):
@@ -14757,6 +14775,7 @@ fn cte_synthetic_table_cols(
                 name: n.clone(),
                 ty: type_from_resolved(t)?,
                 decimal: None,
+                varchar_len: None,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -15033,6 +15052,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
             name: alias.unwrap_or(func_name).to_string(),
             ty: col_ty,
             decimal: None,
+            varchar_len: None,
             primary_key: false,
             not_null: false,
             default: None,
@@ -15326,7 +15346,7 @@ fn coerce_json_member(
         Type::Scalar(st) => match json::node_to_text(node) {
             None => Ok(Value::Null),
             Some(text) => {
-                let (rexpr, _) = coerce_string_literal(&text, *st, decimal)?;
+                let (rexpr, _) = coerce_string_literal(&text, *st, decimal, None)?;
                 rexpr.eval(&[], env, meter)
             }
         },
@@ -15351,6 +15371,7 @@ fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmod>) -> Colu
         name: name.to_string(),
         ty: Type::Scalar(ty),
         decimal,
+        varchar_len: None,
         primary_key: false,
         not_null: false,
         default: None,
@@ -15561,6 +15582,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
                 name: name.to_string(),
                 ty,
                 decimal: None,
+                varchar_len: None,
                 primary_key: false,
                 not_null: false,
                 default: None,
@@ -23367,6 +23389,7 @@ fn bind_params(supplied: &[Value], types: &[ScalarType]) -> Result<Vec<Value>> {
             v.clone(),
             *ty,
             None,
+            None,
             false,
             &format!("${}", i + 1),
         )?);
@@ -24772,8 +24795,8 @@ fn resolve(
             if let Some(desc) = crate::range::range_by_name(type_name) {
                 return coerce_string_to_range_expr(text, desc);
             }
-            let (target, _) = resolve_type_and_typmod(type_name, &None)?;
-            coerce_string_literal(text, target, None)
+            let (target, _, _) = resolve_type_and_typmod(type_name, &None)?;
+            coerce_string_literal(text, target, None, None)
         }
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
         // scope chain here, so its column-count / type errors fire even over an empty outer.
@@ -25067,13 +25090,14 @@ fn resolve(
                     )),
                 };
             }
-            let (target, typmod) = resolve_type_and_typmod(type_name, type_mod)?;
+            let (target, typmod, varchar_len) = resolve_type_and_typmod(type_name, type_mod)?;
             // A string LITERAL operand is coerced to the target at resolve — `CAST('42' AS int)`,
             // the same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5).
             // This is the ONLY text→T cast admitted ahead of the general cast slice; a non-literal
-            // text operand still falls through to the deferred 0A000 below.
+            // text operand still falls through to the deferred 0A000 below. A `varchar(n)` target
+            // truncates the literal to n code points (types.md §15).
             if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
-                return coerce_string_literal(s, target, typmod);
+                return coerce_string_literal(s, target, typmod, varchar_len);
             }
             // Cross-family datetime casts (timezones.md §9.3): a `timestamp`/`timestamptz`/`date`
             // TARGET from another datetime family. A same-family cast is the identity; a cross-family
@@ -25132,6 +25156,7 @@ fn resolve(
                             inner: Box::new(rinner),
                             target,
                             typmod: None,
+                            varchar_len: None,
                         },
                         to_rt,
                     )),
@@ -25157,15 +25182,32 @@ fn resolve(
                 }
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
                 return match ity {
-                    ResolvedType::Null | ResolvedType::Text => Ok((rinner, ResolvedType::Text)),
+                    // text → text: the identity, UNLESS a `varchar(n)` length is present — then it
+                    // becomes a real Cast node that silently truncates to n code points at eval
+                    // (types.md §15). A NULL adapts (NULL → NULL, no truncation needed).
+                    ResolvedType::Null => Ok((rinner, ResolvedType::Text)),
+                    ResolvedType::Text => Ok((
+                        match varchar_len {
+                            Some(_) => RExpr::Cast {
+                                inner: Box::new(rinner),
+                                target,
+                                typmod: None,
+                                varchar_len,
+                            },
+                            None => rinner,
+                        },
+                        ResolvedType::Text,
+                    )),
                     // json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
                     // casts.toml/types.md §14: the canonical lowercase 8-4-4-4-12 form). Explicit —
-                    // stricter than PG's assignment-cast-to-text (a documented divergence).
+                    // stricter than PG's assignment-cast-to-text (a documented divergence). A
+                    // `varchar(n)` length truncates the rendered text (types.md §15).
                     ResolvedType::Json | ResolvedType::Jsonb | ResolvedType::Uuid => Ok((
                         RExpr::Cast {
                             inner: Box::new(rinner),
                             target,
                             typmod: None,
+                            varchar_len,
                         },
                         ResolvedType::Text,
                     )),
@@ -25206,6 +25248,7 @@ fn resolve(
                             inner: Box::new(rinner),
                             target,
                             typmod: None,
+                            varchar_len: None,
                         },
                         ResolvedType::Bytea,
                     )),
@@ -25233,6 +25276,7 @@ fn resolve(
                             inner: Box::new(rinner),
                             target,
                             typmod: None,
+                            varchar_len: None,
                         },
                         ResolvedType::Uuid,
                     )),
@@ -25295,6 +25339,7 @@ fn resolve(
                             inner: Box::new(rinner),
                             target,
                             typmod,
+                            varchar_len: None,
                         },
                         ResolvedType::Bool,
                     )),
@@ -25311,6 +25356,7 @@ fn resolve(
                             inner: Box::new(rinner),
                             target,
                             typmod,
+                            varchar_len: None,
                         },
                         ResolvedType::Int(ScalarType::Int32),
                     ));
@@ -25420,6 +25466,7 @@ fn resolve(
                     inner: Box::new(rinner),
                     target,
                     typmod,
+                    varchar_len: None,
                 },
                 result_ty,
             ))
@@ -27896,6 +27943,7 @@ fn widen_float_to_f64(node: RExpr, ty: &ResolvedType) -> RExpr {
             inner: Box::new(node),
             target: ScalarType::Float64,
             typmod: None,
+            varchar_len: None,
         }
     } else {
         node
@@ -28198,7 +28246,7 @@ fn eval_range_ctor(elem: ScalarType, vals: &[Value]) -> Result<Value> {
 /// range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
 /// non-assignable value is 42804 (the resolver already screened the common 42883 cases).
 fn coerce_range_bound(v: Value, elem: ScalarType) -> Result<Option<Value>> {
-    match store_value(v, elem, None, false, "range bound")? {
+    match store_value(v, elem, None, None, false, "range bound")? {
         Value::Null => Ok(None),
         other => Ok(Some(other)),
     }
@@ -28216,12 +28264,12 @@ fn eval_range_op(op: RangeOp, l: &Value, r: &Value, elem: ScalarType) -> Result<
     let result = match op {
         // `range @> element`: l is the range, r the element (coerced to the range's element type).
         RangeOp::ContainsElem => {
-            let e = store_value(r.clone(), elem, None, false, "range element")?;
+            let e = store_value(r.clone(), elem, None, None, false, "range element")?;
             crate::range::range_contains_elem(expect_range(l), &e)
         }
         // `element <@ range`: l is the element, r the range.
         RangeOp::ElemContainedBy => {
-            let e = store_value(l.clone(), elem, None, false, "range element")?;
+            let e = store_value(l.clone(), elem, None, None, false, "range element")?;
             crate::range::range_contains_elem(expect_range(r), &e)
         }
         _ => {
@@ -29109,10 +29157,18 @@ fn missing_from_entry(qualifier: &str) -> EngineError {
 /// and other parameterized types are deferred — spec/design/grammar.md §14). Type-specific
 /// narrowings (a text/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the
 /// call site, not here.
+/// The maximum `varchar(n)` length — PostgreSQL's `varchar` ceiling (spec/design/types.md §15).
+/// Stored on disk as a `u32`, so it fits comfortably.
+const MAX_VARCHAR_LEN: u32 = 10485760;
+
+/// Resolve a scalar type name + optional type modifier, returning the type, the decimal typmod
+/// (when the type is `decimal`), and the `varchar(n)` max length (when the type is `text` —
+/// spec/design/types.md §15). At most one of the two typmods is ever `Some` (they belong to
+/// different types). A typmod on any other type is `0A000`.
 fn resolve_type_and_typmod(
     name: &str,
     type_mod: &Option<TypeMod>,
-) -> Result<(ScalarType, Option<DecimalTypmod>)> {
+) -> Result<(ScalarType, Option<DecimalTypmod>, Option<u32>)> {
     let ty = if let Some(ty) = ScalarType::from_name(name) {
         ty
     } else {
@@ -29121,23 +29177,50 @@ fn resolve_type_and_typmod(
             format!("type does not exist: {name}"),
         ));
     };
-    let typmod = match type_mod {
-        None => None,
+    match type_mod {
+        None => Ok((ty, None, None)),
         Some(tm) => {
             if ty.is_decimal() {
-                Some(validate_decimal_typmod(tm)?)
+                Ok((ty, Some(validate_decimal_typmod(tm)?), None))
+            } else if ty.is_text() {
+                Ok((ty, None, Some(validate_varchar_typmod(tm)?)))
             } else {
-                return Err(EngineError::new(
+                Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     format!(
                         "a type modifier is not supported for type {}",
                         ty.canonical_name()
                     ),
-                ));
+                ))
             }
         }
-    };
-    Ok((ty, typmod))
+    }
+}
+
+/// Validate a `varchar(n)` type modifier: `1 <= n <= 10485760` (PostgreSQL's `varchar` ceiling),
+/// else trap 22023 (spec/design/types.md §15). A scale (`varchar(n, m)`) is a syntax error here —
+/// `varchar` takes a single length argument.
+fn validate_varchar_typmod(tm: &TypeMod) -> Result<u32> {
+    if tm.scale.is_some() {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "varchar takes exactly one type modifier (a length)".to_string(),
+        ));
+    }
+    let n = tm.precision;
+    if n < 1 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "length for type varchar must be at least 1".to_string(),
+        ));
+    }
+    if n > MAX_VARCHAR_LEN as u64 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("length for type varchar cannot exceed {MAX_VARCHAR_LEN}"),
+        ));
+    }
+    Ok(n as u32)
 }
 
 /// Validate a decimal `numeric(p[,s])` type modifier: `1 <= p <= 1000`, `0 <= s <= p`; else
@@ -29247,7 +29330,9 @@ fn coerce_string_to_composite(
                             .expect("nested composite type resolved at CREATE TYPE / load");
                         coerce_string_to_composite(&s, nested, catalog)?
                     }
-                    Type::Scalar(scalar) => coerce_string_literal(&s, *scalar, f.decimal)?,
+                    Type::Scalar(scalar) => {
+                        coerce_string_literal(&s, *scalar, f.decimal, f.varchar_len)?
+                    }
                     // An array-typed field (spec/design/array.md §12): the token is an array text
                     // literal, coerced through `array_in` against the element type — the same path a
                     // bare `'{…}'::T[]` cast uses, one level down. Folds to a constant array.
@@ -29373,7 +29458,7 @@ fn coerce_string_to_range(text: &str, desc: &crate::ranges_gen::RangeDesc) -> Re
         match b {
             None => Ok(None),
             Some(s) => {
-                let (node, _) = coerce_string_literal(s, elem, None)?;
+                let (node, _) = coerce_string_literal(s, elem, None, None)?;
                 Ok(Some(rexpr_const_to_value(&node)?))
             }
         }
@@ -29387,6 +29472,7 @@ fn coerce_string_literal(
     s: &str,
     target: ScalarType,
     typmod: Option<DecimalTypmod>,
+    varchar_len: Option<u32>,
 ) -> Result<(RExpr, ResolvedType)> {
     Ok(match target {
         ScalarType::Bytea => (
@@ -29428,8 +29514,16 @@ fn coerce_string_literal(
             RExpr::ConstJsonPath(crate::jsonpath::JsonPath::compile(s)?.render()),
             ResolvedType::JsonPath,
         ),
-        // `text 'x'` is identity — the string IS the value.
-        ScalarType::Text => (RExpr::ConstText(s.to_string()), ResolvedType::Text),
+        // `text 'x'` is identity — the string IS the value. A `varchar(n) 'x'` typed literal /
+        // `CAST('x' AS varchar(n))` silently truncates to n code points (the explicit-cast rule,
+        // spec/design/types.md §15) — no 22001 at resolve.
+        ScalarType::Text => (
+            RExpr::ConstText(match varchar_len {
+                Some(n) => truncate_to_chars(s, n as usize),
+                None => s.to_string(),
+            }),
+            ResolvedType::Text,
+        ),
         ScalarType::Bool => (RExpr::ConstBool(parse_bool_literal(s)?), ResolvedType::Bool),
         ScalarType::Decimal => {
             let d = parse_decimal_literal(s)?;
@@ -29763,6 +29857,9 @@ struct AssignPlan {
     name: String,
     target: ScalarType,
     decimal: Option<DecimalTypmod>,
+    /// The `varchar(n)` length for a text column (spec/design/types.md §15) — UPDATE re-checks
+    /// the new value's length exactly like INSERT (over-length 22001, trailing-space truncate).
+    varchar_len: Option<u32>,
     not_null: bool,
     source: RExpr,
     /// The resolved `ColType` for a NON-scalar (range / array) column — `Some` ⇒ `check` stores
@@ -29781,8 +29878,22 @@ impl AssignPlan {
     /// decimal→int implicitly).
     fn check(&self, v: Value) -> Result<Value> {
         match &self.col_type {
-            Some(ct) => coerce_for_store(v, ct, self.decimal, self.not_null, &self.name),
-            None => store_value(v, self.target, self.decimal, self.not_null, &self.name),
+            Some(ct) => coerce_for_store(
+                v,
+                ct,
+                self.decimal,
+                self.varchar_len,
+                self.not_null,
+                &self.name,
+            ),
+            None => store_value(
+                v,
+                self.target,
+                self.decimal,
+                self.varchar_len,
+                self.not_null,
+                &self.name,
+            ),
         }
     }
 }
@@ -29796,6 +29907,7 @@ fn store_value(
     v: Value,
     col_ty: ScalarType,
     typmod: Option<DecimalTypmod>,
+    varchar_len: Option<u32>,
     not_null: bool,
     col_name: &str,
 ) -> Result<Value> {
@@ -29840,7 +29952,9 @@ fn store_value(
         }
         Value::Text(s) => {
             if col_ty.is_text() {
-                Ok(Value::Text(s))
+                // A `varchar(n)` column enforces its length on store (assignment semantics):
+                // over-length traps 22001, unless the excess is all spaces (truncate) — §15.
+                Ok(Value::Text(coerce_varchar_store(s, varchar_len, col_name)?))
             } else if col_ty.is_bytea() {
                 // A string literal adapts to a bytea column, decoding the hex input form
                 // (types.md §6/§13); malformed hex traps 22P02.
@@ -30030,11 +30144,12 @@ fn coerce_for_store(
     v: Value,
     ty: &ColType,
     typmod: Option<DecimalTypmod>,
+    varchar_len: Option<u32>,
     not_null: bool,
     col_name: &str,
 ) -> Result<Value> {
     match ty {
-        ColType::Scalar(s) => store_value(v, *s, typmod, not_null, col_name),
+        ColType::Scalar(s) => store_value(v, *s, typmod, varchar_len, not_null, col_name),
         ColType::Composite { name, fields } => store_composite(v, name, fields, not_null, col_name),
         ColType::Array(elem) => store_array(v, elem, not_null, col_name),
         ColType::Range(elem) => store_range(v, elem, not_null, col_name),
@@ -30068,7 +30183,7 @@ fn store_range(v: Value, elem: &ColType, not_null: bool, col_name: &str) -> Resu
                 match b {
                     None => Ok(None),
                     Some(val) => Ok(Some(Box::new(coerce_for_store(
-                        *val, elem, None, false, col_name,
+                        *val, elem, None, None, false, col_name,
                     )?))),
                 }
             };
@@ -30105,8 +30220,8 @@ fn store_array(v: Value, elem: &ColType, not_null: bool, col_name: &str) -> Resu
             let mut out = Vec::with_capacity(arr.elements.len());
             for val in arr.elements {
                 // Elements are nullable (not_null = false); the element typmod is unconstrained
-                // this slice (numeric(p,s)[] is deferred — §12).
-                out.push(coerce_for_store(val, elem, None, false, col_name)?);
+                // this slice (numeric(p,s)[] and varchar(n)[] are deferred — §12, types.md §15).
+                out.push(coerce_for_store(val, elem, None, None, false, col_name)?);
             }
             Ok(Value::Array(ArrayVal {
                 dims: arr.dims,
@@ -30151,7 +30266,14 @@ fn store_composite(
             }
             let mut out = Vec::with_capacity(vals.len());
             for (val, f) in vals.into_iter().zip(fields.iter()) {
-                out.push(coerce_for_store(val, &f.ty, f.typmod, f.not_null, &f.name)?);
+                out.push(coerce_for_store(
+                    val,
+                    &f.ty,
+                    f.typmod,
+                    f.varchar_len,
+                    f.not_null,
+                    &f.name,
+                )?);
             }
             Ok(Value::Composite(out))
         }
@@ -30168,6 +30290,41 @@ fn coerce_decimal(d: Decimal, typmod: Option<DecimalTypmod>) -> Result<Decimal> 
     match typmod {
         Some(t) => d.coerce_to_typmod(t.precision as u32, t.scale as u32),
         None => d.check_cap(),
+    }
+}
+
+/// Truncate a text value to at most `n` code points (the explicit `varchar(n)` cast rule —
+/// spec/design/types.md §15). Cuts on a code-point boundary, never mid-byte; a string already
+/// within `n` is returned unchanged.
+fn truncate_to_chars(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// Coerce a text value into a `varchar(n)` column/field for STORAGE (the assignment rule —
+/// spec/design/types.md §15): a value longer than `n` code points traps `22001`, UNLESS every
+/// excess code point is a space (U+0020), in which case it is silently truncated to `n` (the
+/// SQL-standard trailing-space exception PostgreSQL implements). `varchar_len` of `None` (an
+/// unbounded `text` column) passes the value through unchanged.
+fn coerce_varchar_store(s: String, varchar_len: Option<u32>, col_name: &str) -> Result<String> {
+    let Some(n) = varchar_len else {
+        return Ok(s);
+    };
+    let n = n as usize;
+    // Find the byte offset of the (n+1)-th code point, if any; if there is none the value
+    // fits within `n` and is stored verbatim.
+    let Some((cut, _)) = s.char_indices().nth(n) else {
+        return Ok(s);
+    };
+    if s[cut..].chars().all(|c| c == ' ') {
+        Ok(s[..cut].to_string())
+    } else {
+        Err(EngineError::new(
+            SqlState::StringDataRightTruncation,
+            format!("value too long for type varchar({n}) in column {col_name}"),
+        ))
     }
 }
 
@@ -30457,7 +30614,7 @@ fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
 fn coerce_array_element_text(tok: &str, elem: &ColType) -> Result<Value> {
     match elem {
         ColType::Scalar(s) => {
-            let (node, _) = coerce_string_literal(tok, *s, None)?;
+            let (node, _) = coerce_string_literal(tok, *s, None, None)?;
             rexpr_const_to_value(&node)
         }
         ColType::Composite { name, fields } => coerce_record_text(tok, name, fields),
@@ -30495,7 +30652,7 @@ fn coerce_record_text(
             None => vals.push(Value::Null),
             Some(s) => vals.push(match &f.ty {
                 ColType::Scalar(sc) => {
-                    let (node, _) = coerce_string_literal(&s, *sc, f.typmod)?;
+                    let (node, _) = coerce_string_literal(&s, *sc, f.typmod, f.varchar_len)?;
                     rexpr_const_to_value(&node)?
                 }
                 ColType::Composite {
@@ -30798,9 +30955,10 @@ impl RExpr {
                 inner,
                 target,
                 typmod,
+                varchar_len,
             } => {
                 m.charge(COSTS.operator_eval);
-                match inner.eval(row, env, m)? {
+                let out = match inner.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) => {
                         if target.is_bool() {
@@ -30867,6 +31025,10 @@ impl RExpr {
                     // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible
                     // uuid_in parser; a malformed string traps 22P02.
                     Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
+                    // text → text: the identity (a `varchar(n)` length, if any, truncates in the
+                    // post-match step below — types.md §15). The resolver only produces a text→text
+                    // Cast node when a length is present, so this arm is unreachable without one.
+                    Value::Text(s) if target.is_text() => Ok(Value::Text(s)),
                     // text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same
                     // per-row coercion the `type 'string'` literal folds at resolve, run here over
                     // the runtime string. The resolver admits only int/decimal/float/bool targets
@@ -30951,6 +31113,15 @@ impl RExpr {
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
+                }?;
+                // A `varchar(n)` cast target silently truncates the resulting text to n code points
+                // (the explicit-cast rule, types.md §15) — applied after any *→text conversion above.
+                // A non-text result (or no length) passes through unchanged.
+                match (varchar_len, out) {
+                    (Some(n), Value::Text(s)) => {
+                        Ok(Value::Text(truncate_to_chars(&s, *n as usize)))
+                    }
+                    (_, v) => Ok(v),
                 }
             }
             // The three array-involving casts (spec/design/array.md §7), none expressible by the
