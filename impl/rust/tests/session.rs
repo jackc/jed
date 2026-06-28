@@ -1,12 +1,13 @@
-//! S1 session surface (spec/design/session.md §2): the `Engine`-owned **stateful default
-//! session**, **additional** sessions minted by `db.session(opts)` (shared committed storage,
-//! independent settings + transaction state, run sequentially via the swap), the relocated
-//! settings, and the explicit `Idle`/`Open`/`Failed` transaction state machine. These are per-core
-//! API behaviors the shared corpus cannot express (it is single-handle SQL-in/rows-out — CLAUDE.md
-//! §10), so they live here.
+//! Session surface (spec/design/session.md §2): the `Engine`-owned **stateful default session**
+//! (the bare single-handle path), and — after the §2.4 convergence — **additional** sessions minted
+//! by `db.session(opts)` over a shared [`Database`] core (each owns its private `Engine`, shares
+//! committed storage through the core, carries an independent envelope, and runs autocommit with the
+//! lazy gate — no swap). Also the explicit `Idle`/`Open`/`Failed` transaction state machine. These
+//! are per-core API behaviors the shared corpus cannot express (it is single-handle SQL-in/rows-out
+//! — CLAUDE.md §10), so they live here.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, SessionOptions, TxStatus};
+use jed::{Database, Engine, Outcome, SessionOptions, TxStatus};
 
 fn rows(o: Outcome) -> Vec<Vec<Value>> {
     match o {
@@ -58,84 +59,86 @@ fn failed_block_is_the_failed_state() {
 
 #[test]
 fn additional_session_shares_storage_with_independent_settings() {
-    let mut db = Engine::new();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    // Two sessions over one shared Database core: each owns its private Engine, but committed storage
+    // is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
+    let db = Database::new_in_memory();
+    let mut a = db.session(SessionOptions::default());
+    a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10)", &[]).unwrap();
+    a.execute("INSERT INTO t VALUES (1, 10)", &[]).unwrap();
 
-    // Mint a second session with its own cost ceiling — the default is untouched.
+    // A second session with its own cost ceiling — `a`'s is untouched.
     let mut s = db.session(SessionOptions {
         max_cost: 5,
         ..SessionOptions::default()
     });
     assert_eq!(s.max_cost(), 5);
-    assert_eq!(db.max_cost(), 0);
+    assert_eq!(a.max_cost(), 0);
 
-    // It sees the default session's committed data (committed storage is shared).
+    // It sees `a`'s committed data (committed storage is shared via the core).
     assert_eq!(
-        rows(s.execute(&mut db, "SELECT id, v FROM t", &[]).unwrap()),
+        rows(s.execute("SELECT id, v FROM t", &[]).unwrap()),
         vec![vec![Value::Int(1), Value::Int(10)]]
     );
 
-    // A write through the second session is visible to the default session.
-    s.execute(&mut db, "INSERT INTO t VALUES (2, 20)", &[])
-        .unwrap();
+    // A write through the second session (autocommit, lazy gate) is visible to `a`'s next read.
+    s.execute("INSERT INTO t VALUES (2, 20)", &[]).unwrap();
     assert_eq!(
-        rows(db.execute("SELECT id FROM t ORDER BY id", &[]).unwrap()),
+        rows(a.execute("SELECT id FROM t ORDER BY id", &[]).unwrap()),
         vec![vec![Value::Int(1)], vec![Value::Int(2)]]
     );
 
-    // The swap restored the default session: still Idle, still unlimited.
-    assert_eq!(db.status(), TxStatus::Idle);
-    assert_eq!(db.max_cost(), 0);
+    // Each session keeps its own state/settings: `a` is still Idle and unlimited.
+    assert_eq!(a.status(), TxStatus::Idle);
+    assert_eq!(a.max_cost(), 0);
 }
 
 #[test]
-fn additional_session_cost_ceiling_is_enforced_via_swap() {
-    // Proves the swap installs the additional session's *settings* into the execution path:
-    // a tiny ceiling aborts the scan with 54P01, while the unlimited default runs it fine.
-    let mut db = Engine::new();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+fn additional_session_cost_ceiling_is_enforced() {
+    // The session's *settings* drive the execution path: a tiny ceiling aborts the scan with 54P01,
+    // while an unlimited session runs it fine — both over the same shared core.
+    let db = Database::new_in_memory();
+    let mut a = db.session(SessionOptions::default());
+    a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
+    a.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
         .unwrap();
 
-    db.execute("SELECT * FROM t", &[]).unwrap(); // default: unlimited
+    a.execute("SELECT * FROM t", &[]).unwrap(); // unlimited
 
     let mut s = db.session(SessionOptions {
         max_cost: 1,
         ..SessionOptions::default()
     });
     assert_eq!(
-        s.execute(&mut db, "SELECT * FROM t", &[])
-            .err()
-            .unwrap()
-            .code(),
+        s.execute("SELECT * FROM t", &[]).err().unwrap().code(),
         "54P01"
     );
 
-    // The default session is unaffected.
-    db.execute("SELECT * FROM t", &[]).unwrap();
-    assert_eq!(db.max_cost(), 0);
+    // The unlimited session is unaffected.
+    a.execute("SELECT * FROM t", &[]).unwrap();
+    assert_eq!(a.max_cost(), 0);
 }
 
 #[test]
 fn additional_session_update_closure_commits_to_shared_storage() {
-    let mut db = Engine::new();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    let db = Database::new_in_memory();
+    let mut a = db.session(SessionOptions::default());
+    a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
     let mut s = db.session(SessionOptions::default());
-    s.update(&mut db, |tx| {
+    s.update(|tx| {
         tx.execute("INSERT INTO t VALUES (1)", &[])?;
         tx.execute("INSERT INTO t VALUES (2)", &[])?;
         Ok(())
     })
     .unwrap();
 
+    // The update closure committed through the shared core; another session sees both rows.
     assert_eq!(
-        rows(db.execute("SELECT count(*) FROM t", &[]).unwrap()),
+        rows(a.execute("SELECT count(*) FROM t", &[]).unwrap()),
         vec![vec![Value::Int(2)]]
     );
-    assert_eq!(db.status(), TxStatus::Idle);
+    assert_eq!(a.status(), TxStatus::Idle);
 }

@@ -5,7 +5,7 @@
 //! call (CLAUDE.md §10); the splitter's own boundary correctness is unit-tested in `src/split.rs`.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, TxStatus};
+use jed::{Database, Engine, Outcome, SessionOptions, TxStatus};
 
 fn count(db: &mut Engine) -> i64 {
     match db.execute("SELECT count(*) FROM t", &[]).unwrap() {
@@ -155,23 +155,24 @@ fn script_error_inside_an_open_transaction_leaves_it_failed_for_the_caller() {
 }
 
 #[test]
-fn additional_session_runs_a_script_via_the_swap() {
-    // execute_script on an *additional* session (spec/design/session.md §2.1) shares committed
-    // storage and runs sequentially via the swap — the default session is untouched.
-    let mut db = Engine::new();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+fn additional_session_runs_a_script_over_the_shared_core() {
+    // execute_script on an *additional* session (spec/design/session.md §2.1/§2.4) shares committed
+    // storage through the Database core and commits the run all-or-nothing — another session sees it.
+    let db = Database::new_in_memory();
+    let mut a = db.session(SessionOptions::default());
+    a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
-    let mut s = db.session(jed::SessionOptions::default());
+    let mut s = db.session(SessionOptions::default());
     let summary = s
-        .execute_script(
-            &mut db,
-            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
-        )
+        .execute_script("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)")
         .unwrap();
     assert_eq!(summary.statements_run, 2);
 
-    // Committed through the additional session, visible to the default one.
-    assert_eq!(count(&mut db), 2);
-    assert_eq!(db.status(), TxStatus::Idle);
+    // Committed through the additional session, visible to another session over the core.
+    match a.execute("SELECT count(*) FROM t", &[]).unwrap() {
+        Outcome::Query { rows, .. } => assert_eq!(rows[0][0], Value::Int(2)),
+        other => panic!("expected a query, got {other:?}"),
+    }
+    assert_eq!(a.status(), TxStatus::Idle);
 }

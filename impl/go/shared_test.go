@@ -14,7 +14,7 @@ import (
 )
 
 // readCount runs SELECT count(*) FROM t against a read handle and returns the count.
-func readCount(t *testing.T, r *ReadHandle) int64 {
+func readCount(t *testing.T, r *Session) int64 {
 	t.Helper()
 	rows, err := r.Query("SELECT count(*) FROM t", nil)
 	if err != nil {
@@ -34,7 +34,7 @@ func readCount(t *testing.T, r *ReadHandle) int64 {
 func seeded(t *testing.T, ids ...int64) *Database {
 	t.Helper()
 	db := NewDatabase()
-	w := db.Write()
+	w := db.WriteSession()
 	if _, err := w.Execute("CREATE TABLE t (id bigint PRIMARY KEY)", nil); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestSharedWriteThenReadSeesCommittedRows(t *testing.T) {
 	if db.Version() != 1 {
 		t.Fatalf("version = %d, want 1", db.Version())
 	}
-	r := db.Read()
+	r := db.ReadSession()
 	defer r.Close()
 	if got := readCount(t, r); got != 3 {
 		t.Fatalf("count = %d, want 3", got)
@@ -63,7 +63,7 @@ func TestSharedWriteThenReadSeesCommittedRows(t *testing.T) {
 
 func TestSharedReadHandleRejectsWrites(t *testing.T) {
 	db := seeded(t, 1)
-	r := db.Read()
+	r := db.ReadSession()
 	defer r.Close()
 	_, err := r.Execute("INSERT INTO t VALUES (2)", nil)
 	if err == nil {
@@ -81,11 +81,11 @@ func TestSharedReaderDoesNotBlockOnOpenWriter(t *testing.T) {
 	// A reader running while a writer holds an open, uncommitted transaction must not block and
 	// must see the pre-commit (committed) state — the core "readers parallel with a writer" claim.
 	db := seeded(t, 1)
-	w := db.Write()
+	w := db.WriteSession()
 	if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil { // staged, not committed
 		t.Fatalf("staged insert: %v", err)
 	}
-	r := db.Read() // does NOT block on the open writer
+	r := db.ReadSession() // does NOT block on the open writer
 	defer r.Close()
 	if got := readCount(t, r); got != 1 { // sees only the committed row
 		t.Fatalf("count during open writer = %d, want 1", got)
@@ -96,7 +96,7 @@ func TestSharedReaderDoesNotBlockOnOpenWriter(t *testing.T) {
 	if got := readCount(t, r); got != 1 { // the already-pinned reader is unaffected by the commit
 		t.Fatalf("count after commit (pinned) = %d, want 1", got)
 	}
-	r2 := db.Read()
+	r2 := db.ReadSession()
 	defer r2.Close()
 	if got := readCount(t, r2); got != 2 { // a fresh reader sees the new row
 		t.Fatalf("fresh reader count = %d, want 2", got)
@@ -105,13 +105,13 @@ func TestSharedReaderDoesNotBlockOnOpenWriter(t *testing.T) {
 
 func TestSharedPinnedReaderIsolatedFromConcurrentWriter(t *testing.T) {
 	db := seeded(t, 1)
-	pinned := db.Read() // pins version 1 (one row)
+	pinned := db.ReadSession() // pins version 1 (one row)
 	defer pinned.Close()
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		w := db.Write()
+		w := db.WriteSession()
 		if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
 			t.Errorf("writer insert: %v", err)
 			return
@@ -128,7 +128,7 @@ func TestSharedPinnedReaderIsolatedFromConcurrentWriter(t *testing.T) {
 	if db.Version() != 2 { // the writer's commit advanced the published version
 		t.Fatalf("version = %d, want 2", db.Version())
 	}
-	fresh := db.Read()
+	fresh := db.ReadSession()
 	defer fresh.Close()
 	if got := readCount(t, fresh); got != 2 { // a fresh reader sees both rows
 		t.Fatalf("fresh reader count = %d, want 2", got)
@@ -146,7 +146,7 @@ func TestSharedManyReadersParallelWithWriter(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := int64(2); i <= 20; i++ {
-			w := db.Write()
+			w := db.WriteSession()
 			if _, err := w.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
 				t.Errorf("writer insert %d: %v", i, err)
 				return
@@ -163,7 +163,7 @@ func TestSharedManyReadersParallelWithWriter(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for n := 0; n < 50; n++ {
-				r := db.Read()
+				r := db.ReadSession()
 				first := readCount(t, r)
 				second := readCount(t, r) // same pinned snapshot ⇒ identical
 				if first != second {
@@ -182,7 +182,7 @@ func TestSharedManyReadersParallelWithWriter(t *testing.T) {
 	if db.Version() != 20 {
 		t.Fatalf("version = %d, want 20", db.Version())
 	}
-	r := db.Read()
+	r := db.ReadSession()
 	defer r.Close()
 	if got := readCount(t, r); got != 20 {
 		t.Fatalf("final count = %d, want 20", got)
@@ -198,12 +198,12 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 		t.Fatalf("oldest (no readers) = %d, want 1", db.OldestLiveTxid())
 	}
 
-	r1 := db.Read() // pins version 1
+	r1 := db.ReadSession() // pins version 1
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("oldest (r1 pinned v1) = %d, want 1", db.OldestLiveTxid())
 	}
 
-	w := db.Write()
+	w := db.WriteSession()
 	if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 		t.Fatalf("oldest (r1 still pinned) = %d, want 1", db.OldestLiveTxid())
 	}
 
-	r2 := db.Read() // pins version 2
+	r2 := db.ReadSession() // pins version 2
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("oldest (r1+r2) = %d, want 1", db.OldestLiveTxid())
 	}
@@ -235,14 +235,14 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 
 func TestSharedRolledBackWriterPublishesNothing(t *testing.T) {
 	db := seeded(t, 1)
-	w := db.Write()
+	w := db.WriteSession()
 	if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	if err := w.Rollback(); err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
-	r := db.Read()
+	r := db.ReadSession()
 	defer r.Close()
 	if got := readCount(t, r); got != 1 { // the rolled-back insert never became visible
 		t.Fatalf("count after rollback = %d, want 1", got)
@@ -252,14 +252,14 @@ func TestSharedRolledBackWriterPublishesNothing(t *testing.T) {
 	}
 
 	// A second writer can proceed after the first rolled back (the gate was released).
-	w2 := db.Write()
+	w2 := db.WriteSession()
 	if _, err := w2.Execute("INSERT INTO t VALUES (3)", nil); err != nil {
 		t.Fatalf("second insert: %v", err)
 	}
 	if err := w2.Commit(); err != nil {
 		t.Fatalf("second commit: %v", err)
 	}
-	r2 := db.Read()
+	r2 := db.ReadSession()
 	defer r2.Close()
 	if got := readCount(t, r2); got != 2 {
 		t.Fatalf("count after second commit = %d, want 2", got)

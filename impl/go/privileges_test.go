@@ -94,24 +94,32 @@ func TestFunctionExecuteIsRevocable(t *testing.T) {
 }
 
 func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
-	db := NewEngine()
-	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	// db.Session(opts) mints an independent session over a shared Database core (§2.4): a restricted
+	// one rejects a write a permissive session still allows, and they share committed storage through
+	// the core (§2.1/§5.3) — each owns its envelope, no swap.
+	db := NewDatabase()
+	a := db.Session(SessionOptions{})
+	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
+		t.Fatal(err)
+	}
 
 	readOnly := PrivSetEmpty.With(PrivSelect)
-	restricted := db.NewSession(SessionOptions{DefaultPrivileges: &readOnly})
-	if _, err := restricted.ExecuteSQL(db, "SELECT * FROM t", nil); err != nil {
+	restricted := db.Session(SessionOptions{DefaultPrivileges: &readOnly})
+	if _, err := restricted.Execute("SELECT * FROM t", nil); err != nil {
 		t.Fatalf("read should be allowed on the restricted session: %v", err)
 	}
-	if _, err := restricted.ExecuteSQL(db, "INSERT INTO t VALUES (1, 10)", nil); sessCode(t, err) != "42501" {
+	if _, err := restricted.Execute("INSERT INTO t VALUES (1, 10)", nil); sessCode(t, err) != "42501" {
 		t.Fatalf("write should be 42501 on the restricted session")
 	}
 
-	// The default session is unaffected — it still writes.
-	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
+	// The permissive session is unaffected — it still writes.
+	if _, err := a.Execute("INSERT INTO t VALUES (1, 10)", nil); err != nil {
+		t.Fatal(err)
+	}
 
 	// A grant on the additional session lifts the restriction for it alone.
 	restricted.Grant(PrivSetEmpty.With(PrivInsert), "t")
-	if _, err := restricted.ExecuteSQL(db, "INSERT INTO t VALUES (2, 20)", nil); err != nil {
+	if _, err := restricted.Execute("INSERT INTO t VALUES (2, 20)", nil); err != nil {
 		t.Fatalf("insert should be allowed after grant on the restricted session: %v", err)
 	}
 }

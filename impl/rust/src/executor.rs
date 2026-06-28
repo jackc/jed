@@ -995,7 +995,7 @@ pub struct Engine {
     /// long-lived stateful default session; the convenience methods (`execute`/`begin`/
     /// `set_max_cost`/…) operate on it. `db.session(opts)` mints additional, independent sessions
     /// (run sequentially on this single-threaded handle by swapping into this slot).
-    pub(crate) session: Session,
+    pub(crate) session: SessionState,
     /// The backing file path (`None` for an in-memory database). Set by the host API
     /// `open`/`create` (spec/design/api.md §2); `commit` writes here.
     pub(crate) path: Option<std::path::PathBuf>,
@@ -1028,14 +1028,14 @@ pub struct Engine {
     pub(crate) read_only: bool,
     /// The DATABASE-WIDE shared temporary-table snapshot (spec/design/temp-tables.md §4): the
     /// committed rows of every `SHARED` temp table, held in memory and NEVER serialized — the shared
-    /// analogue of `Session::temp_committed`, but on the handle (so it is visible to every session
+    /// analogue of `SessionState::temp_committed`, but on the handle (so it is visible to every session
     /// minted from this `Engine`) rather than per-session. On a single handle this is just a field;
     /// for the thread-safe shared layer ([`crate::shared`]) it is pinned from / published to the
     /// shared `Snapshot` root alongside `committed` (the two-root commit, §5). Born empty, gone when
     /// the handle/database closes — never recovered (divergence D5).
     pub(crate) shared_temp_committed: Snapshot,
     /// The GLOBAL byte budget for shared temp storage (`shared_temp_mem`, temp-tables.md §7); `0` ⇒
-    /// unlimited. The shared-temp analogue of `Session::temp_buffers`, but `Engine`-level (shared
+    /// unlimited. The shared-temp analogue of `SessionState::temp_buffers`, but `Engine`-level (shared
     /// temp data is global). An over-budget shared-temp write aborts `54P03`.
     pub(crate) shared_temp_mem: usize,
 }
@@ -1043,8 +1043,8 @@ pub struct Engine {
 /// The relocatable session settings (spec/design/session.md §3 — the bucket-A envelope subset that
 /// has landed in S1): the per-statement cost ceiling, the input-size limit, and the work-memory
 /// budget. Passed to [`Engine::session`] to mint an additional session; an absent field takes its
-/// default. (The entropy/clock seam is injected via [`Session::set_random_source`] /
-/// [`Session::set_clock_source`], not here.)
+/// default. (The entropy/clock seam is injected via [`SessionState::set_random_source`] /
+/// [`SessionState::set_clock_source`], not here.)
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
     /// Execution-cost ceiling (CLAUDE.md §13); `0` ⇒ unlimited (the default).
@@ -1061,7 +1061,7 @@ pub struct SessionOptions {
     /// The table-privilege set granted to **every** table — the `GRANT … ON ALL TABLES` default
     /// (spec/design/session.md §5.3). Default: all four (`SELECT`/`INSERT`/`UPDATE`/`DELETE`), so a
     /// fresh session is unrestricted; `{SELECT}` (via [`PrivilegeSet::EMPTY`]`.with(Select)`) is a
-    /// read-only session. Per-object adjustments are [`Session::grant`] / [`Session::revoke`].
+    /// read-only session. Per-object adjustments are [`SessionState::grant`] / [`SessionState::revoke`].
     pub default_privileges: PrivilegeSet,
     /// Whether **persistent** DDL (CREATE / DROP / ALTER of persistent tables, indexes, types,
     /// sequences) is permitted; a denied schema change is `42501` (session.md §5.3). Default **on**.
@@ -1088,8 +1088,8 @@ pub struct SessionOptions {
     /// `timestamptz` is decomposed *in* by `date_trunc` / `EXTRACT` / the cross-family datetime casts.
     /// Default `"UTC"`. Accepts `UTC`, a fixed `±HH:MM` offset, or a **named** IANA zone a loaded
     /// `JTZ` bundle provides; a name no bundle provides is rejected (`22023`) when the session is minted
-    /// — the resolved zone is cached on the [`Session`]. (An invalid value here falls back to `UTC`
-    /// rather than failing the mint; use [`Session::set_time_zone`] for the validated setter.)
+    /// — the resolved zone is cached on the [`SessionState`]. (An invalid value here falls back to `UTC`
+    /// rather than failing the mint; use [`SessionState::set_time_zone`] for the validated setter.)
     pub time_zone: String,
 }
 
@@ -1137,7 +1137,7 @@ impl TxStatus {
 /// the entropy/clock seam, and the `currval`/`lastval` session state. A [`Engine`] holds one as
 /// its long-lived default session; [`Engine::session`] mints additional independent ones that run
 /// sequentially on a single-threaded handle (by swapping into the default slot for a call).
-pub struct Session {
+pub struct SessionState {
     /// The open transaction, if any. `None` is autocommit between statements (transactions.md
     /// §4.1); a single-statement autocommit write opens one implicitly for its duration. The
     /// `Idle`/`Open`/`Failed` status (session.md §2.2) is derived from this ([`TxStatus::of`]).
@@ -1147,14 +1147,14 @@ pub struct Session {
     /// this limit and aborts `54P01` the instant accrued cost reaches it.
     pub(crate) max_cost: i64,
     /// The per-session cumulative cost budget (spec/design/session.md §5.4), or `0` for
-    /// **unlimited**. Bounds the whole session: the instant [`lifetime_total`](Session::lifetime_total)
+    /// **unlimited**. Bounds the whole session: the instant [`lifetime_total`](SessionState::lifetime_total)
     /// reaches it the in-flight statement aborts `54P02`, and once spent every further statement is
-    /// rejected `54P02` at admission. Sibling to [`max_cost`](Session::max_cost) (one statement).
+    /// rejected `54P02` at admission. Sibling to [`max_cost`](SessionState::max_cost) (one statement).
     pub(crate) lifetime_max_cost: i64,
     /// The session's running **cumulative** execution cost (spec/design/session.md §5.4) — the gauge
     /// `lifetime_cost()` reads and the `54P02` budget bounds. Shared (`Rc<Cell>`) with every statement
     /// [`Meter`](crate::cost::Meter), which live-charges its units into it, so partial cost of an
-    /// aborted statement counts automatically. **Session state, not snapshot state**: it does NOT roll
+    /// aborted statement counts automatically. **SessionState state, not snapshot state**: it does NOT roll
     /// back when a transaction rolls back (the compute was spent regardless).
     pub(crate) lifetime_total: std::rc::Rc<std::cell::Cell<i64>>,
     /// The maximum input SQL length, in **bytes**, accepted on this session (CLAUDE.md §13; api.md
@@ -1171,11 +1171,11 @@ pub struct Session {
     /// primitive. Tests inject `seeded_random_source` + `fixed_clock` (the `# seed:`/`# clock:`
     /// directives) for byte-identical cross-core output.
     pub(crate) seam: crate::seam::Seam,
-    /// **Session** `currval` state (spec/design/sequences.md §6): the last value `nextval`/
+    /// **SessionState** `currval` state (spec/design/sequences.md §6): the last value `nextval`/
     /// `setval(…,true)` produced **in this session** for each sequence (lowercased name). NOT in the
     /// snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
     pub(crate) session_seq: HashMap<String, i64>,
-    /// **Session** `lastval` state (sequences.md §6): the lowercased name of the sequence the most
+    /// **SessionState** `lastval` state (sequences.md §6): the lowercased name of the sequence the most
     /// recent `nextval` (of any sequence) ran on — `None` before the first `nextval`.
     pub(crate) session_last_name: Option<String>,
     /// Per-**statement** running sequence advances (sequences.md §4), behind a `RefCell` for interior
@@ -1208,20 +1208,20 @@ pub struct Session {
     pub(crate) temp_buffers: usize,
     /// The session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to the
     /// session — a `string→string` map (PG GUCs are all text) the host sets (`set_var`/`reset_var`)
-    /// and SQL reads with `current_setting`. Custom (dotted) names only in v1. **Session state, not
+    /// and SQL reads with `current_setting`. Custom (dotted) names only in v1. **SessionState state, not
     /// snapshot state**: it does NOT roll back with a transaction (PG `SET SESSION`), and it carries
-    /// across the additional-session swap because it lives on `Session` (like the privilege envelope).
+    /// across the additional-session swap because it lives on `SessionState` (like the privilege envelope).
     pub(crate) vars: HashMap<String, String>,
     /// The resolved session **time zone** (spec/design/session.md §6.2, timezones.md §9.4): the zone a
     /// `timestamptz` is decomposed *in* by `date_trunc` / `EXTRACT` / the cross-family casts. Resolved
-    /// once (from [`SessionOptions::time_zone`] at mint, or [`Session::set_time_zone`]) to a cheap
+    /// once (from [`SessionOptions::time_zone`] at mint, or [`SessionState::set_time_zone`]) to a cheap
     /// [`crate::timezone::ZoneRef`] (`UTC` = `Fixed(0)`); the evaluator reads it via the active session.
-    /// **Session state** — carries across the additional-session swap, no storage effect.
+    /// **SessionState state** — carries across the additional-session swap, no storage effect.
     pub(crate) time_zone: crate::timezone::ZoneRef,
     /// The session-local **temporary-table** catalog + stores (spec/design/temp-tables.md §2): a
     /// `Snapshot` holding only this session's temp tables, their stores, and their (UNIQUE) index
     /// stores. **Never serialized** — only [`Engine::committed`] is written to the file, so a temp
-    /// table makes ZERO file writes (§2). Private to this `Session` (so it carries across the
+    /// table makes ZERO file writes (§2). Private to this `SessionState` (so it carries across the
     /// additional-session swap and is invisible to other sessions — the [[session-design]] privacy),
     /// and dropped wholesale when the session is. Transactional like the main snapshot: an open
     /// transaction clones it into [`ActiveTx::temp_working`], which a successful COMMIT adopts back
@@ -1252,16 +1252,16 @@ fn require_custom_var_name(name: &str) -> Result<String> {
     }
 }
 
-impl Default for Session {
+impl Default for SessionState {
     fn default() -> Self {
-        Session::new()
+        SessionState::new()
     }
 }
 
-impl Session {
+impl SessionState {
     /// A fresh default session: no open transaction, default settings, empty sequence state.
     pub fn new() -> Self {
-        Session::with_options(SessionOptions::default())
+        SessionState::with_options(SessionOptions::default())
     }
 
     /// A fresh session configured from `opts` (spec/design/session.md §2.1); the rest of the
@@ -1269,7 +1269,7 @@ impl Session {
     pub fn with_options(opts: SessionOptions) -> Self {
         let mut privileges = crate::privileges::Privileges::default();
         privileges.set_default_table(opts.default_privileges);
-        Session {
+        SessionState {
             tx: None,
             max_cost: opts.max_cost,
             lifetime_max_cost: opts.lifetime_max_cost,
@@ -1317,58 +1317,6 @@ impl Session {
                 format!("time zone \"{zone}\" not recognized"),
             )),
         }
-    }
-
-    /// Run `f` with this session installed as `db`'s active session — the swap mechanism that lets an
-    /// additional session run sequentially on a single-threaded [`Engine`] (spec/design/session.md
-    /// §2.1): swap this session into the default slot, run, swap back so this session carries forward
-    /// its mutated state and the default is restored.
-    fn run<R>(&mut self, db: &mut Engine, f: impl FnOnce(&mut Engine) -> R) -> R {
-        std::mem::swap(&mut db.session, self);
-        let r = f(db);
-        std::mem::swap(&mut db.session, self);
-        r
-    }
-
-    /// Run a (possibly mutating) statement on this session against `db`, binding `$N` params.
-    pub fn execute(&mut self, db: &mut Engine, sql: &str, params: &[Value]) -> Result<Outcome> {
-        self.run(db, |db| db.execute(sql, params))
-    }
-
-    /// Run a **query** on this session against `db`, returning a row cursor.
-    pub fn query(
-        &mut self,
-        db: &mut Engine,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<crate::api::Rows> {
-        self.run(db, |db| db.query(sql, params))
-    }
-
-    /// Run `f` in a READ ONLY transaction on this session (auto-commit/rollback, §2.2).
-    pub fn view<R>(
-        &mut self,
-        db: &mut Engine,
-        f: impl FnOnce(&mut crate::api::Transaction) -> Result<R>,
-    ) -> Result<R> {
-        self.run(db, |db| db.view(f))
-    }
-
-    /// Run `f` in a READ WRITE transaction on this session (auto-commit/rollback, §2.2).
-    pub fn update<R>(
-        &mut self,
-        db: &mut Engine,
-        f: impl FnOnce(&mut crate::api::Transaction) -> Result<R>,
-    ) -> Result<R> {
-        self.run(db, |db| db.update(f))
-    }
-
-    /// Run a multi-statement `sql` **script** on this session (spec/design/session.md §4.2): split
-    /// it, run each statement in order, discard result rows, and return the `O(1)` [`ScriptSummary`].
-    /// When this session is `Idle` the whole run is one implicit transaction (all-or-nothing); when
-    /// it is `Open` the run joins that transaction. In-script transaction control is `0A000`.
-    pub fn execute_script(&mut self, db: &mut Engine, sql: &str) -> Result<ScriptSummary> {
-        self.run(db, |db| db.execute_script(sql))
     }
 
     /// The transaction status (`Idle`/`Open`/`Failed`, spec/design/session.md §2.2).
@@ -1486,7 +1434,7 @@ impl Session {
     /// session. Custom variables must be **namespaced** (a dotted name like `myapp.tenant`); a
     /// non-dotted name is `42704` (no built-in setting is reachable through this map in v1 — the
     /// `time_zone` built-in is its own slice). The name is case-insensitive (folded to lowercase, PG);
-    /// the value is text. Session state, not snapshot state — it does NOT roll back with a transaction.
+    /// the value is text. SessionState state, not snapshot state — it does NOT roll back with a transaction.
     pub fn set_var(&mut self, name: &str, value: &str) -> Result<()> {
         let key = require_custom_var_name(name)?;
         self.vars.insert(key, value.to_string());
@@ -1546,7 +1494,7 @@ pub(crate) struct ActiveTx {
     saved_session_seq: HashMap<String, i64>,
     saved_session_last_name: Option<String>,
     /// The transaction's working copy of the session's temp-table snapshot
-    /// (spec/design/temp-tables.md §5): cloned from [`Session::temp_committed`] at tx open (cheap —
+    /// (spec/design/temp-tables.md §5): cloned from [`SessionState::temp_committed`] at tx open (cheap —
     /// persistent stores clone O(1)), mutated by temp DDL/DML, adopted back into `temp_committed` on a
     /// successful COMMIT and discarded on ROLLBACK. The temp analogue of `working`, kept SEPARATE so
     /// it is never serialized.
@@ -1596,7 +1544,7 @@ impl Engine {
             free_pages: Vec::new(),
             paging: None,
             read_only: false,
-            session: Session::new(),
+            session: SessionState::new(),
             shared_temp_committed: Snapshot::default(),
             shared_temp_mem: DEFAULT_SHARED_TEMP_MEM,
         }
@@ -1616,7 +1564,7 @@ impl Engine {
             free_pages: Vec::new(),
             paging: None,
             read_only: false,
-            session: Session::new(),
+            session: SessionState::new(),
             shared_temp_committed: Snapshot::default(),
             shared_temp_mem: DEFAULT_SHARED_TEMP_MEM,
         }
@@ -2134,17 +2082,6 @@ impl Engine {
         self.session.status()
     }
 
-    /// Mint an **additional** independent session over this database (spec/design/session.md §2.1),
-    /// configured from `opts`. The new session has its own settings, transaction status, and
-    /// sequence state; the committed storage is shared. On a single-threaded handle, additional
-    /// sessions run **sequentially** — a statement is issued through [`Session::execute`] /
-    /// [`Session::query`] (which swaps the session into the active slot for the call). The bare
-    /// `Engine` keeps its long-lived default session, so this is purely additive.
-    pub fn session(&self, opts: SessionOptions) -> Session {
-        let _ = self;
-        Session::with_options(opts)
-    }
-
     /// Whether the open transaction has been aborted (a statement errored → it is in the failed
     /// state, §6). False under autocommit or for a clean block. The shared write handle
     /// ([`crate::shared`]) reads this at commit to know whether to publish (a failed block
@@ -2404,7 +2341,7 @@ impl Engine {
         self.path.as_deref()
     }
 
-    /// Look up a table definition by name (case-insensitive). Session-local temp tables resolve
+    /// Look up a table definition by name (case-insensitive). SessionState-local temp tables resolve
     /// FIRST (spec/design/temp-tables.md §3); preclude-overlaps guarantees a name is temp XOR
     /// persistent, so this is just "where the table lives", not a precedence contest. Falls through
     /// to the currently-visible main snapshot (the open transaction's working set, else committed).
@@ -2836,7 +2773,7 @@ impl Engine {
             self.committed = working;
         }
         // Adopt the transaction's temp changes into the committed temp snapshots (temp-tables.md §5) —
-        // the temp analogue of publishing `committed`, but purely in memory. Session-local temp lives
+        // the temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives
         // on the session; shared temp lives on the handle (and is published to the shared root by the
         // thread-safe layer's `WriteHandle::commit`, the two-root commit).
         self.session.temp_committed = temp_working;
@@ -20260,7 +20197,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "currval" => ScalarFunc::Currval,
         "setval" => ScalarFunc::Setval,
         "lastval" => ScalarFunc::Lastval,
-        // Session-variable read (spec/design/session.md §6.1): reads the session's variable map.
+        // SessionState-variable read (spec/design/session.md §6.1): reads the session's variable map.
         "current_setting" => ScalarFunc::CurrentSetting,
         // json/jsonb processing functions (B1, json-sql-functions.md §2).
         "jsonb_typeof" => ScalarFunc::JsonbTypeof,

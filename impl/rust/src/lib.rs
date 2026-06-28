@@ -58,12 +58,12 @@ pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Engine, Outcome, ScriptSummary,
-    Session, SessionOptions, Snapshot, TxStatus,
+    SessionOptions, Snapshot, TxStatus,
 };
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
-pub use shared::{Database, ReadHandle, WriteHandle};
+pub use shared::{Database, Session};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
 pub use timezone::load_time_zone_data;

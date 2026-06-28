@@ -919,7 +919,7 @@ type Engine struct {
 	// currval/lastval session state. A bare Engine IS committed storage + this one long-lived
 	// stateful default session; the convenience methods operate on it. NewSession mints additional
 	// independent sessions (run sequentially on this single-threaded handle by swapping in here).
-	session Session
+	session sessionState
 	// path is the backing file (empty for an in-memory database). Set by the host API
 	// Open/Create (spec/design/api.md §2); Commit writes here.
 	path string
@@ -1040,13 +1040,14 @@ func txStatusOf(tx *activeTx) TxStatus {
 	}
 }
 
-// Session is the per-connection SESSION state (spec/design/session.md §2.1): the configured,
-// stateful context a host runs statements through, un-fused from the committed storage on Engine.
-// It owns the open transaction (the Idle/Open/Failed machine), the relocated handle settings, the
-// entropy/clock seam, and the currval/lastval session state. A Engine holds one as its long-lived
-// default session; (*Engine).NewSession mints additional independent ones that run sequentially
-// on a single-threaded handle (by swapping into the default slot for the duration of a call).
-type Session struct {
+// sessionState is the per-connection SESSION envelope (spec/design/session.md §2.1/§2.4): the
+// configured, stateful context a host runs statements through, un-fused from the committed storage on
+// Engine. It owns the open transaction (the Idle/Open/Failed machine), the relocated handle settings,
+// the entropy/clock seam, and the currval/lastval session state. An Engine holds one as its default
+// session; the host-facing Session (shared.go) wraps an Engine and exposes this envelope, delegating
+// its setters/getters here. (Pre-§2.4 this type was the exported `Session`; the convergence renamed
+// it and made the per-caller handle the public `Session`.)
+type sessionState struct {
 	// tx is the open transaction, or nil under autocommit (transactions.md §4.1); a single-statement
 	// autocommit write opens one implicitly for its duration. The Idle/Open/Failed status (session.md
 	// §2.2) is derived from this (txStatusOf).
@@ -1154,20 +1155,20 @@ func requireCustomVarName(name string) (string, error) {
 }
 
 // newSession builds a fresh default session: no open transaction, default settings, empty state.
-func newSession() Session {
+func newSession() sessionState {
 	return newSessionWithOptions(SessionOptions{})
 }
 
 // newSessionWithOptions builds a session configured from opts (spec/design/session.md §2.1). A zero
 // MaxSQLLength or WorkMem takes its default; the rest of the per-connection state starts empty.
-func newSessionWithOptions(opts SessionOptions) Session {
+func newSessionWithOptions(opts SessionOptions) sessionState {
 	if opts.MaxSQLLength == 0 {
 		opts.MaxSQLLength = DefaultMaxSQLLength
 	}
 	if opts.WorkMem == 0 {
 		opts.WorkMem = DefaultWorkMem
 	}
-	s := Session{
+	s := sessionState{
 		maxCost:         opts.MaxCost,
 		lifetimeMaxCost: opts.LifetimeMaxCost,
 		lifetimeTotal:   new(int64),
@@ -1216,7 +1217,7 @@ func newSessionWithOptions(opts SessionOptions) Session {
 // SetTimeZone sets the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
 // timestamptz is decomposed in. Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ
 // bundle provides; a name no bundle provides (and not a built-in) is 22023, the value unchanged.
-func (s *Session) SetTimeZone(zone string) error {
+func (s *sessionState) SetTimeZone(zone string) error {
 	zr, ok := ResolveZone(zone)
 	if !ok {
 		return NewError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", zone))
@@ -1799,126 +1800,81 @@ func (db *Engine) WorkMem() int { return db.session.workMem }
 // §2.2) — the explicit three-state machine the convenience methods drive.
 func (db *Engine) Status() TxStatus { return txStatusOf(db.session.tx) }
 
-// NewSession mints an ADDITIONAL independent session over this database (spec/design/session.md
-// §2.1), configured from opts. The new session has its own settings, transaction status, and
-// sequence state; the committed storage is shared. On a single-threaded handle, additional sessions
-// run sequentially — a statement is issued through (*Session).ExecuteSQL/QuerySQL/View/Update, which
-// swaps the session into the active slot for the call. The bare Engine keeps its long-lived
-// default session, so this is purely additive.
-func (db *Engine) NewSession(opts SessionOptions) *Session {
-	s := newSessionWithOptions(opts)
-	return &s
-}
-
-// --- additional-session surface (spec/design/session.md §2.1): run sequentially via the swap ---
-
-// activate installs s as db's active session and returns the restore function — the swap that lets
-// an additional session run on a single-threaded handle. Use as `defer s.activate(db)()`: the swap
-// in happens immediately, the deferred restore runs at return (even on a panic).
-func (s *Session) activate(db *Engine) func() {
-	db.session, *s = *s, db.session
-	return func() { db.session, *s = *s, db.session }
-}
-
-// ExecuteSQL runs a (possibly mutating) statement on this session against db, binding $N params.
-func (s *Session) ExecuteSQL(db *Engine, sql string, params []Value) (Outcome, error) {
-	defer s.activate(db)()
-	return db.ExecuteSQL(sql, params)
-}
-
-// QuerySQL runs a query on this session against db, returning a row cursor.
-func (s *Session) QuerySQL(db *Engine, sql string, params []Value) (*Rows, error) {
-	defer s.activate(db)()
-	return db.QuerySQL(sql, params)
-}
-
-// View runs fn in a READ ONLY transaction on this session (auto-commit/rollback, §2.2).
-func (s *Session) View(db *Engine, fn func(tx *Transaction) error) error {
-	defer s.activate(db)()
-	return db.View(fn)
-}
-
-// Update runs fn in a READ WRITE transaction on this session (auto-commit/rollback, §2.2).
-func (s *Session) Update(db *Engine, fn func(tx *Transaction) error) error {
-	defer s.activate(db)()
-	return db.Update(fn)
-}
-
 // Status reports this session's transaction status (Idle/Open/Failed, session.md §2.2).
-func (s *Session) Status() TxStatus { return txStatusOf(s.tx) }
+func (s *sessionState) Status() TxStatus { return txStatusOf(s.tx) }
 
 // InTransaction reports whether an explicit transaction block is open on this session.
-func (s *Session) InTransaction() bool { return s.tx != nil }
+func (s *sessionState) InTransaction() bool { return s.tx != nil }
 
 // MaxCost / SetMaxCost — the per-statement execution-cost ceiling (0 ⇒ unlimited).
-func (s *Session) MaxCost() int64         { return s.maxCost }
-func (s *Session) SetMaxCost(limit int64) { s.maxCost = limit }
+func (s *sessionState) MaxCost() int64         { return s.maxCost }
+func (s *sessionState) SetMaxCost(limit int64) { s.maxCost = limit }
 
 // LifetimeMaxCost / SetLifetimeMaxCost — the per-session cumulative cost budget (0 ⇒ unlimited,
 // spec/design/session.md §5.4). Bounds the whole session: a statement aborts 54P02 the instant the
 // session's cumulative cost reaches limit, and once spent every further statement is rejected 54P02
 // at admission.
-func (s *Session) LifetimeMaxCost() int64         { return s.lifetimeMaxCost }
-func (s *Session) SetLifetimeMaxCost(limit int64) { s.lifetimeMaxCost = limit }
+func (s *sessionState) LifetimeMaxCost() int64         { return s.lifetimeMaxCost }
+func (s *sessionState) SetLifetimeMaxCost(limit int64) { s.lifetimeMaxCost = limit }
 
 // LifetimeCost is the session's running CUMULATIVE execution cost so far (spec/design/session.md
 // §5.4) — the gauge the lifetime_max_cost budget bounds. Tracked even when unlimited; survives a
 // transaction rollback (session state, not snapshot state).
-func (s *Session) LifetimeCost() int64 { return *s.lifetimeTotal }
+func (s *sessionState) LifetimeCost() int64 { return *s.lifetimeTotal }
 
 // newMeter builds the Meter for a statement run on this session: the per-statement max_cost ceiling
 // (54P01) plus a handle to the session's cumulative total + budget (54P02). Every statement's meter
 // is minted here, so all execution cost live-charges into the cumulative.
-func (s *Session) newMeter() *Meter {
+func (s *sessionState) newMeter() *Meter {
 	return &Meter{Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost}
 }
 
 // MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
-func (s *Session) MaxSQLLength() int     { return s.maxSQLLength }
-func (s *Session) SetMaxSQLLength(b int) { s.maxSQLLength = b }
+func (s *sessionState) MaxSQLLength() int     { return s.maxSQLLength }
+func (s *sessionState) SetMaxSQLLength(b int) { s.maxSQLLength = b }
 
 // WorkMem / SetWorkMem — the work-memory budget in bytes (0 ⇒ unlimited).
-func (s *Session) WorkMem() int     { return s.workMem }
-func (s *Session) SetWorkMem(b int) { s.workMem = b }
+func (s *sessionState) WorkMem() int     { return s.workMem }
+func (s *sessionState) SetWorkMem(b int) { s.workMem = b }
 
 // SetDefaultPrivileges replaces the default table-privilege set — the GRANT … ON ALL TABLES default
 // (§5.3). A read-only session is PrivSetEmpty.With(PrivSelect).
-func (s *Session) SetDefaultPrivileges(privs PrivilegeSet) { s.privileges.SetDefaultTable(privs) }
+func (s *sessionState) SetDefaultPrivileges(privs PrivilegeSet) { s.privileges.SetDefaultTable(privs) }
 
 // Grant grants privs on a specific object (table or function), beyond the default (§5.3).
-func (s *Session) Grant(privs PrivilegeSet, object string) { s.privileges.Grant(privs, object) }
+func (s *sessionState) Grant(privs PrivilegeSet, object string) { s.privileges.Grant(privs, object) }
 
 // Revoke revokes privs from a specific object (revoke wins over grant and the default, §5.3).
-func (s *Session) Revoke(privs PrivilegeSet, object string) { s.privileges.Revoke(privs, object) }
+func (s *sessionState) Revoke(privs PrivilegeSet, object string) { s.privileges.Revoke(privs, object) }
 
 // Privileges is read-only access to this session's authorization envelope (§5.3).
-func (s *Session) Privileges() *Privileges { return &s.privileges }
+func (s *sessionState) Privileges() *Privileges { return &s.privileges }
 
 // AllowDDL / SetAllowDDL — whether DDL is permitted on this session (§5.3); a denied change is 42501.
-func (s *Session) AllowDDL() bool         { return s.allowDDL }
-func (s *Session) SetAllowDDL(allow bool) { s.allowDDL = allow }
+func (s *sessionState) AllowDDL() bool         { return s.allowDDL }
+func (s *sessionState) SetAllowDDL(allow bool) { s.allowDDL = allow }
 
 // AllowTempDDL / SetAllowTempDDL — whether session-local temporary-table DDL is permitted on this
 // session (spec/design/temp-tables.md §5); a denied temp DDL is 42501.
-func (s *Session) AllowTempDDL() bool         { return s.allowTempDDL }
-func (s *Session) SetAllowTempDDL(allow bool) { s.allowTempDDL = allow }
+func (s *sessionState) AllowTempDDL() bool         { return s.allowTempDDL }
+func (s *sessionState) SetAllowTempDDL(allow bool) { s.allowTempDDL = allow }
 
 // AllowSharedTempDDL / SetAllowSharedTempDDL — whether DATABASE-WIDE shared temporary-table DDL is
 // permitted on this session (spec/design/temp-tables.md §5); a denied shared-temp DDL is 42501.
-func (s *Session) AllowSharedTempDDL() bool         { return s.allowSharedTempDDL }
-func (s *Session) SetAllowSharedTempDDL(allow bool) { s.allowSharedTempDDL = allow }
+func (s *sessionState) AllowSharedTempDDL() bool         { return s.allowSharedTempDDL }
+func (s *sessionState) SetAllowSharedTempDDL(allow bool) { s.allowSharedTempDDL = allow }
 
 // TempBuffers / SetTempBuffers — the per-session temp-table storage budget in BYTES
 // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
-func (s *Session) TempBuffers() int         { return s.tempBuffers }
-func (s *Session) SetTempBuffers(bytes int) { s.tempBuffers = bytes }
+func (s *sessionState) TempBuffers() int         { return s.tempBuffers }
+func (s *sessionState) SetTempBuffers(bytes int) { s.tempBuffers = bytes }
 
 // SetVar sets a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to
 // the session. Custom variables must be namespaced (a dotted name like myapp.tenant); a non-dotted
 // name is 42704 (no built-in setting is reachable through this map in v1 — the time_zone built-in is
 // its own slice). The name is case-insensitive (folded to lowercase, PG); the value is text. Session
 // state, not snapshot state — it does NOT roll back with a transaction.
-func (s *Session) SetVar(name, value string) error {
+func (s *sessionState) SetVar(name, value string) error {
 	key, err := requireCustomVarName(name)
 	if err != nil {
 		return err
@@ -1932,7 +1888,7 @@ func (s *Session) SetVar(name, value string) error {
 
 // ResetVar clears a session variable (§6.1). A non-dotted name is 42704 (as for SetVar); an unset
 // name is a no-op success (PG RESET of an unset custom variable).
-func (s *Session) ResetVar(name string) error {
+func (s *sessionState) ResetVar(name string) error {
 	key, err := requireCustomVarName(name)
 	if err != nil {
 		return err
@@ -1943,22 +1899,22 @@ func (s *Session) ResetVar(name string) error {
 
 // Var reads a session variable's value (§6.1); ok is false if it is not set. The host getter never
 // errors — it is the SQL current_setting read that raises 42704 on an unset name.
-func (s *Session) Var(name string) (string, bool) {
+func (s *sessionState) Var(name string) (string, bool) {
 	v, ok := s.vars[strings.ToLower(name)]
 	return v, ok
 }
 
 // ResetVars clears every session variable (§6.1) — PostgreSQL's RESET ALL for the variable map (also
 // the per-record reset hook the conformance harness's # set: directive uses).
-func (s *Session) ResetVars() { s.vars = map[string]string{} }
+func (s *sessionState) ResetVars() { s.vars = map[string]string{} }
 
 // SetRandomSource / ClearRandomSource — the uuid-generator entropy seam (entropy.md §6).
-func (s *Session) SetRandomSource(f RandomSource) { s.seam.SetRandom(f) }
-func (s *Session) ClearRandomSource()             { s.seam.ClearRandom() }
+func (s *sessionState) SetRandomSource(f RandomSource) { s.seam.SetRandom(f) }
+func (s *sessionState) ClearRandomSource()             { s.seam.ClearRandom() }
 
 // SetClockSource / ClearClockSource — the uuidv7 / clock-function clock seam (entropy.md §6).
-func (s *Session) SetClockSource(f ClockSource) { s.seam.SetClock(f) }
-func (s *Session) ClearClockSource()            { s.seam.ClearClock() }
+func (s *sessionState) SetClockSource(f ClockSource) { s.seam.SetClock(f) }
+func (s *sessionState) ClearClockSource()            { s.seam.ClearClock() }
 
 // ReadOnly reports whether this handle was opened read-only (spec/design/api.md §2.1): every
 // transaction defaults to READ ONLY, writes are 25006, and the file is never written.

@@ -1511,12 +1511,13 @@ function txStatusOf(tx: ActiveTx | null): TxStatus {
   return tx.failed ? "Failed" : "Open";
 }
 
-// Session is the per-connection SESSION state (spec/design/session.md §2.1): the configured, stateful
-// context a host runs statements through, un-fused from the committed storage on Engine. It owns the
-// open transaction (the Idle/Open/Failed machine), the relocated handle settings, the entropy/clock
-// seam, and the currval/lastval session state. A Engine holds one as its long-lived default session;
-// db.newSession mints additional independent ones that run sequentially on a single-threaded handle
-// (by swapping into the default slot for the duration of a call — TS objects swap by reference).
+// SessionState is the per-connection SESSION envelope (spec/design/session.md §2.1/§2.4): the
+// configured, stateful context a host runs statements through, un-fused from the committed storage on
+// Engine. It owns the open transaction (the Idle/Open/Failed machine), the relocated handle settings,
+// the entropy/clock seam, and the currval/lastval session state. An Engine holds one as its default
+// session; the host-facing Session (shared.ts) wraps an Engine and exposes this envelope, delegating
+// its setters/getters here. (Pre-§2.4 this class was the exported `Session`; the convergence renamed
+// it and made the per-caller handle the public `Session`.)
 // requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md
 // §6.1). A variable must be namespaced like a PostgreSQL custom GUC — a dotted name (myapp.tenant); a
 // non-dotted name would be a built-in setting, and v1 exposes none through this map (the time_zone
@@ -1529,7 +1530,7 @@ function requireCustomVarName(name: string): string {
   throw engineError("undefined_object", "unrecognized configuration parameter: " + name);
 }
 
-export class Session {
+export class SessionState {
   // The open transaction, or null under autocommit (transactions.md §4.1); the Idle/Open/Failed
   // status (session.md §2.2) is derived from this.
   tx: ActiveTx | null;
@@ -1652,33 +1653,6 @@ export class Session {
     this.timeZone = zr;
   }
 
-  // run installs this session as db's active session, runs fn, and restores the default — the swap
-  // that lets an additional session run on a single-threaded handle (spec/design/session.md §2.1).
-  // TS swaps by reference (no value copy); the default is restored even if fn throws.
-  private run<T>(db: Engine, fn: () => T): T {
-    const saved = db.session;
-    db.session = this;
-    try {
-      return fn();
-    } finally {
-      db.session = saved;
-    }
-  }
-
-  // execute runs a (possibly mutating) statement on this session against db, binding $N params. A
-  // SELECT returns the query Outcome (with its rows). Transactions are driven via SQL BEGIN/COMMIT
-  // through execute; the view/update closure sugar (Rust/Go) is a TS follow-on (it would import the
-  // api.ts Transaction, a module cycle the executor avoids).
-  execute(db: Engine, sql: string, params: Value[] = []): Outcome {
-    return this.run(db, () => db.executeStmtParams(db.parse(sql), params));
-  }
-
-  // executeScript runs a multi-statement script on this ADDITIONAL session against db, sharing
-  // committed storage and running sequentially via the swap (spec/design/session.md §2.1/§4.2).
-  executeScript(db: Engine, sql: string): ScriptSummary {
-    return this.run(db, () => db.executeScript(sql));
-  }
-
   // status is this session's transaction status (Idle/Open/Failed, session.md §2.2).
   status(): TxStatus {
     return txStatusOf(this.tx);
@@ -1794,7 +1768,7 @@ export class Engine {
   // state. A bare Engine IS committed storage + this one long-lived stateful default session; the
   // convenience methods operate on it. newSession mints additional independent sessions (run
   // sequentially on this single-threaded handle by swapping into this slot for a call).
-  session: Session;
+  session: SessionState;
   // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory) and
   // the page size this database serializes with. The commit counter lives in `committed.txid`.
   path: string | null;
@@ -1848,7 +1822,7 @@ export class Engine {
 
   constructor() {
     this.committed = new Snapshot();
-    this.session = new Session();
+    this.session = new SessionState();
     this.path = null;
     this.pageSize = DEFAULT_PAGE_SIZE;
     this.pageCount = 0;
@@ -2517,14 +2491,6 @@ export class Engine {
     return txStatusOf(this.session.tx);
   }
 
-  // newSession mints an ADDITIONAL independent session over this database (spec/design/session.md
-  // §2.1), configured from opts. The new session has its own settings, transaction status, and
-  // sequence state; the committed storage is shared. On a single-threaded handle, additional sessions
-  // run sequentially — a statement is issued through Session.execute, which swaps the session into the
-  // active slot for the call. The bare Engine keeps its long-lived default session.
-  newSession(opts: SessionOptions = {}): Session {
-    return new Session(opts);
-  }
 
   // executeScript runs a multi-statement sql SCRIPT on the default session (spec/design/session.md
   // §4.2): split it, run each statement in order, DISCARD the result rows (keeping only counts), and
@@ -2554,8 +2520,9 @@ export class Engine {
   }
 
   // runScriptBody splits sql and runs each statement on the current transaction, accumulating the
-  // ScriptSummary. Separated so executeScript's wrapper commit/rollback runs once on either path.
-  private runScriptBody(sql: string): ScriptSummary {
+  // ScriptSummary. Separated so executeScript's wrapper commit/rollback runs once on either path —
+  // and so Session.executeScript (shared.ts) can reuse it under a shared-core-aware wrapper (§2.4).
+  runScriptBody(sql: string): ScriptSummary {
     let statementsRun = 0;
     let rowsAffectedTotal = 0;
     let cost = 0n;

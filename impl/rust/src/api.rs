@@ -87,6 +87,16 @@ pub struct Transaction<'a> {
     done: bool,
 }
 
+impl<'a> Transaction<'a> {
+    /// Construct a transaction handle that BORROWS `db` for a [`Session`](crate::Session)-driven
+    /// block (spec/design/session.md §2.4). `done` is preset **true** so its `Drop` does **not**
+    /// roll back — the owning `Session` ends the block (committing through the shared core / releasing
+    /// the writer gate / publishing). The closure runs only `execute`/`query` against it.
+    pub(crate) fn borrow(db: &'a mut Engine) -> Transaction<'a> {
+        Transaction { db, done: true }
+    }
+}
+
 impl Transaction<'_> {
     /// Run a (possibly mutating) statement within this transaction, binding `params`. A write in
     /// a READ ONLY transaction is `25006`; a statement error aborts the block (every later
@@ -245,8 +255,9 @@ impl Engine {
 
     /// The body of [`execute_script`](Engine::execute_script): split, then run each statement on
     /// the current transaction. Separated so the wrapper's commit/rollback in `execute_script` runs
-    /// on either the `Ok` or the `Err` path with no duplication.
-    fn run_script_body(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {
+    /// on either the `Ok` or the `Err` path with no duplication — and so [`Session::execute_script`]
+    /// (crate::Session) can reuse it under a shared-core-aware wrapper (session.md §2.4).
+    pub(crate) fn run_script_body(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {
         use crate::ast::Statement;
         let mut summary = crate::executor::ScriptSummary::default();
         for span in crate::split::split_statements(sql) {

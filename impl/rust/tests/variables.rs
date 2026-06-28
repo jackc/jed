@@ -8,7 +8,7 @@
 //! independent variables, and `reset_vars` (PG `RESET ALL`). CLAUDE.md §10.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, SessionOptions, execute};
+use jed::{Database, Engine, Outcome, SessionOptions, execute};
 
 /// Run a single-row, single-column query and return the lone value.
 fn scalar(db: &mut Engine, sql: &str) -> Value {
@@ -133,17 +133,18 @@ fn variables_are_session_state_not_snapshot_state() {
 
 #[test]
 fn an_additional_session_has_independent_variables() {
-    // db.session(opts) mints an independent session (§2.1): its variable map is its own — a variable
-    // set on it is invisible to the default session and vice versa.
-    let mut db = Engine::new();
-    db.set_var("myapp.who", "default").unwrap();
+    // db.session(opts) mints an independent session over a shared core (§2.1/§2.4): its variable map
+    // is its own — a variable set on it is invisible to another session and vice versa.
+    let db = Database::new_in_memory();
+    let mut a = db.session(SessionOptions::default());
+    a.set_var("myapp.who", "a").unwrap();
 
     let mut other = db.session(SessionOptions::default());
     other.set_var("myapp.who", "other").unwrap();
 
     // Each session reads its own value.
     match other
-        .execute(&mut db, "SELECT current_setting('myapp.who')", &[])
+        .execute("SELECT current_setting('myapp.who')", &[])
         .unwrap()
     {
         Outcome::Query { rows, .. } => {
@@ -151,12 +152,12 @@ fn an_additional_session_has_independent_variables() {
         }
         _ => panic!("expected a query result"),
     }
-    assert_eq!(db.var("myapp.who"), Some("default".to_string()));
+    assert_eq!(a.var("myapp.who"), Some("a".to_string()));
     assert_eq!(other.var("myapp.who"), Some("other".to_string()));
 
-    // A variable only on the additional session is not visible to the default at all.
+    // A variable only on one session is not visible to the other at all.
     other.set_var("myapp.only", "x").unwrap();
-    assert_eq!(db.var("myapp.only"), None);
+    assert_eq!(a.var("myapp.only"), None);
 }
 
 #[test]

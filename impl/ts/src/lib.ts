@@ -678,7 +678,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "txn.read_only",
   "txn.failed_state",
   // Shared-handle concurrency — the Database schedule format (spec/design/concurrency-testing.md
-  // §4). Declared because this core implements Database/ReadHandle/WriteHandle + the watermark
+  // §4). Declared because this core implements Database + read/write Sessions + the watermark
   // (shared.ts); a core lacking them skips suites/concurrency files via the capability gate. This
   // core runs the schedule stepped-sequentially only (JS has no shared-memory threads for live
   // objects), which still defines + verifies the canonical, timing-free result (§4.3).
@@ -727,7 +727,6 @@ export {
   Engine,
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_PAGE_SIZE,
-  Session,
   Snapshot,
 } from "./executor.ts";
 export type {
@@ -767,6 +766,6 @@ export {
   residentLeaves,
 } from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
-export { ReadHandle, Database, WriteHandle } from "./shared.ts";
+export { Database, Session } from "./shared.ts";
 export { advancingClock, fixedClock, seededRandomSource } from "./seam.ts";
 export type { ClockFunc, RandomFill } from "./seam.ts";

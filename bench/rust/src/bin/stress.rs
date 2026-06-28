@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use jed::{Database, ReadHandle, Value, WriteHandle};
+use jed::{Database, Session, Value};
 use jed_bench::{Checksum, Prng};
 
 /// Bounds a threaded run: the balance workload finishes in well under a second, so a minute with no
@@ -187,7 +187,7 @@ fn parse_op(op: &str) -> Vec<String> {
 /// query_scalar runs a single-column, single-row query on a read handle and renders the scalar to
 /// its canonical string (Value::render — so the decimal `sum(bigint)` result `1000` renders
 /// identically across cores). The invariant is a string compare, not folded into the checksum.
-fn query_scalar(rh: &mut ReadHandle, sql: &str) -> Result<String, String> {
+fn query_scalar(rh: &mut Session, sql: &str) -> Result<String, String> {
     let mut rows = rh.query(sql, &[]).map_err(|e| e.to_string())?;
     match rows.next() {
         Some(row) => row
@@ -203,7 +203,7 @@ fn query_scalar(rh: &mut ReadHandle, sql: &str) -> Result<String, String> {
 
 /// setup runs the file's setup SQL as one durable write transaction (committed version 1).
 fn setup(db: &Database, f: &StressFile) -> Result<(), String> {
-    let mut wh = db.write();
+    let mut wh = db.write_session();
     for s in &f.setup {
         if let Err(e) = wh.execute(s, &[]) {
             let _ = wh.rollback();
@@ -219,7 +219,7 @@ fn check_final(db: &Database, f: &StressFile) -> Result<(String, bool), String> 
     let Some(query) = &f.final_query else {
         return Ok((String::new(), true));
     };
-    let mut rh = db.read();
+    let mut rh = db.read_session();
     let rows = rh.query(query, &[]).map_err(|e| e.to_string())?;
     let mut sum = Checksum::new();
     let mut got: Vec<Vec<i64>> = Vec::new();
@@ -258,7 +258,7 @@ fn final_equal(got: &[Vec<i64>], want: &[Vec<i64>]) -> bool {
 
 fn run_writer(db: &Database, stmts: &[String], iterations: i64) -> Result<(), String> {
     for _ in 0..iterations {
-        let mut wh = db.write(); // blocks while another writer holds the gate (real contention)
+        let mut wh = db.write_session(); // blocks while another writer holds the gate (real contention)
         for s in stmts {
             if let Err(e) = wh.execute(s, &[]) {
                 let _ = wh.rollback();
@@ -278,7 +278,7 @@ fn run_reader(
     checks: &AtomicI64,
 ) -> Result<(), String> {
     for _ in 0..iterations {
-        let mut rh = db.read();
+        let mut rh = db.read_session();
         let got = query_scalar(&mut rh, query)?; // rh drops at end of iteration → deregistered
         checks.fetch_add(1, Ordering::Relaxed);
         if got != expect {
@@ -355,8 +355,8 @@ struct SeqWorker {
     iterations: i64,
     iter: i64,
     op: usize,
-    wh: Option<WriteHandle>,
-    rh: Option<ReadHandle>,
+    wh: Option<Session>,
+    rh: Option<Session>,
 }
 
 impl SeqWorker {
@@ -424,7 +424,7 @@ fn step_seq(
 ) -> Result<(), String> {
     if w.kind == "writer" {
         if w.op == 0 {
-            w.wh = Some(db.write()); // gate is free (guaranteed by runnable)
+            w.wh = Some(db.write_session()); // gate is free (guaranteed by runnable)
             *gate_held = true;
             w.op += 1;
         } else if w.op <= w.stmts.len() {
@@ -446,7 +446,7 @@ fn step_seq(
     } else {
         match w.op {
             0 => {
-                w.rh = Some(db.read());
+                w.rh = Some(db.read_session());
                 w.op += 1;
             }
             1 => {

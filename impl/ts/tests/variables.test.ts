@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute } from "../src/lib.ts";
+import { Database, Engine, EngineError, execute } from "../src/lib.ts";
 import type { Value } from "../src/value.ts";
 
 function code(fn: () => unknown): string {
@@ -122,23 +122,24 @@ test("variables are session state, not snapshot state", () => {
 });
 
 test("an additional session has independent variables", () => {
-  // db.newSession(opts) mints an independent session (§2.1): its variable map is its own — a variable
-  // set on it is invisible to the default session and vice versa.
-  const db = new Engine();
-  db.setVar("myapp.who", "default");
+  // db.session(opts) mints an independent session over a shared core (§2.1/§2.4): its variable map is
+  // its own — a variable set on it is invisible to another session and vice versa.
+  const db = Database.newInMemory();
+  const a = db.session({});
+  a.setVar("myapp.who", "a");
 
-  const other = db.newSession({});
+  const other = db.session({});
   other.setVar("myapp.who", "other");
 
-  const o = other.execute(db, "SELECT current_setting('myapp.who')");
+  const o = other.execute("SELECT current_setting('myapp.who')");
   if (o.kind !== "query") throw new Error("expected a query result");
   assertText(o.rows[0]![0]!, "other");
-  assert.equal(db.var("myapp.who"), "default");
+  assert.equal(a.var("myapp.who"), "a");
   assert.equal(other.var("myapp.who"), "other");
 
-  // A variable only on the additional session is not visible to the default at all.
+  // A variable only on one session is not visible to the other at all.
   other.setVar("myapp.only", "x");
-  assert.equal(db.var("myapp.only"), undefined);
+  assert.equal(a.var("myapp.only"), undefined);
 });
 
 test("resetVars clears every variable", () => {

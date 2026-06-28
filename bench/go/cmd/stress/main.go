@@ -21,7 +21,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	jed "github.com/jackc/jed/impl/go"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,6 +28,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	jed "github.com/jackc/jed/impl/go"
 
 	"jed-bench/internal/bench"
 
@@ -113,7 +114,7 @@ func parseOp(op string) []string {
 // canonical string (Value.Render — the same deterministic rendering the conformance harness uses, so
 // e.g. the decimal `sum(bigint)` result `1000` renders identically across cores). The invariant is a
 // string comparison against `invariant_expect`, not folded into the cross-core checksum.
-func queryScalar(r *jed.ReadHandle, sql string) (string, error) {
+func queryScalar(r *jed.Session, sql string) (string, error) {
 	rows, err := r.Query(sql, nil)
 	if err != nil {
 		return "", err
@@ -128,7 +129,7 @@ func queryScalar(r *jed.ReadHandle, sql string) (string, error) {
 
 // setup runs the file's setup SQL as one durable write transaction (committed version 1).
 func setup(db *jed.Database, f *stressFile) error {
-	w := db.Write()
+	w := db.WriteSession()
 	for _, s := range f.Setup.SQL {
 		if _, err := w.Execute(s, nil); err != nil {
 			_ = w.Rollback()
@@ -144,7 +145,7 @@ func checkFinal(db *jed.Database, fin *stressFinal) (checksum string, ok bool, e
 	if fin == nil {
 		return "", true, nil
 	}
-	r := db.Read()
+	r := db.ReadSession()
 	defer r.Close()
 	rows, err := r.Query(fin.Query, nil)
 	if err != nil {
@@ -195,11 +196,11 @@ func finalEqual(got, want [][]int64) bool {
 
 // --- threaded mode (Go's native mode; real goroutines, race-detector coverage) ---------------
 
-// runWriter runs one writer worker: `iterations` transactions, each taking the gate (db.Write()
+// runWriter runs one writer worker: `iterations` transactions, each taking the gate (db.WriteSession()
 // blocks while another writer holds it — the real contention path), running `op`, and committing.
 func runWriter(db *jed.Database, stmts []string, iterations int) error {
 	for i := 0; i < iterations; i++ {
-		w := db.Write()
+		w := db.WriteSession()
 		for _, s := range stmts {
 			if _, err := w.Execute(s, nil); err != nil {
 				_ = w.Rollback()
@@ -216,7 +217,7 @@ func runWriter(db *jed.Database, stmts []string, iterations int) error {
 // runReader runs one reader worker: `iterations` snapshots, each asserting the invariant.
 func runReader(db *jed.Database, query, expect string, iterations int, checks *int64) error {
 	for i := 0; i < iterations; i++ {
-		r := db.Read()
+		r := db.ReadSession()
 		got, err := queryScalar(r, query)
 		r.Close()
 		if err != nil {
@@ -288,8 +289,8 @@ type seqWorker struct {
 	iterations int
 	iter       int
 	op         int
-	wh         *jed.WriteHandle
-	rh         *jed.ReadHandle
+	wh         *jed.Session
+	rh         *jed.Session
 }
 
 // done reports whether the worker has run all its iterations.
@@ -353,7 +354,7 @@ func stepSeq(db *jed.Database, w *seqWorker, idx int, gateHolder *int, checks *i
 	case "writer":
 		switch {
 		case w.op == 0: // acquire (the gate is free — guaranteed by runnable)
-			w.wh = db.Write()
+			w.wh = db.WriteSession()
 			*gateHolder = idx
 			w.op++
 		case w.op <= len(w.stmts): // exec stmt[op-1]
@@ -374,7 +375,7 @@ func stepSeq(db *jed.Database, w *seqWorker, idx int, gateHolder *int, checks *i
 	case "reader":
 		switch w.op {
 		case 0: // open a snapshot
-			w.rh = db.Read()
+			w.rh = db.ReadSession()
 			w.op++
 		case 1: // assert the invariant
 			got, err := queryScalar(w.rh, w.query)

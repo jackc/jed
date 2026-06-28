@@ -157,21 +157,30 @@ func TestScriptErrorInsideOpenTransactionLeavesItFailed(t *testing.T) {
 	}
 }
 
-func TestAdditionalSessionRunsAScriptViaTheSwap(t *testing.T) {
-	db := NewEngine()
-	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	s := db.NewSession(SessionOptions{})
-	summary, err := s.ExecuteScript(db, "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)")
+func TestAdditionalSessionRunsAScriptOverTheSharedCore(t *testing.T) {
+	// ExecuteScript on an ADDITIONAL session (§2.1/§2.4) shares committed storage through the Database
+	// core and commits the run all-or-nothing — another session sees it.
+	db := NewDatabase()
+	a := db.Session(SessionOptions{})
+	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session(SessionOptions{})
+	summary, err := s.ExecuteScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)")
 	if err != nil {
 		t.Fatalf("ExecuteScript: %v", err)
 	}
 	if summary.StatementsRun != 2 {
 		t.Fatalf("StatementsRun: want 2, got %d", summary.StatementsRun)
 	}
-	if n := scriptCount(t, db); n != 2 {
-		t.Fatalf("count: want 2, got %d", n)
+	out, err := a.Execute("SELECT count(*) FROM t", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if db.Status() != TxIdle {
-		t.Fatalf("status: want Idle, got %v", db.Status())
+	if out.Rows[0][0].Int != 2 {
+		t.Fatalf("count: want 2, got %v", out.Rows[0][0])
+	}
+	if a.Status() != TxIdle {
+		t.Fatalf("status: want Idle, got %v", a.Status())
 	}
 }

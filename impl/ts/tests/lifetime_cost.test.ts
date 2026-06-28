@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute, PrivilegeSet } from "../src/lib.ts";
+import { Database, Engine, EngineError, execute, PrivilegeSet } from "../src/lib.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -132,26 +132,27 @@ test("an exact tie breaks to the per-statement ceiling", () => {
 });
 
 test("an additional session carries its own budget", () => {
-  // db.newSession(opts) mints an independent session with its own cumulative + budget (§2.1/§5.4): a
-  // restricted additional session aborts at its budget while the permissive default keeps running,
-  // and the two cumulatives are independent.
-  const db = new Engine();
-  execute(db, "SELECT 1"); // default cumulative 1
+  // db.session(opts) mints an independent session with its own cumulative + budget (§2.1/§2.4/§5.4):
+  // a budgeted additional session aborts at its budget while a permissive one keeps running, and the
+  // two cumulatives are independent (each session owns its envelope).
+  const db = Database.newInMemory();
+  const a = db.session({});
+  a.execute("SELECT 1"); // a's cumulative 1
 
-  const budgeted = db.newSession({ lifetimeMaxCost: 2n });
-  budgeted.execute(db, "SELECT 1"); // its cumulative 1
-  // Its second statement drives its own budget to 2 and aborts 54P02 — independent of the default.
+  const budgeted = db.session({ lifetimeMaxCost: 2n });
+  budgeted.execute("SELECT 1"); // its cumulative 1
+  // Its second statement drives its own budget to 2 and aborts 54P02 — independent of a.
   assert.equal(
-    code(() => budgeted.execute(db, "SELECT 1")),
+    code(() => budgeted.execute("SELECT 1")),
     "54P02",
   );
   assert.equal(budgeted.lifetimeCost(), 2n);
 
-  // The default session is untouched by the additional session's budget — it still runs, and its
-  // cumulative reflects only its own statements.
-  assert.equal(db.lifetimeCost(), 1n);
-  execute(db, "SELECT 1");
-  assert.equal(db.lifetimeCost(), 2n);
+  // a is untouched by the additional session's budget — it still runs, and its cumulative reflects
+  // only its own statements.
+  assert.equal(a.lifetimeCost(), 1n);
+  a.execute("SELECT 1");
+  assert.equal(a.lifetimeCost(), 2n);
 });
 
 test("admission is checked before existence and privileges", () => {

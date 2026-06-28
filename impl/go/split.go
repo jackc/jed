@@ -234,10 +234,3 @@ func (db *Engine) runScriptBody(sql string) (ScriptSummary, error) {
 	}
 	return summary, nil
 }
-
-// ExecuteScript runs a multi-statement script on this ADDITIONAL session against db, sharing
-// committed storage and running sequentially via the swap (spec/design/session.md §2.1/§4.2).
-func (s *Session) ExecuteScript(db *Engine, sql string) (ScriptSummary, error) {
-	defer s.activate(db)()
-	return db.ExecuteScript(sql)
-}

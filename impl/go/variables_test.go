@@ -155,33 +155,34 @@ func TestVarsAreSessionStateNotSnapshotState(t *testing.T) {
 }
 
 func TestVarAdditionalSessionHasIndependentVariables(t *testing.T) {
-	// db.NewSession(opts) mints an independent session (§2.1): its variable map is its own — a variable
-	// set on it is invisible to the default session and vice versa.
-	db := NewEngine()
-	if err := db.SetVar("myapp.who", "default"); err != nil {
+	// db.Session(opts) mints an independent session over a shared core (§2.1/§2.4): its variable map
+	// is its own — a variable set on it is invisible to another session and vice versa.
+	db := NewDatabase()
+	a := db.Session(SessionOptions{})
+	if err := a.SetVar("myapp.who", "a"); err != nil {
 		t.Fatal(err)
 	}
-	other := db.NewSession(SessionOptions{})
+	other := db.Session(SessionOptions{})
 	if err := other.SetVar("myapp.who", "other"); err != nil {
 		t.Fatal(err)
 	}
-	out, err := other.ExecuteSQL(db, "SELECT current_setting('myapp.who')", nil)
+	out, err := other.Execute("SELECT current_setting('myapp.who')", nil)
 	if err != nil {
 		t.Fatalf("other execute: %v", err)
 	}
 	mustText(t, out.Rows[0][0], "other")
-	if v, _ := db.Var("myapp.who"); v != "default" {
-		t.Fatalf("default session: want default, got %q", v)
+	if v, _ := a.Var("myapp.who"); v != "a" {
+		t.Fatalf("session a: want a, got %q", v)
 	}
 	if v, _ := other.Var("myapp.who"); v != "other" {
 		t.Fatalf("other session: want other, got %q", v)
 	}
-	// A variable only on the additional session is not visible to the default at all.
+	// A variable only on one session is not visible to the other at all.
 	if err := other.SetVar("myapp.only", "x"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := db.Var("myapp.only"); ok {
-		t.Fatal("additional session's var leaked to the default")
+	if _, ok := a.Var("myapp.only"); ok {
+		t.Fatal("additional session's var leaked to the other")
 	}
 }
 

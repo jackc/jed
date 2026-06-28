@@ -5,7 +5,7 @@
 //! `Privilege`/`PrivilegeSet` surface, the per-session independence of an additional session, and
 //! the introspection accessors (CLAUDE.md §10).
 
-use jed::{Engine, Outcome, Privilege, PrivilegeSet, SessionOptions};
+use jed::{Database, Engine, Outcome, Privilege, PrivilegeSet, SessionOptions};
 
 fn code(db: &mut Engine, sql: &str) -> String {
     db.execute(sql, &[])
@@ -94,10 +94,13 @@ fn function_execute_is_revocable() {
 
 #[test]
 fn an_additional_session_carries_its_own_envelope() {
-    // db.session(opts) mints an independent session: a restricted one rejects a write the permissive
-    // default still allows, and the two share committed storage (spec/design/session.md §2.1/§5.3).
-    let mut db = Engine::new();
-    ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    // db.session(opts) mints an independent session over a shared Database core (§2.4): a restricted
+    // one rejects a write a permissive session still allows, and they share committed storage
+    // through the core (spec/design/session.md §2.1/§5.3) — each owns its envelope, no swap.
+    let db = Database::new_in_memory();
+    let mut a = db.session(SessionOptions::default());
+    a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+        .expect("create on the permissive session");
 
     let mut restricted = db.session(SessionOptions {
         default_privileges: PrivilegeSet::EMPTY.with(Privilege::Select),
@@ -105,21 +108,22 @@ fn an_additional_session_carries_its_own_envelope() {
     });
     // The restricted session may read but not write.
     restricted
-        .execute(&mut db, "SELECT * FROM t", &[])
+        .execute("SELECT * FROM t", &[])
         .expect("read allowed on the restricted session");
     let err = restricted
-        .execute(&mut db, "INSERT INTO t VALUES (1, 10)", &[])
+        .execute("INSERT INTO t VALUES (1, 10)", &[])
         .err()
         .unwrap();
     assert_eq!(err.code(), "42501");
 
-    // The default session is unaffected — it still writes.
-    ok(&mut db, "INSERT INTO t VALUES (1, 10)");
+    // The permissive session is unaffected — it still writes.
+    a.execute("INSERT INTO t VALUES (1, 10)", &[])
+        .expect("insert allowed on the permissive session");
 
     // A grant on the additional session lifts the restriction for it alone.
     restricted.grant(PrivilegeSet::EMPTY.with(Privilege::Insert), "t");
     restricted
-        .execute(&mut db, "INSERT INTO t VALUES (2, 20)", &[])
+        .execute("INSERT INTO t VALUES (2, 20)", &[])
         .expect("insert allowed after grant on the restricted session");
 }
 

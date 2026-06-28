@@ -7,10 +7,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, type ReadHandle, Database } from "../src/lib.ts";
+import { EngineError, type Session, Database } from "../src/lib.ts";
 
 // count runs SELECT count(*) FROM t against a read handle and returns the bigint count.
-function count(r: ReadHandle): bigint {
+function count(r: Session): bigint {
   const rows = [...r.query("SELECT count(*) FROM t")];
   const v = rows[0][0];
   assert.equal(v.kind, "int", "expected an int count");
@@ -20,7 +20,7 @@ function count(r: ReadHandle): bigint {
 // seeded builds a shared db with table t holding the given ids, committed via a write handle.
 function seeded(...ids: number[]): Database {
   const db = Database.newInMemory();
-  const w = db.write();
+  const w = db.writeSession();
   w.execute("CREATE TABLE t (id bigint PRIMARY KEY)");
   for (const id of ids) w.execute(`INSERT INTO t VALUES (${id})`);
   w.commit();
@@ -30,7 +30,7 @@ function seeded(...ids: number[]): Database {
 test("write then read sees committed rows", () => {
   const db = seeded(1, 2, 3);
   assert.equal(db.version, 1n); // one commit ⇒ version 1
-  const r = db.read();
+  const r = db.readSession();
   try {
     assert.equal(count(r), 3n);
   } finally {
@@ -40,7 +40,7 @@ test("write then read sees committed rows", () => {
 
 test("a read handle rejects writes (25006) without poisoning", () => {
   const db = seeded(1);
-  const r = db.read();
+  const r = db.readSession();
   try {
     assert.throws(
       () => r.execute("INSERT INTO t VALUES (2)"),
@@ -56,15 +56,15 @@ test("a pinned reader is isolated from a writer that commits between its calls",
   // The interleaving analog of "readers parallel with a writer": a reader pins a snapshot, a writer
   // opens + commits a new version, and the already-pinned reader still sees its original snapshot.
   const db = seeded(1);
-  const pinned = db.read(); // pins version 1 (one row)
+  const pinned = db.readSession(); // pins version 1 (one row)
   try {
     const before = count(pinned);
     assert.equal(before, 1n);
 
-    const w = db.write();
+    const w = db.writeSession();
     w.execute("INSERT INTO t VALUES (2)"); // staged
     // While the writer is open, a *fresh* reader still sees only the committed row.
-    const during = db.read();
+    const during = db.readSession();
     try {
       assert.equal(count(during), 1n);
     } finally {
@@ -74,7 +74,7 @@ test("a pinned reader is isolated from a writer that commits between its calls",
 
     assert.equal(count(pinned), 1n); // snapshot isolation: pinned reader unchanged by the commit
     assert.equal(db.version, 2n);
-    const fresh = db.read();
+    const fresh = db.readSession();
     try {
       assert.equal(count(fresh), 2n); // a fresh reader sees both rows
     } finally {
@@ -87,20 +87,20 @@ test("a pinned reader is isolated from a writer that commits between its calls",
 
 test("a second writer while one is open is rejected (25001)", () => {
   const db = seeded(1);
-  const w = db.write();
+  const w = db.writeSession();
   try {
     assert.throws(
-      () => db.write(),
+      () => db.writeSession(),
       (e: unknown) => e instanceof EngineError && e.code() === "25001",
     );
   } finally {
     w.rollback(); // release the writer flag
   }
   // After the first writer ends, a new writer can proceed.
-  const w2 = db.write();
+  const w2 = db.writeSession();
   w2.execute("INSERT INTO t VALUES (2)");
   w2.commit();
-  const r = db.read();
+  const r = db.readSession();
   try {
     assert.equal(count(r), 2n);
   } finally {
@@ -113,16 +113,16 @@ test("oldestLiveTxid tracks pinned readers", () => {
   assert.equal(db.version, 1n);
   assert.equal(db.oldestLiveTxid(), 1n); // no readers ⇒ the committed version
 
-  const r1 = db.read(); // pins version 1
+  const r1 = db.readSession(); // pins version 1
   assert.equal(db.oldestLiveTxid(), 1n);
 
-  const w = db.write();
+  const w = db.writeSession();
   w.execute("INSERT INTO t VALUES (2)");
   w.commit(); // version 2
   assert.equal(db.version, 2n);
   assert.equal(db.oldestLiveTxid(), 1n); // r1 still pins v1 ⇒ watermark held at 1
 
-  const r2 = db.read(); // pins version 2
+  const r2 = db.readSession(); // pins version 2
   assert.equal(db.oldestLiveTxid(), 1n); // still held by r1
 
   r1.close();
@@ -134,10 +134,10 @@ test("oldestLiveTxid tracks pinned readers", () => {
 
 test("a rolled-back writer publishes nothing", () => {
   const db = seeded(1);
-  const w = db.write();
+  const w = db.writeSession();
   w.execute("INSERT INTO t VALUES (2)");
   w.rollback();
-  const r = db.read();
+  const r = db.readSession();
   try {
     assert.equal(count(r), 1n); // the rolled-back insert never became visible
     assert.equal(db.version, 1n); // version unchanged by a rollback

@@ -7,7 +7,7 @@
 //! `54P01`-vs-`54P02` precedence (and its exact tie), and an additional session's independent budget
 //! (CLAUDE.md §10).
 
-use jed::{Engine, PrivilegeSet, SessionOptions};
+use jed::{Database, Engine, PrivilegeSet, SessionOptions};
 
 fn code(db: &mut Engine, sql: &str) -> String {
     db.execute(sql, &[])
@@ -121,27 +121,28 @@ fn an_exact_tie_breaks_to_the_per_statement_ceiling() {
 
 #[test]
 fn an_additional_session_carries_its_own_budget() {
-    // db.session(opts) mints an independent session with its own cumulative + budget (§2.1/§5.4): a
-    // restricted additional session aborts at its budget while the permissive default keeps running,
-    // and the two cumulatives are independent.
-    let mut db = Engine::new();
-    db.execute("SELECT 1", &[]).unwrap(); // default cumulative 1
+    // db.session(opts) mints an independent session with its own cumulative + budget (§2.1/§2.4/§5.4):
+    // a budgeted additional session aborts at its budget while a permissive one keeps running, and
+    // the two cumulatives are independent (each session owns its envelope).
+    let db = Database::new_in_memory();
+    let mut a = db.session(SessionOptions::default());
+    a.execute("SELECT 1", &[]).unwrap(); // a's cumulative 1
 
     let mut budgeted = db.session(SessionOptions {
         lifetime_max_cost: 2,
         ..SessionOptions::default()
     });
-    budgeted.execute(&mut db, "SELECT 1", &[]).unwrap(); // its cumulative 1
-    // Its second statement drives its own budget to 2 and aborts 54P02 — independent of the default.
-    let err = budgeted.execute(&mut db, "SELECT 1", &[]).err().unwrap();
+    budgeted.execute("SELECT 1", &[]).unwrap(); // its cumulative 1
+    // Its second statement drives its own budget to 2 and aborts 54P02 — independent of `a`.
+    let err = budgeted.execute("SELECT 1", &[]).err().unwrap();
     assert_eq!(err.code(), "54P02");
     assert_eq!(budgeted.lifetime_cost(), 2);
 
-    // The default session is untouched by the additional session's budget — it still runs, and its
-    // cumulative reflects only its own statements.
-    assert_eq!(db.lifetime_cost(), 1);
-    db.execute("SELECT 1", &[]).unwrap();
-    assert_eq!(db.lifetime_cost(), 2);
+    // `a` is untouched by the additional session's budget — it still runs, and its cumulative
+    // reflects only its own statements.
+    assert_eq!(a.lifetime_cost(), 1);
+    a.execute("SELECT 1", &[]).unwrap();
+    assert_eq!(a.lifetime_cost(), 2);
 }
 
 #[test]

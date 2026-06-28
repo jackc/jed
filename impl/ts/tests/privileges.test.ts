@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute, PrivilegeSet } from "../src/lib.ts";
+import { Database, Engine, EngineError, execute, PrivilegeSet } from "../src/lib.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -95,22 +95,26 @@ test("function EXECUTE is revocable", () => {
 });
 
 test("an additional session carries its own envelope", () => {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  // db.session(opts) mints an independent session over a shared Database core (§2.4): a restricted
+  // one rejects a write a permissive session still allows, and they share committed storage through
+  // the core (§2.1/§5.3) — each owns its envelope, no swap.
+  const db = Database.newInMemory();
+  const a = db.session({});
+  a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
 
-  const restricted = db.newSession({ defaultPrivileges: PrivilegeSet.empty().with("select") });
-  restricted.execute(db, "SELECT * FROM t"); // read allowed
+  const restricted = db.session({ defaultPrivileges: PrivilegeSet.empty().with("select") });
+  restricted.execute("SELECT * FROM t"); // read allowed
   assert.equal(
-    code(() => restricted.execute(db, "INSERT INTO t VALUES (1, 10)")),
+    code(() => restricted.execute("INSERT INTO t VALUES (1, 10)")),
     "42501",
   );
 
-  // The default session is unaffected — it still writes.
-  execute(db, "INSERT INTO t VALUES (1, 10)");
+  // The permissive session is unaffected — it still writes.
+  a.execute("INSERT INTO t VALUES (1, 10)");
 
   // A grant on the additional session lifts the restriction for it alone.
   restricted.grant(PrivilegeSet.empty().with("insert"), "t");
-  restricted.execute(db, "INSERT INTO t VALUES (2, 20)");
+  restricted.execute("INSERT INTO t VALUES (2, 20)");
 });
 
 test("a missing object is 42P01, not authorization", () => {

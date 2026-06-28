@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute, intValue } from "../src/lib.ts";
+import { Database, Engine, EngineError, execute, intValue } from "../src/lib.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -117,12 +117,17 @@ test("script error inside an open transaction leaves it Failed for the caller", 
   assert.strictEqual(db.status(), "Idle");
 });
 
-test("additional session runs a script via the swap", () => {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
-  const s = db.newSession();
-  const summary = s.executeScript(db, "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
+test("additional session runs a script over the shared core", () => {
+  // executeScript on an ADDITIONAL session (§2.1/§2.4) shares committed storage through the Database
+  // core and commits the run all-or-nothing — another session sees it.
+  const db = Database.newInMemory();
+  const a = db.session({});
+  a.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+  const s = db.session({});
+  const summary = s.executeScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
   assert.strictEqual(summary.statementsRun, 2);
-  assert.deepStrictEqual(countRows(db), [[intValue(2n)]]);
-  assert.strictEqual(db.status(), "Idle");
+  const o = a.execute("SELECT count(*) FROM t");
+  if (o.kind !== "query") throw new Error("expected a query result");
+  assert.deepStrictEqual(o.rows, [[intValue(2n)]]);
+  assert.strictEqual(a.status(), "Idle");
 });

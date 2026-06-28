@@ -681,13 +681,35 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    Sub-slices, all three cores in lockstep, the rename landed as its own commit so the semantic diff
    is reviewable:
    - **7a — rename only.** `Database`→`Engine`, `SharedDb`→`Database`, no semantic change; green ×3.
-   - **7b — in-memory convergence.** Fuse the handles + envelope into `Session`; delete the
-     `activate`/swap; add the default-session delegators and the lazy-gate logic; migrate the
-     concurrency conformance driver, the stress harness, and the `shared`/`session` per-core tests to
-     the new API. Corpus + results byte-identical.
-   - **7c — file-backed sessions.** Thread-safe pager/buffer-pool under concurrent reader faults, and
-     **watermark-gated page reclamation** (transactions.md §8); `open`/`create` return the shared
-     `Database`. Add the `Database` concurrent-reader bench ([../../TODO.md](../../TODO.md)).
+   - **7b — in-memory convergence.** ✅ **landed (all 3 cores)** — the handle convergence + the
+     additional-session fold-in. The envelope type renamed `Session`→`SessionState` (an internal type
+     an `Engine` owns as `engine.session`); the **unified `Session`** is now the host handle — the §3
+     envelope + a private `Engine` + an access mode — minted by **`db.read_session()`** (READ ONLY,
+     pinned, registered in the watermark, a write is `25006` — the old `ReadHandle`),
+     **`db.write_session()`** (READ WRITE with an eager open write block — the BEGIN READ WRITE form,
+     §2.4 — the old `WriteHandle`), and **`db.session(opts)`** (a configured session running
+     **autocommit with the lazy gate**: an autocommit read pins the latest committed for that one
+     statement, an autocommit write takes the gate per statement / publishes / releases, and
+     `BEGIN`/`COMMIT`/`ROLLBACK` open and end an explicit block — the old `Engine::session(opts)` swap,
+     now owning its own `Engine`). The `activate`/swap is **deleted**; `ReadHandle`/`WriteHandle` are
+     **folded into `Session`**. Migrated the concurrency conformance driver (`read()/write()`→
+     `read_session()/write_session()`, the read/write enum collapsed to one type), the stress harness,
+     and the `shared`/`session`/`privileges`/`execute_script`/`lifetime_cost`/`variables` per-core
+     tests. Corpus + results **byte-identical** (281×3); the threaded concurrency suites still pass
+     under the Go/Rust race detector. No new capability flags, no on-disk format change.
+     **Scope note (refines this plan):** the **`Database`-level default-session delegators**
+     (`db.execute`/`db.query`/`db.begin`/`db.status`/`db.execute_script`) move to **7c** — they are
+     load-bearing only once `open`/`create` return a `Database` (the bare single-handle path is still
+     `Engine` through 7b), and folding them in there keeps the primary-handle shape (and, in Rust, the
+     `Send`/`Sync` boundary — `Database` stays `Arc<Shared>`, the `!Send` `Session` is minted per
+     thread) decided in one place. Through 7b the bare `Engine` remains the single-handle path,
+     unchanged.
+   - **7c — file-backed sessions + the default-session bridge.** Thread-safe pager/buffer-pool under
+     concurrent reader faults, and **watermark-gated page reclamation** (transactions.md §8);
+     `open`/`create` return the shared `Database`, and the **default-session delegators**
+     (`db.execute`/`db.query`/`db.begin`/`db.status`/`db.execute_script`, §2.1/§2.4) land here as the
+     back-compat single-handle bridge over that `Database`. Add the `Database` concurrent-reader bench
+     ([../../TODO.md](../../TODO.md)).
    - **7d — docs.** `web/src/routes/docs/api/*`, `web/examples/*`; the worker bridge keeps the
      single-handle path via the delegators.
 

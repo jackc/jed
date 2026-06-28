@@ -19,7 +19,7 @@ import { join } from "node:path";
 
 import { parse as parseToml } from "smol-toml";
 
-import { type ReadHandle, Database, type WriteHandle, render } from "../../../impl/ts/src/lib.ts";
+import { Database, type Session, render } from "../../../impl/ts/src/lib.ts";
 
 import { Checksum, Prng } from "./lib.ts";
 
@@ -104,7 +104,7 @@ function parseOp(op: string): string[] {
 // queryScalar runs a single-column, single-row query and renders the scalar to its canonical string
 // (render — so the decimal `sum(bigint)` result `1000` renders identically across cores). The
 // invariant is a string compare, not folded into the cross-core checksum.
-function queryScalar(rh: ReadHandle, sql: string): string {
+function queryScalar(rh: Session, sql: string): string {
   for (const row of rh.query(sql, [])) {
     return render(row[0]);
   }
@@ -114,7 +114,7 @@ function queryScalar(rh: ReadHandle, sql: string): string {
 // --- setup + the final check -----------------------------------------------------------------
 
 function setup(db: Database, sql: string[]): void {
-  const wh = db.write();
+  const wh = db.writeSession();
   try {
     for (const s of sql) wh.execute(s, []);
     wh.commit();
@@ -126,7 +126,7 @@ function setup(db: Database, sql: string[]): void {
 
 function checkFinal(db: Database, f: StressFile): { checksum: string; ok: boolean } {
   if (f.finalQuery === null) return { checksum: "", ok: true };
-  const rh = db.read();
+  const rh = db.readSession();
   try {
     const sum = new Checksum();
     const got: bigint[][] = [];
@@ -175,8 +175,8 @@ interface SeqWorker {
   iterations: number;
   iter: number;
   op: number;
-  wh: WriteHandle | null;
-  rh: ReadHandle | null;
+  wh: Session | null;
+  rh: Session | null;
 }
 
 // runnable: the only gated op is a writer's acquire (op 0), which needs the gate free; every other
@@ -195,7 +195,7 @@ interface State {
 function stepSeq(db: Database, w: SeqWorker, st: State): void {
   if (w.kind === "writer") {
     if (w.op === 0) {
-      w.wh = db.write(); // gate is free (guaranteed by runnable) — never throws 25001 here
+      w.wh = db.writeSession(); // gate is free (guaranteed by runnable) — never throws 25001 here
       st.gateHeld = true;
       w.op++;
     } else if (w.op <= w.stmts.length) {
@@ -210,7 +210,7 @@ function stepSeq(db: Database, w: SeqWorker, st: State): void {
     }
   } else {
     if (w.op === 0) {
-      w.rh = db.read();
+      w.rh = db.readSession();
       w.op++;
     } else if (w.op === 1) {
       const got = queryScalar(w.rh!, w.query); // rh is set while op > 0

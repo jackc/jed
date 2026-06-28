@@ -142,32 +142,37 @@ func TestAnExactTieBreaksToThePerStatementCeiling(t *testing.T) {
 }
 
 func TestAnAdditionalSessionCarriesItsOwnBudget(t *testing.T) {
-	// db.NewSession(opts) mints an independent session with its own cumulative + budget (§2.1/§5.4): a
-	// restricted additional session aborts at its budget while the permissive default keeps running,
-	// and the two cumulatives are independent.
-	db := NewEngine()
-	sessExec(t, db, "SELECT 1") // default cumulative 1
+	// db.Session(opts) mints an independent session with its own cumulative + budget (§2.1/§2.4/§5.4):
+	// a budgeted additional session aborts at its budget while a permissive one keeps running, and the
+	// two cumulatives are independent (each session owns its envelope).
+	db := NewDatabase()
+	a := db.Session(SessionOptions{})
+	if _, err := a.Execute("SELECT 1", nil); err != nil { // a's cumulative 1
+		t.Fatal(err)
+	}
 
-	budgeted := db.NewSession(SessionOptions{LifetimeMaxCost: 2})
-	if _, err := budgeted.ExecuteSQL(db, "SELECT 1", nil); err != nil { // its cumulative 1
+	budgeted := db.Session(SessionOptions{LifetimeMaxCost: 2})
+	if _, err := budgeted.Execute("SELECT 1", nil); err != nil { // its cumulative 1
 		t.Fatalf("first: %v", err)
 	}
-	// Its second statement drives its own budget to 2 and aborts 54P02 — independent of the default.
-	if _, err := budgeted.ExecuteSQL(db, "SELECT 1", nil); err == nil || err.(*EngineError).Code() != "54P02" {
+	// Its second statement drives its own budget to 2 and aborts 54P02 — independent of a.
+	if _, err := budgeted.Execute("SELECT 1", nil); err == nil || err.(*EngineError).Code() != "54P02" {
 		t.Fatalf("second: want 54P02, got %v", err)
 	}
 	if budgeted.LifetimeCost() != 2 {
 		t.Fatalf("additional cumulative: want 2, got %d", budgeted.LifetimeCost())
 	}
 
-	// The default session is untouched by the additional session's budget — it still runs, and its
-	// cumulative reflects only its own statements.
-	if db.LifetimeCost() != 1 {
-		t.Fatalf("default cumulative: want 1, got %d", db.LifetimeCost())
+	// a is untouched by the additional session's budget — it still runs, and its cumulative reflects
+	// only its own statements.
+	if a.LifetimeCost() != 1 {
+		t.Fatalf("a cumulative: want 1, got %d", a.LifetimeCost())
 	}
-	sessExec(t, db, "SELECT 1")
-	if db.LifetimeCost() != 2 {
-		t.Fatalf("default after SELECT 1: want 2, got %d", db.LifetimeCost())
+	if _, err := a.Execute("SELECT 1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if a.LifetimeCost() != 2 {
+		t.Fatalf("a after SELECT 1: want 2, got %d", a.LifetimeCost())
 	}
 }
 

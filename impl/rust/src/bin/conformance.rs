@@ -15,7 +15,7 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{Database, Engine, Outcome, ReadHandle, SUPPORTED_CAPABILITIES, Value, WriteHandle};
+use jed::{Database, Engine, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1123,32 +1123,15 @@ enum Step {
     ExpectOldestLive(u64),
 }
 
-/// Anything a session can run a statement/query against — a `ReadHandle` or a `WriteHandle`. Lets
-/// `run_record` be written once for both, and used the same way in the sequential map and on a
-/// worker thread.
-trait Exec {
-    fn exec(&mut self, sql: &str) -> jed::Result<Outcome>;
-}
-impl Exec for ReadHandle {
-    fn exec(&mut self, sql: &str) -> jed::Result<Outcome> {
-        // A write through a read handle is 25006 (rejected before dispatch, never poisoning it).
-        self.execute(sql, &[])
-    }
-}
-impl Exec for WriteHandle {
-    fn exec(&mut self, sql: &str) -> jed::Result<Outcome> {
-        self.execute(sql, &[])
-    }
-}
-
-/// One open handle in a schedule: exactly one of read/write. Used only by the sequential runner
-/// (the threaded runner keeps each handle on its own worker thread).
+/// One open handle in a schedule: a unified [`jed::Session`] tagged with its read/write mode (so the
+/// end step dispatches commit vs. close — §2.4 folded `ReadHandle`/`WriteHandle` into one type). Used
+/// only by the sequential runner (the threaded runner keeps each handle on its own worker thread).
 enum Session {
-    Read(ReadHandle),
-    Write(WriteHandle),
+    Read(JedSession),
+    Write(JedSession),
 }
 impl Session {
-    fn as_exec(&mut self) -> &mut dyn Exec {
+    fn handle(&mut self) -> &mut JedSession {
         match self {
             Session::Read(h) => h,
             Session::Write(h) => h,
@@ -1156,11 +1139,12 @@ impl Session {
     }
 }
 
-/// Run one `on <sid>` record against `ex`, returning the first mismatch as an error string.
-fn run_record(ex: &mut dyn Exec, sid: &str, record: &Record) -> Result<(), String> {
+/// Run one `on <sid>` record against `sess`, returning the first mismatch as an error string. A
+/// write through a read-only session is `25006` (rejected before dispatch, never poisoning it).
+fn run_record(sess: &mut JedSession, sid: &str, record: &Record) -> Result<(), String> {
     match record {
         Record::Statement { expect, code, sql } => {
-            let result = ex.exec(sql);
+            let result = sess.execute(sql, &[]);
             match expect.as_str() {
                 "ok" => {
                     if let Err(e) = result {
@@ -1194,7 +1178,7 @@ fn run_record(ex: &mut dyn Exec, sid: &str, record: &Record) -> Result<(), Strin
             sql,
             expected,
         } => {
-            let outcome = ex.exec(sql).map_err(|e| {
+            let outcome = sess.execute(sql, &[]).map_err(|e| {
                 format!(
                     "[{sid}] query failed with {}: {}\n  SQL: {sql}",
                     e.code(),
@@ -1364,15 +1348,15 @@ fn end_session(kind: &str, sess: Session) -> Result<(), String> {
     let wrap = |e: jed::EngineError| format!("{}: {}", e.code(), e.message);
     match (kind, sess) {
         ("close", Session::Read(h)) => {
-            drop(h); // ReadHandle::drop deregisters, advancing the watermark
+            drop(h); // Session::drop deregisters the read pin, advancing the watermark
             Ok(())
         }
         ("close", Session::Write(_)) => {
             Err("close of a write session (use commit/rollback)".into())
         }
-        ("commit", Session::Write(h)) => h.commit().map_err(wrap),
+        ("commit", Session::Write(mut h)) => h.commit().map_err(wrap),
         ("commit", Session::Read(_)) => Err("commit of a read session (use close)".into()),
-        ("rollback", Session::Write(h)) => h.rollback().map_err(wrap),
+        ("rollback", Session::Write(mut h)) => h.rollback().map_err(wrap),
         ("rollback", Session::Read(_)) => Err("rollback of a read session (use close)".into()),
         _ => Ok(()),
     }
@@ -1416,7 +1400,7 @@ fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
                                 "open {sid}: `blocks` is only valid for a write session"
                             ));
                         }
-                        sessions.insert(sid.clone(), Session::Read(db.read())); // readers never gate
+                        sessions.insert(sid.clone(), Session::Read(db.read_session())); // readers never gate
                     }
                     "write" if *blocks => {
                         // Layer 2: assert the gate is held, then QUEUE the open — running `write()`
@@ -1439,7 +1423,7 @@ fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
                                 "open {sid} write: the gate is held by '{h}' — use `blocks`"
                             ));
                         }
-                        sessions.insert(sid.clone(), Session::Write(db.write()));
+                        sessions.insert(sid.clone(), Session::Write(db.write_session()));
                         gate_holder = Some(sid.clone());
                     }
                     other => {
@@ -1454,7 +1438,7 @@ fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
                 let session = sessions
                     .get_mut(sid)
                     .ok_or_else(|| format!("on unknown session '{sid}'"))?;
-                run_record(session.as_exec(), sid, record)?;
+                run_record(session.handle(), sid, record)?;
             }
             Step::Commit(sid) | Step::Rollback(sid) | Step::Close(sid) => {
                 let kind = match step {
@@ -1477,7 +1461,7 @@ fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
                 if gate_holder.as_deref() == Some(sid.as_str()) {
                     gate_holder = None;
                     if let Some(b) = blocked.take() {
-                        sessions.insert(b.clone(), Session::Write(db.write()));
+                        sessions.insert(b.clone(), Session::Write(db.write_session()));
                         gate_holder = Some(b);
                     }
                 }
@@ -1529,7 +1513,7 @@ struct Worker {
 /// (dropping the handle, which deregisters → advances the watermark).
 #[cfg(test)]
 fn read_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
-    let mut h = db.read();
+    let mut h = db.read_session();
     let _ = tx.send(Ok(())); // ack the open: the snapshot is pinned + registered
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -1552,7 +1536,7 @@ fn read_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(
 /// and on `commit`/`rollback` ends the transaction (publishing or discarding) then returns.
 #[cfg(test)]
 fn write_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
-    let mut h = db.write();
+    let mut h = db.write_session();
     let _ = tx.send(Ok(())); // ack the open: the writer gate is held, working set captured
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -1575,7 +1559,7 @@ fn write_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<
 
 /// The threaded-mode driver state: the live (open-acked) workers, the gate holder, and the
 /// at-most-one writer queued on the gate (Layer 2 `blocks`). A blocked writer's thread is parked
-/// inside `db.write()` on the held gate, so its open ack has NOT been received yet; it is drained at
+/// inside `db.write_session()` on the held gate, so its open ack has NOT been received yet; it is drained at
 /// the gate-releasing step, when its `write()` returns and it sends the deferred ack.
 #[cfg(test)]
 struct Driver {

@@ -21,12 +21,11 @@ import {
   type Privilege,
   PrivilegeSet,
   privilegeFromName,
-  type ReadHandle,
   render,
   seededRandomSource,
   Database,
+  type Session,
   SUPPORTED_CAPABILITIES,
-  type WriteHandle,
 } from "../lib.ts";
 
 function repoRoot(): string {
@@ -839,13 +838,14 @@ function isConcurrencyFormat(text: string): boolean {
   return false;
 }
 
-// CSession is one open handle in a schedule: exactly one of read/write is set.
-type CSession = { read?: ReadHandle; write?: WriteHandle };
+// CSession is one open handle in a schedule: a unified Session tagged with its read/write mode (so
+// the end step dispatches commit vs. close — §2.4 folded ReadHandle/WriteHandle into one type).
+type CSession = { h: Session; isWrite: boolean };
 
 // sessionExecute runs sql against the session's handle, returning the outcome. A read session's
-// writes are rejected with 25006 by the handle itself (without poisoning it).
+// writes are rejected with 25006 by the session itself (without poisoning it).
 function sessionExecute(s: CSession, sql: string): Outcome {
-  return s.write ? s.write.execute(sql) : s.read!.execute(sql);
+  return s.h.execute(sql);
 }
 
 // concurrencyDirectives are the line-leading keywords that bound a record body. Unlike the
@@ -955,14 +955,14 @@ function runConcurrencyRecord(
 // endSession ends a session: commit/rollback a write session, close a read session.
 function endSession(kind: string, s: CSession): void {
   if (kind === "close") {
-    if (!s.read) throw new Error("close of a write session (use commit/rollback)");
-    s.read.close();
+    if (s.isWrite) throw new Error("close of a write session (use commit/rollback)");
+    s.h.close();
   } else if (kind === "commit") {
-    if (!s.write) throw new Error("commit of a read session (use close)");
-    s.write.commit();
+    if (!s.isWrite) throw new Error("commit of a read session (use close)");
+    s.h.commit();
   } else if (kind === "rollback") {
-    if (!s.write) throw new Error("rollback of a read session (use close)");
-    s.write.rollback();
+    if (!s.isWrite) throw new Error("rollback of a read session (use close)");
+    s.h.rollback();
   }
 }
 
@@ -1006,7 +1006,7 @@ function runConcurrencyFile(text: string): void {
         if (mode === "read") {
           if (blocksAnn)
             throw new Error(`open ${sid}: \`blocks\` is only valid for a write session`);
-          sessions.set(sid, { read: db.read() }); // readers never take the gate
+          sessions.set(sid, { h: db.readSession(), isWrite: false }); // readers never take the gate
         } else if (mode === "write") {
           if (blocksAnn) {
             // Layer 2: assert the gate is held, then QUEUE the open — calling write() now would throw
@@ -1028,7 +1028,7 @@ function runConcurrencyFile(text: string): void {
                 `open ${sid} write: the gate is held by "${gateHolder}" — use \`blocks\``,
               );
             }
-            sessions.set(sid, { write: db.write() });
+            sessions.set(sid, { h: db.writeSession(), isWrite: true });
             gateHolder = sid;
           }
         } else {
@@ -1055,7 +1055,7 @@ function runConcurrencyFile(text: string): void {
         if (sid === gateHolder) {
           gateHolder = "";
           if (blocked !== "") {
-            sessions.set(blocked, { write: db.write() });
+            sessions.set(blocked, { h: db.writeSession(), isWrite: true });
             gateHolder = blocked;
             blocked = "";
           }

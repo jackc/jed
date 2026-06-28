@@ -1,14 +1,15 @@
-// S1 session surface (spec/design/session.md §2): the Engine-owned STATEFUL default session,
-// ADDITIONAL sessions minted by db.newSession (shared committed storage, independent settings +
-// transaction state, run sequentially via the swap), the relocated settings, and the explicit
+// Session surface (spec/design/session.md §2): the Engine-owned STATEFUL default session (the bare
+// single-handle path), and — after the §2.4 convergence — ADDITIONAL sessions minted by db.session
+// over a shared Database core (each owns its private Engine, shares committed storage through the
+// core, carries an independent envelope, autocommit with the lazy gate — no swap), plus the explicit
 // Idle/Open/Failed transaction state machine. Per-core API behaviors the shared corpus cannot
 // express (it is single-handle SQL-in/rows-out — CLAUDE.md §10). Mirrors impl/rust/tests/session.rs
-// (TS drives transactions via SQL BEGIN/COMMIT through Session.execute — the view/update closure
-// sugar is a TS follow-on, since it would import the api.ts Transaction the executor avoids).
+// (TS drives an additional session's transactions via SQL BEGIN/COMMIT through Session.execute — the
+// view/update closure sugar is a TS follow-on, since it would import the api.ts Transaction).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute, intValue } from "../src/lib.ts";
+import { Database, Engine, EngineError, execute, intValue } from "../src/lib.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -58,46 +59,50 @@ test("failed block is the Failed state", () => {
 });
 
 test("additional session shares storage with independent settings", () => {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
-  execute(db, "INSERT INTO t VALUES (1, 10)");
+  // Two sessions over one shared Database core: each owns its private Engine, but committed storage
+  // is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
+  const db = Database.newInMemory();
+  const a = db.session({});
+  a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  a.execute("INSERT INTO t VALUES (1, 10)");
 
-  // Mint a second session with its own cost ceiling — the default is untouched.
-  const s = db.newSession({ maxCost: 5n });
+  // A second session with its own cost ceiling — a's is untouched.
+  const s = db.session({ maxCost: 5n });
   assert.strictEqual(s.maxCost, 5n);
-  assert.strictEqual(db.session.maxCost, 0n);
+  assert.strictEqual(a.maxCost, 0n);
 
-  // It sees the default session's committed data (committed storage is shared).
-  assert.deepStrictEqual(queryRows(s.execute(db, "SELECT id, v FROM t")), [
+  // It sees a's committed data (committed storage is shared via the core).
+  assert.deepStrictEqual(queryRows(s.execute("SELECT id, v FROM t")), [
     [intValue(1n), intValue(10n)],
   ]);
 
-  // A write through the second session is visible to the default session.
-  s.execute(db, "INSERT INTO t VALUES (2, 20)");
-  assert.deepStrictEqual(queryRows(execute(db, "SELECT id FROM t ORDER BY id")), [
+  // A write through the second session (autocommit, lazy gate) is visible to a's next read.
+  s.execute("INSERT INTO t VALUES (2, 20)");
+  assert.deepStrictEqual(queryRows(a.execute("SELECT id FROM t ORDER BY id")), [
     [intValue(1n)],
     [intValue(2n)],
   ]);
 
-  // The swap restored the default session: still Idle, still unlimited.
-  assert.strictEqual(db.status(), "Idle");
-  assert.strictEqual(db.session.maxCost, 0n);
+  // Each session keeps its own state/settings: a is still Idle and unlimited.
+  assert.strictEqual(a.status(), "Idle");
+  assert.strictEqual(a.maxCost, 0n);
 });
 
-test("additional session cost ceiling is enforced via swap", () => {
-  // Proves the swap installs the additional session's settings into the execution path: a tiny
-  // ceiling aborts the scan with 54P01, while the unlimited default runs it fine.
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
-  execute(db, "INSERT INTO t VALUES (1), (2), (3)");
-  execute(db, "SELECT * FROM t"); // default: unlimited
+test("additional session cost ceiling is enforced", () => {
+  // The session's settings drive the execution path: a tiny ceiling aborts the scan with 54P01,
+  // while an unlimited session runs it fine — both over the same shared core.
+  const db = Database.newInMemory();
+  const a = db.session({});
+  a.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+  a.execute("INSERT INTO t VALUES (1), (2), (3)");
+  a.execute("SELECT * FROM t"); // unlimited
 
-  const s = db.newSession({ maxCost: 1n });
+  const s = db.session({ maxCost: 1n });
   assert.strictEqual(
-    code(() => s.execute(db, "SELECT * FROM t")),
+    code(() => s.execute("SELECT * FROM t")),
     "54P01",
   );
 
-  execute(db, "SELECT * FROM t"); // default unaffected
-  assert.strictEqual(db.session.maxCost, 0n);
+  a.execute("SELECT * FROM t"); // a unaffected
+  assert.strictEqual(a.maxCost, 0n);
 });

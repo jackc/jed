@@ -67,19 +67,17 @@ type cStep struct {
 	expectVal  uint64
 }
 
-// cSession is one open handle in a schedule: exactly one of read/write is set.
+// cSession is one open handle in a schedule: a unified *jed.Session tagged with its read/write mode
+// (so the end step dispatches commit vs. close — §2.4 folded ReadHandle/WriteHandle into one type).
 type cSession struct {
-	read  *jed.ReadHandle
-	write *jed.WriteHandle
+	h       *jed.Session
+	isWrite bool
 }
 
 // execute runs sql against the session's handle, returning the outcome. A read session's writes are
-// rejected with 25006 by the handle itself (without poisoning it).
+// rejected with 25006 by the session itself (without poisoning it).
 func (s *cSession) execute(sql string) (jed.Outcome, error) {
-	if s.write != nil {
-		return s.write.Execute(sql, nil)
-	}
-	return s.read.Execute(sql, nil)
+	return s.h.Execute(sql, nil)
 }
 
 // --- parsing (shared by both modes) ----------------------------------------------------------
@@ -271,20 +269,20 @@ func runRecord(exec func(string) (jed.Outcome, error), sid string, rec cRecord) 
 func endSession(kind string, s *cSession) error {
 	switch kind {
 	case "close":
-		if s.read == nil {
+		if s.isWrite {
 			return fmt.Errorf("close of a write session (use commit/rollback)")
 		}
-		s.read.Close()
+		s.h.Close()
 	case "commit":
-		if s.write == nil {
+		if !s.isWrite {
 			return fmt.Errorf("commit of a read session (use close)")
 		}
-		return s.write.Commit()
+		return s.h.Commit()
 	case "rollback":
-		if s.write == nil {
+		if !s.isWrite {
 			return fmt.Errorf("rollback of a read session (use close)")
 		}
-		return s.write.Rollback()
+		return s.h.Rollback()
 	}
 	return nil
 }
@@ -324,7 +322,7 @@ func runScheduleSequential(steps []cStep) error {
 				if st.blocks {
 					return fmt.Errorf("open %s: `blocks` is only valid for a write session", st.sid)
 				}
-				sessions[st.sid] = &cSession{read: db.Read()} // readers never take the gate
+				sessions[st.sid] = &cSession{h: db.ReadSession(), isWrite: false} // readers never take the gate
 			case "write":
 				if st.blocks {
 					// Layer 2: assert the gate is held, then QUEUE the open — running Write() now
@@ -340,7 +338,7 @@ func runScheduleSequential(steps []cStep) error {
 					if gateHolder != "" {
 						return fmt.Errorf("open %s write: the gate is held by %q — use `blocks`", st.sid, gateHolder)
 					}
-					sessions[st.sid] = &cSession{write: db.Write()}
+					sessions[st.sid] = &cSession{h: db.WriteSession(), isWrite: true}
 					gateHolder = st.sid
 				}
 			default:
@@ -364,7 +362,7 @@ func runScheduleSequential(steps []cStep) error {
 			if st.sid == gateHolder {
 				gateHolder = ""
 				if blockedSid != "" {
-					sessions[blockedSid] = &cSession{write: db.Write()}
+					sessions[blockedSid] = &cSession{h: db.WriteSession(), isWrite: true}
 					gateHolder = blockedSid
 					blockedSid = ""
 				}
@@ -436,13 +434,13 @@ type cWorker struct {
 // `close` (or a closed command channel during teardown) deregisters by closing the handle.
 func readWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
 	defer close(done)
-	s := &cSession{read: db.Read()}
+	s := &cSession{h: db.ReadSession(), isWrite: false}
 	reply <- nil // ack the open: the snapshot is pinned + registered
 	for c := range cmd {
 		if c.end {
 			var err error
 			if c.kind == "close" {
-				s.read.Close() // deregister BEFORE the reply, so the watermark is advanced on return
+				s.h.Close() // deregister BEFORE the reply, so the watermark is advanced on return
 			} else {
 				err = fmt.Errorf("%s of a read session (use close)", c.kind)
 			}
@@ -451,23 +449,23 @@ func readWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, d
 		}
 		reply <- runRecord(s.execute, sid, c.rec)
 	}
-	s.read.Close() // teardown: command channel closed without an explicit end
+	s.h.Close() // teardown: command channel closed without an explicit end
 }
 
 // writeWorker is a write session's goroutine: it acquires the writer gate, runs records against the
 // working set, and on `commit`/`rollback` (or teardown) ends the transaction, releasing the gate.
 func writeWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, done chan struct{}) {
 	defer close(done)
-	s := &cSession{write: db.Write()}
+	s := &cSession{h: db.WriteSession(), isWrite: true}
 	reply <- nil // ack the open: the writer gate is held, the working set captured
 	for c := range cmd {
 		if c.end {
 			var err error
 			switch c.kind {
 			case "commit":
-				err = s.write.Commit()
+				err = s.h.Commit()
 			case "rollback":
-				err = s.write.Rollback()
+				err = s.h.Rollback()
 			default:
 				err = fmt.Errorf("%s of a write session (use commit/rollback)", c.kind)
 			}
@@ -476,7 +474,7 @@ func writeWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, 
 		}
 		reply <- runRecord(s.execute, sid, c.rec)
 	}
-	_ = s.write.Rollback() // teardown: command channel closed without an explicit end (release gate)
+	_ = s.h.Rollback() // teardown: command channel closed without an explicit end (release gate)
 }
 
 // newCWorker mints the channels for a per-session worker goroutine.
