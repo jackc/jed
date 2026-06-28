@@ -6,9 +6,9 @@ package jed
 
 import "testing"
 
-func query(t *testing.T, db *Engine, sql string) [][]Value {
+func query(t *testing.T, db *engine, sql string) [][]Value {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -18,7 +18,7 @@ func query(t *testing.T, db *Engine, sql string) [][]Value {
 	return out.Rows
 }
 
-func queryIDs(t *testing.T, db *Engine, sql string) []int64 {
+func queryIDs(t *testing.T, db *engine, sql string) []int64 {
 	t.Helper()
 	rows := query(t, db, sql)
 	out := make([]int64, len(rows))
@@ -28,7 +28,7 @@ func queryIDs(t *testing.T, db *Engine, sql string) []int64 {
 	return out
 }
 
-func setupT(t *testing.T) *Engine {
+func setupT(t *testing.T) *engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
@@ -44,7 +44,7 @@ func TestUnknownColumnTraps(t *testing.T) {
 	wantErr(t, db, "SELECT id FROM t WHERE nope = 1", "42703")
 }
 
-func limitDB(t *testing.T) *Engine {
+func limitDB(t *testing.T) *engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
@@ -63,7 +63,7 @@ func TestLimitOffsetWindowReducesProducedCost(t *testing.T) {
 	// (spec/design/cost.md §3). (Ordering by the PK instead short-circuits — pinned cross-core in
 	// query/limit_offset.test, cost 5.)
 	db := limitDB(t)
-	out, err := Execute(db, "SELECT id FROM t ORDER BY v LIMIT 2")
+	out, err := execute(db, "SELECT id FROM t ORDER BY v LIMIT 2")
 	if err != nil {
 		t.Fatal(err)
 	}

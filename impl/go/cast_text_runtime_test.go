@@ -15,11 +15,11 @@ import (
 )
 
 // seededText builds t(id i32 pk, s text) with one row per string (id = 1..).
-func seededText(t *testing.T, rows ...string) *Engine {
+func seededText(t *testing.T, rows ...string) *engine {
 	t.Helper()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
 	for i, s := range rows {
-		if _, err := Execute(db, "INSERT INTO t VALUES ("+itoaTest(i+1)+", '"+s+"')"); err != nil {
+		if _, err := execute(db, "INSERT INTO t VALUES ("+itoaTest(i+1)+", '"+s+"')"); err != nil {
 			t.Fatalf("seed %q: %v", s, err)
 		}
 	}
@@ -38,12 +38,12 @@ func itoaTest(n int) string {
 	return string(b)
 }
 
-func castAt(t *testing.T, db *Engine, expr string, id int) Value {
+func castAt(t *testing.T, db *engine, expr string, id int) Value {
 	t.Helper()
 	return castOne(t, db, "SELECT "+expr+" FROM t WHERE id = "+itoaTest(id))
 }
 
-func castErrAt(t *testing.T, db *Engine, expr string, id int) string {
+func castErrAt(t *testing.T, db *engine, expr string, id int) string {
 	t.Helper()
 	return castErrCode(t, db, "SELECT "+expr+" FROM t WHERE id = "+itoaTest(id))
 }

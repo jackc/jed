@@ -14,9 +14,9 @@ import (
 )
 
 // wcRun executes sql and returns its outcome, failing the test on error.
-func wcRun(t *testing.T, db *Engine, sql string) Outcome {
+func wcRun(t *testing.T, db *engine, sql string) Outcome {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -24,22 +24,22 @@ func wcRun(t *testing.T, db *Engine, sql string) Outcome {
 }
 
 // wcRows executes sql and returns its result rows, failing if it is not a query result.
-func wcRows(t *testing.T, db *Engine, sql string) []Row {
+func wcRows(t *testing.T, db *engine, sql string) []storedRow {
 	t.Helper()
 	out := wcRun(t, db, sql)
 	if out.Kind != OutcomeQuery {
 		t.Fatalf("expected a query result for %q", sql)
 	}
-	rows := make([]Row, len(out.Rows))
+	rows := make([]storedRow, len(out.Rows))
 	for i, r := range out.Rows {
-		rows[i] = Row(r)
+		rows[i] = storedRow(r)
 	}
 	return rows
 }
 
 // wcAffected executes sql and returns its statement-shaped affected-row count, failing if it is not
 // a statement result.
-func wcAffected(t *testing.T, db *Engine, sql string) int64 {
+func wcAffected(t *testing.T, db *engine, sql string) int64 {
 	t.Helper()
 	out := wcRun(t, db, sql)
 	if out.Kind != OutcomeStatement || !out.HasRowsAffected {
@@ -49,7 +49,7 @@ func wcAffected(t *testing.T, db *Engine, sql string) int64 {
 }
 
 // wcInts collects the first column of each row as a sorted []int64.
-func wcInts(rows []Row) []int64 {
+func wcInts(rows []storedRow) []int64 {
 	v := make([]int64, len(rows))
 	for i, r := range rows {
 		v[i] = r[0].Int
@@ -58,7 +58,7 @@ func wcInts(rows []Row) []int64 {
 	return v
 }
 
-func wcSetup(t *testing.T) *Engine {
+func wcSetup(t *testing.T) *engine {
 	t.Helper()
 	return dbWith(
 		t,

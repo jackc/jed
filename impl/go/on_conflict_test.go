@@ -8,29 +8,29 @@ package jed
 
 import "testing"
 
-func ocDB(t *testing.T, sql ...string) *Engine {
+func ocDB(t *testing.T, sql ...string) *engine {
 	t.Helper()
-	db := NewEngine()
+	db := newEngine()
 	for _, s := range sql {
-		if _, err := Execute(db, s); err != nil {
+		if _, err := execute(db, s); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
 	return db
 }
 
-func ocErr(t *testing.T, db *Engine, sql string) string {
+func ocErr(t *testing.T, db *engine, sql string) string {
 	t.Helper()
-	_, err := Execute(db, sql)
+	_, err := execute(db, sql)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
 	return err.(*EngineError).Code()
 }
 
-func ocAffected(t *testing.T, db *Engine, sql string) (int64, bool) {
+func ocAffected(t *testing.T, db *engine, sql string) (int64, bool) {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}

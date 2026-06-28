@@ -14,10 +14,10 @@ import (
 // Hinnant -399/-146096 adjustment; the instant↔civil decomposition uses FLOOR div/mod helpers.
 
 // NegInfinity is the -infinity sentinel — the smallest i64, sorts before every finite instant.
-const NegInfinity int64 = -9223372036854775808
+const negInfinity int64 = -9223372036854775808
 
 // PosInfinity is the +infinity sentinel — the largest i64, sorts after every finite instant.
-const PosInfinity int64 = 9223372036854775807
+const posInfinity int64 = 9223372036854775807
 
 const (
 	microsPerSec = 1_000_000
@@ -130,11 +130,11 @@ func civilFromMicros(t int64) (y, mo, d, h, mi, s, us int64) {
 // --- parsing -----------------------------------------------------------------
 
 func invalidDatetime(detail string) error {
-	return NewError(InvalidDatetimeFormat, detail)
+	return newError(InvalidDatetimeFormat, detail)
 }
 
 func datetimeFieldOverflow(detail string) error {
-	return NewError(DatetimeFieldOverflow, detail)
+	return newError(DatetimeFieldOverflow, detail)
 }
 
 func isWS(b byte) bool {
@@ -213,9 +213,9 @@ func parseDatetime(input string, applyOffset bool, typeName string) (int64, erro
 
 	switch low {
 	case "infinity", "+infinity":
-		return PosInfinity, nil
+		return posInfinity, nil
 	case "-infinity":
-		return NegInfinity, nil
+		return negInfinity, nil
 	}
 
 	bc := false
@@ -365,7 +365,7 @@ func parseDatetime(input string, applyOffset bool, typeName string) (int64, erro
 			return 0, datetimeFieldOverflow("value out of range")
 		}
 	}
-	if micros == NegInfinity || micros == PosInfinity {
+	if micros == negInfinity || micros == posInfinity {
 		return 0, datetimeFieldOverflow("value out of range")
 	}
 	return micros, nil
@@ -409,10 +409,10 @@ func sub64(a, b int64) (int64, bool) {
 
 // ParseTimestamp parses a timestamp (zoneless) literal: an offset in the text is accepted and
 // ignored (PG behavior).
-func ParseTimestamp(s string) (int64, error) { return parseDatetime(s, false, "timestamp") }
+func parseTimestamp(s string) (int64, error) { return parseDatetime(s, false, "timestamp") }
 
 // ParseTimestamptz parses a timestamptz literal: a trailing offset normalizes the value to UTC.
-func ParseTimestamptz(s string) (int64, error) { return parseDatetime(s, true, "timestamptz") }
+func parseTimestamptz(s string) (int64, error) { return parseDatetime(s, true, "timestamptz") }
 
 // MakeTimestamp builds a zoneless timestamp (µs since the 1970 epoch) from calendar fields — the
 // workhorse for make_timestamp / make_timestamptz (functions.md §11; PG make_timestamp_internal). A
@@ -423,7 +423,7 @@ func ParseTimestamptz(s string) (int64, error) { return parseDatetime(s, true, "
 // folds to micros by one correctly-rounded multiply + half-away round (the engine's one mode —
 // float.md §6); it differs from PG's rint only at an exact half-microsecond tie, which realistic
 // input never hits.
-func MakeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, error) {
+func makeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, error) {
 	// Date fields (22008). A negative year is BC; year 0 has no AD/BC representation.
 	if year == 0 {
 		return 0, datetimeFieldOverflow("date field value out of range")
@@ -464,7 +464,7 @@ func MakeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, er
 	if !ok {
 		return 0, datetimeFieldOverflow("timestamp out of range")
 	}
-	if micros == NegInfinity || micros == PosInfinity {
+	if micros == negInfinity || micros == posInfinity {
 		return 0, datetimeFieldOverflow("timestamp out of range") // reserved for ±infinity
 	}
 	return micros, nil
@@ -473,10 +473,10 @@ func MakeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, er
 // --- rendering ---------------------------------------------------------------
 
 func renderDatetime(micros int64, isTz bool) string {
-	if micros == NegInfinity {
+	if micros == negInfinity {
 		return "-infinity"
 	}
-	if micros == PosInfinity {
+	if micros == posInfinity {
 		return "infinity"
 	}
 	y, mo, d, h, mi, s, us := civilFromMicros(micros)
@@ -502,7 +502,7 @@ func renderDatetime(micros int64, isTz bool) string {
 }
 
 // RenderTimestamp renders a timestamp value to its canonical text.
-func RenderTimestamp(micros int64) string { return renderDatetime(micros, false) }
+func renderTimestamp(micros int64) string { return renderDatetime(micros, false) }
 
 // RenderTimestamptz renders a timestamptz value to its canonical text (always UTC, fixed +00).
-func RenderTimestamptz(micros int64) string { return renderDatetime(micros, true) }
+func renderTimestamptz(micros int64) string { return renderDatetime(micros, true) }

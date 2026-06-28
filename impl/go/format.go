@@ -53,44 +53,44 @@ const (
 
 // typeCodeForScalar maps a scalar type to its stable on-disk code, independent of
 // the in-memory iota discriminant (which may be reordered). See format.md.
-func typeCodeForScalar(ty ScalarType) byte {
+func typeCodeForScalar(ty scalarType) byte {
 	switch ty {
-	case Int16:
+	case scalarInt16:
 		return 1
-	case Int32:
+	case scalarInt32:
 		return 2
-	case Int64:
+	case scalarInt64:
 		return 3
-	case Text:
+	case scalarText:
 		return 4
-	case Bool:
+	case scalarBool:
 		return 5
-	case DecimalType:
+	case scalarDecimal:
 		return 6
-	case Bytea:
+	case scalarBytea:
 		return 7
-	case Uuid:
+	case scalarUuid:
 		return 8
-	case Timestamp:
+	case scalarTimestamp:
 		return 9
-	case Timestamptz:
+	case scalarTimestamptz:
 		return 10
-	case IntervalType:
+	case scalarInterval:
 		return 11
-	case Float64:
+	case scalarFloat64:
 		return 12
-	case Float32:
+	case scalarFloat32:
 		return 13
-	case Date:
+	case scalarDate:
 		return 16
 	// 14 (composite) / 15 (array) / 17 (range) are container element-type codes, not scalars.
-	case Json:
+	case scalarJson:
 		return 18
-	case Jsonb:
+	case scalarJsonb:
 		return 19
 	// jsonpath reserves type code 20, but is literal-only this slice (no storable column), so this
 	// code is never written to disk yet — a storable jsonpath column is a P1a follow-on.
-	case JsonPathType:
+	case scalarJsonPath:
 		return 20
 	default:
 		return 0
@@ -101,7 +101,7 @@ func typeCodeForScalar(ty ScalarType) byte {
 // the element's type code, then (for a composite element) its name. v1 element types are scalars;
 // a composite element is handled for forward-compat, a nested array element is rejected
 // (multidimensionality is a value property, not array-of-array — §2).
-func pushArrayElementType(out []byte, elem Type) []byte {
+func pushArrayElementType(out []byte, elem dataType) []byte {
 	if elem.Array != nil {
 		panic("nested array element (array-of-array) is not a jed type — array.md §2")
 	}
@@ -118,23 +118,23 @@ func pushArrayElementType(out []byte, elem Type) []byte {
 
 // readArrayElementType decodes an array column's element type descriptor (inverse of
 // pushArrayElementType).
-func readArrayElementType(buf []byte, pos *int) (Type, error) {
+func readArrayElementType(buf []byte, pos *int) (dataType, error) {
 	code, err := readU8(buf, pos)
 	if err != nil {
-		return Type{}, err
+		return dataType{}, err
 	}
 	if code == 14 {
 		name, err := readString(buf, pos)
 		if err != nil {
-			return Type{}, err
+			return dataType{}, err
 		}
-		return CompositeT(name), nil
+		return compositeT(name), nil
 	}
 	s, ok := scalarForTypeCode(code)
 	if !ok {
-		return Type{}, NewError(DataCorrupted, "invalid array element code")
+		return dataType{}, newError(DataCorrupted, "invalid array element code")
 	}
-	return ScalarT(s), nil
+	return scalarT(s), nil
 }
 
 // pushRangeElementType appends a range column's element type descriptor (spec/design/ranges.md §3): a
@@ -143,7 +143,7 @@ func readArrayElementType(buf []byte, pos *int) (Type, error) {
 // element is the unconstrained decimal, so no typmod is stored (the type name fully determines the
 // element). The element descriptor is self-describing: it identifies which of the six ranges the
 // column is.
-func pushRangeElementType(out []byte, elem Type) []byte {
+func pushRangeElementType(out []byte, elem dataType) []byte {
 	if elem.Comp != nil || elem.Array != nil || elem.Range != nil {
 		panic("a range element is always a scalar subtype (ranges.md §2)")
 	}
@@ -153,59 +153,59 @@ func pushRangeElementType(out []byte, elem Type) []byte {
 // readRangeElementType decodes a range column's element type descriptor (inverse of
 // pushRangeElementType): one scalar code, validated to be one of the six range element subtypes
 // (else XX001).
-func readRangeElementType(buf []byte, pos *int) (Type, error) {
+func readRangeElementType(buf []byte, pos *int) (dataType, error) {
 	code, err := readU8(buf, pos)
 	if err != nil {
-		return Type{}, err
+		return dataType{}, err
 	}
 	s, ok := scalarForTypeCode(code)
 	if !ok {
-		return Type{}, NewError(DataCorrupted, "invalid range element code")
+		return dataType{}, newError(DataCorrupted, "invalid range element code")
 	}
 	if _, ok := rangeForElement(s); !ok {
-		return Type{}, NewError(DataCorrupted, "type code is not a valid range element subtype")
+		return dataType{}, newError(DataCorrupted, "type code is not a valid range element subtype")
 	}
-	return ScalarT(s), nil
+	return scalarT(s), nil
 }
 
 // scalarForTypeCode is the inverse of typeCodeForScalar; ok=false for an unknown code.
-func scalarForTypeCode(code byte) (ScalarType, bool) {
+func scalarForTypeCode(code byte) (scalarType, bool) {
 	switch code {
 	case 1:
-		return Int16, true
+		return scalarInt16, true
 	case 2:
-		return Int32, true
+		return scalarInt32, true
 	case 3:
-		return Int64, true
+		return scalarInt64, true
 	case 4:
-		return Text, true
+		return scalarText, true
 	case 5:
-		return Bool, true
+		return scalarBool, true
 	case 6:
-		return DecimalType, true
+		return scalarDecimal, true
 	case 7:
-		return Bytea, true
+		return scalarBytea, true
 	case 8:
-		return Uuid, true
+		return scalarUuid, true
 	case 9:
-		return Timestamp, true
+		return scalarTimestamp, true
 	case 10:
-		return Timestamptz, true
+		return scalarTimestamptz, true
 	case 11:
-		return IntervalType, true
+		return scalarInterval, true
 	case 12:
-		return Float64, true
+		return scalarFloat64, true
 	case 13:
-		return Float32, true
+		return scalarFloat32, true
 	case 16:
-		return Date, true
+		return scalarDate, true
 	case 18:
-		return Json, true
+		return scalarJson, true
 	case 19:
-		return Jsonb, true
+		return scalarJsonb, true
 	// jsonpath reserves code 20 (non-storable this slice, so never actually decoded off disk).
 	case 20:
-		return JsonPathType, true
+		return scalarJsonPath, true
 	default:
 		return 0, false
 	}
@@ -244,7 +244,7 @@ func pageCRC(page []byte) uint32 {
 // present-value body. A scalar dispatches to encodeScalar; a COMPOSITE (spec/design/composite.md §4)
 // is the shared presence tag then a body of `null-bitmap ‖ each present field's value-codec body`
 // (no per-field tag — the bitmap carries presence), recursing for nested composites.
-func encodeValue(ty ColType, v Value) []byte {
+func encodeValue(ty colType, v Value) []byte {
 	if ty.Elem != nil {
 		// An array column (spec/design/array.md §4): the shared presence tag then the array body.
 		if v.Kind == ValNull {
@@ -286,7 +286,7 @@ func encodeValue(ty ColType, v Value) []byte {
 // the dimension count and each dimension records its length and lower bound (multidim + custom lower
 // bounds — spec/design/array.md §12). The bitmap (MSB-first, like composite) is present iff any
 // element is NULL; a NULL element contributes zero body bytes.
-func encodeArrayBody(elem ColType, a *ArrayVal) []byte {
+func encodeArrayBody(elem colType, a *ArrayVal) []byte {
 	if len(a.Elements) == 0 {
 		return []byte{0, 0} // ndim 0, flags 0 (empty array)
 	}
@@ -333,7 +333,7 @@ func encodeArrayBody(elem ColType, a *ArrayVal) []byte {
 // contribute the element's value-codec body MINUS the presence tag (the same tag-byte+body split
 // array/composite use). The stored value is canonical (§4) — canonicalization happens at parse/cast,
 // not here.
-func encodeRangeBody(elem ColType, rv *RangeVal) []byte {
+func encodeRangeBody(elem colType, rv *RangeVal) []byte {
 	if rv.Empty {
 		return []byte{0x01} // RANGE_EMPTY
 	}
@@ -365,7 +365,7 @@ func encodeRangeBody(elem ColType, rv *RangeVal) []byte {
 // bit 0x80 >> (i%8) of byte i/8; a set bit = NULL) followed by each PRESENT field's value-codec body
 // in declaration order. A NULL field contributes zero body bytes; a present field's body is its
 // encodeValue minus the leading presence tag (a nested composite recurses).
-func encodeCompositeBody(fields []ColField, vals []Value) []byte {
+func encodeCompositeBody(fields []colField, vals []Value) []byte {
 	nbytes := (len(fields) + 7) / 8
 	bitmap := make([]byte, nbytes)
 	var bodies []byte
@@ -430,7 +430,7 @@ func readUvarint(buf []byte, pos *int) (uint64, error) {
 			return 0, err
 		}
 		if shift >= 64 || (shift == 63 && b > 1) {
-			return 0, NewError(DataCorrupted, "jsonb varint overflows u64")
+			return 0, newError(DataCorrupted, "jsonb varint overflows u64")
 		}
 		result |= uint64(b&0x7f) << shift
 		if b&0x80 == 0 {
@@ -508,7 +508,7 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 		return JsonNode{}, err
 	}
 	if tag&0xf0 != 0 {
-		return JsonNode{}, NewError(DataCorrupted, "jsonb node tag has a reserved flag bit set")
+		return JsonNode{}, newError(DataCorrupted, "jsonb node tag has a reserved flag bit set")
 	}
 	switch tag & 0x0f {
 	case ntagNull:
@@ -530,7 +530,7 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 		}
 		return JsonNode{Kind: JString, S: s}, nil
 	case ntagStringDict:
-		return JsonNode{}, NewError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
+		return JsonNode{}, newError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
 	case ntagArray:
 		count, err := readUvarint(buf, pos)
 		if err != nil {
@@ -558,15 +558,15 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 				return JsonNode{}, err
 			}
 			if ktag&0xf0 != 0 {
-				return JsonNode{}, NewError(DataCorrupted, "jsonb object key tag has a reserved flag bit set")
+				return JsonNode{}, newError(DataCorrupted, "jsonb object key tag has a reserved flag bit set")
 			}
 			switch ktag & 0x0f {
 			case ntagString:
 				// fall through to read the key payload below
 			case ntagStringDict:
-				return JsonNode{}, NewError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
+				return JsonNode{}, newError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
 			default:
-				return JsonNode{}, NewError(DataCorrupted, "jsonb object key is not a string node")
+				return JsonNode{}, newError(DataCorrupted, "jsonb object key is not a string node")
 			}
 			key, err := decodeJsonbString(buf, pos)
 			if err != nil {
@@ -580,7 +580,7 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 		}
 		return JsonNode{Kind: JObject, Obj: members}, nil
 	default:
-		return JsonNode{}, NewError(DataCorrupted, "unknown jsonb node tag")
+		return JsonNode{}, newError(DataCorrupted, "unknown jsonb node tag")
 	}
 }
 
@@ -605,15 +605,15 @@ func decodeJsonbString(buf []byte, pos *int) (string, error) {
 		return "", err
 	}
 	if !utf8.Valid(sb) {
-		return "", NewError(DataCorrupted, "non-UTF-8 jsonb string")
+		return "", newError(DataCorrupted, "non-UTF-8 jsonb string")
 	}
 	return string(sb), nil
 }
 
-func encodeScalar(ty ScalarType, v Value) []byte {
+func encodeScalar(ty scalarType, v Value) []byte {
 	switch v.Kind {
 	case ValNull:
-		return EncodeNullable(ty, nil)
+		return encodeNullable(ty, nil)
 	case ValUnfetched:
 		// An unfetched reference is resolved before any encode/plan (the scan layer for reads,
 		// the mutation path for stores, resolveForEncode at commit — large-values.md §14).
@@ -714,7 +714,7 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 		return appendU32(out, bits)
 	default:
 		n := v.Int
-		return EncodeNullable(ty, &n)
+		return encodeNullable(ty, &n)
 	}
 }
 
@@ -741,7 +741,7 @@ func appendI64(b []byte, v int64) []byte {
 // over Snapshot.ToImage for the committed snapshot — txid is written into both meta slots. (The
 // writer's working snapshot is serialized directly via Snapshot.ToImage at commit; this serves
 // callers/tests holding a *Engine.)
-func (db *Engine) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+func (db *engine) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	return db.committed.ToImage(pageSize, txid)
 }
 
@@ -755,16 +755,16 @@ func pageSizeValid(ps int) bool {
 
 // ToImage serializes this snapshot's whole state to one on-disk image (format.md). pageSize
 // is recorded in the meta page; txid is written into both meta slots.
-func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	ps := int(pageSize)
 	if ps < minPageSize {
-		return nil, NewError(FeatureNotSupported, "page size too small for the format")
+		return nil, newError(FeatureNotSupported, "page size too small for the format")
 	}
 	if ps > maxPageSize {
-		return nil, NewError(FeatureNotSupported, "page size too large for the format")
+		return nil, newError(FeatureNotSupported, "page size too large for the format")
 	}
 	if ps&(ps-1) != 0 {
-		return nil, NewError(FeatureNotSupported, "page size must be a power of two")
+		return nil, newError(FeatureNotSupported, "page size must be a power of two")
 	}
 	capacity := ps - pageHeader
 
@@ -782,7 +782,7 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	rootDataPage := make([]uint32, len(keys))
 	indexRoots := make([][]uint32, len(keys))
 	// Index trees have no value columns — encode against an empty colTypes.
-	var indexColTypes []ColType
+	var indexColTypes []colType
 	nextIndex := rootPage
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
@@ -797,7 +797,7 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		// (spec/fileformat/format.md "From-scratch image").
 		for _, idx := range s.tables[k].Indexes {
 			var r uint32
-			if idx.Kind == IndexGist {
+			if idx.Kind == indexGist {
 				// GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md
 				// §4.1). Serialize the canonical tree, allocating from the same counter.
 				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, func() uint32 { p := nextIndex; nextIndex++; return p })
@@ -901,7 +901,7 @@ type bodyPage struct {
 // its bytes are a pure function of the set — content-deterministic and cross-core identical (§3).
 // alloc hands out page numbers (a counter for the whole image, the free-list allocator for an
 // incremental commit). Returns the node pages + the root; an empty index returns no pages and root 0.
-func serializeGistIndex(s *Snapshot, table *Table, idx IndexDef, alloc func() uint32) ([]gistPage, uint32, error) {
+func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, alloc func() uint32) ([]gistPage, uint32, error) {
 	// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per WITH column
 	// for an EXCLUDE backing index.
 	ops := gistOpclassesFor(idx.Columns, table.Columns)
@@ -931,7 +931,7 @@ func serializeGistIndex(s *Snapshot, table *Table, idx IndexDef, alloc func() ui
 // this node's assigned page index and the next free index. A leaf's payload is its records; an
 // interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node whose
 // payload would exceed the page is an oversized record (over RECORD_MAX) — feature_not_supported.
-func serializeNode(n *pnode, colTypes []ColType, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
+func serializeNode(n *pnode, colTypes []colType, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
 	childPages := make([]uint32, len(n.children))
 	for i, c := range n.children {
 		// Whole-image serialize renumbers pages from scratch and runs only on a fully-resident
@@ -967,7 +967,7 @@ func serializeNode(n *pnode, colTypes []ColType, capacity int, nextIndex uint32,
 		payload = append(payload, encodeRecord(colTypes, n.keys[i], n.vals[i], capacity, take, &ovf)...)
 	}
 	if len(payload) > capacity {
-		return 0, 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
+		return 0, 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
 	*body = append(*body, bodyPage{index: index, pageType: pageType, itemCount: uint32(len(n.keys)), payload: payload})
 	for _, o := range ovf {
@@ -1024,7 +1024,7 @@ func (a *pageAlloc) take() uint32 {
 // catalog chain is always rewritten (it carries each table's possibly-moved root). The dirty nodes'
 // set-once page ids are assigned here. The page size was validated at file creation, so no size check
 // is repeated.
-func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, paging *sharedPaging) (incrementalWrite, error) {
+func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, paging *sharedPaging) (incrementalWrite, error) {
 	ps := int(pageSize)
 	capacity := ps - pageHeader
 
@@ -1040,7 +1040,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 	var pages []dirtyPage
 	rootDataPage := make([]uint32, len(keys))
 	indexRoots := make([][]uint32, len(keys))
-	var indexColTypes []ColType
+	var indexColTypes []colType
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
 			rp, err := serializeDirty(root, s.stores[k].colTypes, capacity, ps, alloc, &pages, paging)
@@ -1054,7 +1054,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 		// "Allocation & incremental commit").
 		for _, idx := range s.tables[k].Indexes {
 			var r uint32
-			if idx.Kind == IndexGist {
+			if idx.Kind == indexGist {
 				// GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from the
 				// allocator (free-list first), the old tree's pages reclaimed on the next open.
 				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, alloc.take)
@@ -1135,7 +1135,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 // references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
 // like all commit work. Returns the row unchanged when nothing is unfetched (the common case);
 // resolution builds a fresh copy, never mutating the shared tree's row.
-func resolveForEncode(row Row, colTypes []ColType, paging *sharedPaging) (Row, error) {
+func resolveForEncode(row storedRow, colTypes []colType, paging *sharedPaging) (storedRow, error) {
 	needs := false
 	for _, v := range row {
 		if v.Kind == ValUnfetched {
@@ -1147,10 +1147,10 @@ func resolveForEncode(row Row, colTypes []ColType, paging *sharedPaging) (Row, e
 		return row, nil
 	}
 	if paging == nil {
-		return nil, NewError(DataCorrupted, "unfetched large value with no pager at commit")
+		return nil, newError(DataCorrupted, "unfetched large value with no pager at commit")
 	}
 	fetch := func(p uint32) ([]byte, error) { return paging.readBlock(p) }
-	out := make(Row, len(row))
+	out := make(storedRow, len(row))
 	copy(out, row)
 	for i := range out {
 		if out[i].Kind == ValUnfetched {
@@ -1171,7 +1171,7 @@ func resolveForEncode(row Row, colTypes []ColType, paging *sharedPaging) (Row, e
 // set-once page id is stored here — safe, as the working tree is owned by the single writer at commit.
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout.
-func serializeDirty(n *pnode, colTypes []ColType, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, paging *sharedPaging) (uint32, error) {
+func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, paging *sharedPaging) (uint32, error) {
 	if n.page != 0 {
 		return n.page, nil
 	}
@@ -1212,7 +1212,7 @@ func serializeDirty(n *pnode, colTypes []ColType, capacity, ps int, alloc *pageA
 		payload = append(payload, encodeRecord(colTypes, n.keys[i], row, capacity, alloc.take, &ovf)...)
 	}
 	if len(payload) > capacity {
-		return 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
+		return 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
 	index := alloc.take()
 	n.page = index
@@ -1225,13 +1225,13 @@ func serializeDirty(n *pnode, colTypes []ColType, capacity, ps int, alloc *pageA
 
 // LoadEngine reconstructs a database from an on-disk image (inverse of ToImage).
 // Returns a structured data_corrupted (XX001) error for malformed input.
-func LoadEngine(image []byte) (*Engine, error) {
+func loadEngine(image []byte) (*engine, error) {
 	if len(image) < 12 {
-		return nil, NewError(DataCorrupted, "image smaller than a meta header")
+		return nil, newError(DataCorrupted, "image smaller than a meta header")
 	}
 	pageSize := int(binary.BigEndian.Uint32(image[8:12]))
 	if !pageSizeValid(pageSize) || len(image) < pageSize*2 {
-		return nil, NewError(DataCorrupted, "invalid page size")
+		return nil, newError(DataCorrupted, "invalid page size")
 	}
 	mt, err := selectMeta(image, pageSize)
 	if err != nil {
@@ -1254,7 +1254,7 @@ func LoadEngine(image []byte) (*Engine, error) {
 			return nil, err
 		}
 		if pg.pageType != pageCatalog {
-			return nil, NewError(DataCorrupted, "expected a catalog page")
+			return nil, newError(DataCorrupted, "expected a catalog page")
 		}
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
@@ -1295,7 +1295,7 @@ func LoadEngine(image []byte) (*Engine, error) {
 				continue
 			}
 			if kind != 0 {
-				return nil, NewError(DataCorrupted, "unknown catalog entry kind")
+				return nil, newError(DataCorrupted, "unknown catalog entry kind")
 			}
 			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
 			if err != nil {
@@ -1322,15 +1322,15 @@ func LoadEngine(image []byte) (*Engine, error) {
 					if err != nil {
 						return nil, err
 					}
-					store.BumpRowidTo(DecodeInt(Int64, keys[len(keys)-1]) + 1)
+					store.BumpRowidTo(decodeInt(scalarInt64, keys[len(keys)-1]) + 1)
 				}
 			}
 			// The table's index trees (v5): zero-column stores of entry keys
 			// (spec/design/indexes.md §3), reachable pages included in the walk.
 			for k, idx := range table.Indexes {
-				istore := NewTableStore(pageSize-pageHeader, nil)
+				istore := newTableStore(pageSize-pageHeader, nil)
 				if indexRoots[k] != 0 {
-					if idx.Kind == IndexGist {
+					if idx.Kind == indexGist {
 						// GiST: parse the persisted R-tree (pages 5/6), marking its pages reached, and
 						// recover its leaf keys to repopulate the flat leaf store. The resident R-tree is
 						// rebuilt canonically below (rebuildGistTrees).
@@ -1372,7 +1372,7 @@ func LoadEngine(image []byte) (*Engine, error) {
 	if err := snap.rebuildGistTrees(); err != nil {
 		return nil, err
 	}
-	db := NewEngine()
+	db := newEngine()
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount // the on-disk high-water for the next incremental commit
 	// The free-list: every body page [2, pageCount) the committed root does not reach (P6.2).
@@ -1395,10 +1395,10 @@ func LoadEngine(image []byte) (*Engine, error) {
 // free-list), then discards it — memory stays bounded (only the skeleton is retained), but open is
 // O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a deferred follow-on,
 // pager.md §6); the residency win — a bounded resident set — already holds.
-func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
+func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 	pageSize := int(pgr.pageSize)
 	if !pageSizeValid(pageSize) {
-		return nil, NewError(DataCorrupted, "invalid page size")
+		return nil, newError(DataCorrupted, "invalid page size")
 	}
 	paging := newSharedPaging(pgr, capacity)
 
@@ -1417,7 +1417,7 @@ func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
 		mt, ok = mb, true
 	}
 	if !ok {
-		return nil, NewError(DataCorrupted, "no valid meta page")
+		return nil, newError(DataCorrupted, "no valid meta page")
 	}
 
 	snap := newSnapshot()
@@ -1437,7 +1437,7 @@ func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
 			return nil, err
 		}
 		if pg.pageType != pageCatalog {
-			return nil, NewError(DataCorrupted, "expected a catalog page")
+			return nil, newError(DataCorrupted, "expected a catalog page")
 		}
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
@@ -1478,7 +1478,7 @@ func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
 				continue
 			}
 			if kind != 0 {
-				return nil, NewError(DataCorrupted, "unknown catalog entry kind")
+				return nil, newError(DataCorrupted, "unknown catalog entry kind")
 			}
 			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
 			if err != nil {
@@ -1515,15 +1515,15 @@ func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
 					if err != nil {
 						return nil, err
 					}
-					store.BumpRowidTo(DecodeInt(Int64, keys[len(keys)-1]) + 1)
+					store.BumpRowidTo(decodeInt(scalarInt64, keys[len(keys)-1]) + 1)
 				}
 			}
 			// The table's index trees (v5): zero-column demand-paged stores of entry keys
 			// (spec/design/indexes.md §3); no spillable columns, so no overflow collection
 			// is ever needed.
 			for k, idx := range table.Indexes {
-				istore := NewTableStore(pageSize-pageHeader, nil)
-				if indexRoots[k] != 0 && idx.Kind == IndexGist {
+				istore := newTableStore(pageSize-pageHeader, nil)
+				if indexRoots[k] != 0 && idx.Kind == indexGist {
 					// GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the whole R-tree
 					// (marking pages reached), recover its leaf keys into a fully-resident leaf store.
 					var keys [][]byte
@@ -1571,7 +1571,7 @@ func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
 	if err := snap.rebuildGistTrees(); err != nil {
 		return nil, err
 	}
-	db := NewEngine()
+	db := newEngine()
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount
 	for p := rootPage; p < mt.pageCount; p++ {
@@ -1587,7 +1587,7 @@ func LoadEnginePaged(pgr *pager, capacity int) (*Engine, error) {
 // anySpillableMasked is anySpillable restricted to the columns a query's touched set selects —
 // the gate for the masked scan-units walk (cost.md §3 "The touched set"): if no TOUCHED column
 // can spill, the whole walk yields zero and is skipped.
-func anySpillableMasked(colTypes []ColType, mask []bool) bool {
+func anySpillableMasked(colTypes []colType, mask []bool) bool {
 	for i, ty := range colTypes {
 		if mask[i] && isSpillable(ty) {
 			return true
@@ -1597,7 +1597,7 @@ func anySpillableMasked(colTypes []ColType, mask []bool) bool {
 }
 
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
-func anySpillable(colTypes []ColType) bool {
+func anySpillable(colTypes []colType) bool {
 	for _, ty := range colTypes {
 		if isSpillable(ty) {
 			return true
@@ -1612,7 +1612,7 @@ func anySpillable(colTypes []ColType) bool {
 // the paged-open free-list reconstruction; it decodes each leaf lazily and follows its chains by
 // HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
 // decompresses a large value.
-func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []ColType, reached map[uint32]bool) error {
+func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached map[uint32]bool) error {
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
 		return err
@@ -1653,7 +1653,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []ColTyp
 		}
 		return nil
 	default:
-		return NewError(DataCorrupted, "expected a B-tree node page")
+		return newError(DataCorrupted, "expected a B-tree node page")
 	}
 }
 
@@ -1661,7 +1661,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []ColTyp
 // interior nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A
 // table whose root is itself a single leaf has no interior parent to hold an OnDisk reference, so the
 // root leaf is faulted resident (spec/design/pager.md §1/§4).
-func readSkeleton(paging *sharedPaging, root uint32, colTypes []ColType, reached map[uint32]bool) (*pnode, int, error) {
+func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType, reached map[uint32]bool) (*pnode, int, error) {
 	c, length, err := readSkeletonNode(paging, root, colTypes, reached)
 	if err != nil {
 		return nil, 0, err
@@ -1680,7 +1680,7 @@ func readSkeleton(paging *sharedPaging, root uint32, colTypes []ColType, reached
 // (its rows counted from the header, then dropped — not retained); an interior node becomes a resident
 // childRef with its children resolved recursively. Returns the child reference and the subtree's row
 // count.
-func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ColType, reached map[uint32]bool) (childRef, int, error) {
+func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached map[uint32]bool) (childRef, int, error) {
 	reached[pageIdx] = true
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
@@ -1710,7 +1710,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ColType, 
 			children = append(children, child)
 			total += clen
 		}
-		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+		keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
 		// Separators decode lazily like leaves (large-values.md §14): an external value stays an
 		// unfetched reference; its chain is marked reachable by headers only.
 		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
@@ -1729,7 +1729,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ColType, 
 		total += n
 		return residentRef(&pnode{keys: keys, vals: vals, weights: weights, children: children, page: pageIdx}), total, nil
 	default:
-		return childRef{}, 0, NewError(DataCorrupted, "expected a B-tree node page")
+		return childRef{}, 0, newError(DataCorrupted, "expected a B-tree node page")
 	}
 }
 
@@ -1738,7 +1738,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ColType, 
 // N+1 child pointers then its N records; we recurse the pointers, then read the separators. Weights
 // are recomputed from the value codec (the exact size the writer used), so the loaded tree is ready
 // for further size-driven splits.
-func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached map[uint32]bool) (*pnode, int, error) {
+func readTree(image []byte, ps int, pageIdx uint32, colTypes []colType, reached map[uint32]bool) (*pnode, int, error) {
 	reached[pageIdx] = true
 	capacity := ps - pageHeader
 	pg, err := readPage(image, ps, pageIdx)
@@ -1749,7 +1749,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached 
 	switch pg.pageType {
 	case pageLeaf:
 		n := int(pg.itemCount)
-		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+		keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
 		pos := 0
 		for i := 0; i < n; i++ {
 			key, row, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
@@ -1783,7 +1783,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached 
 			children = append(children, residentRef(child))
 			total += clen
 		}
-		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+		keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
 		for i := 0; i < n; i++ {
 			key, row, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
 			if err != nil {
@@ -1799,7 +1799,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached 
 		total += n
 		return &pnode{keys: keys, vals: vals, weights: weights, children: children, page: pageIdx}, total, nil
 	default:
-		return nil, 0, NewError(DataCorrupted, "expected a B-tree node page")
+		return nil, 0, newError(DataCorrupted, "expected a B-tree node page")
 	}
 }
 
@@ -1808,7 +1808,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached 
 // (spec/design/large-values.md §12). A COMPOSITE is treated as spillable — its opaque inline body
 // spills via the same overflow + LZ4 path when a record exceeds RECORD_MAX (spec/design/composite.md
 // §4); a small composite is never actually chosen by the plan.
-func isSpillable(ty ColType) bool {
+func isSpillable(ty colType) bool {
 	if ty.Composite || ty.Elem != nil || ty.RangeElem != nil {
 		// An array's opaque inline body spills via the same overflow + LZ4 path (array.md §4). A
 		// range's body is its flags byte + bound bodies; a numrange over huge decimals could exceed
@@ -1871,7 +1871,7 @@ type recordPlan struct {
 // their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the compressed
 // block) until the record fits. Shared by the serializer and recordSize (the B-tree split
 // weight): in-memory node boundaries must match the serialized pages.
-func planDispositions(colTypes []ColType, key []byte, row Row, capacity int) recordPlan {
+func planDispositions(colTypes []colType, key []byte, row storedRow, capacity int) recordPlan {
 	inline := make([]int, len(colTypes))
 	size := 2 + len(key)
 	for i, ty := range colTypes {
@@ -1951,7 +1951,7 @@ func planDispositions(colTypes []ColType, key []byte, row Row, capacity int) rec
 // (format.md). Accounts for compression and out-of-line spill: a compressed value contributes its
 // compressed inline form, an externalized one its fixed pointer size (large-values.md §12/§13).
 // Must equal what the serializer produces, so in-memory node boundaries match serialized pages.
-func recordSize(colTypes []ColType, key []byte, row Row, capacity int) int {
+func recordSize(colTypes []colType, key []byte, row storedRow, capacity int) int {
 	return planDispositions(colTypes, key, row, capacity).size
 }
 
@@ -1961,7 +1961,7 @@ func recordSize(colTypes []ColType, key []byte, row Row, capacity int) int {
 // external-plain, the COMPRESSED block for external-compressed) and decompress = ceil(raw/capacity)
 // value_decompress slabs per compressed stored value (inline- or external-). Zero/zero for a
 // fully-inline-plain record or an untouched column.
-func recordScanUnits(colTypes []ColType, key []byte, row Row, capacity int, mask []bool) (pages, decompress int) {
+func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int, mask []bool) (pages, decompress int) {
 	// A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
 	// §14): read the units straight off them — no disposition re-plan, which would need the
 	// unfetched bytes. The numbers equal the resident plan below by construction (the
@@ -2017,14 +2017,14 @@ func recordScanUnits(colTypes []ColType, key []byte, row Row, capacity int, mask
 // ceil(raw/capacity) block per pass-1 compression attempt, adopted or not (cost.md §3;
 // large-values.md §13). Charged once per stored row version at the statement's write site,
 // never for B-tree re-encodes.
-func recordCompressUnits(colTypes []ColType, key []byte, row Row, capacity int) int {
+func recordCompressUnits(colTypes []colType, key []byte, row storedRow, capacity int) int {
 	return planDispositions(colTypes, key, row, capacity).compressUnits
 }
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
 // externalized (large-values.md §12): raw UTF-8 for text / raw bytes for bytea (both in v.Str), the
 // decimal body (encoding minus its presence tag) for decimal. Only spillable types reach here.
-func valuePayload(ty ColType, v Value) []byte {
+func valuePayload(ty colType, v Value) []byte {
 	if ty.Elem != nil {
 		// An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies);
 		// a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
@@ -2057,7 +2057,7 @@ func valuePayload(ty ColType, v Value) []byte {
 
 // valueFromPayload reconstructs a value from the P(v) content gathered from its overflow chain
 // (inverse of valuePayload) — large-values.md §12.
-func valueFromPayload(ty ColType, payload []byte) (Value, error) {
+func valueFromPayload(ty colType, payload []byte) (Value, error) {
 	if ty.Elem != nil {
 		// An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
 		pos := 0
@@ -2077,14 +2077,14 @@ func valueFromPayload(ty ColType, payload []byte) (Value, error) {
 	switch {
 	case ty.Scalar.IsText():
 		if !utf8.Valid(payload) {
-			return Value{}, NewError(DataCorrupted, "non-UTF-8 text value")
+			return Value{}, newError(DataCorrupted, "non-UTF-8 text value")
 		}
 		return TextValue(string(payload)), nil
 	case ty.Scalar.IsBytea():
 		return ByteaValue(payload), nil
 	case ty.Scalar.IsJson():
 		if !utf8.Valid(payload) {
-			return Value{}, NewError(DataCorrupted, "non-UTF-8 json value")
+			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
 		}
 		return JsonValue(string(payload)), nil
 	case ty.Scalar.IsJsonb():
@@ -2098,7 +2098,7 @@ func valueFromPayload(ty ColType, payload []byte) (Value, error) {
 		pos := 0
 		return decodeDecimalBody(payload, &pos)
 	default:
-		return Value{}, NewError(DataCorrupted, "a non-spillable type was stored external")
+		return Value{}, newError(DataCorrupted, "a non-spillable type was stored external")
 	}
 }
 
@@ -2107,7 +2107,7 @@ func valueFromPayload(ty ColType, payload []byte) (Value, error) {
 // page(s) via take, append them to *ovf, and write a tag|first_page|len pointer instead of the inline
 // body. capacity is the page payload (the slab size + the spill-plan input). Shared by the whole-image
 // (serializeNode) and incremental (serializeDirty) writers, which differ only in how take allocates.
-func encodeRecord(colTypes []ColType, key []byte, row Row, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
+func encodeRecord(colTypes []colType, key []byte, row storedRow, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
 	plan := planDispositions(colTypes, key, row, capacity)
 	out := make([]byte, 0, 2+len(key)+len(row)*2)
 	out = appendU16(out, uint16(len(key)))
@@ -2180,7 +2180,7 @@ func writeOverflowChain(payload []byte, capacity int, take func() uint32, ovf *[
 // entry_kind = 1 byte): name, field count, then per field — name, type code, [type name when code
 // 14 (nested composite)], flags (bit0 not_null), [decimal typmod when code 6]
 // (spec/fileformat/format.md *Composite-type entry*).
-func compositeTypeEntryBytes(ct *CompositeType) []byte {
+func compositeTypeEntryBytes(ct *compositeType) []byte {
 	var out []byte
 	out = appendU16(out, uint16(len(ct.Name)))
 	out = append(out, ct.Name...)
@@ -2222,7 +2222,7 @@ func compositeTypeEntryBytes(ct *CompositeType) []byte {
 // compositeTypeEntryBytes); the caller has already consumed the entry_kind byte. Nested composite
 // fields hold the referenced type's NAME (resolved/validated after the whole catalog is read — the
 // two-pass load).
-func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
+func decodeCompositeTypeEntry(buf []byte, pos *int) (*compositeType, error) {
 	name, err := readString(buf, pos)
 	if err != nil {
 		return nil, err
@@ -2231,7 +2231,7 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
 	if err != nil {
 		return nil, err
 	}
-	fields := make([]CompositeField, 0, fieldCount)
+	fields := make([]compositeField, 0, fieldCount)
 	for i := uint16(0); i < fieldCount; i++ {
 		fname, err := readString(buf, pos)
 		if err != nil {
@@ -2241,14 +2241,14 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
 		if err != nil {
 			return nil, err
 		}
-		var fty Type
+		var fty dataType
 		isDecimal := false
 		if tc == 14 {
 			tn, err := readString(buf, pos)
 			if err != nil {
 				return nil, err
 			}
-			fty = CompositeT(tn)
+			fty = compositeT(tn)
 		} else if tc == 15 {
 			// An array-typed field (spec/design/array.md §12): the element-type descriptor, then
 			// (below) the flags byte — the inverse of the array arm in compositeTypeEntryBytes.
@@ -2256,13 +2256,13 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
 			if err != nil {
 				return nil, err
 			}
-			fty = ArrayT(elem)
+			fty = arrayT(elem)
 		} else {
 			s, ok := scalarForTypeCode(tc)
 			if !ok {
-				return nil, NewError(DataCorrupted, "unknown field type code")
+				return nil, newError(DataCorrupted, "unknown field type code")
 			}
-			fty = ScalarT(s)
+			fty = scalarT(s)
 			isDecimal = s.IsDecimal()
 		}
 		flags, err := readU8(buf, pos)
@@ -2270,9 +2270,9 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
 			return nil, err
 		}
 		if flags&^uint8(0b1) != 0 {
-			return nil, NewError(DataCorrupted, "reserved composite field flag set")
+			return nil, newError(DataCorrupted, "reserved composite field flag set")
 		}
-		var decimal *DecimalTypmod
+		var decimal *decimalTypmod
 		if isDecimal {
 			precision, err := readU16(buf, pos)
 			if err != nil {
@@ -2283,18 +2283,18 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
 				return nil, err
 			}
 			if precision != 0 {
-				decimal = &DecimalTypmod{Precision: precision, Scale: scale}
+				decimal = &decimalTypmod{Precision: precision, Scale: scale}
 			}
 		}
-		fields = append(fields, CompositeField{Name: fname, Type: fty, Decimal: decimal, NotNull: flags&0b1 != 0})
+		fields = append(fields, compositeField{Name: fname, Type: fty, Decimal: decimal, NotNull: flags&0b1 != 0})
 	}
-	return &CompositeType{Name: name, Fields: fields}, nil
+	return &compositeType{Name: name, Fields: fields}, nil
 }
 
 // sequenceEntryBytes serializes a sequence catalog entry's BODY (after its entry_kind = 2 byte):
 // name, then the six fixed i64 fields (big-endian two's-complement, no sign-flip) and a flags byte
 // — spec/fileformat/format.md *Sequence entry*. Fixed-width, every field present (no presence tags).
-func sequenceEntryBytes(s *SequenceDef) []byte {
+func sequenceEntryBytes(s *sequenceDef) []byte {
 	var out []byte
 	out = appendU16(out, uint16(len(s.Name)))
 	out = append(out, s.Name...)
@@ -2327,7 +2327,7 @@ func sequenceEntryBytes(s *SequenceDef) []byte {
 
 // decodeSequenceEntry decodes a sequence catalog entry's body (inverse of sequenceEntryBytes); the
 // caller has already consumed the entry_kind byte.
-func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
+func decodeSequenceEntry(buf []byte, pos *int) (*sequenceDef, error) {
 	name, err := readString(buf, pos)
 	if err != nil {
 		return nil, err
@@ -2361,10 +2361,10 @@ func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
 		return nil, err
 	}
 	if flags&^uint8(0b111) != 0 {
-		return nil, NewError(DataCorrupted, "reserved sequence flag set")
+		return nil, newError(DataCorrupted, "reserved sequence flag set")
 	}
 	// The OWNED BY tail (v13): present iff bit2 (has_owner) is set.
-	var owner *SeqOwner
+	var owner *seqOwner
 	if flags&0b100 != 0 {
 		ownerTable, err := readString(buf, pos)
 		if err != nil {
@@ -2374,9 +2374,9 @@ func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
 		if err != nil {
 			return nil, err
 		}
-		owner = &SeqOwner{Table: ownerTable, Column: ownerCol}
+		owner = &seqOwner{Table: ownerTable, Column: ownerCol}
 	}
-	return &SequenceDef{
+	return &sequenceDef{
 		Name:      name,
 		Increment: increment,
 		MinValue:  minValue,
@@ -2418,7 +2418,7 @@ func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
 		return nil, false, err
 	}
 	if flags&^uint8(0b1) != 0 {
-		return nil, false, NewError(DataCorrupted, "reserved collation flag set")
+		return nil, false, newError(DataCorrupted, "reserved collation flag set")
 	}
 	isDefault := flags&0b1 != 0
 	name, err := readString(buf, pos)
@@ -2445,7 +2445,7 @@ func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
 	// a version-skewed collation, by contrast, opens and is enforced read-only at write time §14).
 	loaded := LoadedCollation(name)
 	if loaded == nil {
-		return nil, false, NewError(CollationVersionMismatch,
+		return nil, false, newError(CollationVersionMismatch,
 			fmt.Sprintf("collation %q (@ %s/%s) is not provided by any loaded bundle", name, unicode, cldr))
 	}
 	coll := &Collation{
@@ -2461,7 +2461,7 @@ func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
 
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
 // index's tree root page, parallel to table.Indexes.
-func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []byte {
+func tableEntryBytes(table *catTable, rootDataPage uint32, indexRoots []uint32) []byte {
 	var out []byte
 	out = appendU16(out, uint16(len(table.Name)))
 	out = append(out, table.Name...)
@@ -2528,7 +2528,7 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		// (bit1) + the nextval expression default (bit3) — spec/design/sequences.md §13.
 		if col.Identity != nil {
 			flags |= 0b1_0000
-			if *col.Identity == IdentityAlways {
+			if *col.Identity == identityAlways {
 				flags |= 0b10_0000
 			}
 		}
@@ -2649,8 +2649,8 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 
 // exclusionOpCode is the 1-byte on-disk code for an EXCLUDE element operator (format.md): && = 0,
 // = 1.
-func exclusionOpCode(op ExclusionOp) byte {
-	if op == ExclEqual {
+func exclusionOpCode(op exclusionOp) byte {
+	if op == exclEqual {
 		return 1
 	}
 	return 0
@@ -2658,22 +2658,22 @@ func exclusionOpCode(op ExclusionOp) byte {
 
 // exclusionOpFromCode decodes an EXCLUDE element operator code; an unsupported code in an
 // otherwise-valid file is XX001 (reserved for future GiST exclusion operators).
-func exclusionOpFromCode(c byte) (ExclusionOp, error) {
+func exclusionOpFromCode(c byte) (exclusionOp, error) {
 	switch c {
 	case 0:
-		return ExclOverlaps, nil
+		return exclOverlaps, nil
 	case 1:
-		return ExclEqual, nil
+		return exclEqual, nil
 	default:
-		return 0, NewError(DataCorrupted, "unsupported exclusion-constraint operator code")
+		return 0, newError(DataCorrupted, "unsupported exclusion-constraint operator code")
 	}
 }
 
 // fkActionCode is the 2-bit on-disk code for a referential action (format.md): NO ACTION = 0,
 // RESTRICT = 1.
-func fkActionCode(a FkAction) byte {
+func fkActionCode(a fkAction) byte {
 	switch a {
-	case FkRestrict:
+	case fkRestrict:
 		return 1
 	default:
 		return 0
@@ -2682,14 +2682,14 @@ func fkActionCode(a FkAction) byte {
 
 // fkActionFromCode decodes a 2-bit referential-action code; an unsupported code (2/3, reserved
 // for the deferred write-actions) in an otherwise-valid file is XX001.
-func fkActionFromCode(c byte) (FkAction, error) {
+func fkActionFromCode(c byte) (fkAction, error) {
 	switch c {
 	case 0:
-		return FkNoAction, nil
+		return fkNoAction, nil
 	case 1:
-		return FkRestrict, nil
+		return fkRestrict, nil
 	default:
-		return 0, NewError(DataCorrupted, "unsupported foreign-key action code")
+		return 0, newError(DataCorrupted, "unsupported foreign-key action code")
 	}
 }
 
@@ -2702,7 +2702,7 @@ func pack(sizes []int, capacity int) ([][]int, error) {
 	used := 0
 	for i, sz := range sizes {
 		if sz > capacity {
-			return nil, NewError(FeatureNotSupported,
+			return nil, newError(FeatureNotSupported,
 				"a record or table entry larger than a page is not supported")
 		}
 		if len(cur) > 0 && used+sz > capacity {
@@ -2834,7 +2834,7 @@ func selectMeta(image []byte, ps int) (meta, error) {
 	case bok:
 		return b, nil
 	default:
-		return meta{}, NewError(DataCorrupted, "no valid meta page")
+		return meta{}, newError(DataCorrupted, "no valid meta page")
 	}
 }
 
@@ -2851,12 +2851,12 @@ type page struct {
 // readPage slices it out of a whole image.
 func parsePage(block []byte) (page, error) {
 	if len(block) < pageHeader {
-		return page{}, NewError(DataCorrupted, "page shorter than its header")
+		return page{}, newError(DataCorrupted, "page shorter than its header")
 	}
 	// Verify the per-page checksum (v7) before trusting any header field — a mismatch is silent
 	// at-rest corruption (format.md *Page header*; storage.md §6).
 	if pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) {
-		return page{}, NewError(DataCorrupted, "page checksum mismatch (corrupted page)")
+		return page{}, newError(DataCorrupted, "page checksum mismatch (corrupted page)")
 	}
 	return page{
 		pageType:  block[0],
@@ -2869,7 +2869,7 @@ func parsePage(block []byte) (page, error) {
 func readPage(image []byte, ps int, index uint32) (page, error) {
 	off := int(index) * ps
 	if off+ps > len(image) {
-		return page{}, NewError(DataCorrupted, "page index out of range")
+		return page{}, newError(DataCorrupted, "page index out of range")
 	}
 	return parsePage(image[off : off+ps])
 }
@@ -2879,7 +2879,7 @@ func readPage(image []byte, ps int, index uint32) (page, error) {
 func pageBlock(image []byte, ps int, index uint32) ([]byte, error) {
 	off := int(index) * ps
 	if off+ps > len(image) {
-		return nil, NewError(DataCorrupted, "page index out of range")
+		return nil, newError(DataCorrupted, "page index out of range")
 	}
 	out := make([]byte, ps)
 	copy(out, image[off:off+ps])
@@ -2892,16 +2892,16 @@ func pageBlock(image []byte, ps int, index uint32) ([]byte, error) {
 // an external/compressed value becomes an Unfetched reference — no chain read, no decompression —
 // resolved later only for the columns a query touches. Each weight is the bytes the record occupies
 // on the page (exactly the writer's recordSize).
-func decodeLeafNode(block []byte, pageID uint32, colTypes []ColType) (*pnode, error) {
+func decodeLeafNode(block []byte, pageID uint32, colTypes []colType) (*pnode, error) {
 	pg, err := parsePage(block)
 	if err != nil {
 		return nil, err
 	}
 	if pg.pageType != pageLeaf {
-		return nil, NewError(DataCorrupted, "demand-paged a non-leaf page")
+		return nil, newError(DataCorrupted, "demand-paged a non-leaf page")
 	}
 	n := int(pg.itemCount)
-	keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+	keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
 	pos := 0
 	for i := 0; i < n; i++ {
 		key, row, w, err := decodeRecordLazy(colTypes, pg.payload, &pos)
@@ -2918,7 +2918,7 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []ColType) (*pnode, er
 // decodeTableEntry decodes one catalog table entry: the *Table (its pk list, checks, and
 // index definitions included), its root_data_page, and each index's root page (parallel
 // to Table.Indexes).
-func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
+func decodeTableEntry(buf []byte, pos *int) (*catTable, uint32, []uint32, error) {
 	name, err := readString(buf, pos)
 	if err != nil {
 		return nil, 0, nil, err
@@ -2927,7 +2927,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	columns := make([]Column, 0, colCount)
+	columns := make([]catColumn, 0, colCount)
 	for i := uint16(0); i < colCount; i++ {
 		cname, err := readString(buf, pos)
 		if err != nil {
@@ -2946,15 +2946,15 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				return nil, 0, nil, err
 			}
 			if flags&0b01 != 0 {
-				return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+				return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
 			tname, err := readString(buf, pos)
 			if err != nil {
 				return nil, 0, nil, err
 			}
-			columns = append(columns, Column{
+			columns = append(columns, catColumn{
 				Name:    cname,
-				Type:    CompositeT(tname),
+				Type:    compositeT(tname),
 				NotNull: flags&0b10 != 0,
 			})
 			continue
@@ -2966,15 +2966,15 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				return nil, 0, nil, err
 			}
 			if flags&0b01 != 0 {
-				return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+				return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
 			elem, err := readArrayElementType(buf, pos)
 			if err != nil {
 				return nil, 0, nil, err
 			}
-			columns = append(columns, Column{
+			columns = append(columns, catColumn{
 				Name:    cname,
-				Type:    ArrayT(elem),
+				Type:    arrayT(elem),
 				NotNull: flags&0b10 != 0,
 			})
 			continue
@@ -2987,22 +2987,22 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				return nil, 0, nil, err
 			}
 			if flags&0b01 != 0 {
-				return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+				return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
 			elem, err := readRangeElementType(buf, pos)
 			if err != nil {
 				return nil, 0, nil, err
 			}
-			columns = append(columns, Column{
+			columns = append(columns, catColumn{
 				Name:    cname,
-				Type:    RangeT(elem),
+				Type:    rangeT(elem),
 				NotNull: flags&0b10 != 0,
 			})
 			continue
 		}
 		ty, ok := scalarForTypeCode(tc)
 		if !ok {
-			return nil, 0, nil, NewError(DataCorrupted, "unknown type code")
+			return nil, 0, nil, newError(DataCorrupted, "unknown type code")
 		}
 		flags, err := readU8(buf, pos)
 		if err != nil {
@@ -3011,26 +3011,26 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		// bit0 was the primary_key flag through v4; v5 retired it (the pk list below is
 		// the authority) and reserves it as must-be-zero. bit6 = has_collation (v17); bit7 reserved.
 		if flags&0b01 != 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+			return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 		}
 		if flags&0b1000_0000 != 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit7 set")
+			return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit7 set")
 		}
 		// bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
 		// is_identity (spec/design/sequences.md §13).
 		if flags&0b11_0000 == 0b10_0000 {
-			return nil, 0, nil, NewError(DataCorrupted, "identity_always set without is_identity")
+			return nil, 0, nil, newError(DataCorrupted, "identity_always set without is_identity")
 		}
-		var identity *IdentityKind
+		var identity *identityKind
 		if flags&0b1_0000 != 0 {
-			k := IdentityByDefault
+			k := identityByDefault
 			if flags&0b10_0000 != 0 {
-				k = IdentityAlways
+				k = identityAlways
 			}
 			identity = &k
 		}
 		// A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
-		var decimal *DecimalTypmod
+		var decimal *decimalTypmod
 		if ty.IsDecimal() {
 			precision, err := readU16(buf, pos)
 			if err != nil {
@@ -3041,7 +3041,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				return nil, 0, nil, err
 			}
 			if precision != 0 {
-				decimal = &DecimalTypmod{Precision: precision, Scale: scale}
+				decimal = &decimalTypmod{Precision: precision, Scale: scale}
 			}
 		}
 		// The default follows the typmod (spec/fileformat/format.md): a CONSTANT default (flags
@@ -3051,29 +3051,29 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		// the ordinary expression parser (XX001 if it fails, like a stored check). The two bits
 		// are mutually exclusive — both set is a corrupt catalog.
 		if flags&0b1100 == 0b1100 {
-			return nil, 0, nil, NewError(DataCorrupted, "column has both a constant and an expression default")
+			return nil, 0, nil, newError(DataCorrupted, "column has both a constant and an expression default")
 		}
 		var defaultVal *Value
 		if flags&0b100 != 0 {
 			var sink []uint32
 			// A constant default is a scalar value (this branch is the scalar type path).
-			dv, err := readValue(ScalarColType(ty), buf, pos, nil, &sink)
+			dv, err := readValue(scalarColType(ty), buf, pos, nil, &sink)
 			if err != nil {
 				return nil, 0, nil, err
 			}
 			defaultVal = &dv
 		}
-		var defaultExpr *DefaultExpr
+		var defaultExpr *defaultExprDef
 		if flags&0b1000 != 0 {
 			exprText, err := readString(buf, pos)
 			if err != nil {
 				return nil, 0, nil, err
 			}
-			expr, err := ParseExpression(exprText)
+			expr, err := parseExpression(exprText)
 			if err != nil {
-				return nil, 0, nil, NewError(DataCorrupted, "stored default expression does not parse: "+err.Error())
+				return nil, 0, nil, newError(DataCorrupted, "stored default expression does not parse: "+err.Error())
 			}
-			defaultExpr = &DefaultExpr{ExprText: exprText, Expr: expr}
+			defaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr}
 		}
 		// The effective collation (v17, flags bit6) — appended last; a non-collated column has the
 		// bit clear and reads nothing (spec/design/collation.md §5).
@@ -3084,9 +3084,9 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				return nil, 0, nil, err
 			}
 		}
-		columns = append(columns, Column{
+		columns = append(columns, catColumn{
 			Name:    cname,
-			Type:    ScalarT(ty),
+			Type:    scalarT(ty),
 			Decimal: decimal,
 			// PrimaryKey is set from the pk list below.
 			NotNull:     flags&0b10 != 0,
@@ -3110,7 +3110,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		}
 		o := int(ord)
 		if o >= len(columns) || slices.Contains(pk, o) {
-			return nil, 0, nil, NewError(DataCorrupted, "invalid primary key ordinal")
+			return nil, 0, nil, newError(DataCorrupted, "invalid primary key ordinal")
 		}
 		columns[o].PrimaryKey = true
 		pk = append(pk, o)
@@ -3122,7 +3122,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	checks := make([]CheckConstraint, 0, checkCount)
+	checks := make([]checkConstraint, 0, checkCount)
 	for i := uint16(0); i < checkCount; i++ {
 		checkName, err := readString(buf, pos)
 		if err != nil {
@@ -3132,12 +3132,12 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		expr, err := ParseExpression(exprText)
+		expr, err := parseExpression(exprText)
 		if err != nil {
-			return nil, 0, nil, NewError(DataCorrupted,
+			return nil, 0, nil, newError(DataCorrupted,
 				"stored check constraint does not parse: "+err.Error())
 		}
-		checks = append(checks, CheckConstraint{Name: checkName, ExprText: exprText, Expr: expr})
+		checks = append(checks, checkConstraint{Name: checkName, ExprText: exprText, Expr: expr})
 	}
 	// Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
 	// unique; the rest reserved-zero) + root page, in the catalog's (lowercased-name
@@ -3147,7 +3147,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	indexes := make([]IndexDef, 0, indexCount)
+	indexes := make([]indexDef, 0, indexCount)
 	indexRoots := make([]uint32, 0, indexCount)
 	for i := uint16(0); i < indexCount; i++ {
 		iname, err := readString(buf, pos)
@@ -3159,7 +3159,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		if kc == 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "index with no key columns")
+			return nil, 0, nil, newError(DataCorrupted, "index with no key columns")
 		}
 		cols := make([]int, 0, kc)
 		for j := uint16(0); j < kc; j++ {
@@ -3168,7 +3168,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				return nil, 0, nil, err
 			}
 			if int(ord) >= len(columns) {
-				return nil, 0, nil, NewError(DataCorrupted, "invalid index column ordinal")
+				return nil, 0, nil, newError(DataCorrupted, "invalid index column ordinal")
 			}
 			cols = append(cols, int(ord))
 		}
@@ -3177,20 +3177,20 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		if iflags&^uint8(0b01) != 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "reserved index flag set")
+			return nil, 0, nil, newError(DataCorrupted, "reserved index flag set")
 		}
 		ikind, err := readU8(buf, pos) // v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		if ikind > 2 {
-			return nil, 0, nil, NewError(DataCorrupted, "unsupported index kind")
+			return nil, 0, nil, newError(DataCorrupted, "unsupported index kind")
 		}
 		iroot, err := readU32(buf, pos)
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		indexes = append(indexes, IndexDef{Name: iname, Columns: cols, Unique: iflags&0b01 != 0, Kind: IndexKind(ikind)})
+		indexes = append(indexes, indexDef{Name: iname, Columns: cols, Unique: iflags&0b01 != 0, Kind: indexKind(ikind)})
 		indexRoots = append(indexRoots, iroot)
 	}
 	// Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
@@ -3202,7 +3202,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	foreignKeys := make([]ForeignKey, 0, fkCount)
+	foreignKeys := make([]foreignKey, 0, fkCount)
 	for i := uint16(0); i < fkCount; i++ {
 		fname, err := readString(buf, pos)
 		if err != nil {
@@ -3213,7 +3213,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		if lc == 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "foreign key with no columns")
+			return nil, 0, nil, newError(DataCorrupted, "foreign key with no columns")
 		}
 		cols := make([]int, 0, lc)
 		for j := uint16(0); j < lc; j++ {
@@ -3222,7 +3222,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				return nil, 0, nil, err
 			}
 			if int(ord) >= len(columns) {
-				return nil, 0, nil, NewError(DataCorrupted, "invalid foreign-key column ordinal")
+				return nil, 0, nil, newError(DataCorrupted, "invalid foreign-key column ordinal")
 			}
 			cols = append(cols, int(ord))
 		}
@@ -3235,7 +3235,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		if rc != lc {
-			return nil, 0, nil, NewError(DataCorrupted, "foreign-key referencing/referenced column count mismatch")
+			return nil, 0, nil, newError(DataCorrupted, "foreign-key referencing/referenced column count mismatch")
 		}
 		refCols := make([]int, 0, rc)
 		for j := uint16(0); j < rc; j++ {
@@ -3250,7 +3250,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		if actions&^byte(0b1111) != 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "reserved foreign-key action bit set")
+			return nil, 0, nil, newError(DataCorrupted, "reserved foreign-key action bit set")
 		}
 		onDelete, err := fkActionFromCode(actions & 0b11)
 		if err != nil {
@@ -3260,7 +3260,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		foreignKeys = append(foreignKeys, ForeignKey{
+		foreignKeys = append(foreignKeys, foreignKey{
 			Name:       fname,
 			Columns:    cols,
 			RefTable:   refTable,
@@ -3275,7 +3275,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	exclusions := make([]ExclusionConstraint, 0, excCount)
+	exclusions := make([]exclusionConstraint, 0, excCount)
 	for i := uint16(0); i < excCount; i++ {
 		ename, err := readString(buf, pos)
 		if err != nil {
@@ -3290,16 +3290,16 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		if ec == 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "exclusion constraint with no elements")
+			return nil, 0, nil, newError(DataCorrupted, "exclusion constraint with no elements")
 		}
-		elements := make([]ExclusionElement, 0, ec)
+		elements := make([]exclusionElement, 0, ec)
 		for j := uint16(0); j < ec; j++ {
 			ord, err := readU16(buf, pos)
 			if err != nil {
 				return nil, 0, nil, err
 			}
 			if int(ord) >= len(columns) {
-				return nil, 0, nil, NewError(DataCorrupted, "invalid exclusion-constraint column ordinal")
+				return nil, 0, nil, newError(DataCorrupted, "invalid exclusion-constraint column ordinal")
 			}
 			opb, err := readU8(buf, pos)
 			if err != nil {
@@ -3309,15 +3309,15 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			if err != nil {
 				return nil, 0, nil, err
 			}
-			elements = append(elements, ExclusionElement{Column: int(ord), Op: op})
+			elements = append(elements, exclusionElement{Column: int(ord), Op: op})
 		}
-		exclusions = append(exclusions, ExclusionConstraint{Name: ename, Index: iname, Elements: elements})
+		exclusions = append(exclusions, exclusionConstraint{Name: ename, Index: iname, Elements: elements})
 	}
 	root, err := readU32(buf, pos)
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	return &Table{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions}, root, indexRoots, nil
+	return &catTable{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions}, root, indexRoots, nil
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL
@@ -3325,7 +3325,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 // the record's pointer fields — no chain read, no decompression. The scan layer resolves the
 // references for the columns a query touches (resolveUnfetched); the commit path resolves the
 // rest when a dirty leaf re-encodes (resolveForEncode).
-func readValueLazy(ty ColType, buf []byte, pos *int) (Value, error) {
+func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
@@ -3378,7 +3378,7 @@ func readValueLazy(ty ColType, buf []byte, pos *int) (Value, error) {
 		}
 		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: rawLen}}, nil
 	default:
-		return Value{}, NewError(DataCorrupted, "invalid value presence tag")
+		return Value{}, newError(DataCorrupted, "invalid value presence tag")
 	}
 }
 
@@ -3386,7 +3386,7 @@ func readValueLazy(ty ColType, buf []byte, pos *int) (Value, error) {
 // where the weight is the bytes the record occupies on the page — exactly the recordSize the
 // writer split on, read off the cursor instead of re-planned (a re-plan would need the unfetched
 // bytes).
-func decodeRecordLazy(colTypes []ColType, buf []byte, pos *int) ([]byte, Row, int, error) {
+func decodeRecordLazy(colTypes []colType, buf []byte, pos *int) ([]byte, storedRow, int, error) {
 	start := *pos
 	keyLen, err := readU16(buf, pos)
 	if err != nil {
@@ -3398,7 +3398,7 @@ func decodeRecordLazy(colTypes []ColType, buf []byte, pos *int) ([]byte, Row, in
 	}
 	key := make([]byte, len(keySlice))
 	copy(key, keySlice)
-	row := make(Row, len(colTypes))
+	row := make(storedRow, len(colTypes))
 	for i, ty := range colTypes {
 		v, err := readValueLazy(ty, buf, pos)
 		if err != nil {
@@ -3413,7 +3413,7 @@ func decodeRecordLazy(colTypes []ColType, buf []byte, pos *int) ([]byte, Row, in
 // (spec/design/large-values.md §14): gather the overflow chain through fetch for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
 // data_corrupted, surfaced only when the value is actually touched.
-func resolveUnfetched(ty ColType, u *Unfetched, fetch func(uint32) ([]byte, error)) (Value, error) {
+func resolveUnfetched(ty colType, u *Unfetched, fetch func(uint32) ([]byte, error)) (Value, error) {
 	var sink []uint32
 	switch u.Form {
 	case tagExternal:
@@ -3439,7 +3439,7 @@ func resolveUnfetched(ty ColType, u *Unfetched, fetch func(uint32) ([]byte, erro
 		}
 		return valueFromPayload(ty, payload)
 	default:
-		return Value{}, NewError(DataCorrupted, "invalid unfetched value form")
+		return Value{}, newError(DataCorrupted, "invalid unfetched value form")
 	}
 }
 
@@ -3453,7 +3453,7 @@ func chainPages(first uint32, length int, fetch func(uint32) ([]byte, error)) ([
 	p := first
 	for gathered < length {
 		if p == 0 {
-			return nil, NewError(DataCorrupted, "overflow chain ended before the value length")
+			return nil, newError(DataCorrupted, "overflow chain ended before the value length")
 		}
 		out = append(out, p)
 		block, err := fetch(p)
@@ -3465,11 +3465,11 @@ func chainPages(first uint32, length int, fetch func(uint32) ([]byte, error)) ([
 			return nil, err
 		}
 		if pg.pageType != pageOverflow {
-			return nil, NewError(DataCorrupted, "expected an overflow page")
+			return nil, newError(DataCorrupted, "expected an overflow page")
 		}
 		n := int(pg.itemCount)
 		if n == 0 || n > len(pg.payload) || gathered+n > length {
-			return nil, NewError(DataCorrupted, "overflow page slab out of range")
+			return nil, newError(DataCorrupted, "overflow page slab out of range")
 		}
 		gathered += n
 		p = pg.nextPage
@@ -3479,7 +3479,7 @@ func chainPages(first uint32, length int, fetch func(uint32) ([]byte, error)) ([
 
 // markChains adds the overflow chain pages a lazily-decoded row references to reached (the
 // free-list reachability walk), via the header-only chainPages hop.
-func markChains(row Row, fetch func(uint32) ([]byte, error), reached map[uint32]bool) error {
+func markChains(row storedRow, fetch func(uint32) ([]byte, error), reached map[uint32]bool) error {
 	for _, v := range row {
 		if v.Kind != ValUnfetched {
 			continue
@@ -3501,7 +3501,7 @@ func markChains(row Row, fetch func(uint32) ([]byte, error), reached map[uint32]
 // decodeRecord decodes one record (key, row) and the overflow chain pages any external value
 // followed (for the free-list reachability walk — large-values.md §12). fetch reads a page block by
 // index, used to follow overflow chains; nil is only valid where no value can be external (a default).
-func decodeRecord(colTypes []ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, error)) ([]byte, Row, []uint32, error) {
+func decodeRecord(colTypes []colType, buf []byte, pos *int, fetch func(uint32) ([]byte, error)) ([]byte, storedRow, []uint32, error) {
 	keyLen, err := readU16(buf, pos)
 	if err != nil {
 		return nil, nil, nil, err
@@ -3512,7 +3512,7 @@ func decodeRecord(colTypes []ColType, buf []byte, pos *int, fetch func(uint32) (
 	}
 	key := make([]byte, len(keySlice))
 	copy(key, keySlice)
-	row := make(Row, len(colTypes))
+	row := make(storedRow, len(colTypes))
 	var ovf []uint32
 	for i, ty := range colTypes {
 		v, err := readValue(ty, buf, pos, fetch, &ovf)
@@ -3528,7 +3528,7 @@ func decodeRecord(colTypes []ColType, buf []byte, pos *int, fetch func(uint32) (
 // first: 0x00 an inline body, 0x01 NULL, 0x02 an external pointer (u32 first_page + u32 len) whose
 // payload is gathered from the overflow chain via fetch and reconstructed by type (large-values.md
 // §12). Pages visited while following a chain are appended to *ovfOut for the free-list walk.
-func readValue(ty ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, error), ovfOut *[]uint32) (Value, error) {
+func readValue(ty colType, buf []byte, pos *int, fetch func(uint32) ([]byte, error), ovfOut *[]uint32) (Value, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
@@ -3548,7 +3548,7 @@ func readValue(ty ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 			return Value{}, err
 		}
 		if fetch == nil {
-			return Value{}, NewError(DataCorrupted, "external value with no overflow reader")
+			return Value{}, newError(DataCorrupted, "external value with no overflow reader")
 		}
 		payload, err := readOverflowChain(first, int(length), fetch, ovfOut)
 		if err != nil {
@@ -3587,7 +3587,7 @@ func readValue(ty ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 			return Value{}, err
 		}
 		if fetch == nil {
-			return Value{}, NewError(DataCorrupted, "external value with no overflow reader")
+			return Value{}, newError(DataCorrupted, "external value with no overflow reader")
 		}
 		comp, err := readOverflowChain(first, int(stored), fetch, ovfOut)
 		if err != nil {
@@ -3599,13 +3599,13 @@ func readValue(ty ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 		}
 		return valueFromPayload(ty, payload)
 	default:
-		return Value{}, NewError(DataCorrupted, "invalid value presence tag")
+		return Value{}, newError(DataCorrupted, "invalid value presence tag")
 	}
 }
 
 // readInlineBody reads the present-value body (after a 0x00 tag) for any ColType: a scalar via
 // readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4).
-func readInlineBody(ty ColType, buf []byte, pos *int) (Value, error) {
+func readInlineBody(ty colType, buf []byte, pos *int) (Value, error) {
 	if ty.Elem != nil {
 		return readArrayBody(ty, buf, pos)
 	}
@@ -3622,16 +3622,16 @@ func readInlineBody(ty ColType, buf []byte, pos *int) (Value, error) {
 // (spec/design/ranges.md §4). Reads the flags byte; an EMPTY range stops there. Otherwise the finite
 // lower bound (!LB_INF) then the finite upper bound (!UB_INF) are each read as the element's
 // value-codec body (no presence tag). A reserved flag bit set is XX001.
-func readRangeBody(elem ColType, buf []byte, pos *int) (Value, error) {
+func readRangeBody(elem colType, buf []byte, pos *int) (Value, error) {
 	flags, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
 	}
 	if flags&^0x1f != 0 {
-		return Value{}, NewError(DataCorrupted, "range flags has a reserved bit set")
+		return Value{}, newError(DataCorrupted, "range flags has a reserved bit set")
 	}
 	if flags&0x01 != 0 {
-		return RangeValue(EmptyRangeVal()), nil
+		return RangeValue(emptyRangeVal()), nil
 	}
 	lbInf := flags&0x02 != 0
 	ubInf := flags&0x04 != 0
@@ -3663,9 +3663,9 @@ func readRangeBody(elem ColType, buf []byte, pos *int) (Value, error) {
 // encodeArrayBody (spec/design/array.md §4). Reads ndim/flags/per-dim (len, lb), then the optional
 // null bitmap and the present element bodies (row-major). Accepts ndim 0 (empty) through 6 (MAXDIM);
 // a higher ndim or an element-count overflow is XX001.
-func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
+func readArrayBody(ty colType, buf []byte, pos *int) (Value, error) {
 	if ty.Elem == nil {
-		return Value{}, NewError(DataCorrupted, "readArrayBody on a non-array type")
+		return Value{}, newError(DataCorrupted, "readArrayBody on a non-array type")
 	}
 	ndim, err := readU8(buf, pos)
 	if err != nil {
@@ -3676,14 +3676,14 @@ func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
 		return Value{}, err
 	}
 	if flags&^0x01 != 0 {
-		return Value{}, NewError(DataCorrupted, "array flags has a reserved bit set")
+		return Value{}, newError(DataCorrupted, "array flags has a reserved bit set")
 	}
 	if ndim == 0 {
 		// An empty array (ndim 0) — all-empty slices.
-		return ArrayValueOf(EmptyArray()), nil
+		return arrayValueOf(emptyArray()), nil
 	}
 	if ndim > 6 {
-		return Value{}, NewError(DataCorrupted, "array ndim exceeds the maximum of 6")
+		return Value{}, newError(DataCorrupted, "array ndim exceeds the maximum of 6")
 	}
 	dims := make([]int, ndim)
 	lbounds := make([]int32, ndim)
@@ -3701,7 +3701,7 @@ func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
 		lbounds[d] = int32(lb)
 		n *= int(ln)
 		if n < 0 || n > (1<<31) {
-			return Value{}, NewError(DataCorrupted, "array element count overflow")
+			return Value{}, newError(DataCorrupted, "array element count overflow")
 		}
 	}
 	hasNulls := flags&0x01 != 0
@@ -3724,16 +3724,16 @@ func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
 			elems[i] = v
 		}
 	}
-	return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
+	return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
 }
 
 // readCompositeBody reads a composite value's present body (after the 0x00 tag): the null bitmap then
 // each present field's body in declaration order (inverse of encodeCompositeBody,
 // spec/design/composite.md §4). A field whose bitmap bit is set is NULL and consumes no body bytes;
 // otherwise its body is read recursively (no per-field presence tag).
-func readCompositeBody(ty ColType, buf []byte, pos *int) (Value, error) {
+func readCompositeBody(ty colType, buf []byte, pos *int) (Value, error) {
 	if !ty.Composite {
-		return Value{}, NewError(DataCorrupted, "readCompositeBody on a non-composite type")
+		return Value{}, newError(DataCorrupted, "readCompositeBody on a non-composite type")
 	}
 	nbytes := (len(ty.Fields) + 7) / 8
 	bitmap, err := take(buf, pos, nbytes)
@@ -3758,7 +3758,7 @@ func readCompositeBody(ty ColType, buf []byte, pos *int) (Value, error) {
 // readInlineScalar reads the present-value body of a SCALAR (after a 0x00 tag): a fixed-width integer,
 // a u16 length + UTF-8 bytes for text, a single bool-byte, the decimal body, etc. (format.md *Value
 // codec*).
-func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
+func readInlineScalar(ty scalarType, buf []byte, pos *int) (Value, error) {
 	switch {
 	case ty.IsText():
 		n, err := readU16(buf, pos)
@@ -3770,7 +3770,7 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 			return Value{}, err
 		}
 		if !utf8.Valid(sb) {
-			return Value{}, NewError(DataCorrupted, "non-UTF-8 text value")
+			return Value{}, newError(DataCorrupted, "non-UTF-8 text value")
 		}
 		return TextValue(string(sb)), nil
 	case ty.IsBool():
@@ -3784,7 +3784,7 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		case 0x01:
 			return BoolValue(true), nil
 		default:
-			return Value{}, NewError(DataCorrupted, "invalid boolean value byte")
+			return Value{}, newError(DataCorrupted, "invalid boolean value byte")
 		}
 	case ty.IsDecimal():
 		return decodeDecimalBody(buf, pos)
@@ -3810,7 +3810,7 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 			return Value{}, err
 		}
 		if !utf8.Valid(sb) {
-			return Value{}, NewError(DataCorrupted, "non-UTF-8 json value")
+			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
 		}
 		return JsonValue(string(sb)), nil
 	case ty.IsJsonb():
@@ -3833,7 +3833,7 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		m := DecodeInt(ty, vb)
+		m := decodeInt(ty, vb)
 		if ty.IsTimestamp() {
 			return TimestampValue(m), nil
 		}
@@ -3861,7 +3861,7 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return DateValue(int32(DecodeInt(ty, vb))), nil
+		return DateValue(int32(decodeInt(ty, vb))), nil
 	case ty.IsInterval():
 		// Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
 		mb, err := take(buf, pos, 4)
@@ -3886,7 +3886,7 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return IntValue(DecodeInt(ty, vb)), nil
+		return IntValue(decodeInt(ty, vb)), nil
 	}
 }
 
@@ -3914,7 +3914,7 @@ func decodeDecimalBody(buf []byte, pos *int) (Value, error) {
 		}
 		groups[i] = g
 	}
-	return DecimalValue(DecimalFromCodec(flags&1 != 0, uint32(scale), groups)), nil
+	return DecimalValue(decimalFromCodec(flags&1 != 0, uint32(scale), groups)), nil
 }
 
 // readOverflowChain gathers length bytes of an external value's payload by following its overflow
@@ -3926,7 +3926,7 @@ func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, err
 	p := first
 	for len(out) < length {
 		if p == 0 {
-			return nil, NewError(DataCorrupted, "overflow chain ended before the value length")
+			return nil, newError(DataCorrupted, "overflow chain ended before the value length")
 		}
 		*visited = append(*visited, p)
 		block, err := fetch(p)
@@ -3938,11 +3938,11 @@ func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, err
 			return nil, err
 		}
 		if pg.pageType != pageOverflow {
-			return nil, NewError(DataCorrupted, "expected an overflow page")
+			return nil, newError(DataCorrupted, "expected an overflow page")
 		}
 		n := int(pg.itemCount)
 		if n == 0 || n > len(pg.payload) || len(out)+n > length {
-			return nil, NewError(DataCorrupted, "overflow page slab out of range")
+			return nil, newError(DataCorrupted, "overflow page slab out of range")
 		}
 		out = append(out, pg.payload[:n]...)
 		p = pg.nextPage
@@ -3954,7 +3954,7 @@ func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, err
 
 func take(buf []byte, pos *int, n int) ([]byte, error) {
 	if *pos+n > len(buf) {
-		return nil, NewError(DataCorrupted, "unexpected end of page data")
+		return nil, newError(DataCorrupted, "unexpected end of page data")
 	}
 	s := buf[*pos : *pos+n]
 	*pos += n
@@ -4004,7 +4004,7 @@ func readString(buf []byte, pos *int) (string, error) {
 		return "", err
 	}
 	if !utf8.Valid(s) {
-		return "", NewError(DataCorrupted, "non-UTF-8 name")
+		return "", newError(DataCorrupted, "non-UTF-8 name")
 	}
 	return string(s), nil
 }

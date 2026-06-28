@@ -16,7 +16,7 @@ var uuid16 = string([]byte{
 
 // uuid → bytea is the 16 raw bytes (PG: 42846 — jed adds this cast).
 func TestUuidToByteaIsThe16Bytes(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	v := castOne(t, db, "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid::bytea")
 	if v.Kind != ValBytea || v.Str != uuid16 {
 		t.Fatalf("uuid::bytea = %v, want the 16 bytes", v)
@@ -25,7 +25,7 @@ func TestUuidToByteaIsThe16Bytes(t *testing.T) {
 
 // bytea → uuid takes the 16 raw bytes (PG: 42846 — jed adds this cast).
 func TestByteaToUuidIsThe16Bytes(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	v := castOne(t, db, "SELECT '\\x550e8400e29b41d4a716446655440000'::bytea::uuid")
 	if v.Kind != ValUuid || v.Str != uuid16 {
 		t.Fatalf("bytea::uuid = %v, want the 16 bytes", v)
@@ -35,7 +35,7 @@ func TestByteaToUuidIsThe16Bytes(t *testing.T) {
 // bytea → uuid requires EXACTLY 16 bytes; any other length traps 22P02 (the wrong-width body —
 // there is no PG code to match, so jed reuses invalid_text_representation).
 func TestByteaToUuidWrongLengthTraps22P02(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	for _, sql := range []string{
 		"SELECT '\\xabcd'::bytea::uuid",                               // 2 bytes
 		"SELECT '\\x'::bytea::uuid",                                   // empty (0 bytes)

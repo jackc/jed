@@ -29,35 +29,35 @@ type ClockSource func() int64
 // Seam is the host seam carried on the Engine handle (spec/design/api.md §10): the injected random
 // + clock functions, each nil ⇒ the platform default. Only the volatile uuid generators touch it;
 // every other expression ignores it.
-type Seam struct {
+type seam struct {
 	random RandomSource
 	clock  ClockSource
 }
 
 // SetRandom injects a random source (the deterministic / reproducible path); ClearRandom falls back
 // to the OS CSPRNG, drawn per value (production — unpredictable output).
-func (s *Seam) SetRandom(f RandomSource) { s.random = f }
-func (s *Seam) ClearRandom()             { s.random = nil }
+func (s *seam) SetRandom(f RandomSource) { s.random = f }
+func (s *seam) ClearRandom()             { s.random = nil }
 
 // SetClock injects a clock source; ClearClock falls back to the wall clock (production).
-func (s *Seam) SetClock(f ClockSource) { s.clock = f }
-func (s *Seam) ClearClock()            { s.clock = nil }
+func (s *seam) SetClock(f ClockSource) { s.clock = f }
+func (s *seam) ClearClock()            { s.clock = nil }
 
 // fill writes len(buf) random bytes: the injected source, else the OS CSPRNG (crypto/rand).
-func (s *Seam) fill(buf []byte) error {
+func (s *seam) fill(buf []byte) error {
 	if s.random != nil {
 		s.random(buf)
 		return nil
 	}
 	if _, err := rand.Read(buf); err != nil {
-		return NewError(IoError, "OS entropy source unavailable")
+		return newError(IoError, "OS entropy source unavailable")
 	}
 	return nil
 }
 
 // nowMicros returns the current time in micros since the Unix epoch: the injected clock, else the
 // wall clock.
-func (s *Seam) nowMicros() int64 {
+func (s *seam) nowMicros() int64 {
 	if s.clock != nil {
 		return s.clock()
 	}
@@ -116,17 +116,17 @@ func AdvancingClock(start, step int64) ClockSource {
 // StmtRng is the per-statement mutable seam state: the uuidv7 monotonic counter and the
 // once-resolved statement clock (entropy.md §5 — read once, reused, so a statement's time cannot
 // vary row-to-row). The PRNG state itself lives in the injected RandomSource (handle-scoped).
-type StmtRng struct {
+type stmtRng struct {
 	counter       uint32
 	clock         int64
 	clockResolved bool
 }
 
-func newStmtRng() *StmtRng { return &StmtRng{} }
+func newStmtRng() *stmtRng { return &stmtRng{} }
 
 // statementClockMicros returns the statement clock in micros since the Unix epoch, resolved once
 // (entropy.md §5): the seam's clock source. Reused for every uuidv7 / now() in the statement (STABLE).
-func (r *StmtRng) statementClockMicros(seam *Seam) int64 {
+func (r *stmtRng) statementClockMicros(seam *seam) int64 {
 	if !r.clockResolved {
 		r.clock = seam.nowMicros()
 		r.clockResolved = true
@@ -137,12 +137,12 @@ func (r *StmtRng) statementClockMicros(seam *Seam) int64 {
 // clockNowMicros is a fresh read of the clock seam in micros since the Unix epoch — used by
 // clock_timestamp() (entropy.md §5), which reads on EVERY call (VOLATILE) and so does NOT touch the
 // once-resolved statement clock above. It caches nothing.
-func (r *StmtRng) clockNowMicros(seam *Seam) int64 {
+func (r *stmtRng) clockNowMicros(seam *seam) int64 {
 	return seam.nowMicros()
 }
 
 // uuidV4 — 16 bytes from the seam's random source, version/variant overwritten (entropy.md §3).
-func (r *StmtRng) uuidV4(seam *Seam) ([]byte, error) {
+func (r *stmtRng) uuidV4(seam *seam) ([]byte, error) {
 	b := make([]byte, 16)
 	if err := seam.fill(b); err != nil {
 		return nil, err
@@ -153,10 +153,10 @@ func (r *StmtRng) uuidV4(seam *Seam) ([]byte, error) {
 // uuidV7 — the 48-bit ms of shiftedMicros (the statement clock, possibly interval-shifted by the
 // caller), a per-statement monotonic counter in rand_a, and 62 random bits (8 bytes from the seam)
 // in rand_b (entropy.md §3). An out-of-48-bit ms traps 22008.
-func (r *StmtRng) uuidV7(seam *Seam, shiftedMicros int64) ([]byte, error) {
+func (r *stmtRng) uuidV7(seam *seam, shiftedMicros int64) ([]byte, error) {
 	unixMs := floorDiv(shiftedMicros, 1000)
 	if unixMs < 0 || unixMs >= (int64(1)<<48) {
-		return nil, NewError(DatetimeFieldOverflow, "uuidv7 timestamp out of range")
+		return nil, newError(DatetimeFieldOverflow, "uuidv7 timestamp out of range")
 	}
 	counter := uint16(r.counter & 0x0FFF)
 	r.counter++

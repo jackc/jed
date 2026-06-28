@@ -14,9 +14,9 @@ import (
 
 // rangeByName looks up a range type by name (case-insensitive), matching the canonical id or any
 // alias (int4range → i32range). The second result is false if name is not one of the six ranges.
-func rangeByName(name string) (RangeDesc, bool) {
+func rangeByName(name string) (rangeDesc, bool) {
 	lname := strings.ToLower(name)
-	for _, r := range Ranges {
+	for _, r := range ranges {
 		if r.ID == lname {
 			return r, true
 		}
@@ -26,15 +26,15 @@ func rangeByName(name string) (RangeDesc, bool) {
 			}
 		}
 	}
-	return RangeDesc{}, false
+	return rangeDesc{}, false
 }
 
 // rangeNameForElement returns the canonical range type name for an element scalar (i32 → i32range),
 // or ("", false) if the element has no built-in range type. Inverse of elementScalar; used to name
 // a Type.Range for output.
-func rangeNameForElement(elem ScalarType) (string, bool) {
+func rangeNameForElement(elem scalarType) (string, bool) {
 	ename := elem.CanonicalName()
-	for _, r := range Ranges {
+	for _, r := range ranges {
 		if r.Element == ename {
 			return r.ID, true
 		}
@@ -44,8 +44,8 @@ func rangeNameForElement(elem ScalarType) (string, bool) {
 
 // elementScalar returns the element scalar type of a range descriptor (i32range → i32). The
 // descriptor's Element is always a valid scalar id, so the lookup never fails.
-func elementScalar(desc RangeDesc) ScalarType {
-	s, _ := ScalarTypeFromName(desc.Element)
+func elementScalar(desc rangeDesc) scalarType {
+	s, _ := scalarTypeFromName(desc.Element)
 	return s
 }
 
@@ -53,14 +53,14 @@ func elementScalar(desc RangeDesc) ScalarType {
 // and true, or (zero, false) if the scalar has no built-in range type. Used by the storage/codec
 // paths that hold a resolved element ScalarType (a range column's RangeElem) and need the descriptor's
 // discreteness / canonicalization rule.
-func rangeForElement(elem ScalarType) (RangeDesc, bool) {
+func rangeForElement(elem scalarType) (rangeDesc, bool) {
 	ename := elem.CanonicalName()
-	for _, r := range Ranges {
+	for _, r := range ranges {
 		if r.Element == ename {
 			return r, true
 		}
 	}
-	return RangeDesc{}, false
+	return rangeDesc{}, false
 }
 
 // --- text input ------------------------------------------------------------
@@ -76,7 +76,7 @@ type parsedRange struct {
 }
 
 func malformedRange(input string) error {
-	return NewError(InvalidTextRepresentation, "malformed range literal: \""+input+"\"")
+	return newError(InvalidTextRepresentation, "malformed range literal: \""+input+"\"")
 }
 
 // parseRangeText parses a range text literal into its lexical parts (spec/design/ranges.md §5), PG
@@ -199,15 +199,15 @@ func rangeElemCmp(a, b Value) int {
 // elemMaxFinite returns the inclusive maximum finite value a discrete element's underlying integer
 // may hold (canonicalization steps up by one; exceeding traps 22003). For date, i32::MAX is the
 // +infinity sentinel, so the finite max is one below it.
-func elemMaxFinite(elem ScalarType) int64 {
+func elemMaxFinite(elem scalarType) int64 {
 	switch elem {
-	case Int16:
+	case scalarInt16:
 		return math.MaxInt16
-	case Int32:
+	case scalarInt32:
 		return math.MaxInt32
-	case Int64:
+	case scalarInt64:
 		return math.MaxInt64
-	case Date:
+	case scalarDate:
 		return math.MaxInt32 - 1
 	default:
 		return math.MaxInt64
@@ -216,10 +216,10 @@ func elemMaxFinite(elem ScalarType) int64 {
 
 // incrementDiscrete steps a discrete bound value up by one unit (the canonicalization +1): an
 // integer +1 or a date +1 day. A step past the element domain traps 22003.
-func incrementDiscrete(v Value, elem ScalarType) (Value, error) {
+func incrementDiscrete(v Value, elem scalarType) (Value, error) {
 	max := elemMaxFinite(elem)
 	if v.Int >= max {
-		return Value{}, NewError(NumericValueOutOfRange,
+		return Value{}, newError(NumericValueOutOfRange,
 			"value out of range for type "+elem.CanonicalName())
 	}
 	out := v
@@ -231,11 +231,11 @@ func incrementDiscrete(v Value, elem ScalarType) (Value, error) {
 // the order check (lower > upper → 22000), discrete canonicalization to `[)` (trapping 22003 on a
 // step past the domain), and empty normalization (lower == upper not-both-inclusive → empty). A nil
 // bound is infinite.
-func finalizeRange(desc RangeDesc, lower, upper *Value, lowerInc, upperInc bool) (*RangeVal, error) {
+func finalizeRange(desc rangeDesc, lower, upper *Value, lowerInc, upperInc bool) (*RangeVal, error) {
 	elem := elementScalar(desc)
 	// Order check: two finite bounds must be lower ≤ upper.
 	if lower != nil && upper != nil && rangeElemCmp(*lower, *upper) > 0 {
-		return nil, NewError(DataException,
+		return nil, newError(DataException,
 			"range lower bound must be less than or equal to range upper bound")
 	}
 	if desc.Discrete {
@@ -274,7 +274,7 @@ func finalizeRange(desc RangeDesc, lower, upper *Value, lowerInc, upperInc bool)
 	// Empty normalization: equal finite bounds that are not both inclusive contain no points. For
 	// discrete ranges the canonical `[)` form already makes a one-point range `[x,x)` land here.
 	if lower != nil && upper != nil && rangeElemCmp(*lower, *upper) == 0 && !(lowerInc && upperInc) {
-		return EmptyRangeVal(), nil
+		return emptyRangeVal(), nil
 	}
 	return &RangeVal{Empty: false, Lower: lower, Upper: upper, LowerInc: lowerInc, UpperInc: upperInc}, nil
 }
@@ -295,7 +295,7 @@ func parseBoundFlags(s string) (lowerInc, upperInc bool, err error) {
 	case "()":
 		return false, false, nil
 	default:
-		return false, false, NewError(SyntaxError, "invalid range bound flags")
+		return false, false, newError(SyntaxError, "invalid range bound flags")
 	}
 }
 
@@ -389,7 +389,7 @@ func cmpBounds(v1 *Value, inc1 bool, lower1 bool, v2 *Value, inc2 bool, lower2 b
 // −∞ on the lower side, 0x02 = +∞ on the upper — ordered −∞ < finite < +∞) or 0x01 ‖ the element's
 // own order-preserving key ‖ an inclusivity byte. elem names the element scalar (the integer codec
 // needs the width). Keys never round-trip (the row body holds the full value), so this need only sort.
-func encodeRangeKey(elem ScalarType, rv *RangeVal) []byte {
+func encodeRangeKey(elem scalarType, rv *RangeVal) []byte {
 	if rv.Empty {
 		return []byte{0x00} // the empty range sorts below every non-empty one; this is its whole key
 	}
@@ -404,7 +404,7 @@ func encodeRangeKey(elem ScalarType, rv *RangeVal) []byte {
 // inclusivity tie-break (PG range_cmp_bounds): on the LOWER side an inclusive bound sorts before an
 // exclusive one, on the UPPER side an exclusive bound sorts before an inclusive one — i.e. the byte
 // is 0x00 when inc == isLower, else 0x01.
-func pushRangeBound(out []byte, elem ScalarType, v *Value, inc bool, isLower bool) []byte {
+func pushRangeBound(out []byte, elem scalarType, v *Value, inc bool, isLower bool) []byte {
 	if v == nil {
 		if isLower {
 			return append(out, 0x00)
@@ -422,11 +422,11 @@ func pushRangeBound(out []byte, elem ScalarType, v *Value, inc bool, isLower boo
 // encodeRangeElem encodes one range bound value's element key. A range element is one of the six
 // scalar subtypes (i32/i64/decimal/date/timestamp/timestamptz); the decimal stores its value in Dec
 // (decimal-order-preserving, §2.5), the rest in Int via the int-be-signflip / day / instant codec.
-func encodeRangeElem(elem ScalarType, v Value) []byte {
+func encodeRangeElem(elem scalarType, v Value) []byte {
 	if v.Kind == ValDecimal {
 		return v.Dec.EncodeKey()
 	}
-	return EncodeInt(elem, v.Int)
+	return encodeInt(elem, v.Int)
 }
 
 // --- boolean operators (RF3, spec/design/range-functions.md §3) -------------
@@ -574,9 +574,9 @@ func makeRange(lower, upper *Value, lowerInc, upperInc bool) *RangeVal {
 	if lower != nil && upper != nil {
 		switch c := rangeElemCmp(*lower, *upper); {
 		case c > 0:
-			return EmptyRangeVal()
+			return emptyRangeVal()
 		case c == 0 && !(lowerInc && upperInc):
-			return EmptyRangeVal()
+			return emptyRangeVal()
 		}
 	}
 	return &RangeVal{Empty: false, Lower: lower, Upper: upper, LowerInc: lowerInc, UpperInc: upperInc}
@@ -594,7 +594,7 @@ func rangeUnion(a, b *RangeVal, strict bool) (*RangeVal, error) {
 		return a, nil
 	}
 	if strict && !rangeOverlaps(a, b) && !rangeAdjacent(a, b) {
-		return nil, NewError(DataException, "result of range union would not be contiguous")
+		return nil, newError(DataException, "result of range union would not be contiguous")
 	}
 	// result lower = the lesser lower bound; result upper = the greater upper bound.
 	var lower *Value
@@ -619,7 +619,7 @@ func rangeUnion(a, b *RangeVal, strict bool) (*RangeVal, error) {
 // errors.
 func rangeIntersect(a, b *RangeVal) *RangeVal {
 	if a.Empty || b.Empty || !rangeOverlaps(a, b) {
-		return EmptyRangeVal()
+		return emptyRangeVal()
 	}
 	// result lower = the greater lower bound; result upper = the lesser upper bound.
 	var lower *Value
@@ -654,7 +654,7 @@ func rangeMinus(a, b *RangeVal) (*RangeVal, error) {
 	// `b` strictly inside `a` (a.lower < b.lower and a.upper > b.upper): removing it leaves two
 	// disjoint pieces — a non-contiguous result.
 	if cmpL1L2 < 0 && cmpU1U2 > 0 {
-		return nil, NewError(DataException, "result of range difference would not be contiguous")
+		return nil, newError(DataException, "result of range difference would not be contiguous")
 	}
 	// `a` and `b` do not overlap: `a` is unchanged.
 	if cmpL1U2 > 0 || cmpU1L2 < 0 {
@@ -662,7 +662,7 @@ func rangeMinus(a, b *RangeVal) (*RangeVal, error) {
 	}
 	// `a` is wholly within `b`: nothing remains.
 	if cmpL1L2 >= 0 && cmpU1U2 <= 0 {
-		return EmptyRangeVal(), nil
+		return emptyRangeVal(), nil
 	}
 	// `b` covers the right part of `a`: keep `[a.lower, b.lower)` — `b`'s lower bound becomes the
 	// result's upper bound, so its inclusivity flips.

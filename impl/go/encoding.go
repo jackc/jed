@@ -9,7 +9,7 @@ package jed
 
 // EncodeInt encodes a non-null integer value of the given type to its
 // order-preserving key bytes. value is assumed in range for t (callers range-check).
-func EncodeInt(t ScalarType, value int64) []byte {
+func encodeInt(t scalarType, value int64) []byte {
 	width := t.WidthBytes()
 	shift := uint(width * 8)
 	// value + 2^(bits-1), in uint64 arithmetic. For width 8 the add wraps mod 2^64,
@@ -29,7 +29,7 @@ func EncodeInt(t ScalarType, value int64) []byte {
 // uuid. Byte-identical to the boolean value-codec body (a stored boolean reuses these bytes
 // behind the §2.2 presence tag — spec/fileformat/format.md). A PK is NOT NULL, so no
 // presence tag.
-func EncodeBool(value bool) []byte {
+func encodeBool(value bool) []byte {
 	if value {
 		return []byte{0x01}
 	}
@@ -44,7 +44,7 @@ func EncodeBool(value bool) []byte {
 // is the only place a 0x00 is followed by a byte < 0xFF, so it sorts below any real continuation
 // — a value sorts before any value that extends it. A PK is NOT NULL, so the stored key is this
 // bare body with no presence tag.
-func EncodeTerminated(content []byte) []byte {
+func encodeTerminated(content []byte) []byte {
 	out := make([]byte, 0, len(content)+2)
 	for _, b := range content {
 		out = append(out, b)
@@ -56,7 +56,7 @@ func EncodeTerminated(content []byte) []byte {
 }
 
 // DecodeInt is the inverse of EncodeInt. len(b) must equal the type's width.
-func DecodeInt(t ScalarType, b []byte) int64 {
+func decodeInt(t scalarType, b []byte) int64 {
 	width := t.WidthBytes()
 	shift := uint(width * 8)
 	var u uint64
@@ -71,9 +71,9 @@ func DecodeInt(t ScalarType, b []byte) int64 {
 // 0x01, present values sort before NULL, so NULLs sort LAST in ascending order;
 // descending inverts the component, lifting NULL to first (the PostgreSQL model —
 // NULL is the largest value; spec/design/encoding.md §2/§4). A nil pointer means NULL.
-func EncodeNullable(t ScalarType, value *int64) []byte {
+func encodeNullable(t scalarType, value *int64) []byte {
 	if value == nil {
 		return []byte{0x01}
 	}
-	return append([]byte{0x00}, EncodeInt(t, *value)...)
+	return append([]byte{0x00}, encodeInt(t, *value)...)
 }

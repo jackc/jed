@@ -19,7 +19,7 @@ import (
 
 // JsonPath is a compiled jsonpath. The body is EITHER an accessor path (produces a sequence) or a
 // top-level boolean predicate (`$.a == 1`, for jsonb_path_match / @@; jsonpath.md §6).
-type JsonPath struct {
+type jsonPath struct {
 	Strict bool
 	// Path holds the accessor steps when Pred == nil; Pred holds a top-level predicate otherwise.
 	// Exactly one is meaningful (Go has no sum types): Pred == nil ⇒ an accessor-path body.
@@ -130,18 +130,18 @@ type jpIndex struct {
 // jpUnsupported is a jsonpath construct that is valid in PostgreSQL but not yet supported by jed (a
 // deferred P1b follow-on): 0A000, a documented divergence.
 func jpUnsupported(what string) *EngineError {
-	return NewError(FeatureNotSupported, "jsonpath "+what+" is not supported yet")
+	return newError(FeatureNotSupported, "jsonpath "+what+" is not supported yet")
 }
 
 // jpMalformed is a malformed jsonpath literal: 42601 (PostgreSQL's syntax-error class for a bad
 // path literal).
 func jpMalformed(detail string) *EngineError {
-	return NewError(SyntaxError, "invalid jsonpath: "+detail)
+	return newError(SyntaxError, "invalid jsonpath: "+detail)
 }
 
 // Compile compiles a jsonpath source string (P1a structural subset). Malformed → 42601; a valid-PG
 // but unsupported construct → 0A000.
-func Compile(src string) (JsonPath, error) {
+func compile(src string) (jsonPath, error) {
 	p := &jpParser{s: []byte(src)}
 	p.skipWs()
 	// Optional mode word: strict / lax (default lax).
@@ -157,13 +157,13 @@ func Compile(src string) (JsonPath, error) {
 	if c, ok := p.peek(); ok && c == '(' {
 		pred, err := p.parsePred()
 		if err != nil {
-			return JsonPath{}, err
+			return jsonPath{}, err
 		}
 		p.skipWs()
 		if _, ok := p.peek(); ok {
-			return JsonPath{}, jpMalformed("unexpected trailing input in predicate")
+			return jsonPath{}, jpMalformed("unexpected trailing input in predicate")
 		}
-		return JsonPath{Strict: strict, Pred: pred}, nil
+		return jsonPath{Strict: strict, Pred: pred}, nil
 	}
 	// Remember the body start: if the accessor path turns out to be the LHS of a TOP-LEVEL
 	// predicate (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
@@ -171,16 +171,16 @@ func Compile(src string) (JsonPath, error) {
 	if !p.eat('$') {
 		// @, a variable, or a bare literal as a top-level path expression — the filter / scalar
 		// path-expression surface (a P1b follow-on).
-		return JsonPath{}, jpUnsupported("expressions other than a `$`-rooted accessor path")
+		return jsonPath{}, jpUnsupported("expressions other than a `$`-rooted accessor path")
 	}
 	// $name — a path variable (the $ immediately followed by a name char / quote) is a P1b
 	// follow-on (the bound-variable vars surface).
 	if c, ok := p.peek(); ok && (isMemberStart(c) || c == '"') {
-		return JsonPath{}, jpUnsupported("path variables `$name`")
+		return jsonPath{}, jpUnsupported("path variables `$name`")
 	}
 	steps, err := p.parseSteps()
 	if err != nil {
-		return JsonPath{}, err
+		return jsonPath{}, err
 	}
 	p.skipWs()
 	// After the accessor path: a comparison / logical operator makes the whole thing a top-level
@@ -188,39 +188,39 @@ func Compile(src string) (JsonPath, error) {
 	c, ok := p.peek()
 	if !ok {
 		// `$` alone is valid (the root document) — steps is empty in that case.
-		return JsonPath{Strict: strict, Path: steps}, nil
+		return jsonPath{Strict: strict, Path: steps}, nil
 	}
 	switch c {
 	case '=', '<', '>', '!', '&', '|':
 		p.i = bodyStart
 		pred, err := p.parsePred()
 		if err != nil {
-			return JsonPath{}, err
+			return jsonPath{}, err
 		}
 		p.skipWs()
 		if _, ok := p.peek(); ok {
-			return JsonPath{}, jpMalformed("unexpected trailing input in predicate")
+			return jsonPath{}, jpMalformed("unexpected trailing input in predicate")
 		}
-		return JsonPath{Strict: strict, Pred: pred}, nil
+		return jsonPath{Strict: strict, Pred: pred}, nil
 	case '+', '-', '*', '/', '%':
-		return JsonPath{}, jpUnsupported("path arithmetic")
+		return jsonPath{}, jpUnsupported("path arithmetic")
 	default:
 		// A trailing WORD predicate operator (`like_regex`, `starts with`, `is unknown`) is a
 		// top-level predicate too — deferred 0A000 (not malformed). Any other word is malformed.
 		if isAsciiAlpha(c) {
 			rest := string(p.s[p.i:])
 			if strings.HasPrefix(rest, "like_regex") || strings.HasPrefix(rest, "starts") || strings.HasPrefix(rest, "is") {
-				return JsonPath{}, jpUnsupported("top-level predicate expressions")
+				return jsonPath{}, jpUnsupported("top-level predicate expressions")
 			}
-			return JsonPath{}, jpMalformed("unexpected trailing input in path")
+			return jsonPath{}, jpMalformed("unexpected trailing input in path")
 		}
-		return JsonPath{}, jpMalformed("unexpected trailing input in path")
+		return jsonPath{}, jpMalformed("unexpected trailing input in path")
 	}
 }
 
 // Render is the canonical render (spec/design/jsonpath.md §2): strict kept / lax omitted; member
 // keys quoted; [*], [i], [i to j] subscripts; matches PostgreSQL's jsonpath_out.
-func (jp JsonPath) Render() string {
+func (jp jsonPath) Render() string {
 	var out strings.Builder
 	if jp.Strict {
 		out.WriteString("strict ")
@@ -331,7 +331,7 @@ func writeFiltExpr(e *jpFiltExpr, out *strings.Builder) {
 // auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); strict raises.
 // The P1b structural subset (no filters / item methods / arithmetic — those are still 0A000 at
 // compile).
-func (jp JsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
+func (jp jsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
 	if jp.Pred != nil {
 		// A top-level predicate → a single boolean item: TRUE iff the predicate is definitely true
 		// (unknown / false both render as `false`, matching PG's jsonb_path_query).
@@ -397,7 +397,7 @@ func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []
 		} else if !strict {
 			elems = []JsonNode{*item}
 		} else {
-			return nil, NewError(InvalidSqlJsonSubscript,
+			return nil, newError(InvalidSqlJsonSubscript,
 				"jsonpath array accessor can only be applied to an array")
 		}
 		for i := range step.subs {
@@ -416,7 +416,7 @@ func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []
 		if !strict {
 			return append(out, *item), nil
 		}
-		return nil, NewError(InvalidSqlJsonSubscript,
+		return nil, newError(InvalidSqlJsonSubscript,
 			"jsonpath wildcard array accessor can only be applied to an array")
 	default: // jpFilter
 		// `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
@@ -586,14 +586,14 @@ func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode) ([]Js
 			}
 		}
 		if strict {
-			return nil, NewError(SqlJsonItemCannotBeCastToTargetType,
+			return nil, newError(SqlJsonItemCannotBeCastToTargetType,
 				"JSON object does not contain key \""+key+"\"")
 		}
 		// lax: a missing member contributes no item (§4.2 rule 5).
 		return out, nil
 	}
 	if strict {
-		return nil, NewError(SqlJsonObjectNotFound,
+		return nil, newError(SqlJsonObjectNotFound,
 			"jsonpath member accessor can only be applied to an object")
 	}
 	// lax: a member accessor on a non-object/non-array contributes no item.
@@ -608,7 +608,7 @@ func wildcardMember(item *JsonNode, strict bool, out []JsonNode) ([]JsonNode, er
 		return out, nil
 	}
 	if strict {
-		return nil, NewError(SqlJsonObjectNotFound,
+		return nil, newError(SqlJsonObjectNotFound,
 			"jsonpath wildcard member accessor can only be applied to an object")
 	}
 	return out, nil
@@ -640,7 +640,7 @@ func subscript(elems []JsonNode, sub *jpSubscript, strict bool, out []JsonNode) 
 	if i >= 0 && i < length {
 		out = append(out, elems[i])
 	} else if strict {
-		return nil, NewError(InvalidSqlJsonSubscript,
+		return nil, newError(InvalidSqlJsonSubscript,
 			"jsonpath array subscript is out of bounds")
 	}
 	// lax: an out-of-range subscript contributes no item.

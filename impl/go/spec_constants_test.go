@@ -46,7 +46,7 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 		}
 		integers++
 		id := row.str("id")
-		st, ok := ScalarTypeFromName(id)
+		st, ok := scalarTypeFromName(id)
 		if !ok {
 			t.Fatalf("unknown type id %q", id)
 		}
@@ -69,7 +69,7 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 			t.Errorf("%s: rank got %d want %d", id, got, want)
 		}
 		for _, alias := range row.strs("aliases") {
-			if a, ok := ScalarTypeFromName(alias); !ok || a != st {
+			if a, ok := scalarTypeFromName(alias); !ok || a != st {
 				t.Errorf("alias %q should resolve to %s", alias, id)
 			}
 		}
@@ -90,7 +90,7 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 	if !boolean.boolVal("storable") {
 		t.Errorf("boolean must be storable this slice")
 	}
-	boolTy, ok := ScalarTypeFromName("boolean")
+	boolTy, ok := scalarTypeFromName("boolean")
 	if !ok {
 		t.Fatalf("boolean should resolve to a ScalarType")
 	}
@@ -98,7 +98,7 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 		t.Errorf("boolean: canonical name mismatch")
 	}
 	for _, alias := range boolean.strs("aliases") {
-		if a, ok := ScalarTypeFromName(alias); !ok || a != boolTy {
+		if a, ok := scalarTypeFromName(alias); !ok || a != boolTy {
 			t.Errorf("alias %q should resolve to boolean", alias)
 		}
 	}
@@ -115,7 +115,7 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 			text = &tables[i]
 		}
 	}
-	if text == nil || !text.boolVal("storable") || mustType(t, "text") != Text {
+	if text == nil || !text.boolVal("storable") || mustType(t, "text") != scalarText {
 		t.Error("text type missing or not storable")
 	}
 	if decimal == nil {
@@ -127,21 +127,21 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 	if !decimal.boolVal("storable") {
 		t.Errorf("decimal must be storable")
 	}
-	if DecimalType.CanonicalName() != "decimal" {
+	if scalarDecimal.CanonicalName() != "decimal" {
 		t.Errorf("decimal canonical name mismatch")
 	}
 	for _, name := range []string{"decimal", "numeric", "dec"} {
-		if got, ok := ScalarTypeFromName(name); !ok || got != DecimalType {
+		if got, ok := scalarTypeFromName(name); !ok || got != scalarDecimal {
 			t.Errorf("%q should resolve to decimal", name)
 		}
 	}
-	if got, want := decimal.int("max_precision"), int64(MaxPrecision); got != want {
+	if got, want := decimal.int("max_precision"), int64(maxPrecision); got != want {
 		t.Errorf("max_precision: spec %d, module %d", got, want)
 	}
-	if got, want := decimal.int("max_scale"), int64(MaxScale); got != want {
+	if got, want := decimal.int("max_scale"), int64(maxScale); got != want {
 		t.Errorf("max_scale: spec %d, module %d", got, want)
 	}
-	if got, want := decimal.int("max_int_digits"), int64(MaxIntDigits); got != want {
+	if got, want := decimal.int("max_int_digits"), int64(decimalMaxIntDigits); got != want {
 		t.Errorf("max_int_digits: spec %d, module %d", got, want)
 	}
 
@@ -162,20 +162,20 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 	if !uuid.boolVal("storable") {
 		t.Errorf("uuid must be storable")
 	}
-	if got, ok := ScalarTypeFromName("uuid"); !ok || got != Uuid {
+	if got, ok := scalarTypeFromName("uuid"); !ok || got != scalarUuid {
 		t.Errorf("\"uuid\" should resolve to Uuid")
 	}
-	if Uuid.CanonicalName() != "uuid" {
+	if scalarUuid.CanonicalName() != "uuid" {
 		t.Errorf("uuid canonical name mismatch")
 	}
-	if Uuid.WidthBytes() != 16 {
-		t.Errorf("uuid should be fixed 16 bytes, got %d", Uuid.WidthBytes())
+	if scalarUuid.WidthBytes() != 16 {
+		t.Errorf("uuid should be fixed 16 bytes, got %d", scalarUuid.WidthBytes())
 	}
 }
 
-func mustType(t *testing.T, name string) ScalarType {
+func mustType(t *testing.T, name string) scalarType {
 	t.Helper()
-	ty, ok := ScalarTypeFromName(name)
+	ty, ok := scalarTypeFromName(name)
 	if !ok {
 		t.Fatalf("type %q should resolve", name)
 	}
@@ -188,11 +188,11 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 	// compiles the generated Errors slice in and asserts it matches registry.toml row-for-row
 	// (the enum is not iterable, so the cross-check walks Errors).
 	rows := readTomlTables(t, specPath(t, "errors/registry.toml"), "error")
-	if len(rows) != len(Errors) {
-		t.Fatalf("error count: registry %d, generated %d", len(rows), len(Errors))
+	if len(rows) != len(errorDescs) {
+		t.Fatalf("error count: registry %d, generated %d", len(rows), len(errorDescs))
 	}
 	for i, row := range rows {
-		d := Errors[i]
+		d := errorDescs[i]
 		if d.Code != row.str("code") {
 			t.Errorf("row %d code: got %q, want %q", i, d.Code, row.str("code"))
 		}
@@ -216,18 +216,18 @@ func TestOperatorsMatchSpec(t *testing.T) {
 	// The generated operator descriptor table (codegen middle path, CLAUDE.md §5) must
 	// match the canonical catalog field-for-field.
 	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "operator")
-	if len(rows) != len(Operators) {
-		t.Fatalf("operator count: spec %d, generated %d", len(rows), len(Operators))
+	if len(rows) != len(operators) {
+		t.Fatalf("operator count: spec %d, generated %d", len(rows), len(operators))
 	}
 	// Operators are overloaded across operand families (one row per (name, arg_families)
 	// — e.g. `eq` for integer and for text), so match on the full signature, not the name.
-	find := func(name string, fams []string) (OperatorDesc, bool) {
-		for _, d := range Operators {
+	find := func(name string, fams []string) (operatorDesc, bool) {
+		for _, d := range operators {
 			if d.Name == name && strings.Join(d.ArgFamilies, ",") == strings.Join(fams, ",") {
 				return d, true
 			}
 		}
-		return OperatorDesc{}, false
+		return operatorDesc{}, false
 	}
 	for _, row := range rows {
 		name := row.str("name")
@@ -285,16 +285,16 @@ func TestAggregatesMatchSpec(t *testing.T) {
 	// [[aggregate]] rows field-for-field (codegen middle path, CLAUDE.md §5). Aggregates are
 	// overloaded across operand families (one row per (name, arg_families)), like operators.
 	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "aggregate")
-	if len(rows) != len(Aggregates) {
-		t.Fatalf("aggregate count: spec %d, generated %d", len(rows), len(Aggregates))
+	if len(rows) != len(aggregates) {
+		t.Fatalf("aggregate count: spec %d, generated %d", len(rows), len(aggregates))
 	}
-	find := func(name string, fams []string) (AggregateDesc, bool) {
-		for _, d := range Aggregates {
+	find := func(name string, fams []string) (aggregateDesc, bool) {
+		for _, d := range aggregates {
 			if d.Name == name && strings.Join(d.ArgFamilies, ",") == strings.Join(fams, ",") {
 				return d, true
 			}
 		}
-		return AggregateDesc{}, false
+		return aggregateDesc{}, false
 	}
 	for _, row := range rows {
 		name := row.str("name")
@@ -328,16 +328,16 @@ func TestSetReturningMatchSpec(t *testing.T) {
 	// [[set_returning]] rows field-for-field (codegen middle path, CLAUDE.md §5). SRFs are
 	// overloaded across ARITY (one row per (name, arity)) — functions.md §10.
 	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "set_returning")
-	if len(rows) != len(SetReturning) {
-		t.Fatalf("set_returning count: spec %d, generated %d", len(rows), len(SetReturning))
+	if len(rows) != len(setReturning) {
+		t.Fatalf("set_returning count: spec %d, generated %d", len(rows), len(setReturning))
 	}
-	find := func(name string, arity int64) (SetReturningDesc, bool) {
-		for _, d := range SetReturning {
+	find := func(name string, arity int64) (setReturningDesc, bool) {
+		for _, d := range setReturning {
 			if d.Name == name && int64(d.Arity) == arity {
 				return d, true
 			}
 		}
-		return SetReturningDesc{}, false
+		return setReturningDesc{}, false
 	}
 	for _, row := range rows {
 		name := row.str("name")
@@ -383,45 +383,45 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 	weight := func(id string) int64 {
 		switch id {
 		case "storage_row_read":
-			return Costs.StorageRowRead
+			return costs.StorageRowRead
 		case "page_read":
-			return Costs.PageRead
+			return costs.PageRead
 		case "value_compress":
-			return Costs.ValueCompress
+			return costs.ValueCompress
 		case "value_decompress":
-			return Costs.ValueDecompress
+			return costs.ValueDecompress
 		case "decimal_work":
-			return Costs.DecimalWork
+			return costs.DecimalWork
 		case "row_produced":
-			return Costs.RowProduced
+			return costs.RowProduced
 		case "operator_eval":
-			return Costs.OperatorEval
+			return costs.OperatorEval
 		case "aggregate_accumulate":
-			return Costs.AggregateAccumulate
+			return costs.AggregateAccumulate
 		case "cte_scan_row":
-			return Costs.CteScanRow
+			return costs.CteScanRow
 		case "generated_row":
-			return Costs.GeneratedRow
+			return costs.GeneratedRow
 		case "sequence_advance":
-			return Costs.SequenceAdvance
+			return costs.SequenceAdvance
 		case "gin_entry":
-			return Costs.GinEntry
+			return costs.GinEntry
 		case "gist_descent":
-			return Costs.GistDescent
+			return costs.GistDescent
 		case "collate":
-			return Costs.Collate
+			return costs.Collate
 		case "timezone":
-			return Costs.Timezone
+			return costs.Timezone
 		case "regex_compile":
-			return Costs.RegexCompile
+			return costs.RegexCompile
 		case "regex_step":
-			return Costs.RegexStep
+			return costs.RegexStep
 		case "window_result":
-			return Costs.WindowResult
+			return costs.WindowResult
 		case "window_frame_step":
-			return Costs.WindowFrameStep
+			return costs.WindowFrameStep
 		case "varlen_compare":
-			return Costs.VarlenCompare
+			return costs.VarlenCompare
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0
@@ -462,11 +462,11 @@ func TestRegistryCoversCatalog(t *testing.T) {
 		case "jsonb":
 			return resolvedType{kind: rtJsonb}
 		default: // "integer" or "any"
-			return resolvedType{kind: rtInt, intTy: Int32}
+			return resolvedType{kind: rtInt, intTy: scalarInt32}
 		}
 	}
-	for i := range Operators {
-		o := &Operators[i]
+	for i := range operators {
+		o := &operators[i]
 		if o.Kind != "function" {
 			continue
 		}
@@ -477,9 +477,9 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			// A concrete array result `<scalar>[]` (array_positions → "i32[]") is also valid.
 			concreteArray := false
 			if base, ok := strings.CutSuffix(o.Result, "[]"); ok {
-				_, concreteArray = ScalarTypeFromName(base)
+				_, concreteArray = scalarTypeFromName(base)
 			}
-			if _, ok := ScalarTypeFromName(o.Result); o.Result != "anyarray" && o.Result != "anyelement" && !concreteArray && !ok {
+			if _, ok := scalarTypeFromName(o.Result); o.Result != "anyarray" && o.Result != "anyelement" && !concreteArray && !ok {
 				t.Fatalf("array function %s has unhandled result code %s", o.Name, o.Result)
 			}
 			continue
@@ -489,13 +489,13 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			// builders route to jsonBuildClassify + an reJsonBuild node (json/jsonb result); the count
 			// functions (num_nulls/num_nonnulls) keep variadicFuncID + reVariadic (a concrete scalar id).
 			if _, _, isBuild := jsonBuildClassify(o.Name); isBuild {
-				if _, ok := ScalarTypeFromName(o.Result); !ok {
+				if _, ok := scalarTypeFromName(o.Result); !ok {
 					t.Fatalf("json builder %s has unhandled result code %s", o.Name, o.Result)
 				}
 				continue
 			}
 			_ = variadicFuncID(o.Name) // panics if the name has no kernel id
-			if _, ok := ScalarTypeFromName(o.Result); !ok {
+			if _, ok := scalarTypeFromName(o.Result); !ok {
 				t.Fatalf("variadic function %s has unhandled result code %s", o.Name, o.Result)
 			}
 			continue
@@ -513,7 +513,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			// A polymorphic range accessor (range-functions.md §1): its kernel id comes from
 			// rangeFuncID and its result is a reserved poly code (anyelement) or a scalar id (boolean).
 			_ = rangeFuncID(o.Name) // panics if the name has no kernel id
-			if _, ok := ScalarTypeFromName(o.Result); o.Result != "anyelement" && !ok {
+			if _, ok := scalarTypeFromName(o.Result); o.Result != "anyelement" && !ok {
 				t.Fatalf("range function %s has unhandled result code %s", o.Name, o.Result)
 			}
 			continue
@@ -533,9 +533,9 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			// i32) or a concrete text[] code.
 			concreteArray := false
 			if base, ok := strings.CutSuffix(o.Result, "[]"); ok {
-				_, concreteArray = ScalarTypeFromName(base)
+				_, concreteArray = scalarTypeFromName(base)
 			}
-			if _, ok := ScalarTypeFromName(o.Result); !ok && !concreteArray {
+			if _, ok := scalarTypeFromName(o.Result); !ok && !concreteArray {
 				t.Fatalf("regex function %s has unhandled result code %s", o.Name, o.Result)
 			}
 			continue
@@ -546,7 +546,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 		}
 		_ = scalarFuncID(o.Name, tys) // panics if the name has no kernel id
 		// The result code is "promoted" or a literal scalar-type id.
-		if _, ok := ScalarTypeFromName(o.Result); o.Result != "promoted" && !ok {
+		if _, ok := scalarTypeFromName(o.Result); o.Result != "promoted" && !ok {
 			t.Fatalf("function %s has unhandled result code %s", o.Name, o.Result)
 		}
 		// make_interval / make_timestamp / make_timestamptz resolve on their own named path (§11);
@@ -556,8 +556,8 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			t.Fatalf("function %s %v has no registry overload", o.Name, o.ArgFamilies)
 		}
 	}
-	for i := range Aggregates {
-		a := &Aggregates[i]
+	for i := range aggregates {
+		a := &aggregates[i]
 		switch a.Result {
 		case "i64", "decimal", "sum_widen", "same_as_input", "json", "jsonb":
 		default:
@@ -588,19 +588,19 @@ func TestRegistryCoversCatalog(t *testing.T) {
 // (the latent gap this guards against — a mis-parsed key on a multi-column index with a
 // text/decimal/bytea/interval trailing key column under an equality on the leading column).
 func TestIsFixedWidthPartitionsWidthBytes(t *testing.T) {
-	for _, st := range AllScalarTypes() {
+	for _, st := range allScalarTypes() {
 		if got, want := st.IsFixedWidth(), st.WidthBytes() != 0; got != want {
 			t.Errorf("%v: IsFixedWidth=%v but WidthBytes=%d", st, got, st.WidthBytes())
 		}
 	}
 	// The concrete partition, spelled out so the intent is legible and all 14 types are accounted
 	// for (4 variable-width + 10 fixed-width).
-	for _, st := range []ScalarType{Text, DecimalType, Bytea, IntervalType} {
+	for _, st := range []scalarType{scalarText, scalarDecimal, scalarBytea, scalarInterval} {
 		if st.IsFixedWidth() {
 			t.Errorf("%v should be variable-width", st)
 		}
 	}
-	for _, st := range []ScalarType{Int16, Int32, Int64, Bool, Uuid, Timestamp, Timestamptz, Float32, Float64, Date} {
+	for _, st := range []scalarType{scalarInt16, scalarInt32, scalarInt64, scalarBool, scalarUuid, scalarTimestamp, scalarTimestamptz, scalarFloat32, scalarFloat64, scalarDate} {
 		if !st.IsFixedWidth() {
 			t.Errorf("%v should be fixed-width", st)
 		}

@@ -25,7 +25,7 @@ const lazyPageSize = 256
 // external-plain (incompressible 600-char filler → a 3-page chain), id 2 external-compressed
 // (half filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 // inline-compressed (a 600-char run), id 4 plain inline.
-func lazySeed(t *testing.T, db *Engine) {
+func lazySeed(t *testing.T, db *engine) {
 	t.Helper()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	plain := fillerText(600)
@@ -69,7 +69,7 @@ func corruptOverflowPayloads(t *testing.T, path string) {
 // touching the spilled column fails XX001 — read-on-touch, physically.
 func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_touch.jed")
-	db, err := Create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	corruptOverflowPayloads(t, path)
 
 	// Open walks live chains by headers only — corrupt payloads are invisible.
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	// Touching the spilled column reads the chain: the corruption surfaces as XX001 —
 	// non-UTF-8 for the external-plain text, a malformed LZ4 block for external-compressed.
 	for _, id := range []int{1, 2} {
-		_, err := Execute(db, fmt.Sprintf("SELECT body FROM t WHERE id = %d", id))
+		_, err := execute(db, fmt.Sprintf("SELECT body FROM t WHERE id = %d", id))
 		if err == nil {
 			t.Fatalf("id %d: a corrupted chain must fail when touched", id)
 		}
@@ -118,7 +118,7 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 // All three lazy forms materialize exactly through the paged path (resolution correctness).
 func TestLazyValuesRoundTripExactly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_roundtrip.jed")
-	db, err := Create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestLazyValuesRoundTripExactly(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestLazyValuesRoundTripExactly(t *testing.T) {
 func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_update.jed")
 	big := fillerText(600)
-	db, err := Create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,9 +192,9 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 // units equal the resident disposition plan's by construction.
 func TestLazyPagedAndResidentCostsMatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_cost.jed")
-	mem := WithPageSize(lazyPageSize)
+	mem := withPageSize(lazyPageSize)
 	lazySeed(t, mem)
-	db, err := Create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestLazyPagedAndResidentCostsMatch(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	paged, err := Open(path)
+	paged, err := open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

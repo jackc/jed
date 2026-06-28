@@ -53,7 +53,7 @@ func absI64(v int64) int64 {
 
 // decimalScaled builds a numeric from an unscaled int64 and a scale (value = unscaled * 10^-scale).
 func decimalScaled(unscaled int64, scale uint32) Decimal {
-	return DecimalFromDigitsScale(unscaled < 0, strconv.FormatInt(absI64(unscaled), 10), scale)
+	return decimalFromDigitsScale(unscaled < 0, strconv.FormatInt(absI64(unscaled), 10), scale)
 }
 
 // dowSun0 is the day of week, 0 = Sunday .. 6 = Saturday (PG `dow`). 1970-01-01 was a Thursday (=4).
@@ -123,7 +123,7 @@ func intervalQuarter(mo int64) int64 {
 // DateTruncMicros truncates a wall-clock instant `micros` down to the start of `unit`. ±infinity
 // passes through; an unrecognized unit is 22023.
 func dateTruncMicros(unit string, micros int64) (int64, error) {
-	if micros == PosInfinity || micros == NegInfinity {
+	if micros == posInfinity || micros == negInfinity {
 		return micros, nil
 	}
 	u := strings.ToLower(unit)
@@ -177,7 +177,7 @@ func dateTruncMicros(unit string, micros int64) (int64, error) {
 		}
 		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0), nil
 	default:
-		return 0, NewError(InvalidParameterValue, "unit \""+unit+"\" not recognized")
+		return 0, newError(InvalidParameterValue, "unit \""+unit+"\" not recognized")
 	}
 }
 
@@ -202,7 +202,7 @@ func dateTruncInterval(unit string, iv Interval) (Interval, error) {
 	case "day":
 		return keepMd(0), nil
 	case "week":
-		return Interval{}, NewError(FeatureNotSupported, "unit \"week\" not supported for type interval")
+		return Interval{}, newError(FeatureNotSupported, "unit \"week\" not supported for type interval")
 	case "month":
 		return Interval{Months: iv.Months}, nil
 	case "quarter":
@@ -216,7 +216,7 @@ func dateTruncInterval(unit string, iv Interval) (Interval, error) {
 	case "millennium":
 		return Interval{Months: int32((months / 12000) * 12000)}, nil
 	default:
-		return Interval{}, NewError(InvalidParameterValue, "unit \""+unit+"\" not recognized")
+		return Interval{}, newError(InvalidParameterValue, "unit \""+unit+"\" not recognized")
 	}
 }
 
@@ -257,10 +257,10 @@ func extractField(field string, src extractSrc) (Decimal, error) {
 }
 
 func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs int64) (Decimal, error) {
-	if micros == PosInfinity || micros == NegInfinity {
+	if micros == posInfinity || micros == negInfinity {
 		// jed's decimal is finite-only (decimal.md §2); PG returns ±Infinity — a documented
 		// divergence (timezones.md §9.2).
-		return Decimal{}, NewError(NumericValueOutOfRange, "cannot extract field from an infinite timestamp")
+		return Decimal{}, newError(NumericValueOutOfRange, "cannot extract field from an infinite timestamp")
 	}
 	y, mo, d, h, mi, s, us := civilFromMicros(micros)
 	secUs := s*microsPerSecDT + us
@@ -273,35 +273,35 @@ func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs 
 	case "second":
 		return decimalScaled(secUs, 6), nil
 	case "minute":
-		return DecimalFromInt64(mi), nil
+		return decimalFromInt64(mi), nil
 	case "hour":
-		return DecimalFromInt64(h), nil
+		return decimalFromInt64(h), nil
 	case "day":
-		return DecimalFromInt64(d), nil
+		return decimalFromInt64(d), nil
 	case "month":
-		return DecimalFromInt64(mo), nil
+		return decimalFromInt64(mo), nil
 	case "quarter":
-		return DecimalFromInt64((mo-1)/3 + 1), nil
+		return decimalFromInt64((mo-1)/3 + 1), nil
 	case "year":
-		return DecimalFromInt64(toPgYear(y)), nil
+		return decimalFromInt64(toPgYear(y)), nil
 	case "decade":
-		return DecimalFromInt64(extractDecade(toPgYear(y))), nil
+		return decimalFromInt64(extractDecade(toPgYear(y))), nil
 	case "century":
-		return DecimalFromInt64(extractCentury(toPgYear(y))), nil
+		return decimalFromInt64(extractCentury(toPgYear(y))), nil
 	case "millennium":
-		return DecimalFromInt64(extractMillennium(toPgYear(y))), nil
+		return decimalFromInt64(extractMillennium(toPgYear(y))), nil
 	case "week":
 		w, _ := isoWeekYear(y, mo, d)
-		return DecimalFromInt64(w), nil
+		return decimalFromInt64(w), nil
 	case "dow":
-		return DecimalFromInt64(dowSun0(days)), nil
+		return decimalFromInt64(dowSun0(days)), nil
 	case "isodow":
-		return DecimalFromInt64(isodowMon1(days)), nil
+		return decimalFromInt64(isodowMon1(days)), nil
 	case "doy":
-		return DecimalFromInt64(days - daysFromCivil(y, 1, 1) + 1), nil
+		return decimalFromInt64(days - daysFromCivil(y, 1, 1) + 1), nil
 	case "isoyear":
 		_, iy := isoWeekYear(y, mo, d)
-		return DecimalFromInt64(toPgYear(iy)), nil
+		return decimalFromInt64(toPgYear(iy)), nil
 	case "epoch":
 		inst := micros
 		if isTz {
@@ -310,21 +310,21 @@ func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs 
 		return decimalScaled(inst, 6), nil
 	case "timezone", "timezone_hour", "timezone_minute":
 		if !isTz {
-			return Decimal{}, NewError(FeatureNotSupported,
+			return Decimal{}, newError(FeatureNotSupported,
 				"unit \""+field+"\" not supported for type timestamp without time zone")
 		}
 		switch field {
 		case "timezone":
-			return DecimalFromInt64(offsetSecs), nil
+			return decimalFromInt64(offsetSecs), nil
 		case "timezone_hour":
-			return DecimalFromInt64(offsetSecs / 3600), nil
+			return decimalFromInt64(offsetSecs / 3600), nil
 		default:
-			return DecimalFromInt64((offsetSecs % 3600) / 60), nil
+			return decimalFromInt64((offsetSecs % 3600) / 60), nil
 		}
 	case "julian":
-		return Decimal{}, NewError(FeatureNotSupported, "unit \"julian\" not supported yet (jed deferred)")
+		return Decimal{}, newError(FeatureNotSupported, "unit \"julian\" not supported yet (jed deferred)")
 	default:
-		return Decimal{}, NewError(InvalidParameterValue, "unit \""+field+"\" not recognized")
+		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized")
 	}
 }
 
@@ -332,38 +332,38 @@ func extractDate(field string, days int64) (Decimal, error) {
 	y, mo, d := civilFromDays(days)
 	switch field {
 	case "day":
-		return DecimalFromInt64(d), nil
+		return decimalFromInt64(d), nil
 	case "month":
-		return DecimalFromInt64(mo), nil
+		return decimalFromInt64(mo), nil
 	case "quarter":
-		return DecimalFromInt64((mo-1)/3 + 1), nil
+		return decimalFromInt64((mo-1)/3 + 1), nil
 	case "year":
-		return DecimalFromInt64(toPgYear(y)), nil
+		return decimalFromInt64(toPgYear(y)), nil
 	case "decade":
-		return DecimalFromInt64(extractDecade(toPgYear(y))), nil
+		return decimalFromInt64(extractDecade(toPgYear(y))), nil
 	case "century":
-		return DecimalFromInt64(extractCentury(toPgYear(y))), nil
+		return decimalFromInt64(extractCentury(toPgYear(y))), nil
 	case "millennium":
-		return DecimalFromInt64(extractMillennium(toPgYear(y))), nil
+		return decimalFromInt64(extractMillennium(toPgYear(y))), nil
 	case "week":
 		w, _ := isoWeekYear(y, mo, d)
-		return DecimalFromInt64(w), nil
+		return decimalFromInt64(w), nil
 	case "dow":
-		return DecimalFromInt64(dowSun0(days)), nil
+		return decimalFromInt64(dowSun0(days)), nil
 	case "isodow":
-		return DecimalFromInt64(isodowMon1(days)), nil
+		return decimalFromInt64(isodowMon1(days)), nil
 	case "doy":
-		return DecimalFromInt64(days - daysFromCivil(y, 1, 1) + 1), nil
+		return decimalFromInt64(days - daysFromCivil(y, 1, 1) + 1), nil
 	case "isoyear":
 		_, iy := isoWeekYear(y, mo, d)
-		return DecimalFromInt64(toPgYear(iy)), nil
+		return decimalFromInt64(toPgYear(iy)), nil
 	case "epoch":
-		return DecimalFromInt64(days * secsPerDayDT), nil
+		return decimalFromInt64(days * secsPerDayDT), nil
 	case "microseconds", "milliseconds", "second", "minute", "hour",
 		"timezone", "timezone_hour", "timezone_minute", "julian":
-		return Decimal{}, NewError(FeatureNotSupported, "unit \""+field+"\" not supported for type date")
+		return Decimal{}, newError(FeatureNotSupported, "unit \""+field+"\" not supported for type date")
 	default:
-		return Decimal{}, NewError(InvalidParameterValue, "unit \""+field+"\" not recognized")
+		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized")
 	}
 }
 
@@ -382,32 +382,32 @@ func extractInterval(field string, iv Interval) (Decimal, error) {
 	case "second":
 		return decimalScaled(timeSecUs, 6), nil
 	case "minute":
-		return DecimalFromInt64((micros / microsPerMinDT) % 60), nil
+		return decimalFromInt64((micros / microsPerMinDT) % 60), nil
 	case "hour":
-		return DecimalFromInt64(micros / microsPerHourDT), nil
+		return decimalFromInt64(micros / microsPerHourDT), nil
 	case "day":
-		return DecimalFromInt64(days), nil
+		return decimalFromInt64(days), nil
 	case "week":
-		return DecimalFromInt64(days / 7), nil
+		return decimalFromInt64(days / 7), nil
 	case "month":
-		return DecimalFromInt64(mo), nil
+		return decimalFromInt64(mo), nil
 	case "quarter":
-		return DecimalFromInt64(intervalQuarter(mo)), nil
+		return decimalFromInt64(intervalQuarter(mo)), nil
 	case "year":
-		return DecimalFromInt64(years), nil
+		return decimalFromInt64(years), nil
 	case "decade":
-		return DecimalFromInt64(years / 10), nil
+		return decimalFromInt64(years / 10), nil
 	case "century":
-		return DecimalFromInt64(years / 100), nil
+		return decimalFromInt64(years / 100), nil
 	case "millennium":
-		return DecimalFromInt64(years / 1000), nil
+		return decimalFromInt64(years / 1000), nil
 	case "epoch":
 		intSecs := years*secsPerIntervalYear + mo*secsPerIntervalMonth + days*secsPerDayDT
-		return DecimalFromInt64(intSecs).Add(decimalScaled(micros, 6))
+		return decimalFromInt64(intSecs).Add(decimalScaled(micros, 6))
 	case "dow", "isodow", "doy", "isoyear", "julian",
 		"timezone", "timezone_hour", "timezone_minute":
-		return Decimal{}, NewError(FeatureNotSupported, "unit \""+field+"\" not supported for type interval")
+		return Decimal{}, newError(FeatureNotSupported, "unit \""+field+"\" not supported for type interval")
 	default:
-		return Decimal{}, NewError(InvalidParameterValue, "unit \""+field+"\" not recognized")
+		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized")
 	}
 }

@@ -12,9 +12,9 @@ package jed
 import "testing"
 
 // varScalar runs a single-row, single-column query and returns the lone value.
-func varScalar(t *testing.T, db *Engine, sql string) Value {
+func varScalar(t *testing.T, db *engine, sql string) Value {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -24,9 +24,9 @@ func varScalar(t *testing.T, db *Engine, sql string) Value {
 	return out.Rows[0][0]
 }
 
-func varErrCode(t *testing.T, db *Engine, sql string) string {
+func varErrCode(t *testing.T, db *engine, sql string) string {
 	t.Helper()
-	_, err := Execute(db, sql)
+	_, err := execute(db, sql)
 	if err == nil {
 		t.Fatalf("%q: expected an error", sql)
 	}
@@ -42,7 +42,7 @@ func mustText(t *testing.T, v Value, want string) {
 
 func TestVarHostSetAndReadRoundTrip(t *testing.T) {
 	// SetVar stores; Var reads it back through the host API; current_setting reads it in SQL.
-	db := NewEngine()
+	db := newEngine()
 	if _, ok := db.Var("myapp.tenant"); ok {
 		t.Fatal("fresh var should be unset")
 	}
@@ -58,7 +58,7 @@ func TestVarHostSetAndReadRoundTrip(t *testing.T) {
 func TestVarSetAndResetRejectANonDottedName(t *testing.T) {
 	// A variable must be namespaced (dotted) — a non-dotted name is a built-in setting name, and v1
 	// exposes none through this map (the time_zone built-in is its own slice), so it is 42704.
-	db := NewEngine()
+	db := newEngine()
 	if err := db.SetVar("bogus", "x"); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("SetVar non-dotted: want 42704, got %v", err)
 	}
@@ -72,7 +72,7 @@ func TestVarSetAndResetRejectANonDottedName(t *testing.T) {
 }
 
 func TestVarResetRemovesAndIsIdempotent(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if err := db.SetVar("myapp.k", "v"); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestVarResetRemovesAndIsIdempotent(t *testing.T) {
 
 func TestVarNamesAreCaseInsensitiveButValuesAreVerbatim(t *testing.T) {
 	// The NAME folds to lowercase (PG GUC names are case-insensitive); the VALUE is preserved exactly.
-	db := NewEngine()
+	db := newEngine()
 	if err := db.SetVar("myApp.Tenant", "AcmeCorp"); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestVarNamesAreCaseInsensitiveButValuesAreVerbatim(t *testing.T) {
 }
 
 func TestVarMissingOkTurnsTheUnsetErrorIntoNull(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if got := varErrCode(t, db, "SELECT current_setting('myapp.unset')"); got != "42704" {
 		t.Fatalf("one-arg unset: want 42704, got %s", got)
 	}
@@ -122,7 +122,7 @@ func TestVarMissingOkTurnsTheUnsetErrorIntoNull(t *testing.T) {
 func TestVarNullNamePropagatesToNull(t *testing.T) {
 	// null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
 	// a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
-	db := NewEngine()
+	db := newEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, n text)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, NULL)")
 	if err := db.SetVar("myapp.x", "set"); err != nil {
@@ -136,7 +136,7 @@ func TestVarNullNamePropagatesToNull(t *testing.T) {
 func TestVarsAreSessionStateNotSnapshotState(t *testing.T) {
 	// Variables are SESSION state, not snapshot state (§6.1): a ROLLBACK undoes DATA but never a
 	// session variable (PG SET SESSION). Set one outside, one inside a block, roll back — both survive.
-	db := NewEngine()
+	db := newEngine()
 	if err := db.SetVar("myapp.outer", "a"); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestVarAdditionalSessionHasIndependentVariables(t *testing.T) {
 
 func TestVarResetVarsClearsEveryVariable(t *testing.T) {
 	// ResetVars is PG RESET ALL for the variable map.
-	db := NewEngine()
+	db := newEngine()
 	if err := db.SetVar("myapp.a", "1"); err != nil {
 		t.Fatal(err)
 	}

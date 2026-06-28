@@ -125,11 +125,11 @@ func (p *regexProgram) classListing() []string {
 }
 
 func regexInvalid(detail string) error {
-	return NewError(InvalidRegularExpression, "invalid regular expression: "+detail)
+	return newError(InvalidRegularExpression, "invalid regular expression: "+detail)
 }
 
 func regexTooComplex() error {
-	return NewError(StatementTooComplex,
+	return newError(StatementTooComplex,
 		fmt.Sprintf("regular expression compiles to more than %d instructions", maxRegexProgram))
 }
 
@@ -807,14 +807,14 @@ type regexThread struct {
 }
 
 // isMatch reports whether the pattern matches somewhere in input (the `~` operator).
-func (p *regexProgram) isMatch(input []rune, m *Meter) (bool, error) {
+func (p *regexProgram) isMatch(input []rune, m *costMeter) (bool, error) {
 	caps, err := p.run(input, m)
 	return caps != nil, err
 }
 
 // run executes the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
 // capture slots on a match (code-point offsets; -1 = unset), or nil.
-func (p *regexProgram) run(input []rune, m *Meter) ([]int64, error) {
+func (p *regexProgram) run(input []rune, m *costMeter) ([]int64, error) {
 	return p.search(input, 0, m)
 }
 
@@ -822,7 +822,7 @@ func (p *regexProgram) run(input []rune, m *Meter) ([]int64, error) {
 // later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
 // input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
 // guards once per input position.
-func (p *regexProgram) search(input []rune, start int, m *Meter) ([]int64, error) {
+func (p *regexProgram) search(input []rune, start int, m *costMeter) ([]int64, error) {
 	nslots := 2 * (p.ngroups + 1)
 	length := len(input)
 	seen := make([]uint32, len(p.insts))
@@ -886,7 +886,7 @@ func (p *regexProgram) search(input []rune, start int, m *Meter) ([]int64, error
 // consuming/Match threads to *list, deduping by pc within this generation. Iterative (explicit
 // stack) so a long Jmp/Split chain cannot overflow the native stack; the y arm of a Split is pushed
 // before x so x is processed first (higher priority). Charges regex_step per explored state.
-func (p *regexProgram) addThread(list *[]regexThread, seen []uint32, generation uint32, pc0 int, saves0 []int64, sp, length int, m *Meter) error {
+func (p *regexProgram) addThread(list *[]regexThread, seen []uint32, generation uint32, pc0 int, saves0 []int64, sp, length int, m *costMeter) error {
 	type frame struct {
 		pc    int
 		saves []int64
@@ -899,7 +899,7 @@ func (p *regexProgram) addThread(list *[]regexThread, seen []uint32, generation 
 			continue
 		}
 		seen[top.pc] = generation
-		m.Charge(Costs.RegexStep)
+		m.Charge(costs.RegexStep)
 		in := p.insts[top.pc]
 		switch in.op {
 		case opJmp:
@@ -934,7 +934,7 @@ func (p *regexProgram) addThread(list *[]regexThread, seen []uint32, generation 
 // has no group — the PG rule), an unset group being a nil pointer. Returns ok=false on no match.
 // matchInput is the (possibly case-folded) subject the VM matches; origInput is the ORIGINAL-case
 // subject the returned substrings are sliced from (same length).
-func (p *regexProgram) regexpMatch(matchInput, origInput []rune, m *Meter) (groups []*string, ok bool, err error) {
+func (p *regexProgram) regexpMatch(matchInput, origInput []rune, m *costMeter) (groups []*string, ok bool, err error) {
 	saves, err := p.search(matchInput, 0, m)
 	if err != nil {
 		return nil, false, err
@@ -956,7 +956,7 @@ func (p *regexProgram) regexpMatch(matchInput, origInput []rune, m *Meter) (grou
 // match (or all when global) by the replacement TEMPLATE (\1..\9 = capture group, \& = whole match,
 // \\ = literal backslash). Non-matched text and captured substrings come from origInput (original
 // case); the VM matches over matchInput (possibly case-folded).
-func (p *regexProgram) regexpReplace(matchInput, origInput, replacement []rune, global bool, m *Meter) (string, error) {
+func (p *regexProgram) regexpReplace(matchInput, origInput, replacement []rune, global bool, m *costMeter) (string, error) {
 	var out []rune
 	pos := 0
 	for {
@@ -997,7 +997,7 @@ func (p *regexProgram) regexpReplace(matchInput, origInput, replacement []rune, 
 // continue at e, or at e+1 for an EMPTY match so a nullable pattern terminates. `start` may be up to
 // len (an empty match at the very end still counts); start > len (clamped to len+1 by the caller)
 // yields 0.
-func (p *regexProgram) regexpCount(input []rune, start int, m *Meter) (int64, error) {
+func (p *regexProgram) regexpCount(input []rune, start int, m *costMeter) (int64, error) {
 	length := len(input)
 	pos := start
 	var count int64
@@ -1023,7 +1023,7 @@ func (p *regexProgram) regexpCount(input []rune, start int, m *Meter) (int64, er
 // nthMatch returns the capture slots of the N-th (1-based) non-overlapping match at or after `start`
 // (regexp_substr / regexp_instr, regex.md §8b), or nil when fewer than N matches exist. Same
 // non-overlapping advance as regexpCount.
-func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *Meter) ([]int64, error) {
+func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *costMeter) ([]int64, error) {
 	length := len(input)
 	pos := start
 	var count int64

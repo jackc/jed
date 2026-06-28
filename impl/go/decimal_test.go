@@ -16,7 +16,7 @@ func dec(s string) Decimal {
 		neg, s = true, rest
 	}
 	intPart, frac, _ := strings.Cut(s, ".")
-	return DecimalFromDigitsScale(neg, intPart+frac, uint32(len(frac)))
+	return decimalFromDigitsScale(neg, intPart+frac, uint32(len(frac)))
 }
 
 // mustRender renders the result of an arithmetic op, panicking on an unexpected error (so it
@@ -171,7 +171,7 @@ func TestDecimalCodecRoundTrip(t *testing.T) {
 	for _, s := range []string{"0", "1.50", "-12345.6789", "100000000.000001", "999999999999"} {
 		d := dec(s)
 		neg, scale, groups := d.ToCodec()
-		back := DecimalFromCodec(neg, scale, groups)
+		back := decimalFromCodec(neg, scale, groups)
 		if back.Render() != d.Render() {
 			t.Errorf("codec round trip %s = %q", s, back.Render())
 		}
@@ -193,16 +193,16 @@ func TestDecimalBigMultiplicationExact(t *testing.T) {
 
 // --- end-to-end through Execute ---------------------------------------------
 
-func decExec(t *testing.T, db *Engine, sql string) {
+func decExec(t *testing.T, db *engine, sql string) {
 	t.Helper()
-	if _, err := Execute(db, sql); err != nil {
+	if _, err := execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
 
-func decDB(t *testing.T, stmts ...string) *Engine {
+func decDB(t *testing.T, stmts ...string) *engine {
 	t.Helper()
-	db := NewEngine()
+	db := newEngine()
 	for _, s := range stmts {
 		decExec(t, db, s)
 	}
@@ -210,7 +210,7 @@ func decDB(t *testing.T, stmts ...string) *Engine {
 }
 
 // decOne runs a query expected to return a single cell, rendered.
-func decOne(t *testing.T, db *Engine, sql string) string {
+func decOne(t *testing.T, db *engine, sql string) string {
 	t.Helper()
 	rows := query(t, db, sql)
 	if len(rows) != 1 || len(rows[0]) != 1 {
@@ -229,7 +229,7 @@ func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadEngine(image)
+	loaded, err := loadEngine(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 // fix. Too large to reach through SQL literals (a 131072-digit value is ~74 KB), so pinned here.
 // a is exactly at the cap (131072 nines); a + a is one digit over it.
 func TestSumAccumulatorChecksOnlyFinalCap(t *testing.T) {
-	a := DecimalFromDigitsScale(false, strings.Repeat("9", MaxIntDigits), 0)
+	a := decimalFromDigitsScale(false, strings.Repeat("9", decimalMaxIntDigits), 0)
 	if _, err := a.CheckCap(); err != nil {
 		t.Fatalf("a should be exactly at the cap, got %v", err)
 	}
@@ -301,7 +301,7 @@ func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
 	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	big := strings.Repeat("9", 20000) + ".5"
 	db.SetMaxCost(1000)
-	_, err := Execute(db, "SELECT "+big+" * "+big+" FROM t")
+	_, err := execute(db, "SELECT "+big+" * "+big+" FROM t")
 	if err == nil {
 		t.Fatal("expected the cost ceiling to abort the multiply")
 	}

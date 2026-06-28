@@ -7,112 +7,112 @@ import "strings"
 // in tests so the two never drift. The integer-only accessors (WidthBytes/Min/Max/Rank/
 // InRange) return their zero value for Text/Bool; callers route those through their own
 // paths (the value codec, the comparators), never these.
-type ScalarType int
+type scalarType int
 
 const (
 	// Int16 is i16 / smallint (PG byte-shorthand alias int2).
-	Int16 ScalarType = iota
+	scalarInt16 scalarType = iota
 	// Int32 is i32 / int / integer (PG byte-shorthand alias int4).
-	Int32
+	scalarInt32
 	// Int64 is i64 / bigint (PG byte-shorthand alias int8).
-	Int64
+	scalarInt64
 	// Text is text / varchar / string: variable-width UTF-8, collation C (byte /
 	// code-point order — spec/design/types.md §11).
-	Text
+	scalarText
 	// Bool is boolean / bool: false/true stored as the value codec's 1-byte bool-byte
 	// (spec/design/types.md §9).
-	Bool
+	scalarBool
 	// DecimalType is the exact base-10 decimal / numeric (spec/design/decimal.md). Variable-
 	// width and non-integer; the per-column typmod (precision/scale) lives on the Column, not
 	// here. (Named DecimalType, not Decimal, because Decimal is the value struct.)
-	DecimalType
+	scalarDecimal
 	// Bytea is a variable-width binary string (raw bytes), compared by unsigned byte
 	// order — spec/design/types.md §13.
-	Bytea
+	scalarBytea
 	// Uuid is a fixed 16-byte value (RFC 4122), compared by unsigned byte order —
 	// spec/design/types.md §14. The first non-integer type usable as a key (WidthBytes 16).
-	Uuid
+	scalarUuid
 	// Timestamp is the zoneless wall clock, i64 microseconds since the Unix epoch
 	// (spec/design/timestamp.md).
-	Timestamp
+	scalarTimestamp
 	// Timestamptz is the UTC instant, i64 microseconds since the Unix epoch.
-	Timestamptz
+	scalarTimestamptz
 	// IntervalType is a span of time — three independent fields (months/days/micros), compared
 	// by the canonical 128-bit span (spec/design/interval.md). Not a key this slice; not
 	// serialized through the fixed-width integer codec. (Named IntervalType, not Interval,
 	// because Interval is the value struct.)
-	IntervalType
+	scalarInterval
 	// Float32 is IEEE 754 binary32 / real (spec/design/float.md): the lower rung of the float
 	// promotion tower (rank 1, 4 bytes). Approximate, admits NaN/±Infinity, compared by the PG
 	// total order (NOT raw IEEE). Storable; never a key (float PRIMARY KEY → 0A000).
-	Float32
+	scalarFloat32
 	// Float64 is IEEE 754 binary64 / double precision / float (rank 2, 8 bytes). Same family as
 	// f32; a mixed-width float op promotes to f64 (the only implicit float edge).
-	Float64
+	scalarFloat64
 	// Date is a calendar date — i32 days since the Unix epoch, no time/zone
 	// (spec/design/date.md). Reuses timestamp's calendar core; stored as a 4-byte order-preserving
 	// i32 body (type code 16). A key this slice (the i32 key encoding is exercised).
-	Date
+	scalarDate
 	// Json is JSON text stored VERBATIM (spec/design/json.md §4): validated well-formed, the original
 	// bytes preserved (whitespace, key order, duplicate keys). On-disk type code 18. Variable-width,
 	// NOT comparable (PG ships no btree/hash opclass — §5), never a key.
-	Json
+	scalarJson
 	// Jsonb is canonicalized binary JSON (spec/design/json.md §2): parsed to a tagged-node tree
 	// (numbers exact Decimal, object keys deduped last-wins + sorted), stored compactly. On-disk type
 	// code 19. Variable-width; comparable by PG's total btree order (§5); not a key this slice.
-	Jsonb
+	scalarJsonb
 	// JsonPathType is a compiled SQL/JSON path (spec/design/jsonpath.md, slice P1a): a first-class
 	// scalar (reserved on-disk type code 20), built from a '…'::jsonpath literal. NOT comparable (PG
 	// ships no opclass — 42883), and literal-only this slice (a jsonpath COLUMN is 0A000, like a
 	// J0-stage json column). The stored value is the canonical normalized source text. (Named
 	// JsonPathType, not JsonPath, because JsonPath is the compiled-path struct in jsonpath.go.)
-	JsonPathType
+	scalarJsonPath
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
 // an unconstrained numeric column carries no typmod (spec/design/decimal.md §2). Validated at
 // resolve (1 <= precision <= 1000, 0 <= scale <= precision; else 22023).
-type DecimalTypmod struct {
+type decimalTypmod struct {
 	Precision uint16
 	Scale     uint16
 }
 
 // CanonicalName is the single name used in all output (determinism — CLAUDE.md §10).
-func (t ScalarType) CanonicalName() string {
+func (t scalarType) CanonicalName() string {
 	switch t {
-	case Int16:
+	case scalarInt16:
 		return "i16"
-	case Int32:
+	case scalarInt32:
 		return "i32"
-	case Int64:
+	case scalarInt64:
 		return "i64"
-	case Text:
+	case scalarText:
 		return "text"
-	case Bool:
+	case scalarBool:
 		return "boolean"
-	case DecimalType:
+	case scalarDecimal:
 		return "decimal"
-	case Bytea:
+	case scalarBytea:
 		return "bytea"
-	case Uuid:
+	case scalarUuid:
 		return "uuid"
-	case Timestamp:
+	case scalarTimestamp:
 		return "timestamp"
-	case Timestamptz:
+	case scalarTimestamptz:
 		return "timestamptz"
-	case IntervalType:
+	case scalarInterval:
 		return "interval"
-	case Float32:
+	case scalarFloat32:
 		return "f32"
-	case Float64:
+	case scalarFloat64:
 		return "f64"
-	case Date:
+	case scalarDate:
 		return "date"
-	case Json:
+	case scalarJson:
 		return "json"
-	case Jsonb:
+	case scalarJsonb:
 		return "jsonb"
-	case JsonPathType:
+	case scalarJsonPath:
 		return "jsonpath"
 	default:
 		return "?"
@@ -128,100 +128,100 @@ func (t ScalarType) CanonicalName() string {
 // int8 → i64 with no collision and a future 8-bit i8 stays free (types.md §11; §1/§4). The
 // two-word "character varying" alias is recognized, though this slice's parser only
 // produces single-word type names (a documented narrowing — spec/design/types.md §11).
-func ScalarTypeFromName(name string) (ScalarType, bool) {
+func scalarTypeFromName(name string) (scalarType, bool) {
 	switch strings.ToLower(name) {
 	case "i16", "smallint", "int2":
-		return Int16, true
+		return scalarInt16, true
 	case "i32", "int", "integer", "int4":
-		return Int32, true
+		return scalarInt32, true
 	case "i64", "bigint", "int8":
-		return Int64, true
+		return scalarInt64, true
 	case "text", "varchar", "string", "character varying":
-		return Text, true
+		return scalarText, true
 	case "boolean", "bool":
-		return Bool, true
+		return scalarBool, true
 	case "decimal", "numeric", "dec":
-		return DecimalType, true
+		return scalarDecimal, true
 	case "bytea":
-		return Bytea, true
+		return scalarBytea, true
 	case "uuid":
-		return Uuid, true
+		return scalarUuid, true
 	case "timestamp", "timestamp without time zone":
-		return Timestamp, true
+		return scalarTimestamp, true
 	case "timestamptz", "timestamp with time zone":
-		return Timestamptz, true
+		return scalarTimestamptz, true
 	case "interval":
-		return IntervalType, true
+		return scalarInterval, true
 	case "f32", "real", "float4":
 		// f32 / real / float4 (binary32). A bare `float` (no precision) is double precision in
 		// PG, so it maps to f64 below — NOT here (spec/design/float.md §2).
-		return Float32, true
+		return scalarFloat32, true
 	case "f64", "double precision", "float", "float8":
 		// f64 / double precision / float / float8. A bare `float` (no precision) is double
 		// precision in PG — NOT 32-bit. The `float(p)` typmod is not accepted (float.md §2).
 		// "double precision" is a two-word alias; this slice's parser only emits single-word type
 		// names, so it is reachable only via a future multi-word parse (a documented narrowing).
-		return Float64, true
+		return scalarFloat64, true
 	case "date":
-		return Date, true
+		return scalarDate, true
 	case "json":
-		return Json, true
+		return scalarJson, true
 	case "jsonb":
-		return Jsonb, true
+		return scalarJsonb, true
 	case "jsonpath":
-		return JsonPathType, true
+		return scalarJsonPath, true
 	default:
 		return 0, false
 	}
 }
 
 // IsText reports whether this is the variable-width text type (vs a fixed-width integer).
-func (t ScalarType) IsText() bool { return t == Text }
+func (t scalarType) IsText() bool { return t == scalarText }
 
 // IsBool reports whether this is the boolean type.
-func (t ScalarType) IsBool() bool { return t == Bool }
+func (t scalarType) IsBool() bool { return t == scalarBool }
 
 // IsDecimal reports whether this is the exact decimal type.
-func (t ScalarType) IsDecimal() bool { return t == DecimalType }
+func (t scalarType) IsDecimal() bool { return t == scalarDecimal }
 
 // IsBytea reports whether this is the variable-width bytea type (raw bytes).
-func (t ScalarType) IsBytea() bool { return t == Bytea }
+func (t scalarType) IsBytea() bool { return t == scalarBytea }
 
 // IsUuid reports whether this is the fixed 16-byte uuid type.
-func (t ScalarType) IsUuid() bool { return t == Uuid }
+func (t scalarType) IsUuid() bool { return t == scalarUuid }
 
 // IsTimestamp reports whether this is the zoneless timestamp type.
-func (t ScalarType) IsTimestamp() bool { return t == Timestamp }
+func (t scalarType) IsTimestamp() bool { return t == scalarTimestamp }
 
 // IsTimestamptz reports whether this is the UTC-instant timestamptz type.
-func (t ScalarType) IsTimestamptz() bool { return t == Timestamptz }
+func (t scalarType) IsTimestamptz() bool { return t == scalarTimestamptz }
 
 // IsInterval reports whether this is the interval (span) type.
-func (t ScalarType) IsInterval() bool { return t == IntervalType }
+func (t scalarType) IsInterval() bool { return t == scalarInterval }
 
 // IsDate reports whether this is the date (calendar date) type.
-func (t ScalarType) IsDate() bool { return t == Date }
+func (t scalarType) IsDate() bool { return t == scalarDate }
 
 // IsJson reports whether this is the verbatim-text json type.
-func (t ScalarType) IsJson() bool { return t == Json }
+func (t scalarType) IsJson() bool { return t == scalarJson }
 
 // IsJsonb reports whether this is the canonicalized-binary jsonb type.
-func (t ScalarType) IsJsonb() bool { return t == Jsonb }
+func (t scalarType) IsJsonb() bool { return t == scalarJsonb }
 
 // IsJsonPath reports whether this is the jsonpath type.
-func (t ScalarType) IsJsonPath() bool { return t == JsonPathType }
+func (t scalarType) IsJsonPath() bool { return t == scalarJsonPath }
 
 // IsFloat32 reports whether this is the binary32 float type (real).
-func (t ScalarType) IsFloat32() bool { return t == Float32 }
+func (t scalarType) IsFloat32() bool { return t == scalarFloat32 }
 
 // IsFloat64 reports whether this is the binary64 float type (double precision).
-func (t ScalarType) IsFloat64() bool { return t == Float64 }
+func (t scalarType) IsFloat64() bool { return t == scalarFloat64 }
 
 // IsFloat reports whether this is one of the two binary float types (the float family).
-func (t ScalarType) IsFloat() bool { return t == Float32 || t == Float64 }
+func (t scalarType) IsFloat() bool { return t == scalarFloat32 || t == scalarFloat64 }
 
 // IsInteger reports whether this is one of the fixed-width signed integer types.
-func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
+func (t scalarType) IsInteger() bool { return t == scalarInt16 || t == scalarInt32 || t == scalarInt64 }
 
 // WidthBytes is the fixed KEY-encoding width in bytes — the bare key body, no presence tag —
 // for the fixed-width keyable types: the three integers, uuid (16), boolean (1 — the bool-byte
@@ -233,25 +233,25 @@ func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == I
 // IsUuid / IsFloat before the integer decode path, since DecodeInt would sign-flip their bytes
 // (floats store raw IEEE big-endian, no sign flip). boolean's VALUE codec has its own 1-byte
 // branch and never reaches the integer decode path either; this width is the key path only.
-func (t ScalarType) WidthBytes() int {
+func (t scalarType) WidthBytes() int {
 	switch t {
-	case Bool:
+	case scalarBool:
 		return 1
-	case Int16:
+	case scalarInt16:
 		return 2
-	case Int32:
+	case scalarInt32:
 		return 4
-	case Int64, Timestamp, Timestamptz:
+	case scalarInt64, scalarTimestamp, scalarTimestamptz:
 		// The two timestamps are i64-microsecond instants — fixed-width 8-byte, reusing the
 		// i64 key/value codec (spec/design/timestamp.md §6).
 		return 8
-	case Uuid:
+	case scalarUuid:
 		return 16
-	case Float32:
+	case scalarFloat32:
 		return 4
-	case Float64:
+	case scalarFloat64:
 		return 8
-	case Date:
+	case scalarDate:
 		// A date is a fixed-width 4-byte i32 day count (reuses the i32 codec — it is a key
 		// this slice, like timestamp; spec/design/date.md).
 		return 4
@@ -266,9 +266,9 @@ func (t ScalarType) WidthBytes() int {
 // tail-slot skip, executor.go) is sound only when this returns true, so the index-bound pushdown
 // gates on it (a variable-width tail column ⇒ no pushdown, full scan instead). Were the skip to run
 // over a variable-width tail it would advance by WidthBytes()==0 and mis-parse the row's key.
-func (t ScalarType) IsFixedWidth() bool {
+func (t scalarType) IsFixedWidth() bool {
 	switch t {
-	case Text, DecimalType, Bytea, IntervalType, Json, Jsonb, JsonPathType:
+	case scalarText, scalarDecimal, scalarBytea, scalarInterval, scalarJson, scalarJsonb, scalarJsonPath:
 		return false
 	default:
 		return true
@@ -276,13 +276,13 @@ func (t ScalarType) IsFixedWidth() bool {
 }
 
 // Min is the inclusive minimum value.
-func (t ScalarType) Min() int64 {
+func (t scalarType) Min() int64 {
 	switch t {
-	case Int16:
+	case scalarInt16:
 		return -32768
-	case Int32:
+	case scalarInt32:
 		return -2147483648
-	case Int64:
+	case scalarInt64:
 		return -9223372036854775808
 	default:
 		return 0
@@ -290,13 +290,13 @@ func (t ScalarType) Min() int64 {
 }
 
 // Max is the inclusive maximum value.
-func (t ScalarType) Max() int64 {
+func (t scalarType) Max() int64 {
 	switch t {
-	case Int16:
+	case scalarInt16:
 		return 32767
-	case Int32:
+	case scalarInt32:
 		return 2147483647
-	case Int64:
+	case scalarInt64:
 		return 9223372036854775807
 	default:
 		return 0
@@ -306,13 +306,13 @@ func (t ScalarType) Max() int64 {
 // Rank is the promotion-tower rank within a family: i16 < i32 < i64, and (a SEPARATE
 // tower) f32 < f64 (spec/types/compare.toml). Ranks are only compared within one family
 // (the integer promote path and the float promote path never mix — float is a strict island).
-func (t ScalarType) Rank() int {
+func (t scalarType) Rank() int {
 	switch t {
-	case Int16, Float32:
+	case scalarInt16, scalarFloat32:
 		return 1
-	case Int32, Float64:
+	case scalarInt32, scalarFloat64:
 		return 2
-	case Int64:
+	case scalarInt64:
 		return 3
 	default:
 		return 0
@@ -320,13 +320,13 @@ func (t ScalarType) Rank() int {
 }
 
 // InRange reports whether v fits this type's inclusive range.
-func (t ScalarType) InRange(v int64) bool {
+func (t scalarType) InRange(v int64) bool {
 	return v >= t.Min() && v <= t.Max()
 }
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
-func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64, Date, Json, Jsonb, JsonPathType}
+func allScalarTypes() []scalarType {
+	return []scalarType{scalarInt16, scalarInt32, scalarInt64, scalarText, scalarBool, scalarDecimal, scalarBytea, scalarUuid, scalarTimestamp, scalarTimestamptz, scalarInterval, scalarFloat32, scalarFloat64, scalarDate, scalarJson, scalarJsonb, scalarJsonPath}
 }
 
 // Type is a column / value type: either a built-in ScalarType or a reference to a user-defined
@@ -343,49 +343,49 @@ func AllScalarTypes() []ScalarType {
 // composite-aware equality must go through CanonicalName / an explicit helper, never ==. In S1 no
 // composite is ever constructed, so this cannot bite yet (it is the §8 trap to watch in S2+).
 // Scalar-only paths call ScalarTy(); the value codec / resolver branch on IsComposite (S2+).
-type Type struct {
+type dataType struct {
 	// Comp is the composite reference when this is a composite type, else nil (⇒ scalar). The
 	// pointer is the discriminant (keeps Type ==-comparable for the scalar case).
-	Comp *CompositeRef
+	Comp *compositeRef
 	// Array is the element type when this is a *structural* array type (`i32[]`), else nil
 	// (spec/design/array.md §2). The element type is carried inline — no catalog object, unlike
 	// Comp. The element is a scalar or composite, never another array (multidimensionality is a
 	// value property, not array-of-array — §2). The pointer also breaks == like Comp.
-	Array *Type
+	Array *dataType
 	// Range is the element (subtype) when this is a *structural* range type (`i32range`), else nil
 	// (spec/design/ranges.md §2). Like Array, the element is carried inline (no catalog object); it
 	// is one of the six scalar subtypes that have a range, never a composite/array/range. The
 	// pointer also breaks == like Comp/Array.
-	Range *Type
+	Range *dataType
 	// Scalar is the inner scalar type when Comp == nil && Array == nil && Range == nil. Meaningless
 	// otherwise.
-	Scalar ScalarType
+	Scalar scalarType
 }
 
 // CompositeRef is a by-name reference to a composite type in the database's type catalog. The
 // display name is case-preserved; lookups lowercase it (the table-name convention).
-type CompositeRef struct {
+type compositeRef struct {
 	Name string
 }
 
 // ScalarT wraps a ScalarType as a (scalar) Type.
-func ScalarT(s ScalarType) Type { return Type{Scalar: s} }
+func scalarT(s scalarType) dataType { return dataType{Scalar: s} }
 
 // CompositeT builds a composite Type referencing the named catalog type. Unused in S1 (no
 // composite is constructed yet); present so the wrapper is complete for later slices.
-func CompositeT(name string) Type { return Type{Comp: &CompositeRef{Name: name}} }
+func compositeT(name string) dataType { return dataType{Comp: &compositeRef{Name: name}} }
 
 // ArrayT builds a structural array Type over the given element type (spec/design/array.md §2).
-func ArrayT(elem Type) Type { return Type{Array: &elem} }
+func arrayT(elem dataType) dataType { return dataType{Array: &elem} }
 
 // RangeT builds a structural range Type over the given scalar element (spec/design/ranges.md §2).
-func RangeT(elem Type) Type { return Type{Range: &elem} }
+func rangeT(elem dataType) dataType { return dataType{Range: &elem} }
 
 // ScalarTy returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
 // codec, the scalar resolver) call this; a composite/array column reaches those paths only after
 // the caller has branched on IsComposite/IsArray, so a non-scalar here is an engine-invariant
 // violation (matches the Rust Type::scalar unreachable!).
-func (t Type) ScalarTy() ScalarType {
+func (t dataType) ScalarTy() scalarType {
 	if t.Comp != nil {
 		panic("BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " +
 			"composite path must branch before this point (spec/design/composite.md)")
@@ -400,7 +400,7 @@ func (t Type) ScalarTy() ScalarType {
 }
 
 // AsScalar returns the inner scalar type and true, or (0, false) for a composite/array/range.
-func (t Type) AsScalar() (ScalarType, bool) {
+func (t dataType) AsScalar() (scalarType, bool) {
 	if t.Comp != nil || t.Array != nil || t.Range != nil {
 		return 0, false
 	}
@@ -408,20 +408,20 @@ func (t Type) AsScalar() (ScalarType, bool) {
 }
 
 // IsComposite reports whether this is a composite (user-defined row) type.
-func (t Type) IsComposite() bool { return t.Comp != nil }
+func (t dataType) IsComposite() bool { return t.Comp != nil }
 
 // IsArray reports whether this is an array type.
-func (t Type) IsArray() bool { return t.Array != nil }
+func (t dataType) IsArray() bool { return t.Array != nil }
 
 // IsRange reports whether this is a range type.
-func (t Type) IsRange() bool { return t.Range != nil }
+func (t dataType) IsRange() bool { return t.Range != nil }
 
 // RangeElement returns the element (subtype) of a range type, or (zero, false) if not a range.
-func (t Type) RangeElement() (Type, bool) {
+func (t dataType) RangeElement() (dataType, bool) {
 	if t.Range != nil {
 		return *t.Range, true
 	}
-	return Type{}, false
+	return dataType{}, false
 }
 
 // CompositeRefOf returns the composite type this type references, looking through one array level —
@@ -429,7 +429,7 @@ func (t Type) RangeElement() (Type, bool) {
 // (arrays are over a single element; composites are referenced by name, never inlined), so the
 // dependency-tracking (DROP TYPE) and two-pass-load validation paths use this to find a composite
 // reference whether it is direct or wrapped in an array field/column (spec/design/array.md §12).
-func (t Type) CompositeRefOf() *CompositeRef {
+func (t dataType) CompositeRefOf() *compositeRef {
 	if t.Comp != nil {
 		return t.Comp
 	}
@@ -441,7 +441,7 @@ func (t Type) CompositeRefOf() *CompositeRef {
 
 // CanonicalName is this type's canonical name for output / error messages — the scalar's
 // canonical name, the composite's name, or `<elem>[]` for an array.
-func (t Type) CanonicalName() string {
+func (t dataType) CanonicalName() string {
 	if t.Comp != nil {
 		return t.Comp.Name
 	}
@@ -462,46 +462,46 @@ func (t Type) CanonicalName() string {
 // none of these families — so keyability checks (IsInteger || IsUuid || …) correctly reject them
 // (0A000), and family branches fall through to their composite/array handling.
 
-func (t Type) isScalar() bool { return t.Comp == nil && t.Array == nil && t.Range == nil }
+func (t dataType) isScalar() bool { return t.Comp == nil && t.Array == nil && t.Range == nil }
 
 // IsInteger reports whether this is a scalar integer type (false for a composite/array).
-func (t Type) IsInteger() bool { return t.isScalar() && t.Scalar.IsInteger() }
+func (t dataType) IsInteger() bool { return t.isScalar() && t.Scalar.IsInteger() }
 
 // IsDecimal reports whether this is the scalar decimal type (false for a composite/array).
-func (t Type) IsDecimal() bool { return t.isScalar() && t.Scalar.IsDecimal() }
+func (t dataType) IsDecimal() bool { return t.isScalar() && t.Scalar.IsDecimal() }
 
 // IsFloat reports whether this is one of the binary float types (false for a composite/array).
-func (t Type) IsFloat() bool { return t.isScalar() && t.Scalar.IsFloat() }
+func (t dataType) IsFloat() bool { return t.isScalar() && t.Scalar.IsFloat() }
 
 // IsBool reports whether this is the scalar boolean type (false for a composite/array).
-func (t Type) IsBool() bool { return t.isScalar() && t.Scalar.IsBool() }
+func (t dataType) IsBool() bool { return t.isScalar() && t.Scalar.IsBool() }
 
 // IsText reports whether this is the scalar text type (false for a composite/array).
-func (t Type) IsText() bool { return t.isScalar() && t.Scalar.IsText() }
+func (t dataType) IsText() bool { return t.isScalar() && t.Scalar.IsText() }
 
 // IsBytea reports whether this is the scalar bytea type (false for a composite/array).
-func (t Type) IsBytea() bool { return t.isScalar() && t.Scalar.IsBytea() }
+func (t dataType) IsBytea() bool { return t.isScalar() && t.Scalar.IsBytea() }
 
 // IsUuid reports whether this is the scalar uuid type (false for a composite/array).
-func (t Type) IsUuid() bool { return t.isScalar() && t.Scalar.IsUuid() }
+func (t dataType) IsUuid() bool { return t.isScalar() && t.Scalar.IsUuid() }
 
 // IsTimestamp reports whether this is the scalar timestamp type (false for a composite/array).
-func (t Type) IsTimestamp() bool { return t.isScalar() && t.Scalar.IsTimestamp() }
+func (t dataType) IsTimestamp() bool { return t.isScalar() && t.Scalar.IsTimestamp() }
 
 // IsTimestamptz reports whether this is the scalar timestamptz type (false for a composite/array).
-func (t Type) IsTimestamptz() bool { return t.isScalar() && t.Scalar.IsTimestamptz() }
+func (t dataType) IsTimestamptz() bool { return t.isScalar() && t.Scalar.IsTimestamptz() }
 
 // IsDate reports whether this is the scalar date type (false for a composite/array).
-func (t Type) IsDate() bool { return t.isScalar() && t.Scalar.IsDate() }
+func (t dataType) IsDate() bool { return t.isScalar() && t.Scalar.IsDate() }
 
 // IsInterval reports whether this is the scalar interval type (false for a composite/array).
-func (t Type) IsInterval() bool { return t.isScalar() && t.Scalar.IsInterval() }
+func (t dataType) IsInterval() bool { return t.isScalar() && t.Scalar.IsInterval() }
 
 // IsJson reports whether this is the scalar json type (false for a composite/array).
-func (t Type) IsJson() bool { return t.isScalar() && t.Scalar.IsJson() }
+func (t dataType) IsJson() bool { return t.isScalar() && t.Scalar.IsJson() }
 
 // IsJsonb reports whether this is the scalar jsonb type (false for a composite/array).
-func (t Type) IsJsonb() bool { return t.isScalar() && t.Scalar.IsJsonb() }
+func (t dataType) IsJsonb() bool { return t.isScalar() && t.Scalar.IsJsonb() }
 
 // IsJsonPath reports whether this is the scalar jsonpath type (false for a composite/array).
-func (t Type) IsJsonPath() bool { return t.isScalar() && t.Scalar.IsJsonPath() }
+func (t dataType) IsJsonPath() bool { return t.isScalar() && t.Scalar.IsJsonPath() }

@@ -152,7 +152,7 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 		execDB(t, db, "INSERT INTO t VALUES (1)")
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true})
+	db, err := openDatabaseWithOptions(path, openOptions{ReadOnly: true})
 	if err != nil {
 		t.Fatalf("open read-only: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 		execDB(t, db, "INSERT INTO t VALUES (1)")
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{CacheBytes: 4 * 256}) // a handful of resident leaves
+	db, err := openDatabaseWithOptions(path, openOptions{CacheBytes: 4 * 256}) // a handful of resident leaves
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

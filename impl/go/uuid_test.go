@@ -4,7 +4,7 @@ import "testing"
 
 func mustUUID(t *testing.T, s string) []byte {
 	t.Helper()
-	b, reason := ParseUUID(s)
+	b, reason := parseUUID(s)
 	if reason != "" {
 		t.Fatalf("ParseUUID(%q): %s", s, reason)
 	}

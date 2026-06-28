@@ -4,8 +4,8 @@ import "testing"
 
 // seededSeam returns a seam on the provided deterministic random source (seed) + a fixed clock —
 // the test / reproducible path (spec/design/entropy.md §6).
-func seededSeam(seed uint64, clock int64) Seam {
-	var s Seam
+func seededSeam(seed uint64, clock int64) seam {
+	var s seam
 	s.SetRandom(SeededRandomSource(seed))
 	s.SetClock(FixedClock(clock))
 	return s
@@ -34,7 +34,7 @@ func TestUUIDv4DeterministicAndWellFormed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, _ := ParseUUID("910a2dec-8902-4cc1-beeb-8da1658eec67")
+	want, _ := parseUUID("910a2dec-8902-4cc1-beeb-8da1658eec67")
 	if string(b) != string(want) {
 		t.Fatalf("uuidv4 = %x, want %x", b, want)
 	}
@@ -69,7 +69,7 @@ func TestUUIDv7EmbedsClockAndIsMonotonic(t *testing.T) {
 func TestUnseededPathUsesOSEntropyAndWallClock(t *testing.T) {
 	// The PRODUCTION path: a default seam (no injected source) → crypto/rand per draw + the wall
 	// clock. Assert only STRUCTURAL invariants so the outcome is deterministic.
-	var seam Seam
+	var seam seam
 	r := newStmtRng()
 	v4, err := r.uuidV4(&seam)
 	if err != nil {
@@ -106,7 +106,7 @@ func TestAdvancingClockStepsPerReadAndNowCaches(t *testing.T) {
 	// now() (statementClockMicros) reads ONCE and caches: it pulls 1000 then stays 1000 even as
 	// clock_timestamp() (clockNowMicros) keeps advancing the SAME source — the stable-vs-volatile
 	// distinction, made deterministic.
-	var seam Seam
+	var seam seam
 	seam.SetClock(AdvancingClock(1000, 1))
 	r := newStmtRng()
 	if got := r.statementClockMicros(&seam); got != 1000 {

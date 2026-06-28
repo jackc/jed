@@ -8,7 +8,7 @@ package jed
 // Statements run through Execute/Query; Commit/Rollback end it. Go has no destructor, so a raw
 // Begin caller must end it explicitly — View/Update do that automatically (and are preferred).
 type Transaction struct {
-	db   *Engine
+	db   *engine
 	done bool
 }
 
@@ -47,7 +47,7 @@ func (tx *Transaction) Rollback() error {
 // Begin opens an explicit transaction (spec/design/api.md §2.2). writable false is READ ONLY (a
 // write inside → 25006); true is READ WRITE. A nested Begin (a transaction is already open) is
 // 25001. Prefer View/Update, which cannot forget to end the transaction.
-func (db *Engine) Begin(writable bool) (*Transaction, error) {
+func (db *engine) Begin(writable bool) (*Transaction, error) {
 	if _, err := db.beginTx(writable, true); err != nil {
 		return nil, err
 	}
@@ -56,17 +56,17 @@ func (db *Engine) Begin(writable bool) (*Transaction, error) {
 
 // View runs fn in a READ ONLY transaction (bbolt-style): open it, run fn(tx), then auto-commit on
 // success / auto-rollback on error or panic. A write inside is 25006.
-func (db *Engine) View(fn func(tx *Transaction) error) error {
+func (db *engine) View(fn func(tx *Transaction) error) error {
 	return db.withTx(false, fn)
 }
 
 // Update runs fn in a READ WRITE transaction (bbolt-style): open it, run fn(tx), then auto-commit
 // on success / auto-rollback on error or panic — the safe default over a raw Begin.
-func (db *Engine) Update(fn func(tx *Transaction) error) error {
+func (db *engine) Update(fn func(tx *Transaction) error) error {
 	return db.withTx(true, fn)
 }
 
-func (db *Engine) withTx(writable bool, fn func(tx *Transaction) error) error {
+func (db *engine) withTx(writable bool, fn func(tx *Transaction) error) error {
 	tx, err := db.Begin(writable)
 	if err != nil {
 		return err
@@ -85,14 +85,14 @@ func (db *Engine) withTx(writable bool, fn func(tx *Transaction) error) error {
 // Session/Database (sess set) Execute routes through the session's dispatch — the lazy writer
 // gate for writes, the pinned snapshot for reads — so it observes the converged §2.4 semantics.
 type PreparedStatement struct {
-	db   *Engine
+	db   *engine
 	sess *Session
-	ast  Statement
+	ast  statement
 }
 
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
 // errors (42601, …) surface here.
-func (db *Engine) Prepare(sql string) (*PreparedStatement, error) {
+func (db *engine) Prepare(sql string) (*PreparedStatement, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return nil, err
@@ -121,13 +121,13 @@ func (s *PreparedStatement) Query(params []Value) (*Rows, error) {
 
 // ExecuteSQL is a one-shot: parse + execute sql, binding params, returning the outcome. (The
 // package function Execute(db, sql) is the zero-parameter convenience kept for back-compat.)
-func (db *Engine) ExecuteSQL(sql string, params []Value) (Outcome, error) {
-	return ExecuteParams(db, sql, params)
+func (db *engine) ExecuteSQL(sql string, params []Value) (Outcome, error) {
+	return executeParams(db, sql, params)
 }
 
 // QuerySQL is a one-shot: parse + run a query sql, binding params, returning a row cursor.
-func (db *Engine) QuerySQL(sql string, params []Value) (*Rows, error) {
-	out, err := ExecuteParams(db, sql, params)
+func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
+	out, err := executeParams(db, sql, params)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +147,7 @@ type Rows struct {
 
 func rowsFromOutcome(out Outcome) (*Rows, error) {
 	if out.Kind != OutcomeQuery {
-		return nil, NewError(SyntaxError, "Query called on a statement that produces no rows; use Execute")
+		return nil, newError(SyntaxError, "Query called on a statement that produces no rows; use Execute")
 	}
 	return &Rows{columnNames: out.ColumnNames, rows: out.Rows, cost: out.Cost}, nil
 }

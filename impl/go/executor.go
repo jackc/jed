@@ -19,7 +19,7 @@ import (
 // ORDER BY restriction to decide whether an expression sort key matches a select-list expression. The
 // AST carries no source positions, so textually-identical fragments (`a + b` here and there) compare
 // equal; following the node pointers is exactly the recursive tree comparison.
-func exprEqual(a, b Expr) bool { return reflect.DeepEqual(a, b) }
+func exprEqual(a, b exprNode) bool { return reflect.DeepEqual(a, b) }
 
 // Statement executor (CLAUDE.md §10).
 //
@@ -76,7 +76,7 @@ const DefaultMaxSQLLength = 1 << 20
 // tempBuffers is the §13 gate that does: the instant a session's resident temp storage (byte-identical
 // on-disk record bytes) would exceed it, the write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
 // Identical across cores (§8); the abort point is part of the cross-core contract.
-const DefaultTempBuffers = 32 << 20
+const defaultTempBuffers = 32 << 20
 
 // DefaultSharedTempMem is the default GLOBAL storage budget for DATABASE-WIDE shared temporary tables,
 // in BYTES (spec/design/temp-tables.md §7). The shared-temp analogue of DefaultTempBuffers: shared
@@ -84,7 +84,7 @@ const DefaultTempBuffers = 32 << 20
 // Engine-level setting (sharedTempMem) rather than per-session. An over-budget shared write aborts
 // the same 54P03. 0 ⇒ unlimited; measured identically (deterministic on-disk record bytes), so the
 // abort point is part of the cross-core contract.
-const DefaultSharedTempMem = 32 << 20
+const defaultSharedTempMem = 32 << 20
 
 // maxCompositeDepth is the maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md
 // §7b). A composite type's depth is the length of its deepest chain of nested composites, counting
@@ -104,28 +104,28 @@ const maxCompositeDepth = 32
 // pmap.go / §3). A reader holds a *Snapshot and is thereby stable for its life: a later commit
 // produces a new Snapshot and never mutates this one. (P5.3a is single-handle; sharing a *Snapshot
 // across goroutines is P5.3b.)
-type Snapshot struct {
+type snapshot struct {
 	// txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
 	txid   uint64
-	tables map[string]*Table
+	tables map[string]*catTable
 	// types holds user-defined composite (row) types, keyed by lowercased name
 	// (spec/design/composite.md). A database-level object set, separate from tables; serialized
 	// into the catalog's composite-type entries (spec/fileformat/format.md). Sorted by key when
 	// serialized so map-iteration order never leaks (CLAUDE.md §8).
-	types  map[string]*CompositeType
-	stores map[string]*TableStore
+	types  map[string]*compositeType
+	stores map[string]*tableStore
 	// indexStores holds each secondary index's B-tree (spec/design/indexes.md §3): a
 	// TableStore with ZERO value columns (entry keys only — the on-disk empty-payload
 	// record), keyed by the lowercased index name (index names live in the relation
 	// namespace, globally unique). Which table owns an index is recorded in that table's
 	// Indexes list.
-	indexStores map[string]*TableStore
+	indexStores map[string]*tableStore
 	// sequences holds sequences, keyed by lowercased name (spec/design/sequences.md). A
 	// database-level object set separate from tables/types; serialized into the catalog's
 	// sequence entries (spec/fileformat/format.md, entry_kind = 2). The mutable counter
 	// (LastValue/IsCalled) lives here, so nextval advances the working snapshot and rolls back
 	// with it (sequences.md §5).
-	sequences map[string]*SequenceDef
+	sequences map[string]*sequenceDef
 	// collations caches collations RESOLVED from the file's reference entries on open, keyed by their
 	// exact (CASE-SENSITIVE) name — collation names are quoted identifiers ("en-US",
 	// spec/design/collation.md §1). C is never stored (table-free, built in). Under the reference-only
@@ -147,13 +147,13 @@ type Snapshot struct {
 }
 
 // newSnapshot builds an empty snapshot.
-func newSnapshot() *Snapshot {
-	return &Snapshot{
-		tables:      make(map[string]*Table),
-		types:       make(map[string]*CompositeType),
-		stores:      make(map[string]*TableStore),
-		indexStores: make(map[string]*TableStore),
-		sequences:   make(map[string]*SequenceDef),
+func newSnapshot() *snapshot {
+	return &snapshot{
+		tables:      make(map[string]*catTable),
+		types:       make(map[string]*compositeType),
+		stores:      make(map[string]*tableStore),
+		indexStores: make(map[string]*tableStore),
+		sequences:   make(map[string]*sequenceDef),
 		collations:  make(map[string]*Collation),
 		gistTrees:   make(map[string]*gistTree),
 	}
@@ -161,28 +161,28 @@ func newSnapshot() *Snapshot {
 
 // clone returns an independent copy: the catalog map is shallow (Table structs are never mutated
 // in place — only added/removed) and each store is an O(1) persistent-map clone (pmap.go).
-func (s *Snapshot) clone() *Snapshot {
-	tables := make(map[string]*Table, len(s.tables))
+func (s *snapshot) clone() *snapshot {
+	tables := make(map[string]*catTable, len(s.tables))
 	for k, v := range s.tables {
 		tables[k] = v
 	}
 	// Composite types, like Table, are never mutated in place — only added/removed — so the map
 	// copy is shallow (spec/design/composite.md §3).
-	types := make(map[string]*CompositeType, len(s.types))
+	types := make(map[string]*compositeType, len(s.types))
 	for k, v := range s.types {
 		types[k] = v
 	}
-	stores := make(map[string]*TableStore, len(s.stores))
+	stores := make(map[string]*tableStore, len(s.stores))
 	for k, v := range s.stores {
 		stores[k] = v.clone()
 	}
-	indexStores := make(map[string]*TableStore, len(s.indexStores))
+	indexStores := make(map[string]*tableStore, len(s.indexStores))
 	for k, v := range s.indexStores {
 		indexStores[k] = v.clone()
 	}
 	// Sequences, like Table/CompositeType, are never mutated in place — only added/removed/replaced
 	// (nextval inserts a fresh struct) — so the map copy is shallow (spec/design/sequences.md §2).
-	sequences := make(map[string]*SequenceDef, len(s.sequences))
+	sequences := make(map[string]*sequenceDef, len(s.sequences))
 	for k, v := range s.sequences {
 		sequences[k] = v
 	}
@@ -198,7 +198,7 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.gistTrees {
 		gistTrees[k] = v
 	}
-	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees}
+	return &snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees}
 }
 
 // resolveCollation resolves a collation name for USE — query resolution and key encoding
@@ -207,7 +207,7 @@ func (s *Snapshot) clone() *Snapshot {
 // LOADED set (db.LoadUnicodeData, §4). nil ⇒ neither has it (the resolver raises 42704). C is handled
 // by the caller (built-in). This is the reference-only read path: a collation is never baked into the
 // file — the file references it by name and the table comes from a loaded bundle.
-func (s *Snapshot) resolveCollation(name string) *Collation {
+func (s *snapshot) resolveCollation(name string) *Collation {
 	if c := s.collations[name]; c != nil {
 		return c
 	}
@@ -221,12 +221,12 @@ func (s *Snapshot) resolveCollation(name string) *Collation {
 // file pin so it is freshly the loaded version, an in-memory-only database). A pure comparison of the
 // file pin already in the catalog (§5) vs the engine-global loaded set; the Snapshot wiring of
 // collation.VersionSkew.
-func (s *Snapshot) collationSkew(name string) (fileU, fileC, loadedU, loadedC string, skewed bool) {
+func (s *snapshot) collationSkew(name string) (fileU, fileC, loadedU, loadedC string, skewed bool) {
 	cat := s.collations[name]
 	if cat == nil {
 		return "", "", "", "", false
 	}
-	lu, lc, sk := VersionSkew(name, cat.UnicodeVersion, cat.CldrVersion)
+	lu, lc, sk := versionSkew(name, cat.UnicodeVersion, cat.CldrVersion)
 	if !sk {
 		return "", "", "", "", false
 	}
@@ -240,7 +240,7 @@ func (s *Snapshot) collationSkew(name string) (fileU, fileC, loadedU, loadedC st
 // the schema uses it, regardless of whether it was ever passed to a (now-removed) import call. C
 // columns (empty Collation) reference nothing. A referenced name this build does not vendor is a bug
 // surfaced here (the precursor to the slice-2d open-time verdict).
-func (s *Snapshot) referencedCollations() ([]*Collation, error) {
+func (s *snapshot) referencedCollations() ([]*Collation, error) {
 	names := map[string]struct{}{}
 	for _, t := range s.tables {
 		for _, col := range t.Columns {
@@ -261,7 +261,7 @@ func (s *Snapshot) referencedCollations() ([]*Collation, error) {
 	for i, name := range sorted {
 		c := s.resolveCollation(name)
 		if c == nil {
-			return nil, NewError(UndefinedObject,
+			return nil, newError(UndefinedObject,
 				fmt.Sprintf("collation %q referenced by the schema is not provided by a loaded bundle", name))
 		}
 		out[i] = c
@@ -280,7 +280,7 @@ func (s *Snapshot) referencedCollations() ([]*Collation, error) {
 // falsely read as Full (corruption). The caller swaps the result in atomically. resolveCollation
 // already yields the loaded table data (the file entry carries the file pin but loaded
 // singles/contractions), so re-encoding produces loaded-version sort keys; the re-pin realigns the label.
-func (s *Snapshot) upgradeCollations(pageSize uint32) (int, error) {
+func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 	refs, err := s.referencedCollations()
 	if err != nil {
 		return 0, err
@@ -315,7 +315,7 @@ func (s *Snapshot) upgradeCollations(pageSize uint32) (int, error) {
 				break
 			}
 		}
-		var indexes []IndexDef
+		var indexes []indexDef
 		for _, idx := range table.Indexes {
 			affected := pkSkewed
 			for _, c := range idx.Columns {
@@ -378,9 +378,9 @@ func (s *Snapshot) upgradeCollations(pageSize uint32) (int, error) {
 				ekeys = append(ekeys, eks...)
 			}
 			sort.Slice(ekeys, func(a, b int) bool { return bytes.Compare(ekeys[a], ekeys[b]) < 0 })
-			fresh := NewTableStore(c, nil)
+			fresh := newTableStore(c, nil)
 			for _, ek := range ekeys {
-				if _, err := fresh.Insert(ek, Row{}); err != nil {
+				if _, err := fresh.Insert(ek, storedRow{}); err != nil {
 					return 0, err
 				}
 			}
@@ -397,40 +397,40 @@ func (s *Snapshot) upgradeCollations(pageSize uint32) (int, error) {
 }
 
 // table looks up a table definition by name (case-insensitive).
-func (s *Snapshot) table(name string) (*Table, bool) {
+func (s *snapshot) table(name string) (*catTable, bool) {
 	t, ok := s.tables[strings.ToLower(name)]
 	return t, ok
 }
 
 // store returns a table's store (the table is known to exist).
-func (s *Snapshot) store(name string) *TableStore { return s.stores[strings.ToLower(name)] }
+func (s *snapshot) store(name string) *tableStore { return s.stores[strings.ToLower(name)] }
 
 // compositeType looks up a composite type definition by name (case-insensitive); nil if absent.
-func (s *Snapshot) compositeType(name string) *CompositeType {
+func (s *snapshot) compositeType(name string) *compositeType {
 	return s.types[strings.ToLower(name)]
 }
 
 // putType registers a composite type (CREATE TYPE). The lower-cased name is the key. The caller
 // has already resolved field types and checked for a duplicate.
-func (s *Snapshot) putType(ct *CompositeType) {
+func (s *snapshot) putType(ct *compositeType) {
 	s.types[strings.ToLower(ct.Name)] = ct
 }
 
 // removeType removes a composite type (DROP TYPE). The caller has checked there are no dependents.
-func (s *Snapshot) removeType(key string) {
+func (s *snapshot) removeType(key string) {
 	delete(s.types, key)
 }
 
 // compositeTypesSorted returns all composite types in ascending lowercased-name order — the
 // on-disk emission order (spec/fileformat/format.md) and a deterministic order with no
 // map-iteration leak (CLAUDE.md §8).
-func (s *Snapshot) compositeTypesSorted() []*CompositeType {
+func (s *snapshot) compositeTypesSorted() []*compositeType {
 	keys := make([]string, 0, len(s.types))
 	for k := range s.types {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	out := make([]*CompositeType, len(keys))
+	out := make([]*compositeType, len(keys))
 	for i, k := range keys {
 		out[i] = s.types[k]
 	}
@@ -438,31 +438,31 @@ func (s *Snapshot) compositeTypesSorted() []*CompositeType {
 }
 
 // sequence looks up a sequence definition by name (case-insensitive); nil if absent.
-func (s *Snapshot) sequence(name string) *SequenceDef {
+func (s *snapshot) sequence(name string) *sequenceDef {
 	return s.sequences[strings.ToLower(name)]
 }
 
 // putSequence registers a sequence (CREATE SEQUENCE). The lower-cased name is the key. The caller
 // has already validated the option set and checked the relation namespace for a collision.
-func (s *Snapshot) putSequence(seq *SequenceDef) {
+func (s *snapshot) putSequence(seq *sequenceDef) {
 	s.sequences[strings.ToLower(seq.Name)] = seq
 }
 
 // removeSequence removes a sequence (DROP SEQUENCE). The caller has checked it exists.
-func (s *Snapshot) removeSequence(key string) {
+func (s *snapshot) removeSequence(key string) {
 	delete(s.sequences, key)
 }
 
 // sequencesSorted returns all sequences in ascending lowercased-name order — the on-disk emission
 // order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak
 // (CLAUDE.md §8).
-func (s *Snapshot) sequencesSorted() []*SequenceDef {
+func (s *snapshot) sequencesSorted() []*sequenceDef {
 	keys := make([]string, 0, len(s.sequences))
 	for k := range s.sequences {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	out := make([]*SequenceDef, len(keys))
+	out := make([]*sequenceDef, len(keys))
 	for i, k := range keys {
 		out[i] = s.sequences[k]
 	}
@@ -473,7 +473,7 @@ func (s *Snapshot) sequencesSorted() []*SequenceDef {
 // (case-insensitive) — the serial-created sequences DROP TABLE must auto-drop
 // (spec/design/sequences.md §12). Sorted so the auto-drop is deterministic (no map-iteration
 // leak, CLAUDE.md §8).
-func (s *Snapshot) sequencesOwnedBy(name string) []string {
+func (s *snapshot) sequencesOwnedBy(name string) []string {
 	var keys []string
 	for k, seq := range s.sequences {
 		if seq.OwnedBy != nil && strings.EqualFold(seq.OwnedBy.Table, name) {
@@ -489,7 +489,7 @@ func (s *Snapshot) sequencesOwnedBy(name string) []string {
 // returns the first dependent's description for the error detail, or ("", false) if there are no
 // dependents. Tables and types are scanned in lowercased-name order so the chosen dependent is
 // deterministic (CLAUDE.md §8).
-func (s *Snapshot) compositeDependent(name string) (string, bool) {
+func (s *snapshot) compositeDependent(name string) (string, bool) {
 	key := strings.ToLower(name)
 	tableKeys := make([]string, 0, len(s.tables))
 	for k := range s.tables {
@@ -540,7 +540,7 @@ type fkDependent struct {
 // both named in the same statement never blocks. Referencing tables are scanned in ascending
 // lowercased key order (each table's ForeignKeys is already name-ordered) for determinism (§8).
 // RESTRICT raises 2BP01 on the first entry; CASCADE removes every entry's FK.
-func (s *Snapshot) foreignKeyDependentsExcluding(dropping map[string]bool) []fkDependent {
+func (s *snapshot) foreignKeyDependentsExcluding(dropping map[string]bool) []fkDependent {
 	tableKeys := make([]string, 0, len(s.tables))
 	for k := range s.tables {
 		tableKeys = append(tableKeys, k)
@@ -576,12 +576,12 @@ func (s *Snapshot) foreignKeyDependentsExcluding(dropping map[string]bool) []fkD
 // store and rows. DROP TABLE … CASCADE's removal of a dependent FK on a table that survives the
 // drop (spec/design/grammar.md §13). An FK owns no B-tree (constraints.md §6), so only the catalog
 // list changes.
-func (s *Snapshot) removeForeignKey(tableKey, fkName string) {
+func (s *snapshot) removeForeignKey(tableKey, fkName string) {
 	old, ok := s.tables[tableKey]
 	if !ok {
 		return
 	}
-	kept := make([]ForeignKey, 0, len(old.ForeignKeys))
+	kept := make([]foreignKey, 0, len(old.ForeignKeys))
 	for _, fk := range old.ForeignKeys {
 		if !strings.EqualFold(fk.Name, fkName) {
 			kept = append(kept, fk)
@@ -599,7 +599,7 @@ func (s *Snapshot) removeForeignKey(tableKey, fkName string) {
 // BEFORE any store is built — so the subsequent ResolveColType walks (and every later
 // value-codec/comparator walk) recurse over a depth-bounded catalog and stay stack-safe (CLAUDE.md
 // §13; cost.md §7b).
-func (s *Snapshot) validateCompositeTypes() error {
+func (s *snapshot) validateCompositeTypes() error {
 	// Existence: every nested-composite field names a registered type. Visit in name order so the
 	// first reported dangling reference is deterministic.
 	keys := make([]string, 0, len(s.types))
@@ -613,7 +613,7 @@ func (s *Snapshot) validateCompositeTypes() error {
 			// CompositeRefOf looks through one array level, so an array-of-composite field
 			// (`addr[]`) is validated like a bare `addr` one (spec/design/array.md §12).
 			if r := f.Type.CompositeRefOf(); r != nil && s.compositeType(r.Name) == nil {
-				return NewError(DataCorrupted,
+				return newError(DataCorrupted,
 					"composite type "+ct.Name+" references unknown type "+r.Name)
 			}
 		}
@@ -630,12 +630,12 @@ func (s *Snapshot) validateCompositeTypes() error {
 	var visit func(key string, levelsAbove int) (int, error)
 	visit = func(key string, levelsAbove int) (int, error) {
 		if levelsAbove >= maxCompositeDepth {
-			return 0, NewError(DataCorrupted,
+			return 0, newError(DataCorrupted,
 				fmt.Sprintf("composite type nesting exceeds the maximum depth of %d", maxCompositeDepth))
 		}
 		switch color[key] {
 		case 1:
-			return 0, NewError(DataCorrupted, "composite type definition cycle through "+key)
+			return 0, newError(DataCorrupted, "composite type definition cycle through "+key)
 		case 2:
 			return cache[key], nil
 		}
@@ -658,7 +658,7 @@ func (s *Snapshot) validateCompositeTypes() error {
 		}
 		depth := 1 + child
 		if depth > maxCompositeDepth {
-			return 0, NewError(DataCorrupted,
+			return 0, newError(DataCorrupted,
 				fmt.Sprintf("composite type nesting exceeds the maximum depth of %d", maxCompositeDepth))
 		}
 		color[key] = 2
@@ -682,7 +682,7 @@ func (s *Snapshot) validateCompositeTypes() error {
 // against the *existing* catalog, every type of which already satisfies depth ≤ maxCompositeDepth
 // (the load + create invariant), so the recursion is bounded by the limit; memoization keeps a
 // diamond-shaped reference graph linear (spec/design/cost.md §7b).
-func (s *Snapshot) compositeTypeDepth(ty Type, cache map[string]int) int {
+func (s *snapshot) compositeTypeDepth(ty dataType, cache map[string]int) int {
 	r := ty.CompositeRefOf()
 	if r == nil {
 		return 0 // a scalar (or a scalar array) adds no composite level
@@ -708,15 +708,15 @@ func (s *Snapshot) compositeTypeDepth(ty Type, cache map[string]int) int {
 // putTable registers a new table and its empty store. The store carries the page payload cap (=
 // page_size − 16) and the column types so the page-backed B-tree can weigh records for its
 // size-driven split (spec/fileformat/format.md).
-func (s *Snapshot) putTable(t *Table, pageSize uint32) {
+func (s *snapshot) putTable(t *catTable, pageSize uint32) {
 	// Resolve each column's ColType against the (already-registered) composite-type catalog — the
 	// codec/coercion tree the store keeps so neither re-walks the type catalog per row
 	// (spec/design/composite.md §4). Composite types are registered before any table (the types-first
 	// catalog order / CREATE TYPE-before-CREATE TABLE rule), so the lookup inside ResolveColType
 	// always resolves.
-	colTypes := make([]ColType, len(t.Columns))
+	colTypes := make([]colType, len(t.Columns))
 	for i, c := range t.Columns {
-		colTypes[i] = ResolveColType(c.Type, s.types)
+		colTypes[i] = resolveColType(c.Type, s.types)
 	}
 	s.putTableResolved(t, colTypes, pageSize)
 }
@@ -727,15 +727,15 @@ func (s *Snapshot) putTable(t *Table, pageSize uint32) {
 // (temp) snapshot's empty types map. The resolved ColType tree is fully self-contained
 // (spec/design/composite.md §4), so the store needs nothing from the catalog thereafter. The plain
 // putTable resolves against s.types and delegates here.
-func (s *Snapshot) putTableResolved(t *Table, colTypes []ColType, pageSize uint32) {
+func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize uint32) {
 	key := strings.ToLower(t.Name)
-	s.stores[key] = NewTableStore(pagePayload(pageSize), colTypes)
+	s.stores[key] = newTableStore(pagePayload(pageSize), colTypes)
 	s.tables[key] = t
 }
 
 // removeTable removes a table's definition, its store, and its indexes' stores (DROP
 // TABLE — the indexes have no independent life, spec/design/indexes.md §2).
-func (s *Snapshot) removeTable(key string) {
+func (s *snapshot) removeTable(key string) {
 	if t, ok := s.tables[key]; ok {
 		for _, idx := range t.Indexes {
 			delete(s.indexStores, strings.ToLower(idx.Name))
@@ -747,11 +747,11 @@ func (s *Snapshot) removeTable(key string) {
 
 // indexStore returns a secondary index's store (the index is known to exist). nameKey is
 // the lowercased index name.
-func (s *Snapshot) indexStore(nameKey string) *TableStore { return s.indexStores[nameKey] }
+func (s *snapshot) indexStore(nameKey string) *tableStore { return s.indexStores[nameKey] }
 
 // hasIndexStore reports whether this snapshot holds a store for the named index (lowercased key).
 // Used to route index access to the session temp snapshot vs the main snapshot (temp-tables.md §2).
-func (s *Snapshot) hasIndexStore(nameKey string) bool {
+func (s *snapshot) hasIndexStore(nameKey string) bool {
 	_, ok := s.indexStores[nameKey]
 	return ok
 }
@@ -759,7 +759,7 @@ func (s *Snapshot) hasIndexStore(nameKey string) bool {
 // storageBytes is the total on-disk record bytes of every table store + index store in this snapshot
 // — the temp budget's deterministic footprint measure (spec/design/temp-tables.md §7), summed over
 // the session temp snapshot. Iteration order does not matter (it is a sum).
-func (s *Snapshot) storageBytes() uint64 {
+func (s *snapshot) storageBytes() uint64 {
 	var total uint64
 	for _, st := range s.stores {
 		total += st.storedBytes()
@@ -774,9 +774,9 @@ func (s *Snapshot) storageBytes() uint64 {
 // into the table's Indexes in ascending lowercased-name order (the catalog/planner order —
 // spec/design/indexes.md §6) and create its zero-column store. The Table struct is
 // re-allocated (catalog Tables are never mutated in place — snapshots share them).
-func (s *Snapshot) putIndex(tableKey string, def IndexDef, pageSize uint32) {
+func (s *snapshot) putIndex(tableKey string, def indexDef, pageSize uint32) {
 	nameKey := strings.ToLower(def.Name)
-	s.indexStores[nameKey] = NewTableStore(pagePayload(pageSize), nil)
+	s.indexStores[nameKey] = newTableStore(pagePayload(pageSize), nil)
 	old := s.tables[tableKey]
 	t := *old
 	pos := len(old.Indexes)
@@ -786,7 +786,7 @@ func (s *Snapshot) putIndex(tableKey string, def IndexDef, pageSize uint32) {
 			break
 		}
 	}
-	t.Indexes = make([]IndexDef, 0, len(old.Indexes)+1)
+	t.Indexes = make([]indexDef, 0, len(old.Indexes)+1)
 	t.Indexes = append(t.Indexes, old.Indexes[:pos]...)
 	t.Indexes = append(t.Indexes, def)
 	t.Indexes = append(t.Indexes, old.Indexes[pos:]...)
@@ -798,13 +798,13 @@ func (s *Snapshot) putIndex(tableKey string, def IndexDef, pageSize uint32) {
 // (spec/design/sequences.md §15.3), leaving the table's rows/store untouched. The Table and its
 // Columns slice are re-allocated (catalog tables are never mutated in place — snapshots share them).
 // A no-op if the table or column ordinal is absent.
-func (s *Snapshot) setColumnDefaultExpr(tableKey string, column int, de *DefaultExpr) {
+func (s *snapshot) setColumnDefaultExpr(tableKey string, column int, de *defaultExprDef) {
 	old, ok := s.tables[tableKey]
 	if !ok || column < 0 || column >= len(old.Columns) {
 		return
 	}
 	t := *old
-	t.Columns = make([]Column, len(old.Columns))
+	t.Columns = make([]catColumn, len(old.Columns))
 	copy(t.Columns, old.Columns)
 	t.Columns[column].DefaultExpr = de
 	s.tables[tableKey] = &t
@@ -813,14 +813,14 @@ func (s *Snapshot) setColumnDefaultExpr(tableKey string, column int, de *Default
 // putIndexStore registers a loaded index store under its (lowercased) name — the file
 // loader's hook (format.go): the owning table's Indexes list came from its catalog entry,
 // so only the store is registered here.
-func (s *Snapshot) putIndexStore(nameKey string, store *TableStore) {
+func (s *snapshot) putIndexStore(nameKey string, store *tableStore) {
 	s.indexStores[nameKey] = store
 }
 
 // gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or nil if the
 // index is not GiST / not present (spec/design/gist.md §4.1). The planner descends it for a &&/@>
 // bound.
-func (s *Snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[nameKey] }
+func (s *snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[nameKey] }
 
 // rebuildGistTrees rebuilds EVERY GiST index's resident R-tree from its leaf-key store
 // (spec/design/gist.md §3/§4.1). Called after any statement that may have changed a GiST index's
@@ -830,7 +830,7 @@ func (s *Snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[na
 // on-disk persisted R-tree. Trees whose index has been dropped are removed. A whole-tree rewrite (the
 // §4.1(b) narrowing extended to in-memory writes); the O(rows)-per-mutation cost is unmetered
 // structure maintenance on the (trusted) write path — the untrusted surface is SELECT-only.
-func (s *Snapshot) rebuildGistTrees() error {
+func (s *snapshot) rebuildGistTrees() error {
 	type spec struct {
 		nameKey string
 		ops     []gistOpclass
@@ -839,7 +839,7 @@ func (s *Snapshot) rebuildGistTrees() error {
 	for _, t := range s.tables {
 		for i := range t.Indexes {
 			idx := &t.Indexes[i]
-			if idx.Kind != IndexGist {
+			if idx.Kind != indexGist {
 				continue
 			}
 			// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per
@@ -879,7 +879,7 @@ func (s *Snapshot) rebuildGistTrees() error {
 
 // removeIndex removes one secondary index (DROP INDEX): its definition from the owning
 // table and its store.
-func (s *Snapshot) removeIndex(tableKey, nameKey string) {
+func (s *snapshot) removeIndex(tableKey, nameKey string) {
 	if old, ok := s.tables[tableKey]; ok {
 		t := *old
 		t.Indexes = nil
@@ -894,7 +894,7 @@ func (s *Snapshot) removeIndex(tableKey, nameKey string) {
 }
 
 // findIndex finds the table owning the named index (case-insensitive): (tableKey, def, true).
-func (s *Snapshot) findIndex(name string) (string, IndexDef, bool) {
+func (s *snapshot) findIndex(name string) (string, indexDef, bool) {
 	key := strings.ToLower(name)
 	for tk, t := range s.tables {
 		for _, ix := range t.Indexes {
@@ -903,7 +903,7 @@ func (s *Snapshot) findIndex(name string) (string, IndexDef, bool) {
 			}
 		}
 	}
-	return "", IndexDef{}, false
+	return "", indexDef{}, false
 }
 
 // Engine is the database handle: the last committed Snapshot plus, while a transaction is open,
@@ -911,8 +911,8 @@ func (s *Snapshot) findIndex(name string) (string, IndexDef, bool) {
 // snapshot — the open transaction's working if any, else committed; a write mutates working and
 // commit swaps committed := working (rollback drops working, since committed was never touched).
 // Every write — autocommit included — runs as a transaction, which unifies the two paths.
-type Engine struct {
-	committed *Snapshot
+type engine struct {
+	committed *snapshot
 	// session is the DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this
 	// handle runs statements through — the open transaction (the Idle/Open/Failed machine, §2.2),
 	// the relocated settings (maxCost/maxSQLLength/workMem, the entropy/clock seam), and the
@@ -954,7 +954,7 @@ type Engine struct {
 	// Engine) rather than per-session. On a single handle this is just a field; for the shared layer
 	// (shared.go) it is pinned from / published to the shared roots alongside committed (the two-root
 	// commit, §5). Born empty, gone at close — never recovered (divergence D5).
-	sharedTempCommitted *Snapshot
+	sharedTempCommitted *snapshot
 	// sharedTempMem is the GLOBAL byte budget for shared temp storage (shared_temp_mem, §7); 0 ⇒
 	// unlimited. The shared analogue of session.tempBuffers, but Engine-level (shared temp is
 	// global). An over-budget shared write aborts 54P03.
@@ -1080,7 +1080,7 @@ type sessionState struct {
 	// host-injectable functions (a random source + a clock), each nil ⇒ the platform primitive.
 	// Tests inject SeededRandomSource + FixedClock (the # seed: / # clock: directives) for
 	// byte-identical cross-core output.
-	seam Seam
+	seam seam
 	// sessionSeq is the SESSION currval state (sequences.md §6): the last value nextval/setval(…,true)
 	// produced IN THIS SESSION for each sequence (lowercased name). NOT in the snapshot, NOT persisted.
 	sessionSeq map[string]int64
@@ -1089,7 +1089,7 @@ type sessionState struct {
 	sessionLastName string
 	// pendingSeq is the per-STATEMENT running sequence advances (sequences.md §4); flushed into the
 	// working snapshot on success, discarded on error (the transactional rollback of the advance, §5).
-	pendingSeq map[string]*SequenceDef
+	pendingSeq map[string]*sequenceDef
 	// pendingCurrval is the per-STATEMENT running currval updates → flushed into sessionSeq on success.
 	pendingCurrval map[string]int64
 	// pendingLastName is the per-STATEMENT running lastval update → flushed into sessionLastName.
@@ -1121,7 +1121,7 @@ type sessionState struct {
 	// invisible to other sessions), and dropped wholesale when the session is. Transactional like the
 	// main snapshot: an open transaction clones it into activeTx.tempWorking, which a successful COMMIT
 	// adopts back here and a ROLLBACK discards.
-	tempCommitted *Snapshot
+	tempCommitted *snapshot
 	// vars are the session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to
 	// the session — a string→string map (PG GUCs are all text) the host sets (SetVar/ResetVar) and SQL
 	// reads with current_setting. Custom (dotted) names only in v1. SESSION state, not snapshot state:
@@ -1139,7 +1139,7 @@ type sessionState struct {
 	// transaction's working). Set by the writable-CTE orchestrator before the first sub-statement runs
 	// and cleared when it finishes (success or error); nil for every other statement, where reads fall
 	// through to working/committed as usual (readSnap).
-	readPin *Snapshot
+	readPin *snapshot
 }
 
 // requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md
@@ -1151,7 +1151,7 @@ func requireCustomVarName(name string) (string, error) {
 	if strings.Contains(name, ".") {
 		return strings.ToLower(name), nil
 	}
-	return "", NewError(UndefinedObject, "unrecognized configuration parameter: "+name)
+	return "", newError(UndefinedObject, "unrecognized configuration parameter: "+name)
 }
 
 // newSession builds a fresh default session: no open transaction, default settings, empty state.
@@ -1166,7 +1166,7 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 		opts.MaxSQLLength = DefaultMaxSQLLength
 	}
 	if opts.WorkMem == 0 {
-		opts.WorkMem = DefaultWorkMem
+		opts.WorkMem = defaultWorkMem
 	}
 	s := sessionState{
 		maxCost:         opts.MaxCost,
@@ -1176,7 +1176,7 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 		workMem:         opts.WorkMem,
 		privileges:      newPrivileges(),
 		allowDDL:        true,
-		tempBuffers:     DefaultTempBuffers,
+		tempBuffers:     defaultTempBuffers,
 		tempCommitted:   newSnapshot(),
 		vars:            map[string]string{},
 	}
@@ -1220,7 +1220,7 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 func (s *sessionState) SetTimeZone(zone string) error {
 	zr, ok := ResolveZone(zone)
 	if !ok {
-		return NewError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", zone))
+		return newError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", zone))
 	}
 	s.timeZone = zr
 	return nil
@@ -1234,7 +1234,7 @@ func (s *sessionState) SetTimeZone(zone string) error {
 type activeTx struct {
 	writable bool
 	failed   bool
-	working  *Snapshot
+	working  *snapshot
 	// savedSessionSeq / savedSessionLastName capture the handle's currval/lastval session state
 	// (spec/design/sequences.md §6) when this transaction opened. A nextval/setval inside the block
 	// updates the handle's session state per-statement (so an in-block currval sees its own
@@ -1246,13 +1246,13 @@ type activeTx struct {
 	// (spec/design/temp-tables.md §5): cloned from Session.tempCommitted at tx open (cheap — persistent
 	// stores clone O(1)), mutated by temp DDL/DML, adopted back into tempCommitted on a successful COMMIT
 	// and discarded on ROLLBACK. The temp analogue of working, kept SEPARATE so it is never serialized.
-	tempWorking *Snapshot
+	tempWorking *snapshot
 	// sharedTempWorking is the transaction's working copy of the DATABASE-WIDE shared temp-table
 	// snapshot (spec/design/temp-tables.md §5): cloned from Engine.sharedTempCommitted at tx open,
 	// mutated by shared-temp DDL/DML, adopted back on a successful COMMIT and discarded on ROLLBACK.
 	// The shared analogue of tempWorking; for the shared layer the adopted state is then published to
 	// the shared root (the two-root commit, §5).
-	sharedTempWorking *Snapshot
+	sharedTempWorking *snapshot
 	// mainDirty is whether this transaction mutated the MAIN (persistent) snapshot — set by
 	// (*Engine).workingMut. Drives the commit's persist decision so a transaction that touched ONLY
 	// temp tables makes zero file writes (temp-tables.md §2).
@@ -1268,23 +1268,23 @@ type activeTx struct {
 }
 
 // NewEngine builds an empty in-memory database.
-func NewEngine() *Engine {
-	return &Engine{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
+func newEngine() *engine {
+	return &engine{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: defaultSharedTempMem}
 }
 
 // WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
 // fan-out tracks the page size (spec/fileformat/format.md), so the in-memory tree must be built at
 // the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
 // in-memory database uses NewEngine (the default page size).
-func WithPageSize(pageSize uint32) *Engine {
-	return &Engine{committed: newSnapshot(), pageSize: pageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
+func withPageSize(pageSize uint32) *engine {
+	return &engine{committed: newSnapshot(), pageSize: pageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: defaultSharedTempMem}
 }
 
 // readSnap is the snapshot a read sees: the read pin if one is set (a data-modifying WITH statement
 // pins the pre-statement snapshot so every sub-statement reads it — writable-cte.md §2), else the
 // open transaction's working (read-your-writes for a writable tx; the pinned snapshot for a
 // read-only tx), else the committed snapshot.
-func (db *Engine) readSnap() *Snapshot {
+func (db *engine) readSnap() *snapshot {
 	if db.session.readPin != nil {
 		return db.session.readPin
 	}
@@ -1297,7 +1297,7 @@ func (db *Engine) readSnap() *Snapshot {
 // columnCollations resolves each column's frozen collation (Column.Collation, the name) to its
 // baked table, indexed by column ordinal — nil for a C / non-text column (the fast path). The key
 // encoders (§2.12) consult colls[ci] to pick a text column's key form.
-func (db *Engine) ensureCollationsWritable(columns []Column) error {
+func (db *engine) ensureCollationsWritable(columns []catColumn) error {
 	// Refuse a WRITE that would maintain a collated B-tree under a version-skewed collation (the
 	// slice-2d verdict, spec/design/collation.md §12/§14): if any of columns carries a collation the
 	// file pinned to a different (unicode, cldr) than the loaded bundle provides, an
@@ -1312,7 +1312,7 @@ func (db *Engine) ensureCollationsWritable(columns []Column) error {
 			continue
 		}
 		if fu, fc, lu, lc, skewed := snap.collationSkew(columns[i].Collation); skewed {
-			return NewError(CollationVersionMismatch, fmt.Sprintf(
+			return newError(CollationVersionMismatch, fmt.Sprintf(
 				"collation %q version mismatch: this database's keys were built under %s/%s but the "+
 					"loaded bundle is %s/%s; tables using it are read-only until a REINDEX migration rebuilds them",
 				columns[i].Collation, fu, fc, lu, lc,
@@ -1322,7 +1322,7 @@ func (db *Engine) ensureCollationsWritable(columns []Column) error {
 	return nil
 }
 
-func (db *Engine) columnCollations(columns []Column) []*Collation {
+func (db *engine) columnCollations(columns []catColumn) []*Collation {
 	snap := db.readSnap()
 	out := make([]*Collation, len(columns))
 	for i := range columns {
@@ -1339,14 +1339,14 @@ func (db *Engine) columnCollations(columns []Column) []*Collation {
 // does not map — propagated, so a collated INSERT of an unmapped string aborts the write.
 func collatedTextKey(coll *Collation, s string) ([]byte, error) {
 	if coll != nil {
-		return SortKey(coll, s)
+		return sortKey(coll, s)
 	}
-	return EncodeTerminated([]byte(s)), nil
+	return encodeTerminated([]byte(s)), nil
 }
 
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
 // with a transaction open (autocommit opens one implicitly), so tx is non-nil here.
-func (db *Engine) working() *Snapshot {
+func (db *engine) working() *snapshot {
 	// Mark the main image dirty so the commit knows to persist it; a temp-only transaction never
 	// reaches here (it writes via the temp funnels) and so makes zero file writes (temp-tables.md §2).
 	db.session.tx.mainDirty = true
@@ -1356,7 +1356,7 @@ func (db *Engine) working() *Snapshot {
 // tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
 // transaction's tempWorking, else the session's committed temp state. The temp analogue of readSnap
 // (it does not consult readPin — a writable-CTE pins only the main snapshot).
-func (db *Engine) tempSnap() *Snapshot {
+func (db *engine) tempSnap() *snapshot {
 	if db.session.tx != nil {
 		return db.session.tx.tempWorking
 	}
@@ -1366,7 +1366,7 @@ func (db *Engine) tempSnap() *Snapshot {
 // isTempTable reports whether name resolves to a SESSION-LOCAL temporary table in the visible temp
 // snapshot (spec/design/temp-tables.md §3). Preclude-overlaps guarantees a name is temp XOR
 // persistent, so this is the routing predicate the table/store funnels use.
-func (db *Engine) isTempTable(name string) bool {
+func (db *engine) isTempTable(name string) bool {
 	_, ok := db.tempSnap().table(name)
 	return ok
 }
@@ -1374,7 +1374,7 @@ func (db *Engine) isTempTable(name string) bool {
 // sharedTempSnap is the DATABASE-WIDE shared temp-table snapshot for READS (temp-tables.md §4/§5):
 // the open transaction's sharedTempWorking, else the handle's sharedTempCommitted. The shared
 // analogue of tempSnap.
-func (db *Engine) sharedTempSnap() *Snapshot {
+func (db *engine) sharedTempSnap() *snapshot {
 	if db.session.tx != nil {
 		return db.session.tx.sharedTempWorking
 	}
@@ -1384,7 +1384,7 @@ func (db *Engine) sharedTempSnap() *Snapshot {
 // isSharedTempTable reports whether name resolves to a DATABASE-WIDE shared temporary table in the
 // visible shared-temp snapshot (temp-tables.md §3). Checked AFTER session-local in the resolution
 // walk (session-local → shared → persistent); preclude-overlaps keeps a name in at most one scope.
-func (db *Engine) isSharedTempTable(name string) bool {
+func (db *engine) isSharedTempTable(name string) bool {
 	_, ok := db.sharedTempSnap().table(name)
 	return ok
 }
@@ -1397,7 +1397,7 @@ func (db *Engine) isSharedTempTable(name string) bool {
 // temp tables plus the shared ones, so the check is scoped to what is visible (another session's
 // private temp table is invisible by design — and its resolved ColType is self-contained, so it keeps
 // working regardless).
-func (db *Engine) compositeDependentAny(name string) (string, bool) {
+func (db *engine) compositeDependentAny(name string) (string, bool) {
 	if dep, ok := db.readSnap().compositeDependent(name); ok {
 		return dep, true
 	}
@@ -1410,7 +1410,7 @@ func (db *Engine) compositeDependentAny(name string) (string, bool) {
 // isTempIndex reports whether name is a secondary index on a SESSION-LOCAL temp table
 // (spec/design/temp-tables.md §8) — the index analogue of isTempTable, used to gate (allowTempDDL)
 // and route a DROP INDEX of a temp index. Preclude-overlaps keeps an index name in one scope.
-func (db *Engine) isTempIndex(name string) bool {
+func (db *engine) isTempIndex(name string) bool {
 	_, _, ok := db.tempSnap().findIndex(name)
 	return ok
 }
@@ -1418,7 +1418,7 @@ func (db *Engine) isTempIndex(name string) bool {
 // isSharedTempIndex reports whether name is a secondary index on a DATABASE-WIDE shared temp table
 // (temp-tables.md §8) — the index analogue of isSharedTempTable; checked AFTER the session-local
 // index (the resolution walk).
-func (db *Engine) isSharedTempIndex(name string) bool {
+func (db *engine) isSharedTempIndex(name string) bool {
 	_, _, ok := db.sharedTempSnap().findIndex(name)
 	return ok
 }
@@ -1428,7 +1428,7 @@ func (db *Engine) isSharedTempIndex(name string) bool {
 // (the shared relation namespace), so this is just "where the sequence lives". Every sequence READ
 // (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a serial/IDENTITY
 // column's OWNED temp sequence resolves exactly like a persistent one.
-func (db *Engine) sequence(name string) *SequenceDef {
+func (db *engine) sequence(name string) *sequenceDef {
 	if s := db.tempSnap().sequence(name); s != nil {
 		return s
 	}
@@ -1441,19 +1441,19 @@ func (db *Engine) sequence(name string) *SequenceDef {
 // isTempSequence reports whether name is a sequence in the SESSION-LOCAL temp snapshot
 // (temp-tables.md §8) — the sequence analogue of isTempTable. A temp sequence only ever arises from a
 // serial/IDENTITY temp column (standalone CREATE SEQUENCE is always persistent), so it is always owned.
-func (db *Engine) isTempSequence(name string) bool {
+func (db *engine) isTempSequence(name string) bool {
 	return db.tempSnap().sequence(name) != nil
 }
 
 // isSharedTempSequence reports whether name is a sequence in the DATABASE-WIDE shared temp snapshot
 // (temp-tables.md §8) — checked AFTER session-local (the resolution walk).
-func (db *Engine) isSharedTempSequence(name string) bool {
+func (db *engine) isSharedTempSequence(name string) bool {
 	return db.sharedTempSnap().sequence(name) != nil
 }
 
 // anyTempSequence / anySharedTempSequence report whether any name in a DROP SEQUENCE list is a
 // session-local / shared temp sequence — the gate classifiers for a temp DROP SEQUENCE (§5/§8).
-func (db *Engine) anyTempSequence(names []string) bool {
+func (db *engine) anyTempSequence(names []string) bool {
 	for _, n := range names {
 		if db.isTempSequence(n) {
 			return true
@@ -1462,7 +1462,7 @@ func (db *Engine) anyTempSequence(names []string) bool {
 	return false
 }
 
-func (db *Engine) anySharedTempSequence(names []string) bool {
+func (db *engine) anySharedTempSequence(names []string) bool {
 	for _, n := range names {
 		if db.isSharedTempSequence(n) {
 			return true
@@ -1475,7 +1475,7 @@ func (db *Engine) anySharedTempSequence(names []string) bool {
 // a session-local / database-wide-shared temp table — the DDL capability gate's classification of a
 // mixed list (temp-tables.md §5): if any target is temp-scoped the whole statement is gated by the
 // matching temp-DDL grant (shared checked before session-local, the resolution-walk order).
-func (db *Engine) anyTempTable(names []string) bool {
+func (db *engine) anyTempTable(names []string) bool {
 	for _, n := range names {
 		if db.isTempTable(n) {
 			return true
@@ -1484,7 +1484,7 @@ func (db *Engine) anyTempTable(names []string) bool {
 	return false
 }
 
-func (db *Engine) anySharedTempTable(names []string) bool {
+func (db *engine) anySharedTempTable(names []string) bool {
 	for _, n := range names {
 		if db.isSharedTempTable(n) {
 			return true
@@ -1498,7 +1498,7 @@ func (db *Engine) anySharedTempTable(names []string) bool {
 // temp column's owned sequence advances (nextval flush) into its temp snapshot — like the table's rows,
 // zero file writes (temp-tables.md §2); a brand-new persistent sequence is absent from both temp scopes
 // and lands in the main image.
-func (db *Engine) putSequenceRouted(def *SequenceDef) {
+func (db *engine) putSequenceRouted(def *sequenceDef) {
 	if db.isTempSequence(def.Name) {
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.putSequence(def)
@@ -1512,7 +1512,7 @@ func (db *Engine) putSequenceRouted(def *SequenceDef) {
 
 // removeSequenceRouted removes a sequence from whichever scope owns its name (the routed analogue of
 // putSequenceRouted). Used by DROP SEQUENCE and DROP TABLE's owned-sequence auto-drop.
-func (db *Engine) removeSequenceRouted(name string) {
+func (db *engine) removeSequenceRouted(name string) {
 	key := strings.ToLower(name)
 	if db.isTempSequence(name) {
 		db.session.tx.tempDirty = true
@@ -1528,7 +1528,7 @@ func (db *Engine) removeSequenceRouted(name string) {
 // setColumnDefaultExprRouted rewrites a column's stored DEFAULT expression in whichever scope owns the
 // table — the routed analogue used by ALTER SEQUENCE … RENAME of an owned sequence (temp-tables.md §8),
 // so a renamed owned TEMP sequence's nextval default is rewritten in the temp snapshot.
-func (db *Engine) setColumnDefaultExprRouted(tableKey string, column int, de *DefaultExpr) {
+func (db *engine) setColumnDefaultExprRouted(tableKey string, column int, de *defaultExprDef) {
 	if db.isTempTable(tableKey) {
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.setColumnDefaultExpr(tableKey, column, de)
@@ -1542,7 +1542,7 @@ func (db *Engine) setColumnDefaultExprRouted(tableKey string, column int, de *De
 
 // lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
 // (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
-func (db *Engine) lkpTable(name string) (*Table, bool) {
+func (db *engine) lkpTable(name string) (*catTable, bool) {
 	if t, ok := db.tempSnap().table(name); ok {
 		return t, true
 	}
@@ -1554,7 +1554,7 @@ func (db *Engine) lkpTable(name string) (*Table, bool) {
 
 // lkpStore returns a table's store for READS, routing by the resolution walk (session-local temp →
 // shared temp → visible main snapshot — temp-tables.md §2/§4). No dirty flag — reads never persist.
-func (db *Engine) lkpStore(name string) *TableStore {
+func (db *engine) lkpStore(name string) *tableStore {
 	if db.isTempTable(name) {
 		return db.tempSnap().store(name)
 	}
@@ -1568,7 +1568,7 @@ func (db *Engine) lkpStore(name string) *TableStore {
 // (flagging tempDirty), a shared temp write to sharedTempWorking (flagging sharedTempDirty), and a
 // persistent write to working (which flags mainDirty) — so a pure-temp transaction leaves the main
 // image untouched (temp-tables.md §2).
-func (db *Engine) writeStore(name string) *TableStore {
+func (db *engine) writeStore(name string) *tableStore {
 	if db.isTempTable(name) {
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.store(name)
@@ -1582,7 +1582,7 @@ func (db *Engine) writeStore(name string) *TableStore {
 
 // lkpIndexStore returns a secondary index's store for READS, walking session-local → shared → main
 // (temp-tables.md §8).
-func (db *Engine) lkpIndexStore(nameKey string) *TableStore {
+func (db *engine) lkpIndexStore(nameKey string) *tableStore {
 	if db.tempSnap().hasIndexStore(nameKey) {
 		return db.tempSnap().indexStore(nameKey)
 	}
@@ -1594,7 +1594,7 @@ func (db *Engine) lkpIndexStore(nameKey string) *TableStore {
 
 // writeIndexStore returns a secondary index's store for MUTATION, walking session-local → shared →
 // main (flagging the matching dirty bit).
-func (db *Engine) writeIndexStore(nameKey string) *TableStore {
+func (db *engine) writeIndexStore(nameKey string) *tableStore {
 	if db.tempSnap().hasIndexStore(nameKey) {
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.indexStore(nameKey)
@@ -1608,35 +1608,35 @@ func (db *Engine) writeIndexStore(nameKey string) *TableStore {
 
 // InTransaction reports whether an explicit transaction block is currently open
 // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
-func (db *Engine) InTransaction() bool { return db.session.tx != nil }
+func (db *engine) InTransaction() bool { return db.session.tx != nil }
 
 // Txid is the monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
-func (db *Engine) Txid() uint64 { return db.committed.txid }
+func (db *engine) Txid() uint64 { return db.committed.txid }
 
 // OldestLiveTxid is the oldest still-live snapshot's txid (spec/design/transactions.md §8) — the
 // Phase-6 free-list reclamation gate. Single-handle (P5.3a) it is trivially the committed txid; the
 // P5.3b shared read snapshots make it meaningful.
-func (db *Engine) OldestLiveTxid() uint64 { return db.committed.txid }
+func (db *engine) OldestLiveTxid() uint64 { return db.committed.txid }
 
 // PageSize is the page size this database serializes with (spec/design/api.md §2).
-func (db *Engine) PageSize() uint32 { return db.pageSize }
+func (db *engine) PageSize() uint32 { return db.pageSize }
 
 // PageCount is the committed logical page high-water — the number of pages the on-disk image
 // references (the count the meta records, format.md), the size an incremental commit extends at
 // (spec/fileformat/format.md *Reclamation*). It is not the physical file length, which the chunked
 // preallocation (pager.go, spec/design/pager.md §7) runs ahead of with trailing zero slack. 0 for a
 // fresh in-memory database.
-func (db *Engine) PageCount() uint32 { return db.pageCount }
+func (db *engine) PageCount() uint32 { return db.pageCount }
 
 // Path is the backing file path, or "" for an in-memory database.
-func (db *Engine) Path() string { return db.path }
+func (db *engine) Path() string { return db.path }
 
 // SetMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
 // spec/design/api.md §8). A positive limit bounds every subsequent statement: it aborts with
 // 54P01 the instant accrued cost reaches limit (spec/design/cost.md §6). limit <= 0 (the default)
 // is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
 // setting, not stored in the file.
-func (db *Engine) SetMaxCost(limit int64) { db.session.maxCost = limit }
+func (db *engine) SetMaxCost(limit int64) { db.session.maxCost = limit }
 
 // SetLifetimeMaxCost sets the PER-SESSION cumulative cost budget on the default session
 // (spec/design/session.md §5.4); limit <= 0 (the default) is unlimited. Where max_cost bounds one
@@ -1644,32 +1644,32 @@ func (db *Engine) SetMaxCost(limit int64) { db.session.maxCost = limit }
 // cost reaches limit the in-flight statement aborts 54P02, and once spent every further statement is
 // rejected 54P02 at admission. The multi-tenant / untrusted-host gate atop max_cost; a handle
 // setting, not stored in the file.
-func (db *Engine) SetLifetimeMaxCost(limit int64) { db.session.lifetimeMaxCost = limit }
+func (db *engine) SetLifetimeMaxCost(limit int64) { db.session.lifetimeMaxCost = limit }
 
 // LifetimeMaxCost is the default session's per-session cumulative cost budget (0 ⇒ unlimited).
-func (db *Engine) LifetimeMaxCost() int64 { return db.session.lifetimeMaxCost }
+func (db *engine) LifetimeMaxCost() int64 { return db.session.lifetimeMaxCost }
 
 // LifetimeCost is the default session's running CUMULATIVE execution cost so far
 // (spec/design/session.md §5.4) — the gauge the lifetime_max_cost budget bounds. Tracked even when
 // unlimited; survives a transaction rollback (session state, not snapshot state).
-func (db *Engine) LifetimeCost() int64 { return *db.session.lifetimeTotal }
+func (db *engine) LifetimeCost() int64 { return *db.session.lifetimeTotal }
 
 // SetDefaultPrivileges replaces the default session's default table-privilege set — the
 // GRANT … ON ALL TABLES default (spec/design/session.md §5.3). PrivSetEmpty.With(PrivSelect) makes
 // the session read-only (a write resolves to 42501). A handle setting, not stored in the file.
-func (db *Engine) SetDefaultPrivileges(privs PrivilegeSet) {
+func (db *engine) SetDefaultPrivileges(privs PrivilegeSet) {
 	db.session.privileges.SetDefaultTable(privs)
 }
 
 // Grant grants privs on a specific object (table or function) on the default session, beyond the
 // default (§5.3).
-func (db *Engine) Grant(privs PrivilegeSet, object string) {
+func (db *engine) Grant(privs PrivilegeSet, object string) {
 	db.session.privileges.Grant(privs, object)
 }
 
 // Revoke revokes privs from a specific object on the default session (revoke wins over grant and the
 // default, §5.3).
-func (db *Engine) Revoke(privs PrivilegeSet, object string) {
+func (db *engine) Revoke(privs PrivilegeSet, object string) {
 	db.session.privileges.Revoke(privs, object)
 }
 
@@ -1677,7 +1677,7 @@ func (db *Engine) Revoke(privs PrivilegeSet, object string) {
 // table privilege, no per-object delta, DDL allowed (§5.3). The conformance harness calls this before
 // each record so a # default_privileges: / # grant: / # revoke: / # allow_ddl: directive never leaks
 // past the record it decorates.
-func (db *Engine) ResetPrivileges() {
+func (db *engine) ResetPrivileges() {
 	db.session.privileges = newPrivileges()
 	db.session.allowDDL = true
 	// The temp-DDL gates are part of the authorization envelope (temp-tables.md §5); reset them with
@@ -1688,74 +1688,74 @@ func (db *Engine) ResetPrivileges() {
 }
 
 // Privileges is read-only access to the default session's authorization envelope (§5.3).
-func (db *Engine) Privileges() *Privileges { return &db.session.privileges }
+func (db *engine) Privileges() *Privileges { return &db.session.privileges }
 
 // SetAllowDDL sets whether DDL is permitted on the default session (§5.3); a denied schema change is
 // 42501.
-func (db *Engine) SetAllowDDL(allow bool) { db.session.allowDDL = allow }
+func (db *engine) SetAllowDDL(allow bool) { db.session.allowDDL = allow }
 
 // AllowDDL reports whether DDL is permitted on the default session.
-func (db *Engine) AllowDDL() bool { return db.session.allowDDL }
+func (db *engine) AllowDDL() bool { return db.session.allowDDL }
 
 // SetAllowTempDDL sets whether session-local temporary-table DDL is permitted on the default session
 // (spec/design/temp-tables.md §5) — the temp-scoped split of AllowDDL; a denied temp DDL is 42501.
-func (db *Engine) SetAllowTempDDL(allow bool) { db.session.allowTempDDL = allow }
+func (db *engine) SetAllowTempDDL(allow bool) { db.session.allowTempDDL = allow }
 
 // AllowTempDDL reports whether session-local temporary-table DDL is permitted on the default session.
-func (db *Engine) AllowTempDDL() bool { return db.session.allowTempDDL }
+func (db *engine) AllowTempDDL() bool { return db.session.allowTempDDL }
 
 // SetAllowSharedTempDDL sets whether DATABASE-WIDE shared temporary-table DDL is permitted on the
 // default session (spec/design/temp-tables.md §5) — the shared-temp split of AllowDDL, the more
 // privileged of the two temp gates; a denied shared-temp DDL is 42501.
-func (db *Engine) SetAllowSharedTempDDL(allow bool) { db.session.allowSharedTempDDL = allow }
+func (db *engine) SetAllowSharedTempDDL(allow bool) { db.session.allowSharedTempDDL = allow }
 
 // AllowSharedTempDDL reports whether shared temporary-table DDL is permitted on the default session.
-func (db *Engine) AllowSharedTempDDL() bool { return db.session.allowSharedTempDDL }
+func (db *engine) AllowSharedTempDDL() bool { return db.session.allowSharedTempDDL }
 
 // SetTempBuffers sets the default session's per-session temp-table storage budget in BYTES
 // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
-func (db *Engine) SetTempBuffers(bytes int) { db.session.tempBuffers = bytes }
+func (db *engine) SetTempBuffers(bytes int) { db.session.tempBuffers = bytes }
 
 // TempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
-func (db *Engine) TempBuffers() int { return db.session.tempBuffers }
+func (db *engine) TempBuffers() int { return db.session.tempBuffers }
 
 // SetSharedTempMem sets the GLOBAL shared-temp storage budget in BYTES (shared_temp_mem,
 // spec/design/temp-tables.md §7); 0 ⇒ unlimited. A Engine-level setting (shared temp data is
 // global); an over-budget shared-temp write aborts 54P03.
-func (db *Engine) SetSharedTempMem(bytes int) { db.sharedTempMem = bytes }
+func (db *engine) SetSharedTempMem(bytes int) { db.sharedTempMem = bytes }
 
 // SharedTempMem reports the handle's shared-temp storage budget (0 ⇒ unlimited).
-func (db *Engine) SharedTempMem() int { return db.sharedTempMem }
+func (db *engine) SharedTempMem() int { return db.sharedTempMem }
 
 // SetVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
 // variables must be namespaced (a dotted name); a non-dotted name is 42704. Read it back in SQL with
 // current_setting('name'[, missing_ok]).
-func (db *Engine) SetVar(name, value string) error { return db.session.SetVar(name, value) }
+func (db *engine) SetVar(name, value string) error { return db.session.SetVar(name, value) }
 
 // ResetVar clears a session variable on the default session (§6.1); a non-dotted name is 42704.
-func (db *Engine) ResetVar(name string) error { return db.session.ResetVar(name) }
+func (db *engine) ResetVar(name string) error { return db.session.ResetVar(name) }
 
 // Var reads a session variable's value on the default session (§6.1); ok is false if it is not set.
-func (db *Engine) Var(name string) (string, bool) { return db.session.Var(name) }
+func (db *engine) Var(name string) (string, bool) { return db.session.Var(name) }
 
 // ResetVars clears every session variable on the default session (§6.1) — PostgreSQL's RESET ALL for
 // the variable map (also the conformance harness # set: reset hook).
-func (db *Engine) ResetVars() { db.session.ResetVars() }
+func (db *engine) ResetVars() { db.session.ResetVars() }
 
 // SetTimeZone sets the time zone on the default session (spec/design/session.md §6.2, timezones.md
 // §9.4): the zone a timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts.
 // Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; else 22023.
-func (db *Engine) SetTimeZone(zone string) error { return db.session.SetTimeZone(zone) }
+func (db *engine) SetTimeZone(zone string) error { return db.session.SetTimeZone(zone) }
 
 // SetMaxSQLLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
 // §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
 // parse entry, before lexing — the §13 input-size gate (cost.md §7). 0 is unlimited (a trusted
 // caller's opt-out); the default is DefaultMaxSQLLength (1 MiB). A handle setting, not stored in
 // the file (mirrors SetMaxCost).
-func (db *Engine) SetMaxSQLLength(bytes int) { db.session.maxSQLLength = bytes }
+func (db *engine) SetMaxSQLLength(bytes int) { db.session.maxSQLLength = bytes }
 
 // MaxSQLLength is the current input-SQL byte limit (0 = unlimited). See SetMaxSQLLength.
-func (db *Engine) MaxSQLLength() int { return db.session.maxSQLLength }
+func (db *engine) MaxSQLLength() int { return db.session.maxSQLLength }
 
 // parse parses one statement from sql, first enforcing this handle's maxSQLLength input-size limit
 // (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an over-limit
@@ -1764,26 +1764,26 @@ func (db *Engine) MaxSQLLength() int { return db.session.maxSQLLength }
 // == 0 is unlimited. Every handle-bound parse path routes through here (Execute/ExecuteParams/
 // Prepare/ExecuteSQL/the session handles), so the per-handle limit has no hole. The byte length is
 // len(sql) (Go strings are UTF-8).
-func (db *Engine) parse(sql string) (Statement, error) {
+func (db *engine) parse(sql string) (statement, error) {
 	if db.session.maxSQLLength > 0 && len(sql) > db.session.maxSQLLength {
-		return Statement{}, NewError(ProgramLimitExceeded, fmt.Sprintf("SQL statement exceeds the maximum length of %d bytes", db.session.maxSQLLength))
+		return statement{}, newError(ProgramLimitExceeded, fmt.Sprintf("SQL statement exceeds the maximum length of %d bytes", db.session.maxSQLLength))
 	}
-	return ParseSQL(sql)
+	return parseSQL(sql)
 }
 
 // SetRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) — the
 // deterministic / reproducible path. Pass SeededRandomSource for a byte-identical cross-core stream
 // (the conformance # seed: directive). ClearRandomSource returns to the OS CSPRNG, drawn per value.
-func (db *Engine) SetRandomSource(f RandomSource) { db.session.seam.SetRandom(f) }
-func (db *Engine) ClearRandomSource()             { db.session.seam.ClearRandom() }
+func (db *engine) SetRandomSource(f RandomSource) { db.session.seam.SetRandom(f) }
+func (db *engine) ClearRandomSource()             { db.session.seam.ClearRandom() }
 
 // SetClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. FixedClock (the # clock:
 // directive). ClearClockSource returns to the wall clock.
-func (db *Engine) SetClockSource(f ClockSource) { db.session.seam.SetClock(f) }
-func (db *Engine) ClearClockSource()            { db.session.seam.ClearClock() }
+func (db *engine) SetClockSource(f ClockSource) { db.session.seam.SetClock(f) }
+func (db *engine) ClearClockSource()            { db.session.seam.ClearClock() }
 
 // MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
-func (db *Engine) MaxCost() int64 { return db.session.maxCost }
+func (db *engine) MaxCost() int64 { return db.session.maxCost }
 
 // SetWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
 // (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly
@@ -1791,14 +1791,14 @@ func (db *Engine) MaxCost() int64 { return db.session.maxCost }
 // spill). It never changes what a query observes (results + cost are invariant — spill.md §6), only
 // when an operator spills; an in-memory database ignores it. A handle setting, not stored in the
 // file (mirrors SetMaxCost).
-func (db *Engine) SetWorkMem(bytes int) { db.session.workMem = bytes }
+func (db *engine) SetWorkMem(bytes int) { db.session.workMem = bytes }
 
 // WorkMem is the current work-memory budget in bytes (0 ⇒ unlimited). See SetWorkMem.
-func (db *Engine) WorkMem() int { return db.session.workMem }
+func (db *engine) WorkMem() int { return db.session.workMem }
 
 // Status reports the DEFAULT session's transaction status (Idle/Open/Failed, spec/design/session.md
 // §2.2) — the explicit three-state machine the convenience methods drive.
-func (db *Engine) Status() TxStatus { return txStatusOf(db.session.tx) }
+func (db *engine) Status() TxStatus { return txStatusOf(db.session.tx) }
 
 // Status reports this session's transaction status (Idle/Open/Failed, session.md §2.2).
 func (s *sessionState) Status() TxStatus { return txStatusOf(s.tx) }
@@ -1825,8 +1825,8 @@ func (s *sessionState) LifetimeCost() int64 { return *s.lifetimeTotal }
 // newMeter builds the Meter for a statement run on this session: the per-statement max_cost ceiling
 // (54P01) plus a handle to the session's cumulative total + budget (54P02). Every statement's meter
 // is minted here, so all execution cost live-charges into the cumulative.
-func (s *sessionState) newMeter() *Meter {
-	return &Meter{Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost}
+func (s *sessionState) newMeter() *costMeter {
+	return &costMeter{Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost}
 }
 
 // MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
@@ -1918,23 +1918,23 @@ func (s *sessionState) ClearClockSource()            { s.seam.ClearClock() }
 
 // ReadOnly reports whether this handle was opened read-only (spec/design/api.md §2.1): every
 // transaction defaults to READ ONLY, writes are 25006, and the file is never written.
-func (db *Engine) ReadOnly() bool { return db.readOnly }
+func (db *engine) ReadOnly() bool { return db.readOnly }
 
 // Table looks up a table definition by name (case-insensitive) in the visible snapshot.
-func (db *Engine) Table(name string) (*Table, bool) {
+func (db *engine) Table(name string) (*catTable, bool) {
 	return db.readSnap().table(name)
 }
 
 // CompositeType looks up a composite type definition by name (case-insensitive) in the visible
 // snapshot (spec/design/composite.md); nil if absent.
-func (db *Engine) CompositeType(name string) *CompositeType {
+func (db *engine) CompositeType(name string) *compositeType {
 	return db.readSnap().compositeType(name)
 }
 
 // TableNames is the canonical name of every table in the visible snapshot, sorted ascending
 // by lowercased name (the catalog's standing order — no map-iteration order may leak,
 // CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
-func (db *Engine) TableNames() []string {
+func (db *engine) TableNames() []string {
 	snap := db.readSnap()
 	keys := make([]string, 0, len(snap.tables))
 	for k := range snap.tables {
@@ -1950,7 +1950,7 @@ func (db *Engine) TableNames() []string {
 
 // putTable registers a new table and its empty store in the working snapshot (DDL is
 // transactional — transactions.md §4.5).
-func (db *Engine) putTable(t *Table) {
+func (db *engine) putTable(t *catTable) {
 	db.working().putTable(t, db.pageSize)
 }
 
@@ -1960,11 +1960,11 @@ func (db *Engine) putTable(t *Table) {
 // ⇒ a loaded bundle provides it at a DIFFERENT version, so its objects are read-only (reads recompute
 // against the loaded table — the heap-scan fallback; a write raises XX002). A pure comparison of the
 // file pin (§5) vs the loaded set — every core computes the identical verdict (the §10 contract).
-type CollationVerdict int
+type collationVerdict int
 
 const (
-	VerdictFull CollationVerdict = iota
-	VerdictSkewed
+	verdictFull collationVerdict = iota
+	verdictSkewed
 )
 
 // CollationInfo is introspection metadata for one loaded collation (db.Collations,
@@ -1973,14 +1973,14 @@ const (
 // version-skew verdict (§12) — VerdictFull for the engine-global loaded set (it IS the reference);
 // for a database's referenced collations it is VerdictSkewed when the file's pin differs from the
 // loaded bundle's.
-type CollationInfo struct {
+type collationInfo struct {
 	Name           string
 	UnicodeVersion string
 	CLDRVersion    string
 	ContentHash    uint32
 	Description    string
 	IsDefault      bool
-	Verdict        CollationVerdict
+	Verdict        collationVerdict
 }
 
 // ImportCollation / ExportCollation are GONE (the reference-only pivot, spec/design/collation.md
@@ -1995,7 +1995,7 @@ type CollationInfo struct {
 // Privileged host op (not SQL-reachable, no path, no engine I/O — §11); ADDITIVE and idempotent for
 // an already-loaded bundle. A malformed bundle is XX001. (Mirrors the package-level LoadUnicodeData,
 // which the host may call before opening any file.)
-func (db *Engine) LoadUnicodeData(data []byte) error {
+func (db *engine) LoadUnicodeData(data []byte) error {
 	return LoadUnicodeData(data)
 }
 
@@ -2005,15 +2005,15 @@ func (db *Engine) LoadUnicodeData(data []byte) error {
 // seam, this is a privileged host op (not SQL-reachable, no path, no engine I/O — §10), additive and
 // idempotent, engine-global so it may be called before open. A malformed bundle is XX001. (UTC and
 // fixed offsets are built in and need no load.)
-func (db *Engine) LoadTimeZoneData(data []byte) error {
+func (db *engine) LoadTimeZoneData(data []byte) error {
 	return LoadTimeZoneData(data)
 }
 
 // LoadedTimeZones introspects the engine-global loaded zone set (db.LoadedTimeZones, timezones.md
 // §3.3) — every named zone (and alias) a loaded bundle provides, ascending by name. A property of the
 // running engine, not of this database. UTC and fixed offsets are built in and not listed.
-func (db *Engine) LoadedTimeZones() []TimeZoneInfo {
-	return LoadedTimeZones()
+func (db *engine) LoadedTimeZones() []timeZoneInfo {
+	return loadedTimeZones()
 }
 
 // LoadedCollations introspects the engine-global LOADED collation set (db.LoadedCollations,
@@ -2021,19 +2021,19 @@ func (db *Engine) LoadedTimeZones() []TimeZoneInfo {
 // database on this handle, ascending by name. A property of the running ENGINE, not of this database;
 // for the collations this database references, use Engine.Collations. IsDefault is always false here
 // (that is a per-database property). C is built in and not listed.
-func (db *Engine) LoadedCollations() []CollationInfo {
+func (db *engine) LoadedCollations() []collationInfo {
 	colls := loadedCollationTables()
-	out := make([]CollationInfo, len(colls))
+	out := make([]collationInfo, len(colls))
 	for i, c := range colls {
-		out[i] = CollationInfo{
+		out[i] = collationInfo{
 			Name:           c.Name,
 			UnicodeVersion: c.UnicodeVersion,
 			CLDRVersion:    c.CldrVersion,
-			ContentHash:    crc32IEEE(SerializeTable(c)),
+			ContentHash:    crc32IEEE(serializeTable(c)),
 			Description:    c.Description,
 			IsDefault:      false,
 			// The loaded set IS the version reference — it can never be skewed against itself.
-			Verdict: VerdictFull,
+			Verdict: verdictFull,
 		}
 	}
 	return out
@@ -2052,7 +2052,7 @@ func (db *Engine) LoadedCollations() []CollationInfo {
 // Whole-database + atomic (the rebuild stages in a snapshot clone swapped in only on success);
 // idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit Commit. Returns the
 // number of collations re-pinned.
-func (db *Engine) UpgradeCollations() (int, error) {
+func (db *engine) UpgradeCollations() (int, error) {
 	work := db.committed.clone()
 	n, err := work.upgradeCollations(db.pageSize)
 	if err != nil {
@@ -2064,13 +2064,13 @@ func (db *Engine) UpgradeCollations() (int, error) {
 	return n, nil
 }
 
-func (db *Engine) SetDefaultCollation(name string) error {
+func (db *engine) SetDefaultCollation(name string) error {
 	if name == "C" {
 		db.committed.defaultCollation = ""
 		return nil
 	}
 	if db.committed.resolveCollation(name) == nil {
-		return NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
+		return newError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
 	}
 	db.committed.defaultCollation = name
 	return nil
@@ -2078,7 +2078,7 @@ func (db *Engine) SetDefaultCollation(name string) error {
 
 // DefaultCollation returns the per-database default collation name — "C" unless SetDefaultCollation
 // moved it (db.DefaultCollation, spec/design/collation.md §1).
-func (db *Engine) DefaultCollation() string {
+func (db *engine) DefaultCollation() string {
 	if db.committed.defaultCollation == "" {
 		return "C"
 	}
@@ -2089,25 +2089,25 @@ func (db *Engine) DefaultCollation() string {
 // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
 // per-database default), in ascending name order. This is the per-file view; for the engine-global
 // LOADED set, use Engine.LoadedCollations. C is built in and not listed.
-func (db *Engine) Collations() []CollationInfo {
+func (db *engine) Collations() []collationInfo {
 	// referencedCollations resolves each referenced name (from a loaded bundle).
 	colls, err := db.committed.referencedCollations()
 	if err != nil {
 		return nil
 	}
-	out := make([]CollationInfo, len(colls))
+	out := make([]collationInfo, len(colls))
 	for i, c := range colls {
-		verdict := VerdictFull
+		verdict := verdictFull
 		// The slice-2d verdict: Skewed when the file's pin differs from the loaded bundle's version
 		// (the object is read-only), else Full (collation.md §12).
 		if _, _, _, _, skewed := db.committed.collationSkew(c.Name); skewed {
-			verdict = VerdictSkewed
+			verdict = verdictSkewed
 		}
-		out[i] = CollationInfo{
+		out[i] = collationInfo{
 			Name:           c.Name,
 			UnicodeVersion: c.UnicodeVersion,
 			CLDRVersion:    c.CldrVersion,
-			ContentHash:    crc32IEEE(SerializeTable(c)),
+			ContentHash:    crc32IEEE(serializeTable(c)),
 			Description:    c.Description,
 			IsDefault:      db.committed.defaultCollation == c.Name,
 			Verdict:        verdict,
@@ -2117,7 +2117,7 @@ func (db *Engine) Collations() []CollationInfo {
 }
 
 // ExecuteStmt executes one parsed statement with no bind parameters.
-func (db *Engine) ExecuteStmt(stmt Statement) (Outcome, error) {
+func (db *engine) ExecuteStmt(stmt statement) (Outcome, error) {
 	return db.ExecuteStmtParams(stmt, nil)
 }
 
@@ -2141,7 +2141,7 @@ func (db *Engine) ExecuteStmt(stmt Statement) (Outcome, error) {
 //     (synchronous, the single persist chokepoint). Any failure — in the statement or in the
 //     durable write — restores the captured state (rollback-on-error, discarding partial work and
 //     any rowid allocations, §7). For an in-memory database persist is a no-op.
-func (db *Engine) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, error) {
+func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.Begin != nil:
 		return db.beginTx(stmt.Begin.Writable, stmt.Begin.ModeSet)
@@ -2159,14 +2159,14 @@ func (db *Engine) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, er
 	// Inside an explicit block?
 	if db.session.tx != nil {
 		if db.session.tx.failed {
-			return Outcome{}, NewError(InFailedSqlTransaction,
+			return Outcome{}, newError(InFailedSqlTransaction,
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
 		// Run the statement; ANY error aborts the block (it enters the failed state — §6).
 		var outcome Outcome
 		var err error
 		if stmtIsWrite(stmt) && !db.session.tx.writable {
-			err = NewError(ReadOnlySqlTransaction,
+			err = newError(ReadOnlySqlTransaction,
 				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 		} else {
 			outcome, err = db.dispatchStmt(stmt, params)
@@ -2202,7 +2202,7 @@ func (db *Engine) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, er
 	// behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
 	// READ ONLY block.
 	if db.readOnly {
-		return Outcome{}, NewError(ReadOnlySqlTransaction,
+		return Outcome{}, newError(ReadOnlySqlTransaction,
 			"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 	}
 	db.session.tx = db.newTx(true)
@@ -2240,12 +2240,12 @@ func (db *Engine) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, er
 // snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged (read-your-
 // snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.go) and the catalog is shallow.
 // committed is untouched until commit.
-func (db *Engine) beginTx(writable, modeSet bool) (Outcome, error) {
+func (db *engine) beginTx(writable, modeSet bool) (Outcome, error) {
 	if db.session.tx != nil {
-		return Outcome{}, NewError(ActiveSqlTransaction, "there is already a transaction in progress")
+		return Outcome{}, newError(ActiveSqlTransaction, "there is already a transaction in progress")
 	}
 	if modeSet && writable && db.readOnly {
-		return Outcome{}, NewError(ReadOnlySqlTransaction,
+		return Outcome{}, newError(ReadOnlySqlTransaction,
 			"cannot set transaction read-write mode on a read-only database")
 	}
 	if !modeSet {
@@ -2258,7 +2258,7 @@ func (db *Engine) beginTx(writable, modeSet bool) (Outcome, error) {
 // newTx opens a transaction over a clone of the committed snapshot, capturing the handle's
 // currval/lastval session state so it can be restored if the transaction is discarded (the
 // rollback of any in-block nextval/setval session updates — spec/design/sequences.md §5/§6).
-func (db *Engine) newTx(writable bool) *activeTx {
+func (db *engine) newTx(writable bool) *activeTx {
 	saved := make(map[string]int64, len(db.session.sessionSeq))
 	for k, v := range db.session.sessionSeq {
 		saved[k] = v
@@ -2276,7 +2276,7 @@ func (db *Engine) newTx(writable bool) *activeTx {
 // restoreSessionState restores the handle's currval/lastval session state from a discarded
 // transaction's captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block
 // nextval/setval session updates. Called wherever a transaction is dropped without publishing.
-func (db *Engine) restoreSessionState(tx *activeTx) {
+func (db *engine) restoreSessionState(tx *activeTx) {
 	db.session.sessionSeq = tx.savedSessionSeq
 	db.session.sessionLastName = tx.savedSessionLastName
 }
@@ -2287,7 +2287,7 @@ func (db *Engine) restoreSessionState(tx *activeTx) {
 // publishes its working snapshot: bump its txid (file-backed only — an in-memory database stays at
 // txid 0), make it durable (the single persist chokepoint, §9), then swap it in as committed. A
 // durable-write failure leaves committed untouched and propagates. Returns to autocommit.
-func (db *Engine) commitTx() (Outcome, error) {
+func (db *engine) commitTx() (Outcome, error) {
 	tx := db.session.tx
 	if tx == nil {
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -2327,7 +2327,7 @@ func (db *Engine) commitTx() (Outcome, error) {
 // committed was never mutated, so there is nothing to restore there. The handle's currval/lastval
 // session state, however, was updated in place by in-block nextval/setval, so it is restored from
 // the block's captured copy (sequences.md §5/§6).
-func (db *Engine) rollbackTx() (Outcome, error) {
+func (db *engine) rollbackTx() (Outcome, error) {
 	if db.session.tx != nil {
 		db.restoreSessionState(db.session.tx)
 	}
@@ -2340,21 +2340,21 @@ func (db *Engine) rollbackTx() (Outcome, error) {
 // snapshot on first touch this statement, and is flushed into the working snapshot + sessionSeq on
 // statement success (flushPendingSequences). A missing sequence is 42P01; advancing past a bound
 // without CYCLE is 2200H.
-func (db *Engine) seqNextval(name string) (int64, error) {
+func (db *engine) seqNextval(name string) (int64, error) {
 	key := strings.ToLower(name)
-	var def SequenceDef
+	var def sequenceDef
 	if db.session.pendingSeq != nil {
 		if d, ok := db.session.pendingSeq[key]; ok {
 			def = *d
 		} else if snapDef := db.sequence(name); snapDef != nil {
 			def = *snapDef
 		} else {
-			return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+			return 0, newError(UndefinedTable, "relation does not exist: "+name)
 		}
 	} else if snapDef := db.sequence(name); snapDef != nil {
 		def = *snapDef
 	} else {
-		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+		return 0, newError(UndefinedTable, "relation does not exist: "+name)
 	}
 	var result int64
 	if !def.IsCalled {
@@ -2379,7 +2379,7 @@ func (db *Engine) seqNextval(name string) (int64, error) {
 				if def.Increment < 0 {
 					kind = "minimum"
 				}
-				return 0, NewError(SequenceGeneratorLimitExceeded,
+				return 0, newError(SequenceGeneratorLimitExceeded,
 					"nextval: reached "+kind+" value of sequence "+name)
 			}
 		}
@@ -2387,7 +2387,7 @@ func (db *Engine) seqNextval(name string) (int64, error) {
 		result = next
 	}
 	if db.session.pendingSeq == nil {
-		db.session.pendingSeq = make(map[string]*SequenceDef)
+		db.session.pendingSeq = make(map[string]*sequenceDef)
 	}
 	d := def
 	db.session.pendingSeq[key] = &d
@@ -2406,25 +2406,25 @@ func (db *Engine) seqNextval(name string) (int64, error) {
 // [MinValue, MaxValue] is 22003. LastValue = n, IsCalled = the flag (default true); when isCalled is
 // true the value also defines this session's currval (PG: isCalled=false leaves currval untouched).
 // setval never updates lastval (PG — §6).
-func (db *Engine) seqSetval(name string, n int64, isCalled bool) (int64, error) {
+func (db *engine) seqSetval(name string, n int64, isCalled bool) (int64, error) {
 	key := strings.ToLower(name)
-	var def SequenceDef
+	var def sequenceDef
 	if d, ok := db.session.pendingSeq[key]; ok {
 		def = *d
 	} else if snapDef := db.sequence(name); snapDef != nil {
 		def = *snapDef
 	} else {
-		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+		return 0, newError(UndefinedTable, "relation does not exist: "+name)
 	}
 	if n < def.MinValue || n > def.MaxValue {
-		return 0, NewError(NumericValueOutOfRange,
+		return 0, newError(NumericValueOutOfRange,
 			fmt.Sprintf("setval: value %d is out of bounds for sequence %s (%d..%d)",
 				n, name, def.MinValue, def.MaxValue))
 	}
 	def.LastValue = n
 	def.IsCalled = isCalled
 	if db.session.pendingSeq == nil {
-		db.session.pendingSeq = make(map[string]*SequenceDef)
+		db.session.pendingSeq = make(map[string]*sequenceDef)
 	}
 	d := def
 	db.session.pendingSeq[key] = &d
@@ -2442,9 +2442,9 @@ func (db *Engine) seqSetval(name string, n int64, isCalled bool) (int64, error) 
 // setval(…,true) last produced for this sequence IN THIS SESSION. Resolves the name against the
 // catalog first (42P01 if absent), then reads the running update this statement (pendingCurrval)
 // else the session value (sessionSeq); 55000 if it has not been defined this session.
-func (db *Engine) seqCurrval(name string) (int64, error) {
+func (db *engine) seqCurrval(name string) (int64, error) {
 	if db.sequence(name) == nil {
-		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+		return 0, newError(UndefinedTable, "relation does not exist: "+name)
 	}
 	key := strings.ToLower(name)
 	if v, ok := db.session.pendingCurrval[key]; ok {
@@ -2453,7 +2453,7 @@ func (db *Engine) seqCurrval(name string) (int64, error) {
 	if v, ok := db.session.sessionSeq[key]; ok {
 		return v, nil
 	}
-	return 0, NewError(ObjectNotInPrerequisiteState,
+	return 0, newError(ObjectNotInPrerequisiteState,
 		"currval of sequence "+name+" is not yet defined in this session")
 }
 
@@ -2462,13 +2462,13 @@ func (db *Engine) seqCurrval(name string) (int64, error) {
 // sequence's cached value, so a setval on that same sequence is reflected, while a setval on a
 // different sequence is not. Takes no name argument (no 42P01); 55000 before the first nextval. The
 // effective name and its value both honor the statement's running updates over the session state.
-func (db *Engine) seqLastval() (int64, error) {
+func (db *engine) seqLastval() (int64, error) {
 	key := db.session.pendingLastName
 	if key == "" {
 		key = db.session.sessionLastName
 	}
 	if key == "" {
-		return 0, NewError(ObjectNotInPrerequisiteState,
+		return 0, newError(ObjectNotInPrerequisiteState,
 			"lastval is not yet defined in this session")
 	}
 	if v, ok := db.session.pendingCurrval[key]; ok {
@@ -2479,7 +2479,7 @@ func (db *Engine) seqLastval() (int64, error) {
 	}
 	// A nextval always defines the sequence's session value, so a recorded last-name with no value
 	// is unreachable; fall back to 55000 defensively rather than returning a wrong value.
-	return 0, NewError(ObjectNotInPrerequisiteState,
+	return 0, newError(ObjectNotInPrerequisiteState,
 		"lastval is not yet defined in this session")
 }
 
@@ -2488,7 +2488,7 @@ func (db *Engine) seqLastval() (int64, error) {
 // currval/lastval see them). Called on the success of a sequence-advancing statement, while a write
 // transaction is open; a no-op when nothing advanced. On statement error the pending state is
 // instead discarded (cleared at the next statement), giving the transactional rollback (§5).
-func (db *Engine) flushPendingSequences() {
+func (db *engine) flushPendingSequences() {
 	for _, def := range db.session.pendingSeq {
 		// Route each advance to its owning scope (temp-tables.md §8): a serial/IDENTITY temp column's
 		// owned sequence flushes into its temp snapshot (zero file writes), a persistent one into main.
@@ -2522,7 +2522,7 @@ func checkedAddInt64(a, b int64) (sum int64, overflow bool) {
 // stmtIsWrite reports whether a statement mutates the database (so autocommit must capture +
 // durably persist it, and a READ ONLY transaction must reject it — transactions.md §4.1/§4.3).
 // Reads (SELECT, set operations) and transaction control run with no data mutation.
-func stmtIsWrite(stmt Statement) bool {
+func stmtIsWrite(stmt statement) bool {
 	if stmt.CreateTable != nil || stmt.DropTable != nil ||
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
@@ -2547,7 +2547,7 @@ func stmtIsWrite(stmt Statement) bool {
 // already writes (stmtIsWrite short-circuits before this), and an INSERT VALUES slot is
 // literal-only (no function call). currval is a pure read and is NOT counted. The Expr walk is
 // exhaustive, so no expression position is missed.
-func stmtCallsSeqMutator(stmt Statement) bool {
+func stmtCallsSeqMutator(stmt statement) bool {
 	switch {
 	case stmt.Select != nil:
 		return selectCallsSeqMutator(stmt.Select)
@@ -2569,14 +2569,14 @@ func stmtCallsSeqMutator(stmt Statement) bool {
 // delegates to the query walk; a data-modifying body already makes the WITH a write (via withHasDml),
 // so this is not reached for it via stmtCallsSeqMutator — it is treated as a write regardless
 // (writable-cte.md).
-func cteBodyCallsSeqMutator(body *CteBody) bool {
+func cteBodyCallsSeqMutator(body *cteBody) bool {
 	if body.Query != nil {
 		return queryCallsSeqMutator(body.Query)
 	}
 	return true
 }
 
-func queryCallsSeqMutator(qe *QueryExpr) bool {
+func queryCallsSeqMutator(qe *queryExpr) bool {
 	if qe.Select != nil {
 		return selectCallsSeqMutator(qe.Select)
 	}
@@ -2595,11 +2595,11 @@ func queryCallsSeqMutator(qe *QueryExpr) bool {
 	return false
 }
 
-func setopCallsSeqMutator(so *SetOp) bool {
+func setopCallsSeqMutator(so *setOp) bool {
 	return queryCallsSeqMutator(&so.Lhs) || queryCallsSeqMutator(&so.Rhs)
 }
 
-func selectCallsSeqMutator(s *Select) bool {
+func selectCallsSeqMutator(s *selectStmt) bool {
 	for i := range s.Items.Items {
 		if exprCallsSeqMutator(&s.Items.Items[i].Expr) {
 			return true
@@ -2621,7 +2621,7 @@ func selectCallsSeqMutator(s *Select) bool {
 	}
 	for i := range s.GroupBy {
 		found := false
-		s.GroupBy[i].forEachExpr(func(e *Expr) {
+		s.GroupBy[i].forEachExpr(func(e *exprNode) {
 			if exprCallsSeqMutator(e) {
 				found = true
 			}
@@ -2636,7 +2636,7 @@ func selectCallsSeqMutator(s *Select) bool {
 	return false
 }
 
-func tableRefCallsSeqMutator(t *TableRef) bool {
+func tableRefCallsSeqMutator(t *tableRef) bool {
 	for _, a := range t.Args {
 		if exprCallsSeqMutator(a) {
 			return true
@@ -2656,9 +2656,9 @@ func tableRefCallsSeqMutator(t *TableRef) bool {
 }
 
 // exprCallsSeqMutator is exhaustive over Expr: true iff the tree contains a nextval call.
-func exprCallsSeqMutator(e *Expr) bool {
+func exprCallsSeqMutator(e *exprNode) bool {
 	switch e.Kind {
-	case ExprFuncCall:
+	case exprFuncCall:
 		if strings.EqualFold(e.FuncCall.Name, "nextval") || strings.EqualFold(e.FuncCall.Name, "setval") {
 			return true
 		}
@@ -2668,21 +2668,21 @@ func exprCallsSeqMutator(e *Expr) bool {
 			}
 		}
 		return false
-	case ExprColumn, ExprQualifiedColumn, ExprLiteral, ExprTypedLiteral, ExprParam:
+	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprParam:
 		return false
-	case ExprRow, ExprArray:
+	case exprRow, exprArray:
 		for i := range e.RowItems {
 			if exprCallsSeqMutator(&e.RowItems[i]) {
 				return true
 			}
 		}
 		return false
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		return exprCallsSeqMutator(e.Base)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return false // `t.*` is a leaf relation reference — no sub-expression
 
-	case ExprSubscript:
+	case exprSubscript:
 		if exprCallsSeqMutator(e.Base) {
 			return true
 		}
@@ -2699,35 +2699,35 @@ func exprCallsSeqMutator(e *Expr) bool {
 			}
 		}
 		return false
-	case ExprCast:
+	case exprCast:
 		return exprCallsSeqMutator(&e.Cast.Inner)
-	case ExprExtract:
+	case exprExtract:
 		return exprCallsSeqMutator(&e.Extract.Source)
-	case ExprCollate:
+	case exprCollate:
 		return exprCallsSeqMutator(&e.Collate.Inner)
-	case ExprUnary:
+	case exprUnary:
 		return exprCallsSeqMutator(&e.Unary.Operand)
-	case ExprIsNull:
+	case exprIsNull:
 		return exprCallsSeqMutator(&e.IsNullOf.Operand)
-	case ExprIsJson:
+	case exprIsJson:
 		return exprCallsSeqMutator(&e.IsJsonOf.Operand)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		return exprCallsSeqMutator(&e.JsonCtorOf.Operand)
-	case ExprJsonExists:
+	case exprJsonExists:
 		return exprCallsSeqMutator(&e.JsonExists.Ctx) || exprCallsSeqMutator(&e.JsonExists.Path)
-	case ExprJsonValue:
+	case exprJsonValue:
 		return exprCallsSeqMutator(&e.JsonValue.Ctx) || exprCallsSeqMutator(&e.JsonValue.Path)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		return exprCallsSeqMutator(&e.JsonQuery.Ctx) || exprCallsSeqMutator(&e.JsonQuery.Path)
-	case ExprBinary:
+	case exprBinary:
 		return exprCallsSeqMutator(&e.Binary.Lhs) || exprCallsSeqMutator(&e.Binary.Rhs)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		return exprCallsSeqMutator(&e.IsDistinct.Lhs) || exprCallsSeqMutator(&e.IsDistinct.Rhs)
-	case ExprLike:
+	case exprLike:
 		return exprCallsSeqMutator(&e.Like.Lhs) || exprCallsSeqMutator(&e.Like.Rhs)
-	case ExprRegex:
+	case exprRegex:
 		return exprCallsSeqMutator(&e.Regex.Lhs) || exprCallsSeqMutator(&e.Regex.Rhs)
-	case ExprIn:
+	case exprIn:
 		if exprCallsSeqMutator(&e.In.Lhs) {
 			return true
 		}
@@ -2737,11 +2737,11 @@ func exprCallsSeqMutator(e *Expr) bool {
 			}
 		}
 		return false
-	case ExprBetween:
+	case exprBetween:
 		return exprCallsSeqMutator(&e.Between.Lhs) ||
 			exprCallsSeqMutator(&e.Between.Lo) ||
 			exprCallsSeqMutator(&e.Between.Hi)
-	case ExprCase:
+	case exprCase:
 		if e.Case.Operand != nil && exprCallsSeqMutator(e.Case.Operand) {
 			return true
 		}
@@ -2754,13 +2754,13 @@ func exprCallsSeqMutator(e *Expr) bool {
 			return true
 		}
 		return false
-	case ExprScalarSubquery, ExprExists:
+	case exprScalarSubquery, exprExists:
 		return queryCallsSeqMutator(e.Subquery)
-	case ExprInSubquery:
+	case exprInSubquery:
 		return exprCallsSeqMutator(&e.InSubquery.Lhs) || queryCallsSeqMutator(&e.InSubquery.Query)
-	case ExprQuantifiedSubquery:
+	case exprQuantifiedSubquery:
 		return exprCallsSeqMutator(&e.QuantifiedSubquery.Lhs) || queryCallsSeqMutator(&e.QuantifiedSubquery.Query)
-	case ExprQuantified:
+	case exprQuantified:
 		return exprCallsSeqMutator(&e.Quantified.Lhs) || exprCallsSeqMutator(&e.Quantified.Array)
 	default:
 		return false
@@ -2806,11 +2806,11 @@ func (r *privReq) needFunction(name string) { r.functions = append(r.functions, 
 // already spent (spec/design/session.md §5.4): if a budget is set and the session's cumulative cost
 // has reached it, no further statement may run (it "cannot accrue") — 54P02. A no-op when the budget
 // is unlimited (the default), so the common path pays one comparison.
-func (db *Engine) checkLifetimeAdmission() error {
+func (db *engine) checkLifetimeAdmission() error {
 	limit := db.session.lifetimeMaxCost
 	total := *db.session.lifetimeTotal
 	if limit > 0 && total >= limit {
-		return NewError(SessionCostLimitExceeded, fmt.Sprintf(
+		return newError(SessionCostLimitExceeded, fmt.Sprintf(
 			"session exceeded the lifetime cost limit of %d (accrued %d)", limit, total,
 		))
 	}
@@ -2824,7 +2824,7 @@ func (db *Engine) checkLifetimeAdmission() error {
 // discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits. tempBuffers
 // 0 ⇒ unlimited; a transaction that did not touch temp cannot have grown it, so the check self-gates on
 // tempDirty and is a no-op for ordinary (persistent) statements. The WITHIN-statement bound is maxCost.
-func (db *Engine) checkTempBudget() error {
+func (db *engine) checkTempBudget() error {
 	limit := db.session.tempBuffers
 	if limit == 0 {
 		return nil
@@ -2833,7 +2833,7 @@ func (db *Engine) checkTempBudget() error {
 		return nil
 	}
 	if used := db.tempSnap().storageBytes(); used > uint64(limit) {
-		return NewError(TempStorageLimitExceeded, fmt.Sprintf(
+		return newError(TempStorageLimitExceeded, fmt.Sprintf(
 			"temporary table storage exceeded the limit of %d bytes", limit,
 		))
 	}
@@ -2844,7 +2844,7 @@ func (db *Engine) checkTempBudget() error {
 // spec/design/temp-tables.md §7) — the shared analogue of checkTempBudget, charged against the
 // Engine-level budget over the shared-temp footprint. Self-gates on sharedTempDirty (a no-op for any
 // statement that did not write shared temp). The over-budget write is staged, so the abort rolls it back.
-func (db *Engine) checkSharedTempBudget() error {
+func (db *engine) checkSharedTempBudget() error {
 	limit := db.sharedTempMem
 	if limit == 0 {
 		return nil
@@ -2853,14 +2853,14 @@ func (db *Engine) checkSharedTempBudget() error {
 		return nil
 	}
 	if used := db.sharedTempSnap().storageBytes(); used > uint64(limit) {
-		return NewError(TempStorageLimitExceeded, fmt.Sprintf(
+		return newError(TempStorageLimitExceeded, fmt.Sprintf(
 			"shared temporary table storage exceeded the limit of %d bytes", limit,
 		))
 	}
 	return nil
 }
 
-func (db *Engine) checkPrivileges(stmt Statement) error {
+func (db *engine) checkPrivileges(stmt statement) error {
 	// Fast path: a session that allows ALL DDL (persistent + both temp kinds) and grants every
 	// privilege pays nothing. All three gates must be on, since temp DDL now has its own gates (§5).
 	if db.session.allowDDL && db.session.allowTempDDL && db.session.allowSharedTempDDL && db.session.privileges.IsPermissive() {
@@ -2894,7 +2894,7 @@ func (db *Engine) checkPrivileges(stmt Statement) error {
 			allowed = db.session.allowDDL
 		}
 		if !allowed {
-			return NewError(InsufficientPrivilege, "permission denied: DDL is not permitted in this session")
+			return newError(InsufficientPrivilege, "permission denied: DDL is not permitted in this session")
 		}
 	}
 	snap := db.readSnap()
@@ -2903,13 +2903,13 @@ func (db *Engine) checkPrivileges(stmt Statement) error {
 		// Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
 		// left to raise 42P01 in execution (existence before authorization).
 		if _, ok := snap.table(key); ok && !db.session.privileges.AllowsTable(key, t.priv) {
-			return NewError(InsufficientPrivilege, "permission denied for table "+key)
+			return newError(InsufficientPrivilege, "permission denied for table "+key)
 		}
 	}
 	for _, fn := range req.functions {
 		key := strings.ToLower(fn)
 		if !db.session.privileges.AllowsFunction(key) {
-			return NewError(InsufficientPrivilege, "permission denied for function "+key)
+			return newError(InsufficientPrivilege, "permission denied for function "+key)
 		}
 	}
 	return nil
@@ -2917,7 +2917,7 @@ func (db *Engine) checkPrivileges(stmt Statement) error {
 
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
 // Transaction control carries none (handled before dispatch); DDL just sets isDDL.
-func collectStmtPrivs(stmt Statement, req *privReq) {
+func collectStmtPrivs(stmt statement, req *privReq) {
 	locals := map[string]bool{}
 	switch {
 	case stmt.CreateTable != nil:
@@ -2945,7 +2945,7 @@ func collectStmtPrivs(stmt Statement, req *privReq) {
 	}
 }
 
-func collectInsertPrivs(ins *Insert, req *privReq, locals map[string]bool) {
+func collectInsertPrivs(ins *insert, req *privReq, locals map[string]bool) {
 	// The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
 	// params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
 	req.needTable(ins.Table, PrivInsert)
@@ -2963,7 +2963,7 @@ func collectInsertPrivs(ins *Insert, req *privReq, locals map[string]bool) {
 	collectItemsPrivs(ins.Returning, req, locals)
 }
 
-func collectUpdatePrivs(upd *Update, req *privReq, locals map[string]bool) {
+func collectUpdatePrivs(upd *update, req *privReq, locals map[string]bool) {
 	req.needTable(upd.Table, PrivUpdate)
 	// SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
 	// referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
@@ -2985,7 +2985,7 @@ func collectUpdatePrivs(upd *Update, req *privReq, locals map[string]bool) {
 	collectItemsPrivs(upd.Returning, req, locals)
 }
 
-func collectDeletePrivs(del *Delete, req *privReq, locals map[string]bool) {
+func collectDeletePrivs(del *deleteStmt, req *privReq, locals map[string]bool) {
 	req.needTable(del.Table, PrivDelete)
 	// DELETE reads the target's columns through a WHERE or a RETURNING.
 	if del.Filter != nil || del.Returning != nil {
@@ -2997,7 +2997,7 @@ func collectDeletePrivs(del *Delete, req *privReq, locals map[string]bool) {
 	collectItemsPrivs(del.Returning, req, locals)
 }
 
-func collectQueryPrivs(qe *QueryExpr, req *privReq, locals map[string]bool) {
+func collectQueryPrivs(qe *queryExpr, req *privReq, locals map[string]bool) {
 	if qe.Select != nil {
 		collectSelectPrivs(qe.Select, req, locals)
 	} else if qe.SetOp != nil {
@@ -3015,12 +3015,12 @@ func collectQueryPrivs(qe *QueryExpr, req *privReq, locals map[string]bool) {
 	}
 }
 
-func collectSetopPrivs(so *SetOp, req *privReq, locals map[string]bool) {
+func collectSetopPrivs(so *setOp, req *privReq, locals map[string]bool) {
 	collectQueryPrivs(&so.Lhs, req, locals)
 	collectQueryPrivs(&so.Rhs, req, locals)
 }
 
-func collectWithPrivs(wq *WithQuery, req *privReq, locals map[string]bool) {
+func collectWithPrivs(wq *withQuery, req *privReq, locals map[string]bool) {
 	// A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
 	// added to the local scope and never privilege-checked. Forward-only visibility: each CTE body
 	// sees the CTE names declared before it. A data-modifying body / primary needs the write privilege
@@ -3039,7 +3039,7 @@ func collectWithPrivs(wq *WithQuery, req *privReq, locals map[string]bool) {
 // collectCteBodyPrivs collects the privilege requirements of a cte_body — a query, or a
 // data-modifying statement (spec/design/writable-cte.md) which needs the write privilege on its
 // target.
-func collectCteBodyPrivs(body *CteBody, req *privReq, locals map[string]bool) {
+func collectCteBodyPrivs(body *cteBody, req *privReq, locals map[string]bool) {
 	switch {
 	case body.Query != nil:
 		collectQueryPrivs(body.Query, req, locals)
@@ -3052,7 +3052,7 @@ func collectCteBodyPrivs(body *CteBody, req *privReq, locals map[string]bool) {
 	}
 }
 
-func collectSelectPrivs(s *Select, req *privReq, locals map[string]bool) {
+func collectSelectPrivs(s *selectStmt, req *privReq, locals map[string]bool) {
 	if s.From != nil {
 		collectTableRefPrivs(s.From, req, locals)
 	}
@@ -3069,7 +3069,7 @@ func collectSelectPrivs(s *Select, req *privReq, locals map[string]bool) {
 		collectExprPrivs(s.Filter, req, locals)
 	}
 	for i := range s.GroupBy {
-		s.GroupBy[i].forEachExpr(func(e *Expr) {
+		s.GroupBy[i].forEachExpr(func(e *exprNode) {
 			collectExprPrivs(e, req, locals)
 		})
 	}
@@ -3078,7 +3078,7 @@ func collectSelectPrivs(s *Select, req *privReq, locals map[string]bool) {
 	}
 }
 
-func collectTableRefPrivs(t *TableRef, req *privReq, locals map[string]bool) {
+func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 	switch {
 	case t.IsFunc:
 		// A set-returning function used as a row source — EXECUTE on the function; its args are exprs.
@@ -3102,7 +3102,7 @@ func collectTableRefPrivs(t *TableRef, req *privReq, locals map[string]bool) {
 	}
 }
 
-func collectItemsPrivs(items *SelectItems, req *privReq, locals map[string]bool) {
+func collectItemsPrivs(items *selectItems, req *privReq, locals map[string]bool) {
 	if items == nil {
 		return
 	}
@@ -3113,25 +3113,25 @@ func collectItemsPrivs(items *SelectItems, req *privReq, locals map[string]bool)
 
 // collectExprPrivs is exhaustive over Expr (mirroring exprCallsSeqMutator): collect every named
 // function call (EXECUTE) and walk every subquery (its tables need SELECT).
-func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
+func collectExprPrivs(e *exprNode, req *privReq, locals map[string]bool) {
 	switch e.Kind {
-	case ExprFuncCall:
+	case exprFuncCall:
 		req.needFunction(e.FuncCall.Name)
 		for _, a := range e.FuncCall.Args {
 			collectExprPrivs(a, req, locals)
 		}
-	case ExprColumn, ExprQualifiedColumn, ExprLiteral, ExprTypedLiteral, ExprParam:
+	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprParam:
 		// leaf — nothing to collect
-	case ExprRow, ExprArray:
+	case exprRow, exprArray:
 		for i := range e.RowItems {
 			collectExprPrivs(&e.RowItems[i], req, locals)
 		}
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		collectExprPrivs(e.Base, req, locals)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		// `t.*` names a relation already in FROM — its SELECT privilege is required by the FROM
 		// clause itself, so the star adds no new function/table privilege here.
-	case ExprSubscript:
+	case exprSubscript:
 		collectExprPrivs(e.Base, req, locals)
 		for i := range e.Subscripts {
 			sub := &e.Subscripts[i]
@@ -3145,51 +3145,51 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 				collectExprPrivs(sub.Upper, req, locals)
 			}
 		}
-	case ExprCast:
+	case exprCast:
 		collectExprPrivs(&e.Cast.Inner, req, locals)
-	case ExprExtract:
+	case exprExtract:
 		collectExprPrivs(&e.Extract.Source, req, locals)
-	case ExprCollate:
+	case exprCollate:
 		collectExprPrivs(&e.Collate.Inner, req, locals)
-	case ExprUnary:
+	case exprUnary:
 		collectExprPrivs(&e.Unary.Operand, req, locals)
-	case ExprIsNull:
+	case exprIsNull:
 		collectExprPrivs(&e.IsNullOf.Operand, req, locals)
-	case ExprIsJson:
+	case exprIsJson:
 		collectExprPrivs(&e.IsJsonOf.Operand, req, locals)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		collectExprPrivs(&e.JsonCtorOf.Operand, req, locals)
-	case ExprJsonExists:
+	case exprJsonExists:
 		collectExprPrivs(&e.JsonExists.Ctx, req, locals)
 		collectExprPrivs(&e.JsonExists.Path, req, locals)
-	case ExprJsonValue:
+	case exprJsonValue:
 		collectExprPrivs(&e.JsonValue.Ctx, req, locals)
 		collectExprPrivs(&e.JsonValue.Path, req, locals)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		collectExprPrivs(&e.JsonQuery.Ctx, req, locals)
 		collectExprPrivs(&e.JsonQuery.Path, req, locals)
-	case ExprBinary:
+	case exprBinary:
 		collectExprPrivs(&e.Binary.Lhs, req, locals)
 		collectExprPrivs(&e.Binary.Rhs, req, locals)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		collectExprPrivs(&e.IsDistinct.Lhs, req, locals)
 		collectExprPrivs(&e.IsDistinct.Rhs, req, locals)
-	case ExprLike:
+	case exprLike:
 		collectExprPrivs(&e.Like.Lhs, req, locals)
 		collectExprPrivs(&e.Like.Rhs, req, locals)
-	case ExprRegex:
+	case exprRegex:
 		collectExprPrivs(&e.Regex.Lhs, req, locals)
 		collectExprPrivs(&e.Regex.Rhs, req, locals)
-	case ExprIn:
+	case exprIn:
 		collectExprPrivs(&e.In.Lhs, req, locals)
 		for i := range e.In.List {
 			collectExprPrivs(&e.In.List[i], req, locals)
 		}
-	case ExprBetween:
+	case exprBetween:
 		collectExprPrivs(&e.Between.Lhs, req, locals)
 		collectExprPrivs(&e.Between.Lo, req, locals)
 		collectExprPrivs(&e.Between.Hi, req, locals)
-	case ExprCase:
+	case exprCase:
 		if e.Case.Operand != nil {
 			collectExprPrivs(e.Case.Operand, req, locals)
 		}
@@ -3200,15 +3200,15 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 		if e.Case.Els != nil {
 			collectExprPrivs(e.Case.Els, req, locals)
 		}
-	case ExprScalarSubquery, ExprExists:
+	case exprScalarSubquery, exprExists:
 		collectQueryPrivs(e.Subquery, req, locals)
-	case ExprInSubquery:
+	case exprInSubquery:
 		collectExprPrivs(&e.InSubquery.Lhs, req, locals)
 		collectQueryPrivs(&e.InSubquery.Query, req, locals)
-	case ExprQuantifiedSubquery:
+	case exprQuantifiedSubquery:
 		collectExprPrivs(&e.QuantifiedSubquery.Lhs, req, locals)
 		collectQueryPrivs(&e.QuantifiedSubquery.Query, req, locals)
-	case ExprQuantified:
+	case exprQuantified:
 		collectExprPrivs(&e.Quantified.Lhs, req, locals)
 		collectExprPrivs(&e.Quantified.Array, req, locals)
 	}
@@ -3217,27 +3217,27 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 // exprReadsColumns reports whether e reads a stored column or a subquery's rows — the trigger for an
 // UPDATE's SELECT requirement on its target (spec/design/session.md §5.3). A column reference or any
 // subquery counts; a pure constant / parameter expression does not. Exhaustive over Expr.
-func exprReadsColumns(e *Expr) bool {
+func exprReadsColumns(e *exprNode) bool {
 	switch e.Kind {
-	case ExprColumn, ExprQualifiedColumn:
+	case exprColumn, exprQualifiedColumn:
 		return true
-	case ExprScalarSubquery, ExprExists, ExprInSubquery, ExprQuantifiedSubquery:
+	case exprScalarSubquery, exprExists, exprInSubquery, exprQuantifiedSubquery:
 		return true
-	case ExprLiteral, ExprTypedLiteral, ExprParam:
+	case exprLiteral, exprTypedLiteral, exprParam:
 		return false
-	case ExprRow, ExprArray:
+	case exprRow, exprArray:
 		for i := range e.RowItems {
 			if exprReadsColumns(&e.RowItems[i]) {
 				return true
 			}
 		}
 		return false
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		return exprReadsColumns(e.Base)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return true // `t.*` reads the relation's columns (e.g. `RETURNING t.*`)
 
-	case ExprSubscript:
+	case exprSubscript:
 		if exprReadsColumns(e.Base) {
 			return true
 		}
@@ -3254,42 +3254,42 @@ func exprReadsColumns(e *Expr) bool {
 			}
 		}
 		return false
-	case ExprCast:
+	case exprCast:
 		return exprReadsColumns(&e.Cast.Inner)
-	case ExprExtract:
+	case exprExtract:
 		return exprReadsColumns(&e.Extract.Source)
-	case ExprCollate:
+	case exprCollate:
 		return exprReadsColumns(&e.Collate.Inner)
-	case ExprUnary:
+	case exprUnary:
 		return exprReadsColumns(&e.Unary.Operand)
-	case ExprIsNull:
+	case exprIsNull:
 		return exprReadsColumns(&e.IsNullOf.Operand)
-	case ExprIsJson:
+	case exprIsJson:
 		return exprReadsColumns(&e.IsJsonOf.Operand)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		return exprReadsColumns(&e.JsonCtorOf.Operand)
-	case ExprJsonExists:
+	case exprJsonExists:
 		return exprReadsColumns(&e.JsonExists.Ctx) || exprReadsColumns(&e.JsonExists.Path)
-	case ExprJsonValue:
+	case exprJsonValue:
 		return exprReadsColumns(&e.JsonValue.Ctx) || exprReadsColumns(&e.JsonValue.Path)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		return exprReadsColumns(&e.JsonQuery.Ctx) || exprReadsColumns(&e.JsonQuery.Path)
-	case ExprFuncCall:
+	case exprFuncCall:
 		for _, a := range e.FuncCall.Args {
 			if exprReadsColumns(a) {
 				return true
 			}
 		}
 		return false
-	case ExprBinary:
+	case exprBinary:
 		return exprReadsColumns(&e.Binary.Lhs) || exprReadsColumns(&e.Binary.Rhs)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		return exprReadsColumns(&e.IsDistinct.Lhs) || exprReadsColumns(&e.IsDistinct.Rhs)
-	case ExprLike:
+	case exprLike:
 		return exprReadsColumns(&e.Like.Lhs) || exprReadsColumns(&e.Like.Rhs)
-	case ExprRegex:
+	case exprRegex:
 		return exprReadsColumns(&e.Regex.Lhs) || exprReadsColumns(&e.Regex.Rhs)
-	case ExprIn:
+	case exprIn:
 		if exprReadsColumns(&e.In.Lhs) {
 			return true
 		}
@@ -3299,9 +3299,9 @@ func exprReadsColumns(e *Expr) bool {
 			}
 		}
 		return false
-	case ExprBetween:
+	case exprBetween:
 		return exprReadsColumns(&e.Between.Lhs) || exprReadsColumns(&e.Between.Lo) || exprReadsColumns(&e.Between.Hi)
-	case ExprCase:
+	case exprCase:
 		if e.Case.Operand != nil && exprReadsColumns(e.Case.Operand) {
 			return true
 		}
@@ -3314,7 +3314,7 @@ func exprReadsColumns(e *Expr) bool {
 			return true
 		}
 		return false
-	case ExprQuantified:
+	case exprQuantified:
 		return exprReadsColumns(&e.Quantified.Lhs) || exprReadsColumns(&e.Quantified.Array)
 	default:
 		return false
@@ -3323,7 +3323,7 @@ func exprReadsColumns(e *Expr) bool {
 
 // stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
 // message text is informational — never matched; spec/design/conformance.md §2).
-func stmtKind(stmt Statement) string {
+func stmtKind(stmt statement) string {
 	switch {
 	case stmt.CreateTable != nil:
 		return "CREATE TABLE"
@@ -3356,7 +3356,7 @@ func stmtKind(stmt Statement) string {
 
 // dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
 // (capture / durable commit / rollback-on-error) lives in ExecuteStmtParams.
-func (db *Engine) dispatchStmt(stmt Statement, params []Value) (Outcome, error) {
+func (db *engine) dispatchStmt(stmt statement, params []Value) (Outcome, error) {
 	// Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
 	// reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
 	// checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
@@ -3390,14 +3390,14 @@ func (db *Engine) dispatchStmt(stmt Statement, params []Value) (Outcome, error) 
 // statement's own working() writes): a read or a temp-only write leaves it unset, so this is a no-op
 // and never forces a spurious main-image persist (the temp-no-file-write invariant). GiST on a temp
 // table is 0A000 this slice, so only the main working snapshot is refreshed.
-func (db *Engine) rebuildMainGistTreesIfDirty() error {
+func (db *engine) rebuildMainGistTreesIfDirty() error {
 	if db.session.tx != nil && db.session.tx.mainDirty {
 		return db.session.tx.working.rebuildGistTrees()
 	}
 	return nil
 }
 
-func (db *Engine) dispatchStmtBody(stmt Statement, params []Value) (Outcome, error) {
+func (db *engine) dispatchStmtBody(stmt statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
@@ -3457,7 +3457,7 @@ func (db *Engine) dispatchStmtBody(stmt Statement, params []Value) (Outcome, err
 	case stmt.Delete != nil:
 		return db.executeDelete(stmt.Delete, params, cteCtx{})
 	default:
-		return Outcome{}, NewError(SyntaxError, "empty statement")
+		return Outcome{}, newError(SyntaxError, "empty statement")
 	}
 }
 
@@ -3465,7 +3465,7 @@ func (db *Engine) dispatchStmtBody(stmt Statement, params []Value) (Outcome, err
 // (which has no expressions to bind — spec/design/api.md §5).
 func rejectParamsForDDL(params []Value) error {
 	if len(params) > 0 {
-		return NewError(SyntaxError, "bind parameters are not allowed in a DDL statement")
+		return newError(SyntaxError, "bind parameters are not allowed in a DDL statement")
 	}
 	return nil
 }
@@ -3478,7 +3478,7 @@ func rejectParamsForDDL(params []Value) error {
 // a second primary key traps 42P16 before its members resolve; members resolve
 // left to right (unknown 42703, repeated 42701); then the jed narrowings — the
 // declaration-order rule and the per-member key-type gate — trap 0A000.
-func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
+func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
 	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
 	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
@@ -3487,20 +3487,20 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	if ct.Temp && len(ct.Excludes) > 0 {
 		// An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
 		// the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
-		return Outcome{}, NewError(FeatureNotSupported, "an EXCLUDE constraint on a temporary table is not yet supported")
+		return Outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on a temporary table is not yet supported")
 	}
 	if ct.Temp && len(ct.ForeignKeys) > 0 {
-		return Outcome{}, NewError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
+		return Outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
 	}
 	// The relation namespace is shared between tables and indexes (indexes.md §2), so a
 	// CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
 	// relationExists is temp-aware, so a temp name collides with temp + persistent alike (preclude-
 	// overlaps — temp-tables.md §3).
 	if db.relationExists(ct.Name) {
-		return Outcome{}, NewError(DuplicateTable, "relation already exists: "+ct.Name)
+		return Outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
 	}
 
-	columns := make([]Column, 0, len(ct.Columns))
+	columns := make([]catColumn, 0, len(ct.Columns))
 	// pk is the primary-key member ordinals in KEY order (constraints.md §3): the
 	// column-level form is the one-member case; the table-level list below records its
 	// own order.
@@ -3509,11 +3509,11 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// The OWNED sequences a serial column desugars to (spec/design/sequences.md §12), collected
 	// during the column walk and staged into the working snapshot only after the whole CREATE TABLE
 	// validates — so a later failure (e.g. a bad CHECK) discards them with the statement.
-	var pendingSerials []*SequenceDef
+	var pendingSerials []*sequenceDef
 	for _, def := range ct.Columns {
 		for _, c := range columns {
 			if strings.EqualFold(c.Name, def.Name) {
-				return Outcome{}, NewError(DuplicateColumn, "duplicate column name: "+def.Name)
+				return Outcome{}, newError(DuplicateColumn, "duplicate column name: "+def.Name)
 			}
 		}
 		// Resolve the column type: a built-in scalar, or a user-defined composite referenced by name
@@ -3527,32 +3527,32 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		// desugaring (the owned sequence + default + NOT NULL force) happens below. serial[] is NOT a
 		// serial column (it falls to the array branch as an unknown element type — §12.1).
 		serialKind, isSerial := serialPseudoType(def.TypeName)
-		var colType Type
-		var decimal *DecimalTypmod
+		var colType dataType
+		var decimal *decimalTypmod
 		isComposite := false
 		isArray := false
 		isRange := false
 		if isSerial {
 			// A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
 			if def.TypeMod != nil {
-				return Outcome{}, NewError(SyntaxError,
+				return Outcome{}, newError(SyntaxError,
 					"type modifier is not allowed for type "+def.TypeName)
 			}
-			colType = ScalarT(serialKind)
+			colType = scalarT(serialKind)
 		} else if base, ok := strings.CutSuffix(def.TypeName, "[]"); ok {
 			// An array column (spec/design/array.md §3). The element type is a scalar or a
 			// previously-defined composite (array-of-composite, §12 AC1 — element_type_code 14 +
 			// name); a nested-array element and an array typmod (numeric(p,s)[]) stay deferred (0A000).
 			if def.TypeMod != nil {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a type modifier on an array type is not supported yet")
 			}
-			if elemScalar, scalarOK := ScalarTypeFromName(base); scalarOK {
-				colType = ArrayT(ScalarT(elemScalar))
+			if elemScalar, scalarOK := scalarTypeFromName(base); scalarOK {
+				colType = arrayT(scalarT(elemScalar))
 			} else if ctype := db.readSnap().compositeType(base); ctype != nil {
-				colType = ArrayT(CompositeT(ctype.Name))
+				colType = arrayT(compositeT(ctype.Name))
 			} else {
-				return Outcome{}, NewError(UndefinedObject, "type does not exist: "+base)
+				return Outcome{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
 			isArray = true
 		} else if rdesc, ok := rangeByName(def.TypeName); ok {
@@ -3560,32 +3560,32 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// inline. A range takes no typmod (numrange(10,2) is not a thing — the element is the
 			// unconstrained subtype), so a type modifier is rejected.
 			if def.TypeMod != nil {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a type modifier on a range type is not supported")
 			}
-			colType = RangeT(ScalarT(elementScalar(rdesc)))
+			colType = rangeT(scalarT(elementScalar(rdesc)))
 			isRange = true
-		} else if _, ok := ScalarTypeFromName(def.TypeName); ok {
+		} else if _, ok := scalarTypeFromName(def.TypeName); ok {
 			ty, d, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 			if err != nil {
 				return Outcome{}, err
 			}
 			// jsonpath is literal-only this slice (P1a) — a jsonpath COLUMN is 0A000, like a J0-stage
 			// json column (a storable jsonpath is a follow-on).
-			if ty == JsonPathType {
-				return Outcome{}, NewError(FeatureNotSupported, "a jsonpath column is not supported yet")
+			if ty == scalarJsonPath {
+				return Outcome{}, newError(FeatureNotSupported, "a jsonpath column is not supported yet")
 			}
-			colType = ScalarT(ty)
+			colType = scalarT(ty)
 			decimal = d
 		} else if ctype := db.readSnap().compositeType(def.TypeName); ctype != nil {
 			if def.TypeMod != nil {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a type modifier is not supported for composite type "+def.TypeName)
 			}
-			colType = CompositeT(ctype.Name)
+			colType = compositeT(ctype.Name)
 			isComposite = true
 		} else {
-			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+def.TypeName)
+			return Outcome{}, newError(UndefinedObject, "type does not exist: "+def.TypeName)
 		}
 		if def.PrimaryKey {
 			// The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
@@ -3603,19 +3603,19 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				// A composite PRIMARY KEY (composite.md §6) or a non-keyable array PRIMARY KEY (a
 				// composite element) is rejected 0A000. colType.CanonicalName() gives the
 				// canonical type name (e.g. addr[], even when declared with an alias).
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
 			// A range / keyable array is a container key (encoding.md §2.11/§2.14); every other
 			// keyable column is a scalar, gated here.
 			if !isRange && !isArray {
 				if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() {
-					return Outcome{}, NewError(FeatureNotSupported,
+					return Outcome{}, newError(FeatureNotSupported,
 						"a "+ty.CanonicalName()+" primary key is not supported yet")
 				}
 			}
 			if pkSeen {
-				return Outcome{}, NewError(InvalidTableDefinition,
+				return Outcome{}, newError(InvalidTableDefinition,
 					"multiple primary keys for table "+ct.Name+" are not allowed")
 			}
 			pkSeen = true
@@ -3630,8 +3630,8 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		//     EMPTY scope — a default may not reference a column — then its result type is
 		//     checked assignable to the column, 42804) and stored as text for per-row eval.
 		var defaultVal *Value
-		var defaultExpr *DefaultExpr
-		var identityKind *IdentityKind
+		var defaultExpr *defaultExprDef
+		var identityKind *identityKind
 		// A serial pseudo-type OR a GENERATED … AS IDENTITY constraint both desugar to an
 		// auto-numbered column: an OWNED sequence + a synthesized DEFAULT nextval(...) + NOT NULL
 		// (sequences.md §12/§13). Identity additionally records ALWAYS/BY DEFAULT and gates the
@@ -3641,19 +3641,19 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// (sequences.md §13.1). serial's type is the pseudo-type (always integer), so this only
 			// bites an identity column written on a non-integer type.
 			if def.Identity != nil && !colType.IsInteger() {
-				return Outcome{}, NewError(InvalidParameterValue,
+				return Outcome{}, newError(InvalidParameterValue,
 					"identity column type must be smallint, integer, or bigint")
 			}
 			// Conflicts (42601, sequences.md §13.2). An explicit DEFAULT — or a serial type, itself a
 			// synthesized default — alongside IDENTITY is "both default and identity"; a serial column
 			// with its own explicit DEFAULT is "multiple default values" (the S3 message, unchanged).
 			if def.Identity != nil && (def.Default != nil || isSerial) {
-				return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+				return Outcome{}, newError(SyntaxError, fmt.Sprintf(
 					"both default and identity specified for column %s of table %s", def.Name, ct.Name,
 				))
 			}
 			if isSerial && def.Default != nil {
-				return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+				return Outcome{}, newError(SyntaxError, fmt.Sprintf(
 					"multiple default values specified for column %s of table %s", def.Name, ct.Name,
 				))
 			}
@@ -3661,8 +3661,8 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
 			// expression default (format_version 8 mechanism).
 			seqName := db.chooseSerialSeqName(ct.Name, def.Name, pendingSerials)
-			owner := &SeqOwner{Table: ct.Name, Column: uint16(len(columns))} // this column's ordinal
-			var opts SeqOptions
+			owner := &seqOwner{Table: ct.Name, Column: uint16(len(columns))} // this column's ordinal
+			var opts seqOptions
 			if def.Identity != nil {
 				opts = def.Identity.Options
 			}
@@ -3671,16 +3671,16 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// conflicts with that — 42601 (PG: "conflicting or redundant options"). serial carries no
 			// parsed options, so this only fires for identity.
 			if opts.DataType != "" {
-				return Outcome{}, NewError(SyntaxError, "conflicting or redundant options")
+				return Outcome{}, newError(SyntaxError, "conflicting or redundant options")
 			}
 			seqScalar := serialKind
 			if !isSerial {
 				seqScalar = colType.ScalarTy()
 			}
-			seqDtype, ok := SeqDataTypeForScalar(seqScalar)
+			seqDtype, ok := seqDataTypeForScalar(seqScalar)
 			if !ok {
 				// Unreachable: a serial / identity column is i16/i32/i64 (gated above).
-				return Outcome{}, NewError(InvalidParameterValue,
+				return Outcome{}, newError(InvalidParameterValue,
 					"serial / identity column is i16/i32/i64")
 			}
 			opts.DataType = seqDtype.PgName()
@@ -3694,15 +3694,15 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// so the in-memory expr matches what reload re-parses. The seqName is a lowercased
 			// identifier-derived name, so the quoting is always safe.
 			exprText := "nextval ( '" + strings.ReplaceAll(seqName, "'", "''") + "' )"
-			expr, err := ParseExpression(exprText)
+			expr, err := parseExpression(exprText)
 			if err != nil {
 				return Outcome{}, err
 			}
-			defaultExpr = &DefaultExpr{ExprText: exprText, Expr: expr}
+			defaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr}
 			if def.Identity != nil {
-				k := IdentityByDefault
+				k := identityByDefault
 				if def.Identity.Always {
-					k = IdentityAlways
+					k = identityAlways
 				}
 				identityKind = &k
 			}
@@ -3710,12 +3710,12 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// A DEFAULT on a composite-, array-, or range-typed column is not supported this slice
 			// (composite.md §12 / array.md §12 / ranges.md §8).
 			if def.Default != nil {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
 			}
 		} else if def.Default != nil {
 			ty := colType.Scalar
-			if def.Default.Expr.Kind == ExprLiteral {
+			if def.Default.Expr.Kind == exprLiteral {
 				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, false, def.Name)
 				if err != nil {
 					return Outcome{}, err
@@ -3735,7 +3735,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 						def.Name, ty.CanonicalName(), rtName(rt),
 					))
 				}
-				defaultExpr = &DefaultExpr{ExprText: def.Default.Text, Expr: def.Default.Expr}
+				defaultExpr = &defaultExprDef{ExprText: def.Default.Text, Expr: def.Default.Expr}
 			}
 		}
 		// The column's effective collation, frozen now (spec/design/collation.md §1). An explicit
@@ -3758,7 +3758,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		} else if colType.IsText() {
 			collation = db.readSnap().defaultCollation
 		}
-		columns = append(columns, Column{
+		columns = append(columns, catColumn{
 			Name:       def.Name,
 			Type:       colType,
 			Decimal:    decimal,
@@ -3780,7 +3780,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// per-member key-type gate (0A000) remains.
 	for _, pkList := range ct.TablePKs {
 		if pkSeen {
-			return Outcome{}, NewError(InvalidTableDefinition,
+			return Outcome{}, newError(InvalidTableDefinition,
 				"multiple primary keys for table "+ct.Name+" are not allowed")
 		}
 		pkSeen = true
@@ -3794,11 +3794,11 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				}
 			}
 			if idx < 0 {
-				return Outcome{}, NewError(UndefinedColumn,
+				return Outcome{}, newError(UndefinedColumn,
 					"column "+name+" named in key does not exist")
 			}
 			if slices.Contains(indices, idx) {
-				return Outcome{}, NewError(DuplicateColumn,
+				return Outcome{}, newError(DuplicateColumn,
 					"column "+name+" appears twice in primary key constraint")
 			}
 			indices = append(indices, idx)
@@ -3806,7 +3806,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		for _, i := range indices {
 			ty := columns[i].Type
 			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
 			columns[i].PrimaryKey = true
@@ -3838,11 +3838,11 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				}
 			}
 			if idx < 0 {
-				return Outcome{}, NewError(UndefinedColumn,
+				return Outcome{}, newError(UndefinedColumn,
 					"column "+cname+" named in key does not exist")
 			}
 			if slices.Contains(indices, idx) {
-				return Outcome{}, NewError(DuplicateColumn,
+				return Outcome{}, newError(DuplicateColumn,
 					"column "+cname+" appears twice in unique constraint")
 			}
 			indices = append(indices, idx)
@@ -3850,7 +3850,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		for _, i := range indices {
 			ty := columns[i].Type
 			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
 		}
@@ -3862,7 +3862,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
 	// before a 42710 between earlier ones. Resolution needs a catalog *Table, so build it
 	// now (checks attach below, before putTable).
-	table := &Table{Name: ct.Name, Columns: columns, PK: pk}
+	table := &catTable{Name: ct.Name, Columns: columns, PK: pk}
 	for i := range ct.Checks {
 		def := &ct.Checks[i]
 		// Structural rejections first (a single pre-walk — a documented micro-order
@@ -3886,7 +3886,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// else `<table>_check` — suffixed with the smallest positive integer that frees it. A
 	// collision (case-insensitive, PG folds) is 42710; derived names never yield to a later
 	// explicit one (oracle-probed).
-	checks := make([]CheckConstraint, 0, len(ct.Checks))
+	checks := make([]checkConstraint, 0, len(ct.Checks))
 	nameTaken := func(name string) bool {
 		for _, c := range checks {
 			if strings.EqualFold(c.Name, name) {
@@ -3900,7 +3900,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		name := def.Name
 		if name != "" {
 			if nameTaken(name) {
-				return Outcome{}, NewError(DuplicateObject,
+				return Outcome{}, newError(DuplicateObject,
 					"constraint "+name+" for relation "+table.Name+" already exists")
 			}
 		} else {
@@ -3916,7 +3916,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				name = base + strconv.Itoa(suffix)
 			}
 		}
-		checks = append(checks, CheckConstraint{Name: name, ExprText: def.Text, Expr: def.Expr})
+		checks = append(checks, checkConstraint{Name: name, ExprText: def.Text, Expr: def.Expr})
 	}
 	// Evaluation (and on-disk) order: ascending byte order of the lowercased name
 	// (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
@@ -3975,10 +3975,10 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		name := ru.name
 		if name != "" {
 			if relationTaken(name) {
-				return Outcome{}, NewError(DuplicateTable, "relation already exists: "+name)
+				return Outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 			}
 			if checkNameTaken(name) {
-				return Outcome{}, NewError(DuplicateObject,
+				return Outcome{}, newError(DuplicateObject,
 					"constraint "+name+" for relation "+table.Name+" already exists")
 			}
 		} else {
@@ -3993,7 +3993,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 		}
 		// Insert in catalog (ascending lowercased-name) order — indexes.md §6.
-		def := IndexDef{Name: name, Columns: ru.cols, Unique: true, Kind: IndexBtree}
+		def := indexDef{Name: name, Columns: ru.cols, Unique: true, Kind: indexBtree}
 		nameKey := strings.ToLower(name)
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
@@ -4014,7 +4014,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// the unsupported write-actions (0A000); require the referenced columns to be the parent PK
 	// or a UNIQUE set (42830); and require same-type pairing (42804, stricter than PG). An FK
 	// owns no B-tree — enforcement probes the parent at every write (§6.4/§6.5).
-	resolvedFks := make([]ForeignKey, 0, len(ct.ForeignKeys))
+	resolvedFks := make([]foreignKey, 0, len(ct.ForeignKeys))
 	for _, fk := range ct.ForeignKeys {
 		// 1. Local (referencing) columns into this table.
 		local := make([]int, 0, len(fk.Columns))
@@ -4027,24 +4027,24 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				}
 			}
 			if idx < 0 {
-				return Outcome{}, NewError(UndefinedColumn,
+				return Outcome{}, newError(UndefinedColumn,
 					"column "+cname+" named in key does not exist")
 			}
 			if slices.Contains(local, idx) {
-				return Outcome{}, NewError(DuplicateColumn,
+				return Outcome{}, newError(DuplicateColumn,
 					"column "+cname+" appears twice in foreign key constraint")
 			}
 			local = append(local, idx)
 		}
 		// 2. Parent table — a self-reference resolves against the in-progress definition.
 		selfRef := strings.EqualFold(fk.RefTable, table.Name)
-		var parent *Table
+		var parent *catTable
 		if selfRef {
 			parent = table
 		} else {
 			p, ok := db.Table(fk.RefTable)
 			if !ok {
-				return Outcome{}, NewError(UndefinedTable, "table does not exist: "+fk.RefTable)
+				return Outcome{}, newError(UndefinedTable, "table does not exist: "+fk.RefTable)
 			}
 			parent = p
 		}
@@ -4055,7 +4055,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				// Omitting the referenced list defaults to the parent's PRIMARY KEY; a parent
 				// without one is 42704 (PG's code here — undefined_object — even when the parent
 				// has a UNIQUE), distinct from the explicit-no-match 42830.
-				return Outcome{}, NewError(UndefinedObject,
+				return Outcome{}, newError(UndefinedObject,
 					"there is no primary key for referenced table "+parent.Name)
 			}
 			refs = append([]int(nil), parent.PK...)
@@ -4070,11 +4070,11 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 					}
 				}
 				if idx < 0 {
-					return Outcome{}, NewError(UndefinedColumn,
+					return Outcome{}, newError(UndefinedColumn,
 						"column "+cname+" named in key does not exist")
 				}
 				if slices.Contains(refs, idx) {
-					return Outcome{}, NewError(DuplicateColumn,
+					return Outcome{}, newError(DuplicateColumn,
 						"column "+cname+" appears twice in foreign key constraint")
 				}
 				refs = append(refs, idx)
@@ -4082,7 +4082,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		// 4. Referencing/referenced count must agree.
 		if len(local) != len(refs) {
-			return Outcome{}, NewError(InvalidForeignKey,
+			return Outcome{}, newError(InvalidForeignKey,
 				"number of referencing and referenced columns for foreign key disagree")
 		}
 		// 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
@@ -4104,7 +4104,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				}
 			}
 			if collide {
-				return Outcome{}, NewError(DuplicateObject,
+				return Outcome{}, newError(DuplicateObject,
 					"constraint "+fk.Name+" for relation "+table.Name+" already exists")
 			}
 			name = fk.Name
@@ -4133,11 +4133,11 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 		}
 		// 6. Reject the unsupported write-actions (§6.6).
-		onDelete, err := fkAction(fk.OnDelete, "DELETE")
+		onDelete, err := newFkAction(fk.OnDelete, "DELETE")
 		if err != nil {
 			return Outcome{}, err
 		}
-		onUpdate, err := fkAction(fk.OnUpdate, "UPDATE")
+		onUpdate, err := newFkAction(fk.OnUpdate, "UPDATE")
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -4153,7 +4153,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 		}
 		if !matchesUnique {
-			return Outcome{}, NewError(InvalidForeignKey,
+			return Outcome{}, newError(InvalidForeignKey,
 				"there is no unique constraint matching given keys for referenced table "+parent.Name)
 		}
 		// 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they
@@ -4163,7 +4163,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			lt := table.Columns[local[i]].Type
 			rt := parent.Columns[refs[i]].Type
 			if !typesEqual(lt, rt) {
-				return Outcome{}, NewError(DatatypeMismatch, fmt.Sprintf(
+				return Outcome{}, newError(DatatypeMismatch, fmt.Sprintf(
 					"foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s",
 					name,
 					table.Columns[local[i]].Name,
@@ -4173,7 +4173,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				))
 			}
 		}
-		resolvedFks = append(resolvedFks, ForeignKey{
+		resolvedFks = append(resolvedFks, foreignKey{
 			Name:       name,
 			Columns:    local,
 			RefTable:   parent.Name,
@@ -4196,10 +4196,10 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// that enforces it. The probe + 23P01 live in INSERT/UPDATE.
 	for _, exc := range ct.Excludes {
 		if exc.Using != "" && !strings.EqualFold(exc.Using, "gist") {
-			return Outcome{}, NewError(UndefinedObject, "access method "+exc.Using+" does not support exclusion constraints")
+			return Outcome{}, newError(UndefinedObject, "access method "+exc.Using+" does not support exclusion constraints")
 		}
 		indices := make([]int, 0, len(exc.Elements))
-		elements := make([]ExclusionElement, 0, len(exc.Elements))
+		elements := make([]exclusionElement, 0, len(exc.Elements))
 		for _, el := range exc.Elements {
 			ci := -1
 			for i := range table.Columns {
@@ -4209,38 +4209,38 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				}
 			}
 			if ci < 0 {
-				return Outcome{}, NewError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
+				return Outcome{}, newError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
 			}
 			if slices.Contains(indices, ci) {
-				return Outcome{}, NewError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
+				return Outcome{}, newError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
 			}
 			ty := table.Columns[ci].Type
 			// The WITH operator must pair with the column's GiST opclass (gist.md §7): && over a
 			// range column (range_ops), = over a fixed-width keyable scalar (the in-core btree_gist).
-			var op ExclusionOp
+			var op exclusionOp
 			switch el.Op {
 			case "&&":
 				if !ty.IsRange() {
-					return Outcome{}, NewError(UndefinedObject,
+					return Outcome{}, newError(UndefinedObject,
 						"data type "+ty.CanonicalName()+" has no default operator class for access method gist that accepts operator &&")
 				}
-				op = ExclOverlaps
+				op = exclOverlaps
 			case "=":
 				switch {
 				case isGistScalarType(ty):
-					op = ExclEqual
+					op = exclEqual
 				case isGistDeferredScalarType(ty):
-					return Outcome{}, NewError(FeatureNotSupported,
+					return Outcome{}, newError(FeatureNotSupported,
 						"an exclusion constraint with = over "+ty.CanonicalName()+" is not supported yet")
 				default:
-					return Outcome{}, NewError(UndefinedObject,
+					return Outcome{}, newError(UndefinedObject,
 						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
 				}
 			default:
-				return Outcome{}, NewError(FeatureNotSupported, "exclusion constraint operator "+el.Op+" is not supported yet")
+				return Outcome{}, newError(FeatureNotSupported, "exclusion constraint operator "+el.Op+" is not supported yet")
 			}
 			indices = append(indices, ci)
-			elements = append(elements, ExclusionElement{Column: ci, Op: op})
+			elements = append(elements, exclusionElement{Column: ci, Op: op})
 		}
 		// Name the constraint (= its backing index name). An explicit name checks the relation
 		// namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
@@ -4277,10 +4277,10 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		var name string
 		if exc.Name != "" {
 			if relTaken(exc.Name) {
-				return Outcome{}, NewError(DuplicateTable, "relation already exists: "+exc.Name)
+				return Outcome{}, newError(DuplicateTable, "relation already exists: "+exc.Name)
 			}
 			if conTaken(exc.Name) {
-				return Outcome{}, NewError(DuplicateObject, "constraint "+exc.Name+" for relation "+table.Name+" already exists")
+				return Outcome{}, newError(DuplicateObject, "constraint "+exc.Name+" for relation "+table.Name+" already exists")
 			}
 			name = exc.Name
 		} else {
@@ -4295,7 +4295,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 		}
 		// Insert the backing GiST index in catalog (ascending lowercased-name) order.
-		def := IndexDef{Name: name, Columns: indices, Unique: false, Kind: IndexGist}
+		def := indexDef{Name: name, Columns: indices, Unique: false, Kind: indexGist}
 		nameKey := strings.ToLower(name)
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
@@ -4305,7 +4305,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 		}
 		table.Indexes = slices.Insert(table.Indexes, pos, def)
-		table.Exclusions = append(table.Exclusions, ExclusionConstraint{Name: name, Index: name, Elements: elements})
+		table.Exclusions = append(table.Exclusions, exclusionConstraint{Name: name, Index: name, Elements: elements})
 	}
 	// Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
 	sort.SliceStable(table.Exclusions, func(i, j int) bool {
@@ -4320,7 +4320,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		// COMPOSITE-typed columns (resolved against the MAIN type catalog just below) are fully supported.
 		for _, c := range table.Columns {
 			if c.Collation != "" {
-				return Outcome{}, NewError(FeatureNotSupported, "COLLATE on temporary-table column "+c.Name+" is not yet supported")
+				return Outcome{}, newError(FeatureNotSupported, "COLLATE on temporary-table column "+c.Name+" is not yet supported")
 			}
 		}
 		// Resolve each column's ColType against the MAIN snapshot's composite-type catalog
@@ -4329,15 +4329,15 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		// reference. The resulting ColType tree is self-contained, so the temp store needs nothing from
 		// the catalog after this (composite.md §4).
 		mainTypes := db.readSnap().types
-		colTypes := make([]ColType, len(table.Columns))
+		colTypes := make([]colType, len(table.Columns))
 		for i, c := range table.Columns {
-			colTypes[i] = ResolveColType(c.Type, mainTypes)
+			colTypes[i] = resolveColType(c.Type, mainTypes)
 		}
 		// Register into the matching temp snapshot — never the main image, so the table makes zero file
 		// writes (§2). A SHARED table goes in the database-wide shared snapshot (visible to every
 		// session, §4); a plain temp table in the session-local one. Flag the matching dirty bit so the
 		// commit can skip persisting the main image.
-		var ts *Snapshot
+		var ts *snapshot
 		if ct.Shared {
 			db.session.tx.sharedTempDirty = true
 			ts = db.session.tx.sharedTempWorking
@@ -4347,7 +4347,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		ts.putTableResolved(table, colTypes, db.pageSize)
 		for _, ix := range table.Indexes {
-			ts.putIndexStore(strings.ToLower(ix.Name), NewTableStore(pagePayload(db.pageSize), nil))
+			ts.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
 		}
 		// Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
 		// (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
@@ -4363,7 +4363,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	db.putTable(table)
 	// The table is brand new (no rows), so each backing index store starts empty.
 	for _, ix := range table.Indexes {
-		db.working().putIndexStore(strings.ToLower(ix.Name), NewTableStore(pagePayload(db.pageSize), nil))
+		db.working().putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
 	}
 	// Stage each serial column's OWNED sequence now that the table validated
 	// (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
@@ -4379,7 +4379,7 @@ func (db *Engine) executeCreateTable(ct *CreateTable) (Outcome, error) {
 // expression against a one-relation scope, in the catalog's (evaluation/name) order.
 // Cannot fail for a catalog produced by CREATE TABLE or a well-formed file (both
 // validated); a hand-corrupted expression surfaces its natural resolve error.
-func (db *Engine) resolveChecks(table *Table) ([]namedCheck, error) {
+func (db *engine) resolveChecks(table *catTable) ([]namedCheck, error) {
 	if len(table.Checks) == 0 {
 		return nil, nil
 	}
@@ -4401,7 +4401,7 @@ func (db *Engine) resolveChecks(table *Table) ([]namedCheck, error) {
 // table.Columns): a non-nil node for an expression default, nil for a column with a constant
 // default or no default. The default resolves against an EMPTY scope (no columns; a column
 // reference was rejected 0A000 at CREATE TABLE) with the column's type as the operand hint.
-func (db *Engine) resolveDefaultExprs(table *Table) ([]*rExpr, error) {
+func (db *engine) resolveDefaultExprs(table *catTable) ([]*rExpr, error) {
 	out := make([]*rExpr, len(table.Columns))
 	for i := range table.Columns {
 		de := table.Columns[i].DefaultExpr
@@ -4424,7 +4424,7 @@ func (db *Engine) resolveDefaultExprs(table *Table) ([]*rExpr, error) {
 // per-statement seam/clock (rng) and metered (operator_eval per node). Reused by the VALUES
 // materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
 // so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is nil for a constant/no default.
-func (db *Engine) evalDefault(col Column, defaultRExpr *rExpr, rng *StmtRng, meter *Meter) (Value, error) {
+func (db *engine) evalDefault(col catColumn, defaultRExpr *rExpr, rng *stmtRng, meter *costMeter) (Value, error) {
 	if defaultRExpr == nil {
 		return defaultOrNull(col), nil
 	}
@@ -4445,14 +4445,14 @@ type namedCheck struct {
 // evalChecks evaluates a row's CHECK constraints in name order (constraints.md §4.4):
 // TRUE and NULL pass; the first FALSE aborts with 23514 and PG's message. Shared by the
 // INSERT and UPDATE write paths.
-func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, meter *Meter) error {
+func evalChecks(checks []namedCheck, relation string, row storedRow, env *evalEnv, meter *costMeter) error {
 	for _, c := range checks {
 		v, err := c.node.eval(row, env, meter)
 		if err != nil {
 			return err
 		}
 		if v.Kind == ValBool && !v.Bool {
-			return NewError(CheckViolation,
+			return newError(CheckViolation,
 				"new row for relation "+relation+" violates check constraint "+c.name)
 		}
 	}
@@ -4482,7 +4482,7 @@ type dropTarget struct {
 // anything removed. A repeated name is deduplicated; a FK between two tables both in the drop set
 // never blocks; CASCADE drops the surviving tables' now-dangling FK constraints. Like CREATE TABLE
 // it touches no rows and evaluates no expression tree, so it accrues zero cost.
-func (db *Engine) executeDropTable(dt *DropTable) (Outcome, error) {
+func (db *engine) executeDropTable(dt *dropTable) (Outcome, error) {
 	// ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
 	// repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
 	// `a` once and succeeds); seen is the set of lowercased keys actually being dropped.
@@ -4509,12 +4509,12 @@ func (db *Engine) executeDropTable(dt *DropTable) (Outcome, error) {
 				// indexes.md §2); IF EXISTS does NOT suppress this. Otherwise a missing table is
 				// 42P01, unless IF EXISTS makes it a no-op for just this name.
 				if _, _, ok := db.findIndex(name); ok {
-					return Outcome{}, NewError(WrongObjectType, name+" is not a table")
+					return Outcome{}, newError(WrongObjectType, name+" is not a table")
 				}
 				if dt.IfExists {
 					continue
 				}
-				return Outcome{}, NewError(UndefinedTable, "table does not exist: "+name)
+				return Outcome{}, newError(UndefinedTable, "table does not exist: "+name)
 			}
 		}
 		seen[key] = true
@@ -4533,7 +4533,7 @@ func (db *Engine) executeDropTable(dt *DropTable) (Outcome, error) {
 		// RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks the
 		// drop with 2BP01 — the same message the single-table check produced.
 		d := deps[0]
-		return Outcome{}, NewError(DependentObjectsStillExist,
+		return Outcome{}, newError(DependentObjectsStillExist,
 			"cannot drop table "+d.droppedName+" because other objects depend on it: constraint "+
 				d.fkName+" on table "+d.refTableName)
 	}
@@ -4580,7 +4580,7 @@ func (db *Engine) executeDropTable(dt *DropTable) (Outcome, error) {
 // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
 // taken by an existing relation, not equal to the table being created, and not already chosen by an
 // earlier serial column of the same statement (pending). All-lowercase identifier-derived.
-func (db *Engine) chooseSerialSeqName(table, column string, pending []*SequenceDef) string {
+func (db *engine) chooseSerialSeqName(table, column string, pending []*sequenceDef) string {
 	base := strings.ToLower(table) + "_" + strings.ToLower(column) + "_seq"
 	taken := func(c string) bool {
 		if db.relationExists(c) || strings.EqualFold(c, table) {
@@ -4611,13 +4611,13 @@ func (db *Engine) chooseSerialSeqName(table, column string, pending []*SequenceD
 // range, MINVALUE ≤ MAXVALUE, and START in [min, max] (each 22023); a fresh sequence starts with
 // LastValue = Start, IsCalled = false. ownedBy carries the IDENTITY / serial owner link (nil for a
 // plain CREATE SEQUENCE).
-func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*SequenceDef, error) {
+func buildSequenceDef(name string, options seqOptions, ownedBy *seqOwner) (*sequenceDef, error) {
 	// The value type (§14): `AS <type>` → the named type (22023 if not an integer type), else bigint.
-	dtype := SeqBigInt
+	dtype := seqBigInt
 	if options.DataType != "" {
-		dt, ok := SeqDataTypeFromName(options.DataType)
+		dt, ok := seqDataTypeFromName(options.DataType)
 		if !ok {
-			return nil, NewError(InvalidParameterValue,
+			return nil, newError(InvalidParameterValue,
 				"sequence type must be smallint, integer, or bigint")
 		}
 		dtype = dt
@@ -4628,26 +4628,26 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 		increment = *options.Increment
 	}
 	if increment == 0 {
-		return nil, NewError(InvalidParameterValue, "INCREMENT must not be zero")
+		return nil, newError(InvalidParameterValue, "INCREMENT must not be zero")
 	}
 	cache := int64(1)
 	if options.Cache != nil {
 		cache = *options.Cache
 	}
 	if cache < 1 {
-		return nil, NewError(InvalidParameterValue,
+		return nil, newError(InvalidParameterValue,
 			fmt.Sprintf("CACHE (%d) must be greater than zero", cache))
 	}
 	defMin, defMax := dtype.DefaultBounds(increment)
 	// An explicit MAXVALUE/MINVALUE outside the type range is 22023 — checked (MAX first, PG order)
 	// BEFORE the MIN > MAX consistency check (§14.2).
 	if options.MaxValue != nil && !options.MaxValue.NoValue && options.MaxValue.Value > typeMax {
-		return nil, NewError(InvalidParameterValue, fmt.Sprintf(
+		return nil, newError(InvalidParameterValue, fmt.Sprintf(
 			"MAXVALUE (%d) is out of range for sequence data type %s", options.MaxValue.Value, dtype.PgName(),
 		))
 	}
 	if options.MinValue != nil && !options.MinValue.NoValue && options.MinValue.Value < typeMin {
-		return nil, NewError(InvalidParameterValue, fmt.Sprintf(
+		return nil, newError(InvalidParameterValue, fmt.Sprintf(
 			"MINVALUE (%d) is out of range for sequence data type %s", options.MinValue.Value, dtype.PgName(),
 		))
 	}
@@ -4664,7 +4664,7 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 	// PG requires MINVALUE strictly less than MAXVALUE (a one-value sequence is rejected); jed
 	// previously allowed `==` — corrected here so CREATE and ALTER (sequences.md §15.2) agree with PG.
 	if minValue >= maxValue {
-		return nil, NewError(InvalidParameterValue,
+		return nil, newError(InvalidParameterValue,
 			fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", minValue, maxValue))
 	}
 	// START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
@@ -4682,7 +4682,7 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 	if options.Cycle != nil {
 		cycle = *options.Cycle
 	}
-	return &SequenceDef{
+	return &sequenceDef{
 		Name:      name,
 		Increment: increment,
 		MinValue:  minValue,
@@ -4700,11 +4700,11 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 // 22023 with PG's wording. Shared by CREATE (buildSequenceDef) and ALTER (applySeqAlter).
 func seqBoundCheckStart(start, minValue, maxValue int64) error {
 	if start < minValue {
-		return NewError(InvalidParameterValue,
+		return newError(InvalidParameterValue,
 			fmt.Sprintf("START value (%d) cannot be less than MINVALUE (%d)", start, minValue))
 	}
 	if start > maxValue {
-		return NewError(InvalidParameterValue,
+		return newError(InvalidParameterValue,
 			fmt.Sprintf("START value (%d) cannot be greater than MAXVALUE (%d)", start, maxValue))
 	}
 	return nil
@@ -4714,11 +4714,11 @@ func seqBoundCheckStart(start, minValue, maxValue int64) error {
 // [min, max], else 22023. PG uses the "RESTART value …" wording even with no RESTART written (§15.2).
 func seqBoundCheckLast(lastValue, minValue, maxValue int64) error {
 	if lastValue < minValue {
-		return NewError(InvalidParameterValue,
+		return newError(InvalidParameterValue,
 			fmt.Sprintf("RESTART value (%d) cannot be less than MINVALUE (%d)", lastValue, minValue))
 	}
 	if lastValue > maxValue {
-		return NewError(InvalidParameterValue,
+		return newError(InvalidParameterValue,
 			fmt.Sprintf("RESTART value (%d) cannot be greater than MAXVALUE (%d)", lastValue, maxValue))
 	}
 	return nil
@@ -4729,17 +4729,17 @@ func seqBoundCheckLast(lastValue, minValue, maxValue int64) error {
 // change; LastValue/IsCalled are preserved unless restart is given. The value type is not persisted
 // (§14.4), so NO MINVALUE/NO MAXVALUE reset the open direction to the bigint bound and an explicit
 // bound is i64-checked only. options.DataType must be "" (the caller rejects AS as 0A000 first).
-func applySeqAlter(existing *SequenceDef, options SeqOptions, restart *SeqRestart) (*SequenceDef, error) {
+func applySeqAlter(existing *sequenceDef, options seqOptions, restart *seqRestart) (*sequenceDef, error) {
 	def := *existing
 	if options.Increment != nil {
 		if *options.Increment == 0 {
-			return nil, NewError(InvalidParameterValue, "INCREMENT must not be zero")
+			return nil, newError(InvalidParameterValue, "INCREMENT must not be zero")
 		}
 		def.Increment = *options.Increment
 	}
 	if options.Cache != nil {
 		if *options.Cache < 1 {
-			return nil, NewError(InvalidParameterValue,
+			return nil, newError(InvalidParameterValue,
 				fmt.Sprintf("CACHE (%d) must be greater than zero", *options.Cache))
 		}
 		def.Cache = *options.Cache
@@ -4747,7 +4747,7 @@ func applySeqAlter(existing *SequenceDef, options SeqOptions, restart *SeqRestar
 	// NO MINVALUE/NO MAXVALUE recompute the default for the (possibly new) INCREMENT sign — against
 	// the bigint range (the value type is not persisted, §14.4). An explicit bound is taken as
 	// written; an unwritten bound is preserved (PG keeps it even when the sign flips).
-	defMin, defMax := SeqBigInt.DefaultBounds(def.Increment)
+	defMin, defMax := seqBigInt.DefaultBounds(def.Increment)
 	if options.MinValue != nil {
 		if options.MinValue.NoValue {
 			def.MinValue = defMin
@@ -4763,7 +4763,7 @@ func applySeqAlter(existing *SequenceDef, options SeqOptions, restart *SeqRestar
 		}
 	}
 	if def.MinValue >= def.MaxValue {
-		return nil, NewError(InvalidParameterValue,
+		return nil, newError(InvalidParameterValue,
 			fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", def.MinValue, def.MaxValue))
 	}
 	if options.Start != nil {
@@ -4796,14 +4796,14 @@ func applySeqAlter(existing *SequenceDef, options SeqOptions, restart *SeqRestar
 // (spec/design/sequences.md §12) — serial/serial4 → Int32, bigserial/serial8 → Int64,
 // smallserial/serial2 → Int16. The bool is false for any other name. Recognized only in a
 // CREATE TABLE column-type position; the match is case-insensitive.
-func serialPseudoType(name string) (ScalarType, bool) {
+func serialPseudoType(name string) (scalarType, bool) {
 	switch strings.ToLower(name) {
 	case "serial", "serial4":
-		return Int32, true
+		return scalarInt32, true
 	case "bigserial", "serial8":
-		return Int64, true
+		return scalarInt64, true
 	case "smallserial", "serial2":
-		return Int16, true
+		return scalarInt16, true
 	default:
 		return 0, false
 	}
@@ -4811,13 +4811,13 @@ func serialPseudoType(name string) (ScalarType, bool) {
 
 // findIndex finds the table owning the named index in the visible snapshot
 // (case-insensitive).
-func (db *Engine) findIndex(name string) (string, IndexDef, bool) {
+func (db *engine) findIndex(name string) (string, indexDef, bool) {
 	return db.readSnap().findIndex(name)
 }
 
 // relationExists reports whether name is taken in the shared relation namespace (a table
 // OR an index — spec/design/indexes.md §2), case-insensitively.
-func (db *Engine) relationExists(name string) bool {
+func (db *engine) relationExists(name string) bool {
 	// Temp tables (session-local AND shared) + their (UNIQUE) index names join the namespace too, so a
 	// name colliding with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md
 	// §3). db.Table is persistent-only, so both temp snapshots are checked explicitly.
@@ -4852,7 +4852,7 @@ func (db *Engine) relationExists(name string) bool {
 // the lowercased <table>_<col>..._idx with the smallest free suffix. The index is then
 // built by scanning the table once: page_read per node + storage_row_read per row (the
 // metered build scan — cost.md §3); maintenance thereafter is unmetered.
-func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
+func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	// A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
 	// temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
 	// lkpTable/lkpStore/writeIndexStore funnels route by the resolution walk; the cost meter, UNIQUE
@@ -4860,7 +4860,7 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	// putIndex write must target the owning snapshot, so the routing happens there.
 	table, ok := db.lkpTable(ci.Table)
 	if !ok {
-		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ci.Table)
+		return Outcome{}, newError(UndefinedTable, "table does not exist: "+ci.Table)
 	}
 	tableKey := strings.ToLower(table.Name)
 	columns := table.Columns
@@ -4875,45 +4875,45 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	// Resolve the access method (spec/design/gin.md §3): the default / "btree" is the ordered
 	// B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
 	// parser) so the error is the resolve-time undefined_object, after the table-exists check.
-	var kind IndexKind
+	var kind indexKind
 	switch strings.ToLower(ci.Using) {
 	case "", "btree":
-		kind = IndexBtree
+		kind = indexBtree
 	case "gin":
-		kind = IndexGin
+		kind = indexGin
 	case "gist":
-		kind = IndexGist
+		kind = indexGist
 	default:
-		return Outcome{}, NewError(UndefinedObject, "access method does not exist: "+ci.Using)
+		return Outcome{}, newError(UndefinedObject, "access method does not exist: "+ci.Using)
 	}
 	cols := make([]int, 0, len(ci.Columns))
 	for _, name := range ci.Columns {
 		idx := table.ColumnIndex(name)
 		if idx < 0 {
-			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+name)
+			return Outcome{}, newError(UndefinedColumn, "column does not exist: "+name)
 		}
 		ty := columns[idx].Type
 		switch kind {
-		case IndexBtree:
+		case indexBtree:
 			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}
-		case IndexGin:
+		case indexGin:
 			// GIN needs an operator class for the column type: only an array has one (else 42704),
 			// and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
 			// element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean,
 			// uuid, date, timestamp, timestamptz (interval's GIN-element support is a separate
 			// follow-on — its key landed but the GIN slice has not; gin.md §3/§10).
 			if ty.Array == nil {
-				return Outcome{}, NewError(UndefinedObject,
+				return Outcome{}, newError(UndefinedObject,
 					"data type "+ty.CanonicalName()+" has no default operator class for access method gin")
 			}
 			if elem, ok := ty.Array.AsScalar(); !ok || !isGinElementType(elem) {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a gin index on "+ty.CanonicalName()+" is not supported yet")
 			}
-		case IndexGist:
+		case indexGist:
 			// GiST opclasses (gist.md §5/§6): range_ops over a range column, or the in-core
 			// btree_gist-equivalent scalar `=` opclass over a FIXED-WIDTH keyable scalar (integers /
 			// boolean / uuid / date / timestamp / timestamptz — its bound is [min,max] over that type's
@@ -4926,10 +4926,10 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 				case isGistScalarType(ty):
 					// supported scalar `=` opclass — ok
 				case isGistDeferredScalarType(ty):
-					return Outcome{}, NewError(FeatureNotSupported,
+					return Outcome{}, newError(FeatureNotSupported,
 						"a gist index on "+ty.CanonicalName()+" is not supported yet")
 				default:
-					return Outcome{}, NewError(UndefinedObject,
+					return Outcome{}, newError(UndefinedObject,
 						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
 				}
 			}
@@ -4939,33 +4939,33 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	}
 	// GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an inverted
 	// index) and a single column only — both deferred 0A000.
-	if kind == IndexGin {
+	if kind == indexGin {
 		if ci.Unique {
-			return Outcome{}, NewError(FeatureNotSupported, "access method gin does not support unique indexes")
+			return Outcome{}, newError(FeatureNotSupported, "access method gin does not support unique indexes")
 		}
 		if len(cols) != 1 {
-			return Outcome{}, NewError(FeatureNotSupported, "a multi-column gin index is not supported yet")
+			return Outcome{}, newError(FeatureNotSupported, "a multi-column gin index is not supported yet")
 		}
 	}
 	// GiST narrowings (gist.md §1/§5/§11): no uniqueness (express it as EXCLUDE … WITH =, GX3) and a
 	// single column only (multi-column GiST is GX2/GX3). A GiST index on a TEMP table is 0A000 (its
 	// resident R-tree would live on the temp snapshot — deferred, gist.md §11). File persistence
 	// landed in GX1b, so a file-backed GiST index is supported.
-	if kind == IndexGist {
+	if kind == indexGist {
 		if ci.Unique {
-			return Outcome{}, NewError(FeatureNotSupported, "access method gist does not support unique indexes")
+			return Outcome{}, newError(FeatureNotSupported, "access method gist does not support unique indexes")
 		}
 		if len(cols) != 1 {
-			return Outcome{}, NewError(FeatureNotSupported, "a multi-column gist index is not supported yet")
+			return Outcome{}, newError(FeatureNotSupported, "a multi-column gist index is not supported yet")
 		}
 		if db.isTempTable(ci.Table) || db.isSharedTempTable(ci.Table) {
-			return Outcome{}, NewError(FeatureNotSupported, "a gist index on a temporary table is not supported yet")
+			return Outcome{}, newError(FeatureNotSupported, "a gist index on a temporary table is not supported yet")
 		}
 	}
 	name := ci.Name
 	if name != "" {
 		if db.relationExists(name) {
-			return Outcome{}, NewError(DuplicateTable, "relation already exists: "+name)
+			return Outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 		}
 	} else {
 		// PG's ChooseIndexName (probed): lowercased table + every listed column name
@@ -4990,13 +4990,13 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	for _, c := range cols {
 		mask[c] = true
 	}
-	def := IndexDef{Name: name, Columns: cols, Unique: ci.Unique, Kind: kind}
+	def := indexDef{Name: name, Columns: cols, Unique: ci.Unique, Kind: kind}
 	store := db.lkpStore(ci.Table)
 	stored, nodes, slabs, err := store.ScanWithUnits(mask)
 	if err != nil {
 		return Outcome{}, err
 	}
-	meter.Charge(Costs.PageRead*int64(nodes) + Costs.ValueDecompress*int64(slabs))
+	meter.Charge(costs.PageRead*int64(nodes) + costs.ValueDecompress*int64(slabs))
 	entries := make([][]byte, 0, len(stored))
 	// A UNIQUE build verifies the existing rows before the index is registered
 	// (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
@@ -5006,7 +5006,7 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row
 			return Outcome{}, err
 		}
-		meter.Charge(Costs.StorageRowRead)
+		meter.Charge(costs.StorageRowRead)
 		if def.Unique {
 			prefix, ok, err := indexPrefixKey(columns, colls, def, e.Row)
 			if err != nil {
@@ -5014,7 +5014,7 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 			}
 			if ok {
 				if seenPrefixes[string(prefix)] {
-					return Outcome{}, NewError(UniqueViolation,
+					return Outcome{}, newError(UniqueViolation,
 						"duplicate key value violates unique constraint: "+def.Name)
 				}
 				seenPrefixes[string(prefix)] = true
@@ -5068,10 +5068,10 @@ func (db *Engine) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 // 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is
 // resolved along the resolution walk (session-local → shared → persistent — temp-tables.md §8) and
 // removed from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
-func (db *Engine) executeDropIndex(di *DropIndex) (Outcome, error) {
+func (db *engine) executeDropIndex(di *dropIndex) (Outcome, error) {
 	// lkpTable covers all three scopes, so DROP INDEX naming a table is 42809 regardless of kind.
 	if _, ok := db.lkpTable(di.Name); ok {
-		return Outcome{}, NewError(WrongObjectType, di.Name+" is not an index")
+		return Outcome{}, newError(WrongObjectType, di.Name+" is not an index")
 	}
 	nameKey := strings.ToLower(di.Name)
 	switch {
@@ -5086,7 +5086,7 @@ func (db *Engine) executeDropIndex(di *DropIndex) (Outcome, error) {
 	default:
 		tableKey, _, ok := db.findIndex(di.Name)
 		if !ok {
-			return Outcome{}, NewError(UndefinedObject, "index does not exist: "+di.Name)
+			return Outcome{}, newError(UndefinedObject, "index does not exist: "+di.Name)
 		}
 		// An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns
 		// it (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01,
@@ -5094,7 +5094,7 @@ func (db *Engine) executeDropIndex(di *DropIndex) (Outcome, error) {
 		if t, tok := db.lkpTable(tableKey); tok {
 			for _, e := range t.Exclusions {
 				if strings.EqualFold(e.Index, di.Name) {
-					return Outcome{}, NewError(DependentObjectsStillExist,
+					return Outcome{}, newError(DependentObjectsStillExist,
 						"cannot drop index "+di.Name+" because constraint "+di.Name+" on table "+t.Name+" requires it")
 				}
 			}
@@ -5108,57 +5108,57 @@ func (db *Engine) executeDropIndex(di *DropIndex) (Outcome, error) {
 // type name (42710), resolve each field's type (a built-in scalar, or a previously-defined
 // composite — 42704 if unknown; no self- or forward-reference), reject a duplicate field name
 // (42701), then register the composite type in the catalog. Named composites only.
-func (db *Engine) executeCreateType(ct *CreateType) (Outcome, error) {
+func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
 	if db.readSnap().compositeType(ct.Name) != nil {
-		return Outcome{}, NewError(DuplicateObject, "type "+ct.Name+" already exists")
+		return Outcome{}, newError(DuplicateObject, "type "+ct.Name+" already exists")
 	}
-	fields := make([]CompositeField, 0, len(ct.Fields))
+	fields := make([]compositeField, 0, len(ct.Fields))
 	for _, f := range ct.Fields {
 		for _, g := range fields {
 			if strings.EqualFold(g.Name, f.Name) {
-				return Outcome{}, NewError(DuplicateColumn, "attribute "+f.Name+" specified more than once")
+				return Outcome{}, newError(DuplicateColumn, "attribute "+f.Name+" specified more than once")
 			}
 		}
-		var fty Type
-		var fdecimal *DecimalTypmod
+		var fty dataType
+		var fdecimal *decimalTypmod
 		if base, ok := strings.CutSuffix(f.TypeName, "[]"); ok {
 			// An array-typed field (spec/design/array.md §12 — the mirror of an array-of-composite
 			// element). The element is a scalar or a previously-defined composite (element_type_code
 			// 14 + name on disk); a nested-array element and an array typmod stay deferred (0A000),
 			// exactly as for an array column.
 			if f.TypeMod != nil {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a type modifier on an array type is not supported yet")
 			}
-			if elemScalar, scalarOK := ScalarTypeFromName(base); scalarOK {
-				fty = ArrayT(ScalarT(elemScalar))
+			if elemScalar, scalarOK := scalarTypeFromName(base); scalarOK {
+				fty = arrayT(scalarT(elemScalar))
 			} else if ctype := db.readSnap().compositeType(base); ctype != nil {
-				fty = ArrayT(CompositeT(ctype.Name))
+				fty = arrayT(compositeT(ctype.Name))
 			} else {
-				return Outcome{}, NewError(UndefinedObject, "type does not exist: "+base)
+				return Outcome{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
-		} else if _, ok := ScalarTypeFromName(f.TypeName); ok {
+		} else if _, ok := scalarTypeFromName(f.TypeName); ok {
 			s, d, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
 			if err != nil {
 				return Outcome{}, err
 			}
-			fty, fdecimal = ScalarT(s), d
+			fty, fdecimal = scalarT(s), d
 		} else if _, ok := rangeByName(f.TypeName); ok {
 			// A range-typed composite field (a range inside CREATE TYPE) is deferred this slice (only
 			// range *columns* are storable — spec/design/ranges.md §3); the type name IS known, so this
 			// is 0A000, not the 42704 below.
-			return Outcome{}, NewError(FeatureNotSupported,
+			return Outcome{}, newError(FeatureNotSupported,
 				"a range-typed composite field ("+f.TypeName+") is not supported yet")
 		} else if db.readSnap().compositeType(f.TypeName) != nil {
 			if f.TypeMod != nil {
-				return Outcome{}, NewError(FeatureNotSupported,
+				return Outcome{}, newError(FeatureNotSupported,
 					"a type modifier is not supported for composite type "+f.TypeName)
 			}
-			fty = CompositeT(f.TypeName)
+			fty = compositeT(f.TypeName)
 		} else {
-			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+f.TypeName)
+			return Outcome{}, newError(UndefinedObject, "type does not exist: "+f.TypeName)
 		}
-		fields = append(fields, CompositeField{Name: f.Name, Type: fty, Decimal: fdecimal, NotNull: f.NotNull})
+		fields = append(fields, compositeField{Name: f.Name, Type: fty, Decimal: fdecimal, NotNull: f.NotNull})
 	}
 	// Bound composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A chain of CREATE TYPEs each
 	// nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across many cheap statements —
@@ -5175,25 +5175,25 @@ func (db *Engine) executeCreateType(ct *CreateType) (Outcome, error) {
 		}
 	}
 	if depth := 1 + maxField; depth > maxCompositeDepth {
-		return Outcome{}, NewError(StatementTooComplex,
+		return Outcome{}, newError(StatementTooComplex,
 			fmt.Sprintf("composite type %s nesting depth %d exceeds the maximum of %d", ct.Name, depth, maxCompositeDepth))
 	}
-	db.working().putType(&CompositeType{Name: ct.Name, Fields: fields})
+	db.working().putType(&compositeType{Name: ct.Name, Fields: fields})
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
 // executeDropType analyzes and runs a DROP TYPE (spec/design/composite.md §7). RESTRICT (the only
 // behavior this slice): a missing type is 42704 unless IF EXISTS; if any table column or composite
 // field still references the type, 2BP01; otherwise remove it from the catalog.
-func (db *Engine) executeDropType(dt *DropType) (Outcome, error) {
+func (db *engine) executeDropType(dt *dropType) (Outcome, error) {
 	if db.readSnap().compositeType(dt.Name) == nil {
 		if dt.IfExists {
 			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 		}
-		return Outcome{}, NewError(UndefinedObject, "type does not exist: "+dt.Name)
+		return Outcome{}, newError(UndefinedObject, "type does not exist: "+dt.Name)
 	}
 	if dep, ok := db.compositeDependentAny(dt.Name); ok {
-		return Outcome{}, NewError(DependentObjectsStillExist,
+		return Outcome{}, newError(DependentObjectsStillExist,
 			"cannot drop type "+dt.Name+" because other objects depend on it: "+dep)
 	}
 	db.working().removeType(strings.ToLower(dt.Name))
@@ -5203,12 +5203,12 @@ func (db *Engine) executeDropType(dt *DropType) (Outcome, error) {
 // executeCreateSequence analyzes and runs a CREATE SEQUENCE (spec/design/sequences.md). Resolve
 // the option overrides against the INCREMENT sign's type defaults, validate the set (22023),
 // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
-func (db *Engine) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
+func (db *engine) executeCreateSequence(cs *createSequence) (Outcome, error) {
 	if db.relationExists(cs.Name) {
 		if cs.IfNotExists {
 			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 		}
-		return Outcome{}, NewError(DuplicateTable, "relation already exists: "+cs.Name)
+		return Outcome{}, newError(DuplicateTable, "relation already exists: "+cs.Name)
 	}
 	def, err := buildSequenceDef(cs.Name, cs.Options, nil)
 	if err != nil {
@@ -5221,7 +5221,7 @@ func (db *Engine) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
 // executeDropSequence analyzes and runs a DROP SEQUENCE (spec/design/sequences.md §1).
 // RESTRICT-only: a missing sequence is 42P01 unless IF EXISTS. No dependency tracking this slice
 // (a plain DEFAULT nextval('s') creates none — PG). Multiple names are dropped left to right.
-func (db *Engine) executeDropSequence(ds *DropSequence) (Outcome, error) {
+func (db *engine) executeDropSequence(ds *dropSequence) (Outcome, error) {
 	for _, name := range ds.Names {
 		// Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
 		// column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
@@ -5231,7 +5231,7 @@ func (db *Engine) executeDropSequence(ds *DropSequence) (Outcome, error) {
 			if ds.IfExists {
 				continue
 			}
-			return Outcome{}, NewError(UndefinedTable, "sequence does not exist: "+name)
+			return Outcome{}, newError(UndefinedTable, "sequence does not exist: "+name)
 		}
 		if seq.OwnedBy != nil {
 			// The owning table is always present (its own DROP TABLE would auto-drop this sequence
@@ -5244,7 +5244,7 @@ func (db *Engine) executeDropSequence(ds *DropSequence) (Outcome, error) {
 					colName = t.Columns[seq.OwnedBy.Column].Name
 				}
 			}
-			return Outcome{}, NewError(DependentObjectsStillExist, fmt.Sprintf(
+			return Outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
 				"cannot drop sequence %s because other objects depend on it: default value for column %s of table %s depends on sequence %s",
 				seq.Name, colName, tableName, seq.Name,
 			))
@@ -5261,13 +5261,13 @@ func (db *Engine) executeDropSequence(ds *DropSequence) (Outcome, error) {
 // The option form re-edits the definition (PG init_params, isInit=false — only written options
 // change, the counter preserved unless RESTART); RENAME TO moves the catalog key. Touches no session
 // state (currval/lastval unchanged). A catalog write (the write path, transactional, §5).
-func (db *Engine) executeAlterSequence(as *AlterSequence) (Outcome, error) {
+func (db *engine) executeAlterSequence(as *alterSequence) (Outcome, error) {
 	snapDef := db.sequence(as.Name)
 	if snapDef == nil {
 		if as.IfExists {
 			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 		}
-		return Outcome{}, NewError(UndefinedTable, "relation does not exist: "+as.Name)
+		return Outcome{}, newError(UndefinedTable, "relation does not exist: "+as.Name)
 	}
 	existing := *snapDef
 	if as.RenameTo != "" {
@@ -5278,7 +5278,7 @@ func (db *Engine) executeAlterSequence(as *AlterSequence) (Outcome, error) {
 		// AS type on ALTER is 0A000 — the value type is not persisted (sequences.md §14.4), so the
 		// original type for re-deriving a default bound is gone.
 		if as.Options.DataType != "" {
-			return Outcome{}, NewError(FeatureNotSupported, "ALTER SEQUENCE ... AS type is not supported")
+			return Outcome{}, newError(FeatureNotSupported, "ALTER SEQUENCE ... AS type is not supported")
 		}
 		newDef, err := applySeqAlter(&existing, as.Options, as.Restart)
 		if err != nil {
@@ -5294,20 +5294,20 @@ func (db *Engine) executeAlterSequence(as *AlterSequence) (Outcome, error) {
 // key. For an OWNED sequence, the owning column's DEFAULT nextval('s') text is rewritten in place to
 // nextval('s2') (the rows survive — not via putTable) so a later INSERT still advances the renamed
 // sequence (jed resolves the sequence by name, unlike PG's OID reference).
-func (db *Engine) alterSequenceRename(existing *SequenceDef, newName string) error {
+func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) error {
 	if db.relationExists(newName) {
-		return NewError(DuplicateTable, "relation already exists: "+newName)
+		return newError(DuplicateTable, "relation already exists: "+newName)
 	}
 	if existing.OwnedBy != nil {
 		exprText := "nextval ( '" + strings.ReplaceAll(strings.ToLower(newName), "'", "''") + "' )"
-		expr, err := ParseExpression(exprText)
+		expr, err := parseExpression(exprText)
 		if err != nil {
 			return err
 		}
 		// Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default in
 		// the temp snapshot (temp-tables.md §8).
 		db.setColumnDefaultExprRouted(strings.ToLower(existing.OwnedBy.Table),
-			int(existing.OwnedBy.Column), &DefaultExpr{ExprText: exprText, Expr: expr})
+			int(existing.OwnedBy.Column), &defaultExprDef{ExprText: exprText, Expr: expr})
 	}
 	// Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
 	// scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
@@ -5315,7 +5315,7 @@ func (db *Engine) alterSequenceRename(existing *SequenceDef, newName string) err
 	isShared := db.isSharedTempSequence(existing.Name)
 	def := *existing
 	def.Name = newName
-	var w *Snapshot
+	var w *snapshot
 	switch {
 	case isTemp:
 		db.session.tx.tempDirty = true
@@ -5336,7 +5336,7 @@ func (db *Engine) alterSequenceRename(existing *SequenceDef, newName string) err
 // order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
 // for a NOT NULL column) — then the row's storage key as the suffix. Indexable types are
 // fixed-width and never spill, so the values are always resident (never unfetched).
-func indexEntryKey(columns []Column, colls []*Collation, def IndexDef, storageKey []byte, row Row) ([]byte, error) {
+func indexEntryKey(columns []catColumn, colls []*Collation, def indexDef, storageKey []byte, row storedRow) ([]byte, error) {
 	var out []byte
 	for _, ci := range def.Columns {
 		v := row[ci]
@@ -5345,16 +5345,16 @@ func indexEntryKey(columns []Column, colls []*Collation, def IndexDef, storageKe
 			out = append(out, 0x01)
 		case ValInt:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValBool:
 			out = append(out, 0x00)
-			out = append(out, EncodeBool(v.Bool)...)
+			out = append(out, encodeBool(v.Bool)...)
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValText:
 			// text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
 			b, err := collatedTextKey(colls[ci], v.Str)
@@ -5365,7 +5365,7 @@ func indexEntryKey(columns []Column, colls []*Collation, def IndexDef, storageKe
 			out = append(out, b...)
 		case ValBytea:
 			out = append(out, 0x00)
-			out = append(out, EncodeTerminated([]byte(v.Str))...)
+			out = append(out, encodeTerminated([]byte(v.Str))...)
 		case ValDecimal:
 			out = append(out, 0x00)
 			out = append(out, v.Dec.EncodeKey()...)
@@ -5405,11 +5405,11 @@ func indexEntryKey(columns []Column, colls []*Collation, def IndexDef, storageKe
 // element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
 // uniformly as "a row maps to a set of entries." colls (column-ordinal-indexed) selects each text
 // key column's collated form (§2.12); GIN elements are fixed-width, so a GIN index never collates.
-func indexEntryKeys(columns []Column, colls []*Collation, def IndexDef, storageKey []byte, row Row) ([][]byte, error) {
-	if def.Kind == IndexGin {
+func indexEntryKeys(columns []catColumn, colls []*Collation, def indexDef, storageKey []byte, row storedRow) ([][]byte, error) {
+	if def.Kind == indexGin {
 		return ginEntries(columns, def, storageKey, row), nil
 	}
-	if def.Kind == IndexGist {
+	if def.Kind == indexGist {
 		return gistEntries(columns, def, storageKey, row), nil
 	}
 	ek, err := indexEntryKey(columns, colls, def, storageKey, row)
@@ -5423,7 +5423,7 @@ func indexEntryKeys(columns []Column, colls []*Collation, def IndexDef, storageK
 // leaf key, encodeRangeBody(bound) ‖ storage_key (the GIN term ‖ skey pattern), so all existing
 // index maintenance (insert/update/delete) reuses it unchanged. A NULL range value is not indexed;
 // the empty range is a real value and IS indexed.
-func gistEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
+func gistEntries(columns []catColumn, def indexDef, storageKey []byte, row storedRow) [][]byte {
 	ops := make([]gistOpclass, len(def.Columns))
 	bound := make([]gistBound, len(def.Columns))
 	for i, ci := range def.Columns {
@@ -5434,7 +5434,7 @@ func gistEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][
 		}
 		if rt, ok := col.Type.RangeElement(); ok {
 			// range_ops: the row range's value-codec bytes.
-			ops[i] = gistOpclass{scalar: false, elem: ScalarColType(rt.Scalar)}
+			ops[i] = gistOpclass{scalar: false, elem: scalarColType(rt.Scalar)}
 			bound[i] = gistBound{rng: v.Range}
 			continue
 		}
@@ -5456,7 +5456,7 @@ func gistEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][
 // a && element holds the empty range (empty && anything is FALSE, so the conjunction can never be
 // TRUE — this also sidesteps the empty-range overlap-descend trap, gist.md §5). The query is fed to
 // the resident GiST tree's search, whose leaf recheck IS the full conjunction, so a hit is a conflict.
-func exclusionProbeQuery(columns []Column, exc ExclusionConstraint, row Row) ([]gistQuery, []gistStrategy, bool) {
+func exclusionProbeQuery(columns []catColumn, exc exclusionConstraint, row storedRow) ([]gistQuery, []gistStrategy, bool) {
 	q := make([]gistQuery, 0, len(exc.Elements))
 	strats := make([]gistStrategy, 0, len(exc.Elements))
 	for _, el := range exc.Elements {
@@ -5466,13 +5466,13 @@ func exclusionProbeQuery(columns []Column, exc ExclusionConstraint, row Row) ([]
 			return nil, nil, false // NULL rule: exempt
 		}
 		switch el.Op {
-		case ExclOverlaps:
+		case exclOverlaps:
 			if v.Range.Empty {
 				return nil, nil, false // empty && anything is FALSE → exempt
 			}
 			q = append(q, gistQuery{rng: v.Range})
 			strats = append(strats, gistOverlaps)
-		case ExclEqual:
+		case exclEqual:
 			k, err := encodeKeyValue(columns[ci].Type.ScalarTy(), v, nil)
 			if err != nil {
 				panic("a fixed-width GiST scalar key is infallible (no collation)")
@@ -5489,7 +5489,7 @@ func exclusionProbeQuery(columns []Column, exc ExclusionConstraint, row Row) ([]
 // holds only stored rows). A NULL in any excluded column of either row, or an empty range under &&
 // (rangeOverlaps of an empty range is FALSE), makes that element not-TRUE → no conflict. Returns true
 // only when EVERY element is definitely TRUE.
-func exclusionPairConflicts(columns []Column, exc ExclusionConstraint, a, b Row) bool {
+func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b storedRow) bool {
 	for _, el := range exc.Elements {
 		ci := el.Column
 		va, vb := a[ci], b[ci]
@@ -5498,9 +5498,9 @@ func exclusionPairConflicts(columns []Column, exc ExclusionConstraint, a, b Row)
 		}
 		var ok bool
 		switch el.Op {
-		case ExclOverlaps:
+		case exclOverlaps:
 			ok = rangeOverlaps(va.Range, vb.Range)
-		case ExclEqual:
+		case exclEqual:
 			ka, err := encodeKeyValue(columns[ci].Type.ScalarTy(), va, nil)
 			if err != nil {
 				panic("a fixed-width GiST scalar key is infallible")
@@ -5525,7 +5525,7 @@ func exclusionPairConflicts(columns []Column, exc ExclusionConstraint, a, b Row)
 // valid ordered-index / PK keys — are 0A000 here, as is float. interval is fixed-width keyable (its
 // 16-byte span key landed, encoding.md §2.10) but its GIN element support is a separate follow-on
 // slice (gin.md §3/§10), so it is not yet admitted here.
-func isGinElementType(elem ScalarType) bool {
+func isGinElementType(elem scalarType) bool {
 	return elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
 		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate()
 }
@@ -5534,7 +5534,7 @@ func isGinElementType(elem ScalarType) bool {
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
 // Exactly isGinElementType's set, kept a separate predicate so the two surfaces evolve independently.
-func isGistScalarType(ty Type) bool {
+func isGistScalarType(ty dataType) bool {
 	return ty.IsInteger() || ty.IsBool() || ty.IsUuid() ||
 		ty.IsTimestamp() || ty.IsTimestamptz() || ty.IsDate()
 }
@@ -5542,7 +5542,7 @@ func isGistScalarType(ty Type) bool {
 // isGistDeferredScalarType reports a keyable scalar the GiST scalar `=` opclass will eventually admit
 // but defers this slice (gist.md §6/§11): the VARIABLE-width / collation-sensitive keyables — text,
 // bytea, decimal, interval. A column of one of these is 0A000 ("not supported yet"), not 42704.
-func isGistDeferredScalarType(ty Type) bool {
+func isGistDeferredScalarType(ty dataType) bool {
 	return ty.IsText() || ty.IsBytea() || ty.IsDecimal() || ty.IsInterval()
 }
 
@@ -5552,7 +5552,7 @@ func isGistDeferredScalarType(ty Type) bool {
 // they appear in no posting list). Returned sorted by encoded term (= key-encoding byte order, which
 // is order-preserving for every admitted element type). array_ops over any fixed-width key-encodable
 // element type.
-func ginEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
+func ginEntries(columns []catColumn, def indexDef, storageKey []byte, row storedRow) [][]byte {
 	ci := def.Columns[0]
 	elemTy := columns[ci].Type.Array.ScalarTy()
 	v := row[ci]
@@ -5610,7 +5610,7 @@ func bytesDiff(a, b [][]byte) [][]byte {
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or ok=false when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same prefix.
-func indexPrefixKey(columns []Column, colls []*Collation, def IndexDef, row Row) ([]byte, bool, error) {
+func indexPrefixKey(columns []catColumn, colls []*Collation, def indexDef, row storedRow) ([]byte, bool, error) {
 	var out []byte
 	for _, ci := range def.Columns {
 		v := row[ci]
@@ -5619,16 +5619,16 @@ func indexPrefixKey(columns []Column, colls []*Collation, def IndexDef, row Row)
 			return nil, false, nil
 		case ValInt:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValBool:
 			out = append(out, 0x00)
-			out = append(out, EncodeBool(v.Bool)...)
+			out = append(out, encodeBool(v.Bool)...)
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValText:
 			// text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
 			b, err := collatedTextKey(colls[ci], v.Str)
@@ -5639,7 +5639,7 @@ func indexPrefixKey(columns []Column, colls []*Collation, def IndexDef, row Row)
 			out = append(out, b...)
 		case ValBytea:
 			out = append(out, 0x00)
-			out = append(out, EncodeTerminated([]byte(v.Str))...)
+			out = append(out, encodeTerminated([]byte(v.Str))...)
 		case ValDecimal:
 			out = append(out, 0x00)
 			out = append(out, v.Dec.EncodeKey()...)
@@ -5697,7 +5697,7 @@ func uniqueProbeBound(prefix []byte) keyBound {
 // self-delimiting and bytes.Compare equals the tuple's logical order. Shared by the INSERT
 // duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK column is NOT NULL, so
 // there is no presence tag.
-func encodePkKey(table *Table, pk []int, colls []*Collation, row Row) ([]byte, error) {
+func encodePkKey(table *catTable, pk []int, colls []*Collation, row storedRow) ([]byte, error) {
 	var key []byte
 	for _, i := range pk {
 		switch {
@@ -5706,7 +5706,7 @@ func encodePkKey(table *Table, pk []int, colls []*Collation, row Row) ([]byte, e
 			key = append(key, row[i].Str...)
 		case table.Columns[i].Type.IsBool():
 			// boolean: the bare 1-byte bool-byte (encoding.md §2.9).
-			key = append(key, EncodeBool(row[i].Bool)...)
+			key = append(key, encodeBool(row[i].Bool)...)
 		case table.Columns[i].Type.IsText():
 			// text: the C …-terminated-escape body (encoding.md §2.4), or the collation's UCA
 			// sort key for a non-C collated column (text-collated-sortkey, §2.12).
@@ -5717,7 +5717,7 @@ func encodePkKey(table *Table, pk []int, colls []*Collation, row Row) ([]byte, e
 			key = append(key, b...)
 		case table.Columns[i].Type.IsBytea():
 			// bytea: the variable-width bytea-terminated-escape body (encoding.md §2.6).
-			key = append(key, EncodeTerminated([]byte(row[i].Str))...)
+			key = append(key, encodeTerminated([]byte(row[i].Str))...)
 		case table.Columns[i].Type.IsDecimal():
 			// decimal: the variable-width decimal-order-preserving body (encoding.md §2.5).
 			key = append(key, row[i].Dec.EncodeKey()...)
@@ -5740,14 +5740,14 @@ func encodePkKey(table *Table, pk []int, colls []*Collation, row Row) ([]byte, e
 		case table.Columns[i].Type.IsFloat():
 			// float: the fixed-width float-order-preserving key (encoding.md §2.8) — NOT the integer
 			// codec (the float bits do not sort numerically as an int).
-			if table.Columns[i].Type.ScalarTy() == Float32 {
+			if table.Columns[i].Type.ScalarTy() == scalarFloat32 {
 				key = append(key, encodeFloat32Key(uint32(row[i].Int))...)
 			} else {
 				key = append(key, encodeFloat64Key(uint64(row[i].Int))...)
 			}
 		default:
 			// integers / timestamp / timestamptz / date: the fixed-width key codec.
-			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
+			key = append(key, encodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
 		}
 	}
 	return key, nil
@@ -5775,7 +5775,7 @@ type conflictPlan struct {
 // column list is matched as an order-independent SET against a unique index / the primary key (no
 // match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
 // 42704). A nil target → nil arbiter (legal only with DO NOTHING).
-func resolveArbiter(table *Table, target *ConflictTarget) (*arbiter, error) {
+func resolveArbiter(table *catTable, target *conflictTarget) (*arbiter, error) {
 	if target == nil {
 		return nil, nil
 	}
@@ -5785,7 +5785,7 @@ func resolveArbiter(table *Table, target *ConflictTarget) (*arbiter, error) {
 		for _, c := range target.Columns {
 			idx := table.ColumnIndex(c)
 			if idx < 0 {
-				return nil, NewError(UndefinedColumn, "column does not exist: "+c)
+				return nil, newError(UndefinedColumn, "column does not exist: "+c)
 			}
 			want[idx] = struct{}{}
 		}
@@ -5797,7 +5797,7 @@ func resolveArbiter(table *Table, target *ConflictTarget) (*arbiter, error) {
 				return &arbiter{indexPos: i}, nil
 			}
 		}
-		return nil, NewError(InvalidColumnReference,
+		return nil, newError(InvalidColumnReference,
 			"there is no unique or exclusion constraint matching the ON CONFLICT specification")
 	}
 	pkey := strings.ToLower(table.Name) + "_pkey"
@@ -5809,7 +5809,7 @@ func resolveArbiter(table *Table, target *ConflictTarget) (*arbiter, error) {
 			return &arbiter{indexPos: i}, nil
 		}
 	}
-	return nil, NewError(UndefinedObject, fmt.Sprintf(
+	return nil, newError(UndefinedObject, fmt.Sprintf(
 		"constraint %s for table %s does not exist", target.Constraint, table.Name,
 	))
 }
@@ -5834,7 +5834,7 @@ func sameIntSet(s []int, set map[int]struct{}) bool {
 // arbiterKey is the arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for
 // a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (the bool is false
 // when a nullable arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
-func arbiterKey(arb *arbiter, table *Table, pk []int, colls []*Collation, row Row) ([]byte, bool, error) {
+func arbiterKey(arb *arbiter, table *catTable, pk []int, colls []*Collation, row storedRow) ([]byte, bool, error) {
 	if arb.isPK {
 		k, err := encodePkKey(table, pk, colls, row)
 		if err != nil {
@@ -5849,7 +5849,7 @@ func arbiterKey(arb *arbiter, table *Table, pk []int, colls []*Collation, row Ro
 // conflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
 // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
 // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
-func (db *Engine) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramTypes) (*conflictPlan, error) {
+func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, ptypes *paramTypes) (*conflictPlan, error) {
 	arb, err := resolveArbiter(table, oc.Target)
 	if err != nil {
 		return nil, err
@@ -5859,7 +5859,7 @@ func (db *Engine) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramT
 	}
 	// DO UPDATE requires a target (spec/design/upsert.md §2) — PostgreSQL's message.
 	if arb == nil {
-		return nil, NewError(SyntaxError,
+		return nil, newError(SyntaxError,
 			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
 	}
 	s := onConflictExcludedScope(db, table)
@@ -5868,21 +5868,21 @@ func (db *Engine) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramT
 	for _, a := range oc.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
-			return nil, NewError(UndefinedColumn, "column does not exist: "+a.Column)
+			return nil, newError(UndefinedColumn, "column does not exist: "+a.Column)
 		}
-		if c := table.Columns[idx].Identity; c != nil && *c == IdentityAlways {
-			return nil, NewError(GeneratedAlways,
+		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways {
+			return nil, newError(GeneratedAlways,
 				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
 		}
 		// Assigning a PRIMARY KEY member in DO UPDATE remains deferred (0A000, upsert.md §5/§9):
 		// the standalone UPDATE re-keying has landed (§11 step 6), but extending it to the upsert
 		// conflict path is a separate follow-on.
 		if slices.Contains(pkMembers, idx) {
-			return nil, NewError(FeatureNotSupported, "updating a primary key column is not supported")
+			return nil, newError(FeatureNotSupported, "updating a primary key column is not supported")
 		}
 		for _, p := range plans {
 			if p.idx == idx {
-				return nil, NewError(DuplicateColumn, "column "+a.Column+" assigned more than once")
+				return nil, newError(DuplicateColumn, "column "+a.Column+" assigned more than once")
 			}
 		}
 		col := table.Columns[idx]
@@ -5897,7 +5897,7 @@ func (db *Engine) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramT
 			case col.Type.IsArray():
 				noun = "array"
 			}
-			return nil, NewError(FeatureNotSupported,
+			return nil, newError(FeatureNotSupported,
 				"updating "+noun+" column "+a.Column+" is not supported yet")
 		}
 		colScalar := col.Type.ScalarTy()
@@ -5926,7 +5926,7 @@ func (db *Engine) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramT
 // arbiterExisting looks up the EXISTING (committed) conflicting row for an arbiter key
 // (spec/design/upsert.md §3): always a committed row (an in-batch row sharing the arbiter key was
 // caught earlier by the proposed-arbiter set). Returns (storageKey, fully-resident row, found).
-func (db *Engine) arbiterExisting(arb *arbiter, store *TableStore, table *Table, ak []byte) ([]byte, Row, bool, error) {
+func (db *engine) arbiterExisting(arb *arbiter, store *tableStore, table *catTable, ak []byte) ([]byte, storedRow, bool, error) {
 	if arb.isPK {
 		row, exists, err := store.Get(ak)
 		if err != nil || !exists {
@@ -5965,7 +5965,7 @@ func (db *Engine) arbiterExisting(arb *arbiter, store *TableStore, table *Table,
 // rowConflictsCommitted reports whether a candidate row conflicts with a COMMITTED row on the
 // primary key or any unique index (the no-target DO NOTHING skip test — spec/design/upsert.md §2).
 // NULLS DISTINCT: a unique tuple with any NULL component never conflicts.
-func (db *Engine) rowConflictsCommitted(store *TableStore, table *Table, pk []int, colls []*Collation, row Row) (bool, error) {
+func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk []int, colls []*Collation, row storedRow) (bool, error) {
 	if len(pk) > 0 {
 		k, err := encodePkKey(table, pk, colls, row)
 		if err != nil {
@@ -5999,10 +5999,10 @@ func (db *Engine) rowConflictsCommitted(store *TableStore, table *Table, pk []in
 	return false, nil
 }
 
-func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.lkpTable(ins.Table) // temp-first (temp-tables.md §3)
 	if !ok {
-		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
+		return Outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
 	// Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
 	// maintained B-tree would mix two orderings (collation.md §12, XX002).
@@ -6041,12 +6041,12 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 		for p, name := range ins.Columns {
 			idx := table.ColumnIndex(name)
 			if idx < 0 {
-				return Outcome{}, NewError(UndefinedColumn, fmt.Sprintf(
+				return Outcome{}, newError(UndefinedColumn, fmt.Sprintf(
 					"column %s of relation %s does not exist", name, table.Name,
 				))
 			}
 			if provided[idx] >= 0 {
-				return Outcome{}, NewError(DuplicateColumn,
+				return Outcome{}, newError(DuplicateColumn,
 					"column "+table.Columns[idx].Name+" specified more than once")
 			}
 			provided[idx] = p
@@ -6062,7 +6062,7 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 	// supplied value for every identity column and uses its sequence instead — modeled by treating
 	// the column as omitted (provided[i] = -1, so its nextval default applies). Apply it before the
 	// GENERATED ALWAYS gate below so a User-overridden ALWAYS column needs no further check.
-	if ins.Overriding != nil && *ins.Overriding == OverridingUser {
+	if ins.Overriding != nil && *ins.Overriding == overridingUser {
 		for i, col := range table.Columns {
 			if col.Identity != nil {
 				provided[i] = -1
@@ -6074,9 +6074,9 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 	// so the source branches can enforce it (VALUES per-row, SELECT up-front).
 	type alwaysTarget struct{ col, pos int }
 	var alwaysTargeted []alwaysTarget
-	if !(ins.Overriding != nil && *ins.Overriding == OverridingSystem) {
+	if !(ins.Overriding != nil && *ins.Overriding == overridingSystem) {
 		for i, col := range table.Columns {
-			if col.Identity != nil && *col.Identity == IdentityAlways && provided[i] >= 0 {
+			if col.Identity != nil && *col.Identity == identityAlways && provided[i] >= 0 {
 				alwaysTargeted = append(alwaysTargeted, alwaysTarget{col: i, pos: provided[i]})
 			}
 		}
@@ -6087,7 +6087,7 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 		// explicit value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is
 		// 428C9 — raised up front (PG raises it at rewrite), firing even over a zero-row source.
 		if len(alwaysTargeted) > 0 {
-			return Outcome{}, NewError(GeneratedAlways, fmt.Sprintf(
+			return Outcome{}, newError(GeneratedAlways, fmt.Sprintf(
 				"cannot insert a non-DEFAULT value into column %s", table.Columns[alwaysTargeted[0].col].Name,
 			))
 		}
@@ -6099,7 +6099,7 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 		// The source query (and the RETURNING sublinks) see the statement's CTE bindings
 		// (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
 		ptypes := &paramTypes{}
-		plan, err := db.planQuery(QueryExpr{Select: ins.Select}, nil, ctx.bindings, ptypes)
+		plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, ctx.bindings, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -6151,7 +6151,7 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 			if arity == 1 {
 				noun = "column"
 			}
-			return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+			return Outcome{}, newError(SyntaxError, fmt.Sprintf(
 				"INSERT into table %s has %d target %s but SELECT produces %d",
 				table.Name, arity, noun, len(q.columnNames),
 			))
@@ -6165,14 +6165,14 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 				// INSERT ... SELECT into a composite column lands in a later slice (the VALUES +
 				// ROW(...) path is S3 — spec/design/composite.md §12).
 				if col.Type.IsComposite() {
-					return Outcome{}, NewError(FeatureNotSupported, fmt.Sprintf(
+					return Outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
 						"INSERT ... SELECT into composite column %s is not supported yet", col.Name,
 					))
 				}
 				// INSERT ... SELECT into a range column is deferred (the VALUES + range literal/cast
 				// path is the supported input — spec/design/ranges.md §1).
 				if col.Type.IsRange() {
-					return Outcome{}, NewError(FeatureNotSupported, fmt.Sprintf(
+					return Outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
 						"INSERT ... SELECT into range column %s is not supported yet", col.Name,
 					))
 				}
@@ -6206,7 +6206,7 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 			if ins.Columns != nil {
 				expected = "target columns are"
 			}
-			return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+			return Outcome{}, newError(SyntaxError, fmt.Sprintf(
 				"INSERT row has %d values but %d %s expected for table %s",
 				len(values), arity, expected, table.Name,
 			))
@@ -6237,7 +6237,7 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 			}
 		}
 		if nonDefault {
-			return Outcome{}, NewError(GeneratedAlways, fmt.Sprintf(
+			return Outcome{}, newError(GeneratedAlways, fmt.Sprintf(
 				"cannot insert a non-DEFAULT value into column %s", table.Columns[at.col].Name,
 			))
 		}
@@ -6338,20 +6338,20 @@ func (db *Engine) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcom
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
+func (db *engine) insertRows(table *catTable, store *tableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	n := len(table.Columns)
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
 	// mutation; nil everywhere for a C-only / non-text table (the fast path).
 	colls := db.columnCollations(table.Columns)
 	type preparedRow struct {
 		key []byte // nil for a no-PK table (rowid allocated in phase 2)
-		row Row
+		row storedRow
 	}
 	prepared := make([]preparedRow, 0, len(rows))
 	seenKeys := make(map[string]struct{})
 	// Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
 	// claimed — an in-batch duplicate traps 23505 like a stored one (indexes.md §8).
-	var uniqDefs []IndexDef
+	var uniqDefs []indexDef
 	for _, def := range table.Indexes {
 		if def.Unique {
 			uniqDefs = append(uniqDefs, def)
@@ -6363,7 +6363,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 	}
 	var cunits int64
 	for _, values := range rows {
-		row := make(Row, n)
+		row := make(storedRow, n)
 		for i, col := range table.Columns {
 			var candidate Value
 			if p := provided[i]; p >= 0 {
@@ -6417,7 +6417,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
 			// `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
 			if _, dup := seenKeys[string(key)]; dup {
-				return nil, NewError(UniqueViolation,
+				return nil, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			// The duplicate probe reads the pin (readSnap) — under the writable-CTE read pin
@@ -6427,7 +6427,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 			if _, exists, err := db.lkpStore(table.Name).Get(key); err != nil {
 				return nil, err
 			} else if exists {
-				return nil, NewError(UniqueViolation,
+				return nil, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			seenKeys[string(key)] = struct{}{}
@@ -6451,7 +6451,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 				return nil, err
 			}
 			if _, dup := seenPrefixes[u][string(prefix)]; dup || len(stored) > 0 {
-				return nil, NewError(UniqueViolation,
+				return nil, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+def.Name)
 			}
 			seenPrefixes[u][string(prefix)] = struct{}{}
@@ -6514,7 +6514,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 				return nil, err
 			}
 			if !hit {
-				return nil, NewError(ForeignKeyViolation,
+				return nil, newError(ForeignKeyViolation,
 					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
 			}
 		}
@@ -6540,14 +6540,14 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 					conflict = len(hits) > 0
 				}
 				if conflict {
-					return nil, NewError(ExclusionViolation,
+					return nil, newError(ExclusionViolation,
 						"conflicting key value violates exclusion constraint: "+exc.Name)
 				}
 			}
 			for i := range prepared {
 				for j := 0; j < i; j++ {
 					if exclusionPairConflicts(tcols, exc, prepared[i].row, prepared[j].row) {
-						return nil, NewError(ExclusionViolation,
+						return nil, newError(ExclusionViolation,
 							"conflicting key value violates exclusion constraint: "+exc.Name)
 					}
 				}
@@ -6556,7 +6556,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 	}
 
 	// Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
-	meter.Charge(Costs.ValueCompress * cunits)
+	meter.Charge(costs.ValueCompress * cunits)
 	if err := meter.Guard(); err != nil {
 		return nil, err
 	}
@@ -6566,7 +6566,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 	// the pre-statement snapshot and a 54P01 here leaves the store untouched.
 	var returned [][]Value
 	if returning != nil {
-		prows := make([]Row, len(prepared))
+		prows := make([]storedRow, len(prepared))
 		for i := range prepared {
 			prows[i] = prepared[i].row
 		}
@@ -6586,7 +6586,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 	for _, pr := range prepared {
 		key := pr.key
 		if key == nil {
-			key = EncodeInt(Int64, store.AllocRowid())
+			key = encodeInt(scalarInt64, store.AllocRowid())
 		}
 		for k, def := range table.Indexes {
 			eks, err := indexEntryKeys(table.Columns, colls, def, key, pr.row)
@@ -6605,7 +6605,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 			// (reading the pin) did not see. Matches PostgreSQL's unique violation; the whole statement
 			// aborts all-or-nothing. For a single statement, phase 1 already caught every duplicate, so
 			// this is never reached.
-			return nil, NewError(UniqueViolation,
+			return nil, newError(UniqueViolation,
 				"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 		}
 	}
@@ -6618,7 +6618,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 			}
 			if !inserted {
 				// A cross-sub-statement unique-index collision under the read pin (as above).
-				return nil, NewError(UniqueViolation,
+				return nil, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+def.Name)
 			}
 		}
@@ -6628,7 +6628,7 @@ func (db *Engine) insertRows(table *Table, store *TableStore, pk []int, checks [
 
 // foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their
 // cost is added a single time — cost.md §3), exactly as UPDATE folds its assignment/filter.
-func (db *Engine) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *int64) error {
+func (db *engine) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *int64) error {
 	if plan == nil || !plan.doUpdate {
 		return nil
 	}
@@ -6648,7 +6648,7 @@ func (db *Engine) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *i
 // runInsertRows dispatches the validated candidate rows to the plain or the ON CONFLICT insert
 // path, shared by both INSERT sources. Returns (rows affected, RETURNING rows): a plain insert
 // affects every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
-func (db *Engine) runInsertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
+func (db *engine) runInsertRows(table *catTable, store *tableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
 	if conflict != nil {
 		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
 	}
@@ -6665,7 +6665,7 @@ func (db *Engine) runInsertRows(table *Table, store *TableStore, pk []int, check
 // inserts + updates are then validated against the statement END STATE (PK / unique / CHECK / FK)
 // before phase 2 writes anything (all-or-nothing). returning projects the AFFECTED rows (inserts
 // with an all-NULL old side, updates with their pre-update existing row).
-func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
+func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
 	n := len(table.Columns)
 	relation := table.Name
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
@@ -6681,10 +6681,10 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 
 	type pendingUpdate struct {
 		key    []byte
-		newRow Row
-		oldRow Row
+		newRow storedRow
+		oldRow storedRow
 	}
-	var inserts []Row
+	var inserts []storedRow
 	var updates []pendingUpdate
 	// Arbiter keys this statement has already proposed (the §4 second-affect rule).
 	proposedArb := make(map[string]struct{})
@@ -6699,7 +6699,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 	for _, values := range rows {
 		// Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL
 		// before CHECK before conflict; constraints.md §4.4).
-		row := make(Row, n)
+		row := make(storedRow, n)
 		for i, col := range table.Columns {
 			var candidate Value
 			if p := provided[i]; p >= 0 {
@@ -6794,7 +6794,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 		if _, dup := proposedArb[string(ak)]; dup {
 			// A second proposed row with the same arbiter key (§4).
 			if plan.doUpdate {
-				return 0, nil, NewError(CardinalityViolation,
+				return 0, nil, newError(CardinalityViolation,
 					"ON CONFLICT DO UPDATE command cannot affect row a second time")
 			}
 			continue // DO NOTHING → skip
@@ -6814,7 +6814,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 			continue // DO NOTHING → skip
 		}
 		// DO UPDATE: the combined eval row [existing | proposed] the §5 scope resolves against.
-		combined := make(Row, 0, 2*n)
+		combined := make(storedRow, 0, 2*n)
 		combined = append(combined, existRow...)
 		combined = append(combined, row...)
 		env := &evalEnv{exec: db, params: params, rng: rng}
@@ -6829,7 +6829,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 				continue
 			}
 		}
-		newRow := make(Row, n)
+		newRow := make(storedRow, n)
 		copy(newRow, existRow)
 		for _, ap := range plan.assignments {
 			raw, err := ap.source.eval(combined, env, meter)
@@ -6864,11 +6864,11 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 			if _, exists, err := store.Get(k); err != nil {
 				return 0, nil, err
 			} else if exists {
-				return 0, nil, NewError(UniqueViolation,
+				return 0, nil, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(relation)+"_pkey")
 			}
 			if _, dup := seen[string(k)]; dup {
-				return 0, nil, NewError(UniqueViolation,
+				return 0, nil, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(relation)+"_pkey")
 			}
 			seen[string(k)] = struct{}{}
@@ -6882,7 +6882,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 		for _, u := range updates {
 			rewritten[string(u.key)] = struct{}{}
 		}
-		newRows := make([]Row, 0, len(updates)+len(inserts))
+		newRows := make([]storedRow, 0, len(updates)+len(inserts))
 		for _, u := range updates {
 			newRows = append(newRows, u.newRow)
 		}
@@ -6915,7 +6915,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 					}
 				}
 				if conflict {
-					return 0, nil, NewError(UniqueViolation,
+					return 0, nil, newError(UniqueViolation,
 						"duplicate key value violates unique constraint: "+def.Name)
 				}
 				batch[string(prefix)] = struct{}{}
@@ -6970,7 +6970,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 				}
 			}
 		}
-		toCheck := make([]Row, 0, len(inserts)+len(updates))
+		toCheck := make([]storedRow, 0, len(inserts)+len(updates))
 		toCheck = append(toCheck, inserts...)
 		if checkUpdates {
 			for _, u := range updates {
@@ -6993,7 +6993,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 				return 0, nil, err
 			}
 			if !hit {
-				return 0, nil, NewError(ForeignKeyViolation,
+				return 0, nil, newError(ForeignKeyViolation,
 					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
 			}
 		}
@@ -7046,7 +7046,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 					return 0, nil, err
 				}
 				if referenced {
-					return 0, nil, NewError(ForeignKeyViolation,
+					return 0, nil, newError(ForeignKeyViolation,
 						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
 				}
 			}
@@ -7071,7 +7071,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 	for _, u := range updates {
 		cunits += int64(store.WriteCompressUnits(u.key, u.newRow))
 	}
-	meter.Charge(Costs.ValueCompress * cunits)
+	meter.Charge(costs.ValueCompress * cunits)
 	if err := meter.Guard(); err != nil {
 		return 0, nil, err
 	}
@@ -7080,12 +7080,12 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 	// updates (old side the pre-update existing row) — after all validation, before any write.
 	var returned [][]Value
 	if returning != nil {
-		nullRow := make(Row, n)
+		nullRow := make(storedRow, n)
 		for i := range nullRow {
 			nullRow[i] = NullValue()
 		}
-		prows := make([]Row, 0, len(inserts)+len(updates))
-		olds := make([]Row, 0, len(inserts)+len(updates))
+		prows := make([]storedRow, 0, len(inserts)+len(updates))
+		olds := make([]storedRow, 0, len(inserts)+len(updates))
 		for _, row := range inserts {
 			prows = append(prows, row)
 			olds = append(olds, nullRow)
@@ -7114,7 +7114,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 			}
 			key = k
 		} else {
-			key = EncodeInt(Int64, store.AllocRowid())
+			key = encodeInt(scalarInt64, store.AllocRowid())
 		}
 		for k, def := range table.Indexes {
 			eks, err := indexEntryKeys(table.Columns, colls, def, key, row)
@@ -7188,7 +7188,7 @@ func (db *Engine) insertRowsOnConflict(table *Table, store *TableStore, pk []int
 
 // defaultOrNull is the column's stored default value, or a NULL value when it has none —
 // the candidate for an omitted column or a DEFAULT keyword slot (constraints.md §2).
-func defaultOrNull(col Column) Value {
+func defaultOrNull(col catColumn) Value {
 	if col.Default != nil {
 		return *col.Default
 	}
@@ -7202,7 +7202,7 @@ func defaultOrNull(col Column) Value {
 // The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
 // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
 // baseIsOld true for DELETE).
-func (db *Engine) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
+func (db *engine) resolveReturning(table *catTable, items selectItems, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
 	s := returningScope(db, table, baseIsOld)
 	s.ctes = ctes
 	nodes, names, types, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
@@ -7220,15 +7220,15 @@ func (db *Engine) resolveReturning(table *Table, items SelectItems, baseIsOld bo
 // The evaluation row is the concatenation [base | other] the RETURNING scope resolved
 // against: others[i] is the row's opposite version (UPDATE's old rows), nil the all-NULL
 // row (INSERT's old side, DELETE's new side).
-func (db *Engine) projectReturning(nodes []*rExpr, rows []Row, others []Row, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
+func (db *engine) projectReturning(nodes []*rExpr, rows []storedRow, others []storedRow, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	env := &evalEnv{exec: db, params: params, rng: newStmtRng(), ctes: ctes}
 	out := make([][]Value, 0, len(rows))
 	for i, row := range rows {
 		if err := meter.Guard(); err != nil {
 			return nil, err
 		}
-		meter.Charge(Costs.RowProduced)
-		combined := make(Row, 0, 2*len(row))
+		meter.Charge(costs.RowProduced)
+		combined := make(storedRow, 0, 2*len(row))
 		combined = append(combined, row...)
 		if others != nil {
 			combined = append(combined, others[i]...)
@@ -7268,10 +7268,10 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 // collect the keys of matching rows (only a TRUE predicate matches — Kleene), then
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
-func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.lkpTable(del.Table) // temp-first (temp-tables.md §3)
 	if !ok {
-		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
+		return Outcome{}, newError(UndefinedTable, "table does not exist: "+del.Table)
 	}
 	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): a
 	// DELETE must locate + remove a stored key, which a skewed encoding cannot match.
@@ -7342,7 +7342,7 @@ func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcom
 	// index-entry removal (indexed columns are fixed-width and always resident).
 	type matchedRow struct {
 		key []byte
-		row Row
+		row storedRow
 	}
 	var matched []matchedRow
 	// DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
@@ -7364,7 +7364,7 @@ func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcom
 	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
 	// scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-	var entries []Entry
+	var entries []entry
 	var overlap, slabs int
 	if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
@@ -7404,12 +7404,12 @@ func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcom
 			return Outcome{}, err
 		}
 	}
-	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
+	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return Outcome{}, err
 		}
-		meter.Charge(Costs.StorageRowRead)
+		meter.Charge(costs.StorageRowRead)
 		// Materialize the filter's columns if the lazy load left them unfetched — exactly the
 		// touched set the block above charged (large-values.md §14).
 		row, err := store.resolveColumns(e.Row, mask)
@@ -7462,7 +7462,7 @@ func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcom
 					return Outcome{}, err
 				}
 				if referenced {
-					return Outcome{}, NewError(ForeignKeyViolation,
+					return Outcome{}, newError(ForeignKeyViolation,
 						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
 				}
 			}
@@ -7474,7 +7474,7 @@ func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcom
 	// snapshot, and a 54P01 here deletes nothing (all-or-nothing).
 	var returned [][]Value
 	if retNodes != nil {
-		prows := make([]Row, len(matched))
+		prows := make([]storedRow, len(matched))
 		for i := range matched {
 			prows[i] = matched[i].row
 		}
@@ -7513,10 +7513,10 @@ func (db *Engine) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcom
 // writes. Phase 2 applies. Assigning a PRIMARY KEY column traps 0A000 (the storage
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
-func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.lkpTable(upd.Table) // temp-first (temp-tables.md §3)
 	if !ok {
-		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
+		return Outcome{}, newError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
 	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): an
 	// UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
@@ -7542,18 +7542,18 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 	for _, a := range upd.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
-			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+a.Column)
+			return Outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column)
 		}
 		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
 		// UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
 		// 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
-		if c := table.Columns[idx].Identity; c != nil && *c == IdentityAlways {
-			return Outcome{}, NewError(GeneratedAlways,
+		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways {
+			return Outcome{}, newError(GeneratedAlways,
 				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
 		}
 		for _, p := range plans {
 			if p.idx == idx {
-				return Outcome{}, NewError(DuplicateColumn,
+				return Outcome{}, newError(DuplicateColumn,
 					"column "+a.Column+" assigned more than once")
 			}
 		}
@@ -7562,7 +7562,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 		// assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
 		// ARE updatable (ranges.md §4 / array.md §4) through the container path below.
 		if col.Type.IsComposite() {
-			return Outcome{}, NewError(FeatureNotSupported,
+			return Outcome{}, newError(FeatureNotSupported,
 				"updating composite column "+a.Column+" is not supported yet")
 		}
 		if scalar, ok := col.Type.AsScalar(); ok {
@@ -7588,7 +7588,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 			if err != nil {
 				return Outcome{}, err
 			}
-			ct := ResolveColType(col.Type, s.catalog.readSnap().types)
+			ct := resolveColType(col.Type, s.catalog.readSnap().types)
 			plans = append(plans, assignPlan{
 				idx: idx, name: col.Name, notNull: col.NotNull, source: src, colType: &ct,
 			})
@@ -7671,8 +7671,8 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 	type pending struct {
 		key    []byte
 		newKey []byte
-		row    Row
-		oldRow Row
+		row    storedRow
+		oldRow storedRow
 	}
 	var updates []pending
 	// UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's, and
@@ -7706,7 +7706,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
 	// scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-	var entries []Entry
+	var entries []entry
 	var overlap, slabs int
 	if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
@@ -7745,12 +7745,12 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 			return Outcome{}, err
 		}
 	}
-	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
+	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return Outcome{}, err
 		}
-		meter.Charge(Costs.StorageRowRead)
+		meter.Charge(costs.StorageRowRead)
 		// Materialize the filter's + assignment sources' columns if the lazy load left them
 		// unfetched — exactly the touched set the block above charged (large-values.md §14).
 		row, err := store.resolveColumns(e.Row, mask)
@@ -7766,7 +7766,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 				continue
 			}
 		}
-		newRow := make(Row, len(row))
+		newRow := make(storedRow, len(row))
 		copy(newRow, row)
 		for _, p := range plans {
 			raw, err := p.source.eval(row, env, meter)
@@ -7826,7 +7826,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 				collides = true
 			}
 			if collides {
-				return Outcome{}, NewError(UniqueViolation,
+				return Outcome{}, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			batch[string(u.newKey)] = struct{}{}
@@ -7875,7 +7875,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 					}
 				}
 				if conflict {
-					return Outcome{}, NewError(UniqueViolation,
+					return Outcome{}, newError(UniqueViolation,
 						"duplicate key value violates unique constraint: "+def.Name)
 				}
 				batch[string(prefix)] = struct{}{}
@@ -7912,14 +7912,14 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 					}
 				}
 				if conflict {
-					return Outcome{}, NewError(ExclusionViolation,
+					return Outcome{}, newError(ExclusionViolation,
 						"conflicting key value violates exclusion constraint: "+exc.Name)
 				}
 			}
 			for i := range updates {
 				for j := 0; j < i; j++ {
 					if exclusionPairConflicts(table.Columns, exc, updates[i].row, updates[j].row) {
-						return Outcome{}, NewError(ExclusionViolation,
+						return Outcome{}, newError(ExclusionViolation,
 							"conflicting key value violates exclusion constraint: "+exc.Name)
 					}
 				}
@@ -7984,7 +7984,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 				return Outcome{}, err
 			}
 			if !hit {
-				return Outcome{}, NewError(ForeignKeyViolation,
+				return Outcome{}, newError(ForeignKeyViolation,
 					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
 			}
 		}
@@ -8068,7 +8068,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 					return Outcome{}, err
 				}
 				if _, dangles := newChildRefs[string(oldProbe.bytes)]; referenced || dangles {
-					return Outcome{}, NewError(ForeignKeyViolation,
+					return Outcome{}, newError(ForeignKeyViolation,
 						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
 				}
 			}
@@ -8082,7 +8082,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 	for _, u := range updates {
 		cunits += int64(store.WriteCompressUnits(u.newKey, u.row))
 	}
-	meter.Charge(Costs.ValueCompress * cunits)
+	meter.Charge(costs.ValueCompress * cunits)
 	if err := meter.Guard(); err != nil {
 		return Outcome{}, err
 	}
@@ -8093,8 +8093,8 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 	// writes nothing (all-or-nothing).
 	var returned [][]Value
 	if retNodes != nil {
-		prows := make([]Row, len(updates))
-		olds := make([]Row, len(updates))
+		prows := make([]storedRow, len(updates))
+		olds := make([]storedRow, len(updates))
 		for i := range updates {
 			prows[i] = updates[i].row
 			olds[i] = updates[i].oldRow
@@ -8155,7 +8155,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 				// Reachable only under the writable-CTE read pin (writable-cte.md §7): an earlier
 				// sub-statement staged this key, unseen by phase 1. Aborts all-or-nothing, matching
 				// INSERT. For a single statement, phase 1's end-state check caught every duplicate.
-				return Outcome{}, NewError(UniqueViolation,
+				return Outcome{}, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 		}
@@ -8176,7 +8176,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 					}
 					if !inserted {
 						// A cross-sub-statement collision under the read pin (as above).
-						return Outcome{}, NewError(UniqueViolation,
+						return Outcome{}, newError(UniqueViolation,
 							"duplicate key value violates unique constraint: "+def.Name)
 					}
 				}
@@ -8215,7 +8215,7 @@ func (db *Engine) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcom
 // or nil if the table does not exist. A test/debug convenience — the SELECT path scans through
 // IterInKeyOrder directly (propagating fault errors); these callers are in-memory, where a scan never
 // faults, so the error is inert and panicking on it surfaces a genuine bug rather than hiding it.
-func (db *Engine) RowsInKeyOrder(name string) []Row {
+func (db *engine) RowsInKeyOrder(name string) []storedRow {
 	snap := db.readSnap()
 	if db.isTempTable(name) { // temp tables live in the session temp snapshot (temp-tables.md §2)
 		snap = db.tempSnap()
@@ -8251,7 +8251,7 @@ type selectResult struct {
 
 // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query Outcome
 // (the projection types are internal — only INSERT ... SELECT consumes them).
-func (db *Engine) executeSelect(sel *Select, params []Value) (Outcome, error) {
+func (db *engine) executeSelect(sel *selectStmt, params []Value) (Outcome, error) {
 	r, err := db.runSelect(sel, params)
 	if err != nil {
 		return Outcome{}, err
@@ -8261,7 +8261,7 @@ func (db *Engine) executeSelect(sel *Select, params []Value) (Outcome, error) {
 
 // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
 // Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-func (db *Engine) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
+func (db *engine) executeSetOp(so *setOp, params []Value) (Outcome, error) {
 	r, err := db.runSetOp(so, params)
 	if err != nil {
 		return Outcome{}, err
@@ -8271,7 +8271,7 @@ func (db *Engine) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 
 // executeWith runs a WITH query (spec/design/cte.md) — the host-API entry point; runWith does the
 // CTE orchestration.
-func (db *Engine) executeWith(wq *WithQuery, params []Value) (Outcome, error) {
+func (db *engine) executeWith(wq *withQuery, params []Value) (Outcome, error) {
 	// A WITH containing any data-modifying part (a data-modifying CTE or a data-modifying primary)
 	// runs through the writable-CTE orchestrator (spec/design/writable-cte.md): it pins the
 	// pre-statement snapshot and runs the parts in lexical order, all-or-nothing. A pure-query WITH
@@ -8295,14 +8295,14 @@ func (db *Engine) executeWith(wq *WithQuery, params []Value) (Outcome, error) {
 // the recursive UNION shape, so it is always non-recursive. The refs counters are bumped as later
 // query bodies / a query primary reference each binding (a data-modifying part's references are
 // static-counted by the orchestrator, since it is not planned here).
-func (db *Engine) planCteBindings(ctes []Cte, recursive bool, ptypes *paramTypes) ([]*cteBinding, error) {
+func (db *engine) planCteBindings(ctes []cte, recursive bool, ptypes *paramTypes) ([]*cteBinding, error) {
 	bindings := make([]*cteBinding, 0, len(ctes))
 	for i := range ctes {
 		cte := &ctes[i]
 		lname := strings.ToLower(cte.Name)
 		for _, b := range bindings {
 			if b.name == lname {
-				return nil, NewError(DuplicateAlias,
+				return nil, newError(DuplicateAlias,
 					"WITH query name "+lname+" specified more than once")
 			}
 		}
@@ -8373,9 +8373,9 @@ func (db *Engine) planCteBindings(ctes []Cte, recursive bool, ptypes *paramTypes
 // the synthetic relation, and capture the statement to execute later. A body with no RETURNING yields
 // a zero-column relation flagged noReturning (a FROM reference to it is 0A000, §5). The target must
 // be a base table — a CTE name / missing table is 42P01 (§1).
-func (db *Engine) planDmCte(lname string, body *CteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*Table, *dmCte, error) {
+func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*catTable, *dmCte, error) {
 	var tableName string
-	var returning *SelectItems
+	var returning *selectItems
 	var baseIsOld bool
 	dm := &dmCte{}
 	switch {
@@ -8391,7 +8391,7 @@ func (db *Engine) planDmCte(lname string, body *CteBody, bindings []*cteBinding,
 	}
 	tdef, ok := db.lkpTable(tableName) // temp-first (temp-tables.md §3)
 	if !ok {
-		return nil, nil, NewError(UndefinedTable, "table does not exist: "+tableName)
+		return nil, nil, newError(UndefinedTable, "table does not exist: "+tableName)
 	}
 	if returning == nil {
 		dm.noReturning = true
@@ -8420,7 +8420,7 @@ func (db *Engine) planDmCte(lname string, body *CteBody, bindings []*cteBinding,
 // reference count + [NOT] MATERIALIZED hint; (4) MATERIALIZE each referenced materialized CTE once,
 // in list order (a later body sees the earlier buffers); (5) fold + EXECUTE the main body with the
 // CTE context. Cost composes like set operations — a sum of the parts.
-func (db *Engine) runWith(wq *WithQuery, params []Value) (selectResult, error) {
+func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
 	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
 	if err != nil {
@@ -8466,11 +8466,11 @@ func (db *Engine) runWith(wq *WithQuery, params []Value) (selectResult, error) {
 // here (the orchestrator runs it for its effect — executeWithDml); its buffer slot is left empty for
 // the orchestrator to fill. Returns the filled buffers + the accrued materialization cost (a later
 // body sees the earlier buffers).
-func (db *Engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound []Value) ([][]Row, int64, error) {
+func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound []Value) ([][]storedRow, int64, error) {
 	var totalCost int64
-	buffers := make([][]Row, 0, len(bindings))
+	buffers := make([][]storedRow, 0, len(bindings))
 	for i := range bindings {
-		var buf []Row
+		var buf []storedRow
 		switch {
 		case bindings[i].recursive != nil:
 			b, err := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, &totalCost)
@@ -8501,14 +8501,14 @@ func (db *Engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound
 // materialized rows (visible to both terms). totalCost accrues every term evaluation's cost and gates
 // the per-statement ceiling between iterations, so a non-terminating recursion of cheap iterations
 // still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
-func (db *Engine) materializeRecursive(ci int, rt *recursiveTerm,
-	modes []cteMode, bindings []*cteBinding, priorBuffers [][]Row, params []Value, totalCost *int64,
-) ([]Row, error) {
+func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
+	modes []cteMode, bindings []*cteBinding, priorBuffers [][]storedRow, params []Value, totalCost *int64,
+) ([]storedRow, error) {
 	anchorPlan := &bindings[ci].plan
 	maxCost := db.session.maxCost
 	guard := func(total int64) error {
 		if maxCost > 0 && total >= maxCost {
-			return NewError(CostLimitExceeded, fmt.Sprintf(
+			return newError(CostLimitExceeded, fmt.Sprintf(
 				"query exceeded the cost limit of %d (accrued %d)", maxCost, total,
 			))
 		}
@@ -8531,7 +8531,7 @@ func (db *Engine) materializeRecursive(ci int, rt *recursiveTerm,
 	// For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
 	// NULL-safe distinctRowKey the set operators use.
 	seen := map[string]bool{}
-	keep := func(row Row) bool {
+	keep := func(row storedRow) bool {
 		if rt.unionAll {
 			return true
 		}
@@ -8542,7 +8542,7 @@ func (db *Engine) materializeRecursive(ci int, rt *recursiveTerm,
 		seen[k] = true
 		return true
 	}
-	var result, working []Row
+	var result, working []storedRow
 	for _, row := range ar.rows {
 		if keep(row) {
 			result = append(result, row)
@@ -8552,7 +8552,7 @@ func (db *Engine) materializeRecursive(ci int, rt *recursiveTerm,
 
 	// The recursive term scans the WORKING table through the CTE's own buffer slot (ci); the earlier
 	// CTEs keep their full buffers. Build the buffer vec once and swap slot ci per iteration.
-	rhsBuffers := make([][]Row, ci+1)
+	rhsBuffers := make([][]storedRow, ci+1)
 	copy(rhsBuffers, priorBuffers)
 
 	for len(working) > 0 {
@@ -8570,7 +8570,7 @@ func (db *Engine) materializeRecursive(ci int, rt *recursiveTerm,
 		}
 		coerceSetopRows(rr.rows, rhsTypes, anchorTypes)
 		for _, vrow := range rr.rows {
-			row := Row(vrow)
+			row := storedRow(vrow)
 			if keep(row) {
 				result = append(result, row)
 				working = append(working, row)
@@ -8586,7 +8586,7 @@ func (db *Engine) materializeRecursive(ci int, rt *recursiveTerm,
 // crosses only via a CTE's RETURNING buffer), runs the parts in lexical order, and returns the
 // primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or block)
 // wrapper publishes the accumulated working only if this returns nil error (§6).
-func (db *Engine) executeWithDml(wq *WithQuery, params []Value) (Outcome, error) {
+func (db *engine) executeWithDml(wq *withQuery, params []Value) (Outcome, error) {
 	// Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
 	// opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
 	// every exit path so the next statement reads normally.
@@ -8599,7 +8599,7 @@ func (db *Engine) executeWithDml(wq *WithQuery, params []Value) (Outcome, error)
 // runWithDml is the body of executeWithDml, run under the read pin. Plans every CTE binding + the
 // query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
 // primary — every read against the pin, every write into the transaction's working.
-func (db *Engine) runWithDml(wq *WithQuery, params []Value) (Outcome, error) {
+func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
 	ptypes := &paramTypes{}
 	// (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
 	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
@@ -8647,9 +8647,9 @@ func (db *Engine) runWithDml(wq *WithQuery, params []Value) (Outcome, error) {
 	// (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its effect
 	//     + RETURNING buffer; the query/recursive CTEs use the shared materialize loop's logic.
 	var totalCost int64
-	buffers := make([][]Row, 0, len(bindings))
+	buffers := make([][]storedRow, 0, len(bindings))
 	for i := range bindings {
-		var buf []Row
+		var buf []storedRow
 		switch {
 		case bindings[i].recursive != nil:
 			b, rerr := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, &totalCost)
@@ -8715,7 +8715,7 @@ func (db *Engine) runWithDml(wq *WithQuery, params []Value) (Outcome, error) {
 // DELETE at binding i for its effect, with the earlier bindings/buffers in scope (so its inner
 // queries may reference an earlier CTE), and return its RETURNING rows (the buffer the later parts
 // scan) + its cost. A body with no RETURNING runs for its effect and buffers no rows.
-func (db *Engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx cteCtx) ([]Row, int64, error) {
+func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx cteCtx) ([]storedRow, int64, error) {
 	dm := bindings[i].dm
 	var outcome Outcome
 	var err error
@@ -8748,33 +8748,33 @@ func (db *Engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx c
 // (false, _, nil) when the body does not reference name (an ordinary CTE, even under RECURSIVE);
 // otherwise it validates the recursive shape and returns (true, unionAll, nil), or an error (42P19
 // for a malformed recursion, 0A000 for a deferred shape).
-func analyzeRecursiveCte(name string, body QueryExpr) (bool, bool, error) {
+func analyzeRecursiveCte(name string, body queryExpr) (bool, bool, error) {
 	if countSelfRefsQuery(body, name) == 0 {
 		return false, false, nil
 	}
 	so := body.SetOp
-	if so == nil || so.Op != SetOpUnion {
-		return false, false, NewError(InvalidRecursion, fmt.Sprintf(
+	if so == nil || so.Op != setOpUnion {
+		return false, false, newError(InvalidRecursion, fmt.Sprintf(
 			"recursive query %q does not have the form non-recursive-term UNION [ALL] recursive-term", name,
 		))
 	}
 	if len(so.OrderBy) > 0 {
-		return false, false, NewError(FeatureNotSupported, "ORDER BY in a recursive query is not implemented")
+		return false, false, newError(FeatureNotSupported, "ORDER BY in a recursive query is not implemented")
 	}
 	if so.Limit != nil || so.Offset != nil {
-		return false, false, NewError(FeatureNotSupported, "LIMIT in a recursive query is not implemented")
+		return false, false, newError(FeatureNotSupported, "LIMIT in a recursive query is not implemented")
 	}
 	if countSelfRefsQuery(so.Lhs, name) > 0 {
-		return false, false, NewError(InvalidRecursion, fmt.Sprintf(
+		return false, false, newError(InvalidRecursion, fmt.Sprintf(
 			"recursive reference to query %q must not appear within its non-recursive term", name,
 		))
 	}
 	if so.Rhs.With != nil {
-		return false, false, NewError(FeatureNotSupported,
+		return false, false, newError(FeatureNotSupported,
 			"a nested WITH in the recursive term of a recursive query is not supported yet")
 	}
 	if so.Rhs.Select == nil {
-		return false, false, NewError(FeatureNotSupported,
+		return false, false, newError(FeatureNotSupported,
 			"a set operation in the recursive term of a recursive query is not supported yet")
 	}
 	if err := validateRecursiveTerm(name, so.Rhs.Select); err != nil {
@@ -8788,29 +8788,29 @@ func analyzeRecursiveCte(name string, body QueryExpr) (bool, bool, error) {
 // relation, not on the nullable side of an outer join; the term must contain no aggregate. The
 // checks fire in PostgreSQL's order — a self-reference in a bad CONTEXT (a sublink, an outer join)
 // is reported as that context even when a valid FROM reference also exists.
-func validateRecursiveTerm(name string, sel *Select) error {
+func validateRecursiveTerm(name string, sel *selectStmt) error {
 	if countSublinkSelfRefs(sel, name) >= 1 {
-		return NewError(InvalidRecursion, fmt.Sprintf(
+		return newError(InvalidRecursion, fmt.Sprintf(
 			"recursive reference to query %q must not appear within a subquery", name,
 		))
 	}
 	if countFromSubquerySelfRefs(sel, name) >= 1 {
-		return NewError(FeatureNotSupported, fmt.Sprintf(
+		return newError(FeatureNotSupported, fmt.Sprintf(
 			"recursive reference to query %q inside a FROM subquery is not supported yet", name,
 		))
 	}
 	direct := countDirectFromSelfRefs(sel, name)
 	if direct > 1 {
-		return NewError(InvalidRecursion, fmt.Sprintf(
+		return newError(InvalidRecursion, fmt.Sprintf(
 			"recursive reference to query %q must not appear more than once", name,
 		))
 	}
 	if itemsHaveAggregate(sel.Items) || (sel.Having != nil && exprHasAggregate(*sel.Having)) {
-		return NewError(InvalidRecursion,
+		return newError(InvalidRecursion,
 			"aggregate functions are not allowed in a recursive query's recursive term")
 	}
 	if direct == 1 && directSelfRefOnNullableSide(sel, name) {
-		return NewError(InvalidRecursion, fmt.Sprintf(
+		return newError(InvalidRecursion, fmt.Sprintf(
 			"recursive reference to query %q must not appear within an outer join", name,
 		))
 	}
@@ -8819,7 +8819,7 @@ func validateRecursiveTerm(name string, sel *Select) error {
 
 // countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
 // relations at every nesting level plus expression sublinks).
-func countSelfRefsQuery(qe QueryExpr, name string) int {
+func countSelfRefsQuery(qe queryExpr, name string) int {
 	if qe.Select != nil {
 		return countSelfRefsSelect(qe.Select, name)
 	}
@@ -8831,7 +8831,7 @@ func countSelfRefsQuery(qe QueryExpr, name string) int {
 
 // countSelfRefsSelect counts self-references in a SELECT: its FROM relations (deep) plus all of its
 // expressions' sublinks.
-func countSelfRefsSelect(s *Select, name string) int {
+func countSelfRefsSelect(s *selectStmt, name string) int {
 	n := 0
 	for _, tref := range fromRelations(s) {
 		n += countSelfRefsTableref(tref, name)
@@ -8845,7 +8845,7 @@ func countSelfRefsSelect(s *Select, name string) int {
 // countSelfRefsTableref counts self-references reachable through one FROM relation: a plain table
 // reference with the matching name (+1), a derived-table subquery (recurse), or a table-function's
 // / VALUES' argument exprs.
-func countSelfRefsTableref(tref *TableRef, name string) int {
+func countSelfRefsTableref(tref *tableRef, name string) int {
 	if isPlainRelation(tref) {
 		if strings.EqualFold(tref.Name, name) {
 			return 1
@@ -8870,51 +8870,51 @@ func countSelfRefsTableref(tref *TableRef, name string) int {
 // countSelfRefsExpr counts self-references inside an expression — only reachable through a sublink
 // (a subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
 // (like exprHasAggregate).
-func countSelfRefsExpr(e Expr, name string) int {
+func countSelfRefsExpr(e exprNode, name string) int {
 	switch e.Kind {
-	case ExprScalarSubquery, ExprExists:
+	case exprScalarSubquery, exprExists:
 		return countSelfRefsQuery(*e.Subquery, name)
-	case ExprInSubquery:
+	case exprInSubquery:
 		return countSelfRefsExpr(e.InSubquery.Lhs, name) + countSelfRefsQuery(e.InSubquery.Query, name)
-	case ExprQuantifiedSubquery:
+	case exprQuantifiedSubquery:
 		return countSelfRefsExpr(e.QuantifiedSubquery.Lhs, name) + countSelfRefsQuery(e.QuantifiedSubquery.Query, name)
-	case ExprCast:
+	case exprCast:
 		return countSelfRefsExpr(e.Cast.Inner, name)
-	case ExprExtract:
+	case exprExtract:
 		return countSelfRefsExpr(e.Extract.Source, name)
-	case ExprCollate:
+	case exprCollate:
 		return countSelfRefsExpr(e.Collate.Inner, name)
-	case ExprUnary:
+	case exprUnary:
 		return countSelfRefsExpr(e.Unary.Operand, name)
-	case ExprIsNull:
+	case exprIsNull:
 		return countSelfRefsExpr(e.IsNullOf.Operand, name)
-	case ExprIsJson:
+	case exprIsJson:
 		return countSelfRefsExpr(e.IsJsonOf.Operand, name)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		return countSelfRefsExpr(e.JsonCtorOf.Operand, name)
-	case ExprJsonExists:
+	case exprJsonExists:
 		return countSelfRefsExpr(e.JsonExists.Ctx, name) + countSelfRefsExpr(e.JsonExists.Path, name)
-	case ExprJsonValue:
+	case exprJsonValue:
 		return countSelfRefsExpr(e.JsonValue.Ctx, name) + countSelfRefsExpr(e.JsonValue.Path, name)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		return countSelfRefsExpr(e.JsonQuery.Ctx, name) + countSelfRefsExpr(e.JsonQuery.Path, name)
-	case ExprBinary:
+	case exprBinary:
 		return countSelfRefsExpr(e.Binary.Lhs, name) + countSelfRefsExpr(e.Binary.Rhs, name)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		return countSelfRefsExpr(e.IsDistinct.Lhs, name) + countSelfRefsExpr(e.IsDistinct.Rhs, name)
-	case ExprIn:
+	case exprIn:
 		n := countSelfRefsExpr(e.In.Lhs, name)
 		for _, x := range e.In.List {
 			n += countSelfRefsExpr(x, name)
 		}
 		return n
-	case ExprBetween:
+	case exprBetween:
 		return countSelfRefsExpr(e.Between.Lhs, name) + countSelfRefsExpr(e.Between.Lo, name) + countSelfRefsExpr(e.Between.Hi, name)
-	case ExprLike:
+	case exprLike:
 		return countSelfRefsExpr(e.Like.Lhs, name) + countSelfRefsExpr(e.Like.Rhs, name)
-	case ExprRegex:
+	case exprRegex:
 		return countSelfRefsExpr(e.Regex.Lhs, name) + countSelfRefsExpr(e.Regex.Rhs, name)
-	case ExprCase:
+	case exprCase:
 		n := 0
 		if e.Case.Operand != nil {
 			n += countSelfRefsExpr(*e.Case.Operand, name)
@@ -8926,18 +8926,18 @@ func countSelfRefsExpr(e Expr, name string) int {
 			n += countSelfRefsExpr(*e.Case.Els, name)
 		}
 		return n
-	case ExprFuncCall:
+	case exprFuncCall:
 		n := 0
 		for _, a := range e.FuncCall.Args {
 			n += countSelfRefsExpr(*a, name)
 		}
 		return n
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		return countSelfRefsExpr(*e.Base, name)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return 0 // a leaf relation reference — no sublink to recurse into
 
-	case ExprSubscript:
+	case exprSubscript:
 		n := countSelfRefsExpr(*e.Base, name)
 		for _, sp := range e.Subscripts {
 			for _, x := range subscriptSpecExprs(sp) {
@@ -8945,13 +8945,13 @@ func countSelfRefsExpr(e Expr, name string) int {
 			}
 		}
 		return n
-	case ExprRow, ExprArray:
+	case exprRow, exprArray:
 		n := 0
 		for _, it := range e.RowItems {
 			n += countSelfRefsExpr(it, name)
 		}
 		return n
-	case ExprQuantified:
+	case exprQuantified:
 		return countSelfRefsExpr(e.Quantified.Lhs, name) + countSelfRefsExpr(e.Quantified.Array, name)
 	default:
 		return 0
@@ -8962,7 +8962,7 @@ func countSelfRefsExpr(e Expr, name string) int {
 // CTE body or a data-modifying primary (spec/design/writable-cte.md). Such a statement runs through
 // the writable-CTE orchestrator (the read pin + lexical-order, all-or-nothing execution); a
 // pure-query WITH keeps the runWith path.
-func withHasDml(wq *WithQuery) bool {
+func withHasDml(wq *withQuery) bool {
 	if wq.Body.IsDataModifying() {
 		return true
 	}
@@ -9009,7 +9009,7 @@ func addOutcomeCost(outcome Outcome, extra int64) Outcome {
 // delegates to the query counter; a data-modifying body counts the references in its source query /
 // WHERE / SET RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the
 // references a NON-planned data-modifying part contributes to the inline-vs-materialize decision.
-func countCteRefsDml(body *CteBody, name string) int {
+func countCteRefsDml(body *cteBody, name string) int {
 	switch {
 	case body.Query != nil:
 		return countSelfRefsQuery(*body.Query, name)
@@ -9052,7 +9052,7 @@ func countCteRefsDml(body *CteBody, name string) int {
 
 // countReturningRefs counts references to CTE name in a RETURNING item list's sublinks (the star
 // form RETURNING * has no expressions, so it contributes none).
-func countReturningRefs(returning *SelectItems, name string) int {
+func countReturningRefs(returning *selectItems, name string) int {
 	if returning == nil || returning.All {
 		return 0
 	}
@@ -9065,7 +9065,7 @@ func countReturningRefs(returning *SelectItems, name string) int {
 
 // countDirectFromSelfRefs counts self-references that are DIRECT FROM/JOIN relations of this SELECT
 // (a plain table ref matching the name). This is the only valid position for a recursive reference.
-func countDirectFromSelfRefs(s *Select, name string) int {
+func countDirectFromSelfRefs(s *selectStmt, name string) int {
 	n := 0
 	for _, tref := range fromRelations(s) {
 		if isPlainRelation(tref) && strings.EqualFold(tref.Name, name) {
@@ -9077,7 +9077,7 @@ func countDirectFromSelfRefs(s *Select, name string) int {
 
 // countFromSubquerySelfRefs counts self-references nested inside a FROM-position subquery /
 // table-function args / VALUES of this SELECT (the deferred 0A000 shape).
-func countFromSubquerySelfRefs(s *Select, name string) int {
+func countFromSubquerySelfRefs(s *selectStmt, name string) int {
 	n := 0
 	for _, tref := range fromRelations(s) {
 		if !isPlainRelation(tref) {
@@ -9089,7 +9089,7 @@ func countFromSubquerySelfRefs(s *Select, name string) int {
 
 // countSublinkSelfRefs counts self-references reachable only through an expression sublink in this
 // SELECT's top-level expressions — the `within a subquery` position.
-func countSublinkSelfRefs(s *Select, name string) int {
+func countSublinkSelfRefs(s *selectStmt, name string) int {
 	n := 0
 	for _, e := range selectExprs(s) {
 		n += countSelfRefsExpr(e, name)
@@ -9101,19 +9101,19 @@ func countSublinkSelfRefs(s *Select, name string) int {
 // NULLABLE side of an outer join — the position PostgreSQL rejects. The FROM is a left-deep chain:
 // relation 0 is From, relation i+1 is Joins[i].Table, combined by Joins[i].Kind. A LEFT/FULL join
 // makes its right operand nullable; a RIGHT/FULL join makes the whole accumulated left nullable.
-func directSelfRefOnNullableSide(s *Select, name string) bool {
+func directSelfRefOnNullableSide(s *selectStmt, name string) bool {
 	rels := fromRelations(s)
 	nullable := make([]bool, len(rels))
 	for j := range s.Joins {
 		right := j + 1
 		switch s.Joins[j].Kind {
-		case JoinLeft:
+		case joinLeft:
 			nullable[right] = true
-		case JoinRight:
+		case joinRight:
 			for i := 0; i <= j; i++ {
 				nullable[i] = true
 			}
-		case JoinFull:
+		case joinFull:
 			for i := 0; i <= right; i++ {
 				nullable[i] = true
 			}
@@ -9129,14 +9129,14 @@ func directSelfRefOnNullableSide(s *Select, name string) bool {
 
 // isPlainRelation reports whether a FROM relation is a plain table NAME — not a derived-table
 // subquery, a table function, or a VALUES body. Only a plain relation can resolve to a CTE.
-func isPlainRelation(tref *TableRef) bool {
+func isPlainRelation(tref *tableRef) bool {
 	return !tref.IsFunc && tref.Subquery == nil && tref.Values == nil
 }
 
 // fromRelations returns the FROM relations of a SELECT in left-deep order: From (if present) then
 // each join's table.
-func fromRelations(s *Select) []*TableRef {
-	rels := make([]*TableRef, 0, 1+len(s.Joins))
+func fromRelations(s *selectStmt) []*tableRef {
+	rels := make([]*tableRef, 0, 1+len(s.Joins))
 	if s.From != nil {
 		rels = append(rels, s.From)
 	}
@@ -9149,8 +9149,8 @@ func fromRelations(s *Select) []*TableRef {
 // selectExprs returns every top-level expression of a SELECT that can hold a sublink (select items,
 // WHERE, GROUP BY, HAVING, join ON conditions). ORDER BY keys are bare/qualified column references
 // (never expressions), so they carry no sublink.
-func selectExprs(s *Select) []Expr {
-	var v []Expr
+func selectExprs(s *selectStmt) []exprNode {
+	var v []exprNode
 	for _, it := range s.Items.Items {
 		v = append(v, it.Expr)
 	}
@@ -9158,7 +9158,7 @@ func selectExprs(s *Select) []Expr {
 		v = append(v, *s.Filter)
 	}
 	for i := range s.GroupBy {
-		s.GroupBy[i].forEachExpr(func(e *Expr) {
+		s.GroupBy[i].forEachExpr(func(e *exprNode) {
 			v = append(v, *e)
 		})
 	}
@@ -9182,15 +9182,15 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string) error 
 	a := anchor.columnTypes()
 	r := recursive.columnTypes()
 	if len(a) != len(r) {
-		return NewError(SyntaxError, "each UNION query must have the same number of columns")
+		return newError(SyntaxError, "each UNION query must have the same number of columns")
 	}
 	for i := range a {
-		unified, err := unifySetopColumn(a[i], r[i], SetOpUnion)
+		unified, err := unifySetopColumn(a[i], r[i], setOpUnion)
 		if err != nil {
 			return err
 		}
 		if rtName(unified) != rtName(a[i]) {
-			return NewError(DatatypeMismatch, fmt.Sprintf(
+			return newError(DatatypeMismatch, fmt.Sprintf(
 				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
 				name, i+1, rtName(a[i]), rtName(unified),
 			))
@@ -9203,21 +9203,21 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string) error 
 // (spec/design/cte.md §2): one column per body output, named by the rename list (a count mismatch is
 // 42P10) or the body's own output names, typed from the planned body. The relation has no primary
 // key / constraints — it is read-only and its rows come from the CTE context, never a store.
-func cteSyntheticTable(name string, plan *queryPlan, rename []string) (*Table, error) {
+func cteSyntheticTable(name string, plan *queryPlan, rename []string) (*catTable, error) {
 	return cteSyntheticTableCols(name, plan.columnNames(), plan.columnTypes(), rename)
 }
 
 // cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
 // types — so a data-modifying CTE (whose "body output" is its RETURNING projection, not a queryPlan)
 // builds its synthetic relation the same way (spec/design/writable-cte.md §1).
-func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolvedType, rename []string) (*Table, error) {
+func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolvedType, rename []string) (*catTable, error) {
 	var colNames []string
 	if rename != nil {
 		// PostgreSQL allows FEWER aliases than the body has columns — the first len(rename) columns
 		// take the aliases, the rest keep their body output names (a partial rename). Only MORE
 		// aliases than columns is an error (42P10).
 		if len(rename) > len(bodyTypes) {
-			return nil, NewError(InvalidColumnReference, fmt.Sprintf(
+			return nil, newError(InvalidColumnReference, fmt.Sprintf(
 				"WITH query \"%s\" has %d columns available but %d columns specified",
 				name, len(bodyTypes), len(rename),
 			))
@@ -9233,15 +9233,15 @@ func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolved
 	} else {
 		colNames = append([]string(nil), bodyNames...)
 	}
-	columns := make([]Column, len(colNames))
+	columns := make([]catColumn, len(colNames))
 	for i, n := range colNames {
 		ty, err := typeFromResolved(bodyTypes[i])
 		if err != nil {
 			return nil, err
 		}
-		columns[i] = Column{Name: n, Type: ty}
+		columns[i] = catColumn{Name: n, Type: ty}
 	}
-	return &Table{Name: name, Columns: columns}, nil
+	return &catTable{Name: name, Columns: columns}, nil
 }
 
 // typeFromResolved is the catalog Type for a resolved expression type — used to give a CTE's
@@ -9249,46 +9249,46 @@ func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolved
 // unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only CTE column
 // (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite has no catalog
 // type to name — deferred (0A000), a corner not reached by the corpus.
-func typeFromResolved(rt resolvedType) (Type, error) {
+func typeFromResolved(rt resolvedType) (dataType, error) {
 	switch rt.kind {
 	case rtInt:
-		return ScalarT(rt.intTy), nil
+		return scalarT(rt.intTy), nil
 	case rtFloat32:
-		return ScalarT(Float32), nil
+		return scalarT(scalarFloat32), nil
 	case rtFloat64:
-		return ScalarT(Float64), nil
+		return scalarT(scalarFloat64), nil
 	case rtBool:
-		return ScalarT(Bool), nil
+		return scalarT(scalarBool), nil
 	case rtText, rtNull:
-		return ScalarT(Text), nil
+		return scalarT(scalarText), nil
 	case rtDecimal:
-		return ScalarT(DecimalType), nil
+		return scalarT(scalarDecimal), nil
 	case rtBytea:
-		return ScalarT(Bytea), nil
+		return scalarT(scalarBytea), nil
 	case rtUuid:
-		return ScalarT(Uuid), nil
+		return scalarT(scalarUuid), nil
 	case rtTimestamp:
-		return ScalarT(Timestamp), nil
+		return scalarT(scalarTimestamp), nil
 	case rtTimestamptz:
-		return ScalarT(Timestamptz), nil
+		return scalarT(scalarTimestamptz), nil
 	case rtDate:
-		return ScalarT(Date), nil
+		return scalarT(scalarDate), nil
 	case rtInterval:
-		return ScalarT(IntervalType), nil
+		return scalarT(scalarInterval), nil
 	case rtComposite:
 		if rt.comp != nil && rt.comp.named {
-			return CompositeT(rt.comp.name), nil
+			return compositeT(rt.comp.name), nil
 		}
-		return Type{}, NewError(FeatureNotSupported,
+		return dataType{}, newError(FeatureNotSupported,
 			"an anonymous composite column in a CTE is not supported yet")
 	case rtArray:
 		elem, err := typeFromResolved(*rt.elem)
 		if err != nil {
-			return Type{}, err
+			return dataType{}, err
 		}
-		return ArrayT(elem), nil
+		return arrayT(elem), nil
 	default:
-		return Type{}, NewError(FeatureNotSupported, "unsupported CTE column type")
+		return dataType{}, newError(FeatureNotSupported, "unsupported CTE column type")
 	}
 }
 
@@ -9301,7 +9301,7 @@ func typeFromResolved(rt resolvedType) (Type, error) {
 // globally-uncorrelated subquery once and folds it to a constant (preserving the once-only cost),
 // and finally EXECUTE against an empty outer-row environment. Correlated subqueries that survive
 // the fold are re-executed per outer row by the evaluator.
-func (db *Engine) runQueryExpr(qe QueryExpr, params []Value) (selectResult, error) {
+func (db *engine) runQueryExpr(qe queryExpr, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
 	plan, err := db.planQuery(qe, nil, nil, ptypes)
 	if err != nil {
@@ -9328,20 +9328,20 @@ func (db *Engine) runQueryExpr(qe QueryExpr, params []Value) (selectResult, erro
 }
 
 // runSelect runs a lone SELECT — the entry point executeSelect and INSERT ... SELECT use.
-func (db *Engine) runSelect(sel *Select, params []Value) (selectResult, error) {
-	return db.runQueryExpr(QueryExpr{Select: sel}, params)
+func (db *engine) runSelect(sel *selectStmt, params []Value) (selectResult, error) {
+	return db.runQueryExpr(queryExpr{Select: sel}, params)
 }
 
 // runSetOp runs a set operation as a top-level statement.
-func (db *Engine) runSetOp(so *SetOp, params []Value) (selectResult, error) {
-	return db.runQueryExpr(QueryExpr{SetOp: so}, params)
+func (db *engine) runSetOp(so *setOp, params []Value) (selectResult, error) {
+	return db.runQueryExpr(queryExpr{SetOp: so}, params)
 }
 
 // planQuery resolves a query expression into an owned queryPlan against the scope chain (parent
 // = the enclosing query's scope, nil at top level). ctes are the statement's CTE bindings visible
 // here (spec/design/cte.md §2), empty for a non-WITH statement. A subquery is planned here, once
 // (§26).
-func (db *Engine) planQuery(qe QueryExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
+func (db *engine) planQuery(qe queryExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
 	if qe.Select != nil {
 		sp, err := db.planSelect(qe.Select, parent, ctes, ptypes)
 		if err != nil {
@@ -9370,10 +9370,10 @@ func (db *Engine) planQuery(qe QueryExpr, parent *scope, ctes []*cteBinding, pty
 // inner main query keeps the enclosing parent (so a LATERAL derived-table body still correlates to
 // its left siblings), while the CTE bodies stay independent (parent=nil, inside planCteBindings). A
 // data-modifying CTE here is rejected 0A000 — PostgreSQL restricts a DML-WITH to the top level.
-func (db *Engine) planWithExpr(we *WithExpr, parent *scope, ptypes *paramTypes) (*withPlan, error) {
+func (db *engine) planWithExpr(we *withExpr, parent *scope, ptypes *paramTypes) (*withPlan, error) {
 	for i := range we.Ctes {
 		if we.Ctes[i].Body.IsDataModifying() {
-			return nil, NewError(FeatureNotSupported,
+			return nil, newError(FeatureNotSupported,
 				fmt.Sprintf("WITH clause containing a data-modifying statement (%s) is only supported at the top level", we.Ctes[i].Name))
 		}
 	}
@@ -9391,7 +9391,7 @@ func (db *Engine) planWithExpr(we *WithExpr, parent *scope, ptypes *paramTypes) 
 // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
 // rows, innermost last; nil at top level) and the bound parameters. ctes is the per-statement CTE
 // execution context (spec/design/cte.md §5), the zero cteCtx for a non-WITH statement.
-func (db *Engine) execQueryPlan(plan *queryPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *engine) execQueryPlan(plan *queryPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
 	if plan.sel != nil {
 		return db.execSelectPlan(plan.sel, outer, params, ctes)
 	}
@@ -9410,7 +9410,7 @@ func (db *Engine) execQueryPlan(plan *queryPlan, outer []Row, params []Value, ct
 // §7), and run the inner body against it. The body still sees the outer row environment (so a
 // LATERAL nested-WITH derived-table body correlates to its left siblings). The materialization cost
 // folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
-func (db *Engine) execWithPlan(wp *withPlan, outer []Row, params []Value) (selectResult, error) {
+func (db *engine) execWithPlan(wp *withPlan, outer []storedRow, params []Value) (selectResult, error) {
 	buffers, totalCost, err := db.materializeCtes(wp.bindings, wp.modes, params)
 	if err != nil {
 		return selectResult{}, err
@@ -9427,7 +9427,7 @@ func (db *Engine) execWithPlan(wp *withPlan, outer []Row, params []Value) (selec
 // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
 // parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
 // empty operands), and resolve the trailing ORDER BY by output column name.
-func (db *Engine) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*setOpPlan, error) {
+func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*setOpPlan, error) {
 	lhs, err := db.planQuery(so.Lhs, parent, ctes, ptypes)
 	if err != nil {
 		return nil, err
@@ -9438,7 +9438,7 @@ func (db *Engine) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptypes
 	}
 
 	if len(lhs.columnTypes()) != len(rhs.columnTypes()) {
-		return nil, NewError(SyntaxError, fmt.Sprintf(
+		return nil, newError(SyntaxError, fmt.Sprintf(
 			"each %s query must have the same number of columns", setopName(so.Op),
 		))
 	}
@@ -9483,7 +9483,7 @@ func (db *Engine) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptypes
 // execSetOpPlan executes a resolved set operation: run both operands against the outer
 // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
 // rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-func (db *Engine) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
 	left, err := db.execQueryPlan(&plan.lhs, outer, params, ctes)
 	if err != nil {
 		return selectResult{}, err
@@ -9530,7 +9530,7 @@ func (db *Engine) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, ct
 // its column's unified type (so VALUES (1),($1) types $1 as int); a column with no concrete type —
 // all NULL/param — leaves its $N untyped, surfacing 42P18 at finalize (jed's no-cross-context
 // inference posture, §26).
-func (db *Engine) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
+func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
 	arity := len(rows[0]) // the parser guarantees at least one row, each with at least one value
 	// A constant scope: no local relations. With parent==nil (the usual case) any column reference is
 	// unresolved (the non-LATERAL rule, §42); with a parent (a LATERAL VALUES body, §44) a column
@@ -9544,7 +9544,7 @@ func (db *Engine) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding, 
 	colParams := make([][]int, arity)
 	for ri, row := range rows {
 		if len(row) != arity {
-			return nil, NewError(SyntaxError, "VALUES lists must all be the same length")
+			return nil, newError(SyntaxError, "VALUES lists must all be the same length")
 		}
 		resolvedRow := make([]*rExpr, arity)
 		for ci, val := range row {
@@ -9593,7 +9593,7 @@ func (db *Engine) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding, 
 // the set-operation rule), and emit the rows. Charges row_produced per row plus each value's
 // operator_eval (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded into the
 // caller's meter via execQueryPlan.
-func (db *Engine) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *engine) execValuesPlan(plan *valuesPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
 	meter := db.session.newMeter()
 	rows := make([][]Value, 0, len(plan.rows))
@@ -9601,7 +9601,7 @@ func (db *Engine) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, 
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 			return selectResult{}, err
 		}
-		meter.Charge(Costs.RowProduced)
+		meter.Charge(costs.RowProduced)
 		out := make([]Value, len(plan.columnTypes))
 		for ci, e := range row {
 			v, err := e.eval(nil, env, meter)
@@ -9611,7 +9611,7 @@ func (db *Engine) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, 
 			// Int -> decimal where the column unified to decimal (the set-operation rule); every
 			// other unified type is a value no-op (int-width promotion is free — all ints are i64).
 			if plan.columnTypes[ci].kind == rtDecimal && v.Kind == ValInt {
-				v = DecimalValue(DecimalFromInt64(v.Int))
+				v = DecimalValue(decimalFromInt64(v.Int))
 			}
 			out[ci] = v
 		}
@@ -9621,11 +9621,11 @@ func (db *Engine) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, 
 }
 
 // setopName is the operator's name for an error message (PostgreSQL phrasing).
-func setopName(op SetOpKind) string {
+func setopName(op setOpKind) string {
 	switch op {
-	case SetOpUnion:
+	case setOpUnion:
 		return "UNION"
-	case SetOpIntersect:
+	case setOpIntersect:
 		return "INTERSECT"
 	default:
 		return "EXCEPT"
@@ -9638,7 +9638,7 @@ func setopName(op SetOpKind) string {
 // PostgreSQL would call a top-level one text, but the type is never observed in output); a
 // same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable pairs
 // mirrors the comparability matrix (compare.toml).
-func unifySetopColumn(a, b resolvedType, op SetOpKind) (resolvedType, error) {
+func unifySetopColumn(a, b resolvedType, op setOpKind) (resolvedType, error) {
 	switch {
 	case a.kind == rtNull && b.kind == rtNull:
 		return resolvedType{kind: rtNull}, nil
@@ -9654,7 +9654,7 @@ func unifySetopColumn(a, b resolvedType, op SetOpKind) (resolvedType, error) {
 	case a.kind == b.kind:
 		return a, nil
 	default:
-		return resolvedType{}, NewError(DatatypeMismatch, fmt.Sprintf(
+		return resolvedType{}, newError(DatatypeMismatch, fmt.Sprintf(
 			"%s types %s and %s cannot be matched", setopName(op), rtName(a), rtName(b),
 		))
 	}
@@ -9691,7 +9691,7 @@ func unifyValuesColumn(a, b resolvedType) (resolvedType, error) {
 		a.kind == rtFloat64 && b.kind == rtFloat64:
 		return a, nil
 	default:
-		return resolvedType{}, NewError(DatatypeMismatch, fmt.Sprintf(
+		return resolvedType{}, newError(DatatypeMismatch, fmt.Sprintf(
 			"VALUES types %s and %s cannot be matched", rtName(a), rtName(b),
 		))
 	}
@@ -9701,52 +9701,52 @@ func unifyValuesColumn(a, b resolvedType) (resolvedType, error) {
 // unified type (spec/design/grammar.md §42). A scalar type flows through; a NULL / composite / array
 // column has no scalar parameter type, so nil is returned and the parameter stays untyped (42P18 at
 // finalize).
-func scalarForParamHint(rt resolvedType) *ScalarType {
+func scalarForParamHint(rt resolvedType) *scalarType {
 	switch rt.kind {
 	case rtInt:
 		t := rt.intTy // rtInt carries its width in intTy
 		return &t
 	case rtFloat32:
-		t := Float32
+		t := scalarFloat32
 		return &t
 	case rtFloat64:
-		t := Float64
+		t := scalarFloat64
 		return &t
 	case rtBool:
-		t := Bool
+		t := scalarBool
 		return &t
 	case rtText:
-		t := Text
+		t := scalarText
 		return &t
 	case rtDecimal:
-		t := DecimalType
+		t := scalarDecimal
 		return &t
 	case rtBytea:
-		t := Bytea
+		t := scalarBytea
 		return &t
 	case rtUuid:
-		t := Uuid
+		t := scalarUuid
 		return &t
 	case rtTimestamp:
-		t := Timestamp
+		t := scalarTimestamp
 		return &t
 	case rtTimestamptz:
-		t := Timestamptz
+		t := scalarTimestamptz
 		return &t
 	case rtDate:
-		t := Date
+		t := scalarDate
 		return &t
 	case rtInterval:
-		t := IntervalType
+		t := scalarInterval
 		return &t
 	case rtJson:
-		t := Json
+		t := scalarJson
 		return &t
 	case rtJsonb:
-		t := Jsonb
+		t := scalarJsonb
 		return &t
 	case rtJsonPath:
-		t := JsonPathType
+		t := scalarJsonPath
 		return &t
 	default:
 		return nil
@@ -9761,7 +9761,7 @@ func coerceSetopRows(rows [][]Value, from, to []resolvedType) {
 		if from[i].kind == rtInt && to[i].kind == rtDecimal {
 			for r := range rows {
 				if rows[r][i].Kind == ValInt {
-					rows[r][i] = DecimalValue(DecimalFromInt64(rows[r][i].Int))
+					rows[r][i] = DecimalValue(decimalFromInt64(rows[r][i].Int))
 				}
 			}
 		}
@@ -9774,14 +9774,14 @@ func coerceSetopRows(rows [][]Value, from, to []resolvedType) {
 // key is its FIRST occurrence scanning the LEFT operand then the right, and emitted rows keep that
 // left-then-right scan order — deterministic and identical across cores. (A later ORDER BY
 // re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
-func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
+func combineSetop(op setOpKind, all bool, left, right [][]Value) [][]Value {
 	switch {
-	case op == SetOpUnion && all:
+	case op == setOpUnion && all:
 		out := make([][]Value, 0, len(left)+len(right))
 		out = append(out, left...)
 		out = append(out, right...)
 		return out
-	case op == SetOpUnion:
+	case op == setOpUnion:
 		seen := make(map[string]bool)
 		out := make([][]Value, 0)
 		for _, row := range left {
@@ -9797,7 +9797,7 @@ func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
 			}
 		}
 		return out
-	case op == SetOpIntersect && all:
+	case op == setOpIntersect && all:
 		counts := make(map[string]int)
 		for _, row := range right {
 			counts[distinctRowKey(row)]++
@@ -9811,7 +9811,7 @@ func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
 			}
 		}
 		return out
-	case op == SetOpIntersect:
+	case op == setOpIntersect:
 		rightSet := make(map[string]bool)
 		for _, row := range right {
 			rightSet[distinctRowKey(row)] = true
@@ -9826,7 +9826,7 @@ func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
 			}
 		}
 		return out
-	case op == SetOpExcept && all:
+	case op == setOpExcept && all:
 		counts := make(map[string]int)
 		for _, row := range right {
 			counts[distinctRowKey(row)]++
@@ -9862,32 +9862,32 @@ func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
 // resolveSetopOrderKey resolves a trailing ORDER BY key for a set operation against the OUTPUT
 // column names (the left operand's). A qualified key is 42P01 (no relation scope after a set
 // operation); an unknown name is 42703. Returns the output column index.
-func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
+func resolveSetopOrderKey(key *orderKey, names []string) (int, error) {
 	// A set-operation ORDER BY accepts only an output column name or ordinal — a general expression key
 	// (after the inputs are unified) is 0A000, matching PostgreSQL's "invalid UNION/INTERSECT/EXCEPT
 	// ORDER BY clause" (grammar.md §10).
 	if key.Expr != nil {
-		return 0, NewError(FeatureNotSupported, "invalid UNION/INTERSECT/EXCEPT ORDER BY clause")
+		return 0, newError(FeatureNotSupported, "invalid UNION/INTERSECT/EXCEPT ORDER BY clause")
 	}
 	// An output-column ordinal (`... ORDER BY 1`) resolves by position into the output columns; out
 	// of [1, ncols] is 42P10 (grammar.md §10). It precedes the name path (an ordinal has no column).
 	if key.Ordinal != nil {
 		ord := *key.Ordinal
 		if ord < 1 || ord > int64(len(names)) {
-			return 0, NewError(InvalidColumnReference,
+			return 0, newError(InvalidColumnReference,
 				fmt.Sprintf("ORDER BY position %d is not in select list", ord))
 		}
 		return int(ord - 1), nil
 	}
 	if key.Qualifier != "" {
-		return 0, NewError(UndefinedTable, "missing FROM-clause entry for table "+key.Qualifier)
+		return 0, newError(UndefinedTable, "missing FROM-clause entry for table "+key.Qualifier)
 	}
 	for i, n := range names {
 		if strings.EqualFold(n, key.Column) {
 			return i, nil
 		}
 	}
-	return 0, NewError(UndefinedColumn, "column "+key.Column+" does not exist")
+	return 0, newError(UndefinedColumn, "column "+key.Column+" does not exist")
 }
 
 // runSelect analyzes and runs a SELECT: resolve projected columns and the WHERE/ORDER BY columns
@@ -9899,7 +9899,7 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 // query's scope, for correlated references — grammar.md §26). The resolve half of the old
 // runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
 // touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
-func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*selectPlan, error) {
+func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*selectPlan, error) {
 	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
 	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
 	// without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -9907,7 +9907,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 	// through to `parent` (the correlated-subquery rule) or 42703 at top level
 	// (spec/design/grammar.md §34). The scope links to `parent` (correlation) + the catalog
 	// (so a subquery resolves its own FROM); allowSubquery is true.
-	tableRefs := make([]TableRef, 0, 1+len(sel.Joins))
+	tableRefs := make([]tableRef, 0, 1+len(sel.Joins))
 	if sel.From != nil {
 		tableRefs = append(tableRefs, *sel.From)
 	}
@@ -9928,7 +9928,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 	seenLabels := make(map[string]bool)
 	offset := 0
 	for i, tref := range tableRefs {
-		var t *Table
+		var t *catTable
 		var cteIdx *int
 		isDerived := tref.Subquery != nil || tref.Values != nil
 		// A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
@@ -10037,7 +10037,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 				// it is 0A000 (writable-cte.md §5; PostgreSQL's addRangeTableEntryForCTE check), raised
 				// at resolution before any execution.
 				if ctes[ci].dm != nil && ctes[ci].dm.noReturning {
-					return nil, NewError(FeatureNotSupported,
+					return nil, newError(FeatureNotSupported,
 						"WITH query "+lname+" does not have a RETURNING clause")
 				}
 				ctes[ci].refs++
@@ -10047,15 +10047,15 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 			} else {
 				tbl, ok := db.lkpTable(tref.Name) // temp-first (temp-tables.md §3)
 				if !ok {
-					return nil, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+					return nil, newError(UndefinedTable, "table does not exist: "+tref.Name)
 				}
 				t = tbl
 			}
 		}
 		// RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
 		// kept whole and evaluated per left row. (i ≥ 1 here, so the item carries a join kind.)
-		if lateralFlags[i] && (sel.Joins[i-1].Kind == JoinRight || sel.Joins[i-1].Kind == JoinFull) {
-			return nil, NewError(InvalidColumnReference,
+		if lateralFlags[i] && (sel.Joins[i-1].Kind == joinRight || sel.Joins[i-1].Kind == joinFull) {
+			return nil, newError(InvalidColumnReference,
 				"invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT")
 		}
 		label := strings.ToLower(t.Name)
@@ -10068,7 +10068,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 		// non-empty label (a table/function name or an explicit alias).
 		if label != "" {
 			if seenLabels[label] {
-				return nil, NewError(DuplicateAlias, "table name "+label+" specified more than once")
+				return nil, newError(DuplicateAlias, "table name "+label+" specified more than once")
 			}
 			seenLabels[label] = true
 		}
@@ -10116,35 +10116,35 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 		}
 		switch {
 		case len(usingCols) > 0:
-			if j.Kind == JoinFull {
-				return nil, NewError(FeatureNotSupported, "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet")
+			if j.Kind == joinFull {
+				return nil, newError(FeatureNotSupported, "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet")
 			}
 			left := &scope{rels: rels[seg : k+1], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
-			var predAST *Expr
+			var predAST *exprNode
 			for _, name := range usingCols {
 				lr, lerr := left.resolveBare(name)
 				if lerr != nil || lr.level != 0 {
-					return nil, NewError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in left table")
+					return nil, newError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in left table")
 				}
 				li := lr.index
 				llabel, lname := relOfIndex(rels, li)
 				rightRel := &rels[k+1]
 				rl := rightRel.table.ColumnIndex(name)
 				if rl < 0 {
-					return nil, NewError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in right table")
+					return nil, newError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in right table")
 				}
 				ri := rightRel.offset + rl
-				eq := binaryExpr(OpEq,
-					Expr{Kind: ExprQualifiedColumn, Qualifier: llabel, Column: lname},
-					Expr{Kind: ExprQualifiedColumn, Qualifier: rightRel.label, Column: name})
+				eq := newBinaryExpr(opEq,
+					exprNode{Kind: exprQualifiedColumn, Qualifier: llabel, Column: lname},
+					exprNode{Kind: exprQualifiedColumn, Qualifier: rightRel.label, Column: name})
 				if predAST == nil {
 					predAST = &eq
 				} else {
-					a := binaryExpr(OpAnd, *predAST, eq)
+					a := newBinaryExpr(opAnd, *predAST, eq)
 					predAST = &a
 				}
 				mi := li
-				if j.Kind == JoinRight {
+				if j.Kind == joinRight {
 					mi = ri
 				}
 				merges = slices.DeleteFunc(merges, func(m mergeCol) bool { return strings.EqualFold(m.name, name) })
@@ -10210,7 +10210,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 				// `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md
 				// §5), so GROUP BY a json column is 42883. jsonb IS groupable.
 				if s.columnAt(gr.index).Type.IsJson() {
-					return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
+					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
 				}
 				idx = gr.index
 				found := false
@@ -10226,7 +10226,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 				}
 			} else {
 				if gr.ty.kind == rtJson {
-					return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
+					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
 				}
 				// Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
 				pos := -1
@@ -10357,7 +10357,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 	if sel.Distinct {
 		for _, t := range columnTypes {
 			if t.kind == rtJson {
-				return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
+				return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
 			}
 		}
 	}
@@ -10464,7 +10464,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 		// Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
 		// general expression, or an ordinal pointing at a computed projection).
 		var slotRes resolved
-		var orderExpr *Expr
+		var orderExpr *exprNode
 		if key.Ordinal != nil {
 			ord := *key.Ordinal
 			var ncols int64
@@ -10474,7 +10474,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 				ncols = int64(len(items.Items))
 			}
 			if ord < 1 || ord > ncols {
-				return nil, NewError(InvalidColumnReference,
+				return nil, newError(InvalidColumnReference,
 					fmt.Sprintf("ORDER BY position %d is not in select list", ord))
 			}
 			pos := int(ord - 1)
@@ -10482,11 +10482,11 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 				slotRes = resolved{level: 0, index: pos}
 			} else {
 				switch e := items.Items[pos].Expr; e.Kind {
-				case ExprColumn:
+				case exprColumn:
 					if slotRes, err = s.resolveBare(e.Column); err != nil {
 						return nil, err
 					}
-				case ExprQualifiedColumn:
+				case exprQualifiedColumn:
 					if slotRes, err = s.resolveQualified(e.Qualifier, e.Column); err != nil {
 						return nil, err
 					}
@@ -10514,11 +10514,11 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 				if slotRes, err = s.resolveBare(key.Column); err != nil {
 					return nil, err
 				}
-			case matched.Kind == ExprColumn:
+			case matched.Kind == exprColumn:
 				if slotRes, err = s.resolveBare(matched.Column); err != nil {
 					return nil, err
 				}
-			case matched.Kind == ExprQualifiedColumn:
+			case matched.Kind == exprQualifiedColumn:
 				if slotRes, err = s.resolveQualified(matched.Qualifier, matched.Column); err != nil {
 					return nil, err
 				}
@@ -10540,7 +10540,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 					return nil, rerr
 				}
 				if ty.kind == rtJson {
-					return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
+					return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
 				}
 				var coll *Collation
 				if key.Collation != "" {
@@ -10563,7 +10563,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 			// `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
 			// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
 			if s.columnOf(r).Type.IsJson() {
-				return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
+				return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
 			}
 			idx := r.index
 			// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
@@ -10631,7 +10631,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 		// runs. PostgreSQL accepts it; it is a degenerate (constant) leading key.
 		// A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
 		if ty.kind == rtJson {
-			return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
+			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
 		}
 		// The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
 		// parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
@@ -10745,11 +10745,11 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 		projected := make(map[int]bool)
 		for _, it := range items.Items {
 			switch it.Expr.Kind {
-			case ExprColumn:
+			case exprColumn:
 				if r, e := s.resolveBare(it.Expr.Column); e == nil && r.level == 0 {
 					projected[r.index] = true
 				}
-			case ExprQualifiedColumn:
+			case exprQualifiedColumn:
 				if r, e := s.resolveQualified(it.Expr.Qualifier, it.Expr.Column); e == nil && r.level == 0 {
 					projected[r.index] = true
 				}
@@ -10787,7 +10787,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 				inList = e == nil && r.level == 0 && projected[r.index]
 			}
 			if !inList {
-				return nil, NewError(InvalidColumnReference,
+				return nil, newError(InvalidColumnReference,
 					"for SELECT DISTINCT, ORDER BY expressions must appear in select list")
 			}
 		}
@@ -10913,7 +10913,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 	// output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
 	joinPkOrdered := false
 	if !isAgg && !hasWindow && !sel.Distinct && len(order) > 0 && len(orderExprs) == 0 && sel.Limit != nil &&
-		len(planRels) == 2 && len(joins) == 1 && (joins[0].kind == JoinInner || joins[0].kind == JoinCross) &&
+		len(planRels) == 2 && len(joins) == 1 && (joins[0].kind == joinInner || joins[0].kind == joinCross) &&
 		!planRels[0].lateral && planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil &&
 		!planRels[1].lateral && planRels[1].srf == nil && planRels[1].cte == nil && planRels[1].derived == nil &&
 		(relBounds[0] == nil || (relBounds[0].index == nil && relBounds[0].gin == nil && relBounds[0].gist == nil)) &&
@@ -10943,7 +10943,7 @@ func (db *Engine) planSelect(sel *Select, parent *scope, ctes []*cteBinding, pty
 // (len(order) >= len(pk)) because a strict DESC prefix of a composite PK would have the eager sort
 // break ties in PK-ascending input order, which a reverse scan inverts — so reverse is restricted
 // to the unique full key, where no ties remain.
-func (db *Engine) orderSatisfiedByPK(table *Table, offset int, order []orderSlot) (bool, bool) {
+func (db *engine) orderSatisfiedByPK(table *catTable, offset int, order []orderSlot) (bool, bool) {
 	pk := table.PKIndices()
 	if len(pk) == 0 {
 		return false, false // no PK (synthetic rowid order is not a user-visible column)
@@ -10991,7 +10991,7 @@ func (db *Engine) orderSatisfiedByPK(table *Table, offset int, order []orderSlot
 // (range/composite), or the table has no PK. Used by the secondary-index-order scan to peel the PK
 // suffix off the END of each index entry key (the "key-suffix skip", cost.md §3) — sound only when
 // that suffix is a known fixed length.
-func pkStorageWidth(table *Table) (int, bool) {
+func pkStorageWidth(table *catTable) (int, bool) {
 	pk := table.PKIndices()
 	if len(pk) == 0 {
 		return 0, false // a no-PK table keys on a synthetic rowid — not handled this slice
@@ -11024,13 +11024,13 @@ type indexOrderPlan struct {
 // match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
-func (db *Engine) orderSatisfiedByIndex(table *Table, offset int, order []orderSlot) *indexOrderPlan {
+func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []orderSlot) *indexOrderPlan {
 	pkWidth, ok := pkStorageWidth(table)
 	if !ok {
 		return nil
 	}
 	for _, idx := range table.Indexes {
-		if idx.Kind != IndexBtree {
+		if idx.Kind != indexBtree {
 			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
 		}
 		if len(order) != len(idx.Columns) {
@@ -11077,7 +11077,7 @@ func (db *Engine) orderSatisfiedByIndex(table *Table, offset int, order []orderS
 // type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows PostgreSQL's
 // single-column function-alias rule: the table alias when one is given (generate_series(1,5) AS g
 // ⇒ column g), else the function name generate_series.
-func (db *Engine) resolveSRF(name string, args []*Expr, alias *string, columnDefs []TypeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, columnDefs []typeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
 	// inherited so an arg subquery can reference a CTE (cte.md §2).
 	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
@@ -11099,7 +11099,7 @@ func (db *Engine) resolveSRF(name string, args []*Expr, alias *string, columnDef
 	}
 	// A column-definition list is valid ONLY on a record-returning function (PG).
 	if columnDefs != nil {
-		return nil, nil, NewError(SyntaxError,
+		return nil, nil, newError(SyntaxError,
 			"a column definition list is only allowed for a record-returning function, not "+name)
 	}
 	switch {
@@ -11113,26 +11113,26 @@ func (db *Engine) resolveSRF(name string, args []*Expr, alias *string, columnDef
 	// json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
 	switch lname {
 	case "jsonb_each":
-		return db.resolveJSONEach(lname, srfJsonbEach, ScalarT(Jsonb), args, alias, argScope, ptypes)
+		return db.resolveJSONEach(lname, srfJsonbEach, scalarT(scalarJsonb), args, alias, argScope, ptypes)
 	case "jsonb_each_text":
-		return db.resolveJSONEach(lname, srfJsonbEachText, ScalarT(Text), args, alias, argScope, ptypes)
+		return db.resolveJSONEach(lname, srfJsonbEachText, scalarT(scalarText), args, alias, argScope, ptypes)
 	case "json_each", "json_each_text":
-		return nil, nil, NewError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
+		return nil, nil, newError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
 	}
 	// json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
 	// variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
 	// the json accessor operators; the jsonb variants + `json_object_keys` ship here.
 	switch lname {
 	case "jsonb_array_elements":
-		return db.resolveJSONSrf(lname, srfJsonbArrayElements, ScalarT(Jsonb), true, args, alias, argScope, ptypes)
+		return db.resolveJSONSrf(lname, srfJsonbArrayElements, scalarT(scalarJsonb), true, args, alias, argScope, ptypes)
 	case "jsonb_array_elements_text":
-		return db.resolveJSONSrf(lname, srfJsonbArrayElementsText, ScalarT(Text), true, args, alias, argScope, ptypes)
+		return db.resolveJSONSrf(lname, srfJsonbArrayElementsText, scalarT(scalarText), true, args, alias, argScope, ptypes)
 	case "jsonb_object_keys":
-		return db.resolveJSONSrf(lname, srfJsonbObjectKeys, ScalarT(Text), true, args, alias, argScope, ptypes)
+		return db.resolveJSONSrf(lname, srfJsonbObjectKeys, scalarT(scalarText), true, args, alias, argScope, ptypes)
 	case "json_object_keys":
-		return db.resolveJSONSrf(lname, srfJsonObjectKeys, ScalarT(Text), false, args, alias, argScope, ptypes)
+		return db.resolveJSONSrf(lname, srfJsonObjectKeys, scalarT(scalarText), false, args, alias, argScope, ptypes)
 	case "json_array_elements", "json_array_elements_text":
-		return nil, nil, NewError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
+		return nil, nil, newError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
 	}
 	// jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
 	// evaluation sequence over the context document. A bare string literal adapts (the ctx to jsonb,
@@ -11143,21 +11143,21 @@ func (db *Engine) resolveSRF(name string, args []*Expr, alias *string, columnDef
 		if err != nil {
 			return nil, nil, err
 		}
-		return srfTable(lname, alias, ScalarT(Jsonb)), &srfPlan{kind: srfJsonbPathQuery, args: []*rExpr{ctx, path}}, nil
+		return srfTable(lname, alias, scalarT(scalarJsonb)), &srfPlan{kind: srfJsonbPathQuery, args: []*rExpr{ctx, path}}, nil
 	}
-	return nil, nil, NewError(UndefinedFunction, "function does not exist: "+name)
+	return nil, nil, newError(UndefinedFunction, "function does not exist: "+name)
 }
 
 // resolveJSONSrf resolves a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one
 // argument is a json/jsonb value (a bare string literal adapts to the expected document type). The
 // synthetic column's type is fixed (`jsonb`/`text`). A NULL argument yields zero rows at exec.
-func (db *Engine) resolveJSONSrf(name string, kind srfKind, colTy Type, jsonb bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveJSONSrf(name string, kind srfKind, colTy dataType, jsonb bool, args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload(name)
 	}
-	want := Json
+	want := scalarJson
 	if jsonb {
-		want = Jsonb
+		want = scalarJsonb
 	}
 	forbidden := &aggCtx{}
 	r, t, err := resolve(argScope, *args[0], &want, forbidden, ptypes)
@@ -11175,11 +11175,11 @@ func (db *Engine) resolveJSONSrf(name string, kind srfKind, colTy Type, jsonb bo
 // json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts). The
 // synthetic relation has the fixed columns `key text` and `value <valueTy>` (the C0 multi-column
 // synthetic table). A non-object argument → 22023 at exec; a NULL → zero rows.
-func (db *Engine) resolveJSONEach(name string, kind srfKind, valueTy Type, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveJSONEach(name string, kind srfKind, valueTy dataType, args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload(name)
 	}
-	want := Jsonb
+	want := scalarJsonb
 	forbidden := &aggCtx{}
 	r, t, err := resolve(argScope, *args[0], &want, forbidden, ptypes)
 	if err != nil {
@@ -11188,7 +11188,7 @@ func (db *Engine) resolveJSONEach(name string, kind srfKind, valueTy Type, args 
 	if t.kind != rtJsonb && t.kind != rtNull {
 		return nil, nil, noFuncOverload(name)
 	}
-	table := srfTableCols(name, alias, []srfCol{{"key", ScalarT(Text)}, {"value", valueTy}})
+	table := srfTableCols(name, alias, []srfCol{{"key", scalarT(scalarText)}, {"value", valueTy}})
 	return table, &srfPlan{kind: kind, args: []*rExpr{r}}, nil
 }
 
@@ -11197,13 +11197,13 @@ func (db *Engine) resolveJSONEach(name string, kind srfKind, valueTy Type, args 
 // columns come from the C0 col-def list `AS t(col type, …)` (required — else 42601). The synthetic
 // table's columns are the declared types (a composite/array column type is a deferred 0A000), and
 // the srfPlan carries them as recordCols so the row generator can map members → columns by name.
-func (db *Engine) resolveJSONRecord(name string, jsonb, set bool, args []*Expr, alias *string, columnDefs []TypeFieldDef, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveJSONRecord(name string, jsonb, set bool, args []*exprNode, alias *string, columnDefs []typeFieldDef, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload(name)
 	}
-	want := Json
+	want := scalarJson
 	if jsonb {
-		want = Jsonb
+		want = scalarJsonb
 	}
 	forbidden := &aggCtx{}
 	r, t, err := resolve(argScope, *args[0], &want, forbidden, ptypes)
@@ -11215,27 +11215,27 @@ func (db *Engine) resolveJSONRecord(name string, jsonb, set bool, args []*Expr, 
 		return nil, nil, noFuncOverload(name)
 	}
 	if columnDefs == nil {
-		return nil, nil, NewError(SyntaxError,
+		return nil, nil, newError(SyntaxError,
 			"a column definition list is required for function "+name)
 	}
-	columns := make([]Column, 0, len(columnDefs))
+	columns := make([]catColumn, 0, len(columnDefs))
 	for _, d := range columnDefs {
 		// A composite/array column type in the col-def list is a deferred 0A000 follow-on.
 		if strings.HasSuffix(d.TypeName, "[]") || db.CompositeType(d.TypeName) != nil {
-			return nil, nil, NewError(FeatureNotSupported,
+			return nil, nil, newError(FeatureNotSupported,
 				"a composite/array column in a record column-definition list is not supported yet")
 		}
 		st, decimal, err := resolveTypeAndTypmod(d.TypeName, d.TypeMod)
 		if err != nil {
 			return nil, nil, err
 		}
-		columns = append(columns, Column{Name: d.Name, Type: ScalarT(st), Decimal: decimal})
+		columns = append(columns, catColumn{Name: d.Name, Type: scalarT(st), Decimal: decimal})
 	}
 	tname := name
 	if alias != nil {
 		tname = *alias
 	}
-	table := &Table{Name: tname, Columns: columns}
+	table := &catTable{Name: tname, Columns: columns}
 	kind := srfJSONRecord
 	if set {
 		kind = srfJSONRecordset
@@ -11248,7 +11248,7 @@ func (db *Engine) resolveJSONRecord(name string, jsonb, set bool, args []*Expr, 
 // the output column shape; the SECOND is the json/jsonb document. Reuses the R1 row machinery
 // (srfJSONRecord(set)) — only the column source differs (a composite type vs a col-def list). A
 // non-composite first argument → 42804; an anonymous record base → 0A000.
-func (db *Engine) resolveJSONPopulate(name string, jsonb, set bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveJSONPopulate(name string, jsonb, set bool, args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 2 {
 		return nil, nil, noFuncOverload(name)
 	}
@@ -11259,25 +11259,25 @@ func (db *Engine) resolveJSONPopulate(name string, jsonb, set bool, args []*Expr
 		return nil, nil, err
 	}
 	if bt.kind != rtComposite {
-		return nil, nil, NewError(DatatypeMismatch,
+		return nil, nil, newError(DatatypeMismatch,
 			"the first argument of "+name+" must be a composite type")
 	}
 	// A named composite supplies the columns; an anonymous record base is 0A000.
 	if !bt.comp.named {
-		return nil, nil, NewError(FeatureNotSupported, "an anonymous record base is not supported yet")
+		return nil, nil, newError(FeatureNotSupported, "an anonymous record base is not supported yet")
 	}
 	ctype := db.CompositeType(bt.comp.name)
 	if ctype == nil {
-		return nil, nil, NewError(UndefinedObject, "composite type no longer exists")
+		return nil, nil, newError(UndefinedObject, "composite type no longer exists")
 	}
-	columns := make([]Column, 0, len(ctype.Fields))
+	columns := make([]catColumn, 0, len(ctype.Fields))
 	for _, f := range ctype.Fields {
-		columns = append(columns, Column{Name: f.Name, Type: f.Type, Decimal: f.Decimal})
+		columns = append(columns, catColumn{Name: f.Name, Type: f.Type, Decimal: f.Decimal})
 	}
 	// The SECOND argument is the json/jsonb document.
-	want := Json
+	want := scalarJson
 	if jsonb {
-		want = Jsonb
+		want = scalarJsonb
 	}
 	r, dt, err := resolve(argScope, *args[1], &want, forbidden, ptypes)
 	if err != nil {
@@ -11291,7 +11291,7 @@ func (db *Engine) resolveJSONPopulate(name string, jsonb, set bool, args []*Expr
 	if alias != nil {
 		tname = *alias
 	}
-	table := &Table{Name: tname, Columns: columns}
+	table := &catTable{Name: tname, Columns: columns}
 	kind := srfJSONRecord
 	if set {
 		kind = srfJSONRecordset
@@ -11304,11 +11304,11 @@ func (db *Engine) resolveJSONPopulate(name string, jsonb, set bool, args []*Expr
 // synthetic relation (the flattened columns), the `[ctx]` arg, and the resolved jtPlan. The ctx /
 // root path see only params + the lateral prefix (never sibling columns of THIS relation) — an
 // empty-local-rels scope chained to `parent`, exactly like an SRF (grammar.md §44).
-func (db *Engine) resolveJSONTable(jt *JsonTable, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 	forbidden := &aggCtx{}
 	// The context item (json / jsonb / text, coerced to a jsonb document at eval).
-	jsonbHint := Jsonb
+	jsonbHint := scalarJsonb
 	rctx, ctxTy, err := resolve(argScope, *jt.Ctx, &jsonbHint, forbidden, ptypes)
 	if err != nil {
 		return nil, nil, err
@@ -11317,23 +11317,23 @@ func (db *Engine) resolveJSONTable(jt *JsonTable, alias *string, parent *scope, 
 	case rtJsonb, rtJson, rtText, rtNull:
 		// ok
 	default:
-		return nil, nil, NewError(DatatypeMismatch,
+		return nil, nil, newError(DatatypeMismatch,
 			fmt.Sprintf("the context item of JSON_TABLE must be json/jsonb/text, not %s", rtName(ctxTy)))
 	}
 	// The root path — a constant jsonpath (a string literal compiles to a reConstJsonPath node).
-	pathHint := JsonPathType
+	pathHint := scalarJsonPath
 	rpath, pathTy, err := resolve(argScope, *jt.Path, &pathHint, forbidden, ptypes)
 	if err != nil {
 		return nil, nil, err
 	}
 	if pathTy.kind != rtJsonPath {
-		return nil, nil, NewError(DatatypeMismatch, "the path of JSON_TABLE must be a constant jsonpath")
+		return nil, nil, newError(DatatypeMismatch, "the path of JSON_TABLE must be a constant jsonpath")
 	}
 	if rpath.kind != reConstJsonPath {
-		return nil, nil, NewError(FeatureNotSupported, "a non-constant JSON_TABLE path is not supported")
+		return nil, nil, newError(FeatureNotSupported, "a non-constant JSON_TABLE path is not supported")
 	}
 	rootPath := rpath.cText
-	var outColumns []Column
+	var outColumns []catColumn
 	columns, err := db.resolveJtColumns(jt.Columns, &outColumns)
 	if err != nil {
 		return nil, nil, err
@@ -11342,7 +11342,7 @@ func (db *Engine) resolveJSONTable(jt *JsonTable, alias *string, parent *scope, 
 	if alias != nil {
 		tname = *alias
 	}
-	table := &Table{Name: tname, Columns: outColumns}
+	table := &catTable{Name: tname, Columns: outColumns}
 	return table, &srfPlan{
 		kind:      srfJsonTable,
 		args:      []*rExpr{rctx},
@@ -11352,35 +11352,35 @@ func (db *Engine) resolveJSONTable(jt *JsonTable, alias *string, parent *scope, 
 
 // resolveJtColumns recursively resolves a JSON_TABLE COLUMNS tree, flattening the leaf columns into
 // `outColumns` (pre-order, declaration order) and assigning each its flat output index.
-func (db *Engine) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]jtCol, error) {
+func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn) ([]jtCol, error) {
 	resolved := make([]jtCol, 0, len(cols))
 	for _, col := range cols {
 		switch c := col.(type) {
-		case *JtColumnOrdinality:
+		case *jtColumnOrdinality:
 			idx := len(*outColumns)
-			*outColumns = append(*outColumns, jtColumn(c.Name, Int32, nil))
+			*outColumns = append(*outColumns, newJtColumn(c.Name, scalarInt32, nil))
 			resolved = append(resolved, &jtColOrdinality{idx: idx})
-		case *JtColumnRegular:
+		case *jtColumnRegular:
 			if c.Array {
-				return nil, NewError(FeatureNotSupported, "an array JSON_TABLE column is not supported yet")
+				return nil, newError(FeatureNotSupported, "an array JSON_TABLE column is not supported yet")
 			}
 			st, decimal, err := jtScalarType(db, c.TypeName)
 			if err != nil {
 				return nil, err
 			}
 			if !c.KeepQuotes {
-				return nil, NewError(FeatureNotSupported, "JSON_TABLE OMIT QUOTES is not supported yet")
+				return nil, newError(FeatureNotSupported, "JSON_TABLE OMIT QUOTES is not supported yet")
 			}
-			query := st == Json || st == Jsonb
-			if !query && c.Wrapper != JWWithout {
-				return nil, NewError(FeatureNotSupported, "a WRAPPER on a scalar JSON_TABLE column is not supported yet")
+			query := st == scalarJson || st == scalarJsonb
+			if !query && c.Wrapper != jWWithout {
+				return nil, newError(FeatureNotSupported, "a WRAPPER on a scalar JSON_TABLE column is not supported yet")
 			}
 			compiled, err := jtCompilePath(c.Path, c.Name)
 			if err != nil {
 				return nil, err
 			}
 			idx := len(*outColumns)
-			*outColumns = append(*outColumns, jtColumn(c.Name, st, decimal))
+			*outColumns = append(*outColumns, newJtColumn(c.Name, st, decimal))
 			resolved = append(resolved, &jtColRegular{
 				idx:       idx,
 				returning: st,
@@ -11388,10 +11388,10 @@ func (db *Engine) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]jtC
 				path:      compiled,
 				query:     query,
 				wrapper:   c.Wrapper,
-				onEmpty:   jtBehavior(c.OnEmpty, JOBNull),
-				onError:   jtBehavior(c.OnError, JOBNull),
+				onEmpty:   jtBehavior(c.OnEmpty, jOBNull),
+				onError:   jtBehavior(c.OnError, jOBNull),
 			})
-		case *JtColumnExists:
+		case *jtColumnExists:
 			st, _, err := jtScalarType(db, c.TypeName)
 			if err != nil {
 				return nil, err
@@ -11401,15 +11401,15 @@ func (db *Engine) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]jtC
 				return nil, err
 			}
 			idx := len(*outColumns)
-			*outColumns = append(*outColumns, jtColumn(c.Name, st, nil))
+			*outColumns = append(*outColumns, newJtColumn(c.Name, st, nil))
 			resolved = append(resolved, &jtColExists{
 				idx:       idx,
 				returning: st,
 				path:      compiled,
-				onError:   jtBehavior(c.OnError, JOBFalse),
+				onError:   jtBehavior(c.OnError, jOBFalse),
 			})
-		case *JtColumnNested:
-			compiled, err := Compile(c.Path)
+		case *jtColumnNested:
+			compiled, err := compile(c.Path)
 			if err != nil {
 				return nil, err
 			}
@@ -11429,14 +11429,14 @@ func (db *Engine) resolveJtColumns(cols []JtColumn, outColumns *[]Column) ([]jtC
 // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
 // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
 // i64.
-func (db *Engine) resolveGenerateSeries(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveGenerateSeries(args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 2 && len(args) != 3 {
 		return nil, nil, noFuncOverload("generate_series")
 	}
-	int64Ctx := Int64
+	int64Ctx := scalarInt64
 	forbidden := &aggCtx{}
 	rargs := make([]*rExpr, 0, len(args))
-	var result ScalarType
+	var result scalarType
 	haveResult := false
 	for _, a := range args {
 		r, t, err := resolve(argScope, *a, &int64Ctx, forbidden, ptypes)
@@ -11457,9 +11457,9 @@ func (db *Engine) resolveGenerateSeries(args []*Expr, alias *string, argScope *s
 		rargs = append(rargs, r)
 	}
 	if !haveResult {
-		result = Int64
+		result = scalarInt64
 	}
-	return srfTable("generate_series", alias, ScalarT(result)), &srfPlan{kind: srfGenerateSeries, args: rargs}, nil
+	return srfTable("generate_series", alias, scalarT(result)), &srfPlan{kind: srfGenerateSeries, args: rargs}, nil
 }
 
 // resolveUnnest resolves unnest(anyarray) (spec/design/array-functions.md §9, §13): the single
@@ -11470,7 +11470,7 @@ func (db *Engine) resolveGenerateSeries(args []*Expr, alias *string, argScope *s
 // unnest(composite[])): the synthetic column is typed at the bound element type directly
 // (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
 // has no catalog name → 0A000, not reachable from a typed array).
-func (db *Engine) resolveUnnest(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload("unnest")
 	}
@@ -11498,21 +11498,21 @@ func (db *Engine) resolveUnnest(args []*Expr, alias *string, argScope *scope, pt
 // NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
 // else the function name — and its TYPE is colTy (the promoted integer for generate_series, the
 // bound element type for unnest).
-func srfTable(funcName string, alias *string, colTy Type) *Table {
+func srfTable(funcName string, alias *string, colTy dataType) *catTable {
 	colName := funcName
 	if alias != nil {
 		colName = *alias
 	}
-	return &Table{
+	return &catTable{
 		Name:    funcName,
-		Columns: []Column{{Name: colName, Type: colTy}},
+		Columns: []catColumn{{Name: colName, Type: colTy}},
 	}
 }
 
 // srfCol is one fixed column of a multi-column SRF synthetic table (its name + type).
 type srfCol struct {
 	name string
-	ty   Type
+	ty   dataType
 }
 
 // srfTableCols builds a MULTI-COLUMN synthetic table for a set-returning function (C0,
@@ -11520,16 +11520,16 @@ type srfCol struct {
 // fixed by the function (e.g. jsonb_each → key, value); the FROM alias renames the RELATION (the
 // table Name), not its columns. Used by json[b]_each[_text] (and, with a col-def list, the record
 // functions).
-func srfTableCols(funcName string, alias *string, cols []srfCol) *Table {
+func srfTableCols(funcName string, alias *string, cols []srfCol) *catTable {
 	name := funcName
 	if alias != nil {
 		name = *alias
 	}
-	columns := make([]Column, len(cols))
+	columns := make([]catColumn, len(cols))
 	for i, c := range cols {
-		columns[i] = Column{Name: c.name, Type: c.ty}
+		columns[i] = catColumn{Name: c.name, Type: c.ty}
 	}
-	return &Table{Name: name, Columns: columns}
+	return &catTable{Name: name, Columns: columns}
 }
 
 // srfKindName is the catalog name of a json two-column SRF, for its non-object error message.
@@ -11551,7 +11551,7 @@ func srfKindName(kind srfKind) string {
 // an i64 overflow while stepping STOPS the series cleanly (no trap). Each generated element
 // charges one generated_row AT THE SOURCE, guarded so a max_cost ceiling aborts a runaway series
 // (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
-func (db *Engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
 	evalInt := func(e *rExpr) (int64, bool, error) {
 		v, err := e.eval(nil, env, m)
 		if err != nil {
@@ -11586,9 +11586,9 @@ func (db *Engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row
 		return nil, nil
 	}
 	if step == 0 {
-		return nil, NewError(InvalidParameterValue, "step size cannot be equal to zero")
+		return nil, newError(InvalidParameterValue, "step size cannot be equal to zero")
 	}
-	var out []Row
+	var out []storedRow
 	cur := start
 	for {
 		inRange := false
@@ -11603,8 +11603,8 @@ func (db *Engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row
 		if err := m.Guard(); err != nil {
 			return nil, err
 		}
-		m.Charge(Costs.GeneratedRow)
-		out = append(out, Row{IntValue(cur)})
+		m.Charge(costs.GeneratedRow)
+		out = append(out, storedRow{IntValue(cur)})
 		// i64 overflow while stepping ends the series cleanly, matching PostgreSQL.
 		next := cur + step
 		if (step > 0 && next < cur) || (step < 0 && next > cur) {
@@ -11618,7 +11618,7 @@ func (db *Engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row
 // jsonSrfRows generates the rows of a json/jsonb single-column SRF (B2, json-sql-functions.md §3). A
 // NULL argument yields zero rows (empty_on_null). array_elements[_text] over a non-array, or
 // object_keys over a non-object, is 22023. Each produced row charges one generated_row.
-func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
 	arg, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
 		return nil, err
@@ -11630,17 +11630,17 @@ func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error
 	if err != nil {
 		return nil, err
 	}
-	var out []Row
+	var out []storedRow
 	switch sp.kind {
 	case srfJsonbArrayElements, srfJsonbArrayElementsText:
 		if node.Kind != JArray {
-			return nil, NewError(InvalidParameterValue, "cannot extract elements from a scalar")
+			return nil, newError(InvalidParameterValue, "cannot extract elements from a scalar")
 		}
 		for i := range node.Arr {
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
-			m.Charge(Costs.GeneratedRow)
+			m.Charge(costs.GeneratedRow)
 			e := node.Arr[i]
 			var v Value
 			if sp.kind == srfJsonbArrayElementsText {
@@ -11652,28 +11652,28 @@ func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error
 			} else {
 				v = JsonbValue(e)
 			}
-			out = append(out, Row{v})
+			out = append(out, storedRow{v})
 		}
 	case srfJsonbObjectKeys, srfJsonObjectKeys:
 		if node.Kind != JObject {
-			return nil, NewError(InvalidParameterValue, "cannot call jsonb_object_keys on a non-object")
+			return nil, newError(InvalidParameterValue, "cannot call jsonb_object_keys on a non-object")
 		}
 		for i := range node.Obj {
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
-			m.Charge(Costs.GeneratedRow)
-			out = append(out, Row{TextValue(node.Obj[i].Key)})
+			m.Charge(costs.GeneratedRow)
+			out = append(out, storedRow{TextValue(node.Obj[i].Key)})
 		}
 	case srfJsonbEach, srfJsonbEachText:
 		if node.Kind != JObject {
-			return nil, NewError(InvalidParameterValue, "cannot call "+srfKindName(sp.kind)+" on a non-object")
+			return nil, newError(InvalidParameterValue, "cannot call "+srfKindName(sp.kind)+" on a non-object")
 		}
 		for i := range node.Obj {
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
-			m.Charge(Costs.GeneratedRow)
+			m.Charge(costs.GeneratedRow)
 			// (key text, value): jsonb_each keeps the value node; _text renders ->>-style
 			// (a string member's raw content, a JSON null → SQL NULL, else canonical).
 			var value Value
@@ -11686,14 +11686,14 @@ func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error
 			} else {
 				value = JsonbValue(node.Obj[i].Val)
 			}
-			out = append(out, Row{TextValue(node.Obj[i].Key), value})
+			out = append(out, storedRow{TextValue(node.Obj[i].Key), value})
 		}
 	case srfJSONRecord:
 		// json[b]_to_record (R1): one record row, mapping members → the col-def columns by name.
 		if err := m.Guard(); err != nil {
 			return nil, err
 		}
-		m.Charge(Costs.GeneratedRow)
+		m.Charge(costs.GeneratedRow)
 		row, err := jsonRecordRow(&node, sp.recordCols, env, m)
 		if err != nil {
 			return nil, err
@@ -11703,13 +11703,13 @@ func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error
 		// json[b]_to_recordset (R1): one record row per element of a top-level array (preserving
 		// order); a non-array document → 22023.
 		if node.Kind != JArray {
-			return nil, NewError(InvalidParameterValue, "cannot call json_to_recordset on a non-array")
+			return nil, newError(InvalidParameterValue, "cannot call json_to_recordset on a non-array")
 		}
 		for i := range node.Arr {
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
-			m.Charge(Costs.GeneratedRow)
+			m.Charge(costs.GeneratedRow)
 			row, err := jsonRecordRow(&node.Arr[i], sp.recordCols, env, m)
 			if err != nil {
 				return nil, err
@@ -11727,7 +11727,7 @@ func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error
 		if path.Kind == ValNull {
 			return nil, nil
 		}
-		compiled, err := Compile(path.Str)
+		compiled, err := compile(path.Str)
 		if err != nil {
 			return nil, err
 		}
@@ -11739,8 +11739,8 @@ func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
-			m.Charge(Costs.GeneratedRow)
-			out = append(out, Row{JsonbValue(seq[i])})
+			m.Charge(costs.GeneratedRow)
+			out = append(out, storedRow{JsonbValue(seq[i])})
 		}
 	default:
 		panic("jsonSrfRows only handles the json SRF kinds")
@@ -11751,11 +11751,11 @@ func (db *Engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error
 // jsonRecordRow builds one output row for json[b]_to_record(set) (R1): map each declared column to
 // the JSON object's member of that name, coercing it to the column type. A missing member or a JSON
 // null → SQL NULL; a non-object node → 22023. (json-table.md §2)
-func jsonRecordRow(node *JsonNode, cols []Column, env *evalEnv, m *Meter) (Row, error) {
+func jsonRecordRow(node *JsonNode, cols []catColumn, env *evalEnv, m *costMeter) (storedRow, error) {
 	if node.Kind != JObject {
-		return nil, NewError(InvalidParameterValue, "argument of json_to_record must be a JSON object")
+		return nil, newError(InvalidParameterValue, "argument of json_to_record must be a JSON object")
 	}
-	row := make(Row, 0, len(cols))
+	row := make(storedRow, 0, len(cols))
 	for ci := range cols {
 		col := &cols[ci]
 		var member *JsonNode
@@ -11783,17 +11783,17 @@ func jsonRecordRow(node *JsonNode, cols []Column, env *evalEnv, m *Meter) (Row, 
 // path): a `jsonb` column embeds the node, a `json` column its canonical text, every other scalar
 // coerces the node's `->>`-style text through the cast machinery (so `"42"` / `42` → an `int`
 // column, etc.). A composite/array column type is a deferred 0A000.
-func coerceJSONMember(node *JsonNode, colTy Type, decimal *DecimalTypmod, env *evalEnv, m *Meter) (Value, error) {
+func coerceJSONMember(node *JsonNode, colTy dataType, decimal *decimalTypmod, env *evalEnv, m *costMeter) (Value, error) {
 	// A composite / array / range field type is a deferred 0A000 (only scalar / json / jsonb coerce
 	// this slice). R1's col-def list rejects these at resolve; R2's composite fields can carry one.
 	if _, ok := colTy.AsScalar(); !ok {
-		return Value{}, NewError(FeatureNotSupported, "a composite/array record column is not supported yet")
+		return Value{}, newError(FeatureNotSupported, "a composite/array record column is not supported yet")
 	}
 	st := colTy.ScalarTy()
 	switch {
-	case st == Jsonb:
+	case st == scalarJsonb:
 		return JsonbValue(*node), nil
-	case st == Json:
+	case st == scalarJson:
 		return JsonValue(jsonbOut(node)), nil
 	default:
 		text, ok := jsonNodeToText(node)
@@ -11820,19 +11820,19 @@ func isSQLJSONError(err error) bool {
 
 // applyJSONBehavior applies a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING
 // type. underlying is the SQL/JSON error this behavior replaces (raised verbatim by `ERROR`).
-func applyJSONBehavior(behavior JsonOnBehavior, underlying error, returning ScalarType, env *evalEnv, m *Meter) (Value, error) {
+func applyJSONBehavior(behavior jsonOnBehavior, underlying error, returning scalarType, env *evalEnv, m *costMeter) (Value, error) {
 	switch behavior {
-	case JOBError:
+	case jOBError:
 		return Value{}, underlying
-	case JOBNull:
+	case jOBNull:
 		return NullValue(), nil
-	case JOBTrue:
+	case jOBTrue:
 		return BoolValue(true), nil
-	case JOBFalse:
+	case jOBFalse:
 		return BoolValue(false), nil
-	case JOBUnknown:
+	case jOBUnknown:
 		return NullValue(), nil
-	case JOBEmptyArray:
+	case jOBEmptyArray:
 		return jsonNodeAsReturning(JsonNode{Kind: JArray}, returning, env, m)
 	default: // JOBEmptyObject
 		return jsonNodeAsReturning(JsonNode{Kind: JObject}, returning, env, m)
@@ -11841,35 +11841,35 @@ func applyJSONBehavior(behavior JsonOnBehavior, underlying error, returning Scal
 
 // jsonNodeAsReturning renders a json result node as the RETURNING type: `jsonb` embeds, `json` its
 // canonical text, any other scalar coerces the node's `->>`-style text through the cast machinery.
-func jsonNodeAsReturning(node JsonNode, returning ScalarType, env *evalEnv, m *Meter) (Value, error) {
-	return coerceJSONMember(&node, ScalarT(returning), nil, env, m)
+func jsonNodeAsReturning(node JsonNode, returning scalarType, env *evalEnv, m *costMeter) (Value, error) {
+	return coerceJSONMember(&node, scalarT(returning), nil, env, m)
 }
 
 // evalJSONSqlResult applies the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an
 // evaluated sequence. (JSON_EXISTS is handled inline — non-empty → true.)
-func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning ScalarType, wrapper JsonWrapper, onEmpty, onError JsonOnBehavior, env *evalEnv, m *Meter) (Value, error) {
+func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, wrapper jsonWrapper, onEmpty, onError jsonOnBehavior, env *evalEnv, m *costMeter) (Value, error) {
 	switch kind {
 	case jsExists:
 		return BoolValue(len(seq) > 0), nil
 	case jsValue:
 		if len(seq) == 0 {
-			return applyJSONBehavior(onEmpty, NewError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+			return applyJSONBehavior(onEmpty, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
 		}
 		if len(seq) > 1 {
 			return applyJSONBehavior(onError,
-				NewError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_VALUE should return singleton scalar item"),
+				newError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_VALUE should return singleton scalar item"),
 				returning, env, m)
 		}
 		item := seq[0]
 		// JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
 		if item.Kind == JArray || item.Kind == JObject {
 			return applyJSONBehavior(onError,
-				NewError(SqlJsonMemberNotFound, "JSON path expression in JSON_VALUE should return singleton scalar item"),
+				newError(SqlJsonMemberNotFound, "JSON path expression in JSON_VALUE should return singleton scalar item"),
 				returning, env, m)
 		}
 		// Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
 		// SQL/JSON error honored by ON ERROR.
-		v, err := coerceJSONMember(&item, ScalarT(returning), nil, env, m)
+		v, err := coerceJSONMember(&item, scalarT(returning), nil, env, m)
 		if err != nil {
 			if isSQLJSONError(err) {
 				return applyJSONBehavior(onError, err, returning, env, m)
@@ -11880,9 +11880,9 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning ScalarType, w
 	default: // jsQuery
 		var node JsonNode
 		switch wrapper {
-		case JWUnconditional:
+		case jWUnconditional:
 			node = JsonNode{Kind: JArray, Arr: seq}
-		case JWConditional:
+		case jWConditional:
 			if len(seq) == 1 {
 				node = seq[0]
 			} else {
@@ -11890,11 +11890,11 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning ScalarType, w
 			}
 		default: // JWWithout
 			if len(seq) == 0 {
-				return applyJSONBehavior(onEmpty, NewError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
+				return applyJSONBehavior(onEmpty, newError(NoSqlJsonItem, "no SQL/JSON item"), returning, env, m)
 			}
 			if len(seq) > 1 {
 				return applyJSONBehavior(onError,
-					NewError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_QUERY should return singleton item without wrapper"),
+					newError(MoreThanOneSqlJsonItem, "JSON path expression in JSON_QUERY should return singleton item without wrapper"),
 					returning, env, m)
 			}
 			node = seq[0]
@@ -11917,7 +11917,7 @@ type jtAssign struct {
 // jsonTableRows generates the rows of a JSON_TABLE SRF (T1, json-table.md §3) — the default-plan
 // recursive expansion (parent→child LEFT OUTER, sibling NESTED paths UNIONed). A NULL ctx → zero
 // rows; a structural error evaluating the root path → zero rows.
-func (db *Engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
 	plan := sp.jsonTable
 	ctx, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
@@ -11931,7 +11931,7 @@ func (db *Engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, err
 		return nil, err
 	}
 	// The root path → the sequence of row items (a structural error here yields no rows).
-	root, err := Compile(plan.rootPath)
+	root, err := compile(plan.rootPath)
 	if err != nil {
 		return nil, err
 	}
@@ -11947,13 +11947,13 @@ func (db *Engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, err
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Row, 0, len(sparse))
+	out := make([]storedRow, 0, len(sparse))
 	for _, assignment := range sparse {
 		if err := m.Guard(); err != nil {
 			return nil, err
 		}
-		m.Charge(Costs.GeneratedRow)
-		row := make(Row, plan.width)
+		m.Charge(costs.GeneratedRow)
+		row := make(storedRow, plan.width)
 		for i := range row {
 			row[i] = NullValue()
 		}
@@ -11966,12 +11966,12 @@ func (db *Engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, err
 }
 
 // jtColumn builds a synthetic JSON_TABLE output column.
-func jtColumn(name string, ty ScalarType, decimal *DecimalTypmod) Column {
-	return Column{Name: name, Type: ScalarT(ty), Decimal: decimal}
+func newJtColumn(name string, ty scalarType, decimal *decimalTypmod) catColumn {
+	return catColumn{Name: name, Type: scalarT(ty), Decimal: decimal}
 }
 
 // jtBehavior resolves an optional ON EMPTY / ON ERROR behavior to its value, falling back to def.
-func jtBehavior(b *JsonOnBehavior, def JsonOnBehavior) JsonOnBehavior {
+func jtBehavior(b *jsonOnBehavior, def jsonOnBehavior) jsonOnBehavior {
 	if b != nil {
 		return *b
 	}
@@ -11980,14 +11980,14 @@ func jtBehavior(b *JsonOnBehavior, def JsonOnBehavior) JsonOnBehavior {
 
 // jtScalarType resolves a JSON_TABLE column type name → its scalar type + decimal typmod (a composite
 // → 0A000, an unknown name → 42704).
-func jtScalarType(db *Engine, typeName string) (ScalarType, *DecimalTypmod, error) {
-	if st, ok := ScalarTypeFromName(typeName); ok {
+func jtScalarType(db *engine, typeName string) (scalarType, *decimalTypmod, error) {
+	if st, ok := scalarTypeFromName(typeName); ok {
 		return st, nil, nil
 	}
 	if db.CompositeType(typeName) != nil {
-		return 0, nil, NewError(FeatureNotSupported, "a composite JSON_TABLE column is not supported yet")
+		return 0, nil, newError(FeatureNotSupported, "a composite JSON_TABLE column is not supported yet")
 	}
-	return 0, nil, NewError(UndefinedObject, fmt.Sprintf("type \"%s\" does not exist", typeName))
+	return 0, nil, newError(UndefinedObject, fmt.Sprintf("type \"%s\" does not exist", typeName))
 }
 
 // jtCompilePath compiles a JSON_TABLE column path — the explicit `PATH p`, or the default
@@ -11997,7 +11997,7 @@ func jtCompilePath(path *string, name string) (string, error) {
 	if path != nil {
 		src = *path
 	}
-	compiled, err := Compile(src)
+	compiled, err := compile(src)
 	if err != nil {
 		return "", err
 	}
@@ -12006,7 +12006,7 @@ func jtCompilePath(path *string, name string) (string, error) {
 
 // expandJtLevel expands a JSON_TABLE COLUMNS level over a sequence of row items → the sparse rows
 // (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3).
-func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *Meter) ([][]jtAssign, error) {
+func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
 	var rows [][]jtAssign
 	for i := range items {
 		if err := m.Guard(); err != nil {
@@ -12060,13 +12060,13 @@ func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *Meter) ([][]
 // expandJtNested expands the NESTED siblings of a level over one parent item — the default-plan
 // UNION of the siblings (each row fills only its own subtree), with the parent→child LEFT OUTER fill
 // (no child rows at all → one all-NULL nested row).
-func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *Meter) ([][]jtAssign, error) {
+func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
 	if len(children) == 0 {
 		return [][]jtAssign{nil}, nil
 	}
 	var union [][]jtAssign
 	for _, child := range children {
-		p, err := Compile(child.path)
+		p, err := compile(child.path)
 		if err != nil {
 			return nil, err
 		}
@@ -12092,8 +12092,8 @@ func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *Me
 
 // evalJtRegular evaluates a regular JSON_TABLE column over a row item — JSON_VALUE (scalar) /
 // JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
-func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *Meter) (Value, error) {
-	p, err := Compile(c.path)
+func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *costMeter) (Value, error) {
+	p, err := compile(c.path)
 	if err != nil {
 		return Value{}, err
 	}
@@ -12114,7 +12114,7 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *Meter) (Val
 // evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the
 // column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
 func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
-	p, err := Compile(c.path)
+	p, err := compile(c.path)
 	if err != nil {
 		return Value{}, err
 	}
@@ -12123,11 +12123,11 @@ func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
 	if err != nil {
 		if isSQLJSONError(err) {
 			switch c.onError {
-			case JOBError:
+			case jOBError:
 				return Value{}, err
-			case JOBTrue:
+			case jOBTrue:
 				exists = true
-			case JOBUnknown:
+			case jOBUnknown:
 				return NullValue(), nil
 			default:
 				exists = false
@@ -12148,7 +12148,7 @@ func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
 		}
 		return IntValue(0), nil
 	default:
-		return Value{}, NewError(FeatureNotSupported, "an EXISTS JSON_TABLE column must be boolean or integer this slice")
+		return Value{}, newError(FeatureNotSupported, "an EXISTS JSON_TABLE column must be boolean or integer this slice")
 	}
 }
 
@@ -12159,7 +12159,7 @@ func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
 // flattens; a NULL element is produced as a NULL row). Each produced element charges one generated_row AT
 // THE SOURCE, guarded so a max_cost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like
 // generate_series (CLAUDE.md §13).
-func (db *Engine) unnestRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
 	v, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
 		return nil, err
@@ -12169,13 +12169,13 @@ func (db *Engine) unnestRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error)
 		// A NULL array → zero rows (PG; the empty_on_null discipline).
 		return nil, nil
 	case ValArray:
-		out := make([]Row, 0, len(v.Array.Elements))
+		out := make([]storedRow, 0, len(v.Array.Elements))
 		for _, e := range v.Array.Elements {
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
-			m.Charge(Costs.GeneratedRow)
-			out = append(out, Row{e})
+			m.Charge(costs.GeneratedRow)
+			out = append(out, storedRow{e})
 		}
 		return out, nil
 	default:
@@ -12191,7 +12191,7 @@ func (db *Engine) unnestRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error)
 // point-lookup work (TODO Phase 6) builds on; today only scanSource exists and feeds the
 // existing materialize-then-join pipeline unchanged, so results and cost are byte-identical.
 type rowSource interface {
-	next(env *evalEnv, m *Meter) (Row, bool, error)
+	next(env *evalEnv, m *costMeter) (storedRow, bool, error)
 }
 
 // scanSource streams a base table's rows in primary-key order. It charges the page_read block
@@ -12202,13 +12202,13 @@ type rowSource interface {
 // node/row count, not a physical leaf fetch (pager.md §5). The block fires on the first next()
 // even for an empty table (nodeCount 0 ⇒ a no-op charge), so the accrued total never moves.
 type scanSource struct {
-	rows         []Row
+	rows         []storedRow
 	i            int
 	nodeCount    int
 	chargedBlock bool
 }
 
-func (s *scanSource) next(env *evalEnv, m *Meter) (Row, bool, error) {
+func (s *scanSource) next(env *evalEnv, m *costMeter) (storedRow, bool, error) {
 	// Enforce the cost ceiling before pulling the next row (CLAUDE.md §13): a runaway scan (or a
 	// JOIN/correlated re-scan built on this source) stops deterministically once accrued cost
 	// reaches the limit. No-op when unlimited (spec/design/cost.md §6).
@@ -12216,13 +12216,13 @@ func (s *scanSource) next(env *evalEnv, m *Meter) (Row, bool, error) {
 		return nil, false, err
 	}
 	if !s.chargedBlock {
-		m.Charge(Costs.PageRead * int64(s.nodeCount))
+		m.Charge(costs.PageRead * int64(s.nodeCount))
 		s.chargedBlock = true
 	}
 	if s.i >= len(s.rows) {
 		return nil, false, nil
 	}
-	m.Charge(Costs.StorageRowRead)
+	m.Charge(costs.StorageRowRead)
 	row := s.rows[s.i]
 	s.i++
 	return row, true, nil
@@ -12241,14 +12241,14 @@ func (s *scanSource) next(env *evalEnv, m *Meter) (Row, bool, error) {
 // boundTerm is one resolved `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is
 // the LEFT side (a `5 < pk` flips to `pk > 5`). src is the constant/parameter operand.
 type boundTerm struct {
-	op  BinaryOp
+	op  binaryOp
 	src *rExpr
 }
 
 // pkBoundPlan is the plan-time result of PK analysis: the PK column's storage type + the bound
 // terms. The concrete key range is built per execution by buildKeyBound.
 type pkBoundPlan struct {
-	pkType ScalarType
+	pkType scalarType
 	terms  []boundTerm
 	// coll is the key column's resolved collation when it is collated AND Full (loaded version
 	// matches the file pin) — the probe encodes via this collation's UCA sort key (encoding.md
@@ -12282,7 +12282,7 @@ type gistBoundPlan struct {
 	// scalarType is the GiST-indexed column's scalar type for the scalar `=` opclass (strategy
 	// gistEqual, GX2): gistBoundRows encodes the equality constant to its order-preserving key bytes
 	// with it. Unused for range_ops, whose &&/@> query is a range constant the R-tree compares directly.
-	scalarType ScalarType
+	scalarType scalarType
 }
 
 // ginStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
@@ -12312,7 +12312,7 @@ const (
 // re-found in plan.filter at exec time by ginMatch and evaluated there.
 type ginBoundPlan struct {
 	nameKey   string
-	elemType  ScalarType
+	elemType  scalarType
 	strategy  ginStrategy
 	colGlobal int
 }
@@ -12324,7 +12324,7 @@ type ginBoundPlan struct {
 // range-scanned over that value's presence-tagged prefix.
 type indexBoundPlan struct {
 	nameKey string // the index store's key — the lowercased index name
-	colType ScalarType
+	colType scalarType
 	eqs     []*rExpr
 	// coll is the leading key column's resolved collation when it is collated AND Full — the
 	// equality probe encodes via its UCA sort key (encoding.md §2.12) to match the index's stored
@@ -12335,7 +12335,7 @@ type indexBoundPlan struct {
 	// entry's row-key suffix sits after every component slot, so the fetch skips these
 	// (each slot is self-delimiting — a 0x01 NULL tag alone, or 0x00 + the type's fixed
 	// width).
-	tailTypes []ScalarType
+	tailTypes []scalarType
 }
 
 // detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
@@ -12343,7 +12343,7 @@ type indexBoundPlan struct {
 // lowercased-name order — the deterministic tie-break), the first whose FIRST key column
 // has at least one equality conjunct against a type-matched const-source; else nil (full
 // scan).
-func detectScanBound(filter *rExpr, rel scopeRel, db *Engine) *scanBound {
+func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
 		// Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
 		// deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
@@ -12363,7 +12363,7 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *Engine) *scanBound {
 		// (gin.md §6); a GiST index is keyed by a bounding [min,max] / range, NOT the whole value — a
 		// scalar GiST index's store key is [v,v]‖skey, not the ordered-index key form, so it must NOT
 		// be probed here (handled by the GiST pass below, gist.md §5/§6). Both are skipped.
-		if idx.Kind != IndexBtree {
+		if idx.Kind != indexBtree {
 			continue
 		}
 		ci := idx.Columns[0]
@@ -12400,13 +12400,13 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *Engine) *scanBound {
 		var eqs []*rExpr
 		if bp := detectPKBound(filter, rel.offset+ci, ty, coll); bp != nil {
 			for _, t := range bp.terms {
-				if t.op == OpEq {
+				if t.op == opEq {
 					eqs = append(eqs, t.src)
 				}
 			}
 		}
 		if len(eqs) > 0 {
-			tail := make([]ScalarType, 0, len(idx.Columns)-1)
+			tail := make([]scalarType, 0, len(idx.Columns)-1)
 			for _, c := range idx.Columns[1:] {
 				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 			}
@@ -12439,7 +12439,7 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *Engine) *scanBound {
 //     read-safety rule §12; seeking a loaded-version probe in a file-version B-tree would mis-match —
 //     the tripwire suites/collation/skew.test stays green only because this refuses). An
 //     unresolvable collation likewise refuses rather than mis-encoding.
-func (db *Engine) keyCollationCtx(col Column) (*Collation, bool) {
+func (db *engine) keyCollationCtx(col catColumn) (*Collation, bool) {
 	if col.Collation == "" {
 		return nil, true
 	}
@@ -12458,12 +12458,12 @@ func (db *Engine) keyCollationCtx(col Column) (*Collation, bool) {
 // `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
 // (detectScanBound) and the UPDATE/DELETE scan both use the identical detection — the mutations
 // pass their own table's indexes/columns at offset 0.
-func detectGinBound(filter *rExpr, indexes []IndexDef, columns []Column, offset int) *ginBoundPlan {
+func detectGinBound(filter *rExpr, indexes []indexDef, columns []catColumn, offset int) *ginBoundPlan {
 	if filter == nil {
 		return nil
 	}
 	for _, idx := range indexes {
-		if idx.Kind != IndexGin {
+		if idx.Kind != indexGin {
 			continue
 		}
 		ci := idx.Columns[0]
@@ -12519,7 +12519,7 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 	// the constant array Q the other. Recovered operand is Q; ginBoundRows reads it via ginEqual
 	// (the @>-superset gather + the residual =). <> is NOT matched (only OpEq). When the column is an
 	// array, the other constant operand is necessarily an array too (resolve rejects array/scalar =).
-	if filter.kind == reCompare && filter.op == OpEq {
+	if filter.kind == reCompare && filter.op == opEq {
 		if isColumn(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs) {
 			return ginEqual, filter.rhs, true
 		}
@@ -12531,7 +12531,7 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 	// ARRAY operand (rhs) and c (the scalar lhs) a constant. Only = ANY (not = ALL, not any other
 	// comparison/quantifier — those are not a single-term posting gather). The recovered query
 	// operand is the scalar c; ginBoundRows reads it via ginMember.
-	if filter.kind == reQuantified && filter.op == OpEq && !filter.quantAll &&
+	if filter.kind == reQuantified && filter.op == opEq && !filter.quantAll &&
 		isColumn(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs) {
 		return ginMember, filter.lhs, true
 	}
@@ -12542,9 +12542,9 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 // lowest-named GiST index whose range column at offset+ci has a `col && const` / `col @> const`
 // conjunct. Factored out so the SELECT planner (detectScanBound) and the UPDATE/DELETE scan share
 // the identical detection (the GIN precedent) — the mutations pass their indexes/columns at offset 0.
-func detectGistBound(filter *rExpr, indexes []IndexDef, columns []Column, offset int) *gistBoundPlan {
+func detectGistBound(filter *rExpr, indexes []indexDef, columns []catColumn, offset int) *gistBoundPlan {
 	for _, idx := range indexes {
-		if idx.Kind != IndexGist {
+		if idx.Kind != indexGist {
 			continue
 		}
 		// The planner gather is single-operator: only a single-column GiST index accelerates a
@@ -12586,7 +12586,7 @@ func gistScalarMatch(filter *rExpr, colGlobal int) (gistStrategy, *rExpr, bool) 
 		}
 		return gistScalarMatch(filter.rhs, colGlobal)
 	}
-	if filter.kind == reCompare && filter.op == OpEq {
+	if filter.kind == reCompare && filter.op == opEq {
 		if isColumn(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs) {
 			return gistEqual, filter.rhs, true
 		}
@@ -12699,7 +12699,7 @@ func rexprIsConstant(e *rExpr) bool {
 // feeds the rows through the same scanSource as any bounded scan (page_read block +
 // per-row storage_row_read). A provably empty bound (NULL / contradictory equalities /
 // out-of-range) returns nothing and charges nothing.
-func (db *Engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []Row, mask []bool) (rows []Row, pages, slabs int, err error) {
+func (db *engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []storedRow, mask []bool) (rows []storedRow, pages, slabs int, err error) {
 	// Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
 	// true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
 	// integer can equal no stored value — all provably empty.
@@ -12768,14 +12768,14 @@ func (db *Engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []
 // (the candidate set IS the storage keys), with the up-front (page_read nodes, value_decompress
 // slabs) block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
 // (gin.md §6). GinEntry is charged inside (during the gather); the caller charges the block.
-func (db *Engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
+func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool) (out []entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
 	}
 	// Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
 	// §3): evaluate Q on a scratch meter. Q is a constant, so the nil row suffices.
-	qv, err := query.eval(nil, env, &Meter{})
+	qv, err := query.eval(nil, env, &costMeter{})
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -12881,7 +12881,7 @@ func (db *Engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		}
 		postings = append(postings, keys)
 	}
-	meter.Charge(Costs.GinEntry * int64(entriesVisited))
+	meter.Charge(costs.GinEntry * int64(entriesVisited))
 
 	// Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
 	// lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8).
@@ -12905,7 +12905,7 @@ func (db *Engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		if !ok {
 			panic("a GIN entry references a stored row")
 		}
-		out = append(out, Entry{Key: key, Row: row})
+		out = append(out, entry{Key: key, Row: row})
 	}
 	return out, pages, slabs, nil
 }
@@ -12920,13 +12920,13 @@ func (db *Engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 // directly. Degenerate constant queries (gist.md §5): a NULL Q and an empty && query match nothing; an
 // empty @> query (col @> 'empty') matches every row → full-scan fallback (the empty bound is invisible
 // to the overlap-descend).
-func (db *Engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
+func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool) (out []entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
 	}
 	// The query operand is a constant; evaluating it (extract query) is a planning step, NOT metered.
-	qv, err := query.eval(nil, env, &Meter{})
+	qv, err := query.eval(nil, env, &costMeter{})
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -12969,7 +12969,7 @@ func (db *Engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 		nodes, interior := 0, 0
 		skeys, nodes, interior = tree.search([]gistQuery{gq}, []gistStrategy{gb.strategy})
 		pages += nodes
-		meter.Charge(Costs.GistDescent * int64(interior))
+		meter.Charge(costs.GistDescent * int64(interior))
 	}
 	// Point-look-up each candidate in storage-key order (the candidates ARE storage keys).
 	slices.SortFunc(skeys, bytes.Compare)
@@ -12984,7 +12984,7 @@ func (db *Engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 		if !ok {
 			panic("a GiST entry references a stored row")
 		}
-		out = append(out, Entry{Key: key, Row: row})
+		out = append(out, entry{Key: key, Row: row})
 	}
 	return out, pages, slabs, nil
 }
@@ -13047,7 +13047,7 @@ func prefixSuccessor(p []byte) []byte {
 }
 
 // pkBoundFor detects a single-table mutation's (UPDATE/DELETE) PK pushdown bound; nil ⇒ full scan.
-func (db *Engine) pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
+func (db *engine) pkBoundFor(table *catTable, filter *rExpr) *pkBoundPlan {
 	if filter == nil {
 		return nil
 	}
@@ -13076,7 +13076,7 @@ func (db *Engine) pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
 // none exist (⇒ full scan). Conservative + sound: an unrecognized conjunct contributes no bound and
 // stays in the residual filter. coll is the key column's collation when collated AND Full (nil for a
 // C key); a comparison's own collation must match it for the comparison to seed a bound.
-func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType, coll *Collation) *pkBoundPlan {
+func detectPKBound(filter *rExpr, pkIdx int, pkType scalarType, coll *Collation) *pkBoundPlan {
 	colColl := ""
 	if coll != nil {
 		colColl = coll.Name
@@ -13105,7 +13105,7 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType, coll *Collation)
 // matches) on one side and a const-source of the PK's own type on the other (a promoted comparison
 // — e.g. intpk = 2.5 → a reConstDecimal — does not match, so it stays residual). The op is flipped
 // when the PK is on the right.
-func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType, colColl string) (boundTerm, bool) {
+func asBoundTerm(e *rExpr, pkIdx int, pkType scalarType, colColl string) (boundTerm, bool) {
 	if e.kind != reCompare {
 		return boundTerm{}, false
 	}
@@ -13126,7 +13126,7 @@ func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType, colColl string) (boundT
 		return boundTerm{}, false
 	}
 	switch e.op {
-	case OpEq, OpLt, OpLe, OpGt, OpGe:
+	case opEq, opLt, opLe, opGt, opGe:
 	default:
 		return boundTerm{}, false
 	}
@@ -13148,7 +13148,7 @@ func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType, colColl string) (boundT
 // row's column and seeks instead of re-scanning the whole inner table per outer row (cost.md §3
 // "bounded scan", grammar.md §26). A type-mismatched outer reference is wrapped in a cast by the
 // resolver (as for a const literal), so it never arrives here bare — the type check stays implicit.
-func isConstSource(e *rExpr, pkType ScalarType) bool {
+func isConstSource(e *rExpr, pkType scalarType) bool {
 	switch e.kind {
 	case reParam, reConstNull, reOuterColumn:
 		return true
@@ -13178,16 +13178,16 @@ func isConstSource(e *rExpr, pkType ScalarType) bool {
 
 // flipCompare swaps a comparison's sense (for `const <op> pk` ⇒ `pk <flipped> const`). Eq is
 // symmetric.
-func flipCompare(op BinaryOp) BinaryOp {
+func flipCompare(op binaryOp) binaryOp {
 	switch op {
-	case OpLt:
-		return OpGt
-	case OpLe:
-		return OpGe
-	case OpGt:
-		return OpLt
-	case OpGe:
-		return OpLe
+	case opLt:
+		return opGt
+	case opLe:
+		return opGe
+	case opGt:
+		return opLt
+	case opGe:
+		return opLe
 	default:
 		return op
 	}
@@ -13200,7 +13200,7 @@ func flipCompare(op BinaryOp) BinaryOp {
 // sound, scan), never a wrong key.
 // outer carries the enclosing rows (innermost last) so a correlated reOuterColumn source resolves to
 // the current outer row's value; it is nil for a top-level statement.
-func (db *Engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) (keyBound, bool) {
+func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedRow) (keyBound, bool) {
 	b := unboundedBound()
 	for _, t := range bp.terms {
 		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll)
@@ -13211,16 +13211,16 @@ func (db *Engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) (k
 			continue
 		}
 		switch t.op {
-		case OpEq:
+		case opEq:
 			b = intersectLo(b, key, true)
 			b = intersectHi(b, key, true)
-		case OpGt:
+		case opGt:
 			b = intersectLo(b, key, false)
-		case OpGe:
+		case opGe:
 			b = intersectLo(b, key, true)
-		case OpLt:
+		case opLt:
 			b = intersectHi(b, key, false)
-		case OpLe:
+		case opLe:
 			b = intersectHi(b, key, true)
 		}
 	}
@@ -13236,7 +13236,7 @@ func (db *Engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) (k
 // type's range (no key can equal it), so the caller drops this bound. reParam/reOuterColumn resolve
 // to a runtime Value first (the param table / the enclosing outer row) and then encode through the
 // shared path.
-func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row, coll *Collation) (key []byte, isNull bool, ok bool) {
+func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation) (key []byte, isNull bool, ok bool) {
 	switch src.kind {
 	case reConstNull:
 		return nil, true, false
@@ -13244,17 +13244,17 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row, 
 		if !pkType.InRange(src.cInt) {
 			return nil, false, false
 		}
-		return EncodeInt(pkType, src.cInt), false, true
+		return encodeInt(pkType, src.cInt), false, true
 	case reConstBool:
-		return EncodeBool(src.cBool), false, true
+		return encodeBool(src.cBool), false, true
 	case reConstUuid:
 		return src.cBytea, false, true
 	case reConstTimestamp, reConstTimestamptz:
-		return EncodeInt(pkType, src.cInt), false, true
+		return encodeInt(pkType, src.cInt), false, true
 	case reConstText:
 		return encodeTextBound(src.cText, coll)
 	case reConstBytea:
-		return EncodeTerminated(src.cBytea), false, true
+		return encodeTerminated(src.cBytea), false, true
 	case reConstDecimal:
 		return src.cDec.EncodeKey(), false, true
 	case reConstInterval:
@@ -13279,9 +13279,9 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row, 
 // Identical across cores (mirrors Rust encode_text_bound / TS encodeTextBound).
 func encodeTextBound(s string, coll *Collation) (key []byte, isNull bool, ok bool) {
 	if coll == nil {
-		return EncodeTerminated([]byte(s)), false, true
+		return encodeTerminated([]byte(s)), false, true
 	}
-	k, err := SortKey(coll, s)
+	k, err := sortKey(coll, s)
 	if err != nil {
 		return nil, false, false
 	}
@@ -13292,19 +13292,19 @@ func encodeTextBound(s string, coll *Collation) (key []byte, isNull bool, ok boo
 // storage key. isNull ⇒ the value is NULL (a 3VL-empty range); ok=false (not null) ⇒ an integer
 // outside the PK width, so the caller drops this half-bound (a wider, still sound, scan). coll
 // selects a text value's key form (collated sort key vs raw bytes — encodeTextBound).
-func encodeValueKey(pkType ScalarType, v Value, coll *Collation) (key []byte, isNull bool, ok bool) {
+func encodeValueKey(pkType scalarType, v Value, coll *Collation) (key []byte, isNull bool, ok bool) {
 	if v.IsNull() {
 		return nil, true, false
 	}
 	switch {
 	case pkType.IsBool():
-		return EncodeBool(v.Bool), false, true
+		return encodeBool(v.Bool), false, true
 	case pkType.IsUuid():
 		return []byte(v.Str), false, true
 	case pkType.IsText():
 		return encodeTextBound(v.Str, coll)
 	case pkType.IsBytea():
-		return EncodeTerminated([]byte(v.Str)), false, true
+		return encodeTerminated([]byte(v.Str)), false, true
 	case pkType.IsDecimal():
 		if v.Kind != ValDecimal {
 			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
@@ -13323,9 +13323,9 @@ func encodeValueKey(pkType ScalarType, v Value, coll *Collation) (key []byte, is
 		if !pkType.InRange(v.Int) {
 			return nil, false, false
 		}
-		return EncodeInt(pkType, v.Int), false, true
+		return encodeInt(pkType, v.Int), false, true
 	default: // timestamp / timestamptz / date
-		return EncodeInt(pkType, v.Int), false, true
+		return encodeInt(pkType, v.Int), false, true
 	}
 }
 
@@ -13387,7 +13387,7 @@ func boundEmpty(b keyBound) bool {
 // short-circuit; only the row reads do. Rows match the eager path exactly: the offset..offset+limit
 // slice of the primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's
 // result — the stored PK order is the requested order).
-func (db *Engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
+func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
@@ -13407,7 +13407,7 @@ func (db *Engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter
 			return selectResult{}, err
 		}
 	}
-	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
+	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 
 	// limit is optional here: a pkOrdered query may have no LIMIT (it streams every survivor in
 	// order, eliding the sort), while the LIMIT short-circuit always has one.
@@ -13426,11 +13426,11 @@ func (db *Engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter
 		var passed int64
 		// A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
 		// (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
-		visit := func(_ []byte, row Row) (bool, error) {
+		visit := func(_ []byte, row storedRow) (bool, error) {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 				return false, err
 			}
-			meter.Charge(Costs.StorageRowRead)
+			meter.Charge(costs.StorageRowRead)
 			// Materialize the touched columns if the lazy load left them unfetched
 			// (large-values.md §14) — a fresh copy only when needed (resolveColumns).
 			row, err := store.resolveColumns(row, plan.relMasks[0])
@@ -13466,14 +13466,14 @@ func (db *Engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter
 				if passed <= offset {
 					return true, nil
 				}
-				meter.Charge(Costs.RowProduced)
+				meter.Charge(costs.RowProduced)
 				out = append(out, projected)
 			} else {
 				passed++
 				if passed <= offset {
 					return true, nil
 				}
-				meter.Charge(Costs.RowProduced)
+				meter.Charge(costs.RowProduced)
 				projected := make([]Value, len(plan.projections))
 				for i, p := range plan.projections {
 					v, err := p.eval(row, env, meter)
@@ -13513,11 +13513,11 @@ func (db *Engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *Meter
 // up front as the full block (like the streaming PK scan — only the per-row work short-circuits);
 // each scanned entry then charges its point-lookup's page_read/value_decompress + one
 // storage_row_read, plus row_produced and projection operator_evals per produced row.
-func (db *Engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *evalEnv, meter *Meter) (selectResult, error) {
+func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *evalEnv, meter *costMeter) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 	istore := db.lkpIndexStore(io.nameKey)
 	// Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
-	meter.Charge(Costs.PageRead * int64(istore.NodeCount()))
+	meter.Charge(costs.PageRead * int64(istore.NodeCount()))
 
 	var offset int64
 	if plan.offset != nil {
@@ -13526,7 +13526,7 @@ func (db *Engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 	out := make([][]Value, 0)
 	if plan.limit == nil || *plan.limit > 0 {
 		var passed int64
-		err := istore.ScanRange(unboundedBound(), func(ekey []byte, _ Row) (bool, error) {
+		err := istore.ScanRange(unboundedBound(), func(ekey []byte, _ storedRow) (bool, error) {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
 				return false, err
 			}
@@ -13541,7 +13541,7 @@ func (db *Engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 			if !ok {
 				panic("an index entry references a stored row")
 			}
-			meter.Charge(Costs.PageRead*int64(n) + Costs.ValueDecompress*int64(sl) + Costs.StorageRowRead)
+			meter.Charge(costs.PageRead*int64(n) + costs.ValueDecompress*int64(sl) + costs.StorageRowRead)
 			row, err = store.resolveColumns(row, plan.relMasks[0])
 			if err != nil {
 				return false, err
@@ -13559,7 +13559,7 @@ func (db *Engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 			if passed <= offset {
 				return true, nil
 			}
-			meter.Charge(Costs.RowProduced)
+			meter.Charge(costs.RowProduced)
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
 				v, err := p.eval(row, env, meter)
@@ -13590,7 +13590,7 @@ func (db *Engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 // filter operator_eval, and row_produced per windowed row accrue — only the sort, which is unmetered
 // (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
 // non-DISTINCT, with an ORDER BY and no index bound.
-func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
+func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read + value_decompress
@@ -13607,7 +13607,7 @@ func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter
 			return selectResult{}, err
 		}
 	}
-	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
+	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 
 	// A collated ORDER BY cannot use the C-ordered Sorter / spill (collated keys are slice 1e), and
 	// collation is in-memory only this slice — so materialize the survivors and sort them with the
@@ -13624,11 +13624,11 @@ func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter
 	if collated {
 		var rows [][]Value
 		if !empty {
-			err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
+			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil {
 					return false, err
 				}
-				meter.Charge(Costs.StorageRowRead)
+				meter.Charge(costs.StorageRowRead)
 				row, err := store.resolveColumns(row, plan.relMasks[0])
 				if err != nil {
 					return false, err
@@ -13671,7 +13671,7 @@ func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter
 			if err := meter.Guard(); err != nil {
 				return selectResult{}, err
 			}
-			meter.Charge(Costs.RowProduced)
+			meter.Charge(costs.RowProduced)
 			projected := make([]Value, len(plan.projections))
 			for j, p := range plan.projections {
 				v, err := p.eval(rows[i], env, meter)
@@ -13691,11 +13691,11 @@ func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter
 	// the sorter, which spills when it exceeds the budget.
 	s := db.newSorterFor(plan.order)
 	if !empty {
-		err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
+		err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 				return false, err
 			}
-			meter.Charge(Costs.StorageRowRead)
+			meter.Charge(costs.StorageRowRead)
 			row, err := store.resolveColumns(row, plan.relMasks[0])
 			if err != nil {
 				return false, err
@@ -13755,7 +13755,7 @@ func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 			return selectResult{}, err
 		}
-		meter.Charge(Costs.RowProduced)
+		meter.Charge(costs.RowProduced)
 		projected := make([]Value, len(plan.projections))
 		for j, p := range plan.projections {
 			v, err := p.eval(row, env, meter)
@@ -13777,7 +13777,7 @@ func (db *Engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter
 // ON/WHERE operator_evals and row_produced short-circuit. Gated (by the caller / plan.joinPkOrdered)
 // to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
 // ORDER BY.
-func (db *Engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Meter, params []Value, outer []Row, rng *StmtRng) (selectResult, error) {
+func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outer []storedRow, rng *stmtRng) (selectResult, error) {
 	leftRows, err := db.materializeRel(plan, 0, params, outer, rng, env.ctes, meter)
 	if err != nil {
 		return selectResult{}, err
@@ -13798,7 +13798,7 @@ func (db *Engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Meter
 	outerLoop:
 		for _, left := range leftRows {
 			for _, right := range rightRows {
-				combined := make(Row, 0, len(left)+len(right))
+				combined := make(storedRow, 0, len(left)+len(right))
 				combined = append(combined, left...)
 				combined = append(combined, right...)
 				// INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
@@ -13828,7 +13828,7 @@ func (db *Engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Meter
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 					return selectResult{}, err
 				}
-				meter.Charge(Costs.RowProduced)
+				meter.Charge(costs.RowProduced)
 				projected := make([]Value, len(plan.projections))
 				for j, p := range plan.projections {
 					v, err := p.eval(combined, env, meter)
@@ -13851,7 +13851,7 @@ func (db *Engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *Meter
 // newSorterFor builds a sorter for order, bounded by this handle's workMem. Spilling is enabled only
 // for a file-backed database (an in-memory one has nowhere to spill — spill.md §2); spill runs live
 // next to the database file (same filesystem, guaranteed writable).
-func (db *Engine) newSorterFor(order []orderSlot) *sorter {
+func (db *engine) newSorterFor(order []orderSlot) *sorter {
 	spillDir := ""
 	if db.paging != nil {
 		spillDir = filepath.Dir(db.path)
@@ -13862,10 +13862,10 @@ func (db *Engine) newSorterFor(order []orderSlot) *sorter {
 // rowsFromValues reinterprets a result-row slice ([][]Value) as a join-feed buffer ([]Row). Row is
 // []Value, so each element converts directly; used where a CTE body's selectResult rows feed the
 // join pipeline (spec/design/cte.md §5).
-func rowsFromValues(in [][]Value) []Row {
-	out := make([]Row, len(in))
+func rowsFromValues(in [][]Value) []storedRow {
+	out := make([]storedRow, len(in))
 	for i, r := range in {
-		out[i] = Row(r)
+		out[i] = storedRow(r)
 	}
 	return out
 }
@@ -13877,7 +13877,7 @@ func rowsFromValues(in [][]Value) []Row {
 // body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
 // query's own outer and its parent=nil body simply ignores it (a parent=nil plan holds no
 // outerColumn, so the two are observably identical).
-func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []Row, rng *StmtRng, ctes cteCtx, meter *Meter) ([]Row, error) {
+func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
 	rel := plan.rels[ri]
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	// A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
@@ -13907,9 +13907,9 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 				if err := meter.Guard(); err != nil {
 					return nil, err
 				}
-				meter.Charge(Costs.CteScanRow)
+				meter.Charge(costs.CteScanRow)
 			}
-			return append([]Row(nil), buf...), nil
+			return append([]storedRow(nil), buf...), nil
 		case cteInline:
 			// Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
 			// (writable-cte.md §3), so its buffer was filled above.
@@ -13938,7 +13938,7 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	// storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead of a
 	// full walk; an empty bound reads nothing.
 	store := db.lkpStore(rel.tableName)
-	var rows []Row
+	var rows []storedRow
 	var nodeCount, slabs int
 	if sb := plan.relBounds[ri]; sb != nil && sb.index != nil {
 		var err error
@@ -13959,7 +13959,7 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return nil, err
 		}
 		// SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
-		rows = make([]Row, len(entries))
+		rows = make([]storedRow, len(entries))
 		for i := range entries {
 			rows[i] = entries[i].Row
 		}
@@ -13977,7 +13977,7 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		if err != nil {
 			return nil, err
 		}
-		rows = make([]Row, len(entries))
+		rows = make([]storedRow, len(entries))
 		for i := range entries {
 			rows[i] = entries[i].Row
 		}
@@ -13989,7 +13989,7 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			if err != nil {
 				return nil, err
 			}
-			rows = make([]Row, len(entries))
+			rows = make([]storedRow, len(entries))
 			for i := range entries {
 				rows[i] = entries[i].Row
 			}
@@ -14000,7 +14000,7 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		if err != nil {
 			return nil, err
 		}
-		rows = make([]Row, len(entries))
+		rows = make([]storedRow, len(entries))
 		for i := range entries {
 			rows[i] = entries[i].Row
 		}
@@ -14014,9 +14014,9 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return nil, err
 		}
 	}
-	meter.Charge(Costs.ValueDecompress * int64(slabs))
+	meter.Charge(costs.ValueDecompress * int64(slabs))
 	src := &scanSource{rows: rows, nodeCount: nodeCount}
-	var tableRows []Row
+	var tableRows []storedRow
 	for {
 		row, ok, err := src.next(env, meter)
 		if err != nil {
@@ -14030,7 +14030,7 @@ func (db *Engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	return tableRows, nil
 }
 
-func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
 	meter := db.session.newMeter()
 
@@ -14100,7 +14100,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 	// re-reads from these in-memory buffers, which are not stores and charge nothing. A CORRELATED
 	// LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up front — a
 	// placeholder (nil) holds its slot and the join loop re-materializes it per combined left row.
-	materialized := make([][]Row, len(plan.rels))
+	materialized := make([][]storedRow, len(plan.rels))
 	for ri, rel := range plan.rels {
 		if rel.lateral {
 			continue
@@ -14123,27 +14123,27 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 	// match run, all unmatched right rows last in right key order (CLAUDE.md §10).
 	// A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
 	// instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
-	running := []Row{{}}
+	running := []storedRow{{}}
 	if len(plan.rels) > 0 {
 		running = materialized[0]
 	}
 	for k := range plan.joins {
 		on := plan.joins[k].on
-		emitLeft := plan.joins[k].kind == JoinLeft || plan.joins[k].kind == JoinFull
-		emitRight := plan.joins[k].kind == JoinRight || plan.joins[k].kind == JoinFull
+		emitLeft := plan.joins[k].kind == joinLeft || plan.joins[k].kind == joinFull
+		emitRight := plan.joins[k].kind == joinRight || plan.joins[k].kind == joinFull
 		// NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when
 		// `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
 		// (= the width of every running row) and is that many columns wide.
 		leftPad := plan.rels[k+1].offset
 		rightPad := plan.rels[k+1].colCount
-		var next []Row
+		var next []storedRow
 		// A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row, with
 		// that row pushed onto the outer-row stack as the body's immediate outer (the correlated-
 		// subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated
 		// lateral is 42P10), so there is no unmatched-right emission.
 		if plan.rels[k+1].lateral {
 			for _, left := range running {
-				latOuter := make([]Row, len(outer)+1)
+				latOuter := make([]storedRow, len(outer)+1)
 				copy(latOuter, outer)
 				latOuter[len(outer)] = left
 				rightRows, err := db.materializeRel(plan, k+1, params, latOuter, env.rng, env.ctes, meter)
@@ -14152,7 +14152,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 				}
 				leftMatched := false
 				for _, right := range rightRows {
-					combined := make(Row, 0, len(left)+len(right))
+					combined := make(storedRow, 0, len(left)+len(right))
 					combined = append(combined, left...)
 					combined = append(combined, right...)
 					keep := true
@@ -14169,7 +14169,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 					}
 				}
 				if emitLeft && !leftMatched {
-					combined := make(Row, 0, len(left)+rightPad)
+					combined := make(storedRow, 0, len(left)+rightPad)
 					combined = append(combined, left...)
 					for i := 0; i < rightPad; i++ {
 						combined = append(combined, NullValue())
@@ -14185,7 +14185,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 		for _, left := range running {
 			leftMatched := false
 			for ri, right := range rightRows {
-				combined := make(Row, 0, len(left)+len(right))
+				combined := make(storedRow, 0, len(left)+len(right))
 				combined = append(combined, left...)
 				combined = append(combined, right...)
 				keep := true
@@ -14203,7 +14203,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 				}
 			}
 			if emitLeft && !leftMatched {
-				combined := make(Row, 0, len(left)+rightPad)
+				combined := make(storedRow, 0, len(left)+rightPad)
 				combined = append(combined, left...)
 				for i := 0; i < rightPad; i++ {
 					combined = append(combined, NullValue())
@@ -14214,7 +14214,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 		if emitRight {
 			for ri, right := range rightRows {
 				if !rightMatched[ri] {
-					combined := make(Row, 0, leftPad+len(right))
+					combined := make(storedRow, 0, leftPad+len(right))
 					for i := 0; i < leftPad; i++ {
 						combined = append(combined, NullValue())
 					}
@@ -14228,7 +14228,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 
 	// WHERE over the combined rows. A WHERE arithmetic can trap (22003/22012); each surviving
 	// combined row's filter accrues operator_eval.
-	var rows []Row
+	var rows []storedRow
 	for _, row := range running {
 		keep := true
 		if plan.filter != nil {
@@ -14358,7 +14358,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 				}
 			}
 		}
-		var groupRows []Row
+		var groupRows []storedRow
 		for gsi := range plan.groupSets {
 			gset := &plan.groupSets[gsi]
 			index := make(map[string]int)
@@ -14400,7 +14400,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 							continue
 						}
 					}
-					meter.Charge(Costs.AggregateAccumulate)
+					meter.Charge(costs.AggregateAccumulate)
 					// A hypothetical-set aggregate (rank/dense_rank/… — aggregates.md §19) buffers the
 					// row's WITHIN GROUP key TUPLE (no NULL-skip — every row counts, sorted by NULLS
 					// FIRST/LAST). The hypothetical row itself is evaluated per group at finalize. No
@@ -14462,7 +14462,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 					// (aggregates.md §13/§17) — so it may reference grouping columns. Unmetered
 					// (the finalize step, like the sort), via a scratch meter. mode has none.
 					if fe := plan.aggSpecs[si].osaFrac; fe != nil {
-						fv, ferr := fe.eval(srow, env, &Meter{})
+						fv, ferr := fe.eval(srow, env, &costMeter{})
 						if ferr != nil {
 							return selectResult{}, ferr
 						}
@@ -14475,7 +14475,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 					if hp := plan.aggSpecs[si].hypo; hp != nil {
 						hyp := make([]Value, len(hp.args))
 						for ai, arg := range hp.args {
-							av, aerr := arg.eval(srow, env, &Meter{})
+							av, aerr := arg.eval(srow, env, &costMeter{})
 							if aerr != nil {
 								return selectResult{}, aerr
 							}
@@ -14564,7 +14564,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 					return selectResult{}, err
 				}
-				meter.Charge(Costs.RowProduced)
+				meter.Charge(costs.RowProduced)
 				out = append(out, row)
 			}
 		} else {
@@ -14575,7 +14575,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 					return selectResult{}, err
 				}
-				meter.Charge(Costs.RowProduced)
+				meter.Charge(costs.RowProduced)
 				projected := make([]Value, len(plan.projections))
 				for i, p := range plan.projections {
 					v, perr := p.eval(srow, env, meter)
@@ -14616,7 +14616,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return selectResult{}, err
 			}
-			meter.Charge(Costs.RowProduced)
+			meter.Charge(costs.RowProduced)
 			out = append(out, row)
 		}
 	} else {
@@ -14631,7 +14631,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return selectResult{}, err
 			}
-			meter.Charge(Costs.RowProduced)
+			meter.Charge(costs.RowProduced)
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
 				v, err := p.eval(row, env, meter)
@@ -14659,7 +14659,7 @@ func (db *Engine) execSelectPlan(plan *selectPlan, outer []Row, params []Value, 
 // once-only cost — cost.md §3). A CORRELATED subquery is left in place; the evaluator re-executes
 // it per outer row. So after this pass the only surviving reSubquery nodes are correlated.
 
-func (db *Engine) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes cteCtx, cost *int64) error {
+func (db *engine) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes cteCtx, cost *int64) error {
 	if plan.sel != nil {
 		return db.foldUncorrelatedInSelect(plan.sel, bound, ctes, cost)
 	}
@@ -14689,7 +14689,7 @@ func (db *Engine) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes ct
 	return db.foldUncorrelatedInPlan(&plan.setop.rhs, bound, ctes, cost)
 }
 
-func (db *Engine) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes cteCtx, cost *int64) error {
+func (db *engine) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes cteCtx, cost *int64) error {
 	for k := range sp.joins {
 		if sp.joins[k].on != nil {
 			if err := db.foldUncorrelatedInRExpr(sp.joins[k].on, bound, ctes, cost); err != nil {
@@ -14735,7 +14735,7 @@ func (db *Engine) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes c
 
 // foldUncorrelatedInRExpr folds this node if it is an uncorrelated reSubquery, else recurses into
 // its children. A reSubquery is mutated IN PLACE (*e = ...) so every pointer to it sees the fold.
-func (db *Engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, cost *int64) error {
+func (db *engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, cost *int64) error {
 	if e.kind == reSubquery {
 		// Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
 		// globally-uncorrelated subquery nested inside it is already a constant before we run it.
@@ -14759,7 +14759,7 @@ func (db *Engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 		switch e.subKind {
 		case sqScalar:
 			if len(r.rows) > 1 {
-				return NewError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
+				return newError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
 			}
 			val := NullValue()
 			if len(r.rows) == 1 {
@@ -14776,7 +14776,7 @@ func (db *Engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 			for i, row := range r.rows {
 				elems[i] = row[0]
 			}
-			arr := &rExpr{kind: reConstArray, cArray: OneDimArray(elems)}
+			arr := &rExpr{kind: reConstArray, cArray: oneDimArray(elems)}
 			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr}
 		default: // sqIn
 			list := make([]Value, len(r.rows))
@@ -15039,18 +15039,18 @@ type groupSetPlan struct {
 
 // groupItemSetCount is the number of grouping sets a single GROUP BY term expands to, saturating well
 // below the int max so a huge CUBE cannot overflow the product before the maxGroupingSets check.
-func groupItemSetCount(item *GroupItem) int {
+func groupItemSetCount(item *groupItem) int {
 	switch item.Kind {
-	case GroupSet:
+	case groupSet:
 		return 1
-	case GroupRollup:
+	case groupRollup:
 		return len(item.Groups) + 1
-	case GroupCube:
+	case groupCube:
 		if len(item.Groups) >= 20 {
 			return maxGroupingSets + 1
 		}
 		return 1 << len(item.Groups)
-	case GroupGroupingSets:
+	case groupGroupingSets:
 		total := 0
 		for i := range item.Elems {
 			total += groupItemSetCount(&item.Elems[i])
@@ -15066,19 +15066,19 @@ func groupItemSetCount(item *GroupItem) int {
 // expandGroupItem expands a single GROUP BY term into its grouping sets, each a list of column Exprs
 // (ROLLUP/CUBE/GROUPING SETS and nesting — spec/design/aggregates.md §12). The per-set column order
 // is textual; the set order is deterministic and identical across cores (tests compare with rowsort).
-func expandGroupItem(item *GroupItem) [][]*Expr {
+func expandGroupItem(item *groupItem) [][]*exprNode {
 	switch item.Kind {
-	case GroupSet:
-		set := make([]*Expr, len(item.Cols))
+	case groupSet:
+		set := make([]*exprNode, len(item.Cols))
 		for i := range item.Cols {
 			set[i] = &item.Cols[i]
 		}
-		return [][]*Expr{set}
-	case GroupRollup:
+		return [][]*exprNode{set}
+	case groupRollup:
 		// The prefixes longest-first down to the empty set — n+1 sets.
-		out := make([][]*Expr, 0, len(item.Groups)+1)
+		out := make([][]*exprNode, 0, len(item.Groups)+1)
 		for k := len(item.Groups); k >= 0; k-- {
-			var set []*Expr
+			var set []*exprNode
 			for i := 0; i < k; i++ {
 				for j := range item.Groups[i] {
 					set = append(set, &item.Groups[i][j])
@@ -15087,12 +15087,12 @@ func expandGroupItem(item *GroupItem) [][]*Expr {
 			out = append(out, set)
 		}
 		return out
-	case GroupCube:
+	case groupCube:
 		// Every subset of the column groups — 2^n sets (bit i = include group i).
 		n := len(item.Groups)
-		out := make([][]*Expr, 0, 1<<n)
+		out := make([][]*exprNode, 0, 1<<n)
 		for mask := 0; mask < (1 << n); mask++ {
-			var set []*Expr
+			var set []*exprNode
 			for i := 0; i < n; i++ {
 				if mask&(1<<i) != 0 {
 					for j := range item.Groups[i] {
@@ -15103,8 +15103,8 @@ func expandGroupItem(item *GroupItem) [][]*Expr {
 			out = append(out, set)
 		}
 		return out
-	case GroupGroupingSets:
-		var out [][]*Expr
+	case groupGroupingSets:
+		var out [][]*exprNode
 		for i := range item.Elems {
 			out = append(out, expandGroupItem(&item.Elems[i])...)
 		}
@@ -15116,21 +15116,21 @@ func expandGroupItem(item *GroupItem) [][]*Expr {
 // expandGroupBy expands a whole GROUP BY clause into its grouping sets: the cross-product of the
 // top-level terms' expansions. An empty clause yields one empty set (the whole-table grand total).
 // Aborts 54001 if the expansion exceeds maxGroupingSets (spec/design/aggregates.md §12).
-func expandGroupBy(items []GroupItem) ([][]*Expr, error) {
+func expandGroupBy(items []groupItem) ([][]*exprNode, error) {
 	total := 1
 	for i := range items {
 		total *= groupItemSetCount(&items[i])
 		if total > maxGroupingSets {
-			return nil, NewError(StatementTooComplex, fmt.Sprintf("too many grouping sets (the limit is %d)", maxGroupingSets))
+			return nil, newError(StatementTooComplex, fmt.Sprintf("too many grouping sets (the limit is %d)", maxGroupingSets))
 		}
 	}
-	acc := [][]*Expr{{}}
+	acc := [][]*exprNode{{}}
 	for i := range items {
 		exp := expandGroupItem(&items[i])
-		next := make([][]*Expr, 0, len(acc)*len(exp))
+		next := make([][]*exprNode, 0, len(acc)*len(exp))
 		for _, a := range acc {
 			for _, s := range exp {
-				combined := make([]*Expr, 0, len(a)+len(s))
+				combined := make([]*exprNode, 0, len(a)+len(s))
 				combined = append(combined, a...)
 				combined = append(combined, s...)
 				next = append(next, combined)
@@ -15145,7 +15145,7 @@ func expandGroupBy(items []GroupItem) ([][]*Expr, error) {
 // canonical AST (so a matching projection / HAVING / ORDER BY expression resolves to its synthetic
 // slot) and its resolved type.
 type groupKeyExpr struct {
-	canon Expr
+	canon exprNode
 	ty    resolvedType
 }
 
@@ -15157,18 +15157,18 @@ type groupKeyResolved struct {
 	index    int    // valid when isColumn
 	node     *rExpr // valid when !isColumn — the materialized expression
 	ty       resolvedType
-	canon    Expr // valid when !isColumn — the canonical AST kept for projection matching
+	canon    exprNode // valid when !isColumn — the canonical AST kept for projection matching
 }
 
 // resolveGroupTerm resolves one GROUP BY grouping term to a column or a materialized expression
 // (aggregates.md §15). Classifies the term: a bare integer literal is a select-list ORDINAL (1-based;
 // out of range 42P10) whose target select item is then resolved as a term; otherwise it is a column
 // / alias / general expression (resolveGroupNamed).
-func resolveGroupTerm(s *scope, term Expr, items SelectItems, params *paramTypes) (groupKeyResolved, error) {
+func resolveGroupTerm(s *scope, term exprNode, items selectItems, params *paramTypes) (groupKeyResolved, error) {
 	// Only a *bare* integer literal is an ordinal — `GROUP BY 1`; `GROUP BY 1 + 1` is a constant
 	// expression (PG). The parser folds a unary minus into the value, so a negative is just out of
 	// range. The select list fixes the position count: `*` expands to the scope width.
-	if term.Kind == ExprLiteral && term.Literal != nil && term.Literal.Kind == LiteralInt {
+	if term.Kind == exprLiteral && term.Literal != nil && term.Literal.Kind == literalInt {
 		n := term.Literal.Int
 		var ncols int64
 		if items.All {
@@ -15177,7 +15177,7 @@ func resolveGroupTerm(s *scope, term Expr, items SelectItems, params *paramTypes
 			ncols = int64(len(items.Items))
 		}
 		if n < 1 || n > ncols {
-			return groupKeyResolved{}, NewError(InvalidColumnReference,
+			return groupKeyResolved{}, newError(InvalidColumnReference,
 				fmt.Sprintf("GROUP BY position %d is not in select list", n))
 		}
 		pos := int(n - 1)
@@ -15194,9 +15194,9 @@ func resolveGroupTerm(s *scope, term Expr, items SelectItems, params *paramTypes
 // or a general expression (aggregates.md §15). A bare name resolves an INPUT column FIRST, then —
 // only if there is no such column — an output alias (PG's rule, the opposite of ORDER BY's
 // output-first rule).
-func resolveGroupNamed(s *scope, term Expr, items SelectItems, params *paramTypes) (groupKeyResolved, error) {
+func resolveGroupNamed(s *scope, term exprNode, items selectItems, params *paramTypes) (groupKeyResolved, error) {
 	switch term.Kind {
-	case ExprColumn:
+	case exprColumn:
 		r, err := s.resolveBare(term.Column)
 		if err != nil {
 			// No input column of this name: try an output alias (`SELECT a+b AS s … GROUP BY s`). If
@@ -15213,16 +15213,16 @@ func resolveGroupNamed(s *scope, term Expr, items SelectItems, params *paramType
 			return groupKeyResolved{}, err
 		}
 		if r.level != 0 {
-			return groupKeyResolved{}, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+			return groupKeyResolved{}, newError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
 		}
 		return groupKeyResolved{isColumn: true, index: r.index}, nil
-	case ExprQualifiedColumn:
+	case exprQualifiedColumn:
 		r, err := s.resolveQualified(term.Qualifier, term.Column)
 		if err != nil {
 			return groupKeyResolved{}, err
 		}
 		if r.level != 0 {
-			return groupKeyResolved{}, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+			return groupKeyResolved{}, newError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
 		}
 		return groupKeyResolved{isColumn: true, index: r.index}, nil
 	default:
@@ -15235,13 +15235,13 @@ func resolveGroupNamed(s *scope, term Expr, items SelectItems, params *paramType
 // matches it); anything else is MATERIALIZED — resolved against the input row with aggregates
 // forbidden (an aggregate in GROUP BY is 42803), its canonical AST kept for projection matching
 // (aggregates.md §15).
-func resolveGroupExpr(s *scope, e Expr, params *paramTypes) (groupKeyResolved, error) {
+func resolveGroupExpr(s *scope, e exprNode, params *paramTypes) (groupKeyResolved, error) {
 	switch e.Kind {
-	case ExprColumn:
+	case exprColumn:
 		if r, err := s.resolveBare(e.Column); err == nil && r.level == 0 {
 			return groupKeyResolved{isColumn: true, index: r.index}, nil
 		}
-	case ExprQualifiedColumn:
+	case exprQualifiedColumn:
 		if r, err := s.resolveQualified(e.Qualifier, e.Column); err == nil && r.level == 0 {
 			return groupKeyResolved{isColumn: true, index: r.index}, nil
 		}
@@ -15259,7 +15259,7 @@ func resolveGroupExpr(s *scope, e Expr, params *paramTypes) (groupKeyResolved, e
 // resolved type (aggregates.md §15). Only fires in a collecting context with groupKeyExprs; an
 // aggregate operand / FILTER resolves under Forbidden (no groupKeyExprs), so a grouping expression
 // there is correctly NOT remapped (it is a per-row value, not the group key).
-func matchGroupExpr(ag *aggCtx, e Expr) (int, resolvedType, bool) {
+func matchGroupExpr(ag *aggCtx, e exprNode) (int, resolvedType, bool) {
 	if ag == nil {
 		return 0, resolvedType{}, false
 	}
@@ -15376,17 +15376,17 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 // = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
 // -> NULL; else FALSE. NOT IN is the Kleene negation. Shared by reInValues and the correlated
 // reSubquery/sqIn eval.
-func inMembership(lv Value, list []Value, negated bool, m *Meter) (Value, error) {
+func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, error) {
 	if len(list) == 0 {
 		return BoolValue(negated), nil
 	}
 	anyMatch := false
 	anyNull := false
 	for _, v := range list {
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		// Each element comparison over a decimal pair charges its size-scaled decimal_work
 		// (spec/design/cost.md §3 "decimal_work"), like a compare node.
-		m.Charge(Costs.DecimalWork * (decimalCmpWork(lv, v) - 1))
+		m.Charge(costs.DecimalWork * (decimalCmpWork(lv, v) - 1))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -15419,14 +15419,14 @@ func inMembership(lv Value, list []Value, negated bool, m *Meter) (Value, error)
 // FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
 // empty → TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
 // exactly like inMembership, so max_cost bounds the walk (54P01).
-func quantifiedMembership(op BinaryOp, all bool, lv, av Value, m *Meter) (Value, error) {
+func quantifiedMembership(op binaryOp, all bool, lv, av Value, m *costMeter) (Value, error) {
 	if av.Kind == ValNull {
 		return NullValue(), nil
 	}
 	anyNull := false
 	for _, e := range av.Array.Elements {
-		m.Charge(Costs.OperatorEval)
-		m.Charge(Costs.DecimalWork * (decimalCmpWork(lv, e) - 1))
+		m.Charge(costs.OperatorEval)
+		m.Charge(costs.DecimalWork * (decimalCmpWork(lv, e) - 1))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -15465,7 +15465,7 @@ func quantifiedMembership(op BinaryOp, all bool, lv, av Value, m *Meter) (Value,
 // composite elements (array.md §5). A whole-element NULL is still UNKNOWN — the operator stays strict
 // at the value level — so the resolver-guaranteed same-type pair is composite-vs-composite or
 // composite-vs-NULL.
-func quantifiedCmp3(op BinaryOp, x, e Value) ThreeValued {
+func quantifiedCmp3(op binaryOp, x, e Value) ThreeValued {
 	if x.Kind == ValComposite || e.Kind == ValComposite {
 		if x.Kind == ValNull || e.Kind == ValNull {
 			return Unknown
@@ -15473,15 +15473,15 @@ func quantifiedCmp3(op BinaryOp, x, e Value) ThreeValued {
 		ord := valueCmp(x, e)
 		var matched bool
 		switch op {
-		case OpEq:
+		case opEq:
 			matched = ord == 0
-		case OpNe:
+		case opNe:
 			matched = ord != 0
-		case OpLt:
+		case opLt:
 			matched = ord < 0
-		case OpGt:
+		case opGt:
 			matched = ord > 0
-		case OpLe:
+		case opLe:
 			matched = ord <= 0
 		default: // OpGe
 			matched = ord >= 0
@@ -15497,15 +15497,15 @@ func quantifiedCmp3(op BinaryOp, x, e Value) ThreeValued {
 		e = Float64Value(float64(e.F32()))
 	}
 	switch op {
-	case OpEq:
+	case opEq:
 		return x.Eq3(e)
-	case OpNe:
+	case opNe:
 		return not3(x.Eq3(e))
-	case OpLt:
+	case opLt:
 		return x.Lt3(e)
-	case OpGt:
+	case opGt:
 		return x.Gt3(e)
-	case OpLe:
+	case opLe:
 		return or3(x.Lt3(e), x.Eq3(e))
 	default: // OpGe
 		return or3(x.Gt3(e), x.Eq3(e))
@@ -15780,16 +15780,16 @@ func isFloatKind(k rtKind) bool { return k == rtFloat32 || k == rtFloat64 }
 
 // promoteFloat is the float promotion tower (compare.toml max-rank): a mixed-width pair widens to
 // f64; same-width stays. Caller guarantees both kinds are float.
-func promoteFloat(a, b rtKind) ScalarType {
+func promoteFloat(a, b rtKind) scalarType {
 	if a == rtFloat64 || b == rtFloat64 {
-		return Float64
+		return scalarFloat64
 	}
-	return Float32
+	return scalarFloat32
 }
 
 type resolvedType struct {
 	kind  rtKind
-	intTy ScalarType      // valid when kind == rtInt
+	intTy scalarType      // valid when kind == rtInt
 	comp  *compositeRType // valid when kind == rtComposite
 	elem  *resolvedType   // valid when kind == rtArray (the element type)
 }
@@ -15809,7 +15809,7 @@ type compositeRField struct {
 	ty   resolvedType
 }
 
-func intType(t resolvedType) (ScalarType, bool) {
+func intType(t resolvedType) (scalarType, bool) {
 	if t.kind == rtInt {
 		return t.intTy, true
 	}
@@ -15818,7 +15818,7 @@ func intType(t resolvedType) (ScalarType, bool) {
 
 // resolvedOfColumn is the resolved type of a stored column of ty — the output type of a bare
 // column projection (SELECT * / SELECT col). A column always has a concrete type, never rtNull.
-func resolvedOfColumn(ty ScalarType) resolvedType {
+func resolvedOfColumn(ty scalarType) resolvedType {
 	if ty.IsInteger() {
 		return resolvedType{kind: rtInt, intTy: ty}
 	}
@@ -15859,7 +15859,7 @@ func resolvedOfColumn(ty ScalarType) resolvedType {
 // timestamptz only to a timestamptz column (the two never cross — they do not even compare,
 // timestamp.md), and a NULL-typed projection to any column (a NOT NULL target then traps 23502
 // per row). A non-assignable pair is a 42804.
-func assignableTo(t resolvedType, colTy ScalarType) bool {
+func assignableTo(t resolvedType, colTy scalarType) bool {
 	switch t.kind {
 	case rtNull:
 		return true
@@ -15970,18 +15970,18 @@ func rtName(t resolvedType) string {
 // resolvedRangeElementScalar returns the scalar element type of a resolved range element. A range's
 // element is always one of the six scalar subtypes; ok is false for anything else (never a valid
 // range). Used to name a range and to build its codec.
-func resolvedRangeElementScalar(elem *resolvedType) (ScalarType, bool) {
+func resolvedRangeElementScalar(elem *resolvedType) (scalarType, bool) {
 	switch elem.kind {
 	case rtInt:
 		return elem.intTy, true
 	case rtDecimal:
-		return DecimalType, true
+		return scalarDecimal, true
 	case rtTimestamp:
-		return Timestamp, true
+		return scalarTimestamp, true
 	case rtTimestamptz:
-		return Timestamptz, true
+		return scalarTimestamptz, true
 	case rtDate:
-		return Date, true
+		return scalarDate, true
 	default:
 		return 0, false
 	}
@@ -15992,53 +15992,53 @@ func resolvedRangeElementScalar(elem *resolvedType) (ScalarType, bool) {
 // the hex/uuid input); a bind parameter additionally adopts a decimal/boolean sibling (a literal
 // ignores those — its arm keeps i64/text — so widening the mapping is safe). Only a bare NULL
 // offers no context (spec/design/api.md §5).
-func ctxOf(t resolvedType) *ScalarType {
+func ctxOf(t resolvedType) *scalarType {
 	switch t.kind {
 	case rtInt:
 		ty := t.intTy
 		return &ty
 	case rtBytea:
-		ty := Bytea
+		ty := scalarBytea
 		return &ty
 	case rtUuid:
-		ty := Uuid
+		ty := scalarUuid
 		return &ty
 	case rtText:
-		ty := Text
+		ty := scalarText
 		return &ty
 	case rtBool:
-		ty := Bool
+		ty := scalarBool
 		return &ty
 	case rtDecimal:
-		ty := DecimalType
+		ty := scalarDecimal
 		return &ty
 	case rtTimestamp:
-		ty := Timestamp
+		ty := scalarTimestamp
 		return &ty
 	case rtTimestamptz:
-		ty := Timestamptz
+		ty := scalarTimestamptz
 		return &ty
 	case rtDate:
-		ty := Date
+		ty := scalarDate
 		return &ty
 	case rtInterval:
-		ty := IntervalType
+		ty := scalarInterval
 		return &ty
 	case rtFloat32:
-		ty := Float32
+		ty := scalarFloat32
 		return &ty
 	case rtFloat64:
-		ty := Float64
+		ty := scalarFloat64
 		return &ty
 	case rtJson:
 		// A json/jsonb sibling offers its type so a string literal parses as that type.
-		ty := Json
+		ty := scalarJson
 		return &ty
 	case rtJsonb:
-		ty := Jsonb
+		ty := scalarJsonb
 		return &ty
 	case rtJsonPath:
-		ty := JsonPathType
+		ty := scalarJsonPath
 		return &ty
 	default:
 		return nil
@@ -16667,10 +16667,10 @@ type rExpr struct {
 	cBytea   []byte         // reConstBytea
 	cIv      Interval       // reConstInterval
 	cFloat   float64        // reConstFloat32 / reConstFloat64 (a f32 const is held as the f64 of its value)
-	op       BinaryOp       // reArith, reCompare
-	result   ScalarType     // reCast target; reNeg / reArith result type
-	typmod   *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
-	castElem *ColType       // reArrayCast: the target element ColType (nil ⇒ array → text)
+	op       binaryOp       // reArith, reCompare
+	result   scalarType     // reCast target; reNeg / reArith result type
+	typmod   *decimalTypmod // reCast: a decimal target's numeric(p,s) typmod
+	castElem *colType       // reArrayCast: the target element ColType (nil ⇒ array → text)
 	lhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
 	rhs      *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
 	operand  *rExpr         // reCast, reNeg, reNot, reIsNull, reCasing
@@ -16719,7 +16719,7 @@ type rExpr struct {
 	// reRangeCtor: the element scalar of the range being built (i32range → i32). The result range type
 	// is recovered from it (a bijection); the bound/flags argument nodes reuse `sargs`. reRangeOp also
 	// uses `relem` — the range's element scalar, for the element-overload coercion at eval.
-	relem ScalarType
+	relem scalarType
 	// reRangeOp: the range boolean operator kernel. Its two operand nodes reuse `sargs`.
 	rop rangeOp
 	// reRangeSetOp: the range set operator kernel (+ union, - difference, * intersection, range_merge).
@@ -16744,10 +16744,10 @@ type rExpr struct {
 	// §5, S2). `sargs` = [ctx, path]; `result`/`typmod` hold the RETURNING scalar type + decimal typmod.
 	// jsKind selects the function; jsWrapper/jsKeepQuotes/jsOnEmpty/jsOnError drive the result.
 	jsKind       jsonSqlKind
-	jsWrapper    JsonWrapper
+	jsWrapper    jsonWrapper
 	jsKeepQuotes bool
-	jsOnEmpty    JsonOnBehavior
-	jsOnError    JsonOnBehavior
+	jsOnEmpty    jsonOnBehavior
+	jsOnError    jsonOnBehavior
 
 	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert). Argument nodes are in
 	// `sargs` = [target, path, value, flag] (json-sql-functions.md §2).
@@ -16770,7 +16770,7 @@ type rExpr struct {
 
 	// reIsJson: the optional kind word (json-sql-functions.md §5) and the WITH UNIQUE KEYS flag. The
 	// operand reuses `operand`; `negated` carries IS NOT JSON.
-	jpKind   JsonPredicateKind
+	jpKind   jsonPredicateKind
 	jpUnique bool
 
 	// reJsonGet: the jsonb accessor operator (`-> ->> #> #>>`). `lhs` is the jsonb base, `rhs` the
@@ -16903,7 +16903,7 @@ const (
 // resolves to it (refs then counts the self-reference too).
 type cteBinding struct {
 	name  string
-	table *Table
+	table *catTable
 	// source is what this binding evaluates to (cte.md, writable-cte.md): a planned query body, or
 	// a data-modifying statement (dm non-nil). Exactly one of plan/dm is meaningful (selected by dm).
 	// A data-modifying CTE is always materialized (writable-cte.md §3), so the inline-execution path
@@ -16924,9 +16924,9 @@ func (b *cteBinding) isDml() bool { return b.dm != nil }
 // RETURNING clause — in which case a FROM reference to it is 0A000 (§5). Exactly one of
 // insert/update/delete is non-nil.
 type dmCte struct {
-	insert      *Insert
-	update      *Update
-	delete      *Delete
+	insert      *insert
+	update      *update
+	delete      *deleteStmt
 	noReturning bool
 }
 
@@ -16949,7 +16949,7 @@ type recursiveTerm struct {
 type cteCtx struct {
 	modes    []cteMode
 	bindings []*cteBinding
-	buffers  [][]Row
+	buffers  [][]storedRow
 }
 
 // planRel is one relation in a SELECT plan: the table name (looked up in the store at exec), the
@@ -17033,7 +17033,7 @@ type srfPlan struct {
 	args []*rExpr
 	// recordCols is the declared output columns for a record-returning SRF (srfJSONRecord[set]) — the
 	// C0 col-def list, used to map JSON members to columns by name + coerce. nil for every other kind.
-	recordCols []Column
+	recordCols []catColumn
 	// jsonTable is the resolved column tree for a JSON_TABLE SRF (srfJsonTable), else nil.
 	jsonTable *jtPlan
 }
@@ -17062,23 +17062,23 @@ type jtColOrdinality struct {
 // JSON_QUERY (json/jsonb) semantics, coerce to `returning`, and write it to flat index `idx`.
 type jtColRegular struct {
 	idx       int
-	returning ScalarType
-	decimal   *DecimalTypmod
+	returning scalarType
+	decimal   *decimalTypmod
 	path      string
 	// query selects JSON_QUERY semantics (json/jsonb returning) vs JSON_VALUE (scalar).
 	query   bool
-	wrapper JsonWrapper
-	onEmpty JsonOnBehavior
-	onError JsonOnBehavior
+	wrapper jsonWrapper
+	onEmpty jsonOnBehavior
+	onError jsonOnBehavior
 }
 
 // jtColExists is an EXISTS column: JSON_EXISTS of `path`, coerced to `returning` (bool/int), written
 // to flat index `idx`.
 type jtColExists struct {
 	idx       int
-	returning ScalarType
+	returning scalarType
 	path      string
-	onError   JsonOnBehavior
+	onError   jsonOnBehavior
 }
 
 // jtColNested is a NESTED PATH subtree: expanded over the row item (the default-plan LEFT OUTER /
@@ -17096,7 +17096,7 @@ func (*jtColNested) isJtCol()     {}
 // planJoin is one join in a SELECT plan: its kind and resolved ON predicate (nil for CROSS). The
 // right relation is rels[k+1].
 type planJoin struct {
-	kind JoinKind
+	kind joinKind
 	on   *rExpr
 }
 
@@ -17199,7 +17199,7 @@ type selectPlan struct {
 // setOpPlan is a resolved set operation: both operands planned with the same parent scope, the
 // unified output types, and the trailing ORDER BY / LIMIT / OFFSET resolved by output column.
 type setOpPlan struct {
-	op          SetOpKind
+	op          setOpKind
 	all         bool
 	lhs         queryPlan
 	rhs         queryPlan
@@ -17216,13 +17216,13 @@ type setOpPlan struct {
 // a correlated subquery pushes the current row before running its inner plan, so an reOuterColumn
 // at frame `level` reads outer[len(outer)-level][index].
 type evalEnv struct {
-	exec   *Engine
+	exec   *engine
 	params []Value
-	outer  []Row
+	outer  []storedRow
 	// The per-statement entropy+clock state (spec/design/entropy.md §5): the uuidv7 monotonic counter
 	// + the once-resolved statement clock. The injected random/clock functions live on exec.session.seam
 	// (handle-scoped); only the volatile uuid generators touch any of this.
-	rng *StmtRng
+	rng *stmtRng
 	// ctes is the statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at
 	// any nesting depth delivers a CTE's rows. The zero cteCtx for every non-WITH statement.
 	ctes cteCtx
@@ -17317,10 +17317,10 @@ type windowSpec struct {
 // resolvedFrame is a resolved window frame (spec/design/window.md §6). ROWS physical offsets,
 // GROUPS peer-group offsets (both integer counts), and RANGE value offsets over the ordering key.
 type resolvedFrame struct {
-	mode    FrameMode
+	mode    frameMode
 	start   resolvedBound
 	end     resolvedBound
-	exclude FrameExclusion // EXCLUDE … — rows dropped from [lo, hi) per current row (window.md §6)
+	exclude frameExclusion // EXCLUDE … — rows dropped from [lo, hi) per current row (window.md §6)
 }
 
 // resolvedBoundKind distinguishes the five resolved frame-boundary forms.
@@ -17537,7 +17537,7 @@ type objAggPair struct {
 func newAcc(plan aggPlan) *acc {
 	a := &acc{plan: plan}
 	if plan == planSumDecimal || plan == planAvg {
-		a.sumDec = DecimalFromInt64(0)
+		a.sumDec = decimalFromInt64(0)
 	}
 	switch plan {
 	case planSumFloat32, planAvgFloat32:
@@ -17630,7 +17630,7 @@ func (a *acc) clone() *acc {
 // A decimal SUM/AVG fold charges size-scaled decimal_work against the running accumulator
 // (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds are direct Value
 // compares like the sort's and stay unmetered.
-func (a *acc) fold(v Value, m *Meter) error {
+func (a *acc) fold(v Value, m *costMeter) error {
 	switch a.plan {
 	case planCountStar:
 		a.count++
@@ -17642,7 +17642,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 		if !v.IsNull() {
 			s := a.sumInt + v.Int
 			if (v.Int > 0 && s < a.sumInt) || (v.Int < 0 && s > a.sumInt) {
-				return overflowErr(Int64)
+				return overflowErr(scalarInt64)
 			}
 			a.sumInt = s
 			a.seen = true
@@ -17650,7 +17650,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 	case planSumDecimal:
 		if !v.IsNull() {
 			in := toDecimal(v)
-			m.Charge(Costs.DecimalWork * (WorkLinear(a.sumDec, in) - 1))
+			m.Charge(costs.DecimalWork * (workLinear(a.sumDec, in) - 1))
 			if err := m.Guard(); err != nil {
 				return err
 			}
@@ -17663,7 +17663,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 	case planAvg:
 		if !v.IsNull() {
 			in := toDecimal(v)
-			m.Charge(Costs.DecimalWork * (WorkLinear(a.sumDec, in) - 1))
+			m.Charge(costs.DecimalWork * (workLinear(a.sumDec, in) - 1))
 			if err := m.Guard(); err != nil {
 				return err
 			}
@@ -17699,7 +17699,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 		// image is the to_jsonb kernel (deferred 0A000 sources propagate here). One generated_row
 		// per appended element.
 		if !(a.jsonStrict && v.IsNull()) {
-			m.Charge(Costs.GeneratedRow)
+			m.Charge(costs.GeneratedRow)
 			if err := m.Guard(); err != nil {
 				return err
 			}
@@ -17713,7 +17713,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 		// The operand is a Row(key, value) composite; mark the group non-empty (an empty group → NULL,
 		// not `{}`) and split the two fields back out.
 		a.seen = true
-		m.Charge(Costs.GeneratedRow)
+		m.Charge(costs.GeneratedRow)
 		if err := m.Guard(); err != nil {
 			return err
 		}
@@ -17726,7 +17726,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 		// DIFFERENT message from build_object's "key must not be null" (NULL handled here, before
 		// objectKeyText, so the non-NULL coercion + the non-scalar 0A000 still reuse it).
 		if kv.Kind == ValNull {
-			return NewError(InvalidParameterValue, "field name must not be null")
+			return newError(InvalidParameterValue, "field name must not be null")
 		}
 		key, err := objectKeyText(kv, 1)
 		if err != nil {
@@ -17735,7 +17735,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 		if a.objUnique {
 			for i := range a.objPairs {
 				if a.objPairs[i].key == key {
-					return NewError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+					return newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
 				}
 			}
 		}
@@ -17769,7 +17769,7 @@ func (a *acc) fold(v Value, m *Meter) error {
 // add-then-remove is exact and order-independent). Every other accumulator is never un-folded — a
 // moving frame over SUM/AVG/MIN/MAX/float re-folds from scratch instead (decimal scale,
 // intermediate-overflow trap order, and float non-associativity make them unsafe to invert).
-func (a *acc) unfold(v Value, _ *Meter) {
+func (a *acc) unfold(v Value, _ *costMeter) {
 	switch a.plan {
 	case planCountStar:
 		a.count--
@@ -17810,7 +17810,7 @@ func (a *acc) finalize() (Value, error) {
 		}
 		// Div cap-checks its (in-range) result; the over-cap-capable running sum is never
 		// surfaced directly, so AVG matches PG even when SUM would overflow.
-		d, err := a.sumDec.Div(DecimalFromInt64(a.count))
+		d, err := a.sumDec.Div(decimalFromInt64(a.count))
 		if err != nil {
 			return NullValue(), err
 		}
@@ -18020,7 +18020,7 @@ func finalizePercentile(frac *Value, empty bool, compute func(p float64) (Value,
 			}
 			out = append(out, v)
 		}
-		return ArrayValueOf(&ArrayVal{Dims: []int{len(out)}, Lbounds: []int32{1}, Elements: out}), nil
+		return arrayValueOf(&ArrayVal{Dims: []int{len(out)}, Lbounds: []int32{1}, Elements: out}), nil
 	}
 	p, err := fractionToF64(frac)
 	if err != nil {
@@ -18074,7 +18074,7 @@ func intervalMul(span Interval, factor float64) (Interval, error) {
 	)
 	// TSROUND: round to microsecond precision (PG TS_PREC_INV = 1e6). PG rint = ties-to-EVEN.
 	tsround := func(j float64) float64 { return math.RoundToEven(j*usecsPerSecF) / usecsPerSecF }
-	oor := func() error { return NewError(DatetimeFieldOverflow, "interval out of range") }
+	oor := func() error { return newError(DatetimeFieldOverflow, "interval out of range") }
 	// FLOAT8_FITS_IN_INT32/64: x in [INT_MIN, -INT_MIN) — matches Rust's fits_i32/fits_i64.
 	fitsI32 := func(x float64) bool { return x >= float64(math.MinInt32) && x < -float64(math.MinInt32) }
 	fitsI64 := func(x float64) bool { return x >= float64(math.MinInt64) && x < -float64(math.MinInt64) }
@@ -18218,7 +18218,7 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 		if v.Kind != ValText {
 			panic("a collated WITHIN GROUP key buffers only text")
 		}
-		sk, err := SortKey(collation, v.Str)
+		sk, err := sortKey(collation, v.Str)
 		if err != nil {
 			return err
 		}
@@ -18339,7 +18339,7 @@ func compareHypoKey(a, b Value, ks keySort) (int, error) {
 // 1". Called per group at finalize, after the NULL-fraction check.
 func checkPercentileFraction(p float64) error {
 	if math.IsNaN(p) || p < 0 || p > 1 {
-		return NewError(NumericValueOutOfRange, fmt.Sprintf("percentile value %v is not between 0 and 1", p))
+		return newError(NumericValueOutOfRange, fmt.Sprintf("percentile value %v is not between 0 and 1", p))
 	}
 	return nil
 }
@@ -18361,7 +18361,7 @@ func percentileInputF64(v Value) (float64, error) {
 }
 
 // itemsHaveAggregate reports whether any select item contains an aggregate call.
-func itemsHaveAggregate(items SelectItems) bool {
+func itemsHaveAggregate(items selectItems) bool {
 	if items.All {
 		return false
 	}
@@ -18378,7 +18378,7 @@ func itemsHaveAggregate(items SelectItems) bool {
 // query an aggregate query (a whole-table aggregate if there is no GROUP BY), exactly as a top-level
 // aggregate would, so the window keys resolve against the grouped row. Used by both the inline-over
 // walk in exprHasAggregate and the WINDOW-clause scan that computes isAgg.
-func windowDefHasAggregate(wd *WindowDef) bool {
+func windowDefHasAggregate(wd *windowDef) bool {
 	for _, p := range wd.Partition {
 		if exprHasAggregate(p) {
 			return true
@@ -18396,7 +18396,7 @@ func windowDefHasAggregate(wd *WindowDef) bool {
 // AS (ORDER BY sum(x))`), which — like a top-level aggregate — makes the query an aggregate query
 // (spec/design/window.md §5.1). The entries are still named references at this point (the OVER-name
 // desugar runs later), so the WINDOW clause is scanned directly.
-func windowsHaveAggregate(windows []NamedWindow) bool {
+func windowsHaveAggregate(windows []namedWindow) bool {
 	for i := range windows {
 		if windowDefHasAggregate(&windows[i].Def) {
 			return true
@@ -18410,8 +18410,8 @@ func windowsHaveAggregate(windows []NamedWindow) bool {
 // + CHECK-structure walks.
 func isAggregateName(name string) bool {
 	lname := toLowerASCII(name)
-	for i := range Aggregates {
-		if toLowerASCII(Aggregates[i].Surface) == lname {
+	for i := range aggregates {
+		if toLowerASCII(aggregates[i].Surface) == lname {
 			return true
 		}
 	}
@@ -18471,8 +18471,8 @@ func objectAggClassify(name string) (aggPlan, bool) {
 // functions but are not in Windows, so they are still valid without OVER.
 func isWindowOnlyName(name string) bool {
 	lname := toLowerASCII(name)
-	for i := range Windows {
-		if toLowerASCII(Windows[i].Surface) == lname {
+	for i := range windows {
+		if toLowerASCII(windows[i].Surface) == lname {
 			return true
 		}
 	}
@@ -18481,11 +18481,11 @@ func isWindowOnlyName(name string) bool {
 
 // subscriptSpecExprs returns the sub-expressions of one AST subscript spec (an index, or a slice's
 // present bounds) — for the Expr tree walkers (spec/design/array.md §6).
-func subscriptSpecExprs(s SubscriptSpec) []*Expr {
+func subscriptSpecExprs(s subscriptSpec) []*exprNode {
 	if !s.IsSlice {
-		return []*Expr{s.Index}
+		return []*exprNode{s.Index}
 	}
-	var out []*Expr
+	var out []*exprNode
 	if s.Lower != nil {
 		out = append(out, s.Lower)
 	}
@@ -18498,9 +18498,9 @@ func subscriptSpecExprs(s SubscriptSpec) []*Expr {
 // exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
 // scalar-function call is not itself an aggregate but may CONTAIN one (abs(sum(x))), so its
 // arguments are walked.
-func exprHasAggregate(e Expr) bool {
+func exprHasAggregate(e exprNode) bool {
 	switch e.Kind {
-	case ExprFuncCall:
+	case exprFuncCall:
 		// An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW
 		// function, not a bare aggregate (so a `sum(x) OVER ()` / `sum(x) OVER w` query is a window
 		// query, not an aggregate query). Mirrors Rust: (over.is_none() && over_name.is_none() &&
@@ -18526,31 +18526,31 @@ func exprHasAggregate(e Expr) bool {
 			return true
 		}
 		return false
-	case ExprCast:
+	case exprCast:
 		return exprHasAggregate(e.Cast.Inner)
-	case ExprExtract:
+	case exprExtract:
 		return exprHasAggregate(e.Extract.Source)
-	case ExprCollate:
+	case exprCollate:
 		return exprHasAggregate(e.Collate.Inner)
-	case ExprUnary:
+	case exprUnary:
 		return exprHasAggregate(e.Unary.Operand)
-	case ExprIsNull:
+	case exprIsNull:
 		return exprHasAggregate(e.IsNullOf.Operand)
-	case ExprIsJson:
+	case exprIsJson:
 		return exprHasAggregate(e.IsJsonOf.Operand)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		return exprHasAggregate(e.JsonCtorOf.Operand)
-	case ExprJsonExists:
+	case exprJsonExists:
 		return exprHasAggregate(e.JsonExists.Ctx) || exprHasAggregate(e.JsonExists.Path)
-	case ExprJsonValue:
+	case exprJsonValue:
 		return exprHasAggregate(e.JsonValue.Ctx) || exprHasAggregate(e.JsonValue.Path)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		return exprHasAggregate(e.JsonQuery.Ctx) || exprHasAggregate(e.JsonQuery.Path)
-	case ExprBinary:
+	case exprBinary:
 		return exprHasAggregate(e.Binary.Lhs) || exprHasAggregate(e.Binary.Rhs)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		return exprHasAggregate(e.IsDistinct.Lhs) || exprHasAggregate(e.IsDistinct.Rhs)
-	case ExprIn:
+	case exprIn:
 		if exprHasAggregate(e.In.Lhs) {
 			return true
 		}
@@ -18560,13 +18560,13 @@ func exprHasAggregate(e Expr) bool {
 			}
 		}
 		return false
-	case ExprBetween:
+	case exprBetween:
 		return exprHasAggregate(e.Between.Lhs) || exprHasAggregate(e.Between.Lo) || exprHasAggregate(e.Between.Hi)
-	case ExprLike:
+	case exprLike:
 		return exprHasAggregate(e.Like.Lhs) || exprHasAggregate(e.Like.Rhs)
-	case ExprRegex:
+	case exprRegex:
 		return exprHasAggregate(e.Regex.Lhs) || exprHasAggregate(e.Regex.Rhs)
-	case ExprCase:
+	case exprCase:
 		if e.Case.Operand != nil && exprHasAggregate(*e.Case.Operand) {
 			return true
 		}
@@ -18576,13 +18576,13 @@ func exprHasAggregate(e Expr) bool {
 			}
 		}
 		return e.Case.Els != nil && exprHasAggregate(*e.Case.Els)
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		// Field selection `(expr).field` / `(expr).*` recurses into the composite base
 		// (spec/design/composite.md §S4) — an aggregate hidden in the base must surface.
 		return exprHasAggregate(*e.Base)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return false // `t.*` is a leaf relation reference — no aggregate
-	case ExprSubscript:
+	case exprSubscript:
 		// `base[..]` — an aggregate hidden in the base array or any subscript bound must surface.
 		if exprHasAggregate(*e.Base) {
 			return true
@@ -18595,7 +18595,7 @@ func exprHasAggregate(e Expr) bool {
 			}
 		}
 		return false
-	case ExprRow, ExprArray:
+	case exprRow, exprArray:
 		// A ROW(...) / ARRAY[...] constructor recurses into its element expressions.
 		for _, it := range e.RowItems {
 			if exprHasAggregate(it) {
@@ -18603,7 +18603,7 @@ func exprHasAggregate(e Expr) bool {
 			}
 		}
 		return false
-	case ExprQuantified:
+	case exprQuantified:
 		return exprHasAggregate(e.Quantified.Lhs) || exprHasAggregate(e.Quantified.Array)
 	default:
 		return false
@@ -18612,7 +18612,7 @@ func exprHasAggregate(e Expr) bool {
 
 // itemsHaveWindow reports whether any select item contains a window-function call (a FuncCall
 // carrying OVER). A window query resolves its projection in window mode (spec/design/window.md §5.1).
-func itemsHaveWindow(items SelectItems) bool {
+func itemsHaveWindow(items selectItems) bool {
 	if items.All {
 		return false
 	}
@@ -18627,7 +18627,7 @@ func itemsHaveWindow(items SelectItems) bool {
 // orderByHasWindow reports whether any ORDER BY key is (or contains) a window function, so a query
 // whose only OVER call sits in the ORDER BY still sets up the window machinery (grammar.md §10,
 // window.md §5.1). An ordinal/column key carries no expression.
-func orderByHasWindow(keys []OrderKey) bool {
+func orderByHasWindow(keys []orderKey) bool {
 	for _, k := range keys {
 		if k.Expr != nil && exprHasWindow(*k.Expr) {
 			return true
@@ -18641,9 +18641,9 @@ func orderByHasWindow(keys []OrderKey) bool {
 // (abs(row_number() OVER ())), so the arguments are walked; a window call's own PARTITION BY /
 // ORDER BY may not contain a window function (rejected at resolve, 42P20), so they are not walked
 // here. A subquery is an independent query: a window function inside it is the subquery's own.
-func exprHasWindow(e Expr) bool {
+func exprHasWindow(e exprNode) bool {
 	switch e.Kind {
-	case ExprFuncCall:
+	case exprFuncCall:
 		if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
 			return true
 		}
@@ -18653,31 +18653,31 @@ func exprHasWindow(e Expr) bool {
 			}
 		}
 		return false
-	case ExprCast:
+	case exprCast:
 		return exprHasWindow(e.Cast.Inner)
-	case ExprExtract:
+	case exprExtract:
 		return exprHasWindow(e.Extract.Source)
-	case ExprCollate:
+	case exprCollate:
 		return exprHasWindow(e.Collate.Inner)
-	case ExprUnary:
+	case exprUnary:
 		return exprHasWindow(e.Unary.Operand)
-	case ExprIsNull:
+	case exprIsNull:
 		return exprHasWindow(e.IsNullOf.Operand)
-	case ExprIsJson:
+	case exprIsJson:
 		return exprHasWindow(e.IsJsonOf.Operand)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		return exprHasWindow(e.JsonCtorOf.Operand)
-	case ExprJsonExists:
+	case exprJsonExists:
 		return exprHasWindow(e.JsonExists.Ctx) || exprHasWindow(e.JsonExists.Path)
-	case ExprJsonValue:
+	case exprJsonValue:
 		return exprHasWindow(e.JsonValue.Ctx) || exprHasWindow(e.JsonValue.Path)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		return exprHasWindow(e.JsonQuery.Ctx) || exprHasWindow(e.JsonQuery.Path)
-	case ExprBinary:
+	case exprBinary:
 		return exprHasWindow(e.Binary.Lhs) || exprHasWindow(e.Binary.Rhs)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		return exprHasWindow(e.IsDistinct.Lhs) || exprHasWindow(e.IsDistinct.Rhs)
-	case ExprIn:
+	case exprIn:
 		if exprHasWindow(e.In.Lhs) {
 			return true
 		}
@@ -18687,13 +18687,13 @@ func exprHasWindow(e Expr) bool {
 			}
 		}
 		return false
-	case ExprBetween:
+	case exprBetween:
 		return exprHasWindow(e.Between.Lhs) || exprHasWindow(e.Between.Lo) || exprHasWindow(e.Between.Hi)
-	case ExprLike:
+	case exprLike:
 		return exprHasWindow(e.Like.Lhs) || exprHasWindow(e.Like.Rhs)
-	case ExprRegex:
+	case exprRegex:
 		return exprHasWindow(e.Regex.Lhs) || exprHasWindow(e.Regex.Rhs)
-	case ExprCase:
+	case exprCase:
 		if e.Case.Operand != nil && exprHasWindow(*e.Case.Operand) {
 			return true
 		}
@@ -18703,12 +18703,12 @@ func exprHasWindow(e Expr) bool {
 			}
 		}
 		return e.Case.Els != nil && exprHasWindow(*e.Case.Els)
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		return exprHasWindow(*e.Base)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return false // `t.*` is a leaf relation reference — no window function
 
-	case ExprSubscript:
+	case exprSubscript:
 		if exprHasWindow(*e.Base) {
 			return true
 		}
@@ -18720,14 +18720,14 @@ func exprHasWindow(e Expr) bool {
 			}
 		}
 		return false
-	case ExprRow, ExprArray:
+	case exprRow, exprArray:
 		for _, it := range e.RowItems {
 			if exprHasWindow(it) {
 				return true
 			}
 		}
 		return false
-	case ExprQuantified:
+	case exprQuantified:
 		return exprHasWindow(e.Quantified.Lhs) || exprHasWindow(e.Quantified.Array)
 	default:
 		return false
@@ -18741,21 +18741,21 @@ func exprHasWindow(e Expr) bool {
 // none (42P20 otherwise), and the base must not carry a frame (42P20). The three checks fire in
 // PostgreSQL's priority order: PARTITION, then ORDER, then frame. Returns the merged inline
 // definition (Base == "").
-func extendWindow(base, ext WindowDef, baseName string) (WindowDef, error) {
+func extendWindow(base, ext windowDef, baseName string) (windowDef, error) {
 	if len(ext.Partition) > 0 {
-		return WindowDef{}, NewError(WindowingError, fmt.Sprintf("cannot override PARTITION BY clause of window %q", baseName))
+		return windowDef{}, newError(WindowingError, fmt.Sprintf("cannot override PARTITION BY clause of window %q", baseName))
 	}
 	if len(base.Order) > 0 && len(ext.Order) > 0 {
-		return WindowDef{}, NewError(WindowingError, fmt.Sprintf("cannot override ORDER BY clause of window %q", baseName))
+		return windowDef{}, newError(WindowingError, fmt.Sprintf("cannot override ORDER BY clause of window %q", baseName))
 	}
 	if base.Frame != nil {
-		return WindowDef{}, NewError(WindowingError, fmt.Sprintf("cannot copy window %q because it has a frame clause", baseName))
+		return windowDef{}, newError(WindowingError, fmt.Sprintf("cannot copy window %q because it has a frame clause", baseName))
 	}
 	order := ext.Order
 	if len(base.Order) > 0 {
 		order = base.Order
 	}
-	return WindowDef{Base: "", Partition: base.Partition, Order: order, Frame: ext.Frame}, nil
+	return windowDef{Base: "", Partition: base.Partition, Order: order, Frame: ext.Frame}, nil
 }
 
 // resolveWindowClause resolves a WINDOW clause into all-inline definitions (spec/design/window.md
@@ -18763,8 +18763,8 @@ func extendWindow(base, ext WindowDef, baseName string) (WindowDef, error) {
 // earlier entry (a self- or forward-reference is therefore "does not exist" — 42704), via
 // extendWindow. Every entry is resolved — even ones no OVER references — matching PostgreSQL's
 // whole-clause check.
-func resolveWindowClause(windows []NamedWindow) ([]NamedWindow, error) {
-	resolved := make([]NamedWindow, 0, len(windows))
+func resolveWindowClause(windows []namedWindow) ([]namedWindow, error) {
+	resolved := make([]namedWindow, 0, len(windows))
 	for _, nw := range windows {
 		r := nw.Def
 		if nw.Def.Base != "" {
@@ -18777,20 +18777,20 @@ func resolveWindowClause(windows []NamedWindow) ([]NamedWindow, error) {
 				return nil, err
 			}
 		}
-		resolved = append(resolved, NamedWindow{Name: nw.Name, Def: r})
+		resolved = append(resolved, namedWindow{Name: nw.Name, Def: r})
 	}
 	return resolved, nil
 }
 
 // lookupWindow finds a (resolved, Base == "") window definition by name in windows,
 // case-insensitively, or raises 42704 `window "<name>" does not exist`.
-func lookupWindow(windows []NamedWindow, name string) (WindowDef, error) {
+func lookupWindow(windows []namedWindow, name string) (windowDef, error) {
 	for i := range windows {
 		if strings.EqualFold(windows[i].Name, name) {
 			return windows[i].Def, nil
 		}
 	}
-	return WindowDef{}, NewError(UndefinedObject, fmt.Sprintf("window %q does not exist", name))
+	return windowDef{}, newError(UndefinedObject, fmt.Sprintf("window %q does not exist", name))
 }
 
 // desugarItems desugars `OVER name` / `OVER (base …)` references in a select list to their
@@ -18800,17 +18800,17 @@ func lookupWindow(windows []NamedWindow, name string) (WindowDef, error) {
 // Over (Base == ""), so resolution (S0–S4) handles named and inline windows uniformly. Returns a
 // fresh SelectItems (the original AST is not mutated — the FuncCall pointers along each rewritten
 // path are freshly allocated).
-func desugarItems(items SelectItems, windows []NamedWindow) (SelectItems, error) {
+func desugarItems(items selectItems, windows []namedWindow) (selectItems, error) {
 	if items.All {
 		return items, nil
 	}
-	out := SelectItems{Items: make([]SelectItem, len(items.Items))}
+	out := selectItems{Items: make([]selectItem, len(items.Items))}
 	for i, it := range items.Items {
 		e, err := desugarNamedWindows(it.Expr, windows)
 		if err != nil {
-			return SelectItems{}, err
+			return selectItems{}, err
 		}
-		out.Items[i] = SelectItem{Expr: e, Alias: it.Alias}
+		out.Items[i] = selectItem{Expr: e, Alias: it.Alias}
 	}
 	return out, nil
 }
@@ -18821,16 +18821,16 @@ func desugarItems(items SelectItems, windows []NamedWindow) (SelectItems, error)
 // the other arms recurse into their sub-expressions; leaves, subscripts, and subqueries (independent)
 // carry no top-level window ref to rewrite. The walk returns a fresh Expr so the original AST stays
 // unmutated.
-func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
+func desugarNamedWindows(e exprNode, windows []namedWindow) (exprNode, error) {
 	switch e.Kind {
-	case ExprFuncCall:
+	case exprFuncCall:
 		fc := *e.FuncCall // shallow copy; we replace Args/Over/OverName below
 		if fc.OverName != "" {
 			// `OVER name` — a pure reference: copy the named definition whole, frame included (no
 			// merge rules; copying a framed window is forbidden only for the extend form below — §5).
 			def, err := lookupWindow(windows, fc.OverName)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			fc.Over = &def
 			fc.OverName = ""
@@ -18838,20 +18838,20 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 			// `OVER (base …)` — an extend: merge the inline definition onto the named base.
 			base, err := lookupWindow(windows, fc.Over.Base)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			merged, err := extendWindow(base, *fc.Over, fc.Over.Base)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			fc.Over = &merged
 		}
 		if len(fc.Args) > 0 {
-			args := make([]*Expr, len(fc.Args))
+			args := make([]*exprNode, len(fc.Args))
 			for i, a := range fc.Args {
 				na, err := desugarNamedWindows(*a, windows)
 				if err != nil {
-					return Expr{}, err
+					return exprNode{}, err
 				}
 				args[i] = &na
 			}
@@ -18860,84 +18860,84 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.FuncCall = &fc
 		return ne, nil
-	case ExprCast:
+	case exprCast:
 		inner, err := desugarNamedWindows(e.Cast.Inner, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nc := *e.Cast
 		nc.Inner = inner
 		ne := e
 		ne.Cast = &nc
 		return ne, nil
-	case ExprExtract:
+	case exprExtract:
 		src, err := desugarNamedWindows(e.Extract.Source, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nx := *e.Extract
 		nx.Source = src
 		ne := e
 		ne.Extract = &nx
 		return ne, nil
-	case ExprCollate:
+	case exprCollate:
 		inner, err := desugarNamedWindows(e.Collate.Inner, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nc := *e.Collate
 		nc.Inner = inner
 		ne := e
 		ne.Collate = &nc
 		return ne, nil
-	case ExprUnary:
+	case exprUnary:
 		op, err := desugarNamedWindows(e.Unary.Operand, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nu := *e.Unary
 		nu.Operand = op
 		ne := e
 		ne.Unary = &nu
 		return ne, nil
-	case ExprIsNull:
+	case exprIsNull:
 		op, err := desugarNamedWindows(e.IsNullOf.Operand, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		ni := *e.IsNullOf
 		ni.Operand = op
 		ne := e
 		ne.IsNullOf = &ni
 		return ne, nil
-	case ExprIsJson:
+	case exprIsJson:
 		op, err := desugarNamedWindows(e.IsJsonOf.Operand, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		ni := *e.IsJsonOf
 		ni.Operand = op
 		ne := e
 		ne.IsJsonOf = &ni
 		return ne, nil
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		op, err := desugarNamedWindows(e.JsonCtorOf.Operand, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		ni := *e.JsonCtorOf
 		ni.Operand = op
 		ne := e
 		ne.JsonCtorOf = &ni
 		return ne, nil
-	case ExprJsonExists:
+	case exprJsonExists:
 		ctx, err := desugarNamedWindows(e.JsonExists.Ctx, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		path, err := desugarNamedWindows(e.JsonExists.Path, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nj := *e.JsonExists
 		nj.Ctx = ctx
@@ -18945,14 +18945,14 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.JsonExists = &nj
 		return ne, nil
-	case ExprJsonValue:
+	case exprJsonValue:
 		ctx, err := desugarNamedWindows(e.JsonValue.Ctx, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		path, err := desugarNamedWindows(e.JsonValue.Path, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nj := *e.JsonValue
 		nj.Ctx = ctx
@@ -18960,14 +18960,14 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.JsonValue = &nj
 		return ne, nil
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		ctx, err := desugarNamedWindows(e.JsonQuery.Ctx, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		path, err := desugarNamedWindows(e.JsonQuery.Path, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nj := *e.JsonQuery
 		nj.Ctx = ctx
@@ -18975,14 +18975,14 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.JsonQuery = &nj
 		return ne, nil
-	case ExprBinary:
+	case exprBinary:
 		lhs, err := desugarNamedWindows(e.Binary.Lhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		rhs, err := desugarNamedWindows(e.Binary.Rhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nb := *e.Binary
 		nb.Lhs = lhs
@@ -18990,14 +18990,14 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.Binary = &nb
 		return ne, nil
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		lhs, err := desugarNamedWindows(e.IsDistinct.Lhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		rhs, err := desugarNamedWindows(e.IsDistinct.Rhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nd := *e.IsDistinct
 		nd.Lhs = lhs
@@ -19005,16 +19005,16 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.IsDistinct = &nd
 		return ne, nil
-	case ExprIn:
+	case exprIn:
 		lhs, err := desugarNamedWindows(e.In.Lhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		list := make([]Expr, len(e.In.List))
+		list := make([]exprNode, len(e.In.List))
 		for i, x := range e.In.List {
 			nx, err := desugarNamedWindows(x, windows)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			list[i] = nx
 		}
@@ -19024,14 +19024,14 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.In = &nin
 		return ne, nil
-	case ExprQuantified:
+	case exprQuantified:
 		lhs, err := desugarNamedWindows(e.Quantified.Lhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		arr, err := desugarNamedWindows(e.Quantified.Array, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nq := *e.Quantified
 		nq.Lhs = lhs
@@ -19039,18 +19039,18 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.Quantified = &nq
 		return ne, nil
-	case ExprBetween:
+	case exprBetween:
 		lhs, err := desugarNamedWindows(e.Between.Lhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		lo, err := desugarNamedWindows(e.Between.Lo, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		hi, err := desugarNamedWindows(e.Between.Hi, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nbt := *e.Between
 		nbt.Lhs = lhs
@@ -19059,14 +19059,14 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.Between = &nbt
 		return ne, nil
-	case ExprLike:
+	case exprLike:
 		lhs, err := desugarNamedWindows(e.Like.Lhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		rhs, err := desugarNamedWindows(e.Like.Rhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nl := *e.Like
 		nl.Lhs = lhs
@@ -19074,14 +19074,14 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.Like = &nl
 		return ne, nil
-	case ExprRegex:
+	case exprRegex:
 		lhs, err := desugarNamedWindows(e.Regex.Lhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		rhs, err := desugarNamedWindows(e.Regex.Rhs, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		nr := *e.Regex
 		nr.Lhs = lhs
@@ -19089,54 +19089,54 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.Regex = &nr
 		return ne, nil
-	case ExprRow, ExprArray:
-		items := make([]Expr, len(e.RowItems))
+	case exprRow, exprArray:
+		items := make([]exprNode, len(e.RowItems))
 		for i, x := range e.RowItems {
 			nx, err := desugarNamedWindows(x, windows)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			items[i] = nx
 		}
 		ne := e
 		ne.RowItems = items
 		return ne, nil
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return e, nil // a leaf relation reference — no named window to desugar
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		base, err := desugarNamedWindows(*e.Base, windows)
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		ne := e
 		ne.Base = &base
 		return ne, nil
-	case ExprCase:
+	case exprCase:
 		nc := *e.Case
 		if e.Case.Operand != nil {
 			op, err := desugarNamedWindows(*e.Case.Operand, windows)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			nc.Operand = &op
 		}
-		whens := make([]CaseWhen, len(e.Case.Whens))
+		whens := make([]caseWhen, len(e.Case.Whens))
 		for i, w := range e.Case.Whens {
 			cond, err := desugarNamedWindows(w.Cond, windows)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			res, err := desugarNamedWindows(w.Result, windows)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			whens[i] = CaseWhen{Cond: cond, Result: res}
+			whens[i] = caseWhen{Cond: cond, Result: res}
 		}
 		nc.Whens = whens
 		if e.Case.Els != nil {
 			els, err := desugarNamedWindows(*e.Case.Els, windows)
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			nc.Els = &els
 		}
@@ -19154,16 +19154,16 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 // resolution: a subquery is 0A000, an aggregate call 42803, a bind parameter 42P02 — PG's
 // codes and messages (oracle-probed; PG interleaves these with resolution in parse order,
 // a documented micro-order divergence).
-func rejectCheckStructure(e Expr) error {
+func rejectCheckStructure(e exprNode) error {
 	switch e.Kind {
-	case ExprScalarSubquery, ExprExists, ExprInSubquery, ExprQuantifiedSubquery:
-		return NewError(FeatureNotSupported, "cannot use subquery in check constraint")
-	case ExprParam:
-		return NewError(UndefinedParameter,
+	case exprScalarSubquery, exprExists, exprInSubquery, exprQuantifiedSubquery:
+		return newError(FeatureNotSupported, "cannot use subquery in check constraint")
+	case exprParam:
+		return newError(UndefinedParameter,
 			"there is no parameter $"+strconv.FormatUint(e.Param, 10))
-	case ExprFuncCall:
+	case exprFuncCall:
 		if isAggregateName(e.FuncCall.Name) {
-			return NewError(GroupingError,
+			return newError(GroupingError,
 				"aggregate functions are not allowed in check constraints")
 		}
 		for _, a := range e.FuncCall.Args {
@@ -19172,56 +19172,56 @@ func rejectCheckStructure(e Expr) error {
 			}
 		}
 		return nil
-	case ExprCast:
+	case exprCast:
 		return rejectCheckStructure(e.Cast.Inner)
-	case ExprExtract:
+	case exprExtract:
 		return rejectCheckStructure(e.Extract.Source)
-	case ExprCollate:
+	case exprCollate:
 		return rejectCheckStructure(e.Collate.Inner)
-	case ExprUnary:
+	case exprUnary:
 		return rejectCheckStructure(e.Unary.Operand)
-	case ExprIsNull:
+	case exprIsNull:
 		return rejectCheckStructure(e.IsNullOf.Operand)
-	case ExprIsJson:
+	case exprIsJson:
 		return rejectCheckStructure(e.IsJsonOf.Operand)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		return rejectCheckStructure(e.JsonCtorOf.Operand)
-	case ExprJsonExists:
+	case exprJsonExists:
 		if err := rejectCheckStructure(e.JsonExists.Ctx); err != nil {
 			return err
 		}
 		return rejectCheckStructure(e.JsonExists.Path)
-	case ExprJsonValue:
+	case exprJsonValue:
 		if err := rejectCheckStructure(e.JsonValue.Ctx); err != nil {
 			return err
 		}
 		return rejectCheckStructure(e.JsonValue.Path)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		if err := rejectCheckStructure(e.JsonQuery.Ctx); err != nil {
 			return err
 		}
 		return rejectCheckStructure(e.JsonQuery.Path)
-	case ExprBinary:
+	case exprBinary:
 		if err := rejectCheckStructure(e.Binary.Lhs); err != nil {
 			return err
 		}
 		return rejectCheckStructure(e.Binary.Rhs)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		if err := rejectCheckStructure(e.IsDistinct.Lhs); err != nil {
 			return err
 		}
 		return rejectCheckStructure(e.IsDistinct.Rhs)
-	case ExprLike:
+	case exprLike:
 		if err := rejectCheckStructure(e.Like.Lhs); err != nil {
 			return err
 		}
 		return rejectCheckStructure(e.Like.Rhs)
-	case ExprRegex:
+	case exprRegex:
 		if err := rejectCheckStructure(e.Regex.Lhs); err != nil {
 			return err
 		}
 		return rejectCheckStructure(e.Regex.Rhs)
-	case ExprIn:
+	case exprIn:
 		if err := rejectCheckStructure(e.In.Lhs); err != nil {
 			return err
 		}
@@ -19231,7 +19231,7 @@ func rejectCheckStructure(e Expr) error {
 			}
 		}
 		return nil
-	case ExprBetween:
+	case exprBetween:
 		if err := rejectCheckStructure(e.Between.Lhs); err != nil {
 			return err
 		}
@@ -19239,7 +19239,7 @@ func rejectCheckStructure(e Expr) error {
 			return err
 		}
 		return rejectCheckStructure(e.Between.Hi)
-	case ExprCase:
+	case exprCase:
 		if e.Case.Operand != nil {
 			if err := rejectCheckStructure(*e.Case.Operand); err != nil {
 				return err
@@ -19257,13 +19257,13 @@ func rejectCheckStructure(e Expr) error {
 			return rejectCheckStructure(*e.Case.Els)
 		}
 		return nil
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		// Recurse into the composite base (spec/design/composite.md §S4) so a forbidden
 		// subquery/aggregate/parameter hidden there is still rejected.
 		return rejectCheckStructure(*e.Base)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return nil // cannot syntactically reach a CHECK (select-item-only); accept structurally
-	case ExprSubscript:
+	case exprSubscript:
 		// Recurse into the array base and every subscript bound.
 		if err := rejectCheckStructure(*e.Base); err != nil {
 			return err
@@ -19276,7 +19276,7 @@ func rejectCheckStructure(e Expr) error {
 			}
 		}
 		return nil
-	case ExprQuantified:
+	case exprQuantified:
 		if err := rejectCheckStructure(e.Quantified.Lhs); err != nil {
 			return err
 		}
@@ -19291,18 +19291,18 @@ func rejectCheckStructure(e Expr) error {
 // rejectCheckStructure carries). A default extends the CHECK rejections with one more: it may
 // NOT reference a column (it is computed before the row exists). Codes match PostgreSQL
 // (oracle-probed): a column reference / subquery is 0A000, an aggregate 42803, a parameter 42P02.
-func rejectDefaultStructure(e Expr) error {
+func rejectDefaultStructure(e exprNode) error {
 	switch e.Kind {
-	case ExprColumn, ExprQualifiedColumn:
-		return NewError(FeatureNotSupported, "cannot use column reference in DEFAULT expression")
-	case ExprScalarSubquery, ExprExists, ExprInSubquery, ExprQuantifiedSubquery:
-		return NewError(FeatureNotSupported, "cannot use subquery in DEFAULT expression")
-	case ExprParam:
-		return NewError(UndefinedParameter,
+	case exprColumn, exprQualifiedColumn:
+		return newError(FeatureNotSupported, "cannot use column reference in DEFAULT expression")
+	case exprScalarSubquery, exprExists, exprInSubquery, exprQuantifiedSubquery:
+		return newError(FeatureNotSupported, "cannot use subquery in DEFAULT expression")
+	case exprParam:
+		return newError(UndefinedParameter,
 			"there is no parameter $"+strconv.FormatUint(e.Param, 10))
-	case ExprFuncCall:
+	case exprFuncCall:
 		if isAggregateName(e.FuncCall.Name) {
-			return NewError(GroupingError,
+			return newError(GroupingError,
 				"aggregate functions are not allowed in DEFAULT expressions")
 		}
 		for _, a := range e.FuncCall.Args {
@@ -19311,56 +19311,56 @@ func rejectDefaultStructure(e Expr) error {
 			}
 		}
 		return nil
-	case ExprCast:
+	case exprCast:
 		return rejectDefaultStructure(e.Cast.Inner)
-	case ExprExtract:
+	case exprExtract:
 		return rejectDefaultStructure(e.Extract.Source)
-	case ExprCollate:
+	case exprCollate:
 		return rejectDefaultStructure(e.Collate.Inner)
-	case ExprUnary:
+	case exprUnary:
 		return rejectDefaultStructure(e.Unary.Operand)
-	case ExprIsNull:
+	case exprIsNull:
 		return rejectDefaultStructure(e.IsNullOf.Operand)
-	case ExprIsJson:
+	case exprIsJson:
 		return rejectDefaultStructure(e.IsJsonOf.Operand)
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		return rejectDefaultStructure(e.JsonCtorOf.Operand)
-	case ExprJsonExists:
+	case exprJsonExists:
 		if err := rejectDefaultStructure(e.JsonExists.Ctx); err != nil {
 			return err
 		}
 		return rejectDefaultStructure(e.JsonExists.Path)
-	case ExprJsonValue:
+	case exprJsonValue:
 		if err := rejectDefaultStructure(e.JsonValue.Ctx); err != nil {
 			return err
 		}
 		return rejectDefaultStructure(e.JsonValue.Path)
-	case ExprJsonQuery:
+	case exprJsonQuery:
 		if err := rejectDefaultStructure(e.JsonQuery.Ctx); err != nil {
 			return err
 		}
 		return rejectDefaultStructure(e.JsonQuery.Path)
-	case ExprBinary:
+	case exprBinary:
 		if err := rejectDefaultStructure(e.Binary.Lhs); err != nil {
 			return err
 		}
 		return rejectDefaultStructure(e.Binary.Rhs)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		if err := rejectDefaultStructure(e.IsDistinct.Lhs); err != nil {
 			return err
 		}
 		return rejectDefaultStructure(e.IsDistinct.Rhs)
-	case ExprLike:
+	case exprLike:
 		if err := rejectDefaultStructure(e.Like.Lhs); err != nil {
 			return err
 		}
 		return rejectDefaultStructure(e.Like.Rhs)
-	case ExprRegex:
+	case exprRegex:
 		if err := rejectDefaultStructure(e.Regex.Lhs); err != nil {
 			return err
 		}
 		return rejectDefaultStructure(e.Regex.Rhs)
-	case ExprIn:
+	case exprIn:
 		if err := rejectDefaultStructure(e.In.Lhs); err != nil {
 			return err
 		}
@@ -19370,7 +19370,7 @@ func rejectDefaultStructure(e Expr) error {
 			}
 		}
 		return nil
-	case ExprBetween:
+	case exprBetween:
 		if err := rejectDefaultStructure(e.Between.Lhs); err != nil {
 			return err
 		}
@@ -19378,7 +19378,7 @@ func rejectDefaultStructure(e Expr) error {
 			return err
 		}
 		return rejectDefaultStructure(e.Between.Hi)
-	case ExprCase:
+	case exprCase:
 		if e.Case.Operand != nil {
 			if err := rejectDefaultStructure(*e.Case.Operand); err != nil {
 				return err
@@ -19396,12 +19396,12 @@ func rejectDefaultStructure(e Expr) error {
 			return rejectDefaultStructure(*e.Case.Els)
 		}
 		return nil
-	case ExprFieldAccess, ExprFieldStar:
+	case exprFieldAccess, exprFieldStar:
 		// Recurse into the composite base (spec/design/composite.md §S4).
 		return rejectDefaultStructure(*e.Base)
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		return nil // cannot syntactically reach a DEFAULT (select-item-only); accept structurally
-	case ExprSubscript:
+	case exprSubscript:
 		// Recurse into the array base and every subscript bound.
 		if err := rejectDefaultStructure(*e.Base); err != nil {
 			return err
@@ -19414,7 +19414,7 @@ func rejectDefaultStructure(e Expr) error {
 			}
 		}
 		return nil
-	case ExprQuantified:
+	case exprQuantified:
 		if err := rejectDefaultStructure(e.Quantified.Lhs); err != nil {
 			return err
 		}
@@ -19429,9 +19429,9 @@ func rejectDefaultStructure(e Expr) error {
 // one distinct column → <table>_<col>_check). Resolution already validated every
 // reference, so an unknown name is simply skipped; a qualified reference counts its column
 // like a bare one (oracle-probed).
-func checkReferencedColumns(e Expr, columns []Column) []int {
+func checkReferencedColumns(e exprNode, columns []catColumn) []int {
 	var out []int
-	var walk func(e Expr)
+	var walk func(e exprNode)
 	note := func(name string) {
 		for i := range columns {
 			if strings.EqualFold(columns[i].Name, name) {
@@ -19442,55 +19442,55 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			}
 		}
 	}
-	walk = func(e Expr) {
+	walk = func(e exprNode) {
 		switch e.Kind {
-		case ExprColumn, ExprQualifiedColumn:
+		case exprColumn, exprQualifiedColumn:
 			note(e.Column)
-		case ExprCast:
+		case exprCast:
 			walk(e.Cast.Inner)
-		case ExprExtract:
+		case exprExtract:
 			walk(e.Extract.Source)
-		case ExprCollate:
+		case exprCollate:
 			walk(e.Collate.Inner)
-		case ExprUnary:
+		case exprUnary:
 			walk(e.Unary.Operand)
-		case ExprIsNull:
+		case exprIsNull:
 			walk(e.IsNullOf.Operand)
-		case ExprIsJson:
+		case exprIsJson:
 			walk(e.IsJsonOf.Operand)
-		case ExprJsonCtor:
+		case exprJsonCtor:
 			walk(e.JsonCtorOf.Operand)
-		case ExprJsonExists:
+		case exprJsonExists:
 			walk(e.JsonExists.Ctx)
 			walk(e.JsonExists.Path)
-		case ExprJsonValue:
+		case exprJsonValue:
 			walk(e.JsonValue.Ctx)
 			walk(e.JsonValue.Path)
-		case ExprJsonQuery:
+		case exprJsonQuery:
 			walk(e.JsonQuery.Ctx)
 			walk(e.JsonQuery.Path)
-		case ExprBinary:
+		case exprBinary:
 			walk(e.Binary.Lhs)
 			walk(e.Binary.Rhs)
-		case ExprIsDistinct:
+		case exprIsDistinct:
 			walk(e.IsDistinct.Lhs)
 			walk(e.IsDistinct.Rhs)
-		case ExprLike:
+		case exprLike:
 			walk(e.Like.Lhs)
 			walk(e.Like.Rhs)
-		case ExprRegex:
+		case exprRegex:
 			walk(e.Regex.Lhs)
 			walk(e.Regex.Rhs)
-		case ExprIn:
+		case exprIn:
 			walk(e.In.Lhs)
 			for _, elem := range e.In.List {
 				walk(elem)
 			}
-		case ExprBetween:
+		case exprBetween:
 			walk(e.Between.Lhs)
 			walk(e.Between.Lo)
 			walk(e.Between.Hi)
-		case ExprCase:
+		case exprCase:
 			if e.Case.Operand != nil {
 				walk(*e.Case.Operand)
 			}
@@ -19501,16 +19501,16 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			if e.Case.Els != nil {
 				walk(*e.Case.Els)
 			}
-		case ExprFuncCall:
+		case exprFuncCall:
 			for _, a := range e.FuncCall.Args {
 				walk(*a)
 			}
-		case ExprFieldAccess, ExprFieldStar:
+		case exprFieldAccess, exprFieldStar:
 			// Field selection recurses into the composite base (spec/design/composite.md §S4).
 			walk(*e.Base)
-		case ExprQualifiedStar:
+		case exprQualifiedStar:
 			// `t.*` cannot appear in a CHECK expression (select-item-only); no columns to note.
-		case ExprSubscript:
+		case exprSubscript:
 			// `base[..]` recurses into the array base and every subscript bound.
 			walk(*e.Base)
 			for _, s := range e.Subscripts {
@@ -19518,7 +19518,7 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 					walk(*x)
 				}
 			}
-		case ExprQuantified:
+		case exprQuantified:
 			walk(e.Quantified.Lhs)
 			walk(e.Quantified.Array)
 		}
@@ -19531,9 +19531,9 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 // aggSpec. Valid only in collect mode; in Forbidden mode (WHERE/ON/nested) it is 42803. The
 // operand resolves in a fresh Forbidden sub-context (a nested aggregate is 42803; its columns
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
-func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if !ag.collecting {
-		return nil, resolvedType{}, NewError(GroupingError, "aggregate functions are not allowed here")
+		return nil, resolvedType{}, newError(GroupingError, "aggregate functions are not allowed here")
 	}
 	name := toLowerASCII(fc.Name)
 	sub := &aggCtx{collecting: false}
@@ -19568,9 +19568,9 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	if fc.Star {
 		// Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
 		if !aggregateHasStar(name) {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
-		plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: Int64}
+		plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: scalarInt64}
 	} else {
 		// One operand, resolved in a fresh Forbidden sub-context. The registry validates the
 		// (surface, operand-family) overload exists (else 42883) and yields its result code; the
@@ -19582,7 +19582,7 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		// An aggregate's argument may not contain a window function (PG 42803 — window.md §7): the
 		// window stage runs AFTER aggregation, so a window result cannot be folded into an aggregate.
 		if exprHasWindow(arg) {
-			return nil, resolvedType{}, NewError(GroupingError, "aggregate function calls cannot contain window function calls")
+			return nil, resolvedType{}, newError(GroupingError, "aggregate function calls cannot contain window function calls")
 		}
 		r, t, err := resolve(s, arg, nil, sub, params)
 		if err != nil {
@@ -19623,13 +19623,13 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 // synthetic-row reference. The WITHIN GROUP key is the aggregate's operand (resolved with aggregates
 // forbidden — a nested aggregate is 42803); the parenthesized Args are the per-group direct argument
 // (the percentile fraction; empty for mode).
-func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if !ag.collecting {
-		return nil, resolvedType{}, NewError(GroupingError, "aggregate functions are not allowed here")
+		return nil, resolvedType{}, newError(GroupingError, "aggregate functions are not allowed here")
 	}
 	// DISTINCT cannot decorate an ordered-set aggregate (PG: a 42601 syntax error).
 	if fc.Distinct {
-		return nil, resolvedType{}, NewError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
+		return nil, resolvedType{}, newError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
 	}
 	name := toLowerASCII(fc.Name)
 	// Exactly one WITHIN GROUP sort key (PG models a second as a missing overload → 42883).
@@ -19641,13 +19641,13 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 	// (a nested aggregate in the order key is 42803, matching PG). A general-expression key
 	// (`ORDER BY a + b`) carries Expr; a bare/qualified column key carries Column (rebuilt here as an
 	// Expr so both paths share one resolve).
-	var keyExpr Expr
+	var keyExpr exprNode
 	if key.Expr != nil {
 		keyExpr = *key.Expr
 	} else if key.Qualifier != "" {
-		keyExpr = Expr{Kind: ExprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
+		keyExpr = exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
 	} else {
-		keyExpr = Expr{Kind: ExprColumn, Column: key.Column}
+		keyExpr = exprNode{Kind: exprColumn, Column: key.Column}
 	}
 	sub := &aggCtx{collecting: false}
 	operand, optype, err := resolve(s, keyExpr, nil, sub, params)
@@ -19751,12 +19751,12 @@ func resolveOrderedSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *
 // group (it may reference grouping columns) and coerced to the key's type. Like the other
 // ordered-set aggregates, OVER is 0A000, DISTINCT is 42601, and it is valid only in a collecting
 // context.
-func resolveHypotheticalSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if !ag.collecting {
-		return nil, resolvedType{}, NewError(GroupingError, "aggregate functions are not allowed here")
+		return nil, resolvedType{}, newError(GroupingError, "aggregate functions are not allowed here")
 	}
 	if fc.Distinct {
-		return nil, resolvedType{}, NewError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
+		return nil, resolvedType{}, newError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
 	}
 	name := toLowerASCII(fc.Name)
 	// The number of hypothetical direct arguments must match the number of ordering columns (PG
@@ -19775,13 +19775,13 @@ func resolveHypotheticalSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, par
 		arg := fc.Args[i]
 		// The WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN (a nested aggregate is
 		// 42803). A general-expression key carries Expr; a bare/qualified column key carries Column.
-		var keyExpr Expr
+		var keyExpr exprNode
 		if key.Expr != nil {
 			keyExpr = *key.Expr
 		} else if key.Qualifier != "" {
-			keyExpr = Expr{Kind: ExprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
+			keyExpr = exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
 		} else {
-			keyExpr = Expr{Kind: ExprColumn, Column: key.Column}
+			keyExpr = exprNode{Kind: exprColumn, Column: key.Column}
 		}
 		sub := &aggCtx{collecting: false}
 		knode, ktype, err := resolve(s, keyExpr, nil, sub, params)
@@ -19816,7 +19816,7 @@ func resolveHypotheticalSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, par
 		}
 		// The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
 		// key's scalar type via the hint. Its type must match the key's family (else 42883).
-		var hint *ScalarType
+		var hint *scalarType
 		if t, err := typeFromResolved(ktype); err == nil && t.Comp == nil && t.Array == nil && t.Range == nil {
 			st := t.Scalar
 			hint = &st
@@ -19853,9 +19853,9 @@ func resolveHypotheticalSetAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, par
 	)
 	switch name {
 	case "rank":
-		plan, result = planHypoRank, resolvedType{kind: rtInt, intTy: Int64}
+		plan, result = planHypoRank, resolvedType{kind: rtInt, intTy: scalarInt64}
 	case "dense_rank":
-		plan, result = planHypoDenseRank, resolvedType{kind: rtInt, intTy: Int64}
+		plan, result = planHypoDenseRank, resolvedType{kind: rtInt, intTy: scalarInt64}
 	case "percent_rank":
 		plan, result = planHypoPercentRank, resolvedType{kind: rtFloat64}
 	case "cume_dist":
@@ -19904,16 +19904,16 @@ func hypoArgCompatible(arg, key resolvedType) bool {
 // NUMERIC array fraction (percentile_cont(ARRAY[…])) computes one percentile per element and returns
 // an array (§18). A non-numeric fraction or a wrong argument count matches no overload (42883); a
 // NULL fraction yields a NULL result at finalize.
-func resolveOsaFraction(s *scope, name string, args []*Expr, ag *aggCtx, params *paramTypes) (*rExpr, bool, error) {
+func resolveOsaFraction(s *scope, name string, args []*exprNode, ag *aggCtx, params *paramTypes) (*rExpr, bool, error) {
 	if len(args) != 1 {
 		return nil, false, noAggOverload(name) // wrong argument count
 	}
 	// The fraction is evaluated before the fold (it is a direct argument, not an aggregate operand),
 	// so a nested aggregate is illegal — 42803, matching PG.
 	if exprHasAggregate(*args[0]) {
-		return nil, false, NewError(GroupingError, "aggregate function calls cannot be nested")
+		return nil, false, newError(GroupingError, "aggregate function calls cannot be nested")
 	}
-	fl := Float64
+	fl := scalarFloat64
 	rarg, rtype, err := resolve(s, *args[0], &fl, ag, params)
 	if err != nil {
 		return nil, false, err
@@ -19950,17 +19950,17 @@ func arrayIf(t resolvedType, isArray bool) resolvedType {
 // integer (i32) whose bit (k-1-j) is 1 iff c_j is grouped away in the row's grouping set. The value
 // is computed per group row at execution from the grouping set's mask, so the call resolves to the
 // placeholder slot groupingGsBase+index (rebased to its real trailing synthetic slot afterwards).
-func resolveGrouping(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedType, error) {
+func resolveGrouping(s *scope, fc *funcCallExpr, ag *aggCtx) (*rExpr, resolvedType, error) {
 	if fc.Star {
 		// GROUPING(*) — PG raises a syntax error; mirror the COUNT-only `*` message (42601).
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	if len(fc.Args) == 0 {
 		// GROUPING() with no arguments — PG raises a syntax error (42601).
-		return nil, resolvedType{}, NewError(SyntaxError, "GROUPING requires at least one argument")
+		return nil, resolvedType{}, newError(SyntaxError, "GROUPING requires at least one argument")
 	}
 	groupingArgErr := func() error {
-		return NewError(GroupingError, "arguments to GROUPING must be grouping expressions of the associated query level")
+		return newError(GroupingError, "arguments to GROUPING must be grouping expressions of the associated query level")
 	}
 	// GROUPING is meaningful only in a grouped query (ag.collecting) — including a grouped query that
 	// ALSO has window functions (GROUPING SETS + window, aggregates.md §21); outside one its arguments
@@ -19975,9 +19975,9 @@ func resolveGrouping(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedTy
 			err error
 		)
 		switch arg.Kind {
-		case ExprColumn:
+		case exprColumn:
 			r, err = s.resolveBare(arg.Column)
-		case ExprQualifiedColumn:
+		case exprQualifiedColumn:
 			r, err = s.resolveQualified(arg.Qualifier, arg.Column)
 		default:
 			// A non-column argument is never a grouping column (jed groups by columns only).
@@ -20003,14 +20003,14 @@ func resolveGrouping(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedTy
 	}
 	slot := groupingGsBase + len(ag.groupingSpecs)
 	ag.groupingSpecs = append(ag.groupingSpecs, positions)
-	return &rExpr{kind: reColumn, index: slot}, resolvedType{kind: rtInt, intTy: Int32}, nil
+	return &rExpr{kind: reColumn, index: slot}, resolvedType{kind: rtInt, intTy: scalarInt32}, nil
 }
 
 // resolveWindowCall resolves a window-function call `f(args) OVER (window_definition)`
 // (spec/design/window.md §5.1). Valid only in a window query's projection (ag.windowing); anywhere
 // else (WHERE / JOIN ON / HAVING / an aggregate query) it is 42P20. The call collects into a
 // windowSpec and resolves to the synthetic slot windowBase+window_index. S0: only row_number().
-func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	name := toLowerASCII(fc.Name)
 	// The plan + result type from the function name. S0: only row_number(); an aggregate name with
 	// OVER (a window aggregate, S3) resolves to planAgg carrying the aggregate plan in wagg; any
@@ -20049,13 +20049,13 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 	switch {
 	case isNoArg:
 		if fc.Star || len(fc.Args) != 0 {
-			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes no arguments")
+			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes no arguments")
 		}
 		plan = noArgI64
-		result = resolvedType{kind: rtInt, intTy: Int64}
+		result = resolvedType{kind: rtInt, intTy: scalarInt64}
 	case isNoArgRatio:
 		if fc.Star || len(fc.Args) != 0 {
-			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes no arguments")
+			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes no arguments")
 		}
 		plan = noArgRatio
 		result = resolvedType{kind: rtFloat64}
@@ -20063,7 +20063,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 		// ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh
 		// Forbidden sub-context (no aggregate/window nesting in a window argument).
 		if fc.Star || len(fc.Args) != 1 {
-			return nil, resolvedType{}, NewError(UndefinedFunction, "ntile takes exactly one argument")
+			return nil, resolvedType{}, newError(UndefinedFunction, "ntile takes exactly one argument")
 		}
 		anode, aty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
@@ -20074,13 +20074,13 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 		}
 		wargs = append(wargs, anode)
 		plan = planNtile
-		result = resolvedType{kind: rtInt, intTy: Int64}
+		result = resolvedType{kind: rtInt, intTy: scalarInt64}
 	case name == "lag" || name == "lead":
 		// lag/lead(value [, offset [, default]]) — window.md §4. The value expression's type is the
 		// result; offset is an integer (default 1); default (returned when the offset leaves the
 		// partition) must match the value type. Args resolved in a fresh Forbidden sub-context.
 		if fc.Star || len(fc.Args) == 0 || len(fc.Args) > 3 {
-			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes 1 to 3 arguments")
+			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes 1 to 3 arguments")
 		}
 		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
@@ -20088,16 +20088,16 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 		}
 		// The scalar hint for resolving the default literal: the value's scalar for an int/float
 		// value type, else none (mirrors Rust's Int(s) | Float(s) => Some(*s)).
-		var hint *ScalarType
+		var hint *scalarType
 		switch vty.kind {
 		case rtInt:
 			h := vty.intTy
 			hint = &h
 		case rtFloat32:
-			h := Float32
+			h := scalarFloat32
 			hint = &h
 		case rtFloat64:
-			h := Float64
+			h := scalarFloat64
 			hint = &h
 		}
 		wargs = append(wargs, vnode)
@@ -20134,10 +20134,10 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 		if fc.Star {
 			// Only COUNT has a star overload; SUM(*) OVER () etc. is a syntax error.
 			if !aggregateHasStar(name) {
-				return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+				return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 			}
 			wagg = planCountStar
-			result = resolvedType{kind: rtInt, intTy: Int64}
+			result = resolvedType{kind: rtInt, intTy: scalarInt64}
 		} else {
 			// One operand, resolved in a fresh Forbidden sub-context (no aggregate/window nesting
 			// in a window aggregate's argument). The registry validates the (surface, operand-family)
@@ -20163,14 +20163,14 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 		// expression (→ result type); nth_value takes the value + an integer position. Args
 		// resolved in a fresh Forbidden sub-context (no aggregate/window nesting).
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		want := 1
 		if name == "nth_value" {
 			want = 2
 		}
 		if len(fc.Args) != want {
-			return nil, resolvedType{}, NewError(UndefinedFunction,
+			return nil, resolvedType{}, newError(UndefinedFunction,
 				fmt.Sprintf("%s takes %d argument(s)", name, want))
 		}
 		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
@@ -20195,7 +20195,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 		}
 		result = vty
 	default:
-		return nil, resolvedType{}, NewError(UndefinedFunction, name+" is not a window function")
+		return nil, resolvedType{}, newError(UndefinedFunction, name+" is not a window function")
 	}
 	// Resolve the window definition (PARTITION BY / ORDER BY expressions → slots, explicit frame).
 	// Keys resolve in `sub` (the grouped collecting ctx — a bare grouping column → its grouped-row
@@ -20224,7 +20224,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 	// A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
 	// HAVING / an aggregate-only query ag is not windowing → 42P20 (window.md §7).
 	if !ag.windowing {
-		return nil, resolvedType{}, NewError(WindowingError, "window functions are not allowed here")
+		return nil, resolvedType{}, newError(WindowingError, "window functions are not allowed here")
 	}
 	// Write back the (possibly grown) aggregate specs collected from this call's arguments AND window
 	// keys so the next window's nested aggregates continue the numbering (grouped query — window.md
@@ -20246,7 +20246,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, filter *Expr, ag *aggCtx, par
 // enclosing query (a correlated window — clause names it) is the deferred follow-on (0A000).
 func windowKeySlot(rexpr *rExpr, clause string, windowKeys *[]*rExpr) (int, error) {
 	if rexprReferencesOuter(rexpr, 0) {
-		return 0, NewError(FeatureNotSupported, clause+" may not reference an outer query column")
+		return 0, newError(FeatureNotSupported, clause+" may not reference an outer query column")
 	}
 	if rexpr.kind == reColumn {
 		return rexpr.index, nil
@@ -20264,7 +20264,7 @@ func windowKeySlot(rexpr *rExpr, clause string, windowKeys *[]*rExpr) (int, erro
 // aggregate key (reColumn) keeps its real slot; any compound key is materialized into windowKeys at a
 // windowKeyBase+k placeholder. A key referencing an enclosing-query column (a correlated window) is
 // 0A000; a window function inside a key is rejected by keyCtx (42P20).
-func resolveWindowDef(s *scope, wd *WindowDef, keyCtx *aggCtx, windowKeys *[]*rExpr, params *paramTypes) ([]int, []orderSlot, *resolvedFrame, error) {
+func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rExpr, params *paramTypes) ([]int, []orderSlot, *resolvedFrame, error) {
 	partition := make([]int, 0, len(wd.Partition))
 	for _, key := range wd.Partition {
 		rexpr, _, err := resolve(s, key, nil, keyCtx, params)
@@ -20280,7 +20280,7 @@ func resolveWindowDef(s *scope, wd *WindowDef, keyCtx *aggCtx, windowKeys *[]*rE
 	order := make([]orderSlot, 0, len(wd.Order))
 	// The ORDER BY key types, captured in lockstep with order — a RANGE value-offset frame folds
 	// key ± offset over the single ordering key, so it needs the key's type (§6).
-	orderTypes := make([]Type, 0, len(wd.Order))
+	orderTypes := make([]dataType, 0, len(wd.Order))
 	for _, key := range wd.Order {
 		rexpr, ty, err := resolve(s, key.Expr, nil, keyCtx, params)
 		if err != nil {
@@ -20336,11 +20336,11 @@ func resolveWindowDef(s *scope, wd *WindowDef, keyCtx *aggCtx, windowKeys *[]*rE
 // ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer,
 // decimal, or float type (a timestamp/date key is the deferred D4 follow-on, any other type is
 // 0A000). A negative offset is 22013. Mirrors Rust's resolve_frame.
-func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolvedFrame, error) {
-	isOffset := func(b FrameBound) bool { return b.Kind == FramePreceding || b.Kind == FrameFollowing }
+func resolveFrame(f *windowFrame, order []orderSlot, orderTypes []dataType) (*resolvedFrame, error) {
+	isOffset := func(b frameBound) bool { return b.Kind == framePreceding || b.Kind == frameFollowing }
 	hasOffset := isOffset(f.Start) || isOffset(f.End)
 	switch f.Mode {
-	case FrameRows:
+	case frameRows:
 		start, err := resolveIntBound(f.Start)
 		if err != nil {
 			return nil, err
@@ -20349,10 +20349,10 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 		if err != nil {
 			return nil, err
 		}
-		return &resolvedFrame{mode: FrameRows, start: start, end: end, exclude: f.Exclude}, nil
-	case FrameGroups:
+		return &resolvedFrame{mode: frameRows, start: start, end: end, exclude: f.Exclude}, nil
+	case frameGroups:
 		if len(order) == 0 {
-			return nil, NewError(WindowingError, "GROUPS mode requires an ORDER BY clause")
+			return nil, newError(WindowingError, "GROUPS mode requires an ORDER BY clause")
 		}
 		start, err := resolveIntBound(f.Start)
 		if err != nil {
@@ -20362,16 +20362,16 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 		if err != nil {
 			return nil, err
 		}
-		return &resolvedFrame{mode: FrameGroups, start: start, end: end, exclude: f.Exclude}, nil
+		return &resolvedFrame{mode: frameGroups, start: start, end: end, exclude: f.Exclude}, nil
 	default: // FrameRange
 		if hasOffset {
 			if len(order) != 1 {
-				return nil, NewError(WindowingError,
+				return nil, newError(WindowingError,
 					"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
 			}
 			kt := orderTypes[0]
 			if !(kt.IsInteger() || kt.IsDecimal() || kt.IsFloat()) {
-				return nil, NewError(FeatureNotSupported, fmt.Sprintf(
+				return nil, newError(FeatureNotSupported, fmt.Sprintf(
 					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s", kt.CanonicalName(),
 				))
 			}
@@ -20383,7 +20383,7 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 			if err != nil {
 				return nil, err
 			}
-			return &resolvedFrame{mode: FrameRange, start: start, end: end, exclude: f.Exclude}, nil
+			return &resolvedFrame{mode: frameRange, start: start, end: end, exclude: f.Exclude}, nil
 		}
 		// RANGE with only UNBOUNDED / CURRENT ROW bounds — peer/edge based, any number of ORDER BY
 		// keys (or none); no key arithmetic, so it reuses the plain bound resolution.
@@ -20395,44 +20395,44 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 		if err != nil {
 			return nil, err
 		}
-		return &resolvedFrame{mode: FrameRange, start: start, end: end, exclude: f.Exclude}, nil
+		return &resolvedFrame{mode: frameRange, start: start, end: end, exclude: f.Exclude}, nil
 	}
 }
 
 // resolveIntBound resolves a ROWS/GROUPS frame bound: the offset of `n PRECEDING`/`n FOLLOWING` must
 // be a non-negative integer literal (22013 if negative; a non-literal/non-integer offset is 0A000).
-func resolveIntBound(b FrameBound) (resolvedBound, error) {
-	offset := func(e Expr) (Value, error) {
-		if e.Kind == ExprLiteral && e.Literal != nil && e.Literal.Kind == LiteralInt {
+func resolveIntBound(b frameBound) (resolvedBound, error) {
+	offset := func(e exprNode) (Value, error) {
+		if e.Kind == exprLiteral && e.Literal != nil && e.Literal.Kind == literalInt {
 			if e.Literal.Int >= 0 {
 				return IntValue(e.Literal.Int), nil
 			}
-			return Value{}, NewError(InvalidPrecedingOrFollowingSize,
+			return Value{}, newError(InvalidPrecedingOrFollowingSize,
 				"frame starting or ending offset must not be negative")
 		}
-		return Value{}, NewError(FeatureNotSupported, "frame offset must be a non-negative integer literal")
+		return Value{}, newError(FeatureNotSupported, "frame offset must be a non-negative integer literal")
 	}
 	switch b.Kind {
-	case FrameUnboundedPreceding:
+	case frameUnboundedPreceding:
 		return resolvedBound{kind: boundUnboundedPreceding}, nil
-	case FrameCurrentRow:
+	case frameCurrentRow:
 		return resolvedBound{kind: boundCurrentRow}, nil
-	case FrameUnboundedFollowing:
+	case frameUnboundedFollowing:
 		return resolvedBound{kind: boundUnboundedFollowing}, nil
-	case FramePreceding:
+	case framePreceding:
 		v, err := offset(b.Offset)
 		if err != nil {
 			return resolvedBound{}, err
 		}
 		return resolvedBound{kind: boundPreceding, offVal: v}, nil
-	case FrameFollowing:
+	case frameFollowing:
 		v, err := offset(b.Offset)
 		if err != nil {
 			return resolvedBound{}, err
 		}
 		return resolvedBound{kind: boundFollowing, offVal: v}, nil
 	default:
-		return resolvedBound{}, NewError(FeatureNotSupported, "unsupported frame bound")
+		return resolvedBound{}, newError(FeatureNotSupported, "unsupported frame bound")
 	}
 }
 
@@ -20442,27 +20442,27 @@ func resolveIntBound(b FrameBound) (resolvedBound, error) {
 // a float key takes an integer or decimal offset converted to f64 (PG's in_range_float*_float8 — the
 // offset is float8 for both f32 and f64 keys). The decimal→f64 conversion traps 22003 on overflow
 // (jed's float-cast rule); an int offset is always finite.
-func resolveRangeBound(b FrameBound, kt Type) (resolvedBound, error) {
-	offset := func(e Expr) (Value, error) {
-		if e.Kind != ExprLiteral || e.Literal == nil {
-			return Value{}, NewError(FeatureNotSupported, "frame offset must be a non-negative numeric literal")
+func resolveRangeBound(b frameBound, kt dataType) (resolvedBound, error) {
+	offset := func(e exprNode) (Value, error) {
+		if e.Kind != exprLiteral || e.Literal == nil {
+			return Value{}, newError(FeatureNotSupported, "frame offset must be a non-negative numeric literal")
 		}
 		switch e.Literal.Kind {
-		case LiteralInt:
+		case literalInt:
 			if e.Literal.Int < 0 {
-				return Value{}, NewError(InvalidPrecedingOrFollowingSize,
+				return Value{}, newError(InvalidPrecedingOrFollowingSize,
 					"frame starting or ending offset must not be negative")
 			}
 			if kt.IsFloat() {
 				return Float64Value(float64(e.Literal.Int)), nil
 			}
 			if kt.IsDecimal() {
-				return DecimalValue(DecimalFromInt64(e.Literal.Int)), nil
+				return DecimalValue(decimalFromInt64(e.Literal.Int)), nil
 			}
 			return IntValue(e.Literal.Int), nil
-		case LiteralDecimal:
+		case literalDecimal:
 			if e.Literal.Dec.Neg && !e.Literal.Dec.IsZero() {
-				return Value{}, NewError(InvalidPrecedingOrFollowingSize,
+				return Value{}, newError(InvalidPrecedingOrFollowingSize,
 					"frame starting or ending offset must not be negative")
 			}
 			if kt.IsFloat() {
@@ -20473,57 +20473,57 @@ func resolveRangeBound(b FrameBound, kt Type) (resolvedBound, error) {
 				return Float64Value(f), nil
 			}
 			if !kt.IsDecimal() {
-				return Value{}, NewError(FeatureNotSupported, fmt.Sprintf(
+				return Value{}, newError(FeatureNotSupported, fmt.Sprintf(
 					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s and offset type decimal",
 					kt.CanonicalName(),
 				))
 			}
 			return DecimalValue(e.Literal.Dec), nil
 		default:
-			return Value{}, NewError(FeatureNotSupported, "frame offset must be a non-negative numeric literal")
+			return Value{}, newError(FeatureNotSupported, "frame offset must be a non-negative numeric literal")
 		}
 	}
 	switch b.Kind {
-	case FrameUnboundedPreceding:
+	case frameUnboundedPreceding:
 		return resolvedBound{kind: boundUnboundedPreceding}, nil
-	case FrameCurrentRow:
+	case frameCurrentRow:
 		return resolvedBound{kind: boundCurrentRow}, nil
-	case FrameUnboundedFollowing:
+	case frameUnboundedFollowing:
 		return resolvedBound{kind: boundUnboundedFollowing}, nil
-	case FramePreceding:
+	case framePreceding:
 		v, err := offset(b.Offset)
 		if err != nil {
 			return resolvedBound{}, err
 		}
 		return resolvedBound{kind: boundPreceding, offVal: v}, nil
-	case FrameFollowing:
+	case frameFollowing:
 		v, err := offset(b.Offset)
 		if err != nil {
 			return resolvedBound{}, err
 		}
 		return resolvedBound{kind: boundFollowing, offVal: v}, nil
 	default:
-		return resolvedBound{}, NewError(FeatureNotSupported, "unsupported frame bound")
+		return resolvedBound{}, newError(FeatureNotSupported, "unsupported frame bound")
 	}
 }
 
 // aggArg returns the single argument of a non-star aggregate call. Each aggregate takes
 // exactly one argument; a different count matches no aggregate overload and is 42883 (PG).
-func aggArg(fc *FuncCallExpr) (Expr, error) {
+func aggArg(fc *funcCallExpr) (exprNode, error) {
 	if len(fc.Args) != 1 {
-		return Expr{}, NewError(UndefinedFunction, "no aggregate function matches the given argument count")
+		return exprNode{}, newError(UndefinedFunction, "no aggregate function matches the given argument count")
 	}
 	return *fc.Args[0], nil
 }
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
 func noAggOverload(fn string) error {
-	return NewError(UndefinedFunction, "no "+fn+" aggregate for that argument type")
+	return newError(UndefinedFunction, "no "+fn+" aggregate for that argument type")
 }
 
 // noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
 func noFuncOverload(fn string) error {
-	return NewError(UndefinedFunction, "no "+fn+" function for those argument types")
+	return newError(UndefinedFunction, "no "+fn+" function for those argument types")
 }
 
 // === Function registry (spec/design/extensibility.md §5) ============================
@@ -20583,8 +20583,8 @@ func familyMatches(slot string, t resolvedType) bool {
 // isScalarFuncName reports whether name (lowercased) is a registered scalar function (catalog
 // Kind=="function") — the data-driven replacement for the old hand-written known-name gate.
 func isScalarFuncName(name string) bool {
-	for i := range Operators {
-		if Operators[i].Kind == "function" && Operators[i].Name == name {
+	for i := range operators {
+		if operators[i].Kind == "function" && operators[i].Name == name {
 			return true
 		}
 	}
@@ -20595,8 +20595,8 @@ func isScalarFuncName(name string) bool {
 // (array-functions.md §12) — a Kind=="function" row with Variadic set (num_nulls/num_nonnulls).
 // Data-driven, so adding a variadic row to the catalog wires it here without touching this gate.
 func isVariadicFuncName(name string) bool {
-	for i := range Operators {
-		if Operators[i].Kind == "function" && Operators[i].Variadic && Operators[i].Name == name {
+	for i := range operators {
+		if operators[i].Kind == "function" && operators[i].Variadic && operators[i].Name == name {
 			return true
 		}
 	}
@@ -20619,9 +20619,9 @@ func variadicFuncID(name string) variadicFunc {
 // lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
 // argument types: the Kind=="function" catalog row whose ArgFamilies agree by arity + per-slot
 // family. nil ⇒ no overload (42883). make_interval resolves on its own named/defaulted path (§11).
-func lookupScalarOverload(name string, tys []resolvedType) *OperatorDesc {
-	for i := range Operators {
-		o := &Operators[i]
+func lookupScalarOverload(name string, tys []resolvedType) *operatorDesc {
+	for i := range operators {
+		o := &operators[i]
 		if o.Kind != "function" || o.Name != name || len(o.ArgFamilies) != len(tys) {
 			continue
 		}
@@ -20845,11 +20845,11 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 // scalarResultType is the result ScalarType of a scalar function from its catalog result code
 // (functions.md §9): "promoted" = the (single) operand's own type; otherwise the code is a literal
 // scalar-type id (e.g. "decimal", "f64", "interval", "i16", "timestamptz", "uuid").
-func scalarResultType(code string, tys []resolvedType) ScalarType {
+func scalarResultType(code string, tys []resolvedType) scalarType {
 	if code == "promoted" {
 		return resolvedScalarType(tys[0])
 	}
-	ty, ok := ScalarTypeFromName(code)
+	ty, ok := scalarTypeFromName(code)
 	if !ok {
 		panic("scalarResultType: unknown result code " + code)
 	}
@@ -20858,16 +20858,16 @@ func scalarResultType(code string, tys []resolvedType) ScalarType {
 
 // resolvedScalarType is the concrete ScalarType carried by a numeric resolved type (for the
 // "promoted" / "same_as_input" result rules). Only reached for the numeric families they admit.
-func resolvedScalarType(t resolvedType) ScalarType {
+func resolvedScalarType(t resolvedType) scalarType {
 	switch t.kind {
 	case rtInt:
 		return t.intTy
 	case rtFloat32:
-		return Float32
+		return scalarFloat32
 	case rtFloat64:
-		return Float64
+		return scalarFloat64
 	case rtDecimal:
-		return DecimalType
+		return scalarDecimal
 	default:
 		panic("resolvedScalarType: non-numeric operand")
 	}
@@ -20883,8 +20883,8 @@ func resolvedScalarType(t resolvedType) ScalarType {
 // isArrayFuncName reports whether name (lowercased) is a polymorphic array function — a
 // Kind=="function" catalog row whose ArgFamilies mention anyarray/anyelement. Data-driven.
 func isArrayFuncName(name string) bool {
-	for i := range Operators {
-		o := &Operators[i]
+	for i := range operators {
+		o := &operators[i]
 		if o.Kind == "function" && o.Name == name {
 			for _, f := range o.ArgFamilies {
 				if f == "anyarray" || f == "anyelement" {
@@ -20964,32 +20964,32 @@ func resolvedTypeEqual(a, b resolvedType) bool {
 // null type (composite / array / range / json / null). Used by the element-wise array→array cast
 // resolver (spec/design/array.md §7) to decide whether the source element is a scalar with an
 // admitted scalarPairCastable cast to the target element scalar.
-func resolvedToScalar(t resolvedType) (ScalarType, bool) {
+func resolvedToScalar(t resolvedType) (scalarType, bool) {
 	switch t.kind {
 	case rtInt:
 		return t.intTy, true
 	case rtBool:
-		return Bool, true
+		return scalarBool, true
 	case rtText:
-		return Text, true
+		return scalarText, true
 	case rtDecimal:
-		return DecimalType, true
+		return scalarDecimal, true
 	case rtBytea:
-		return Bytea, true
+		return scalarBytea, true
 	case rtUuid:
-		return Uuid, true
+		return scalarUuid, true
 	case rtTimestamp:
-		return Timestamp, true
+		return scalarTimestamp, true
 	case rtTimestamptz:
-		return Timestamptz, true
+		return scalarTimestamptz, true
 	case rtDate:
-		return Date, true
+		return scalarDate, true
 	case rtInterval:
-		return IntervalType, true
+		return scalarInterval, true
 	case rtFloat32:
-		return Float32, true
+		return scalarFloat32, true
 	case rtFloat64:
-		return Float64, true
+		return scalarFloat64, true
 	default:
 		return 0, false
 	}
@@ -21000,16 +21000,16 @@ func resolvedToScalar(t resolvedType) (ScalarType, bool) {
 // matrix (spec/types/casts.toml) for the pairs an array element can take: numeric↔numeric,
 // text→numeric/boolean/uuid, boolean⇄i32, uuid⇄text, uuid⇄bytea. The identity (from == to) is
 // handled by the caller. A pair outside this set is rejected (42804) at resolve.
-func scalarPairCastable(from, to ScalarType) bool {
-	numeric := func(t ScalarType) bool { return t.IsInteger() || t.IsDecimal() || t.IsFloat() }
+func scalarPairCastable(from, to scalarType) bool {
+	numeric := func(t scalarType) bool { return t.IsInteger() || t.IsDecimal() || t.IsFloat() }
 	switch {
 	case numeric(from) && numeric(to):
 		return true
 	case from.IsText() && (numeric(to) || to.IsBool() || to.IsUuid()):
 		return true
-	case from.IsBool() && to == Int32:
+	case from.IsBool() && to == scalarInt32:
 		return true
-	case from == Int32 && to.IsBool():
+	case from == scalarInt32 && to.IsBool():
 		return true
 	case from.IsUuid() && (to.IsText() || to.IsBytea()):
 		return true
@@ -21109,14 +21109,14 @@ func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
 		// A concrete array result `<scalar>[]` (array_positions → "i32[]"): the element type is
 		// fixed (independent of ELEM), so the result is Array(scalar) (array-functions.md §8).
 		if base, ok := strings.CutSuffix(code, "[]"); ok {
-			ty, ok := ScalarTypeFromName(base)
+			ty, ok := scalarTypeFromName(base)
 			if !ok {
 				panic("polyResultType: unknown array element " + base)
 			}
 			et := resolvedTypeOf(ty)
 			return resolvedType{kind: rtArray, elem: &et}, nil
 		}
-		ty, ok := ScalarTypeFromName(code)
+		ty, ok := scalarTypeFromName(code)
 		if !ok {
 			panic("polyResultType: unknown result code " + code)
 		}
@@ -21127,45 +21127,45 @@ func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
 // indeterminatePoly is the 42P18 raised when an array function's polymorphic type cannot be
 // determined because every polymorphic argument was an untyped NULL (array_append(NULL, NULL)).
 func indeterminatePoly() error {
-	return NewError(IndeterminateDatatype, "could not determine polymorphic type because input has type unknown")
+	return newError(IndeterminateDatatype, "could not determine polymorphic type because input has type unknown")
 }
 
 // elemScalarHint is the element type's ScalarType, for the literal-adaptation hint
 // (array-functions.md §2): the bound array element type is threaded back as the ctx when
 // re-resolving the polymorphic args, so a bare integer/decimal literal element adapts (with
 // range-checking) to it. ok=false for a composite/array/NULL element.
-func elemScalarHint(t resolvedType) (ScalarType, bool) {
+func elemScalarHint(t resolvedType) (scalarType, bool) {
 	switch t.kind {
 	case rtInt:
 		return t.intTy, true
 	case rtFloat32:
-		return Float32, true
+		return scalarFloat32, true
 	case rtFloat64:
-		return Float64, true
+		return scalarFloat64, true
 	case rtDecimal:
-		return DecimalType, true
+		return scalarDecimal, true
 	case rtText:
-		return Text, true
+		return scalarText, true
 	case rtBool:
-		return Bool, true
+		return scalarBool, true
 	case rtBytea:
-		return Bytea, true
+		return scalarBytea, true
 	case rtUuid:
-		return Uuid, true
+		return scalarUuid, true
 	case rtTimestamp:
-		return Timestamp, true
+		return scalarTimestamp, true
 	case rtTimestamptz:
-		return Timestamptz, true
+		return scalarTimestamptz, true
 	case rtDate:
-		return Date, true
+		return scalarDate, true
 	case rtInterval:
-		return IntervalType, true
+		return scalarInterval, true
 	case rtJson:
-		return Json, true
+		return scalarJson, true
 	case rtJsonb:
-		return Jsonb, true
+		return scalarJsonb, true
 	case rtJsonPath:
-		return JsonPathType, true
+		return scalarJsonPath, true
 	default:
 		return 0, false
 	}
@@ -21178,16 +21178,16 @@ func elemScalarHint(t resolvedType) (ScalarType, bool) {
 // 2 re-resolves the polymorphic-slot arguments with it as the ctx, so an untyped literal element (or
 // an ARRAY[…] constructor argument) adapts to the array's element type, with a range check. The
 // kernel id is the name; NULL handling lives in the eval kernel.
-func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveArrayFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	name := toLowerASCII(fc.Name)
 	// Each array-function name is single-overload; find its row by (name, arity). A wrong argument
 	// count matches no overload (42883), exactly as a missing scalar overload does.
-	var desc *OperatorDesc
-	for i := range Operators {
-		o := &Operators[i]
+	var desc *operatorDesc
+	for i := range operators {
+		o := &operators[i]
 		if o.Kind == "function" && o.Name == name && o.Arity == len(fc.Args) {
 			desc = o
 			break
@@ -21210,7 +21210,7 @@ func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	}
 	// Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar. The hint
 	// is the element type of the first anyarray argument.
-	var hint *ScalarType
+	var hint *scalarType
 	for j, slot := range slots {
 		if slot == "anyarray" && tys[j].kind == rtArray {
 			if s, ok := elemScalarHint(*tys[j].elem); ok {
@@ -21248,9 +21248,9 @@ func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 // slots (source, pattern, flags) require text-or-null; the numeric slots (start/N/endoption/subexpr)
 // require integer-or-null (a non-integer is 42883). A constant pattern is precompiled once here
 // (regex.md §5) — but only when the case-insensitive `i` flag is statically known.
-func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	name := toLowerASCII(fc.Name)
 	var rfn regexFunc
@@ -21309,7 +21309,7 @@ func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		}
 		return false
 	}
-	textHint, intHint := Text, Int64
+	textHint, intHint := scalarText, scalarInt64
 	rargs := make([]*rExpr, len(fc.Args))
 	for i := range fc.Args {
 		if isInt(i) {
@@ -21345,7 +21345,7 @@ func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	if rargs[1].kind == reConstText && insensitiveKnown {
 		pat := rargs[1].cText
 		if insensitive {
-			pat = FoldLowerSimple(pat, LoadedProperty())
+			pat = foldLowerSimple(pat, loadedProperty())
 		}
 		var err error
 		prog, err = compileRegex(pat)
@@ -21363,7 +21363,7 @@ func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	case rxLike:
 		result = resolvedType{kind: rtBool}
 	default: // rxCount, rxInstr
-		result = resolvedType{kind: rtInt, intTy: Int32}
+		result = resolvedType{kind: rtInt, intTy: scalarInt32}
 	}
 	return &rExpr{kind: reRegexFunc, rxFunc: rfn, sargs: rargs, rxProgram: prog}, result, nil
 }
@@ -21372,8 +21372,8 @@ func resolveRegexFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 // Kind=="function" catalog row whose ArgFamilies mention anyrange (range-functions.md §1).
 // Data-driven, so a new range-function row wires here without touching this gate.
 func isRangeFuncName(name string) bool {
-	for i := range Operators {
-		o := &Operators[i]
+	for i := range operators {
+		o := &operators[i]
 		if o.Kind == "function" && o.Name == name {
 			for _, f := range o.ArgFamilies {
 				if f == "anyrange" {
@@ -21414,11 +21414,11 @@ func rangeFuncID(name string) rangeFunc {
 // range keeps its range type and ignores the scalar hint). A text/NULL argument folds case (reCasing,
 // result text); a range argument is the bound accessor (reRangeFunc, result the element type);
 // anything else is 42883 (no overload).
-func resolveLowerUpper(s *scope, name string, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveLowerUpper(s *scope, name string, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if len(fc.Args) != 1 {
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
-	textHint := Text
+	textHint := scalarText
 	r, t, err := resolve(s, *fc.Args[0], &textHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -21438,11 +21438,11 @@ func resolveLowerUpper(s *scope, name string, fc *FuncCallExpr, ag *aggCtx, para
 // of value: timestamptz → timestamp (render the instant locally) and timestamp → timestamptz
 // (interpret the wall clock in the zone). Any other value family — or an untyped/NULL value, which
 // cannot pick an overload — is 42883.
-func resolveTimezone(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveTimezone(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if len(fc.Args) != 2 {
 		return nil, resolvedType{}, noFuncOverload("timezone")
 	}
-	textHint := Text
+	textHint := scalarText
 	zoneR, zoneT, err := resolve(s, *fc.Args[0], &textHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -21474,11 +21474,11 @@ func resolveTimezone(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 // (text) is the 3-arg form, valid only for a timestamptz value. The result family is the value
 // family. A non-text unit/zone, a non-datetime value, or the 3-arg form on a non-timestamptz value is
 // 42883 (a date value also has no overload — jed has no implicit date->timestamp cast).
-func resolveDateTrunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveDateTrunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if len(fc.Args) != 2 && len(fc.Args) != 3 {
 		return nil, resolvedType{}, noFuncOverload("date_trunc")
 	}
-	textHint := Text
+	textHint := scalarText
 	unitR, unitT, err := resolve(s, *fc.Args[0], &textHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -21518,14 +21518,14 @@ func resolveDateTrunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 // (range-functions.md §1). Simpler than resolveArrayFunc — the accessors take a single anyrange arg
 // with no anyelement arg, so there is no element-hint literal adaptation. lower/upper resolve to ELEM
 // (the bound type), the rest to boolean.
-func resolveRangeFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveRangeFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	name := toLowerASCII(fc.Name)
-	var desc *OperatorDesc
-	for i := range Operators {
-		o := &Operators[i]
+	var desc *operatorDesc
+	for i := range operators {
+		o := &operators[i]
 		if o.Kind == "function" && o.Name == name && o.Arity == len(fc.Args) {
 			desc = o
 			break
@@ -21577,7 +21577,7 @@ func isRangeCtorName(name string) bool {
 // NULL is an infinite bound (always ok); an integer adapts to an integer (range-checked) or decimal
 // element; a decimal to a decimal element; an already-temporal value to its own element; and a string
 // literal/text to a temporal element (parsed at eval). Anything else is no overload (42883).
-func rangeBoundAssignable(t resolvedType, elem ScalarType) bool {
+func rangeBoundAssignable(t resolvedType, elem scalarType) bool {
 	switch t.kind {
 	case rtNull:
 		return true
@@ -21605,9 +21605,9 @@ func rangeBoundAssignable(t resolvedType, elem ScalarType) bool {
 // adapts to the element width, `'2024-01-01'` to a date), then is type-checked assignable to the
 // element; the optional third argument is the bounds-flags TEXT. The kernel (evalRangeCtor) does the
 // element coercion (assignment-style, 22003), the flags parse (42601 / 22000), and finalizeRange.
-func resolveRangeCtor(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveRangeCtor(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	name := toLowerASCII(fc.Name)
 	desc, ok := rangeByName(name)
@@ -21659,9 +21659,9 @@ func resolveRangeCtor(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 // left un-adapted. matchPoly defers a bare NULL in an anyarray slot, so cat-first makes `arr || NULL`
 // / `NULL || arr` resolve to array_cat (the NULL array = identity), matching PostgreSQL; adapting the
 // bare NULL to a typed element would wrongly steer it into array_append.
-func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	noOverload := func() error {
-		return NewError(UndefinedFunction,
+		return newError(UndefinedFunction,
 			"operator does not exist: the || operands are not an array and a compatible element/array")
 	}
 	// Pass 1: resolve both operands with no hint.
@@ -21678,7 +21678,7 @@ func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rE
 		return resolveJSONbConcat(s, lhs, rhs, ag, params)
 	}
 	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
-	var hint *ScalarType
+	var hint *scalarType
 	if lt.kind == rtArray {
 		if h, ok := elemScalarHint(*lt.elem); ok {
 			hint = &h
@@ -21705,10 +21705,10 @@ func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rE
 	}
 	// Try the three concat overloads in catalog order; the first whose slots unify wins.
 	tys := []resolvedType{lt, rt}
-	var desc *OperatorDesc
+	var desc *operatorDesc
 	var elem *resolvedType
-	for i := range Operators {
-		o := &Operators[i]
+	for i := range operators {
+		o := &operators[i]
 		if o.Kind != "concat" {
 			continue
 		}
@@ -21743,19 +21743,19 @@ func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rE
 // whose operands are neither arrays of a common element type nor ranges of a common element type
 // (matches PG).
 func noSetOpOverload() error {
-	return NewError(UndefinedFunction,
+	return newError(UndefinedFunction,
 		"operator does not exist: the operands are not arrays or ranges of a common element type")
 }
 
 // setOpArrayFunc maps a containment/overlap BinaryOp to its array-axis kernel. The five positional/
 // adjacency operators have no array overload — ok is false (caller → 42883).
-func setOpArrayFunc(op BinaryOp) (arrayFunc, bool) {
+func setOpArrayFunc(op binaryOp) (arrayFunc, bool) {
 	switch op {
-	case OpContains:
+	case opContains:
 		return afContains, true
-	case OpContainedBy:
+	case opContainedBy:
 		return afContainedBy, true
-	case OpOverlaps:
+	case opOverlaps:
 		return afOverlaps, true
 	default:
 		return 0, false
@@ -21772,7 +21772,7 @@ func setOpArrayFunc(op BinaryOp) (arrayFunc, bool) {
 // the first array operand's element type, then unifies the two element types over the single
 // (anyarray, anyarray) overload. The result is always boolean (so an all-untyped-NULL pair is NOT
 // 42P18). The operators are strict (a NULL whole-array operand → NULL).
-func resolveSetOp(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveSetOp(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// Pass 1: resolve both operands with no hint.
 	rl, lt, err := resolve(s, lhs, nil, ag, params)
 	if err != nil {
@@ -21791,7 +21791,7 @@ func resolveSetOp(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *para
 	// JSONB axis: only @>/<@ have a jsonb overload (json-sql-functions.md §1, J5). A jsonb operand
 	// (or a string literal adapting to one) routes here; `&&`/the positional operators have no jsonb
 	// overload and fall through to the array branch (42883). A json operand has no @> opclass (42883).
-	if (op == OpContains || op == OpContainedBy) && (lt.kind == rtJsonb || rt.kind == rtJsonb) {
+	if (op == opContains || op == opContainedBy) && (lt.kind == rtJsonb || rt.kind == rtJsonb) {
 		return resolveJSONbContains(s, op, lhs, rhs, ag, params)
 	}
 
@@ -21801,7 +21801,7 @@ func resolveSetOp(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *para
 		return nil, resolvedType{}, noSetOpOverload()
 	}
 	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
-	var hint *ScalarType
+	var hint *scalarType
 	if lt.kind == rtArray {
 		if h, ok := elemScalarHint(*lt.elem); ok {
 			hint = &h
@@ -21834,21 +21834,21 @@ func resolveSetOp(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *para
 }
 
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (rangeOp).
-func rangeOpFor(op BinaryOp) rangeOp {
+func rangeOpFor(op binaryOp) rangeOp {
 	switch op {
-	case OpContains:
+	case opContains:
 		return roContains
-	case OpContainedBy:
+	case opContainedBy:
 		return roContainedBy
-	case OpOverlaps:
+	case opOverlaps:
 		return roOverlaps
-	case OpStrictlyLeft:
+	case opStrictlyLeft:
 		return roBefore
-	case OpStrictlyRight:
+	case opStrictlyRight:
 		return roAfter
-	case OpNotExtendRight:
+	case opNotExtendRight:
 		return roOverleft
-	case OpNotExtendLeft:
+	case opNotExtendLeft:
 		return roOverright
 	default: // OpAdjacent
 		return roAdjacent
@@ -21862,7 +21862,7 @@ func rangeOpFor(op BinaryOp) rangeOp {
 // the bare element overloads `range @> element` and `element <@ range` re-resolve the element operand
 // with the range's element type as the hint and type-check assignability. A bare untyped NULL on one
 // side is treated as a NULL range (the range×range overload; eval yields NULL). Anything else is 42883.
-func resolveRangeOp(s *scope, op BinaryOp, lhs, rhs Expr, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveRangeOp(s *scope, op binaryOp, lhs, rhs exprNode, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch {
 	// range × range (or a bare NULL on one side, taken as a NULL range): the elements must match.
 	case lt.kind == rtRange && rt.kind == rtRange:
@@ -21883,7 +21883,7 @@ func resolveRangeOp(s *scope, op BinaryOp, lhs, rhs Expr, rl *rExpr, lt resolved
 			resolvedType{kind: rtBool}, nil
 	// `range @> element` — the element overload of `@>` (the only operator with one). Re-resolve the
 	// right operand with the range's element as the hint, then check it is assignable.
-	case lt.kind == rtRange && op == OpContains:
+	case lt.kind == rtRange && op == opContains:
 		elem, _ := resolvedRangeElementScalar(lt.elem)
 		reNode, reTy, err := resolve(s, rhs, &elem, ag, params)
 		if err != nil {
@@ -21895,7 +21895,7 @@ func resolveRangeOp(s *scope, op BinaryOp, lhs, rhs Expr, rl *rExpr, lt resolved
 		return &rExpr{kind: reRangeOp, rop: roContainsElem, relem: elem, sargs: []*rExpr{rl, reNode}},
 			resolvedType{kind: rtBool}, nil
 	// `element <@ range` — the element overload of `<@`.
-	case rt.kind == rtRange && op == OpContainedBy:
+	case rt.kind == rtRange && op == opContainedBy:
 		elem, _ := resolvedRangeElementScalar(rt.elem)
 		leNode, leTy, err := resolve(s, lhs, &elem, ag, params)
 		if err != nil {
@@ -21918,8 +21918,8 @@ func resolveRangeOp(s *scope, op BinaryOp, lhs, rhs Expr, rl *rExpr, lt resolved
 // is taken as a NULL range (the range×range overload; eval → NULL, strict). The result is a range over
 // that element type. range_merge does NOT come through here (it is a function call — see
 // resolveRangeFunc); it shares the reRangeSetOp node with op = rsoMerge.
-func resolveRangeSetOp(op BinaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType) (*rExpr, resolvedType, error) {
-	var elem ScalarType
+func resolveRangeSetOp(op binaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType) (*rExpr, resolvedType, error) {
+	var elem scalarType
 	switch {
 	case lt.kind == rtRange && rt.kind == rtRange:
 		le, _ := resolvedRangeElementScalar(lt.elem)
@@ -21938,11 +21938,11 @@ func resolveRangeSetOp(op BinaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt re
 	}
 	var setop rangeSetOp
 	switch op {
-	case OpAdd:
+	case opAdd:
 		setop = rsoUnion
-	case OpSub:
+	case opSub:
 		setop = rsoDifference
-	case OpMul:
+	case opMul:
 		setop = rsoIntersect
 	default:
 		panic("resolveRangeSetOp is only called for +, -, *")
@@ -21958,7 +21958,7 @@ func resolveRangeSetOp(op BinaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt re
 // element type, a bare ARRAY[…] operand adapts its elements to `x`'s type. The right operand must be
 // an array (a non-array side is 42809; a bare untyped NULL is 42P18); `x` and the element type must
 // be comparable (else 42883, PG's operator-not-found). The result is always boolean.
-func resolveQuantified(s *scope, q *QuantifiedExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveQuantified(s *scope, q *quantifiedExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// Pass 1: resolve both operands with no hint.
 	rl, lt, err := resolve(s, q.Lhs, nil, ag, params)
 	if err != nil {
@@ -21995,16 +21995,16 @@ func resolveQuantified(s *scope, q *QuantifiedExpr, ag *aggCtx, params *paramTyp
 	case at.kind == rtNull:
 		// A bare untyped NULL leaves the array type undeterminable — jed's polymorphic posture
 		// (§11; the unnest(NULL) / §5 #6 precedent), a documented degenerate divergence from PG.
-		return nil, resolvedType{}, NewError(IndeterminateDatatype,
+		return nil, resolvedType{}, newError(IndeterminateDatatype,
 			"could not determine the array element type of a NULL ANY/ALL operand")
 	default:
-		return nil, resolvedType{}, NewError(WrongObjectType,
+		return nil, resolvedType{}, newError(WrongObjectType,
 			"op ANY/ALL (array) requires array on right side")
 	}
 	// `x` and the element type must be comparable; PG reports operator-not-found (42883) here, NOT
 	// the bare 42804 a plain `int = text` raises — matching AF4's element-mismatch posture (§10.2).
 	if err := classifyComparable(lt, *at.elem); err != nil {
-		return nil, resolvedType{}, NewError(UndefinedFunction,
+		return nil, resolvedType{}, newError(UndefinedFunction,
 			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(*at.elem)))
 	}
 	return &rExpr{kind: reQuantified, op: q.Op, quantAll: q.All, lhs: rl, rhs: ra}, resolvedType{kind: rtBool}, nil
@@ -22014,7 +22014,7 @@ func resolveQuantified(s *scope, q *QuantifiedExpr, ag *aggCtx, params *paramTyp
 // IN-subquery pattern with the quantifier's comparison + 3VL fold. Resolve the outer lhs, plan the
 // body, require ONE column (42601), and require comparability — reporting operator-not-found (42883)
 // the way the array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
-func resolveQuantifiedSubquery(s *scope, q *QuantifiedSubqueryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveQuantifiedSubquery(s *scope, q *quantifiedSubqueryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	rlhs, lt, err := resolve(s, q.Lhs, nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -22024,10 +22024,10 @@ func resolveQuantifiedSubquery(s *scope, q *QuantifiedSubqueryExpr, ag *aggCtx, 
 		return nil, resolvedType{}, err
 	}
 	if len(plan.columnTypes()) != 1 {
-		return nil, resolvedType{}, NewError(SyntaxError, "subquery has too many columns")
+		return nil, resolvedType{}, newError(SyntaxError, "subquery has too many columns")
 	}
 	if err := classifyComparable(lt, plan.columnTypes()[0]); err != nil {
-		return nil, resolvedType{}, NewError(UndefinedFunction,
+		return nil, resolvedType{}, newError(UndefinedFunction,
 			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(plan.columnTypes()[0])))
 	}
 	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs}, resolvedType{kind: rtBool}, nil
@@ -22039,7 +22039,7 @@ func resolveQuantifiedSubquery(s *scope, q *QuantifiedSubqueryExpr, ag *aggCtx, 
 // (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string literal
 // `'{a,b}'` adapts via array_in). The result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a missing
 // access yields SQL NULL at eval.
-func resolveJSONAccess(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONAccess(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	rbase, baseTy, err := resolve(s, lhs, nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -22049,23 +22049,23 @@ func resolveJSONAccess(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params 
 	switch baseTy.kind {
 	case rtJsonb:
 	case rtJson:
-		return nil, resolvedType{}, NewError(FeatureNotSupported,
+		return nil, resolvedType{}, newError(FeatureNotSupported,
 			"json accessor operators are not supported yet; cast to jsonb")
 	case rtNull:
 		// a NULL base propagates (the access is NULL)
 	default:
-		return nil, resolvedType{}, NewError(UndefinedFunction,
+		return nil, resolvedType{}, newError(UndefinedFunction,
 			fmt.Sprintf("operator does not exist: %s %s ...", rtName(baseTy), jsonOpSymbol(op)))
 	}
 	var jop jsonGetOp
 	var result resolvedType
 	var path bool
 	switch op {
-	case OpJsonGet:
+	case opJsonGet:
 		jop, result, path = jgArrow, resolvedType{kind: rtJsonb}, false
-	case OpJsonGetText:
+	case opJsonGetText:
 		jop, result, path = jgArrowText, resolvedType{kind: rtText}, false
-	case OpJsonGetPath:
+	case opJsonGetPath:
 		jop, result, path = jgHashArrow, resolvedType{kind: rtJsonb}, true
 	default: // OpJsonGetPathText
 		jop, result, path = jgHashArrowText, resolvedType{kind: rtText}, true
@@ -22074,8 +22074,8 @@ func resolveJSONAccess(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params 
 	if path {
 		// `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
 		// otherwise the resolved argument must be a text[] (else 42883).
-		if rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText {
-			val, err := coerceStringToArray(rhs.Literal.Str, ScalarColType(Text))
+		if rhs.Kind == exprLiteral && rhs.Literal != nil && rhs.Literal.Kind == literalText {
+			val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText))
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -22089,7 +22089,7 @@ func resolveJSONAccess(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params 
 			case argTy.kind == rtArray && argTy.elem != nil && argTy.elem.kind == rtText:
 			case argTy.kind == rtNull:
 			default:
-				return nil, resolvedType{}, NewError(UndefinedFunction,
+				return nil, resolvedType{}, newError(UndefinedFunction,
 					"the #> / #>> path argument must be text[]")
 			}
 			rarg = ra
@@ -22104,7 +22104,7 @@ func resolveJSONAccess(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params 
 		switch argTy.kind {
 		case rtText, rtInt, rtNull:
 		default:
-			return nil, resolvedType{}, NewError(UndefinedFunction,
+			return nil, resolvedType{}, newError(UndefinedFunction,
 				fmt.Sprintf("operator does not exist: jsonb %s %s", jsonOpSymbol(op), rtName(argTy)))
 		}
 		rarg = ra
@@ -22113,15 +22113,15 @@ func resolveJSONAccess(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params 
 }
 
 // jsonOpSymbol is the display symbol for a jsonb accessor operator, for error messages.
-func jsonOpSymbol(op BinaryOp) string {
+func jsonOpSymbol(op binaryOp) string {
 	switch op {
-	case OpJsonGet:
+	case opJsonGet:
 		return "->"
-	case OpJsonGetText:
+	case opJsonGetText:
 		return "->>"
-	case OpJsonGetPath:
+	case opJsonGetPath:
 		return "#>"
-	case OpJsonGetPathText:
+	case opJsonGetPathText:
 		return "#>>"
 	default:
 		return "?"
@@ -22155,7 +22155,7 @@ func valueToNode(v Value) (JsonNode, error) {
 	case ValBool:
 		return JsonNode{Kind: JBool, B: v.Bool}, nil
 	case ValInt:
-		return JsonNode{Kind: JNumber, Num: DecimalFromInt64(v.Int)}, nil
+		return JsonNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}, nil
 	case ValDecimal:
 		return JsonNode{Kind: JNumber, Num: *v.Dec}, nil
 	case ValText:
@@ -22167,7 +22167,7 @@ func valueToNode(v Value) (JsonNode, error) {
 	case ValArray:
 		arr := v.Array
 		if arr.Ndim() > 1 {
-			return JsonNode{}, NewError(FeatureNotSupported,
+			return JsonNode{}, newError(FeatureNotSupported,
 				"to_jsonb of a multidimensional array is not supported yet")
 		}
 		elems := make([]JsonNode, 0, len(arr.Elements))
@@ -22180,19 +22180,19 @@ func valueToNode(v Value) (JsonNode, error) {
 		}
 		return JsonNode{Kind: JArray, Arr: elems}, nil
 	case ValFloat32, ValFloat64:
-		return JsonNode{}, NewError(FeatureNotSupported,
+		return JsonNode{}, newError(FeatureNotSupported,
 			"to_jsonb of a float value is not supported yet")
 	case ValComposite:
-		return JsonNode{}, NewError(FeatureNotSupported,
+		return JsonNode{}, newError(FeatureNotSupported,
 			"to_jsonb of a composite value is not supported yet")
 	case ValUuid, ValDate, ValTimestamp, ValTimestamptz, ValInterval, ValBytea:
-		return JsonNode{}, NewError(FeatureNotSupported,
+		return JsonNode{}, newError(FeatureNotSupported,
 			"to_jsonb of this type is not supported yet")
 	case ValRange:
-		return JsonNode{}, NewError(FeatureNotSupported,
+		return JsonNode{}, newError(FeatureNotSupported,
 			"to_jsonb of a range value is not supported yet")
 	case ValJsonPath:
-		return JsonNode{}, NewError(FeatureNotSupported,
+		return JsonNode{}, newError(FeatureNotSupported,
 			"to_jsonb of a jsonpath value is not supported yet")
 	default: // ValUnfetched
 		panic("BUG: unfetched large value escaped the storage layer")
@@ -22224,7 +22224,7 @@ func elemJsonText(v Value) (string, error) {
 func objectKeyText(v Value, pos int) (string, error) {
 	switch v.Kind {
 	case ValNull:
-		return "", NewError(InvalidParameterValue,
+		return "", newError(InvalidParameterValue,
 			"argument "+strconv.Itoa(pos)+": key must not be null")
 	case ValText:
 		return v.Str, nil
@@ -22238,24 +22238,24 @@ func objectKeyText(v Value, pos int) (string, error) {
 		}
 		return "false", nil
 	default:
-		return "", NewError(FeatureNotSupported,
+		return "", newError(FeatureNotSupported,
 			"a json_build_object key of this type is not supported yet")
 	}
 }
 
 // objectKeyNull is the 22004 raised when a json_object / jsonb_object key element is NULL.
 func objectKeyNull() error {
-	return NewError(NullValueNotAllowed, "null value not allowed for object key")
+	return newError(NullValueNotAllowed, "null value not allowed for object key")
 }
 
 // resolveJSONbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to `reJsonContains` with the operands swapped
 // (`a <@ b` is `b @> a`). The result is boolean; the operator is strict (a NULL operand → SQL NULL).
-func resolveJSONbContains(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	jsonbHint := Jsonb
+func resolveJSONbContains(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	jsonbHint := scalarJsonb
 	// Resolve each operand with a jsonb context, so a bare `'{"a":1}'` string literal adapts.
-	resolveJSONb := func(e Expr) (*rExpr, error) {
+	resolveJSONb := func(e exprNode) (*rExpr, error) {
 		r, t, err := resolve(s, e, &jsonbHint, ag, params)
 		if err != nil {
 			return nil, err
@@ -22264,7 +22264,7 @@ func resolveJSONbContains(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, para
 		case rtJsonb, rtNull:
 			return r, nil
 		default:
-			return nil, NewError(UndefinedFunction,
+			return nil, newError(UndefinedFunction,
 				fmt.Sprintf("operator does not exist: %s %s jsonb", rtName(t), binaryOpSymbol(op)))
 		}
 	}
@@ -22278,7 +22278,7 @@ func resolveJSONbContains(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, para
 	}
 	// `a @> b` keeps the order; `a <@ b` is `b @> a`.
 	a, b := rl, rr
-	if op == OpContainedBy {
+	if op == opContainedBy {
 		a, b = rr, rl
 	}
 	return &rExpr{kind: reJsonContains, lhs: a, rhs: b}, resolvedType{kind: rtBool}, nil
@@ -22288,8 +22288,8 @@ func resolveJSONbContains(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, para
 // §1, J5). The base must be `jsonb` (a json base is 42883 — no operator). `?` takes a `text` key;
 // `?|`/`?&` take a `text[]` (a bare `'{a,b}'` string literal adapts via array_in). The result is
 // boolean; the operator is strict.
-func resolveJSONHasKey(s *scope, kind hasKeyKind, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	jsonbHint := Jsonb
+func resolveJSONHasKey(s *scope, kind hasKeyKind, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	jsonbHint := scalarJsonb
 	rbase, baseTy, err := resolve(s, lhs, &jsonbHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -22297,14 +22297,14 @@ func resolveJSONHasKey(s *scope, kind hasKeyKind, lhs, rhs Expr, ag *aggCtx, par
 	switch baseTy.kind {
 	case rtJsonb, rtNull:
 	default:
-		return nil, resolvedType{}, NewError(UndefinedFunction,
+		return nil, resolvedType{}, newError(UndefinedFunction,
 			fmt.Sprintf("operator does not exist: %s %s", rtName(baseTy), hasKeySymbol(kind)))
 	}
 	var rarg *rExpr
 	switch kind {
 	case hkOne:
 		// `?` takes a single text key.
-		textHint := Text
+		textHint := scalarText
 		r, t, err := resolve(s, rhs, &textHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -22313,13 +22313,13 @@ func resolveJSONHasKey(s *scope, kind hasKeyKind, lhs, rhs Expr, ag *aggCtx, par
 		case rtText, rtNull:
 			rarg = r
 		default:
-			return nil, resolvedType{}, NewError(UndefinedFunction,
+			return nil, resolvedType{}, newError(UndefinedFunction,
 				"the ? operator's right argument must be text")
 		}
 	default: // hkAny / hkAll
 		// `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
-		if rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText {
-			val, err := coerceStringToArray(rhs.Literal.Str, ScalarColType(Text))
+		if rhs.Kind == exprLiteral && rhs.Literal != nil && rhs.Literal.Kind == literalText {
+			val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText))
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -22335,7 +22335,7 @@ func resolveJSONHasKey(s *scope, kind hasKeyKind, lhs, rhs Expr, ag *aggCtx, par
 			case t.kind == rtNull:
 				rarg = r
 			default:
-				return nil, resolvedType{}, NewError(UndefinedFunction,
+				return nil, resolvedType{}, newError(UndefinedFunction,
 					"the ?| / ?& operator's right argument must be text[]")
 			}
 		}
@@ -22357,9 +22357,9 @@ func hasKeySymbol(kind hasKeyKind) string {
 
 // resolveJSONbConcat resolves a jsonb `||` concatenation/merge (json-sql-functions.md §1, J6). Both
 // operands must be jsonb (a string literal adapts via `jsonbIn`). Result jsonb; strict.
-func resolveJSONbConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	jsonbHint := Jsonb
-	resolveJSONb := func(e Expr) (*rExpr, error) {
+func resolveJSONbConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	jsonbHint := scalarJsonb
+	resolveJSONb := func(e exprNode) (*rExpr, error) {
 		r, t, err := resolve(s, e, &jsonbHint, ag, params)
 		if err != nil {
 			return nil, err
@@ -22368,7 +22368,7 @@ func resolveJSONbConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 		case rtJsonb, rtNull:
 			return r, nil
 		default:
-			return nil, NewError(UndefinedFunction,
+			return nil, newError(UndefinedFunction,
 				fmt.Sprintf("operator does not exist: %s || jsonb", rtName(t)))
 		}
 	}
@@ -22388,7 +22388,7 @@ func resolveJSONbConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 // (rbase, jsonb-typed). The form is chosen by the argument type; a bare `'{a,b}'` string literal
 // adapts to `text[]` only for `#-` (for `-` it is a single text key, verbatim like PG). Result
 // jsonb; strict.
-func resolveJSONbDelete(s *scope, isPath bool, rhs Expr, rbase *rExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONbDelete(s *scope, isPath bool, rhs exprNode, rbase *rExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	var kind deleteKind
 	var rarg *rExpr
 	switch {
@@ -22399,9 +22399,9 @@ func resolveJSONbDelete(s *scope, isPath bool, rhs Expr, rbase *rExpr, ag *aggCt
 			return nil, resolvedType{}, err
 		}
 		kind, rarg = dkPath, r
-	case rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText:
+	case rhs.Kind == exprLiteral && rhs.Literal != nil && rhs.Literal.Kind == literalText:
 		// A bare string literal is a text key (`jsonb - 'a'`), NOT a text[].
-		textHint := Text
+		textHint := scalarText
 		r, _, err := resolve(s, rhs, &textHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -22420,7 +22420,7 @@ func resolveJSONbDelete(s *scope, isPath bool, rhs Expr, rbase *rExpr, ag *aggCt
 		case t.kind == rtArray && t.elem != nil && t.elem.kind == rtText:
 			kind, rarg = dkKeys, r
 		default:
-			return nil, resolvedType{}, NewError(UndefinedFunction,
+			return nil, resolvedType{}, newError(UndefinedFunction,
 				fmt.Sprintf("operator does not exist: jsonb - %s (expected text, integer, or text[])", rtName(t)))
 		}
 	}
@@ -22430,9 +22430,9 @@ func resolveJSONbDelete(s *scope, isPath bool, rhs Expr, rbase *rExpr, ag *aggCt
 // resolveTextArrayArg resolves a `text[]` operator argument (the `#-` path): a bare string literal
 // `'{a,b}'` adapts via `coerceStringToArray`; otherwise the resolved type must be `text[]` (or NULL).
 // `sym` is the operator symbol for the error message.
-func resolveTextArrayArg(s *scope, rhs Expr, sym string, ag *aggCtx, params *paramTypes) (*rExpr, error) {
-	if rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText {
-		val, err := coerceStringToArray(rhs.Literal.Str, ScalarColType(Text))
+func resolveTextArrayArg(s *scope, rhs exprNode, sym string, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+	if rhs.Kind == exprLiteral && rhs.Literal != nil && rhs.Literal.Kind == literalText {
+		val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText))
 		if err != nil {
 			return nil, err
 		}
@@ -22448,7 +22448,7 @@ func resolveTextArrayArg(s *scope, rhs Expr, sym string, ag *aggCtx, params *par
 	case t.kind == rtNull:
 		return r, nil
 	default:
-		return nil, NewError(UndefinedFunction,
+		return nil, newError(UndefinedFunction,
 			fmt.Sprintf("the %s operator's right argument must be text[]", sym))
 	}
 }
@@ -22456,7 +22456,7 @@ func resolveTextArrayArg(s *scope, rhs Expr, sym string, ag *aggCtx, params *par
 // resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb,
 // path jsonpath)`. A bare string literal adapts (the context to jsonb, the path to a compiled
 // jsonpath). STRICT (any NULL → SQL NULL).
-func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	ctx, path, err := resolveJsonpathArgs(s, name, fc.Args, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -22471,10 +22471,10 @@ func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *FuncCallE
 // resolveJSONSqlFn resolves a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY
 // (json-sql-functions.md §5, S2) → an reJsonSqlFn node + its fixed result type. ctx is json/jsonb/
 // text (coerced to a jsonb document at eval); path is a jsonpath (a bare string literal compiles).
-func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path Expr, returning *string, wrapper JsonWrapper, keepQuotes bool, onEmpty, onError *JsonOnBehavior, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, returning *string, wrapper jsonWrapper, keepQuotes bool, onEmpty, onError *jsonOnBehavior, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// The context item — json / jsonb / text, coerced to a jsonb document at eval; a bare string
 	// literal adapts to jsonb.
-	jsonbHint := Jsonb
+	jsonbHint := scalarJsonb
 	rctx, ctxTy, err := resolve(s, ctx, &jsonbHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -22483,52 +22483,52 @@ func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path Expr, returning *str
 	case rtJsonb, rtJson, rtText, rtNull:
 		// ok
 	default:
-		return nil, resolvedType{}, NewError(DatatypeMismatch,
+		return nil, resolvedType{}, newError(DatatypeMismatch,
 			fmt.Sprintf("the context item of a SQL/JSON query function must be json/jsonb/text, not %s", rtName(ctxTy)))
 	}
 	// The path — a jsonpath; a bare string literal compiles.
-	pathHint := JsonPathType
+	pathHint := scalarJsonPath
 	rpath, pathTy, err := resolve(s, path, &pathHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
 	if pathTy.kind != rtJsonPath && pathTy.kind != rtNull {
-		return nil, resolvedType{}, NewError(DatatypeMismatch, "the path of a SQL/JSON query function must be a jsonpath")
+		return nil, resolvedType{}, newError(DatatypeMismatch, "the path of a SQL/JSON query function must be a jsonpath")
 	}
 	// OMIT QUOTES is the deferred S2 follow-on (the jsonb-of-bare-text result quirk).
 	if !keepQuotes {
-		return nil, resolvedType{}, NewError(FeatureNotSupported, "JSON_QUERY OMIT QUOTES is not supported yet")
+		return nil, resolvedType{}, newError(FeatureNotSupported, "JSON_QUERY OMIT QUOTES is not supported yet")
 	}
 	// The fixed RETURNING scalar type.
-	var returningST ScalarType
+	var returningST scalarType
 	switch {
 	case kind == jsExists:
-		returningST = Bool
+		returningST = scalarBool
 	case returning == nil && kind == jsValue:
-		returningST = Text
+		returningST = scalarText
 	case returning == nil: // jsQuery
-		returningST = Jsonb
+		returningST = scalarJsonb
 	default:
-		st, ok := ScalarTypeFromName(*returning)
+		st, ok := scalarTypeFromName(*returning)
 		if !ok {
-			return nil, resolvedType{}, NewError(UndefinedObject, fmt.Sprintf("type \"%s\" does not exist", *returning))
+			return nil, resolvedType{}, newError(UndefinedObject, fmt.Sprintf("type \"%s\" does not exist", *returning))
 		}
 		returningST = st
 	}
 	// JSON_QUERY's result must be a JSON type (json/jsonb); JSON_VALUE's must be a scalar — a
 	// composite/array RETURNING is a deferred 0A000 (it cannot hold an extracted scalar).
-	if kind == jsQuery && returningST != Json && returningST != Jsonb {
-		return nil, resolvedType{}, NewError(FeatureNotSupported, "JSON_QUERY RETURNING a non-json type is not supported yet")
+	if kind == jsQuery && returningST != scalarJson && returningST != scalarJsonb {
+		return nil, resolvedType{}, newError(FeatureNotSupported, "JSON_QUERY RETURNING a non-json type is not supported yet")
 	}
-	onEmptyB := JOBNull
+	onEmptyB := jOBNull
 	if onEmpty != nil {
 		onEmptyB = *onEmpty
 	}
-	onErrorB := JOBNull
+	onErrorB := jOBNull
 	if onError != nil {
 		onErrorB = *onError
 	} else if kind == jsExists {
-		onErrorB = JOBFalse
+		onErrorB = jOBFalse
 	}
 	return &rExpr{
 		kind:         reJsonSqlFn,
@@ -22546,11 +22546,11 @@ func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path Expr, returning *str
 // jsonpath query functions (the SRF and the scalar forms). A bare string literal adapts: the context
 // to jsonb, the path to a compiled `jsonpath`. Exactly two args this slice (the optional vars /
 // silent are a follow-on).
-func resolveJsonpathArgs(s *scope, name string, args []*Expr, ag *aggCtx, params *paramTypes) (*rExpr, *rExpr, error) {
+func resolveJsonpathArgs(s *scope, name string, args []*exprNode, ag *aggCtx, params *paramTypes) (*rExpr, *rExpr, error) {
 	if len(args) != 2 {
 		return nil, nil, noFuncOverload(name)
 	}
-	jsonbHint := Jsonb
+	jsonbHint := scalarJsonb
 	ctx, ct, err := resolve(s, *args[0], &jsonbHint, ag, params)
 	if err != nil {
 		return nil, nil, err
@@ -22558,7 +22558,7 @@ func resolveJsonpathArgs(s *scope, name string, args []*Expr, ag *aggCtx, params
 	if ct.kind != rtJsonb && ct.kind != rtNull {
 		return nil, nil, noFuncOverload(name)
 	}
-	pathHint := JsonPathType
+	pathHint := scalarJsonPath
 	path, pt, err := resolve(s, *args[1], &pathHint, ag, params)
 	if err != nil {
 		return nil, nil, err
@@ -22581,7 +22581,7 @@ func evalJsonpath(ctx, path Value) ([]JsonNode, bool, error) {
 		return nil, false, err
 	}
 	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
-	compiled, err := Compile(path.Str)
+	compiled, err := compile(path.Str)
 	if err != nil {
 		return nil, false, err
 	}
@@ -22597,11 +22597,11 @@ func evalJsonpath(ctx, path Value) ([]JsonNode, bool, error) {
 // and a bare string `value` literal adapts to jsonb. STRICT (the eval propagates any NULL). The
 // optional flag defaults to `true` for jsonb_set (create_if_missing) / `false` for jsonb_insert
 // (insert_after).
-func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if len(fc.Args) != 3 && len(fc.Args) != 4 {
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
-	jsonbHint := Jsonb
+	jsonbHint := scalarJsonb
 	target, t0, err := resolve(s, *fc.Args[0], &jsonbHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -22622,7 +22622,7 @@ func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *FuncCallE
 	}
 	var flag *rExpr
 	if len(fc.Args) == 4 {
-		boolHint := Bool
+		boolHint := scalarBool
 		f, tf, err := resolve(s, *fc.Args[3], &boolHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -22643,7 +22643,7 @@ func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *FuncCallE
 // alternating keys/values, or two `text[]` (keys, values). A bare `'{…}'` literal adapts to text[].
 // STRICT (the eval propagates a NULL whole-array argument). `jsonResult` selects the json (insertion
 // order + dups + " : " spacing) vs jsonb (canonical) result.
-func resolveJSONObject(s *scope, name string, jsonResult bool, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONObject(s *scope, name string, jsonResult bool, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if len(fc.Args) == 0 || len(fc.Args) > 2 {
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
@@ -22681,69 +22681,69 @@ func valueToOptTextArray(v Value) []*string {
 
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
 // `operator does not exist` message (only the comparison operators reach resolveQuantified).
-func binaryOpSymbol(op BinaryOp) string {
+func binaryOpSymbol(op binaryOp) string {
 	switch op {
-	case OpEq:
+	case opEq:
 		return "="
-	case OpNe:
+	case opNe:
 		return "<>"
-	case OpLt:
+	case opLt:
 		return "<"
-	case OpGt:
+	case opGt:
 		return ">"
-	case OpLe:
+	case opLe:
 		return "<="
-	case OpGe:
+	case opGe:
 		return ">="
-	case OpAdd:
+	case opAdd:
 		return "+"
-	case OpSub:
+	case opSub:
 		return "-"
-	case OpMul:
+	case opMul:
 		return "*"
-	case OpDiv:
+	case opDiv:
 		return "/"
-	case OpMod:
+	case opMod:
 		return "%"
-	case OpAnd:
+	case opAnd:
 		return "AND"
-	case OpOr:
+	case opOr:
 		return "OR"
-	case OpConcat:
+	case opConcat:
 		return "||"
-	case OpContains:
+	case opContains:
 		return "@>"
-	case OpContainedBy:
+	case opContainedBy:
 		return "<@"
-	case OpOverlaps:
+	case opOverlaps:
 		return "&&"
-	case OpStrictlyLeft:
+	case opStrictlyLeft:
 		return "<<"
-	case OpStrictlyRight:
+	case opStrictlyRight:
 		return ">>"
-	case OpNotExtendRight:
+	case opNotExtendRight:
 		return "&<"
-	case OpNotExtendLeft:
+	case opNotExtendLeft:
 		return "&>"
-	case OpAdjacent:
+	case opAdjacent:
 		return "-|-"
-	case OpJsonGet:
+	case opJsonGet:
 		return "->"
-	case OpJsonGetText:
+	case opJsonGetText:
 		return "->>"
-	case OpJsonGetPath:
+	case opJsonGetPath:
 		return "#>"
-	case OpJsonGetPathText:
+	case opJsonGetPathText:
 		return "#>>"
-	case OpJsonHasKey:
+	case opJsonHasKey:
 		return "?"
-	case OpJsonHasAnyKey:
+	case opJsonHasAnyKey:
 		return "?|"
-	case OpJsonHasAllKeys:
+	case opJsonHasAllKeys:
 		return "?&"
-	case OpJsonDeletePath:
+	case opJsonDeletePath:
 		return "#-"
-	case OpJsonPathExists:
+	case opJsonPathExists:
 		return "@?"
 	default: // OpJsonPathMatch
 		return "@@"
@@ -22753,8 +22753,8 @@ func binaryOpSymbol(op BinaryOp) string {
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
 // overload — only COUNT does. The data-driven replacement for the special-cased star arm.
 func aggregateHasStar(surface string) bool {
-	for i := range Aggregates {
-		if toLowerASCII(Aggregates[i].Surface) == surface && Aggregates[i].Arg == "star" {
+	for i := range aggregates {
+		if toLowerASCII(aggregates[i].Surface) == surface && aggregates[i].Arg == "star" {
 			return true
 		}
 	}
@@ -22764,9 +22764,9 @@ func aggregateHasStar(surface string) bool {
 // lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased)
 // over a single operand of resolved type t: the Arg=="expr" catalog row whose lone ArgFamilies
 // slot matches. nil ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
-func lookupAggregateOverload(surface string, t resolvedType) *AggregateDesc {
-	for i := range Aggregates {
-		a := &Aggregates[i]
+func lookupAggregateOverload(surface string, t resolvedType) *aggregateDesc {
+	for i := range aggregates {
+		a := &aggregates[i]
 		if toLowerASCII(a.Surface) == surface && a.Arg == "expr" && len(a.ArgFamilies) == 1 && familyMatches(a.ArgFamilies[0], t) {
 			return a
 		}
@@ -22782,13 +22782,13 @@ func lookupAggregateOverload(surface string, t resolvedType) *AggregateDesc {
 func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedType) {
 	switch {
 	case surface == "count":
-		return planCount, resolvedType{kind: rtInt, intTy: Int64}
+		return planCount, resolvedType{kind: rtInt, intTy: scalarInt64}
 	case surface == "sum" && result == "sum_widen":
 		// SUM(i16|i32) → i64; SUM(i64) → decimal (PG widening).
-		if t.kind == rtInt && t.intTy == Int64 {
+		if t.kind == rtInt && t.intTy == scalarInt64 {
 			return planSumDecimal, resolvedType{kind: rtDecimal}
 		}
-		return planSumInt, resolvedType{kind: rtInt, intTy: Int64}
+		return planSumInt, resolvedType{kind: rtInt, intTy: scalarInt64}
 	case surface == "sum" && result == "decimal":
 		return planSumDecimal, resolvedType{kind: rtDecimal}
 	case surface == "sum" && result == "same_as_input":
@@ -22826,20 +22826,20 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 // or 42883 for any other name. Aggregates and scalar functions share the call syntax (grammar.md
 // §17); they are distinguished here. Named notation (name => value) is valid only for a function
 // that declares parameter names (make_interval); on every other function it is 42883.
-func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	name := toLowerASCII(fc.Name)
 	// DISTINCT is an aggregate-only modifier: `abs(DISTINCT x)` is 42809 (PG's wrong_object_type,
 	// "DISTINCT specified, but <fn> is not an aggregate function" — aggregates.md §5). Checked
 	// before the per-kind dispatch so it covers every non-aggregate path (scalar, array, …).
 	if fc.Distinct && !isAggregateName(name) {
-		return nil, resolvedType{}, NewError(WrongObjectType,
+		return nil, resolvedType{}, newError(WrongObjectType,
 			fmt.Sprintf("DISTINCT specified, but %s is not an aggregate function", name))
 	}
 	// FILTER is likewise aggregate-only: `abs(x) FILTER (WHERE …)` is 42809 (PG's wrong_object_type,
 	// "FILTER specified, but <fn> is not an aggregate function" — aggregates.md §11). Same placement
 	// as DISTINCT, so it covers every non-aggregate path before the per-kind dispatch.
 	if fc.Filter != nil && !isAggregateName(name) {
-		return nil, resolvedType{}, NewError(WrongObjectType,
+		return nil, resolvedType{}, newError(WrongObjectType,
 			fmt.Sprintf("FILTER specified, but %s is not an aggregate function", name))
 	}
 	// The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
@@ -22871,7 +22871,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		return resolveLowerUpper(s, name, fc, ag, params)
 	}
@@ -22883,7 +22883,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		return resolveTimezone(s, fc, ag, params)
 	}
@@ -22895,7 +22895,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		return resolveDateTrunc(s, fc, ag, params)
 	}
@@ -22917,7 +22917,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		mode := psSet
 		if name == "jsonb_insert" {
@@ -22933,7 +22933,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		return resolveJSONObject(s, name, name == "json_object", fc, ag, params)
 	}
@@ -22944,7 +22944,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		var kind jsonPathFnKind
 		switch name {
@@ -23009,7 +23009,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		rl, lt, rr, rt, err := resolveOperandPair(s, *fc.Args[0], *fc.Args[1], ag, params)
 		if err != nil {
@@ -23030,7 +23030,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		rl, rr, result, err := resolveIntOrDecimalPair(s, name, *fc.Args[0], *fc.Args[1], ag, params)
 		if err != nil {
@@ -23050,7 +23050,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		rargs := make([]*rExpr, 4)
 		tys := make([]resolvedType, 4)
@@ -23075,7 +23075,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		if !ok(tys[0].kind) || !ok(tys[1].kind) || !ok(tys[2].kind) {
 			return nil, resolvedType{}, noFuncOverload("width_bucket")
 		}
-		return &rExpr{kind: reScalarFunc, sfunc: sfWidthBucket, sargs: rargs, result: Int32}, resolvedTypeOf(Int32), nil
+		return &rExpr{kind: reScalarFunc, sfunc: sfWidthBucket, sargs: rargs, result: scalarInt32}, resolvedTypeOf(scalarInt32), nil
 	}
 	// `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME
 	// arithmetic machinery so mod() and % are observably identical (promotion, the integer/decimal/
@@ -23086,9 +23086,9 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
-			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
-		return resolveBinary(s, &BinaryExpr{Op: OpMod, Lhs: *fc.Args[0], Rhs: *fc.Args[1]}, ag, params)
+		return resolveBinary(s, &binaryExpr{Op: opMod, Lhs: *fc.Args[0], Rhs: *fc.Args[1]}, ag, params)
 	}
 	if isScalarFuncName(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
@@ -23096,7 +23096,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveScalarFunc(s, fc, ag, params)
 	}
-	return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
+	return nil, resolvedType{}, newError(UndefinedFunction, "function does not exist: "+fc.Name)
 }
 
 // rejectNamed errors 42883 if any argument is named — named notation is valid only for a function
@@ -23104,7 +23104,7 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 func rejectNamed(name string, argNames []*string) error {
 	for _, n := range argNames {
 		if n != nil {
-			return NewError(UndefinedFunction, "function "+name+" has no parameter named \""+*n+"\"")
+			return newError(UndefinedFunction, "function "+name+" has no parameter named \""+*n+"\"")
 		}
 	}
 	return nil
@@ -23113,10 +23113,10 @@ func rejectNamed(name string, argNames []*string) error {
 // scalarFuncDesc returns the lone scalar-function catalog row of this name (e.g. make_interval),
 // reading named/default/family metadata for named-notation resolution (functions.md §11) from the
 // generated catalog table (CLAUDE.md §5) rather than re-hardcoding it.
-func scalarFuncDesc(name string) *OperatorDesc {
-	for i := range Operators {
-		if Operators[i].Kind == "function" && Operators[i].Name == name {
-			return &Operators[i]
+func scalarFuncDesc(name string) *operatorDesc {
+	for i := range operators {
+		if operators[i].Kind == "function" && operators[i].Name == name {
+			return &operators[i]
 		}
 	}
 	return nil
@@ -23125,10 +23125,10 @@ func scalarFuncDesc(name string) *OperatorDesc {
 // scalarFuncDescArity is scalarFuncDesc restricted to a given arity — for a named function
 // overloaded on arity (make_timestamptz: a 6-arg session-zone form + a 7-arg explicit-zone form),
 // so named-notation resolution reads the right slot list (functions.md §11).
-func scalarFuncDescArity(name string, arity int) *OperatorDesc {
-	for i := range Operators {
-		if Operators[i].Kind == "function" && Operators[i].Name == name && Operators[i].Arity == arity {
-			return &Operators[i]
+func scalarFuncDescArity(name string, arity int) *operatorDesc {
+	for i := range operators {
+		if operators[i].Kind == "function" && operators[i].Name == name && operators[i].Arity == arity {
+			return &operators[i]
 		}
 	}
 	return nil
@@ -23138,16 +23138,16 @@ func scalarFuncDescArity(name string, arity int) *OperatorDesc {
 // given family, so it adapts (functions.md §11): an integer slot offers i64, a float slot offers
 // f64 (so a bare 0/1.5 becomes f64 for secs), a text slot offers text (so a bare 'UTC' adapts to
 // the make_timestamptz timezone slot). Other families offer no hint (nil).
-func familyHint(family string) *ScalarType {
+func familyHint(family string) *scalarType {
 	switch family {
 	case "integer":
-		t := Int64
+		t := scalarInt64
 		return &t
 	case "float":
-		t := Float64
+		t := scalarFloat64
 		return &t
 	case "text":
-		t := Text
+		t := scalarText
 		return &t
 	default:
 		return nil
@@ -23157,12 +23157,12 @@ func familyHint(family string) *ScalarType {
 // defaultExpr materializes a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an
 // Expr so an omitted trailing argument resolves through the normal literal path — adapting to its
 // slot's family (e.g. "0" → f64 for secs). functions.md §11.
-func defaultExpr(lit string) Expr {
+func newDefaultExpr(lit string) exprNode {
 	n, err := strconv.ParseInt(lit, 10, 64)
 	if err != nil {
 		panic("catalog arg_defaults are integer literals (verify.rb): " + lit)
 	}
-	return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: n}}
+	return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: n}}
 }
 
 // normalizeNamedArgs maps a call's positional + named arguments onto a function's positional
@@ -23170,9 +23170,9 @@ func defaultExpr(lit string) Expr {
 // + DEFAULTs, functions.md §11). Returns the positional Expr slice of length desc.Arity. Errors:
 // 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
 // unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
-func normalizeNamedArgs(desc *OperatorDesc, args []*Expr, argNames []*string) ([]*Expr, error) {
+func normalizeNamedArgs(desc *operatorDesc, args []*exprNode, argNames []*string) ([]*exprNode, error) {
 	arity := desc.Arity
-	slots := make([]*Expr, arity)
+	slots := make([]*exprNode, arity)
 	seenNamed := false
 	for i, a := range args {
 		var nm *string
@@ -23181,7 +23181,7 @@ func normalizeNamedArgs(desc *OperatorDesc, args []*Expr, argNames []*string) ([
 		}
 		if nm == nil {
 			if seenNamed {
-				return nil, NewError(SyntaxError, "positional argument cannot follow named argument")
+				return nil, newError(SyntaxError, "positional argument cannot follow named argument")
 			}
 			if i >= arity {
 				return nil, noFuncOverload(desc.Name) // too many positional arguments
@@ -23198,21 +23198,21 @@ func normalizeNamedArgs(desc *OperatorDesc, args []*Expr, argNames []*string) ([
 			}
 		}
 		if idx < 0 {
-			return nil, NewError(UndefinedFunction, "function "+desc.Name+" has no parameter named \""+*nm+"\"")
+			return nil, newError(UndefinedFunction, "function "+desc.Name+" has no parameter named \""+*nm+"\"")
 		}
 		if slots[idx] != nil {
-			return nil, NewError(SyntaxError, "argument name \""+*nm+"\" used more than once")
+			return nil, newError(SyntaxError, "argument name \""+*nm+"\" used more than once")
 		}
 		slots[idx] = a
 	}
 	firstDefaulted := arity - len(desc.ArgDefaults)
-	out := make([]*Expr, 0, arity)
+	out := make([]*exprNode, 0, arity)
 	for i := 0; i < arity; i++ {
 		switch {
 		case slots[i] != nil:
 			out = append(out, slots[i])
 		case i >= firstDefaulted:
-			e := defaultExpr(desc.ArgDefaults[i-firstDefaulted])
+			e := newDefaultExpr(desc.ArgDefaults[i-firstDefaulted])
 			out = append(out, &e)
 		default:
 			return nil, noFuncOverload(desc.Name) // missing required argument
@@ -23226,9 +23226,9 @@ func normalizeNamedArgs(desc *OperatorDesc, args []*Expr, argNames []*string) ([
 // defaults onto the seven slots, resolve each with its declared family as the type hint (so a bare
 // numeric literal adapts to the f64 secs slot), and emit a sfMakeInterval node. The arguments
 // keep their families (no promotion); a wrong family in a slot is 42883.
-func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveMakeInterval(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	desc := scalarFuncDesc("make_interval")
 	if desc == nil {
@@ -23255,8 +23255,8 @@ func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 		}
 		rargs = append(rargs, r)
 	}
-	return &rExpr{kind: reScalarFunc, sfunc: sfMakeInterval, sargs: rargs, result: IntervalType},
-		resolvedTypeOf(IntervalType), nil
+	return &rExpr{kind: reScalarFunc, sfunc: sfMakeInterval, sargs: rargs, result: scalarInterval},
+		resolvedTypeOf(scalarInterval), nil
 }
 
 // resolveMakeTimestamp resolves make_timestamp(year, month, mday, hour, min, sec) /
@@ -23267,9 +23267,9 @@ func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 // catalog row then drives named-notation normalization. Each slot resolves with its declared family
 // as the type hint (a bare numeric literal adapts to the f64 sec slot, a bare string to the text
 // timezone slot); a wrong family in a slot is 42883.
-func resolveMakeTimestamp(s *scope, name string, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveMakeTimestamp(s *scope, name string, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	isTz := name == "make_timestamptz"
 	// Pick the overload: the 7-arg explicit-zone form is selected by a 7th positional argument or a
@@ -23319,9 +23319,9 @@ func resolveMakeTimestamp(s *scope, name string, fc *FuncCallExpr, ag *aggCtx, p
 		}
 		rargs = append(rargs, r)
 	}
-	sf, result := sfMakeTimestamp, Timestamp
+	sf, result := sfMakeTimestamp, scalarTimestamp
 	if isTz {
-		sf, result = sfMakeTimestamptz, Timestamptz
+		sf, result = sfMakeTimestamptz, scalarTimestamptz
 	}
 	return &rExpr{kind: reScalarFunc, sfunc: sf, sargs: rargs, result: result},
 		resolvedTypeOf(result), nil
@@ -23335,7 +23335,7 @@ func f64ToMicros(secs float64) (int64, error) {
 	p := math.Round(secs * 1_000_000.0) // round-half-away-from-zero (math.Round)
 	// 2^63 = 9_223_372_036_854_775_808.0 is the first f64 strictly above math.MaxInt64.
 	if math.IsNaN(p) || math.IsInf(p, 0) || p < -9_223_372_036_854_775_808.0 || p >= 9_223_372_036_854_775_808.0 {
-		return 0, NewError(DatetimeFieldOverflow, "interval out of range")
+		return 0, newError(DatetimeFieldOverflow, "interval out of range")
 	}
 	return int64(p), nil
 }
@@ -23344,9 +23344,9 @@ func f64ToMicros(secs float64) (int64, error) {
 // node. Unlike an aggregate it is legal in any context, so its arguments resolve in the SAME
 // agg context (a nested aggregate is still collected in a projection and 42803 in WHERE). The
 // overload is picked by the argument families; no match is 42883. spec/design/functions.md §9.
-func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	name := toLowerASCII(fc.Name)
 	rargs := make([]*rExpr, 0, len(fc.Args))
@@ -23378,7 +23378,7 @@ func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 // variadicNotArray is the 42804 raised when a VARIADIC operand is not an array (array-functions.md
 // §12 / §7).
 func variadicNotArray() error {
-	return NewError(DatatypeMismatch, "VARIADIC argument must be an array")
+	return newError(DatatypeMismatch, "VARIADIC argument must be an array")
 }
 
 // resolveVariadicFunc resolves a VARIADIC scalar-function call (num_nulls/num_nonnulls —
@@ -23386,9 +23386,9 @@ func variadicNotArray() error {
 // spread of trailing arguments OR (with the VARIADIC keyword) a single array passed directly.
 // Non-strict (null = "none"): the node carries no blanket NULL short-circuit. The result type is
 // the catalog Result (i32 here), independent of the arguments.
-func resolveVariadicFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
-		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
 	name := toLowerASCII(fc.Name)
 	desc := scalarFuncDesc(name)
@@ -23479,7 +23479,7 @@ func jsonBuildClassify(name string) (jsonBuildKind, bool, bool) {
 
 // groupingErrorColumn is the 42803 for a non-aggregated column not in GROUP BY.
 func groupingErrorColumn(name string) error {
-	return NewError(GroupingError, "column "+name+" must appear in the GROUP BY clause or be used in an aggregate function")
+	return newError(GroupingError, "column "+name+" must appear in the GROUP BY clause or be used in an aggregate function")
 }
 
 // collectColumn resolves a column reference (already at real flat index idx) under an
@@ -23520,7 +23520,7 @@ func collectColumn(s *scope, ag *aggCtx, idx int, name string) (*rExpr, resolved
 // ambiguity), every other statement never builds one.
 type scopeRel struct {
 	label         string
-	table         *Table
+	table         *catTable
 	offset        int
 	qualifierOnly bool
 	// cte is non-nil (pointing to the index into the statement's CTE list — spec/design/cte.md)
@@ -23546,7 +23546,7 @@ type scope struct {
 	// parent is the enclosing query's scope, for correlated resolution (nil at top level).
 	parent *scope
 	// catalog lets a subquery's inner FROM tables be looked up during planning.
-	catalog *Engine
+	catalog *engine
 	// allowSubquery is true inside a SELECT (and its nested subqueries), false for UPDATE/DELETE
 	// (a subquery there is 0A000 this slice).
 	allowSubquery bool
@@ -23576,7 +23576,7 @@ type mergeCol struct {
 // Subqueries ARE allowed: a correlated reference resolves to the target row via the per-row
 // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
 // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
-func singleScope(catalog *Engine, t *Table) *scope {
+func singleScope(catalog *engine, t *catTable) *scope {
 	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
 }
 
@@ -23584,7 +23584,7 @@ func singleScope(catalog *Engine, t *Table) *scope {
 // §2): a default may not reference a column (rejected as 0A000 by the structural pre-walk
 // before resolution) and may not contain a subquery, so there are no relations and subqueries
 // are disallowed.
-func emptyScope(catalog *Engine) *scope {
+func emptyScope(catalog *engine) *scope {
 	return &scope{catalog: catalog, allowSubquery: false}
 }
 
@@ -23597,7 +23597,7 @@ func emptyScope(catalog *Engine) *scope {
 // A target table literally named old/new SHADOWS that qualifier (the pseudo-relation is
 // suppressed; PostgreSQL's probed rule — its WITH (OLD AS o, ...) aliasing escape stays
 // deferred).
-func returningScope(catalog *Engine, t *Table, baseIsOld bool) *scope {
+func returningScope(catalog *engine, t *catTable, baseIsOld bool) *scope {
 	n := len(t.Columns)
 	label := strings.ToLower(t.Name)
 	oldOffset, newOffset := n, 0
@@ -23622,7 +23622,7 @@ func returningScope(catalog *Engine, t *Table, baseIsOld bool) *scope {
 // over the combined row [existing | proposed] (excluded.col reads the proposed row). A target
 // table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like the
 // RETURNING old/new qualifiers).
-func onConflictExcludedScope(catalog *Engine, t *Table) *scope {
+func onConflictExcludedScope(catalog *engine, t *catTable) *scope {
 	n := len(t.Columns)
 	label := strings.ToLower(t.Name)
 	rels := []scopeRel{{label: label, table: t, offset: 0}}
@@ -23726,7 +23726,7 @@ func (s *scope) width() int {
 }
 
 // columnAt returns the column at a flat index in THIS scope (index known valid).
-func (s *scope) columnAt(flat int) *Column {
+func (s *scope) columnAt(flat int) *catColumn {
 	for i := range s.rels {
 		r := s.rels[i]
 		n := len(r.table.Columns)
@@ -23785,13 +23785,13 @@ func (s *scope) ancestor(level int) *scope {
 }
 
 // columnOf returns the column a resolution refers to — local here, or outer in an ancestor.
-func (s *scope) columnOf(r resolved) *Column {
+func (s *scope) columnOf(r resolved) *catColumn {
 	return s.ancestor(r.level).columnAt(r.index)
 }
 
 // undefinedColumn is 42703 — a column name that no relation in scope defines.
 func undefinedColumn(name string) error {
-	return NewError(UndefinedColumn, "column does not exist: "+name)
+	return newError(UndefinedColumn, "column does not exist: "+name)
 }
 
 // resolveFieldOf builds field selection `(base).field` over an already-resolved `base` node and
@@ -23801,7 +23801,7 @@ func undefinedColumn(name string) error {
 // Returns the reField node carrying the fixed field ordinal, plus the field's static type.
 func resolveFieldOf(baseNode *rExpr, baseTy resolvedType, field string) (*rExpr, resolvedType, error) {
 	if baseTy.kind != rtComposite {
-		return nil, resolvedType{}, NewError(WrongObjectType, fmt.Sprintf(
+		return nil, resolvedType{}, newError(WrongObjectType, fmt.Sprintf(
 			"column notation .%s applied to type %s, which is not a composite type",
 			field, rtName(baseTy),
 		))
@@ -23816,25 +23816,25 @@ func resolveFieldOf(baseNode *rExpr, baseTy resolvedType, field string) (*rExpr,
 
 // ambiguousColumn is 42702 — a bare column name that more than one relation in scope defines.
 func ambiguousColumn(name string) error {
-	return NewError(AmbiguousColumn, "column reference "+name+" is ambiguous")
+	return newError(AmbiguousColumn, "column reference "+name+" is ambiguous")
 }
 
 // missingFromEntry is 42P01 — a qualifier that names no relation in the FROM clause.
 func missingFromEntry(qualifier string) error {
-	return NewError(UndefinedTable, "missing FROM-clause entry for table "+qualifier)
+	return newError(UndefinedTable, "missing FROM-clause entry for table "+qualifier)
 }
 
 // paramTypes accumulates the inferred type of each bind parameter ($N) across every clause of a
 // statement (spec/design/api.md §5). types[i] is the inferred scalar type of $(i+1); a nil entry
 // marks a parameter referenced before any context fixed its type.
 type paramTypes struct {
-	types []*ScalarType
+	types []*scalarType
 }
 
 // note records that $(idx0+1) appears with context type ty (nil = no context here). It unifies
 // with any prior inference: equal types agree, two integer widths widen to the wider, an
 // incompatible concrete pair is 42804.
-func (p *paramTypes) note(idx0 int, ty *ScalarType) error {
+func (p *paramTypes) note(idx0 int, ty *scalarType) error {
 	for idx0 >= len(p.types) {
 		p.types = append(p.types, nil)
 	}
@@ -23856,11 +23856,11 @@ func (p *paramTypes) note(idx0 int, ty *ScalarType) error {
 
 // finalize returns the ordered parameter types. A slot referenced but never typed — including a
 // gap in $1..$N — is 42P18 indeterminate_datatype.
-func (p *paramTypes) finalize() ([]ScalarType, error) {
-	out := make([]ScalarType, 0, len(p.types))
+func (p *paramTypes) finalize() ([]scalarType, error) {
+	out := make([]scalarType, 0, len(p.types))
 	for i, t := range p.types {
 		if t == nil {
-			return nil, NewError(IndeterminateDatatype,
+			return nil, newError(IndeterminateDatatype,
 				fmt.Sprintf("could not determine data type of parameter $%d", i+1))
 		}
 		out = append(out, *t)
@@ -23870,7 +23870,7 @@ func (p *paramTypes) finalize() ([]ScalarType, error) {
 
 // unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
 // widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
-func unifyParamType(a, b ScalarType, idx0 int) (ScalarType, error) {
+func unifyParamType(a, b scalarType, idx0 int) (scalarType, error) {
 	if a == b {
 		return a, nil
 	}
@@ -23880,17 +23880,17 @@ func unifyParamType(a, b ScalarType, idx0 int) (ScalarType, error) {
 		}
 		return b, nil
 	}
-	var zero ScalarType
-	return zero, NewError(DatatypeMismatch,
+	var zero scalarType
+	return zero, newError(DatatypeMismatch,
 		fmt.Sprintf("inconsistent types inferred for parameter $%d", idx0+1))
 }
 
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
 // all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
 // is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
-func bindParams(supplied []Value, types []ScalarType) ([]Value, error) {
+func bindParams(supplied []Value, types []scalarType) ([]Value, error) {
 	if len(supplied) != len(types) {
-		return nil, NewError(SyntaxError, fmt.Sprintf(
+		return nil, newError(SyntaxError, fmt.Sprintf(
 			"bind parameter count mismatch: statement expects %d, got %d", len(types), len(supplied),
 		))
 	}
@@ -23906,7 +23906,7 @@ func bindParams(supplied []Value, types []ScalarType) ([]Value, error) {
 }
 
 // resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
-func resolvedTypeOf(ty ScalarType) resolvedType {
+func resolvedTypeOf(ty scalarType) resolvedType {
 	switch {
 	case ty.IsText():
 		return resolvedType{kind: rtText}
@@ -23942,7 +23942,7 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 // resolvedTypeOfCol is the resolved static type of a column of open type ty (spec/design/composite.md
 // §5): a scalar via resolvedTypeOf, or a composite resolved against the snapshot's type catalog (the
 // reference is guaranteed present — resolved at load / CREATE TYPE). Recursive for nested composites.
-func resolvedTypeOfCol(ty Type, snap *Snapshot) resolvedType {
+func resolvedTypeOfCol(ty dataType, snap *snapshot) resolvedType {
 	if ty.Array != nil {
 		elem := resolvedTypeOfCol(*ty.Array, snap)
 		return resolvedType{kind: rtArray, elem: &elem}
@@ -23966,7 +23966,7 @@ func resolvedTypeOfCol(ty Type, snap *Snapshot) resolvedType {
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
 // each relation's columns in catalog order (§15).
-func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, error) {
+func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, error) {
 	if items.All {
 		// `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
 		// (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
@@ -23979,7 +23979,7 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 			}
 		}
 		if !expandable {
-			return nil, nil, nil, NewError(SyntaxError, "SELECT * with no tables specified is not valid")
+			return nil, nil, nil, newError(SyntaxError, "SELECT * with no tables specified is not valid")
 		}
 		var ps []*rExpr
 		var names []string
@@ -24020,7 +24020,7 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 		// catalog order (grammar.md §15) — like bare `*` but for one named relation and mixable with
 		// other items. Resolved against the LOCAL scope only (like bare `*`); an unknown label is
 		// 42P01, exactly as a qualified column ref.
-		if it.Expr.Kind == ExprQualifiedStar {
+		if it.Expr.Kind == exprQualifiedStar {
 			want := toLowerASCII(it.Expr.Qualifier)
 			var found *scopeRel
 			for i := range s.rels {
@@ -24030,7 +24030,7 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 				}
 			}
 			if found == nil {
-				return nil, nil, nil, NewError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
+				return nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
 			}
 			for i := range found.table.Columns {
 				ps = append(ps, &rExpr{kind: reColumn, index: found.offset + i})
@@ -24043,13 +24043,13 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 		// order (spec/design/composite.md §S4). The base is resolved once and each output column is
 		// a reField node over a shared base node — the base is pure, so sharing the resolved node is
 		// safe (no clone needed, unlike Rust where RExpr isn't Clone). A non-composite base is 42809.
-		if it.Expr.Kind == ExprFieldStar {
+		if it.Expr.Kind == exprFieldStar {
 			baseNode, baseTy, err := resolve(s, *it.Expr.Base, nil, ag, params)
 			if err != nil {
 				return nil, nil, nil, err
 			}
 			if baseTy.kind != rtComposite {
-				return nil, nil, nil, NewError(WrongObjectType, fmt.Sprintf(
+				return nil, nil, nil, newError(WrongObjectType, fmt.Sprintf(
 					"column notation .* applied to type %s, which is not a composite type",
 					rtName(baseTy),
 				))
@@ -24080,26 +24080,26 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 // bare or qualified column reference takes the catalog's canonical name (never the qualifier,
 // never the SELECT spelling); every other expression takes the fixed "?column?". The column
 // is known to exist — resolve validated it.
-func outputName(s *scope, e Expr) string {
+func outputName(s *scope, e exprNode) string {
 	switch e.Kind {
-	case ExprColumn:
+	case exprColumn:
 		if r, err := s.resolveBare(e.Column); err == nil {
 			return s.columnOf(r).Name
 		}
 		return e.Column
-	case ExprQualifiedColumn:
+	case exprQualifiedColumn:
 		if r, err := s.resolveQualified(e.Qualifier, e.Column); err == nil {
 			return s.columnOf(r).Name
 		}
 		return e.Column
-	case ExprFuncCall:
+	case exprFuncCall:
 		// An un-aliased aggregate call is named by its lowercased function name (PG; §8).
 		return toLowerASCII(e.FuncCall.Name)
-	case ExprFieldAccess:
+	case exprFieldAccess:
 		// A field selection takes the FIELD name (PG names the output column after the selected
 		// field, lowercased — spec/design/composite.md §S4).
 		return toLowerASCII(e.Field)
-	case ExprSubscript:
+	case exprSubscript:
 		// A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to
 		// the same base. A non-column base falls through to `?column?`.
 		return outputName(s, *e.Base)
@@ -24117,11 +24117,11 @@ func outputName(s *scope, e Expr) string {
 // case-insensitive (§8). Only an explicit list is scanned — with * the output names are the scope
 // columns, so the FROM-scope fallback already binds the same column. Two items of the same name
 // with DIFFERENT expressions are ambiguous (42702); the same expression twice is not, matching PG.
-func orderAliasMatch(items SelectItems, name string, s *scope) (*Expr, error) {
+func orderAliasMatch(items selectItems, name string, s *scope) (*exprNode, error) {
 	if items.All {
 		return nil, nil
 	}
-	var found *Expr
+	var found *exprNode
 	for i := range items.Items {
 		it := &items.Items[i]
 		var oname string
@@ -24136,7 +24136,7 @@ func orderAliasMatch(items SelectItems, name string, s *scope) (*Expr, error) {
 		if found == nil {
 			found = &it.Expr
 		} else if !exprEqual(*found, it.Expr) {
-			return nil, NewError(AmbiguousColumn, fmt.Sprintf("ORDER BY \"%s\" is ambiguous", name))
+			return nil, newError(AmbiguousColumn, fmt.Sprintf("ORDER BY \"%s\" is ambiguous", name))
 		}
 	}
 	return found, nil
@@ -24144,7 +24144,7 @@ func orderAliasMatch(items SelectItems, name string, s *scope) (*Expr, error) {
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, which is always unknown → no rows). An integer- or text-valued one is 42804.
-func resolveBooleanFilter(s *scope, e *Expr, params *paramTypes) (*rExpr, error) {
+func resolveBooleanFilter(s *scope, e *exprNode, params *paramTypes) (*rExpr, error) {
 	// WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
 	node, ty, err := resolve(s, *e, nil, &aggCtx{collecting: false}, params)
 	if err != nil {
@@ -24175,9 +24175,9 @@ func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, re
 // documented divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The
 // inner query is resolved ONCE, with `s` as its parent, so correlated references become
 // reOuterColumn and errors fire even over an empty outer.
-func planSubquery(s *scope, inner QueryExpr, params *paramTypes) (queryPlan, error) {
+func planSubquery(s *scope, inner queryExpr, params *paramTypes) (queryPlan, error) {
 	if !s.allowSubquery {
-		return queryPlan{}, NewError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
+		return queryPlan{}, newError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
 	}
 	// A subquery inherits the enclosing scope's CTE bindings directly (cte.md §2): a CTE is
 	// visible inside a nested subquery without counting as a correlation level.
@@ -24187,8 +24187,8 @@ func planSubquery(s *scope, inner QueryExpr, params *paramTypes) (queryPlan, err
 // resolveSubscriptInt resolves one array-subscript bound to an integer rExpr (a literal adapts to
 // int4; a non-integer is 42804). A NULL-typed bound is accepted — it evaluates to a NULL subscript
 // → NULL result (spec/design/array.md §6).
-func resolveSubscriptInt(s *scope, e Expr, ag *aggCtx, params *paramTypes) (*rExpr, error) {
-	idxCtx := Int32
+func resolveSubscriptInt(s *scope, e exprNode, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+	idxCtx := scalarInt32
 	node, ty, err := resolve(s, e, &idxCtx, ag, params)
 	if err != nil {
 		return nil, err
@@ -24200,7 +24200,7 @@ func resolveSubscriptInt(s *scope, e Expr, ag *aggCtx, params *paramTypes) (*rEx
 }
 
 // resolveSubscriptIntPtr resolves an optional (possibly-omitted) slice bound; nil stays nil.
-func resolveSubscriptIntPtr(s *scope, e *Expr, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+func resolveSubscriptIntPtr(s *scope, e *exprNode, ag *aggCtx, params *paramTypes) (*rExpr, error) {
 	if e == nil {
 		return nil, nil
 	}
@@ -24210,19 +24210,19 @@ func resolveSubscriptIntPtr(s *scope, e *Expr, ag *aggCtx, params *paramTypes) (
 // resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to i64.
-func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
 	// matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT a+b
 	// … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own path
 	// (matched by index); an aggregate operand / FILTER resolves under the Forbidden mode (no
 	// groupKeyExprs), so this is correctly inert there (its `a+b` is a per-row value, not the group key).
-	if e.Kind != ExprColumn && e.Kind != ExprQualifiedColumn {
+	if e.Kind != exprColumn && e.Kind != exprQualifiedColumn {
 		if slot, ty, ok := matchGroupExpr(ag, e); ok {
 			return &rExpr{kind: reColumn, index: slot}, ty, nil
 		}
 	}
 	switch e.Kind {
-	case ExprParam:
+	case exprParam:
 		// A bind parameter is an adaptable operand (like an integer/string literal): it takes its
 		// type from ctx — the sibling operand, target column, or CAST target. Record the inferred
 		// type (nil = no context here; finalize 42P18s a parameter that never gets one).
@@ -24237,7 +24237,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			rty = resolvedType{kind: rtNull}
 		}
 		return &rExpr{kind: reParam, index: idx0}, rty, nil
-	case ExprColumn:
+	case exprColumn:
 		// Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
 		// (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
 		r, err := s.resolveBare(e.Column)
@@ -24245,7 +24245,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return resolveColumnRef(s, ag, r, e.Column)
-	case ExprQualifiedColumn:
+	case exprQualifiedColumn:
 		// A bare `rel.col` resolves strictly against the FROM relations — `qualifier` MUST name a
 		// relation (else 42P01), matching PostgreSQL. Composite field access on a column is the
 		// **parens-required** `(col).field` form (spec/design/composite.md §1/§S4), an
@@ -24256,24 +24256,24 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return resolveColumnRef(s, ag, r, e.Column)
-	case ExprFieldAccess:
+	case exprFieldAccess:
 		// `(expr).field` — composite field selection (spec/design/composite.md §S4).
 		node, ty, err := resolve(s, *e.Base, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return resolveFieldOf(node, ty, e.Field)
-	case ExprFieldStar:
+	case exprFieldStar:
 		// `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
 		// expression position it is unsupported (PG rejects row expansion here — 0A000).
-		return nil, resolvedType{}, NewError(FeatureNotSupported,
+		return nil, resolvedType{}, newError(FeatureNotSupported,
 			"row expansion (.*) is not supported in this context")
-	case ExprQualifiedStar:
+	case exprQualifiedStar:
 		// `t.*` is likewise projection-list only — resolveProjections expands it before ever
 		// calling resolve(); reaching here means it appeared in a scalar position (which the parser
 		// already rejects as 42601). Defensive parity with the FieldStar arm.
-		return nil, resolvedType{}, NewError(SyntaxError, "t.* is only allowed in a select list")
-	case ExprSubscript:
+		return nil, resolvedType{}, newError(SyntaxError, "t.* is only allowed in a select list")
+	case exprSubscript:
 		// `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array
 		// (else 42804). Each subscript bound is an integer (a literal adapts; a non-integer is
 		// 42804). If any spec is a slice the result is the array type (a sub-array); otherwise it is
@@ -24321,7 +24321,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			resTy = baseTy
 		}
 		return &rExpr{kind: reSubscript, operand: baseNode, subs: rsubs, isSlice: isSlice}, resTy, nil
-	case ExprRow:
+	case exprRow:
 		// A ROW(...) constructor (spec/design/composite.md §1): resolve each field (no context — a
 		// field defaults like a bare expression), build the anonymous (structural) composite type
 		// (name unset; fields named f1, f2, …) the result types as. Storing it into a named composite
@@ -24337,7 +24337,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			fields[i] = compositeRField{name: fmt.Sprintf("f%d", i+1), ty: ty}
 		}
 		return &rExpr{kind: reRow, sargs: nodes}, resolvedType{kind: rtComposite, comp: &compositeRType{fields: fields}}, nil
-	case ExprArray:
+	case exprArray:
 		// An ARRAY[...] constructor (spec/design/array.md §1): resolve each element (natural type),
 		// unify to a common element type, build a reArray. A bare empty ARRAY[] has no element type
 		// to infer — use '{}'::T[] instead (the cast supplies it).
@@ -24372,13 +24372,13 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reArray, sargs: nodes, nested: true}, common, nil
 		}
 		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &common}, nil
-	case ExprFuncCall:
+	case exprFuncCall:
 		// A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19) is
 		// one of these window-function names used WITH a WITHIN GROUP clause; that clause routes it
 		// here instead of the window path. OVER + WITHIN GROUP together is 0A000.
 		if isHypotheticalSetName(e.FuncCall.Name) && e.FuncCall.WithinGroup != nil {
 			if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					fmt.Sprintf("OVER is not supported for hypothetical-set aggregate %s", toLowerASCII(e.FuncCall.Name)))
 			}
 			return resolveHypotheticalSetAggregate(s, e.FuncCall, ag, params)
@@ -24389,7 +24389,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// 42883 (PG: "function mode() does not exist").
 		if isOrderedSetAggregateName(e.FuncCall.Name) {
 			if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					fmt.Sprintf("OVER is not supported for ordered-set aggregate %s", toLowerASCII(e.FuncCall.Name)))
 			}
 			if e.FuncCall.WithinGroup == nil {
@@ -24407,12 +24407,12 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			if strings.EqualFold(e.FuncCall.Name, "grouping") {
 				// GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in
 				// PostgreSQL (42601); match it rather than treating GROUPING as an unknown window fn.
-				return nil, resolvedType{}, NewError(SyntaxError, "OVER is not supported for GROUPING")
+				return nil, resolvedType{}, newError(SyntaxError, "OVER is not supported for GROUPING")
 			}
 			// DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5):
 			// a window aggregate folds over a frame, where per-frame de-duplication is undefined.
 			if e.FuncCall.Distinct {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"DISTINCT is not implemented for window functions")
 			}
 			// FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the
@@ -24420,7 +24420,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			// FILTER is PG's own 0A000 ("FILTER is not implemented for non-aggregate window
 			// functions"). The filter is threaded into the windowSpec and applied in the window stage.
 			if e.FuncCall.Filter != nil && !isAggregateName(e.FuncCall.Name) {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"FILTER is not implemented for non-aggregate window functions")
 			}
 			return resolveWindowCall(s, e.FuncCall, e.FuncCall.Filter, ag, params)
@@ -24428,17 +24428,17 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's wrong_object_type,
 		// not the windowing_error 42P20 it uses for a window in WHERE — window.md §7, oracle-verified).
 		if isWindowOnlyName(e.FuncCall.Name) {
-			return nil, resolvedType{}, NewError(WrongObjectType,
+			return nil, resolvedType{}, newError(WrongObjectType,
 				fmt.Sprintf("window function %s requires an OVER clause", toLowerASCII(e.FuncCall.Name)))
 		}
 		return resolveFuncCall(s, e.FuncCall, ag, params)
-	case ExprLiteral:
+	case exprLiteral:
 		switch e.Literal.Kind {
-		case LiteralNull:
+		case literalNull:
 			return &rExpr{kind: reConstNull}, resolvedType{kind: rtNull}, nil
-		case LiteralBool:
+		case literalBool:
 			return &rExpr{kind: reConstBool, cBool: e.Literal.Bool}, resolvedType{kind: rtBool}, nil
-		case LiteralText:
+		case literalText:
 			// A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
 			// context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
 			// input (uuid) — 22P02 on malformed; any other context — including none — keeps it text.
@@ -24459,13 +24459,13 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				}
 				return &rExpr{kind: reConstUuid, cBytea: b}, resolvedType{kind: rtUuid}, nil
 			case ctx != nil && ctx.IsTimestamp():
-				m, err := ParseTimestamp(e.Literal.Str)
+				m, err := parseTimestamp(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
 			case ctx != nil && ctx.IsTimestamptz():
-				m, err := ParseTimestamptz(e.Literal.Str)
+				m, err := parseTimestamptz(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
@@ -24473,7 +24473,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case ctx != nil && ctx.IsDate():
 				// A string adapts to a DATE context (parse the ISO date, dropping any time/offset;
 				// 22007/22008 — spec/design/date.md §2), like timestamp adaptation.
-				m, err := ParseDate(e.Literal.Str)
+				m, err := parseDate(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
@@ -24481,7 +24481,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case ctx != nil && ctx.IsInterval():
 				// A string adapts to an INTERVAL context (parse the "unit + time" subset,
 				// 22007/22008 — spec/design/interval.md), like timestamp adaptation.
-				iv, err := ParseInterval(e.Literal.Str)
+				iv, err := parseInterval(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
@@ -24506,14 +24506,14 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case ctx != nil && ctx.IsJsonPath():
 				// A string literal adapts to a jsonpath context (a jsonpath function argument) — it
 				// is compiled to a path at resolve (jsonpath.md §1); malformed → 42601.
-				jp, err := Compile(e.Literal.Str)
+				jp, err := compile(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstJsonPath, cText: jp.Render()}, resolvedType{kind: rtJsonPath}, nil
 			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
-		case LiteralDecimal:
+		case literalDecimal:
 			// A decimal literal is decimal by default, but ADAPTS to a FLOAT context: in a
 			// f64/f32 column/operand context it coerces decimal→float at resolve (the
 			// nearest binary value, round-ties-to-even — spec/design/float.md §4). Any other
@@ -24538,7 +24538,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				return &rExpr{kind: reConstFloat64, cFloat: intToFloat64(e.Literal.Int)},
 					resolvedType{kind: rtFloat64}, nil
 			}
-			ty := Int64
+			ty := scalarInt64
 			if ctx != nil && ctx.IsInteger() {
 				ty = *ctx
 			}
@@ -24548,7 +24548,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reConstInt, cInt: e.Literal.Int},
 				resolvedType{kind: rtInt, intTy: ty}, nil
 		}
-	case ExprTypedLiteral:
+	case exprTypedLiteral:
 		// A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
 		// `type 'string'`, equal to CAST('string' AS type) over a string-literal operand. Resolve
 		// the type by name (unknown → 42704) and coerce the string to it at resolve, context-free.
@@ -24569,7 +24569,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return coerceStringLiteral(e.TypeLitText, target, nil)
-	case ExprScalarSubquery:
+	case exprScalarSubquery:
 		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
 		// non-SELECT context and a $N inside (both 0A000). The fold pass folds an uncorrelated one
@@ -24579,11 +24579,11 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		if len(plan.columnTypes()) != 1 {
-			return nil, resolvedType{}, NewError(SyntaxError, "subquery must return only one column")
+			return nil, resolvedType{}, newError(SyntaxError, "subquery must return only one column")
 		}
 		outType := plan.columnTypes()[0]
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqScalar}, outType, nil
-	case ExprExists:
+	case exprExists:
 		// EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
 		// EXISTS parses as the unary NOT wrapping this, so negated here is always false.
 		plan, err := planSubquery(s, *e.Subquery, params)
@@ -24591,7 +24591,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqExists}, resolvedType{kind: rtBool}, nil
-	case ExprInSubquery:
+	case exprInSubquery:
 		// The LHS is an OUTER expression (resolved in the current scope / agg context); the
 		// subquery yields the single membership column. The test is `lhs = element`, so the pair
 		// must be comparable (42804), exactly like a literal IN.
@@ -24605,13 +24605,13 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		if len(plan.columnTypes()) != 1 {
-			return nil, resolvedType{}, NewError(SyntaxError, "subquery has too many columns")
+			return nil, resolvedType{}, newError(SyntaxError, "subquery has too many columns")
 		}
 		if err := classifyComparable(lt, plan.columnTypes()[0]); err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated}, resolvedType{kind: rtBool}, nil
-	case ExprCollate:
+	case exprCollate:
 		// `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
 		// the inner expression, require a collatable (text) type (42804, PG-matching), and validate
 		// the named collation exists ("C" or loaded, else 42704). A runtime PASSTHROUGH: a collation
@@ -24629,7 +24629,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return inner, ty, nil
-	case ExprExtract:
+	case exprExtract:
 		// EXTRACT(field FROM source) (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
 		// validated at RESOLVE (not per row): an unsupported field for the source type is 0A000, an
 		// unrecognized field is 22023 — surfaced by probing the kernel with a zero value of the source's
@@ -24652,7 +24652,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case rtInterval:
 				probe = extractSrc{kind: srcIv}
 			default:
-				return nil, resolvedType{}, NewError(UndefinedFunction,
+				return nil, resolvedType{}, newError(UndefinedFunction,
 					"function extract(text, "+rtName(srcT)+") does not exist")
 			}
 			if _, err := extractField(e.Extract.Field, probe); err != nil {
@@ -24660,42 +24660,42 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			}
 		}
 		return &rExpr{kind: reExtract, cText: e.Extract.Field, operand: srcR}, resolvedType{kind: rtDecimal}, nil
-	case ExprCast:
+	case exprCast:
 		// An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
 		// string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
 		// text→array, array→text, element-wise array→array) is a documented 0A000 narrowing.
 		if base, ok := strings.CutSuffix(e.Cast.TypeName, "[]"); ok {
 			if e.Cast.TypeMod != nil {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"a type modifier on an array type is not supported yet")
 			}
 			snap := s.catalog.readSnap()
-			var elemCol ColType
+			var elemCol colType
 			var elemRT resolvedType
-			if elemScalar, scalarOK := ScalarTypeFromName(base); scalarOK {
-				elemCol = ScalarColType(elemScalar)
+			if elemScalar, scalarOK := scalarTypeFromName(base); scalarOK {
+				elemCol = scalarColType(elemScalar)
 				elemRT = resolvedTypeOf(elemScalar)
 			} else if ctype := snap.compositeType(base); ctype != nil {
-				elemTy := CompositeT(ctype.Name)
-				elemCol = ResolveColType(elemTy, snap.types)
+				elemTy := compositeT(ctype.Name)
+				elemCol = resolveColType(elemTy, snap.types)
 				elemRT = resolvedTypeOfCol(elemTy, snap)
 			} else {
-				return nil, resolvedType{}, NewError(UndefinedObject, "type does not exist: "+base)
+				return nil, resolvedType{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
-			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
 				val, err := coerceStringToArray(in.Literal.Str, elemCol)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
 				return valueToRExpr(val), resolvedType{kind: rtArray, elem: &elemRT}, nil
 			}
-			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralNull {
+			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalNull {
 				return &rExpr{kind: reConstNull}, resolvedType{kind: rtArray, elem: &elemRT}, nil
 			}
 			// A bind parameter into an array stays the container-param narrowing (0A000), like
 			// INSERT's $N-into-a-container handling (spec/design/array.md §4).
-			if e.Cast.Inner.Kind == ExprParam {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+			if e.Cast.Inner.Kind == exprParam {
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"casting a parameter to an array type is not supported yet")
 			}
 			// A runtime (non-literal) operand: the two follow-on array-producing casts (array.md §7).
@@ -24726,7 +24726,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				}
 				// A composite element on either side is the deferred composite cast surface (0A000).
 				if !srcScalar || elemCol.Composite {
-					return nil, resolvedType{}, NewError(FeatureNotSupported,
+					return nil, resolvedType{}, newError(FeatureNotSupported,
 						"casting between composite-element arrays is not supported yet")
 				}
 				// Both elements are scalars but no cast exists between them — forbidden (42804;
@@ -24741,17 +24741,17 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// (spec/design/ranges.md §1/§5).
 		if desc, ok := rangeByName(e.Cast.TypeName); ok {
 			if e.Cast.TypeMod != nil {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"a type modifier on a range type is not supported")
 			}
 			elemRT := resolvedTypeOf(elementScalar(desc))
-			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
 				return coerceStringToRangeExpr(in.Literal.Str, desc)
 			}
-			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralNull {
+			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalNull {
 				return &rExpr{kind: reConstNull}, resolvedType{kind: rtRange, elem: &elemRT}, nil
 			}
-			return nil, resolvedType{}, NewError(FeatureNotSupported,
+			return nil, resolvedType{}, newError(FeatureNotSupported,
 				"casting to a range type is only supported from a string literal this slice")
 		}
 		// A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
@@ -24762,10 +24762,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// composite is meaningless (0A000).
 		if ct := s.catalog.readSnap().compositeType(e.Cast.TypeName); ct != nil {
 			if e.Cast.TypeMod != nil {
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"a type modifier is not supported on a composite type")
 			}
-			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
 				return coerceStringToComposite(in.Literal.Str, ct, s.catalog)
 			}
 			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
@@ -24774,12 +24774,12 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			}
 			switch {
 			case ity.kind == rtNull:
-				return rinner, resolvedTypeOfCol(CompositeT(ct.Name), s.catalog.readSnap()), nil
+				return rinner, resolvedTypeOfCol(compositeT(ct.Name), s.catalog.readSnap()), nil
 			case ity.kind == rtComposite && ity.comp.named && ity.comp.name == ct.Name:
 				// An identical named composite is the identity cast.
 				return rinner, ity, nil
 			default:
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"casting to a composite type is only supported from a string literal")
 			}
 		}
@@ -24791,7 +24791,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The
 		// ONLY text→T cast admitted ahead of the general cast slice; a non-literal text operand
 		// still falls through to the deferred 0A000 below.
-		if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+		if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
 			return coerceStringLiteral(in.Literal.Str, target, typmod)
 		}
 		// The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
@@ -24801,7 +24801,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// text; same-type is the identity. Any other source is a 42804 cast error (jed's invalid-cast
 		// convention; PG reports 42846 — a documented divergence).
 		if target.IsJson() || target.IsJsonb() {
-			if e.Cast.Inner.Kind == ExprParam {
+			if e.Cast.Inner.Kind == exprParam {
 				t := target
 				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
 				if err != nil {
@@ -24833,8 +24833,8 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			// A bare parameter has no inferable source type for a text target (text is not a
 			// json/jsonb-target case that declares it), so `$1::text` stays the deferred 0A000 it
 			// was before J3 rather than resolving to an untyped-NULL text node.
-			if e.Cast.Inner.Kind == ExprParam {
-				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
+			if e.Cast.Inner.Kind == exprParam {
+				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to text is not supported yet")
 			}
 			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 			if err != nil {
@@ -24853,7 +24853,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case rtArray:
 				return &rExpr{kind: reArrayCast, operand: rinner}, resolvedType{kind: rtText}, nil
 			default:
-				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
+				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to text is not supported yet")
 			}
 		}
 		// A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
@@ -24864,8 +24864,8 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// operand is the identity. text → bytea and every other bytea cast stay deferred (0A000 — the
 		// bytea cast slice's own follow-on, types.md §13).
 		if target.IsBytea() {
-			if e.Cast.Inner.Kind == ExprParam {
-				t := Bytea
+			if e.Cast.Inner.Kind == exprParam {
+				t := scalarBytea
 				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
@@ -24882,7 +24882,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case rtUuid:
 				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtBytea}, nil
 			default:
-				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
+				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to bytea is not supported yet")
 			}
 		}
 		// The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
@@ -24891,8 +24891,8 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// coerced above (the §6 adaptation); $1::uuid declares the param as uuid; a NULL adapts; a uuid
 		// operand is the identity.
 		if target.IsUuid() {
-			if e.Cast.Inner.Kind == ExprParam {
-				t := Uuid
+			if e.Cast.Inner.Kind == exprParam {
+				t := scalarUuid
 				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
@@ -24918,7 +24918,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// source is the deferred 0A000. A NULL operand adapts to the target. text↔datetime casts stay
 		// deferred and fall through (a non-datetime source is rejected here).
 		if target.IsTimestamp() || target.IsTimestamptz() || target.IsDate() {
-			if e.Cast.Inner.Kind == ExprParam {
+			if e.Cast.Inner.Kind == exprParam {
 				t := target
 				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
 				if err != nil {
@@ -24941,21 +24941,21 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case ity.kind == rtTimestamp || ity.kind == rtTimestamptz || ity.kind == rtDate:
 				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
 			default:
-				return nil, resolvedType{}, NewError(FeatureNotSupported,
+				return nil, resolvedType{}, newError(FeatureNotSupported,
 					"cannot cast "+rtName(ity)+" to "+target.CanonicalName())
 			}
 		}
 		// interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
 		if target.IsInterval() {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to an interval type is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting to an interval type is not supported yet")
 		}
 		// A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
 		// `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
 		// (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
 		// context (its value is range-checked / coerced against target at eval), so changing the
 		// context only for a parameter leaves all existing CAST behavior untouched.
-		var innerCtx *ScalarType
-		if e.Cast.Inner.Kind == ExprParam {
+		var innerCtx *scalarType
+		if e.Cast.Inner.Kind == exprParam {
 			t := target
 			innerCtx = &t
 		} else if target.IsBool() {
@@ -24963,7 +24963,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			// integer literal operand adapts to i32 (CAST(5 AS boolean) / 5::boolean), matching PG.
 			// A column/expression keeps its own type; a literal beyond i32 range then traps 22003
 			// (PG 42846 — a documented divergence).
-			t := Int32
+			t := scalarInt32
 			innerCtx = &t
 		}
 		inner, ity, err := resolve(s, e.Cast.Inner, innerCtx, ag, params)
@@ -24981,7 +24981,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			// parses the per-row string via the same parseBoolLiteral (PG boolin) the 't'::boolean
 			// literal uses. A string LITERAL operand was already coerced above, so a text source
 			// here is non-literal (a column / expression).
-			if (ity.kind == rtInt && ity.intTy == Int32) || ity.kind == rtNull || ity.kind == rtBool || ity.kind == rtText {
+			if (ity.kind == rtInt && ity.intTy == scalarInt32) || ity.kind == rtNull || ity.kind == rtBool || ity.kind == rtText {
 				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod},
 					resolvedType{kind: rtBool}, nil
 			}
@@ -24989,9 +24989,9 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		if ity.kind == rtBool {
 			// boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
-			if target == Int32 {
+			if target == scalarInt32 {
 				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod},
-					resolvedType{kind: rtInt, intTy: Int32}, nil
+					resolvedType{kind: rtInt, intTy: scalarInt32}, nil
 			}
 			return nil, resolvedType{}, typeError("cannot cast boolean to " + target.CanonicalName())
 		}
@@ -25004,32 +25004,32 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// numeric cast node below.
 		// Casting FROM bytea is likewise deferred (0A000).
 		if ity.kind == rtBytea {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from bytea is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting from bytea is not supported yet")
 		}
 		// Casting FROM uuid is likewise deferred (0A000).
 		if ity.kind == rtUuid {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from uuid is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting from uuid is not supported yet")
 		}
 		// Casting FROM a timestamp is likewise deferred (0A000).
 		if ity.kind == rtTimestamp || ity.kind == rtTimestamptz {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from a timestamp type is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting from a timestamp type is not supported yet")
 		}
 		// Casting FROM an interval is likewise deferred (0A000).
 		if ity.kind == rtInterval {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from an interval type is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting from an interval type is not supported yet")
 		}
 		// Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
 		if ity.kind == rtDate {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from a date type is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting from a date type is not supported yet")
 		}
 		// Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
 		if ity.kind == rtArray {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting an array value is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting an array value is not supported yet")
 		}
 		// Casting FROM json/jsonb (json↔jsonb, json[b]→text, text→json[b]) lands in J3
 		// (spec/design/json.md §6); deferred this slice.
 		if ity.kind == rtJson || ity.kind == rtJsonb {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting a json value is not supported yet")
+			return nil, resolvedType{}, newError(FeatureNotSupported, "casting a json value is not supported yet")
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
@@ -25039,8 +25039,8 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// f32->f64, is the tower, never a CAST.
 		resultRt := resolvedTypeOf(target)
 		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
-	case ExprUnary:
-		if e.Unary.Op == OpNeg {
+	case exprUnary:
+		if e.Unary.Op == opNeg {
 			rop, ty, err := resolve(s, e.Unary.Operand, ctx, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
@@ -25050,19 +25050,19 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				return &rExpr{kind: reNeg, operand: rop, result: ty.intTy},
 					resolvedType{kind: rtInt, intTy: ty.intTy}, nil
 			case rtDecimal:
-				return &rExpr{kind: reNeg, operand: rop, result: DecimalType},
+				return &rExpr{kind: reNeg, operand: rop, result: scalarDecimal},
 					resolvedType{kind: rtDecimal}, nil
 			case rtNull:
-				return &rExpr{kind: reNeg, operand: rop, result: Int64}, // -NULL = NULL
-					resolvedType{kind: rtInt, intTy: Int64}, nil
+				return &rExpr{kind: reNeg, operand: rop, result: scalarInt64}, // -NULL = NULL
+					resolvedType{kind: rtInt, intTy: scalarInt64}, nil
 			case rtInterval:
-				return &rExpr{kind: reNeg, operand: rop, result: IntervalType}, // -interval (interval.md §5)
+				return &rExpr{kind: reNeg, operand: rop, result: scalarInterval}, // -interval (interval.md §5)
 					resolvedType{kind: rtInterval}, nil
 			case rtFloat32:
-				return &rExpr{kind: reNeg, operand: rop, result: Float32}, // -f32 (IEEE sign flip)
+				return &rExpr{kind: reNeg, operand: rop, result: scalarFloat32}, // -f32 (IEEE sign flip)
 					resolvedType{kind: rtFloat32}, nil
 			case rtFloat64:
-				return &rExpr{kind: reNeg, operand: rop, result: Float64},
+				return &rExpr{kind: reNeg, operand: rop, result: scalarFloat64},
 					resolvedType{kind: rtFloat64}, nil
 			default: // rtBool, rtText, ...
 				return nil, resolvedType{}, typeError("unary minus requires a numeric operand")
@@ -25077,14 +25077,14 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reNot, operand: rop}, resolvedType{kind: rtBool}, nil
-	case ExprIsNull:
+	case exprIsNull:
 		rop, _, err := resolve(s, e.IsNullOf.Operand, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reIsNull, operand: rop, negated: e.IsNullOf.Negated},
 			resolvedType{kind: rtBool}, nil
-	case ExprIsJson:
+	case exprIsJson:
 		// The operand must be a character string / json / jsonb (else 42804); a bare string literal
 		// resolves as text. The predicate is always a definite boolean (NULL operand → NULL at eval).
 		rop, ty, err := resolve(s, e.IsJsonOf.Operand, nil, ag, params)
@@ -25095,7 +25095,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		case rtText, rtJson, rtJsonb, rtNull:
 			// ok
 		default:
-			return nil, resolvedType{}, NewError(DatatypeMismatch,
+			return nil, resolvedType{}, newError(DatatypeMismatch,
 				fmt.Sprintf("cannot use type %s in IS JSON predicate", rtName(ty)))
 		}
 		return &rExpr{
@@ -25103,10 +25103,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				jpKind: e.IsJsonOf.Kind, jpUnique: e.IsJsonOf.UniqueKeys,
 			},
 			resolvedType{kind: rtBool}, nil
-	case ExprJsonCtor:
+	case exprJsonCtor:
 		// JSON(text) parses a character string to a `json` value (verbatim). The operand must be text
 		// (a bare string literal stays text); a non-text operand → 42804. The result is `json`.
-		textHint := Text
+		textHint := scalarText
 		rop, ty, err := resolve(s, e.JsonCtorOf.Operand, &textHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -25115,23 +25115,23 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		case rtText, rtNull:
 			// ok
 		default:
-			return nil, resolvedType{}, NewError(DatatypeMismatch,
+			return nil, resolvedType{}, newError(DatatypeMismatch,
 				fmt.Sprintf("cannot use type %s as JSON() input", rtName(ty)))
 		}
 		return &rExpr{
 				kind: reJsonCtor, operand: rop, jpUnique: e.JsonCtorOf.UniqueKeys,
 			},
 			resolvedType{kind: rtJson}, nil
-	case ExprJsonExists:
+	case exprJsonExists:
 		return resolveJSONSqlFn(s, jsExists, e.JsonExists.Ctx, e.JsonExists.Path, nil,
-			JWWithout, true, nil, e.JsonExists.OnError, ag, params)
-	case ExprJsonValue:
+			jWWithout, true, nil, e.JsonExists.OnError, ag, params)
+	case exprJsonValue:
 		return resolveJSONSqlFn(s, jsValue, e.JsonValue.Ctx, e.JsonValue.Path, e.JsonValue.Returning,
-			JWWithout, true, e.JsonValue.OnEmpty, e.JsonValue.OnError, ag, params)
-	case ExprJsonQuery:
+			jWWithout, true, e.JsonValue.OnEmpty, e.JsonValue.OnError, ag, params)
+	case exprJsonQuery:
 		return resolveJSONSqlFn(s, jsQuery, e.JsonQuery.Ctx, e.JsonQuery.Path, e.JsonQuery.Returning,
 			e.JsonQuery.Wrapper, e.JsonQuery.KeepQuotes, e.JsonQuery.OnEmpty, e.JsonQuery.OnError, ag, params)
-	case ExprIsDistinct:
+	case exprIsDistinct:
 		// NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a
 		// literal adapts to its sibling; a text literal stays text), then require the
 		// operands be comparable (both integer-ish or both text-ish; a mixed pair is
@@ -25145,7 +25145,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
 			resolvedType{kind: rtBool}, nil
-	case ExprIn:
+	case exprIn:
 		// An EMPTY list reaches here only from folding an IN-subquery whose result was empty
 		// (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant —
 		// `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL. Still
@@ -25164,33 +25164,33 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// operand typing (a too-wide literal → 22003, a cross-family element → 42804), and cost
 		// all fall out. The LHS is evaluated once per element (the OR-chain model — a documented
 		// cost consequence, cost.md §3).
-		var folded Expr
+		var folded exprNode
 		for i, elem := range e.In.List {
-			eq := binaryExpr(OpEq, e.In.Lhs, elem)
+			eq := newBinaryExpr(opEq, e.In.Lhs, elem)
 			if i == 0 {
 				folded = eq
 			} else {
-				folded = binaryExpr(OpOr, folded, eq)
+				folded = newBinaryExpr(opOr, folded, eq)
 			}
 		}
 		if e.In.Negated {
-			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
+			folded = exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: folded}}
 		}
 		return resolve(s, folded, ctx, ag, params)
-	case ExprBetween:
+	case exprBetween:
 		// Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
 		// result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a FALSE
 		// operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL. NOT BETWEEN
 		// negates the whole conjunction. The LHS is evaluated twice (the desugar model — a
 		// documented cost consequence, cost.md §3).
-		ge := binaryExpr(OpGe, e.Between.Lhs, e.Between.Lo)
-		le := binaryExpr(OpLe, e.Between.Lhs, e.Between.Hi)
-		folded := binaryExpr(OpAnd, ge, le)
+		ge := newBinaryExpr(opGe, e.Between.Lhs, e.Between.Lo)
+		le := newBinaryExpr(opLe, e.Between.Lhs, e.Between.Hi)
+		folded := newBinaryExpr(opAnd, ge, le)
 		if e.Between.Negated {
-			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
+			folded = exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: folded}}
 		}
 		return resolve(s, folded, ctx, ag, params)
-	case ExprLike:
+	case exprLike:
 		// LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal stays
 		// text), then require BOTH operands be text (or a bare NULL); a non-text operand is
 		// 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
@@ -25206,7 +25206,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reLike, lhs: rl, rhs: rr, negated: e.Like.Negated, insensitive: e.Like.Insensitive},
 			resolvedType{kind: rtBool}, nil
-	case ExprRegex:
+	case exprRegex:
 		// ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand typing
 		// as LIKE: resolve the pair, require both text (or a bare NULL); a non-text operand is 42804.
 		rl, lt, rr, rt, err := resolveOperandPair(s, e.Regex.Lhs, e.Regex.Rhs, ag, params)
@@ -25226,7 +25226,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if rr.kind == reConstText {
 			pat := rr.cText
 			if e.Regex.Insensitive {
-				pat = FoldLowerSimple(pat, LoadedProperty())
+				pat = foldLowerSimple(pat, loadedProperty())
 			}
 			prog, err = compileRegex(pat)
 			if err != nil {
@@ -25235,7 +25235,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reRegex, lhs: rl, rhs: rr, negated: e.Regex.Negated, insensitive: e.Regex.Insensitive, rxProgram: prog},
 			resolvedType{kind: rtBool}, nil
-	case ExprCase:
+	case exprCase:
 		// Resolve each branch's condition: searched form requires a boolean WHEN (42804
 		// otherwise); simple form desugars to `operand = value` (reusing the `=` operand pairing
 		// + comparability check, so the value adapts to the operand's type). The operand is
@@ -25245,7 +25245,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		for _, w := range e.Case.Whens {
 			var rcond *rExpr
 			if e.Case.Operand != nil {
-				eq := binaryExpr(OpEq, *e.Case.Operand, w.Cond)
+				eq := newBinaryExpr(opEq, *e.Case.Operand, w.Cond)
 				rc, _, err := resolve(s, eq, nil, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
@@ -25286,9 +25286,9 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reCase, caseArms: arms, caseEls: rels, caseDecimal: unified.kind == rtDecimal},
 			unified, nil
-	case ExprQuantified:
+	case exprQuantified:
 		return resolveQuantified(s, e.Quantified, ag, params)
-	case ExprQuantifiedSubquery:
+	case exprQuantifiedSubquery:
 		return resolveQuantifiedSubquery(s, e.QuantifiedSubquery, ag, params)
 	default: // ExprBinary
 		return resolveBinary(s, e.Binary, ag, params)
@@ -25299,14 +25299,14 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 // built-in byte / code-point order → nil (the unchanged fast path); any other name resolves through
 // the reference-only read path (the database's resolved set, then the binary's vendored set), else
 // 42704.
-func resolveCollationName(catalog *Engine, name string) (*Collation, error) {
+func resolveCollationName(catalog *engine, name string) (*Collation, error) {
 	if name == "C" {
 		return nil, nil
 	}
 	if c := catalog.readSnap().resolveCollation(name); c != nil {
 		return c, nil
 	}
-	return nil, NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
+	return nil, newError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
 }
 
 // A text expression's collation derivation (spec/design/collation.md §1, PG's rules). kind:
@@ -25328,18 +25328,18 @@ type deriv struct {
 // deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
 // is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
 // operands. Every other shape resets to none (takes a neighbour's) — a documented narrowing (§14).
-func deriveCollation(s *scope, e Expr) (deriv, error) {
+func deriveCollation(s *scope, e exprNode) (deriv, error) {
 	switch e.Kind {
-	case ExprCollate:
+	case exprCollate:
 		return deriv{name: e.Collate.Collation, kind: derivExplicit}, nil
-	case ExprColumn:
+	case exprColumn:
 		r, err := s.resolveBare(e.Column)
 		return columnDeriv(s, r, err), nil
-	case ExprQualifiedColumn:
+	case exprQualifiedColumn:
 		r, err := s.resolveQualified(e.Qualifier, e.Column)
 		return columnDeriv(s, r, err), nil
-	case ExprBinary:
-		if e.Binary.Op == OpConcat {
+	case exprBinary:
+		if e.Binary.Op == opConcat {
 			l, err := deriveCollation(s, e.Binary.Lhs)
 			if err != nil {
 				return deriv{}, err
@@ -25380,7 +25380,7 @@ func columnDeriv(s *scope, r resolved, err error) deriv {
 func combineDeriv(a, b deriv) (deriv, error) {
 	if a.kind == derivExplicit && b.kind == derivExplicit {
 		if a.name != b.name {
-			return deriv{}, NewError(CollationMismatch,
+			return deriv{}, newError(CollationMismatch,
 				fmt.Sprintf("collation mismatch between explicit collations %q and %q", a.name, b.name))
 		}
 		return a, nil
@@ -25409,10 +25409,10 @@ func combineDeriv(a, b deriv) (deriv, error) {
 // resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. none
 // and C → nil (byte order, the fast path); a loaded name → its table (42704 if it vanished);
 // derivIndeterminate → 42P22 (the collation is required but ambiguous).
-func resolveDeriv(catalog *Engine, d deriv) (*Collation, error) {
+func resolveDeriv(catalog *engine, d deriv) (*Collation, error) {
 	switch d.kind {
 	case derivIndeterminate:
-		return nil, NewError(IndeterminateCollation,
+		return nil, newError(IndeterminateCollation,
 			"could not determine which collation to use for string comparison")
 	case derivImplicit, derivExplicit:
 		return resolveCollationName(catalog, d.name)
@@ -25425,25 +25425,25 @@ func resolveDeriv(catalog *Engine, d deriv) (*Collation, error) {
 // §6/§7): order by the UCA sort keys, whose memcmp order IS the collation order. The caller charges
 // the collate cost and handles NULLs.
 func collatedCmp(coll *Collation, a, b string) (int, error) {
-	ka, err := SortKey(coll, a)
+	ka, err := sortKey(coll, a)
 	if err != nil {
 		return 0, err
 	}
-	kb, err := SortKey(coll, b)
+	kb, err := sortKey(coll, b)
 	if err != nil {
 		return 0, err
 	}
 	return bytes.Compare(ka, kb), nil
 }
 
-func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch b.Op {
-	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
+	case opAdd, opSub, opMul, opDiv, opMod:
 		// jsonb `-` is the delete operator (json-sql-functions.md §1, J6), NOT arithmetic — its right
 		// operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a jsonb LHS with
 		// `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ * / %` over a jsonb
 		// operand fall through and 42804 in the numeric path.)
-		if b.Op == OpSub {
+		if b.Op == opSub {
 			rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
@@ -25465,7 +25465,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		// operands must be ranges of a common element type, else 42883 (matching PG's "operator does not
 		// exist"); the numeric/temporal arithmetic below never sees a range. `/` and `%` have no range
 		// meaning and fall straight through.
-		if (b.Op == OpAdd || b.Op == OpSub || b.Op == OpMul) && (lt.kind == rtRange || rt.kind == rtRange) {
+		if (b.Op == opAdd || b.Op == opSub || b.Op == opMul) && (lt.kind == rtRange || rt.kind == rtRange) {
 			return resolveRangeSetOp(b.Op, rl, lt, rr, rt)
 		}
 		// Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32 (days
@@ -25521,13 +25521,13 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			return nil, resolvedType{}, err
 		}
 		if lt.kind == rtDecimal || rt.kind == rtDecimal {
-			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: DecimalType},
+			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: scalarDecimal},
 				resolvedType{kind: rtDecimal}, nil
 		}
 		result := promote(lt, rt)
 		return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: result},
 			resolvedType{kind: rtInt, intTy: result}, nil
-	case OpEq, OpNe, OpLt, OpGt, OpLe, OpGe:
+	case opEq, opNe, opLt, opGt, opLe, opGe:
 		// Comparison is overloaded across families: integer×integer or text×text. Resolve
 		// the operands (a literal adapts to its sibling; text literals stay text), then
 		// require they be comparable — a mixed integer/text pair is 42804. The runtime
@@ -25566,55 +25566,55 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		}
 		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr, collation: coll},
 			resolvedType{kind: rtBool}, nil
-	case OpConcat:
+	case opConcat:
 		return resolveConcat(s, b.Lhs, b.Rhs, ag, params)
 	// The containment/overlap operators (@>/<@/&&, shared by arrays and ranges) and the five
 	// range-only positional/adjacency operators (<</>>/&</&>/-|-) all dispatch here: the operand type
 	// chooses the array axis (array-functions.md §10) or the range axis (range-functions.md §3).
-	case OpContains, OpContainedBy, OpOverlaps,
-		OpStrictlyLeft, OpStrictlyRight, OpNotExtendRight, OpNotExtendLeft, OpAdjacent:
+	case opContains, opContainedBy, opOverlaps,
+		opStrictlyLeft, opStrictlyRight, opNotExtendRight, opNotExtendLeft, opAdjacent:
 		return resolveSetOp(s, b.Op, b.Lhs, b.Rhs, ag, params)
 	// The jsonb accessor operators (spec/design/json-sql-functions.md §1, J4).
-	case OpJsonGet, OpJsonGetText, OpJsonGetPath, OpJsonGetPathText:
+	case opJsonGet, opJsonGetText, opJsonGetPath, opJsonGetPathText:
 		return resolveJSONAccess(s, b.Op, b.Lhs, b.Rhs, ag, params)
 	// The jsonb key-existence operators (spec/design/json-sql-functions.md §1, J5).
-	case OpJsonHasKey:
+	case opJsonHasKey:
 		return resolveJSONHasKey(s, hkOne, b.Lhs, b.Rhs, ag, params)
-	case OpJsonHasAnyKey:
+	case opJsonHasAnyKey:
 		return resolveJSONHasKey(s, hkAny, b.Lhs, b.Rhs, ag, params)
-	case OpJsonHasAllKeys:
+	case opJsonHasAllKeys:
 		return resolveJSONHasKey(s, hkAll, b.Lhs, b.Rhs, ag, params)
 	// `jsonb @? jsonpath` = jsonb_path_exists, `jsonb @@ jsonpath` = jsonb_path_match
 	// (jsonpath.md §6). Both reuse the jsonpath kernels.
-	case OpJsonPathExists, OpJsonPathMatch:
+	case opJsonPathExists, opJsonPathMatch:
 		sym, fnKind := "@?", jpfExists
-		if b.Op == OpJsonPathMatch {
+		if b.Op == opJsonPathMatch {
 			sym, fnKind = "@@", jpfMatch
 		}
-		jsonbHint := Jsonb
+		jsonbHint := scalarJsonb
 		ctx, ct, err := resolve(s, b.Lhs, &jsonbHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		if ct.kind != rtJsonb && ct.kind != rtNull {
-			return nil, resolvedType{}, NewError(UndefinedFunction,
+			return nil, resolvedType{}, newError(UndefinedFunction,
 				fmt.Sprintf("operator does not exist: %s %s jsonpath", rtName(ct), sym))
 		}
-		pathHint := JsonPathType
+		pathHint := scalarJsonPath
 		path, pt, err := resolve(s, b.Rhs, &pathHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		if pt.kind != rtJsonPath && pt.kind != rtNull {
-			return nil, resolvedType{}, NewError(UndefinedFunction,
+			return nil, resolvedType{}, newError(UndefinedFunction,
 				fmt.Sprintf("operator does not exist: jsonb %s (a non-jsonpath)", sym))
 		}
 		return &rExpr{kind: reJsonPathFn, jpFnKind: fnKind, sargs: []*rExpr{ctx, path}},
 			resolvedType{kind: rtBool}, nil
 	// The jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1, J6). `||` and
 	// `-` (delete) are dispatched by operand type in resolveConcat / the arithmetic arm.
-	case OpJsonDeletePath:
-		jsonbHint := Jsonb
+	case opJsonDeletePath:
+		jsonbHint := scalarJsonb
 		rbase, baseTy, err := resolve(s, b.Lhs, &jsonbHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -25622,7 +25622,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		switch baseTy.kind {
 		case rtJsonb, rtNull:
 		default:
-			return nil, resolvedType{}, NewError(UndefinedFunction,
+			return nil, resolvedType{}, newError(UndefinedFunction,
 				fmt.Sprintf("operator does not exist: %s #- text[]", rtName(baseTy)))
 		}
 		return resolveJSONbDelete(s, true, b.Rhs, rbase, ag, params)
@@ -25642,7 +25642,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			return nil, resolvedType{}, err
 		}
 		kind := reAnd
-		if b.Op == OpOr {
+		if b.Op == opOr {
 			kind = reOr
 		}
 		return &rExpr{kind: kind, lhs: rl, rhs: rr}, resolvedType{kind: rtBool}, nil
@@ -25656,7 +25656,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 // context (ctxOf returns nil) and defaults to i64 — the caller's family check then
 // reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
-func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+func resolveOperandPair(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
 	lhsLit := isAdaptableOperand(lhs)
 	rhsLit := isAdaptableOperand(rhs)
 	var rl, rr *rExpr
@@ -25664,7 +25664,7 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 	var err error
 	switch {
 	case lhsLit && rhsLit:
-		i64 := Int64
+		i64 := scalarInt64
 		if rl, lt, err = resolve(s, lhs, &i64, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
@@ -25695,7 +25695,7 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 // operand-pair resolution (literal adaptation), then settling the result type. Both operands must be
 // integer or decimal (a float/other operand → 42883); the result is the promoted integer type when
 // both are integer, else decimal (an integer operand promotes, as PG does).
-func resolveIntOrDecimalPair(s *scope, name string, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, *rExpr, ScalarType, error) {
+func resolveIntOrDecimalPair(s *scope, name string, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, *rExpr, scalarType, error) {
 	rl, lt, rr, rt, err := resolveOperandPair(s, lhs, rhs, ag, params)
 	if err != nil {
 		return nil, nil, 0, err
@@ -25714,7 +25714,7 @@ func resolveIntOrDecimalPair(s *scope, name string, lhs, rhs Expr, ag *aggCtx, p
 // promotion gcd/lcm/div use).
 func valueToDecimal(v Value) Decimal {
 	if v.Kind == ValInt {
-		return DecimalFromInt64(v.Int)
+		return decimalFromInt64(v.Int)
 	}
 	return *v.Dec
 }
@@ -25830,7 +25830,7 @@ const maxResultChars int64 = 0x3FFFFFFF
 // length ≤ 0 is empty. A length above maxResultChars traps 54000. Matches PostgreSQL's lpad/rpad.
 func padChars(s string, length int64, fill string, left bool) (string, error) {
 	if length > maxResultChars {
-		return "", NewError(ProgramLimitExceeded, "requested length too large")
+		return "", newError(ProgramLimitExceeded, "requested length too large")
 	}
 	if length <= 0 {
 		return "", nil
@@ -25927,7 +25927,7 @@ func repeatText(s string, n int64) (string, error) {
 		return "", nil
 	}
 	if n > maxResultChars/int64(len(s)) {
-		return "", NewError(ProgramLimitExceeded, "requested length too large")
+		return "", newError(ProgramLimitExceeded, "requested length too large")
 	}
 	return strings.Repeat(s, int(n)), nil
 }
@@ -25938,7 +25938,7 @@ func repeatText(s string, n int64) (string, error) {
 // otherwise split into characters — a cross-core trap). Matches PostgreSQL's split_part.
 func splitPart(s, delim string, n int64) (string, error) {
 	if n == 0 {
-		return "", NewError(InvalidParameterValue, "field position must not be zero")
+		return "", newError(InvalidParameterValue, "field position must not be zero")
 	}
 	var fields []string
 	if delim == "" {
@@ -25964,16 +25964,16 @@ func splitPart(s, delim string, n int64) (string, error) {
 // surrogate (U+D800..U+DFFF) trap 54000.
 func chrText(n int64) (string, error) {
 	if n < 0 {
-		return "", NewError(InvalidParameterValue, "character number must be positive")
+		return "", newError(InvalidParameterValue, "character number must be positive")
 	}
 	if n == 0 {
-		return "", NewError(ProgramLimitExceeded, "null character not permitted")
+		return "", newError(ProgramLimitExceeded, "null character not permitted")
 	}
 	if n > 0x10FFFF {
-		return "", NewError(ProgramLimitExceeded, fmt.Sprintf("requested character too large for encoding: %d", n))
+		return "", newError(ProgramLimitExceeded, fmt.Sprintf("requested character too large for encoding: %d", n))
 	}
 	if n >= 0xD800 && n <= 0xDFFF {
-		return "", NewError(ProgramLimitExceeded, fmt.Sprintf("requested character not valid for encoding: %d", n))
+		return "", newError(ProgramLimitExceeded, fmt.Sprintf("requested character not valid for encoding: %d", n))
 	}
 	return string(rune(n)), nil
 }
@@ -26011,7 +26011,7 @@ func encodeBytea(bytes []byte, format string) (string, error) {
 	case "base64":
 		return base64EncodeWrapped(bytes), nil
 	default:
-		return "", NewError(InvalidParameterValue, fmt.Sprintf("unrecognized encoding: %q", format))
+		return "", newError(InvalidParameterValue, fmt.Sprintf("unrecognized encoding: %q", format))
 	}
 }
 
@@ -26116,7 +26116,7 @@ func decodeText(s, format string) ([]byte, error) {
 	case "escape":
 		return decodeEscape([]byte(s))
 	default:
-		return nil, NewError(InvalidParameterValue, fmt.Sprintf("unrecognized encoding: %q", format))
+		return nil, newError(InvalidParameterValue, fmt.Sprintf("unrecognized encoding: %q", format))
 	}
 }
 
@@ -26147,12 +26147,12 @@ func decodeHex(bytes []byte) ([]byte, error) {
 		}
 		v, ok := hexNibble(b)
 		if !ok {
-			return nil, NewError(InvalidParameterValue, "invalid hexadecimal digit")
+			return nil, newError(InvalidParameterValue, "invalid hexadecimal digit")
 		}
 		nibbles = append(nibbles, v)
 	}
 	if len(nibbles)%2 != 0 {
-		return nil, NewError(InvalidParameterValue, "invalid hexadecimal data: odd number of digits")
+		return nil, newError(InvalidParameterValue, "invalid hexadecimal data: odd number of digits")
 	}
 	out := make([]byte, 0, len(nibbles)/2)
 	for i := 0; i < len(nibbles); i += 2 {
@@ -26164,7 +26164,7 @@ func decodeHex(bytes []byte) ([]byte, error) {
 // decodeBase64 (RFC 4648); whitespace is ignored; an out-of-alphabet byte (or data after the =
 // padding) traps 22023. Bit-accumulation emits a byte per full 8 bits.
 func decodeBase64(bytes []byte) ([]byte, error) {
-	bad := func() error { return NewError(InvalidParameterValue, "invalid base64 end sequence") }
+	bad := func() error { return newError(InvalidParameterValue, "invalid base64 end sequence") }
 	var out []byte
 	var acc uint32
 	nbits := 0
@@ -26208,7 +26208,7 @@ func decodeBase64(bytes []byte) ([]byte, error) {
 // decodeEscape (on the input's UTF-8 bytes): \\ → backslash, \nnn (exactly 3 octal digits ≤ 255) →
 // that byte, any other byte → itself. A lone/short backslash or an octal > 255 traps 22P02.
 func decodeEscape(bytes []byte) ([]byte, error) {
-	bad := func() error { return NewError(InvalidTextRepresentation, "invalid input syntax for type bytea") }
+	bad := func() error { return newError(InvalidTextRepresentation, "invalid input syntax for type bytea") }
 	oct := func(c byte) (byte, bool) {
 		if c >= '0' && c <= '7' {
 			return c - '0', true
@@ -26300,7 +26300,7 @@ func substrChars(s string, start int64, count *int64) (string, error) {
 	var to int64
 	if count != nil {
 		if *count < 0 {
-			return "", NewError(SubstringError, "negative substring length not allowed")
+			return "", newError(SubstringError, "negative substring length not allowed")
 		}
 		to = satAddInt64(start, *count)
 		if to > n+1 {
@@ -26365,7 +26365,7 @@ func rightChars(s string, n int64) string {
 
 // widthBucketErr is the 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
 func widthBucketErr(detail string) error {
-	return NewError(InvalidArgumentForWidthBucketFunction, detail)
+	return newError(InvalidArgumentForWidthBucketFunction, detail)
 }
 
 // minScaleOf is the minimum scale that represents d exactly — its display scale minus trailing
@@ -26392,7 +26392,7 @@ func widthBucketNumeric(op, low, high Decimal, count int64) (int64, error) {
 	if cmpBounds == 0 {
 		return 0, widthBucketErr("lower bound cannot equal upper bound")
 	}
-	countDec := DecimalFromInt64(count)
+	countDec := decimalFromInt64(count)
 	bucket := func(hiNum, loNum, hiDen, loDen Decimal) (int64, error) {
 		diff, err := hiNum.Sub(loNum)
 		if err != nil {
@@ -26420,7 +26420,7 @@ func widthBucketNumeric(op, low, high Decimal, count int64) (int64, error) {
 		}
 		b, ok := q.RoundToScale(0).ToInt64Round()
 		if !ok {
-			return 0, overflowErr(Int32)
+			return 0, overflowErr(scalarInt32)
 		}
 		return satAdd1(b), nil
 	}
@@ -26495,20 +26495,20 @@ func requireNumericOperand(t resolvedType) error {
 // interval * number, number * interval (commute), interval / number → interval. isScale is false
 // when no interval is involved (or the op is not * / /). number / interval and interval × interval
 // return false and fall to the ±-only temporal rule (which reports the 42804).
-func intervalScaleResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isScale bool) {
+func intervalScaleResult(op binaryOp, lt, rt rtKind) (st scalarType, isScale bool) {
 	lIv, rIv := lt == rtInterval, rt == rtInterval
 	if !lIv && !rIv {
 		return 0, false
 	}
 	numeric := func(k rtKind) bool { return k == rtInt || k == rtDecimal || k == rtNull }
 	switch op {
-	case OpMul:
+	case opMul:
 		if (lIv && numeric(rt)) || (rIv && numeric(lt)) {
-			return IntervalType, true
+			return scalarInterval, true
 		}
-	case OpDiv:
+	case opDiv:
 		if lIv && numeric(rt) {
-			return IntervalType, true
+			return scalarInterval, true
 		}
 	}
 	return 0, false
@@ -26519,7 +26519,7 @@ func factorToFraction(v Value) (*big.Int, *big.Int, error) {
 	if v.Kind == ValInt {
 		return big.NewInt(v.Int), big.NewInt(1), nil
 	}
-	return ParseFactorDecimal(v.Dec.Render())
+	return parseFactorDecimal(v.Dec.Render())
 }
 
 // temporalArithResult gives the result type of a temporal +/- (spec/design/interval.md §5).
@@ -26527,7 +26527,7 @@ func factorToFraction(v Value) (*big.Int, *big.Int, error) {
 // numeric path); true with a non-nil error is a temporal operand in an unsupported combination
 // (42804). A NULL operand adopts the other side's temporal type (so `timestamp ± NULL` types as
 // timestamp and evaluates to NULL).
-func temporalArithResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isTemporal bool, err error) {
+func temporalArithResult(op binaryOp, lt, rt rtKind) (st scalarType, isTemporal bool, err error) {
 	temporal := func(k rtKind) bool { return k == rtInterval || k == rtTimestamp || k == rtTimestamptz }
 	if !temporal(lt) && !temporal(rt) {
 		return 0, false, nil
@@ -26540,19 +26540,19 @@ func temporalArithResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isTemporal 
 		r = lt
 	}
 	switch {
-	case (op == OpAdd || op == OpSub) && l == rtInterval && r == rtInterval:
-		return IntervalType, true, nil
-	case op == OpAdd && l == rtTimestamp && r == rtInterval,
-		op == OpAdd && l == rtInterval && r == rtTimestamp,
-		op == OpSub && l == rtTimestamp && r == rtInterval:
-		return Timestamp, true, nil
-	case op == OpAdd && l == rtTimestamptz && r == rtInterval,
-		op == OpAdd && l == rtInterval && r == rtTimestamptz,
-		op == OpSub && l == rtTimestamptz && r == rtInterval:
-		return Timestamptz, true, nil
-	case op == OpSub && l == rtTimestamp && r == rtTimestamp,
-		op == OpSub && l == rtTimestamptz && r == rtTimestamptz:
-		return IntervalType, true, nil
+	case (op == opAdd || op == opSub) && l == rtInterval && r == rtInterval:
+		return scalarInterval, true, nil
+	case op == opAdd && l == rtTimestamp && r == rtInterval,
+		op == opAdd && l == rtInterval && r == rtTimestamp,
+		op == opSub && l == rtTimestamp && r == rtInterval:
+		return scalarTimestamp, true, nil
+	case op == opAdd && l == rtTimestamptz && r == rtInterval,
+		op == opAdd && l == rtInterval && r == rtTimestamptz,
+		op == opSub && l == rtTimestamptz && r == rtInterval:
+		return scalarTimestamptz, true, nil
+	case op == opSub && l == rtTimestamp && r == rtTimestamp,
+		op == opSub && l == rtTimestamptz && r == rtTimestamptz:
+		return scalarInterval, true, nil
 	default:
 		return 0, true, typeError("unsupported operand types for temporal arithmetic")
 	}
@@ -26566,18 +26566,18 @@ func temporalArithResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isTemporal 
 // there is no integer − date nor interval − date. Any other combination involving a date is a
 // 42804 (PG reports 42883; jed uses its datatype-mismatch code, like the interval rule). A bare
 // untyped NULL partner is NOT adopted — date ± NULL is a 42804 (PG rejects the ambiguous form too).
-func dateArithResult(op BinaryOp, lt, rt rtKind) (ScalarType, error) {
+func dateArithResult(op binaryOp, lt, rt rtKind) (scalarType, error) {
 	switch {
-	case op == OpAdd && lt == rtDate && rt == rtInt,
-		op == OpAdd && lt == rtInt && rt == rtDate,
-		op == OpSub && lt == rtDate && rt == rtInt:
-		return Date, nil
-	case op == OpSub && lt == rtDate && rt == rtDate:
-		return Int32, nil
-	case op == OpAdd && lt == rtDate && rt == rtInterval,
-		op == OpAdd && lt == rtInterval && rt == rtDate,
-		op == OpSub && lt == rtDate && rt == rtInterval:
-		return Timestamp, nil
+	case op == opAdd && lt == rtDate && rt == rtInt,
+		op == opAdd && lt == rtInt && rt == rtDate,
+		op == opSub && lt == rtDate && rt == rtInt:
+		return scalarDate, nil
+	case op == opSub && lt == rtDate && rt == rtDate:
+		return scalarInt32, nil
+	case op == opAdd && lt == rtDate && rt == rtInterval,
+		op == opAdd && lt == rtInterval && rt == rtDate,
+		op == opSub && lt == rtDate && rt == rtInterval:
+		return scalarTimestamp, nil
 	default:
 		return 0, typeError("unsupported operand types for date arithmetic")
 	}
@@ -26594,12 +26594,12 @@ func classifyComparable(lt, rt resolvedType) error {
 	// or json × a bare NULL — is 42883 (operator does not exist), distinct from the cross-family
 	// 42804 other types use. Must precede the jsonb arms so json × jsonb is 42883.
 	if lt.kind == rtJson || rt.kind == rtJson {
-		return NewError(UndefinedFunction, "operator does not exist: json is not comparable")
+		return newError(UndefinedFunction, "operator does not exist: json is not comparable")
 	}
 	// jsonpath is likewise NOT comparable (PG ships no opclass — jsonpath.md §1): every comparison is
 	// 42883.
 	if lt.kind == rtJsonPath || rt.kind == rtJsonPath {
-		return NewError(UndefinedFunction, "operator does not exist: jsonpath is not comparable")
+		return newError(UndefinedFunction, "operator does not exist: jsonpath is not comparable")
 	}
 	// jsonb IS comparable — PostgreSQL's total btree order (spec/design/json.md §5) — but only with
 	// another jsonb (or a bare NULL). jsonb vs any other family is 42804 (jed's cross-family
@@ -26717,11 +26717,11 @@ func classifyComparable(lt, rt resolvedType) error {
 // isAdaptableOperand reports whether e is an adaptable operand — one that takes its type from
 // its sibling: an integer or string literal, or a bind parameter $N (spec/design/api.md §5).
 // NULL, boolean, and decimal literals do not take a sibling's context here.
-func isAdaptableOperand(e Expr) bool {
-	if e.Kind == ExprParam {
+func isAdaptableOperand(e exprNode) bool {
+	if e.Kind == exprParam {
 		return true
 	}
-	return e.Kind == ExprLiteral && (e.Literal.Kind == LiteralInt || e.Literal.Kind == LiteralText)
+	return e.Kind == exprLiteral && (e.Literal.Kind == literalInt || e.Literal.Kind == literalText)
 }
 
 // decodeByteaLiteral decodes a single-quoted literal's content as a bytea value via the hex
@@ -26729,9 +26729,9 @@ func isAdaptableOperand(e Expr) bool {
 // Used when a string literal adapts to a bytea context (types.md §6/§13); the trap is
 // deterministic and fires at resolve time, before any scan.
 func decodeByteaLiteral(s string) ([]byte, error) {
-	b, reason := ParseByteaHex(s)
+	b, reason := parseByteaHex(s)
 	if reason != "" {
-		return nil, NewError(InvalidTextRepresentation, "invalid input syntax for type bytea: "+reason)
+		return nil, newError(InvalidTextRepresentation, "invalid input syntax for type bytea: "+reason)
 	}
 	return b, nil
 }
@@ -26740,9 +26740,9 @@ func decodeByteaLiteral(s string) ([]byte, error) {
 // PG-flexible input (ParseUUID), mapping malformed input to a 22P02. Used when a string literal
 // adapts to a uuid context (types.md §6/§14); deterministic, fires at resolve time before any scan.
 func decodeUUIDLiteral(s string) ([]byte, error) {
-	b, reason := ParseUUID(s)
+	b, reason := parseUUID(s)
 	if reason != "" {
-		return nil, NewError(InvalidTextRepresentation, "invalid input syntax for type uuid: "+reason)
+		return nil, newError(InvalidTextRepresentation, "invalid input syntax for type uuid: "+reason)
 	}
 	return b, nil
 }
@@ -26756,7 +26756,7 @@ const litWhitespace = " \t\n\f\r"
 // (spec/design/float.md §4): the nearest binary value at the context width, round-ties-to-even. A
 // magnitude beyond the width's range traps 22003 at resolve (the §3 finite-overflow rule). The
 // decimal is NOT cap-checked first — it is converted directly (a huge literal traps via overflow).
-func floatConstFromDecimal(d Decimal, ctx ScalarType) (*rExpr, resolvedType, error) {
+func floatConstFromDecimal(d Decimal, ctx scalarType) (*rExpr, resolvedType, error) {
 	if ctx.IsFloat32() {
 		f, err := decimalToFloat32(d)
 		if err != nil {
@@ -26779,10 +26779,10 @@ func floatConstFromDecimal(d Decimal, ctx ScalarType) (*rExpr, resolvedType, err
 // (the same string-literal coercion as a typed literal), and a composite field recurses. The folded
 // result is an reRow of the coerced const field nodes, typed as the named composite — the inverse of
 // recordOut.
-func coerceStringToComposite(text string, ct *CompositeType, catalog *Engine) (*rExpr, resolvedType, error) {
+func coerceStringToComposite(text string, ct *compositeType, catalog *engine) (*rExpr, resolvedType, error) {
 	snap := catalog.readSnap()
 	malformed := func() error {
-		return NewError(InvalidTextRepresentation,
+		return newError(InvalidTextRepresentation,
 			fmt.Sprintf("malformed record literal: %q for type %s", text, ct.Name))
 	}
 	tokens, ok := parseRecordTokens(text)
@@ -26811,7 +26811,7 @@ func coerceStringToComposite(text string, ct *CompositeType, catalog *Engine) (*
 			// An array-typed field (spec/design/array.md §12): the token is an array text literal,
 			// coerced through array_in against the element type — the same path a bare `'{…}'::T[]`
 			// cast uses, one level down. Folds to a constant array.
-			elemCol := ResolveColType(*f.Type.Array, snap.types)
+			elemCol := resolveColType(*f.Type.Array, snap.types)
 			val, err := coerceStringToArray(*tokens[i], elemCol)
 			if err != nil {
 				return nil, resolvedType{}, err
@@ -26847,12 +26847,12 @@ func coerceStringToComposite(text string, ct *CompositeType, catalog *Engine) (*
 // array_in, a bare NULL is the typed NULL, and any other expression must resolve to the SAME
 // container type (matching element) else 42804. A top-level $N parameter is deferred (0A000) —
 // INSERT's param-to-container handling is special and not generalized to the assignment RHS yet.
-func resolveContainerAssign(s *scope, col Column, e Expr, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, params *paramTypes) (*rExpr, error) {
 	snap := s.catalog.readSnap()
 	colRT := resolvedTypeOfCol(col.Type, snap)
 	// A bare string literal adapts to the container context (the same string-adapts-to-context rule
 	// the cast and INSERT VALUES paths use).
-	if e.Kind == ExprLiteral && e.Literal != nil && e.Literal.Kind == LiteralText {
+	if e.Kind == exprLiteral && e.Literal != nil && e.Literal.Kind == literalText {
 		if col.Type.IsRange() {
 			elem, _ := col.Type.RangeElement()
 			desc, ok := rangeForElement(elem.Scalar)
@@ -26863,21 +26863,21 @@ func resolveContainerAssign(s *scope, col Column, e Expr, ag *aggCtx, params *pa
 			return node, err
 		}
 		// array
-		val, err := coerceStringToArray(e.Literal.Str, ResolveColType(*col.Type.Array, snap.types))
+		val, err := coerceStringToArray(e.Literal.Str, resolveColType(*col.Type.Array, snap.types))
 		if err != nil {
 			return nil, err
 		}
 		return valueToRExpr(val), nil
 	}
-	if e.Kind == ExprLiteral && e.Literal != nil && e.Literal.Kind == LiteralNull {
+	if e.Kind == exprLiteral && e.Literal != nil && e.Literal.Kind == literalNull {
 		return &rExpr{kind: reConstNull}, nil
 	}
-	if e.Kind == ExprParam {
+	if e.Kind == exprParam {
 		kind := "range"
 		if col.Type.IsArray() {
 			kind = "array"
 		}
-		return nil, NewError(FeatureNotSupported,
+		return nil, newError(FeatureNotSupported,
 			"updating "+kind+" column "+col.Name+" from a parameter is not supported yet")
 	}
 	// For an array column over a SCALAR element, pass the element type as the hint so a bare
@@ -26885,7 +26885,7 @@ func resolveContainerAssign(s *scope, col Column, e Expr, ag *aggCtx, params *pa
 	// adaptation `col = ARRAY[…]` uses — without it, bare int literals would type as i64 and miss a
 	// narrower i32[]/i16[] column). A range gets no scalar hint (its bare-literal form was handled
 	// above; other forms self-describe their element).
-	var hint *ScalarType
+	var hint *scalarType
 	if col.Type.IsArray() {
 		if es, ok := col.Type.Array.AsScalar(); ok {
 			hint = &es
@@ -26925,7 +26925,7 @@ func containerAssignable(rhs, col resolvedType) bool {
 	}
 }
 
-func coerceStringToRangeExpr(text string, desc RangeDesc) (*rExpr, resolvedType, error) {
+func coerceStringToRangeExpr(text string, desc rangeDesc) (*rExpr, resolvedType, error) {
 	val, err := coerceStringToRange(text, desc)
 	if err != nil {
 		return nil, resolvedType{}, err
@@ -26936,13 +26936,13 @@ func coerceStringToRangeExpr(text string, desc RangeDesc) (*rExpr, resolvedType,
 
 // coerceStringToRange parses a range text literal and coerces its bounds to the element type,
 // producing a canonical RangeVal (spec/design/ranges.md §4). Shared by the cast / typed-literal paths.
-func coerceStringToRange(text string, desc RangeDesc) (*RangeVal, error) {
+func coerceStringToRange(text string, desc rangeDesc) (*RangeVal, error) {
 	parsed, err := parseRangeText(text)
 	if err != nil {
 		return nil, err
 	}
 	if parsed.empty {
-		return EmptyRangeVal(), nil
+		return emptyRangeVal(), nil
 	}
 	elem := elementScalar(desc)
 	coerceBound := func(b *string) (*Value, error) {
@@ -26966,52 +26966,52 @@ func coerceStringToRange(text string, desc RangeDesc) (*RangeVal, error) {
 	return finalizeRange(desc, lower, upper, parsed.lowerInc, parsed.upperInc)
 }
 
-func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*rExpr, resolvedType, error) {
+func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod) (*rExpr, resolvedType, error) {
 	switch target {
-	case Bytea:
+	case scalarBytea:
 		b, err := decodeByteaLiteral(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstBytea, cBytea: b}, resolvedType{kind: rtBytea}, nil
-	case Uuid:
+	case scalarUuid:
 		b, err := decodeUUIDLiteral(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstUuid, cBytea: b}, resolvedType{kind: rtUuid}, nil
-	case Timestamp:
-		m, err := ParseTimestamp(s)
+	case scalarTimestamp:
+		m, err := parseTimestamp(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
-	case Timestamptz:
-		m, err := ParseTimestamptz(s)
+	case scalarTimestamptz:
+		m, err := parseTimestamptz(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
-	case IntervalType:
-		iv, err := ParseInterval(s)
+	case scalarInterval:
+		iv, err := parseInterval(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
-	case Date:
-		d, err := ParseDate(s)
+	case scalarDate:
+		d, err := parseDate(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstDate, cInt: int64(d)}, resolvedType{kind: rtDate}, nil
-	case Json:
+	case scalarJson:
 		// `json '…'` / CAST('…' AS json) — validate well-formedness, store the bytes verbatim
 		// (spec/design/json.md §4); malformed → 22P02.
 		if err := validateJSON(s); err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstJson, cText: s}, resolvedType{kind: rtJson}, nil
-	case Jsonb:
+	case scalarJsonb:
 		// `jsonb '…'` / CAST('…' AS jsonb) — parse + canonicalize (numbers→decimal, keys deduped +
 		// sorted — §2); malformed → 22P02.
 		node, err := jsonbIn(s)
@@ -27019,24 +27019,24 @@ func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*r
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstJsonb, cJsonb: &node}, resolvedType{kind: rtJsonb}, nil
-	case JsonPathType:
+	case scalarJsonPath:
 		// '…'::jsonpath / jsonpath '…' — compile (P1a structural subset) + store the canonical
 		// normalized text. Malformed → 42601; an unsupported (valid-PG) construct → 0A000.
-		jp, err := Compile(s)
+		jp, err := compile(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstJsonPath, cText: jp.Render()}, resolvedType{kind: rtJsonPath}, nil
-	case Text:
+	case scalarText:
 		// text 'x' is identity — the string IS the value.
 		return &rExpr{kind: reConstText, cText: s}, resolvedType{kind: rtText}, nil
-	case Bool:
+	case scalarBool:
 		v, err := parseBoolLiteral(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstBool, cBool: v}, resolvedType{kind: rtBool}, nil
-	case DecimalType:
+	case scalarDecimal:
 		d, err := parseDecimalLiteral(s)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -27050,14 +27050,14 @@ func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*r
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstDecimal, cDec: d}, resolvedType{kind: rtDecimal}, nil
-	case Float64:
-		f, err := parseFloatLiteral(s, Float64)
+	case scalarFloat64:
+		f, err := parseFloatLiteral(s, scalarFloat64)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstFloat64, cFloat: f}, resolvedType{kind: rtFloat64}, nil
-	case Float32:
-		f, err := parseFloatLiteral(s, Float32)
+	case scalarFloat32:
+		f, err := parseFloatLiteral(s, scalarFloat32)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -27075,10 +27075,10 @@ func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*r
 // text→integer coercion for INTEGER '42' / CAST('42' AS int) (grammar.md §36). jed's OWN
 // integer-literal grammar: trimmed ASCII whitespace, optional +/-, then ASCII decimal digits
 // (NO hex/octal/binary or underscores — 22P02, a documented PG divergence). Out of range → 22003.
-func parseIntLiteral(s string, ty ScalarType) (int64, error) {
+func parseIntLiteral(s string, ty scalarType) (int64, error) {
 	t := strings.Trim(s, litWhitespace)
 	invalid := func() error {
-		return NewError(InvalidTextRepresentation,
+		return newError(InvalidTextRepresentation,
 			"invalid input syntax for type "+ty.CanonicalName()+": \""+s+"\"")
 	}
 	neg := false
@@ -27116,11 +27116,11 @@ func parseIntLiteral(s string, ty ScalarType) (int64, error) {
 // value outside the width's range → 22003. Returns the value as a f64 (a f32 result is the
 // f64 of the binary32 value). NO hex floats / underscores (a documented PG-input narrowing,
 // cross-core determinism — like the int/decimal literals).
-func parseFloatLiteral(s string, ty ScalarType) (float64, error) {
+func parseFloatLiteral(s string, ty scalarType) (float64, error) {
 	t := strings.Trim(s, litWhitespace)
 	tn := ty.CanonicalName()
 	invalid := func() error {
-		return NewError(InvalidTextRepresentation,
+		return newError(InvalidTextRepresentation,
 			"invalid input syntax for type "+tn+": \""+s+"\"")
 	}
 	// Special words (case-insensitive), with an optional leading sign on the infinities.
@@ -27213,7 +27213,7 @@ func validFloatNumeric(t string) bool {
 func parseDecimalLiteral(s string) (Decimal, error) {
 	t := strings.Trim(s, litWhitespace)
 	invalid := func() (Decimal, error) {
-		return Decimal{}, NewError(InvalidTextRepresentation,
+		return Decimal{}, newError(InvalidTextRepresentation,
 			"invalid input syntax for type numeric: \""+s+"\"")
 	}
 	neg := false
@@ -27263,7 +27263,7 @@ func parseDecimalLiteral(s string) (Decimal, error) {
 		return invalid()
 	}
 	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
-	return DecimalFromDigitsScale(neg, digits, scale), nil
+	return decimalFromDigitsScale(neg, digits, scale), nil
 }
 
 // parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for
@@ -27277,7 +27277,7 @@ func parseBoolLiteral(s string) (bool, error) {
 	case "f", "fa", "fal", "fals", "false", "n", "no", "off", "0":
 		return false, nil
 	default:
-		return false, NewError(InvalidTextRepresentation,
+		return false, newError(InvalidTextRepresentation,
 			"invalid input syntax for type boolean: \""+s+"\"")
 	}
 }
@@ -27296,7 +27296,7 @@ func allASCIIDigits(s string) bool {
 
 // promote is the promotion-tower result type of two arithmetic operands: the
 // higher-ranked integer type, or i64 when both are untyped NULLs.
-func promote(a, b resolvedType) ScalarType {
+func promote(a, b resolvedType) scalarType {
 	ax, aok := intType(a)
 	bx, bok := intType(b)
 	switch {
@@ -27310,7 +27310,7 @@ func promote(a, b resolvedType) ScalarType {
 	case bok:
 		return bx
 	default:
-		return Int64
+		return scalarInt64
 	}
 }
 
@@ -27372,7 +27372,7 @@ func unifyArrayElementTypes(types []resolvedType) (resolvedType, error) {
 }
 
 // arraySubscriptErr is a 2202E array-subscript error (spec/design/array.md §11).
-func arraySubscriptErr(detail string) error { return NewError(ArraySubscriptError, detail) }
+func arraySubscriptErr(detail string) error { return newError(ArraySubscriptError, detail) }
 
 // buildNestedArray stacks the evaluated elements of a nested ARRAY[...] constructor into a value of
 // one higher dimension (spec/design/array.md §4). The resolver guarantees every item is an array; a
@@ -27398,7 +27398,7 @@ func buildNestedArray(subs []Value) (Value, error) {
 		}
 	}
 	if len(dims0) == 0 {
-		return ArrayValueOf(EmptyArray()), nil // all sub-arrays empty → empty array
+		return arrayValueOf(emptyArray()), nil // all sub-arrays empty → empty array
 	}
 	dims := append([]int{len(arrs)}, dims0...)
 	lbounds := append([]int32{1}, lbounds0...)
@@ -27406,7 +27406,7 @@ func buildNestedArray(subs []Value) (Value, error) {
 	for _, a := range arrs {
 		elements = append(elements, a.Elements...)
 	}
-	return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elements}), nil
+	return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elements}), nil
 }
 
 // countNulls counts the NULL (when wantNulls) or non-NULL values in vals — the shared kernel of
@@ -27546,7 +27546,7 @@ func evalRangeFunc(fn rangeFunc, vals []Value) (Value, error) {
 // int→decimal / text→temporal adapts), the bounds flags are read (default `[)`; a NULL 3-arg flags →
 // 22000; an invalid flags string → 42601), and finalizeRange produces the canonical value (order-check
 // 22000, canonicalize, empty-normalize).
-func evalRangeCtor(elem ScalarType, vals []Value) (Value, error) {
+func evalRangeCtor(elem scalarType, vals []Value) (Value, error) {
 	desc, ok := rangeForElement(elem)
 	if !ok {
 		panic("evalRangeCtor: a range constructor's elem has a range")
@@ -27563,7 +27563,7 @@ func evalRangeCtor(elem ScalarType, vals []Value) (Value, error) {
 	if len(vals) > 2 {
 		switch vals[2].Kind {
 		case ValNull:
-			return Value{}, NewError(DataException, "range constructor flags argument must not be null")
+			return Value{}, newError(DataException, "range constructor flags argument must not be null")
 		case ValText:
 			lowerInc, upperInc, err = parseBoundFlags(vals[2].Str)
 			if err != nil {
@@ -27584,7 +27584,7 @@ func evalRangeCtor(elem ScalarType, vals []Value) (Value, error) {
 // NULL bound (an infinite bound). Reuses storeValue (the INSERT/UPDATE assignment coercion): an
 // integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
 // non-assignable value is 42804 (the resolver already screened the common 42883 cases).
-func coerceRangeBound(v Value, elem ScalarType) (*Value, error) {
+func coerceRangeBound(v Value, elem scalarType) (*Value, error) {
 	out, err := storeValue(v, elem, nil, false, "range bound")
 	if err != nil {
 		return nil, err
@@ -27600,7 +27600,7 @@ func coerceRangeBound(v Value, elem ScalarType) (*Value, error) {
 // operands are ranges; for the element overloads (roContainsElem/roElemContainedBy) the non-range
 // operand is coerced to the range's element type elem (assignment-style, matching the resolver's hint).
 // The boolean kernels live in range.go.
-func evalRangeOp(op rangeOp, l, r Value, elem ScalarType) (Value, error) {
+func evalRangeOp(op rangeOp, l, r Value, elem scalarType) (Value, error) {
 	if l.Kind == ValNull || r.Kind == ValNull {
 		return NullValue(), nil
 	}
@@ -27733,7 +27733,7 @@ func arrayRemoveValue(arr, elem Value) (Value, error) {
 	}
 	a := arr.Array
 	if a.Ndim() > 1 {
-		return Value{}, NewError(FeatureNotSupported, "removing elements from multidimensional arrays is not supported")
+		return Value{}, newError(FeatureNotSupported, "removing elements from multidimensional arrays is not supported")
 	}
 	kept := make([]Value, 0, len(a.Elements))
 	for _, e := range a.Elements {
@@ -27742,13 +27742,13 @@ func arrayRemoveValue(arr, elem Value) (Value, error) {
 		}
 	}
 	if len(kept) == 0 {
-		return ArrayValueOf(EmptyArray()), nil
+		return arrayValueOf(emptyArray()), nil
 	}
 	lb := int32(1)
 	if len(a.Lbounds) > 0 {
 		lb = a.Lbounds[0]
 	}
-	return ArrayValueOf(&ArrayVal{Dims: []int{len(kept)}, Lbounds: []int32{lb}, Elements: kept}), nil
+	return arrayValueOf(&ArrayVal{Dims: []int{len(kept)}, Lbounds: []int32{lb}, Elements: kept}), nil
 }
 
 // arrayReplaceValue is array_replace(a, from, to) (array-functions.md §8): substitute every element
@@ -27767,7 +27767,7 @@ func arrayReplaceValue(arr, from, to Value) (Value, error) {
 			elements[i] = e
 		}
 	}
-	return ArrayValueOf(&ArrayVal{Dims: append([]int(nil), a.Dims...), Lbounds: append([]int32(nil), a.Lbounds...), Elements: elements}), nil
+	return arrayValueOf(&ArrayVal{Dims: append([]int(nil), a.Dims...), Lbounds: append([]int32(nil), a.Lbounds...), Elements: elements}), nil
 }
 
 // arrayPositionValue is array_position(a, e[, start]) (array-functions.md §8): the SUBSCRIPT (in the
@@ -27780,7 +27780,7 @@ func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
 	}
 	a := arr.Array
 	if a.Ndim() > 1 {
-		return Value{}, NewError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
+		return Value{}, newError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
 	}
 	lb := int32(1)
 	if len(a.Lbounds) > 0 {
@@ -27789,7 +27789,7 @@ func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
 	begin := 0
 	if start != nil {
 		if start.Kind == ValNull {
-			return Value{}, NewError(NullValueNotAllowed, "initial position must not be null")
+			return Value{}, newError(NullValueNotAllowed, "initial position must not be null")
 		}
 		if off := start.Int - int64(lb); off > 0 {
 			begin = int(off)
@@ -27812,7 +27812,7 @@ func arrayPositionsValue(arr, elem Value) (Value, error) {
 	}
 	a := arr.Array
 	if a.Ndim() > 1 {
-		return Value{}, NewError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
+		return Value{}, newError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
 	}
 	lb := int32(1)
 	if len(a.Lbounds) > 0 {
@@ -27824,7 +27824,7 @@ func arrayPositionsValue(arr, elem Value) (Value, error) {
 			positions = append(positions, IntValue(int64(lb)+int64(i)))
 		}
 	}
-	return ArrayValueOf(OneDimArray(positions)), nil
+	return arrayValueOf(oneDimArray(positions)), nil
 }
 
 // arrayDimsText is the array_dims text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike array_out's
@@ -27842,11 +27842,11 @@ func arrayDimsText(a *ArrayVal) string {
 // array grows by one element, preserving its lower bound; a multidimensional array is 22000.
 func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
 	if arr.Kind == ValNull || arr.Array.Ndim() == 0 {
-		return ArrayValueOf(OneDimArray([]Value{elem})), nil
+		return arrayValueOf(oneDimArray([]Value{elem})), nil
 	}
 	a := arr.Array
 	if a.Ndim() != 1 {
-		return Value{}, NewError(DataException, "argument must be empty or one-dimensional array")
+		return Value{}, newError(DataException, "argument must be empty or one-dimensional array")
 	}
 	elements := make([]Value, 0, len(a.Elements)+1)
 	if atEnd {
@@ -27856,7 +27856,7 @@ func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
 		elements = append(elements, elem)
 		elements = append(elements, a.Elements...)
 	}
-	return ArrayValueOf(&ArrayVal{Dims: []int{a.Dims[0] + 1}, Lbounds: cloneI32(a.Lbounds), Elements: elements}), nil
+	return arrayValueOf(&ArrayVal{Dims: []int{a.Dims[0] + 1}, Lbounds: cloneI32(a.Lbounds), Elements: elements}), nil
 }
 
 // arrayCatValues is array_cat (array-functions.md §3.2): identity-aware concatenation along the
@@ -27881,7 +27881,7 @@ func arrayCatValues(a, b Value) (Value, error) {
 	if bv.Ndim() == 0 {
 		return a, nil
 	}
-	mismatch := func() error { return NewError(ArraySubscriptError, "cannot concatenate incompatible arrays") }
+	mismatch := func() error { return newError(ArraySubscriptError, "cannot concatenate incompatible arrays") }
 	elements := make([]Value, 0, len(av.Elements)+len(bv.Elements))
 	elements = append(elements, av.Elements...)
 	elements = append(elements, bv.Elements...)
@@ -27893,21 +27893,21 @@ func arrayCatValues(a, b Value) (Value, error) {
 		}
 		dims := cloneInts(av.Dims)
 		dims[0] = av.Dims[0] + bv.Dims[0]
-		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
+		return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
 	case na == nb+1:
 		if !equalInts(av.Dims[1:], bv.Dims) {
 			return Value{}, mismatch()
 		}
 		dims := cloneInts(av.Dims)
 		dims[0] = av.Dims[0] + 1
-		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
+		return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
 	case nb == na+1:
 		if !equalInts(bv.Dims[1:], av.Dims) {
 			return Value{}, mismatch()
 		}
 		dims := cloneInts(bv.Dims)
 		dims[0] = bv.Dims[0] + 1
-		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(bv.Lbounds), Elements: elements}), nil
+		return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(bv.Lbounds), Elements: elements}), nil
 	default:
 		return Value{}, mismatch()
 	}
@@ -27941,7 +27941,7 @@ func equalInts(a, b []int) bool {
 // evalSubscript evaluates an array subscript `base[..][..]` (spec/design/array.md §6). A NULL array
 // or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
 // access a (renumbered) sub-array.
-func evalSubscript(e *rExpr, row Row, env *evalEnv, m *Meter) (Value, error) {
+func evalSubscript(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 	base, err := e.operand.eval(row, env, m)
 	if err != nil {
 		return Value{}, err
@@ -28009,7 +28009,7 @@ func evalSubscript(e *rExpr, row Row, env *evalEnv, m *Meter) (Value, error) {
 
 // evalOptBound evaluates an optional slice-bound expression: nil expr → (nil, false); a NULL value →
 // (nil, true); an integer → (&i, false).
-func evalOptBound(e *rExpr, row Row, env *evalEnv, m *Meter) (*int64, bool, error) {
+func evalOptBound(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (*int64, bool, error) {
 	if e == nil {
 		return nil, false, nil
 	}
@@ -28053,7 +28053,7 @@ func arrayGetElement(a *ArrayVal, idxs []int64) Value {
 func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
 	ndim := a.Ndim()
 	if len(los) > ndim || ndim == 0 {
-		return ArrayValueOf(EmptyArray())
+		return arrayValueOf(emptyArray())
 	}
 	newDims := make([]int, ndim)
 	starts := make([]int, ndim) // source 0-based start per dimension
@@ -28078,7 +28078,7 @@ func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
 			hi = ub
 		}
 		if lo > hi {
-			return ArrayValueOf(EmptyArray()) // any empty dimension → empty slice
+			return arrayValueOf(emptyArray()) // any empty dimension → empty slice
 		}
 		newDims[d] = int(hi - lo + 1)
 		starts[d] = int(lo - lb)
@@ -28113,7 +28113,7 @@ func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
 	for d := range lbounds {
 		lbounds[d] = 1
 	}
-	return ArrayValueOf(&ArrayVal{Dims: newDims, Lbounds: lbounds, Elements: elements})
+	return arrayValueOf(&ArrayVal{Dims: newDims, Lbounds: lbounds, Elements: elements})
 }
 
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or rtNull for an
@@ -28170,7 +28170,7 @@ func unifyCaseTypes(arms []resolvedType) (resolvedType, error) {
 // evaluates to NULL anyway.
 func coerceCase(v Value, toDecimal bool) Value {
 	if toDecimal && v.Kind == ValInt {
-		return DecimalValue(DecimalFromInt64(v.Int))
+		return DecimalValue(decimalFromInt64(v.Int))
 	}
 	return v
 }
@@ -28181,7 +28181,7 @@ func coerceCase(v Value, toDecimal bool) Value {
 // boolean (or NULL) value. A decimal value into an integer column is NOT assignable (decimal→int
 // is explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
 // type-check, generalized to expressions.
-func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
+func requireAssignable(t resolvedType, colTy scalarType, col string) error {
 	var ok bool
 	switch {
 	case colTy.IsBool():
@@ -28217,16 +28217,16 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 // decimal (validated to numeric(p,s) — 22023); on any other type it is 0A000 (varchar(n) and
 // other parameterized types are deferred — spec/design/grammar.md §14). Type-specific narrowings
 // (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the call site.
-func resolveTypeAndTypmod(name string, tm *TypeMod) (ScalarType, *DecimalTypmod, error) {
-	ty, ok := ScalarTypeFromName(name)
+func resolveTypeAndTypmod(name string, tm *typeMod) (scalarType, *decimalTypmod, error) {
+	ty, ok := scalarTypeFromName(name)
 	if !ok {
-		return 0, nil, NewError(UndefinedObject, "type does not exist: "+name)
+		return 0, nil, newError(UndefinedObject, "type does not exist: "+name)
 	}
 	if tm == nil {
 		return ty, nil, nil
 	}
 	if !ty.IsDecimal() {
-		return 0, nil, NewError(FeatureNotSupported,
+		return 0, nil, newError(FeatureNotSupported,
 			"a type modifier is not supported for type "+ty.CanonicalName())
 	}
 	typmod, err := validateDecimalTypmod(tm)
@@ -28238,28 +28238,28 @@ func resolveTypeAndTypmod(name string, tm *TypeMod) (ScalarType, *DecimalTypmod,
 
 // validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
 // 0 <= s <= p; else trap 22023 (spec/design/decimal.md §2). numeric(p) means scale 0.
-func validateDecimalTypmod(tm *TypeMod) (*DecimalTypmod, error) {
+func validateDecimalTypmod(tm *typeMod) (*decimalTypmod, error) {
 	p := tm.Precision
-	if p < 1 || p > MaxPrecision {
-		return nil, NewError(InvalidParameterValue,
-			fmt.Sprintf("NUMERIC precision %d must be between 1 and %d", p, MaxPrecision))
+	if p < 1 || p > maxPrecision {
+		return nil, newError(InvalidParameterValue,
+			fmt.Sprintf("NUMERIC precision %d must be between 1 and %d", p, maxPrecision))
 	}
 	var s uint64
 	if tm.Scale != nil {
 		s = *tm.Scale
 	}
-	if s > p || s > MaxScale {
-		return nil, NewError(InvalidParameterValue,
+	if s > p || s > maxScale {
+		return nil, newError(InvalidParameterValue,
 			fmt.Sprintf("NUMERIC scale %d must be between 0 and precision %d", s, p))
 	}
-	return &DecimalTypmod{Precision: uint16(p), Scale: uint16(s)}, nil
+	return &decimalTypmod{Precision: uint16(p), Scale: uint16(s)}, nil
 }
 
-func overflowErr(ty ScalarType) error {
-	return NewError(NumericValueOutOfRange, "value out of range for type "+ty.CanonicalName())
+func overflowErr(ty scalarType) error {
+	return newError(NumericValueOutOfRange, "value out of range for type "+ty.CanonicalName())
 }
 
-func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
+func typeError(msg string) error { return newError(DatatypeMismatch, msg) }
 
 // eval evaluates against a row, accruing cost into m, and returns a Value (a boolean for
 // comparisons / connectives). Arithmetic traps 22003 on overflow and 22012 on a zero
@@ -28274,43 +28274,43 @@ func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
 // to `to` (Timestamp/Timestamptz/Date). The casts crossing the timestamptz boundary consult the
 // session zone (charging timezone); the others are zone-free. ±infinity maps to the target's own
 // sentinel. The (source family, to) pair is guaranteed cross-family by the resolver.
-func evalDateConvert(v Value, to ScalarType, env *evalEnv, m *Meter) (Value, error) {
+func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value, error) {
 	const microsPerDay int64 = 86_400 * 1_000_000
 	microsToDate := func(mc int64) Value {
 		switch mc {
-		case PosInfinity:
-			return DateValue(DatePosInfinity)
-		case NegInfinity:
-			return DateValue(DateNegInfinity)
+		case posInfinity:
+			return DateValue(datePosInfinity)
+		case negInfinity:
+			return DateValue(dateNegInfinity)
 		default:
 			return DateValue(int32(floorDiv(mc, microsPerDay)))
 		}
 	}
 	dateToMicros := func(d int32) int64 {
 		switch d {
-		case DatePosInfinity:
-			return PosInfinity
-		case DateNegInfinity:
-			return NegInfinity
+		case datePosInfinity:
+			return posInfinity
+		case dateNegInfinity:
+			return negInfinity
 		default:
 			return int64(d) * microsPerDay
 		}
 	}
-	isInf := func(mc int64) bool { return mc == PosInfinity || mc == NegInfinity }
+	isInf := func(mc int64) bool { return mc == posInfinity || mc == negInfinity }
 	zoneCharge := func() (ZoneRef, error) {
 		zr := env.exec.session.timeZone
-		m.Charge(Costs.Timezone)
+		m.Charge(costs.Timezone)
 		if err := m.Guard(); err != nil {
 			return ZoneRef{}, err
 		}
 		return zr, nil
 	}
 	switch {
-	case v.Kind == ValTimestamp && to == Date:
+	case v.Kind == ValTimestamp && to == scalarDate:
 		return microsToDate(v.Int), nil
-	case v.Kind == ValDate && to == Timestamp:
+	case v.Kind == ValDate && to == scalarTimestamp:
 		return TimestampValue(dateToMicros(int32(v.Int))), nil
-	case v.Kind == ValTimestamptz && to == Timestamp:
+	case v.Kind == ValTimestamptz && to == scalarTimestamp:
 		if isInf(v.Int) {
 			return TimestampValue(v.Int), nil
 		}
@@ -28318,8 +28318,8 @@ func evalDateConvert(v Value, to ScalarType, env *evalEnv, m *Meter) (Value, err
 		if err != nil {
 			return Value{}, err
 		}
-		return TimestampValue(InstantToLocalMicros(zr, v.Int)), nil
-	case v.Kind == ValTimestamp && to == Timestamptz:
+		return TimestampValue(instantToLocalMicros(zr, v.Int)), nil
+	case v.Kind == ValTimestamp && to == scalarTimestamptz:
 		if isInf(v.Int) {
 			return TimestamptzValue(v.Int), nil
 		}
@@ -28327,8 +28327,8 @@ func evalDateConvert(v Value, to ScalarType, env *evalEnv, m *Meter) (Value, err
 		if err != nil {
 			return Value{}, err
 		}
-		return TimestamptzValue(LocalToInstantMicros(zr, v.Int)), nil
-	case v.Kind == ValTimestamptz && to == Date:
+		return TimestamptzValue(localToInstantMicros(zr, v.Int)), nil
+	case v.Kind == ValTimestamptz && to == scalarDate:
 		if isInf(v.Int) {
 			return microsToDate(v.Int), nil
 		}
@@ -28336,8 +28336,8 @@ func evalDateConvert(v Value, to ScalarType, env *evalEnv, m *Meter) (Value, err
 		if err != nil {
 			return Value{}, err
 		}
-		return microsToDate(InstantToLocalMicros(zr, v.Int)), nil
-	case v.Kind == ValDate && to == Timestamptz:
+		return microsToDate(instantToLocalMicros(zr, v.Int)), nil
+	case v.Kind == ValDate && to == scalarTimestamptz:
 		mid := dateToMicros(int32(v.Int))
 		if isInf(mid) {
 			return TimestamptzValue(mid), nil
@@ -28346,13 +28346,13 @@ func evalDateConvert(v Value, to ScalarType, env *evalEnv, m *Meter) (Value, err
 		if err != nil {
 			return Value{}, err
 		}
-		return TimestamptzValue(LocalToInstantMicros(zr, mid)), nil
+		return TimestamptzValue(localToInstantMicros(zr, mid)), nil
 	default:
 		panic("resolver restricts DateConvert to cross-family datetime casts")
 	}
 }
 
-func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
+func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 	// Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). eval recurses once
 	// per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot;
 	// it is a no-op when no ceiling is set (spec/design/cost.md §6).
@@ -28372,7 +28372,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reRow:
 		// A ROW(...) constructor — one operator_eval, then build the composite from the evaluated
 		// fields (spec/design/composite.md §1, cost.md §9).
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		vals := make([]Value, len(e.sargs))
 		for i, f := range e.sargs {
 			v, err := f.eval(row, env, m)
@@ -28385,7 +28385,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reArray:
 		// An ARRAY[...] constructor — one operator_eval. A `nested` constructor stacks its
 		// sub-arrays into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		elems := make([]Value, len(e.sargs))
 		for i, el := range e.sargs {
 			v, err := el.eval(row, env, m)
@@ -28400,7 +28400,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return ArrayValue(elems), nil
 	case reConstArray:
 		// A folded array constant (shape preserved) — return it directly.
-		return ArrayValueOf(e.cArray), nil
+		return arrayValueOf(e.cArray), nil
 	case reConstRange:
 		// A folded range constant (already canonical) — return it directly.
 		return RangeValue(e.cRange), nil
@@ -28408,7 +28408,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// Field selection `(composite).field` — one operator_eval, then return the `index`-th field
 		// of the evaluated composite base (spec/design/composite.md §S4, cost.md §9). A whole-value
 		// NULL composite yields NULL for any field.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		base, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28425,7 +28425,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// Array subscript `base[..][..]` — one operator_eval (spec/design/array.md §6). A NULL array
 		// or any NULL subscript bound yields NULL; element access returns the element (or NULL),
 		// slice access a (renumbered) sub-array. The per-element walk is internal (unmetered).
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		return evalSubscript(e, row, env, m)
 	case reConstInt:
 		return IntValue(e.cInt), nil
@@ -28463,7 +28463,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28476,7 +28476,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// The three array-involving casts (spec/design/array.md §7): array → text (array_out),
 		// runtime text → T[] (array_in per row), and element-wise array → array (each element through
 		// the scalar cast). The node carries the cast's operator_eval charge (no new cost unit).
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28514,7 +28514,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			newElems[i] = ce
 		}
-		return ArrayValueOf(&ArrayVal{Dims: src.Dims, Lbounds: src.Lbounds, Elements: newElems}), nil
+		return arrayValueOf(&ArrayVal{Dims: src.Dims, Lbounds: src.Lbounds, Elements: newElems}), nil
 	case reNeg:
 		m.Charge(operatorCost("neg"))
 		v, err := e.operand.eval(row, env, m)
@@ -28537,7 +28537,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		if e.result.IsDecimal() {
 			if v.Kind == ValInt {
-				return DecimalValue(DecimalFromInt64(v.Int).Negate()), nil
+				return DecimalValue(decimalFromInt64(v.Int).Negate()), nil
 			}
 			return DecimalValue(v.Dec.Negate()), nil
 		}
@@ -28576,7 +28576,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if a.Kind == ValDate || b.Kind == ValDate {
 			return evalDateArith(e.op, a, b, e.result)
 		}
-		if e.result.IsInterval() && (e.op == OpMul || e.op == OpDiv) {
+		if e.result.IsInterval() && (e.op == opMul || e.op == opDiv) {
 			// interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
 			// Mul commutes; Div is interval / number. A zero divisor traps 22012.
 			iv, num := a, b
@@ -28587,9 +28587,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if ferr != nil {
 				return Value{}, ferr
 			}
-			if e.op == OpDiv {
+			if e.op == opDiv {
 				if fnum.Sign() == 0 {
-					return Value{}, NewError(DivisionByZero, "division by zero")
+					return Value{}, newError(DivisionByZero, "division by zero")
 				}
 				// interval / number = interval * (den/num); keep fden > 0.
 				if fnum.Sign() < 0 {
@@ -28598,7 +28598,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 					fnum, fden = fden, fnum
 				}
 			}
-			r, rerr := MulByFraction(iv.Iv, fnum, fden)
+			r, rerr := mulByFraction(iv.Iv, fnum, fden)
 			if rerr != nil {
 				return Value{}, rerr
 			}
@@ -28609,7 +28609,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// (spec/design/interval.md §5). Dispatch on the operand kinds.
 			if a.Kind == ValInterval && b.Kind == ValInterval {
 				var r Interval
-				if e.op == OpAdd {
+				if e.op == opAdd {
 					r, err = a.Iv.Add(b.Iv)
 				} else {
 					r, err = a.Iv.Sub(b.Iv)
@@ -28620,7 +28620,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return IntervalValue(r), nil
 			}
 			// timestamp[tz] − timestamp[tz] (both Int-carried instants).
-			r, err := TsDiff(a.Int, b.Int)
+			r, err := tsDiff(a.Int, b.Int)
 			if err != nil {
 				return Value{}, err
 			}
@@ -28636,7 +28636,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			} else {
 				instant, iv = a.Int, b.Iv
 			}
-			r, terr := TsShift(instant, iv, e.op == OpSub)
+			r, terr := tsShift(instant, iv, e.op == opSub)
 			if terr != nil {
 				return Value{}, terr
 			}
@@ -28657,7 +28657,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// charged BEFORE the operation runs, so a cost ceiling aborts ahead of the limb
 			// work (spec/design/cost.md §3 "decimal_work").
 			da, db := toDecimal(a), toDecimal(b)
-			m.Charge(Costs.DecimalWork * (decimalArithWork(e.op, da, db) - 1))
+			m.Charge(costs.DecimalWork * (decimalArithWork(e.op, da, db) - 1))
 			if err := m.Guard(); err != nil {
 				return Value{}, err
 			}
@@ -28676,7 +28676,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		// A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
 		// where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
-		m.Charge(Costs.DecimalWork * (decimalCmpWork(a, b) - 1))
+		m.Charge(costs.DecimalWork * (decimalCmpWork(a, b) - 1))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -28685,9 +28685,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// point of each operand (cost.md "collate"). =/<> are byte-equality even under a deterministic
 		// collation (§7), so they take the plain path and charge no collate. A NULL operand makes the
 		// result Unknown (no sort key).
-		if e.collation != nil && (e.op == OpLt || e.op == OpGt || e.op == OpLe || e.op == OpGe) {
+		if e.collation != nil && (e.op == opLt || e.op == opGt || e.op == opLe || e.op == opGe) {
 			if a.Kind == ValText && b.Kind == ValText {
-				m.Charge(Costs.Collate * int64(utf8.RuneCountInString(a.Str)+utf8.RuneCountInString(b.Str)))
+				m.Charge(costs.Collate * int64(utf8.RuneCountInString(a.Str)+utf8.RuneCountInString(b.Str)))
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
@@ -28696,11 +28696,11 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 					return Value{}, err
 				}
 				switch e.op {
-				case OpLt:
+				case opLt:
 					return BoolValue(c < 0), nil
-				case OpGt:
+				case opGt:
 					return BoolValue(c > 0), nil
-				case OpLe:
+				case opLe:
 					return BoolValue(c <= 0), nil
 				default: // OpGe
 					return BoolValue(c >= 0), nil
@@ -28714,20 +28714,20 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// untrusted join / correlated re-scan can amplify by fan-out is metered, not flat
 		// (spec/design/cost.md §3 "varlen_compare"). Collated ORDERING already charged collate above
 		// and returned; this covers =/<>, C/default-collation ordering, and all bytea.
-		m.Charge(Costs.VarlenCompare * (varlenCompareWork(a, b) - 1))
+		m.Charge(costs.VarlenCompare * (varlenCompareWork(a, b) - 1))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
 		switch e.op {
-		case OpEq:
+		case opEq:
 			return from3(a.Eq3(b)), nil
-		case OpNe:
+		case opNe:
 			return from3(not3(a.Eq3(b))), nil
-		case OpLt:
+		case opLt:
 			return from3(a.Lt3(b)), nil
-		case OpGt:
+		case opGt:
 			return from3(a.Gt3(b)), nil
-		case OpLe:
+		case opLe:
 			return from3(or3(a.Lt3(b), a.Eq3(b))), nil
 		default: // OpGe
 			return from3(or3(a.Gt3(b), a.Eq3(b))), nil
@@ -28736,7 +28736,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). One
 		// operator_eval; the operands charge their own. The operators are STRICT — a NULL base or
 		// argument propagates to SQL NULL.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		bv, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28796,7 +28796,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reJsonContains:
 		// `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5). One
 		// operator_eval; STRICT — a NULL operand yields SQL NULL.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		av, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28816,7 +28816,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reJsonHasKey:
 		// `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (json-sql-functions.md §1, J5).
 		// One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		bv, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28869,7 +28869,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reJsonConcat:
 		// `a || b` jsonb concatenate / shallow-merge (json-sql-functions.md §1, J6). One
 		// operator_eval; STRICT — a NULL operand yields SQL NULL.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		av, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28889,7 +28889,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reJsonDelete:
 		// `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
 		// J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		bv, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28965,7 +28965,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return boolOr(a, b), nil
 	case reIsNull:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28974,7 +28974,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// a scalar follows the ordinary rule. IsNullTest folds both.
 		return BoolValue(v.IsNullTest(e.negated)), nil
 	case reIsJson:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -28999,7 +28999,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return BoolValue(ok != e.negated), nil
 	case reJsonCtor:
 		// JSON(text) → the verbatim input text as a `json` value (json-sql-functions.md §5). STRICT.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29015,7 +29015,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, perr
 			}
 			if e.jpUnique && hasDuplicateKeys(&node) {
-				return Value{}, NewError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+				return Value{}, newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
 			}
 			// The result is the verbatim input text as a `json` value (PG).
 			return JsonValue(v.Str), nil
@@ -29023,7 +29023,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			panic("BUG: resolver restricts JSON() to a text operand")
 		}
 	case reLike:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		subject, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29041,9 +29041,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16)
 		// before matching — 1:1 folding so _/length semantics survive.
 		if e.insensitive {
-			prop := LoadedProperty()
-			sub = FoldLowerSimple(sub, prop)
-			pat = FoldLowerSimple(pat, prop)
+			prop := loadedProperty()
+			sub = foldLowerSimple(sub, prop)
+			pat = foldLowerSimple(pat, prop)
 		}
 		matched, err := likeMatch(sub, pat)
 		if err != nil {
@@ -29052,7 +29052,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// negated carries NOT LIKE/ILIKE: matched != negated flips for the NOT form.
 		return BoolValue(matched != e.negated), nil
 	case reRegex:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		subject, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29067,13 +29067,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return NullValue(), nil
 		}
 		sub := subject.Str
-		var prop *PropertyTable
+		var prop *propertyTable
 		if e.insensitive {
 			// ~* (insensitive): simple-lowercase the subject under the engine casing regime
 			// (collation.md §16). The constant pattern was folded at resolve; a non-constant pattern
 			// is folded below before compiling.
-			prop = LoadedProperty()
-			sub = FoldLowerSimple(sub, prop)
+			prop = loadedProperty()
+			sub = foldLowerSimple(sub, prop)
 		}
 		subjRunes := []rune(sub)
 		var matched bool
@@ -29082,7 +29082,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// execution (on first eval), not per row (regex.md §5).
 			if !e.rxCompileCharged {
 				e.rxCompileCharged = true
-				m.Charge(Costs.RegexCompile * int64(e.rxProgram.ninst()))
+				m.Charge(costs.RegexCompile * int64(e.rxProgram.ninst()))
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
@@ -29095,13 +29095,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// Non-constant pattern: compile now (charging regex_compile) and run.
 			pat := pattern.Str
 			if e.insensitive {
-				pat = FoldLowerSimple(pat, prop)
+				pat = foldLowerSimple(pat, prop)
 			}
 			prog, err := compileRegex(pat)
 			if err != nil {
 				return Value{}, err
 			}
-			m.Charge(Costs.RegexCompile * int64(prog.ninst()))
+			m.Charge(costs.RegexCompile * int64(prog.ninst()))
 			if err := m.Guard(); err != nil {
 				return Value{}, err
 			}
@@ -29113,7 +29113,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// negated carries !~ / !~*: matched != negated flips for the negated form.
 		return BoolValue(matched != e.negated), nil
 	case reRegexFunc:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		// STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
 		vals := make([]Value, len(e.sargs))
 		for i, a := range e.sargs {
@@ -29180,7 +29180,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// Numeric argument validation (regex.md §8b), BEFORE the pattern compiles (PG order: a bad
 		// `start` beats a bad pattern). 22023 names the offending parameter.
 		badParam := func(p string, v int64) error {
-			return NewError(InvalidParameterValue,
+			return newError(InvalidParameterValue,
 				fmt.Sprintf("invalid value for parameter %q: %d", p, v))
 		}
 		switch e.rxFunc {
@@ -29215,7 +29215,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// Validate flags: `i` (all), `g` (replace only); anything else is 2201B.
 		for _, c := range flags {
 			if !(c == 'i' || (c == 'g' && e.rxFunc == rxReplace)) {
-				return Value{}, NewError(InvalidRegularExpression,
+				return Value{}, newError(InvalidRegularExpression,
 					fmt.Sprintf("invalid regular expression: invalid option %q", string(c)))
 			}
 		}
@@ -29225,16 +29225,16 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// case-insensitive — same length, so offsets carry over, regex.md §8).
 		origRunes := []rune(source)
 		matchRunes := origRunes
-		var prop *PropertyTable
+		var prop *propertyTable
 		if insensitive {
-			prop = LoadedProperty()
-			matchRunes = []rune(FoldLowerSimple(source, prop))
+			prop = loadedProperty()
+			matchRunes = []rune(foldLowerSimple(source, prop))
 		}
 		var prog *regexProgram
 		if e.rxProgram != nil {
 			if !e.rxCompileCharged {
 				e.rxCompileCharged = true
-				m.Charge(Costs.RegexCompile * int64(e.rxProgram.ninst()))
+				m.Charge(costs.RegexCompile * int64(e.rxProgram.ninst()))
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
@@ -29243,14 +29243,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		} else {
 			pat := pattern
 			if insensitive {
-				pat = FoldLowerSimple(pattern, prop)
+				pat = foldLowerSimple(pattern, prop)
 			}
 			var err error
 			prog, err = compileRegex(pat)
 			if err != nil {
 				return Value{}, err
 			}
-			m.Charge(Costs.RegexCompile * int64(prog.ninst()))
+			m.Charge(costs.RegexCompile * int64(prog.ninst()))
 			if err := m.Guard(); err != nil {
 				return Value{}, err
 			}
@@ -29333,7 +29333,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return IntValue(e2 + 1), nil
 		}
 	case reCasing:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29341,9 +29341,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
-		return TextValue(FoldCase(v.Str, e.casingUpper, LoadedProperty())), nil
+		return TextValue(foldCase(v.Str, e.casingUpper, loadedProperty())), nil
 	case reAtTimeZone:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		zv, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29355,13 +29355,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if zv.Kind == ValNull || vv.Kind == ValNull {
 			return NullValue(), nil
 		}
-		m.Charge(Costs.Timezone)
+		m.Charge(costs.Timezone)
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
 		micros := vv.Int
 		// ±infinity passes through unchanged (PG): no zone offset applies, zone not validated.
-		if micros == PosInfinity || micros == NegInfinity {
+		if micros == posInfinity || micros == negInfinity {
 			if e.atTzToTimestamptz {
 				return TimestamptzValue(micros), nil
 			}
@@ -29369,15 +29369,15 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		zr, ok := ResolveZone(zv.Str)
 		if !ok {
-			return Value{}, NewError(InvalidParameterValue,
+			return Value{}, newError(InvalidParameterValue,
 				fmt.Sprintf("time zone %q not recognized", zv.Str))
 		}
 		if e.atTzToTimestamptz {
-			return TimestamptzValue(LocalToInstantMicros(zr, micros)), nil
+			return TimestamptzValue(localToInstantMicros(zr, micros)), nil
 		}
-		return TimestampValue(InstantToLocalMicros(zr, micros)), nil
+		return TimestampValue(instantToLocalMicros(zr, micros)), nil
 	case reDateTrunc:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		uv, err := e.sargs[0].eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29413,7 +29413,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return IntervalValue(r), nil
 		case ValTimestamptz:
 			mc := vv.Int
-			if mc == PosInfinity || mc == NegInfinity {
+			if mc == posInfinity || mc == negInfinity {
 				if _, err := dateTruncMicros(unitS, mc); err != nil { // still validate the unit
 					return Value{}, err
 				}
@@ -29423,28 +29423,28 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if zv != nil {
 				z, ok := ResolveZone(zv.Str)
 				if !ok {
-					return Value{}, NewError(InvalidParameterValue,
+					return Value{}, newError(InvalidParameterValue,
 						fmt.Sprintf("time zone %q not recognized", zv.Str))
 				}
 				zr = z
 			} else {
 				zr = env.exec.session.timeZone
 			}
-			m.Charge(Costs.Timezone)
+			m.Charge(costs.Timezone)
 			if err := m.Guard(); err != nil {
 				return Value{}, err
 			}
-			local := InstantToLocalMicros(zr, mc)
+			local := instantToLocalMicros(zr, mc)
 			trunc, err := dateTruncMicros(unitS, local)
 			if err != nil {
 				return Value{}, err
 			}
-			return TimestamptzValue(LocalToInstantMicros(zr, trunc)), nil
+			return TimestamptzValue(localToInstantMicros(zr, trunc)), nil
 		default:
 			panic("resolver restricts date_trunc to ts/tstz/interval")
 		}
 	case reExtract:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		vv, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29464,16 +29464,16 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			mc := vv.Int
 			// `epoch` is zone-independent (the instant); every other field decomposes in the session
 			// zone — so only the zone-consulting fields charge `timezone`.
-			if field == "epoch" || mc == PosInfinity || mc == NegInfinity {
+			if field == "epoch" || mc == posInfinity || mc == negInfinity {
 				src = extractSrc{kind: srcTstz, instant: mc, local: mc, offsetSecs: 0}
 			} else {
 				zr := env.exec.session.timeZone
-				m.Charge(Costs.Timezone)
+				m.Charge(costs.Timezone)
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
-				local := InstantToLocalMicros(zr, mc)
-				off := int64(OffsetAtRef(zr, floorDiv(mc, 1_000_000)).Utoff)
+				local := instantToLocalMicros(zr, mc)
+				off := int64(offsetAtRef(zr, floorDiv(mc, 1_000_000)).Utoff)
 				src = extractSrc{kind: srcTstz, instant: mc, local: local, offsetSecs: off}
 			}
 		default:
@@ -29485,7 +29485,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return DecimalValue(d), nil
 	case reDateConvert:
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -29500,7 +29500,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// condition falls through, and later arms (and their results) are NOT evaluated. Required
 		// for PG semantics (e.g. `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero).
 		// Charge the node, then only the conditions up to the match plus the selected result.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		for _, arm := range e.caseArms {
 			cv, err := arm.cond.eval(row, env, m)
 			if err != nil {
@@ -29521,7 +29521,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return coerceCase(ev, e.caseDecimal), nil
 	case reScalarFunc:
 		// One operator_eval per call (the uniform weight); arguments charge their own.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		// quote_nullable is the one NON-STRICT scalar function: a NULL argument yields the text
 		// 'NULL', not a propagated NULL, so it runs before the strict short-circuit loop below
 		// (string-functions.md §3).
@@ -29567,7 +29567,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfRound:
 			var d Decimal
 			if vals[0].Kind == ValInt {
-				d = DecimalFromInt64(vals[0].Int)
+				d = decimalFromInt64(vals[0].Int)
 			} else {
 				d = *vals[0].Dec
 			}
@@ -29589,7 +29589,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			iv, err := MakeInterval(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].Int, secMicros)
+			iv, err := makeInterval(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].Int, secMicros)
 			if err != nil {
 				return Value{}, err
 			}
@@ -29600,7 +29600,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// field traps 22008). make_timestamptz then interprets that wall clock in a zone (the
 			// session zone for the 6-arg form, the trailing timezone text for the 7-arg form),
 			// charging one timezone unit like AT TIME ZONE; an unrecognized explicit zone is 22023.
-			wall, err := MakeTimestamp(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].asF64())
+			wall, err := makeTimestamp(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].asF64())
 			if err != nil {
 				return Value{}, err
 			}
@@ -29608,7 +29608,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return TimestampValue(wall), nil
 			}
 			// make_timestamptz: interpret the wall clock in a zone → a UTC instant.
-			m.Charge(Costs.Timezone)
+			m.Charge(costs.Timezone)
 			if err := m.Guard(); err != nil {
 				return Value{}, err
 			}
@@ -29616,14 +29616,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if len(vals) == 7 {
 				z, ok := ResolveZone(vals[6].Str)
 				if !ok {
-					return Value{}, NewError(InvalidParameterValue,
+					return Value{}, newError(InvalidParameterValue,
 						fmt.Sprintf("time zone %q not recognized", vals[6].Str))
 				}
 				zr = z
 			} else {
 				zr = env.exec.session.timeZone
 			}
-			return TimestamptzValue(LocalToInstantMicros(zr, wall)), nil
+			return TimestamptzValue(localToInstantMicros(zr, wall)), nil
 		case sfUuidExtractVersion:
 			// uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a
 			// non-RFC variant (and, for the timestamp, any version other than 1/7). The
@@ -29651,7 +29651,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if len(vals) == 1 {
 				// The optional interval arg shifts the embedded instant via the existing
 				// calendar-aware timestamptz arithmetic (entropy.md §4).
-				s, err := TsShift(clock, vals[0].Iv, false)
+				s, err := tsShift(clock, vals[0].Iv, false)
 				if err != nil {
 					return Value{}, err
 				}
@@ -29674,7 +29674,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// additional sequence_advance unit (the catalog-tuple read+rewrite) and mutates the
 			// per-statement pending state; currval is a pure session-state read. The NULL-arg case
 			// is handled by the blanket propagation above.
-			m.Charge(Costs.SequenceAdvance)
+			m.Charge(costs.SequenceAdvance)
 			n, err := env.exec.seqNextval(vals[0].Str)
 			if err != nil {
 				return Value{}, err
@@ -29689,7 +29689,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfSetval:
 			// setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2
 			// → isCalled defaults true; arity 3 → the boolean third argument.
-			m.Charge(Costs.SequenceAdvance)
+			m.Charge(costs.SequenceAdvance)
 			isCalled := true
 			if len(vals) > 2 {
 				isCalled = vals[2].Bool
@@ -29718,7 +29718,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if missingOK {
 				return NullValue(), nil
 			}
-			return Value{}, NewError(UndefinedObject, "unrecognized configuration parameter: "+name)
+			return Value{}, newError(UndefinedObject, "unrecognized configuration parameter: "+name)
 		case sfJsonbTypeof, sfJsonTypeof:
 			// json/jsonb processing functions (B1, json-sql-functions.md §2). A jsonb arg is the node
 			// directly; a json arg is parsed from its verbatim text on demand (json.md §4), then
@@ -29786,7 +29786,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			var node JsonNode
 			switch vals[0].Kind {
 			case ValInt:
-				node = JsonNode{Kind: JNumber, Num: DecimalFromInt64(vals[0].Int)}
+				node = JsonNode{Kind: JNumber, Num: decimalFromInt64(vals[0].Int)}
 			case ValDecimal:
 				node = JsonNode{Kind: JNumber, Num: *vals[0].Dec}
 			case ValBool:
@@ -29794,7 +29794,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			case ValText:
 				node = JsonNode{Kind: JString, S: vals[0].Str}
 			default:
-				return Value{}, NewError(FeatureNotSupported, "JSON_SCALAR of this type is not supported yet")
+				return Value{}, newError(FeatureNotSupported, "JSON_SCALAR of this type is not supported yet")
 			}
 			return JsonValue(jsonCompactOut(&node)), nil
 		case sfJsonSerialize:
@@ -29977,7 +29977,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				} else if vals[0].Dec.Neg {
 					s = -1
 				}
-				return DecimalValue(DecimalFromInt64(s)), nil
+				return DecimalValue(decimalFromInt64(s)), nil
 			}
 			f := vals[0].asF64()
 			r := 0.0
@@ -29993,7 +29993,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// only drops the (already-zero) fraction. 22012 on a zero divisor (the a%b step traps).
 			toDec := func(v Value) Decimal {
 				if v.Kind == ValInt {
-					return DecimalFromInt64(v.Int)
+					return decimalFromInt64(v.Int)
 				}
 				return *v.Dec
 			}
@@ -30048,12 +30048,12 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// before its limb work runs (cost.md §3, §13); a product over the value cap traps 22003.
 			n := vals[0].Int
 			if n < 0 {
-				return Value{}, NewError(NumericValueOutOfRange, "factorial of a negative number is undefined")
+				return Value{}, newError(NumericValueOutOfRange, "factorial of a negative number is undefined")
 			}
-			acc := DecimalFromInt64(1)
+			acc := decimalFromInt64(1)
 			for k := int64(2); k <= n; k++ {
-				kd := DecimalFromInt64(k)
-				m.Charge(Costs.DecimalWork * (WorkMul(acc, kd) - 1))
+				kd := decimalFromInt64(k)
+				m.Charge(costs.DecimalWork * (workMul(acc, kd) - 1))
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
@@ -30084,8 +30084,8 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			if !Int32.InRange(idx) {
-				return Value{}, overflowErr(Int32)
+			if !scalarInt32.InRange(idx) {
+				return Value{}, overflowErr(scalarInt32)
 			}
 			return IntValue(idx), nil
 		case sfCeil, sfFloor, sfTrunc:
@@ -30098,7 +30098,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			var d Decimal
 			if vals[0].Kind == ValInt {
-				d = DecimalFromInt64(vals[0].Int)
+				d = decimalFromInt64(vals[0].Int)
 			} else {
 				d = *vals[0].Dec
 			}
@@ -30143,7 +30143,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			case sfLog10:
 				r, err = a.DecLog10()
 			default: // sfPow
-				r, err = DecPower(a, *vals[1].Dec)
+				r, err = decPower(a, *vals[1].Dec)
 			}
 			if err != nil {
 				return Value{}, err
@@ -30155,7 +30155,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			var r Decimal
 			var err error
 			if len(vals) > 1 {
-				r, err = DecLog(a, *vals[1].Dec)
+				r, err = decLog(a, *vals[1].Dec)
 			} else {
 				r, err = a.DecLog10()
 			}
@@ -30184,7 +30184,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// call; arguments charge their own. NULL handling is per-kernel (the introspectors
 		// propagate, the builders are non-strict), so — unlike reScalarFunc — there is no blanket
 		// NULL short-circuit here.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		vals := make([]Value, len(e.sargs))
 		for i, a := range e.sargs {
 			v, err := a.eval(row, env, m)
@@ -30197,7 +30197,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reRangeFunc:
 		// A polymorphic range accessor (spec/design/range-functions.md §1). One operator_eval per
 		// call; arguments charge their own. STRICT — the NULL short-circuit lives in the kernel.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		vals := make([]Value, len(e.sargs))
 		for i, a := range e.sargs {
 			v, err := a.eval(row, env, m)
@@ -30211,7 +30211,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// A range CONSTRUCTOR call (spec/design/range-functions.md §2). One operator_eval (like the
 		// range accessors); arguments charge their own evaluation. Non-strict — the kernel turns a NULL
 		// bound into an infinite bound, so there is no blanket NULL short-circuit.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		vals := make([]Value, len(e.sargs))
 		for i, a := range e.sargs {
 			v, err := a.eval(row, env, m)
@@ -30224,7 +30224,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reRangeOp:
 		// A range BOOLEAN operator (spec/design/range-functions.md §3). One operator_eval; the operands
 		// charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeOp.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		l, err := e.sargs[0].eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30237,7 +30237,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reRangeSetOp:
 		// A range SET operator (spec/design/range-functions.md §4). One operator_eval; the operands
 		// charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeSetOp.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		l, err := e.sargs[0].eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30253,7 +30253,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// arguments charge their own. Non-strict — no blanket NULL short-circuit. The two forms
 		// differ: the spread form counts the args' null-ness (never NULL); the VARIADIC-array form
 		// returns NULL on a NULL whole-array, else counts the array's flattened elements' null-ness.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		wantNulls := e.vfunc == vfNumNulls
 		if e.variadicArray {
 			v, err := e.sargs[0].eval(row, env, m)
@@ -30279,7 +30279,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// spread form directly; the VARIADIC-array form spreads the lone array — a NULL array → NULL),
 		// then build an array / object node. Non-strict — a NULL argument is a JSON null (array) or a
 		// value (object), so there is no blanket NULL short-circuit.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		var vals []Value
 		if e.variadicArray {
 			v, err := e.sargs[0].eval(row, env, m)
@@ -30301,7 +30301,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				vals[i] = v
 			}
 		}
-		m.Charge(Costs.OperatorEval * int64(len(vals)))
+		m.Charge(costs.OperatorEval * int64(len(vals)))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -30329,7 +30329,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return JsonbValue(JsonNode{Kind: JArray, Arr: nodes}), nil
 		default: // jbObject
 			if len(vals)%2 != 0 {
-				return Value{}, NewError(InvalidParameterValue,
+				return Value{}, newError(InvalidParameterValue,
 					"argument list must have even number of elements")
 			}
 			if e.jbJson {
@@ -30363,7 +30363,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 	case reJsonObject:
 		// json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		// STRICT: a NULL whole-array argument → SQL NULL.
 		arrays := make([][]*string, 0, len(e.sargs))
 		for _, a := range e.sargs {
@@ -30382,7 +30382,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if len(arrays) == 1 {
 			flat := arrays[0]
 			if len(flat)%2 != 0 {
-				return Value{}, NewError(ArraySubscriptError, "array must have even number of elements")
+				return Value{}, newError(ArraySubscriptError, "array must have even number of elements")
 			}
 			pairs = make([]kvPair, 0, len(flat)/2)
 			for i := 0; i < len(flat); i += 2 {
@@ -30390,14 +30390,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 		} else {
 			if len(arrays[0]) != len(arrays[1]) {
-				return Value{}, NewError(ArraySubscriptError, "mismatched array dimensions")
+				return Value{}, newError(ArraySubscriptError, "mismatched array dimensions")
 			}
 			pairs = make([]kvPair, 0, len(arrays[0]))
 			for i := range arrays[0] {
 				pairs = append(pairs, kvPair{arrays[0][i], arrays[1][i]})
 			}
 		}
-		m.Charge(Costs.OperatorEval * int64(len(pairs)))
+		m.Charge(costs.OperatorEval * int64(len(pairs)))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -30431,7 +30431,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reJsonSetInsert:
 		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
 		// (or a NULL path element) → SQL NULL. One operator_eval; the args charge their own.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		target, err := e.sargs[0].eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30480,7 +30480,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return JsonbValue(out), nil
 	case reJsonPathFn:
 		// A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		ctx, err := e.sargs[0].eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30497,7 +30497,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return NullValue(), nil
 		}
 		// Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
-		m.Charge(Costs.OperatorEval * int64(len(seq)))
+		m.Charge(costs.OperatorEval * int64(len(seq)))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -30514,14 +30514,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if len(seq) == 1 && seq[0].Kind == JBool {
 				return BoolValue(seq[0].B), nil
 			}
-			return Value{}, NewError(SingletonSqlJsonItemRequired, "single boolean result is expected")
+			return Value{}, newError(SingletonSqlJsonItemRequired, "single boolean result is expected")
 		default: // jpfQueryArray
 			return JsonbValue(JsonNode{Kind: JArray, Arr: seq}), nil
 		}
 	case reJsonSqlFn:
 		// A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
 		// S2). A NULL context / path → NULL; a SQL/JSON (class-22) error honors ON ERROR.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		cv, err := e.sargs[0].eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30546,7 +30546,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return NullValue(), nil
 		}
 		// Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
-		m.Charge(Costs.OperatorEval * int64(len(seq)))
+		m.Charge(costs.OperatorEval * int64(len(seq)))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -30555,8 +30555,8 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued
 		// cost into this meter, plus one operator_eval for the node.
-		m.Charge(Costs.OperatorEval)
-		child := make([]Row, len(env.outer)+1)
+		m.Charge(costs.OperatorEval)
+		child := make([]storedRow, len(env.outer)+1)
 		copy(child, env.outer)
 		child[len(env.outer)] = row
 		r, err := env.exec.execQueryPlan(e.subPlan, child, env.params, env.ctes)
@@ -30567,7 +30567,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		switch e.subKind {
 		case sqScalar:
 			if len(r.rows) > 1 {
-				return Value{}, NewError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
+				return Value{}, newError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
 			}
 			if len(r.rows) == 0 {
 				return NullValue(), nil // 0 rows -> NULL (the static type was settled at resolve)
@@ -30601,7 +30601,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 	case reInValues:
 		// A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		lv, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30610,7 +30610,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reQuantified:
 		// A quantified array comparison `lhs op ANY/ALL(array)` (array-functions.md §11) — the
 		// array spelling of IN, the 3VL fold over the array's flattened elements.
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		lv, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30621,7 +30621,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return quantifiedMembership(e.op, e.quantAll, lv, av, m)
 	default: // reDistinct
-		m.Charge(Costs.OperatorEval)
+		m.Charge(costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
@@ -30632,7 +30632,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		// IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its size-scaled
 		// decimal_work like reCompare (spec/design/cost.md §3 "decimal_work").
-		m.Charge(Costs.DecimalWork * (decimalCmpWork(a, b) - 1))
+		m.Charge(costs.DecimalWork * (decimalCmpWork(a, b) - 1))
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
@@ -30662,7 +30662,7 @@ func likeMatch(subject, pattern string) (bool, error) {
 		case pi < len(p) && p[pi] == '\\':
 			// Escape: the next pattern character must match the subject literally.
 			if pi+1 >= len(p) {
-				return false, NewError(InvalidEscapeSequence, "LIKE pattern must not end with escape character")
+				return false, newError(InvalidEscapeSequence, "LIKE pattern must not end with escape character")
 			}
 			if s[si] == p[pi+1] {
 				si++
@@ -30706,15 +30706,15 @@ func likeMatch(subject, pattern string) (bool, error) {
 // day count cannot land on a timestamp sentinel (i64 min/max are not multiples of a day's micros),
 // so no sentinel-collision check is needed here; TsShift re-checks the shifted result anyway.
 func dateMidnightMicros(d int32) (int64, error) {
-	if d == DatePosInfinity {
-		return PosInfinity, nil
+	if d == datePosInfinity {
+		return posInfinity, nil
 	}
-	if d == DateNegInfinity {
-		return NegInfinity, nil
+	if d == dateNegInfinity {
+		return negInfinity, nil
 	}
 	mc, ok := mul64(int64(d), microsPerDay)
 	if !ok {
-		return 0, NewError(DatetimeFieldOverflow, "date out of range")
+		return 0, newError(DatetimeFieldOverflow, "date out of range")
 	}
 	return mc, nil
 }
@@ -30725,8 +30725,8 @@ func dateMidnightMicros(d int32) (int64, error) {
 // 22008; a difference beyond i32 traps 22008), and date ± interval → timestamp (the date widens to
 // midnight, then the timestamp ± interval calendar shift). The resolver guarantees a Date operand
 // is present and settled result.
-func evalDateArith(op BinaryOp, a, b Value, result ScalarType) (Value, error) {
-	dtOflow := func(msg string) error { return NewError(DatetimeFieldOverflow, msg) }
+func evalDateArith(op binaryOp, a, b Value, result scalarType) (Value, error) {
+	dtOflow := func(msg string) error { return newError(DatetimeFieldOverflow, msg) }
 
 	// date ± interval → timestamp: widen the date to midnight micros, then the calendar shift.
 	if result.IsTimestamp() {
@@ -30741,7 +30741,7 @@ func evalDateArith(op BinaryOp, a, b Value, result ScalarType) (Value, error) {
 		if merr != nil {
 			return Value{}, merr
 		}
-		r, terr := TsShift(mid, iv, op == OpSub)
+		r, terr := tsShift(mid, iv, op == opSub)
 		if terr != nil {
 			return Value{}, terr
 		}
@@ -30751,11 +30751,11 @@ func evalDateArith(op BinaryOp, a, b Value, result ScalarType) (Value, error) {
 	// date − date → i32 (days between); an ±infinity operand traps 22008.
 	if a.Kind == ValDate && b.Kind == ValDate {
 		x, y := int32(a.Int), int32(b.Int)
-		if x == DateNegInfinity || x == DatePosInfinity || y == DateNegInfinity || y == DatePosInfinity {
+		if x == dateNegInfinity || x == datePosInfinity || y == dateNegInfinity || y == datePosInfinity {
 			return Value{}, dtOflow("cannot subtract infinite dates")
 		}
 		diff := int64(x) - int64(y)
-		if diff < int64(DateNegInfinity) || diff > int64(DatePosInfinity) {
+		if diff < int64(dateNegInfinity) || diff > int64(datePosInfinity) {
 			return Value{}, dtOflow("date out of range")
 		}
 		return IntValue(diff), nil
@@ -30769,19 +30769,19 @@ func evalDateArith(op BinaryOp, a, b Value, result ScalarType) (Value, error) {
 	} else {
 		d, n = int32(b.Int), a.Int
 	}
-	if d == DateNegInfinity || d == DatePosInfinity {
+	if d == dateNegInfinity || d == datePosInfinity {
 		return DateValue(d), nil
 	}
 	var shifted int64
 	var ok bool
-	if op == OpSub {
+	if op == opSub {
 		shifted, ok = sub64(int64(d), n)
 	} else {
 		shifted, ok = add64(int64(d), n)
 	}
 	// A finite result must land strictly inside the i32 day range (the two extremes are the
 	// reserved ±infinity sentinels — date.md §1); an i64 wrap or an out-of-range value traps 22008.
-	if !ok || shifted <= int64(DateNegInfinity) || shifted >= int64(DatePosInfinity) {
+	if !ok || shifted <= int64(dateNegInfinity) || shifted >= int64(datePosInfinity) {
 		return Value{}, dtOflow("date out of range")
 	}
 	return DateValue(int32(shifted)), nil
@@ -30790,27 +30790,27 @@ func evalDateArith(op BinaryOp, a, b Value, result ScalarType) (Value, error) {
 // evalArith evaluates an integer arithmetic op in 64-bit, trapping 22012 on a zero
 // divisor and 22003 if the op overflows i64 OR the in-range result falls outside the
 // declared result type (the i16+i16 → i16 boundary — spec/design/functions.md §7).
-func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
+func evalArith(op binaryOp, x, y int64, result scalarType) (Value, error) {
 	var v int64
 	switch op {
-	case OpAdd:
+	case opAdd:
 		v = x + y
 		if (y > 0 && v < x) || (y < 0 && v > x) {
 			return Value{}, overflowErr(result)
 		}
-	case OpSub:
+	case opSub:
 		v = x - y
 		if (y < 0 && v < x) || (y > 0 && v > x) {
 			return Value{}, overflowErr(result)
 		}
-	case OpMul:
+	case opMul:
 		v = x * y
 		if x != 0 && (v/x != y || (x == -1 && y == math.MinInt64)) {
 			return Value{}, overflowErr(result)
 		}
-	case OpDiv:
+	case opDiv:
 		if y == 0 {
-			return Value{}, NewError(DivisionByZero, "division by zero")
+			return Value{}, newError(DivisionByZero, "division by zero")
 		}
 		if x == math.MinInt64 && y == -1 {
 			return Value{}, overflowErr(result)
@@ -30818,7 +30818,7 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 		v = x / y
 	default: // OpMod
 		if y == 0 {
-			return Value{}, NewError(DivisionByZero, "division by zero")
+			return Value{}, newError(DivisionByZero, "division by zero")
 		}
 		// `x % -1` is mathematically 0 for every x; Go computes it as 0 natively (no
 		// overflow). Unlike division, modulo by -1 has no out-of-range result, so it does
@@ -30834,7 +30834,7 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 // evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
-func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) {
+func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) {
 	// The JSON cast matrix (spec/design/json.md §6.1). text → json/jsonb is the only runtime text
 	// cast (every other text cast target is resolver-rejected): json validates + stores verbatim
 	// (22P02 on malformed); jsonb parses + canonicalizes.
@@ -30884,14 +30884,14 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 			return DecimalValue(d), nil
 		}
 		if target.IsFloat32() {
-			f, err := parseFloatLiteral(v.Str, Float32)
+			f, err := parseFloatLiteral(v.Str, scalarFloat32)
 			if err != nil {
 				return Value{}, err
 			}
 			return Float32Value(float32(f)), nil
 		}
 		if target.IsFloat64() {
-			f, err := parseFloatLiteral(v.Str, Float64)
+			f, err := parseFloatLiteral(v.Str, scalarFloat64)
 			if err != nil {
 				return Value{}, err
 			}
@@ -30920,7 +30920,7 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 	if v.Kind == ValBytea {
 		if target.IsUuid() {
 			if len(v.Str) != 16 {
-				return Value{}, NewError(InvalidTextRepresentation,
+				return Value{}, newError(InvalidTextRepresentation,
 					fmt.Sprintf("invalid length for type uuid: %d bytes (expected 16)", len(v.Str)))
 			}
 			return UuidValue([]byte(v.Str)), nil
@@ -30984,7 +30984,7 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 			return Float64Value(intToFloat64(v.Int)), nil
 		}
 		if target.IsDecimal() {
-			d, err := coerceDecimal(DecimalFromInt64(v.Int), typmod)
+			d, err := coerceDecimal(decimalFromInt64(v.Int), typmod)
 			if err != nil {
 				return Value{}, err
 			}
@@ -31054,22 +31054,22 @@ func toDecimal(v Value) Decimal {
 	if v.Kind == ValDecimal {
 		return *v.Dec
 	}
-	return DecimalFromInt64(v.Int)
+	return decimalFromInt64(v.Int)
 }
 
 // decimalArithWork is the decimal_work W of an arithmetic node — which group-count formula
 // applies per op (spec/design/cost.md §3 "decimal_work"). The evaluator charges W − 1 before
 // the op runs.
-func decimalArithWork(op BinaryOp, a, b Decimal) int64 {
+func decimalArithWork(op binaryOp, a, b Decimal) int64 {
 	switch op {
-	case OpAdd, OpSub:
-		return WorkLinear(a, b)
-	case OpMul:
-		return WorkMul(a, b)
-	case OpDiv:
-		return WorkDiv(a, b)
+	case opAdd, opSub:
+		return workLinear(a, b)
+	case opMul:
+		return workMul(a, b)
+	case opDiv:
+		return workDiv(a, b)
 	default: // OpMod
-		return WorkMod(a, b)
+		return workMod(a, b)
 	}
 }
 
@@ -31079,11 +31079,11 @@ func decimalArithWork(op BinaryOp, a, b Decimal) int64 {
 func decimalCmpWork(a, b Value) int64 {
 	switch {
 	case a.Kind == ValDecimal && b.Kind == ValDecimal:
-		return WorkLinear(*a.Dec, *b.Dec)
+		return workLinear(*a.Dec, *b.Dec)
 	case a.Kind == ValDecimal && b.Kind == ValInt:
-		return WorkLinear(*a.Dec, DecimalFromInt64(b.Int))
+		return workLinear(*a.Dec, decimalFromInt64(b.Int))
 	case a.Kind == ValInt && b.Kind == ValDecimal:
-		return WorkLinear(DecimalFromInt64(a.Int), *b.Dec)
+		return workLinear(decimalFromInt64(a.Int), *b.Dec)
 	default:
 		return 1
 	}
@@ -31122,7 +31122,7 @@ func varlenCompareWork(a, b Value) int64 {
 // Cost == 0 sentinel means "use OperatorEval". Built once at package init from the generated table.
 var opCostOverrides = func() map[string]int64 {
 	m := map[string]int64{}
-	for _, o := range Operators {
+	for _, o := range operators {
 		if o.Cost != 0 {
 			m[o.Name] = o.Cost
 		}
@@ -31135,39 +31135,39 @@ var opCostOverrides = func() map[string]int64 {
 // single check, so no per-node map lookup happens until a weight is actually tuned.
 func operatorCost(name string) int64 {
 	if len(opCostOverrides) == 0 {
-		return Costs.OperatorEval
+		return costs.OperatorEval
 	}
 	if c, ok := opCostOverrides[name]; ok {
 		return c
 	}
-	return Costs.OperatorEval
+	return costs.OperatorEval
 }
 
 // catalogName is the catalog operator name (catalog.toml) for an arithmetic or comparison BinaryOp —
 // the key for its per-operator Cost base (functions.md §8, operatorCost).
-func (op BinaryOp) catalogName() string {
+func (op binaryOp) catalogName() string {
 	switch op {
-	case OpAdd:
+	case opAdd:
 		return "add"
-	case OpSub:
+	case opSub:
 		return "sub"
-	case OpMul:
+	case opMul:
 		return "mul"
-	case OpDiv:
+	case opDiv:
 		return "div"
-	case OpMod:
+	case opMod:
 		return "mod"
-	case OpEq:
+	case opEq:
 		return "eq"
-	case OpNe:
+	case opNe:
 		return "ne"
-	case OpLt:
+	case opLt:
 		return "lt"
-	case OpGt:
+	case opGt:
 		return "gt"
-	case OpLe:
+	case opLe:
 		return "le"
-	case OpGe:
+	case opGe:
 		return "ge"
 	default:
 		// Only arithmetic/comparison BinaryOps flow through here (reArith/reCompare); any other
@@ -31178,19 +31178,19 @@ func (op BinaryOp) catalogName() string {
 
 // evalDecimalArith evaluates decimal arithmetic with PG's result-scale rules
 // (spec/design/decimal.md §4), trapping 22003 at the cap and 22012 on a zero divisor/modulus.
-func evalDecimalArith(op BinaryOp, a, b Decimal) (Value, error) {
+func evalDecimalArith(op binaryOp, a, b Decimal) (Value, error) {
 	var (
 		r   Decimal
 		err error
 	)
 	switch op {
-	case OpAdd:
+	case opAdd:
 		r, err = a.Add(b)
-	case OpSub:
+	case opSub:
 		r, err = a.Sub(b)
-	case OpMul:
+	case opMul:
 		r, err = a.Mul(b)
-	case OpDiv:
+	case opDiv:
 		r, err = a.Div(b)
 	default: // OpMod
 		r, err = a.Rem(b)
@@ -31305,7 +31305,7 @@ func rangeVVsBound(v, cur, off Value, subtract bool) (int, error) {
 // end). Mirrors Rust's FrameCtx.
 type frameCtx struct {
 	ordered    []int
-	rows       []Row
+	rows       []storedRow
 	order      []orderSlot
 	np         int
 	peerStart  []int
@@ -31314,7 +31314,7 @@ type frameCtx struct {
 	groupSpans [][2]int
 }
 
-func newFrameCtx(ordered []int, rows []Row, order []orderSlot, collKeys [][][]byte) *frameCtx {
+func newFrameCtx(ordered []int, rows []storedRow, order []orderSlot, collKeys [][][]byte) *frameCtx {
 	np := len(ordered)
 	var groupSpans [][2]int
 	s := 0
@@ -31347,10 +31347,10 @@ func (c *frameCtx) bounds(pos int, frame *resolvedFrame) (int, int, error) {
 		return 0, c.peerEnd[pos], nil
 	}
 	switch frame.mode {
-	case FrameRows:
+	case frameRows:
 		lo, hi := c.rowsBounds(pos, frame)
 		return lo, hi, nil
-	case FrameGroups:
+	case frameGroups:
 		lo, hi := c.groupsBounds(pos, frame)
 		return lo, hi, nil
 	default: // FrameRange
@@ -31362,13 +31362,13 @@ func (c *frameCtx) bounds(pos int, frame *resolvedFrame) (int, int, error) {
 // EXCLUDE (window.md §6): CURRENT ROW drops the row itself, GROUP its whole peer group, TIES the
 // peers but not the row, NO OTHERS nothing. Exclusion removes only rows already in [lo, hi).
 // Mirrors Rust's FrameCtx::is_excluded.
-func (c *frameCtx) isExcluded(pos, k int, exclude FrameExclusion) bool {
+func (c *frameCtx) isExcluded(pos, k int, exclude frameExclusion) bool {
 	switch exclude {
-	case FrameExcludeCurrentRow:
+	case frameExcludeCurrentRow:
 		return k == pos
-	case FrameExcludeGroup:
+	case frameExcludeGroup:
 		return c.peerStart[pos] <= k && k < c.peerEnd[pos]
-	case FrameExcludeTies:
+	case frameExcludeTies:
 		return k != pos && c.peerStart[pos] <= k && k < c.peerEnd[pos]
 	default: // FrameExcludeNoOthers
 		return false
@@ -31376,9 +31376,9 @@ func (c *frameCtx) isExcluded(pos, k int, exclude FrameExclusion) bool {
 }
 
 // frameExclusion returns a resolved frame's exclusion, or NoOthers for the default (nil) frame.
-func frameExclusion(frame *resolvedFrame) FrameExclusion {
+func newFrameExclusion(frame *resolvedFrame) frameExclusion {
 	if frame == nil {
-		return FrameExcludeNoOthers
+		return frameExcludeNoOthers
 	}
 	return frame.exclude
 }
@@ -31641,7 +31641,7 @@ func clampIdx(x, np int) int {
 // pre-sort row (before LIMIT, since the sort needs them all); the per-row evaluation is metered like a
 // projection (operator_eval per node, charged inside eval). A no-op — and zero added cost — when
 // orderExprs is empty (a column/ordinal-only ORDER BY, byte-identical to before).
-func materializeOrderExprs(rows []Row, orderExprs []*rExpr, env *evalEnv, meter *Meter) error {
+func materializeOrderExprs(rows []storedRow, orderExprs []*rExpr, env *evalEnv, meter *costMeter) error {
 	if len(orderExprs) == 0 {
 		return nil
 	}
@@ -31659,7 +31659,7 @@ func materializeOrderExprs(rows []Row, orderExprs []*rExpr, env *evalEnv, meter 
 	return nil
 }
 
-func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *evalEnv, meter *Meter) error {
+func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr, env *evalEnv, meter *costMeter) error {
 	n := len(rows)
 	if n == 0 {
 		return nil
@@ -31753,7 +31753,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 					if err := meter.Guard(); err != nil { // enforce the cost ceiling per result (CLAUDE.md §13)
 						return err
 					}
-					meter.Charge(Costs.WindowResult)
+					meter.Charge(costs.WindowResult)
 					results[ri] = IntValue(int64(pos) + 1)
 				}
 			case planRank, planDenseRank, planPercentRank, planCumeDist:
@@ -31782,7 +31782,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 						if err := meter.Guard(); err != nil {
 							return err
 						}
-						meter.Charge(Costs.WindowResult)
+						meter.Charge(costs.WindowResult)
 						switch spec.plan {
 						case planRank:
 							results[ri] = IntValue(int64(g.start) + 1)
@@ -31815,13 +31815,13 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 						if err := meter.Guard(); err != nil {
 							return err
 						}
-						meter.Charge(Costs.WindowResult)
+						meter.Charge(costs.WindowResult)
 						results[ri] = NullValue()
 					}
 				default:
 					nbuckets := nv.Int
 					if nbuckets <= 0 {
-						return NewError(InvalidArgumentForNtile, "argument of ntile must be greater than zero")
+						return newError(InvalidArgumentForNtile, "argument of ntile must be greater than zero")
 					}
 					nb := int(nbuckets)
 					base := np / nb         // floor rows per bucket
@@ -31831,7 +31831,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 						if err := meter.Guard(); err != nil {
 							return err
 						}
-						meter.Charge(Costs.WindowResult)
+						meter.Charge(costs.WindowResult)
 						// Larger buckets first: positions [0, big) → (base+1)-sized buckets, the rest
 						// → base-sized buckets. `base` is 0 only when nbuckets > np, and then every
 						// pos < big so the else branch never divides by 0.
@@ -31883,7 +31883,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 					if err := meter.Guard(); err != nil {
 						return err
 					}
-					meter.Charge(Costs.WindowResult)
+					meter.Charge(costs.WindowResult)
 					switch {
 					case offsetNull:
 						results[ri] = NullValue()
@@ -31951,7 +31951,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 						for k := g.start; k < g.end; k++ {
 							// The frame fold work (window.md §8) — metered so a running aggregate over
 							// a large partition stays cost-bounded.
-							meter.Charge(Costs.WindowFrameStep)
+							meter.Charge(costs.WindowFrameStep)
 							pass, err := filterPass(k)
 							if err != nil {
 								return err
@@ -31977,7 +31977,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 							if err := meter.Guard(); err != nil {
 								return err
 							}
-							meter.Charge(Costs.WindowResult)
+							meter.Charge(costs.WindowResult)
 							results[ri] = out
 						}
 					}
@@ -31997,7 +31997,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 					// each row's operand is evaluated at most once (cached in vals), so operator_eval
 					// never rises.
 					ctx := newFrameCtx(ordered, rows, spec.order, collKeys)
-					exclude := frameExclusion(spec.frame)
+					exclude := newFrameExclusion(spec.frame)
 					vals := make([]Value, np)
 					valSet := make([]bool, np)
 					evalAt := func(k int) (Value, error) {
@@ -32013,7 +32013,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 						}
 						return vals[k], nil
 					}
-					if exclude != FrameExcludeNoOthers || spec.filter != nil {
+					if exclude != frameExcludeNoOthers || spec.filter != nil {
 						// EXCLUDE or FILTER breaks the clean add/remove model → naive per-row re-fold
 						// (dropped rows are neither metered nor counted), over the cached operand. A
 						// FILTER additionally skips a non-TRUE frame row.
@@ -32027,7 +32027,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 								if ctx.isExcluded(pos, k, exclude) {
 									continue
 								}
-								meter.Charge(Costs.WindowFrameStep)
+								meter.Charge(costs.WindowFrameStep)
 								pass, err := filterPass(k)
 								if err != nil {
 									return err
@@ -32046,7 +32046,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 							if err := meter.Guard(); err != nil {
 								return err
 							}
-							meter.Charge(Costs.WindowResult)
+							meter.Charge(costs.WindowResult)
 							out, err := a.finalize()
 							if err != nil {
 								return err
@@ -32068,7 +32068,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 								// Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
 								a = newAcc(spec.aggPlan)
 								for k := lo; k < hi; k++ {
-									meter.Charge(Costs.WindowFrameStep)
+									meter.Charge(costs.WindowFrameStep)
 									v, err := evalAt(k)
 									if err != nil {
 										return err
@@ -32084,7 +32084,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 									remHi = curHi
 								}
 								for k := curLo; k < remHi; k++ {
-									meter.Charge(Costs.WindowFrameStep)
+									meter.Charge(costs.WindowFrameStep)
 									v, err := evalAt(k)
 									if err != nil {
 										return err
@@ -32097,7 +32097,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 									addLo = lo
 								}
 								for k := addLo; k < hi; k++ {
-									meter.Charge(Costs.WindowFrameStep)
+									meter.Charge(costs.WindowFrameStep)
 									v, err := evalAt(k)
 									if err != nil {
 										return err
@@ -32111,7 +32111,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 							if err := meter.Guard(); err != nil {
 								return err
 							}
-							meter.Charge(Costs.WindowResult)
+							meter.Charge(costs.WindowResult)
 							out, err := a.clone().finalize()
 							if err != nil {
 								return err
@@ -32145,16 +32145,16 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 					} else if nv.Int >= 1 {
 						nth = int(nv.Int)
 					} else {
-						return NewError(InvalidArgumentForNthValue, "argument of nth_value must be greater than zero")
+						return newError(InvalidArgumentForNthValue, "argument of nth_value must be greater than zero")
 					}
 				}
 				ctx := newFrameCtx(ordered, rows, spec.order, collKeys)
-				exclude := frameExclusion(spec.frame)
+				exclude := newFrameExclusion(spec.frame)
 				for pos := 0; pos < np; pos++ {
 					if err := meter.Guard(); err != nil {
 						return err
 					}
-					meter.Charge(Costs.WindowResult)
+					meter.Charge(costs.WindowResult)
 					lo, hi, err := ctx.bounds(pos, spec.frame)
 					if err != nil {
 						return err
@@ -32243,7 +32243,7 @@ func cmpRowsByOrder[R ~[]Value](a, b R, order []orderSlot) int {
 // slots (if any), indexed in parallel with rows, so the partition sort AND peer determination
 // (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Returns nil when no
 // key is collated. An unmapped code point fails 0A000 here, at this deterministic per-row point.
-func windowCollKeys(rows []Row, order []orderSlot) ([][][]byte, error) {
+func windowCollKeys(rows []storedRow, order []orderSlot) ([][][]byte, error) {
 	collated := false
 	for _, k := range order {
 		if k.collation != nil {
@@ -32262,7 +32262,7 @@ func windowCollKeys(rows []Row, order []orderSlot) ([][][]byte, error) {
 				continue
 			}
 			if row[k.idx].Kind == ValText {
-				sk, err := SortKey(k.collation, row[k.idx].Str)
+				sk, err := sortKey(k.collation, row[k.idx].Str)
 				if err != nil {
 					return nil, err
 				}
@@ -32284,7 +32284,7 @@ func windowCollKeys(rows []Row, order []orderSlot) ([][][]byte, error) {
 // (ranking, the aggregate default frame, frameCtx's peer groups), so a collated window orders, ranks,
 // and frames identically (window.md §3/§5). With no collated key, collKeys is unused and this is
 // cmpRowsByOrder by index.
-func cmpWindowRows(a, b int, rows []Row, order []orderSlot, collKeys [][][]byte) int {
+func cmpWindowRows(a, b int, rows []storedRow, order []orderSlot, collKeys [][][]byte) int {
 	ci := 0 // advances once per collated slot (keys stored in slot order)
 	for _, k := range order {
 		var c int
@@ -32342,7 +32342,7 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
 				continue
 			}
 			if row[k.idx].Kind == ValText {
-				sk, err := SortKey(k.collation, row[k.idx].Str)
+				sk, err := sortKey(k.collation, row[k.idx].Str)
 				if err != nil {
 					return err
 				}
@@ -32452,7 +32452,7 @@ func valueCmp(a, b Value) int {
 		// uuid's 16 raw bytes are held in Str; strings.Compare is unsigned byte order.
 		return strings.Compare(a.Str, b.Str)
 	case a.Kind == ValBool && b.Kind == ValBool:
-		return cmpInt64(orderKey(a), orderKey(b))
+		return cmpInt64(newOrderKey(a), newOrderKey(b))
 	case a.Kind == ValTimestamp && b.Kind == ValTimestamp:
 		return cmpInt64(a.Int, b.Int)
 	case a.Kind == ValTimestamptz && b.Kind == ValTimestamptz:
@@ -32532,7 +32532,7 @@ func cmpInt64(x, y int64) int {
 	}
 }
 
-func orderKey(v Value) int64 {
+func newOrderKey(v Value) int64 {
 	if v.Kind == ValBool {
 		if v.Bool {
 			return 1
@@ -32592,15 +32592,15 @@ func familyRank(v Value) int {
 type assignPlan struct {
 	idx     int
 	name    string
-	target  ScalarType
-	decimal *DecimalTypmod
+	target  scalarType
+	decimal *decimalTypmod
 	notNull bool
 	source  *rExpr
 	// colType is the resolved ColType for a NON-scalar (range / array) column — when set, check
 	// stores through coerceForStore (the container codec, ranges.md §4 / array.md §4); nil for a
 	// scalar column, which stays on the storeValue fast path. Composite columns are deferred
 	// (0A000) at resolution, so they never reach here.
-	colType *ColType
+	colType *colType
 }
 
 // check type-checks + coerces a candidate value against this column — the same store path INSERT
@@ -32620,11 +32620,11 @@ func (p assignPlan) check(v Value) (Value, error) {
 // integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
 // a decimal column coerces to the typmod (rounds to scale, precision-checks → 22003); a
 // cross-family value (decimal→int, text→int, etc.) is a 42804 (decimal→int is explicit-CAST only).
-func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, colName string) (Value, error) {
+func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, notNull bool, colName string) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, NewError(NotNullViolation,
+			return Value{}, newError(NotNullViolation,
 				"null value in column "+colName+" violates not-null constraint")
 		}
 		return NullValue(), nil
@@ -32636,7 +32636,7 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			return IntValue(v.Int), nil
 		}
 		if colTy.IsDecimal() {
-			d, err := coerceDecimal(DecimalFromInt64(v.Int), typmod)
+			d, err := coerceDecimal(decimalFromInt64(v.Int), typmod)
 			if err != nil {
 				return Value{}, err
 			}
@@ -32703,14 +32703,14 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 		if colTy.IsTimestamp() {
 			// A string literal adapts to a timestamp column (spec/design/timestamp.md);
 			// malformed input traps 22007, an out-of-range field 22008.
-			m, err := ParseTimestamp(v.Str)
+			m, err := parseTimestamp(v.Str)
 			if err != nil {
 				return Value{}, err
 			}
 			return TimestampValue(m), nil
 		}
 		if colTy.IsTimestamptz() {
-			m, err := ParseTimestamptz(v.Str)
+			m, err := parseTimestamptz(v.Str)
 			if err != nil {
 				return Value{}, err
 			}
@@ -32719,7 +32719,7 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 		if colTy.IsDate() {
 			// A string literal adapts to a date column (spec/design/date.md); malformed input
 			// traps 22007, an out-of-range field 22008.
-			d, err := ParseDate(v.Str)
+			d, err := parseDate(v.Str)
 			if err != nil {
 				return Value{}, err
 			}
@@ -32742,7 +32742,7 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 		if colTy.IsInterval() {
 			// A string literal adapts to an interval column (spec/design/interval.md);
 			// malformed input traps 22007, an out-of-range field 22008.
-			iv, err := ParseInterval(v.Str)
+			iv, err := parseInterval(v.Str)
 			if err != nil {
 				return Value{}, err
 			}
@@ -32831,7 +32831,7 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 
 // coerceForStore coerces a value into a column of resolved type ty for storage
 // (spec/design/composite.md §4): a scalar dispatches to storeValue; a composite to storeComposite.
-func coerceForStore(v Value, ty ColType, typmod *DecimalTypmod, notNull bool, colName string) (Value, error) {
+func coerceForStore(v Value, ty colType, typmod *decimalTypmod, notNull bool, colName string) (Value, error) {
 	if ty.Elem != nil {
 		return storeArray(v, *ty.Elem, notNull, colName)
 	}
@@ -32849,11 +32849,11 @@ func coerceForStore(v Value, ty ColType, typmod *DecimalTypmod, notNull bool, co
 // canonicalized it), so each present bound is re-coerced to the element type as a belt-and-suspenders
 // identity (an unconstrained scalar coercion — no typmod, NULL-tolerant) and the value passes through;
 // any other value is a 42804.
-func storeRange(v Value, elem ColType, notNull bool, colName string) (Value, error) {
+func storeRange(v Value, elem colType, notNull bool, colName string) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, NewError(NotNullViolation,
+			return Value{}, newError(NotNullViolation,
 				"null value in column "+colName+" violates not-null constraint")
 		}
 		return NullValue(), nil
@@ -32898,11 +32898,11 @@ func storeRange(v Value, elem ColType, notNull bool, colName string) (Value, err
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
 // (23502); a ValArray coerces each element to the declared element type via coerceForStore (a NULL
 // element is allowed — array elements are nullable). Any other value is a 42804.
-func storeArray(v Value, elem ColType, notNull bool, colName string) (Value, error) {
+func storeArray(v Value, elem colType, notNull bool, colName string) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, NewError(NotNullViolation,
+			return Value{}, newError(NotNullViolation,
 				"null value in column "+colName+" violates not-null constraint")
 		}
 		return NullValue(), nil
@@ -32918,7 +32918,7 @@ func storeArray(v Value, elem ColType, notNull bool, colName string) (Value, err
 			}
 			out[i] = cv
 		}
-		return ArrayValueOf(&ArrayVal{Dims: a.Dims, Lbounds: a.Lbounds, Elements: out}), nil
+		return arrayValueOf(&ArrayVal{Dims: a.Dims, Lbounds: a.Lbounds, Elements: out}), nil
 	default:
 		return Value{}, typeError("cannot store a non-array value in array column " + colName)
 	}
@@ -32928,11 +32928,11 @@ func storeArray(v Value, elem ColType, notNull bool, colName string) (Value, err
 // NOT NULL (23502); a composite must have exactly the declared field count (42804) and each field is
 // coerced to its declared field type via coerceForStore (recursing); any other value is a 42804. A
 // NULL field of a NOT NULL composite field traps 23502.
-func storeComposite(v Value, typeName string, fields []ColField, notNull bool, colName string) (Value, error) {
+func storeComposite(v Value, typeName string, fields []colField, notNull bool, colName string) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, NewError(NotNullViolation,
+			return Value{}, newError(NotNullViolation,
 				"null value in column "+colName+" violates not-null constraint")
 		}
 		return NullValue(), nil
@@ -32961,7 +32961,7 @@ func storeComposite(v Value, typeName string, fields []ColField, notNull bool, c
 
 // coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
 // precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
-func coerceDecimal(d Decimal, typmod *DecimalTypmod) (Decimal, error) {
+func coerceDecimal(d Decimal, typmod *decimalTypmod) (Decimal, error) {
 	if typmod != nil {
 		return d.CoerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
 	}
@@ -32969,15 +32969,15 @@ func coerceDecimal(d Decimal, typmod *DecimalTypmod) (Decimal, error) {
 }
 
 // literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
-func literalToValue(lit Literal) Value {
+func literalToValue(lit literal) Value {
 	switch lit.Kind {
-	case LiteralNull:
+	case literalNull:
 		return NullValue()
-	case LiteralInt:
+	case literalInt:
 		return IntValue(lit.Int)
-	case LiteralBool:
+	case literalBool:
 		return BoolValue(lit.Bool)
-	case LiteralText:
+	case literalText:
 		return TextValue(lit.Str)
 	default: // LiteralDecimal
 		return DecimalValue(lit.Dec)
@@ -32989,7 +32989,7 @@ func literalToValue(lit Literal) Value {
 // composite slot is a ROW(...) whose fields recurse against the composite's field types, or a bound
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(...)).
-func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, error) {
+func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, error) {
 	if ty.Elem != nil {
 		switch {
 		case iv.IsArray:
@@ -33030,12 +33030,12 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 		case iv.IsRow:
 			return Value{}, typeError("cannot assign a record value to an array column")
 		case iv.IsDefault:
-			return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ARRAY[...]")
-		case iv.Lit.Kind == LiteralText:
+			return Value{}, newError(SyntaxError, "DEFAULT is not allowed inside ARRAY[...]")
+		case iv.Lit.Kind == literalText:
 			// A bare string literal adapts to the array context via array_in (the same
 			// string-adapts-to-context rule bytea/uuid use — spec/design/array.md §7).
 			return coerceStringToArray(iv.Lit.Str, *ty.Elem)
-		case iv.Lit.Kind == LiteralNull:
+		case iv.Lit.Kind == literalNull:
 			return NullValue(), nil
 		default:
 			return Value{}, typeError("cannot assign a scalar value to an array column")
@@ -33057,8 +33057,8 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 		case iv.IsArray:
 			return Value{}, typeError("cannot assign an array value to a range column")
 		case iv.IsDefault:
-			return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
-		case iv.Lit.Kind == LiteralText:
+			return Value{}, newError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
+		case iv.Lit.Kind == literalText:
 			// A bare string literal adapts to the range context via range_in (the same
 			// string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
 			rv, err := coerceStringToRange(iv.Lit.Str, desc)
@@ -33066,7 +33066,7 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 				return Value{}, err
 			}
 			return RangeValue(rv), nil
-		case iv.Lit.Kind == LiteralNull:
+		case iv.Lit.Kind == literalNull:
 			return NullValue(), nil
 		default:
 			return Value{}, typeError("cannot assign a scalar value to a range column")
@@ -33075,7 +33075,7 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 	if !ty.Composite {
 		switch {
 		case iv.IsDefault:
-			return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
+			return Value{}, newError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
 		case iv.IsRow:
 			return Value{}, typeError("cannot assign a record value to a " + ty.Scalar.CanonicalName() + " field")
 		case iv.IsArray:
@@ -33107,7 +33107,7 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 	case iv.IsArray:
 		return Value{}, typeError("cannot assign an array value to composite column (type " + ty.Name + ")")
 	case iv.IsDefault:
-		return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
+		return Value{}, newError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
 	default:
 		return Value{}, typeError("cannot assign a scalar value to composite column (type " + ty.Name + ")")
 	}
@@ -33116,11 +33116,11 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 // coerceStringToArray parses a text array literal into a ValArray against the element ColType via
 // array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted NULL
 // token → NULL element). A malformed literal is 22P02.
-func coerceStringToArray(s string, elem ColType) (Value, error) {
+func coerceStringToArray(s string, elem colType) (Value, error) {
 	parsed, errKind := parseArrayLiteral(s)
 	switch errKind {
 	case arrayMalformed:
-		return Value{}, NewError(InvalidTextRepresentation, "malformed array literal")
+		return Value{}, newError(InvalidTextRepresentation, "malformed array literal")
 	case arrayBoundFlip:
 		return Value{}, arraySubscriptErr("upper bound cannot be less than lower bound")
 	}
@@ -33136,7 +33136,7 @@ func coerceStringToArray(s string, elem ColType) (Value, error) {
 		}
 		vals[i] = ev
 	}
-	return ArrayValueOf(&ArrayVal{Dims: parsed.Dims, Lbounds: parsed.Lbounds, Elements: vals}), nil
+	return arrayValueOf(&ArrayVal{Dims: parsed.Dims, Lbounds: parsed.Lbounds, Elements: vals}), nil
 }
 
 // coerceArrayElementText coerces one array-element token to a Value against the element ColType (the
@@ -33144,7 +33144,7 @@ func coerceStringToArray(s string, elem ColType) (Value, error) {
 // composite via record_in (recursive — the array-of-composite quoting nests, §12 AC1 / §7).
 // Self-contained over the resolved ColType, so no catalog re-walk. A nested-array element token
 // would recurse, but array-of-array is not a jed type, so it is unreachable in v1.
-func coerceArrayElementText(tok string, elem ColType) (Value, error) {
+func coerceArrayElementText(tok string, elem colType) (Value, error) {
 	switch {
 	case elem.Composite:
 		return coerceRecordTextToValue(tok, elem)
@@ -33164,9 +33164,9 @@ func coerceArrayElementText(tok string, elem ColType) (Value, error) {
 // parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
 // Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Engine). A
 // bad shape / field count is 22P02.
-func coerceRecordTextToValue(text string, ct ColType) (Value, error) {
+func coerceRecordTextToValue(text string, ct colType) (Value, error) {
 	malformed := func() error {
-		return NewError(InvalidTextRepresentation,
+		return newError(InvalidTextRepresentation,
 			fmt.Sprintf("malformed record literal: %q for type %s", text, ct.Name))
 	}
 	tokens, ok := parseRecordTokens(text)
@@ -33208,7 +33208,7 @@ func coerceRecordTextToValue(text string, ct ColType) (Value, error) {
 // coerceStringLiteralToValue coerces an array-element token string to a runtime Value of the
 // element scalar type, via the same string-literal coercion the typed-literal path uses (22P02 /
 // 22003 on bad input).
-func coerceStringLiteralToValue(s string, target ScalarType) (Value, error) {
+func coerceStringLiteralToValue(s string, target scalarType) (Value, error) {
 	node, _, err := coerceStringLiteral(s, target, nil)
 	if err != nil {
 		return Value{}, err
@@ -33254,20 +33254,20 @@ func rExprConstToValue(e *rExpr) (Value, error) {
 // fkAction maps a parsed referential action to its persisted form, rejecting the unsupported
 // write-actions (CASCADE / SET NULL / SET DEFAULT) as 0A000 (spec/design/constraints.md §6.6).
 // clause is "DELETE" or "UPDATE" for the message.
-func fkAction(a RefAction, clause string) (FkAction, error) {
+func newFkAction(a refAction, clause string) (fkAction, error) {
 	switch a {
-	case RefNoAction:
-		return FkNoAction, nil
-	case RefRestrict:
-		return FkRestrict, nil
-	case RefCascade:
-		return 0, NewError(FeatureNotSupported, "ON "+clause+" CASCADE is not supported")
-	case RefSetNull:
-		return 0, NewError(FeatureNotSupported, "ON "+clause+" SET NULL is not supported")
-	case RefSetDefault:
-		return 0, NewError(FeatureNotSupported, "ON "+clause+" SET DEFAULT is not supported")
+	case refNoAction:
+		return fkNoAction, nil
+	case refRestrict:
+		return fkRestrict, nil
+	case refCascade:
+		return 0, newError(FeatureNotSupported, "ON "+clause+" CASCADE is not supported")
+	case refSetNull:
+		return 0, newError(FeatureNotSupported, "ON "+clause+" SET NULL is not supported")
+	case refSetDefault:
+		return 0, newError(FeatureNotSupported, "ON "+clause+" SET DEFAULT is not supported")
 	default:
-		return 0, NewError(FeatureNotSupported, "ON "+clause+" action is not supported")
+		return 0, newError(FeatureNotSupported, "ON "+clause+" action is not supported")
 	}
 }
 
@@ -33284,7 +33284,7 @@ func sortedUnique(v []int) []int {
 // (spec/design/constraints.md §6.2), mirroring Rust's Type PartialEq. Two scalars are equal
 // when their scalar types match; a composite/array on either side (never a referenced PK/UNIQUE
 // column) differs from a scalar, so a mismatched local column correctly fails 42804.
-func typesEqual(a, b Type) bool {
+func typesEqual(a, b dataType) bool {
 	if a.Comp != nil || a.Array != nil || b.Comp != nil || b.Array != nil {
 		// Composite/array equality is not reachable for an FK pairing (referenced columns are
 		// keyable scalars); treat any non-scalar pair as unequal unless structurally identical.
@@ -33304,20 +33304,20 @@ func typesEqual(a, b Type) bool {
 // encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
 // matching the PK / index encoders. value is non-NULL and of a keyable type (a foreign-key
 // column always is — its type equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
-func encodeKeyValue(ty ScalarType, value Value, coll *Collation) ([]byte, error) {
+func encodeKeyValue(ty scalarType, value Value, coll *Collation) ([]byte, error) {
 	switch value.Kind {
 	case ValInt:
-		return EncodeInt(ty, value.Int), nil
+		return encodeInt(ty, value.Int), nil
 	case ValBool:
-		return EncodeBool(value.Bool), nil
+		return encodeBool(value.Bool), nil
 	case ValUuid:
 		return []byte(value.Str), nil
 	case ValTimestamp, ValTimestamptz, ValDate:
-		return EncodeInt(ty, value.Int), nil
+		return encodeInt(ty, value.Int), nil
 	case ValText:
 		return collatedTextKey(coll, value.Str)
 	case ValBytea:
-		return EncodeTerminated([]byte(value.Str)), nil
+		return encodeTerminated([]byte(value.Str)), nil
 	case ValDecimal:
 		return value.Dec.EncodeKey(), nil
 	case ValInterval:
@@ -33337,7 +33337,7 @@ func encodeKeyValue(ty ScalarType, value Value, coll *Collation) ([]byte, error)
 // the column type; every other keyable value ignores the wrapper and dispatches on its scalar via
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
 // holds a ValRange, so the scalar arm never sees a range type.
-func encodeTypedKey(ty Type, value Value, coll *Collation) ([]byte, error) {
+func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
 	if value.Kind == ValRange {
 		elem, ok := ty.RangeElement()
 		if !ok {
@@ -33363,7 +33363,7 @@ func encodeTypedKey(ty Type, value Value, coll *Collation) ([]byte, error) {
 // elements included since the §2.8 lift; the DDL gate rejects only a composite element 0A000), so the
 // per-element key is encodeKeyValue with the C byte order (a collated array-element key is not a
 // feature this slice).
-func encodeArrayKey(elem ScalarType, a *ArrayVal) ([]byte, error) {
+func encodeArrayKey(elem scalarType, a *ArrayVal) ([]byte, error) {
 	var out []byte
 	for _, e := range a.Elements {
 		if e.Kind == ValNull {
@@ -33382,7 +33382,7 @@ func encodeArrayKey(elem ScalarType, a *ArrayVal) ([]byte, error) {
 	for d := 0; d < a.Ndim(); d++ {
 		n := uint32(a.Dims[d])
 		out = append(out, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
-		out = append(out, EncodeInt(Int32, int64(a.Lbounds[d]))...)
+		out = append(out, encodeInt(scalarInt32, int64(a.Lbounds[d]))...)
 	}
 	return out, nil
 }
@@ -33390,7 +33390,7 @@ func encodeArrayKey(elem ScalarType, a *ArrayVal) ([]byte, error) {
 // isKeyableScalarType reports whether a scalar is key-encodable — the element-type gate for
 // isArrayKeyable. With float keys exercised (§2.8) every scalar is keyable; only the recursive
 // composite container is excluded (it is not a ScalarType).
-func isKeyableScalarType(s ScalarType) bool {
+func isKeyableScalarType(s scalarType) bool {
 	return s.IsInteger() || s.IsBool() || s.IsText() || s.IsBytea() || s.IsDecimal() ||
 		s.IsUuid() || s.IsTimestamp() || s.IsTimestamptz() || s.IsDate() || s.IsInterval() ||
 		s.IsFloat()
@@ -33400,7 +33400,7 @@ func isKeyableScalarType(s ScalarType) bool {
 // is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated). A
 // float-element array (f64[]/f32[]) IS keyable (the §2.8 lift); only a composite-element array is NOT
 // keyable (composite is not yet keyable).
-func isArrayKeyable(ty Type) bool {
+func isArrayKeyable(ty dataType) bool {
 	return ty.Array != nil && ty.Array.isScalar() && isKeyableScalarType(ty.Array.Scalar)
 }
 
@@ -33429,7 +33429,7 @@ type fkProbe struct {
 // ordinals = fk.RefColumns (the row viewed as a parent). Returns ok=false when any supplied value
 // is NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is
 // the PK, else the matching unique index (re-derived deterministically — §6.8).
-func buildFkProbe(fk *ForeignKey, parent *Table, parentColls []*Collation, row Row, ordinals []int) (fkProbe, bool, error) {
+func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, row storedRow, ordinals []int) (fkProbe, bool, error) {
 	// MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
 	for _, o := range ordinals {
 		if row[o].Kind == ValNull {
@@ -33456,7 +33456,7 @@ func buildFkProbe(fk *ForeignKey, parent *Table, parentColls []*Collation, row R
 		}
 		return fkProbe{kind: fkProbePk, bytes: k}, true, nil
 	}
-	var idx *IndexDef
+	var idx *indexDef
 	for i := range parent.Indexes {
 		ix := &parent.Indexes[i]
 		if ix.Unique && slices.Equal(sortedUnique(ix.Columns), refSet) {
@@ -33482,7 +33482,7 @@ func buildFkProbe(fk *ForeignKey, parent *Table, parentColls []*Collation, row R
 // fkProbeHits reports whether the parent currently holds the key/prefix probe (committed +
 // working state) — the child-side foreign-key existence test (spec/design/constraints.md §6.4).
 // parentTable is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
-func (db *Engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
+func (db *engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 	switch probe.kind {
 	case fkProbePk:
 		_, ok, err := db.lkpStore(parentTable).Get(probe.bytes)
@@ -33503,7 +33503,7 @@ func (db *Engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 // nothing. Rows whose storage key is in exclude are skipped — the END STATE for a self-reference,
 // whose child IS the table being mutated (so its deleted/updated rows must not count). parent is
 // the referenced table's catalog. Unmetered validation.
-func (db *Engine) fkChildReferences(childTable string, fk *ForeignKey, parent *Table, target []byte, exclude map[string]struct{}) (bool, error) {
+func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *catTable, target []byte, exclude map[string]struct{}) (bool, error) {
 	entries, err := db.lkpStore(childTable).EntriesInKeyOrder()
 	if err != nil {
 		return false, err
@@ -33529,7 +33529,7 @@ func (db *Engine) fkChildReferences(childTable string, fk *ForeignKey, parent *T
 // fkReferencer is one (child table name, FK) inbound-reference pair.
 type fkReferencer struct {
 	childTable string
-	fk         ForeignKey
+	fk         foreignKey
 }
 
 // fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
@@ -33537,7 +33537,7 @@ type fkReferencer struct {
 // DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased child
 // table, FK name) for a deterministic report order; the FK is copied so the caller can probe
 // stores without a snapshot borrow.
-func (db *Engine) fkReferencers(parentName string) []fkReferencer {
+func (db *engine) fkReferencers(parentName string) []fkReferencer {
 	snap := db.readSnap()
 	key := strings.ToLower(parentName)
 	tableKeys := make([]string, 0, len(snap.tables))

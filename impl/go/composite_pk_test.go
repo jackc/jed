@@ -12,9 +12,9 @@ import (
 	"testing"
 )
 
-func compositeErrCode(t *testing.T, db *Engine, sql string) string {
+func compositeErrCode(t *testing.T, db *engine, sql string) string {
 	t.Helper()
-	_, err := Execute(db, sql)
+	_, err := execute(db, sql)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -51,7 +51,7 @@ func TestCompositeKeyOrdersByTuple(t *testing.T) {
 		"INSERT INTO t VALUES (1, 1, 20)",
 		"INSERT INTO t VALUES (2, 0, 40)",
 	} {
-		if _, err := Execute(db, stmt); err != nil {
+		if _, err := execute(db, stmt); err != nil {
 			t.Fatalf("%q: %v", stmt, err)
 		}
 	}
@@ -75,7 +75,7 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 		"CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
 		"INSERT INTO t VALUES (1, 1)",
 	)
-	if _, err := Execute(db, "INSERT INTO t VALUES (1, 2)"); err != nil {
+	if _, err := execute(db, "INSERT INTO t VALUES (1, 2)"); err != nil {
 		t.Fatalf("shared prefix must be a distinct row: %v", err)
 	}
 	if code := compositeErrCode(t, db, "INSERT INTO t VALUES (1, 1)"); code != "23505" {
@@ -94,8 +94,8 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 // 42701, more than one primary key across both forms 42P16 — plus the jed narrowings
 // (0A000): out-of-declaration-order list, non-keyable member type.
 func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
-	db := NewEngine()
-	if _, err := Execute(db, "CREATE TYPE addr AS (street text, zip i32)"); err != nil {
+	db := newEngine()
+	if _, err := execute(db, "CREATE TYPE addr AS (street text, zip i32)"); err != nil {
 		t.Fatal(err)
 	}
 	cases := []struct {
@@ -118,19 +118,19 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	}
 	// f64 IS now a key-encodable PK member (the float-order-preserving key lifted the narrowing,
 	// encoding.md §2.8): a composite PK with a float member succeeds.
-	if _, err := Execute(db, "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))"); err != nil {
+	if _, err := execute(db, "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))"); err != nil {
 		t.Fatalf("composite PK with f64 member: %v", err)
 	}
 	// The list order is the KEY order — it may differ from declaration order (the original
 	// 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
 	// keys by (b, a), so the stored scan order is b-major.
-	if _, err := Execute(db, "CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))"); err != nil {
+	if _, err := execute(db, "CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))"); err != nil {
 		t.Fatalf("out-of-declaration-order PK: %v", err)
 	}
 	if revTab, _ := db.Table("rev"); !slices.Equal(revTab.PKIndices(), []int{1, 0}) {
 		t.Fatalf("PKIndices = %v, want [1 0]", func() []int { rt, _ := db.Table("rev"); return rt.PKIndices() }())
 	}
-	if _, err := Execute(db, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)"); err != nil {
+	if _, err := execute(db, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)"); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	var bs []int64
@@ -142,7 +142,7 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	}
 
 	// A single-column table constraint is the column-level form's equivalent.
-	if _, err := Execute(db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))"); err != nil {
+	if _, err := execute(db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))"); err != nil {
 		t.Fatalf("single-column table constraint: %v", err)
 	}
 	tab, _ := db.Table("ok")
@@ -168,7 +168,7 @@ func TestCompositeMembersNotNullAndRekey(t *testing.T) {
 	}
 	// Assigning a key member re-keys the row: (1,1) → (9,1) → (9,9); a non-member is in place.
 	for _, stmt := range []string{"UPDATE t SET a = 9", "UPDATE t SET b = 9", "UPDATE t SET v = 11"} {
-		if _, err := Execute(db, stmt); err != nil {
+		if _, err := execute(db, stmt); err != nil {
 			t.Fatalf("%q: %v", stmt, err)
 		}
 	}
@@ -187,7 +187,7 @@ func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
 		"INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
 		"INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', -2)",
 	} {
-		if _, err := Execute(db, stmt); err != nil {
+		if _, err := execute(db, stmt); err != nil {
 			t.Fatalf("%q: %v", stmt, err)
 		}
 	}
@@ -214,7 +214,7 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
-	loaded, err := LoadEngine(image)
+	loaded, err := loadEngine(image)
 	if err != nil {
 		t.Fatalf("LoadEngine: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 	if code := compositeErrCode(t, loaded, "INSERT INTO t VALUES (1, 2, 99)"); code != "23505" {
 		t.Fatalf("duplicate after reload: got %s, want 23505", code)
 	}
-	if _, err := Execute(loaded, "INSERT INTO t VALUES (2, 2, 50)"); err != nil {
+	if _, err := execute(loaded, "INSERT INTO t VALUES (2, 2, 50)"); err != nil {
 		t.Fatalf("fresh insert after reload: %v", err)
 	}
 	if n := len(loaded.RowsInKeyOrder("t")); n != 4 {

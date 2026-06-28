@@ -9,7 +9,7 @@ package jed
 
 // OperatorDesc is one operator's metadata, mirroring a [[operator]] entry in catalog.toml.
 // Symbol is "" for operators with no infix symbol (the IS [NOT] NULL tests).
-type OperatorDesc struct {
+type operatorDesc struct {
 	Name          string
 	Symbol        string
 	Kind          string
@@ -37,7 +37,7 @@ type OperatorDesc struct {
 }
 
 // Operators lists every operator in the catalog, in catalog order.
-var Operators = []OperatorDesc{
+var operators = []operatorDesc{
 	{
 		Name:          "or",
 		Symbol:        "",
@@ -5807,7 +5807,7 @@ var Operators = []OperatorDesc{
 // in catalog.toml. Aggregates are not operators (no symbol/precedence/arg_resolution);
 // Arg is "star" (COUNT(*)) or "expr"; Result is a scalar id or a reserved widening id
 // (sum_widen | same_as_input). See spec/design/aggregates.md.
-type AggregateDesc struct {
+type aggregateDesc struct {
 	Name        string
 	Surface     string
 	Arg         string
@@ -5818,7 +5818,7 @@ type AggregateDesc struct {
 }
 
 // Aggregates lists every aggregate in the catalog, in catalog order.
-var Aggregates = []AggregateDesc{
+var aggregates = []aggregateDesc{
 	{
 		Name:        "count_star",
 		Surface:     "COUNT",
@@ -5952,7 +5952,7 @@ var Aggregates = []AggregateDesc{
 // value); Result is a reserved set id (set_of_promoted), Column is the fixed output column
 // name, and Null = "empty_on_null" (any NULL arg -> zero rows). The uniqueness key is
 // (Name, Arity). See spec/design/functions.md §10.
-type SetReturningDesc struct {
+type setReturningDesc struct {
 	Name          string
 	Surface       string
 	Arity         int
@@ -5965,7 +5965,7 @@ type SetReturningDesc struct {
 }
 
 // SetReturning lists every set-returning function in the catalog, in catalog order.
-var SetReturning = []SetReturningDesc{
+var setReturning = []setReturningDesc{
 	{
 		Name:          "generate_series",
 		Surface:       "generate_series",
@@ -6073,7 +6073,7 @@ var SetReturning = []SetReturningDesc{
 // "same_as_input", FrameSensitive whether it reads the per-row frame, RequiresOrder whether a
 // window ORDER BY is mandatory (42P20). The catalog aggregates are ALSO window functions (with
 // OVER); they are not duplicated here. Uniqueness key is Name.
-type WindowDesc struct {
+type windowDesc struct {
 	Name           string
 	Surface        string
 	Args           string
@@ -6086,7 +6086,7 @@ type WindowDesc struct {
 }
 
 // Windows lists every window-exclusive function in the catalog, in catalog order.
-var Windows = []WindowDesc{
+var windows = []windowDesc{
 	{
 		Name:           "row_number",
 		Surface:        "ROW_NUMBER",

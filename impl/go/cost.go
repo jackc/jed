@@ -27,7 +27,7 @@ import "fmt"
 // AND an optional per-session budget (CLAUDE.md §13; spec/design/session.md §5.4). Threaded by
 // pointer through the executor and the recursive expression evaluator; the accrued
 // (per-statement) total is reported on Outcome, while the session cumulative is updated live.
-type Meter struct {
+type costMeter struct {
 	// Accrued is the total cost so far FOR THIS STATEMENT (CLAUDE.md §13) — the figure reported
 	// on Outcome and asserted by the `# cost:` directive. i64 mirrors the engine's native
 	// integer; the per-statement ceiling compares against this counter.
@@ -47,15 +47,15 @@ type Meter struct {
 }
 
 // NewMeter returns a fresh meter with zero accrued cost, no ceiling, and no session context.
-func NewMeter() *Meter {
-	return &Meter{}
+func newMeter() *costMeter {
+	return &costMeter{}
 }
 
 // NewMeterWithLimit returns a fresh meter that aborts once accrued cost reaches limit
 // (limit <= 0 ⇒ unlimited), with no session lifetime budget. The ceiling is the session's
 // max_cost (spec/design/api.md §8). Used where there is no session cumulative to thread.
-func NewMeterWithLimit(limit int64) *Meter {
-	return &Meter{Limit: limit}
+func newMeterWithLimit(limit int64) *costMeter {
+	return &costMeter{Limit: limit}
 }
 
 // Charge adds units of cost. The single accrual chokepoint. Accrues into both the per-statement
@@ -63,7 +63,7 @@ func NewMeterWithLimit(limit int64) *Meter {
 // session's cumulative total (live), so partial cost of an aborted statement counts. Enforcement
 // is NOT here: Guard does the comparisons at the work loops, so the cross-core accrual count is
 // untouched.
-func (m *Meter) Charge(units int64) {
+func (m *costMeter) Charge(units int64) {
 	m.Accrued += units
 	if m.lifetimeTotal != nil {
 		*m.lifetimeTotal += units
@@ -77,7 +77,7 @@ func (m *Meter) Charge(units int64) {
 // per-statement 54P01 (the inner gate). Called at the unbounded-work points — the same mirrored
 // points in every core, so the abort is deterministic and cross-core identical (spec/design/cost.md
 // §6, spec/design/session.md §5.4). A no-op (one or two comparisons) when both are unlimited.
-func (m *Meter) Guard() error {
+func (m *costMeter) Guard() error {
 	stmtOver := m.Limit > 0 && m.Accrued >= m.Limit
 	lifeOver := m.lifetimeTotal != nil && m.lifetimeLimit > 0 && *m.lifetimeTotal >= m.lifetimeLimit
 	if !stmtOver && !lifeOver {
@@ -91,11 +91,11 @@ func (m *Meter) Guard() error {
 		pickLife = (*m.lifetimeTotal - m.lifetimeLimit) > (m.Accrued - m.Limit)
 	}
 	if pickLife {
-		return NewError(SessionCostLimitExceeded, fmt.Sprintf(
+		return newError(SessionCostLimitExceeded, fmt.Sprintf(
 			"session exceeded the lifetime cost limit of %d (accrued %d)", m.lifetimeLimit, *m.lifetimeTotal,
 		))
 	}
-	return NewError(CostLimitExceeded, fmt.Sprintf(
+	return newError(CostLimitExceeded, fmt.Sprintf(
 		"query exceeded the cost limit of %d (accrued %d)", m.Limit, m.Accrued,
 	))
 }

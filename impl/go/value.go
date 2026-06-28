@@ -168,7 +168,7 @@ type RangeVal struct {
 }
 
 // EmptyRangeVal returns the empty range (the canonical representation: no bounds, no inclusivity).
-func EmptyRangeVal() *RangeVal { return &RangeVal{Empty: true} }
+func emptyRangeVal() *RangeVal { return &RangeVal{Empty: true} }
 
 // RangeValue wraps a *RangeVal as a Value.
 func RangeValue(r *RangeVal) Value { return Value{Kind: ValRange, Range: r} }
@@ -194,10 +194,10 @@ func (a *ArrayVal) Ubound(d int) int32 { return a.Lbounds[d] + int32(a.Dims[d]) 
 // EmptyArray is the empty array `{}` (ndim 0). Elements is a non-nil empty slice (matching the
 // store path's make([]Value, 0)) so an empty array read from disk is reflect.DeepEqual to one built
 // in memory (nil != [] in DeepEqual — the golden round-trip test).
-func EmptyArray() *ArrayVal { return &ArrayVal{Elements: []Value{}} }
+func emptyArray() *ArrayVal { return &ArrayVal{Elements: []Value{}} }
 
 // OneDimArray builds a 1-D array with the default lower bound 1; an empty slice is the empty array.
-func OneDimArray(elems []Value) *ArrayVal {
+func oneDimArray(elems []Value) *ArrayVal {
 	if len(elems) == 0 {
 		return &ArrayVal{}
 	}
@@ -255,10 +255,10 @@ func JsonPathValue(s string) Value { return Value{Kind: ValJsonPath, Str: s} }
 func CompositeValue(fields []Value) Value { return Value{Kind: ValComposite, Comp: &fields} }
 
 // ArrayValue builds a 1-D array value from its element list (spec/design/array.md §2).
-func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, Array: OneDimArray(elems)} }
+func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, Array: oneDimArray(elems)} }
 
 // ArrayValueOf builds an array value from an already-shaped ArrayVal (spec/design/array.md §4).
-func ArrayValueOf(a *ArrayVal) Value { return Value{Kind: ValArray, Array: a} }
+func arrayValueOf(a *ArrayVal) Value { return Value{Kind: ValArray, Array: a} }
 
 // Float32Value builds a non-null f32 value from a Go f32 — the bits are stored verbatim
 // in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
@@ -297,7 +297,7 @@ func (v Value) IsFloat() bool { return v.Kind == ValFloat32 || v.Kind == ValFloa
 // so a value round-trips. The traditional escape input format is not accepted (a documented
 // narrowing). On success the reason is ""; on malformed input the bytes are nil and the
 // reason explains why (the caller raises it as a 22P02).
-func ParseByteaHex(s string) (b []byte, reason string) {
+func parseByteaHex(s string) (b []byte, reason string) {
 	if len(s) < 2 || s[0] != '\\' || s[1] != 'x' {
 		return nil, "bytea hex input must begin with \\x"
 	}
@@ -338,7 +338,7 @@ func hexVal(b byte) (byte, bool) {
 // parse, while a hyphen elsewhere is rejected (PG's exact algorithm, not a looser strip-all). On
 // success the reason is ""; on malformed input the bytes are nil and the reason explains why (the
 // caller raises it as a 22P02). The inverse of renderUUID for the canonical form, so it round-trips.
-func ParseUUID(s string) (b []byte, reason string) {
+func parseUUID(s string) (b []byte, reason string) {
 	pos := 0
 	braces := len(s) > 0 && s[0] == '{'
 	if braces {
@@ -474,13 +474,13 @@ func (v Value) Render() string {
 		// Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
 		return renderUUID([]byte(v.Str))
 	case ValTimestamp:
-		return RenderTimestamp(v.Int)
+		return renderTimestamp(v.Int)
 	case ValTimestamptz:
-		return RenderTimestamptz(v.Int)
+		return renderTimestamptz(v.Int)
 	case ValDate:
-		return RenderDate(int32(v.Int))
+		return renderDate(int32(v.Int))
 	case ValInterval:
-		return RenderInterval(v.Iv)
+		return renderInterval(v.Iv)
 	case ValFloat32:
 		return renderFloat32(v.F32())
 	case ValFloat64:
@@ -540,9 +540,9 @@ func numericCmp(a, b Value) (int, bool) {
 	case a.Kind == ValDecimal && b.Kind == ValDecimal:
 		return a.Dec.CmpValue(*b.Dec), true
 	case a.Kind == ValInt && b.Kind == ValDecimal:
-		return DecimalFromInt64(a.Int).CmpValue(*b.Dec), true
+		return decimalFromInt64(a.Int).CmpValue(*b.Dec), true
 	case a.Kind == ValDecimal && b.Kind == ValInt:
-		return a.Dec.CmpValue(DecimalFromInt64(b.Int)), true
+		return a.Dec.CmpValue(decimalFromInt64(b.Int)), true
 	default:
 		return 0, false
 	}

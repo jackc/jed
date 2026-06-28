@@ -8,7 +8,7 @@
 package jed
 
 // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
-type CostSchedule struct {
+type costSchedule struct {
 	StorageRowRead      int64
 	PageRead            int64
 	ValueCompress       int64
@@ -32,7 +32,7 @@ type CostSchedule struct {
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
-var Costs = CostSchedule{
+var costs = costSchedule{
 	StorageRowRead:      1,
 	PageRead:            1,
 	ValueCompress:       1,

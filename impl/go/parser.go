@@ -27,8 +27,8 @@ func foldInt(magnitude uint64, negate bool) (int64, bool) {
 }
 
 // binaryExpr builds a binary-operator expression node.
-func binaryExpr(op BinaryOp, lhs, rhs Expr) Expr {
-	return Expr{Kind: ExprBinary, Binary: &BinaryExpr{Op: op, Lhs: lhs, Rhs: rhs}}
+func newBinaryExpr(op binaryOp, lhs, rhs exprNode) exprNode {
+	return exprNode{Kind: exprBinary, Binary: &binaryExpr{Op: op, Lhs: lhs, Rhs: rhs}}
 }
 
 // Hand-written recursive-descent parser (CLAUDE.md §5, §10).
@@ -61,8 +61,8 @@ const maxExprDepth = 256
 // deterministic and cross-core identical (§8): the SAME in every core (Rust / Go / TS).
 const maxIdentifierLength = 63
 
-type Parser struct {
-	tokens []Token
+type parser struct {
+	tokens []token
 	pos    int
 	// depth is the current expression/query nesting depth (see maxExprDepth). Incremented once
 	// per AST level descended (deepen), restored on the way back up; left stale on the error path
@@ -71,8 +71,8 @@ type Parser struct {
 }
 
 // NewParser builds a parser over the given tokens.
-func NewParser(tokens []Token) *Parser {
-	return &Parser{tokens: tokens}
+func newParser(tokens []token) *parser {
+	return &parser{tokens: tokens}
 }
 
 // deepen descends one nesting level, enforcing maxExprDepth (spec/design/cost.md §7). Call at
@@ -80,10 +80,10 @@ func NewParser(tokens []Token) *Parser {
 // fresh sub-expression, a nested subquery, a set-op branch. The caller restores the depth with
 // undeepen on the success path (an error short-circuits, leaving it stale, which is harmless: the
 // parse is aborting).
-func (p *Parser) deepen() error {
+func (p *parser) deepen() error {
 	p.depth++
 	if p.depth > maxExprDepth {
-		return NewError(StatementTooComplex, fmt.Sprintf(
+		return newError(StatementTooComplex, fmt.Sprintf(
 			"statement too complex: nesting depth exceeds the maximum of %d", maxExprDepth,
 		))
 	}
@@ -91,26 +91,26 @@ func (p *Parser) deepen() error {
 }
 
 // undeepen restores one nesting level taken by deepen (success path only).
-func (p *Parser) undeepen() { p.depth-- }
+func (p *parser) undeepen() { p.depth-- }
 
 // ParseSQL parses a single complete statement from sql.
-func ParseSQL(sql string) (Statement, error) {
-	tokens, err := Lex(sql)
+func parseSQL(sql string) (statement, error) {
+	tokens, err := lex(sql)
 	if err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
-	p := NewParser(tokens)
+	p := newParser(tokens)
 	stmt, err := p.parseStatement()
 	if err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
 	if err := p.expectEof(); err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
 	return stmt, nil
 }
 
-func (p *Parser) parseStatement() (Statement, error) {
+func (p *parser) parseStatement() (statement, error) {
 	switch p.peekKeyword() {
 	// CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX — grammar.md
 	// §30; UNIQUE needs no lookahead of its own — after CREATE the next word being UNIQUE
@@ -119,59 +119,59 @@ func (p *Parser) parseStatement() (Statement, error) {
 		if p.peekKeywordAt(1) == "index" || p.peekKeywordAt(1) == "unique" {
 			ci, err := p.parseCreateIndex()
 			if err != nil {
-				return Statement{}, err
+				return statement{}, err
 			}
-			return Statement{CreateIndex: ci}, nil
+			return statement{CreateIndex: ci}, nil
 		}
 		// CREATE TYPE — a 2-token lookahead keeps TYPE non-reserved (the CREATE UNIQUE INDEX
 		// precedent — composite.md §1).
 		if p.peekKeywordAt(1) == "type" {
 			ct, err := p.parseCreateType()
 			if err != nil {
-				return Statement{}, err
+				return statement{}, err
 			}
-			return Statement{CreateType: ct}, nil
+			return statement{CreateType: ct}, nil
 		}
 		// CREATE SEQUENCE — a 2-token lookahead keeps SEQUENCE non-reserved (sequences.md).
 		if p.peekKeywordAt(1) == "sequence" {
 			cs, err := p.parseCreateSequence()
 			if err != nil {
-				return Statement{}, err
+				return statement{}, err
 			}
-			return Statement{CreateSequence: cs}, nil
+			return statement{CreateSequence: cs}, nil
 		}
 		ct, err := p.parseCreateTable()
 		if err != nil {
-			return Statement{}, err
+			return statement{}, err
 		}
-		return Statement{CreateTable: ct}, nil
+		return statement{CreateTable: ct}, nil
 	case "drop":
 		if p.peekKeywordAt(1) == "index" {
 			di, err := p.parseDropIndex()
 			if err != nil {
-				return Statement{}, err
+				return statement{}, err
 			}
-			return Statement{DropIndex: di}, nil
+			return statement{DropIndex: di}, nil
 		}
 		if p.peekKeywordAt(1) == "type" {
 			dt, err := p.parseDropType()
 			if err != nil {
-				return Statement{}, err
+				return statement{}, err
 			}
-			return Statement{DropType: dt}, nil
+			return statement{DropType: dt}, nil
 		}
 		if p.peekKeywordAt(1) == "sequence" {
 			ds, err := p.parseDropSequence()
 			if err != nil {
-				return Statement{}, err
+				return statement{}, err
 			}
-			return Statement{DropSequence: ds}, nil
+			return statement{DropSequence: ds}, nil
 		}
 		dt, err := p.parseDropTable()
 		if err != nil {
-			return Statement{}, err
+			return statement{}, err
 		}
-		return Statement{DropTable: dt}, nil
+		return statement{DropTable: dt}, nil
 	case "alter":
 		// ALTER SEQUENCE — the only ALTER statement this slice (sequences.md §4). A 2-token
 		// lookahead recognizes it; any other `ALTER …` (TABLE, SYSTEM, …) is not a statement
@@ -180,17 +180,17 @@ func (p *Parser) parseStatement() (Statement, error) {
 		if p.peekKeywordAt(1) == "sequence" {
 			as, err := p.parseAlterSequence()
 			if err != nil {
-				return Statement{}, err
+				return statement{}, err
 			}
-			return Statement{AlterSequence: as}, nil
+			return statement{AlterSequence: as}, nil
 		}
-		return Statement{}, NewError(SyntaxError, "unexpected keyword 'alter'")
+		return statement{}, newError(SyntaxError, "unexpected keyword 'alter'")
 	case "insert":
 		ins, err := p.parseInsert()
 		if err != nil {
-			return Statement{}, err
+			return statement{}, err
 		}
-		return Statement{Insert: ins}, nil
+		return statement{Insert: ins}, nil
 	case "select":
 		return p.parseQueryExpr()
 	// `WITH …` at statement start can only begin a query with common table expressions
@@ -200,15 +200,15 @@ func (p *Parser) parseStatement() (Statement, error) {
 	case "update":
 		upd, err := p.parseUpdate()
 		if err != nil {
-			return Statement{}, err
+			return statement{}, err
 		}
-		return Statement{Update: upd}, nil
+		return statement{Update: upd}, nil
 	case "delete":
 		del, err := p.parseDelete()
 		if err != nil {
-			return Statement{}, err
+			return statement{}, err
 		}
-		return Statement{Delete: del}, nil
+		return statement{Delete: del}, nil
 	case "begin", "start":
 		return p.parseBegin()
 	case "commit", "end":
@@ -216,20 +216,20 @@ func (p *Parser) parseStatement() (Statement, error) {
 	case "rollback":
 		return p.parseRollback()
 	case "":
-		return Statement{}, NewError(SyntaxError, "expected a SQL statement")
+		return statement{}, newError(SyntaxError, "expected a SQL statement")
 	default:
-		return Statement{}, NewError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
+		return statement{}, newError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
 	}
 }
 
 // parseBegin parses `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION
 // [READ ONLY|READ WRITE]` — open an explicit transaction (spec/design/grammar.md §27). The access
 // mode defaults to READ WRITE.
-func (p *Parser) parseBegin() (Statement, error) {
+func (p *parser) parseBegin() (statement, error) {
 	if p.peekKeyword() == "start" {
 		p.advance()
 		if err := p.expectKeyword("transaction"); err != nil {
-			return Statement{}, err
+			return statement{}, err
 		}
 	} else {
 		p.advance() // BEGIN
@@ -239,16 +239,16 @@ func (p *Parser) parseBegin() (Statement, error) {
 	}
 	writable, modeSet, err := p.parseAccessMode()
 	if err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
-	return Statement{Begin: &Begin{Writable: writable, ModeSet: modeSet}}, nil
+	return statement{Begin: &begin{Writable: writable, ModeSet: modeSet}}, nil
 }
 
 // parseAccessMode parses the optional access mode after a transaction opener: `READ ONLY` →
 // (false, true), `READ WRITE` → (true, true), absent → (false, false) (unspecified — the
 // executor applies the handle's default: READ WRITE, or READ ONLY on a read-only handle;
 // transactions.md §4.3, api.md §2.1).
-func (p *Parser) parseAccessMode() (writable, modeSet bool, err error) {
+func (p *parser) parseAccessMode() (writable, modeSet bool, err error) {
 	if p.peekKeyword() != "read" {
 		return false, false, nil
 	}
@@ -261,28 +261,28 @@ func (p *Parser) parseAccessMode() (writable, modeSet bool, err error) {
 		p.advance()
 		return true, true, nil
 	default:
-		return false, false, NewError(SyntaxError, fmt.Sprintf("expected ONLY or WRITE after READ, found '%s'", p.peekKeyword()))
+		return false, false, newError(SyntaxError, fmt.Sprintf("expected ONLY or WRITE after READ, found '%s'", p.peekKeyword()))
 	}
 }
 
 // parseCommit parses `COMMIT [TRANSACTION|WORK]` / `END [TRANSACTION|WORK]` (grammar.md §27).
-func (p *Parser) parseCommit() (Statement, error) {
+func (p *parser) parseCommit() (statement, error) {
 	p.advance() // COMMIT or END
 	p.consumeTransactionOrWork()
-	return Statement{Commit: &Commit{}}, nil
+	return statement{Commit: &commit{}}, nil
 }
 
 // parseRollback parses `ROLLBACK [TRANSACTION|WORK]` (grammar.md §27).
-func (p *Parser) parseRollback() (Statement, error) {
+func (p *parser) parseRollback() (statement, error) {
 	if err := p.expectKeyword("rollback"); err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
 	p.consumeTransactionOrWork()
-	return Statement{Rollback: &Rollback{}}, nil
+	return statement{Rollback: &rollback{}}, nil
 }
 
 // consumeTransactionOrWork consumes the optional trailing TRANSACTION / WORK noise word.
-func (p *Parser) consumeTransactionOrWork() {
+func (p *parser) consumeTransactionOrWork() {
 	if kw := p.peekKeyword(); kw == "transaction" || kw == "work" {
 		p.advance()
 	}
@@ -295,7 +295,7 @@ func (p *Parser) consumeTransactionOrWork() {
 // "primary" would need a type named "key", which does not exist. Type names are kept as
 // written and resolved during execution (the catalog owns the type lattice); the
 // constraint's member names are likewise resolved there (42703/42701/42P16).
-func (p *Parser) parseCreateTable() (*CreateTable, error) {
+func (p *parser) parseCreateTable() (*createTable, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
 	}
@@ -314,7 +314,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 		p.advance()
 	}
 	if shared && !temp {
-		return nil, NewError(SyntaxError, "SHARED must be followed by TEMP or TEMPORARY")
+		return nil, newError(SyntaxError, "SHARED must be followed by TEMP or TEMPORARY")
 	}
 	if err := p.expectKeyword("table"); err != nil {
 		return nil, err
@@ -323,16 +323,16 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := p.expect(TokLParen); err != nil {
+	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
 
-	var columns []ColumnDef
+	var columns []columnDef
 	var tablePKs [][]string
-	var checks []CheckDef
-	var uniques []UniqueDef
-	var foreignKeys []ForeignKeyDef
-	var excludes []ExcludeDef
+	var checks []checkDef
+	var uniques []uniqueDef
+	var foreignKeys []foreignKeyDef
+	var excludes []excludeDef
 	for {
 		if p.peekKeyword() == "primary" && p.peekKeywordAt(1) == "key" {
 			p.advance()
@@ -374,26 +374,26 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 			columns = append(columns, col)
 		}
 		switch p.advance().Kind {
-		case TokComma:
+		case tokComma:
 			continue
-		case TokRParen:
+		case tokRParen:
 		default:
-			return nil, NewError(SyntaxError, "expected ',' or ')'")
+			return nil, newError(SyntaxError, "expected ',' or ')'")
 		}
 		break
 	}
 	if len(columns) == 0 {
-		return nil, NewError(SyntaxError, "a table must have at least one column")
+		return nil, newError(SyntaxError, "a table must have at least one column")
 	}
-	return &CreateTable{Name: name, Temp: temp, Shared: shared, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
+	return &createTable{Name: name, Temp: temp, Shared: shared, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
 }
 
 // atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:
 // the keyword EXCLUDE (followed by USING or `(`), or CONSTRAINT <ident> EXCLUDE
 // (spec/design/gist.md §7). The keyword stays non-reserved — a column named "exclude" is followed
 // by a type name (an identifier), never USING or `(`, so the lookahead loses nothing.
-func (p *Parser) atExclusionTableConstraint() bool {
-	if p.peekKeyword() == "exclude" && (p.peekKeywordAt(1) == "using" || p.peekKindAt(1) == TokLParen) {
+func (p *parser) atExclusionTableConstraint() bool {
+	if p.peekKeyword() == "exclude" && (p.peekKeywordAt(1) == "using" || p.peekKindAt(1) == tokLParen) {
 		return true
 	}
 	return p.peekKeyword() == "constraint" && p.peekKeywordAt(2) == "exclude"
@@ -403,55 +403,55 @@ func (p *Parser) atExclusionTableConstraint() bool {
 // [, col2 WITH op2 ...] )` (the cursor is verified by atExclusionTableConstraint). Each operand is a
 // bare column name; the WITH operator is captured as its source text (= / &&) and mapped to a
 // strategy at execution (spec/design/gist.md §7). The USING method (only gist) is captured verbatim.
-func (p *Parser) parseExclusionTableConstraint() (ExcludeDef, error) {
+func (p *parser) parseExclusionTableConstraint() (excludeDef, error) {
 	var name string
 	if p.peekKeyword() == "constraint" {
 		p.advance()
 		n, err := p.expectIdentifier()
 		if err != nil {
-			return ExcludeDef{}, err
+			return excludeDef{}, err
 		}
 		name = n
 	}
 	if err := p.expectKeyword("exclude"); err != nil {
-		return ExcludeDef{}, err
+		return excludeDef{}, err
 	}
 	var using string
 	if p.peekKeyword() == "using" {
 		p.advance()
 		u, err := p.expectIdentifier()
 		if err != nil {
-			return ExcludeDef{}, err
+			return excludeDef{}, err
 		}
 		using = u
 	}
-	if err := p.expect(TokLParen); err != nil {
-		return ExcludeDef{}, err
+	if err := p.expect(tokLParen); err != nil {
+		return excludeDef{}, err
 	}
-	var elements []ExcludeElementDef
+	var elements []excludeElementDef
 	for {
 		col, err := p.expectIdentifier()
 		if err != nil {
-			return ExcludeDef{}, err
+			return excludeDef{}, err
 		}
 		if err := p.expectKeyword("with"); err != nil {
-			return ExcludeDef{}, err
+			return excludeDef{}, err
 		}
 		// The operator is a single token (= / &&); render it to source text for execution.
 		start := p.pos
 		p.advance()
 		op := renderTokens(p.tokens[start:p.pos])
-		elements = append(elements, ExcludeElementDef{Column: col, Op: op})
+		elements = append(elements, excludeElementDef{Column: col, Op: op})
 		switch p.advance().Kind {
-		case TokComma:
+		case tokComma:
 			continue
-		case TokRParen:
+		case tokRParen:
 		default:
-			return ExcludeDef{}, NewError(SyntaxError, "expected ',' or ')'")
+			return excludeDef{}, newError(SyntaxError, "expected ',' or ')'")
 		}
 		break
 	}
-	return ExcludeDef{Name: name, Using: using, Elements: elements}, nil
+	return excludeDef{Name: name, Using: using, Elements: elements}, nil
 }
 
 // atForeignKeyTableConstraint reports whether the cursor sits on a table-level FOREIGN KEY
@@ -459,7 +459,7 @@ func (p *Parser) parseExclusionTableConstraint() (ExcludeDef, error) {
 // (spec/design/grammar.md §43). The keywords stay non-reserved — a column named "foreign"
 // would need a type named "key" (none exists), so the lookahead loses nothing (the PRIMARY
 // KEY precedent).
-func (p *Parser) atForeignKeyTableConstraint() bool {
+func (p *parser) atForeignKeyTableConstraint() bool {
 	if p.peekKeyword() == "foreign" && p.peekKeywordAt(1) == "key" {
 		return true
 	}
@@ -470,31 +470,31 @@ func (p *Parser) atForeignKeyTableConstraint() bool {
 // parseForeignKeyTableConstraint parses one table-level `[CONSTRAINT name] FOREIGN KEY ( col
 // [, col]* ) references_clause` (the cursor is verified by atForeignKeyTableConstraint). The
 // local-column list reuses the PRIMARY KEY list shape (spec/design/grammar.md §43).
-func (p *Parser) parseForeignKeyTableConstraint() (ForeignKeyDef, error) {
+func (p *parser) parseForeignKeyTableConstraint() (foreignKeyDef, error) {
 	name := ""
 	if p.peekKeyword() == "constraint" {
 		p.advance()
 		n, err := p.expectIdentifier()
 		if err != nil {
-			return ForeignKeyDef{}, err
+			return foreignKeyDef{}, err
 		}
 		name = n
 	}
 	if err := p.expectKeyword("foreign"); err != nil {
-		return ForeignKeyDef{}, err
+		return foreignKeyDef{}, err
 	}
 	if err := p.expectKeyword("key"); err != nil {
-		return ForeignKeyDef{}, err
+		return foreignKeyDef{}, err
 	}
 	columns, err := p.parsePKColumnList()
 	if err != nil {
-		return ForeignKeyDef{}, err
+		return foreignKeyDef{}, err
 	}
 	refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
 	if err != nil {
-		return ForeignKeyDef{}, err
+		return foreignKeyDef{}, err
 	}
-	return ForeignKeyDef{
+	return foreignKeyDef{
 		Name:       name,
 		Columns:    columns,
 		RefTable:   refTable,
@@ -508,7 +508,7 @@ func (p *Parser) parseForeignKeyTableConstraint() (ForeignKeyDef, error) {
 // by the column-level and table-level forms — spec/design/grammar.md §43): the referenced
 // table, an optional referenced-column list (nil defaults to the parent's primary key), and
 // the ON DELETE / ON UPDATE actions (each at most once, either order; a repeat is 42601).
-func (p *Parser) parseReferencesClause() (string, []string, RefAction, RefAction, error) {
+func (p *parser) parseReferencesClause() (string, []string, refAction, refAction, error) {
 	if err := p.expectKeyword("references"); err != nil {
 		return "", nil, 0, 0, err
 	}
@@ -517,14 +517,14 @@ func (p *Parser) parseReferencesClause() (string, []string, RefAction, RefAction
 		return "", nil, 0, 0, err
 	}
 	var refColumns []string
-	if p.peek().Kind == TokLParen {
+	if p.peek().Kind == tokLParen {
 		refColumns, err = p.parsePKColumnList()
 		if err != nil {
 			return "", nil, 0, 0, err
 		}
 	}
-	onDelete := RefNoAction
-	onUpdate := RefNoAction
+	onDelete := refNoAction
+	onUpdate := refNoAction
 	seenDelete := false
 	seenUpdate := false
 	for p.peekKeyword() == "on" {
@@ -533,7 +533,7 @@ func (p *Parser) parseReferencesClause() (string, []string, RefAction, RefAction
 		case "delete":
 			p.advance()
 			if seenDelete {
-				return "", nil, 0, 0, NewError(SyntaxError, "ON DELETE specified more than once")
+				return "", nil, 0, 0, newError(SyntaxError, "ON DELETE specified more than once")
 			}
 			seenDelete = true
 			onDelete, err = p.parseReferentialAction()
@@ -543,7 +543,7 @@ func (p *Parser) parseReferencesClause() (string, []string, RefAction, RefAction
 		case "update":
 			p.advance()
 			if seenUpdate {
-				return "", nil, 0, 0, NewError(SyntaxError, "ON UPDATE specified more than once")
+				return "", nil, 0, 0, newError(SyntaxError, "ON UPDATE specified more than once")
 			}
 			seenUpdate = true
 			onUpdate, err = p.parseReferentialAction()
@@ -551,7 +551,7 @@ func (p *Parser) parseReferencesClause() (string, []string, RefAction, RefAction
 				return "", nil, 0, 0, err
 			}
 		default:
-			return "", nil, 0, 0, NewError(SyntaxError, "expected DELETE or UPDATE after ON")
+			return "", nil, 0, 0, newError(SyntaxError, "expected DELETE or UPDATE after ON")
 		}
 	}
 	return refTable, refColumns, onDelete, onUpdate, nil
@@ -559,34 +559,34 @@ func (p *Parser) parseReferencesClause() (string, []string, RefAction, RefAction
 
 // parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
 // PG actions parse; CASCADE / SET NULL / SET DEFAULT are rejected later at CREATE TABLE (0A000).
-func (p *Parser) parseReferentialAction() (RefAction, error) {
+func (p *parser) parseReferentialAction() (refAction, error) {
 	switch p.peekKeyword() {
 	case "no":
 		p.advance()
 		if err := p.expectKeyword("action"); err != nil {
 			return 0, err
 		}
-		return RefNoAction, nil
+		return refNoAction, nil
 	case "restrict":
 		p.advance()
-		return RefRestrict, nil
+		return refRestrict, nil
 	case "cascade":
 		p.advance()
-		return RefCascade, nil
+		return refCascade, nil
 	case "set":
 		p.advance()
 		switch p.peekKeyword() {
 		case "null":
 			p.advance()
-			return RefSetNull, nil
+			return refSetNull, nil
 		case "default":
 			p.advance()
-			return RefSetDefault, nil
+			return refSetDefault, nil
 		default:
-			return 0, NewError(SyntaxError, "expected NULL or DEFAULT after SET")
+			return 0, newError(SyntaxError, "expected NULL or DEFAULT after SET")
 		}
 	default:
-		return 0, NewError(SyntaxError,
+		return 0, newError(SyntaxError,
 			"expected a referential action: NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT")
 	}
 }
@@ -595,51 +595,51 @@ func (p *Parser) parseReferentialAction() (RefAction, error) {
 // CHECK followed by "(", or CONSTRAINT <ident> CHECK "(" (spec/design/grammar.md §29). The
 // keywords stay non-reserved — a column named "check"/"constraint" is followed by a type
 // name (an identifier, never "("), so the lookahead loses nothing.
-func (p *Parser) atCheckConstraint() bool {
-	if p.peekKeyword() == "check" && p.peekKindAt(1) == TokLParen {
+func (p *parser) atCheckConstraint() bool {
+	if p.peekKeyword() == "check" && p.peekKindAt(1) == tokLParen {
 		return true
 	}
 	return p.peekKeyword() == "constraint" &&
-		p.peekKeywordAt(2) == "check" && p.peekKindAt(3) == TokLParen
+		p.peekKeywordAt(2) == "check" && p.peekKindAt(3) == tokLParen
 }
 
 // parseCheckConstraint parses one `[CONSTRAINT name] CHECK ( expr )` (the cursor is
 // verified by atCheckConstraint). The token span between the parentheses is re-rendered as
 // the constraint's persisted text (spec/fileformat/format.md "Check-expression text").
-func (p *Parser) parseCheckConstraint() (CheckDef, error) {
+func (p *parser) parseCheckConstraint() (checkDef, error) {
 	name := ""
 	if p.peekKeyword() == "constraint" {
 		p.advance()
 		n, err := p.expectIdentifier()
 		if err != nil {
-			return CheckDef{}, err
+			return checkDef{}, err
 		}
 		name = n
 	}
 	if err := p.expectKeyword("check"); err != nil {
-		return CheckDef{}, err
+		return checkDef{}, err
 	}
-	if err := p.expect(TokLParen); err != nil {
-		return CheckDef{}, err
+	if err := p.expect(tokLParen); err != nil {
+		return checkDef{}, err
 	}
 	start := p.pos
 	expr, err := p.parseExpr()
 	if err != nil {
-		return CheckDef{}, err
+		return checkDef{}, err
 	}
 	text := renderTokens(p.tokens[start:p.pos])
-	if err := p.expect(TokRParen); err != nil {
-		return CheckDef{}, err
+	if err := p.expect(tokRParen); err != nil {
+		return checkDef{}, err
 	}
-	return CheckDef{Name: name, Expr: expr, Text: text}, nil
+	return checkDef{Name: name, Expr: expr, Text: text}, nil
 }
 
 // atUniqueTableConstraint reports whether the cursor sits on a table-level UNIQUE
 // constraint: the keyword UNIQUE followed by "(", or CONSTRAINT <ident> UNIQUE
 // (spec/design/grammar.md §31). The keywords stay non-reserved — a column named "unique"
 // is followed by a type name (an identifier, never "("), so the lookahead loses nothing.
-func (p *Parser) atUniqueTableConstraint() bool {
-	if p.peekKeyword() == "unique" && p.peekKindAt(1) == TokLParen {
+func (p *parser) atUniqueTableConstraint() bool {
+	if p.peekKeyword() == "unique" && p.peekKindAt(1) == tokLParen {
 		return true
 	}
 	return p.peekKeyword() == "constraint" && p.peekKeywordAt(2) == "unique"
@@ -648,31 +648,31 @@ func (p *Parser) atUniqueTableConstraint() bool {
 // parseUniqueTableConstraint parses one table-level `[CONSTRAINT name] UNIQUE ( col [,
 // col]* )` (the cursor is verified by atUniqueTableConstraint). The member list reuses
 // the PRIMARY KEY list shape (spec/design/grammar.md §31).
-func (p *Parser) parseUniqueTableConstraint() (UniqueDef, error) {
+func (p *parser) parseUniqueTableConstraint() (uniqueDef, error) {
 	name := ""
 	if p.peekKeyword() == "constraint" {
 		p.advance()
 		n, err := p.expectIdentifier()
 		if err != nil {
-			return UniqueDef{}, err
+			return uniqueDef{}, err
 		}
 		name = n
 	}
 	if err := p.expectKeyword("unique"); err != nil {
-		return UniqueDef{}, err
+		return uniqueDef{}, err
 	}
 	columns, err := p.parsePKColumnList()
 	if err != nil {
-		return UniqueDef{}, err
+		return uniqueDef{}, err
 	}
-	return UniqueDef{Name: name, Columns: columns}, nil
+	return uniqueDef{Name: name, Columns: columns}, nil
 }
 
 // parsePKColumnList parses the parenthesized member list of a table-level PRIMARY KEY
 // constraint: `( <col> [, <col>]* )`. Must be non-empty — `PRIMARY KEY ()` is 42601 (the
 // first expectIdentifier rejects `)`).
-func (p *Parser) parsePKColumnList() ([]string, error) {
-	if err := p.expect(TokLParen); err != nil {
+func (p *parser) parsePKColumnList() ([]string, error) {
+	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
 	first, err := p.expectIdentifier()
@@ -682,36 +682,36 @@ func (p *Parser) parsePKColumnList() ([]string, error) {
 	cols := []string{first}
 	for {
 		switch p.advance().Kind {
-		case TokComma:
+		case tokComma:
 			col, err := p.expectIdentifier()
 			if err != nil {
 				return nil, err
 			}
 			cols = append(cols, col)
-		case TokRParen:
+		case tokRParen:
 			return cols, nil
 		default:
-			return nil, NewError(SyntaxError, "expected ',' or ')'")
+			return nil, newError(SyntaxError, "expected ',' or ')'")
 		}
 	}
 }
 
-func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[]UniqueDef, foreignKeys *[]ForeignKeyDef) (ColumnDef, error) {
+func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[]uniqueDef, foreignKeys *[]foreignKeyDef) (columnDef, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
-		return ColumnDef{}, err
+		return columnDef{}, err
 	}
 	typeName, err := p.expectIdentifier()
 	if err != nil {
-		return ColumnDef{}, err
+		return columnDef{}, err
 	}
 	typeMod, err := p.parseTypeMod()
 	if err != nil {
-		return ColumnDef{}, err
+		return columnDef{}, err
 	}
 	isArray, err := p.consumeArrayBrackets()
 	if err != nil {
-		return ColumnDef{}, err
+		return columnDef{}, err
 	}
 	if isArray {
 		typeName += "[]"
@@ -725,14 +725,14 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 	// one-member form (a repeat folds at execution — spec/design/constraints.md §5).
 	primaryKey := false
 	notNull := false
-	var def *DefaultDef
-	var identity *IdentitySpec
+	var def *defaultDef
+	var identity *identitySpec
 	collation := ""
 	for {
 		if p.atCheckConstraint() {
 			check, err := p.parseCheckConstraint()
 			if err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 			*checks = append(*checks, check)
 			continue
@@ -743,12 +743,12 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 			p.advance()
 			cname, err := p.expectIdentifier()
 			if err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 			if err := p.expectKeyword("unique"); err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
-			*uniques = append(*uniques, UniqueDef{Name: cname, Columns: []string{name}})
+			*uniques = append(*uniques, uniqueDef{Name: cname, Columns: []string{name}})
 			continue
 		}
 		// CONSTRAINT <name> REFERENCES … in column position (the named one-member FK).
@@ -756,13 +756,13 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 			p.advance()
 			cname, err := p.expectIdentifier()
 			if err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 			refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
 			if err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
-			*foreignKeys = append(*foreignKeys, ForeignKeyDef{
+			*foreignKeys = append(*foreignKeys, foreignKeyDef{
 				Name:       cname,
 				Columns:    []string{name},
 				RefTable:   refTable,
@@ -776,13 +776,13 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 		case "primary":
 			p.advance()
 			if err := p.expectKeyword("key"); err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 			primaryKey = true
 		case "not":
 			p.advance()
 			if err := p.expectKeyword("null"); err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 			notNull = true
 		case "default":
@@ -794,10 +794,10 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 			start := p.pos
 			expr, err := p.parseExpr()
 			if err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 			text := renderTokens(p.tokens[start:p.pos])
-			def = &DefaultDef{Expr: expr, Text: text}
+			def = &defaultDef{Expr: expr, Text: text}
 		case "generated":
 			// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]`
 			// (spec/design/sequences.md §13). Two identity specs on one column is 42601
@@ -812,32 +812,32 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 			case "by":
 				p.advance()
 				if err := p.expectKeyword("default"); err != nil {
-					return ColumnDef{}, err
+					return columnDef{}, err
 				}
 				always = false
 			default:
-				return ColumnDef{}, NewError(SyntaxError,
+				return columnDef{}, newError(SyntaxError,
 					fmt.Sprintf("expected ALWAYS or BY DEFAULT after GENERATED, found %q", p.peekKeyword()))
 			}
 			if err := p.expectKeyword("as"); err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 			if err := p.expectKeyword("identity"); err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
-			var options SeqOptions
-			if p.peek().Kind == TokLParen {
+			var options seqOptions
+			if p.peek().Kind == tokLParen {
 				options, err = p.parseSequenceOptions(true)
 				if err != nil {
-					return ColumnDef{}, err
+					return columnDef{}, err
 				}
 			}
 			if identity != nil {
-				return ColumnDef{}, NewError(SyntaxError, fmt.Sprintf(
+				return columnDef{}, newError(SyntaxError, fmt.Sprintf(
 					"multiple identity specifications for column %s of table %s", name, tableName,
 				))
 			}
-			identity = &IdentitySpec{Always: always, Options: options}
+			identity = &identitySpec{Always: always, Options: options}
 		case "collate":
 			// COLLATE "name" in column position (spec/design/collation.md §1) — a quoted,
 			// case-sensitive collation name. Validity (text-only 42804, loaded name 42704) is
@@ -845,19 +845,19 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 			p.advance()
 			collation, err = p.expectCollationName()
 			if err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
 		case "unique":
 			p.advance()
-			*uniques = append(*uniques, UniqueDef{Columns: []string{name}})
+			*uniques = append(*uniques, uniqueDef{Columns: []string{name}})
 		case "references":
 			// The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
 			// parseReferencesClause consumes the REFERENCES keyword itself.
 			refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
 			if err != nil {
-				return ColumnDef{}, err
+				return columnDef{}, err
 			}
-			*foreignKeys = append(*foreignKeys, ForeignKeyDef{
+			*foreignKeys = append(*foreignKeys, foreignKeyDef{
 				Name:       "",
 				Columns:    []string{name},
 				RefTable:   refTable,
@@ -866,7 +866,7 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 				OnUpdate:   onUpdate,
 			})
 		default:
-			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Collation: collation}, nil
+			return columnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Collation: collation}, nil
 		}
 	}
 }
@@ -879,11 +879,11 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 // type name (and its optional typmod). Returns whether the type is an array. Multiple `[][]`
 // collapse to one array level — multidimensionality is a value property, not array-of-array (§2).
 // Only the empty-bracket form `[]` is accepted this slice.
-func (p *Parser) consumeArrayBrackets() (bool, error) {
+func (p *parser) consumeArrayBrackets() (bool, error) {
 	isArray := false
-	for p.peek().Kind == TokLBracket {
+	for p.peek().Kind == tokLBracket {
 		p.advance() // '['
-		if err := p.expect(TokRBracket); err != nil {
+		if err := p.expect(tokRBracket); err != nil {
 			return false, err
 		}
 		isArray = true
@@ -891,8 +891,8 @@ func (p *Parser) consumeArrayBrackets() (bool, error) {
 	return isArray, nil
 }
 
-func (p *Parser) parseTypeMod() (*TypeMod, error) {
-	if p.peek().Kind != TokLParen {
+func (p *parser) parseTypeMod() (*typeMod, error) {
+	if p.peek().Kind != tokLParen {
 		return nil, nil
 	}
 	p.advance() // '('
@@ -901,7 +901,7 @@ func (p *Parser) parseTypeMod() (*TypeMod, error) {
 		return nil, err
 	}
 	var scale *uint64
-	if p.peek().Kind == TokComma {
+	if p.peek().Kind == tokComma {
 		p.advance()
 		s, err := p.expectTypmodInt()
 		if err != nil {
@@ -909,16 +909,16 @@ func (p *Parser) parseTypeMod() (*TypeMod, error) {
 		}
 		scale = &s
 	}
-	if err := p.expect(TokRParen); err != nil {
+	if err := p.expect(tokRParen); err != nil {
 		return nil, err
 	}
-	return &TypeMod{Precision: precision, Scale: scale}, nil
+	return &typeMod{Precision: precision, Scale: scale}, nil
 }
 
-func (p *Parser) expectTypmodInt() (uint64, error) {
+func (p *parser) expectTypmodInt() (uint64, error) {
 	t := p.advance()
-	if t.Kind != TokInt {
-		return 0, NewError(SyntaxError, "expected an integer type modifier")
+	if t.Kind != tokInt {
+		return 0, newError(SyntaxError, "expected an integer type modifier")
 	}
 	return t.Int, nil
 }
@@ -930,7 +930,7 @@ func (p *Parser) expectTypmodInt() (uint64, error) {
 // (spec/design/grammar.md §13). IF EXISTS is recognized only when the next two keywords are
 // exactly IF EXISTS (the two-token lookahead the statement dispatch uses) — a lone `if` is an
 // ordinary non-reserved identifier, so `DROP TABLE if` drops a table named `if` (PG-faithful, §1).
-func (p *Parser) parseDropTable() (*DropTable, error) {
+func (p *parser) parseDropTable() (*dropTable, error) {
 	if err := p.expectKeyword("drop"); err != nil {
 		return nil, err
 	}
@@ -947,7 +947,7 @@ func (p *Parser) parseDropTable() (*DropTable, error) {
 		return nil, err
 	}
 	names := []string{name}
-	for p.peek().Kind == TokComma {
+	for p.peek().Kind == tokComma {
 		p.advance()
 		n, err := p.expectIdentifier()
 		if err != nil {
@@ -966,7 +966,7 @@ func (p *Parser) parseDropTable() (*DropTable, error) {
 	case "restrict":
 		p.advance()
 	}
-	return &DropTable{Names: names, IfExists: ifExists, Cascade: cascade}, nil
+	return &dropTable{Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
 // parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`
@@ -975,7 +975,7 @@ func (p *Parser) parseDropTable() (*DropTable, error) {
 // a word and then `(` — that exact three-token shape can only be the unnamed form's
 // `ON table (`. Key columns are bare identifiers (no expression/ordered/partial keys this
 // slice — a `(`/`ASC`/`DESC` after a key is the natural 42601).
-func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
+func (p *parser) parseCreateIndex() (*createIndex, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
 	}
@@ -990,8 +990,8 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 	// index name unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
 	// lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3).
 	unnamed := p.peekKeyword() == "on" &&
-		p.peekKindAt(1) == TokWord &&
-		(p.peekKindAt(2) == TokLParen || p.peekKeywordAt(2) == "using")
+		p.peekKindAt(1) == tokWord &&
+		(p.peekKindAt(2) == tokLParen || p.peekKeywordAt(2) == "using")
 	name := ""
 	if !unnamed {
 		n, err := p.expectIdentifier()
@@ -1019,7 +1019,7 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 		}
 		using = m
 	}
-	if err := p.expect(TokLParen); err != nil {
+	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
 	var columns []string
@@ -1030,20 +1030,20 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 		}
 		columns = append(columns, col)
 		tok := p.advance()
-		if tok.Kind == TokComma {
+		if tok.Kind == tokComma {
 			continue
 		}
-		if tok.Kind == TokRParen {
+		if tok.Kind == tokRParen {
 			break
 		}
-		return nil, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+		return nil, newError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
-	return &CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique, Using: using}, nil
+	return &createIndex{Name: name, Table: table, Columns: columns, Unique: unique, Using: using}, nil
 }
 
 // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index
 // (42704) or a table's name (42809) is rejected at execution time, not here.
-func (p *Parser) parseDropIndex() (*DropIndex, error) {
+func (p *parser) parseDropIndex() (*dropIndex, error) {
 	if err := p.expectKeyword("drop"); err != nil {
 		return nil, err
 	}
@@ -1054,14 +1054,14 @@ func (p *Parser) parseDropIndex() (*DropIndex, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DropIndex{Name: name}, nil
+	return &dropIndex{Name: name}, nil
 }
 
 // parseCreateType parses `CREATE TYPE <name> AS ( <field> <type> [NOT NULL] [, …] )` — a
 // composite (row) type (spec/design/composite.md, grammar.md). At least one field (an empty list
 // is a syntax error); each field's type is a bare type name (built-in or a composite), resolved at
 // execution (42704 if unknown).
-func (p *Parser) parseCreateType() (*CreateType, error) {
+func (p *parser) parseCreateType() (*createType, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
 	}
@@ -1075,18 +1075,18 @@ func (p *Parser) parseCreateType() (*CreateType, error) {
 	if err := p.expectKeyword("as"); err != nil {
 		return nil, err
 	}
-	if err := p.expect(TokLParen); err != nil {
+	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
 	fields, err := p.parseFieldDefList()
 	if err != nil {
 		return nil, err
 	}
-	return &CreateType{Name: name, Fields: fields}, nil
+	return &createType{Name: name, Fields: fields}, nil
 }
 
 // skipFormatJSON skips an optional `FORMAT JSON [ENCODING …]` clause after a SQL/JSON context item.
-func (p *Parser) skipFormatJSON() {
+func (p *parser) skipFormatJSON() {
 	if p.peekKeyword() == "format" && p.peekKeywordAt(1) == "json" {
 		p.advance() // FORMAT
 		p.advance() // JSON
@@ -1095,7 +1095,7 @@ func (p *Parser) skipFormatJSON() {
 
 // parseJSONReturning parses an optional `RETURNING <type> [FORMAT JSON]` clause → the type name
 // (resolved later). nil when absent.
-func (p *Parser) parseJSONReturning() (*string, error) {
+func (p *parser) parseJSONReturning() (*string, error) {
 	if p.peekKeyword() != "returning" {
 		return nil, nil
 	}
@@ -1110,45 +1110,45 @@ func (p *Parser) parseJSONReturning() (*string, error) {
 
 // parseJSONBehavior parses one constant SQL/JSON behavior word (`ERROR` / `NULL` / `TRUE` / `FALSE` /
 // `UNKNOWN` / `EMPTY [ARRAY|OBJECT]`). `DEFAULT expr` is the deferred S3 follow-on (0A000).
-func (p *Parser) parseJSONBehavior() (JsonOnBehavior, error) {
+func (p *parser) parseJSONBehavior() (jsonOnBehavior, error) {
 	switch p.peekKeyword() {
 	case "error":
 		p.advance()
-		return JOBError, nil
+		return jOBError, nil
 	case "null":
 		p.advance()
-		return JOBNull, nil
+		return jOBNull, nil
 	case "true":
 		p.advance()
-		return JOBTrue, nil
+		return jOBTrue, nil
 	case "false":
 		p.advance()
-		return JOBFalse, nil
+		return jOBFalse, nil
 	case "unknown":
 		p.advance()
-		return JOBUnknown, nil
+		return jOBUnknown, nil
 	case "empty":
 		p.advance()
 		switch p.peekKeyword() {
 		case "object":
 			p.advance()
-			return JOBEmptyObject, nil
+			return jOBEmptyObject, nil
 		case "array":
 			p.advance()
-			return JOBEmptyArray, nil
+			return jOBEmptyArray, nil
 		default:
 			// bare `EMPTY` defaults to `EMPTY ARRAY` (PostgreSQL).
-			return JOBEmptyArray, nil
+			return jOBEmptyArray, nil
 		}
 	case "default":
-		return 0, NewError(FeatureNotSupported, "ON ERROR / ON EMPTY DEFAULT expr is not supported yet")
+		return 0, newError(FeatureNotSupported, "ON ERROR / ON EMPTY DEFAULT expr is not supported yet")
 	default:
-		return 0, NewError(SyntaxError, "expected a SQL/JSON ON ERROR/EMPTY behavior")
+		return 0, newError(SyntaxError, "expected a SQL/JSON ON ERROR/EMPTY behavior")
 	}
 }
 
 // parseJSONOnErrorOnly parses JSON_EXISTS's single optional `<behavior> ON ERROR` clause.
-func (p *Parser) parseJSONOnErrorOnly() (*JsonOnBehavior, error) {
+func (p *parser) parseJSONOnErrorOnly() (*jsonOnBehavior, error) {
 	if p.isJSONBehaviorStart() && p.peekOnClauseIs("error") {
 		b, err := p.parseJSONBehavior()
 		if err != nil {
@@ -1163,7 +1163,7 @@ func (p *Parser) parseJSONOnErrorOnly() (*JsonOnBehavior, error) {
 
 // parseJSONOnClauses parses the optional `<behavior> ON EMPTY` then `<behavior> ON ERROR` clauses (in
 // that order).
-func (p *Parser) parseJSONOnClauses() (onEmpty, onError *JsonOnBehavior, err error) {
+func (p *parser) parseJSONOnClauses() (onEmpty, onError *jsonOnBehavior, err error) {
 	if p.isJSONBehaviorStart() && p.peekOnClauseIs("empty") {
 		b, e := p.parseJSONBehavior()
 		if e != nil {
@@ -1188,20 +1188,20 @@ func (p *Parser) parseJSONOnClauses() (onEmpty, onError *JsonOnBehavior, err err
 // parseJSONWrapperQuotes parses JSON_QUERY's optional `[WITH [COND|UNCOND] [ARRAY] WRAPPER | WITHOUT
 // [ARRAY] WRAPPER]` and `[KEEP|OMIT QUOTES [ON SCALAR STRING]]` clauses. Returns the wrapper mode and
 // the keep-quotes flag (true = KEEP, the default).
-func (p *Parser) parseJSONWrapperQuotes() (JsonWrapper, bool, error) {
-	wrapper := JWWithout
+func (p *parser) parseJSONWrapperQuotes() (jsonWrapper, bool, error) {
+	wrapper := jWWithout
 	switch p.peekKeyword() {
 	case "with":
 		p.advance() // WITH
 		switch p.peekKeyword() {
 		case "conditional":
 			p.advance()
-			wrapper = JWConditional
+			wrapper = jWConditional
 		case "unconditional":
 			p.advance()
-			wrapper = JWUnconditional
+			wrapper = jWUnconditional
 		default:
-			wrapper = JWUnconditional
+			wrapper = jWUnconditional
 		}
 		if p.peekKeyword() == "array" {
 			p.advance()
@@ -1238,7 +1238,7 @@ func (p *Parser) parseJSONWrapperQuotes() (JsonWrapper, bool, error) {
 }
 
 // skipOnScalarString skips an optional `ON SCALAR STRING` after a QUOTES clause.
-func (p *Parser) skipOnScalarString() {
+func (p *parser) skipOnScalarString() {
 	if p.peekKeyword() == "on" && p.peekKeywordAt(1) == "scalar" {
 		p.advance() // ON
 		p.advance() // SCALAR
@@ -1250,7 +1250,7 @@ func (p *Parser) skipOnScalarString() {
 
 // isJSONBehaviorStart reports whether the cursor is at a SQL/JSON behavior word
 // (ERROR/NULL/TRUE/FALSE/UNKNOWN/EMPTY/DEFAULT).
-func (p *Parser) isJSONBehaviorStart() bool {
+func (p *parser) isJSONBehaviorStart() bool {
 	switch p.peekKeyword() {
 	case "error", "null", "true", "false", "unknown", "empty", "default":
 		return true
@@ -1260,7 +1260,7 @@ func (p *Parser) isJSONBehaviorStart() bool {
 
 // peekOnClauseIs reports whether the upcoming clause is `… ON <which>` (a one-or-two-token lookahead
 // past the behavior — EMPTY may be `EMPTY ARRAY`/`EMPTY OBJECT`, so scan to the `ON`).
-func (p *Parser) peekOnClauseIs(which string) bool {
+func (p *parser) peekOnClauseIs(which string) bool {
 	for _, skip := range []int{1, 2} {
 		if p.peekKeywordAt(skip) == "on" && p.peekKeywordAt(skip+1) == which {
 			return true
@@ -1273,8 +1273,8 @@ func (p *Parser) peekOnClauseIs(which string) bool {
 // list — the body shared by `CREATE TYPE … AS (…)` (composite.md) and a FROM-clause **column-
 // definition list** `AS t(col type, …)` (C0, json-table.md §1). The caller has consumed the opening
 // `(`; this consumes through the matching `)`.
-func (p *Parser) parseFieldDefList() ([]TypeFieldDef, error) {
-	var fields []TypeFieldDef
+func (p *parser) parseFieldDefList() ([]typeFieldDef, error) {
+	var fields []typeFieldDef
 	for {
 		fname, err := p.expectIdentifier()
 		if err != nil {
@@ -1305,15 +1305,15 @@ func (p *Parser) parseFieldDefList() ([]TypeFieldDef, error) {
 			}
 			notNull = true
 		}
-		fields = append(fields, TypeFieldDef{Name: fname, TypeName: typeName, TypeMod: typeMod, NotNull: notNull})
+		fields = append(fields, typeFieldDef{Name: fname, TypeName: typeName, TypeMod: typeMod, NotNull: notNull})
 		tok := p.advance()
-		if tok.Kind == TokComma {
+		if tok.Kind == tokComma {
 			continue
 		}
-		if tok.Kind == TokRParen {
+		if tok.Kind == tokRParen {
 			break
 		}
-		return nil, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+		return nil, newError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
 	return fields, nil
 }
@@ -1322,7 +1322,7 @@ func (p *Parser) parseFieldDefList() ([]TypeFieldDef, error) {
 // (spec/design/composite.md §7). RESTRICT is the default and the only behavior this slice;
 // CASCADE is rejected (0A000) at execution. A missing type (42704) and dependents (2BP01) are
 // execution-time.
-func (p *Parser) parseDropType() (*DropType, error) {
+func (p *parser) parseDropType() (*dropType, error) {
 	if err := p.expectKeyword("drop"); err != nil {
 		return nil, err
 	}
@@ -1350,16 +1350,16 @@ func (p *Parser) parseDropType() (*DropType, error) {
 		cascade = true
 	}
 	if cascade {
-		return nil, NewError(FeatureNotSupported, "DROP TYPE ... CASCADE is not supported")
+		return nil, newError(FeatureNotSupported, "DROP TYPE ... CASCADE is not supported")
 	}
-	return &DropType{Name: name, IfExists: ifExists}, nil
+	return &dropType{Name: name, IfExists: ifExists}, nil
 }
 
 // parseCreateSequence parses `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]`
 // (spec/design/sequences.md). The options are order-free and each at most once (a repeat is
 // 42601); option values are signed integer literals. Validation of the resolved option set
 // (22023) and the namespace collision (42P07) are execution-time.
-func (p *Parser) parseCreateSequence() (*CreateSequence, error) {
+func (p *parser) parseCreateSequence() (*createSequence, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
 	}
@@ -1378,7 +1378,7 @@ func (p *Parser) parseCreateSequence() (*CreateSequence, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &CreateSequence{Name: name, IfNotExists: ifNotExists, Options: options}, nil
+	return &createSequence{Name: name, IfNotExists: ifNotExists, Options: options}, nil
 }
 
 // parseSequenceOptions parses the order-free sequence-option set (INCREMENT [BY] n,
@@ -1387,7 +1387,7 @@ func (p *Parser) parseCreateSequence() (*CreateSequence, error) {
 // parenthesized, the options are wrapped in `( … )` and the loop stops at `)`; each option appears
 // at most once (a repeat is 42601 via dupCheck). Validation of the resolved set (22023) is
 // execution-time.
-func (p *Parser) parseSequenceOptions(parenthesized bool) (SeqOptions, error) {
+func (p *parser) parseSequenceOptions(parenthesized bool) (seqOptions, error) {
 	seq, _, err := p.parseSeqOptionsInner(parenthesized, false)
 	return seq, err
 }
@@ -1396,14 +1396,14 @@ func (p *Parser) parseSequenceOptions(parenthesized bool) (SeqOptions, error) {
 // parenthesized), `RESTART [[WITH] n]` is also accepted as an interleavable pseudo-option and
 // returned separately (nil = absent; &{ToStart:true} = bare RESTART; &{Value:n} = RESTART WITH n);
 // RESTART is invalid in CREATE/identity, where it ends the loop like any unrecognized keyword.
-func (p *Parser) parseSeqOptionsInner(parenthesized, allowRestart bool) (SeqOptions, *SeqRestart, error) {
+func (p *parser) parseSeqOptionsInner(parenthesized, allowRestart bool) (seqOptions, *seqRestart, error) {
 	if parenthesized {
-		if err := p.expect(TokLParen); err != nil {
-			return SeqOptions{}, nil, err
+		if err := p.expect(tokLParen); err != nil {
+			return seqOptions{}, nil, err
 		}
 	}
-	var seq SeqOptions
-	var restart *SeqRestart
+	var seq seqOptions
+	var restart *seqRestart
 	// Order-free option loop: dispatch on the leading keyword, each option at most once.
 loop:
 	for {
@@ -1414,17 +1414,17 @@ loop:
 				break loop
 			}
 			if err := p.dupCheck(restart != nil, "RESTART"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
-			r := &SeqRestart{ToStart: true}
-			if p.peek().Kind == TokInt || p.peek().Kind == TokMinus || p.peekKeyword() == "with" {
+			r := &seqRestart{ToStart: true}
+			if p.peek().Kind == tokInt || p.peek().Kind == tokMinus || p.peekKeyword() == "with" {
 				p.consumeKeyword("with")
 				v, err := p.parseSignedIntLiteral()
 				if err != nil {
-					return SeqOptions{}, nil, err
+					return seqOptions{}, nil, err
 				}
-				r = &SeqRestart{Value: v}
+				r = &seqRestart{Value: v}
 			}
 			restart = r
 		case "as":
@@ -1432,69 +1432,69 @@ loop:
 			// type name is stored; it is resolved (and a non-integer type rejected 22023) at
 			// execution. Inside an IDENTITY column's `( … )` a set DataType is 42601.
 			if err := p.dupCheck(seq.DataType != "", "AS"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
 			name, err := p.expectIdentifier()
 			if err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			seq.DataType = name
 		case "increment":
 			if err := p.dupCheck(seq.Increment != nil, "INCREMENT"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
 			p.consumeKeyword("by")
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			seq.Increment = &v
 		case "minvalue":
 			if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
-			seq.MinValue = &SeqBound{Value: v}
+			seq.MinValue = &seqBound{Value: v}
 		case "maxvalue":
 			if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
-			seq.MaxValue = &SeqBound{Value: v}
+			seq.MaxValue = &seqBound{Value: v}
 		case "start":
 			if err := p.dupCheck(seq.Start != nil, "START"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
 			p.consumeKeyword("with")
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			seq.Start = &v
 		case "cache":
 			if err := p.dupCheck(seq.Cache != nil, "CACHE"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			seq.Cache = &v
 		case "cycle":
 			if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
-				return SeqOptions{}, nil, err
+				return seqOptions{}, nil, err
 			}
 			p.advance()
 			t := true
@@ -1505,25 +1505,25 @@ loop:
 			switch p.peekKeyword() {
 			case "minvalue":
 				if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
-					return SeqOptions{}, nil, err
+					return seqOptions{}, nil, err
 				}
 				p.advance()
-				seq.MinValue = &SeqBound{NoValue: true}
+				seq.MinValue = &seqBound{NoValue: true}
 			case "maxvalue":
 				if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
-					return SeqOptions{}, nil, err
+					return seqOptions{}, nil, err
 				}
 				p.advance()
-				seq.MaxValue = &SeqBound{NoValue: true}
+				seq.MaxValue = &seqBound{NoValue: true}
 			case "cycle":
 				if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
-					return SeqOptions{}, nil, err
+					return seqOptions{}, nil, err
 				}
 				p.advance()
 				f := false
 				seq.Cycle = &f
 			default:
-				return SeqOptions{}, nil, NewError(SyntaxError,
+				return seqOptions{}, nil, newError(SyntaxError,
 					fmt.Sprintf("expected MINVALUE, MAXVALUE, or CYCLE after NO, found %q", p.peekKeyword()))
 			}
 		default:
@@ -1531,8 +1531,8 @@ loop:
 		}
 	}
 	if parenthesized {
-		if err := p.expect(TokRParen); err != nil {
-			return SeqOptions{}, nil, err
+		if err := p.expect(tokRParen); err != nil {
+			return seqOptions{}, nil, err
 		}
 	}
 	return seq, restart, nil
@@ -1541,7 +1541,7 @@ loop:
 // parseDropSequence parses `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]`
 // (sequences.md §1). CASCADE is 0A000 at execution; a missing sequence (42P01) is
 // execution-time.
-func (p *Parser) parseDropSequence() (*DropSequence, error) {
+func (p *parser) parseDropSequence() (*dropSequence, error) {
 	if err := p.expectKeyword("drop"); err != nil {
 		return nil, err
 	}
@@ -1560,7 +1560,7 @@ func (p *Parser) parseDropSequence() (*DropSequence, error) {
 		return nil, err
 	}
 	names := []string{first}
-	for p.peek().Kind == TokComma {
+	for p.peek().Kind == tokComma {
 		p.advance()
 		n, err := p.expectIdentifier()
 		if err != nil {
@@ -1577,9 +1577,9 @@ func (p *Parser) parseDropSequence() (*DropSequence, error) {
 		cascade = true
 	}
 	if cascade {
-		return nil, NewError(FeatureNotSupported, "DROP SEQUENCE ... CASCADE is not supported")
+		return nil, newError(FeatureNotSupported, "DROP SEQUENCE ... CASCADE is not supported")
 	}
-	return &DropSequence{Names: names, IfExists: ifExists}, nil
+	return &dropSequence{Names: names, IfExists: ifExists}, nil
 }
 
 // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md
@@ -1587,7 +1587,7 @@ func (p *Parser) parseDropSequence() (*DropSequence, error) {
 // 0A000; otherwise the order-free option loop (the CREATE options plus an interleavable RESTART),
 // requiring ≥ 1 option (a bare ALTER SEQUENCE s is 42601). AS is parsed into the option set and
 // rejected as 0A000 at execution.
-func (p *Parser) parseAlterSequence() (*AlterSequence, error) {
+func (p *parser) parseAlterSequence() (*alterSequence, error) {
 	if err := p.expectKeyword("alter"); err != nil {
 		return nil, err
 	}
@@ -1615,25 +1615,25 @@ func (p *Parser) parseAlterSequence() (*AlterSequence, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &AlterSequence{Name: name, IfExists: ifExists, RenameTo: newName}, nil
+		return &alterSequence{Name: name, IfExists: ifExists, RenameTo: newName}, nil
 	case "owned", "owner", "set":
 		// The remaining unsupported ALTER actions are 0A000 (not syntax errors).
-		return nil, NewError(FeatureNotSupported, "this ALTER SEQUENCE action is not supported")
+		return nil, newError(FeatureNotSupported, "this ALTER SEQUENCE action is not supported")
 	default:
 		options, restart, err := p.parseSeqOptionsInner(false, true)
 		if err != nil {
 			return nil, err
 		}
 		// ≥ 1 action required: a bare ALTER SEQUENCE s (no option, no RESTART) is 42601.
-		if (options == SeqOptions{}) && restart == nil {
-			return nil, NewError(SyntaxError, "ALTER SEQUENCE requires at least one action")
+		if (options == seqOptions{}) && restart == nil {
+			return nil, newError(SyntaxError, "ALTER SEQUENCE requires at least one action")
 		}
-		return &AlterSequence{Name: name, IfExists: ifExists, Options: options, Restart: restart}, nil
+		return &alterSequence{Name: name, IfExists: ifExists, Options: options, Restart: restart}, nil
 	}
 }
 
 // parseIfNotExists consumes an optional `IF NOT EXISTS` prefix, reporting whether it was present.
-func (p *Parser) parseIfNotExists() (bool, error) {
+func (p *parser) parseIfNotExists() (bool, error) {
 	if p.peekKeyword() == "if" {
 		p.advance()
 		if err := p.expectKeyword("not"); err != nil {
@@ -1649,16 +1649,16 @@ func (p *Parser) parseIfNotExists() (bool, error) {
 
 // consumeKeyword consumes an optional noise keyword (e.g. the BY in INCREMENT BY, the WITH in
 // START WITH) when present.
-func (p *Parser) consumeKeyword(kw string) {
+func (p *parser) consumeKeyword(kw string) {
 	if p.peekKeyword() == kw {
 		p.advance()
 	}
 }
 
 // dupCheck reports 42601 when an option appeared twice.
-func (p *Parser) dupCheck(already bool, opt string) error {
+func (p *parser) dupCheck(already bool, opt string) error {
 	if already {
-		return NewError(SyntaxError, fmt.Sprintf("%s specified more than once", opt))
+		return newError(SyntaxError, fmt.Sprintf("%s specified more than once", opt))
 	}
 	return nil
 }
@@ -1667,19 +1667,19 @@ func (p *Parser) dupCheck(already bool, opt string) error {
 // sequence-option value form. The lexer caps an Int magnitude at 2^63, so the only out-of-range
 // case is a bare positive 2^63 (22003 — numeric_value_out_of_range); a negated 2^63 is the
 // i64 minimum (valid).
-func (p *Parser) parseSignedIntLiteral() (int64, error) {
+func (p *parser) parseSignedIntLiteral() (int64, error) {
 	negate := false
-	if p.peek().Kind == TokMinus {
+	if p.peek().Kind == tokMinus {
 		p.advance()
 		negate = true
 	}
 	t := p.advance()
-	if t.Kind != TokInt {
-		return 0, NewError(SyntaxError, fmt.Sprintf("expected an integer, found %v", t))
+	if t.Kind != tokInt {
+		return 0, newError(SyntaxError, fmt.Sprintf("expected an integer, found %v", t))
 	}
 	v, ok := foldInt(t.Int, negate)
 	if !ok {
-		return 0, NewError(NumericValueOutOfRange, "sequence parameter out of i64 range")
+		return 0, newError(NumericValueOutOfRange, "sequence parameter out of i64 range")
 	}
 	return v, nil
 }
@@ -1689,7 +1689,7 @@ func (p *Parser) parseSignedIntLiteral() (int64, error) {
 // keyword. The optional column list names the target columns; unlisted columns take their
 // default. The executor resolves names + type-checks each row and inserts all-or-nothing
 // (spec/design/grammar.md §12, constraints.md §2).
-func (p *Parser) parseInsert() (*Insert, error) {
+func (p *parser) parseInsert() (*insert, error) {
 	if err := p.expectKeyword("insert"); err != nil {
 		return nil, err
 	}
@@ -1704,7 +1704,7 @@ func (p *Parser) parseInsert() (*Insert, error) {
 	// Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
 	// first expectIdentifier errors 42601 on `)`).
 	var columns []string
-	if p.peek().Kind == TokLParen {
+	if p.peek().Kind == tokLParen {
 		p.advance() // '('
 		for {
 			name, err := p.expectIdentifier()
@@ -1713,11 +1713,11 @@ func (p *Parser) parseInsert() (*Insert, error) {
 			}
 			columns = append(columns, name)
 			switch p.advance().Kind {
-			case TokComma:
+			case tokComma:
 				continue
-			case TokRParen:
+			case tokRParen:
 			default:
-				return nil, NewError(SyntaxError, "expected ',' or ')'")
+				return nil, newError(SyntaxError, "expected ',' or ')'")
 			}
 			break
 		}
@@ -1726,17 +1726,17 @@ func (p *Parser) parseInsert() (*Insert, error) {
 	// Optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13), after
 	// the column list and before the source. OVERRIDING / SYSTEM / USER / VALUE are non-reserved;
 	// the clause is unambiguous against a VALUES/SELECT source.
-	var overriding *Overriding
+	var overriding *overridingKind
 	if p.peekKeyword() == "overriding" {
 		p.advance()
-		var mode Overriding
+		var mode overridingKind
 		switch p.peekKeyword() {
 		case "system":
-			mode = OverridingSystem
+			mode = overridingSystem
 		case "user":
-			mode = OverridingUser
+			mode = overridingUser
 		default:
-			return nil, NewError(SyntaxError,
+			return nil, newError(SyntaxError,
 				fmt.Sprintf("expected SYSTEM or USER after OVERRIDING, found %q", p.peekKeyword()))
 		}
 		p.advance()
@@ -1761,21 +1761,21 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Insert{Table: table, Columns: columns, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, Columns: columns, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
 		return nil, err
 	}
 
-	var rows [][]InsertValue
+	var rows [][]insertValue
 	for {
 		row, err := p.parseInsertRow()
 		if err != nil {
 			return nil, err
 		}
 		rows = append(rows, row)
-		if p.peek().Kind == TokComma {
+		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
 		}
@@ -1789,13 +1789,13 @@ func (p *Parser) parseInsert() (*Insert, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Insert{Table: table, Columns: columns, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
+	return &insert{Table: table, Columns: columns, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
 }
 
 // parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —
 // spec/design/upsert.md), after the source and before RETURNING. ON / CONFLICT / DO / NOTHING /
 // CONSTRAINT are not reserved (§3); the clause is recognized by the `ON CONFLICT` two-keyword lead.
-func (p *Parser) parseOnConflict() (*OnConflict, error) {
+func (p *parser) parseOnConflict() (*onConflict, error) {
 	if p.peekKeyword() != "on" || p.peekKeywordAt(1) != "conflict" {
 		return nil, nil
 	}
@@ -1803,8 +1803,8 @@ func (p *Parser) parseOnConflict() (*OnConflict, error) {
 	p.advance() // CONFLICT
 
 	// Optional conflict target: a `( col, … )` column list or `ON CONSTRAINT name`.
-	var target *ConflictTarget
-	if p.peek().Kind == TokLParen {
+	var target *conflictTarget
+	if p.peek().Kind == tokLParen {
 		p.advance() // '('
 		var cols []string
 		for {
@@ -1814,15 +1814,15 @@ func (p *Parser) parseOnConflict() (*OnConflict, error) {
 			}
 			cols = append(cols, name)
 			switch p.advance().Kind {
-			case TokComma:
+			case tokComma:
 				continue
-			case TokRParen:
+			case tokRParen:
 			default:
-				return nil, NewError(SyntaxError, "expected ',' or ')'")
+				return nil, newError(SyntaxError, "expected ',' or ')'")
 			}
 			break
 		}
-		target = &ConflictTarget{Columns: cols}
+		target = &conflictTarget{Columns: cols}
 	} else if p.peekKeyword() == "on" {
 		p.advance() // ON
 		if err := p.expectKeyword("constraint"); err != nil {
@@ -1832,7 +1832,7 @@ func (p *Parser) parseOnConflict() (*OnConflict, error) {
 		if err != nil {
 			return nil, err
 		}
-		target = &ConflictTarget{IsConstraint: true, Constraint: name}
+		target = &conflictTarget{IsConstraint: true, Constraint: name}
 	}
 
 	// The action: `DO NOTHING` or `DO UPDATE SET assignment [, …] [WHERE …]`.
@@ -1842,27 +1842,27 @@ func (p *Parser) parseOnConflict() (*OnConflict, error) {
 	switch p.peekKeyword() {
 	case "nothing":
 		p.advance()
-		return &OnConflict{Target: target, DoUpdate: false}, nil
+		return &onConflict{Target: target, DoUpdate: false}, nil
 	case "update":
 		p.advance()
 		if err := p.expectKeyword("set"); err != nil {
 			return nil, err
 		}
-		var assignments []Assignment
+		var assignments []assignment
 		for {
 			column, err := p.expectIdentifier()
 			if err != nil {
 				return nil, err
 			}
-			if err := p.expect(TokEq); err != nil {
+			if err := p.expect(tokEq); err != nil {
 				return nil, err
 			}
 			value, err := p.parseExpr()
 			if err != nil {
 				return nil, err
 			}
-			assignments = append(assignments, Assignment{Column: column, Value: value})
-			if p.peek().Kind == TokComma {
+			assignments = append(assignments, assignment{Column: column, Value: value})
+			if p.peek().Kind == tokComma {
 				p.advance()
 				continue
 			}
@@ -1872,19 +1872,19 @@ func (p *Parser) parseOnConflict() (*OnConflict, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &OnConflict{Target: target, DoUpdate: true, Assignments: assignments, Filter: filter}, nil
+		return &onConflict{Target: target, DoUpdate: true, Assignments: assignments, Filter: filter}, nil
 	default:
-		return nil, NewError(SyntaxError,
+		return nil, newError(SyntaxError,
 			fmt.Sprintf("expected NOTHING or UPDATE after ON CONFLICT DO, found %q", p.peekKeyword()))
 	}
 }
 
 // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row of an INSERT.
-func (p *Parser) parseInsertRow() ([]InsertValue, error) {
-	if err := p.expect(TokLParen); err != nil {
+func (p *parser) parseInsertRow() ([]insertValue, error) {
+	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
-	var values []InsertValue
+	var values []insertValue
 	for {
 		v, err := p.parseInsertValue()
 		if err != nil {
@@ -1892,16 +1892,16 @@ func (p *Parser) parseInsertRow() ([]InsertValue, error) {
 		}
 		values = append(values, v)
 		switch p.advance().Kind {
-		case TokComma:
+		case tokComma:
 			continue
-		case TokRParen:
+		case tokRParen:
 		default:
-			return nil, NewError(SyntaxError, "expected ',' or ')'")
+			return nil, newError(SyntaxError, "expected ',' or ')'")
 		}
 		break
 	}
 	if len(values) == 0 {
-		return nil, NewError(SyntaxError, "a VALUES row must have at least one value")
+		return nil, newError(SyntaxError, "a VALUES row must have at least one value")
 	}
 	return values, nil
 }
@@ -1909,110 +1909,110 @@ func (p *Parser) parseInsertRow() ([]InsertValue, error) {
 // parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3), a
 // ROW(...) composite constructor (spec/design/composite.md §1), a bind parameter ($N, bound at
 // execute — spec/design/api.md §5), else a literal.
-func (p *Parser) parseInsertValue() (InsertValue, error) {
+func (p *parser) parseInsertValue() (insertValue, error) {
 	if p.peekKeyword() == "default" {
 		p.advance()
-		return InsertValue{IsDefault: true}, nil
+		return insertValue{IsDefault: true}, nil
 	}
-	if p.peekKeyword() == "row" && p.peekKindAt(1) == TokLParen {
+	if p.peekKeyword() == "row" && p.peekKindAt(1) == tokLParen {
 		// ROW(field, field, …) — recurse on each field (a literal, a $N, or a nested ROW).
 		p.advance() // ROW
-		if err := p.expect(TokLParen); err != nil {
-			return InsertValue{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return insertValue{}, err
 		}
-		var fields []InsertValue
-		if p.peek().Kind != TokRParen {
+		var fields []insertValue
+		if p.peek().Kind != tokRParen {
 			for {
 				f, err := p.parseInsertValue()
 				if err != nil {
-					return InsertValue{}, err
+					return insertValue{}, err
 				}
 				fields = append(fields, f)
 				tok := p.advance()
-				if tok.Kind == TokComma {
+				if tok.Kind == tokComma {
 					continue
 				}
-				if tok.Kind == TokRParen {
+				if tok.Kind == tokRParen {
 					break
 				}
-				return InsertValue{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+				return insertValue{}, newError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 			}
 		} else {
 			p.advance() // the empty ROW() — consume ')'
 		}
-		return InsertValue{IsRow: true, Row: fields}, nil
+		return insertValue{IsRow: true, Row: fields}, nil
 	}
-	if p.peekKeyword() == "array" && p.peekKindAt(1) == TokLBracket {
+	if p.peekKeyword() == "array" && p.peekKindAt(1) == tokLBracket {
 		// ARRAY[elem, …] — recurse on each element (a literal or a $N).
 		p.advance() // ARRAY
-		if err := p.expect(TokLBracket); err != nil {
-			return InsertValue{}, err
+		if err := p.expect(tokLBracket); err != nil {
+			return insertValue{}, err
 		}
-		var elems []InsertValue
-		if p.peek().Kind != TokRBracket {
+		var elems []insertValue
+		if p.peek().Kind != tokRBracket {
 			for {
 				e, err := p.parseInsertValue()
 				if err != nil {
-					return InsertValue{}, err
+					return insertValue{}, err
 				}
 				elems = append(elems, e)
 				tok := p.advance()
-				if tok.Kind == TokComma {
+				if tok.Kind == tokComma {
 					continue
 				}
-				if tok.Kind == TokRBracket {
+				if tok.Kind == tokRBracket {
 					break
 				}
-				return InsertValue{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ']', found %v", tok))
+				return insertValue{}, newError(SyntaxError, fmt.Sprintf("expected ',' or ']', found %v", tok))
 			}
 		} else {
 			p.advance() // the empty ARRAY[] — consume ']'
 		}
-		return InsertValue{IsArray: true, Array: elems}, nil
+		return insertValue{IsArray: true, Array: elems}, nil
 	}
-	if p.peek().Kind == TokParam {
+	if p.peek().Kind == tokParam {
 		n := p.advance().Int
-		return InsertValue{IsParam: true, Param: n}, nil
+		return insertValue{IsParam: true, Param: n}, nil
 	}
 	lit, err := p.parseLiteral()
 	if err != nil {
-		return InsertValue{}, err
+		return insertValue{}, err
 	}
-	return InsertValue{Lit: lit}, nil
+	return insertValue{Lit: lit}, nil
 }
 
 // parseLiteral parses a literal value for INSERT: an integer (with an optional leading
 // unary minus, folded here), or one of the keywords NULL / TRUE / FALSE. INSERT takes
 // literals only — not general expressions (spec/grammar/grammar.ebnf `literal`).
-func (p *Parser) parseLiteral() (Literal, error) {
+func (p *parser) parseLiteral() (literal, error) {
 	negate := false
-	if p.peek().Kind == TokMinus {
+	if p.peek().Kind == tokMinus {
 		p.advance()
 		negate = true
 	}
 	t := p.advance()
 	switch {
-	case t.Kind == TokInt:
+	case t.Kind == tokInt:
 		v, ok := foldInt(t.Int, negate)
 		if !ok {
-			return Literal{}, NewError(NumericValueOutOfRange,
+			return literal{}, newError(NumericValueOutOfRange,
 				"value out of range: integer literal exceeds the maximum signed 64-bit value")
 		}
-		return Literal{Kind: LiteralInt, Int: v}, nil
-	case t.Kind == TokDecimal:
+		return literal{Kind: literalInt, Int: v}, nil
+	case t.Kind == tokDecimal:
 		// A decimal literal carries the unscaled coefficient + scale; the leading unary minus
 		// (if any) folds into the sign. Cap checks are at resolve.
-		return Literal{Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(negate, t.Word, uint32(t.Int))}, nil
-	case !negate && t.Kind == TokStr:
-		return Literal{Kind: LiteralText, Str: t.Word}, nil
-	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "null":
-		return Literal{Kind: LiteralNull}, nil
-	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "true":
-		return Literal{Kind: LiteralBool, Bool: true}, nil
-	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "false":
-		return Literal{Kind: LiteralBool, Bool: false}, nil
+		return literal{Kind: literalDecimal, Dec: decimalFromDigitsScale(negate, t.Word, uint32(t.Int))}, nil
+	case !negate && t.Kind == tokStr:
+		return literal{Kind: literalText, Str: t.Word}, nil
+	case !negate && t.Kind == tokWord && toLowerASCII(t.Word) == "null":
+		return literal{Kind: literalNull}, nil
+	case !negate && t.Kind == tokWord && toLowerASCII(t.Word) == "true":
+		return literal{Kind: literalBool, Bool: true}, nil
+	case !negate && t.Kind == tokWord && toLowerASCII(t.Word) == "false":
+		return literal{Kind: literalBool, Bool: false}, nil
 	default:
-		return Literal{}, NewError(SyntaxError, "expected a literal value")
+		return literal{}, newError(SyntaxError, "expected a literal value")
 	}
 }
 
@@ -2025,34 +2025,34 @@ func (p *Parser) parseLiteral() (Literal, error) {
 // applying to the whole result. A lone query (no set operator) folds the trailing clauses back onto
 // the single Select and is returned as Statement{Select}, leaving the plain-query path untouched;
 // otherwise it is Statement{SetOp}.
-func (p *Parser) parseQueryExpr() (Statement, error) {
+func (p *parser) parseQueryExpr() (statement, error) {
 	node, err := p.parseQueryExprNode()
 	if err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
 	if node.Select != nil {
-		return Statement{Select: node.Select}, nil
+		return statement{Select: node.Select}, nil
 	}
-	return Statement{SetOp: node.SetOp}, nil
+	return statement{SetOp: node.SetOp}, nil
 }
 
 // parseQueryExprNode parses a top-level query_expr as a QueryExpr node — a set expression plus an
 // optional trailing ORDER BY / LIMIT / OFFSET folded onto it. The shared core of parseQueryExpr
 // (which wraps it in a Statement) and a WITH clause's main body. Unlike parseSubquery it opens no
 // new nesting level — the body is at the statement top level.
-func (p *Parser) parseQueryExprNode() (QueryExpr, error) {
+func (p *parser) parseQueryExprNode() (queryExpr, error) {
 	node, err := p.parseSetExpr()
 	if err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	// Trailing ORDER BY / LIMIT / OFFSET parse once, onto a scratch Select, then move onto the
 	// outermost node (the lone Select, or the outermost SetOp).
-	var trailing Select
+	var trailing selectStmt
 	if err := p.parseOrderBy(&trailing); err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	if err := p.parseLimitOffset(&trailing); err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	if node.Select != nil {
 		node.Select.OrderBy = trailing.OrderBy
@@ -2071,9 +2071,9 @@ func (p *Parser) parseQueryExprNode() (QueryExpr, error) {
 // (spec/design/recursive-cte.md) sets the Recursive flag and lets a CTE reference itself; the CTE
 // bodies and the main body are WITH-less query_exprs (the top-level-only narrowing — a nested WITH
 // surfaces as 42601 because a body must begin with SELECT).
-func (p *Parser) parseWithStatement() (Statement, error) {
+func (p *parser) parseWithStatement() (statement, error) {
 	if err := p.expectKeyword("with"); err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
 	// `WITH RECURSIVE …` enables self-reference (recursive-cte.md). RECURSIVE in this position is
 	// the keyword (PG reserves it), so a CTE may not be named `recursive` — a documented narrowing.
@@ -2084,14 +2084,14 @@ func (p *Parser) parseWithStatement() (Statement, error) {
 		p.advance()
 		recursive = true
 	}
-	var ctes []Cte
+	var ctes []cte
 	for {
 		cte, err := p.parseCte()
 		if err != nil {
-			return Statement{}, err
+			return statement{}, err
 		}
 		ctes = append(ctes, cte)
-		if p.peek().Kind == TokComma {
+		if p.peek().Kind == tokComma {
 			p.advance()
 		} else {
 			break
@@ -2101,9 +2101,9 @@ func (p *Parser) parseWithStatement() (Statement, error) {
 	// INSERT/UPDATE/DELETE keyword selects it, otherwise a WITH-less query_expr.
 	body, err := p.parseCteBody(false)
 	if err != nil {
-		return Statement{}, err
+		return statement{}, err
 	}
-	return Statement{With: &WithQuery{Ctes: ctes, Body: body, Recursive: recursive}}, nil
+	return statement{With: &withQuery{Ctes: ctes, Body: body, Recursive: recursive}}, nil
 }
 
 // parseCteBody parses a cte_body (spec/design/writable-cte.md): a data-modifying
@@ -2111,7 +2111,7 @@ func (p *Parser) parseWithStatement() (Statement, error) {
 // inside ( … ) (the closing ) is the caller's), false for the WITH primary (it runs to end of
 // statement). A query body parsed here is the WITH-less query_expr (the top-level-only nested-WITH
 // narrowing — a nested WITH surfaces as a leftover 42601).
-func (p *Parser) parseCteBody(parenthesized bool) (CteBody, error) {
+func (p *parser) parseCteBody(parenthesized bool) (cteBody, error) {
 	switch p.peekKeyword() {
 	case "insert", "update", "delete":
 		// A parenthesized data-modifying body counts one nesting level, like parseSubquery does for a
@@ -2119,10 +2119,10 @@ func (p *Parser) parseCteBody(parenthesized bool) (CteBody, error) {
 		// statement top level and does not.
 		if parenthesized {
 			if err := p.deepen(); err != nil {
-				return CteBody{}, err
+				return cteBody{}, err
 			}
 		}
-		var body CteBody
+		var body cteBody
 		var err error
 		switch p.peekKeyword() {
 		case "insert":
@@ -2133,7 +2133,7 @@ func (p *Parser) parseCteBody(parenthesized bool) (CteBody, error) {
 			body.Delete, err = p.parseDelete()
 		}
 		if err != nil {
-			return CteBody{}, err
+			return cteBody{}, err
 		}
 		if parenthesized {
 			p.undeepen()
@@ -2143,15 +2143,15 @@ func (p *Parser) parseCteBody(parenthesized bool) (CteBody, error) {
 		if parenthesized {
 			q, err := p.parseSubquery()
 			if err != nil {
-				return CteBody{}, err
+				return cteBody{}, err
 			}
-			return CteBody{Query: &q}, nil
+			return cteBody{Query: &q}, nil
 		}
 		q, err := p.parseQueryExprNode()
 		if err != nil {
-			return CteBody{}, err
+			return cteBody{}, err
 		}
-		return CteBody{Query: &q}, nil
+		return cteBody{Query: &q}, nil
 	}
 }
 
@@ -2160,33 +2160,33 @@ func (p *Parser) parseCteBody(parenthesized bool) (CteBody, error) {
 // ")"` (spec/design/cte.md). The optional column list renames the body's output columns; [NOT]
 // MATERIALIZED is the explicit evaluation hint. The body reuses parseSubquery (one nesting level,
 // trailing clauses allowed) between its parens.
-func (p *Parser) parseCte() (Cte, error) {
+func (p *parser) parseCte() (cte, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
-		return Cte{}, err
+		return cte{}, err
 	}
 	var columns []string
-	if p.peek().Kind == TokLParen {
+	if p.peek().Kind == tokLParen {
 		p.advance()
 		col, err := p.expectIdentifier()
 		if err != nil {
-			return Cte{}, err
+			return cte{}, err
 		}
 		columns = []string{col}
-		for p.peek().Kind == TokComma {
+		for p.peek().Kind == tokComma {
 			p.advance()
 			col, err := p.expectIdentifier()
 			if err != nil {
-				return Cte{}, err
+				return cte{}, err
 			}
 			columns = append(columns, col)
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Cte{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return cte{}, err
 		}
 	}
 	if err := p.expectKeyword("as"); err != nil {
-		return Cte{}, err
+		return cte{}, err
 	}
 	var materialized *bool
 	switch p.peekKeyword() {
@@ -2202,30 +2202,30 @@ func (p *Parser) parseCte() (Cte, error) {
 			materialized = &f
 		}
 	}
-	if err := p.expect(TokLParen); err != nil {
-		return Cte{}, err
+	if err := p.expect(tokLParen); err != nil {
+		return cte{}, err
 	}
 	body, err := p.parseCteBody(true)
 	if err != nil {
-		return Cte{}, err
+		return cte{}, err
 	}
-	if err := p.expect(TokRParen); err != nil {
-		return Cte{}, err
+	if err := p.expect(tokRParen); err != nil {
+		return cte{}, err
 	}
-	return Cte{Name: name, Columns: columns, Materialized: materialized, Body: body}, nil
+	return cte{Name: name, Columns: columns, Materialized: materialized, Body: body}, nil
 }
 
 // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full
 // set-expression plus an optional trailing ORDER BY / LIMIT / OFFSET folded onto the node. Mirrors
 // parseQueryExpr but yields a QueryExpr (the subquery operand) rather than a Statement. The caller
 // has consumed the opening "(" and consumes the closing ")".
-func (p *Parser) parseSubquery() (QueryExpr, error) {
+func (p *parser) parseSubquery() (queryExpr, error) {
 	// A nested scalar subquery / EXISTS / IN (SELECT …) is one query-nesting level deeper; the
 	// guard also protects the parser's own stack against `(SELECT (SELECT … ))`.
 	if err := p.deepen(); err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
-	var node QueryExpr
+	var node queryExpr
 	var err error
 	if p.atWithClause() {
 		// A leading WITH begins a nested common-table-expression query (spec/design/cte.md §7).
@@ -2234,7 +2234,7 @@ func (p *Parser) parseSubquery() (QueryExpr, error) {
 		node, err = p.parseSubqueryInner()
 	}
 	if err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	p.undeepen()
 	return node, nil
@@ -2243,17 +2243,17 @@ func (p *Parser) parseSubquery() (QueryExpr, error) {
 // parseSubqueryInner parses the non-WITH body of a subquery: a set-expression plus an optional
 // trailing ORDER BY / LIMIT / OFFSET folded onto the node. Split out so a nested WITH's main query
 // (parseWithQueryExpr) reuses it.
-func (p *Parser) parseSubqueryInner() (QueryExpr, error) {
+func (p *parser) parseSubqueryInner() (queryExpr, error) {
 	node, err := p.parseSetExpr()
 	if err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
-	var trailing Select
+	var trailing selectStmt
 	if err := p.parseOrderBy(&trailing); err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	if err := p.parseLimitOffset(&trailing); err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	if node.Select != nil {
 		node.Select.OrderBy = trailing.OrderBy
@@ -2271,23 +2271,23 @@ func (p *Parser) parseSubqueryInner() (QueryExpr, error) {
 // QueryExpr{With} (spec/design/cte.md §7). The CTE bodies reuse parseCte (so a CTE body may itself
 // nest a WITH); the main query is a WITH-less query_expr. A data-modifying CTE body parses here but
 // is rejected at planning (0A000, top-level-only — matching PostgreSQL).
-func (p *Parser) parseWithQueryExpr() (QueryExpr, error) {
+func (p *parser) parseWithQueryExpr() (queryExpr, error) {
 	if err := p.expectKeyword("with"); err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	recursive := false
 	if p.peekKeyword() == "recursive" {
 		p.advance()
 		recursive = true
 	}
-	var ctes []Cte
+	var ctes []cte
 	for {
 		cte, err := p.parseCte()
 		if err != nil {
-			return QueryExpr{}, err
+			return queryExpr{}, err
 		}
 		ctes = append(ctes, cte)
-		if p.peek().Kind == TokComma {
+		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
 		}
@@ -2295,63 +2295,63 @@ func (p *Parser) parseWithQueryExpr() (QueryExpr, error) {
 	}
 	body, err := p.parseSubqueryInner()
 	if err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
-	return QueryExpr{With: &WithExpr{Ctes: ctes, Recursive: recursive, Body: &body}}, nil
+	return queryExpr{With: &withExpr{Ctes: ctes, Recursive: recursive, Body: &body}}, nil
 }
 
 // parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
 // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
 // `a UNION (b INTERSECT c)`.
-func (p *Parser) parseSetExpr() (QueryExpr, error) {
+func (p *parser) parseSetExpr() (queryExpr, error) {
 	base := p.depth
 	left, err := p.parseIntersectExpr()
 	if err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
 	for {
-		var op SetOpKind
+		var op setOpKind
 		switch p.peekKeyword() {
 		case "union":
-			op = SetOpUnion
+			op = setOpUnion
 		case "except":
-			op = SetOpExcept
+			op = setOpExcept
 		default:
 			p.depth = base
 			return left, nil
 		}
 		if err := p.deepen(); err != nil { // each chained UNION/EXCEPT is one more set-op level
-			return QueryExpr{}, err
+			return queryExpr{}, err
 		}
 		p.advance() // UNION | EXCEPT
 		all := p.parseSetOpQuantifier()
 		right, err := p.parseIntersectExpr()
 		if err != nil {
-			return QueryExpr{}, err
+			return queryExpr{}, err
 		}
-		left = QueryExpr{SetOp: &SetOp{Op: op, All: all, Lhs: left, Rhs: right}}
+		left = queryExpr{SetOp: &setOp{Op: op, All: all, Lhs: left, Rhs: right}}
 	}
 }
 
 // parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
-func (p *Parser) parseIntersectExpr() (QueryExpr, error) {
+func (p *parser) parseIntersectExpr() (queryExpr, error) {
 	base := p.depth
 	core, err := p.parseSelectCore()
 	if err != nil {
-		return QueryExpr{}, err
+		return queryExpr{}, err
 	}
-	left := QueryExpr{Select: core}
+	left := queryExpr{Select: core}
 	for p.peekKeyword() == "intersect" {
 		if err := p.deepen(); err != nil { // each chained INTERSECT is one more set-op level
-			return QueryExpr{}, err
+			return queryExpr{}, err
 		}
 		p.advance() // INTERSECT
 		all := p.parseSetOpQuantifier()
 		right, err := p.parseSelectCore()
 		if err != nil {
-			return QueryExpr{}, err
+			return queryExpr{}, err
 		}
-		left = QueryExpr{SetOp: &SetOp{Op: SetOpIntersect, All: all, Lhs: left, Rhs: QueryExpr{Select: right}}}
+		left = queryExpr{SetOp: &setOp{Op: setOpIntersect, All: all, Lhs: left, Rhs: queryExpr{Select: right}}}
 	}
 	p.depth = base
 	return left, nil
@@ -2359,7 +2359,7 @@ func (p *Parser) parseIntersectExpr() (QueryExpr, error) {
 
 // parseSetOpQuantifier consumes the optional ALL (multiset) or DISTINCT (explicit default)
 // quantifier after a set operator, returning whether ALL was given.
-func (p *Parser) parseSetOpQuantifier() bool {
+func (p *parser) parseSetOpQuantifier() bool {
 	switch p.peekKeyword() {
 	case "all":
 		p.advance()
@@ -2375,7 +2375,7 @@ func (p *Parser) parseSetOpQuantifier() bool {
 // parseSelect parses a complete SELECT with its own trailing ORDER BY/LIMIT/OFFSET — the form an
 // INSERT ... SELECT source takes (spec/design/grammar.md §24). Behaviorally identical to the
 // pre-set-operations select: a select_core plus the trailing clauses.
-func (p *Parser) parseSelect() (*Select, error) {
+func (p *parser) parseSelect() (*selectStmt, error) {
 	sel, err := p.parseSelectCore()
 	if err != nil {
 		return nil, err
@@ -2393,7 +2393,7 @@ func (p *Parser) parseSelect() (*Select, error) {
 // set operation (spec/design/grammar.md §25). The returned Select has no OrderBy/Limit/Offset set.
 // The FROM clause is optional: with no `from` keyword the SELECT is FROM-less — one virtual
 // zero-column row (spec/design/grammar.md §34).
-func (p *Parser) parseSelectCore() (*Select, error) {
+func (p *parser) parseSelectCore() (*selectStmt, error) {
 	if err := p.expectKeyword("select"); err != nil {
 		return nil, err
 	}
@@ -2406,7 +2406,7 @@ func (p *Parser) parseSelectCore() (*Select, error) {
 	distinct := false
 	if p.peekKeyword() == "distinct" {
 		next := p.tokens[p.pos+1]
-		modifier := next.Kind != TokEof && !(next.Kind == TokWord && toLowerASCII(next.Word) == "from")
+		modifier := next.Kind != tokEof && !(next.Kind == tokWord && toLowerASCII(next.Word) == "from")
 		if modifier {
 			p.advance()
 			distinct = true
@@ -2417,8 +2417,8 @@ func (p *Parser) parseSelectCore() (*Select, error) {
 	if err != nil {
 		return nil, err
 	}
-	var from *TableRef
-	var joins []JoinClause
+	var from *tableRef
+	var joins []joinClause
 	if p.peekKeyword() == "from" {
 		p.advance() // FROM
 		f, j, err := p.parseFromClause()
@@ -2428,7 +2428,7 @@ func (p *Parser) parseSelectCore() (*Select, error) {
 		from, joins = &f, j
 	}
 
-	sel := &Select{Distinct: distinct, Items: items, From: from, Joins: joins}
+	sel := &selectStmt{Distinct: distinct, Items: items, From: from, Joins: joins}
 
 	filter, err := p.parseOptionalWhere()
 	if err != nil {
@@ -2456,7 +2456,7 @@ func (p *Parser) parseSelectCore() (*Select, error) {
 // ("," …)*` (window.md §5) into sel.Windows. Each entry is a full window definition (which may
 // extend an earlier entry via a leading base-window name — §5). Empty when no WINDOW keyword is
 // present. WINDOW is non-reserved. Each definition reuses parseWindowDefinition with the inline OVER.
-func (p *Parser) parseWindowClause(sel *Select) error {
+func (p *parser) parseWindowClause(sel *selectStmt) error {
 	if p.peekKeyword() != "window" {
 		return nil
 	}
@@ -2469,18 +2469,18 @@ func (p *Parser) parseWindowClause(sel *Select) error {
 		if err := p.expectKeyword("as"); err != nil {
 			return err
 		}
-		if err := p.expect(TokLParen); err != nil {
+		if err := p.expect(tokLParen); err != nil {
 			return err
 		}
 		def, err := p.parseWindowDefinition()
 		if err != nil {
 			return err
 		}
-		if err := p.expect(TokRParen); err != nil {
+		if err := p.expect(tokRParen); err != nil {
 			return err
 		}
-		sel.Windows = append(sel.Windows, NamedWindow{Name: name, Def: def})
-		if p.peek().Kind != TokComma {
+		sel.Windows = append(sel.Windows, namedWindow{Name: name, Def: def})
+		if p.peek().Kind != tokComma {
 			break
 		}
 		p.advance()
@@ -2493,13 +2493,13 @@ func (p *Parser) parseWindowClause(sel *Select) error {
 // The optional leading base-window name (a bareword that is not a clause-introducing keyword) marks
 // a definition that extends a named window — the resolver merges it in (§5). Used by both the
 // inline `OVER ( … )` and the `WINDOW name AS ( … )` clause so the two spellings parse identically.
-func (p *Parser) parseWindowDefinition() (WindowDef, error) {
+func (p *parser) parseWindowDefinition() (windowDef, error) {
 	base := p.parseOptBaseWindowName()
-	var partition []Expr
+	var partition []exprNode
 	if p.peekKeyword() == "partition" {
 		p.advance()
 		if err := p.expectKeyword("by"); err != nil {
-			return WindowDef{}, err
+			return windowDef{}, err
 		}
 		// A PARTITION BY key is a general expression (`PARTITION BY a + b`), not just a column
 		// (spec/design/window.md §5.1). A bare column resolves to its slot directly; a compound
@@ -2507,10 +2507,10 @@ func (p *Parser) parseWindowDefinition() (WindowDef, error) {
 		for {
 			expr, err := p.parseExpr()
 			if err != nil {
-				return WindowDef{}, err
+				return windowDef{}, err
 			}
 			partition = append(partition, expr)
-			if p.peek().Kind != TokComma {
+			if p.peek().Kind != tokComma {
 				break
 			}
 			p.advance()
@@ -2518,13 +2518,13 @@ func (p *Parser) parseWindowDefinition() (WindowDef, error) {
 	}
 	order, err := p.parseWindowOrderBy()
 	if err != nil {
-		return WindowDef{}, err
+		return windowDef{}, err
 	}
 	frame, err := p.parseWindowFrame()
 	if err != nil {
-		return WindowDef{}, err
+		return windowDef{}, err
 	}
-	return WindowDef{Base: base, Partition: partition, Order: order, Frame: frame}, nil
+	return windowDef{Base: base, Partition: partition, Order: order, Frame: frame}, nil
 }
 
 // parseOptBaseWindowName returns the optional leading base-window name of a window definition
@@ -2532,9 +2532,9 @@ func (p *Parser) parseWindowDefinition() (WindowDef, error) {
 // clause-introducing keyword (PARTITION/ORDER/ROWS/RANGE/GROUPS) — those start the definition's own
 // clauses, so an unquoted occurrence is the keyword, never a base name (matching PostgreSQL; a
 // window named like a keyword would need quoting, which jed's window names do not support).
-func (p *Parser) parseOptBaseWindowName() string {
+func (p *parser) parseOptBaseWindowName() string {
 	t := p.peek()
-	if t.Kind != TokWord {
+	if t.Kind != tokWord {
 		return ""
 	}
 	switch toLowerASCII(t.Word) {
@@ -2549,17 +2549,17 @@ func (p *Parser) parseOptBaseWindowName() string {
 // table reference followed by a left-deep chain of zero or more joins. The join keywords are
 // not reserved (§3); the loop recognizes a join only by a leading join keyword, so any other
 // trailing word ends the FROM clause.
-func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
+func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 	from, err := p.parseTableRef()
 	if err != nil {
-		return TableRef{}, nil, err
+		return tableRef{}, nil, err
 	}
-	var joins []JoinClause
+	var joins []joinClause
 	for {
 		for {
 			j, ok, err := p.parseJoinClause()
 			if err != nil {
-				return TableRef{}, nil, err
+				return tableRef{}, nil, err
 			}
 			if !ok {
 				break
@@ -2570,13 +2570,13 @@ func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
 		// top-level FROM items, each its own join sub-chain; it binds LOOSER than JOIN, so the new
 		// item begins a fresh ON-resolution segment (recorded by Comma: true). The inner loop then
 		// picks up any joins of the new item (`a, b JOIN c ON …`) before the next comma.
-		if p.peek().Kind == TokComma {
+		if p.peek().Kind == tokComma {
 			p.advance()
 			table, err := p.parseTableRef()
 			if err != nil {
-				return TableRef{}, nil, err
+				return tableRef{}, nil, err
 			}
-			joins = append(joins, JoinClause{Kind: JoinCross, Table: table, Comma: true})
+			joins = append(joins, joinClause{Kind: joinCross, Table: table, Comma: true})
 			continue
 		}
 		break
@@ -2592,54 +2592,54 @@ func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
 // function form; the resolver owns arity/type errors. The alias logic is shared: an explicit AS
 // takes the next identifier unconditionally; an implicit alias is taken only when the next token is
 // a word that is NOT a clause/join keyword. The stop-keyword set is a §8 surface.
-func (p *Parser) parseTableRef() (TableRef, error) {
+func (p *parser) parseTableRef() (tableRef, error) {
 	// An optional leading LATERAL (grammar.md §44) marks a derived table / table function as
 	// correlated to the EARLIER FROM relations. LATERAL is non-reserved (§3), so it is the keyword
 	// only when a derived table `(` or a function call `name(` follows (a two-token lookahead) —
 	// otherwise it is an ordinary identifier (e.g. a table named `lateral`). A table function is
 	// implicitly lateral regardless, so the keyword is redundant (but accepted) there.
 	lateral := p.peekKeyword() == "lateral" &&
-		(p.peekKindAt(1) == TokLParen ||
-			(p.peekKindAt(1) == TokWord && p.peekKindAt(2) == TokLParen))
+		(p.peekKindAt(1) == tokLParen ||
+			(p.peekKindAt(1) == tokWord && p.peekKindAt(2) == tokLParen))
 	if lateral {
 		p.advance()
 	}
-	if p.peek().Kind == TokLParen {
+	if p.peek().Kind == tokLParen {
 		tr, err := p.parseDerivedTable()
 		if err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 		tr.Lateral = lateral
 		return tr, nil
 	}
 	// `JSON_TABLE(ctx, path [AS n] COLUMNS (…))` — a table source (json-table.md §3, T1), recognized
 	// by the keyword followed by `(`.
-	if p.peekKeyword() == "json_table" && p.peekKindAt(1) == TokLParen {
+	if p.peekKeyword() == "json_table" && p.peekKindAt(1) == tokLParen {
 		return p.parseJsonTable()
 	}
 	name, err := p.expectIdentifier()
 	if err != nil {
-		return TableRef{}, err
+		return tableRef{}, err
 	}
 	// A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
-	var args []*Expr
+	var args []*exprNode
 	isFunc := false
-	if p.peek().Kind == TokLParen {
+	if p.peek().Kind == tokLParen {
 		isFunc = true
 		p.advance()
 		for {
 			arg, err := p.parseExpr()
 			if err != nil {
-				return TableRef{}, err
+				return tableRef{}, err
 			}
 			args = append(args, &arg)
-			if p.peek().Kind != TokComma {
+			if p.peek().Kind != tokComma {
 				break
 			}
 			p.advance()
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return TableRef{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return tableRef{}, err
 		}
 	}
 	var alias *string
@@ -2647,10 +2647,10 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 		p.advance()
 		a, err := p.expectIdentifier()
 		if err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 		alias = &a
-	} else if t := p.peek(); t.Kind == TokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+	} else if t := p.peek(); t.Kind == tokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
 		a := t.Word
 		p.advance()
 		alias = &a
@@ -2659,78 +2659,78 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 	// there). The TYPED column-definition list `AS t(col type, …)` (C0, json-table.md §1) — for the
 	// record-returning functions — is parsed here; the rename-only form `AS g(col)` (no type) stays a
 	// deferred narrowing (grammar.md §35).
-	var columnDefs []TypeFieldDef
-	if alias != nil && p.peek().Kind == TokLParen {
+	var columnDefs []typeFieldDef
+	if alias != nil && p.peek().Kind == tokLParen {
 		// Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. With the
 		// cursor still on `(`, the first column name is at offset 1, so a `Word` at offset 2 means a
 		// type follows (col-def list).
-		if p.peekKindAt(2) != TokWord {
-			return TableRef{}, NewError(FeatureNotSupported,
+		if p.peekKindAt(2) != tokWord {
+			return tableRef{}, newError(FeatureNotSupported,
 				"column alias list on a table function is not supported yet")
 		}
 		p.advance() // (
 		defs, err := p.parseFieldDefList()
 		if err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 		columnDefs = defs
 	}
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
-	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args, ColumnDefs: columnDefs, Lateral: lateral}, nil
+	return tableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args, ColumnDefs: columnDefs, Lateral: lateral}, nil
 }
 
 // parseJsonTable parses `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md §3,
 // T1). The caller has verified the `JSON_TABLE` keyword + `(`. An explicit PLAN clause and a PASSING
 // clause are the deferred T2 (0A000).
-func (p *Parser) parseJsonTable() (TableRef, error) {
+func (p *parser) parseJsonTable() (tableRef, error) {
 	p.advance() // JSON_TABLE
 	p.advance() // (
 	ctx, err := p.parseExpr()
 	if err != nil {
-		return TableRef{}, err
+		return tableRef{}, err
 	}
 	p.skipFormatJSON()
-	if err := p.expect(TokComma); err != nil {
-		return TableRef{}, err
+	if err := p.expect(tokComma); err != nil {
+		return tableRef{}, err
 	}
 	path, err := p.parseExpr()
 	if err != nil {
-		return TableRef{}, err
+		return tableRef{}, err
 	}
 	// An optional `AS name` for the root path (the path-name) is accepted and ignored (it only matters
 	// with an explicit PLAN clause, the deferred T2).
 	if p.peekKeyword() == "as" {
 		p.advance()
 		if _, err := p.expectIdentifier(); err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 	}
 	if p.peekKeyword() == "passing" {
-		return TableRef{}, NewError(FeatureNotSupported, "JSON_TABLE PASSING clause is not supported yet")
+		return tableRef{}, newError(FeatureNotSupported, "JSON_TABLE PASSING clause is not supported yet")
 	}
 	if err := p.expectKeyword("columns"); err != nil {
-		return TableRef{}, err
+		return tableRef{}, err
 	}
 	columns, err := p.parseJtColumns()
 	if err != nil {
-		return TableRef{}, err
+		return tableRef{}, err
 	}
 	// An explicit PLAN clause is the deferred T2 slice.
 	if p.peekKeyword() == "plan" {
-		return TableRef{}, NewError(FeatureNotSupported, "JSON_TABLE explicit PLAN clause is not supported yet")
+		return tableRef{}, newError(FeatureNotSupported, "JSON_TABLE explicit PLAN clause is not supported yet")
 	}
-	if err := p.expect(TokRParen); err != nil {
-		return TableRef{}, err
+	if err := p.expect(tokRParen); err != nil {
+		return tableRef{}, err
 	}
 	var alias *string
 	if p.peekKeyword() == "as" {
 		p.advance()
 		a, err := p.expectIdentifier()
 		if err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 		alias = &a
-	} else if t := p.peek(); t.Kind == TokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+	} else if t := p.peek(); t.Kind == tokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
 		a := t.Word
 		p.advance()
 		alias = &a
@@ -2739,25 +2739,25 @@ func (p *Parser) parseJsonTable() (TableRef, error) {
 	if alias != nil {
 		name = *alias
 	}
-	return TableRef{
+	return tableRef{
 		Name:      name,
 		Alias:     alias,
-		JsonTable: &JsonTable{Ctx: &ctx, Path: &path, Columns: columns},
+		JsonTable: &jsonTable{Ctx: &ctx, Path: &path, Columns: columns},
 	}, nil
 }
 
 // parseJtColumns parses a parenthesized `JSON_TABLE` `COLUMNS` list — `"(" jt_column ("," jt_column)*
 // ")"`.
-func (p *Parser) parseJtColumns() ([]JtColumn, error) {
-	if err := p.expect(TokLParen); err != nil {
+func (p *parser) parseJtColumns() ([]jtColumn, error) {
+	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
 	first, err := p.parseJtColumn()
 	if err != nil {
 		return nil, err
 	}
-	cols := []JtColumn{first}
-	for p.peek().Kind == TokComma {
+	cols := []jtColumn{first}
+	for p.peek().Kind == tokComma {
 		p.advance()
 		c, err := p.parseJtColumn()
 		if err != nil {
@@ -2765,7 +2765,7 @@ func (p *Parser) parseJtColumns() ([]JtColumn, error) {
 		}
 		cols = append(cols, c)
 	}
-	if err := p.expect(TokRParen); err != nil {
+	if err := p.expect(tokRParen); err != nil {
 		return nil, err
 	}
 	return cols, nil
@@ -2774,15 +2774,15 @@ func (p *Parser) parseJtColumns() ([]JtColumn, error) {
 // parseJtColumn parses one `JSON_TABLE` column: `NESTED [PATH] p [AS n] COLUMNS (…)`, `name FOR
 // ORDINALITY`, `name type EXISTS [PATH p] [ON ERROR]`, or a regular `name type [PATH p] [wrapper]
 // [quotes] [ON …]` column (json-table.md §3.3).
-func (p *Parser) parseJtColumn() (JtColumn, error) {
+func (p *parser) parseJtColumn() (jtColumn, error) {
 	if p.peekKeyword() == "nested" {
 		p.advance() // NESTED
 		if p.peekKeyword() == "path" {
 			p.advance()
 		}
 		tok := p.advance()
-		if tok.Kind != TokStr {
-			return nil, NewError(SyntaxError, "expected a string path after NESTED PATH")
+		if tok.Kind != tokStr {
+			return nil, newError(SyntaxError, "expected a string path after NESTED PATH")
 		}
 		path := tok.Word
 		if p.peekKeyword() == "as" {
@@ -2798,7 +2798,7 @@ func (p *Parser) parseJtColumn() (JtColumn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &JtColumnNested{Path: path, Columns: columns}, nil
+		return &jtColumnNested{Path: path, Columns: columns}, nil
 	}
 	name, err := p.expectIdentifier()
 	if err != nil {
@@ -2810,7 +2810,7 @@ func (p *Parser) parseJtColumn() (JtColumn, error) {
 		if err := p.expectKeyword("ordinality"); err != nil {
 			return nil, err
 		}
-		return &JtColumnOrdinality{Name: name}, nil
+		return &jtColumnOrdinality{Name: name}, nil
 	}
 	// `name type …` — parse the type name + optional `[]`.
 	typeName, err := p.expectIdentifier()
@@ -2818,9 +2818,9 @@ func (p *Parser) parseJtColumn() (JtColumn, error) {
 		return nil, err
 	}
 	array := false
-	if p.peek().Kind == TokLBracket {
+	if p.peek().Kind == tokLBracket {
 		p.advance()
-		if err := p.expect(TokRBracket); err != nil {
+		if err := p.expect(tokRBracket); err != nil {
 			return nil, err
 		}
 		array = true
@@ -2836,7 +2836,7 @@ func (p *Parser) parseJtColumn() (JtColumn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &JtColumnExists{Name: name, TypeName: typeName, Path: path, OnError: onError}, nil
+		return &jtColumnExists{Name: name, TypeName: typeName, Path: path, OnError: onError}, nil
 	}
 	// A regular column.
 	p.skipFormatJSON()
@@ -2852,7 +2852,7 @@ func (p *Parser) parseJtColumn() (JtColumn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &JtColumnRegular{
+	return &jtColumnRegular{
 		Name:       name,
 		TypeName:   typeName,
 		Array:      array,
@@ -2866,14 +2866,14 @@ func (p *Parser) parseJtColumn() (JtColumn, error) {
 
 // parseJtPathClause parses an optional `PATH '<string>'` clause on a JSON_TABLE column → the literal
 // path string, or nil when absent (the column then defaults to `$.<name>`).
-func (p *Parser) parseJtPathClause() (*string, error) {
+func (p *parser) parseJtPathClause() (*string, error) {
 	if p.peekKeyword() != "path" {
 		return nil, nil
 	}
 	p.advance()
 	tok := p.advance()
-	if tok.Kind != TokStr {
-		return nil, NewError(SyntaxError, "expected a string after PATH")
+	if tok.Kind != tokStr {
+		return nil, newError(SyntaxError, "expected a string after PATH")
 	}
 	s := tok.Word
 	return &s, nil
@@ -2886,34 +2886,34 @@ func (p *Parser) parseJtPathClause() (*string, error) {
 // the old mandatory-alias rule): present, it is the label and may carry a column-rename list; absent,
 // the relation has no qualifier (its bare columns still resolve). Name/Alias carry the alias (empty
 // when none).
-func (p *Parser) parseDerivedTable() (TableRef, error) {
+func (p *parser) parseDerivedTable() (tableRef, error) {
 	// Consume the opening `(`. The body is EITHER a query_expr (a leading SELECT) OR a VALUES list
 	// (a leading VALUES) — FROM (VALUES (e…),(e…)), a computed relation of literal rows
 	// (spec/design/grammar.md §42); any other leading `(` is rejected (a parenthesized-join FROM
 	// `(a JOIN b ON …)` is a deferred narrowing).
 	p.advance()
-	var body *QueryExpr
-	var values [][]*Expr
+	var body *queryExpr
+	var values [][]*exprNode
 	switch {
 	case p.peekKeyword() == "values":
 		v, err := p.parseValuesBody()
 		if err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 		values = v
 	case p.atSubqueryStart():
 		// A leading SELECT, or a nested WITH (cte.md §7), is a query_expr body.
 		b, err := p.parseSubquery()
 		if err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 		body = &b
 	default:
-		return TableRef{}, NewError(SyntaxError,
+		return tableRef{}, newError(SyntaxError,
 			"subquery in FROM must begin with SELECT or VALUES (a parenthesized join is not supported)")
 	}
-	if err := p.expect(TokRParen); err != nil {
-		return TableRef{}, err
+	if err := p.expect(tokRParen); err != nil {
+		return tableRef{}, err
 	}
 	// The alias is optional, parsed exactly like a base table's.
 	var alias *string
@@ -2921,10 +2921,10 @@ func (p *Parser) parseDerivedTable() (TableRef, error) {
 		p.advance()
 		a, err := p.expectIdentifier()
 		if err != nil {
-			return TableRef{}, err
+			return tableRef{}, err
 		}
 		alias = &a
-	} else if t := p.peek(); t.Kind == TokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+	} else if t := p.peek(); t.Kind == tokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
 		a := t.Word
 		p.advance()
 		alias = &a
@@ -2933,28 +2933,28 @@ func (p *Parser) parseDerivedTable() (TableRef, error) {
 	// list with no preceding alias name is a syntax error; the bare `(` falls through and a later
 	// token check rejects it).
 	var columnAliases []string
-	if alias != nil && p.peek().Kind == TokLParen {
+	if alias != nil && p.peek().Kind == tokLParen {
 		p.advance()
 		for {
 			c, err := p.expectIdentifier()
 			if err != nil {
-				return TableRef{}, err
+				return tableRef{}, err
 			}
 			columnAliases = append(columnAliases, c)
-			if p.peek().Kind != TokComma {
+			if p.peek().Kind != tokComma {
 				break
 			}
 			p.advance()
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return TableRef{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return tableRef{}, err
 		}
 	}
 	name := ""
 	if alias != nil {
 		name = *alias
 	}
-	return TableRef{Name: name, Alias: alias, Subquery: body, Values: values, ColumnAliases: columnAliases}, nil
+	return tableRef{Name: name, Alias: alias, Subquery: body, Values: values, ColumnAliases: columnAliases}, nil
 }
 
 // parseValuesBody parses a VALUES-body's rows — VALUES "(" expr ("," expr)* ")" ("," …)*
@@ -2964,32 +2964,32 @@ func (p *Parser) parseDerivedTable() (TableRef, error) {
 // across rows and per-column type unification are resolve-time concerns (the executor's planValues).
 // At least one row, each with at least one value. NO trailing ORDER BY / LIMIT is consumed — the
 // caller's `)` follows the last row.
-func (p *Parser) parseValuesBody() ([][]*Expr, error) {
+func (p *parser) parseValuesBody() ([][]*exprNode, error) {
 	if err := p.expectKeyword("values"); err != nil {
 		return nil, err
 	}
-	var rows [][]*Expr
+	var rows [][]*exprNode
 	for {
-		if err := p.expect(TokLParen); err != nil {
+		if err := p.expect(tokLParen); err != nil {
 			return nil, err
 		}
-		var row []*Expr
+		var row []*exprNode
 		for {
 			e, err := p.parseExpr()
 			if err != nil {
 				return nil, err
 			}
 			row = append(row, &e)
-			if p.peek().Kind != TokComma {
+			if p.peek().Kind != tokComma {
 				break
 			}
 			p.advance()
 		}
-		if err := p.expect(TokRParen); err != nil {
+		if err := p.expect(tokRParen); err != nil {
 			return nil, err
 		}
 		rows = append(rows, row)
-		if p.peek().Kind != TokComma {
+		if p.peek().Kind != tokComma {
 			break
 		}
 		p.advance()
@@ -3001,7 +3001,7 @@ func (p *Parser) parseValuesBody() ([][]*Expr, error) {
 // the FROM chain). CROSS JOIN has no ON; the INNER/outer kinds require ON <expr> (a missing ON
 // is 42601). The outer kinds (LEFT/RIGHT/FULL [OUTER]) parse into the AST but are rejected at
 // execution (0A000) — spec/design/grammar.md §15.
-func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
+func (p *parser) parseJoinClause() (joinClause, bool, error) {
 	// An optional leading NATURAL (grammar.md §15) makes the join derive its USING list from the
 	// common column names. It is non-reserved (in the table-ref stop set so it is not swallowed as
 	// the prior relation's alias); once consumed it MUST be followed by a join (a NATURAL CROSS JOIN
@@ -3011,27 +3011,27 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 		p.advance()
 	}
 	kw := p.peekKeyword()
-	var kind JoinKind
+	var kind joinKind
 	isCross := false
 	switch kw {
 	case "join": // a bare JOIN is INNER
 		p.advance()
-		kind = JoinInner
+		kind = joinInner
 	case "inner":
 		p.advance()
 		if err := p.expectKeyword("join"); err != nil {
-			return JoinClause{}, false, err
+			return joinClause{}, false, err
 		}
-		kind = JoinInner
+		kind = joinInner
 	case "cross":
 		if natural {
-			return JoinClause{}, false, NewError(SyntaxError, "NATURAL CROSS JOIN is not allowed")
+			return joinClause{}, false, newError(SyntaxError, "NATURAL CROSS JOIN is not allowed")
 		}
 		p.advance()
 		if err := p.expectKeyword("join"); err != nil {
-			return JoinClause{}, false, err
+			return joinClause{}, false, err
 		}
-		kind = JoinCross
+		kind = joinCross
 		isCross = true
 	case "left", "right", "full":
 		p.advance()
@@ -3039,68 +3039,68 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 			p.advance()
 		}
 		if err := p.expectKeyword("join"); err != nil {
-			return JoinClause{}, false, err
+			return joinClause{}, false, err
 		}
 		switch kw {
 		case "left":
-			kind = JoinLeft
+			kind = joinLeft
 		case "right":
-			kind = JoinRight
+			kind = joinRight
 		default:
-			kind = JoinFull
+			kind = joinFull
 		}
 	default:
 		// After NATURAL a join keyword is required; otherwise the FROM chain just ends here.
 		if natural {
-			return JoinClause{}, false, NewError(SyntaxError, "NATURAL must be followed by a join")
+			return joinClause{}, false, newError(SyntaxError, "NATURAL must be followed by a join")
 		}
-		return JoinClause{}, false, nil
+		return joinClause{}, false, nil
 	}
 	table, err := p.parseTableRef()
 	if err != nil {
-		return JoinClause{}, false, err
+		return joinClause{}, false, err
 	}
 	// A non-CROSS, non-NATURAL join takes either `ON <expr>` or `USING (col, …)` (grammar.md §15).
 	// A NATURAL join derives its condition (no ON/USING), and CROSS takes none. USING is not
 	// reserved (§3): it is the join condition only as the keyword immediately following the right
 	// table_ref. The column list has one or more names; an empty list is a 42601.
-	var on *Expr
+	var on *exprNode
 	var using []string
 	switch {
 	case isCross || natural:
 		// no condition (NATURAL derives it; CROSS has none)
 	case p.peekKeyword() == "using":
 		p.advance()
-		if err := p.expect(TokLParen); err != nil {
-			return JoinClause{}, false, err
+		if err := p.expect(tokLParen); err != nil {
+			return joinClause{}, false, err
 		}
 		name, err := p.expectIdentifier()
 		if err != nil {
-			return JoinClause{}, false, err
+			return joinClause{}, false, err
 		}
 		using = []string{name}
-		for p.peek().Kind == TokComma {
+		for p.peek().Kind == tokComma {
 			p.advance()
 			name, err := p.expectIdentifier()
 			if err != nil {
-				return JoinClause{}, false, err
+				return joinClause{}, false, err
 			}
 			using = append(using, name)
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return JoinClause{}, false, err
+		if err := p.expect(tokRParen); err != nil {
+			return joinClause{}, false, err
 		}
 	default:
 		if err := p.expectKeyword("on"); err != nil {
-			return JoinClause{}, false, err
+			return joinClause{}, false, err
 		}
 		e, err := p.parseExpr()
 		if err != nil {
-			return JoinClause{}, false, err
+			return joinClause{}, false, err
 		}
 		on = &e
 	}
-	return JoinClause{Kind: kind, Table: table, On: on, Using: using, Natural: natural}, true, nil
+	return joinClause{Kind: kind, Table: table, On: on, Using: using, Natural: natural}, true, nil
 }
 
 // isTableRefStopKeyword reports whether kw (already lower-cased) is a keyword that may legally
@@ -3144,7 +3144,7 @@ func isTableRefStopKeyword(kw string) bool {
 // ROLLUP/CUBE/GROUPING SETS (spec/design/aggregates.md §12); every grouping column is a
 // bare/qualified column (the same narrowing ORDER BY makes). `GROUP` is not reserved, so it is a
 // clause only when immediately followed by `BY`.
-func (p *Parser) parseGroupBy(sel *Select) error {
+func (p *parser) parseGroupBy(sel *selectStmt) error {
 	if p.peekKeyword() != "group" {
 		return nil
 	}
@@ -3158,7 +3158,7 @@ func (p *Parser) parseGroupBy(sel *Select) error {
 			return err
 		}
 		sel.GroupBy = append(sel.GroupBy, item)
-		if p.peek().Kind == TokComma {
+		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
 		}
@@ -3171,66 +3171,66 @@ func (p *Parser) parseGroupBy(sel *Select) error {
 // ordinary column group (a bare column, a parenthesized `(a, b)`, or the empty set `()`). Also used
 // for the elements of a GROUPING SETS list (which may nest these forms). ROLLUP/CUBE/GROUPING/SETS
 // are unreserved, recognized by lookahead only.
-func (p *Parser) parseGroupItem() (GroupItem, error) {
+func (p *parser) parseGroupItem() (groupItem, error) {
 	switch p.peekKeyword() {
 	case "rollup":
 		p.advance()
 		groups, err := p.parseGroupSetList()
-		return GroupItem{Kind: GroupRollup, Groups: groups}, err
+		return groupItem{Kind: groupRollup, Groups: groups}, err
 	case "cube":
 		p.advance()
 		groups, err := p.parseGroupSetList()
-		return GroupItem{Kind: GroupCube, Groups: groups}, err
+		return groupItem{Kind: groupCube, Groups: groups}, err
 	case "grouping":
 		if p.peekKeywordAt(1) == "sets" {
 			p.advance() // GROUPING
 			p.advance() // SETS
-			if err := p.expect(TokLParen); err != nil {
-				return GroupItem{}, err
+			if err := p.expect(tokLParen); err != nil {
+				return groupItem{}, err
 			}
-			var elems []GroupItem
+			var elems []groupItem
 			for {
 				elem, err := p.parseGroupItem()
 				if err != nil {
-					return GroupItem{}, err
+					return groupItem{}, err
 				}
 				elems = append(elems, elem)
-				if p.peek().Kind == TokComma {
+				if p.peek().Kind == tokComma {
 					p.advance()
 					continue
 				}
 				break
 			}
-			if err := p.expect(TokRParen); err != nil {
-				return GroupItem{}, err
+			if err := p.expect(tokRParen); err != nil {
+				return groupItem{}, err
 			}
-			return GroupItem{Kind: GroupGroupingSets, Elems: elems}, nil
+			return groupItem{Kind: groupGroupingSets, Elems: elems}, nil
 		}
 	}
 	cols, err := p.parseGroupSet()
-	return GroupItem{Kind: GroupSet, Cols: cols}, err
+	return groupItem{Kind: groupSet, Cols: cols}, err
 }
 
 // parseGroupSetList parses the parenthesized `( group_set ("," group_set)* )` argument list of
 // ROLLUP / CUBE, where each element is a grouping expression group (spec/design/aggregates.md §12/§15).
-func (p *Parser) parseGroupSetList() ([][]Expr, error) {
-	if err := p.expect(TokLParen); err != nil {
+func (p *parser) parseGroupSetList() ([][]exprNode, error) {
+	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
-	var sets [][]Expr
+	var sets [][]exprNode
 	for {
 		set, err := p.parseGroupSet()
 		if err != nil {
 			return nil, err
 		}
 		sets = append(sets, set)
-		if p.peek().Kind == TokComma {
+		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
 		}
 		break
 	}
-	if err := p.expect(TokRParen); err != nil {
+	if err := p.expect(tokRParen); err != nil {
 		return nil, err
 	}
 	return sets, nil
@@ -3241,25 +3241,25 @@ func (p *Parser) parseGroupSetList() ([][]Expr, error) {
 // select-list ordinal (a bare integer literal), an output alias, or any expression (aggregates.md
 // §15). A parenthesized list of two-or-more is a column group `(a, b)`; a single parenthesized
 // expression `(a + b)` is one term — both fall out of parsing a comma-list of expressions.
-func (p *Parser) parseGroupSet() ([]Expr, error) {
-	if p.peek().Kind == TokLParen {
+func (p *parser) parseGroupSet() ([]exprNode, error) {
+	if p.peek().Kind == tokLParen {
 		p.advance()
-		cols := []Expr{}
-		if p.peek().Kind != TokRParen {
+		cols := []exprNode{}
+		if p.peek().Kind != tokRParen {
 			for {
 				e, err := p.parseExpr()
 				if err != nil {
 					return nil, err
 				}
 				cols = append(cols, e)
-				if p.peek().Kind == TokComma {
+				if p.peek().Kind == tokComma {
 					p.advance()
 					continue
 				}
 				break
 			}
 		}
-		if err := p.expect(TokRParen); err != nil {
+		if err := p.expect(tokRParen); err != nil {
 			return nil, err
 		}
 		return cols, nil
@@ -3268,22 +3268,22 @@ func (p *Parser) parseGroupSet() ([]Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []Expr{e}, nil
+	return []exprNode{e}, nil
 }
 
 // columnRefExpr builds a bare or qualified column-reference Expr from a parsed column_ref (the GROUP
 // BY grouping terms are columns only — spec/design/aggregates.md §12).
-func columnRefExpr(qualifier, col string) Expr {
+func columnRefExpr(qualifier, col string) exprNode {
 	if qualifier != "" {
-		return Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col}
+		return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: col}
 	}
-	return Expr{Kind: ExprColumn, Column: col}
+	return exprNode{Kind: exprColumn, Column: col}
 }
 
 // parseHaving parses `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and
 // before ORDER BY. `HAVING` is not reserved; the predicate is a general expression (it may
 // reference aggregates) checked for boolean at resolve.
-func (p *Parser) parseHaving(sel *Select) error {
+func (p *parser) parseHaving(sel *selectStmt) error {
 	if p.peekKeyword() != "having" {
 		return nil
 	}
@@ -3303,7 +3303,7 @@ func (p *Parser) parseHaving(sel *Select) error {
 // column's collation still apply); anything else is a general expression key. (WITHIN GROUP inlines
 // its own column-only loop, so an integer there is a 42601 — matching PostgreSQL where a WITHIN GROUP
 // integer is a constant, not an ordinal.)
-func (p *Parser) parseOrderBy(sel *Select) error {
+func (p *parser) parseOrderBy(sel *selectStmt) error {
 	if p.peekKeyword() != "order" {
 		return nil
 	}
@@ -3321,7 +3321,7 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 			return err
 		}
 		sel.OrderBy = append(sel.OrderBy, classifyOrderKey(expr, collation, descending, nullsFirst, true))
-		if p.peek().Kind == TokComma {
+		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
 		}
@@ -3338,28 +3338,28 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 // wrapped in a COLLATE that parseExpr absorbed (`ORDER BY name COLLATE "x"`) — is a column key carrying
 // that collation, so it stays on the fast path (PK-scan elision, per-column collation); every other
 // shape is a general expression key.
-func classifyOrderKey(expr Expr, collation string, descending, nullsFirst, allowOrdinal bool) OrderKey {
+func classifyOrderKey(expr exprNode, collation string, descending, nullsFirst, allowOrdinal bool) orderKey {
 	switch expr.Kind {
-	case ExprLiteral:
-		if allowOrdinal && expr.Literal != nil && expr.Literal.Kind == LiteralInt {
+	case exprLiteral:
+		if allowOrdinal && expr.Literal != nil && expr.Literal.Kind == literalInt {
 			ord := expr.Literal.Int
-			return OrderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+			return orderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 		}
-	case ExprColumn:
-		return OrderKey{Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
-	case ExprQualifiedColumn:
-		return OrderKey{Qualifier: expr.Qualifier, Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
-	case ExprCollate:
+	case exprColumn:
+		return orderKey{Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+	case exprQualifiedColumn:
+		return orderKey{Qualifier: expr.Qualifier, Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+	case exprCollate:
 		// parseExpr folds a trailing `COLLATE "x"` into the key (collation.md §1). When it wraps a bare
 		// column, unwrap back to a column key carrying that explicit collation — exactly the column-only
 		// OrderKey the old parser built, so the column fast path is byte-identical.
-		if inner := expr.Collate.Inner; inner.Kind == ExprColumn {
-			return OrderKey{Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
-		} else if inner.Kind == ExprQualifiedColumn {
-			return OrderKey{Qualifier: inner.Qualifier, Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
+		if inner := expr.Collate.Inner; inner.Kind == exprColumn {
+			return orderKey{Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
+		} else if inner.Kind == exprQualifiedColumn {
+			return orderKey{Qualifier: inner.Qualifier, Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
 		}
 	}
-	return OrderKey{Expr: &expr, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+	return orderKey{Expr: &expr, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 }
 
 // parseSortSuffix parses the trailing modifiers shared by every sort key: an optional `COLLATE
@@ -3368,7 +3368,7 @@ func classifyOrderKey(expr Expr, collation string, descending, nullsFirst, allow
 // direction default (ASC → NULLS LAST, DESC → NULLS FIRST: NULL is the largest value, the PostgreSQL
 // model, grammar.md §10). A bare `NULLS` not followed by FIRST/LAST is 42601. Used by both the query
 // ORDER BY (after a column ref) and the window ORDER BY (after a general expression).
-func (p *Parser) parseSortSuffix() (string, bool, bool, error) {
+func (p *parser) parseSortSuffix() (string, bool, bool, error) {
 	collation := ""
 	if p.peekKeyword() == "collate" {
 		p.advance()
@@ -3397,7 +3397,7 @@ func (p *Parser) parseSortSuffix() (string, bool, bool, error) {
 			p.advance()
 			nullsFirst = false
 		default:
-			return "", false, false, NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
+			return "", false, false, newError(SyntaxError, "NULLS must be followed by FIRST or LAST")
 		}
 	}
 	return collation, descending, nullsFirst, nil
@@ -3406,12 +3406,12 @@ func (p *Parser) parseSortSuffix() (string, bool, bool, error) {
 // parseLimitOffset parses an optional trailing `LIMIT <count>` and/or `OFFSET <count>`
 // in either order, each at most once (a repeat is a syntax error, 42601), setting the
 // resolved non-negative counts on sel (spec/grammar/grammar.ebnf `limit_offset`).
-func (p *Parser) parseLimitOffset(sel *Select) error {
+func (p *parser) parseLimitOffset(sel *selectStmt) error {
 	for {
 		switch p.peekKeyword() {
 		case "limit":
 			if sel.Limit != nil {
-				return NewError(SyntaxError, "duplicate LIMIT clause")
+				return newError(SyntaxError, "duplicate LIMIT clause")
 			}
 			p.advance()
 			n, err := p.parseCount(true)
@@ -3421,7 +3421,7 @@ func (p *Parser) parseLimitOffset(sel *Select) error {
 			sel.Limit = &n
 		case "offset":
 			if sel.Offset != nil {
-				return NewError(SyntaxError, "duplicate OFFSET clause")
+				return newError(SyntaxError, "duplicate OFFSET clause")
 			}
 			p.advance()
 			n, err := p.parseCount(false)
@@ -3439,33 +3439,33 @@ func (p *Parser) parseLimitOffset(sel *Select) error {
 // folded as in parseLiteral; a negative value is rejected with 2201W (LIMIT) / 2201X
 // (OFFSET), and a magnitude over i64's max traps 22003 (the value -0 folds to 0 and is
 // accepted). isLimit selects which structured error to raise.
-func (p *Parser) parseCount(isLimit bool) (int64, error) {
+func (p *parser) parseCount(isLimit bool) (int64, error) {
 	negate := false
-	if p.peek().Kind == TokMinus {
+	if p.peek().Kind == tokMinus {
 		p.advance()
 		negate = true
 	}
 	t := p.advance()
-	if t.Kind != TokInt {
-		return 0, NewError(SyntaxError, "expected an integer count")
+	if t.Kind != tokInt {
+		return 0, newError(SyntaxError, "expected an integer count")
 	}
 	v, ok := foldInt(t.Int, negate)
 	if !ok {
-		return 0, NewError(NumericValueOutOfRange,
+		return 0, newError(NumericValueOutOfRange,
 			"value out of range: count exceeds the maximum signed 64-bit value")
 	}
 	if v < 0 {
 		if isLimit {
-			return 0, NewError(InvalidRowCountInLimitClause, "LIMIT must not be negative")
+			return 0, newError(InvalidRowCountInLimitClause, "LIMIT must not be negative")
 		}
-		return 0, NewError(InvalidRowCountInOffsetClause, "OFFSET must not be negative")
+		return 0, newError(InvalidRowCountInOffsetClause, "OFFSET must not be negative")
 	}
 	return v, nil
 }
 
 // parseUpdate parses
 // `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
-func (p *Parser) parseUpdate() (*Update, error) {
+func (p *parser) parseUpdate() (*update, error) {
 	if err := p.expectKeyword("update"); err != nil {
 		return nil, err
 	}
@@ -3477,28 +3477,28 @@ func (p *Parser) parseUpdate() (*Update, error) {
 		return nil, err
 	}
 
-	var assignments []Assignment
+	var assignments []assignment
 	for {
 		column, err := p.expectIdentifier()
 		if err != nil {
 			return nil, err
 		}
-		if err := p.expect(TokEq); err != nil {
+		if err := p.expect(tokEq); err != nil {
 			return nil, err
 		}
 		value, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		assignments = append(assignments, Assignment{Column: column, Value: value})
-		if p.peek().Kind == TokComma {
+		assignments = append(assignments, assignment{Column: column, Value: value})
+		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
 		}
 		break
 	}
 	if len(assignments) == 0 {
-		return nil, NewError(SyntaxError, "UPDATE must set at least one column")
+		return nil, newError(SyntaxError, "UPDATE must set at least one column")
 	}
 
 	filter, err := p.parseOptionalWhere()
@@ -3509,11 +3509,11 @@ func (p *Parser) parseUpdate() (*Update, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Update{Table: table, Assignments: assignments, Filter: filter, Returning: returning}, nil
+	return &update{Table: table, Assignments: assignments, Filter: filter, Returning: returning}, nil
 }
 
 // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
-func (p *Parser) parseDelete() (*Delete, error) {
+func (p *parser) parseDelete() (*deleteStmt, error) {
 	if err := p.expectKeyword("delete"); err != nil {
 		return nil, err
 	}
@@ -3532,13 +3532,13 @@ func (p *Parser) parseDelete() (*Delete, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Delete{Table: table, Filter: filter, Returning: returning}, nil
+	return &deleteStmt{Table: table, Filter: filter, Returning: returning}, nil
 }
 
 // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
 // SELECT / UPDATE / DELETE). The expression must resolve to boolean (checked by the
 // executor).
-func (p *Parser) parseOptionalWhere() (*Expr, error) {
+func (p *parser) parseOptionalWhere() (*exprNode, error) {
 	if p.peekKeyword() != "where" {
 		return nil, nil
 	}
@@ -3556,7 +3556,7 @@ func (p *Parser) parseOptionalWhere() (*Expr, error) {
 // so an `INSERT ... SELECT` source never swallows it — §15). The item list is the ordinary
 // select-items production (`*` or expressions with optional AS labels); an empty list fails
 // in parseExpr (42601).
-func (p *Parser) parseReturning() (*SelectItems, error) {
+func (p *parser) parseReturning() (*selectItems, error) {
 	if p.peekKeyword() != "returning" {
 		return nil, nil
 	}
@@ -3568,26 +3568,26 @@ func (p *Parser) parseReturning() (*SelectItems, error) {
 	return &items, nil
 }
 
-func (p *Parser) parseSelectItems() (SelectItems, error) {
-	if p.peek().Kind == TokStar {
+func (p *parser) parseSelectItems() (selectItems, error) {
+	if p.peek().Kind == tokStar {
 		p.advance()
-		return SelectItems{All: true}, nil
+		return selectItems{All: true}, nil
 	}
-	var items []SelectItem
+	var items []selectItem
 	for {
 		// `t.*` — a qualified star (all columns of the relation labeled `t`), a select-list /
 		// RETURNING item MIXABLE with other items (grammar.md §15). Recognized by the three-token
 		// shape `identifier "." "*"` before the general expr parser, so `t.col` (Dot then a word)
 		// and `a * b` (no Dot) are untouched, and a bare `*` was already handled above. No `AS` alias.
-		if p.peek().Kind == TokWord && p.peekKindAt(1) == TokDot && p.peekKindAt(2) == TokStar {
+		if p.peek().Kind == tokWord && p.peekKindAt(1) == tokDot && p.peekKindAt(2) == tokStar {
 			qualifier, err := p.expectIdentifier()
 			if err != nil {
-				return SelectItems{}, err
+				return selectItems{}, err
 			}
 			p.advance() // .
 			p.advance() // *
-			items = append(items, SelectItem{Expr: Expr{Kind: ExprQualifiedStar, Qualifier: qualifier}})
-			if p.peek().Kind == TokComma {
+			items = append(items, selectItem{Expr: exprNode{Kind: exprQualifiedStar, Qualifier: qualifier}})
+			if p.peek().Kind == tokComma {
 				p.advance()
 				continue
 			}
@@ -3595,7 +3595,7 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 		}
 		e, err := p.parseExpr()
 		if err != nil {
-			return SelectItems{}, err
+			return selectItems{}, err
 		}
 		// Optional `AS alias` output label. `AS` is not reserved, so it is taken as an
 		// alias marker only here, after a complete expr (spec/grammar/grammar.ebnf
@@ -3605,18 +3605,18 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 			p.advance()
 			name, err := p.expectIdentifier()
 			if err != nil {
-				return SelectItems{}, err
+				return selectItems{}, err
 			}
 			alias = &name
 		}
-		items = append(items, SelectItem{Expr: e, Alias: alias})
-		if p.peek().Kind == TokComma {
+		items = append(items, selectItem{Expr: e, Alias: alias})
+		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
 		}
 		break
 	}
-	return SelectItems{Items: items}, nil
+	return selectItems{Items: items}, nil
 }
 
 // --- expression precedence ladder (spec/grammar/grammar.ebnf `expr`) ----------
@@ -3626,76 +3626,76 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 // this ladder must agree with it.
 
 // parseExpr is the entry point for WHERE, the SELECT list, and UPDATE assignment values.
-func (p *Parser) parseExpr() (Expr, error) {
+func (p *parser) parseExpr() (exprNode, error) {
 	// A fresh sub-expression is one nesting level deeper (parens, ARRAY/ROW/CASE/function
 	// operands, subscript indices all re-enter here). Bounds the recursive descent itself.
 	if err := p.deepen(); err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	e, err := p.parseOr()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	p.undeepen()
 	return e, nil
 }
 
-func (p *Parser) parseOr() (Expr, error) {
+func (p *parser) parseOr() (exprNode, error) {
 	base := p.depth
 	lhs, err := p.parseAnd()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	for p.peekKeyword() == "or" {
 		if err := p.deepen(); err != nil { // each chained OR is one more AST level
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.advance()
 		rhs, err := p.parseAnd()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		lhs = binaryExpr(OpOr, lhs, rhs)
+		lhs = newBinaryExpr(opOr, lhs, rhs)
 	}
 	p.depth = base
 	return lhs, nil
 }
 
-func (p *Parser) parseAnd() (Expr, error) {
+func (p *parser) parseAnd() (exprNode, error) {
 	base := p.depth
 	lhs, err := p.parseNot()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	for p.peekKeyword() == "and" {
 		if err := p.deepen(); err != nil { // each chained AND is one more AST level
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.advance()
 		rhs, err := p.parseNot()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		lhs = binaryExpr(OpAnd, lhs, rhs)
+		lhs = newBinaryExpr(opAnd, lhs, rhs)
 	}
 	p.depth = base
 	return lhs, nil
 }
 
-func (p *Parser) parseNot() (Expr, error) {
+func (p *parser) parseNot() (exprNode, error) {
 	if p.peekKeyword() == "not" {
 		p.advance()
 		// right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so the
 		// depth guard also protects the parser's own stack).
 		if err := p.deepen(); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		operand, err := p.parseNot()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.undeepen()
-		return Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: operand}}, nil
+		return exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: operand}}, nil
 	}
 	return p.parseComparison()
 }
@@ -3704,10 +3704,10 @@ func (p *Parser) parseNot() (Expr, error) {
 // IS [NOT] DISTINCT FROM, all non-associative: `a = b = c` is a syntax error, and
 // `a + 1 IS NULL` binds as `(a + 1) IS NULL`. After the shared `IS` `NOT`? it dispatches
 // on the NULL vs DISTINCT FROM keyword (spec/grammar/grammar.ebnf `comparison`).
-func (p *Parser) parseComparison() (Expr, error) {
+func (p *parser) parseComparison() (exprNode, error) {
 	lhs, err := p.parseConcat()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	if p.peekKeyword() == "is" {
 		p.advance()
@@ -3720,32 +3720,32 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if p.peekKeyword() == "distinct" {
 			p.advance()
 			if err := p.expectKeyword("from"); err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			rhs, err := p.parseConcat()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			return Expr{Kind: ExprIsDistinct, IsDistinct: &IsDistinctExpr{Lhs: lhs, Rhs: rhs, Negated: negated}}, nil
+			return exprNode{Kind: exprIsDistinct, IsDistinct: &isDistinctExpr{Lhs: lhs, Rhs: rhs, Negated: negated}}, nil
 		}
 		// IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
 		// well-formedness predicate (json-sql-functions.md §5).
 		if p.peekKeyword() == "json" {
 			p.advance()
-			kind := JPKValue
+			kind := jPKValue
 			switch p.peekKeyword() {
 			case "value":
 				p.advance()
-				kind = JPKValue
+				kind = jPKValue
 			case "scalar":
 				p.advance()
-				kind = JPKScalar
+				kind = jPKScalar
 			case "array":
 				p.advance()
-				kind = JPKArray
+				kind = jPKArray
 			case "object":
 				p.advance()
-				kind = JPKObject
+				kind = jPKObject
 			}
 			// The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only
 			// when `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no
@@ -3759,12 +3759,12 @@ func (p *Parser) parseComparison() (Expr, error) {
 				}
 				uniqueKeys = w == "with"
 			}
-			return Expr{Kind: ExprIsJson, IsJsonOf: &IsJsonExpr{Operand: lhs, Negated: negated, Kind: kind, UniqueKeys: uniqueKeys}}, nil
+			return exprNode{Kind: exprIsJson, IsJsonOf: &isJsonExpr{Operand: lhs, Negated: negated, Kind: kind, UniqueKeys: uniqueKeys}}, nil
 		}
 		if err := p.expectKeyword("null"); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprIsNull, IsNullOf: &IsNullExpr{Operand: lhs, Negated: negated}}, nil
+		return exprNode{Kind: exprIsNull, IsNullOf: &isNullExpr{Operand: lhs, Negated: negated}}, nil
 	}
 	// `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when followed
 	// by one of these postfix-predicate keywords (two-token lookahead; the prefix `NOT` was
@@ -3777,8 +3777,8 @@ func (p *Parser) parseComparison() (Expr, error) {
 	}
 	if p.peekKeyword() == "in" {
 		p.advance()
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		// `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by a
 		// leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
@@ -3786,31 +3786,31 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if p.atSubqueryStart() {
 			q, err := p.parseSubquery()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			if err := p.expect(TokRParen); err != nil {
-				return Expr{}, err
+			if err := p.expect(tokRParen); err != nil {
+				return exprNode{}, err
 			}
-			return Expr{Kind: ExprInSubquery, InSubquery: &InSubqueryExpr{Lhs: lhs, Query: q, Negated: predNegated}}, nil
+			return exprNode{Kind: exprInSubquery, InSubquery: &inSubqueryExpr{Lhs: lhs, Query: q, Negated: predNegated}}, nil
 		}
 		// A non-empty value list (`IN ()` — parseConcat on `)` is a 42601 syntax error).
 		first, err := p.parseConcat()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		list := []Expr{first}
-		for p.peek().Kind == TokComma {
+		list := []exprNode{first}
+		for p.peek().Kind == tokComma {
 			p.advance()
 			elem, err := p.parseConcat()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			list = append(list, elem)
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprIn, In: &InExpr{Lhs: lhs, List: list, Negated: predNegated}}, nil
+		return exprNode{Kind: exprIn, In: &inExpr{Lhs: lhs, List: list, Negated: predNegated}}, nil
 	}
 	if p.peekKeyword() == "between" {
 		p.advance()
@@ -3820,16 +3820,16 @@ func (p *Parser) parseComparison() (Expr, error) {
 		// (grammar.md §21); a `||` bound still works.
 		lo, err := p.parseConcat()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		if err := p.expectKeyword("and"); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		hi, err := p.parseConcat()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprBetween, Between: &BetweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
+		return exprNode{Kind: exprBetween, Between: &betweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
 	}
 	// LIKE / ILIKE (case-insensitive) — grammar.md §22. `ilike` is just another peeked keyword.
 	if p.peekKeyword() == "like" || p.peekKeyword() == "ilike" {
@@ -3837,9 +3837,9 @@ func (p *Parser) parseComparison() (Expr, error) {
 		p.advance()
 		rhs, err := p.parseConcat()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprLike, Like: &LikeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}}, nil
+		return exprNode{Kind: exprLike, Like: &likeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}}, nil
 	}
 	// `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
 	// `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
@@ -3847,12 +3847,12 @@ func (p *Parser) parseComparison() (Expr, error) {
 	var rxNegated, rxInsensitive bool
 	rxMatch := true
 	switch p.peek().Kind {
-	case TokTilde:
-	case TokTildeStar:
+	case tokTilde:
+	case tokTildeStar:
 		rxInsensitive = true
-	case TokBangTilde:
+	case tokBangTilde:
 		rxNegated = true
-	case TokBangTildeStar:
+	case tokBangTildeStar:
 		rxNegated, rxInsensitive = true, true
 	default:
 		rxMatch = false
@@ -3861,24 +3861,24 @@ func (p *Parser) parseComparison() (Expr, error) {
 		p.advance()
 		rhs, err := p.parseConcat()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprRegex, Regex: &RegexExpr{Lhs: lhs, Rhs: rhs, Negated: rxNegated, Insensitive: rxInsensitive}}, nil
+		return exprNode{Kind: exprRegex, Regex: &regexExpr{Lhs: lhs, Rhs: rhs, Negated: rxNegated, Insensitive: rxInsensitive}}, nil
 	}
-	var op BinaryOp
+	var op binaryOp
 	switch p.peek().Kind {
-	case TokEq:
-		op = OpEq
-	case TokNe:
-		op = OpNe
-	case TokLt:
-		op = OpLt
-	case TokGt:
-		op = OpGt
-	case TokLe:
-		op = OpLe
-	case TokGe:
-		op = OpGe
+	case tokEq:
+		op = opEq
+	case tokNe:
+		op = opNe
+	case tokLt:
+		op = opLt
+	case tokGt:
+		op = opGt
+	case tokLe:
+		op = opLe
+	case tokGe:
+		op = opGe
 	default:
 		return lhs, nil
 	}
@@ -3888,8 +3888,8 @@ func (p *Parser) parseComparison() (Expr, error) {
 	if kw := p.peekKeyword(); kw == "all" || kw == "any" || kw == "some" {
 		all := kw == "all"
 		p.advance() // ANY / SOME / ALL
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		// A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery spelling of
 		// IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead (or a nested `WITH` —
@@ -3897,27 +3897,27 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if p.atSubqueryStart() {
 			query, err := p.parseSubquery()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			if err := p.expect(TokRParen); err != nil {
-				return Expr{}, err
+			if err := p.expect(tokRParen); err != nil {
+				return exprNode{}, err
 			}
-			return Expr{Kind: ExprQuantifiedSubquery, QuantifiedSubquery: &QuantifiedSubqueryExpr{Op: op, All: all, Lhs: lhs, Query: query}}, nil
+			return exprNode{Kind: exprQuantifiedSubquery, QuantifiedSubquery: &quantifiedSubqueryExpr{Op: op, All: all, Lhs: lhs, Query: query}}, nil
 		}
 		array, err := p.parseExpr() // a full expression resolving to an array
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprQuantified, Quantified: &QuantifiedExpr{Op: op, All: all, Lhs: lhs, Array: array}}, nil
+		return exprNode{Kind: exprQuantified, Quantified: &quantifiedExpr{Op: op, All: all, Lhs: lhs, Array: array}}, nil
 	}
 	rhs, err := p.parseConcat()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
-	return binaryExpr(op, lhs, rhs), nil
+	return newBinaryExpr(op, lhs, rhs), nil
 }
 
 // parseConcat parses the "any other operator" level (grammar.md §39/§40, array-functions.md §8/§10):
@@ -3925,128 +3925,128 @@ func (p *Parser) parseComparison() (Expr, error) {
 // concatenation plus the `@>`/`<@`/`&&` array containment/overlap operators — all the same precedence
 // in PostgreSQL. Each operand is an additive expression, so `a + b || c` is `(a + b) || c`; chaining
 // mixes freely (`a || b @> c` is `(a || b) @> c`).
-func (p *Parser) parseConcat() (Expr, error) {
+func (p *parser) parseConcat() (exprNode, error) {
 	base := p.depth
 	lhs, err := p.parseAdditive()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	for {
-		var op BinaryOp
+		var op binaryOp
 		switch p.peek().Kind {
-		case TokConcat:
-			op = OpConcat
-		case TokContains:
-			op = OpContains
-		case TokJsonPathExists:
-			op = OpJsonPathExists
-		case TokJsonPathMatch:
-			op = OpJsonPathMatch
-		case TokContainedBy:
-			op = OpContainedBy
-		case TokOverlaps:
-			op = OpOverlaps
-		case TokStrictlyLeft:
-			op = OpStrictlyLeft
-		case TokStrictlyRight:
-			op = OpStrictlyRight
-		case TokNotExtendRight:
-			op = OpNotExtendRight
-		case TokNotExtendLeft:
-			op = OpNotExtendLeft
-		case TokAdjacent:
-			op = OpAdjacent
+		case tokConcat:
+			op = opConcat
+		case tokContains:
+			op = opContains
+		case tokJsonPathExists:
+			op = opJsonPathExists
+		case tokJsonPathMatch:
+			op = opJsonPathMatch
+		case tokContainedBy:
+			op = opContainedBy
+		case tokOverlaps:
+			op = opOverlaps
+		case tokStrictlyLeft:
+			op = opStrictlyLeft
+		case tokStrictlyRight:
+			op = opStrictlyRight
+		case tokNotExtendRight:
+			op = opNotExtendRight
+		case tokNotExtendLeft:
+			op = opNotExtendLeft
+		case tokAdjacent:
+			op = opAdjacent
 		// The jsonb accessor operators (json-sql-functions.md §1) — "any other operator" precedence,
 		// same level as `@>`/`||`, left-associative (`doc -> 'a' -> 'b'`).
-		case TokArrow:
-			op = OpJsonGet
-		case TokArrowText:
-			op = OpJsonGetText
-		case TokHashArrow:
-			op = OpJsonGetPath
-		case TokHashArrowText:
-			op = OpJsonGetPathText
-		case TokQuestion:
-			op = OpJsonHasKey
-		case TokQuestionPipe:
-			op = OpJsonHasAnyKey
-		case TokQuestionAmp:
-			op = OpJsonHasAllKeys
-		case TokHashMinus:
-			op = OpJsonDeletePath
+		case tokArrow:
+			op = opJsonGet
+		case tokArrowText:
+			op = opJsonGetText
+		case tokHashArrow:
+			op = opJsonGetPath
+		case tokHashArrowText:
+			op = opJsonGetPathText
+		case tokQuestion:
+			op = opJsonHasKey
+		case tokQuestionPipe:
+			op = opJsonHasAnyKey
+		case tokQuestionAmp:
+			op = opJsonHasAllKeys
+		case tokHashMinus:
+			op = opJsonDeletePath
 		default:
 			p.depth = base
 			return lhs, nil
 		}
 		if err := p.deepen(); err != nil { // each chained operator is one more AST level
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.advance()
 		rhs, err := p.parseAdditive()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		lhs = binaryExpr(op, lhs, rhs)
+		lhs = newBinaryExpr(op, lhs, rhs)
 	}
 }
 
-func (p *Parser) parseAdditive() (Expr, error) {
+func (p *parser) parseAdditive() (exprNode, error) {
 	base := p.depth
 	lhs, err := p.parseMultiplicative()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	for {
-		var op BinaryOp
+		var op binaryOp
 		switch p.peek().Kind {
-		case TokPlus:
-			op = OpAdd
-		case TokMinus:
-			op = OpSub
+		case tokPlus:
+			op = opAdd
+		case tokMinus:
+			op = opSub
 		default:
 			p.depth = base
 			return lhs, nil
 		}
 		if err := p.deepen(); err != nil { // each chained +/- is one more AST level (`1+1+…`)
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.advance()
 		rhs, err := p.parseMultiplicative()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		lhs = binaryExpr(op, lhs, rhs)
+		lhs = newBinaryExpr(op, lhs, rhs)
 	}
 }
 
-func (p *Parser) parseMultiplicative() (Expr, error) {
+func (p *parser) parseMultiplicative() (exprNode, error) {
 	base := p.depth
 	lhs, err := p.parseAtTimeZone()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	for {
-		var op BinaryOp
+		var op binaryOp
 		switch p.peek().Kind {
-		case TokStar:
-			op = OpMul
-		case TokSlash:
-			op = OpDiv
-		case TokPercent:
-			op = OpMod
+		case tokStar:
+			op = opMul
+		case tokSlash:
+			op = opDiv
+		case tokPercent:
+			op = opMod
 		default:
 			p.depth = base
 			return lhs, nil
 		}
 		if err := p.deepen(); err != nil { // each chained * / % is one more AST level
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.advance()
 		rhs, err := p.parseAtTimeZone()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		lhs = binaryExpr(op, lhs, rhs)
+		lhs = newBinaryExpr(op, lhs, rhs)
 	}
 }
 
@@ -4056,68 +4056,68 @@ func (p *Parser) parseMultiplicative() (Expr, error) {
 // function call `timezone(zone, value)` — PostgreSQL's own implementation — so the resolver/evaluator/
 // cost have one path for the operator and the bare call. AT/TIME/ZONE are non-reserved (matched as a
 // three-token sequence), so a bare column named at/time/zone is unaffected.
-func (p *Parser) parseAtTimeZone() (Expr, error) {
+func (p *parser) parseAtTimeZone() (exprNode, error) {
 	base := p.depth
 	lhs, err := p.parseUnary()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	for p.peekKeyword() == "at" && p.peekKeywordAt(1) == "time" && p.peekKeywordAt(2) == "zone" {
 		if err := p.deepen(); err != nil { // each chained AT TIME ZONE is one more AST level
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.advance() // AT
 		p.advance() // TIME
 		p.advance() // ZONE
 		zone, err := p.parseUnary()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		prev := lhs // capture before reassigning, so the &-of-value stays stable
-		lhs = Expr{Kind: ExprFuncCall, FuncCall: &FuncCallExpr{
+		lhs = exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{
 			Name: "timezone",
-			Args: []*Expr{&zone, &prev},
+			Args: []*exprNode{&zone, &prev},
 		}}
 	}
 	p.depth = base
 	return lhs, nil
 }
 
-func (p *Parser) parseUnary() (Expr, error) {
-	if p.peek().Kind == TokMinus {
+func (p *parser) parseUnary() (exprNode, error) {
+	if p.peek().Kind == tokMinus {
 		p.advance()
 		// Fold unary-minus-of-an-integer-literal into one negative literal, so i64's
 		// minimum is representable and the literal range-checks against context. SUPPRESSED
 		// when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
 		// so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first
 		// (grammar.md §37). A one-token lookahead on the token AFTER the literal.
-		if p.peek().Kind == TokInt && p.peekKindAt(1) != TokDoubleColon {
+		if p.peek().Kind == tokInt && p.peekKindAt(1) != tokDoubleColon {
 			v, ok := foldInt(p.advance().Int, true)
 			if !ok {
-				return Expr{}, NewError(NumericValueOutOfRange,
+				return exprNode{}, newError(NumericValueOutOfRange,
 					"value out of range: integer literal exceeds the maximum signed 64-bit value")
 			}
-			return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
+			return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: v}}, nil
 		}
 		// Fold unary-minus of a decimal literal into one negative decimal literal (decimal
 		// negation never overflows). Same `::` suppression.
-		if p.peek().Kind == TokDecimal && p.peekKindAt(1) != TokDoubleColon {
+		if p.peek().Kind == tokDecimal && p.peekKindAt(1) != tokDoubleColon {
 			t := p.advance()
-			return Expr{Kind: ExprLiteral, Literal: &Literal{
-				Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(true, t.Word, uint32(t.Int)),
+			return exprNode{Kind: exprLiteral, Literal: &literal{
+				Kind: literalDecimal, Dec: decimalFromDigitsScale(true, t.Word, uint32(t.Int)),
 			}}, nil
 		}
 		// each chained unary `-` is one more AST level (recursion here, so the depth guard also
 		// protects the parser's own stack against `- - - … x`).
 		if err := p.deepen(); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		operand, err := p.parseUnary()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		p.undeepen()
-		return Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNeg, Operand: operand}}, nil
+		return exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNeg, Operand: operand}}, nil
 	}
 	return p.parsePostfix()
 }
@@ -4136,117 +4136,117 @@ func (p *Parser) parseUnary() (Expr, error) {
 // the primary started with `(` or after a previous `.field`; otherwise the `.` is left for the
 // caller (a trailing `.field` on a bare name is then a syntax error, like PG). NB: a bare `a.b` is
 // consumed as a single ExprQualifiedColumn by parseColumnRef inside parsePrimary.
-func (p *Parser) parsePostfix() (Expr, error) {
+func (p *parser) parsePostfix() (exprNode, error) {
 	// Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A subsequent
 	// `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
 	base0 := p.depth
-	fieldAccessible := p.peek().Kind == TokLParen
+	fieldAccessible := p.peek().Kind == tokLParen
 	expr, err := p.parsePrimary()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	for {
 		// each postfix `::`/`[…]`/`.field`/COLLATE wraps the base in one more AST level; deepen only
 		// when a postfix actually follows (not on the terminating non-postfix token). COLLATE shares
 		// this rung so it binds tighter than `||` and the comparisons (PG precedence).
-		isCollate := p.peek().Kind == TokWord && p.peekKeyword() == "collate"
-		isPostfix := p.peek().Kind == TokDoubleColon || p.peek().Kind == TokLBracket ||
-			(p.peek().Kind == TokDot && fieldAccessible) || isCollate
+		isCollate := p.peek().Kind == tokWord && p.peekKeyword() == "collate"
+		isPostfix := p.peek().Kind == tokDoubleColon || p.peek().Kind == tokLBracket ||
+			(p.peek().Kind == tokDot && fieldAccessible) || isCollate
 		if !isPostfix {
 			p.depth = base0
 			return expr, nil
 		}
 		if err := p.deepen(); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		switch {
 		case isCollate:
 			p.advance() // COLLATE
 			name, err := p.expectCollationName()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			expr = Expr{Kind: ExprCollate, Collate: &CollateExpr{Inner: expr, Collation: name}}
+			expr = exprNode{Kind: exprCollate, Collate: &collateExpr{Inner: expr, Collation: name}}
 			fieldAccessible = false
-		case p.peek().Kind == TokDoubleColon:
+		case p.peek().Kind == tokDoubleColon:
 			p.advance()
 			typeName, err := p.expectIdentifier()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			typeMod, err := p.parseTypeMod()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			isArray, err := p.consumeArrayBrackets()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			if isArray {
 				typeName += "[]"
 			}
-			expr = Expr{Kind: ExprCast, Cast: &CastExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
+			expr = exprNode{Kind: exprCast, Cast: &castExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
 			fieldAccessible = false
 		// `base[..][..]` — array subscript (spec/design/array.md §6). Applies to ANY base (no parens
 		// rule, unlike `.field`). Consecutive `[…]` brackets collect into ONE access (so `a[1][2]` is
 		// a single multidim element read, not nested). Each spec is an index `[i]` or a slice `[m:n]`
 		// (bounds optionally omitted). After a subscript a `.field` still needs parens (PG).
-		case p.peek().Kind == TokLBracket:
+		case p.peek().Kind == tokLBracket:
 			base := expr
-			var subs []SubscriptSpec
-			for p.peek().Kind == TokLBracket {
+			var subs []subscriptSpec
+			for p.peek().Kind == tokLBracket {
 				p.advance() // [
 				// The lower bound / index is absent only before a `:` or `]` (`[:n]`, `[]`).
-				var lower *Expr
-				if p.peek().Kind != TokColon && p.peek().Kind != TokRBracket {
+				var lower *exprNode
+				if p.peek().Kind != tokColon && p.peek().Kind != tokRBracket {
 					e, err := p.parseExpr()
 					if err != nil {
-						return Expr{}, err
+						return exprNode{}, err
 					}
 					lower = &e
 				}
-				if p.peek().Kind == TokColon {
+				if p.peek().Kind == tokColon {
 					p.advance() // :
-					var upper *Expr
-					if p.peek().Kind != TokRBracket {
+					var upper *exprNode
+					if p.peek().Kind != tokRBracket {
 						e, err := p.parseExpr()
 						if err != nil {
-							return Expr{}, err
+							return exprNode{}, err
 						}
 						upper = &e
 					}
-					if err := p.expect(TokRBracket); err != nil {
-						return Expr{}, err
+					if err := p.expect(tokRBracket); err != nil {
+						return exprNode{}, err
 					}
-					subs = append(subs, SubscriptSpec{IsSlice: true, Lower: lower, Upper: upper})
+					subs = append(subs, subscriptSpec{IsSlice: true, Lower: lower, Upper: upper})
 				} else {
 					// Index form: a bare `[]` (no index, no colon) is a syntax error.
 					if lower == nil {
-						return Expr{}, NewError(SyntaxError, "array subscript requires an index")
+						return exprNode{}, newError(SyntaxError, "array subscript requires an index")
 					}
-					if err := p.expect(TokRBracket); err != nil {
-						return Expr{}, err
+					if err := p.expect(tokRBracket); err != nil {
+						return exprNode{}, err
 					}
-					subs = append(subs, SubscriptSpec{Index: lower})
+					subs = append(subs, subscriptSpec{Index: lower})
 				}
 			}
-			expr = Expr{Kind: ExprSubscript, Base: &base, Subscripts: subs}
+			expr = exprNode{Kind: exprSubscript, Base: &base, Subscripts: subs}
 			fieldAccessible = false
 		// `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
 		// parens-required: only on a parenthesized / chained-field base.
-		case p.peek().Kind == TokDot && fieldAccessible:
+		case p.peek().Kind == tokDot && fieldAccessible:
 			p.advance()
 			base := expr
-			if p.peek().Kind == TokStar {
+			if p.peek().Kind == tokStar {
 				p.advance()
-				expr = Expr{Kind: ExprFieldStar, Base: &base}
+				expr = exprNode{Kind: exprFieldStar, Base: &base}
 				fieldAccessible = false // `.*` is terminal
 			} else {
 				field, err := p.expectIdentifier()
 				if err != nil {
-					return Expr{}, err
+					return exprNode{}, err
 				}
-				expr = Expr{Kind: ExprFieldAccess, Base: &base, Field: field}
+				expr = exprNode{Kind: exprFieldAccess, Base: &base, Field: field}
 				// a field value may itself be composite → `(c).a.b` chains
 			}
 		default:
@@ -4259,167 +4259,167 @@ func (p *Parser) parsePostfix() (Expr, error) {
 
 // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,
 // TRUE/FALSE, NULL), or a column reference.
-func (p *Parser) parsePrimary() (Expr, error) {
-	if p.peek().Kind == TokLParen {
+func (p *parser) parsePrimary() (exprNode, error) {
+	if p.peek().Kind == tokLParen {
 		p.advance()
 		// `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
 		// `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expr.
 		if p.atSubqueryStart() {
 			q, err := p.parseSubquery()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			if err := p.expect(TokRParen); err != nil {
-				return Expr{}, err
+			if err := p.expect(tokRParen); err != nil {
+				return exprNode{}, err
 			}
-			return Expr{Kind: ExprScalarSubquery, Subquery: &q}, nil
+			return exprNode{Kind: exprScalarSubquery, Subquery: &q}, nil
 		}
 		e, err := p.parseExpr()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
 		return e, nil
 	}
 	// `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when an
 	// open-paren + a query start (`SELECT`, or a nested `WITH` — cte.md §7) follows, so `exists`
 	// stays usable as a column / function name.
-	if p.peekKeyword() == "exists" && p.peekKindAt(1) == TokLParen && p.isQueryStartAtOffset(2) {
+	if p.peekKeyword() == "exists" && p.peekKindAt(1) == tokLParen && p.isQueryStartAtOffset(2) {
 		p.advance() // EXISTS
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		q, err := p.parseSubquery()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprExists, Subquery: &q}, nil
+		return exprNode{Kind: exprExists, Subquery: &q}, nil
 	}
 	// `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when ROW is
 	// immediately followed by `(`, so `row` stays usable as a column / function name otherwise. The
 	// bare `(a, b)` form is deferred (0A000); only the keyword form parses.
-	if p.peekKeyword() == "row" && p.peekKindAt(1) == TokLParen {
+	if p.peekKeyword() == "row" && p.peekKindAt(1) == tokLParen {
 		p.advance() // ROW
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
-		var items []Expr
-		if p.peek().Kind != TokRParen {
+		var items []exprNode
+		if p.peek().Kind != tokRParen {
 			for {
 				e, err := p.parseExpr()
 				if err != nil {
-					return Expr{}, err
+					return exprNode{}, err
 				}
 				items = append(items, e)
 				tok := p.advance()
-				if tok.Kind == TokComma {
+				if tok.Kind == tokComma {
 					continue
 				}
-				if tok.Kind == TokRParen {
+				if tok.Kind == tokRParen {
 					break
 				}
-				return Expr{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+				return exprNode{}, newError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 			}
 		} else {
 			p.advance() // the empty ROW() — consume ')'
 		}
-		return Expr{Kind: ExprRow, RowItems: items}, nil
+		return exprNode{Kind: exprRow, RowItems: items}, nil
 	}
 	// `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized when ARRAY is
 	// immediately followed by `[`, so `array` stays usable as an identifier otherwise.
-	if p.peekKeyword() == "array" && p.peekKindAt(1) == TokLBracket {
+	if p.peekKeyword() == "array" && p.peekKindAt(1) == tokLBracket {
 		p.advance() // ARRAY
-		if err := p.expect(TokLBracket); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLBracket); err != nil {
+			return exprNode{}, err
 		}
-		var items []Expr
-		if p.peek().Kind != TokRBracket {
+		var items []exprNode
+		if p.peek().Kind != tokRBracket {
 			for {
 				e, err := p.parseExpr()
 				if err != nil {
-					return Expr{}, err
+					return exprNode{}, err
 				}
 				items = append(items, e)
 				tok := p.advance()
-				if tok.Kind == TokComma {
+				if tok.Kind == tokComma {
 					continue
 				}
-				if tok.Kind == TokRBracket {
+				if tok.Kind == tokRBracket {
 					break
 				}
-				return Expr{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ']', found %v", tok))
+				return exprNode{}, newError(SyntaxError, fmt.Sprintf("expected ',' or ']', found %v", tok))
 			}
 		} else {
 			p.advance() // the empty ARRAY[] — consume ']'
 		}
-		return Expr{Kind: ExprArray, RowItems: items}, nil
+		return exprNode{Kind: exprArray, RowItems: items}, nil
 	}
 	if p.peekKeyword() == "cast" {
 		p.advance()
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		inner, err := p.parseExpr()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		if err := p.expectKeyword("as"); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		typeName, err := p.expectIdentifier()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		typeMod, err := p.parseTypeMod()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		isArray, err := p.consumeArrayBrackets()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		if isArray {
 			typeName += "[]"
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
+		return exprNode{Kind: exprCast, Cast: &castExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
 	}
 	// EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
 	// is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
 	// (the one-token lookahead, §8). The field is an identifier or a string literal (lowercased).
-	if p.peekKeyword() == "extract" && p.peekKindAt(1) == TokLParen {
+	if p.peekKeyword() == "extract" && p.peekKindAt(1) == tokLParen {
 		p.advance() // EXTRACT
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		var field string
-		if p.peekKindAt(0) == TokStr {
+		if p.peekKindAt(0) == tokStr {
 			field = p.advance().Word
 		} else {
 			id, err := p.expectIdentifier()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			field = id
 		}
 		if err := p.expectKeyword("from"); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		source, err := p.parseExpr()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprExtract, Extract: &ExtractExpr{Field: strings.ToLower(field), Source: source}}, nil
+		return exprNode{Kind: exprExtract, Extract: &extractExpr{Field: strings.ToLower(field), Source: source}}, nil
 	}
 	// A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
 	// CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed
@@ -4427,82 +4427,82 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	// Recognized only when the next token is a string — a one-token lookahead — so the word stays
 	// usable as a column / function name otherwise. true/false/null are excluded (their own value
 	// literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
-	if kw := p.peekKeyword(); kw != "" && kw != "null" && kw != "true" && kw != "false" && p.peekKindAt(1) == TokStr {
+	if kw := p.peekKeyword(); kw != "" && kw != "null" && kw != "true" && kw != "false" && p.peekKindAt(1) == tokStr {
 		name := p.advance().Word // the named type (original case; ScalarFromName lowercases)
 		t := p.advance()
-		return Expr{Kind: ExprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
+		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
 	}
 	// The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md
 	// §5, S2) — keyword-led primaries with sub-clauses. Recognized by the function keyword immediately
 	// followed by `(`.
-	if kw := p.peekKeyword(); (kw == "json_exists" || kw == "json_value" || kw == "json_query") && p.peekKindAt(1) == TokLParen {
+	if kw := p.peekKeyword(); (kw == "json_exists" || kw == "json_value" || kw == "json_query") && p.peekKindAt(1) == tokLParen {
 		p.advance() // the function keyword
 		p.advance() // (
 		ctx, err := p.parseExpr()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		// `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb context is
 		// coerced to jsonb regardless).
 		p.skipFormatJSON()
-		if err := p.expect(TokComma); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokComma); err != nil {
+			return exprNode{}, err
 		}
 		path, err := p.parseExpr()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		// `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
 		if p.peekKeyword() == "passing" {
-			return Expr{}, NewError(FeatureNotSupported, "JSON query function PASSING clause is not supported yet")
+			return exprNode{}, newError(FeatureNotSupported, "JSON query function PASSING clause is not supported yet")
 		}
-		var expr Expr
+		var expr exprNode
 		switch kw {
 		case "json_exists":
 			onError, err := p.parseJSONOnErrorOnly()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			expr = Expr{Kind: ExprJsonExists, JsonExists: &JsonExistsExpr{Ctx: ctx, Path: path, OnError: onError}}
+			expr = exprNode{Kind: exprJsonExists, JsonExists: &jsonExistsExpr{Ctx: ctx, Path: path, OnError: onError}}
 		case "json_value":
 			returning, err := p.parseJSONReturning()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			onEmpty, onError, err := p.parseJSONOnClauses()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			expr = Expr{Kind: ExprJsonValue, JsonValue: &JsonValueExpr{Ctx: ctx, Path: path, Returning: returning, OnEmpty: onEmpty, OnError: onError}}
+			expr = exprNode{Kind: exprJsonValue, JsonValue: &jsonValueExpr{Ctx: ctx, Path: path, Returning: returning, OnEmpty: onEmpty, OnError: onError}}
 		default: // json_query
 			returning, err := p.parseJSONReturning()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			wrapper, keepQuotes, err := p.parseJSONWrapperQuotes()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			onEmpty, onError, err := p.parseJSONOnClauses()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			expr = Expr{Kind: ExprJsonQuery, JsonQuery: &JsonQueryExpr{Ctx: ctx, Path: path, Returning: returning, Wrapper: wrapper, KeepQuotes: keepQuotes, OnEmpty: onEmpty, OnError: onError}}
+			expr = exprNode{Kind: exprJsonQuery, JsonQuery: &jsonQueryExpr{Ctx: ctx, Path: path, Returning: returning, Wrapper: wrapper, KeepQuotes: keepQuotes, OnEmpty: onEmpty, OnError: onError}}
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
 		return expr, nil
 	}
 	// `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
 	// (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled above, a
 	// string follows) and a generic call by being the JSON keyword immediately followed by `(`.
-	if p.peekKeyword() == "json" && p.peekKindAt(1) == TokLParen {
+	if p.peekKeyword() == "json" && p.peekKindAt(1) == tokLParen {
 		p.advance() // JSON
 		p.advance() // (
 		operand, err := p.parseExpr()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		uniqueKeys := false
 		if kw := p.peekKeyword(); (kw == "with" || kw == "without") && p.peekKeywordAt(1) == "unique" {
@@ -4513,112 +4513,112 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			}
 			uniqueKeys = kw == "with"
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprJsonCtor, JsonCtorOf: &JsonCtorExpr{Operand: operand, UniqueKeys: uniqueKeys}}, nil
+		return exprNode{Kind: exprJsonCtor, JsonCtorOf: &jsonCtorExpr{Operand: operand, UniqueKeys: uniqueKeys}}, nil
 	}
 	if p.peekKeyword() == "case" {
 		p.advance()
 		// Simple form has an operand between CASE and the first WHEN; the searched form starts
 		// directly with WHEN (grammar.md §23).
-		var operand *Expr
+		var operand *exprNode
 		if p.peekKeyword() != "when" {
 			op, err := p.parseExpr()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			operand = &op
 		}
-		var whens []CaseWhen
+		var whens []caseWhen
 		for p.peekKeyword() == "when" {
 			p.advance()
 			cond, err := p.parseExpr()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			if err := p.expectKeyword("then"); err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			res, err := p.parseExpr()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
-			whens = append(whens, CaseWhen{Cond: cond, Result: res})
+			whens = append(whens, caseWhen{Cond: cond, Result: res})
 		}
 		if len(whens) == 0 {
-			return Expr{}, NewError(SyntaxError, "CASE requires at least one WHEN clause")
+			return exprNode{}, newError(SyntaxError, "CASE requires at least one WHEN clause")
 		}
-		var els *Expr
+		var els *exprNode
 		if p.peekKeyword() == "else" {
 			p.advance()
 			e, err := p.parseExpr()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			els = &e
 		}
 		if err := p.expectKeyword("end"); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		return Expr{Kind: ExprCase, Case: &CaseExpr{Operand: operand, Whens: whens, Els: els}}, nil
+		return exprNode{Kind: exprCase, Case: &caseExpr{Operand: operand, Whens: whens, Els: els}}, nil
 	}
 	t := p.peek()
 	switch {
-	case t.Kind == TokParam:
-		return Expr{Kind: ExprParam, Param: p.advance().Int}, nil
-	case t.Kind == TokInt:
+	case t.Kind == tokParam:
+		return exprNode{Kind: exprParam, Param: p.advance().Int}, nil
+	case t.Kind == tokInt:
 		v, ok := foldInt(p.advance().Int, false)
 		if !ok {
 			// The only magnitude > MaxInt64 the lexer admits is 2^63, which fits no
 			// signed integer type unless negated (handled by the unary-minus fold).
-			return Expr{}, NewError(NumericValueOutOfRange,
+			return exprNode{}, newError(NumericValueOutOfRange,
 				"value out of range: integer literal exceeds the maximum signed 64-bit value")
 		}
-		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
-	case t.Kind == TokDecimal:
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: v}}, nil
+	case t.Kind == tokDecimal:
 		p.advance()
-		return Expr{Kind: ExprLiteral, Literal: &Literal{
-			Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(false, t.Word, uint32(t.Int)),
+		return exprNode{Kind: exprLiteral, Literal: &literal{
+			Kind: literalDecimal, Dec: decimalFromDigitsScale(false, t.Word, uint32(t.Int)),
 		}}, nil
-	case t.Kind == TokStr:
+	case t.Kind == tokStr:
 		p.advance()
-		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralText, Str: t.Word}}, nil
-	case t.Kind == TokWord && toLowerASCII(t.Word) == "null":
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: t.Word}}, nil
+	case t.Kind == tokWord && toLowerASCII(t.Word) == "null":
 		p.advance()
-		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralNull}}, nil
-	case t.Kind == TokWord && toLowerASCII(t.Word) == "true":
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}, nil
+	case t.Kind == tokWord && toLowerASCII(t.Word) == "true":
 		p.advance()
-		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: true}}, nil
-	case t.Kind == TokWord && toLowerASCII(t.Word) == "false":
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: true}}, nil
+	case t.Kind == tokWord && toLowerASCII(t.Word) == "false":
 		p.advance()
-		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: false}}, nil
-	case t.Kind == TokWord && toLowerASCII(t.Word) == "current_timestamp" &&
-		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == TokLParen):
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: false}}, nil
+	case t.Kind == tokWord && toLowerASCII(t.Word) == "current_timestamp" &&
+		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen):
 		// `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the value
 		// literals above. Pure sugar: desugar to a `now()` call so resolution / execution / cost /
 		// volatility are entirely shared (spec/design/functions.md §12). Not fired when followed by
 		// `(` (a precision typmod, deferred) so that form resolves normally (42883).
 		p.advance()
-		return Expr{Kind: ExprFuncCall, FuncCall: &FuncCallExpr{Name: "now"}}, nil
-	case t.Kind == TokWord:
+		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "now"}}, nil
+	case t.Kind == tokWord:
 		// Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
 		// first call syntax — grammar.md §17). The one-token lookahead keeps function names
 		// non-reserved (a column may be named `count`); a qualified name is never a call. Only
 		// aggregates resolve (42883 otherwise).
-		if p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == TokLParen {
+		if p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen {
 			return p.parseFunctionCall()
 		}
 		qualifier, name, err := p.parseColumnRef()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
 		if qualifier != "" {
-			return Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: name}, nil
+			return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: name}, nil
 		}
-		return Expr{Kind: ExprColumn, Column: name}, nil
+		return exprNode{Kind: exprColumn, Column: name}, nil
 	default:
-		return Expr{}, NewError(SyntaxError, "expected an expression")
+		return exprNode{}, newError(SyntaxError, "expected an expression")
 	}
 }
 
@@ -4630,35 +4630,35 @@ func (p *Parser) parsePrimary() (Expr, error) {
 // positional and/or NAMED (name => value) arguments. A positional argument may not follow a named
 // one (42601). ArgNames stays nil when every argument is positional. DISTINCT inside the parens is
 // deferred (rejected 42601). Resolution checks per-function arity and fills defaults.
-func (p *Parser) parseFunctionCall() (Expr, error) {
+func (p *parser) parseFunctionCall() (exprNode, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
-	if err := p.expect(TokLParen); err != nil {
-		return Expr{}, err
+	if err := p.expect(tokLParen); err != nil {
+		return exprNode{}, err
 	}
-	fc := &FuncCallExpr{Name: name}
+	fc := &funcCallExpr{Name: name}
 	// A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct argument
 	// values. It is not reserved, but here — right after `(` — it is always the modifier.
 	// `DISTINCT *` and `DISTINCT )` (no argument) are both 42601 syntax errors (PG); the resolver
 	// rejects DISTINCT on a non-aggregate (42809) or a window function (0A000).
 	if p.peekKeyword() == "distinct" {
 		p.advance()
-		if p.peek().Kind == TokStar {
-			return Expr{}, NewError(SyntaxError, "DISTINCT cannot be used with *")
+		if p.peek().Kind == tokStar {
+			return exprNode{}, newError(SyntaxError, "DISTINCT cannot be used with *")
 		}
-		if p.peek().Kind == TokRParen {
-			return Expr{}, NewError(SyntaxError, "DISTINCT requires an aggregate argument")
+		if p.peek().Kind == tokRParen {
+			return exprNode{}, newError(SyntaxError, "DISTINCT requires an aggregate argument")
 		}
 		fc.Distinct = true
 	}
 	anyNamed := false
 	switch {
-	case p.peek().Kind == TokStar:
+	case p.peek().Kind == tokStar:
 		p.advance()
 		fc.Star = true
-	case p.peek().Kind == TokRParen:
+	case p.peek().Kind == tokRParen:
 		// Empty argument list (make_interval()) — leave Args/ArgNames empty.
 	default:
 		var names []*string
@@ -4672,40 +4672,40 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 				fc.Variadic = true
 				arg, err := p.parseExpr()
 				if err != nil {
-					return Expr{}, err
+					return exprNode{}, err
 				}
 				fc.Args = append(fc.Args, &arg)
 				names = append(names, nil)
 				// A VARIADIC argument must be the last (PostgreSQL, 42601).
-				if p.peek().Kind == TokComma {
-					return Expr{}, NewError(SyntaxError, "VARIADIC argument must be the last argument")
+				if p.peek().Kind == tokComma {
+					return exprNode{}, newError(SyntaxError, "VARIADIC argument must be the last argument")
 				}
 				break
 			}
 			// A named argument is `identifier "=>" expr` (grammar.md §17); a two-token lookahead
 			// (word then "=>") distinguishes it from a bare expr that starts with an identifier.
 			var argName *string
-			if p.peek().Kind == TokWord && p.peekKindAt(1) == TokFatArrow {
+			if p.peek().Kind == tokWord && p.peekKindAt(1) == tokFatArrow {
 				nm, err := p.expectIdentifier()
 				if err != nil {
-					return Expr{}, err
+					return exprNode{}, err
 				}
-				if err := p.expect(TokFatArrow); err != nil {
-					return Expr{}, err
+				if err := p.expect(tokFatArrow); err != nil {
+					return exprNode{}, err
 				}
 				anyNamed = true
 				argName = &nm
 			} else if anyNamed {
 				// A positional argument may not follow a named one (PostgreSQL, 42601).
-				return Expr{}, NewError(SyntaxError, "positional argument cannot follow named argument")
+				return exprNode{}, newError(SyntaxError, "positional argument cannot follow named argument")
 			}
 			arg, err := p.parseExpr()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			fc.Args = append(fc.Args, &arg)
 			names = append(names, argName)
-			if p.peek().Kind != TokComma {
+			if p.peek().Kind != tokComma {
 				break
 			}
 			p.advance()
@@ -4715,8 +4715,8 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 			fc.ArgNames = names
 		}
 	}
-	if err := p.expect(TokRParen); err != nil {
-		return Expr{}, err
+	if err := p.expect(tokRParen); err != nil {
+		return exprNode{}, err
 	}
 	// A trailing WITHIN GROUP (ORDER BY <key>) marks an ordered-set aggregate (mode /
 	// percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list and
@@ -4727,37 +4727,37 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	if p.peekKeyword() == "within" {
 		p.advance()
 		if err := p.expectKeyword("group"); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		if p.peekKeyword() != "order" {
-			return Expr{}, NewError(SyntaxError, "WITHIN GROUP requires an ORDER BY clause")
+			return exprNode{}, newError(SyntaxError, "WITHIN GROUP requires an ORDER BY clause")
 		}
 		p.advance()
 		if err := p.expectKeyword("by"); err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		keys := []OrderKey{}
+		keys := []orderKey{}
 		for {
 			expr, err := p.parseExpr()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			collation, descending, nullsFirst, err := p.parseSortSuffix()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			keys = append(keys, classifyOrderKey(expr, collation, descending, nullsFirst, false))
-			if p.peek().Kind == TokComma {
+			if p.peek().Kind == tokComma {
 				p.advance()
 				continue
 			}
 			break
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
 		fc.WithinGroup = keys
 	}
@@ -4769,19 +4769,19 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	// inside cond (42803), and a non-boolean cond (42804).
 	if p.peekKeyword() == "filter" {
 		p.advance()
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		if p.peekKeyword() != "where" {
-			return Expr{}, NewError(SyntaxError, "FILTER requires a WHERE clause")
+			return exprNode{}, newError(SyntaxError, "FILTER requires a WHERE clause")
 		}
 		p.advance()
 		cond, err := p.parseExpr()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
 		fc.Filter = &cond
 	}
@@ -4793,49 +4793,49 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 		p.advance()
 		// `OVER name` references a named window (the WINDOW clause — window.md §5); `OVER (...)`
 		// is an inline definition. A named reference is desugared to its definition at resolve.
-		if p.peek().Kind != TokLParen {
+		if p.peek().Kind != tokLParen {
 			oname, err := p.expectIdentifier()
 			if err != nil {
-				return Expr{}, err
+				return exprNode{}, err
 			}
 			fc.OverName = oname
-			return Expr{Kind: ExprFuncCall, FuncCall: fc}, nil
+			return exprNode{Kind: exprFuncCall, FuncCall: fc}, nil
 		}
-		if err := p.expect(TokLParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokLParen); err != nil {
+			return exprNode{}, err
 		}
 		// `[base] [PARTITION BY cols] [ORDER BY …] [frame]` — the shared definition body. A leading
 		// base-window name (window.md §5) extends a named window; merged at resolve.
 		def, err := p.parseWindowDefinition()
 		if err != nil {
-			return Expr{}, err
+			return exprNode{}, err
 		}
-		if err := p.expect(TokRParen); err != nil {
-			return Expr{}, err
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
 		}
 		fc.Over = &def
 	}
-	return Expr{Kind: ExprFuncCall, FuncCall: fc}, nil
+	return exprNode{Kind: exprFuncCall, FuncCall: fc}, nil
 }
 
 // parseWindowFrame parses an optional window frame clause `{ROWS|RANGE|GROUPS} frame_extent
 // [EXCLUDE …]` (spec/design/window.md §6, grammar.ebnf `frame_clause`). A single bound is the
 // START (END = CURRENT ROW). EXCLUDE is rejected 0A000 in S4. Returns nil when no frame keyword
 // is present (the default frame).
-func (p *Parser) parseWindowFrame() (*WindowFrame, error) {
-	var mode FrameMode
+func (p *parser) parseWindowFrame() (*windowFrame, error) {
+	var mode frameMode
 	switch p.peekKeyword() {
 	case "rows":
-		mode = FrameRows
+		mode = frameRows
 	case "range":
-		mode = FrameRange
+		mode = frameRange
 	case "groups":
-		mode = FrameGroups
+		mode = frameGroups
 	default:
 		return nil, nil
 	}
 	p.advance()
-	var start, end FrameBound
+	var start, end frameBound
 	if p.peekKeyword() == "between" {
 		p.advance()
 		s, err := p.parseFrameBound()
@@ -4856,20 +4856,20 @@ func (p *Parser) parseWindowFrame() (*WindowFrame, error) {
 		if err != nil {
 			return nil, err
 		}
-		start, end = s, FrameBound{Kind: FrameCurrentRow}
+		start, end = s, frameBound{Kind: frameCurrentRow}
 	}
 	exclude, err := p.parseFrameExclusion()
 	if err != nil {
 		return nil, err
 	}
-	return &WindowFrame{Mode: mode, Start: start, End: end, Exclude: exclude}, nil
+	return &windowFrame{Mode: mode, Start: start, End: end, Exclude: exclude}, nil
 }
 
 // parseFrameExclusion parses an optional `EXCLUDE { CURRENT ROW | GROUP | TIES | NO OTHERS }` clause
 // (spec/design/window.md §6); absent → FrameExcludeNoOthers (drop nothing).
-func (p *Parser) parseFrameExclusion() (FrameExclusion, error) {
+func (p *parser) parseFrameExclusion() (frameExclusion, error) {
 	if p.peekKeyword() != "exclude" {
-		return FrameExcludeNoOthers, nil
+		return frameExcludeNoOthers, nil
 	}
 	p.advance()
 	switch p.peekKeyword() {
@@ -4878,60 +4878,60 @@ func (p *Parser) parseFrameExclusion() (FrameExclusion, error) {
 		if err := p.expectKeyword("row"); err != nil {
 			return 0, err
 		}
-		return FrameExcludeCurrentRow, nil
+		return frameExcludeCurrentRow, nil
 	case "group":
 		p.advance()
-		return FrameExcludeGroup, nil
+		return frameExcludeGroup, nil
 	case "ties":
 		p.advance()
-		return FrameExcludeTies, nil
+		return frameExcludeTies, nil
 	case "no":
 		p.advance()
 		if err := p.expectKeyword("others"); err != nil {
 			return 0, err
 		}
-		return FrameExcludeNoOthers, nil
+		return frameExcludeNoOthers, nil
 	default:
-		return 0, NewError(SyntaxError, "expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE")
+		return 0, newError(SyntaxError, "expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE")
 	}
 }
 
 // parseFrameBound parses one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`, `CURRENT ROW`, or
 // `expr PRECEDING|FOLLOWING` (spec/design/window.md §6).
-func (p *Parser) parseFrameBound() (FrameBound, error) {
+func (p *parser) parseFrameBound() (frameBound, error) {
 	switch p.peekKeyword() {
 	case "unbounded":
 		p.advance()
 		switch p.peekKeyword() {
 		case "preceding":
 			p.advance()
-			return FrameBound{Kind: FrameUnboundedPreceding}, nil
+			return frameBound{Kind: frameUnboundedPreceding}, nil
 		case "following":
 			p.advance()
-			return FrameBound{Kind: FrameUnboundedFollowing}, nil
+			return frameBound{Kind: frameUnboundedFollowing}, nil
 		default:
-			return FrameBound{}, NewError(SyntaxError, "expected PRECEDING or FOLLOWING after UNBOUNDED")
+			return frameBound{}, newError(SyntaxError, "expected PRECEDING or FOLLOWING after UNBOUNDED")
 		}
 	case "current":
 		p.advance()
 		if err := p.expectKeyword("row"); err != nil {
-			return FrameBound{}, err
+			return frameBound{}, err
 		}
-		return FrameBound{Kind: FrameCurrentRow}, nil
+		return frameBound{Kind: frameCurrentRow}, nil
 	default:
 		e, err := p.parseExpr()
 		if err != nil {
-			return FrameBound{}, err
+			return frameBound{}, err
 		}
 		switch p.peekKeyword() {
 		case "preceding":
 			p.advance()
-			return FrameBound{Kind: FramePreceding, Offset: e}, nil
+			return frameBound{Kind: framePreceding, Offset: e}, nil
 		case "following":
 			p.advance()
-			return FrameBound{Kind: FrameFollowing, Offset: e}, nil
+			return frameBound{Kind: frameFollowing, Offset: e}, nil
 		default:
-			return FrameBound{}, NewError(SyntaxError, "expected PRECEDING or FOLLOWING in frame bound")
+			return frameBound{}, newError(SyntaxError, "expected PRECEDING or FOLLOWING in frame bound")
 		}
 	}
 }
@@ -4942,7 +4942,7 @@ func (p *Parser) parseFrameBound() (FrameBound, error) {
 // COLLATE binds tighter than the comparison/arithmetic that could appear in a key, so parseExpr
 // already absorbs an inline `expr COLLATE "x"`; the trailing COLLATE here is the sort-key collation
 // (the same two-level reading the query ORDER BY uses on a bare column). spec/design/window.md §5.1.
-func (p *Parser) parseWindowOrderBy() ([]WindowOrderKey, error) {
+func (p *parser) parseWindowOrderBy() ([]windowOrderKey, error) {
 	if p.peekKeyword() != "order" {
 		return nil, nil
 	}
@@ -4950,7 +4950,7 @@ func (p *Parser) parseWindowOrderBy() ([]WindowOrderKey, error) {
 	if err := p.expectKeyword("by"); err != nil {
 		return nil, err
 	}
-	var order []WindowOrderKey
+	var order []windowOrderKey
 	for {
 		expr, err := p.parseExpr()
 		if err != nil {
@@ -4960,8 +4960,8 @@ func (p *Parser) parseWindowOrderBy() ([]WindowOrderKey, error) {
 		if err != nil {
 			return nil, err
 		}
-		order = append(order, WindowOrderKey{Expr: expr, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
-		if p.peek().Kind != TokComma {
+		order = append(order, windowOrderKey{Expr: expr, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
+		if p.peek().Kind != tokComma {
 			break
 		}
 		p.advance()
@@ -4972,12 +4972,12 @@ func (p *Parser) parseWindowOrderBy() ([]WindowOrderKey, error) {
 // parseColumnRef parses `column_ref ::= identifier ("." identifier)?` — a bare column name, or
 // a qualified `rel.col` (the "." is TokDot). Returns (qualifier, name); qualifier is "" for a
 // bare column (spec/grammar/grammar.ebnf `column_ref`, grammar.md §15).
-func (p *Parser) parseColumnRef() (string, string, error) {
+func (p *parser) parseColumnRef() (string, string, error) {
 	first, err := p.expectIdentifier()
 	if err != nil {
 		return "", "", err
 	}
-	if p.peek().Kind == TokDot {
+	if p.peek().Kind == tokDot {
 		p.advance()
 		second, err := p.expectIdentifier()
 		if err != nil {
@@ -4989,12 +4989,12 @@ func (p *Parser) parseColumnRef() (string, string, error) {
 }
 
 // peek returns the current token without consuming it.
-func (p *Parser) peek() Token { return p.tokens[p.pos] }
+func (p *parser) peek() token { return p.tokens[p.pos] }
 
 // peekKeyword returns the current token lowercased if it is a word, else "".
-func (p *Parser) peekKeyword() string {
+func (p *parser) peekKeyword() string {
 	t := p.peek()
-	if t.Kind == TokWord {
+	if t.Kind == tokWord {
 		return toLowerASCII(t.Word)
 	}
 	return ""
@@ -5003,9 +5003,9 @@ func (p *Parser) peekKeyword() string {
 // peekKeywordAt returns the keyword (lowercased) offset tokens ahead of the cursor if that
 // token is a word, else "". Used for the two-token NOT IN/BETWEEN/LIKE lookahead (a
 // CLAUDE.md §8 determinism surface — byte-identical across the three parsers).
-func (p *Parser) peekKeywordAt(offset int) string {
+func (p *parser) peekKeywordAt(offset int) string {
 	if p.pos+offset < len(p.tokens) {
-		if t := p.tokens[p.pos+offset]; t.Kind == TokWord {
+		if t := p.tokens[p.pos+offset]; t.Kind == tokWord {
 			return toLowerASCII(t.Word)
 		}
 	}
@@ -5014,45 +5014,45 @@ func (p *Parser) peekKeywordAt(offset int) string {
 
 // peekKindAt returns the token kind offset tokens ahead of the cursor, or TokEof past the end.
 // Used by the EXISTS / scalar-subquery lookahead (grammar.md §26).
-func (p *Parser) peekKindAt(offset int) TokenKind {
+func (p *parser) peekKindAt(offset int) tokenKind {
 	if p.pos+offset < len(p.tokens) {
 		return p.tokens[p.pos+offset].Kind
 	}
-	return TokEof
+	return tokEof
 }
 
 // isWithClauseAtOffset reports whether a WITH clause (`WITH RECURSIVE …`, `WITH <name> ( …`, or
 // `WITH <name> AS …`) begins at p.pos+offset (spec/design/cte.md §7), as opposed to an ordinary
 // expression or a column named `with`. The shape-based lookahead keeps the recognition unambiguous
 // even where `with` is a legal identifier (e.g. `x IN (with)` is a value list, not a nested WITH).
-func (p *Parser) isWithClauseAtOffset(offset int) bool {
+func (p *parser) isWithClauseAtOffset(offset int) bool {
 	if p.peekKeywordAt(offset) != "with" {
 		return false
 	}
 	if p.peekKeywordAt(offset+1) == "recursive" {
 		return true
 	}
-	if p.peekKindAt(offset+1) == TokWord {
-		return p.peekKindAt(offset+2) == TokLParen || p.peekKeywordAt(offset+2) == "as"
+	if p.peekKindAt(offset+1) == tokWord {
+		return p.peekKindAt(offset+2) == tokLParen || p.peekKeywordAt(offset+2) == "as"
 	}
 	return false
 }
 
 // isQueryStartAtOffset reports whether a query expression — a SELECT or a nested WITH clause
 // (cte.md §7) — begins at p.pos+offset. The §26 leading-SELECT lookahead, extended with WITH.
-func (p *Parser) isQueryStartAtOffset(offset int) bool {
+func (p *parser) isQueryStartAtOffset(offset int) bool {
 	return p.peekKeywordAt(offset) == "select" || p.isWithClauseAtOffset(offset)
 }
 
 // atSubqueryStart reports whether the NEXT token begins a query expression (a SELECT or nested
 // WITH) — the disambiguator at every subquery position.
-func (p *Parser) atSubqueryStart() bool { return p.isQueryStartAtOffset(0) }
+func (p *parser) atSubqueryStart() bool { return p.isQueryStartAtOffset(0) }
 
 // atWithClause reports whether the NEXT token begins a nested WITH clause (cte.md §7).
-func (p *Parser) atWithClause() bool { return p.isWithClauseAtOffset(0) }
+func (p *parser) atWithClause() bool { return p.isWithClauseAtOffset(0) }
 
 // advance consumes and returns the current token.
-func (p *Parser) advance() Token {
+func (p *parser) advance() token {
 	t := p.tokens[p.pos]
 	if p.pos+1 < len(p.tokens) {
 		p.pos++
@@ -5061,28 +5061,28 @@ func (p *Parser) advance() Token {
 }
 
 // expect consumes the current token, requiring its kind to equal want.
-func (p *Parser) expect(want TokenKind) error {
+func (p *parser) expect(want tokenKind) error {
 	if got := p.advance(); got.Kind != want {
-		return NewError(SyntaxError, "unexpected token")
+		return newError(SyntaxError, "unexpected token")
 	}
 	return nil
 }
 
 // expectKeyword consumes the current token, requiring it to be the given keyword
 // (case-insensitive).
-func (p *Parser) expectKeyword(kw string) error {
+func (p *parser) expectKeyword(kw string) error {
 	t := p.advance()
-	if t.Kind == TokWord && toLowerASCII(t.Word) == kw {
+	if t.Kind == tokWord && toLowerASCII(t.Word) == kw {
 		return nil
 	}
-	return NewError(SyntaxError, fmt.Sprintf("expected keyword '%s'", kw))
+	return newError(SyntaxError, fmt.Sprintf("expected keyword '%s'", kw))
 }
 
 // expectIdentifier consumes the current token, requiring it to be a bare word.
-func (p *Parser) expectIdentifier() (string, error) {
+func (p *parser) expectIdentifier() (string, error) {
 	t := p.advance()
-	if t.Kind != TokWord {
-		return "", NewError(SyntaxError, "expected an identifier")
+	if t.Kind != tokWord {
+		return "", newError(SyntaxError, "expected an identifier")
 	}
 	return t.Word, nil
 }
@@ -5090,21 +5090,21 @@ func (p *Parser) expectIdentifier() (string, error) {
 // expectCollationName consumes a quoted collation name after COLLATE (spec/design/collation.md §1).
 // The name is a double-quoted identifier — case-sensitive and kept verbatim ("C", "en-US") — so a
 // bare word is not accepted (it would case-fold). An empty name ("") is a 42601 syntax error.
-func (p *Parser) expectCollationName() (string, error) {
+func (p *parser) expectCollationName() (string, error) {
 	t := p.advance()
-	if t.Kind != TokQuotedIdent {
-		return "", NewError(SyntaxError, "expected a quoted collation name after COLLATE")
+	if t.Kind != tokQuotedIdent {
+		return "", newError(SyntaxError, "expected a quoted collation name after COLLATE")
 	}
 	if t.Word == "" {
-		return "", NewError(SyntaxError, "collation name may not be empty")
+		return "", newError(SyntaxError, "collation name may not be empty")
 	}
 	return t.Word, nil
 }
 
 // expectEof requires that all input has been consumed.
-func (p *Parser) expectEof() error {
-	if p.peek().Kind != TokEof {
-		return NewError(SyntaxError, "unexpected trailing input")
+func (p *parser) expectEof() error {
+	if p.peek().Kind != tokEof {
+		return newError(SyntaxError, "unexpected trailing input")
 	}
 	return nil
 }
@@ -5123,18 +5123,18 @@ func toLowerASCII(s string) string {
 // expression (spec/design/constraints.md §4.5). The text was written by renderTokens, so
 // it re-lexes to a value-identical token sequence; the caller maps a failure to XX001
 // (the file claimed to be well-formed).
-func ParseExpression(text string) (Expr, error) {
-	tokens, err := Lex(text)
+func parseExpression(text string) (exprNode, error) {
+	tokens, err := lex(text)
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
-	p := &Parser{tokens: tokens}
+	p := &parser{tokens: tokens}
 	expr, err := p.parseExpr()
 	if err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	if err := p.expectEof(); err != nil {
-		return Expr{}, err
+		return exprNode{}, err
 	}
 	return expr, nil
 }
@@ -5142,7 +5142,7 @@ func ParseExpression(text string) (Expr, error) {
 // renderTokens re-renders a token slice as the persisted check-expression text: each token
 // rendered by the closed table in spec/fileformat/format.md "Check-expression text", joined
 // with single spaces. A byte contract — identical across every core (CLAUDE.md §8).
-func renderTokens(tokens []Token) string {
+func renderTokens(tokens []token) string {
 	parts := make([]string, len(tokens))
 	for i, t := range tokens {
 		parts[i] = renderToken(t)
@@ -5150,13 +5150,13 @@ func renderTokens(tokens []Token) string {
 	return strings.Join(parts, " ")
 }
 
-func renderToken(t Token) string {
+func renderToken(t token) string {
 	switch t.Kind {
-	case TokWord:
+	case tokWord:
 		return t.Word
-	case TokInt:
+	case tokInt:
 		return strconv.FormatUint(t.Int, 10)
-	case TokDecimal:
+	case tokDecimal:
 		// The digit string with '.' inserted `scale` digits from the right. The lexer
 		// guarantees scale <= len(coeff) (every fractional digit is in the coefficient), so
 		// the insertion point is in range; scale == len renders a leading-dot form (".5")
@@ -5164,97 +5164,97 @@ func renderToken(t Token) string {
 		// decimal value (spec/fileformat/format.md "Check-expression text").
 		split := len(t.Word) - int(t.Int)
 		return t.Word[:split] + "." + t.Word[split:]
-	case TokStr:
+	case tokStr:
 		return "'" + strings.ReplaceAll(t.Word, "'", "''") + "'"
-	case TokQuotedIdent:
+	case tokQuotedIdent:
 		// A double-quoted identifier round-trips verbatim with `"` doubled (collation names in a
 		// persisted COLLATE expression, spec/design/collation.md §1).
 		return "\"" + strings.ReplaceAll(t.Word, "\"", "\"\"") + "\""
-	case TokParam:
+	case tokParam:
 		return "$" + strconv.FormatUint(t.Int, 10)
-	case TokComma:
+	case tokComma:
 		return ","
-	case TokDot:
+	case tokDot:
 		return "."
-	case TokLParen:
+	case tokLParen:
 		return "("
-	case TokRParen:
+	case tokRParen:
 		return ")"
-	case TokLBracket:
+	case tokLBracket:
 		return "["
-	case TokRBracket:
+	case tokRBracket:
 		return "]"
-	case TokStar:
+	case tokStar:
 		return "*"
-	case TokPlus:
+	case tokPlus:
 		return "+"
-	case TokMinus:
+	case tokMinus:
 		return "-"
-	case TokSlash:
+	case tokSlash:
 		return "/"
-	case TokPercent:
+	case tokPercent:
 		return "%"
-	case TokEq:
+	case tokEq:
 		return "="
-	case TokNe:
+	case tokNe:
 		return "<>"
-	case TokLt:
+	case tokLt:
 		return "<"
-	case TokGt:
+	case tokGt:
 		return ">"
-	case TokLe:
+	case tokLe:
 		return "<="
-	case TokGe:
+	case tokGe:
 		return ">="
-	case TokFatArrow:
+	case tokFatArrow:
 		return "=>"
-	case TokColon:
+	case tokColon:
 		return ":"
-	case TokConcat:
+	case tokConcat:
 		return "||"
-	case TokContains:
+	case tokContains:
 		return "@>"
-	case TokJsonPathExists:
+	case tokJsonPathExists:
 		return "@?"
-	case TokJsonPathMatch:
+	case tokJsonPathMatch:
 		return "@@"
-	case TokContainedBy:
+	case tokContainedBy:
 		return "<@"
-	case TokOverlaps:
+	case tokOverlaps:
 		return "&&"
-	case TokStrictlyLeft:
+	case tokStrictlyLeft:
 		return "<<"
-	case TokStrictlyRight:
+	case tokStrictlyRight:
 		return ">>"
-	case TokNotExtendRight:
+	case tokNotExtendRight:
 		return "&<"
-	case TokNotExtendLeft:
+	case tokNotExtendLeft:
 		return "&>"
-	case TokAdjacent:
+	case tokAdjacent:
 		return "-|-"
-	case TokArrow:
+	case tokArrow:
 		return "->"
-	case TokArrowText:
+	case tokArrowText:
 		return "->>"
-	case TokHashArrow:
+	case tokHashArrow:
 		return "#>"
-	case TokHashArrowText:
+	case tokHashArrowText:
 		return "#>>"
-	case TokQuestion:
+	case tokQuestion:
 		return "?"
-	case TokQuestionPipe:
+	case tokQuestionPipe:
 		return "?|"
-	case TokQuestionAmp:
+	case tokQuestionAmp:
 		return "?&"
-	case TokHashMinus:
+	case tokHashMinus:
 		return "#-"
-	case TokTilde:
+	case tokTilde:
 		return "~"
-	case TokTildeStar:
+	case tokTildeStar:
 		return "~*"
-	case TokBangTilde:
+	case tokBangTilde:
 		return "!~"
-	case TokBangTildeStar:
+	case tokBangTildeStar:
 		return "!~*"
 	default: // TokEof — never inside the parentheses
 		return ""

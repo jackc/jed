@@ -18,29 +18,29 @@ import (
 // --- in-memory zone representation (the parsed TZif file, spec/tz/README.md §2) ---
 
 // LocalTimeType is one RFC 8536 local-time type: the offset east of UT, the DST flag, the abbrev.
-type LocalTimeType struct {
+type localTimeType struct {
 	Utoff  int32
 	IsDst  bool
 	Abbrev string
 }
 
 // TzData is a parsed TZif file's tables (§2): the transition table + types + the optional POSIX footer.
-type TzData struct {
+type tzData struct {
 	Trans     []int64
 	TransType []byte
-	Types     []LocalTimeType
-	Footer    *PosixTz
+	Types     []localTimeType
+	Footer    *posixTz
 }
 
 // Zone is a loaded named zone: its tables plus the bundle metadata it arrived with.
-type Zone struct {
+type zone struct {
 	Name          string
 	TzdataVersion string
-	Data          TzData
+	Data          tzData
 }
 
 // Offset is the local-time type in effect at an instant (the reader output, §4).
-type Offset struct {
+type offset struct {
 	Utoff  int32
 	Abbrev string
 	IsDst  bool
@@ -50,11 +50,11 @@ type Offset struct {
 type ZoneRef struct {
 	Fixed bool
 	Off   int32 // valid when Fixed
-	Zone  *Zone // valid when !Fixed
+	zone  *zone // valid when !Fixed
 }
 
 // TimeZoneInfo is an introspection row for db.LoadedTimeZones (timezones.md §3.3).
-type TimeZoneInfo struct {
+type timeZoneInfo struct {
 	Name          string
 	TzdataVersion string
 }
@@ -63,29 +63,29 @@ type TimeZoneInfo struct {
 
 // PosixRule is a Mm.w.d DST transition rule (§5): month 1–12, week 1–5 (5 = last), day 0–6 (0 = Sun).
 // The Jn / n julian forms are a deferred follow-on (timezones.md §14).
-type PosixRule struct {
+type posixRule struct {
 	M, W, D uint8
 }
 
 // PosixDst is the DST half of a POSIX TZ string: abbrev/offset (east-positive) + start/end rules.
-type PosixDst struct {
+type posixDst struct {
 	Abbr      string
 	Utoff     int32
-	Start     PosixRule
+	Start     posixRule
 	StartTime int32
-	End       PosixRule
+	End       posixRule
 	EndTime   int32
 }
 
 // PosixTz is a parsed POSIX TZ string (§5). Offsets are east-positive (negated from POSIX west).
-type PosixTz struct {
+type posixTz struct {
 	StdAbbr  string
 	StdUtoff int32
-	Dst      *PosixDst
+	Dst      *posixDst
 }
 
 // parsePosixTz parses a POSIX TZ string (§5): std offset[dst[offset][,start[/time],end[/time]]].
-func parsePosixTz(s string) (*PosixTz, error) {
+func parsePosixTz(s string) (*posixTz, error) {
 	b := []byte(s)
 	i := 0
 	stdAbbr, ok := parsePosixAbbr(b, &i)
@@ -99,7 +99,7 @@ func parsePosixTz(s string) (*PosixTz, error) {
 	stdUtoff := -stdPosix
 
 	if i >= len(b) {
-		return &PosixTz{StdAbbr: stdAbbr, StdUtoff: stdUtoff}, nil
+		return &posixTz{StdAbbr: stdAbbr, StdUtoff: stdUtoff}, nil
 	}
 
 	abbr, ok := parsePosixAbbr(b, &i)
@@ -133,10 +133,10 @@ func parsePosixTz(s string) (*PosixTz, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PosixTz{
+	return &posixTz{
 		StdAbbr:  stdAbbr,
 		StdUtoff: stdUtoff,
-		Dst: &PosixDst{
+		Dst: &posixDst{
 			Abbr: abbr, Utoff: dstUtoff,
 			Start: start, StartTime: startTime,
 			End: end, EndTime: endTime,
@@ -203,41 +203,41 @@ func parsePosixOffset(b []byte, i *int) (int32, bool) {
 }
 
 // parsePosixRule parses Mm.w.d with an optional /time (§5). Jn / n are a deferred error.
-func parsePosixRule(b []byte, i *int) (PosixRule, int32, error) {
+func parsePosixRule(b []byte, i *int) (posixRule, int32, error) {
 	if *i >= len(b) {
-		return PosixRule{}, 0, fmt.Errorf("posix: missing transition rule")
+		return posixRule{}, 0, fmt.Errorf("posix: missing transition rule")
 	}
 	if b[*i] != 'M' {
-		return PosixRule{}, 0, fmt.Errorf("posix: Jn/n julian-day transition rules are not yet supported")
+		return posixRule{}, 0, fmt.Errorf("posix: Jn/n julian-day transition rules are not yet supported")
 	}
 	*i++
 	m, ok := parseUint(b, i)
 	if !ok || *i >= len(b) || b[*i] != '.' {
-		return PosixRule{}, 0, fmt.Errorf("posix: bad month")
+		return posixRule{}, 0, fmt.Errorf("posix: bad month")
 	}
 	*i++
 	w, ok := parseUint(b, i)
 	if !ok || *i >= len(b) || b[*i] != '.' {
-		return PosixRule{}, 0, fmt.Errorf("posix: bad week")
+		return posixRule{}, 0, fmt.Errorf("posix: bad week")
 	}
 	*i++
 	d, ok := parseUint(b, i)
 	if !ok {
-		return PosixRule{}, 0, fmt.Errorf("posix: bad day")
+		return posixRule{}, 0, fmt.Errorf("posix: bad day")
 	}
 	if m < 1 || m > 12 || w < 1 || w > 5 || d > 6 {
-		return PosixRule{}, 0, fmt.Errorf("posix: Mm.w.d out of range")
+		return posixRule{}, 0, fmt.Errorf("posix: Mm.w.d out of range")
 	}
 	time := int32(7200)
 	if *i < len(b) && b[*i] == '/' {
 		*i++
 		t, ok := parsePosixOffset(b, i)
 		if !ok {
-			return PosixRule{}, 0, fmt.Errorf("posix: bad transition time")
+			return posixRule{}, 0, fmt.Errorf("posix: bad transition time")
 		}
 		time = t
 	}
-	return PosixRule{M: uint8(m), W: uint8(w), D: uint8(d)}, time, nil
+	return posixRule{M: uint8(m), W: uint8(w), D: uint8(d)}, time, nil
 }
 
 func parseUint(b []byte, i *int) (uint32, bool) {
@@ -278,16 +278,16 @@ func mwdDay(year int64, m, w, d uint8) int64 {
 
 // ruleInstant is the UT seconds of a footer transition: the rule at localTime in year, using the
 // offset in effect just before the transition (utoffBefore).
-func ruleInstant(rule PosixRule, localTime int32, year int64, utoffBefore int32) int64 {
+func ruleInstant(rule posixRule, localTime int32, year int64, utoffBefore int32) int64 {
 	day := mwdDay(year, rule.M, rule.W, rule.D)
 	localEpoch := daysFromCivil(year, int64(rule.M), day)*secsPerDay + int64(localTime)
 	return localEpoch - int64(utoffBefore)
 }
 
 // evalPosix evaluates the POSIX footer (§5) at instantSecs.
-func evalPosix(tz *PosixTz, instantSecs int64) Offset {
+func evalPosix(tz *posixTz, instantSecs int64) offset {
 	if tz.Dst == nil {
-		return Offset{Utoff: tz.StdUtoff, Abbrev: tz.StdAbbr, IsDst: false}
+		return offset{Utoff: tz.StdUtoff, Abbrev: tz.StdAbbr, IsDst: false}
 	}
 	d := tz.Dst
 	year, _, _ := civilFromDays(floorDiv(instantSecs, secsPerDay))
@@ -301,26 +301,26 @@ func evalPosix(tz *PosixTz, instantSecs int64) Offset {
 		inDst = instantSecs >= startUt || instantSecs < endUt
 	}
 	if inDst {
-		return Offset{Utoff: d.Utoff, Abbrev: d.Abbr, IsDst: true}
+		return offset{Utoff: d.Utoff, Abbrev: d.Abbr, IsDst: true}
 	}
-	return Offset{Utoff: tz.StdUtoff, Abbrev: tz.StdAbbr, IsDst: false}
+	return offset{Utoff: tz.StdUtoff, Abbrev: tz.StdAbbr, IsDst: false}
 }
 
-func firstStdOffset(data *TzData) Offset {
+func firstStdOffset(data *tzData) offset {
 	for _, t := range data.Types {
 		if !t.IsDst {
-			return Offset{Utoff: t.Utoff, Abbrev: t.Abbrev, IsDst: false}
+			return offset{Utoff: t.Utoff, Abbrev: t.Abbrev, IsDst: false}
 		}
 	}
 	if len(data.Types) > 0 {
 		t := data.Types[0]
-		return Offset{Utoff: t.Utoff, Abbrev: t.Abbrev, IsDst: t.IsDst}
+		return offset{Utoff: t.Utoff, Abbrev: t.Abbrev, IsDst: t.IsDst}
 	}
-	return Offset{}
+	return offset{}
 }
 
 // OffsetAt is the reader (§4): the local-time type in effect at instantSecs (UT seconds). Pure/total.
-func OffsetAt(data *TzData, instantSecs int64) Offset {
+func offsetAt(data *tzData, instantSecs int64) offset {
 	n := len(data.Trans)
 	if n == 0 {
 		if data.Footer != nil {
@@ -337,7 +337,7 @@ func OffsetAt(data *TzData, instantSecs int64) Offset {
 	// largest i with Trans[i] <= instantSecs
 	i := sort.Search(n, func(k int) bool { return data.Trans[k] > instantSecs }) - 1
 	t := data.Types[data.TransType[i]]
-	return Offset{Utoff: t.Utoff, Abbrev: t.Abbrev, IsDst: t.IsDst}
+	return offset{Utoff: t.Utoff, Abbrev: t.Abbrev, IsDst: t.IsDst}
 }
 
 // --- TZif parsing (RFC 8536 / spec/tz/README.md §2) ---
@@ -388,19 +388,19 @@ func abbrevAt(desig []byte, idx byte) (string, error) {
 	return string(desig[start:end]), nil
 }
 
-func readTzBlock(r *reader, timeSize int, c tzCounts) (TzData, error) {
+func readTzBlock(r *reader, timeSize int, c tzCounts) (tzData, error) {
 	trans := make([]int64, c.timecnt)
 	for i := range trans {
 		if timeSize == 8 {
 			v, err := r.i64()
 			if err != nil {
-				return TzData{}, err
+				return tzData{}, err
 			}
 			trans[i] = v
 		} else {
 			v, err := r.i32()
 			if err != nil {
-				return TzData{}, err
+				return tzData{}, err
 			}
 			trans[i] = int64(v)
 		}
@@ -409,7 +409,7 @@ func readTzBlock(r *reader, timeSize int, c tzCounts) (TzData, error) {
 	for i := range transType {
 		v, err := r.u8()
 		if err != nil {
-			return TzData{}, err
+			return tzData{}, err
 		}
 		transType[i] = v
 	}
@@ -422,83 +422,83 @@ func readTzBlock(r *reader, timeSize int, c tzCounts) (TzData, error) {
 	for i := range raws {
 		off, err := r.i32()
 		if err != nil {
-			return TzData{}, err
+			return tzData{}, err
 		}
 		dst, err := r.u8()
 		if err != nil {
-			return TzData{}, err
+			return tzData{}, err
 		}
 		idx, err := r.u8()
 		if err != nil {
-			return TzData{}, err
+			return tzData{}, err
 		}
 		raws[i] = rawType{off, dst != 0, idx}
 	}
 	desig, err := r.take(c.charcnt)
 	if err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	desigCopy := append([]byte(nil), desig...)
 	// leap seconds (occ width = timeSize, corr = 4) + std/wall + ut/local — skipped (§2).
 	if err := r.skip(c.leapcnt * (timeSize + 4)); err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	if err := r.skip(c.isstdcnt); err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	if err := r.skip(c.isutcnt); err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
-	types := make([]LocalTimeType, c.typecnt)
+	types := make([]localTimeType, c.typecnt)
 	for i, raw := range raws {
 		ab, err := abbrevAt(desigCopy, raw.idx)
 		if err != nil {
-			return TzData{}, err
+			return tzData{}, err
 		}
-		types[i] = LocalTimeType{Utoff: raw.utoff, IsDst: raw.isDst, Abbrev: ab}
+		types[i] = localTimeType{Utoff: raw.utoff, IsDst: raw.isDst, Abbrev: ab}
 	}
 	if len(types) == 0 {
-		return TzData{}, corruptErr("tzif: no local time types")
+		return tzData{}, corruptErr("tzif: no local time types")
 	}
 	for _, t := range transType {
 		if int(t) >= len(types) {
-			return TzData{}, corruptErr("tzif: transition type index out of range")
+			return tzData{}, corruptErr("tzif: transition type index out of range")
 		}
 	}
-	return TzData{Trans: trans, TransType: transType, Types: types}, nil
+	return tzData{Trans: trans, TransType: transType, Types: types}, nil
 }
 
 // ParseTzif parses a TZif file (§2): a v1 block is read directly; a v2+ file skips the v1 block,
 // reads the 64-bit block, then the POSIX footer. A malformed file is XX001.
-func ParseTzif(data []byte) (TzData, error) {
+func parseTzif(data []byte) (tzData, error) {
 	r := &reader{b: data}
 	version, c1, err := readTzHeader(r)
 	if err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	if version == 0 {
 		return readTzBlock(r, 4, c1)
 	}
 	if err := r.skip(tzBlockSize(c1, 4)); err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	_, c2, err := readTzHeader(r)
 	if err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	td, err := readTzBlock(r, 8, c2)
 	if err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	footer, err := readTzFooter(r)
 	if err != nil {
-		return TzData{}, err
+		return tzData{}, err
 	}
 	td.Footer = footer
 	return td, nil
 }
 
-func readTzFooter(r *reader) (*PosixTz, error) {
+func readTzFooter(r *reader) (*posixTz, error) {
 	rest := r.b[min(r.i, len(r.b)):]
 	s := strings.Trim(string(rest), "\n")
 	if s == "" {
@@ -514,19 +514,19 @@ func readTzFooter(r *reader) (*PosixTz, error) {
 // --- the JTZ bundle codec (spec/tz/README.md §3) ---
 
 // TzBundle is a parsed JTZ bundle (README §3).
-type TzBundle struct {
+type tzBundle struct {
 	TzdataVersion string
 	Description   string
-	Zones         []TzZoneSection // (name, raw TZif bytes), ascending by name
-	Links         []TzLink        // (alias, target), ascending by alias
+	Zones         []tzZoneSection // (name, raw TZif bytes), ascending by name
+	Links         []tzLink        // (alias, target), ascending by alias
 }
 
-type TzZoneSection struct {
+type tzZoneSection struct {
 	Name string
 	Raw  []byte
 }
 
-type TzLink struct {
+type tzLink struct {
 	Alias  string
 	Target string
 }
@@ -534,7 +534,7 @@ type TzLink struct {
 var tzBundleMagic = []byte("JTZ\x00\x00\x00")
 
 // SaveTzBundle serializes a JTZ bundle (README §3).
-func SaveTzBundle(b *TzBundle) []byte {
+func saveTzBundle(b *tzBundle) []byte {
 	type packed struct {
 		name   string
 		hash   uint32
@@ -588,7 +588,7 @@ func SaveTzBundle(b *TzBundle) []byte {
 }
 
 // OpenTzBundle reads a JTZ bundle (README §3), verifying the CRC, magic, format, and each zone's hash.
-func OpenTzBundle(data []byte) (*TzBundle, error) {
+func openTzBundle(data []byte) (*tzBundle, error) {
 	if len(data) < 4 {
 		return nil, corruptErr("tz bundle: truncated")
 	}
@@ -657,7 +657,7 @@ func OpenTzBundle(data []byte) (*TzBundle, error) {
 		}
 		metas[i] = meta{name, h, int(rl), int(cl), int(of)}
 	}
-	links := make([]TzLink, linkCount)
+	links := make([]tzLink, linkCount)
 	for i := range links {
 		alias, err := r.str()
 		if err != nil {
@@ -667,9 +667,9 @@ func OpenTzBundle(data []byte) (*TzBundle, error) {
 		if err != nil {
 			return nil, err
 		}
-		links[i] = TzLink{alias, target}
+		links[i] = tzLink{alias, target}
 	}
-	zones := make([]TzZoneSection, zoneCount)
+	zones := make([]tzZoneSection, zoneCount)
 	for i, m := range metas {
 		if m.offs > len(body) || m.offs+m.compLen > len(body) {
 			return nil, corruptErr("tz bundle: section body out of range")
@@ -681,16 +681,16 @@ func OpenTzBundle(data []byte) (*TzBundle, error) {
 		if crc32IEEE(raw) != m.hash {
 			return nil, corruptErr("tz bundle: section content hash mismatch")
 		}
-		zones[i] = TzZoneSection{Name: m.name, Raw: raw}
+		zones[i] = tzZoneSection{Name: m.name, Raw: raw}
 	}
-	return &TzBundle{TzdataVersion: version, Description: desc, Zones: zones, Links: links}, nil
+	return &tzBundle{TzdataVersion: version, Description: desc, Zones: zones, Links: links}, nil
 }
 
 // --- the engine-global loaded zone set + the load seam (timezones.md §3.3) ---
 
 var (
 	loadedTzMu sync.RWMutex
-	loadedTz   = map[string]*Zone{}
+	loadedTz   = map[string]*zone{}
 )
 
 // LoadTimeZoneData loads a JTZ bundle into the engine-global loaded set (§3.3/§4): parse each zone's
@@ -699,17 +699,17 @@ var (
 // TZif) is XX001. The engine primitive behind db.LoadTimeZoneData; may be called before opening any
 // file, reads no path, reaches no host data (§10).
 func LoadTimeZoneData(data []byte) error {
-	bundle, err := OpenTzBundle(data)
+	bundle, err := openTzBundle(data)
 	if err != nil {
 		return err
 	}
-	parsed := make(map[string]*Zone, len(bundle.Zones))
+	parsed := make(map[string]*zone, len(bundle.Zones))
 	for _, z := range bundle.Zones {
-		td, err := ParseTzif(z.Raw)
+		td, err := parseTzif(z.Raw)
 		if err != nil {
 			return err
 		}
-		parsed[z.Name] = &Zone{Name: z.Name, TzdataVersion: bundle.TzdataVersion, Data: td}
+		parsed[z.Name] = &zone{Name: z.Name, TzdataVersion: bundle.TzdataVersion, Data: td}
 	}
 	loadedTzMu.Lock()
 	defer loadedTzMu.Unlock()
@@ -721,7 +721,7 @@ func LoadTimeZoneData(data []byte) error {
 	for _, l := range bundle.Links {
 		if z, ok := parsed[l.Target]; ok {
 			if _, exists := loadedTz[l.Alias]; !exists {
-				loadedTz[l.Alias] = &Zone{Name: l.Alias, TzdataVersion: bundle.TzdataVersion, Data: z.Data}
+				loadedTz[l.Alias] = &zone{Name: l.Alias, TzdataVersion: bundle.TzdataVersion, Data: z.Data}
 			}
 		}
 	}
@@ -729,7 +729,7 @@ func LoadTimeZoneData(data []byte) error {
 }
 
 // LoadedZone looks up a loaded named zone by exact name (nil ⇒ no loaded bundle provides it).
-func LoadedZone(name string) *Zone {
+func loadedZone(name string) *zone {
 	loadedTzMu.RLock()
 	defer loadedTzMu.RUnlock()
 	return loadedTz[name]
@@ -737,7 +737,7 @@ func LoadedZone(name string) *Zone {
 
 // LoadedTimeZones introspects the engine-global loaded zone set (db.LoadedTimeZones, §3.3): every
 // zone + alias a loaded bundle provides, ascending by name.
-func LoadedTimeZones() []TimeZoneInfo {
+func loadedTimeZones() []timeZoneInfo {
 	loadedTzMu.RLock()
 	defer loadedTzMu.RUnlock()
 	names := make([]string, 0, len(loadedTz))
@@ -745,9 +745,9 @@ func LoadedTimeZones() []TimeZoneInfo {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	out := make([]TimeZoneInfo, len(names))
+	out := make([]timeZoneInfo, len(names))
 	for i, n := range names {
-		out[i] = TimeZoneInfo{Name: n, TzdataVersion: loadedTz[n].TzdataVersion}
+		out[i] = timeZoneInfo{Name: n, TzdataVersion: loadedTz[n].TzdataVersion}
 	}
 	return out
 }
@@ -761,30 +761,30 @@ func ResolveZone(name string) (ZoneRef, bool) {
 	if off, ok := parseFixedOffset(name); ok {
 		return ZoneRef{Fixed: true, Off: off}, true
 	}
-	if z := LoadedZone(name); z != nil {
-		return ZoneRef{Zone: z}, true
+	if z := loadedZone(name); z != nil {
+		return ZoneRef{zone: z}, true
 	}
 	return ZoneRef{}, false
 }
 
 // OffsetAtRef is the offset in effect at instantSecs for a resolved zone reference.
-func OffsetAtRef(zr ZoneRef, instantSecs int64) Offset {
+func offsetAtRef(zr ZoneRef, instantSecs int64) offset {
 	if zr.Fixed {
-		return Offset{Utoff: zr.Off, Abbrev: fixedAbbrev(zr.Off), IsDst: false}
+		return offset{Utoff: zr.Off, Abbrev: fixedAbbrev(zr.Off), IsDst: false}
 	}
-	return OffsetAt(&zr.Zone.Data, instantSecs)
+	return offsetAt(&zr.zone.Data, instantSecs)
 }
 
 // InstantToLocalMicros is timestamptz AT TIME ZONE zone (§4): local = instant + utoff.
-func InstantToLocalMicros(zr ZoneRef, instantMicros int64) int64 {
-	off := OffsetAtRef(zr, floorDiv(instantMicros, 1_000_000))
+func instantToLocalMicros(zr ZoneRef, instantMicros int64) int64 {
+	off := offsetAtRef(zr, floorDiv(instantMicros, 1_000_000))
 	return instantMicros + int64(off.Utoff)*1_000_000
 }
 
 // LocalToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. The offset is
 // chosen by determineLocalOffset, matching PostgreSQL's DetermineTimeZoneOffset at a DST gap/overlap
 // (oracle-pinned, timezones.md §6).
-func LocalToInstantMicros(zr ZoneRef, wallMicros int64) int64 {
+func localToInstantMicros(zr ZoneRef, wallMicros int64) int64 {
 	wallSecs := floorDiv(wallMicros, 1_000_000)
 	chosen := determineLocalOffset(zr, wallSecs)
 	return wallMicros - chosen*1_000_000
@@ -800,8 +800,8 @@ func determineLocalOffset(zr ZoneRef, wallSecs int64) int64 {
 	// The offsets a day before / after wallSecs (taken as if UTC). A DST transition is never less
 	// than a day apart, so at most one boundary lies in this 2-day window; if both ends agree there
 	// is no boundary near wallSecs and the time is unambiguous.
-	offLo := int64(OffsetAtRef(zr, wallSecs-day).Utoff)
-	offHi := int64(OffsetAtRef(zr, wallSecs+day).Utoff)
+	offLo := int64(offsetAtRef(zr, wallSecs-day).Utoff)
+	offHi := int64(offsetAtRef(zr, wallSecs+day).Utoff)
 	if offLo == offHi {
 		return offLo
 	}
@@ -810,7 +810,7 @@ func determineLocalOffset(zr ZoneRef, wallSecs int64) int64 {
 	lo, hi := wallSecs-day, wallSecs+day
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		if int64(OffsetAtRef(zr, mid).Utoff) == offLo {
+		if int64(offsetAtRef(zr, mid).Utoff) == offLo {
 			lo = mid + 1
 		} else {
 			hi = mid

@@ -150,7 +150,7 @@ func jsonbValueEqual(a, b *JsonNode) bool { return a.Cmp(b) == 0 }
 // ---------------------------------------------------------------------------------------------
 
 func jsonMalformed(detail string) error {
-	return NewError(InvalidTextRepresentation, "invalid input syntax for type json: "+detail)
+	return newError(InvalidTextRepresentation, "invalid input syntax for type json: "+detail)
 }
 
 // jsonbIn parses + canonicalizes JSON text into a jsonb node tree (`jsonb_in` — spec/design/json.md
@@ -550,7 +550,7 @@ func (p *jsonParser) parseNumber() (JsonNode, error) {
 	}
 
 	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
-	d, err := DecimalFromDigitsScale(neg, digits, scale).CheckCap()
+	d, err := decimalFromDigitsScale(neg, digits, scale).CheckCap()
 	if err != nil {
 		return JsonNode{}, err
 	}
@@ -653,13 +653,13 @@ func hasDuplicateKeys(node *JsonNode) bool {
 
 // jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's
 // kind (json-sql-functions.md §5).
-func jsonPredKindMatches(node *JsonNode, kind JsonPredicateKind) bool {
+func jsonPredKindMatches(node *JsonNode, kind jsonPredicateKind) bool {
 	switch kind {
-	case JPKScalar:
+	case jPKScalar:
 		return node.Kind != JObject && node.Kind != JArray
-	case JPKArray:
+	case jPKArray:
 		return node.Kind == JArray
-	case JPKObject:
+	case jPKObject:
 		return node.Kind == JObject
 	default: // JPKValue
 		return true
@@ -996,7 +996,7 @@ func jsonHasKey(node *JsonNode, key string) bool {
 
 // cannotDelete builds the 22023 (invalid_parameter_value) error for an illegal delete target.
 func cannotDelete(msg string) *EngineError {
-	return NewError(InvalidParameterValue, msg)
+	return newError(InvalidParameterValue, msg)
 }
 
 // jsonConcat is `a || b` — concatenate / shallow-merge (PG): two objects merge with the RIGHT side
@@ -1329,7 +1329,7 @@ func jsonTypeofName(node *JsonNode) string {
 // `22023`.
 func jsonArrayLength(node *JsonNode) (int64, error) {
 	if node.Kind != JArray {
-		return 0, NewError(InvalidParameterValue, "cannot get array length of a scalar")
+		return 0, newError(InvalidParameterValue, "cannot get array length of a scalar")
 	}
 	return int64(len(node.Arr)), nil
 }

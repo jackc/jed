@@ -68,16 +68,16 @@ func parseInlineFields(line string) map[string]string {
 
 func tsParse(typ, in string) (int64, error) {
 	if typ == "timestamp" {
-		return ParseTimestamp(in)
+		return parseTimestamp(in)
 	}
-	return ParseTimestamptz(in)
+	return parseTimestamptz(in)
 }
 
 func tsRender(typ string, m int64) string {
 	if typ == "timestamp" {
-		return RenderTimestamp(m)
+		return renderTimestamp(m)
 	}
-	return RenderTimestamptz(m)
+	return renderTimestamptz(m)
 }
 
 func TestTimestampVectors(t *testing.T) {

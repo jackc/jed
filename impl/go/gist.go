@@ -59,21 +59,21 @@ const (
 // elem unused). A multi-column index threads one per column.
 type gistOpclass struct {
 	scalar bool
-	elem   ColType // range_ops only
+	elem   colType // range_ops only
 }
 
 // gistOpclassFor returns the opclass for a GiST index column of type ty (gist.md §5/§6): range_ops
 // for a range column, the scalar `=` opclass otherwise (the gate guarantees a supported column type,
 // so a non-range column here is a fixed-width keyable scalar).
-func gistOpclassFor(ty Type) gistOpclass {
+func gistOpclassFor(ty dataType) gistOpclass {
 	if rt, ok := ty.RangeElement(); ok {
-		return gistOpclass{scalar: false, elem: ScalarColType(rt.Scalar)}
+		return gistOpclass{scalar: false, elem: scalarColType(rt.Scalar)}
 	}
 	return gistOpclass{scalar: true}
 }
 
 // gistOpclassesFor returns the per-column opclasses of a GiST index (one per indexed column).
-func gistOpclassesFor(cols []int, columns []Column) []gistOpclass {
+func gistOpclassesFor(cols []int, columns []catColumn) []gistOpclass {
 	ops := make([]gistOpclass, len(cols))
 	for i, ci := range cols {
 		ops[i] = gistOpclassFor(columns[ci].Type)
@@ -119,7 +119,7 @@ func (op gistOpclass) readComp(buf []byte, pos *int) (gistBound, error) {
 			return gistBound{}, err
 		}
 		if v.Kind != ValRange {
-			return gistBound{}, NewError(DataCorrupted, "gist: bound is not a range")
+			return gistBound{}, newError(DataCorrupted, "gist: bound is not a range")
 		}
 		return gistBound{rng: v.Range}, nil
 	}
@@ -517,8 +517,8 @@ func gistLeafKey(ops []gistOpclass, bound []gistBound, skey []byte) []byte {
 }
 
 // rangeGistLeafKey builds a single-column range_ops leaf-store key (the GX1 convenience).
-func rangeGistLeafKey(elem ScalarType, rv *RangeVal, skey []byte) []byte {
-	ops := []gistOpclass{{scalar: false, elem: ScalarColType(elem)}}
+func rangeGistLeafKey(elem scalarType, rv *RangeVal, skey []byte) []byte {
+	ops := []gistOpclass{{scalar: false, elem: scalarColType(elem)}}
 	return gistLeafKey(ops, []gistBound{{rng: rv}}, skey)
 }
 
@@ -648,13 +648,13 @@ func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo ui
 		}
 		return nil
 	default:
-		return NewError(DataCorrupted, "expected a GiST node page")
+		return newError(DataCorrupted, "expected a GiST node page")
 	}
 }
 
 func gistReadU16(buf []byte, pos *int) (int, error) {
 	if *pos+2 > len(buf) {
-		return 0, NewError(DataCorrupted, "gist: truncated u16")
+		return 0, newError(DataCorrupted, "gist: truncated u16")
 	}
 	v := int(binary.BigEndian.Uint16(buf[*pos:]))
 	*pos += 2
@@ -663,7 +663,7 @@ func gistReadU16(buf []byte, pos *int) (int, error) {
 
 func gistReadU32(buf []byte, pos *int) (uint32, error) {
 	if *pos+4 > len(buf) {
-		return 0, NewError(DataCorrupted, "gist: truncated u32")
+		return 0, newError(DataCorrupted, "gist: truncated u32")
 	}
 	v := binary.BigEndian.Uint32(buf[*pos:])
 	*pos += 4
@@ -672,7 +672,7 @@ func gistReadU32(buf []byte, pos *int) (uint32, error) {
 
 func gistTakeBytes(buf []byte, pos *int, n int) ([]byte, error) {
 	if *pos+n > len(buf) {
-		return nil, NewError(DataCorrupted, "gist: truncated bytes")
+		return nil, newError(DataCorrupted, "gist: truncated bytes")
 	}
 	v := append([]byte(nil), buf[*pos:*pos+n]...)
 	*pos += n

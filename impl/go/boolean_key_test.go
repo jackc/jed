@@ -12,9 +12,9 @@ import (
 	"testing"
 )
 
-func boolKeyErrCode(t *testing.T, db *Engine, sql string) string {
+func boolKeyErrCode(t *testing.T, db *engine, sql string) string {
 	t.Helper()
-	_, err := Execute(db, sql)
+	_, err := execute(db, sql)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -30,14 +30,14 @@ func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 	)
 
 	// Point lookup on the boolean PK resolves to the right row.
-	out, err := Execute(db, "SELECT v FROM t WHERE k = TRUE")
+	out, err := execute(db, "SELECT v FROM t WHERE k = TRUE")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out.Rows) != 1 || out.Rows[0][0].Int != 20 {
 		t.Fatalf("k = TRUE got %v, want [20]", out.Rows)
 	}
-	out, err = Execute(db, "SELECT v FROM t WHERE k = FALSE")
+	out, err = execute(db, "SELECT v FROM t WHERE k = FALSE")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestBooleanSecondaryIndex(t *testing.T) {
 		"INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)",
 		"CREATE INDEX i ON t (flag)",
 	)
-	out, err := Execute(db, "SELECT id FROM t WHERE flag = TRUE")
+	out, err := execute(db, "SELECT id FROM t WHERE flag = TRUE")
 	if err != nil {
 		t.Fatal(err)
 	}

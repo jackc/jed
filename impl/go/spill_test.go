@@ -17,9 +17,9 @@ import (
 )
 
 // runQuery runs sql and returns (rows, cost).
-func runQuery(t *testing.T, db *Engine, sql string) ([][]Value, int64) {
+func runQuery(t *testing.T, db *engine, sql string) ([][]Value, int64) {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("query %q: %v", sql, err)
 	}
@@ -32,9 +32,9 @@ func runQuery(t *testing.T, db *Engine, sql string) ([][]Value, int64) {
 // seedSpill populates t(id i32 PK, k i32, s text) with n rows whose k is deliberately unsorted
 // and has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL
 // ordering), and a variable-length s (so a spilled run carries variable-width values).
-func seedSpill(t *testing.T, db *Engine, n int64) {
+func seedSpill(t *testing.T, db *engine, n int64) {
 	t.Helper()
-	if _, err := Execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)"); err != nil {
+	if _, err := execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)"); err != nil {
 		t.Fatal(err)
 	}
 	for id := int64(0); id < n; id++ {
@@ -43,7 +43,7 @@ func seedSpill(t *testing.T, db *Engine, n int64) {
 			k = fmt.Sprintf("%d", (id*48271)%100)
 		}
 		s := strings.Repeat("x", int(id%17))
-		if _, err := Execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %s, '%s')", id, k, s)); err != nil {
+		if _, err := execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %s, '%s')", id, k, s)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -105,11 +105,11 @@ func TestSpillingSortMatchesInMemory(t *testing.T) {
 
 	// The source of truth: the same data + queries against a pure in-memory database, which never
 	// spills (spill.md §2).
-	mem := NewEngine()
+	mem := newEngine()
 	seedSpill(t, mem, 200)
 
 	// A file-backed database with a tiny workMem so every shape spills many runs and k-way-merges.
-	db, err := Create(path, DatabaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, DatabaseOptions{PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestSpillLeavesNoTempFiles(t *testing.T) {
 		return n
 	}
 
-	db, err := Create(path, DatabaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, DatabaseOptions{PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,15 +179,15 @@ func TestSpillingSortIsStableOnTies(t *testing.T) {
 	// scan order (primary key = id ascending). The external sort reproduces it only if the merge
 	// tie-breaks by (run, position) = input order (spill.md §6).
 	path := filepath.Join(t.TempDir(), "spill_stable.jed")
-	db, err := Create(path, DatabaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, DatabaseOptions{PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)"); err != nil {
+	if _, err := execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)"); err != nil {
 		t.Fatal(err)
 	}
 	for id := int64(0); id < 100; id++ {
-		if _, err := Execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, 5)", id)); err != nil {
+		if _, err := execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, 5)", id)); err != nil {
 			t.Fatal(err)
 		}
 	}

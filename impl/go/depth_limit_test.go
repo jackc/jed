@@ -14,14 +14,14 @@ import (
 	"testing"
 )
 
-func depthDB(t *testing.T) *Engine {
+func depthDB(t *testing.T) *engine {
 	t.Helper()
 	return dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 1)")
 }
 
 // codeOf returns the SQLSTATE of running sql, or "ok" if it succeeded.
-func codeOf(db *Engine, sql string) string {
-	_, err := Execute(db, sql)
+func codeOf(db *engine, sql string) string {
+	_, err := execute(db, sql)
 	if err == nil {
 		return "ok"
 	}
@@ -63,10 +63,10 @@ func TestDepthExactBoundary(t *testing.T) {
 	// Pin the precise accept/reject boundary at the parser (where the 54001 is raised): a `1+1+…`
 	// chain parses with O(1) parser stack, so maxExprDepth-1 levels parse fine and maxExprDepth is
 	// the first rejected depth. This is the cross-core contract the corpus mirrors.
-	if _, err := ParseSQL(depthChain(maxExprDepth - 1)); err != nil {
+	if _, err := parseSQL(depthChain(maxExprDepth - 1)); err != nil {
 		t.Fatalf("chain(maxExprDepth-1) should parse, got %v", err)
 	}
-	_, err := ParseSQL(depthChain(maxExprDepth))
+	_, err := parseSQL(depthChain(maxExprDepth))
 	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54001" {
 		t.Fatalf("chain(maxExprDepth) = %v, want 54001", err)
 	}

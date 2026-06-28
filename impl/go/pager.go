@@ -100,7 +100,7 @@ func pagerFromStore(store blockStore) (*pager, error) {
 		return nil, err
 	}
 	if size < 12 {
-		return nil, NewError(DataCorrupted, "database file smaller than a meta header")
+		return nil, newError(DataCorrupted, "database file smaller than a meta header")
 	}
 	header, err := store.readAt(0, 12)
 	if err != nil {
@@ -108,7 +108,7 @@ func pagerFromStore(store blockStore) (*pager, error) {
 	}
 	pageSize := binary.BigEndian.Uint32(header[8:12])
 	if pageSize == 0 {
-		return nil, NewError(DataCorrupted, "zero page size in meta header")
+		return nil, newError(DataCorrupted, "zero page size in meta header")
 	}
 	// The allocation high-water is the current file length in pages — already past the committed
 	// pageCount if a prior session preallocated slack (reused for free on this session's growth).
@@ -213,7 +213,7 @@ func (p *pager) sync() error {
 // reported as an ordinary I/O failure so the commit path rolls back exactly as a real write error
 // would (spec/design/storage.md §7). Testing only.
 func injectedCrash() error {
-	return NewError(IoError, "injected commit crash (fault injection)")
+	return newError(IoError, "injected commit crash (fault injection)")
 }
 
 // close releases the backing store (Engine.Close).

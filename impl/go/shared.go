@@ -61,8 +61,8 @@ import (
 // and a writer publishes both with a single Store. sharedTemp is never serialized — it rides the same
 // commit discipline as a pure in-memory swap (no fsync, nothing written to the file).
 type roots struct {
-	committed  *Snapshot // the committed FILE snapshot
-	sharedTemp *Snapshot // the committed shared-temp snapshot (never serialized)
+	committed  *snapshot // the committed FILE snapshot
+	sharedTemp *snapshot // the committed shared-temp snapshot (never serialized)
 }
 
 // sharedCore is the goroutine-safe state shared by every handle minted from one Database
@@ -106,7 +106,7 @@ type storage struct {
 // open free-list pages first), Syncs, publishes the alternate meta slot (snap.txid & 1), Syncs. A
 // crash between the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable
 // from no live snapshot). pageCount/freePages advance only after both syncs succeed.
-func (c *sharedCore) persist(snap *Snapshot) error {
+func (c *sharedCore) persist(snap *snapshot) error {
 	st := c.storage
 	if st == nil {
 		return nil // in-memory: the committed swap is the whole commit
@@ -162,7 +162,7 @@ func (c *sharedCore) pageSize() uint32 {
 // core: its committed snapshot becomes the published roots and its storage identity (page size /
 // pager / page accounting) becomes the storage. The committed snapshot's stores already carry the
 // shared paging, so every pinned snapshot faults clean pages through the one pool (pager.md).
-func sharedCoreFromEngine(e *Engine) *sharedCore {
+func sharedCoreFromEngine(e *engine) *sharedCore {
 	c := &sharedCore{live: make(map[uint64]int)}
 	c.roots.Store(&roots{committed: e.committed, sharedTemp: e.sharedTempCommitted})
 	c.storage = &storage{
@@ -201,7 +201,7 @@ func NewDatabase() *Database {
 // host handle with its default session. 58P02 if the path already exists; the page size is locked
 // into the file.
 func CreateDatabase(path string, opts DatabaseOptions) (*Database, error) {
-	e, err := Create(path, opts)
+	e, err := create(path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -210,13 +210,13 @@ func CreateDatabase(path string, opts DatabaseOptions) (*Database, error) {
 
 // OpenDatabase opens an existing file-backed database at path with default open settings.
 func OpenDatabase(path string) (*Database, error) {
-	return OpenDatabaseWithOptions(path, OpenOptions{})
+	return openDatabaseWithOptions(path, openOptions{})
 }
 
 // OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
 // (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
-func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
-	e, err := OpenWithOptions(path, opts)
+func openDatabaseWithOptions(path string, opts openOptions) (*Database, error) {
+	e, err := openWithOptions(path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +264,7 @@ func (s *Database) ReadSession() *Session {
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshots directly — no clone. Both roots are pinned together (temp-tables.md §5),
 	// so the reader sees a consistent file + shared-temp view.
-	engine := &Engine{committed: snap, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: defaultSharedTempMem}
 	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
 }
 
@@ -285,7 +285,7 @@ func (s *Database) WriteSession() *Session {
 	base := rt.committed
 	// committed/sharedTemp are the immutable bases (the writer mutates only working / sharedTempWorking,
 	// which beginTx clones off them). Both roots are pinned together (temp-tables.md §5).
-	engine := &Engine{committed: base, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	engine := &engine{committed: base, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: defaultSharedTempMem}
 	_, _ = engine.beginTx(true, true)
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid}
 }
@@ -299,7 +299,7 @@ func (s *Database) WriteSession() *Session {
 func (s *Database) Session(opts SessionOptions) *Session {
 	rt := s.core.roots.Load()
 	snap := rt.committed
-	engine := &Engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts), sharedTempCommitted: rt.sharedTemp, sharedTempMem: defaultSharedTempMem}
 	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
 	// version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
 	if s.core.readOnlyMode() {
@@ -392,8 +392,8 @@ func (db *Database) ClearClockSource()               { db.def.ClearClockSource()
 
 // The temp-table envelope + the collation-upgrade host op (spec/design/temp-tables.md §5/§7,
 // collation.md §12), delegating to the default session.
-func (db *Database) ResetPrivileges()                { db.def.ResetPrivileges() }
-func (db *Database) SetAllowTempDDL(allow bool)      { db.def.SetAllowTempDDL(allow) }
+func (db *Database) ResetPrivileges()           { db.def.ResetPrivileges() }
+func (db *Database) SetAllowTempDDL(allow bool) { db.def.SetAllowTempDDL(allow) }
 func (db *Database) SetAllowSharedTempDDL(allow bool) {
 	db.def.SetAllowSharedTempDDL(allow)
 }
@@ -418,7 +418,7 @@ const (
 type Session struct {
 	core *sharedCore
 	// engine is a private executor handle; engine.session is this session's envelope (sessionState).
-	engine *Engine
+	engine *engine
 	access accessMode
 	// gateHeld is whether this session currently holds the single-writer gate.
 	gateHeld bool
@@ -467,10 +467,10 @@ func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
 // a writable block); a statement inside an open block runs against the working set; an autocommit
 // read pins the latest committed for that statement; an autocommit write takes the gate, publishes,
 // and releases it.
-func (s *Session) dispatch(stmt Statement, params []Value) (Outcome, error) {
+func (s *Session) dispatch(stmt statement, params []Value) (Outcome, error) {
 	if s.access == accessReadOnly {
 		if stmtIsWrite(stmt) {
-			return Outcome{}, NewError(ReadOnlySqlTransaction,
+			return Outcome{}, newError(ReadOnlySqlTransaction,
 				"cannot execute a write statement against a read-only snapshot")
 		}
 		return s.engine.ExecuteStmtParams(stmt, params)
@@ -793,7 +793,7 @@ func (s *Session) ResetVars() { s.engine.session.ResetVars() }
 // write op — it routes through the lazy writer gate and publishes through the shared core on change.
 func (s *Session) UpgradeCollations() (int, error) {
 	if s.access == accessReadOnly {
-		return 0, NewError(ReadOnlySqlTransaction, "cannot upgrade collations on a read-only snapshot")
+		return 0, newError(ReadOnlySqlTransaction, "cannot upgrade collations on a read-only snapshot")
 	}
 	if s.engine.session.tx != nil {
 		// Inside an open block: run on the working set (the gate is already held for a writable block).

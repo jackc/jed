@@ -16,7 +16,7 @@ import (
 
 // correlatedTables builds `o` (five outer rows whose k-values all exist as inner ids) and `inr` (n
 // rows id i32 PRIMARY KEY, v i32; v == id) large enough to span several leaves.
-func correlatedTables(t *testing.T, n int) *Engine {
+func correlatedTables(t *testing.T, n int) *engine {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("INSERT INTO inr VALUES ")
@@ -35,9 +35,9 @@ func correlatedTables(t *testing.T, n int) *Engine {
 	)
 }
 
-func mustIds(t *testing.T, db *Engine, sql string) []int64 {
+func mustIds(t *testing.T, db *engine, sql string) []int64 {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%s: unexpected error %v", sql, err)
 	}
@@ -101,7 +101,7 @@ func TestCorrelatedMissAndNullOuterSeekNothing(t *testing.T) {
 
 	// An outer k with no matching inner id is a point-lookup miss (visits the leaf, reads no row); a
 	// NULL outer k is a 3VL-empty bound (reads no page, no row). Neither re-scans the inner.
-	if _, err := Execute(db, "INSERT INTO o VALUES (6, 999999), (7, NULL)"); err != nil {
+	if _, err := execute(db, "INSERT INTO o VALUES (6, 999999), (7, NULL)"); err != nil {
 		t.Fatal(err)
 	}
 	const q = "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id = o.k)"

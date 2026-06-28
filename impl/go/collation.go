@@ -23,7 +23,7 @@ import (
 // Ce is one collation element — a weight triple plus a flags byte. 7 bytes on disk
 // (spec/collation/README.md §2): flags u8, l1 u16, l2 u16, l3 u16 (big-endian). A 0x0000 weight is
 // ignorable at that level (skipped in the sort key, §4).
-type Ce struct {
+type ce struct {
 	Flags byte // bit0 = variable; bits 1-7 reserved (0). non-ignorable in slice 1 (§6).
 	L1    uint16
 	L2    uint16
@@ -32,15 +32,15 @@ type Ce struct {
 
 const ceVariable byte = 0x01 // Flags bit0 — a variable collation element (DUCET marker '*').
 
-func ce(l1, l2, l3 uint16) Ce { return Ce{0, l1, l2, l3} }
+func newCe(l1, l2, l3 uint16) ce { return ce{0, l1, l2, l3} }
 
 type singleEntry struct {
 	cp  uint32
-	ces []Ce
+	ces []ce
 }
 type contractionEntry struct {
 	seq []uint32
-	ces []Ce
+	ces []ce
 }
 
 // Collation is a compiled, fully-resolved collation: jed's own table plus its metadata,
@@ -69,15 +69,15 @@ const (
 )
 
 func featureErr(format string, a ...any) error {
-	return NewError(FeatureNotSupported, fmt.Sprintf(format, a...))
+	return newError(FeatureNotSupported, fmt.Sprintf(format, a...))
 }
 
 func syntaxErr(format string, a ...any) error {
-	return NewError(SyntaxError, fmt.Sprintf(format, a...))
+	return newError(SyntaxError, fmt.Sprintf(format, a...))
 }
 
 func corruptErr(format string, a ...any) error {
-	return NewError(DataCorrupted, fmt.Sprintf(format, a...))
+	return newError(DataCorrupted, fmt.Sprintf(format, a...))
 }
 
 // ============================================================================================
@@ -87,13 +87,13 @@ func corruptErr(format string, a ...any) error {
 // CompileCollation parses a collation definition (spec/collation/README.md §1) and compiles it
 // into a jed table. The definition is a single stream, line-dispatched: @… records, allkeys
 // mapping lines (codepoints ; elements), and LDML rule lines (&anchor < x …). Host-free.
-func CompileCollation(name, definition string) (*Collation, error) {
+func compileCollation(name, definition string) (*Collation, error) {
 	unicodeVersion := ""
 	// working map: code-point sequence → CEs, in insertion order.
 	var keys [][]uint32
-	cesByKey := map[string][]Ce{}
+	cesByKey := map[string][]ce{}
 
-	setMapping := func(seq []uint32, ces []Ce, replace bool) error {
+	setMapping := func(seq []uint32, ces []ce, replace bool) error {
 		k := seqKey(seq)
 		if _, ok := cesByKey[k]; ok {
 			if !replace {
@@ -167,7 +167,7 @@ func stripLineComment(line string) string {
 	return line
 }
 
-type setMappingFn func(seq []uint32, ces []Ce, replace bool) error
+type setMappingFn func(seq []uint32, ces []ce, replace bool) error
 
 func parseMapping(set setMappingFn, line string) error {
 	i := strings.IndexByte(line, ';')
@@ -196,8 +196,8 @@ func parseMapping(set setMappingFn, line string) error {
 }
 
 // parseElements parses [*0209.0020.0002][.0000.0047.0002]… into collation elements.
-func parseElements(s string) ([]Ce, error) {
-	var ces []Ce
+func parseElements(s string) ([]ce, error) {
+	var ces []ce
 	i := 0
 	for i < len(s) {
 		if s[i] == ' ' || s[i] == '\t' {
@@ -237,7 +237,7 @@ func parseElements(s string) ([]Ce, error) {
 		if err != nil {
 			return nil, err
 		}
-		ces = append(ces, Ce{flags, l1, l2, l3})
+		ces = append(ces, ce{flags, l1, l2, l3})
 		i = end + 1
 	}
 	return ces, nil
@@ -269,7 +269,7 @@ type tok struct {
 
 // applyTailoring applies one LDML rule line: &anchor REL target (REL target)*. Single-character
 // anchor/targets only in slice 1b.
-func applyTailoring(keys [][]uint32, cesByKey map[string][]Ce, set setMappingFn, line string) error {
+func applyTailoring(keys [][]uint32, cesByKey map[string][]ce, set setMappingFn, line string) error {
 	body := strings.TrimSpace(line[1:])
 	toks, err := tokenizeRule(body)
 	if err != nil {
@@ -298,7 +298,7 @@ func applyTailoring(keys [][]uint32, cesByKey map[string][]Ce, set setMappingFn,
 		if err != nil {
 			return err
 		}
-		if err := set([]uint32{target}, []Ce{newCe}, true); err != nil {
+		if err := set([]uint32{target}, []ce{newCe}, true); err != nil {
 			return err
 		}
 		cur = newCe
@@ -343,51 +343,51 @@ func tokenizeRule(s string) ([]tok, error) {
 }
 
 // singleCe returns the CE of a single-code-point mapping with exactly one element.
-func singleCe(cesByKey map[string][]Ce, cp uint32) (Ce, bool) {
+func singleCe(cesByKey map[string][]ce, cp uint32) (ce, bool) {
 	ces, ok := cesByKey[seqKey([]uint32{cp})]
 	if !ok || len(ces) != 1 {
-		return Ce{}, false
+		return ce{}, false
 	}
 	return ces[0], true
 }
 
 // allocAfter allocates a fresh CE placed after cur at the given relation level (the dev allocator).
-func allocAfter(keys [][]uint32, cesByKey map[string][]Ce, cur Ce, r rel) (Ce, error) {
+func allocAfter(keys [][]uint32, cesByKey map[string][]ce, cur ce, r rel) (ce, error) {
 	switch r {
 	case relIdentical:
 		return cur, nil
 	case relPrimary:
-		succ, has := minWeightAbove(keys, cesByKey, func(c Ce) (uint16, bool) {
+		succ, has := minWeightAbove(keys, cesByKey, func(c ce) (uint16, bool) {
 			return c.L1, c.L1 > cur.L1
 		})
 		l1, err := freshGap(cur.L1, succ, has, primaryGap)
 		if err != nil {
-			return Ce{}, err
+			return ce{}, err
 		}
-		return ce(l1, baseL2, baseL3), nil
+		return newCe(l1, baseL2, baseL3), nil
 	case relSecondary:
-		succ, has := minWeightAbove(keys, cesByKey, func(c Ce) (uint16, bool) {
+		succ, has := minWeightAbove(keys, cesByKey, func(c ce) (uint16, bool) {
 			return c.L2, c.L1 == cur.L1 && c.L2 > cur.L2
 		})
 		l2, err := freshGap(cur.L2, succ, has, secondaryGap)
 		if err != nil {
-			return Ce{}, err
+			return ce{}, err
 		}
-		return ce(cur.L1, l2, baseL3), nil
+		return newCe(cur.L1, l2, baseL3), nil
 	default: // relTertiary
-		succ, has := minWeightAbove(keys, cesByKey, func(c Ce) (uint16, bool) {
+		succ, has := minWeightAbove(keys, cesByKey, func(c ce) (uint16, bool) {
 			return c.L3, c.L1 == cur.L1 && c.L2 == cur.L2 && c.L3 > cur.L3
 		})
 		l3, err := freshGap(cur.L3, succ, has, tertiaryGap)
 		if err != nil {
-			return Ce{}, err
+			return ce{}, err
 		}
-		return ce(cur.L1, cur.L2, l3), nil
+		return newCe(cur.L1, cur.L2, l3), nil
 	}
 }
 
 // minWeightAbove returns the smallest weight matching pred across every CE in the table.
-func minWeightAbove(keys [][]uint32, cesByKey map[string][]Ce, pred func(Ce) (uint16, bool)) (uint16, bool) {
+func minWeightAbove(keys [][]uint32, cesByKey map[string][]ce, pred func(ce) (uint16, bool)) (uint16, bool) {
 	var best uint16
 	has := false
 	for _, seq := range keys {
@@ -439,7 +439,7 @@ func parseHex16(s string) (uint16, error) {
 
 // SortKey is the byte string whose memcmp order equals the collation's logical order:
 // L1-weights ‖ 0x0000 ‖ L2-weights ‖ 0x0000 ‖ L3-weights ‖ 0x0000 ‖ Ckey(original).
-func SortKey(coll *Collation, s string) ([]byte, error) {
+func sortKey(coll *Collation, s string) ([]byte, error) {
 	var cps []uint32
 	for _, r := range s {
 		cps = append(cps, uint32(r))
@@ -469,18 +469,18 @@ func SortKey(coll *Collation, s string) ([]byte, error) {
 	}
 	key = append(key, 0, 0)
 	// identical level: the §2.4 C-key of the original UTF-8 string.
-	key = append(key, EncodeTerminated([]byte(s))...)
+	key = append(key, encodeTerminated([]byte(s))...)
 	return key, nil
 }
 
-func collationElements(coll *Collation, cps []uint32) ([]Ce, error) {
+func collationElements(coll *Collation, cps []uint32) ([]ce, error) {
 	maxContraction := 0
 	for _, c := range coll.Contractions {
 		if len(c.seq) > maxContraction {
 			maxContraction = len(c.seq)
 		}
 	}
-	var out []Ce
+	var out []ce
 	i := 0
 	for i < len(cps) {
 		matched := false
@@ -510,7 +510,7 @@ func collationElements(coll *Collation, cps []uint32) ([]Ce, error) {
 	return out, nil
 }
 
-func lookupSingle(coll *Collation, cp uint32) ([]Ce, bool) {
+func lookupSingle(coll *Collation, cp uint32) ([]ce, bool) {
 	for _, s := range coll.Singles {
 		if s.cp == cp {
 			return s.ces, true
@@ -519,7 +519,7 @@ func lookupSingle(coll *Collation, cp uint32) ([]Ce, bool) {
 	return nil, false
 }
 
-func lookupContraction(coll *Collation, seq []uint32) ([]Ce, bool) {
+func lookupContraction(coll *Collation, seq []uint32) ([]ce, bool) {
 	for _, c := range coll.Contractions {
 		if equalSeq(c.seq, seq) {
 			return c.ces, true
@@ -547,7 +547,7 @@ func equalSeq(a, b []uint32) bool {
 // ============================================================================================
 
 // SerializeTable serializes the compiled table (§2) — the bytes the content hash covers.
-func SerializeTable(coll *Collation) []byte {
+func serializeTable(coll *Collation) []byte {
 	return serializeEntries(coll.Singles, coll.Contractions)
 }
 
@@ -578,7 +578,7 @@ func serializeEntries(singles []singleEntry, contractions []contractionEntry) []
 	return out
 }
 
-func pushCe(out []byte, c Ce) []byte {
+func pushCe(out []byte, c ce) []byte {
 	out = append(out, c.Flags)
 	out = appendU16(out, c.L1)
 	out = appendU16(out, c.L2)
@@ -589,8 +589,8 @@ func pushCe(out []byte, c Ce) []byte {
 // SaveCollation writes the portable .coll artifact (§3): magic + metadata + provenance + CRC-32 +
 // the LZ4-compressed table. OpenCollation is its exact inverse; the round-trip is byte-identical
 // on every core (collation.md §10).
-func SaveCollation(coll *Collation) []byte {
-	table := SerializeTable(coll)
+func saveCollation(coll *Collation) []byte {
+	table := serializeTable(coll)
 	hash := crc32IEEE(table)
 	comp := lz4Compress(table)
 
@@ -615,7 +615,7 @@ func pushStr(out []byte, s string) []byte {
 
 // OpenCollation reads a .coll artifact (§3) back into a Collation. Verifies the magic, the format
 // version, and the content hash; a malformed or tampered artifact is XX001 (data_corrupted).
-func OpenCollation(bytes []byte) (*Collation, error) {
+func openCollation(bytes []byte) (*Collation, error) {
 	r := &reader{b: bytes}
 	magic, err := r.take(6)
 	if err != nil {
@@ -711,7 +711,7 @@ var (
 	// nil until a bundle carrying a property section is loaded. Its presence is the binary "casing
 	// regime" the C/ASCII baseline flips on: nil ⇒ casing is ASCII-only, table-free, version-free.
 	// FIRST-WINS, like loadedColl.
-	loadedProp *PropertyTable
+	loadedProp *propertyTable
 )
 
 // LoadUnicodeData loads a JUCD Unicode-data bundle into the engine-global loaded set
@@ -726,11 +726,11 @@ var (
 // resolves its table from this set). Privileged host op — the engine reads no file path and reaches
 // no host data (§11); the host sources the bytes.
 func LoadUnicodeData(data []byte) error {
-	bundle, err := OpenBundle(data)
+	bundle, err := openBundle(data)
 	if err != nil {
 		return err
 	}
-	colls, prop, err := LoadBundle(bundle)
+	colls, prop, err := loadBundle(bundle)
 	if err != nil {
 		return err
 	}
@@ -750,7 +750,7 @@ func LoadUnicodeData(data []byte) error {
 // LoadedProperty returns the engine-global property/casing table, or nil if no bundle providing one
 // has been loaded (§16) — nil ⇒ the ASCII-casing baseline. The casing functions look this up ONCE per
 // evaluation and pass it to the pure kernels below, which keeps the un-loaded (ASCII) regime testable.
-func LoadedProperty() *PropertyTable {
+func loadedProperty() *propertyTable {
 	loadedMu.RLock()
 	defer loadedMu.RUnlock()
 	return loadedProp
@@ -773,7 +773,7 @@ func LoadedCollation(name string) *Collation {
 // version, or no loaded table to disagree). A pure, total comparison so EVERY core computes the
 // identical verdict (the §10 cross-core contract). The read side never consults this — a skewed read
 // recomputes against the loaded table (the heap-scan fallback, compatibility.md §8).
-func VersionSkew(name, fileUnicode, fileCldr string) (loadedUnicode, loadedCldr string, skewed bool) {
+func versionSkew(name, fileUnicode, fileCldr string) (loadedUnicode, loadedCldr string, skewed bool) {
 	loaded := LoadedCollation(name)
 	if loaded == nil {
 		return "", "", false
@@ -891,12 +891,12 @@ func (r *reader) u32() (uint32, error) {
 	return uint32(s[0])<<24 | uint32(s[1])<<16 | uint32(s[2])<<8 | uint32(s[3]), nil
 }
 
-func (r *reader) ces() ([]Ce, error) {
+func (r *reader) ces() ([]ce, error) {
 	n, err := r.u8()
 	if err != nil {
 		return nil, err
 	}
-	ces := make([]Ce, 0, n)
+	ces := make([]ce, 0, n)
 	for j := byte(0); j < n; j++ {
 		flags, err := r.u8()
 		if err != nil {
@@ -914,7 +914,7 @@ func (r *reader) ces() ([]Ce, error) {
 		if err != nil {
 			return nil, err
 		}
-		ces = append(ces, Ce{flags, l1, l2, l3})
+		ces = append(ces, ce{flags, l1, l2, l3})
 	}
 	return ces, nil
 }
@@ -984,11 +984,11 @@ func seqLess(a, b []uint32) bool {
 // ============================================================================================
 
 // SimpleCase is a simple 1:1 case mapping (a field equal to Cp is the identity mapping).
-type SimpleCase struct{ Cp, Upper, Lower, Title uint32 }
+type simpleCase struct{ Cp, Upper, Lower, Title uint32 }
 
 // SpecialCasing is a full (multi-code-point) case mapping (README §5). Conditional/locale context
 // is reserved.
-type SpecialCasing struct {
+type specialCasing struct {
 	Cp    uint32
 	Upper []uint32
 	Lower []uint32
@@ -997,9 +997,9 @@ type SpecialCasing struct {
 
 // PropertyTable is the Unicode property/casing data (README §5). First cut: case mappings only
 // (normalization is a reserved later sub-table). Simple is ascending by code point; Special likewise.
-type PropertyTable struct {
-	Simple  []SimpleCase
-	Special []SpecialCasing
+type propertyTable struct {
+	Simple  []simpleCase
+	Special []specialCasing
 }
 
 // ============================================================================================
@@ -1014,7 +1014,7 @@ type PropertyTable struct {
 // points through — the SQLite default, version-independent). A non-nil p folds via the loaded Unicode
 // tables — full mappings incl. SpecialCasing expansions (ß→SS). upper selects the direction. Backs
 // the upper(text)/lower(text) functions (functions.md §9).
-func FoldCase(s string, upper bool, p *PropertyTable) string {
+func foldCase(s string, upper bool, p *propertyTable) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
@@ -1047,7 +1047,7 @@ func FoldCase(s string, upper bool, p *PropertyTable) string {
 // FoldLowerSimple folds to lowercase for case-insensitive matching (ILIKE) — SIMPLE 1:1 mappings
 // only (never the expanding SpecialCasing forms), so every code point stays one code point and the
 // matcher's _/length semantics are preserved (grammar.md §22). ASCII baseline when p == nil.
-func FoldLowerSimple(s string, p *PropertyTable) string {
+func foldLowerSimple(s string, p *propertyTable) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
@@ -1086,15 +1086,15 @@ func runeOr(cp uint32, src rune) rune {
 	return rune(cp)
 }
 
-func propLookupSimple(p *PropertyTable, cp uint32) (SimpleCase, bool) {
+func propLookupSimple(p *propertyTable, cp uint32) (simpleCase, bool) {
 	i := sort.Search(len(p.Simple), func(i int) bool { return p.Simple[i].Cp >= cp })
 	if i < len(p.Simple) && p.Simple[i].Cp == cp {
 		return p.Simple[i], true
 	}
-	return SimpleCase{}, false
+	return simpleCase{}, false
 }
 
-func propLookupSpecial(p *PropertyTable, cp uint32) *SpecialCasing {
+func propLookupSpecial(p *propertyTable, cp uint32) *specialCasing {
 	i := sort.Search(len(p.Special), func(i int) bool { return p.Special[i].Cp >= cp })
 	if i < len(p.Special) && p.Special[i].Cp == cp {
 		return &p.Special[i]
@@ -1118,25 +1118,25 @@ const (
 
 // Section is one bundle section: the property tables (Kind 0), the shared root (Kind 1), or a
 // per-locale override (Kind 2). Exactly one of Property / Entries is set, per Kind.
-type Section struct {
+type section struct {
 	Kind     byte
-	Property *PropertyTable
+	Property *propertyTable
 	Entries  *bundleEntries
 }
 
 // Bundle is a parsed JUCD bundle (README §5): the shared header version axis + its sections.
-type Bundle struct {
+type bundle struct {
 	UnicodeVersion string
 	CldrVersion    string
 	Description    string
-	Sections       []Section
+	Sections       []section
 }
 
 var bundleMagic = []byte{'J', 'U', 'C', 'D', 0, 0}
 
 // SaveBundle serializes a JUCD bundle (README §5): header, manifest (a TOC with per-section
 // offsets), the LZ4-compressed section bodies, and a trailing CRC-32 over everything before it.
-func SaveBundle(b *Bundle) []byte {
+func saveBundle(b *bundle) []byte {
 	type packed struct {
 		kind   byte
 		name   string
@@ -1198,7 +1198,7 @@ func SaveBundle(b *Bundle) []byte {
 
 // OpenBundle reads a JUCD bundle (README §5). Verifies the trailing CRC, the magic, the format
 // version, and each section's content hash; a malformed bundle is XX001 (data_corrupted).
-func OpenBundle(data []byte) (*Bundle, error) {
+func openBundle(data []byte) (*bundle, error) {
 	if len(data) < 4 {
 		return nil, corruptErr("bundle: truncated")
 	}
@@ -1275,7 +1275,7 @@ func OpenBundle(data []byte) (*Bundle, error) {
 		es = append(es, entry{kind, name, hash, int(rawLen), int(compLen), int(offset)})
 	}
 
-	sections := make([]Section, 0, count)
+	sections := make([]section, 0, count)
 	for _, e := range es {
 		if e.offset > len(body) || e.offset+e.compLen > len(body) {
 			return nil, corruptErr("bundle: section body out of range")
@@ -1293,25 +1293,25 @@ func OpenBundle(data []byte) (*Bundle, error) {
 			if err != nil {
 				return nil, err
 			}
-			sections = append(sections, Section{Kind: sectionProperty, Property: p})
+			sections = append(sections, section{Kind: sectionProperty, Property: p})
 		case sectionRoot, sectionTailoring:
 			singles, contractions, err := deserializeTable(raw)
 			if err != nil {
 				return nil, err
 			}
-			sections = append(sections, Section{Kind: e.kind, Entries: &bundleEntries{e.name, singles, contractions}})
+			sections = append(sections, section{Kind: e.kind, Entries: &bundleEntries{e.name, singles, contractions}})
 		default:
 			return nil, corruptErr("bundle: unknown section kind %d", e.kind)
 		}
 	}
-	return &Bundle{uv, cldr, desc, sections}, nil
+	return &bundle{uv, cldr, desc, sections}, nil
 }
 
 // LoadBundle loads a bundle (README §5.1): the root section is a usable collation; each tailoring is
 // merged onto the root (byte-identical to its fully-resolved .coll table). Every collation takes the
 // bundle header's (unicode, cldr) version + description. Returns the collations and the optional
 // property table.
-func LoadBundle(b *Bundle) ([]*Collation, *PropertyTable, error) {
+func loadBundle(b *bundle) ([]*Collation, *propertyTable, error) {
 	var root *bundleEntries
 	for i := range b.Sections {
 		if b.Sections[i].Kind == sectionRoot {
@@ -1326,7 +1326,7 @@ func LoadBundle(b *Bundle) ([]*Collation, *PropertyTable, error) {
 		}
 	}
 	var colls []*Collation
-	var property *PropertyTable
+	var property *propertyTable
 	if root != nil {
 		colls = append(colls, mk(root.name, root.singles, root.contractions))
 	}
@@ -1349,24 +1349,24 @@ func LoadBundle(b *Bundle) ([]*Collation, *PropertyTable, error) {
 // BuildBundle builds a JUCD bundle (README §5) from a root collation, per-locale tailorings (each
 // diffed against the root into a sparse override), and an optional property table — the builder
 // tool's core. The header (unicode, cldr) version is the root's.
-func BuildBundle(root *Collation, tailorings []*Collation, property *PropertyTable, description string) *Bundle {
-	var sections []Section
+func buildBundle(root *Collation, tailorings []*Collation, property *propertyTable, description string) *bundle {
+	var sections []section
 	if property != nil {
-		sections = append(sections, Section{Kind: sectionProperty, Property: property})
+		sections = append(sections, section{Kind: sectionProperty, Property: property})
 	}
-	sections = append(sections, Section{Kind: sectionRoot, Entries: &bundleEntries{root.Name, root.Singles, root.Contractions}})
+	sections = append(sections, section{Kind: sectionRoot, Entries: &bundleEntries{root.Name, root.Singles, root.Contractions}})
 	for _, t := range tailorings {
 		singles, contractions := diffAgainstRoot(t, root)
-		sections = append(sections, Section{Kind: sectionTailoring, Entries: &bundleEntries{t.Name, singles, contractions}})
+		sections = append(sections, section{Kind: sectionTailoring, Entries: &bundleEntries{t.Name, singles, contractions}})
 	}
-	return &Bundle{root.UnicodeVersion, root.CldrVersion, description, sections}
+	return &bundle{root.UnicodeVersion, root.CldrVersion, description, sections}
 }
 
 // mergeOntoRoot merges a tailoring's sparse override onto the root table (README §5.1): start from
 // the root maps, replace-or-add each override by key, re-sort (ascending by code point / lexicographic
 // by sequence — the §2 total order), so the result is byte-identical to the full .coll table.
 func mergeOntoRoot(root, delta *bundleEntries) ([]singleEntry, []contractionEntry) {
-	singleByCp := make(map[uint32][]Ce, len(root.singles)+len(delta.singles))
+	singleByCp := make(map[uint32][]ce, len(root.singles)+len(delta.singles))
 	for _, s := range root.singles {
 		singleByCp[s.cp] = s.ces
 	}
@@ -1398,7 +1398,7 @@ func mergeOntoRoot(root, delta *bundleEntries) ([]singleEntry, []contractionEntr
 // root lacks or maps differently. The current LDML subset only adds or replaces (no removals), so
 // applying this back onto the root reproduces the full table (§5.1).
 func diffAgainstRoot(full, root *Collation) ([]singleEntry, []contractionEntry) {
-	rootSingles := make(map[uint32][]Ce, len(root.Singles))
+	rootSingles := make(map[uint32][]ce, len(root.Singles))
 	for _, s := range root.Singles {
 		rootSingles[s.cp] = s.ces
 	}
@@ -1408,7 +1408,7 @@ func diffAgainstRoot(full, root *Collation) ([]singleEntry, []contractionEntry) 
 			singles = append(singles, s)
 		}
 	}
-	rootContr := make(map[string][]Ce, len(root.Contractions))
+	rootContr := make(map[string][]ce, len(root.Contractions))
 	for _, c := range root.Contractions {
 		rootContr[seqKey(c.seq)] = c.ces
 	}
@@ -1421,7 +1421,7 @@ func diffAgainstRoot(full, root *Collation) ([]singleEntry, []contractionEntry) 
 	return singles, contractions
 }
 
-func equalCes(a, b []Ce) bool {
+func equalCes(a, b []ce) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -1433,7 +1433,7 @@ func equalCes(a, b []Ce) bool {
 	return true
 }
 
-func serializeProperty(p *PropertyTable) []byte {
+func serializeProperty(p *propertyTable) []byte {
 	out := []byte{1} // layout_version
 	out = appendU32(out, uint32(len(p.Simple)))
 	for _, s := range p.Simple {
@@ -1460,7 +1460,7 @@ func pushCps(out []byte, cps []uint32) []byte {
 	return out
 }
 
-func deserializeProperty(raw []byte) (*PropertyTable, error) {
+func deserializeProperty(raw []byte) (*propertyTable, error) {
 	r := &reader{b: raw}
 	layout, err := r.u8()
 	if err != nil {
@@ -1473,7 +1473,7 @@ func deserializeProperty(raw []byte) (*PropertyTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	var simple []SimpleCase
+	var simple []simpleCase
 	for n := uint32(0); n < numSimple; n++ {
 		cp, err := r.u32()
 		if err != nil {
@@ -1491,13 +1491,13 @@ func deserializeProperty(raw []byte) (*PropertyTable, error) {
 		if err != nil {
 			return nil, err
 		}
-		simple = append(simple, SimpleCase{cp, up, lo, ti})
+		simple = append(simple, simpleCase{cp, up, lo, ti})
 	}
 	numSpecial, err := r.u32()
 	if err != nil {
 		return nil, err
 	}
-	var special []SpecialCasing
+	var special []specialCasing
 	for n := uint32(0); n < numSpecial; n++ {
 		cp, err := r.u32()
 		if err != nil {
@@ -1515,10 +1515,10 @@ func deserializeProperty(raw []byte) (*PropertyTable, error) {
 		if err != nil {
 			return nil, err
 		}
-		special = append(special, SpecialCasing{cp, up, lo, ti})
+		special = append(special, specialCasing{cp, up, lo, ti})
 	}
 	if r.i != len(r.b) {
 		return nil, corruptErr("bundle: trailing bytes after property table")
 	}
-	return &PropertyTable{simple, special}, nil
+	return &propertyTable{simple, special}, nil
 }

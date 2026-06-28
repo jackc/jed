@@ -124,7 +124,7 @@ func TestRegexProgramVectors(t *testing.T) {
 		pattern := tomlUnquote(c["pattern"])
 		pat := pattern
 		if strings.Contains(tomlUnquote(c["flags"]), "i") {
-			pat = FoldLowerSimple(pat, LoadedProperty())
+			pat = foldLowerSimple(pat, loadedProperty())
 		}
 		prog, err := compileRegex(pat)
 		if err != nil {
@@ -159,14 +159,14 @@ func TestRegexMatchVectors(t *testing.T) {
 		input := tomlUnquote(c["input"])
 		pat, subj := pattern, input
 		if strings.Contains(tomlUnquote(c["flags"]), "i") {
-			pat = FoldLowerSimple(pat, LoadedProperty())
-			subj = FoldLowerSimple(subj, LoadedProperty())
+			pat = foldLowerSimple(pat, loadedProperty())
+			subj = foldLowerSimple(subj, loadedProperty())
 		}
 		prog, err := compileRegex(pat)
 		if err != nil {
 			t.Fatalf("compile %q: %v", pattern, err)
 		}
-		m := NewMeter()
+		m := newMeter()
 		caps, err := prog.run([]rune(subj), m)
 		if err != nil {
 			t.Fatalf("run %q/%q: %v", pattern, input, err)

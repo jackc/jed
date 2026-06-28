@@ -171,7 +171,7 @@ func renderFloat32(f float32) string {
 // ValFloat32 or ValFloat64). resultIs32 says the static result type is f32 (both operands
 // f32); otherwise f64 (either operand f64 — the promotion). Returns a float Value
 // of the result width, or a trap (22003 finite-overflow, 22012 division by zero).
-func evalFloatArith(op BinaryOp, a, b Value, resultIs32 bool) (Value, error) {
+func evalFloatArith(op binaryOp, a, b Value, resultIs32 bool) (Value, error) {
 	if resultIs32 {
 		x, y := a.F32(), b.F32()
 		r, err := float32Op(op, x, y)
@@ -192,25 +192,25 @@ func evalFloatArith(op BinaryOp, a, b Value, resultIs32 bool) (Value, error) {
 // pair whose result overflows to ±Inf traps 22003; / or % by zero traps 22012 for EVERY numerator
 // except NaN (matching PG — `Inf/0` and `0/0` trap, only `NaN/0` propagates to NaN); an Inf/NaN
 // operand otherwise propagates without trapping.
-func float64Op(op BinaryOp, x, y float64) (float64, error) {
+func float64Op(op binaryOp, x, y float64) (float64, error) {
 	var r float64
 	switch op {
-	case OpAdd:
+	case opAdd:
 		r = x + y
-	case OpSub:
+	case opSub:
 		r = x - y
-	case OpMul:
+	case opMul:
 		r = x * y
-	case OpDiv:
+	case opDiv:
 		// x / 0 traps 22012 (PG) for every numerator — finite, ±Inf, and 0/0 — EXCEPT NaN, which
 		// propagates (NaN/0 = NaN). The strict type system keeps the trap, not a silent ±Inf (§5).
 		if y == 0 && !math.IsNaN(x) {
-			return 0, NewError(DivisionByZero, "division by zero")
+			return 0, newError(DivisionByZero, "division by zero")
 		}
 		r = x / y
 	default: // OpMod — IEEE fmod; the zero divisor follows the SAME rule as division.
 		if y == 0 && !math.IsNaN(x) {
-			return 0, NewError(DivisionByZero, "division by zero")
+			return 0, newError(DivisionByZero, "division by zero")
 		}
 		r = math.Mod(x, y)
 	}
@@ -225,24 +225,24 @@ func float64Op(op BinaryOp, x, y float64) (float64, error) {
 // float32Op is float64Op at binary32 width — every op rounds to binary32 (Go f32 arithmetic),
 // matching the §2/§5 "compute at the input width" rule. The finite-overflow check is against the
 // binary32 range (a finite f32 pair whose true result exceeds f32 max → ±Inf → 22003).
-func float32Op(op BinaryOp, x, y float32) (float32, error) {
+func float32Op(op binaryOp, x, y float32) (float32, error) {
 	var r float32
 	switch op {
-	case OpAdd:
+	case opAdd:
 		r = x + y
-	case OpSub:
+	case opSub:
 		r = x - y
-	case OpMul:
+	case opMul:
 		r = x * y
-	case OpDiv:
+	case opDiv:
 		// Same zero-divisor rule as f64: traps for every numerator except NaN (Inf/0 traps).
 		if y == 0 && !math.IsNaN(float64(x)) {
-			return 0, NewError(DivisionByZero, "division by zero")
+			return 0, newError(DivisionByZero, "division by zero")
 		}
 		r = x / y
 	default: // OpMod
 		if y == 0 && !math.IsNaN(float64(x)) {
-			return 0, NewError(DivisionByZero, "division by zero")
+			return 0, newError(DivisionByZero, "division by zero")
 		}
 		r = float32(math.Mod(float64(x), float64(y)))
 	}
@@ -266,7 +266,7 @@ func isFinite32(f float32) bool { return isFinite(float64(f)) }
 
 // overflowFloatErr is the 22003 a finite float operation traps on overflow to ±Inf (§3).
 func overflowFloatErr() error {
-	return NewError(NumericValueOutOfRange, "value out of range: overflow")
+	return newError(NumericValueOutOfRange, "value out of range: overflow")
 }
 
 // --- casts (spec/design/float.md §6, ../types/casts.toml) ---------------------------------
@@ -281,7 +281,7 @@ func intToFloat32(n int64) float32 { return float32(n) }
 // floatToInt converts a float value to an integer of target type, rounding HALF AWAY FROM ZERO
 // (jed's one rounding mode — a documented divergence from PG's half-to-even rint), then
 // range-checking (22003). NaN / ±Inf → 22003 (no integer representation). spec/design/float.md §6.
-func floatToInt(f float64, target ScalarType) (int64, error) {
+func floatToInt(f float64, target scalarType) (int64, error) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, overflowErr(target)
 	}
@@ -302,9 +302,9 @@ func floatToInt(f float64, target ScalarType) (int64, error) {
 // the target typmod's scale coercion (spec/design/float.md §6). NaN / ±Inf → 22003 (decimal is
 // finite). The exact decimal is produced WITHOUT a bignum library (decimal's limb arithmetic),
 // so it is byte-identical across cores. typmod nil = cap-check only.
-func floatToDecimal(f float64, typmod *DecimalTypmod) (Value, error) {
+func floatToDecimal(f float64, typmod *decimalTypmod) (Value, error) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return Value{}, NewError(NumericValueOutOfRange, "cannot convert a non-finite float to decimal")
+		return Value{}, newError(NumericValueOutOfRange, "cannot convert a non-finite float to decimal")
 	}
 	d := exactDecimalFromFloat64(f)
 	if typmod != nil {
@@ -330,7 +330,7 @@ func floatToDecimal(f float64, typmod *DecimalTypmod) (Value, error) {
 // hand-rolled and cross-core identical (no math/big on the value path).
 func exactDecimalFromFloat64(f float64) Decimal {
 	if f == 0 {
-		return DecimalZero(0) // +0 and -0 both → exact 0
+		return decimalZero(0) // +0 and -0 both → exact 0
 	}
 	bits := math.Float64bits(f)
 	neg := bits>>63 != 0
@@ -361,7 +361,7 @@ func exactDecimalFromFloat64(f float64) Decimal {
 	// zero digits are removed. Reuse the decimal module's canonical trim via a digit round-trip.
 	d := newDecimal(neg, uint32(k), mag)
 	dneg, digits, scale := d.canonical()
-	return DecimalFromDigitsScale(dneg, digits, scale)
+	return decimalFromDigitsScale(dneg, digits, scale)
 }
 
 // decimalToFloat64 converts a decimal to the nearest binary64, round-ties-to-even via Go's
@@ -522,7 +522,7 @@ func (a *floatSumAcc) avgF32() (float32, bool, error) {
 // evalFloatFunc evaluates a float scalar function over its already-evaluated, non-NULL args. fn is
 // the float scalar function; result is the call's width (Float32/Float64). vals[0] is the float
 // operand (either width — widened to f64 for the kernel); a 2-arg form carries vals[1].
-func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error) {
+func evalFloatFunc(fn scalarFunc, vals []Value, result scalarType) (Value, error) {
 	x := vals[0].asF64()
 	// wrap returns the result at the call's width (sfFloatAbs may be f32; the rest are f64).
 	wrap := func(r float64) Value {
@@ -549,7 +549,7 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 	case sfSqrt:
 		// sqrt is IEEE-correctly-rounded (in-contract). Negative → 22003 (NaN is input-only).
 		if x < 0 {
-			return Value{}, NewError(NumericValueOutOfRange, "cannot take square root of a negative number")
+			return Value{}, newError(NumericValueOutOfRange, "cannot take square root of a negative number")
 		}
 		return Float64Value(math.Sqrt(x)), nil
 	case sfExp:
@@ -560,18 +560,18 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 		return Float64Value(r), nil
 	case sfLn:
 		if x == 0 {
-			return Value{}, NewError(NumericValueOutOfRange, "cannot take logarithm of zero")
+			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of zero")
 		}
 		if x < 0 {
-			return Value{}, NewError(NumericValueOutOfRange, "cannot take logarithm of a negative number")
+			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of a negative number")
 		}
 		return Float64Value(math.Log(x)), nil
 	case sfLog10:
 		if x == 0 {
-			return Value{}, NewError(NumericValueOutOfRange, "cannot take logarithm of zero")
+			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of zero")
 		}
 		if x < 0 {
-			return Value{}, NewError(NumericValueOutOfRange, "cannot take logarithm of a negative number")
+			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of a negative number")
 		}
 		return Float64Value(math.Log10(x)), nil
 	case sfPow:
@@ -600,13 +600,13 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 		// asin domain is [-1, 1]: a finite |x| > 1 (and ±Inf, magnitude > 1) is out of range →
 		// 22003, exactly PG; a NaN operand propagates (no trap).
 		if !math.IsNaN(x) && (x < -1 || x > 1) {
-			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+			return Value{}, newError(NumericValueOutOfRange, "input is out of range")
 		}
 		return Float64Value(math.Asin(x)), nil
 	case sfAcos:
 		// acos shares asin's domain [-1, 1]: |x| > 1 (or ±Inf) → 22003, NaN propagates.
 		if !math.IsNaN(x) && (x < -1 || x > 1) {
-			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+			return Value{}, newError(NumericValueOutOfRange, "input is out of range")
 		}
 		return Float64Value(math.Acos(x)), nil
 	case sfAtan:
@@ -630,13 +630,13 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error
 	case sfAcosh:
 		// acosh domain [1, ∞): a finite x < 1 → 22003 (a NaN propagates, acosh(+Inf) = +Inf).
 		if !math.IsNaN(x) && x < 1 {
-			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+			return Value{}, newError(NumericValueOutOfRange, "input is out of range")
 		}
 		return Float64Value(math.Acosh(x)), nil
 	case sfAtanh:
 		// atanh domain [-1, 1]: a finite |x| > 1 (and ±Inf) → 22003; atanh(±1) = ±Inf is admissible.
 		if !math.IsNaN(x) && (x < -1 || x > 1) {
-			return Value{}, NewError(NumericValueOutOfRange, "input is out of range")
+			return Value{}, newError(NumericValueOutOfRange, "input is out of range")
 		}
 		return Float64Value(math.Atanh(x)), nil
 	default:

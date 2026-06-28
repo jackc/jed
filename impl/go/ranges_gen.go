@@ -11,7 +11,7 @@ package jed
 // RangeDesc is one range type's metadata, mirroring a [[range]] entry in
 // spec/types/ranges.toml. Element is a scalar id (the subtype the range is built over);
 // Discrete marks an integer/date subtype stored in canonical [) form.
-type RangeDesc struct {
+type rangeDesc struct {
 	ID       string
 	Element  string
 	Aliases  []string
@@ -19,7 +19,7 @@ type RangeDesc struct {
 }
 
 // Ranges lists every built-in range type, in ranges.toml order.
-var Ranges = []RangeDesc{
+var ranges = []rangeDesc{
 	{
 		ID:       "i32range",
 		Element:  "i32",

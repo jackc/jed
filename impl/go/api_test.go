@@ -15,7 +15,7 @@ import (
 
 func TestCreateCommitReopenRoundTrips(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "round_trip.jed")
-	db, err := Create(path, DefaultDatabaseOptions())
+	db, err := create(path, DefaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 
 func TestOpenMissingFileIs58P01(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nope.jed")
-	if _, err := Open(path); err == nil {
+	if _, err := open(path); err == nil {
 		t.Fatal("expected error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "58P01" {
 		t.Fatalf("code = %v want 58P01", err)
@@ -56,10 +56,10 @@ func TestOpenMissingFileIs58P01(t *testing.T) {
 
 func TestCreateOverExistingFileIs58P02(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "here.jed")
-	if _, err := Create(path, DefaultDatabaseOptions()); err != nil {
+	if _, err := create(path, DefaultDatabaseOptions()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Create(path, DefaultDatabaseOptions()); err == nil {
+	if _, err := create(path, DefaultDatabaseOptions()); err == nil {
 		t.Fatal("expected error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "58P02" {
 		t.Fatalf("code = %v want 58P02", err)
@@ -68,7 +68,7 @@ func TestCreateOverExistingFileIs58P02(t *testing.T) {
 
 func TestCreateWithCustomPageSizeRoundTrips(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "page256.jed")
-	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestCreateWithCustomPageSizeRoundTrips(t *testing.T) {
 		t.Fatalf("page size = %d want 256", db.PageSize())
 	}
 	db.Close()
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 	// succeeds, so it survives a Close with no explicit Commit — the opposite of the original
 	// "no autocommit" model this test used to assert.
 	path := filepath.Join(t.TempDir(), "autocommit.jed")
-	db, err := Create(path, DefaultDatabaseOptions())
+	db, err := create(path, DefaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 	mustExec(t, db, "INSERT INTO t VALUES (1)") // autocommitted, no explicit commit
 	db.Close()
 
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 
 func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 	// With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	if err := db.Commit(); err != nil {
@@ -126,7 +126,7 @@ func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 }
 
 func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	insert, err := db.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
@@ -163,14 +163,14 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 }
 
 func TestQueryOnNonQueryStatementErrors(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if _, err := db.QuerySQL("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestErrorsSurfaceWithSQLState(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if _, err := db.Prepare("SELCT 1"); err == nil {
 		t.Fatal("expected error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "42601" {
@@ -179,7 +179,7 @@ func TestErrorsSurfaceWithSQLState(t *testing.T) {
 }
 
 func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	if err := db.Commit(); err != nil { // no path -> no-op, not an error
 		t.Fatal(err)
@@ -189,9 +189,9 @@ func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 	}
 }
 
-func mustExec(t *testing.T, db *Engine, sql string) {
+func mustExec(t *testing.T, db *engine, sql string) {
 	t.Helper()
-	if _, err := Execute(db, sql); err != nil {
+	if _, err := execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -199,7 +199,7 @@ func mustExec(t *testing.T, db *Engine, sql string) {
 func TestTableNamesListsTablesSortedExcludingIndexes(t *testing.T) {
 	// The catalog-read surface (api.md §6): canonical names, sorted ascending by
 	// lowercased name; secondary indexes are relations but not tables.
-	db := NewEngine()
+	db := newEngine()
 	if got := db.TableNames(); len(got) != 0 {
 		t.Fatalf("empty catalog: got %v", got)
 	}
@@ -228,10 +228,10 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	// how many rows they touched (PostgreSQL's command-tag count); a DML statement that
 	// matched nothing reports (0, true); DDL and transaction control report (0, false);
 	// DML with RETURNING is a query outcome (its row count is the result's length).
-	db := NewEngine()
+	db := newEngine()
 	affected := func(sql string) (int64, bool) {
 		t.Helper()
-		out, err := Execute(db, sql)
+		out, err := execute(db, sql)
 		if err != nil {
 			t.Fatalf("%q: %v", sql, err)
 		}
@@ -268,7 +268,7 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	if n, ok := affected("INSERT INTO dst SELECT id FROM t"); !ok || n != 2 {
 		t.Fatalf("INSERT ... SELECT: got (%d, %v) want (2, true)", n, ok)
 	}
-	out, err := Execute(db, "DELETE FROM dst RETURNING id")
+	out, err := execute(db, "DELETE FROM dst RETURNING id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	// transaction defaults to READ ONLY, an explicit READ WRITE request and any write are
 	// 25006, and the file bytes are never touched.
 	path := filepath.Join(t.TempDir(), "readonly.jed")
-	db, err := Create(path, DefaultDatabaseOptions())
+	db, err := create(path, DefaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = OpenWithOptions(path, OpenOptions{ReadOnly: true})
+	db, err = openWithOptions(path, openOptions{ReadOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	}
 	wantCode := func(sql, code string) {
 		t.Helper()
-		_, err := Execute(db, sql)
+		_, err := execute(db, sql)
 		var ee *EngineError
 		if !errors.As(err, &ee) || ee.Code() != code {
 			t.Fatalf("%q: got %v, want %s", sql, err, code)
@@ -313,7 +313,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	}
 
 	// Reads work — bare and inside an explicit block (plain BEGIN defaults to READ ONLY here).
-	out, err := Execute(db, "SELECT id FROM t")
+	out, err := execute(db, "SELECT id FROM t")
 	if err != nil || len(out.Rows) != 1 {
 		t.Fatalf("read on a read-only handle: %v", err)
 	}
@@ -355,7 +355,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	}
 
 	// A normal reopen is writable again.
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

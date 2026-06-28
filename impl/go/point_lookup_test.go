@@ -13,7 +13,7 @@ import (
 
 // bigTable builds a table of n rows (id i32 PRIMARY KEY, v i32; v == id) large enough to span
 // several B-tree leaves at the default page size.
-func bigTable(t *testing.T, n int) *Engine {
+func bigTable(t *testing.T, n int) *engine {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("INSERT INTO t VALUES ")
@@ -38,7 +38,7 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 
 	// Storage primitive: a point bound visits strictly fewer nodes than the whole tree (the page_read
 	// win), and returns exactly the one matching row.
-	key := EncodeInt(Int32, 500)
+	key := encodeInt(scalarInt32, 500)
 	pb := keyBound{lo: key, loInc: true, hi: key, hiInc: true}
 	if got := store.OverlapNodeCount(pb); got >= nodeCount {
 		t.Errorf("point-lookup overlap node count %d should be < full node count %d", got, nodeCount)
@@ -52,14 +52,14 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 	}
 
 	// End-to-end point lookup: exactly one row, and the cost is sublinear in n (it did not full-scan).
-	out, err := Execute(db, "SELECT v FROM t WHERE id = 500")
+	out, err := execute(db, "SELECT v FROM t WHERE id = 500")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out.Rows) != 1 || out.Rows[0][0].Int != 500 {
 		t.Errorf("point lookup got %v, want [500]", out.Rows)
 	}
-	full, err := Execute(db, "SELECT v FROM t")
+	full, err := execute(db, "SELECT v FROM t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 	}
 
 	// A point-lookup MISS still visits the leaf it would live in (page_read > 0) but reads no row.
-	miss, err := Execute(db, "SELECT v FROM t WHERE id = 99999")
+	miss, err := execute(db, "SELECT v FROM t WHERE id = 99999")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestRangeScanCrossesLeafBoundaries(t *testing.T) {
 	}
 
 	// Empty (contradictory) bound: zero rows, zero cost — proved without scanning.
-	empty, err := Execute(db, "SELECT id FROM t WHERE id > 700 AND id < 300")
+	empty, err := execute(db, "SELECT id FROM t WHERE id > 700 AND id < 300")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,14 +118,14 @@ func TestLimitShortCircuitMultiLeaf(t *testing.T) {
 
 	// LIMIT without ORDER BY stops the scan early: it returns `limit` rows at sublinear cost (it did
 	// NOT read all 1000). The rows are the primary-key-order prefix (our cores' deterministic choice).
-	out, err := Execute(db, "SELECT v FROM t LIMIT 5")
+	out, err := execute(db, "SELECT v FROM t LIMIT 5")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out.Rows) != 5 {
 		t.Fatalf("LIMIT 5 got %d rows, want 5", len(out.Rows))
 	}
-	full, err := Execute(db, "SELECT v FROM t")
+	full, err := execute(db, "SELECT v FROM t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestLimitShortCircuitMultiLeaf(t *testing.T) {
 	if rows := query(t, dz, "SELECT 100 / c FROM z LIMIT 1"); len(rows) != 1 || rows[0][0].Int != 20 {
 		t.Errorf("LIMIT 1 should produce only the safe first row (100/5=20), got %v", rows)
 	}
-	if _, err := Execute(dz, "SELECT 100 / c FROM z LIMIT 2"); err == nil {
+	if _, err := execute(dz, "SELECT 100 / c FROM z LIMIT 2"); err == nil {
 		t.Errorf("LIMIT 2 reaches the c=0 row and must trap (division by zero)")
 	}
 }
@@ -166,7 +166,7 @@ func TestMutationPushdownMultiLeaf(t *testing.T) {
 	db := bigTable(t, n)
 
 	// DELETE by primary key seeks one row at sublinear cost and leaves the rest intact.
-	d, err := Execute(db, "DELETE FROM t WHERE id = 500")
+	d, err := execute(db, "DELETE FROM t WHERE id = 500")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestMutationPushdownMultiLeaf(t *testing.T) {
 	}
 
 	// UPDATE by primary key likewise.
-	u, err := Execute(db, "UPDATE t SET v = -1 WHERE id = 700")
+	u, err := execute(db, "UPDATE t SET v = -1 WHERE id = 700")
 	if err != nil {
 		t.Fatal(err)
 	}

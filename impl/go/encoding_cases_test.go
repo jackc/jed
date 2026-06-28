@@ -59,7 +59,7 @@ func nullableUUIDBytes(c encCase) []byte {
 	if c.isNull {
 		return []byte{0x01}
 	}
-	b, _ := ParseUUID(c.strValue)
+	b, _ := parseUUID(c.strValue)
 	return append([]byte{0x00}, b...)
 }
 
@@ -69,7 +69,7 @@ func nullableBoolBytes(c encCase) []byte {
 	if c.isNull {
 		return []byte{0x01}
 	}
-	return append([]byte{0x00}, EncodeBool(c.boolValue)...)
+	return append([]byte{0x00}, encodeBool(c.boolValue)...)
 }
 
 // parseEncCaseLine parses one `{ value = N, bytes = "hex" },` or

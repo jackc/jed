@@ -182,7 +182,7 @@ type ScriptSummary struct {
 //   - In-script transaction control (BEGIN/COMMIT/ROLLBACK) is 0A000 — the implicit wrapper owns the
 //     boundary (partitioning is deferred, session.md §11). A host that needs self-managed
 //     transactions writes its own SplitStatements loop instead.
-func (db *Engine) ExecuteScript(sql string) (ScriptSummary, error) {
+func (db *engine) ExecuteScript(sql string) (ScriptSummary, error) {
 	ownsWrapper := !db.InTransaction()
 	if ownsWrapper {
 		// The implicit wrapper honors the handle's read-only mode (modeSet=false ⇒ READ ONLY on a
@@ -208,7 +208,7 @@ func (db *Engine) ExecuteScript(sql string) (ScriptSummary, error) {
 
 // runScriptBody splits sql and runs each statement on the current transaction, accumulating the
 // ScriptSummary. Separated so ExecuteScript's wrapper commit/rollback runs once on either path.
-func (db *Engine) runScriptBody(sql string) (ScriptSummary, error) {
+func (db *engine) runScriptBody(sql string) (ScriptSummary, error) {
 	var summary ScriptSummary
 	for span := range SplitStatements(sql) {
 		ast, err := db.parse(span.Text)
@@ -218,7 +218,7 @@ func (db *Engine) runScriptBody(sql string) (ScriptSummary, error) {
 		// Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
 		// wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
 		if ast.Begin != nil || ast.Commit != nil || ast.Rollback != nil {
-			return ScriptSummary{}, NewError(FeatureNotSupported,
+			return ScriptSummary{}, newError(FeatureNotSupported,
 				"transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; "+
 					"use SplitStatements to run a self-managed multi-statement transaction")
 		}

@@ -340,14 +340,14 @@ func (s SqlState) Code() string {
 // ErrorDesc is one error's metadata, mirroring an [[error]] entry in registry.toml. The enum
 // above is the type-safe code used at raise sites; Errors is the iterable data table the
 // cross-check tests walk against the registry (the enum is not iterable).
-type ErrorDesc struct {
+type errorDesc struct {
 	Code  string
 	Name  string
 	Class string
 }
 
 // Errors lists every error, in registry order.
-var Errors = []ErrorDesc{
+var errorDescs = []errorDesc{
 	{Code: "21000", Name: "cardinality_violation", Class: "cardinality violation"},
 	{Code: "22000", Name: "data_exception", Class: "data exception"},
 	{Code: "22003", Name: "numeric_value_out_of_range", Class: "data exception"},

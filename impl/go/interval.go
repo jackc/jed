@@ -105,7 +105,7 @@ func (iv Interval) Sub(o Interval) (Interval, error) {
 // (((hours*60)+mins)*60)*1e6 + secMicros like PG. All math here is exact integer (the one float
 // step, secs → secMicros, lives in the executor so this stays float-free). Any i32 month/day or
 // i64 micros overflow traps 22008.
-func MakeInterval(years, months, weeks, days, hours, mins, secMicros int64) (Interval, error) {
+func makeInterval(years, months, weeks, days, hours, mins, secMicros int64) (Interval, error) {
 	monthsTotal, ok1 := mulAdd(years, monthsPerYear, months)
 	daysTotal, ok2 := mulAdd(weeks, 7, days)
 	hm, ok3 := mulAdd(hours, 60, mins) // total minutes
@@ -130,7 +130,7 @@ func (iv Interval) Neg() (Interval, error) {
 // ParseFactorDecimal parses a canonical decimal string `[-]int[.frac]` into an exact fraction
 // (num, den) with den = 10^len(frac) (value = num/den). Caps the digit counts (matching the
 // Rust i128 cascade's bound) so all cores trap at the same factor size; over-long → 22008.
-func ParseFactorDecimal(s string) (*big.Int, *big.Int, error) {
+func parseFactorDecimal(s string) (*big.Int, *big.Int, error) {
 	neg := strings.HasPrefix(s, "-")
 	body := strings.TrimPrefix(s, "-")
 	intPart, fracPart := body, ""
@@ -154,7 +154,7 @@ func ParseFactorDecimal(s string) (*big.Int, *big.Int, error) {
 // MulByFraction is the exact ×÷ cascade (spec/design/interval.md §5): scale each field by
 // fnum/fden (fden > 0), cascading the fractional part months→days→micros, µs rounded half away
 // from zero. EXACT (big.Int; mirrors Rust's i128). A field beyond i32/i64 traps 22008.
-func MulByFraction(iv Interval, fnum, fden *big.Int) (Interval, error) {
+func mulByFraction(iv Interval, fnum, fden *big.Int) (Interval, error) {
 	g := new(big.Int).GCD(nil, nil, new(big.Int).Abs(fnum), new(big.Int).Abs(fden))
 	if g.Sign() == 0 {
 		g = big.NewInt(1)
@@ -197,8 +197,8 @@ func MulByFraction(iv Interval, fnum, fden *big.Int) (Interval, error) {
 // (spec/design/interval.md §5). Months are added first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1
 // month -> Feb 28/29), then days (24 h each), then micros. Adding to ±infinity stays ±infinity; a
 // finite result onto a sentinel or beyond the i64-µs range traps 22008.
-func TsShift(ts int64, iv Interval, subtract bool) (int64, error) {
-	if ts == NegInfinity || ts == PosInfinity {
+func tsShift(ts int64, iv Interval, subtract bool) (int64, error) {
+	if ts == negInfinity || ts == posInfinity {
 		return ts, nil
 	}
 	sign := int64(1)
@@ -242,7 +242,7 @@ func TsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 	if !ok {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
-	if t == NegInfinity || t == PosInfinity {
+	if t == negInfinity || t == posInfinity {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
 	return t, nil
@@ -251,8 +251,8 @@ func TsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 // TsDiff computes a - b of two timestamps (or timestamptz) → an interval, justified into days +
 // time with months = 0 (PG timestamp_mi → interval_justify_hours). An ±infinity operand traps
 // 22008; a day count beyond i32 traps 22008.
-func TsDiff(a, b int64) (Interval, error) {
-	if a == NegInfinity || a == PosInfinity || b == NegInfinity || b == PosInfinity {
+func tsDiff(a, b int64) (Interval, error) {
+	if a == negInfinity || a == posInfinity || b == negInfinity || b == posInfinity {
 		return Interval{}, intervalFieldOverflow("cannot subtract infinite timestamps")
 	}
 	micros, ok := sub64(a, b)
@@ -269,8 +269,8 @@ func TsDiff(a, b int64) (Interval, error) {
 
 // --- parsing -----------------------------------------------------------------
 
-func invalidInterval(detail string) error       { return NewError(InvalidDatetimeFormat, detail) }
-func intervalFieldOverflow(detail string) error { return NewError(DatetimeFieldOverflow, detail) }
+func invalidInterval(detail string) error       { return newError(InvalidDatetimeFormat, detail) }
+func intervalFieldOverflow(detail string) error { return newError(DatetimeFieldOverflow, detail) }
 
 // intervalAcc accumulates the three fields exactly. The fractional part of each unit token
 // cascades down (months→days→micros) using exact big.Int math, the µs result rounded half away
@@ -579,7 +579,7 @@ func (c *intervalCursor) readIntervalUnitFrac() (*big.Int, *big.Int, error) {
 
 // ParseInterval parses an interval literal (the "unit + time" subset) into the three-field value.
 // Errors: malformed syntax → 22007; a field beyond the representable range → 22008.
-func ParseInterval(input string) (Interval, error) {
+func parseInterval(input string) (Interval, error) {
 	trimmed := trimASCIIWS(input)
 	c := &intervalCursor{b: trimmed}
 	a := &intervalAcc{}
@@ -702,7 +702,7 @@ func neg64(a int64) (int64, bool) {
 
 // RenderInterval renders an interval to PG's canonical `IntervalStyle = postgres` text
 // (spec/design/interval.md §4). Pure integer→string formatting (no locale).
-func RenderInterval(iv Interval) string {
+func renderInterval(iv Interval) string {
 	months := int64(iv.Months)
 	days := int64(iv.Days)
 	micros := iv.Micros

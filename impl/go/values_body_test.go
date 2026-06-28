@@ -11,9 +11,9 @@ package jed
 
 import "testing"
 
-func valuesNames(t *testing.T, db *Engine, sql string) []string {
+func valuesNames(t *testing.T, db *engine, sql string) []string {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -23,18 +23,18 @@ func valuesNames(t *testing.T, db *Engine, sql string) []string {
 	return out.ColumnNames
 }
 
-func valuesTypes(t *testing.T, db *Engine, sql string) []string {
+func valuesTypes(t *testing.T, db *engine, sql string) []string {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 	return out.ColumnTypes
 }
 
-func valuesCost(t *testing.T, db *Engine, sql string) int64 {
+func valuesCost(t *testing.T, db *engine, sql string) int64 {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}

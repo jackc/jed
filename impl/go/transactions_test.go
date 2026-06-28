@@ -10,9 +10,9 @@ package jed
 import "testing"
 
 // txCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
-func txCount(t *testing.T, db *Engine, table string) int {
+func txCount(t *testing.T, db *engine, table string) int {
 	t.Helper()
-	out, err := Execute(db, "SELECT * FROM "+table)
+	out, err := execute(db, "SELECT * FROM "+table)
 	if err != nil {
 		t.Fatalf("count %s: %v", table, err)
 	}
@@ -20,7 +20,7 @@ func txCount(t *testing.T, db *Engine, table string) int {
 }
 
 func TestBeginExecuteCommitIsVisible(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	tx, err := db.Begin(true)
 	if err != nil {
@@ -49,7 +49,7 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 }
 
 func TestBeginExecuteRollbackDiscards(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	tx, err := db.Begin(true)
@@ -71,7 +71,7 @@ func TestBeginExecuteRollbackDiscards(t *testing.T) {
 }
 
 func TestUpdateClosureCommitsOnNil(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	err := db.Update(func(tx *Transaction) error {
 		if _, e := tx.Execute("INSERT INTO t VALUES (1)", nil); e != nil {
@@ -92,7 +92,7 @@ func TestUpdateClosureCommitsOnNil(t *testing.T) {
 }
 
 func TestUpdateClosureRollsBackOnErr(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	err := db.Update(func(tx *Transaction) error {
@@ -116,7 +116,7 @@ func TestUpdateClosureRollsBackOnErr(t *testing.T) {
 }
 
 func TestViewIsReadOnly(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1), (2)")
 	// a read inside a View works
@@ -148,7 +148,7 @@ func TestViewIsReadOnly(t *testing.T) {
 }
 
 func TestNestedBeginIs25001(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	tx, err := db.Begin(true)
 	if err != nil {
@@ -170,7 +170,7 @@ func TestNestedBeginIs25001(t *testing.T) {
 }
 
 func TestCommitRollbackAreNoopsInAutocommit(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	// no open transaction: both are lenient no-op successes (transactions.md §4.2)
 	if err := db.Commit(); err != nil {

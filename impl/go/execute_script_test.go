@@ -8,9 +8,9 @@ package jed
 
 import "testing"
 
-func scriptCount(t *testing.T, db *Engine) int64 {
+func scriptCount(t *testing.T, db *engine) int64 {
 	t.Helper()
-	out, err := Execute(db, "SELECT count(*) FROM t")
+	out, err := execute(db, "SELECT count(*) FROM t")
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
@@ -18,7 +18,7 @@ func scriptCount(t *testing.T, db *Engine) int64 {
 }
 
 func TestScriptSummaryCountsAndCommitsAtomicallyWhenIdle(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	summary, err := db.ExecuteScript(
 		`CREATE TABLE t (id i32 PRIMARY KEY, v i32);
 		 INSERT INTO t VALUES (1, 10);
@@ -47,7 +47,7 @@ func TestScriptSummaryCountsAndCommitsAtomicallyWhenIdle(t *testing.T) {
 }
 
 func TestScriptIsAllOrNothingOnError(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	_, err := db.ExecuteScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (1)")
 	if got := sessCode(t, err); got != "23505" {
@@ -62,7 +62,7 @@ func TestScriptIsAllOrNothingOnError(t *testing.T) {
 }
 
 func TestScriptSelectRowsDiscardedButStatementCounted(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	summary, err := db.ExecuteScript(
 		`CREATE TABLE t (id i32 PRIMARY KEY);
 		 INSERT INTO t VALUES (1), (2);
@@ -83,7 +83,7 @@ func TestScriptSelectRowsDiscardedButStatementCounted(t *testing.T) {
 }
 
 func TestEmptyScriptIsANoOpSuccess(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	summary, err := db.ExecuteScript("  -- just a comment\n /* and a block */ ;;; ")
 	if err != nil {
 		t.Fatalf("ExecuteScript: %v", err)
@@ -97,7 +97,7 @@ func TestEmptyScriptIsANoOpSuccess(t *testing.T) {
 }
 
 func TestInScriptTransactionControlIsFeatureNotSupported(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	for _, script := range []string{
 		"INSERT INTO t VALUES (1); COMMIT; INSERT INTO t VALUES (2)",
@@ -118,7 +118,7 @@ func TestInScriptTransactionControlIsFeatureNotSupported(t *testing.T) {
 }
 
 func TestScriptJoinsAnOpenTransactionWithoutCommitting(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	sessExec(t, db, "BEGIN")
 	summary, err := db.ExecuteScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)")
@@ -141,7 +141,7 @@ func TestScriptJoinsAnOpenTransactionWithoutCommitting(t *testing.T) {
 }
 
 func TestScriptErrorInsideOpenTransactionLeavesItFailed(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	sessExec(t, db, "BEGIN")
 	_, err := db.ExecuteScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (1)")

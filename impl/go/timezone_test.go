@@ -35,7 +35,7 @@ func TestTimezoneReaderMatchesVectors(t *testing.T) {
 		if !ok {
 			t.Fatalf("resolve %s", zone)
 		}
-		off := OffsetAtRef(zr, floorDiv(inst, 1_000_000))
+		off := offsetAtRef(zr, floorDiv(inst, 1_000_000))
 		if int64(off.Utoff) != row.int("utoff_secs") {
 			t.Errorf("%s @ %d: utoff = %d, want %d", zone, inst, off.Utoff, row.int("utoff_secs"))
 		}
@@ -50,7 +50,7 @@ func TestTimezoneReaderMatchesVectors(t *testing.T) {
 
 func TestTimezoneBundleMatchesVectors(t *testing.T) {
 	data := tzBundleBytes(t)
-	parsed, err := OpenTzBundle(data)
+	parsed, err := openTzBundle(data)
 	if err != nil {
 		t.Fatalf("open tzdata.jtz: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestTimezoneBundleMatchesVectors(t *testing.T) {
 		t.Errorf("links = %v, want %v", gotLinks, wantLinks)
 	}
 
-	if !bytes.Equal(SaveTzBundle(parsed), data) {
+	if !bytes.Equal(saveTzBundle(parsed), data) {
 		t.Error("bundle round-trip is not byte-identical")
 	}
 }

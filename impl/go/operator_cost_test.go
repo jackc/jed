@@ -11,8 +11,8 @@ import "testing"
 // operatorCost must reflect the generated Operators table for EVERY operator — proving the lookup
 // is data-driven, so authoring a Cost in catalog.toml is honored with no evaluator change.
 func TestOperatorCostReflectsCatalog(t *testing.T) {
-	for _, o := range Operators {
-		want := Costs.OperatorEval
+	for _, o := range operators {
+		want := costs.OperatorEval
 		if o.Cost != 0 {
 			want = o.Cost
 		}
@@ -21,8 +21,8 @@ func TestOperatorCostReflectsCatalog(t *testing.T) {
 		}
 	}
 	// An unknown name falls back to the uniform OperatorEval.
-	if got := operatorCost("definitely_not_an_operator"); got != Costs.OperatorEval {
-		t.Errorf("unknown operator cost = %d, want %d", got, Costs.OperatorEval)
+	if got := operatorCost("definitely_not_an_operator"); got != costs.OperatorEval {
+		t.Errorf("unknown operator cost = %d, want %d", got, costs.OperatorEval)
 	}
 }
 
@@ -31,13 +31,13 @@ func TestOperatorCostReflectsCatalog(t *testing.T) {
 // by the uniform-weight fallback.
 func TestWiredOperatorNamesExistInCatalog(t *testing.T) {
 	var names []string
-	for _, op := range []BinaryOp{OpAdd, OpSub, OpMul, OpDiv, OpMod, OpEq, OpNe, OpLt, OpGt, OpLe, OpGe} {
+	for _, op := range []binaryOp{opAdd, opSub, opMul, opDiv, opMod, opEq, opNe, opLt, opGt, opLe, opGe} {
 		names = append(names, op.catalogName())
 	}
 	names = append(names, "neg", "not", "and", "or")
 	for _, name := range names {
 		found := false
-		for _, o := range Operators {
+		for _, o := range operators {
 			if o.Name == name {
 				found = true
 				break

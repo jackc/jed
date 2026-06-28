@@ -16,10 +16,10 @@ import (
 )
 
 // DateNegInfinity is the -infinity sentinel — the smallest i32, sorts before every finite date.
-const DateNegInfinity int32 = -2147483648
+const dateNegInfinity int32 = -2147483648
 
 // DatePosInfinity is the +infinity sentinel — the largest i32, sorts after every finite date.
-const DatePosInfinity int32 = 2147483647
+const datePosInfinity int32 = 2147483647
 
 // Finite day counts occupy [MinInt32+1, MaxInt32-1]; the extremes are reserved for ±infinity.
 const (
@@ -32,15 +32,15 @@ const (
 // kept: a trailing time and/or offset is validated then discarded, and 24:00:00 does not advance
 // the day. Malformed syntax traps 22007; an out-of-range field or a day count beyond the finite
 // i32 range traps 22008.
-func ParseDate(input string) (int32, error) {
+func parseDate(input string) (int32, error) {
 	s := trimASCIIWS(input)
 	low := strings.ToLower(s)
 
 	switch low {
 	case "infinity", "+infinity":
-		return DatePosInfinity, nil
+		return datePosInfinity, nil
 	case "-infinity":
-		return DateNegInfinity, nil
+		return dateNegInfinity, nil
 	}
 
 	bc := false
@@ -175,11 +175,11 @@ func ParseDate(input string) (int32, error) {
 
 // RenderDate renders a date value (i32 days since 1970-01-01) to its canonical YYYY-MM-DD text
 // (a BC suffix for an astronomical year <= 0; ±infinity render as the bare words).
-func RenderDate(days int32) string {
-	if days == DateNegInfinity {
+func renderDate(days int32) string {
+	if days == dateNegInfinity {
 		return "-infinity"
 	}
-	if days == DatePosInfinity {
+	if days == datePosInfinity {
 		return "infinity"
 	}
 	y, mo, d := civilFromDays(int64(days))

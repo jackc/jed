@@ -41,10 +41,10 @@ func scanExponent(b []byte, i int) (int64, bool, int) {
 // Lex tokenizes sql into tokens terminated by TokEof (CLAUDE.md §5: parsers are
 // per-language, not codegen'd). Integer literals may carry a leading '-'. Errors are
 // structured (SQLSTATE 42601 syntax error).
-func Lex(sql string) ([]Token, error) {
+func lex(sql string) ([]token, error) {
 	b := []byte(sql)
 	i := 0
-	var tokens []Token
+	var tokens []token
 
 	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
 	isAlpha := func(c byte) bool {
@@ -57,41 +57,41 @@ func Lex(sql string) ([]Token, error) {
 		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
 			i++
 		case c == ',':
-			tokens = append(tokens, Token{Kind: TokComma})
+			tokens = append(tokens, token{Kind: tokComma})
 			i++
 		case c == '(':
-			tokens = append(tokens, Token{Kind: TokLParen})
+			tokens = append(tokens, token{Kind: tokLParen})
 			i++
 		case c == ')':
-			tokens = append(tokens, Token{Kind: TokRParen})
+			tokens = append(tokens, token{Kind: tokRParen})
 			i++
 		case c == '[':
-			tokens = append(tokens, Token{Kind: TokLBracket})
+			tokens = append(tokens, token{Kind: tokLBracket})
 			i++
 		case c == ']':
-			tokens = append(tokens, Token{Kind: TokRBracket})
+			tokens = append(tokens, token{Kind: tokRBracket})
 			i++
 		case c == '*':
-			tokens = append(tokens, Token{Kind: TokStar})
+			tokens = append(tokens, token{Kind: tokStar})
 			i++
 		case c == '+':
-			tokens = append(tokens, Token{Kind: TokPlus})
+			tokens = append(tokens, token{Kind: tokPlus})
 			i++
 		case c == '-':
 			// `-|-` is the range adjacency operator (range-functions.md §3), scanned greedily and
 			// checked FIRST so it is never mistaken for `-` (Minus) `|-`. Its middle `|` keeps it
 			// disjoint from the `--` line comment (which needs a second `-`).
 			if i+2 < len(b) && b[i+1] == '|' && b[i+2] == '-' {
-				tokens = append(tokens, Token{Kind: TokAdjacent})
+				tokens = append(tokens, token{Kind: tokAdjacent})
 				i += 3
 			} else if i+2 < len(b) && b[i+1] == '>' && b[i+2] == '>' {
 				// `->>` is the jsonb accessor-as-text operator (json-sql-functions.md §1),
 				// scanned greedily BEFORE `->` so it is never `-> >`.
-				tokens = append(tokens, Token{Kind: TokArrowText})
+				tokens = append(tokens, token{Kind: tokArrowText})
 				i += 3
 			} else if i+1 < len(b) && b[i+1] == '>' {
 				// `->` is the jsonb accessor operator (json-sql-functions.md §1).
-				tokens = append(tokens, Token{Kind: TokArrow})
+				tokens = append(tokens, token{Kind: tokArrow})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '-' {
 				// `--` starts a line comment running to the end of the line; comments are
@@ -102,7 +102,7 @@ func Lex(sql string) ([]Token, error) {
 					i++
 				}
 			} else {
-				tokens = append(tokens, Token{Kind: TokMinus})
+				tokens = append(tokens, token{Kind: tokMinus})
 				i++
 			}
 		case c == '/':
@@ -115,7 +115,7 @@ func Lex(sql string) ([]Token, error) {
 				depth := 1
 				for depth > 0 {
 					if i+1 >= len(b) {
-						return nil, NewError(SyntaxError, "unterminated /* comment")
+						return nil, newError(SyntaxError, "unterminated /* comment")
 					}
 					switch {
 					case b[i] == '/' && b[i+1] == '*':
@@ -129,60 +129,60 @@ func Lex(sql string) ([]Token, error) {
 					}
 				}
 			} else {
-				tokens = append(tokens, Token{Kind: TokSlash})
+				tokens = append(tokens, token{Kind: tokSlash})
 				i++
 			}
 		case c == '%':
-			tokens = append(tokens, Token{Kind: TokPercent})
+			tokens = append(tokens, token{Kind: tokPercent})
 			i++
 		case c == '|':
 			// `||` is the array concatenation operator (grammar.md §39), scanned greedily as one
 			// token; a lone `|` is not part of jed's surface (no bitwise-or) — 42601.
 			if i+1 < len(b) && b[i+1] == '|' {
-				tokens = append(tokens, Token{Kind: TokConcat})
+				tokens = append(tokens, token{Kind: tokConcat})
 				i += 2
 			} else {
-				return nil, NewError(SyntaxError, "unexpected character '|'")
+				return nil, newError(SyntaxError, "unexpected character '|'")
 			}
 		case c == ':':
 			// `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as one
 			// token; a lone `:` is the array-slice separator a[m:n] (array.md §6).
 			if i+1 < len(b) && b[i+1] == ':' {
-				tokens = append(tokens, Token{Kind: TokDoubleColon})
+				tokens = append(tokens, token{Kind: tokDoubleColon})
 				i += 2
 			} else {
-				tokens = append(tokens, Token{Kind: TokColon})
+				tokens = append(tokens, token{Kind: tokColon})
 				i++
 			}
 		case c == '=':
 			// `=>` is the named-argument arrow (grammar.md §17), scanned greedily as one token;
 			// a bare `=` is the equality operator.
 			if i+1 < len(b) && b[i+1] == '>' {
-				tokens = append(tokens, Token{Kind: TokFatArrow})
+				tokens = append(tokens, token{Kind: tokFatArrow})
 				i += 2
 			} else {
-				tokens = append(tokens, Token{Kind: TokEq})
+				tokens = append(tokens, token{Kind: tokEq})
 				i++
 			}
 		case c == '<':
 			if i+1 < len(b) && b[i+1] == '=' {
-				tokens = append(tokens, Token{Kind: TokLe})
+				tokens = append(tokens, token{Kind: tokLe})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '>' {
 				// `<>` is the not-equal operator (grammar.md §4), scanned greedily; its `!=`
 				// alias is handled in the `!` case and folds to the same token.
-				tokens = append(tokens, Token{Kind: TokNe})
+				tokens = append(tokens, token{Kind: tokNe})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '@' {
 				// `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
-				tokens = append(tokens, Token{Kind: TokContainedBy})
+				tokens = append(tokens, token{Kind: tokContainedBy})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '<' {
 				// `<<` is the range strictly-left operator (range-functions.md §3), scanned greedily.
-				tokens = append(tokens, Token{Kind: TokStrictlyLeft})
+				tokens = append(tokens, token{Kind: tokStrictlyLeft})
 				i += 2
 			} else {
-				tokens = append(tokens, Token{Kind: TokLt})
+				tokens = append(tokens, token{Kind: tokLt})
 				i++
 			}
 		case c == '!':
@@ -190,70 +190,70 @@ func Lex(sql string) ([]Token, error) {
 			// BEFORE the `!=`→TokNe alias and the lone-`!` error. `!=` is the PostgreSQL alias for
 			// `<>`. A lone `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
 			if i+2 < len(b) && b[i+1] == '~' && b[i+2] == '*' {
-				tokens = append(tokens, Token{Kind: TokBangTildeStar})
+				tokens = append(tokens, token{Kind: tokBangTildeStar})
 				i += 3
 			} else if i+1 < len(b) && b[i+1] == '~' {
-				tokens = append(tokens, Token{Kind: TokBangTilde})
+				tokens = append(tokens, token{Kind: tokBangTilde})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '=' {
-				tokens = append(tokens, Token{Kind: TokNe})
+				tokens = append(tokens, token{Kind: tokNe})
 				i += 2
 			} else {
-				return nil, NewError(SyntaxError, "unexpected character '!'")
+				return nil, newError(SyntaxError, "unexpected character '!'")
 			}
 		case c == '~':
 			// `~*` is the case-insensitive regex match operator (grammar.md §22b), scanned greedily
 			// as one token (never `~` TokStar); a bare `~` is the case-sensitive form.
 			if i+1 < len(b) && b[i+1] == '*' {
-				tokens = append(tokens, Token{Kind: TokTildeStar})
+				tokens = append(tokens, token{Kind: tokTildeStar})
 				i += 2
 			} else {
-				tokens = append(tokens, Token{Kind: TokTilde})
+				tokens = append(tokens, token{Kind: tokTilde})
 				i++
 			}
 		case c == '@':
 			// `@>` array containment (grammar.md §40); `@?` / `@@` are the jsonpath exists / match
 			// operators (jsonpath.md §6). Scanned greedily; a lone `@` is not jed's surface — 42601.
 			if i+1 < len(b) && b[i+1] == '>' {
-				tokens = append(tokens, Token{Kind: TokContains})
+				tokens = append(tokens, token{Kind: tokContains})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '?' {
-				tokens = append(tokens, Token{Kind: TokJsonPathExists})
+				tokens = append(tokens, token{Kind: tokJsonPathExists})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '@' {
-				tokens = append(tokens, Token{Kind: TokJsonPathMatch})
+				tokens = append(tokens, token{Kind: tokJsonPathMatch})
 				i += 2
 			} else {
-				return nil, NewError(SyntaxError, "unexpected character '@'")
+				return nil, newError(SyntaxError, "unexpected character '@'")
 			}
 		case c == '#':
 			// `#>>` / `#>` (get-at-path) and `#-` (delete-at-path) are the jsonb path operators
 			// (json-sql-functions.md §1), scanned greedily (`#>>` before `#>`). A lone `#` is not
 			// part of jed's surface — 42601.
 			if i+2 < len(b) && b[i+1] == '>' && b[i+2] == '>' {
-				tokens = append(tokens, Token{Kind: TokHashArrowText})
+				tokens = append(tokens, token{Kind: tokHashArrowText})
 				i += 3
 			} else if i+1 < len(b) && b[i+1] == '>' {
-				tokens = append(tokens, Token{Kind: TokHashArrow})
+				tokens = append(tokens, token{Kind: tokHashArrow})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '-' {
-				tokens = append(tokens, Token{Kind: TokHashMinus})
+				tokens = append(tokens, token{Kind: tokHashMinus})
 				i += 2
 			} else {
-				return nil, NewError(SyntaxError, "unexpected character '#'")
+				return nil, newError(SyntaxError, "unexpected character '#'")
 			}
 		case c == '?':
 			// `?|` (any-key) / `?&` (all-keys) / `?` (key-exists) are the jsonb key-existence
 			// operators (json-sql-functions.md §1), scanned greedily. A lone `?` is the key-exists
 			// operator (jed binds parameters as `$N`, never `?`).
 			if i+1 < len(b) && b[i+1] == '|' {
-				tokens = append(tokens, Token{Kind: TokQuestionPipe})
+				tokens = append(tokens, token{Kind: tokQuestionPipe})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '&' {
-				tokens = append(tokens, Token{Kind: TokQuestionAmp})
+				tokens = append(tokens, token{Kind: tokQuestionAmp})
 				i += 2
 			} else {
-				tokens = append(tokens, Token{Kind: TokQuestion})
+				tokens = append(tokens, token{Kind: tokQuestion})
 				i++
 			}
 		case c == '&':
@@ -261,27 +261,27 @@ func Lex(sql string) ([]Token, error) {
 			// (not-extend-left) are the range positional operators (range-functions.md §3). Each
 			// scanned greedily; a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
 			if i+1 < len(b) && b[i+1] == '&' {
-				tokens = append(tokens, Token{Kind: TokOverlaps})
+				tokens = append(tokens, token{Kind: tokOverlaps})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '<' {
-				tokens = append(tokens, Token{Kind: TokNotExtendRight})
+				tokens = append(tokens, token{Kind: tokNotExtendRight})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '>' {
-				tokens = append(tokens, Token{Kind: TokNotExtendLeft})
+				tokens = append(tokens, token{Kind: tokNotExtendLeft})
 				i += 2
 			} else {
-				return nil, NewError(SyntaxError, "unexpected character '&'")
+				return nil, newError(SyntaxError, "unexpected character '&'")
 			}
 		case c == '>':
 			if i+1 < len(b) && b[i+1] == '=' {
-				tokens = append(tokens, Token{Kind: TokGe})
+				tokens = append(tokens, token{Kind: tokGe})
 				i += 2
 			} else if i+1 < len(b) && b[i+1] == '>' {
 				// `>>` is the range strictly-right operator (range-functions.md §3), scanned greedily.
-				tokens = append(tokens, Token{Kind: TokStrictlyRight})
+				tokens = append(tokens, token{Kind: tokStrictlyRight})
 				i += 2
 			} else {
-				tokens = append(tokens, Token{Kind: TokGt})
+				tokens = append(tokens, token{Kind: tokGt})
 				i++
 			}
 		case c == '\'':
@@ -308,9 +308,9 @@ func Lex(sql string) ([]Token, error) {
 				i++
 			}
 			if !closed {
-				return nil, NewError(SyntaxError, "unterminated string literal")
+				return nil, newError(SyntaxError, "unterminated string literal")
 			}
-			tokens = append(tokens, Token{Kind: TokStr, Word: string(sb)})
+			tokens = append(tokens, token{Kind: tokStr, Word: string(sb)})
 		case c == '"':
 			// Double-quoted identifier (collation names, spec/design/collation.md §1). `""` is an
 			// embedded double quote; the content is kept VERBATIM (case-sensitive). `"` is ASCII, so
@@ -334,9 +334,9 @@ func Lex(sql string) ([]Token, error) {
 				i++
 			}
 			if !closed {
-				return nil, NewError(SyntaxError, "unterminated quoted identifier")
+				return nil, newError(SyntaxError, "unterminated quoted identifier")
 			}
-			tokens = append(tokens, Token{Kind: TokQuotedIdent, Word: string(sb)})
+			tokens = append(tokens, token{Kind: tokQuotedIdent, Word: string(sb)})
 		case isDigit(c):
 			// A numeric literal. Scan the integer digits; a following '.' and/or scientific
 			// e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an
@@ -365,7 +365,7 @@ func Lex(sql string) ([]Token, error) {
 			exp, hasExp, i = scanExponent(b, i)
 			if hasFrac || hasExp {
 				digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
-				tokens = append(tokens, Token{Kind: TokDecimal, Word: digits, Int: uint64(scale)})
+				tokens = append(tokens, token{Kind: tokDecimal, Word: digits, Int: uint64(scale)})
 			} else {
 				// Integer literal: an unsigned magnitude. The sign is TokMinus. The magnitude
 				// must be <= 2^63 so that -(2^63) = i64's minimum is reachable; anything
@@ -374,9 +374,9 @@ func Lex(sql string) ([]Token, error) {
 				text := intPart
 				n, err := strconv.ParseUint(text, 10, 64)
 				if err != nil || n > (uint64(1)<<63) {
-					return nil, NewError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", text))
+					return nil, newError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", text))
 				}
-				tokens = append(tokens, Token{Kind: TokInt, Int: n})
+				tokens = append(tokens, token{Kind: tokInt, Int: n})
 			}
 		case c == '.':
 			// A '.' has two roles, disambiguated on the FOLLOWING byte alone (no preceding-token
@@ -397,9 +397,9 @@ func Lex(sql string) ([]Token, error) {
 				var hasExp bool
 				exp, hasExp, i = scanExponent(b, i)
 				digits, scale := decimalFromParts("", frac, hasExp, exp)
-				tokens = append(tokens, Token{Kind: TokDecimal, Word: digits, Int: uint64(scale)})
+				tokens = append(tokens, token{Kind: tokDecimal, Word: digits, Int: uint64(scale)})
 			} else {
-				tokens = append(tokens, Token{Kind: TokDot})
+				tokens = append(tokens, token{Kind: tokDot})
 				i++
 			}
 		case c == '$':
@@ -413,18 +413,18 @@ func Lex(sql string) ([]Token, error) {
 			}
 			digits := sql[digitStart:i]
 			if len(digits) == 0 {
-				return nil, NewError(SyntaxError, "expected a parameter number after '$'")
+				return nil, newError(SyntaxError, "expected a parameter number after '$'")
 			}
 			if digits[0] == '0' {
-				return nil, NewError(SyntaxError, fmt.Sprintf(
+				return nil, newError(SyntaxError, fmt.Sprintf(
 					"invalid parameter number $%s: parameters are 1-based with no leading zero", digits,
 				))
 			}
 			n, err := strconv.ParseUint(digits, 10, 32)
 			if err != nil {
-				return nil, NewError(SyntaxError, fmt.Sprintf("parameter number out of range: $%s", digits))
+				return nil, newError(SyntaxError, fmt.Sprintf("parameter number out of range: $%s", digits))
 			}
-			tokens = append(tokens, Token{Kind: TokParam, Int: n})
+			tokens = append(tokens, token{Kind: tokParam, Int: n})
 		case isAlpha(c):
 			start := i
 			for i < len(b) && (isAlpha(b[i]) || isDigit(b[i])) {
@@ -435,14 +435,14 @@ func Lex(sql string) ([]Token, error) {
 			// keyword is this long, so bounding the word length bounds every identifier on every
 			// parse path. Aborts with 42622 before the (possibly huge) name is interned.
 			if i-start > maxIdentifierLength {
-				return nil, NewError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
+				return nil, newError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
 			}
-			tokens = append(tokens, Token{Kind: TokWord, Word: sql[start:i]})
+			tokens = append(tokens, token{Kind: tokWord, Word: sql[start:i]})
 		default:
-			return nil, NewError(SyntaxError, fmt.Sprintf("unexpected character '%c'", c))
+			return nil, newError(SyntaxError, fmt.Sprintf("unexpected character '%c'", c))
 		}
 	}
 
-	tokens = append(tokens, Token{Kind: TokEof})
+	tokens = append(tokens, token{Kind: tokEof})
 	return tokens, nil
 }

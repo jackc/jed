@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func setupUpdate(t *testing.T) *Engine {
+func setupUpdate(t *testing.T) *engine {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i16, b i16)",
@@ -22,7 +22,7 @@ func setupUpdate(t *testing.T) *Engine {
 }
 
 func TestUpdateMissingTable(t *testing.T) {
-	wantErr(t, NewEngine(), "UPDATE nope SET a = 1", "42P01")
+	wantErr(t, newEngine(), "UPDATE nope SET a = 1", "42P01")
 }
 
 func TestUpdateUnknownColumn(t *testing.T) {
@@ -31,7 +31,7 @@ func TestUpdateUnknownColumn(t *testing.T) {
 
 // idsABC is the (id, a, b) rows of t in storage-key order, "id/a/b" strings, for end-state
 // assertions.
-func idsABC(db *Engine) []string {
+func idsABC(db *engine) []string {
 	rows := db.RowsInKeyOrder("t")
 	out := make([]string, len(rows))
 	for i, r := range rows {
@@ -45,7 +45,7 @@ func idsABC(db *Engine) []string {
 // per-row check fails on the transient collision. Each row's non-key columns move with it.
 func TestUpdatePkSwapIsEndStateValid(t *testing.T) {
 	db := setupUpdate(t)
-	if _, err := Execute(db, "UPDATE t SET id = 3 - id WHERE id <= 2"); err != nil {
+	if _, err := execute(db, "UPDATE t SET id = 3 - id WHERE id <= 2"); err != nil {
 		t.Fatalf("swap: %v", err)
 	}
 	got := idsABC(db)
@@ -59,7 +59,7 @@ func TestUpdatePkSwapIsEndStateValid(t *testing.T) {
 // three rows — where PostgreSQL rejects the per-row transient (id 1 → 2 while 2 still exists).
 func TestUpdatePkIncrementCascadeSucceeds(t *testing.T) {
 	db := setupUpdate(t)
-	if _, err := Execute(db, "UPDATE t SET id = id + 1"); err != nil {
+	if _, err := execute(db, "UPDATE t SET id = id + 1"); err != nil {
 		t.Fatalf("cascade: %v", err)
 	}
 	got := idsABC(db)

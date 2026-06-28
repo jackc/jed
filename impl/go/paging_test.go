@@ -18,22 +18,22 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	const cap = 3
 
 	// Build a multi-level tree at a small page size, so a few hundred rows span many pages.
-	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
+	if _, err := execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "BEGIN"); err != nil { // one commit, not 600
+	if _, err := execute(db, "BEGIN"); err != nil { // one commit, not 600
 		t.Fatal(err)
 	}
 	for k := 0; k < n; k++ {
-		if _, err := Execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k*2)); err != nil {
+		if _, err := execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k*2)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := Execute(db, "COMMIT"); err != nil {
+	if _, err := execute(db, "COMMIT"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -41,7 +41,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Reopen demand-paged with a 3-leaf budget.
-	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
-	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 		"UPDATE t SET v = 999 WHERE k = 200",
 		"INSERT INTO t VALUES (600, 1200)",
 	} {
-		if _, err := Execute(db, sql); err != nil {
+		if _, err := execute(db, sql); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -92,7 +92,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,29 +128,29 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 	const n = 2000
 	const cap = 4
 
-	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
+	if _, err := execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "BEGIN"); err != nil {
+	if _, err := execute(db, "BEGIN"); err != nil {
 		t.Fatal(err)
 	}
 	for k := 0; k < n; k++ {
-		if _, err := Execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k+1)); err != nil {
+		if _, err := execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k+1)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := Execute(db, "COMMIT"); err != nil {
+	if _, err := execute(db, "COMMIT"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 	// A spread of point queries (each a full scan, no index) repeatedly faults leaves through the
 	// bounded pool; residency never exceeds the budget, and every answer is correct.
 	for k := 0; k < n; k += 97 {
-		out, err := Execute(db, fmt.Sprintf("SELECT v FROM t WHERE k = %d", k))
+		out, err := execute(db, fmt.Sprintf("SELECT v FROM t WHERE k = %d", k))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,22 +188,22 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiny.jed")
 	const n = 400
 
-	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
+	if _, err := execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "BEGIN"); err != nil {
+	if _, err := execute(db, "BEGIN"); err != nil {
 		t.Fatal(err)
 	}
 	for k := 0; k < n; k++ {
-		if _, err := Execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k+1)); err != nil {
+		if _, err := execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k+1)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := Execute(db, "COMMIT"); err != nil {
+	if _, err := execute(db, "COMMIT"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -211,7 +211,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	}
 
 	// A 1-byte budget is far below the 256-byte page size: it must clamp to one resident leaf, not zero.
-	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: 1})
+	db, err = openWithOptions(path, openOptions{CacheBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 // multi-gigabyte allocation.
 func TestCreateRejectsOversizedPageSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "huge.jed")
-	_, err := Create(path, DatabaseOptions{PageSize: 1 << 20})
+	_, err := create(path, DatabaseOptions{PageSize: 1 << 20})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
@@ -256,7 +256,7 @@ func TestReadRejectsOversizedPageSize(t *testing.T) {
 	image := make([]byte, 200)
 	copy(image[0:4], "JEDB")
 	binary.BigEndian.PutUint32(image[8:12], 70000)
-	_, err := LoadEngine(image)
+	_, err := loadEngine(image)
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "XX001" {
 		t.Fatalf("want XX001 data_corrupted, got %v", err)
@@ -269,7 +269,7 @@ func TestReadRejectsOversizedPageSize(t *testing.T) {
 func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 	// Create: 1000 is within [256, 65536] but not a power of two.
 	path := filepath.Join(t.TempDir(), "pow2.jed")
-	_, err := Create(path, DatabaseOptions{PageSize: 1000})
+	_, err := create(path, DatabaseOptions{PageSize: 1000})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
@@ -282,7 +282,7 @@ func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 	image := make([]byte, 4096)
 	copy(image[0:4], "JEDB")
 	binary.BigEndian.PutUint32(image[8:12], 1000)
-	_, err = LoadEngine(image)
+	_, err = loadEngine(image)
 	ee, ok = err.(*EngineError)
 	if !ok || ee.Code() != "XX001" {
 		t.Fatalf("want XX001 data_corrupted, got %v", err)
@@ -293,7 +293,7 @@ func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 // of two but below minPageSize — is rejected on Create.
 func TestRejectsPageSizeBelowFloor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiny.jed")
-	_, err := Create(path, DatabaseOptions{PageSize: 128})
+	_, err := create(path, DatabaseOptions{PageSize: 128})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)

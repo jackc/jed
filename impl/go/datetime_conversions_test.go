@@ -14,9 +14,9 @@ package jed
 
 import "testing"
 
-func dtErrCode(t *testing.T, db *Engine, sql string) string {
+func dtErrCode(t *testing.T, db *engine, sql string) string {
 	t.Helper()
-	_, err := Execute(db, sql)
+	_, err := execute(db, sql)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -24,7 +24,7 @@ func dtErrCode(t *testing.T, db *Engine, sql string) string {
 }
 
 func TestExtractJulianIsDeferred(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if c := dtErrCode(t, db, "SELECT EXTRACT(julian FROM timestamp '2024-03-15 00:00:00')"); c != "0A000" {
 		t.Fatalf("julian/timestamp: got %s, want 0A000", c)
 	}
@@ -34,14 +34,14 @@ func TestExtractJulianIsDeferred(t *testing.T) {
 }
 
 func TestDatePartIsDeferred(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if c := dtErrCode(t, db, "SELECT date_part('hour', timestamp '2024-03-15 13:00:00')"); c != "42883" {
 		t.Fatalf("date_part: got %s, want 42883", c)
 	}
 }
 
 func TestExtractFromInfinityTraps(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if c := dtErrCode(t, db, "SELECT EXTRACT(year FROM timestamp 'infinity')"); c != "22003" {
 		t.Fatalf("extract year/infinity: got %s, want 22003", c)
 	}
@@ -51,7 +51,7 @@ func TestExtractFromInfinityTraps(t *testing.T) {
 }
 
 func TestNonDatetimeSourceToDatetimeIsDeferred(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if c := dtErrCode(t, db, "SELECT CAST(1 + 1 AS timestamp)"); c != "0A000" {
 		t.Fatalf("int->timestamp: got %s, want 0A000", c)
 	}

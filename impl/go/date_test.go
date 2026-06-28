@@ -22,7 +22,7 @@ func TestDateVectors(t *testing.T) {
 		case "parse":
 			in := unquote(c.fields["input"])
 			want, _ := strconv.ParseInt(c.fields["days"], 10, 64)
-			got, err := ParseDate(in)
+			got, err := parseDate(in)
 			switch {
 			case err != nil:
 				t.Errorf("parse %q: unexpected error %v", in, err)
@@ -32,7 +32,7 @@ func TestDateVectors(t *testing.T) {
 		case "parse_error":
 			in := unquote(c.fields["input"])
 			want := unquote(c.fields["error"])
-			_, err := ParseDate(in)
+			_, err := parseDate(in)
 			ee, ok := err.(*EngineError)
 			if !ok {
 				t.Errorf("parse %q: expected error %s, got %v", in, want, err)
@@ -42,7 +42,7 @@ func TestDateVectors(t *testing.T) {
 		case "render":
 			d, _ := strconv.ParseInt(c.fields["days"], 10, 64)
 			want := unquote(c.fields["text"])
-			if got := RenderDate(int32(d)); got != want {
+			if got := renderDate(int32(d)); got != want {
 				t.Errorf("render %d = %q, want %q", d, got, want)
 			}
 		}

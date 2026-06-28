@@ -36,12 +36,12 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 		pad      = "padpadpadpadpadpadpadpadpadpadpadpad" // ~36 chars → ~3 rows/leaf at ps 256
 	)
 	path := filepath.Join(tb.TempDir(), "torn_seed.jed")
-	db, err := Create(path, DatabaseOptions{PageSize: pageSize})
+	db, err := create(path, DatabaseOptions{PageSize: pageSize})
 	if err != nil {
 		tb.Fatal(err)
 	}
 	exec := func(sql string) {
-		if _, err := Execute(db, sql); err != nil {
+		if _, err := execute(db, sql); err != nil {
 			tb.Fatalf("%q: %v", sql, err)
 		}
 	}
@@ -64,7 +64,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 	if err != nil {
 		tb.Fatal(err)
 	}
-	rdb, err := LoadEnginePaged(p, cacheLeaves(DefaultCacheBytes, p.pageSize))
+	rdb, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 		}
 		fmt.Fprintf(&b, "(%d, '%s')", k+i, pad)
 	}
-	if _, err := Execute(rdb, b.String()); err != nil {
+	if _, err := execute(rdb, b.String()); err != nil {
 		tb.Fatalf("fat commit: %v", err)
 	}
 	postBytes := append([]byte(nil), base.buf...)

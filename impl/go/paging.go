@@ -21,7 +21,7 @@ import "sync"
 // a RAM-sized database (CLAUDE.md §9) — stays fully cache-resident under the default; stated in bytes
 // so the budget does not silently scale with a file's page size. Converted to a leaf-page capacity by
 // cacheLeaves.
-const DefaultCacheBytes = 256 * 1024 * 1024
+const defaultCacheBytes = 256 * 1024 * 1024
 
 // cacheLeaves converts a byte budget to a resident-leaf-page capacity for a file of pageSize bytes:
 // max(1, cacheBytes / pageSize) (pager.md §3). The max(1, …) floor keeps one leaf resident even when
@@ -55,7 +55,7 @@ func newSharedPaging(p *pager, capacity int) *sharedPaging {
 // the cached node, a miss reads + decodes the page (with this table's colTypes) and caches it,
 // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
 // with a caller-supplied decoder is consistent (pager.md §4).
-func (s *sharedPaging) faultLeaf(page uint32, colTypes []ColType) (*pnode, error) {
+func (s *sharedPaging) faultLeaf(page uint32, colTypes []colType) (*pnode, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pool.getOrLoad(page, func() (*pnode, error) {

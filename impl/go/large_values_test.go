@@ -27,9 +27,9 @@ func countPageType(image []byte, ps int, ty byte) int {
 
 // bigValueDB builds an in-memory table with a ~1250-byte text value (forces a multi-page overflow
 // chain at page 256: RECORD_MAX = (256-16-12)/2 = 114, cap = 240) plus a small inline value.
-func bigValueDB(t *testing.T) (*Engine, string) {
+func bigValueDB(t *testing.T) (*engine, string) {
 	t.Helper()
-	db := NewEngine()
+	db := newEngine()
 	big := fillerText(1250) // incompressible, so Slice B keeps it external-plain
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s')", big))
@@ -46,7 +46,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 	if n := countPageType(image, 256, pageOverflow); n < 2 {
 		t.Fatalf("a large value should span several overflow pages, got %d", n)
 	}
-	loaded, err := LoadEngine(image)
+	loaded, err := loadEngine(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 }
 
 func TestSmallValuesNeverSpill(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 	image, err := db.ToImage(256, 1)
@@ -83,7 +83,7 @@ func TestLoadReclaimsOnlyDeadOverflowPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadEngine(image)
+	loaded, err := loadEngine(image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large_values.jed")
 	big := fillerText(1500) // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
 
-	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 
 	// Reopen demand-paged (the default Open): the big value reconstructs exactly through the
 	// pager-backed chain read.
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	}
 
 	// Delete the big row; its chain is orphaned (leaked this session).
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	// Reopen: the free-list reconstruction collects only live chains, so the dead chain's pages are
 	// now free. Re-inserting a large value reuses them — the high-water grows by a handful of pages,
 	// not by a whole fresh chain (~7 pages).
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	}
 
 	// Final correctness through the paged path.
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

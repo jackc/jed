@@ -21,12 +21,12 @@ import (
 
 // scanChecksum opens path and returns the rendered "SELECT id, body" rows, or the read error.
 func scanChecksum(path string) ([][]string, error) {
-	db, err := Open(path)
+	db, err := open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
-	out, err := Execute(db, "SELECT id, body FROM t ORDER BY id")
+	out, err := execute(db, "SELECT id, body FROM t ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -62,18 +62,18 @@ func equalRows(a, b [][]string) bool {
 // B-tree (interior root) of ~30 rows, with row 1 a 600-char incompressible body that spills.
 func seedChecksum(t *testing.T, path string) {
 	t.Helper()
-	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)"); err != nil {
+	if _, err := execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)"); err != nil {
 		t.Fatal(err)
 	}
 	sql := "INSERT INTO t VALUES (1, '" + fillerText(600) + "')"
 	for id := 2; id <= 30; id++ {
 		sql += fmt.Sprintf(", (%d, 'row%d')", id, id)
 	}
-	if _, err := Execute(db, sql); err != nil {
+	if _, err := execute(db, sql); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

@@ -694,7 +694,7 @@ var SupportedCapabilities = []string{
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).
-func Execute(db *Engine, sql string) (Outcome, error) {
+func execute(db *engine, sql string) (Outcome, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return Outcome{}, err
@@ -706,7 +706,7 @@ func Execute(db *Engine, sql string) (Outcome, error) {
 // placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type
 // cannot be inferred is 42P18; a bound value out of range / of the wrong family fails like a
 // literal (22003/42804/…).
-func ExecuteParams(db *Engine, sql string, params []Value) (Outcome, error) {
+func executeParams(db *engine, sql string, params []Value) (Outcome, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return Outcome{}, err

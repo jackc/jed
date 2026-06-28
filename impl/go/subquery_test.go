@@ -11,7 +11,7 @@ package jed
 
 import "testing"
 
-func subqueryAB(t *testing.T) *Engine {
+func subqueryAB(t *testing.T) *engine {
 	return dbWith(
 		t,
 		"CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
@@ -23,9 +23,9 @@ func subqueryAB(t *testing.T) *Engine {
 	)
 }
 
-func errCode(t *testing.T, db *Engine, sql string) string {
+func errCode(t *testing.T, db *engine, sql string) string {
 	t.Helper()
-	_, err := Execute(db, sql)
+	_, err := execute(db, sql)
 	if err == nil {
 		t.Fatalf("expected error for %q", sql)
 	}
@@ -38,8 +38,8 @@ func errCode(t *testing.T, db *Engine, sql string) string {
 
 func TestSubqueryCostAddedOnce(t *testing.T) {
 	db := subqueryAB(t)
-	base, _ := Execute(db, "SELECT id FROM a WHERE k = 999")
-	withSub, _ := Execute(db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)")
+	base, _ := execute(db, "SELECT id FROM a WHERE k = 999")
+	withSub, _ := execute(db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)")
 	// The folded constant is a leaf, so the only delta is the subquery's own cost (1 page_read +
 	// 3 scan + 3 accumulate + 1 produced = 8), added exactly once.
 	if d := withSub.Cost - base.Cost; d != 8 {
@@ -74,8 +74,8 @@ func TestDeleteCorrelatedSubqueryCostIsPerRow(t *testing.T) {
 	// A correlated DELETE subquery re-runs per scanned row; an uncorrelated one folds once. The
 	// correlated cost therefore exceeds the uncorrelated baseline on the same data — proving the
 	// per-row execution. Both are deterministic + cross-core identical (CLAUDE.md §13).
-	corr, _ := Execute(subqueryAB(t), "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)")
-	uncorr, _ := Execute(subqueryAB(t), "DELETE FROM a WHERE k IN (SELECT k FROM b)")
+	corr, _ := execute(subqueryAB(t), "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)")
+	uncorr, _ := execute(subqueryAB(t), "DELETE FROM a WHERE k IN (SELECT k FROM b)")
 	if corr.Cost <= uncorr.Cost {
 		t.Errorf("correlated cost %d should exceed uncorrelated %d", corr.Cost, uncorr.Cost)
 	}

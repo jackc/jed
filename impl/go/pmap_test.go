@@ -23,7 +23,7 @@ func pmKey(n uint64) []byte {
 	return b
 }
 
-func pmRow(n int64) Row { return Row{IntValue(n)} }
+func pmRow(n int64) storedRow { return storedRow{IntValue(n)} }
 
 // pmShuffled is a deterministic permutation of 0..n (LCG-driven) — no RNG / wall-clock, so the
 // test is reproducible (CLAUDE.md §10).
@@ -43,7 +43,7 @@ func pmShuffled(n uint64) []uint64 {
 
 // pmCheckInvariants asserts every node (except the root) fits a page and stays non-empty — the
 // structural invariant the byte contract relies on (spec/fileformat/format.md).
-func pmCheckInvariants(t *testing.T, pm *PMap) {
+func pmCheckInvariants(t *testing.T, pm *pMap) {
 	t.Helper()
 	var walk func(n *pnode, isRoot bool)
 	walk = func(n *pnode, isRoot bool) {
@@ -70,8 +70,8 @@ func pmCheckInvariants(t *testing.T, pm *PMap) {
 }
 
 func TestPMapInsertGetRemoveVsReference(t *testing.T) {
-	var pm PMap
-	ref := map[string]Row{}
+	var pm pMap
+	ref := map[string]storedRow{}
 	const n = 4000
 
 	for _, k := range pmShuffled(n) {
@@ -139,7 +139,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 }
 
 func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
-	var base PMap
+	var base pMap
 	for k := uint64(0); k < 2000; k++ {
 		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, nil)
 	}
@@ -185,7 +185,7 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 // Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the
 // non-empty-halves guarantee. With weight 110 (≤ 114 cap) a node holds ~2 entries.
 func TestPMapWideValuesKeepNodesValid(t *testing.T) {
-	var pm PMap
+	var pm pMap
 	ref := map[string]bool{}
 	for _, k := range pmShuffled(300) {
 		pm.Insert(pmKey(k), pmRow(int64(k)), 110, pmCap, nil)
@@ -202,7 +202,7 @@ func TestPMapWideValuesKeepNodesValid(t *testing.T) {
 }
 
 func TestPMapEmptyAndSingle(t *testing.T) {
-	var pm PMap
+	var pm pMap
 	if pm.Len() != 0 {
 		t.Fatal("fresh map not empty")
 	}
@@ -231,7 +231,7 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 // children) and the asymmetric inclusive-lo edge that single-leaf conformance tables (the
 // DESC-LIMIT corpus cases) cannot exercise. 200 entries at pmCap build several levels.
 func TestPMapReverseScanIsForwardReversed(t *testing.T) {
-	var pm PMap
+	var pm pMap
 	for n := uint64(0); n < 200; n++ {
 		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, nil)
 	}
@@ -241,7 +241,7 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 	decode := func(k []byte) uint64 { return binary.BigEndian.Uint64(k) }
 	collect := func(b keyBound, rev bool) []uint64 {
 		var out []uint64
-		visit := func(k []byte, _ Row) (bool, error) { out = append(out, decode(k)); return true, nil }
+		visit := func(k []byte, _ storedRow) (bool, error) { out = append(out, decode(k)); return true, nil }
 		if rev {
 			pm.scanRangeRev(b, nil, visit)
 		} else {
@@ -270,7 +270,7 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 	// largest keys descending, faulting no further.
 	var got []uint64
 	n := 0
-	pm.scanRangeRev(unboundedBound(), nil, func(k []byte, _ Row) (bool, error) {
+	pm.scanRangeRev(unboundedBound(), nil, func(k []byte, _ storedRow) (bool, error) {
 		got = append(got, decode(k))
 		n++
 		return n < 3, nil

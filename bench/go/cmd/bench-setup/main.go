@@ -106,12 +106,12 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 	os.Remove(path)
 	os.Remove(bench.SidecarPath(dataDir, ds.Name, "jed"))
 
-	db, err := jed.Create(path, jed.DefaultDatabaseOptions())
+	db, err := jed.CreateDatabase(path, jed.DefaultDatabaseOptions())
 	if err != nil {
 		return err
 	}
 	exec := func(sql string) error {
-		_, err := db.ExecuteSQL(sql, nil)
+		_, err := db.Execute(sql, nil)
 		return err
 	}
 	for _, t := range ds.Table {
@@ -171,7 +171,7 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 // but NOT jed's on-disk format version (fingerprint.go), so a format bump leaves a stale .jed
 // that the current core rejects (XX001) — regenerate whenever the existing file no longer opens.
 func jedFileReadable(path string) bool {
-	db, err := jed.Open(path)
+	db, err := jed.OpenDatabase(path)
 	if err != nil {
 		return false
 	}

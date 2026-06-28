@@ -201,13 +201,13 @@ func applyCrash(prior []byte, ops []storeOp, cut, tearBytes int, dropMask uint64
 // openImage opens an in-memory database image through a fresh sliceStore — the demand-paged loader
 // over a byte device, no file. Returns the loader's error (XX001/58030/…) unchanged on a malformed
 // image.
-func openImage(image []byte) (*Engine, error) {
+func openImage(image []byte) (*engine, error) {
 	store := newSliceStore(image)
 	p, err := pagerFromStore(store)
 	if err != nil {
 		return nil, err
 	}
-	return LoadEnginePaged(p, cacheLeaves(DefaultCacheBytes, p.pageSize))
+	return loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize))
 }
 
 // errScanHang is returned by guardedScanIDs when an open+scan does not finish within the budget — a
@@ -242,7 +242,7 @@ func guardedQuery(image []byte, sql string) (rows [][]Value, err error) {
 			return
 		}
 		defer db.Close()
-		out, e := Execute(db, sql)
+		out, e := execute(db, sql)
 		if e != nil {
 			ch <- result{nil, e}
 			return

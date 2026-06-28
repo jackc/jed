@@ -24,7 +24,7 @@ import (
 // default (spec/design/spill.md §2, api.md §2.1). Matches the buffer-pool default so a RAM-sized
 // ORDER BY stays fully in memory under the default; a host bounds a hostile/large sort by lowering
 // it. A handle setting, never stored in the file.
-const DefaultWorkMem = 256 * 1024 * 1024
+const defaultWorkMem = 256 * 1024 * 1024
 
 // valueBytes is a cheap, deterministic estimate of a value's resident bytes (spill.md §2): a fixed
 // base plus the variable-width payload. It need not be exact — it only decides spill timing, which
@@ -50,7 +50,7 @@ func valueBytes(v Value) int {
 	}
 }
 
-func rowBytes(row Row) int {
+func rowBytes(row storedRow) int {
 	n := 8
 	for _, v := range row {
 		n += valueBytes(v)
@@ -60,7 +60,7 @@ func rowBytes(row Row) int {
 
 // cmpRows is the stable comparator over the ORDER BY keys: the first non-equal key decides; a full
 // tie is 0 (the SliceStable keeps input order — spill.md §6).
-func cmpRows(keys []orderSlot, a, b Row) int {
+func cmpRows(keys []orderSlot, a, b storedRow) int {
 	for _, k := range keys {
 		if c := keyCmp(a[k.idx], b[k.idx], k.descending, k.nullsFirst); c != 0 {
 			return c
@@ -77,7 +77,7 @@ type sorter struct {
 	keys     []orderSlot
 	budget   int    // 0 ⇒ unlimited (never spill)
 	spillDir string // "" ⇒ never spill (in-memory database)
-	buf      []Row
+	buf      []storedRow
 	bufBytes int
 	runs     []string // spilled run file paths, in input order (run 0 = first chunk — spill.md §6)
 	total    int
@@ -90,7 +90,7 @@ func newSorter(keys []orderSlot, budget int, spillDir string) *sorter {
 func (s *sorter) canSpill() bool { return s.spillDir != "" && s.budget > 0 }
 
 // push adds one row, spilling the current run when the in-memory buffer exceeds the budget.
-func (s *sorter) push(row Row) error {
+func (s *sorter) push(row storedRow) error {
 	s.total++
 	if s.canSpill() {
 		s.bufBytes += rowBytes(row)
@@ -173,13 +173,13 @@ func (s *sorter) finish() (*sortedRows, error) {
 // sortedRows is the sorted output stream (spec/design/spill.md §4). The window/projection loop pulls
 // rows one at a time, so neither the input nor the output is re-materialized in the spill case.
 type sortedRows struct {
-	mem    []Row // set for the no-spill case
+	mem    []storedRow // set for the no-spill case
 	memPos int
 	merge  *merger // set for the spill case
 }
 
 // next returns the next row in sort order, or ok=false at the end.
-func (r *sortedRows) next() (Row, bool, error) {
+func (r *sortedRows) next() (storedRow, bool, error) {
 	if r.merge != nil {
 		return r.merge.next()
 	}
@@ -207,7 +207,7 @@ type merger struct {
 	heap    *mergeHeap
 }
 
-func (m *merger) next() (Row, bool, error) {
+func (m *merger) next() (storedRow, bool, error) {
 	if m.heap.Len() == 0 {
 		return nil, false, nil
 	}
@@ -230,7 +230,7 @@ type mergeSource struct {
 	r         *bufio.Reader
 	path      string
 	remaining uint64
-	mem       []Row
+	mem       []storedRow
 	memIdx    int
 }
 
@@ -249,7 +249,7 @@ func openRunSource(path string) (*mergeSource, error) {
 	return &mergeSource{isFile: true, f: f, r: r, path: path, remaining: remaining}, nil
 }
 
-func (s *mergeSource) next() (Row, bool, error) {
+func (s *mergeSource) next() (storedRow, bool, error) {
 	if !s.isFile {
 		if s.memIdx >= len(s.mem) {
 			return nil, false, nil
@@ -282,7 +282,7 @@ func (s *mergeSource) close() {
 // keys, ties broken by the lowest source index — exactly input order, reproducing the in-memory
 // stable sort (spec/design/spill.md §6).
 type mergeItem struct {
-	row    Row
+	row    storedRow
 	source int
 }
 
@@ -328,7 +328,7 @@ func spillWriteBytes(w *bufio.Writer, b []byte) {
 	_, _ = w.Write(b)
 }
 
-func spillWriteRow(w *bufio.Writer, row Row) {
+func spillWriteRow(w *bufio.Writer, row storedRow) {
 	spillWriteU32(w, uint32(len(row)))
 	for _, v := range row {
 		spillWriteValue(w, v)
@@ -504,12 +504,12 @@ func spillReadBytes(r *bufio.Reader) ([]byte, error) {
 	return b, nil
 }
 
-func spillReadRow(r *bufio.Reader) (Row, error) {
+func spillReadRow(r *bufio.Reader) (storedRow, error) {
 	ncols, err := spillReadU32(r)
 	if err != nil {
 		return nil, err
 	}
-	row := make(Row, ncols)
+	row := make(storedRow, ncols)
 	for i := range row {
 		v, err := spillReadValue(r)
 		if err != nil {
@@ -558,7 +558,7 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			}
 			groups[i] = binary.LittleEndian.Uint16(gb[:])
 		}
-		return DecimalValue(DecimalFromCodec(neg != 0, scale, groups)), nil
+		return DecimalValue(decimalFromCodec(neg != 0, scale, groups)), nil
 	case 5:
 		b, err := spillReadBytes(r)
 		return ByteaValue(b), err
@@ -653,14 +653,14 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			}
 			elems[i] = el
 		}
-		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
+		return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
 	case 18:
 		flags, err := spillReadU8(r)
 		if err != nil {
 			return Value{}, err
 		}
 		if flags&0x01 != 0 {
-			return RangeValue(EmptyRangeVal()), nil
+			return RangeValue(emptyRangeVal()), nil
 		}
 		lbInf := flags&0x02 != 0
 		ubInf := flags&0x04 != 0

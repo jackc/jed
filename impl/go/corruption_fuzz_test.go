@@ -37,18 +37,18 @@ const corruptScanSQL = "SELECT id, body FROM t ORDER BY id"
 func seedCorruptTarget(tb testing.TB) []byte {
 	tb.Helper()
 	path := filepath.Join(tb.TempDir(), "corrupt_seed.jed")
-	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		tb.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)"); err != nil {
+	if _, err := execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)"); err != nil {
 		tb.Fatal(err)
 	}
 	sql := "INSERT INTO t VALUES (1, '" + fillerText(600) + "')"
 	for id := 2; id <= 30; id++ {
 		sql += fmt.Sprintf(", (%d, 'row%d')", id, id)
 	}
-	if _, err := Execute(db, sql); err != nil {
+	if _, err := execute(db, sql); err != nil {
 		tb.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

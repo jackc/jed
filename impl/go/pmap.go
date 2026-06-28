@@ -28,7 +28,7 @@ import (
 // on-disk page index (0 when dirty), set once at the commit that first persists this node.
 type pnode struct {
 	keys     [][]byte
-	vals     []Row
+	vals     []storedRow
 	weights  []uint32
 	children []childRef
 	page     uint32
@@ -103,26 +103,26 @@ func (n *pnode) search(key []byte) (int, bool) {
 
 // PMap is a persistent ordered map from encoded key to Row. A value copy is an O(1) independent
 // snapshot (the root pointer is shared; nodes are immutable).
-type PMap struct {
+type pMap struct {
 	root   *pnode
 	length int
 }
 
 // NewPMap returns an empty map.
-func NewPMap() PMap { return PMap{} }
+func newPMap() pMap { return pMap{} }
 
 // Len returns the entry count.
-func (m *PMap) Len() int { return m.length }
+func (m *pMap) Len() int { return m.length }
 
 // root exposes the root node to the serializer (format.go). nil for an empty map.
-func (m *PMap) rootNode() *pnode { return m.root }
+func (m *pMap) rootNode() *pnode { return m.root }
 
 // fromLoaded reconstructs a map from a loaded root (format.go LoadEngine).
-func fromLoaded(root *pnode, length int) PMap { return PMap{root: root, length: length} }
+func fromLoaded(root *pnode, length int) pMap { return pMap{root: root, length: length} }
 
 // Get looks up the row at key. src faults an OnDisk leaf on the descent (nil for a fully-resident
 // in-memory tree); an I/O error propagates.
-func (m *PMap) Get(key []byte, src leafSource) (Row, bool, error) {
+func (m *pMap) Get(key []byte, src leafSource) (storedRow, bool, error) {
 	n := m.root
 	for n != nil {
 		i, found := n.search(key)
@@ -145,13 +145,13 @@ func (m *PMap) Get(key []byte, src leafSource) (Row, bool, error) {
 // capacity. Returns the previous row and true if key was present (an overwrite); otherwise nil and
 // false (a new insert, which grows the length). An overwrite can change the weight, so it too may
 // overflow and split.
-func (m *PMap) Insert(key []byte, val Row, weight uint32, cap int, src leafSource) (Row, bool, error) {
+func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
-		m.root = &pnode{keys: [][]byte{key}, vals: []Row{val}, weights: []uint32{weight}}
+		m.root = &pnode{keys: [][]byte{key}, vals: []storedRow{val}, weights: []uint32{weight}}
 		m.length++
 		return nil, false, nil
 	}
-	var old Row
+	var old storedRow
 	replaced := false
 	out, err := nodeInsert(m.root, key, val, weight, &old, &replaced, src, cap)
 	if err != nil {
@@ -161,7 +161,7 @@ func (m *PMap) Insert(key []byte, val Row, weight uint32, cap int, src leafSourc
 		m.root = out.whole
 	} else {
 		m.root = &pnode{
-			keys: [][]byte{out.midK}, vals: []Row{out.midV}, weights: []uint32{out.midW},
+			keys: [][]byte{out.midK}, vals: []storedRow{out.midV}, weights: []uint32{out.midW},
 			children: []childRef{residentRef(out.left), residentRef(out.right)},
 		}
 	}
@@ -173,7 +173,7 @@ func (m *PMap) Insert(key []byte, val Row, weight uint32, cap int, src leafSourc
 
 // Remove deletes key. Returns the removed row and true, or (nil,false) if absent (then the map is
 // unchanged). cap is the page payload capacity (the rebalance threshold).
-func (m *PMap) Remove(key []byte, cap int, src leafSource) (Row, bool, error) {
+func (m *pMap) Remove(key []byte, cap int, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
 		return nil, false, nil
 	}
@@ -210,9 +210,9 @@ func (m *PMap) Remove(key []byte, cap int, src leafSource) (Row, bool, error) {
 // row in the executor loop, not here — spec/design/cost.md), so laziness is unobservable. Faults each
 // OnDisk leaf through src; the faulted node is dropped (GC) once its rows are appended, so the resident
 // leaf set stays bounded by the pool, not the tree (pager.md §4).
-func (m *PMap) inorder(src leafSource) ([][]byte, []Row, error) {
+func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 	keys := make([][]byte, 0, m.length)
-	vals := make([]Row, 0, m.length)
+	vals := make([]storedRow, 0, m.length)
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
 		if n == nil {
@@ -250,7 +250,7 @@ func (m *PMap) inorder(src leafSource) ([][]byte, []Row, error) {
 // charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the structural
 // node count (interior + leaf); 0 for an empty map. Deterministic and byte-identical across cores
 // (the node boundaries are a §8 byte contract — format.md).
-func (m *PMap) nodeCount() int {
+func (m *pMap) nodeCount() int {
 	var count func(n *pnode) int
 	count = func(n *pnode) int {
 		if n == nil {
@@ -278,7 +278,7 @@ func (m *PMap) nodeCount() int {
 // (spec/design/temp-tables.md §7; weight is the on-disk record_size, byte-identical across cores —
 // §8). The tree is fully resident for a temp store (temp data never pages), so this never faults; an
 // OnDisk child would contribute 0 (defensive — temp stores have none).
-func (m *PMap) residentRecordBytes() uint64 {
+func (m *pMap) residentRecordBytes() uint64 {
 	var walk func(n *pnode) uint64
 	walk = func(n *pnode) uint64 {
 		if n == nil {
@@ -379,7 +379,7 @@ func (b keyBound) entryWindow(n *pnode) (int, int) {
 // whole tree (identical to inorder). One asymmetric edge: a separator entry equal to an INCLUSIVE lo
 // is in bound while both its adjacent children are pruned, so the entry window can start one slot
 // before the child window — emitted before the descent loop.
-func (m *PMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []Row, error) {
+func (m *pMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []storedRow, error) {
 	keys, vals, _, err := m.rangeEntriesCounted(b, src)
 	return keys, vals, err
 }
@@ -388,9 +388,9 @@ func (m *PMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []Row, error)
 // visits — the page_read count overlapNodeCount would return, observed during the ONE windowed
 // walk instead of a second counting descent (the visited sets are identical by construction:
 // both window with childWindow).
-func (m *PMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []Row, int, error) {
+func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []storedRow, int, error) {
 	var keys [][]byte
-	var vals []Row
+	var vals []storedRow
 	nodes := 0
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
@@ -436,7 +436,7 @@ func (m *PMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []Row,
 // prune, root always visited), counting an OnDisk leaf as one node WITHOUT faulting it (the
 // resident-skeleton dividend, pager.md §5). The unbounded bound returns nodeCount() (every node
 // overlaps), so a full scan's cost is unchanged.
-func (m *PMap) overlapNodeCount(b keyBound) int {
+func (m *pMap) overlapNodeCount(b keyBound) int {
 	var count func(n *pnode) int
 	count = func(n *pnode) int {
 		if n.isLeaf() {
@@ -465,7 +465,7 @@ func (m *PMap) overlapNodeCount(b keyBound) int {
 // faulted (the LIMIT short-circuit is genuine, not a post-hoc truncation — spec/design/cost.md §3
 // "LIMIT short-circuit"). Like rangeEntries it prunes non-overlapping subtrees; unlike it, it streams
 // (one row at a time, no Vec) so a bounded result holds ~one leaf resident.
-func (m *PMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row Row) (bool, error)) error {
+func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		ef, el := b.entryWindow(n)
@@ -517,7 +517,7 @@ func (m *PMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 // from the high end). For an interior node it walks children from cl down to cf, emitting the
 // in-window separator BEFORE descending its child, and the asymmetric inclusive-lo separator
 // key[ef] (when ef<cf) LAST.
-func (m *PMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, row Row) (bool, error)) error {
+func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		ef, el := b.entryWindow(n)
@@ -566,7 +566,7 @@ type insOut struct {
 	whole *pnode // non-nil ⇒ no split
 	left  *pnode
 	midK  []byte
-	midV  Row
+	midV  storedRow
 	midW  uint32
 	right *pnode
 }
@@ -582,7 +582,7 @@ type insOut struct {
 // m yields two non-empty, fitting halves under the RECORD_MAX = (cap-12)/2 cap (format.md). The < 3
 // guard is defensive against an oversized record — it leaves the node whole, and the oversize is
 // surfaced as 0A000 when the node is serialized (format.go).
-func build(keys [][]byte, vals []Row, weights []uint32, children []childRef, cap int, rightEdge bool) insOut {
+func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRef, cap int, rightEdge bool) insOut {
 	interior := len(children) > 0
 	payload := 0
 	for _, w := range weights {
@@ -644,7 +644,7 @@ func build(keys [][]byte, vals []Row, weights []uint32, children []childRef, cap
 // nodeInsert is the recursive insert. On overwrite it sets *old/*replaced and rebuilds the path with
 // the value+weight replaced (which may now overflow). On a new key it inserts into the leaf and
 // splits overflowing nodes back up the path.
-func nodeInsert(n *pnode, key []byte, val Row, weight uint32, old *Row, replaced *bool, src leafSource, cap int) (insOut, error) {
+func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap int) (insOut, error) {
 	i, found := n.search(key)
 	if found {
 		vals := cloneVals(n.vals)
@@ -684,7 +684,7 @@ func nodeInsert(n *pnode, key []byte, val Row, weight uint32, old *Row, replaced
 
 // maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor. Faults the rightmost
 // leaf through src if it is OnDisk.
-func maxKV(n *pnode, src leafSource) ([]byte, Row, uint32, error) {
+func maxKV(n *pnode, src leafSource) ([]byte, storedRow, uint32, error) {
 	for !n.isLeaf() {
 		child, err := resolveChild(n.children[len(n.children)-1], src)
 		if err != nil {
@@ -699,7 +699,7 @@ func maxKV(n *pnode, src leafSource) ([]byte, Row, uint32, error) {
 // underfull — the caller rebalances it) and the removed row. A separator found in an interior node
 // is replaced by its in-order predecessor (drawn from the left subtree), which is then deleted from
 // that subtree; the touched child is rebalanced via rebalanceChild.
-func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, Row, bool, error) {
+func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, storedRow, bool, error) {
 	i, found := n.search(key)
 	if found {
 		if n.isLeaf() {
@@ -796,7 +796,7 @@ func mergeAt(n *pnode, j int, src leafSource, cap int) (*pnode, error) {
 	mkeys = append(mkeys, left.keys...)
 	mkeys = append(mkeys, n.keys[j])
 	mkeys = append(mkeys, right.keys...)
-	mvals := make([]Row, 0, len(left.vals)+1+len(right.vals))
+	mvals := make([]storedRow, 0, len(left.vals)+1+len(right.vals))
 	mvals = append(mvals, left.vals...)
 	mvals = append(mvals, n.vals[j])
 	mvals = append(mvals, right.vals...)
@@ -842,11 +842,11 @@ func cloneKeys(s [][]byte) [][]byte {
 	return out
 }
 
-func cloneVals(s []Row) []Row {
+func cloneVals(s []storedRow) []storedRow {
 	if len(s) == 0 {
 		return nil
 	}
-	out := make([]Row, len(s))
+	out := make([]storedRow, len(s))
 	copy(out, s)
 	return out
 }
@@ -877,8 +877,8 @@ func insertKeyAt(s [][]byte, i int, x []byte) [][]byte {
 	return out
 }
 
-func insertValAt(s []Row, i int, x Row) []Row {
-	out := make([]Row, len(s)+1)
+func insertValAt(s []storedRow, i int, x storedRow) []storedRow {
+	out := make([]storedRow, len(s)+1)
 	copy(out, s[:i])
 	out[i] = x
 	copy(out[i+1:], s[i:])
@@ -908,9 +908,9 @@ func removeKeyAt(s [][]byte, i int) [][]byte {
 	return out
 }
 
-func removeValAt(s []Row, i int) ([]Row, Row) {
+func removeValAt(s []storedRow, i int) ([]storedRow, storedRow) {
 	removed := s[i]
-	out := make([]Row, len(s)-1)
+	out := make([]storedRow, len(s)-1)
 	copy(out, s[:i])
 	copy(out[i:], s[i+1:])
 	return out, removed

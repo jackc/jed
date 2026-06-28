@@ -30,8 +30,8 @@ func i32rangeVal(lo, hi *int64) *RangeVal {
 
 func TestEncodeRangeKeyI32ByteExact(t *testing.T) {
 	p := func(n int64) *int64 { return &n }
-	enc := func(rv *RangeVal) string { return hex.EncodeToString(encodeRangeKey(Int32, rv)) }
-	if got := enc(EmptyRangeVal()); got != "00" {
+	enc := func(rv *RangeVal) string { return hex.EncodeToString(encodeRangeKey(scalarInt32, rv)) }
+	if got := enc(emptyRangeVal()); got != "00" {
 		t.Fatalf("empty: got %s want 00", got)
 	}
 	cases := []struct {
@@ -54,7 +54,7 @@ func TestEncodeRangeKeyOrderPreserving(t *testing.T) {
 	p := func(n int64) *int64 { return &n }
 	// a strictly ascending sequence under rangeTotalCmp
 	ranges := []*RangeVal{
-		EmptyRangeVal(),
+		emptyRangeVal(),
 		i32rangeVal(nil, p(5)),  // (,5)
 		i32rangeVal(nil, nil),   // (,)
 		i32rangeVal(p(1), p(5)), // [1,5)
@@ -63,8 +63,8 @@ func TestEncodeRangeKeyOrderPreserving(t *testing.T) {
 		i32rangeVal(p(2), nil), // [2,)
 	}
 	for i := 1; i < len(ranges); i++ {
-		a := encodeRangeKey(Int32, ranges[i-1])
-		b := encodeRangeKey(Int32, ranges[i])
+		a := encodeRangeKey(scalarInt32, ranges[i-1])
+		b := encodeRangeKey(scalarInt32, ranges[i])
 		if bytes.Compare(a, b) >= 0 {
 			t.Fatalf("keys not strictly ascending at %d: %x !< %x", i, a, b)
 		}
@@ -73,13 +73,13 @@ func TestEncodeRangeKeyOrderPreserving(t *testing.T) {
 
 func TestEncodeRangeKeyInclusivityAndScale(t *testing.T) {
 	dec := func(digits string, scale uint32) *Value {
-		v := DecimalValue(DecimalFromDigitsScale(false, digits, scale))
+		v := DecimalValue(decimalFromDigitsScale(false, digits, scale))
 		return &v
 	}
 	numr := func(lo, hi *Value, loInc, hiInc bool) *RangeVal {
 		return &RangeVal{Lower: lo, Upper: hi, LowerInc: loInc, UpperInc: hiInc}
 	}
-	encN := func(rv *RangeVal) []byte { return encodeRangeKey(DecimalType, rv) }
+	encN := func(rv *RangeVal) []byte { return encodeRangeKey(scalarDecimal, rv) }
 	one, two := dec("1", 0), dec("2", 0)
 	// [1,2) < (1,2)  (inclusive lower before exclusive lower)
 	if bytes.Compare(encN(numr(one, two, true, false)), encN(numr(one, two, false, false))) >= 0 {

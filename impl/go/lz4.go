@@ -97,7 +97,7 @@ func lz4Decompress(comp []byte, rawLen int) ([]byte, error) {
 	n := len(comp)
 	for {
 		if i >= n {
-			return nil, NewError(DataCorrupted, "truncated compressed block")
+			return nil, newError(DataCorrupted, "truncated compressed block")
 		}
 		token := comp[i]
 		i++
@@ -105,7 +105,7 @@ func lz4Decompress(comp []byte, rawLen int) ([]byte, error) {
 		if lit == 15 {
 			for {
 				if i >= n {
-					return nil, NewError(DataCorrupted, "truncated compressed block")
+					return nil, newError(DataCorrupted, "truncated compressed block")
 				}
 				b := comp[i]
 				i++
@@ -116,10 +116,10 @@ func lz4Decompress(comp []byte, rawLen int) ([]byte, error) {
 			}
 		}
 		if i+lit > n {
-			return nil, NewError(DataCorrupted, "truncated compressed block")
+			return nil, newError(DataCorrupted, "truncated compressed block")
 		}
 		if len(out)+lit > rawLen {
-			return nil, NewError(DataCorrupted, "decompressed length overflow")
+			return nil, newError(DataCorrupted, "decompressed length overflow")
 		}
 		out = append(out, comp[i:i+lit]...)
 		i += lit
@@ -127,18 +127,18 @@ func lz4Decompress(comp []byte, rawLen int) ([]byte, error) {
 			break // a literals-only tail ends the block
 		}
 		if i+2 > n {
-			return nil, NewError(DataCorrupted, "truncated compressed block")
+			return nil, newError(DataCorrupted, "truncated compressed block")
 		}
 		offset := int(binary.LittleEndian.Uint16(comp[i:]))
 		i += 2
 		if offset == 0 || offset > len(out) {
-			return nil, NewError(DataCorrupted, "invalid match offset")
+			return nil, newError(DataCorrupted, "invalid match offset")
 		}
 		ml := int(token & 0x0F)
 		if ml == 15 {
 			for {
 				if i >= n {
-					return nil, NewError(DataCorrupted, "truncated compressed block")
+					return nil, newError(DataCorrupted, "truncated compressed block")
 				}
 				b := comp[i]
 				i++
@@ -150,7 +150,7 @@ func lz4Decompress(comp []byte, rawLen int) ([]byte, error) {
 		}
 		ml += lz4MinMatch
 		if len(out)+ml > rawLen {
-			return nil, NewError(DataCorrupted, "decompressed length overflow")
+			return nil, newError(DataCorrupted, "decompressed length overflow")
 		}
 		from := len(out) - offset
 		for k := 0; k < ml; k++ {
@@ -159,7 +159,7 @@ func lz4Decompress(comp []byte, rawLen int) ([]byte, error) {
 		}
 	}
 	if len(out) != rawLen {
-		return nil, NewError(DataCorrupted, "decompressed length mismatch")
+		return nil, newError(DataCorrupted, "decompressed length mismatch")
 	}
 	return out, nil
 }

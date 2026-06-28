@@ -14,9 +14,9 @@ import (
 	"testing"
 )
 
-func costOf(t *testing.T, db *Engine, sql string) int64 {
+func costOf(t *testing.T, db *engine, sql string) int64 {
 	t.Helper()
-	out, err := Execute(db, sql)
+	out, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -24,8 +24,8 @@ func costOf(t *testing.T, db *Engine, sql string) int64 {
 }
 
 func TestNoFromLiteralSelect(t *testing.T) {
-	db := NewEngine()
-	out, err := Execute(db, "SELECT 1")
+	db := newEngine()
+	out, err := execute(db, "SELECT 1")
 	if err != nil {
 		t.Fatalf("SELECT 1: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestNoFromLiteralSelect(t *testing.T) {
 }
 
 func TestNoFromExpressionCost(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	rows := query(t, db, "SELECT 1 + 2")
 	if len(rows) != 1 || rows[0][0].Int != 3 {
 		t.Errorf("rows: %v", rows)
@@ -54,7 +54,7 @@ func TestNoFromExpressionCost(t *testing.T) {
 }
 
 func TestNoFromWhereFiltersTheVirtualRow(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if rows := query(t, db, "SELECT 1 WHERE false"); len(rows) != 0 {
 		t.Errorf("WHERE false rows: %v", rows)
 	}
@@ -71,7 +71,7 @@ func TestNoFromWhereFiltersTheVirtualRow(t *testing.T) {
 }
 
 func TestNoFromAggregatesFoldTheSingleGroup(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	// The virtual row is the one input row of the whole-table group (aggregates.md §4).
 	if rows := query(t, db, "SELECT count(*)"); len(rows) != 1 || rows[0][0].Int != 1 {
 		t.Errorf("count(*) rows: %v", rows)
@@ -96,7 +96,7 @@ func TestNoFromAggregatesFoldTheSingleGroup(t *testing.T) {
 }
 
 func TestNoFromDistinctAndWindow(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if rows := query(t, db, "SELECT DISTINCT 1"); len(rows) != 1 || rows[0][0].Int != 1 {
 		t.Errorf("DISTINCT rows: %v", rows)
 	}
@@ -109,7 +109,7 @@ func TestNoFromDistinctAndWindow(t *testing.T) {
 }
 
 func TestNoFromSetOperationOperands(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	rows := query(t, db, "SELECT 1 UNION SELECT 2")
 	got := make([]int64, len(rows))
 	for i, r := range rows {
@@ -149,7 +149,7 @@ func TestNoFromSubqueries(t *testing.T) {
 
 func TestNoFromInsertSelectSource(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	out, err := Execute(db, "INSERT INTO t SELECT 3")
+	out, err := execute(db, "INSERT INTO t SELECT 3")
 	if err != nil {
 		t.Fatalf("INSERT INTO t SELECT 3: %v", err)
 	}
@@ -162,8 +162,8 @@ func TestNoFromInsertSelectSource(t *testing.T) {
 }
 
 func TestNoFromStarIs42601WithPGMessage(t *testing.T) {
-	db := NewEngine()
-	_, err := Execute(db, "SELECT *")
+	db := newEngine()
+	_, err := execute(db, "SELECT *")
 	if err == nil {
 		t.Fatal("SELECT *: expected an error")
 	}
@@ -180,7 +180,7 @@ func TestNoFromStarIs42601WithPGMessage(t *testing.T) {
 }
 
 func TestNoFromBareColumnsResolveNothing(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if c := errCode(t, db, "SELECT nope"); c != "42703" {
 		t.Errorf("SELECT nope = %s, want 42703", c)
 	}
@@ -202,7 +202,7 @@ func TestNoFromBareColumnsResolveNothing(t *testing.T) {
 }
 
 func TestNoFromParams(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	if c := paramErrCode(t, db, "SELECT $1", IntValue(7)); c != "42P18" {
 		t.Errorf("SELECT $1 = %s, want 42P18", c)
 	}

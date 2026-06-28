@@ -14,21 +14,21 @@ import (
 	"testing"
 )
 
-func retRun(t *testing.T, db *Engine, sql string) Outcome {
+func retRun(t *testing.T, db *engine, sql string) Outcome {
 	t.Helper()
-	o, err := Execute(db, sql)
+	o, err := execute(db, sql)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 	return o
 }
 
-func retCost(t *testing.T, db *Engine, sql string) int64 {
+func retCost(t *testing.T, db *engine, sql string) int64 {
 	t.Helper()
 	return retRun(t, db, sql).Cost
 }
 
-func retRows(t *testing.T, db *Engine, sql string) [][]Value {
+func retRows(t *testing.T, db *engine, sql string) [][]Value {
 	t.Helper()
 	o := retRun(t, db, sql)
 	if o.Kind != OutcomeQuery {
@@ -37,9 +37,9 @@ func retRows(t *testing.T, db *Engine, sql string) [][]Value {
 	return o.Rows
 }
 
-func retErrCode(t *testing.T, db *Engine, sql string) string {
+func retErrCode(t *testing.T, db *engine, sql string) string {
 	t.Helper()
-	_, err := Execute(db, sql)
+	_, err := execute(db, sql)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -63,14 +63,14 @@ func retGrid(rows [][]Value) string {
 	return strings.Join(parts, "|")
 }
 
-func retSetup(t *testing.T) *Engine {
+func retSetup(t *testing.T) *engine {
 	t.Helper()
-	db := NewEngine()
+	db := newEngine()
 	for _, s := range []string{
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
 		"INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
 	} {
-		if _, err := Execute(db, s); err != nil {
+		if _, err := execute(db, s); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
@@ -264,7 +264,7 @@ func TestReturningCeilingAbortIsAllOrNothing(t *testing.T) {
 func TestReturningBindParams(t *testing.T) {
 	db := retSetup(t)
 	// A $N in the RETURNING list types from context like anywhere else (api.md §5).
-	o, err := ExecuteParams(db, "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", []Value{IntValue(5)})
+	o, err := executeParams(db, "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", []Value{IntValue(5)})
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestReturningBindParams(t *testing.T) {
 		t.Fatalf("got %+v", o)
 	}
 	// A parameter no context types is 42P18.
-	if _, err := ExecuteParams(db, "INSERT INTO t VALUES (81, 3, 0) RETURNING $1", []Value{IntValue(5)}); err == nil {
+	if _, err := executeParams(db, "INSERT INTO t VALUES (81, 3, 0) RETURNING $1", []Value{IntValue(5)}); err == nil {
 		t.Fatalf("an untypable parameter must fail")
 	} else if code := err.(*EngineError).Code(); code != "42P18" {
 		t.Fatalf("got %s want 42P18", code)
@@ -284,8 +284,8 @@ func TestReturningGrowsTheTouchedSet(t *testing.T) {
 	// (the §32 touched-set rule). 100_000 raw bytes at page_size 8192 (C = 8180):
 	// ceil(100000/8180) = 13 slabs.
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
-	fresh := func() *Engine {
-		db := NewEngine()
+	fresh := func() *engine {
+		db := newEngine()
 		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db
@@ -378,7 +378,7 @@ func TestOldNewNamingAndStar(t *testing.T) {
 func TestOldNewShadowedByTableName(t *testing.T) {
 	// A target table literally named old (or new) keeps the ordinary table-qualified
 	// meaning — the row-version pseudo-relation is suppressed (PG-probed).
-	db := NewEngine()
+	db := newEngine()
 	retRun(t, db, "CREATE TABLE old (x i32)")
 	if g := retGrid(retRows(t, db, "INSERT INTO old VALUES (1) RETURNING old.x")); g != "1" {
 		t.Fatalf("got %s", g) // the inserted value, NOT the NULL old side
@@ -423,8 +423,8 @@ func TestOldNewTouchedSet(t *testing.T) {
 	// column is assigned; a DELETE's new.col is the constant NULL row and reads nothing.
 	// Compressed 100k text at page_size 8192 = 13 slabs.
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
-	fresh := func() *Engine {
-		db := NewEngine()
+	fresh := func() *engine {
+		db := newEngine()
 		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db

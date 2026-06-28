@@ -20,9 +20,9 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 	}
 	for _, f := range cases64 {
 		v := Float64Value(f)
-		enc := encodeValue(ScalarColType(Float64), v)
+		enc := encodeValue(scalarColType(scalarFloat64), v)
 		pos := 0
-		got, err := readInlineBody(ScalarColType(Float64), enc[1:], &pos) // skip the 0x00 presence tag
+		got, err := readInlineBody(scalarColType(scalarFloat64), enc[1:], &pos) // skip the 0x00 presence tag
 		if err != nil {
 			t.Fatalf("f64 decode %v: %v", f, err)
 		}
@@ -46,9 +46,9 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 	}
 	for _, f := range cases32 {
 		v := Float32Value(f)
-		enc := encodeValue(ScalarColType(Float32), v)
+		enc := encodeValue(scalarColType(scalarFloat32), v)
 		pos := 0
-		got, err := readInlineBody(ScalarColType(Float32), enc[1:], &pos)
+		got, err := readInlineBody(scalarColType(scalarFloat32), enc[1:], &pos)
 		if err != nil {
 			t.Fatalf("f32 decode %v: %v", f, err)
 		}
@@ -77,7 +77,7 @@ func TestFloatImageRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db2, err := LoadEngine(img)
+	db2, err := loadEngine(img)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
 		"CREATE TABLE f (id i32 PRIMARY KEY, a f32, b f64)",
 		"INSERT INTO f VALUES (1, '1.5', '2.25')",
 	)
-	out, err := Execute(db, "SELECT a + b FROM f")
+	out, err := execute(db, "SELECT a + b FROM f")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,21 +177,21 @@ func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
 func TestFloat32ImplicitWidenStoresIntoFloat64Column(t *testing.T) {
 	// f32 → f64 is the implicit, lossless widen (the tower): a f32 VALUE stores into a
 	// f64 column (storeValue widens), and assignableTo permits the family pairing.
-	got, err := storeValue(Float32Value(1.5), Float64, nil, false, "x")
+	got, err := storeValue(Float32Value(1.5), scalarFloat64, nil, false, "x")
 	if err != nil {
 		t.Fatalf("f32 → f64 column store: %v", err)
 	}
 	if got.Kind != ValFloat64 || got.F64() != 1.5 {
 		t.Errorf("f32 1.5 widened = %v (kind %v)", got.Render(), got.Kind)
 	}
-	if !assignableTo(resolvedType{kind: rtFloat32}, Float64) {
+	if !assignableTo(resolvedType{kind: rtFloat32}, scalarFloat64) {
 		t.Errorf("f32 should be assignable to a f64 column")
 	}
 	// f64 → f32 column is NOT implicitly assignable (explicit CAST only).
-	if assignableTo(resolvedType{kind: rtFloat64}, Float32) {
+	if assignableTo(resolvedType{kind: rtFloat64}, scalarFloat32) {
 		t.Errorf("f64 should NOT be implicitly assignable to a f32 column")
 	}
-	if _, err := storeValue(Float64Value(1.5), Float32, nil, false, "x"); err == nil {
+	if _, err := storeValue(Float64Value(1.5), scalarFloat32, nil, false, "x"); err == nil {
 		t.Errorf("storing a f64 value into a f32 column should be a 42804")
 	}
 }

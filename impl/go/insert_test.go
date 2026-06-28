@@ -5,18 +5,18 @@ package jed
 
 import "testing"
 
-func dbWith(t *testing.T, stmts ...string) *Engine {
+func dbWith(t *testing.T, stmts ...string) *engine {
 	t.Helper()
-	db := NewEngine()
+	db := newEngine()
 	for _, s := range stmts {
-		if _, err := Execute(db, s); err != nil {
+		if _, err := execute(db, s); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
 	return db
 }
 
-func ids(rows []Row) []int64 {
+func ids(rows []storedRow) []int64 {
 	out := make([]int64, len(rows))
 	for i, r := range rows {
 		out[i] = r[0].Int
@@ -61,7 +61,7 @@ func TestBoundaryValuesRoundTrip(t *testing.T) {
 }
 
 func TestInsertIntoMissingTableTraps(t *testing.T) {
-	db := NewEngine()
+	db := newEngine()
 	wantErr(t, db, "INSERT INTO nope VALUES (1)", "42P01")
 }
 
@@ -99,7 +99,7 @@ func TestInsertSelectParamInSourceWhere(t *testing.T) {
 		"CREATE TABLE dst (id i32 PRIMARY KEY, a i16)",
 	)
 	// A $1 inside the source SELECT binds through the SELECT's own resolver.
-	if _, err := ExecuteParams(db, "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1",
+	if _, err := executeParams(db, "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1",
 		[]Value{IntValue(2)}); err != nil {
 		t.Fatalf("INSERT ... SELECT with param: %v", err)
 	}

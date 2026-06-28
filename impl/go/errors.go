@@ -18,7 +18,7 @@ type EngineError struct {
 }
 
 // NewError builds an EngineError.
-func NewError(state SqlState, message string) *EngineError {
+func newError(state SqlState, message string) *EngineError {
 	return &EngineError{State: state, Message: message}
 }
 

@@ -23,12 +23,12 @@ const reclaimPS = int64(256)
 // records, which directly reports whether a commit extended the high-water or reused a free page. We
 // track this, not the file length: the file is preallocated in chunks ahead of the high-water
 // (spec/design/pager.md §7), so its physical size no longer equals pageCount*pageSize.
-func reclaimPageCount(db *Engine) int64 {
+func reclaimPageCount(db *engine) int64 {
 	return int64(db.PageCount())
 }
 
 // padOf returns the pad text of the row with id, and whether it exists.
-func padOf(t *testing.T, db *Engine, id int64) (string, bool) {
+func padOf(t *testing.T, db *engine, id int64) (string, bool) {
 	rows := queryRows(t, db, fmt.Sprintf("SELECT pad FROM t WHERE id = %d", id))
 	if len(rows) == 0 {
 		return "", false
@@ -36,8 +36,8 @@ func padOf(t *testing.T, db *Engine, id int64) (string, bool) {
 	return rows[0][0].Str, true
 }
 
-func reclaimSetup(t *testing.T, path string, rows int) *Engine {
-	db, err := Create(path, DatabaseOptions{PageSize: uint32(reclaimPS)})
+func reclaimSetup(t *testing.T, path string, rows int) *engine {
+	db, err := create(path, DatabaseOptions{PageSize: uint32(reclaimPS)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestReopenReclaimsDeadPagesSoALaterChurnReuses(t *testing.T) {
 	}
 
 	// Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
-	db, err := Open(path)
+	db, err := open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestReopenReclaimsDeadPagesSoALaterChurnReuses(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestHeavyInsertDeleteChurnReopensWithReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := Open(path)
+	db, err := open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestHeavyInsertDeleteChurnReopensWithReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestTornCommitAfterReuseFallsBackToPriorSnapshot(t *testing.T) {
 	}
 
 	// Reopen so the free-list holds the churn's dead pages, then do two commits that reuse them.
-	db, err := Open(path)
+	db, err := open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestTornCommitAfterReuseFallsBackToPriorSnapshot(t *testing.T) {
 	// The loader falls back to the prior snapshot — intact even though the torn commit reused
 	// (overwrote) free pages, because those pages were dead and the prior snapshot never referenced
 	// them. Row 11's update vanishes; row 10's prior-commit value and every row survive.
-	db, err = Open(path)
+	db, err = open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

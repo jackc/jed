@@ -56,25 +56,25 @@ func TestCollationCompilerMatchesVectors(t *testing.T) {
 	for _, row := range rows {
 		name := row.str("name")
 		def := collDefinition(t, row.strs("def_files"))
-		coll, err := CompileCollation(row.str("coll_name"), def)
+		coll, err := compileCollation(row.str("coll_name"), def)
 		if err != nil {
 			t.Fatalf("%s: compile: %v", name, err)
 		}
-		if got := hex.EncodeToString(SerializeTable(coll)); got != row.str("table_hex") {
+		if got := hex.EncodeToString(serializeTable(coll)); got != row.str("table_hex") {
 			t.Errorf("%s: table\n got %s\nwant %s", name, got, row.str("table_hex"))
 		}
-		artifact := SaveCollation(coll)
+		artifact := saveCollation(coll)
 		if got := hex.EncodeToString(artifact); got != row.str("artifact_hex") {
 			t.Errorf("%s: artifact\n got %s\nwant %s", name, got, row.str("artifact_hex"))
 		}
-		reopened, err := OpenCollation(artifact)
+		reopened, err := openCollation(artifact)
 		if err != nil {
 			t.Fatalf("%s: open: %v", name, err)
 		}
 		if !reflect.DeepEqual(reopened, coll) {
 			t.Errorf("%s: reopened collation != compiled", name)
 		}
-		if got := hex.EncodeToString(SaveCollation(reopened)); got != row.str("artifact_hex") {
+		if got := hex.EncodeToString(saveCollation(reopened)); got != row.str("artifact_hex") {
 			t.Errorf("%s: open→save round-trip mismatch", name)
 		}
 	}
@@ -100,7 +100,7 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 			if vc := LoadedCollation(collName); vc != nil {
 				coll = vc
 			} else {
-				c, err := CompileCollation(collName, collDefinition(t, row.strs("def_files")))
+				c, err := compileCollation(collName, collDefinition(t, row.strs("def_files")))
 				if err != nil {
 					t.Fatalf("%s: compile: %v", collName, err)
 				}
@@ -109,7 +109,7 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 			lastColl = collName
 			prev = nil
 		}
-		key, err := SortKey(coll, s)
+		key, err := sortKey(coll, s)
 		if err != nil {
 			t.Fatalf("%s %q: sort key: %v", collName, s, err)
 		}
@@ -130,7 +130,7 @@ func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
 	}
 	for _, row := range rows {
 		rootName := row.str("root_name")
-		root, err := CompileCollation(rootName, collDefinition(t, row.strs("root_def_files")))
+		root, err := compileCollation(rootName, collDefinition(t, row.strs("root_def_files")))
 		if err != nil {
 			t.Fatalf("%s: compile root: %v", rootName, err)
 		}
@@ -142,29 +142,29 @@ func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
 		}
 		tailorings := make([]*Collation, len(names))
 		for i, n := range names {
-			c, err := CompileCollation(n, collDefinition(t, strings.Split(defs[i], "|")))
+			c, err := compileCollation(n, collDefinition(t, strings.Split(defs[i], "|")))
 			if err != nil {
 				t.Fatalf("%s: compile tailoring: %v", n, err)
 			}
 			tailorings[i] = c
 		}
 
-		bundle := BuildBundle(root, tailorings, nil, row.str("description"))
-		enc := SaveBundle(bundle)
+		bundle := buildBundle(root, tailorings, nil, row.str("description"))
+		enc := saveBundle(bundle)
 		want := row.str("bundle_hex")
 		if got := hex.EncodeToString(enc); got != want {
 			t.Errorf("bundle bytes\n got %s\nwant %s", got, want)
 		}
 
-		reopened, err := OpenBundle(enc)
+		reopened, err := openBundle(enc)
 		if err != nil {
 			t.Fatalf("open bundle: %v", err)
 		}
-		if got := hex.EncodeToString(SaveBundle(reopened)); got != want {
+		if got := hex.EncodeToString(saveBundle(reopened)); got != want {
 			t.Errorf("bundle open→save round-trip mismatch")
 		}
 
-		colls, _, err := LoadBundle(reopened)
+		colls, _, err := loadBundle(reopened)
 		if err != nil {
 			t.Fatalf("load bundle: %v", err)
 		}
@@ -177,11 +177,11 @@ func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
 			t.Fatalf("loaded bundle missing collation %q", name)
 			return nil
 		}
-		if !bytes.Equal(SerializeTable(find(rootName)), SerializeTable(root)) {
+		if !bytes.Equal(serializeTable(find(rootName)), serializeTable(root)) {
 			t.Errorf("root table changed through the bundle")
 		}
 		for _, tl := range tailorings {
-			if !bytes.Equal(SerializeTable(find(tl.Name)), SerializeTable(tl)) {
+			if !bytes.Equal(serializeTable(find(tl.Name)), serializeTable(tl)) {
 				t.Errorf("merge identity failed for %s", tl.Name)
 			}
 		}
@@ -189,13 +189,13 @@ func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
 }
 
 func TestCollationOpenRejectsTamperedArtifact(t *testing.T) {
-	coll, err := CompileCollation("dev-root", collDefinition(t, []string{"collation/fixtures/dev-root.allkeys"}))
+	coll, err := compileCollation("dev-root", collDefinition(t, []string{"collation/fixtures/dev-root.allkeys"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifact := SaveCollation(coll)
+	artifact := saveCollation(coll)
 	artifact[len(artifact)-1] ^= 0xFF
-	_, err = OpenCollation(artifact)
+	_, err = openCollation(artifact)
 	if err == nil {
 		t.Fatal("expected an error opening a tampered artifact")
 	}
@@ -209,33 +209,33 @@ func TestCollationOpenRejectsTamperedArtifact(t *testing.T) {
 // and full SpecialCasing (ß→SS). The kernels take an EXPLICIT property table, so the un-loaded (ASCII)
 // regime is deterministic regardless of the engine-global loaded set. Mirrors collation.rs casing_tests.
 func TestCasingKernels(t *testing.T) {
-	p := &PropertyTable{
-		Simple: []SimpleCase{
+	p := &propertyTable{
+		Simple: []simpleCase{
 			{0x41, 0x41, 0x61, 0x41}, // A
 			{0x61, 0x41, 0x61, 0x41}, // a
 			{0xC9, 0xC9, 0xE9, 0xC9}, // É
 			{0xE9, 0xC9, 0xE9, 0xC9}, // é
 		},
-		Special: []SpecialCasing{{Cp: 0xDF, Upper: []uint32{0x53, 0x53}, Lower: []uint32{0xDF}, Title: []uint32{0x53, 0x73}}},
+		Special: []specialCasing{{Cp: 0xDF, Upper: []uint32{0x53, 0x53}, Lower: []uint32{0xDF}, Title: []uint32{0x53, 0x73}}},
 	}
 	cases := []struct {
 		got, want string
 	}{
 		// ASCII baseline (nil property): fold a–z/A–Z, pass the rest through.
-		{FoldCase("café", true, nil), "CAFé"},
-		{FoldCase("CAFÉ", false, nil), "cafÉ"},
-		{FoldCase("ß", true, nil), "ß"},
+		{foldCase("café", true, nil), "CAFé"},
+		{foldCase("CAFÉ", false, nil), "cafÉ"},
+		{foldCase("ß", true, nil), "ß"},
 		// Full Unicode via the property table.
-		{FoldCase("aé", true, p), "AÉ"},
-		{FoldCase("AÉ", false, p), "aé"},
-		{FoldCase("ß", true, p), "SS"}, // SpecialCasing expansion — the glibc divergence
-		{FoldCase("aßa", true, p), "ASSA"},
-		{FoldCase("z", true, p), "z"}, // not in the table → identity
+		{foldCase("aé", true, p), "AÉ"},
+		{foldCase("AÉ", false, p), "aé"},
+		{foldCase("ß", true, p), "SS"}, // SpecialCasing expansion — the glibc divergence
+		{foldCase("aßa", true, p), "ASSA"},
+		{foldCase("z", true, p), "z"}, // not in the table → identity
 		// ILIKE folding is simple-only (never expands): ß stays one code point.
-		{FoldLowerSimple("ß", p), "ß"},
-		{FoldLowerSimple("É", p), "é"},
-		{FoldLowerSimple("HELLO", nil), "hello"},
-		{FoldLowerSimple("É", nil), "É"},
+		{foldLowerSimple("ß", p), "ß"},
+		{foldLowerSimple("É", p), "é"},
+		{foldLowerSimple("HELLO", nil), "hello"},
+		{foldLowerSimple("É", nil), "É"},
 	}
 	for i, c := range cases {
 		if c.got != c.want {

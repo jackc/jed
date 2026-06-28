@@ -21,7 +21,7 @@ func TestEncodingVectors(t *testing.T) {
 	cases := readEncodingCases(t, specPath(t, "encoding/integers.toml"))
 	checked := 0
 	for _, c := range cases {
-		st, ok := ScalarTypeFromName(c.typ)
+		st, ok := scalarTypeFromName(c.typ)
 		if !ok {
 			t.Fatalf("unknown type %q", c.typ)
 		}
@@ -31,7 +31,7 @@ func TestEncodingVectors(t *testing.T) {
 			// produces (encoding.md §2.7); nullable/descending use the shared tag/inversion.
 			switch c.kind {
 			case "bare":
-				got, _ = ParseUUID(c.strValue)
+				got, _ = parseUUID(c.strValue)
 				if UuidValue(got).Render() != c.strValue {
 					t.Errorf("bare uuid %s: round-trip got %s", c.strValue, UuidValue(got).Render())
 				}
@@ -52,7 +52,7 @@ func TestEncodingVectors(t *testing.T) {
 			// tag/inversion.
 			switch c.kind {
 			case "bare":
-				got = EncodeBool(c.boolValue)
+				got = encodeBool(c.boolValue)
 			case "nullable":
 				got = nullableBoolBytes(c)
 			case "descending":
@@ -66,24 +66,24 @@ func TestEncodingVectors(t *testing.T) {
 		}
 		switch c.kind {
 		case "bare":
-			got = EncodeInt(st, c.value)
-			if dec := DecodeInt(st, got); dec != c.value {
+			got = encodeInt(st, c.value)
+			if dec := decodeInt(st, got); dec != c.value {
 				t.Errorf("bare %s %d: round-trip got %d", c.typ, c.value, dec)
 			}
 		case "nullable":
 			if c.isNull {
-				got = EncodeNullable(st, nil)
+				got = encodeNullable(st, nil)
 			} else {
 				v := c.value
-				got = EncodeNullable(st, &v)
+				got = encodeNullable(st, &v)
 			}
 		case "descending":
 			var asc []byte
 			if c.isNull {
-				asc = EncodeNullable(st, nil)
+				asc = encodeNullable(st, nil)
 			} else {
 				v := c.value
-				asc = EncodeNullable(st, &v)
+				asc = encodeNullable(st, &v)
 			}
 			got = invertBytes(asc)
 		}
