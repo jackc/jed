@@ -122,6 +122,7 @@ pub struct Bench {
     pub expect_rows_per_iter: Option<usize>,
     pub engines: Vec<String>,
     pub batch: usize,
+    pub readers: usize,
     pub setup_sql: Vec<String>,
     pub sql_override: Vec<(String, String)>,
     pub setup_sql_override: Vec<(String, Vec<String>)>,
@@ -236,6 +237,7 @@ pub fn load_corpus(corpus_dir: &str) -> BoxResult<Vec<Bench>> {
                 .map(|n| n as usize),
             engines: str_list(t, "engines"),
             batch: int_field(t, "batch") as usize,
+            readers: int_field(t, "readers") as usize,
             setup_sql: str_list(t, "setup_sql"),
             sql_override: t
                 .get("sql_override")
@@ -357,6 +359,34 @@ pub trait Engine {
     fn exec_prepared(&mut self, args: &[Arg]) -> BoxResult<()>;
     fn query_int(&mut self, sql: &str) -> BoxResult<i64>;
     fn stored_fingerprint(&mut self) -> BoxResult<String>;
+
+    /// Run a concurrent_read bench (spec/design/benchmarks.md §8.1): open one reader per
+    /// block over the same committed data (jed: one SharedCore + N reader Sessions, the
+    /// slice-7 convergence) and drive each block in parallel. `warm`/`meas` are already
+    /// partitioned into `readers` contiguous blocks. Returns the per-block answer hashes
+    /// (reader order), the merged per-query latencies, the total rows, and the wall clock
+    /// of the timed phase. The default returns `None` → the runner SKIPS the bench, so a
+    /// driver with no concurrent-session story (none, today, beyond jed) opts out for free.
+    fn concurrent_read(
+        &mut self,
+        sql: &str,
+        warm: Vec<Vec<Vec<Arg>>>,
+        meas: Vec<Vec<Vec<Arg>>>,
+        expect_rows: Option<usize>,
+    ) -> BoxResult<Option<ConcurrentOutcome>> {
+        let _ = (sql, warm, meas, expect_rows);
+        Ok(None)
+    }
+}
+
+/// The result of a concurrent_read run (benchmarks.md §8.1). `block_hexes` are the
+/// per-reader-block FNV checksums in reader-index order — the runner folds them in that
+/// order into the one partition-invariant answer checksum.
+pub struct ConcurrentOutcome {
+    pub block_hexes: Vec<String>,
+    pub elapsed: Vec<i64>,
+    pub rows_total: i64,
+    pub wall_ns: i64,
 }
 
 pub struct Config {
@@ -374,6 +404,7 @@ pub struct ResultLine {
     pub dataset: String,
     pub iterations: usize,
     pub warmup: usize,
+    pub readers: usize,
     pub total_ns: i64,
     pub ns_per_op: i64,
     pub min_ns: i64,
@@ -390,7 +421,7 @@ impl ResultLine {
             concat!(
                 "{{\"schema\":1,\"bench\":\"{}\",\"dataset\":\"{}\",\"engine\":\"{}\",",
                 "\"lang\":\"{}\",\"variant\":\"{}\",\"iterations\":{},\"warmup\":{},",
-                "\"total_ns\":{},\"ns_per_op\":{},\"min_ns\":{},\"p50_ns\":{},",
+                "\"readers\":{},\"total_ns\":{},\"ns_per_op\":{},\"min_ns\":{},\"p50_ns\":{},",
                 "\"rows_total\":{},\"checksum\":\"{}\",\"fingerprint\":\"{}\",\"started_at\":\"{}\"}}"
             ),
             self.bench,
@@ -400,6 +431,7 @@ impl ResultLine {
             cfg.variant,
             self.iterations,
             self.warmup,
+            self.readers,
             self.total_ns,
             self.ns_per_op,
             self.min_ns,
@@ -453,7 +485,9 @@ pub fn run(cfg: &Config, corpus_dir: &str, data_dir: &str, filter: &str) -> BoxR
         );
         let line = run_one(cfg, b, corpus_dir, data_dir, &want)
             .map_err(|e| format!("bench {:?}: {e}", b.name))?;
-        lines.push(line.to_json(cfg));
+        if let Some(line) = line {
+            lines.push(line.to_json(cfg));
+        }
     }
     Ok(lines)
 }
@@ -464,7 +498,7 @@ fn run_one(
     corpus_dir: &str,
     data_dir: &str,
     want: &str,
-) -> BoxResult<ResultLine> {
+) -> BoxResult<Option<ResultLine>> {
     let mut eng = (cfg.open)(data_dir, &b.dataset)?;
 
     if b.dataset != "scratch" {
@@ -477,6 +511,11 @@ fn run_one(
         eng.exec(sql)
             .map_err(|e| format!("setup_sql {sql:?}: {e}"))?;
     }
+
+    if b.kind == "concurrent_read" {
+        return run_concurrent(cfg, b, eng.as_mut(), want);
+    }
+
     eng.prepare(b.sql_for(cfg.engine))?;
 
     let started_at = utc_now_rfc3339();
@@ -544,11 +583,12 @@ fn run_one(
 
     elapsed.sort_unstable();
     let total_ns: i64 = elapsed.iter().sum();
-    Ok(ResultLine {
+    Ok(Some(ResultLine {
         bench: b.name.clone(),
         dataset: b.dataset.clone(),
         iterations: b.iterations,
         warmup: b.warmup,
+        readers: 0,
         total_ns,
         ns_per_op: total_ns / b.iterations as i64,
         min_ns: elapsed[0],
@@ -557,7 +597,77 @@ fn run_one(
         checksum: sum.hex(),
         fingerprint: want.to_string(),
         started_at,
-    })
+    }))
+}
+
+/// partition tiles items into n contiguous blocks (the first len%n get one extra) — the
+/// deterministic per-reader split the concurrent_read checksum folds over (benchmarks.md §6).
+fn partition<T>(items: Vec<T>, n: usize) -> Vec<Vec<T>> {
+    let len = items.len();
+    let (base, extra) = (len / n, len % n);
+    let mut it = items.into_iter();
+    let mut blocks = Vec::with_capacity(n);
+    for r in 0..n {
+        let size = base + usize::from(r < extra);
+        blocks.push((&mut it).take(size).collect());
+    }
+    blocks
+}
+
+/// run_concurrent drives a concurrent_read bench through the driver's `concurrent_read`
+/// hook (benchmarks.md §8.1). It materializes the deterministic param stream, partitions
+/// it into `readers` contiguous blocks, and lets the driver run them in parallel. total_ns
+/// is the wall clock of the timed phase (THROUGHPUT — ns_per_op = wall/iterations falls as
+/// readers scale), and the answer checksum folds the per-block hashes in reader order. A
+/// driver without concurrency support returns None → the bench is skipped.
+fn run_concurrent(
+    cfg: &Config,
+    b: &Bench,
+    eng: &mut dyn Engine,
+    want: &str,
+) -> BoxResult<Option<ResultLine>> {
+    let started_at = utc_now_rfc3339();
+    let mut stream = ParamStream::new(b);
+    let warm: Vec<Vec<Arg>> = (0..b.warmup).map(|_| stream.next_args()).collect();
+    let meas: Vec<Vec<Arg>> = (0..b.iterations).map(|_| stream.next_args()).collect();
+    let warm_blocks = partition(warm, b.readers);
+    let meas_blocks = partition(meas, b.readers);
+
+    let outcome = eng.concurrent_read(
+        b.sql_for(cfg.engine),
+        warm_blocks,
+        meas_blocks,
+        b.expect_rows_per_iter,
+    )?;
+    let Some(out) = outcome else {
+        eprintln!(
+            "  skip: {}/{}/{} has no concurrent_read support",
+            cfg.engine, cfg.lang, cfg.variant
+        );
+        return Ok(None);
+    };
+
+    let mut combined = Checksum::new();
+    for hex in &out.block_hexes {
+        combined.text(hex);
+    }
+    let mut elapsed = out.elapsed;
+    elapsed.sort_unstable();
+    Ok(Some(ResultLine {
+        bench: b.name.clone(),
+        dataset: b.dataset.clone(),
+        iterations: b.iterations,
+        warmup: b.warmup,
+        readers: b.readers,
+        total_ns: out.wall_ns,
+        ns_per_op: out.wall_ns / b.iterations as i64,
+        min_ns: elapsed[0],
+        p50_ns: elapsed[(elapsed.len() - 1) / 2],
+        rows_total: out.rows_total,
+        checksum: combined.hex(),
+        fingerprint: want.to_string(),
+        started_at,
+    }))
 }
 
 // The target table of a write statement — the word after INTO (INSERT INTO <table>) or

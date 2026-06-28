@@ -177,7 +177,7 @@ module Bench
     def to_json_line(cfg)
       %({"schema":1,"bench":"#{bench}","dataset":"#{dataset}","engine":"#{cfg[:engine]}",) +
         %("lang":"#{cfg[:lang]}","variant":"#{cfg[:variant]}","iterations":#{iterations},) +
-        %("warmup":#{warmup},"total_ns":#{total_ns},"ns_per_op":#{ns_per_op},"min_ns":#{min_ns},) +
+        %("warmup":#{warmup},"readers":0,"total_ns":#{total_ns},"ns_per_op":#{ns_per_op},"min_ns":#{min_ns},) +
         %("p50_ns":#{p50_ns},"rows_total":#{rows_total},"checksum":"#{checksum}",) +
         %("fingerprint":"#{fingerprint}","started_at":"#{started_at}"})
     end
@@ -190,6 +190,13 @@ module Bench
     load_corpus(corpus_dir).filter_map do |w|
       next if !filter.empty? && !w.name.include?(filter)
       next unless w.runs_on?(cfg[:engine])
+      # concurrent_read needs the host session API + true parallelism; the gem is autocommit
+      # with no Session handle and Ruby's GIL precludes parallel readers, so it opts out
+      # (spec/design/benchmarks.md §8.1). The native cores carry that bench.
+      if w.kind == "concurrent_read"
+        warn "  skip: #{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]} has no concurrent_read support"
+        next
+      end
 
       warn "#{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]}: #{w.name} (#{w.dataset}) ..."
       run_one(cfg, w, corpus_dir, data_dir, want).to_json_line(cfg)

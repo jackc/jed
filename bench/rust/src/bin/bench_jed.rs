@@ -1,7 +1,11 @@
 //! bench-jed benchmarks the Rust jed core (spec/design/benchmarks.md §6/§7).
 
-use jed::{DatabaseOptions, Engine as JedDb, PreparedStatement, Value};
-use jed_bench::{Arg, BoxResult, Checksum, Config, Engine, main_with, read_sidecar};
+use std::time::Instant;
+
+use jed::{DatabaseOptions, Engine as JedDb, PreparedStatement, Session, SharedCore, Value};
+use jed_bench::{
+    Arg, BoxResult, Checksum, ConcurrentOutcome, Config, Engine, main_with, read_sidecar,
+};
 
 fn main() {
     main_with(Config {
@@ -128,4 +132,124 @@ impl Engine for JedEngine {
     fn stored_fingerprint(&mut self) -> BoxResult<String> {
         Ok(read_sidecar(&self.data_dir, &self.dataset, "jed"))
     }
+
+    // concurrent_read opens ONE SharedCore over the dataset file and runs each param block
+    // on its own thread + reader Session (the slice-7 convergence, session.md §2.4/§10) —
+    // every Session shares the core's committed snapshot + buffer pool and reads without
+    // blocking (§3). The first pass warms the shared pool; the second is wall-clock-timed.
+    fn concurrent_read(
+        &mut self,
+        sql: &str,
+        warm: Vec<Vec<Vec<Arg>>>,
+        meas: Vec<Vec<Vec<Arg>>>,
+        expect_rows: Option<usize>,
+    ) -> BoxResult<Option<ConcurrentOutcome>> {
+        let path = format!("{}/{}.jed", self.data_dir, self.dataset);
+        let core = SharedCore::open(&path).map_err(|e| e.to_string())?;
+        let sql = sql.to_string();
+
+        // Pass 1 — warmup, untimed.
+        let warm_handles: Vec<_> = warm
+            .into_iter()
+            .map(|block| {
+                let core = core.clone();
+                let sql = sql.clone();
+                std::thread::spawn(move || -> Result<(), String> {
+                    let mut sess = core.read_session();
+                    for args in &block {
+                        reader_query(&mut sess, &sql, args, None)?;
+                    }
+                    sess.close();
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in warm_handles {
+            h.join()
+                .map_err(|_| "warmup reader panicked".to_string())??;
+        }
+
+        // Pass 2 — measured, timed by wall clock around the spawn/join of all readers.
+        let start = Instant::now();
+        let handles: Vec<_> = meas
+            .into_iter()
+            .map(|block| {
+                let core = core.clone();
+                let sql = sql.clone();
+                std::thread::spawn(move || -> Result<(String, Vec<i64>, i64), String> {
+                    let mut sess = core.read_session();
+                    let mut sum = Checksum::new();
+                    let mut elapsed = Vec::with_capacity(block.len());
+                    let mut rows = 0i64;
+                    for args in &block {
+                        let t0 = Instant::now();
+                        let n = reader_query(&mut sess, &sql, args, Some(&mut sum))?;
+                        elapsed.push(t0.elapsed().as_nanos() as i64);
+                        rows += n as i64;
+                        if let Some(exp) = expect_rows
+                            && n != exp
+                        {
+                            return Err(format!("expected {exp} rows per iteration, got {n}"));
+                        }
+                    }
+                    sess.close();
+                    Ok((sum.hex(), elapsed, rows))
+                })
+            })
+            .collect();
+
+        // Join in spawn (= reader-index) order so block_hexes folds in that order (§6).
+        let mut block_hexes = Vec::new();
+        let mut elapsed = Vec::new();
+        let mut rows_total = 0i64;
+        for h in handles {
+            let (hex, el, rows) = h.join().map_err(|_| "reader panicked".to_string())??;
+            block_hexes.push(hex);
+            elapsed.extend(el);
+            rows_total += rows;
+        }
+        let wall_ns = start.elapsed().as_nanos() as i64;
+        Ok(Some(ConcurrentOutcome {
+            block_hexes,
+            elapsed,
+            rows_total,
+            wall_ns,
+        }))
+    }
+}
+
+// reader_query runs one query through a reader Session, re-parsing the SQL each call (the
+// host session API has no prepared-statement form; benchmarks.md §8.1), folding rows into
+// sum when measuring.
+fn reader_query(
+    sess: &mut Session,
+    sql: &str,
+    args: &[Arg],
+    sum: Option<&mut Checksum>,
+) -> Result<usize, String> {
+    let params = bind_args(args);
+    let rows = sess.query(sql, &params).map_err(|e| e.to_string())?;
+    let mut n = 0;
+    match sum {
+        None => {
+            for _ in rows {
+                n += 1;
+            }
+        }
+        Some(sum) => {
+            for row in rows {
+                n += 1;
+                for v in row {
+                    match v {
+                        Value::Null => sum.null(),
+                        Value::Int(x) => sum.int(x),
+                        Value::Text(s) => sum.text(&s),
+                        other => return Err(format!("unexpected result value {other:?}")),
+                    }
+                }
+                sum.end_row();
+            }
+        }
+    }
+    Ok(n)
 }

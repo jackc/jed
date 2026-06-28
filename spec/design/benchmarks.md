@@ -1,9 +1,11 @@
 # Benchmarks — cross-core and cross-engine wall-clock measurement
 
 Status: v1 landed (corpus format, setup tool, six benchmarks, harnesses in all three
-cores). Grown since with `cte_materialized`, `lateral_top_n_per_group`, and the two
-GIN-bounded-scan benchmarks (`gin_contains` / `gin_overlaps`) over a dedicated `gin`
-dataset (§4). This document is the canonical record for the `bench/` subsystem.
+cores). Grown since with `cte_materialized`, `lateral_top_n_per_group`, the GIN-bounded-scan
+benchmarks (`gin_contains` / `gin_overlaps` / `gin_member` / `gin_array_eq` / `gin_delete`)
+over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **concurrent-reader
+throughput** benchmarks (the `concurrent_read` kind, §8.1). This document is the canonical
+record for the `bench/` subsystem.
 
 ## 1. Purpose and non-goals
 
@@ -23,12 +25,15 @@ is thus also a small differential test.
 
 Non-goals: micro-benchmarks of internal functions (use `cargo bench`/`testing.B` ad hoc
 if needed), benchmarking the deterministic *cost* units (cost is asserted exactly in the
-conformance corpus — `spec/design/cost.md`), and *wall-clock* load/concurrency testing
-(a backfill candidate once file-backed concurrent sessions land — session.md §2.4/§10 slice 7c).
-**Correctness**-under-concurrency
-*is* covered, by a sibling bench-family harness: the Layer 3 stress runner
-(`spec/design/concurrency-testing.md` §6) shares these modules' machinery (the splitmix64 PRNG,
-the FNV-1a answer checksum) via a `stress` binary per core, run by `rake stress` — see §2.
+conformance corpus — `spec/design/cost.md`), and adversarial true-parallelism *stress*
+(random-schedule, invariant-checked — that is the Layer 3 stress runner below, not a
+benchmark). *Wall-clock* concurrent-reader **throughput** — once a non-goal pending
+file-backed concurrent sessions — **has since landed** as the `concurrent_read` kind (§8.1),
+now that the slice-7 convergence (session.md §2.4/§10) gives a shared `Database` minting
+concurrent reader `Session`s. **Correctness**-under-concurrency is *also* covered, by a
+sibling bench-family harness: the Layer 3 stress runner (`spec/design/concurrency-testing.md`
+§6) shares these modules' machinery (the splitmix64 PRNG, the FNV-1a answer checksum) via a
+`stress` binary per core, run by `rake stress` — see §2.
 
 ## 2. Layout
 
@@ -65,7 +70,7 @@ schema_version = 1
 name        = "point_lookup_pk"     # unique; result key together with (engine, lang, variant)
 description = "PK point lookup on 1M rows"
 dataset     = "large"               # "small" | "large" | "scratch" (§8)
-kind        = "query"               # "query" | "write_rollback" | "write_durable"
+kind        = "query"               # "query" | "write_rollback" | "write_durable" | "concurrent_read" (§8.1)
 sql         = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
 warmup      = 2000                  # untimed iterations (consume the same param stream)
 iterations  = 50000                 # timed iterations
@@ -84,6 +89,8 @@ Optional keys:
 - `engines = ["postgres", ...]` — allowlist; default is all three. The escape hatch for
   a benchmark only some engines can run.
 - `batch = N` — write kinds only: statements per iteration (§8).
+- `readers = N` — `concurrent_read` only: the number of reader `Session`s minted from the
+  one shared `Database` (§8.1).
 - `setup_sql = ["..."]` — write kinds only: statements run once before warmup.
 - `[bench.sql_override]` / `[bench.setup_sql_override]` — per-engine SQL text keyed by
   `jed` / `postgres` / `sqlite`, used only where dialects genuinely diverge (v1 uses it
@@ -263,10 +270,15 @@ benchmark:
 
 ```json
 {"schema":1,"bench":"point_lookup_pk","dataset":"large","engine":"jed","lang":"go",
- "variant":"core","iterations":50000,"warmup":2000,"total_ns":312000000,"ns_per_op":6240,
- "min_ns":4100,"p50_ns":5900,"rows_total":50000,"checksum":"9f86d081884c7d65",
+ "variant":"core","iterations":50000,"warmup":2000,"readers":0,"total_ns":312000000,
+ "ns_per_op":6240,"min_ns":4100,"p50_ns":5900,"rows_total":50000,"checksum":"9f86d081884c7d65",
  "fingerprint":"<sha256 hex>","started_at":"2026-06-12T14:03:11Z"}
 ```
+
+`readers` is the concurrency level (`concurrent_read` only; `0` for the other kinds). For
+`concurrent_read`, `total_ns` is the **wall clock of the timed phase** (so `ns_per_op =
+wall / iterations` is the *throughput* latency that falls as readers scale), and `min_ns` /
+`p50_ns` are the merged per-query latency distribution across readers (§8.1).
 
 - `engine` ∈ `jed | postgres | sqlite`; `lang` ∈ `go | rust | ts`; `variant` names the
   driver: `core` (jed), `pgx`, `postgres-crate`, `porsager`, `modernc`, `mattn-cgo`,
@@ -289,6 +301,17 @@ the **measured** iterations only, emitted as 16 lowercase hex chars:
 For write kinds the checksum is the hash of the post-run sanity `count(*)` rendered the
 same way (one value, one row) — `insert_rollback` proves the rollbacks held,
 `insert_commit_durable` proves every commit landed.
+
+For `concurrent_read` (§8.1) the checksum is **partition-folded** so it is identical
+regardless of thread scheduling or reader count's effect on timing: the measured param
+stream is split into `readers` contiguous blocks (one per reader); each reader folds its
+own block's rows in order into a per-block FNV hash; the runner then folds those per-block
+hashes (as their hex text) in **reader-index order** into the one emitted checksum. Two cores
+with different threading (Go goroutines, Rust threads, the single-threaded TS core running
+the blocks sequentially) therefore produce the **same** checksum for a given `(bench,
+readers)`, which is the cross-core answer-agreement gate. (It is partition-dependent — an
+`r1` and an `r4` bench over the same rows hash differently — but each is only ever compared
+within its own bench name, so that is immaterial.)
 
 Identical checksums across all binaries simultaneously prove: the PRNG ports agree (same
 param sequences), the engines agree (same answers), and write semantics agree (same
@@ -390,6 +413,52 @@ numbers are indicative, compare with care. There is also a standing client/serve
 asymmetry: every PG number includes IPC over the Unix socket, which is PG's deployment
 model but not jed's or SQLite's.
 
+## 8.1 Concurrent-reader benchmarks (the `concurrent_read` kind)
+
+`concurrent_read` measures the **throughput of concurrent reader Sessions on one shared
+`Database`** — the slice-7 convergence (session.md §2.4/§10): `open`/`create` return a
+`Database` that mints concurrently-usable reader `Session`s sharing one committed snapshot +
+buffer pool, and the §3 read path is lock-free against everything but a commit. The corpus
+ships `concurrent_read_pk_r1` and `concurrent_read_pk_r4` — the same PK point lookup at one
+and four readers, so r1's `ns_per_op` over r4's is the realized speedup.
+
+Per iteration of the run loop the kind does **not** apply (it is not a per-statement loop).
+Instead the runner materializes the deterministic param stream, splits the measured params
+into `readers` contiguous blocks, and hands them to the driver's concurrency hook, which:
+
+1. opens **one** `Database`/`SharedCore` over the dataset file and mints one reader `Session`
+   per block;
+2. runs a **warmup** pass (untimed) so the shared buffer pool is populated before measuring;
+3. runs a **measured** pass, each reader driving its block on its own thread (Go goroutines,
+   Rust `std::thread` over the `Send + Sync` `SharedCore`; the single-threaded TS core runs
+   the blocks sequentially), folding its block checksum and per-query latencies;
+4. returns the per-block checksums (reader order), the merged latencies, and the **wall
+   clock** of the timed phase.
+
+`total_ns` is that wall clock, so `ns_per_op = wall / iterations` is throughput latency.
+The checksum is partition-folded (§6). Readers re-parse the SQL each call — the host session
+API has no prepared-statement form — so a constant per-query parse cost is *included*
+(uniform across the jed cores, so it does not distort the scaling).
+
+**Dataset choice.** The benches use the **resident** `small` dataset deliberately: with the
+whole working set in the buffer pool after warmup, the bench isolates the concurrent *read
+path* (parse + plan + a resident B-tree seek per reader) and shows near-linear scaling on a
+multi-core box. On a larger-than-pool dataset, random lookups fault under the shared
+buffer-pool mutex, which serializes readers and masks the lock-free read scaling — that is a
+**pager**-concurrency concern (a sharded/lock-free pool is the optimization a future
+larger-than-pool variant would measure), separate from the §3 reader/writer guarantee.
+
+**Scope — jed-only.** `concurrent_read` benches set `engines = ["jed"]`. This validates jed's
+own concurrent sessions and keeps the three-way **cross-core** answer-agreement gate (Go ==
+Rust == TS under three threading models — a new differential test of the concurrent read
+path). The drivers that cannot model it opt out and the runner **skips** them: a driver
+implements an optional capability (Go `ConcurrentEngine`, Rust `Engine::concurrent_read`
+defaulting to `None`, TS optional `Engine.concurrentRead`); the Ruby gem wrap (autocommit, no
+`Session` handle, GIL-bound) and the wasm wrap have no such capability, so they print a skip
+line and emit no result. **Deferred follow-on:** a cross-*engine* concurrent comparison
+(PostgreSQL connection pools, SQLite multi-connection readers) — a larger driver effort
+(thread-per-connection pools across every binary) that is not the slice-7 feature under test.
+
 ## 9. Running and reporting
 
 ```
@@ -440,7 +509,10 @@ like a failing conformance test) or on `fingerprint` (mixed-vintage data):
 ## 10. Methodology caveats
 
 Single-threaded, one binary at a time, no process pinning in v1 — run on an otherwise
-idle machine; `taskset`/`nice` are at the operator's discretion. Wall-clock numbers are
+idle machine; `taskset`/`nice` are at the operator's discretion. The one exception is the
+`concurrent_read` kind (§8.1), which spawns `readers` threads *within* one binary by design;
+its numbers are most meaningful on an otherwise-idle multi-core box (the speedup tops out at
+the available cores). Wall-clock numbers are
 relative to a machine and a moment: compare *within* a run (and trends across runs on
 the same box), not absolute values across machines. Warmup iterations exist to populate
 caches (jed's buffer pool, PG's shared buffers, SQLite's page cache) and JIT-warm the TS
@@ -456,7 +528,12 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 - a join benchmark (needs a second dataset table → `generator_version` bump);
 - GROUP BY aggregate; UPDATE / DELETE throughput; miss-heavy point lookups;
 - text-heavy / large-value rows (exercise the overflow + LZ4 path);
-- `Database` concurrent-reader throughput (concurrent sessions, once file-backed); cold-open time;
+- ✅ **`Database` concurrent-reader throughput** — landed as the `concurrent_read` kind
+  (§8.1): `concurrent_read_pk_r{1,4}` over the resident `small` dataset, jed-only, scaling
+  near-linearly on the native threaded cores (the lock-free §3 read path). Remaining
+  concurrency follow-ons: a larger-than-pool variant (measures the buffer-pool mutex / a
+  future sharded pool), and a cross-*engine* comparison (PG/SQLite connection pools);
+- cold-open time;
 - durable-commit batch-size sweep (1 vs 100 vs 1000 rows per commit).
 
 **Standing obligation** (CLAUDE.md §10): a perf-relevant feature lands with a benchmark

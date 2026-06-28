@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use jed::{SharedCore, Session, Value};
+use jed::{Session, SharedCore, Value};
 use jed_bench::{Checksum, Prng};
 
 /// Bounds a threaded run: the balance workload finishes in well under a second, so a minute with no

@@ -136,3 +136,65 @@ func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
 }
 
 func (s *jedStmt) Close() error { return nil }
+
+// NewReaderPool opens a Database over the dataset file and mints n reader Sessions — the
+// slice-7 concurrent-session path (spec/design/benchmarks.md §8.1). Each Session shares
+// the one Database's committed snapshot + buffer pool and reads without blocking (§3), so
+// the concurrent_read bench measures how the lock-free read path scales with readers.
+func (e *engine) NewReaderPool(n int) (bench.ReaderPool, error) {
+	db, err := jed.OpenDatabase(filepath.Join(e.dataDir, e.dataset+".jed"))
+	if err != nil {
+		return nil, err
+	}
+	readers := make([]*jed.Session, n)
+	for i := range readers {
+		readers[i] = db.ReadSession()
+	}
+	return &jedPool{db: db, readers: readers}, nil
+}
+
+type jedPool struct {
+	db      *jed.Database
+	readers []*jed.Session
+}
+
+func (p *jedPool) Reader(i int) bench.Reader { return jedReader{s: p.readers[i]} }
+
+func (p *jedPool) Close() error {
+	for _, s := range p.readers {
+		s.Close()
+	}
+	return p.db.Close()
+}
+
+// jedReader runs one query through a reader Session, re-parsing the SQL each call — the
+// host session API has no prepared-statement form (benchmarks.md §8.1).
+type jedReader struct{ s *jed.Session }
+
+func (r jedReader) Query(sql string, args []any, sum *bench.Checksum) (int, error) {
+	rows, err := r.s.Query(sql, bindArgs(args))
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for rows.Next() {
+		n++
+		if sum == nil {
+			continue
+		}
+		for _, v := range rows.Row() {
+			switch v.Kind {
+			case jed.ValNull:
+				sum.Null()
+			case jed.ValInt:
+				sum.Int(v.Int)
+			case jed.ValText:
+				sum.Text(v.Str)
+			default:
+				return n, fmt.Errorf("unexpected result kind %d", v.Kind)
+			}
+		}
+		sum.EndRow()
+	}
+	return n, nil
+}

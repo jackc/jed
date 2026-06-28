@@ -326,3 +326,63 @@ warmup = 2
 iterations = 10
 seed = 4222
 expect_rows_per_iter = 100
+
+# Concurrent-reader throughput on the shared Database (the slice-7 convergence, session.md §2.4/§10;
+# the benchmarks.md §11 backfill now that file-backed concurrent sessions have landed). `kind =
+# "concurrent_read"` opens ONE Database and mints `readers` independent reader Sessions, then runs the
+# point lookup `iterations` times divided into `readers` contiguous blocks — each block on its own
+# reader, in parallel where the core can (Go goroutines, Rust threads; the single-threaded TS core
+# runs the blocks sequentially). It measures the §3 lock-free read path: readers see the committed
+# snapshot without blocking, so throughput should scale with reader count until the cores run out.
+# Headline metric is THROUGHPUT — ns_per_op = wall-clock / iterations — so r1's ns_per_op divided by
+# r4's is the realized speedup (near-linear on a multi-core box); min/p50 are per-query latency.
+#
+# The dataset is `small` (10k rows) ON PURPOSE: the whole working set is RESIDENT after warmup, so the
+# bench isolates the concurrent READ PATH (parse + plan + a resident B-tree seek per reader) from the
+# buffer pool's page-fault path. On a larger-than-pool dataset random lookups fault under the shared
+# pool mutex, which serializes readers and hides the lock-free read scaling — a pager-concurrency
+# concern, separate from §3's reader/writer story and a noted future variant (benchmarks.md §8.1).
+#
+# jed-only (engines = ["jed"]): this validates jed's own concurrent sessions and keeps the three-way
+# cross-core answer-agreement gate (Go == Rust == TS under three threading models — a new differential
+# test of the concurrent read path). Cross-ENGINE concurrent comparison (PostgreSQL connection pools,
+# SQLite multi-connection readers) is a deferred follow-on (benchmarks.md §8.1). The answer checksum
+# is partition-folded so it is identical regardless of scheduling or reader count's effect on timing:
+# each reader folds its block in order to a per-block hash, and the blocks combine in reader-index
+# order (benchmarks.md §6). The two benches differ ONLY in `readers`, so r1 is the single-reader
+# baseline the r4 run is read against.
+[[bench]]
+name = "concurrent_read_pk_r1"
+description = "Concurrent PK point lookup on the resident 10k-row table, 1 reader Session (the single-reader baseline for the scaling comparison)"
+dataset = "small"
+kind = "concurrent_read"
+engines = ["jed"]
+readers = 1
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 2000
+iterations = 20000
+seed = 4230
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 10000
+
+[[bench]]
+name = "concurrent_read_pk_r4"
+description = "Concurrent PK point lookup on the resident 10k-row table, 4 reader Sessions sharing one Database — the §3 lock-free read path (read against concurrent_read_pk_r1 for the realized speedup)"
+dataset = "small"
+kind = "concurrent_read"
+engines = ["jed"]
+readers = 4
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 2000
+iterations = 20000
+seed = 4230
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 10000

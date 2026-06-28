@@ -18,7 +18,7 @@ type Bench struct {
 	Name              string              `toml:"name"`
 	Description       string              `toml:"description"`
 	Dataset           string              `toml:"dataset"`
-	Kind              string              `toml:"kind"` // query | write_rollback | write_durable
+	Kind              string              `toml:"kind"` // query | write_rollback | write_durable | concurrent_read
 	SQL               string              `toml:"sql"`
 	Warmup            int                 `toml:"warmup"`
 	Iterations        int                 `toml:"iterations"`
@@ -26,6 +26,7 @@ type Bench struct {
 	ExpectRowsPerIter int                 `toml:"expect_rows_per_iter"` // 0 = unchecked
 	Engines           []string            `toml:"engines"`              // empty = all
 	Batch             int                 `toml:"batch"`                // write kinds: statements per iteration
+	Readers           int                 `toml:"readers"`              // concurrent_read: reader Sessions
 	SetupSQL          []string            `toml:"setup_sql"`            // write kinds: run once before warmup
 	SQLOverride       map[string]string   `toml:"sql_override"`
 	SetupSQLOverride  map[string][]string `toml:"setup_sql_override"`
@@ -83,12 +84,15 @@ func LoadCorpus(corpusDir string) (*Corpus, error) {
 	for i := range c.Bench {
 		b := &c.Bench[i]
 		switch b.Kind {
-		case "query", "write_rollback", "write_durable":
+		case "query", "write_rollback", "write_durable", "concurrent_read":
 		default:
 			return nil, fmt.Errorf("bench %q: unknown kind %q", b.Name, b.Kind)
 		}
 		if b.Kind == "write_rollback" && b.Batch <= 0 {
 			return nil, fmt.Errorf("bench %q: write_rollback requires batch > 0", b.Name)
+		}
+		if b.Kind == "concurrent_read" && b.Readers <= 0 {
+			return nil, fmt.Errorf("bench %q: concurrent_read requires readers > 0", b.Name)
 		}
 	}
 	return &c, nil

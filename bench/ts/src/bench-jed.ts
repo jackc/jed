@@ -8,15 +8,24 @@ import { join } from "node:path";
 import {
   type Engine as JedDb,
   type PreparedStatement,
+  type Session,
   create,
   executeParams,
   open,
+  openDatabase,
   prepare,
   query,
 } from "../../../impl/ts/src/lib.ts";
 import { intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
 
-import { type Arg, type Checksum, type Engine, mainWith, readSidecar } from "./lib.ts";
+import {
+  type Arg,
+  Checksum,
+  type ConcurrentOutcome,
+  type Engine,
+  mainWith,
+  readSidecar,
+} from "./lib.ts";
 
 class JedEngine implements Engine {
   private readonly db: JedDb;
@@ -87,10 +96,83 @@ class JedEngine implements Engine {
       rmSync(this.scratch, { recursive: true, force: true });
     }
   }
+
+  // concurrentRead opens ONE Database over the dataset file and mints a reader Session per
+  // block (the slice-7 convergence, session.md §2.4/§10) — every Session shares the one
+  // Database's committed snapshot + buffer pool. The single-threaded TS core runs the
+  // blocks SEQUENTIALLY (no parallel speedup, documented), but the per-block partition +
+  // fold makes the answer checksum identical to the threaded Go/Rust cores (benchmarks.md §8.1).
+  async concurrentRead(
+    sql: string,
+    warm: Arg[][][],
+    meas: Arg[][][],
+    expectRows: number,
+  ): Promise<ConcurrentOutcome> {
+    const db = openDatabase(join(this.dataDir, `${this.dataset}.jed`));
+    const readers = meas.length;
+    const sessions: Session[] = Array.from({ length: readers }, () => db.readSession());
+    try {
+      // Pass 1 — warmup, untimed: populate the shared buffer pool.
+      for (let r = 0; r < readers; r++) {
+        for (const args of warm[r]) runReaderQuery(sessions[r], sql, args, null);
+      }
+      // Pass 2 — measured (wall-clock).
+      const blockHexes: string[] = [];
+      const elapsed: bigint[] = [];
+      let rowsTotal = 0;
+      const start = process.hrtime.bigint();
+      for (let r = 0; r < readers; r++) {
+        const sum = new Checksum();
+        for (const args of meas[r]) {
+          const t0 = process.hrtime.bigint();
+          const n = runReaderQuery(sessions[r], sql, args, sum);
+          elapsed.push(process.hrtime.bigint() - t0);
+          rowsTotal += n;
+          if (expectRows > 0 && n !== expectRows) {
+            throw new Error(`expected ${expectRows} rows per iteration, got ${n}`);
+          }
+        }
+        blockHexes.push(sum.hex());
+      }
+      const wallNs = process.hrtime.bigint() - start;
+      return { blockHexes, elapsed, rowsTotal, wallNs };
+    } finally {
+      for (const s of sessions) s.close();
+      db.close();
+    }
+  }
 }
 
 function bindArgs(args: Arg[]): Value[] {
   return args.map((a) => (typeof a === "bigint" ? intValue(a) : textValue(a)));
+}
+
+// runReaderQuery runs one query through a reader Session, re-parsing the SQL each call (the
+// host session API has no prepared-statement form; benchmarks.md §8.1), folding rows into sum.
+function runReaderQuery(sess: Session, sql: string, args: Arg[], sum: Checksum | null): number {
+  const rows = sess.query(sql, bindArgs(args));
+  let n = 0;
+  for (const row of rows) {
+    n++;
+    if (sum === null) continue;
+    for (const v of row) {
+      switch (v.kind) {
+        case "null":
+          sum.null();
+          break;
+        case "int":
+          sum.int(v.int);
+          break;
+        case "text":
+          sum.text(v.text);
+          break;
+        default:
+          throw new Error(`unexpected result kind ${v.kind}`);
+      }
+    }
+    sum.endRow();
+  }
+  return n;
 }
 
 await mainWith({

@@ -118,6 +118,7 @@ export interface Bench {
   expectRowsPerIter: number; // 0 = unchecked
   engines: string[];
   batch: number;
+  readers: number; // concurrent_read: reader Sessions
   setupSql: string[];
   sqlOverride: Record<string, string>;
   setupSqlOverride: Record<string, string[]>;
@@ -189,6 +190,7 @@ export function loadCorpus(corpusDir: string): Bench[] {
       expectRowsPerIter: num(raw.expect_rows_per_iter),
       engines: strList(raw.engines),
       batch: num(raw.batch),
+      readers: num(raw.readers),
       setupSql: strList(raw.setup_sql),
       sqlOverride: (raw.sql_override as Record<string, string> | undefined) ?? {},
       setupSqlOverride: (raw.setup_sql_override as Record<string, string[]> | undefined) ?? {},
@@ -278,6 +280,27 @@ export interface Engine {
   queryInt(sql: string): Promise<bigint>;
   storedFingerprint(): Promise<string>;
   close(): Promise<void>;
+  // OPTIONAL concurrent_read support (spec/design/benchmarks.md §8.1): open one reader per
+  // block over the same committed data and run the blocks (parallel on a threaded core; the
+  // single-threaded TS core runs them sequentially). warm/meas are pre-partitioned into
+  // `readers` contiguous blocks. A driver that omits it (the wasm wrap) is skipped.
+  concurrentRead?(
+    sql: string,
+    warm: Arg[][][],
+    meas: Arg[][][],
+    expectRows: number,
+  ): Promise<ConcurrentOutcome>;
+}
+
+// ConcurrentOutcome is what a driver's concurrentRead returns (benchmarks.md §8.1):
+// blockHexes are the per-reader-block FNV checksums in reader-index order (the runner folds
+// them in that order into the one partition-invariant answer checksum), elapsed the merged
+// per-query latencies, wallNs the wall clock of the timed phase.
+export interface ConcurrentOutcome {
+  blockHexes: string[];
+  elapsed: bigint[];
+  rowsTotal: number;
+  wallNs: bigint;
 }
 
 export interface Config {
@@ -305,6 +328,7 @@ interface ResultLine {
   variant: string;
   iterations: number;
   warmup: number;
+  readers: number;
   total_ns: number;
   ns_per_op: number;
   min_ns: number;
@@ -313,6 +337,21 @@ interface ResultLine {
   checksum: string;
   fingerprint: string;
   started_at: string;
+}
+
+// partition tiles items into n contiguous blocks (the first len%n get one extra) — the
+// deterministic per-reader split the concurrent_read checksum folds over (benchmarks.md §6).
+function partition<T>(items: T[], n: number): T[][] {
+  const blocks: T[][] = [];
+  const base = Math.floor(items.length / n);
+  const extra = items.length % n;
+  let idx = 0;
+  for (let r = 0; r < n; r++) {
+    const size = base + (r < extra ? 1 : 0);
+    blocks.push(items.slice(idx, idx + size));
+    idx += size;
+  }
+  return blocks;
 }
 
 export async function run(
@@ -331,7 +370,8 @@ export async function run(
       `${cfg.engine}/${cfg.lang}/${cfg.variant}: ${b.name} (${b.dataset}) ...\n`,
     );
     try {
-      results.push(await runOne(cfg, b, corpusDir, dataDir, want));
+      const line = await runOne(cfg, b, corpusDir, dataDir, want);
+      if (line !== null) results.push(line);
     } catch (e) {
       throw new Error(`bench ${b.name}: ${e instanceof Error ? e.message : e}`);
     }
@@ -345,7 +385,7 @@ async function runOne(
   corpusDir: string,
   dataDir: string,
   want: string,
-): Promise<ResultLine> {
+): Promise<ResultLine | null> {
   const startedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   const eng = await cfg.open(dataDir, b.dataset);
   try {
@@ -356,6 +396,49 @@ async function runOne(
     for (const sql of setupSqlFor(b, cfg.engine)) {
       await eng.exec(sql);
     }
+
+    if (b.kind === "concurrent_read") {
+      if (eng.concurrentRead === undefined) {
+        process.stderr.write(
+          `  skip: ${cfg.engine}/${cfg.lang}/${cfg.variant} has no concurrent_read support\n`,
+        );
+        return null;
+      }
+      const cstream = new ParamStream(b);
+      const warm: Arg[][] = [];
+      for (let i = 0; i < b.warmup; i++) warm.push(cstream.next());
+      const meas: Arg[][] = [];
+      for (let i = 0; i < b.iterations; i++) meas.push(cstream.next());
+      const out = await eng.concurrentRead(
+        sqlFor(b, cfg.engine),
+        partition(warm, b.readers),
+        partition(meas, b.readers),
+        b.expectRowsPerIter,
+      );
+      const combined = new Checksum();
+      for (const h of out.blockHexes) combined.text(h);
+      const cel = out.elapsed.slice().sort((a, z) => (a < z ? -1 : a > z ? 1 : 0));
+      return {
+        schema: 1,
+        bench: b.name,
+        dataset: b.dataset,
+        engine: cfg.engine,
+        lang: cfg.lang,
+        variant: cfg.variant,
+        iterations: b.iterations,
+        warmup: b.warmup,
+        readers: b.readers,
+        total_ns: Number(out.wallNs),
+        ns_per_op: Number(out.wallNs / BigInt(b.iterations)),
+        min_ns: Number(cel[0]),
+        p50_ns: Number(cel[(cel.length - 1) >> 1]),
+        rows_total: out.rowsTotal,
+        checksum: combined.hex(),
+        fingerprint: want,
+        started_at: startedAt,
+      };
+    }
+
     await eng.prepare(sqlFor(b, cfg.engine));
 
     const stream = new ParamStream(b);
@@ -429,6 +512,7 @@ async function runOne(
       variant: cfg.variant,
       iterations: b.iterations,
       warmup: b.warmup,
+      readers: 0,
       total_ns: Number(totalNs),
       ns_per_op: Number(totalNs / BigInt(b.iterations)),
       min_ns: Number(elapsed[0]),
