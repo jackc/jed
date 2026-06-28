@@ -74,6 +74,7 @@ mod integration_tests;
 // embedders should reach for Database/Session. `execute`/`execute_params` are its one-shot helpers.
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use collation::{load_unicode_data, loaded_collation};
+pub use decimal::Decimal;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Engine, Outcome, ScriptSummary,
@@ -97,7 +98,6 @@ pub use value::Value;
 pub mod tooling {
     // The CLI renders query results + dumps schema using these internal types.
     pub use crate::catalog::Table;
-    pub use crate::decimal::Decimal;
     pub use crate::types::{ScalarType, Type};
 
     pub mod collation {

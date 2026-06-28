@@ -300,9 +300,7 @@ fn decode_params(ptr: *const u8, len: u32) -> Result<Vec<Value>, *mut u8> {
                     .map_err(|_| malformed_params())?
                     .to_string();
                 let scale = r.u32().ok_or_else(malformed_params)?;
-                Value::Decimal(jed::decimal::Decimal::from_digits_scale(
-                    neg, &digits, scale,
-                ))
+                Value::Decimal(jed::Decimal::from_digits_scale(neg, &digits, scale))
             }
             // DATE: i32 days since 1970-01-01 (the gem computes it via Date arithmetic, BC-correct).
             6 => Value::Date(r.i32().ok_or_else(malformed_params)?),

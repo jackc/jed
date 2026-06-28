@@ -280,7 +280,7 @@ fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::tooling::Decimal;
+    use jed::Decimal;
 
     fn cols(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
