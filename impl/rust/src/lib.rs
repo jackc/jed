@@ -63,7 +63,7 @@ pub use executor::{
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
-pub use shared::{Database, Session};
+pub use shared::{Database, Session, SharedCore};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
 pub use timezone::load_time_zone_data;

@@ -8,7 +8,7 @@
 //! and the FNV-1a answer checksum (benchmarks.md §6) with no new dependency.
 //!
 //! Two execution modes drive the SAME worker definitions:
-//!   - threaded   (Rust's native mode): one OS thread per worker over a cloned `Database` handle
+//!   - threaded   (Rust's native mode): one OS thread per worker over a cloned `SharedCore` handle
 //!     (proving `Send + Sync` by moving it into each worker); writers contend on the single-writer
 //!     gate for real (`write()` blocks on a held gate via the condvar), readers pin real snapshots.
 //!     A deadline turns a wedged worker into a timeout (TSan optional — the threaded run already
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use jed::{Database, Session, Value};
+use jed::{SharedCore, Session, Value};
 use jed_bench::{Checksum, Prng};
 
 /// Bounds a threaded run: the balance workload finishes in well under a second, so a minute with no
@@ -202,7 +202,7 @@ fn query_scalar(rh: &mut Session, sql: &str) -> Result<String, String> {
 // --- setup + the final check (shared by both modes) ------------------------------------------
 
 /// setup runs the file's setup SQL as one durable write transaction (committed version 1).
-fn setup(db: &Database, f: &StressFile) -> Result<(), String> {
+fn setup(db: &SharedCore, f: &StressFile) -> Result<(), String> {
     let mut wh = db.write_session();
     for s in &f.setup {
         if let Err(e) = wh.execute(s, &[]) {
@@ -215,7 +215,7 @@ fn setup(db: &Database, f: &StressFile) -> Result<(), String> {
 
 /// check_final runs `final.query` against the final committed snapshot, folds the integer rows into
 /// the answer checksum, and compares them to `final.expect` (when present — a confluent workload).
-fn check_final(db: &Database, f: &StressFile) -> Result<(String, bool), String> {
+fn check_final(db: &SharedCore, f: &StressFile) -> Result<(String, bool), String> {
     let Some(query) = &f.final_query else {
         return Ok((String::new(), true));
     };
@@ -256,7 +256,7 @@ fn final_equal(got: &[Vec<i64>], want: &[Vec<i64>]) -> bool {
 
 // --- threaded mode (Rust's native mode; real OS threads, Send + Sync coverage) ----------------
 
-fn run_writer(db: &Database, stmts: &[String], iterations: i64) -> Result<(), String> {
+fn run_writer(db: &SharedCore, stmts: &[String], iterations: i64) -> Result<(), String> {
     for _ in 0..iterations {
         let mut wh = db.write_session(); // blocks while another writer holds the gate (real contention)
         for s in stmts {
@@ -271,7 +271,7 @@ fn run_writer(db: &Database, stmts: &[String], iterations: i64) -> Result<(), St
 }
 
 fn run_reader(
-    db: &Database,
+    db: &SharedCore,
     query: &str,
     expect: &str,
     iterations: i64,
@@ -290,7 +290,7 @@ fn run_reader(
 
 /// run_threaded spawns one OS thread per worker (a cloned handle moved into each), all concurrent,
 /// and collects their results with a deadline (a wedged worker → timeout).
-fn run_threaded(db: &Database, f: &StressFile) -> Result<i64, String> {
+fn run_threaded(db: &SharedCore, f: &StressFile) -> Result<i64, String> {
     let checks = Arc::new(AtomicI64::new(0));
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
     let mut spawned = 0;
@@ -380,7 +380,7 @@ impl SeqWorker {
 /// run_sequential walks the workers through the seeded interleaver: at each step the splitmix64
 /// stream picks one runnable worker (fixed index order) and advances it one op. Deterministic given
 /// the seed; reproduces the logical interleavings without ever truly blocking.
-fn run_sequential(db: &Database, f: &StressFile) -> Result<i64, String> {
+fn run_sequential(db: &SharedCore, f: &StressFile) -> Result<i64, String> {
     let mut workers: Vec<SeqWorker> = Vec::new();
     for wk in &f.workers {
         for _ in 0..wk.count {
@@ -417,7 +417,7 @@ fn run_sequential(db: &Database, f: &StressFile) -> Result<i64, String> {
 }
 
 fn step_seq(
-    db: &Database,
+    db: &SharedCore,
     w: &mut SeqWorker,
     gate_held: &mut bool,
     checks: &mut i64,
@@ -513,7 +513,7 @@ fn run_file(path: &str, force_sequential: bool) -> StressResult {
     }
     res.mode = if sequential { "sequential" } else { "threaded" }.into();
 
-    let db = Database::new_in_memory();
+    let db = SharedCore::new_in_memory();
     if let Err(e) = setup(&db, &f) {
         res.status = "fail".into();
         res.error = e;
