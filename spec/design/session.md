@@ -704,12 +704,29 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
      `Send`/`Sync` boundary — `Database` stays `Arc<Shared>`, the `!Send` `Session` is minted per
      thread) decided in one place. Through 7b the bare `Engine` remains the single-handle path,
      unchanged.
-   - **7c — file-backed sessions + the default-session bridge.** Thread-safe pager/buffer-pool under
-     concurrent reader faults, and **watermark-gated page reclamation** (transactions.md §8);
-     `open`/`create` return the shared `Database`, and the **default-session delegators**
-     (`db.execute`/`db.query`/`db.begin`/`db.status`/`db.execute_script`, §2.1/§2.4) land here as the
-     back-compat single-handle bridge over that `Database`. Add the `Database` concurrent-reader bench
-     ([../../TODO.md](../../TODO.md)).
+   - **7c — file-backed sessions + the default-session bridge.** ✅ **landed (all 3 cores).** The
+     shared core gained the **storage identity** (path / page size / pager+buffer-pool / the mutable
+     page accounting) and a writer's publish now routes through the core's `persist` — the incremental
+     copy-on-write file-layer recipe under the writer gate (a no-op in-memory). `open`/`create` return
+     a handle named **`Database`** that owns one long-lived **default `Session`**, and the
+     **default-session delegators** (`execute`/`query`/`begin`/`commit`/`rollback`/`status`/
+     `execute_script` + the envelope setters) drive it — the back-compat single-handle bridge.
+     **Per-core handle shape** (a deliberate divergence, CLAUDE.md §2 best-experience-per-language):
+     in **Go** and **TS** `Database` *is* the goroutine-/single-thread-safe core itself (it both drives
+     the single handle and mints additional sessions); in **Rust** `Database` is a `!Send` owned handle
+     (core + default session) and the `Send + Sync` core is the separately-named **`SharedCore`**
+     (reached via `db.core()`), because a `!Send` default `Session` cannot live on the type the
+     concurrency/stress harnesses move across threads. **Thread-safe pager/buffer-pool under concurrent
+     reader faults** holds *by construction* — the `Mutex`-guarded `SharedPaging` already serializes a
+     reader's page fault against the committing writer, and a pinned copy-on-write snapshot's leaves are
+     never overwritten. **Page reclamation is watermark-gated, satisfied trivially:** the free-list is
+     reconstruct-on-open only (every reusable page was already dead at the opened version, so it is
+     older than any live reader's pin), so reuse can never recycle a page a live reader observes —
+     *continuous* within-session reclamation, where the gate becomes load-bearing, stays the deferred
+     follow-on (transactions.md §8). A minted session serializes/splits at the **file's** page size
+     (not the in-memory default) so the cores stay byte-identical for non-default-page-size files (§8).
+     No on-disk format change, no new capability flags. The `Database` concurrent-reader bench lands
+     with this slice ([../../TODO.md](../../TODO.md)).
    - **7d — docs.** `web/src/routes/docs/api/*`, `web/examples/*`; the worker bridge keeps the
      single-handle path via the delegators.
 

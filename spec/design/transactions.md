@@ -303,12 +303,18 @@ order-independent, so no hash-map iteration order leaks into it (CLAUDE.md §8).
 assert it tracks pinned readers (a reader pinning an old version holds the watermark back; closing it
 lets the watermark advance).
 
-**The convergence makes it load-bearing for file-backed reclamation** ([session.md §2.4](session.md),
-§10 slice 7c). With concurrent file-backed sessions, the free-list gate above stops holding trivially:
-a page orphaned at commit `T` must stay out of the free-list until `oldest_live_txid > T`, or a
-still-open reader on an older snapshot would observe a recycled page. So the commit allocator consults
-this registry before reusing a page — the "continuous within-session reclamation paired with
-file-backed reader sharing" the P6.2 follow-on (above) anticipated.
+**The convergence keeps the gate trivially satisfied; active gating waits for continuous reclamation**
+([session.md §2.4](session.md), §10 slice 7c — ✅ landed). Slice 7c shipped concurrent file-backed
+sessions, but the commit allocator still reuses **only the reconstruct-on-open free-list** (it does
+not re-add a page orphaned mid-session). Every reconstruct-on-open page was already dead at the opened
+committed version, which is **older than any live reader's pin** (a reader pins ≥ the version it
+opened at), so reuse can never recycle a page a live reader observes — the gate holds **trivially**,
+with concurrent readers or without. The watermark becomes *load-bearing* only in the still-deferred
+follow-on — **continuous within-session reclamation**, where a page orphaned at commit `T` re-enters
+the free-list and must stay out until `oldest_live_txid > T`; there the commit allocator will consult
+this registry before reusing such a page. (The watermark is tracked and asserted now — the per-core
+tests show it tracking pinned readers — so the follow-on is a free-list-allocator change, not a
+retrofit of liveness tracking.)
 
 ## 9. Durability: the `synchronous` setting, this slice vs. Phase 6
 
