@@ -80,11 +80,14 @@ func (db *Engine) withTx(writable bool, fn func(tx *Transaction) error) error {
 }
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4). It holds the
-// parsed AST and a back-pointer to the database it was prepared against (Go is GC'd, so binding
-// the database at prepare is safe — unlike Rust's borrow model, api.md §6).
+// parsed AST and a back-pointer to the handle it was prepared against (Go is GC'd, so binding
+// the handle at prepare is safe — unlike Rust's borrow model, api.md §6). When prepared on a
+// Session/Database (sess set) Execute routes through the session's dispatch — the lazy writer
+// gate for writes, the pinned snapshot for reads — so it observes the converged §2.4 semantics.
 type PreparedStatement struct {
-	db  *Engine
-	ast Statement
+	db   *Engine
+	sess *Session
+	ast  Statement
 }
 
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
@@ -100,6 +103,9 @@ func (db *Engine) Prepare(sql string) (*PreparedStatement, error) {
 // Execute runs this statement, binding params to its $N placeholders (nil when it has none),
 // returning the materialized outcome.
 func (s *PreparedStatement) Execute(params []Value) (Outcome, error) {
+	if s.sess != nil {
+		return s.sess.dispatch(s.ast, params)
+	}
 	return s.db.ExecuteStmtParams(s.ast, params)
 }
 

@@ -15,7 +15,7 @@ func main() {
 }
 
 type engine struct {
-	db      *jed.Engine
+	db      *jed.Database
 	dataDir string
 	dataset string
 	scratch string // temp dir holding the scratch file ("" otherwise)
@@ -29,7 +29,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 			return nil, err
 		}
 		e.scratch = dir
-		db, err := jed.Create(filepath.Join(dir, "scratch.jed"), jed.DefaultDatabaseOptions())
+		db, err := jed.CreateDatabase(filepath.Join(dir, "scratch.jed"), jed.DefaultDatabaseOptions())
 		if err != nil {
 			os.RemoveAll(dir)
 			return nil, err
@@ -37,7 +37,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 		e.db = db
 		return e, nil
 	}
-	db, err := jed.Open(filepath.Join(dataDir, dataset+".jed"))
+	db, err := jed.OpenDatabase(filepath.Join(dataDir, dataset+".jed"))
 	if err != nil {
 		return nil, err
 	}
@@ -46,12 +46,12 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 }
 
 func (e *engine) Exec(sql string) error {
-	_, err := e.db.ExecuteSQL(sql, nil)
+	_, err := e.db.Execute(sql, nil)
 	return err
 }
 
 func (e *engine) QueryInt(sql string) (int64, error) {
-	rows, err := e.db.QuerySQL(sql, nil)
+	rows, err := e.db.Query(sql, nil)
 	if err != nil {
 		return 0, err
 	}

@@ -324,6 +324,9 @@ func (db *Database) Query(sql string, params []Value) (*Rows, error) {
 	return db.def.Query(sql, params)
 }
 
+// Prepare parses sql once into a reusable prepared statement on the default session (§2.4).
+func (db *Database) Prepare(sql string) (*PreparedStatement, error) { return db.def.Prepare(sql) }
+
 // ExecuteScript runs a multi-statement script on the default session (spec/design/session.md §4.2).
 func (db *Database) ExecuteScript(sql string) (ScriptSummary, error) {
 	return db.def.ExecuteScript(sql)
@@ -387,6 +390,18 @@ func (db *Database) ClearRandomSource()              { db.def.ClearRandomSource(
 func (db *Database) SetClockSource(f ClockSource)    { db.def.SetClockSource(f) }
 func (db *Database) ClearClockSource()               { db.def.ClearClockSource() }
 
+// The temp-table envelope + the collation-upgrade host op (spec/design/temp-tables.md §5/§7,
+// collation.md §12), delegating to the default session.
+func (db *Database) ResetPrivileges()                { db.def.ResetPrivileges() }
+func (db *Database) SetAllowTempDDL(allow bool)      { db.def.SetAllowTempDDL(allow) }
+func (db *Database) SetAllowSharedTempDDL(allow bool) {
+	db.def.SetAllowSharedTempDDL(allow)
+}
+func (db *Database) SetTempBuffers(bytes int)        { db.def.SetTempBuffers(bytes) }
+func (db *Database) SetSharedTempMem(bytes int)      { db.def.SetSharedTempMem(bytes) }
+func (db *Database) ResetVars()                      { db.def.ResetVars() }
+func (db *Database) UpgradeCollations() (int, error) { return db.def.UpgradeCollations() }
+
 // accessMode is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1).
 // Distinct from the privilege envelope (§5.3): accessReadOnly is the coarse snapshot read-only mode
 // (a write is 25006), the analogue of the old ReadHandle.
@@ -434,6 +449,17 @@ func (s *Session) Query(sql string, params []Value) (*Rows, error) {
 		return nil, err
 	}
 	return rowsFromOutcome(out)
+}
+
+// Prepare parses sql once into a reusable prepared statement bound to this session (spec/design/api.md
+// §2.4); subsequent Execute/Query route through the session — the lazy writer gate for writes, the
+// pinned snapshot for reads. Parse errors (42601, …) surface here.
+func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
+	stmt, err := s.engine.parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	return &PreparedStatement{sess: s, ast: stmt}, nil
 }
 
 // dispatch is the lazy-gate dispatch (spec/design/session.md §2.4). A read-only session rejects
@@ -488,6 +514,12 @@ func (s *Session) dispatch(stmt Statement, params []Value) (Outcome, error) {
 // read session) without the gate. writable/modeSet match the engine's beginTx so the access mode
 // resolves identically.
 func (s *Session) beginBlock(writable, modeSet bool) (Outcome, error) {
+	// A nested BEGIN (a block is already open) is 25001 — reject it BEFORE touching the gate/pin: a
+	// writable nested BEGIN would otherwise re-lock the single-writer mutex from the same goroutine and
+	// self-deadlock. beginTx returns the 25001 without mutating state.
+	if s.engine.session.tx != nil {
+		return s.engine.beginTx(writable, modeSet)
+	}
 	rw := writable
 	if !modeSet {
 		rw = true // the session(opts) engine is not read-only ⇒ a bare BEGIN defaults READ WRITE
@@ -737,3 +769,45 @@ func (s *Session) ClearRandomSource()             { s.engine.session.seam.ClearR
 // SetClockSource / ClearClockSource — the uuidv7 / clock-function clock seam (entropy.md §6).
 func (s *Session) SetClockSource(f ClockSource) { s.engine.session.seam.SetClock(f) }
 func (s *Session) ClearClockSource()            { s.engine.session.seam.ClearClock() }
+
+// ResetPrivileges resets this session's authorization envelope to fully permissive (every table
+// privilege, DDL + temp-DDL allowed) — the RESET-style hook for the privilege envelope (§5.3).
+func (s *Session) ResetPrivileges() { s.engine.ResetPrivileges() }
+
+// SetAllowTempDDL / SetAllowSharedTempDDL — the session-local and database-wide temporary-table DDL
+// gates (the temp-scoped splits of AllowDDL, spec/design/temp-tables.md §5); a denied temp DDL is 42501.
+func (s *Session) SetAllowTempDDL(allow bool)       { s.engine.session.allowTempDDL = allow }
+func (s *Session) SetAllowSharedTempDDL(allow bool) { s.engine.session.allowSharedTempDDL = allow }
+
+// SetTempBuffers / SetSharedTempMem — the per-session and global temp-table storage budgets in bytes
+// (0 ⇒ unlimited, spec/design/temp-tables.md §7); an over-budget temp write aborts 54P03.
+func (s *Session) SetTempBuffers(bytes int)   { s.engine.session.tempBuffers = bytes }
+func (s *Session) SetSharedTempMem(bytes int) { s.engine.sharedTempMem = bytes }
+
+// ResetVars clears every session variable — PostgreSQL's RESET ALL for the variable map (§6.1).
+func (s *Session) ResetVars() { s.engine.session.ResetVars() }
+
+// UpgradeCollations runs the COLLATION UPGRADE migration (spec/design/collation.md §12) on this
+// session's committed state: re-pin every version-skewed collation to the loaded bundle's version,
+// clearing the skew so the affected objects become read-write again. Returns the count upgraded. A
+// write op — it routes through the lazy writer gate and publishes through the shared core on change.
+func (s *Session) UpgradeCollations() (int, error) {
+	if s.access == accessReadOnly {
+		return 0, NewError(ReadOnlySqlTransaction, "cannot upgrade collations on a read-only snapshot")
+	}
+	if s.engine.session.tx != nil {
+		// Inside an open block: run on the working set (the gate is already held for a writable block).
+		return s.engine.UpgradeCollations()
+	}
+	// Autocommit: take the lazy gate, upgrade the latest committed, publish on change (§2.4).
+	s.core.writeMu.Lock()
+	s.gateHeld = true
+	s.refreshCommitted()
+	n, err := s.engine.UpgradeCollations()
+	if err == nil && n > 0 {
+		err = s.publish()
+	}
+	s.core.writeMu.Unlock()
+	s.gateHeld = false
+	return n, err
+}

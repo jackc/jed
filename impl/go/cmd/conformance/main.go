@@ -11,6 +11,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"os"
@@ -238,10 +239,11 @@ func parseUpgradeCollationsDirective(line string) bool {
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
 // spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
 // referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
-// is the point), then reconstructs the database in memory via LoadEngine. The handle is read-WRITE
-// so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
-// read-only-handle error.
-func openFixture(rel string) (*jed.Engine, error) {
+// is the point), then opens the database via the public host API. The golden image is COPIED to a
+// temp file and that copy is opened read-WRITE — so a write against a skewed table exercises the real
+// XX002 guard (collation.md §12), not a read-only-handle error, while the committed golden stays
+// pristine. The returned cleanup closes the handle and removes the temp file.
+func openFixture(rel string) (*jed.Database, func(), error) {
 	bundle := filepath.Join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd")
 	if data, err := os.ReadFile(bundle); err == nil {
 		_ = jed.LoadUnicodeData(data) // idempotent: the loaded set is engine-global
@@ -249,13 +251,29 @@ func openFixture(rel string) (*jed.Engine, error) {
 	path := filepath.Join(repoRoot(), "spec", rel)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("fixture: read %s: %w", path, err)
+		return nil, nil, fmt.Errorf("fixture: read %s: %w", path, err)
 	}
-	db, err := jed.LoadEngine(data)
+	tmp, err := os.CreateTemp("", "jed-fixture-*.jed")
 	if err != nil {
-		return nil, fmt.Errorf("fixture: open %s: %w", rel, err)
+		return nil, nil, fmt.Errorf("fixture: temp file: %w", err)
 	}
-	return db, nil
+	tmpPath := tmp.Name()
+	_, werr := tmp.Write(data)
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil {
+		os.Remove(tmpPath)
+		return nil, nil, fmt.Errorf("fixture: write temp: %w", cmp.Or(werr, cerr))
+	}
+	db, err := jed.OpenDatabase(tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return nil, nil, fmt.Errorf("fixture: open %s: %w", rel, err)
+	}
+	cleanup := func() {
+		_ = db.Close()
+		os.Remove(tmpPath)
+	}
+	return db, cleanup, nil
 }
 
 func parseRequires(text string) []string {
@@ -642,9 +660,14 @@ func assertTypes(expected []string, actual []string, sql string) error {
 	return nil
 }
 
-// runFile runs all records in one .test file against a fresh database.
+// runFile runs all records in one .test file against a fresh database, driving the public single-handle
+// *Database (its default autocommit session — the back-compat bridge, spec/design/session.md §2.1).
 func runFile(text string) error {
-	db := jed.NewEngine()
+	db := jed.NewDatabase()
+	// cleanup releases the current handle; a `# fixture:` directive swaps in a file-backed handle whose
+	// cleanup also removes the temp image. The deferred call reads the latest cleanup.
+	cleanup := func() {}
+	defer func() { cleanup() }()
 	lines := strings.Split(text, "\n")
 	i := 0
 	// A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -699,11 +722,13 @@ func runFile(text string) error {
 			// `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh NewEngine()
 			// above — appears in the header before any record (spec/design/conformance.md).
 			if rel, ok := parseFixtureDirective(line); ok {
-				fixtureDB, err := openFixture(rel)
+				fixtureDB, fixtureCleanup, err := openFixture(rel)
 				if err != nil {
 					return err
 				}
+				cleanup() // release the prior (in-memory no-op) handle before swapping in the fixture
 				db = fixtureDB
+				cleanup = fixtureCleanup
 				i++
 				continue
 			}
@@ -886,7 +911,7 @@ func runFile(text string) error {
 			}
 			i++
 			sql := takeSQL(lines, &i)
-			outcome, err := jed.Execute(db, sql)
+			outcome, err := db.Execute(sql, nil)
 			switch expect {
 			case "ok":
 				if err != nil {
@@ -925,7 +950,7 @@ func runFile(text string) error {
 				expected = append(expected, strings.TrimSpace(lines[i]))
 				i++
 			}
-			outcome, err := jed.Execute(db, sql)
+			outcome, err := db.Execute(sql, nil)
 			if err != nil {
 				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
 			}
