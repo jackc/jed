@@ -5,7 +5,7 @@
 //! writes the bundle (spec/tz/README.md §3). It does **not** run `zic`; the TZif bytes are committed
 //! source (§3.4). The other cores only *load* the bundle.
 
-use jed::timezone::{TzBundle, save_bundle};
+use jed::tooling::timezone::{TzBundle, save_bundle};
 use std::path::{Path, PathBuf};
 
 fn tz_dir() -> PathBuf {

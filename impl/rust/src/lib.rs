@@ -6,68 +6,102 @@
 //!
 //! Boring, explicit modules with small footprints (CLAUDE.md §10).
 
-pub mod api;
-pub mod ast;
-pub mod blockstore;
-pub mod bufferpool;
-pub mod catalog;
-pub mod collation;
-pub mod cost;
-pub mod costs;
-pub mod date;
-pub mod datetime_fn;
-pub mod decimal;
-pub mod encoding;
-pub mod error;
-pub mod executor;
-pub mod file;
-pub mod format;
-pub mod gist;
-pub mod interval;
-pub mod json;
-pub mod jsonpath;
-pub mod lexer;
-pub mod lz4;
-pub mod operators;
-pub mod pager;
-pub mod paging;
-pub mod parser;
-pub mod pmap;
-pub mod privileges;
-pub mod range;
-pub mod ranges_gen;
+// Now that the modules are private (the API-narrowing change), internal items whose only callers are
+// the in-crate tests read as dead code in the non-test `cargo build`. Allow that there; the `cargo
+// test` build (which compiles the tests) still flags genuinely-unused code.
+#![cfg_attr(not(test), allow(dead_code))]
+
+// The engine is internal machinery; the public API is the curated re-export façade below (CLAUDE.md
+// §2 — the embedding surface). Every module is private (`mod`), so only the items re-exported here
+// are reachable by an external crate (the conformance bin, the Ruby/WASM wraps). `extern crate self
+// as jed` lets the in-crate integration tests (src/integration_tests.rs) keep their `jed::…` paths
+// while reaching these private modules.
+extern crate self as jed;
+
+mod api;
+mod ast;
+mod blockstore;
+mod bufferpool;
+mod catalog;
+mod collation;
+mod cost;
+mod costs;
+mod date;
+mod datetime_fn;
+mod decimal;
+mod encoding;
+mod error;
+mod executor;
+mod file;
+mod format;
+mod gist;
+mod interval;
+mod json;
+mod jsonpath;
+mod lexer;
+mod lz4;
+mod operators;
+mod pager;
+mod paging;
+mod parser;
+mod pmap;
+mod privileges;
+mod range;
+mod ranges_gen;
 #[cfg(test)]
 mod recovery;
-pub mod regex;
-pub mod seam;
-pub mod shared;
-pub mod spill;
-pub mod split;
-pub mod sqlstate;
-pub mod storage;
-pub mod timestamp;
-pub mod timezone;
-pub mod token;
-pub mod types;
-pub mod uuid;
-pub mod value;
+mod regex;
+mod seam;
+mod shared;
+mod spill;
+mod split;
+mod sqlstate;
+mod storage;
+mod timestamp;
+mod timezone;
+mod token;
+mod types;
+mod uuid;
+mod value;
 
+#[cfg(test)]
+mod integration_tests;
+
+// --- public façade: the host-embedding API (CLAUDE.md §2). ---
 pub use api::{PreparedStatement, Rows, Transaction};
-pub use collation::load_unicode_data;
-pub use cost::Meter;
+pub use collation::{load_unicode_data, loaded_collation};
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Engine, Outcome, ScriptSummary,
-    SessionOptions, Snapshot, TxStatus,
+    SessionOptions, TxStatus,
 };
 pub use file::{DatabaseOptions, OpenOptions};
-pub use parser::Parser;
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
+pub use seam::{ClockSource, RandomSource, advancing_clock, fixed_clock, seeded_random_source};
 pub use shared::{Database, Session, SharedCore};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
-pub use timezone::load_time_zone_data;
+pub use timezone::{load_time_zone_data, resolve_zone};
 pub use value::Value;
+
+/// Internal building blocks for the in-repo codegen / bundle tools (`src/bin/{build,gen}_*`). NOT part
+/// of the stable embedding API — `#[doc(hidden)]`, and only those dev binaries use it. The bundle
+/// builders need deep access to the collation / time-zone internals that the façade deliberately hides.
+#[doc(hidden)]
+pub mod tooling {
+    pub mod collation {
+        pub use crate::collation::{
+            Bundle, Collation, PropertyTable, Section, build_bundle, compile_casing,
+            compile_collation, load_bundle, open_bundle, open_collation, save_bundle,
+            save_collation, serialize_table, sort_key,
+        };
+    }
+    pub mod timezone {
+        pub use crate::timezone::{
+            TzBundle, load_time_zone_data, offset_at_ref, open_bundle, resolve_zone, save_bundle,
+        };
+    }
+}
 
 /// The capabilities this implementation currently supports (spec/conformance:
 /// the gating axis). The harness runs a corpus file iff every capability in the

@@ -4,6 +4,10 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 description = "Rust core of the engine — a downstream consumer of /spec (CLAUDE.md §2)."
+# The integration tests reach into internal modules, which are now private (API-narrowing). They are
+# compiled IN-CRATE instead (src/integration_tests.rs #[path]-includes each tests/*.rs as a #[cfg(test)]
+# module, with `extern crate self as jed` keeping their `jed::…` paths working), so auto-discovery is off.
+autotests = false
 
 [lib]
 name = "jed"

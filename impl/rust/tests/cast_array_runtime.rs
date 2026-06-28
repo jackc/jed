@@ -10,7 +10,6 @@
 //!   (d) runtime text → f32[]/f64[] element casts, kept out of the corpus because the float renderer
 //!       is in the determinism-exception ledger.
 
-use jed::value::Value;
 use jed::{Engine, Outcome, execute};
 
 /// The rendered scalar of `SELECT <expr>` (single row, single column).

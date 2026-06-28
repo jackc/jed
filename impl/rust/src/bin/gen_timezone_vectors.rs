@@ -4,7 +4,9 @@
 //! precedent, CLAUDE.md §8). `tzif.toml` pins the reader `(zone, instant) → (offset, abbrev, dst)`
 //! (§4); `bundle.toml` pins the parsed manifest + the `Open`∘`Save` round-trip (§3). Do not hand-edit.
 
-use jed::timezone::{load_time_zone_data, offset_at_ref, open_bundle, resolve_zone, save_bundle};
+use jed::tooling::timezone::{
+    load_time_zone_data, offset_at_ref, open_bundle, resolve_zone, save_bundle,
+};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 

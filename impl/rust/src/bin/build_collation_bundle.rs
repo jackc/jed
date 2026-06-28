@@ -15,7 +15,7 @@
 //! does not recompile the ~2.3 MB root), exactly the pipeline `ExtractHostCollation → CompileCollation
 //! → SaveCollation(.coll) → builder(.coll → JUCD)` (§4.1).
 
-use jed::collation::{
+use jed::tooling::collation::{
     Bundle, Collation, PropertyTable, Section, build_bundle, compile_casing, load_bundle,
     open_bundle, open_collation, save_bundle, serialize_table,
 };

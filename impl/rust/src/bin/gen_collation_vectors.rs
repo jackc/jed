@@ -18,7 +18,7 @@
 //!     bundle identically and (b) the sort-key vectors below (the executor contract, computed from the
 //!     compiled table, which the loaded bundle must reproduce byte-for-byte — README §5.1).
 
-use jed::collation::{
+use jed::tooling::collation::{
     Collation, build_bundle, compile_collation, save_bundle, save_collation, serialize_table,
     sort_key,
 };

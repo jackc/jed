@@ -136,7 +136,7 @@ fn load_collation(name: &str) -> std::result::Result<(), String> {
         .map_err(|e| format!("load-collation: read {}: {e}", path.display()))?;
     jed::load_unicode_data(&bytes)
         .map_err(|e| format!("load-collation: load unicode.jucd: {}", e.message))?;
-    if jed::collation::loaded_collation(name).is_some() {
+    if jed::loaded_collation(name).is_some() {
         return Ok(());
     }
     Err(format!(
@@ -163,7 +163,7 @@ fn load_timezone(name: &str) -> std::result::Result<(), String> {
         std::fs::read(&path).map_err(|e| format!("load-timezone: read {}: {e}", path.display()))?;
     jed::load_time_zone_data(&bytes)
         .map_err(|e| format!("load-timezone: load tzdata.jtz: {}", e.message))?;
-    if name.is_empty() || jed::timezone::resolve_zone(name).is_some() {
+    if name.is_empty() || jed::resolve_zone(name).is_some() {
         return Ok(());
     }
     Err(format!(
@@ -641,16 +641,14 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
         // §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
         match pending_seed.take() {
-            Some(s) => db.set_random_source(jed::seam::seeded_random_source(s)),
+            Some(s) => db.set_random_source(jed::seeded_random_source(s)),
             None => db.clear_random_source(),
         }
         // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one);
         // a record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
         match (pending_clock_advance.take(), pending_clock.take()) {
-            (Some((start, step)), _) => {
-                db.set_clock_source(jed::seam::advancing_clock(start, step))
-            }
-            (None, Some(c)) => db.set_clock_source(jed::seam::fixed_clock(c)),
+            (Some((start, step)), _) => db.set_clock_source(jed::advancing_clock(start, step)),
+            (None, Some(c)) => db.set_clock_source(jed::fixed_clock(c)),
             (None, None) => db.clear_clock_source(),
         }
         // Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to
@@ -851,14 +849,12 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 .unwrap_or(jed::DEFAULT_MAX_SQL_LENGTH),
         );
         match pending_seed.take() {
-            Some(s) => db.set_random_source(jed::seam::seeded_random_source(s)),
+            Some(s) => db.set_random_source(jed::seeded_random_source(s)),
             None => db.clear_random_source(),
         }
         match (pending_clock_advance.take(), pending_clock.take()) {
-            (Some((start, step)), _) => {
-                db.set_clock_source(jed::seam::advancing_clock(start, step))
-            }
-            (None, Some(c)) => db.set_clock_source(jed::seam::fixed_clock(c)),
+            (Some((start, step)), _) => db.set_clock_source(jed::advancing_clock(start, step)),
+            (None, Some(c)) => db.set_clock_source(jed::fixed_clock(c)),
             (None, None) => db.clear_clock_source(),
         }
         let mut parts = trimmed.split_whitespace();
