@@ -28,7 +28,7 @@ impl SchemaPane {
             });
             for (i, col) in t.columns.iter().enumerate() {
                 let ty = match (&col.ty, &col.decimal) {
-                    (jed::types::Type::Scalar(jed::types::ScalarType::Decimal), Some(m)) => {
+                    (jed::tooling::Type::Scalar(jed::tooling::ScalarType::Decimal), Some(m)) => {
                         format!("numeric({},{})", m.precision, m.scale)
                     }
                     (ty, _) => ty.canonical_name().to_string(),

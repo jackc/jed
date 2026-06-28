@@ -8,8 +8,8 @@
 use std::io::{self, Write};
 
 use jed::Engine;
-use jed::catalog::Table;
-use jed::value::Value;
+use jed::Value;
+use jed::tooling::Table;
 
 /// Write the whole database as SQL. Tables come out in the catalog's standing order
 /// (sorted by lowercased name — api.md §6); rows in primary-key order via `ORDER BY`

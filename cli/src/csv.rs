@@ -5,8 +5,8 @@
 //! `OK, N rows (cost C)` path. Every value reaches the engine as a typed SQL literal built
 //! from the column's declared type; the engine's own coercion/constraint checks still run.
 
-use jed::catalog::Table;
-use jed::types::ScalarType;
+use jed::tooling::ScalarType;
+use jed::tooling::Table;
 
 /// One parsed CSV field. `quoted` distinguishes `""` (the empty string) from a bare empty
 /// field, which imports as NULL — the PG `COPY ... CSV` convention, the inverse of the

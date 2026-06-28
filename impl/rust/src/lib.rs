@@ -88,11 +88,18 @@ pub use split::{SplitStatements, StatementSpan, split_statements};
 pub use timezone::{load_time_zone_data, resolve_zone};
 pub use value::Value;
 
-/// Internal building blocks for the in-repo codegen / bundle tools (`src/bin/{build,gen}_*`). NOT part
-/// of the stable embedding API — `#[doc(hidden)]`, and only those dev binaries use it. The bundle
-/// builders need deep access to the collation / time-zone internals that the façade deliberately hides.
+/// Internal building blocks for the in-repo tools (the `src/bin/{build,gen}_*` codegen/bundle binaries
+/// and the `cli/` REPL). NOT part of the stable embedding API — `#[doc(hidden)]`, and only those
+/// in-repo crates use it. They need deep access to internals the façade deliberately hides: the bundle
+/// builders to the collation / time-zone tables, the CLI to a few catalog / type / value details it
+/// renders.
 #[doc(hidden)]
 pub mod tooling {
+    // The CLI renders query results + dumps schema using these internal types.
+    pub use crate::catalog::Table;
+    pub use crate::decimal::Decimal;
+    pub use crate::types::{ScalarType, Type};
+
     pub mod collation {
         pub use crate::collation::{
             Bundle, Collation, PropertyTable, Section, build_bundle, compile_casing,
