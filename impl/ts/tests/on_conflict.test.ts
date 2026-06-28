@@ -7,8 +7,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/lib.ts";
-import type { Engine } from "../src/lib.ts";
+import { execute } from "../src/tooling.ts";
+import type { Engine } from "../src/tooling.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function affected(db: Engine, sql: string): number | null {

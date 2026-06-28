@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, type Engine, execute, open } from "../src/lib.ts";
+import { close, create, type Engine, execute, open } from "../src/tooling.ts";
 
 const PS = 256;
 

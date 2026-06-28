@@ -26,7 +26,7 @@ import {
   Database,
   type Session,
   SUPPORTED_CAPABILITIES,
-} from "../lib.ts";
+} from "../tooling.ts";
 
 function repoRoot(): string {
   let dir = import.meta.dirname; // .../impl/ts/src/bin

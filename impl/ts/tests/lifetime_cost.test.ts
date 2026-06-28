@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Engine, EngineError, execute, PrivilegeSet } from "../src/lib.ts";
+import { Database, Engine, EngineError, execute, PrivilegeSet } from "../src/tooling.ts";
 
 function code(fn: () => unknown): string {
   try {

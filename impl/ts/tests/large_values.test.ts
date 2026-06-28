@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, Engine, execute, loadEngine, open, toImage } from "../src/lib.ts";
+import { close, create, Engine, execute, loadEngine, open, toImage } from "../src/tooling.ts";
 import { fillerText } from "./util.ts";
 
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)

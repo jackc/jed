@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Decimal } from "../src/decimal.ts";
 import { loadEngine, toImage } from "../src/format.ts";
-import { create, Engine, execute } from "../src/lib.ts";
+import { create, Engine, execute } from "../src/tooling.ts";
 import {
   canonFloat,
   float32Value,

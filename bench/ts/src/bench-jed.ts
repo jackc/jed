@@ -15,7 +15,7 @@ import {
   openDatabase,
   prepare,
   query,
-} from "../../../impl/ts/src/lib.ts";
+} from "../../../impl/ts/src/tooling.ts";
 import { intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
 
 import {

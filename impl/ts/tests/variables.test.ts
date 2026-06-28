@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Engine, EngineError, execute } from "../src/lib.ts";
+import { Database, Engine, EngineError, execute } from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
 
 function code(fn: () => unknown): string {

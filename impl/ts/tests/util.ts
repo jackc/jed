@@ -1,6 +1,6 @@
 // Shared test helpers (not a `*.test.ts` file, so the runner does not execute it).
 
-import { Engine, EngineError, execute, render } from "../src/lib.ts";
+import { Engine, EngineError, execute, render } from "../src/tooling.ts";
 
 // dbWith builds a database and runs the given setup statements, failing loudly.
 export function dbWith(stmts: string[]): Engine {

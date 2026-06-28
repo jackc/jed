@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
 
 // `a` is n rows (id i32 PRIMARY KEY, k i32; k == id) wide enough to span several leaves; `b` is

@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute } from "../src/lib.ts";
+import { Engine, EngineError, execute } from "../src/tooling.ts";
 
 function rowTable(n: number): Engine {
   const db = new Engine();

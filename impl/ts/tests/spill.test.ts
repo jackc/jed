@@ -11,7 +11,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { create, Engine, execute } from "../src/lib.ts";
+import { create, Engine, execute } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
 
 function runQuery(db: Engine, sql: string): { rows: Value[][]; cost: bigint } {

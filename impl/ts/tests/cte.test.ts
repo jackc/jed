@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute } from "../src/lib.ts";
+import { Engine, EngineError, execute } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // A 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.

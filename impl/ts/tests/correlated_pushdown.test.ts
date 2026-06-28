@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
 
 // `o` is five outer rows whose k-values all exist as inner ids; `inr` is n rows (id i32 PRIMARY KEY,

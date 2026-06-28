@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, commit, create, Engine, EngineError, execute, open } from "../src/lib.ts";
+import { close, commit, create, Engine, EngineError, execute, open } from "../src/tooling.ts";
 
 // oneInt runs a single-column SELECT and returns its one int value, or null for a NULL value.
 function oneInt(db: Engine, sql: string): bigint | null {

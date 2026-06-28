@@ -16,7 +16,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadedCollation, versionSkew } from "../src/collation.ts";
-import { close, commit, create, Engine, execute, loadUnicodeData, open } from "../src/lib.ts";
+import { close, commit, create, Engine, execute, loadUnicodeData, open } from "../src/tooling.ts";
 import { specPath } from "./tomlmini.ts";
 import { errCode, query } from "./util.ts";
 

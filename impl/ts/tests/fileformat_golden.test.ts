@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Engine, execute, loadUnicodeData } from "../src/lib.ts";
+import { Engine, execute, loadUnicodeData } from "../src/tooling.ts";
 import { crc32Ieee, loadEngine, toImage } from "../src/format.ts";
 import { scalarT } from "../src/types.ts";
 import { specPath } from "./tomlmini.ts";

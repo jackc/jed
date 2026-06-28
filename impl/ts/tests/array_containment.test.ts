@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/tooling.ts";
 import { errCode, query } from "./util.ts";
 
 // val runs a one-column, one-row scalar query and returns the rendered value.

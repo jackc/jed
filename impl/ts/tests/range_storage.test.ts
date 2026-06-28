@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, loadEngine, toImage } from "../src/lib.ts";
+import { Engine, execute, loadEngine, toImage } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // A range column survives a whole-image serialize + reload (toImage → loadEngine), exercising

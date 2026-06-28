@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, EngineError, execute, open, render } from "../src/lib.ts";
+import { close, create, EngineError, execute, open, render } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
 import { createOpfsWithHandle, closeOpfs, openOpfsWithHandle } from "../src/opfs.ts";
 import type { SyncAccessHandle } from "../src/opfsblockstore.ts";

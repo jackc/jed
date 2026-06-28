@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 function cost(db: Engine, sql: string): bigint {

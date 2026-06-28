@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute, loadEngine, toImage } from "../src/lib.ts";
+import { Engine, EngineError, execute, loadEngine, toImage } from "../src/tooling.ts";
 
 function run(db: Engine, sql: string) {
   return execute(db, sql);

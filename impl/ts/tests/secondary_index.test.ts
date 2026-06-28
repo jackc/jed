@@ -18,7 +18,7 @@ import {
   loadEngine,
   open,
   toImage,
-} from "../src/lib.ts";
+} from "../src/tooling.ts";
 import { pkIndices } from "../src/catalog.ts";
 
 function run(db: Engine, sql: string) {

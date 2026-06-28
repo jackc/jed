@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, intValue } from "../src/lib.ts";
+import { Engine, execute, intValue } from "../src/tooling.ts";
 import { PMap, unboundedBound } from "../src/pmap.ts";
 import type { KeyBound } from "../src/pmap.ts";
 import type { Row } from "../src/storage.ts";

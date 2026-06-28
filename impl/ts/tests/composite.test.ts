@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, loadEngine, toImage } from "../src/lib.ts";
+import { Engine, execute, loadEngine, toImage } from "../src/tooling.ts";
 import { arrayT, compositeT, scalarT } from "../src/types.ts";
 import { errCode, query } from "./util.ts";
 

@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, execute, executeParams, intValue } from "../src/lib.ts";
+import { EngineError, execute, executeParams, intValue } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 

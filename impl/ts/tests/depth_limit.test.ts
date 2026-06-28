@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute } from "../src/lib.ts";
+import { Engine, EngineError, execute } from "../src/tooling.ts";
 import { MAX_EXPR_DEPTH, parseSQL } from "../src/parser.ts";
 
 function depthDB(): Engine {

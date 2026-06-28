@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/lib.ts";
+import { execute } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // A `jsonb` comparison with a NON-jsonb family is 42804 (jed's cross-family convention, like

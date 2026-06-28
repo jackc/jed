@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, executeParams, intValue } from "../src/lib.ts";
+import { Engine, execute, executeParams, intValue } from "../src/tooling.ts";
 import { errCode, query } from "./util.ts";
 
 function names(db: Engine, sql: string): string[] {

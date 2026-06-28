@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, render } from "../src/lib.ts";
+import { Engine, execute, render } from "../src/tooling.ts";
 
 function exec(db: Engine, sql: string): void {
   execute(db, sql);

@@ -4,7 +4,14 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute, executeParams, intValue, nullValue } from "../src/lib.ts";
+import {
+  Engine,
+  EngineError,
+  execute,
+  executeParams,
+  intValue,
+  nullValue,
+} from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
 import { dbWith } from "./util.ts";
 

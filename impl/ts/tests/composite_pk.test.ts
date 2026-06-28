@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { pkIndices, primaryKeyIndex } from "../src/catalog.ts";
-import { Engine, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/tooling.ts";
 import { loadEngine, toImage } from "../src/format.ts";
 import { dbWith, errCode } from "./util.ts";
 

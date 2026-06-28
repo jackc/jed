@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/lib.ts";
+import { Engine, execute } from "../src/tooling.ts";
 import { fillerBytesHex, fillerText } from "./util.ts";
 
 // page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into

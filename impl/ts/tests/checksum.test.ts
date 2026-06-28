@@ -14,7 +14,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, EngineError, execute, open, render } from "../src/lib.ts";
+import { close, create, EngineError, execute, open, render } from "../src/tooling.ts";
 import { fillerText } from "./util.ts";
 
 const PAGE_SIZE = 256;

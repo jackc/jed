@@ -22,7 +22,7 @@ import {
   rollback,
   update,
   view,
-} from "../src/lib.ts";
+} from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
 
 function tmpDir(): string {

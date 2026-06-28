@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, loadEngine, toImage } from "../src/lib.ts";
+import { Engine, execute, loadEngine, toImage } from "../src/tooling.ts";
 import { errCode, query } from "./util.ts";
 
 function run(db: Engine, sql: string): void {

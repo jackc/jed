@@ -3,11 +3,6 @@
 // — no build step. i64 is exact (uniform bigint); the on-disk format is byte-identical
 // to the Rust and Go cores (CLAUDE.md §8).
 
-import type { Engine } from "./executor.ts";
-import type { Outcome } from "./executor.ts";
-import type { ScriptSummary } from "./split.ts";
-import type { Value } from "./value.ts";
-
 // SUPPORTED_CAPABILITIES lists the capabilities this core implements (spec/conformance:
 // the gating axis). The harness runs a corpus file iff every capability in the file's
 // `# requires:` header is in this set. Identical to the Rust/Go cores — full parity.
@@ -702,57 +697,19 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "harness.upgrade_collations",
 ];
 
-// THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface). Everything an
-// embedder needs is re-exported below; the other src/*.ts modules are internal machinery (parser, AST,
-// catalog, executor internals, codecs, storage) and are NOT part of the supported API even though TS
-// cannot language-enforce that — import only from this barrel. (The one sanctioned exception is the
-// browser seam: web/src/lib/jed/worker.ts deep-imports executor.ts/opfs.ts/parser.ts directly to keep
-// Node `fs` out of the bundle — an internal seam, not public API.)
-
-// --- low-level one-shot helpers over the Engine handle (used by the in-repo harness/bench/tests;
-// new embedders use Database/Session below). ---
-
-// execute parses and executes one SQL statement against db (no bind parameters).
-export function execute(db: Engine, sql: string): Outcome {
-  return db.executeStmt(db.parse(sql));
-}
-
-// executeParams parses and executes one SQL statement against db, binding params to its $N
-// placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type cannot
-// be inferred is 42P18; a bound value out of range / of the wrong family fails like a literal.
-export function executeParams(db: Engine, sql: string, params: Value[]): Outcome {
-  return db.executeStmtParams(db.parse(sql), params);
-}
-
-// executeScript runs a multi-statement SQL script against db's default session (spec/design/session.md
-// §4.2): split it, run each statement in order, discard the result rows, and return the O(1)
-// ScriptSummary. All-or-nothing when the session is Idle (the migration/import path).
-export function executeScript(db: Engine, sql: string): ScriptSummary {
-  return db.executeScript(sql);
-}
+// THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface): the converged
+// Database/Session handles + the value/type/error/privilege/host-seam surface an embedder needs.
+// Everything re-exported below is supported; the other src/*.ts modules are internal machinery
+// (parser, AST, catalog, executor internals, codecs, storage, AND the low-level `Engine` handle) and
+// are NOT part of the supported API even though TS cannot language-enforce that — import only from this
+// barrel. Two sanctioned internal-seam exceptions: the in-repo harness/benches/tests import the
+// low-level `Engine` from ./tooling.ts, and the browser worker (web/src/lib/jed/worker.ts) deep-imports
+// executor.ts/opfs.ts/parser.ts directly to keep Node `fs` out of the bundle.
 
 // --- primary embedding API ---
 export { Database, Session } from "./shared.ts";
-export {
-  PreparedStatement,
-  Rows,
-  Transaction,
-  prepare,
-  query,
-  querySql,
-  begin,
-  view,
-  update,
-} from "./api.ts";
-export {
-  create,
-  createDatabase,
-  open,
-  openDatabase,
-  commit,
-  rollback,
-  close,
-} from "./file.ts";
+export { PreparedStatement, Rows, Transaction } from "./api.ts";
+export { createDatabase, openDatabase } from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
 export type { CollationInfo, Outcome, SessionOptions, TxStatus } from "./executor.ts";
 export { intValue, nullValue, render } from "./value.ts";
@@ -768,7 +725,7 @@ export { advancingClock, fixedClock, seededRandomSource } from "./seam.ts";
 export type { ClockFunc, RandomFill } from "./seam.ts";
 export { DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE } from "./executor.ts";
 
-// --- low-level handle + golden/byte tooling (the in-repo harness/bench/tests; the Engine is also the
-// browser worker's handle). Not the primary embedding surface — prefer Database/Session above. ---
-export { Engine } from "./executor.ts";
-export { loadEngine, toImage } from "./format.ts";
+// The low-level single-threaded `Engine` handle, its functional one-shot/transaction helpers
+// (execute / query / prepare / begin / create / open / commit / close / …), and the golden/byte
+// tooling (loadEngine / toImage) are deliberately NOT exported here — they live in ./tooling.ts, the
+// in-repo internal seam. Embedders use the Database/Session surface above.

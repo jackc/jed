@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { begin, Engine, EngineError, execute, update, view } from "../src/lib.ts";
+import { begin, Engine, EngineError, execute, update, view } from "../src/tooling.ts";
 
 // rowCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
 function rowCount(db: Engine, table: string): number {

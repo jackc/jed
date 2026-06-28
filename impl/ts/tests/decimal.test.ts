@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Decimal, MAX_INT_DIGITS } from "../src/decimal.ts";
 import { loadEngine, toImage } from "../src/format.ts";
-import { execute } from "../src/lib.ts";
+import { execute } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 const execD = execute;
