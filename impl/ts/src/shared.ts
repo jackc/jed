@@ -31,12 +31,24 @@
 //         per statement (throwing 25001 if another writer is open), publishes, releases;
 //         BEGIN/COMMIT/ROLLBACK open and end an explicit block.
 //
-// In-memory this slice (the isolation mechanism + watermark are the deliverable; durability is the
-// orthogonal §9 axis). Isolation comes for free from the persistent (copy-on-write) stores
-// (pmap.ts): a pinned snapshot is immutable and shares structure with later versions, so pinning is
-// a reference copy, not a deep clone.
+// File-backed sharing (7c) reuses the same publish point plus the §9 persist chokepoint: the shared
+// core carries the storage identity as the file-backed Engine that owns the pager + buffer pool + page
+// accounting (null = in-memory), and a writer's publish routes through SharedCore.persist — the
+// host-independent incremental copy-on-write recipe (persistImpl), a no-op in-memory. Isolation comes
+// for free from the persistent (copy-on-write) stores (pmap.ts): a pinned snapshot is immutable and
+// shares structure with later versions, so pinning is a reference copy, faulting clean pages through
+// SharedPaging. Page reclamation stays watermark-safe trivially: the free-list is reconstruct-on-open
+// only (every reusable page was dead at the opened version); continuous within-session reclamation is
+// the deferred follow-on (transactions.md §8). No threads, so no concurrent-fault hazard (CLAUDE.md §2).
+//
+// The host-facing single handle is Database (the back-compat bridge — §2.1): the shared core PLUS one
+// long-lived default Session, whose delegators (execute/query/begin/.../executeScript) drive that
+// default session. newInMemory and the file.ts open/create wrappers return it; it is also the core
+// itself (TS needs no Rust-style !Send split — single-threaded), so the same Database both drives the
+// single-handle path and mints additional sessions.
 
 import {
+  DEFAULT_PAGE_SIZE,
   Engine,
   SessionState,
   Snapshot,
@@ -47,6 +59,7 @@ import {
 } from "./executor.ts";
 import { type Rows, rowsFromOutcome } from "./api.ts";
 import { engineError } from "./errors.ts";
+import { persistImpl } from "./persist.ts";
 import type { Statement } from "./ast.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
@@ -57,10 +70,15 @@ import type { Value } from "./value.ts";
 // snapshot) and `sharedTemp` (the database-wide shared-temp snapshot, temp-tables.md §5) — no file
 // backing. A read handle keeps one with no open transaction (reads hit committed = the pinned
 // snapshot); a write handle keeps one with an open READ WRITE block and publishes its working set.
-function databaseFromSnapshot(snap: Snapshot, sharedTemp: Snapshot): Engine {
+function databaseFromSnapshot(snap: Snapshot, sharedTemp: Snapshot, pageSize: number): Engine {
   const db = new Engine();
   db.committed = snap;
   db.sharedTempCommitted = sharedTemp;
+  // A minted session MUST serialize/split at the FILE's page size (not the in-memory default), so its
+  // stores' cap matches the physical pages persist writes — and so every core builds byte-identical
+  // file-backed databases (CLAUDE.md §8). In-memory the core's pageSize is the default, so this is a
+  // no-op there.
+  db.pageSize = pageSize;
   return db;
 }
 
@@ -80,10 +98,32 @@ class SharedCore {
   live = new Map<bigint, number>();
   // writerActive is true while a write transaction is open (at most one — CLAUDE.md §3).
   writerActive = false;
+  // storage is the file-backed Engine that owns the storage identity (the pager + buffer pool + the
+  // mutable page accounting: paging/pageSize/pageCount/freePages); null is in-memory (persist is then
+  // a no-op). Only those fields are used — its committed snapshot is unused; readers/writers carry the
+  // published snapshot, whose stores already reference the same paging.
+  storage: Engine | null = null;
+  // readOnly marks a read-only file-backed core (api.md §2.1): every session is then read-only, a
+  // write is 25006.
+  readOnly = false;
 
   constructor(snap: Snapshot) {
     this.committed = snap;
     this.sharedTempCommitted = new Snapshot();
+  }
+
+  // pageSize is the file's page size for a file-backed core, else the in-memory default. Minted
+  // sessions adopt it so their stores' cap matches the physical pages (CLAUDE.md §8).
+  get pageSize(): number {
+    return this.storage?.pageSize ?? DEFAULT_PAGE_SIZE;
+  }
+
+  // persist durably publishes snap to the backing store via an incremental copy-on-write commit
+  // (persistImpl — the host-independent recipe, transactions.md §9). In-memory (no storage) is a no-op
+  // success. Called from Session.publish; pageCount/freePages on the storage engine advance only after
+  // both syncs succeed, so a write failure leaves the file's prior meta untouched.
+  persist(snap: Snapshot): void {
+    if (this.storage !== null) persistImpl(this.storage, snap);
   }
 
   register(version: bigint): void {
@@ -105,18 +145,43 @@ class SharedCore {
   }
 }
 
-// Database is a database handle offering snapshot-isolated readers and a single writer
-// (transactions.md §10). read() and write() mint independent per-caller handles over one core.
+// Database is the host-facing database handle (spec/design/session.md §2.1/§2.4): the shared core PLUS
+// one long-lived default Session whose delegators (execute/query/begin/.../executeScript + the
+// envelope setters) drive it, so the single-handle surface is stateful like a PG/SQLite connection.
+// The same Database is also the concurrency core — readSession/writeSession/session mint independent
+// per-caller handles over it (TS is single-threaded, so no Rust-style !Send split is needed).
 export class Database {
   private core: SharedCore;
+  // def is the long-lived default session the bare delegators drive (§2.1) — a configured autocommit
+  // session over core (the lazy-gate rule). Assigned by `over` right after construction.
+  private def!: Session;
 
   private constructor(core: SharedCore) {
     this.core = core;
   }
 
-  // newInMemory builds a fresh, empty in-memory shared database (committed version 0).
+  // over wraps a shared core with a fresh default session (the lazy-gate autocommit session of §2.4).
+  private static over(core: SharedCore): Database {
+    const db = new Database(core);
+    db.def = db.session({});
+    return db;
+  }
+
+  // newInMemory builds a fresh, empty in-memory database plus its default session (committed version 0).
   static newInMemory(): Database {
-    return new Database(new SharedCore(new Snapshot(0n)));
+    return Database.over(new SharedCore(new Snapshot(0n)));
+  }
+
+  // fromFileEngine lifts a freshly opened/created file-backed Engine (file.ts) into a host handle: its
+  // committed snapshot becomes the published roots and it becomes the storage owner (paging + page
+  // accounting). Called by file.ts's createDatabase/openDatabase wrappers (file.ts is the node host
+  // module; shared.ts stays browser-clean by not importing it).
+  static fromFileEngine(engine: Engine): Database {
+    const core = new SharedCore(engine.committed);
+    core.sharedTempCommitted = engine.sharedTempCommitted;
+    core.storage = engine;
+    core.readOnly = engine.readOnly;
+    return Database.over(core);
   }
 
   // version is the committed version currently published (the monotonic commit counter,
@@ -142,7 +207,7 @@ export class Database {
     this.core.register(snap.txid);
     // Pin both roots together (temp-tables.md §5): the reader sees a consistent file + shared-temp
     // view. Single-threaded JS reads both fields synchronously, so the pin is atomic.
-    const engine = databaseFromSnapshot(snap, this.core.sharedTempCommitted);
+    const engine = databaseFromSnapshot(snap, this.core.sharedTempCommitted, this.core.pageSize);
     return new Session(this.core, engine, "ro", snap.txid, snap.txid);
   }
 
@@ -152,6 +217,11 @@ export class Database {
   // reject). Captures the committed snapshot as a private working set; commit publishes it, rollback
   // / close discards it. (The old SharedDb.write().)
   writeSession(): Session {
+    if (this.core.readOnly) {
+      // A read-only file has no writer (api.md §2.1); a "write" session degrades to a pinned read-only
+      // one — a write through it is 25006, mirroring PostgreSQL hot standby.
+      return this.readSession();
+    }
     if (this.core.writerActive) {
       throw engineError("active_sql_transaction", "there is already a writer in progress");
     }
@@ -159,7 +229,7 @@ export class Database {
     const base = this.core.committed;
     // committed/sharedTempCommitted = the immutable bases; beginTx clones them to working /
     // sharedTempWorking. Both roots are pinned together (temp-tables.md §5).
-    const engine = databaseFromSnapshot(base, this.core.sharedTempCommitted);
+    const engine = databaseFromSnapshot(base, this.core.sharedTempCommitted, this.core.pageSize);
     engine.beginTx(true);
     return new Session(this.core, engine, "rw", base.txid, null, true);
   }
@@ -173,9 +243,132 @@ export class Database {
   // independent owns-its-Engine session.)
   session(opts: SessionOptions = {}): Session {
     const snap = this.core.committed;
-    const engine = databaseFromSnapshot(snap, this.core.sharedTempCommitted);
+    const engine = databaseFromSnapshot(snap, this.core.sharedTempCommitted, this.core.pageSize);
     engine.session = new SessionState(opts);
+    // A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
+    // version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
+    if (this.core.readOnly) {
+      this.core.register(snap.txid);
+      return new Session(this.core, engine, "ro", snap.txid, snap.txid);
+    }
     return new Session(this.core, engine, "rw", snap.txid, null);
+  }
+
+  // --- The default-session delegators (the back-compat single-handle bridge, §2.1): each forwards to
+  // the long-lived default Session. (TS Session has no view/update closures — the documented api.ts
+  // module-cycle deferral, session.md §10 slice 1; drive a block via begin/commit or SQL BEGIN.) ---
+
+  // execute runs a (possibly mutating) statement on the default session, binding $N params.
+  execute(sql: string, params: Value[] = []): Outcome {
+    return this.def.execute(sql, params);
+  }
+  // query runs a query on the default session, returning a row cursor.
+  query(sql: string, params: Value[] = []): Rows {
+    return this.def.query(sql, params);
+  }
+  // executeScript runs a multi-statement script on the default session (spec/design/session.md §4.2).
+  executeScript(sql: string): ScriptSummary {
+    return this.def.executeScript(sql);
+  }
+  // begin opens an explicit transaction block on the default session (§2.2; the host-API BEGIN).
+  begin(writable: boolean): void {
+    this.def.begin(writable);
+  }
+  // commit commits the default session's open block (publish + release the gate; no-op if none).
+  commit(): void {
+    this.def.commit();
+  }
+  // rollback rolls back the default session's open block (discard the working set; no-op if none).
+  rollback(): void {
+    this.def.rollback();
+  }
+  // status reports the default session's transaction status (Idle/Open/Failed, §2.2).
+  status(): TxStatus {
+    return this.def.status();
+  }
+  // inTransaction reports whether an explicit transaction block is open on the default session.
+  inTransaction(): boolean {
+    return this.def.inTransaction();
+  }
+  // close releases the default session and closes the backing file (file-backed only). Idempotent.
+  close(): void {
+    this.def.close();
+    const st = this.core.storage;
+    if (st !== null && st.paging !== null) {
+      st.paging.close();
+      st.paging = null;
+    }
+  }
+
+  // The envelope (spec/design/session.md §3), delegating to the default session.
+  get maxCost(): bigint {
+    return this.def.maxCost;
+  }
+  setMaxCost(limit: bigint): void {
+    this.def.setMaxCost(limit);
+  }
+  setLifetimeMaxCost(limit: bigint): void {
+    this.def.setLifetimeMaxCost(limit);
+  }
+  lifetimeMaxCost(): bigint {
+    return this.def.lifetimeMaxCost();
+  }
+  lifetimeCost(): bigint {
+    return this.def.lifetimeCost();
+  }
+  get maxSqlLength(): number {
+    return this.def.maxSqlLength;
+  }
+  setMaxSqlLength(bytes: number): void {
+    this.def.setMaxSqlLength(bytes);
+  }
+  get workMem(): number {
+    return this.def.workMem;
+  }
+  setWorkMem(bytes: number): void {
+    this.def.setWorkMem(bytes);
+  }
+  setDefaultPrivileges(privs: PrivilegeSet): void {
+    this.def.setDefaultPrivileges(privs);
+  }
+  grant(privs: PrivilegeSet, object: string): void {
+    this.def.grant(privs, object);
+  }
+  revoke(privs: PrivilegeSet, object: string): void {
+    this.def.revoke(privs, object);
+  }
+  get privileges(): Privileges {
+    return this.def.privileges;
+  }
+  get allowDdl(): boolean {
+    return this.def.allowDdl;
+  }
+  setAllowDdl(allow: boolean): void {
+    this.def.setAllowDdl(allow);
+  }
+  setVar(name: string, value: string): void {
+    this.def.setVar(name, value);
+  }
+  resetVar(name: string): void {
+    this.def.resetVar(name);
+  }
+  var(name: string): string | undefined {
+    return this.def.var(name);
+  }
+  setTimeZone(zone: string): void {
+    this.def.setTimeZone(zone);
+  }
+  setRandomSource(f: RandomFill): void {
+    this.def.setRandomSource(f);
+  }
+  clearRandomSource(): void {
+    this.def.clearRandomSource();
+  }
+  setClockSource(f: ClockFunc): void {
+    this.def.setClockSource(f);
+  }
+  clearClockSource(): void {
+    this.def.clearClockSource();
   }
 }
 
@@ -284,18 +477,20 @@ export class Session {
 
   // endBlock ends the open block (spec/design/session.md §2.4). commit: a clean writable block
   // publishes its working set at the next version; a failed/read-only block publishes nothing (a
-  // failed COMMIT is a ROLLBACK, PostgreSQL). Either way the gate is released and any pin deregistered.
+  // failed COMMIT is a ROLLBACK, PostgreSQL). Either way the gate is released and any pin deregistered
+  // — finishBlock runs in `finally` so a persist I/O failure (file-backed) never leaks the writer gate.
   private endBlock(commit: boolean): Outcome {
-    let out: Outcome;
-    if (commit) {
-      const failed = this.engine.session.tx?.failed ?? false;
-      out = this.engine.commitTx(); // inner in-memory swap: committed := working
-      if (!failed && this.gateHeld) this.publish();
-    } else {
-      out = this.engine.rollbackTx();
+    try {
+      if (commit) {
+        const failed = this.engine.session.tx?.failed ?? false;
+        const out = this.engine.commitTx(); // inner in-memory swap: committed := working
+        if (!failed && this.gateHeld) this.publish(); // persist + publish; may throw on I/O failure
+        return out;
+      }
+      return this.engine.rollbackTx();
+    } finally {
+      this.finishBlock();
     }
-    this.finishBlock();
-    return out;
   }
 
   // acquireGate takes the single-writer flag, throwing 25001 if another writer is open (JS cannot
@@ -337,13 +532,27 @@ export class Session {
   // publish stores the engine's committed roots into the shared cell at the next version (the §3
   // commit window — both roots together, temp-tables.md §5). Called after a clean autocommit write or
   // an explicit COMMIT of a writable block.
+  //
+  // File-backed: the new file snapshot is persisted durably first (core.persist) and the cell is
+  // updated only on success, so a persist I/O failure throws and leaves the shared committed state (and
+  // this session's version) unchanged. In-memory persist is a no-op. The shared-temp root is never
+  // serialized — it rides the swap as a pure in-memory reference (temp-tables.md §2/§5).
   private publish(): void {
     const snap = this.engine.committed;
     snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
+    this.core.persist(snap); // durable before publish; throws (publishing nothing) on I/O failure
     this.engine.committed = snap;
     this.core.committed = snap;
     this.core.sharedTempCommitted = this.engine.sharedTempCommitted;
     this.baseVersion += 1n;
+  }
+
+  // begin opens an explicit transaction block on this session (spec/design/session.md §2.2 — the
+  // host-API spelling of SQL BEGIN). writable true is READ WRITE (eager gate, the BEGIN READ WRITE
+  // form); false is READ ONLY (pins + registers in the watermark, no gate). Statements then run on the
+  // session until commit/rollback. A nested begin (a block is already open) is 25001.
+  begin(writable: boolean): void {
+    this.beginBlock(writable);
   }
 
   // commit commits an open write block / write session (publish + release the gate, §2.4). With no

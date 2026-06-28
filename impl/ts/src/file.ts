@@ -23,6 +23,7 @@ import { loadEnginePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
+import { Database } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
@@ -127,6 +128,19 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     if (e instanceof Error && e.name === "EngineError") throw e;
     throw ioError(e);
   }
+}
+
+// createDatabase makes a new file-backed database at path (spec/design/api.md §2/§10 slice 7c) and
+// returns the host Database handle with its default session. 58P02 if the path already exists; the
+// page size is locked into the file. The Database back-compat bridge over the file-backed core.
+export function createDatabase(path: string, opts: DatabaseOptions = {}): Database {
+  return Database.fromFileEngine(create(path, opts));
+}
+
+// openDatabase opens an existing file-backed database at path with optional open settings and returns
+// the host Database handle with its default session (the back-compat bridge, spec/design/session.md §2.4).
+export function openDatabase(path: string, opts: OpenOptions = {}): Database {
+  return Database.fromFileEngine(open(path, opts));
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an

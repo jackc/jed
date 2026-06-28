@@ -759,7 +759,9 @@ export {
 } from "./api.ts";
 export {
   create,
+  createDatabase,
   open,
+  openDatabase,
   commit,
   rollback,
   close,
