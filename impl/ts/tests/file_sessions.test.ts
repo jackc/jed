@@ -60,24 +60,28 @@ test("create + default session persists and reopens", () => {
   }
 });
 
-test("explicit transaction on the default session persists then rolls back", () => {
+test("explicit transaction on a session persists then rolls back", () => {
   const dir = tmpDir();
   const path = join(dir, "explicit_tx.jed");
   try {
     {
       const db = createDatabase(path);
-      db.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
+      // Explicit transactions live on a Session (the persistent default-session bridge was removed
+      // from Database): mint one over the file-backed core and drive begin/commit/rollback on it.
+      const s = db.session({});
+      s.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
       // A committed explicit block is durable.
-      db.begin(true);
-      db.execute("INSERT INTO t VALUES (1)");
-      db.execute("INSERT INTO t VALUES (2)");
-      db.commit();
-      assert.equal(countDB(db), 2n);
+      s.begin(true);
+      s.execute("INSERT INTO t VALUES (1)");
+      s.execute("INSERT INTO t VALUES (2)");
+      s.commit();
+      assert.equal(countSession(s), 2n);
       // A rolled-back block leaves nothing.
-      db.begin(true);
-      db.execute("INSERT INTO t VALUES (3)");
-      db.rollback();
-      assert.equal(countDB(db), 2n);
+      s.begin(true);
+      s.execute("INSERT INTO t VALUES (3)");
+      s.rollback();
+      assert.equal(countSession(s), 2n);
+      s.close();
       db.close();
     }
     const db = openDatabase(path);

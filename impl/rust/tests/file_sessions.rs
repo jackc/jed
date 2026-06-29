@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, OpenOptions};
+use jed::{Database, DatabaseOptions, OpenOptions, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -17,6 +17,14 @@ fn tmp(name: &str) -> PathBuf {
 
 fn count_via(db: &mut Database) -> i64 {
     let rows: Vec<_> = db.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+    match &rows[0][0] {
+        Value::Int(n) => *n,
+        other => panic!("expected an i64 count, got {other:?}"),
+    }
+}
+
+fn count_session(s: &mut Session) -> i64 {
+    let rows: Vec<_> = s.query("SELECT count(*) FROM t", &[]).unwrap().collect();
     match &rows[0][0] {
         Value::Int(n) => *n,
         other => panic!("expected an i64 count, got {other:?}"),
@@ -49,24 +57,27 @@ fn create_default_session_persists_and_reopens() {
 }
 
 #[test]
-fn explicit_transaction_on_the_default_session_persists_then_rolls_back() {
+fn explicit_transaction_on_a_session_persists_then_rolls_back() {
     let path = tmp("file_sessions_explicit_tx.jed");
     let _ = std::fs::remove_file(&path);
     {
         let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
-        db.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+        // Explicit transactions live on a Session (the persistent default-session bridge was removed
+        // from `Database`): mint one over the file-backed core and drive BEGIN/COMMIT/ROLLBACK on it.
+        let mut s = db.session(SessionOptions::default());
+        s.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
         // A committed explicit block is durable.
-        db.begin(true).unwrap();
-        db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
-        db.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
-        db.commit().unwrap();
-        assert_eq!(count_via(&mut db), 2);
+        s.begin(true).unwrap();
+        s.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+        s.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+        s.commit().unwrap();
+        assert_eq!(count_session(&mut s), 2);
         // A rolled-back block leaves nothing.
-        db.begin(true).unwrap();
-        db.execute("INSERT INTO t VALUES (3)", &[]).unwrap();
-        db.rollback().unwrap();
-        assert_eq!(count_via(&mut db), 2);
+        s.begin(true).unwrap();
+        s.execute("INSERT INTO t VALUES (3)", &[]).unwrap();
+        s.rollback().unwrap();
+        assert_eq!(count_session(&mut s), 2);
     }
     let mut db = Database::open(&path).unwrap();
     assert_eq!(count_via(&mut db), 2); // only the committed block survived the reopen

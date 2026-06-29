@@ -521,6 +521,12 @@ fn assert_types(
 /// mismatch as an error string.
 fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut db = Database::new_in_memory();
+    // `Database` no longer owns a persistent default session (it mints a fresh session per
+    // convenience call), so the harness drives one explicit session per file. Keeping a single
+    // session for the whole file preserves the cross-record state the sequential corpus relies on
+    // (sticky `lifetime_max_cost`, session-local temp tables, the per-record `# set:`/privilege
+    // resets). Re-minted whenever a `# fixture:` swaps the underlying database.
+    let mut sess = db.session(jed::SessionOptions::default());
     let mut lines = text.lines().peekable();
     // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
     // next record consumes them.
@@ -569,13 +575,14 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             // above — appears in the header before any record (spec/design/conformance.md).
             if let Some(rel) = parse_fixture_directive(rest) {
                 db = open_fixture(&rel)?;
+                sess = db.session(jed::SessionOptions::default());
                 continue;
             }
             // `# upgrade-collations:` (file-level) runs the COLLATION UPGRADE migration on the running
             // DB — the privileged host op (`db.upgrade_collations`) that clears a version-skew
             // (collation.md §12); the records after it assert the table is read-write again.
             if parse_upgrade_collations_directive(rest) {
-                db.upgrade_collations()
+                sess.upgrade_collations()
                     .map_err(|e| format!("upgrade-collations: {}", e.message))?;
                 continue;
             }
@@ -587,7 +594,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 // Sticky (spec/design/session.md §5.4): apply immediately and persistently — the
                 // session cumulative builds across records, so a later record can assert the 54P02
                 // abort. Not a pending per-record directive (it must NOT reset between records).
-                db.set_lifetime_max_cost(n);
+                sess.set_lifetime_max_cost(n);
             } else if let Some(n) = parse_max_cost_directive(rest) {
                 pending_max_cost = Some(n);
             } else if let Some(n) = parse_max_sql_length_directive(rest) {
@@ -630,10 +637,10 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         let expected_names = pending_names.take();
         let expected_types = pending_types.take();
         // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
-        db.set_max_cost(pending_max_cost.take().unwrap_or(0));
+        sess.set_max_cost(pending_max_cost.take().unwrap_or(0));
         // Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
         // `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
-        db.set_max_sql_length(
+        sess.set_max_sql_length(
             pending_max_sql_length
                 .take()
                 .unwrap_or(jed::DEFAULT_MAX_SQL_LENGTH),
@@ -641,56 +648,56 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
         // §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
         match pending_seed.take() {
-            Some(s) => db.set_random_source(jed::seeded_random_source(s)),
-            None => db.clear_random_source(),
+            Some(s) => sess.set_random_source(jed::seeded_random_source(s)),
+            None => sess.clear_random_source(),
         }
         // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one);
         // a record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
         match (pending_clock_advance.take(), pending_clock.take()) {
-            (Some((start, step)), _) => db.set_clock_source(jed::advancing_clock(start, step)),
-            (None, Some(c)) => db.set_clock_source(jed::fixed_clock(c)),
-            (None, None) => db.clear_clock_source(),
+            (Some((start, step)), _) => sess.set_clock_source(jed::advancing_clock(start, step)),
+            (None, Some(c)) => sess.set_clock_source(jed::fixed_clock(c)),
+            (None, None) => sess.clear_clock_source(),
         }
         // Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to
         // fully permissive (every table privilege, DDL allowed), then layer the pending directives,
         // so a `# default_privileges:` / `# grant:` / `# revoke:` / `# allow_ddl:` decorates only its
         // record and never leaks forward.
-        db.reset_privileges();
+        sess.reset_privileges();
         if let Some(p) = pending_default_privileges.take() {
-            db.set_default_privileges(p);
+            sess.set_default_privileges(p);
         }
         for (privs, object) in pending_grants.drain(..) {
-            db.grant(privs, &object);
+            sess.grant(privs, &object);
         }
         for (privs, object) in pending_revokes.drain(..) {
-            db.revoke(privs, &object);
+            sess.revoke(privs, &object);
         }
         if let Some(a) = pending_allow_ddl.take() {
-            db.set_allow_ddl(a);
+            sess.set_allow_ddl(a);
         }
         // `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md
         // §5); `reset_privileges` above set both back to permissive, so each decorates only its record.
         if let Some(a) = pending_allow_temp_ddl.take() {
-            db.set_allow_temp_ddl(a);
+            sess.set_allow_temp_ddl(a);
         }
         if let Some(a) = pending_allow_shared_temp_ddl.take() {
-            db.set_allow_shared_temp_ddl(a);
+            sess.set_allow_shared_temp_ddl(a);
         }
         // Apply the per-record temp-storage budgets (temp-tables.md §7); absent ⇒ unlimited (`0`), so a
         // `# temp_buffers:` / `# shared_temp_mem:` directive never leaks past its record. Mirrors `# max_cost:`.
-        db.set_temp_buffers(pending_temp_buffers.take().unwrap_or(0));
-        db.set_shared_temp_mem(pending_shared_temp_mem.take().unwrap_or(0));
+        sess.set_temp_buffers(pending_temp_buffers.take().unwrap_or(0));
+        sess.set_shared_temp_mem(pending_shared_temp_mem.take().unwrap_or(0));
         // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
         // pending `# set:` pair, so a directive decorates only its record and never leaks forward.
-        db.reset_vars();
+        sess.reset_vars();
         for (name, value) in pending_vars.drain(..) {
-            db.set_var(&name, &value)
+            sess.set_var(&name, &value)
                 .expect("# set: directive uses a dotted (custom) variable name");
         }
         // Apply the per-record session time zone (spec/design/session.md §6.2, timezones.md §9.4):
         // reset to UTC, then set the pending `# timezone:` zone, so a directive decorates only its
         // record and never leaks forward. A named zone must already be loaded (`# load-timezone:`).
-        db.set_time_zone(pending_timezone.take().as_deref().unwrap_or("UTC"))
+        sess.set_time_zone(pending_timezone.take().as_deref().unwrap_or("UTC"))
             .unwrap_or_else(|e| panic!("# timezone: {}", e.message));
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
@@ -705,7 +712,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 }
                 let expect = parts.next().unwrap_or("");
                 let sql = take_sql(&mut lines);
-                let result = db.execute(&sql, &[]);
+                let result = sess.execute(&sql, &[]);
                 match expect {
                     "ok" => match result {
                         Ok(outcome) => assert_cost(expected_cost, outcome.cost(), &sql)?,
@@ -748,7 +755,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                     }
                     expected.push(l.trim().to_string());
                 }
-                let outcome = db.execute(&sql, &[]).map_err(|e| {
+                let outcome = sess.execute(&sql, &[]).map_err(|e| {
                     format!(
                         "query failed with {}: {}\n  SQL: {sql}",
                         e.code(),
@@ -788,6 +795,9 @@ fn rebaseline_file(text: &str) -> Option<String> {
     }
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
     let mut db = Database::new_in_memory();
+    // One explicit session per file (see `run_file`): `Database` no longer keeps a persistent
+    // default session, so the cost walk drives the same per-file session it would in `run_file`.
+    let mut sess = db.session(jed::SessionOptions::default());
     let mut pending_cost_line: Option<usize> = None;
     let mut pending_max_cost: Option<i64> = None;
     let mut pending_max_sql_length: Option<usize> = None;
@@ -807,6 +817,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 // Mirror `run_file`: a fixture file evolves DB state from the pre-built image, not a
                 // fresh DB, so the cost walk sees the same starting state.
                 db = open_fixture(&rel).ok()?;
+                sess = db.session(jed::SessionOptions::default());
             } else if let Some(name) = parse_load_timezone_directive(rest) {
                 // Mirror `run_file`: load the bundle so a named-zone record runs (and accrues cost)
                 // during the cost walk (timezones.md §11).
@@ -814,17 +825,17 @@ fn rebaseline_file(text: &str) -> Option<String> {
             } else if let Some(z) = parse_timezone_directive(rest) {
                 // The session zone does not change cost (zone-agnostic), but set it so the record
                 // re-executes identically to `run_file`.
-                db.set_time_zone(&z).ok()?;
+                sess.set_time_zone(&z).ok()?;
             } else if parse_upgrade_collations_directive(rest) {
                 // Mirror `run_file`: clear a version-skew so the post-upgrade records run against the
                 // migrated (read-write) state.
-                db.upgrade_collations().ok()?;
+                sess.upgrade_collations().ok()?;
             } else if parse_cost_directive(rest).is_some() {
                 pending_cost_line = Some(i);
             } else if let Some(n) = parse_lifetime_max_cost_directive(rest) {
                 // Sticky session budget (spec/design/session.md §5.4): apply immediately so the DB
                 // state evolves identically to `run_file` (an aborting record writes nothing).
-                db.set_lifetime_max_cost(n);
+                sess.set_lifetime_max_cost(n);
             } else if let Some(n) = parse_max_cost_directive(rest) {
                 pending_max_cost = Some(n);
             } else if let Some(n) = parse_max_sql_length_directive(rest) {
@@ -842,20 +853,20 @@ fn rebaseline_file(text: &str) -> Option<String> {
         // A record: collect its SQL (advancing `i` past the whole record) and run it to
         // accrue cost + advance DB state. Apply any per-record cost ceiling so an aborting
         // record evolves the DB state identically to `run_file` (it writes nothing).
-        db.set_max_cost(pending_max_cost.take().unwrap_or(0));
-        db.set_max_sql_length(
+        sess.set_max_cost(pending_max_cost.take().unwrap_or(0));
+        sess.set_max_sql_length(
             pending_max_sql_length
                 .take()
                 .unwrap_or(jed::DEFAULT_MAX_SQL_LENGTH),
         );
         match pending_seed.take() {
-            Some(s) => db.set_random_source(jed::seeded_random_source(s)),
-            None => db.clear_random_source(),
+            Some(s) => sess.set_random_source(jed::seeded_random_source(s)),
+            None => sess.clear_random_source(),
         }
         match (pending_clock_advance.take(), pending_clock.take()) {
-            (Some((start, step)), _) => db.set_clock_source(jed::advancing_clock(start, step)),
-            (None, Some(c)) => db.set_clock_source(jed::fixed_clock(c)),
-            (None, None) => db.clear_clock_source(),
+            (Some((start, step)), _) => sess.set_clock_source(jed::advancing_clock(start, step)),
+            (None, Some(c)) => sess.set_clock_source(jed::fixed_clock(c)),
+            (None, None) => sess.clear_clock_source(),
         }
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
@@ -868,7 +879,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                     sql.push(out[i].clone());
                     i += 1;
                 }
-                let result = db.execute(&sql.join("\n"), &[]);
+                let result = sess.execute(&sql.join("\n"), &[]);
                 // Only a `statement ok` carries a cost; an error record never does.
                 if expect == "ok" {
                     result.ok().map(|o| o.cost())
@@ -890,7 +901,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 while i < out.len() && !out[i].trim().is_empty() {
                     i += 1;
                 }
-                db.execute(&sql.join("\n"), &[]).ok().map(|o| o.cost())
+                sess.execute(&sql.join("\n"), &[]).ok().map(|o| o.cost())
             }
             _ => {
                 i += 1;

@@ -664,6 +664,11 @@ func assertTypes(expected []string, actual []string, sql string) error {
 // *Database (its default autocommit session — the back-compat bridge, spec/design/session.md §2.1).
 func runFile(text string) error {
 	db := jed.NewDatabase()
+	// Database no longer owns a persistent default session (it mints a fresh session per convenience
+	// call), so the harness drives one explicit session per file — preserving the cross-record state the
+	// sequential corpus relies on (sticky lifetime_max_cost, session-local temp tables, the per-record
+	// # set:/privilege resets). Re-minted whenever a `# fixture:` swaps the underlying database.
+	sess := db.Session(jed.SessionOptions{})
 	// cleanup releases the current handle; a `# fixture:` directive swaps in a file-backed handle whose
 	// cleanup also removes the temp image. The deferred call reads the latest cleanup.
 	cleanup := func() {}
@@ -729,6 +734,7 @@ func runFile(text string) error {
 				cleanup() // release the prior (in-memory no-op) handle before swapping in the fixture
 				db = fixtureDB
 				cleanup = fixtureCleanup
+				sess = db.Session(jed.SessionOptions{})
 				i++
 				continue
 			}
@@ -736,7 +742,7 @@ func runFile(text string) error {
 			// DB — the privileged host op (db.UpgradeCollations) that clears a version-skew
 			// (collation.md §12); the records after it assert the table is read-write again.
 			if parseUpgradeCollationsDirective(line) {
-				if _, err := db.UpgradeCollations(); err != nil {
+				if _, err := sess.UpgradeCollations(); err != nil {
 					return fmt.Errorf("upgrade-collations: %s", err.Error())
 				}
 				i++
@@ -750,7 +756,7 @@ func runFile(text string) error {
 				// Sticky (spec/design/session.md §5.4): apply immediately and persistently — the
 				// session cumulative builds across records, so a later record can assert the 54P02
 				// abort. Not a pending per-record directive (it must NOT reset between records).
-				db.SetLifetimeMaxCost(n)
+				sess.SetLifetimeMaxCost(n)
 			} else if n, ok := parseMaxCostDirective(line); ok {
 				pendingMaxCost = &n
 			} else if n, ok := parseMaxSQLLengthDirective(line); ok {
@@ -801,7 +807,7 @@ func runFile(text string) error {
 		if pendingMaxCost != nil {
 			maxCost = *pendingMaxCost
 		}
-		db.SetMaxCost(maxCost)
+		sess.SetMaxCost(maxCost)
 		pendingMaxCost = nil
 		// Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
 		// `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
@@ -809,24 +815,24 @@ func runFile(text string) error {
 		if pendingMaxSQLLength != nil {
 			maxSQLLength = *pendingMaxSQLLength
 		}
-		db.SetMaxSQLLength(maxSQLLength)
+		sess.SetMaxSQLLength(maxSQLLength)
 		pendingMaxSQLLength = nil
 		// Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
 		// §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
 		if pendingSeed != nil {
-			db.SetRandomSource(jed.SeededRandomSource(*pendingSeed))
+			sess.SetRandomSource(jed.SeededRandomSource(*pendingSeed))
 		} else {
-			db.ClearRandomSource()
+			sess.ClearRandomSource()
 		}
 		pendingSeed = nil
 		// `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one);
 		// a record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
 		if pendingClockAdvance != nil {
-			db.SetClockSource(jed.AdvancingClock(pendingClockAdvance.start, pendingClockAdvance.step))
+			sess.SetClockSource(jed.AdvancingClock(pendingClockAdvance.start, pendingClockAdvance.step))
 		} else if pendingClock != nil {
-			db.SetClockSource(jed.FixedClock(*pendingClock))
+			sess.SetClockSource(jed.FixedClock(*pendingClock))
 		} else {
-			db.ClearClockSource()
+			sess.ClearClockSource()
 		}
 		pendingClock = nil
 		pendingClockAdvance = nil
@@ -834,26 +840,26 @@ func runFile(text string) error {
 		// permissive (every table privilege, DDL allowed), then layer the pending directives, so a
 		// # default_privileges: / # grant: / # revoke: / # allow_ddl: decorates only its record and
 		// never leaks forward.
-		db.ResetPrivileges()
+		sess.ResetPrivileges()
 		if pendingDefaultPrivileges != nil {
-			db.SetDefaultPrivileges(*pendingDefaultPrivileges)
+			sess.SetDefaultPrivileges(*pendingDefaultPrivileges)
 		}
 		for _, g := range pendingGrants {
-			db.Grant(g.privs, g.object)
+			sess.Grant(g.privs, g.object)
 		}
 		for _, r := range pendingRevokes {
-			db.Revoke(r.privs, r.object)
+			sess.Revoke(r.privs, r.object)
 		}
 		if pendingAllowDDL != nil {
-			db.SetAllowDDL(*pendingAllowDDL)
+			sess.SetAllowDDL(*pendingAllowDDL)
 		}
 		// `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md
 		// §5); ResetPrivileges above set both back to permissive, so each decorates only its record.
 		if pendingAllowTempDDL != nil {
-			db.SetAllowTempDDL(*pendingAllowTempDDL)
+			sess.SetAllowTempDDL(*pendingAllowTempDDL)
 		}
 		if pendingAllowSharedTempDDL != nil {
-			db.SetAllowSharedTempDDL(*pendingAllowSharedTempDDL)
+			sess.SetAllowSharedTempDDL(*pendingAllowSharedTempDDL)
 		}
 		pendingDefaultPrivileges = nil
 		pendingGrants = nil
@@ -867,19 +873,19 @@ func runFile(text string) error {
 		if pendingTempBuffers != nil {
 			tempBuffers = *pendingTempBuffers
 		}
-		db.SetTempBuffers(tempBuffers)
+		sess.SetTempBuffers(tempBuffers)
 		pendingTempBuffers = nil
 		sharedTempMem := 0
 		if pendingSharedTempMem != nil {
 			sharedTempMem = *pendingSharedTempMem
 		}
-		db.SetSharedTempMem(sharedTempMem)
+		sess.SetSharedTempMem(sharedTempMem)
 		pendingSharedTempMem = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
 		// pending # set: pair, so a directive decorates only its record and never leaks forward.
-		db.ResetVars()
+		sess.ResetVars()
 		for _, v := range pendingVars {
-			if err := db.SetVar(v.name, v.value); err != nil {
+			if err := sess.SetVar(v.name, v.value); err != nil {
 				return fmt.Errorf("# set: directive uses a non-dotted variable name %q: %w", v.name, err)
 			}
 		}
@@ -891,7 +897,7 @@ func runFile(text string) error {
 		if pendingTimezone != nil {
 			tz = *pendingTimezone
 		}
-		if err := db.SetTimeZone(tz); err != nil {
+		if err := sess.SetTimeZone(tz); err != nil {
 			return fmt.Errorf("# timezone: %w", err)
 		}
 		pendingTimezone = nil
@@ -911,7 +917,7 @@ func runFile(text string) error {
 			}
 			i++
 			sql := takeSQL(lines, &i)
-			outcome, err := db.Execute(sql, nil)
+			outcome, err := sess.Execute(sql, nil)
 			switch expect {
 			case "ok":
 				if err != nil {
@@ -950,7 +956,7 @@ func runFile(text string) error {
 				expected = append(expected, strings.TrimSpace(lines[i]))
 				i++
 			}
-			outcome, err := db.Execute(sql, nil)
+			outcome, err := sess.Execute(sql, nil)
 			if err != nil {
 				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
 			}

@@ -16,6 +16,7 @@ func main() {
 
 type engine struct {
 	db      *jed.Database
+	sess    *jed.Session // the persistent connection the bench drives (BEGIN/COMMIT span calls)
 	dataDir string
 	dataset string
 	scratch string // temp dir holding the scratch file ("" otherwise)
@@ -35,6 +36,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 			return nil, err
 		}
 		e.db = db
+		e.sess = db.Session(jed.SessionOptions{})
 		return e, nil
 	}
 	db, err := jed.OpenDatabase(filepath.Join(dataDir, dataset+".jed"))
@@ -42,16 +44,17 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 		return nil, err
 	}
 	e.db = db
+	e.sess = db.Session(jed.SessionOptions{})
 	return e, nil
 }
 
 func (e *engine) Exec(sql string) error {
-	_, err := e.db.Execute(sql, nil)
+	_, err := e.sess.Execute(sql, nil)
 	return err
 }
 
 func (e *engine) QueryInt(sql string) (int64, error) {
-	rows, err := e.db.Query(sql, nil)
+	rows, err := e.sess.Query(sql, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -66,6 +69,9 @@ func (e *engine) StoredFingerprint() (string, error) {
 }
 
 func (e *engine) Close() error {
+	if e.sess != nil {
+		e.sess.Close()
+	}
 	if e.scratch != "" {
 		os.RemoveAll(e.scratch)
 	}
@@ -73,7 +79,7 @@ func (e *engine) Close() error {
 }
 
 func (e *engine) Prepare(sql string) (bench.Stmt, error) {
-	stmt, err := e.db.Prepare(sql)
+	stmt, err := e.sess.Prepare(sql)
 	if err != nil {
 		return nil, err
 	}

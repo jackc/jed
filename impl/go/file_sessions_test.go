@@ -72,28 +72,40 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 			t.Fatalf("create: %v", err)
 		}
 		defer db.Close()
-		execDB(t, db, "CREATE TABLE t (id i64 PRIMARY KEY)")
+		// Explicit transactions live on a Session (the persistent default-session bridge was removed
+		// from Database): mint one over the file-backed core and drive BEGIN/COMMIT/ROLLBACK on it.
+		s := db.Session(SessionOptions{})
+		defer s.Close()
+		if _, err := s.Execute("CREATE TABLE t (id i64 PRIMARY KEY)", nil); err != nil {
+			t.Fatalf("create table: %v", err)
+		}
 		// A committed explicit block is durable.
-		if err := db.Begin(true); err != nil {
+		if err := s.Begin(true); err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		execDB(t, db, "INSERT INTO t VALUES (1)")
-		execDB(t, db, "INSERT INTO t VALUES (2)")
-		if err := db.Commit(); err != nil {
+		if _, err := s.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+			t.Fatalf("insert 1: %v", err)
+		}
+		if _, err := s.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+			t.Fatalf("insert 2: %v", err)
+		}
+		if err := s.Commit(); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
-		if got := countVia(t, db); got != 2 {
+		if got := readCount(t, s); got != 2 {
 			t.Fatalf("after commit count = %d, want 2", got)
 		}
 		// A rolled-back block leaves nothing.
-		if err := db.Begin(true); err != nil {
+		if err := s.Begin(true); err != nil {
 			t.Fatalf("begin2: %v", err)
 		}
-		execDB(t, db, "INSERT INTO t VALUES (3)")
-		if err := db.Rollback(); err != nil {
+		if _, err := s.Execute("INSERT INTO t VALUES (3)", nil); err != nil {
+			t.Fatalf("insert 3: %v", err)
+		}
+		if err := s.Rollback(); err != nil {
 			t.Fatalf("rollback: %v", err)
 		}
-		if got := countVia(t, db); got != 2 {
+		if got := readCount(t, s); got != 2 {
 			t.Fatalf("after rollback count = %d, want 2", got)
 		}
 	}()

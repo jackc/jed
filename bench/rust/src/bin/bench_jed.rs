@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use jed::{Database, DatabaseOptions, PreparedStatement, Session, SharedCore, Value};
+use jed::{Database, DatabaseOptions, PreparedStatement, Session, SessionOptions, SharedCore, Value};
 use jed_bench::{
     Arg, BoxResult, Checksum, ConcurrentOutcome, Config, Engine, main_with, read_sidecar,
 };
@@ -17,7 +17,9 @@ fn main() {
 }
 
 struct JedEngine {
-    db: Database,
+    // The persistent connection the bench drives (BEGIN/COMMIT/ROLLBACK span calls). It owns an
+    // `Arc<Shared>`, so it keeps the storage alive after the local `Database` handle is dropped.
+    sess: Session,
     stmt: Option<PreparedStatement>,
     data_dir: String,
     dataset: String,
@@ -30,8 +32,9 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
         std::fs::create_dir_all(&dir)?;
         let db = Database::create(format!("{dir}/scratch.jed"), DatabaseOptions::default())
             .map_err(|e| e.to_string())?;
+        let sess = db.session(SessionOptions::default());
         return Ok(Box::new(JedEngine {
-            db,
+            sess,
             stmt: None,
             data_dir: data_dir.to_string(),
             dataset: dataset.to_string(),
@@ -39,8 +42,9 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
         }));
     }
     let db = Database::open(format!("{data_dir}/{dataset}.jed")).map_err(|e| e.to_string())?;
+    let sess = db.session(SessionOptions::default());
     Ok(Box::new(JedEngine {
-        db,
+        sess,
         stmt: None,
         data_dir: data_dir.to_string(),
         dataset: dataset.to_string(),
@@ -67,12 +71,12 @@ fn bind_args(args: &[Arg]) -> Vec<Value> {
 
 impl Engine for JedEngine {
     fn exec(&mut self, sql: &str) -> BoxResult<()> {
-        self.db.execute(sql, &[]).map_err(|e| e.to_string())?;
+        self.sess.execute(sql, &[]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn prepare(&mut self, sql: &str) -> BoxResult<()> {
-        self.stmt = Some(self.db.prepare(sql).map_err(|e| e.to_string())?);
+        self.stmt = Some(self.sess.prepare(sql).map_err(|e| e.to_string())?);
         Ok(())
     }
 
@@ -80,7 +84,7 @@ impl Engine for JedEngine {
         let params = bind_args(args);
         let stmt = self.stmt.as_ref().expect("prepare first");
         let rows = self
-            .db
+            .sess
             .query_prepared(stmt, &params)
             .map_err(|e| e.to_string())?;
         let mut n = 0;
@@ -113,14 +117,14 @@ impl Engine for JedEngine {
     fn exec_prepared(&mut self, args: &[Arg]) -> BoxResult<()> {
         let params = bind_args(args);
         let stmt = self.stmt.as_ref().expect("prepare first");
-        self.db
+        self.sess
             .execute_prepared(stmt, &params)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn query_int(&mut self, sql: &str) -> BoxResult<i64> {
-        let mut rows = self.db.query(sql, &[]).map_err(|e| e.to_string())?;
+        let mut rows = self.sess.query(sql, &[]).map_err(|e| e.to_string())?;
         match rows.next().and_then(|r| r.into_iter().next()) {
             Some(Value::Int(n)) => Ok(n),
             other => Err(format!("expected one integer from {sql:?}, got {other:?}").into()),
