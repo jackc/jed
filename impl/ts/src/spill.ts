@@ -484,8 +484,13 @@ function writeValue(w: ByteWriter, v: Value): void {
       throw new Error("a jsonpath value never reaches the spill codec");
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
-      // opaquely so it round-trips, never resolving it.
+      // opaquely so it round-trips, never resolving it. The same pass-through covers an
+      // inline-deferred value (lazy-record.md §5b) — tag 21.
       switch (v.ref.form) {
+        case 0x00:
+          w.u8(21);
+          w.bytesField(v.ref.comp ?? new Uint8Array(0));
+          break;
         case 0x02:
           w.u8(9);
           w.u32(v.ref.firstPage);
@@ -575,6 +580,13 @@ function readValue(r: SpillByteReader): Value {
           comp: undefined,
         },
       };
+    case 21: {
+      const body = r.bytes(readU32(r));
+      return {
+        kind: "unfetched",
+        ref: { form: 0x00, firstPage: 0, storedLen: 0, rawLen: 0, comp: body },
+      };
+    }
     case 12: {
       const months = readU32(r) | 0; // signed i32
       const days = readU32(r) | 0;

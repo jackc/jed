@@ -292,6 +292,28 @@ export class TableStore {
     );
   }
 
+  // resolveInlineColumns returns `row` with only its inline-deferred values — the form 0x00
+  // unfetched form L2 introduces (lazy-record.md §5b) — materialized, leaving the large-value forms
+  // (0x02/0x03/0x04) deferred for the §14 touched-set path. The internal index/FK-maintenance write
+  // paths read a faulted row's key columns directly (not via a touched-set mask); a key column is
+  // always inline (a value too large to be a key cannot be one), so this restores exactly the pre-L2
+  // picture those paths assume — inline values resident, large values deferred. It is cost-free: an
+  // inline value's bytes are already owned, so it reads no overflow page and decompresses nothing.
+  // Used in place of resolveAll, which would instead read an untouched spilled column's chain
+  // (unmetered I/O the §14 contract forbids on these paths).
+  resolveInlineColumns(row: Row): Row {
+    if (!row.some((v) => v.kind === "unfetched" && v.ref.form === 0x00)) return row;
+    // An inline form reads no overflow pages — the fetch is never invoked.
+    const fetch = (): Uint8Array => {
+      throw new Error("inline-deferred resolution reads no overflow pages");
+    };
+    return row.map((v, i) =>
+      v.kind === "unfetched" && v.ref.form === 0x00
+        ? resolveUnfetched(this.colTypes[i]!, v.ref, fetch)
+        : v,
+    );
+  }
+
   // resolveAll materializes EVERY unfetched value in `row` (all columns). The mutation path uses
   // this on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
   // weight/disposition re-plan exactly like an eager writer's (large-values.md §14).

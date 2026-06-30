@@ -963,7 +963,10 @@ export function recordScanUnits(
     for (let i = 0; i < row.length; i++) {
       const v = row[i]!;
       if (!mask[i] || v.kind !== "unfetched") continue;
-      if (v.ref.form === TAG_EXTERNAL) {
+      if (v.ref.form === 0x00) {
+        // Inline-deferred values live in the record — no chain page, no decompress slab
+        // (lazy-record.md §8: cost is invariant; matches the resident plan's "inline").
+      } else if (v.ref.form === TAG_EXTERNAL) {
         pages += Math.ceil(v.ref.storedLen / capacity);
       } else if (v.ref.form === TAG_INLINE_COMP) {
         decompress += Math.ceil(v.ref.rawLen / capacity);
@@ -2964,10 +2967,21 @@ function decodeTableEntry(
 // rest when a dirty leaf re-encodes (resolveForEncode).
 function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   const tag = readU8(buf, cur);
-  // A composite's inline body has no nested overflow pointers (its fields are inline —
-  // composite.md §4), so it is read eagerly even in the lazy path. (L2 will defer inline values too
-  // via inlineBodySpan — lazy-record.md §12.)
-  if (tag === 0x00) return readInlineBody(ty, buf, cur, "construct");
+  // A present inline value (lazy-record.md §12, L2): a variable-length / structured body (the
+  // isSpillable set — §6) is DEFERRED as an owned-span unfetched (form 0x00), found by walking its
+  // byte extent without constructing it (inlineBodySpan); a fixed-width scalar is decoded eagerly
+  // (deferring it buys nothing — §6). resolveUnfetched reconstructs a touched one from the span,
+  // byte-identically (readInlineBody in construct mode).
+  if (tag === 0x00) {
+    if (isSpillable(ty)) {
+      const body = inlineBodySpan(ty, buf, cur).slice(); // own the bytes (form (b)); page may evict
+      return {
+        kind: "unfetched",
+        ref: { form: 0x00, firstPage: 0, storedLen: 0, rawLen: 0, comp: body },
+      };
+    }
+    return readInlineBody(ty, buf, cur, "construct");
+  }
   if (tag === 0x01) return nullValue();
   if (tag === TAG_EXTERNAL) {
     const first = readU32(buf, cur);
@@ -3033,6 +3047,11 @@ export function resolveUnfetched(
   fetch: (page: number) => Uint8Array,
 ): Value {
   const sink: number[] = [];
+  if (ref.form === 0x00) {
+    // Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
+    // decompression. Re-run the decoder over the captured span in construct mode.
+    return readInlineBody(ty, ref.comp!, { pos: 0 }, "construct");
+  }
   if (ref.form === TAG_EXTERNAL) {
     return valueFromPayload(ty, readOverflowChain(ref.firstPage, ref.storedLen, fetch, sink));
   }
@@ -3075,7 +3094,8 @@ function chainPages(first: number, length: number, fetch: (page: number) => Uint
 // free-list reachability walk), via the header-only chainPages hop.
 function markChains(row: Row, fetch: (page: number) => Uint8Array, reached: Set<number>): void {
   for (const v of row) {
-    if (v.kind !== "unfetched" || v.ref.form === TAG_INLINE_COMP) continue;
+    // Inline forms (0x00 inline-deferred, 0x03 inline-compressed) live in the record — no chain.
+    if (v.kind !== "unfetched" || v.ref.form === 0x00 || v.ref.form === TAG_INLINE_COMP) continue;
     for (const p of chainPages(v.ref.firstPage, v.ref.storedLen, fetch)) reached.add(p);
   }
 }

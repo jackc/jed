@@ -4564,8 +4564,11 @@ export class Engine {
     for (const e of stored) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
+      // The build reads the indexed key columns directly; resolve a faulted row's inline-deferred
+      // values (lazy-record.md §5b — always inline for a key column, so cost-free) before encoding.
+      const row = store.resolveInlineColumns(e.row);
       if (def.unique) {
-        const prefix = indexPrefixKey(columns, colls, def, e.row);
+        const prefix = indexPrefixKey(columns, colls, def, row);
         if (prefix !== null) {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
@@ -4577,7 +4580,7 @@ export class Engine {
           seenPrefixes.add(k);
         }
       }
-      entries.push(...indexEntryKeys(columns, colls, def, e.key, e.row));
+      entries.push(...indexEntryKeys(columns, colls, def, e.key, row));
     }
     meter.guard();
 
@@ -6402,7 +6405,10 @@ export class Engine {
       // touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
       if (filter === null || isTrue(evalExpr(filter, row, env, meter))) {
-        matched.push({ key: e.key, row });
+        // The FK parent-side probe + index-entry removal below read this row's key/index columns
+        // directly; resolve its inline-deferred values (lazy-record.md §5b — a key column is always
+        // inline, so cost-free) so those paths see resident values.
+        matched.push({ key: e.key, row: store.resolveInlineColumns(row) });
       }
     }
 
@@ -6689,8 +6695,12 @@ export class Engine {
       meter.charge(COSTS.storageRowRead);
       // Materialize the filter's + assignment sources' columns if the lazy load left them
       // unfetched — exactly the touched set the block above charged (large-values.md §14).
-      const row = store.resolveColumns(e.row, mask);
-      if (filter !== null && !isTrue(evalExpr(filter, row, env, meter))) continue;
+      const filtered = store.resolveColumns(e.row, mask);
+      if (filter !== null && !isTrue(evalExpr(filter, filtered, env, meter))) continue;
+      // The OLD row is retained for index-entry removal (its key/index columns are read directly
+      // below); resolve its inline-deferred values (lazy-record.md §5b — a key column is always
+      // inline, so cost-free) so that maintenance sees resident values.
+      const row = store.resolveInlineColumns(filtered);
       const newRow = row.slice();
       for (const p of plans) {
         newRow[p.idx] = checkAssign(p, evalExpr(p.source, row, env, meter));
