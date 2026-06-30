@@ -456,8 +456,12 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		panic("BUG: a jsonpath value never reaches the spill codec")
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
-		// it opaquely so it round-trips, never resolving it.
+		// it opaquely so it round-trips, never resolving it. The same pass-through covers an
+		// inline-deferred value (lazy-record.md §5b) — tag 21.
 		switch v.Unf.Form {
+		case 0x00:
+			_ = w.WriteByte(21)
+			spillWriteBytes(w, v.Unf.Comp)
 		case tagExternal:
 			_ = w.WriteByte(9)
 			spillWriteU32(w, v.Unf.FirstPage)
@@ -599,6 +603,9 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		}
 		raw, err := spillReadU32(r)
 		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: raw}}, err
+	case 21:
+		body, err := spillReadBytes(r)
+		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: 0x00, Comp: body}}, err
 	case 12:
 		months, err := spillReadU32(r)
 		if err != nil {

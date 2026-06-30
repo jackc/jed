@@ -1999,6 +1999,9 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int
 				continue
 			}
 			switch v.Unf.Form {
+			case 0x00:
+				// Inline-deferred values live in the record — no chain page, no decompress slab
+				// (lazy-record.md §8: cost is invariant; matches the resident plan's dispInline).
 			case tagExternal:
 				pages += (int(v.Unf.StoredLen) + capacity - 1) / capacity
 			case tagInlineComp:
@@ -3393,9 +3396,20 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 	}
 	switch tag {
 	case 0x00:
-		// A composite's inline body has no nested overflow pointers (its fields are inline —
-		// composite.md §4), so it is read eagerly even in the lazy path. (L2 will defer inline
-		// values too via inlineBodySpan — lazy-record.md §12.)
+		// A present inline value (lazy-record.md §12, L2): a variable-length / structured body (the
+		// isSpillable set — §6) is DEFERRED as an owned-span Unfetched (Form 0x00), found by walking
+		// its byte extent without constructing it (inlineBodySpan); a fixed-width scalar is decoded
+		// eagerly (deferring it buys nothing — §6). resolveUnfetched reconstructs a touched one from
+		// the span, byte-identically (readInlineBody in construct mode).
+		if isSpillable(ty) {
+			span, err := inlineBodySpan(ty, buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			body := make([]byte, len(span)) // own the bytes (form (b)); the page block may be evicted
+			copy(body, span)
+			return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: 0x00, Comp: body}}, nil
+		}
 		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case 0x01:
 		return NullValue(), nil
@@ -3478,6 +3492,11 @@ func decodeRecordLazy(colTypes []colType, buf []byte, pos *int) ([]byte, storedR
 func resolveUnfetched(ty colType, u *Unfetched, fetch func(uint32) ([]byte, error)) (Value, error) {
 	var sink []uint32
 	switch u.Form {
+	case 0x00:
+		// Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
+		// decompression. Re-run the decoder over the captured span in construct mode.
+		p := 0
+		return readInlineBody(ty, u.Comp, &p, decodeConstruct)
 	case tagExternal:
 		payload, err := readOverflowChain(u.FirstPage, int(u.StoredLen), fetch, &sink)
 		if err != nil {

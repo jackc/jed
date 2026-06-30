@@ -5017,8 +5017,14 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 			return Outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
+		// The build reads the indexed key columns directly; resolve a faulted row's inline-deferred
+		// values (lazy-record.md §5b — always inline for a key column, so cost-free) before encoding.
+		row, err := store.resolveInlineColumns(e.Row)
+		if err != nil {
+			return Outcome{}, err
+		}
 		if def.Unique {
-			prefix, ok, err := indexPrefixKey(columns, colls, def, e.Row)
+			prefix, ok, err := indexPrefixKey(columns, colls, def, row)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -5030,7 +5036,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 				seenPrefixes[string(prefix)] = true
 			}
 		}
-		eks, err := indexEntryKeys(columns, colls, def, e.Key, e.Row)
+		eks, err := indexEntryKeys(columns, colls, def, e.Key, row)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -7436,6 +7442,13 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 			keep = v.IsTrue()
 		}
 		if keep {
+			// The FK parent-side probe + index-entry removal below read this row's key/index columns
+			// directly; resolve its inline-deferred values (lazy-record.md §5b — a key column is
+			// always inline, so cost-free) so those paths see resident values.
+			row, err = store.resolveInlineColumns(row)
+			if err != nil {
+				return Outcome{}, err
+			}
 			matched = append(matched, matchedRow{key: e.Key, row: row})
 		}
 	}
@@ -7776,6 +7789,12 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			if !v.IsTrue() {
 				continue
 			}
+		}
+		// The OLD row is retained for index-entry removal (its key/index columns are read directly
+		// below); resolve its inline-deferred values (lazy-record.md §5b — a key column is always
+		// inline, so cost-free) so that maintenance sees resident values.
+		if row, err = store.resolveInlineColumns(row); err != nil {
+			return Outcome{}, err
 		}
 		newRow := make(storedRow, len(row))
 		copy(newRow, row)

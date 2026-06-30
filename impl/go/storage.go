@@ -333,6 +333,41 @@ func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, erro
 	return out, nil
 }
 
+// resolveInlineColumns returns row with only its inline-deferred values — the Form 0x00 Unfetched
+// form L2 introduces (lazy-record.md §5b) — materialized, leaving the large-value forms
+// (tagExternal/tagInlineComp/tagExternalComp) deferred for the §14 touched-set path. The internal
+// index/FK-maintenance write paths read a faulted row's key columns directly (not via a touched-set
+// mask); a key column is always inline (a value too large to be a key cannot be one), so this
+// restores exactly the pre-L2 picture those paths assume — inline values resident, large values
+// deferred. It is cost-free: an inline value's bytes are already owned, so it reads no overflow
+// page and decompresses nothing. Used in place of resolveAll, which would instead read an untouched
+// spilled column's chain (unmetered I/O the §14 contract forbids on these paths).
+func (s *tableStore) resolveInlineColumns(row storedRow) (storedRow, error) {
+	needs := false
+	for _, v := range row {
+		if v.Kind == ValUnfetched && v.Unf.Form == 0x00 {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return row, nil
+	}
+	out := make(storedRow, len(row))
+	copy(out, row)
+	for i := range out {
+		if out[i].Kind == ValUnfetched && out[i].Unf.Form == 0x00 {
+			// An inline form reads no overflow pages — fetch is never invoked.
+			v, err := resolveUnfetched(s.colTypes[i], out[i].Unf, nil)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
+		}
+	}
+	return out, nil
+}
+
 // resolveAll materializes EVERY unfetched value in row (all columns). The mutation path uses
 // this on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
 // weight/disposition re-plan exactly like an eager writer's (large-values.md §14).

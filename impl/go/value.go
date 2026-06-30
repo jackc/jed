@@ -91,13 +91,16 @@ const (
 	ValJsonPath
 )
 
-// Unfetched is the on-disk form of a lazily-loaded large value (spec/design/large-values.md §14;
-// spec/fileformat/format.md "Large values") — exactly the record's pointer fields, so the scan
-// layer can resolve it through the pager (and the cost walk can count its chain pages /
-// decompress slabs) without reading the value. Form is the presence tag (tagExternal /
-// tagInlineComp / tagExternalComp); FirstPage/StoredLen describe the chain for the external
-// forms (the payload for plain, the LZ4 block for compressed); RawLen is the decompressed
-// length for the compressed forms; Comp holds the resident LZ4 block for inline-compressed.
+// Unfetched is the on-disk form of a lazily-loaded value (spec/design/large-values.md §14,
+// generalized to every variable-length value by lazy-record.md §5b/L2) — exactly the record's
+// pointer fields (or, for the inline form, its owned body bytes), so the scan layer can resolve
+// it through the pager (and the cost walk can count its chain pages / decompress slabs) without
+// reading the value. Form is the presence tag: 0x00 inline-deferred (an inline-plain value whose
+// decode is deferred — Comp owns its on-disk body bytes, the span after the 0x00 tag; the L2
+// case), tagExternal / tagInlineComp / tagExternalComp the large-value forms. FirstPage/StoredLen
+// describe the chain for the external forms (the payload for plain, the LZ4 block for compressed);
+// RawLen is the decompressed length for the compressed forms; Comp holds the resident LZ4 block
+// for inline-compressed, or the raw body for inline-deferred.
 type Unfetched struct {
 	Form      byte
 	FirstPage uint32
