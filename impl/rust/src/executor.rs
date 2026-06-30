@@ -4,6 +4,7 @@
 //! feature-by-feature (Phases B–E). The result of running a statement is an
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
+use crate::api::Rows;
 use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
@@ -1179,7 +1180,12 @@ pub struct SessionState {
     /// two host-injectable functions (a random source + a clock), each defaulting to the platform
     /// primitive. Tests inject `seeded_random_source` + `fixed_clock` (the `# seed:`/`# clock:`
     /// directives) for byte-identical cross-core output.
-    pub(crate) seam: crate::seam::Seam,
+    ///
+    /// Behind an `Rc` so a streaming cursor's frozen snapshot engine (streaming.md §5) **shares** the
+    /// live session's seam rather than copying it (the seam holds boxed `FnMut` closures and so is not
+    /// `Clone`): a `uuidv7()` / `now()` in a streaming projection then draws from the same injected
+    /// source as the eager path, keeping the result byte-identical under full drain (streaming.md §6).
+    pub(crate) seam: std::rc::Rc<crate::seam::Seam>,
     /// **SessionState** `currval` state (spec/design/sequences.md §6): the last value `nextval`/
     /// `setval(…,true)` produced **in this session** for each sequence (lowercased name). NOT in the
     /// snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
@@ -1286,7 +1292,7 @@ impl SessionState {
             cancel: None,
             max_sql_length: opts.max_sql_length,
             work_mem: opts.work_mem,
-            seam: crate::seam::Seam::default(),
+            seam: std::rc::Rc::new(crate::seam::Seam::default()),
             session_seq: HashMap::new(),
             session_last_name: None,
             pending_seq: std::cell::RefCell::new(HashMap::new()),
@@ -10782,6 +10788,133 @@ impl Engine {
         })
     }
 
+    /// Build a frozen read-snapshot [`Engine`] for a streaming cursor (spec/design/streaming.md §5):
+    /// the VISIBLE main / session-temp / shared-temp snapshots captured **by value** (copy-on-write
+    /// `Arc` clones, so this pins the roots cheaply and they stay stable for the cursor's whole life,
+    /// isolated from later writes on the live handle) with **no open transaction** — so the owned
+    /// engine's reads see exactly the captured frozen state — plus the session envelope the per-row
+    /// eval / the cost meter read: the cost ceilings + the **shared** lifetime gauge (`Rc` clone — so
+    /// streaming cost still counts against `lifetime_max_cost`), the cancel poll (so mid-drain
+    /// cancellation lands), the **shared** entropy/clock seam (`Rc` clone — `uuidv7()`/`now()` draw
+    /// from the same injected source as the eager path), session vars, the time zone, and the
+    /// `currval`/`lastval` session state. The cursor evaluates its filter/projection against this
+    /// owned engine, so the streaming `Rows` is self-contained (`'static`) and never borrows the live
+    /// handle (so it survives `Database::query`'s transient session, streaming.md §5).
+    fn snapshot_engine(&self) -> Engine {
+        let mut e = Engine::from_snapshot(self.read_snap().clone());
+        e.shared_temp_committed = self.shared_temp_read_snap().clone();
+        e.page_size = self.page_size;
+        e.paging = self.paging.clone();
+        e.read_only = self.read_only;
+        let src = &self.session;
+        let dst = &mut e.session;
+        dst.max_cost = src.max_cost;
+        dst.lifetime_max_cost = src.lifetime_max_cost;
+        dst.lifetime_total = src.lifetime_total.clone(); // shared gauge — streaming cost counts (§5)
+        dst.cancel = src.cancel.clone();
+        dst.work_mem = src.work_mem;
+        dst.seam = src.seam.clone(); // shared seam (Rc) — uuid/clock draw from the injected source
+        dst.vars = src.vars.clone();
+        dst.time_zone = src.time_zone.clone();
+        dst.session_seq = src.session_seq.clone(); // currval/lastval reads stay faithful
+        dst.session_last_name = src.session_last_name.clone();
+        dst.temp_committed = self.temp_read_snap().clone();
+        e
+    }
+
+    /// Try to serve `ast` as a lazy **streaming** query (spec/design/streaming.md §3/§4, S3) — the
+    /// `query()` fast lane. Returns `Some(Rows)` when `ast` is a top-level read `SELECT` whose plan is
+    /// the single-table, no-blocking-operator streaming scan (the same shape `exec_select_plan` routes
+    /// to [`exec_streaming_scan`](Engine::exec_streaming_scan)); else `None`, and the caller falls back
+    /// to the materialized `execute()` path → a `Buffered` cursor. The conformance corpus drives
+    /// `execute()`, so streaming is invisible to it; this lane only affects `query()` and is per-core
+    /// unit-tested to yield the IDENTICAL rows + total cost under full drain (streaming.md §6), while a
+    /// caller that stops early reads (and charges) less. A write-classified statement — including a
+    /// `nextval`/`setval` SELECT ([`stmt_is_write`]) — never streams (it must take the write gate and
+    /// publish, sequences.md §4), so the frozen snapshot never has to reproduce a sequence advance.
+    pub(crate) fn try_streaming_query(
+        &self,
+        ast: &Statement,
+        params: &[Value],
+    ) -> Result<Option<Rows>> {
+        // Only a bare top-level SELECT streams: a set operation / WITH / VALUES / DML buffers (it is
+        // blocking or not a scan); a write-classified SELECT (a sequence mutator) buffers too.
+        let Statement::Select(sel) = ast else {
+            return Ok(None);
+        };
+        if stmt_is_write(ast) {
+            return Ok(None);
+        }
+        let qe = QueryExpr::Select(Box::new(sel.clone()));
+        let mut ptypes = ParamTypes::default();
+        let QueryPlan::Select(mut sp) = self.plan_query(&qe, None, &[], &mut ptypes)? else {
+            return Ok(None);
+        };
+        if !streaming_scan_eligible(&sp) {
+            return Ok(None);
+        }
+        let bound_params = bind_params(params, &ptypes.finalize()?)?;
+        // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
+        // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
+        // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
+        // added to the cursor's reported cost below (mirroring `run_query_expr`'s `r.cost += …`).
+        let mut subquery_cost: i64 = 0;
+        self.fold_uncorrelated_in_select(
+            &mut sp,
+            &bound_params,
+            CteCtx::empty(),
+            &mut subquery_cost,
+        )?;
+
+        // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical to
+        // `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
+        let reverse = sp.pk_reverse;
+        let (bound, empty) = match &sp.rel_bounds[0] {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, &bound_params, &[]) {
+                Some(b) => (b, false),
+                None => (KeyBound::unbounded(), true),
+            },
+            // Eligibility already excludes index/GIN/GiST bounds; this is defensive.
+            Some(_) => return Ok(None),
+            None => (KeyBound::unbounded(), false),
+        };
+        let snap = self.snapshot_engine();
+        let (overlap, slabs) = if empty {
+            (0, 0)
+        } else {
+            snap.store(&sp.rels[0].table_name)
+                .overlap_scan_units(&bound, &sp.rel_masks[0])?
+        };
+        let scan = snap
+            .store(&sp.rels[0].table_name)
+            .store_scan(bound, reverse);
+        let mut meter = snap.session.new_meter();
+        meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
+        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+
+        let limit = sp.limit;
+        let offset = sp.offset.unwrap_or(0);
+        let distinct = sp.distinct;
+        let column_names = sp.column_names.clone();
+        let done = empty || limit == Some(0);
+        let stream = StreamingScan {
+            engine: snap,
+            plan: sp,
+            params: bound_params,
+            rng: std::cell::Cell::new(crate::seam::StmtRng::new()),
+            scan,
+            meter,
+            offset,
+            limit,
+            distinct,
+            seen: std::collections::HashSet::new(),
+            passed: 0,
+            produced: 0,
+            done,
+        };
+        Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
+    }
+
     /// Streaming secondary-index-order scan (spec/design/cost.md §3 "secondary-index order"): an
     /// `ORDER BY` the PK scan does NOT satisfy but a B-tree index does, with a `LIMIT` (the gate —
     /// `plan.index_order` is `Some`). Walks the index store forward in key order (the indexed
@@ -11290,26 +11423,7 @@ impl Engine {
         // elided), so it short-circuits a top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY,
         // a no-ORDER-BY DISTINCT, aggregate, or join must see every row (sort/dedup/group/combine), so
         // it keeps the eager path below. page_read stays the full block; only the row reads short-circuit.
-        if plan.rels.len() == 1
-            && plan.joins.is_empty()
-            && !plan.is_agg
-            && !plan.has_window
-            && (plan.pk_ordered || (!plan.distinct && plan.order.is_empty() && plan.limit.is_some()))
-            // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
-            // gin.md §6): it reads the full admitted set via the eager path below.
-            && !matches!(
-                plan.rel_bounds[0],
-                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
-            )
-            // A set-returning relation is generated, not scanned — it takes the eager path
-            // (functions.md §10); the streaming reader assumes a table store.
-            && plan.rels[0].srf.is_none()
-            // A CTE reference is a computed/buffered source, not a table store — the eager path
-            // (cte.md §5) delivers its rows; the streaming reader assumes a store.
-            && plan.rels[0].cte.is_none()
-            // A derived table is a computed source too (grammar.md §42) — eager path.
-            && plan.rels[0].derived.is_none()
-        {
+        if streaming_scan_eligible(plan) {
             return self.exec_streaming_scan(plan, &env, &mut meter, params);
         }
 
@@ -19245,6 +19359,146 @@ struct EvalEnv<'a> {
     /// The statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at any
     /// nesting depth delivers a CTE's rows. `CteCtx::empty()` for every non-`WITH` statement.
     ctes: CteCtx<'a>,
+}
+
+/// Whether `plan` is the single-table, no-blocking-operator **streaming scan** shape
+/// (spec/design/cost.md §3, streaming.md §4) — a single relation, no join / aggregate / window, an
+/// output order the primary-key scan already yields (`pk_ordered`, or no `ORDER BY` with a `LIMIT`
+/// short-circuit), no index/GIN/GiST bound (those read the full admitted set eagerly), and a real
+/// table store (not an SRF / CTE / derived source). Both [`exec_select_plan`](Engine::exec_select_plan)
+/// (which routes to the eager `exec_streaming_scan`) and [`try_streaming_query`](Engine::try_streaming_query)
+/// (the lazy `query()` lane) gate on this ONE predicate, so the two never drift.
+fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
+    plan.rels.len() == 1
+        && plan.joins.is_empty()
+        && !plan.is_agg
+        && !plan.has_window
+        && (plan.pk_ordered || (!plan.distinct && plan.order.is_empty() && plan.limit.is_some()))
+        && !matches!(
+            plan.rel_bounds[0],
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+        )
+        && plan.rels[0].srf.is_none()
+        && plan.rels[0].cte.is_none()
+        && plan.rels[0].derived.is_none()
+}
+
+/// The lazy pull pipeline behind a streaming [`Rows`](crate::Rows) cursor (spec/design/streaming.md
+/// §3/§4, S3): [`exec_streaming_scan`](Engine::exec_streaming_scan)'s per-row loop turned inside out
+/// so the CALLER pulls each row. It owns a frozen snapshot [`Engine`] (eval's `exec`, so the cursor
+/// is self-contained and outlives the handle — streaming.md §5), a pull B-tree
+/// [`StoreScan`](crate::storage::StoreScan) over that snapshot (the scan pin), the resolved + folded
+/// plan, bound params, a per-statement entropy cell, and its own cost [`Meter`]. Each
+/// [`next_row`](crate::cursor::RowStream::next_row) runs scan → resolve touched columns → `WHERE` →
+/// project for ONE output row, accruing the identical cost units at the identical sites as the eager
+/// path — so a fully-drained streaming query observes the same rows + total cost (streaming.md §6),
+/// while a caller that stops early reads (and charges) less.
+struct StreamingScan {
+    engine: Engine,
+    plan: SelectPlan,
+    params: Vec<Value>,
+    rng: std::cell::Cell<crate::seam::StmtRng>,
+    scan: crate::storage::StoreScan,
+    meter: Meter,
+    offset: i64,
+    limit: Option<i64>,
+    distinct: bool,
+    seen: std::collections::HashSet<Vec<Value>>,
+    /// Survivors past the filter+dedup so far (the `OFFSET` runs against this), like
+    /// `exec_streaming_scan`'s `passed`.
+    passed: i64,
+    /// Output rows produced so far (the `LIMIT` short-circuit runs against this).
+    produced: i64,
+    /// Set once the scan is exhausted, the `LIMIT` window is filled, or the bound is empty —
+    /// after which `next_row` short-circuits without faulting another leaf.
+    done: bool,
+}
+
+impl crate::cursor::RowStream for StreamingScan {
+    fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+        if self.done {
+            return Ok(None);
+        }
+        // The LIMIT short-circuit: once the window is full, stop WITHOUT pulling another row — so no
+        // further leaf is faulted (the streaming early-exit win; cost.md §3 "LIMIT short-circuit").
+        if let Some(l) = self.limit
+            && self.produced >= l
+        {
+            self.done = true;
+            return Ok(None);
+        }
+        let env = EvalEnv {
+            exec: &self.engine,
+            params: &self.params,
+            outer: &[],
+            rng: &self.rng,
+            ctes: CteCtx::empty(),
+        };
+        let mask = &self.plan.rel_masks[0];
+        loop {
+            let (_key, mut row) = match self.scan.next()? {
+                Some(p) => p,
+                None => {
+                    self.done = true;
+                    return Ok(None);
+                }
+            };
+            self.meter.guard()?; // enforce the cost ceiling / cancellation per scanned row
+            self.meter.charge(COSTS.storage_row_read);
+            // Materialize the touched columns left unfetched by the lazy load (large-values.md §14);
+            // the chain reads were already metered in the up-front block (cost.md §3).
+            if TableStore::needs_resolution(&row, mask) {
+                self.scan.resolve_columns(&mut row, mask)?;
+            }
+            let keep = match &self.plan.filter {
+                Some(f) => f.eval(&row, &env, &mut self.meter)?.is_true(),
+                None => true,
+            };
+            if !keep {
+                continue;
+            }
+            if self.distinct {
+                // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged
+                // even for a duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT
+                // window the survivors — exactly `exec_streaming_scan`.
+                let mut projected = Vec::with_capacity(self.plan.projections.len());
+                for p in &self.plan.projections {
+                    projected.push(p.eval(&row, &env, &mut self.meter)?);
+                }
+                if !self.seen.insert(projected.clone()) {
+                    continue;
+                }
+                self.passed += 1;
+                if self.passed <= self.offset {
+                    continue;
+                }
+                self.meter.charge(COSTS.row_produced);
+                self.produced += 1;
+                return Ok(Some(projected));
+            }
+            self.passed += 1;
+            if self.passed <= self.offset {
+                continue;
+            }
+            self.meter.charge(COSTS.row_produced);
+            let mut projected = Vec::with_capacity(self.plan.projections.len());
+            for p in &self.plan.projections {
+                projected.push(p.eval(&row, &env, &mut self.meter)?);
+            }
+            self.produced += 1;
+            return Ok(Some(projected));
+        }
+    }
+
+    fn cost(&self) -> i64 {
+        self.meter.accrued
+    }
+
+    fn close(&mut self) {
+        // The pinned snapshot is owned by `self.engine` / `self.scan` and released on `Drop`; mark
+        // done so any further `next_row` is a no-op (streaming.md §5, idempotent).
+        self.done = true;
+    }
 }
 
 /// Build the constant `RExpr` for a folded uncorrelated-subquery value (§26). The static type

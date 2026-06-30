@@ -316,6 +316,17 @@ export class TableStore {
     this.rows.scanRangeRev(b, this.leafSrc(), visit);
   }
 
+  // scanIter is the PULL form of scanRange / scanRangeRev — a generator yielding (key, row) within b
+  // in ascending (reverse=false) or descending (reverse=true) key order (the S2 pull cursor wrapped
+  // for the S3 streaming pipeline, spec/design/streaming.md §4). The persistent map shares structure,
+  // so this store (a snapshot clone) pins its pages for the cursor's life (transactions.md §5); a leaf
+  // faults through the pool only on descent, so a caller that stops early faults no leaves past the
+  // stop (the LIMIT short-circuit, cost.md §3).
+  scanIter(b: KeyBound, reverse: boolean): Generator<[Uint8Array, Row]> {
+    const src = this.leafSrc();
+    return reverse ? this.rows.scanRangeRevIter(b, src) : this.rows.scanRangeIter(b, src);
+  }
+
   // treeRoot is the root B-tree node of this store, for the page-backed serializer
   // (spec/fileformat/format.md). null for an empty table.
   treeRoot(): PNode | null {

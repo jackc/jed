@@ -525,15 +525,13 @@ impl PMap {
     /// A **pull** cursor over the `(key, row)` pairs within `b`, in ascending (`reverse = false`) or
     /// descending (`reverse = true`) key order — the pull-model equivalent of
     /// [`scan_range`](PMap::scan_range) / [`scan_range_rev`](PMap::scan_range_rev) (the S2 pull
-    /// B-tree scan cursor, spec/design/streaming.md §3/§5). It owns the moved `b` and borrows `src`
-    /// for the life of the traversal; the first node faulted is the root (always resident). See
+    /// B-tree scan cursor, spec/design/streaming.md §3/§5). It owns the moved `b` and the `Arc<Node>`
+    /// frames it descends into, so it borrows nothing and is `'static` — the leaf source is supplied
+    /// **per [`next`](RangeCursor::next) call** (rebuilt cheaply by the caller from its own paging
+    /// context, storage.rs), which lets a streaming cursor own its snapshot and outlive the handle
+    /// (streaming.md §5). The first node on the stack is the root (always resident). See
     /// [`RangeCursor`].
-    pub(crate) fn range_cursor<'a>(
-        &self,
-        b: KeyBound,
-        src: Option<&'a dyn LeafSource>,
-        reverse: bool,
-    ) -> RangeCursor<'a> {
+    pub(crate) fn range_cursor(&self, b: KeyBound, reverse: bool) -> RangeCursor {
         let mut stack = Vec::new();
         if let Some(root) = &self.root {
             stack.push(ScanFrame::new(root.clone(), &b));
@@ -541,7 +539,6 @@ impl PMap {
         RangeCursor {
             stack,
             bound: b,
-            src,
             reverse,
         }
     }
@@ -611,18 +608,18 @@ impl ScanFrame {
 /// leaves past where it stopped (the genuine LIMIT short-circuit, cost.md §3). It clones each
 /// `(key, row)` out (owned), like [`PMap::iter`], because under demand paging a faulted leaf may be
 /// evicted between `next` calls (pager.md §4).
-pub(crate) struct RangeCursor<'a> {
+pub(crate) struct RangeCursor {
     stack: Vec<ScanFrame>,
     bound: KeyBound,
-    src: Option<&'a dyn LeafSource>,
     reverse: bool,
 }
 
-impl RangeCursor<'_> {
+impl RangeCursor {
     /// The next in-bound `(key, row)` pair, or `None` when the traversal is exhausted. Each call
-    /// advances the frame stack until it emits a row, descends into (and faults) a child, or pops an
-    /// exhausted frame.
-    pub(crate) fn next(&mut self) -> Result<Option<(Vec<u8>, Row)>> {
+    /// advances the frame stack until it emits a row, descends into (and faults `src`) a child, or
+    /// pops an exhausted frame. `src` is supplied per call (rebuilt cheaply by the caller) so the
+    /// cursor itself borrows nothing — see [`RangeCursor`].
+    pub(crate) fn next(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<(Vec<u8>, Row)>> {
         enum Step {
             Emit(Vec<u8>, Row),
             Descend(usize),
@@ -673,7 +670,7 @@ impl RangeCursor<'_> {
                 Step::Emit(k, v) => return Ok(Some((k, v))),
                 Step::Descend(i) => {
                     let parent = self.stack.last().expect("top frame present for descend");
-                    let ch = child(&parent.node, i, self.src)?;
+                    let ch = child(&parent.node, i, src)?;
                     self.stack.push(ScanFrame::new(ch, &self.bound));
                 }
                 Step::Pop => {
@@ -1511,9 +1508,9 @@ mod tests {
         };
         // Drain the pull cursor into the same shape.
         let pulled = |b: KeyBound, rev: bool| -> Vec<(u64, i64)> {
-            let mut c = pm.range_cursor(b, None, rev);
+            let mut c = pm.range_cursor(b, rev);
             let mut out = Vec::new();
-            while let Some((k, r)) = c.next().unwrap() {
+            while let Some((k, r)) = c.next(None).unwrap() {
                 out.push((decode(&k), val(&r)));
             }
             out
@@ -1577,10 +1574,10 @@ mod tests {
         // full sequence (forward and reverse), proving the pull short-circuit (the streaming win).
         for rev in [false, true] {
             let full = pushed(&KeyBound::unbounded(), rev);
-            let mut c = pm.range_cursor(KeyBound::unbounded(), None, rev);
+            let mut c = pm.range_cursor(KeyBound::unbounded(), rev);
             let mut got = Vec::new();
             for _ in 0..3 {
-                let (k, r) = c.next().unwrap().unwrap();
+                let (k, r) = c.next(None).unwrap().unwrap();
                 got.push((decode(&k), val(&r)));
             }
             assert_eq!(

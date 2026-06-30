@@ -103,6 +103,7 @@ import {
   versionSkew,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
+import { Cursor, type RowSource } from "./cursor.ts";
 import {
   instantToLocalMicros,
   loadTimeZoneData as loadTimeZoneDataGlobal,
@@ -1756,6 +1757,85 @@ export class SessionState {
   }
   clearClockSource(): void {
     this.seam.clock = undefined;
+  }
+}
+
+// streamingScanEligible reports whether plan is the single-table, no-blocking-operator STREAMING SCAN
+// shape (spec/design/cost.md §3, streaming.md §4) — a single relation, no join/aggregate/window, an
+// output order the primary-key scan already yields (pkOrdered, or no ORDER BY with a LIMIT
+// short-circuit), no index/GIN/GiST bound (those read the full admitted set eagerly), and a real table
+// store (not an SRF / CTE / derived source). Both execSelectPlan (which routes to the eager
+// execStreamingScan) and tryStreamingQuery (the lazy query() lane) gate on this ONE predicate, so the
+// two never drift.
+function streamingScanEligible(plan: SelectPlan): boolean {
+  return (
+    plan.rels.length === 1 &&
+    plan.joins.length === 0 &&
+    !plan.isAgg &&
+    !plan.hasWindow &&
+    (plan.pkOrdered || (!plan.distinct && plan.order.length === 0 && plan.limit !== null)) &&
+    plan.relBounds[0]?.kind !== "index" &&
+    plan.relBounds[0]?.kind !== "gin" &&
+    plan.relBounds[0]?.kind !== "gist" &&
+    plan.rels[0]!.srf === undefined &&
+    plan.rels[0]!.cte === undefined &&
+    plan.rels[0]!.derived === undefined
+  );
+}
+
+// streamRows is the lazy pull pipeline behind a streaming cursor (spec/design/streaming.md §3/§4, S3):
+// execStreamingScan's per-row loop as a function* generator (the natural pull form in JS). It scans the
+// snapshot store, resolves touched columns, applies WHERE, and projects — YIELDING ONE output row at a
+// time, accruing the identical cost units at the identical sites as the eager path. So a fully-drained
+// streaming query observes the same rows + total cost (streaming.md §6), while a caller that stops early
+// abandons the generator (its for-of returns the inner scanIter) and faults no further leaves. The
+// LIMIT check sits AFTER the yield, so once the window is full the generator returns BEFORE the for-of
+// pulls another row (matching execStreamingScan's stop-after-the-limit-th-row, cost.md §3).
+function* streamRows(
+  sp: SelectPlan,
+  env: EvalEnv,
+  meter: Meter,
+  store: TableStore,
+  bound: KeyBound,
+  empty: boolean,
+): Generator<Value[]> {
+  if (empty || sp.limit === 0n) return;
+  const offset = sp.offset ?? 0n;
+  const distinct = sp.distinct;
+  const seen = new Set<string>();
+  let passed = 0n;
+  let produced = 0n;
+  // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
+  for (const [, rawRow] of store.scanIter(bound, sp.pkReverse)) {
+    meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+    meter.charge(COSTS.storageRowRead);
+    // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
+    // reads were already metered in the up-front block (cost.md §3).
+    const row = store.resolveColumns(rawRow, sp.relMasks[0]!);
+    if (sp.filter !== null && !isTrue(evalExpr(sp.filter, row, env, meter))) continue;
+    if (distinct) {
+      // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even for a
+      // duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window the survivors.
+      const tuple = sp.projections.map((p) => evalExpr(p, row, env, meter));
+      const key = distinctRowKey(tuple);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      passed += 1n;
+      if (passed <= offset) continue;
+      meter.charge(COSTS.rowProduced);
+      produced += 1n;
+      yield tuple;
+    } else {
+      passed += 1n;
+      if (passed <= offset) continue;
+      meter.charge(COSTS.rowProduced);
+      produced += 1n;
+      yield sp.projections.map((p) => evalExpr(p, row, env, meter));
+    }
+    // The LIMIT short-circuit (cost.md §3): once the window is full, stop WITHOUT pulling another row —
+    // so no further leaf is faulted (the streaming early-exit win). The check is after the yield, so the
+    // for-of pulls the next row only when another is actually needed.
+    if (sp.limit !== null && produced >= sp.limit) return;
   }
 }
 
@@ -9281,6 +9361,105 @@ export class Engine {
   // deliberate cost change. pageRead is the full block (the bound's node count); only the row reads
   // short-circuit. Rows match the eager path exactly: the offset..offset+limit slice of the
   // primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's result).
+  // snapshotEngine builds a frozen read-snapshot Engine for a streaming cursor (spec/design/streaming.md
+  // §5): the VISIBLE main / session-temp / shared-temp snapshots captured (the snapshots are immutable
+  // copy-on-write, so sharing the references pins the roots and keeps them stable for the cursor's life,
+  // isolated from later writes on the live handle) with NO open transaction — so the engine's reads see
+  // exactly the captured frozen state — plus the session envelope the per-row eval / the cost meter read:
+  // the cost ceilings + the SHARED lifetime gauge (the LifetimeBudget object — so streaming cost still
+  // counts against lifetimeMaxCost), the SHARED seam (same object — uuid/clock draw from the injected
+  // source), session vars, the time zone, and the currval/lastval session state. The cursor evaluates
+  // its filter/projection against this engine, so the streaming cursor is self-contained — it does not
+  // reference the live handle, so it survives Database.query's transient session (streaming.md §5).
+  snapshotEngine(): Engine {
+    const e = new Engine();
+    e.committed = this.readSnap();
+    e.sharedTempCommitted = this.sharedTempSnap();
+    e.pageSize = this.pageSize;
+    e.paging = this.paging;
+    e.readOnly = this.readOnly;
+    e.sharedTempMem = this.sharedTempMem;
+    const src = this.session;
+    const dst = e.session;
+    dst.maxCost = src.maxCost;
+    dst.lifetime = src.lifetime; // shared LifetimeBudget — streaming cost counts (§5)
+    dst.workMem = src.workMem;
+    dst.seam = src.seam; // shared seam — uuid/clock draw from the injected source
+    dst.vars = src.vars;
+    dst.timeZone = src.timeZone;
+    dst.sessionSeq = src.sessionSeq; // currval/lastval reads stay faithful
+    dst.sessionLastName = src.sessionLastName;
+    dst.tempCommitted = this.tempSnap();
+    return e;
+  }
+
+  // tryStreamingQuery tries to serve stmt as a lazy STREAMING query (spec/design/streaming.md §3/§4,
+  // S3) — the query() fast lane. Returns {columnNames, cursor} when stmt is a top-level read SELECT
+  // whose plan is the single-table no-blocking-operator streaming scan (the same shape execSelectPlan
+  // routes to execStreamingScan); else null, and the caller falls back to the materialized execute()
+  // path → a buffered cursor. (It returns a Cursor, not a Rows, to avoid the executor↔api import cycle.)
+  // The conformance corpus drives execute(), so streaming is invisible to it; this lane only affects
+  // query() and is unit-tested to yield the IDENTICAL rows + total cost under full drain (streaming.md
+  // §6), while a caller that stops early reads (and charges) less. A write-classified statement — incl.
+  // a nextval/setval SELECT (stmtIsWrite) — never streams (it must take the write gate and publish,
+  // sequences.md §4), so the frozen snapshot never has to reproduce a sequence advance.
+  tryStreamingQuery(
+    stmt: Statement,
+    params: Value[],
+  ): { columnNames: string[]; cursor: Cursor } | null {
+    if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
+    const ptypes = new ParamTypes();
+    const plan = this.planQuery(stmt, null, [], ptypes);
+    if (plan.kind !== "select" || !streamingScanEligible(plan)) return null;
+    const sp = plan;
+    const bound = bindParams(params, ptypes.finalize());
+    // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
+    // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
+    // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
+    // added to the cursor's reported cost below (mirroring runQueryExpr's r.cost += …).
+    const subqueryCost = { value: 0n };
+    this.foldUncorrelatedInSelect(sp, bound, EMPTY_CTE_CTX, subqueryCost);
+
+    // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical to
+    // execStreamingScan. An empty bound (e.g. pk = NULL) admits no row.
+    let keyB: KeyBound = unboundedBound();
+    let empty = false;
+    const sb = sp.relBounds[0]!;
+    if (sb !== null && sb.kind === "pk") {
+      const b = buildKeyBound(sb.pk, bound, []);
+      if (b === null) empty = true;
+      else keyB = b;
+    }
+    const snap = this.snapshotEngine();
+    const store = snap.lkpStore(sp.rels[0]!.tableName);
+    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(keyB, sp.relMasks[0]!);
+    const meter = snap.session.newMeter();
+    meter.accrued = subqueryCost.value; // the folded constant cost (lifetime already charged)
+    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+
+    const env: EvalEnv = {
+      params: bound,
+      outer: [],
+      runSubquery: (p, o) => snap.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      seam: snap.session.seam,
+      rng: new StmtRng(),
+      ctes: EMPTY_CTE_CTX,
+      exec: snap,
+    };
+    const gen = streamRows(sp, env, meter, store, keyB, empty);
+    const source: RowSource = {
+      nextRow: () => {
+        const r = gen.next();
+        return r.done ? undefined : r.value;
+      },
+      cost: () => meter.accrued,
+      close: () => {
+        gen.return(undefined);
+      },
+    };
+    return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
+  }
+
   private execStreamingScan(
     plan: SelectPlan,
     env: EvalEnv,
@@ -9775,26 +9954,7 @@ export class Engine {
     // DISTINCT streams too: the dedup runs in scan order (the sort elided), so it short-circuits a
     // top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY, a no-ORDER-BY DISTINCT, aggregate,
     // or join must see every row, so it keeps the eager path below. pageRead stays the full block.
-    if (
-      plan.rels.length === 1 &&
-      plan.joins.length === 0 &&
-      !plan.isAgg &&
-      !plan.hasWindow &&
-      (plan.pkOrdered || (!plan.distinct && plan.order.length === 0 && plan.limit !== null)) &&
-      // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
-      // gin.md §6): it reads the full admitted set via the eager path below.
-      plan.relBounds[0]?.kind !== "index" &&
-      plan.relBounds[0]?.kind !== "gin" &&
-      plan.relBounds[0]?.kind !== "gist" &&
-      // A set-returning relation is generated, not scanned — it takes the eager path
-      // (functions.md §10); the streaming reader assumes a table store.
-      plan.rels[0]!.srf === undefined &&
-      // A CTE reference is a computed/buffered source, not a table store — the eager path
-      // (cte.md §5) delivers its rows; the streaming reader assumes a store.
-      plan.rels[0]!.cte === undefined &&
-      // A derived table is a computed source too (grammar.md §42) — eager path.
-      plan.rels[0]!.derived === undefined
-    ) {
+    if (streamingScanEligible(plan)) {
       return this.execStreamingScan(plan, env, meter, params);
     }
 

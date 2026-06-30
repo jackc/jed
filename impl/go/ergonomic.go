@@ -236,11 +236,17 @@ func (r *Rows) Values() ([]any, error) {
 // faults once the cursor streams). Check it after the loop.
 func (r *Rows) Err() error { return r.err }
 
-// Close releases the cursor (its pinned read snapshot once streaming — streaming.md §5). A no-op
-// over today's materialized result, but the contract the streaming cursor needs — and what
-// All()/Collect close automatically on loop exit.
+// Close releases the cursor's pinned read snapshot (spec/design/streaming.md §5): it closes the
+// underlying cursor and deregisters the reader-liveness watermark pin (if any), advancing
+// oldestLiveTxid. A no-op for a buffered cursor (it pins nothing). Idempotent. The ergonomic
+// iterators (All/Collect/Scan) close automatically on loop exit; a raw streaming Rows must be Closed
+// (Go has no destructor), or its pin is held until then.
 func (r *Rows) Close() error {
 	r.cursor.close()
+	if r.onClose != nil {
+		r.onClose()
+		r.onClose = nil
+	}
 	return nil
 }
 

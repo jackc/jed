@@ -39,6 +39,40 @@ impl LeafSource for PagedSource<'_> {
     }
 }
 
+/// A **pull** scan cursor over a [`TableStore`]'s `(key, row)` pairs within a bound (the S3
+/// streaming cursor, spec/design/streaming.md §4/§5). It **owns** an O(1) snapshot clone of the
+/// store — the copy-on-write persistent map shares structure, so the clone pins the root and keeps
+/// its pages alive for the cursor's whole life (transactions.md §5) — and an underlying
+/// [`RangeCursor`] over that snapshot's map. Each [`next`](StoreScan::next) rebuilds the leaf source
+/// from the owned snapshot's `paging`/`col_types` (the disjoint-field [`make_src`] discipline), so
+/// the cursor borrows nothing and is `'static`: a streaming `Rows` can own it and outlive the handle
+/// that produced it. Built by [`TableStore::store_scan`].
+pub(crate) struct StoreScan {
+    store: TableStore,
+    cursor: crate::pmap::RangeCursor,
+}
+
+impl StoreScan {
+    /// The next in-bound `(key, row)` pair, or `None` at end. Yields the EXACT same sequence as the
+    /// push [`scan_range`](TableStore::scan_range) / [`scan_range_rev`](TableStore::scan_range_rev)
+    /// (the S2 contract). Faults a clean leaf through the snapshot's pool only when the traversal
+    /// descends into it, so a caller that stops pulling early faults no leaves past the stop (the
+    /// LIMIT short-circuit, cost.md §3). The returned row is **owned** (cloned out), eviction-safe
+    /// under demand paging (pager.md §4), exactly like [`PMap::iter`].
+    pub(crate) fn next(&mut self) -> Result<Option<(Vec<u8>, Row)>> {
+        let src = make_src(&self.store.paging, &self.store.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.cursor.next(src_ref)
+    }
+
+    /// Materialize the unfetched values in the columns `mask` selects, in place, through the snapshot's
+    /// pager (large-values.md §14) — the per-row resolve step of a streaming pipeline. Delegates to the
+    /// owned snapshot store, so it reads through the same pinned pages the scan walks.
+    pub(crate) fn resolve_columns(&self, row: &mut Row, mask: &[bool]) -> Result<()> {
+        self.store.resolve_columns(row, mask)
+    }
+}
+
 /// Build the leaf source from a store's paging context + column types (disjoint from `rows`). Free
 /// function (not a `&self` method) so the borrow is of `paging`/`col_types` only — `rows` stays free
 /// to be mutated alongside it.
@@ -369,6 +403,21 @@ impl TableStore {
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.scan_range_rev(b, src_ref, visit)
+    }
+
+    /// A **pull** scan cursor over this store's `(key, row)` pairs within `b`, in ascending
+    /// (`reverse = false`) or descending (`reverse = true`) key order — the pull-model equivalent of
+    /// [`scan_range`](TableStore::scan_range) (spec/design/streaming.md §4/§5, the S3 streaming
+    /// cursor). It **owns an O(1) snapshot clone** of this store (the persistent map shares
+    /// structure, so the clone pins the root and keeps its pages alive for the cursor's life —
+    /// transactions.md §5), and rebuilds the leaf source per [`next`](StoreScan::next) call from that
+    /// owned snapshot's paging context, so the returned `StoreScan` borrows nothing and is `'static`.
+    /// This is what lets a streaming `Rows` cursor outlive the handle that produced it.
+    pub(crate) fn store_scan(&self, b: KeyBound, reverse: bool) -> StoreScan {
+        StoreScan {
+            cursor: self.rows.range_cursor(b, reverse),
+            store: self.clone(),
+        }
     }
 
     /// The root B-tree node of this table's store, for the page-backed serializer

@@ -13398,6 +13398,242 @@ func boundEmpty(b keyBound) bool {
 // short-circuit; only the row reads do. Rows match the eager path exactly: the offset..offset+limit
 // slice of the primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's
 // result — the stored PK order is the requested order).
+// streamingScanEligible reports whether plan is the single-table, no-blocking-operator STREAMING SCAN
+// shape (spec/design/cost.md §3, streaming.md §4) — a single relation, no join/aggregate/window, an
+// output order the primary-key scan already yields (pkOrdered, or no ORDER BY with a LIMIT
+// short-circuit), no index/GIN/GiST bound (those read the full admitted set eagerly), and a real
+// table store (not an SRF / CTE / derived source). Both execSelectPlan (which routes to the eager
+// execStreamingScan) and tryStreamingQuery (the lazy Query lane) gate on this ONE predicate, so the
+// two never drift.
+func streamingScanEligible(plan *selectPlan) bool {
+	return len(plan.rels) == 1 && len(plan.joins) == 0 &&
+		!plan.isAgg && !plan.hasWindow &&
+		(plan.pkOrdered || (!plan.distinct && len(plan.order) == 0 && plan.limit != nil)) &&
+		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil && plan.relBounds[0].gist == nil)) &&
+		plan.rels[0].srf == nil &&
+		plan.rels[0].cte == nil &&
+		plan.rels[0].derived == nil
+}
+
+// snapshotEngine builds a frozen read-snapshot engine for a streaming cursor (spec/design/streaming.md
+// §5): the VISIBLE main / session-temp / shared-temp snapshots captured (the snapshots are immutable
+// copy-on-write, so sharing the pointers pins the roots cheaply and keeps them stable for the cursor's
+// life, isolated from later writes on the live handle) with NO open transaction — so the engine's
+// reads see exactly the captured frozen state — plus the session envelope the per-row eval / the cost
+// meter read: the cost ceilings + the SHARED lifetime gauge (the *int64 pointer — so streaming cost
+// still counts against LifetimeMaxCost), the cancel poll, the entropy/clock seam, session vars, the
+// time zone, and the currval/lastval session state. The cursor evaluates its filter/projection against
+// this engine, so the streaming Rows is self-contained (it does not reference the live handle, so it
+// survives Database.QueryValues's transient session, streaming.md §5).
+func (db *engine) snapshotEngine() *engine {
+	s := db.session // struct copy: shares the seam (func fields), the lifetime gauge (pointer), and the
+	// read-only maps (vars/sessionSeq); reset the per-statement / transaction state below.
+	s.tx = nil
+	s.readPin = nil
+	s.pendingSeq = map[string]*sequenceDef{}
+	s.pendingCurrval = map[string]int64{}
+	s.pendingLastName = ""
+	s.tempCommitted = db.tempSnap()
+	return &engine{
+		committed:           db.readSnap(),
+		session:             s,
+		pageSize:            db.pageSize,
+		paging:              db.paging,
+		readOnly:            db.readOnly,
+		sharedTempCommitted: db.sharedTempSnap(),
+		sharedTempMem:       db.sharedTempMem,
+	}
+}
+
+// tryStreamingQuery tries to serve stmt as a lazy STREAMING query (spec/design/streaming.md §3/§4, S3)
+// — the Query fast lane. Returns (rows, true, nil) when stmt is a top-level read SELECT whose plan is
+// the single-table no-blocking-operator streaming scan (the same shape execSelectPlan routes to
+// execStreamingScan); else (nil, false, nil), and the caller falls back to the materialized Execute
+// path → a buffered cursor. The conformance corpus drives Execute, so streaming is invisible to it;
+// this lane only affects Query and is unit-tested to yield the IDENTICAL rows + total cost under full
+// drain (streaming.md §6), while a caller that stops early reads (and charges) less. A write-classified
+// statement — incl. a nextval/setval SELECT (stmtIsWrite) — never streams (it must take the write gate
+// and publish, sequences.md §4), so the frozen snapshot never has to reproduce a sequence advance.
+func (db *engine) tryStreamingQuery(stmt statement, params []Value) (*Rows, bool, error) {
+	if stmt.Select == nil || stmtIsWrite(stmt) {
+		return nil, false, nil
+	}
+	ptypes := &paramTypes{}
+	plan, err := db.planQuery(queryExpr{Select: stmt.Select}, nil, nil, ptypes)
+	if err != nil {
+		return nil, false, err
+	}
+	if plan.sel == nil || !streamingScanEligible(plan.sel) {
+		return nil, false, nil
+	}
+	sp := plan.sel
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return nil, false, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return nil, false, err
+	}
+	// Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
+	// uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
+	// fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
+	// added to the cursor's reported cost below (mirroring runQueryExpr's r.cost += …).
+	var subqueryCost int64
+	if err := db.foldUncorrelatedInSelect(sp, bound, cteCtx{}, &subqueryCost); err != nil {
+		return nil, false, err
+	}
+
+	// Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical to
+	// execStreamingScan. An empty bound (e.g. pk = NULL) admits no row.
+	b := unboundedBound()
+	empty := false
+	if sp.relBounds[0] != nil && sp.relBounds[0].pk != nil {
+		b, empty = db.buildKeyBound(sp.relBounds[0].pk, bound, nil)
+	}
+	snap := db.snapshotEngine()
+	store := snap.lkpStore(sp.rels[0].tableName)
+	overlap, slabs := 0, 0
+	if !empty {
+		if overlap, slabs, err = store.OverlapScanUnits(b, sp.relMasks[0]); err != nil {
+			return nil, false, err
+		}
+	}
+	meter := snap.session.newMeter()
+	meter.Accrued = subqueryCost // the folded constant cost (lifetime already charged)
+	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
+
+	var offset int64
+	if sp.offset != nil {
+		offset = *sp.offset
+	}
+	sc := &streamingCursor{
+		eng:      snap,
+		plan:     sp,
+		env:      &evalEnv{exec: snap, params: bound, outer: nil, rng: newStmtRng(), ctes: cteCtx{}},
+		meter:    meter,
+		offset:   offset,
+		limit:    sp.limit,
+		distinct: sp.distinct,
+		seen:     make(map[string]bool),
+		done:     empty || (sp.limit != nil && *sp.limit == 0),
+	}
+	if !sc.done {
+		sc.scan = store.storeScan(b, sp.pkReverse)
+	}
+	return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: sc}, true, nil
+}
+
+// streamingCursor is the lazy pull pipeline behind a streaming Rows cursor (spec/design/streaming.md
+// §3/§4, S3): execStreamingScan's per-row loop turned inside out so the CALLER pulls each row. It
+// holds a frozen snapshot engine (eval's exec — so the cursor is self-contained and outlives the
+// handle, streaming.md §5), a pull storeScan over that snapshot (the scan pin), the resolved + folded
+// plan, an evalEnv, and its own cost meter. Each nextRow runs scan → resolve touched columns → WHERE →
+// project for ONE output row, accruing the identical cost units at the identical sites as the eager
+// path — so a fully-drained streaming query observes the same rows + total cost (streaming.md §6),
+// while a caller that stops early reads (and charges) less.
+type streamingCursor struct {
+	eng      *engine
+	plan     *selectPlan
+	env      *evalEnv
+	meter    *costMeter
+	scan     *storeScan
+	offset   int64
+	limit    *int64
+	distinct bool
+	seen     map[string]bool
+	passed   int64 // survivors past the filter+dedup so far (OFFSET runs against this)
+	produced int64 // output rows produced so far (the LIMIT short-circuit runs against this)
+	done     bool  // scan exhausted, LIMIT window full, or empty bound — then nextRow is a no-op
+}
+
+func (c *streamingCursor) nextRow() ([]Value, bool, error) {
+	if c.done {
+		return nil, false, nil
+	}
+	// The LIMIT short-circuit: once the window is full, stop WITHOUT pulling another row — so no
+	// further leaf is faulted (the streaming early-exit win; cost.md §3 "LIMIT short-circuit").
+	if c.limit != nil && c.produced >= *c.limit {
+		c.done = true
+		return nil, false, nil
+	}
+	for {
+		_, row, ok, err := c.scan.next()
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			c.done = true
+			return nil, false, nil
+		}
+		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per scanned row
+			return nil, false, err
+		}
+		c.meter.Charge(costs.StorageRowRead)
+		// Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the
+		// chain reads were already metered in the up-front block (cost.md §3).
+		row, err = c.scan.resolveColumns(row, c.plan.relMasks[0])
+		if err != nil {
+			return nil, false, err
+		}
+		if c.plan.filter != nil {
+			v, err := c.plan.filter.eval(row, c.env, c.meter)
+			if err != nil {
+				return nil, false, err
+			}
+			if !v.IsTrue() {
+				continue
+			}
+		}
+		if c.distinct {
+			// DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even
+			// for a duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window
+			// the survivors — exactly execStreamingScan.
+			projected := make([]Value, len(c.plan.projections))
+			for i, p := range c.plan.projections {
+				v, err := p.eval(row, c.env, c.meter)
+				if err != nil {
+					return nil, false, err
+				}
+				projected[i] = v
+			}
+			if key := distinctRowKey(projected); c.seen[key] {
+				continue
+			} else {
+				c.seen[key] = true
+			}
+			c.passed++
+			if c.passed <= c.offset {
+				continue
+			}
+			c.meter.Charge(costs.RowProduced)
+			c.produced++
+			return projected, true, nil
+		}
+		c.passed++
+		if c.passed <= c.offset {
+			continue
+		}
+		c.meter.Charge(costs.RowProduced)
+		projected := make([]Value, len(c.plan.projections))
+		for i, p := range c.plan.projections {
+			v, err := p.eval(row, c.env, c.meter)
+			if err != nil {
+				return nil, false, err
+			}
+			projected[i] = v
+		}
+		c.produced++
+		return projected, true, nil
+	}
+}
+
+func (c *streamingCursor) costAccrued() int64 { return c.meter.Accrued }
+
+// close marks the cursor done; the pinned snapshot is owned by eng/scan and reclaimed by the GC, and
+// the watermark deregister (if any) lives on the Rows (streaming.md §5). Idempotent.
+func (c *streamingCursor) close() { c.done = true }
+
 func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
@@ -14059,16 +14295,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 	// (functions.md §10); the streaming reader assumes a table store.
 	// A pkOrdered DISTINCT streams too: the dedup runs in scan order (the sort elided), so it
 	// short-circuits a top-N like the non-DISTINCT case. A no-ORDER-BY DISTINCT keeps the eager path.
-	if len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.hasWindow &&
-		(plan.pkOrdered || (!plan.distinct && len(plan.order) == 0 && plan.limit != nil)) &&
-		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil && plan.relBounds[0].gist == nil)) &&
-		plan.rels[0].srf == nil &&
-		// A CTE reference is a computed/buffered source, not a table store — the eager path
-		// (cte.md §5) delivers its rows; the streaming reader assumes a store.
-		plan.rels[0].cte == nil &&
-		// A derived table is a computed source too (grammar.md §42) — eager path.
-		plan.rels[0].derived == nil {
+	if streamingScanEligible(plan) {
 		return db.execStreamingScan(plan, env, meter, params)
 	}
 

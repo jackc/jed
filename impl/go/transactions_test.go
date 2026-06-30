@@ -37,7 +37,14 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(rows.cursor.rows); n != 2 {
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
 		t.Fatalf("expected 2 rows visible inside the tx, got %d", n)
 	}
 	if err := tx.Commit(); err != nil {
@@ -126,8 +133,10 @@ func TestViewIsReadOnly(t *testing.T) {
 		if e != nil {
 			return e
 		}
-		got = len(rows.cursor.rows)
-		return nil
+		for rows.Next() {
+			got++
+		}
+		return rows.Err()
 	}); err != nil {
 		t.Fatal(err)
 	}

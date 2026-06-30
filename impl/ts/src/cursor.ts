@@ -2,43 +2,69 @@ import type { Value } from "./value.ts";
 
 // Cursor is the pull source a Rows cursor drives (spec/design/streaming.md §4).
 //
-// S1 ships only the buffered shape: the executor still materializes the full result and the cursor
-// walks it one row at a time — today's behavior, byte-unchanged. Its purpose is the seam: Rows is
-// now defined in terms of this Cursor (nextRow / cost / close) rather than a concrete Value[][], so
-// a later streaming shape (streaming.md §4, S3) can plug in without changing Rows or any caller.
-// The streaming shape will own the pull B-tree scan cursor (S2) and the pinned read snapshot
-// (streaming.md §5), accrue cost as it is pulled (streaming.md §6), and deregister its
-// reader-liveness pin in close.
+// Two shapes, chosen by the plan (streaming.md §4):
+//   - buffered — a fully materialized result, walked one row at a time. The executor ran the query to
+//     completion (the execute() path the conformance corpus drives, byte-unchanged); cost is final.
+//     Every blocking plan (sort/aggregate/join/set-op/DISTINCT/window) and every non-streamable shape
+//     lands here.
+//   - streaming (S3, executor.ts) — a lazy pull pipeline for the single-table no-blocking-op scan,
+//     backed by a function* generator (the natural pull form in JS): scan → resolve → WHERE → project,
+//     ONE row per nextRow over a pinned snapshot, accruing cost as it is pulled (streaming.md §6). Peak
+//     memory is one row; a caller that stops early faults no further leaves.
 //
-// A Cursor is SINGLE-PASS — nextRow advances an internal position and never rewinds — so Rows is
-// single-pass too, matching the Rust (`Iterator`) and Go (`Next`) cores and the streaming contract
-// (a stream cannot be re-read). The old materialized TS Rows happened to be re-iterable; that was an
-// accident of the implementation, not a contract.
-export class Cursor {
-  private readonly rows: Value[][];
-  private readonly accrued: bigint;
-  private i = 0;
+// A Cursor is SINGLE-PASS — nextRow advances and never rewinds — so Rows is single-pass too, matching
+// the Rust (Iterator) and Go (Next) cores and the streaming contract (a stream cannot be re-read).
 
-  constructor(rows: Value[][], cost: bigint) {
-    this.rows = rows;
-    this.accrued = cost;
+// RowSource is the lazy pull pipeline behind a streaming Cursor (executor.ts builds one over a
+// generator). Kept as an interface so cursor.ts stays free of executor internals.
+export interface RowSource {
+  // nextRow pulls the next output row, or undefined at end. May THROW mid-drain (a 54P01 cost abort or
+  // an arithmetic trap) — the throw propagates through Rows' iterator as the statement's error
+  // (streaming.md §6).
+  nextRow(): Value[] | undefined;
+  // cost is the cost accrued so far — final once the source is drained (streaming.md §6).
+  cost(): bigint;
+  // close releases the pinned read snapshot (streaming.md §5). Idempotent.
+  close(): void;
+}
+
+export class Cursor {
+  private readonly source: RowSource;
+
+  private constructor(source: RowSource) {
+    this.source = source;
   }
 
-  // nextRow pulls the next output row, or undefined at end. For the buffered shape this just
-  // advances the index; it is the site where a streaming shape does the per-row work (and accrues
-  // its cost — streaming.md §6).
+  // buffered wraps an already-materialized result (the buffered shape).
+  static buffered(rows: Value[][], cost: bigint): Cursor {
+    let i = 0;
+    return new Cursor({
+      nextRow: () => (i < rows.length ? rows[i++]! : undefined),
+      cost: () => cost,
+      close: () => {},
+    });
+  }
+
+  // streaming wraps a lazy pull pipeline (S3, streaming.md §4).
+  static streaming(source: RowSource): Cursor {
+    return new Cursor(source);
+  }
+
+  // nextRow pulls the next output row, or undefined at end. For streaming this does the per-row work
+  // (and accrues cost — streaming.md §6), so it may throw mid-drain.
   nextRow(): Value[] | undefined {
-    return this.i < this.rows.length ? this.rows[this.i++]! : undefined;
+    return this.source.nextRow();
   }
 
   // cost is the accrued execution cost (CLAUDE.md §13). Final after the cursor is drained
-  // (streaming.md §6); for the buffered shape it is final immediately (the work is already done).
+  // (streaming.md §6); for the buffered shape it is final immediately.
   cost(): bigint {
-    return this.accrued;
+    return this.source.cost();
   }
 
   // close releases any pinned read snapshot (streaming.md §5). Idempotent. A no-op for the buffered
-  // shape — it owns a detached Value[][] and pins nothing; the streaming shape (S3) deregisters its
-  // reader-liveness pin here.
-  close(): void {}
+  // shape; the streaming shape returns its generator and releases its scan snapshot here.
+  close(): void {
+    this.source.close();
+  }
 }

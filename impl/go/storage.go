@@ -72,6 +72,34 @@ func (s *tableStore) leafSrc() leafSource {
 	return &pagedSource{paging: s.paging, colTypes: s.colTypes}
 }
 
+// storeScan is a PULL scan cursor over a tableStore snapshot — the pull-model equivalent of ScanRange
+// (spec/design/streaming.md §4/§5, the S3 streaming cursor). It holds the store (the snapshot pin —
+// the persistent map shares structure and the GC keeps its pages alive for the cursor's life,
+// transactions.md §5) and the underlying rangeCursor over that snapshot's map. A streaming Rows owns
+// it, so the cursor outlives the handle that produced it.
+type storeScan struct {
+	store *tableStore
+	cur   *rangeCursor
+}
+
+// storeScan builds a pull cursor over this store within b, ascending (reverse=false) or descending
+// (reverse=true) — the same sequence as ScanRange / ScanRangeRev.
+func (s *tableStore) storeScan(b keyBound, reverse bool) *storeScan {
+	return &storeScan{store: s, cur: s.rows.rangeCursor(b, s.leafSrc(), reverse)}
+}
+
+// next yields the next in-bound (key, row), or ok=false at end (faulting a leaf only on descent — the
+// early-exit short-circuit, cost.md §3).
+func (s *storeScan) next() (key []byte, row storedRow, ok bool, err error) {
+	return s.cur.next()
+}
+
+// resolveColumns materializes the unfetched values in the columns mask selects, through the snapshot's
+// pager (large-values.md §14) — the per-row resolve step of the streaming pipeline.
+func (s *storeScan) resolveColumns(row storedRow, mask []bool) (storedRow, error) {
+	return s.store.resolveColumns(row, mask)
+}
+
 // weight is this row's on-disk record size — the weight the page-backed B-tree splits on. Accounts
 // for out-of-line spill at cap (an externalized value weighs its pointer, not its full body —
 // large-values.md §12), so split points match the serialized pages.

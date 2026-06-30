@@ -500,16 +500,22 @@ fn run_with(exec: impl FnOnce(&[Value]) -> Result<Outcome>, params: impl Params)
 }
 
 /// Bind `params`, run `q`, and collect the result into typed [`Row`]s (column names shared `Rc`).
+/// Drains the cursor explicitly so a mid-drain streaming error (a `54P01` cost abort, `57014`
+/// cancellation, or an arithmetic trap — streaming.md §6) is surfaced via [`Rows::error`] rather than
+/// silently truncating the result.
 fn rows_with(q: impl FnOnce(&[Value]) -> Result<Rows>, params: impl Params) -> Result<Vec<Row>> {
     let values = params.into_values()?;
-    let rows = q(&values)?;
+    let mut rows = q(&values)?;
     let names: Rc<[String]> = Rc::from(rows.column_names().to_vec());
-    Ok(rows
-        .map(|values| Row {
+    let mut out = Vec::new();
+    while let Some(values) = rows.next() {
+        out.push(Row {
             names: names.clone(),
             values,
-        })
-        .collect())
+        });
+    }
+    rows.error()?; // surface any error raised mid-drain (streaming.md §6)
+    Ok(out)
 }
 
 /// Map every typed row through `f`, short-circuiting on the first error.

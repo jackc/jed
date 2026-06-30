@@ -417,7 +417,37 @@ func (s *Session) Execute(sql string, params []Value) (Outcome, error) {
 
 // Query runs a query on this session, returning a row cursor.
 func (s *Session) Query(sql string, params []Value) (*Rows, error) {
-	out, err := s.Execute(sql, params)
+	stmt, err := s.engine.parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit
+	// (non-block, writable access) read re-pins the latest committed so the snapshot is current
+	// (PG-faithful); a read-only session uses its existing pin, and an open block uses its working set.
+	if s.access != accessReadOnly && s.engine.session.tx == nil && !stmtIsWrite(stmt) {
+		s.refreshCommitted()
+	}
+	rows, ok, err := s.engine.tryStreamingQuery(stmt, params)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		// Register the pinned snapshot version in the reader-liveness watermark (streaming.md §5); the
+		// deregister runs on cursor Close (Go has no destructor), advancing oldestLiveTxid.
+		version := s.baseVersion
+		s.core.liveMu.Lock()
+		s.core.live[version]++
+		s.core.liveMu.Unlock()
+		rows.attachPin(func() {
+			s.core.liveMu.Lock()
+			if s.core.live[version]--; s.core.live[version] <= 0 {
+				delete(s.core.live, version)
+			}
+			s.core.liveMu.Unlock()
+		})
+		return rows, nil
+	}
+	out, err := s.dispatch(stmt, params)
 	if err != nil {
 		return nil, err
 	}

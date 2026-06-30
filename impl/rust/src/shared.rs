@@ -193,6 +193,21 @@ impl Shared {
             .txid
     }
 
+    /// Register a streaming cursor's pinned snapshot `version` in the live-reader watermark and return
+    /// the deregistering RAII guard (spec/design/streaming.md §5). The guard's `Drop` deregisters,
+    /// advancing `oldest_live_txid`; it is boxed as `dyn Any` so the cursor ([`Rows`]) holds it
+    /// opaquely without `api.rs` depending on this module's types.
+    fn reader_pin(self: &Arc<Self>, version: u64) -> Box<dyn std::any::Any> {
+        self.live
+            .lock()
+            .expect("live lock not poisoned")
+            .register(version);
+        Box::new(ReaderPin {
+            shared: self.clone(),
+            version,
+        })
+    }
+
     /// Publish both new committed roots (the §3/§5 commit window — a pointer swap of each under one
     /// write lock).
     fn publish(&self, committed: Arc<Snapshot>, shared_temp: Arc<Snapshot>) {
@@ -259,6 +274,28 @@ impl Shared {
         st.page_count = write.page_count;
         st.free_pages = write.free_remaining;
         Ok(())
+    }
+}
+
+/// An RAII reader-liveness pin for a streaming cursor (spec/design/streaming.md §5): registered in
+/// the [`LiveRegistry`] when the cursor is built ([`Shared::reader_pin`]) and deregistered on `Drop`
+/// (cursor `close`/drop, or the transient mint-a-session `Database::query` whose session is dropped
+/// while the cursor lives — the pin's `Arc<Shared>` keeps the registry alive). Held opaquely by
+/// [`Rows`] as `Box<dyn Any>`. Until *continuous* reclamation lands (transactions.md §8) the
+/// registration is forward-looking — a streaming cursor is already safe trivially because it owns its
+/// snapshot's pages — but it keeps that follow-on safe with no retrofit (streaming.md §5).
+struct ReaderPin {
+    shared: Arc<Shared>,
+    version: u64,
+}
+
+impl Drop for ReaderPin {
+    fn drop(&mut self) {
+        self.shared
+            .live
+            .lock()
+            .expect("live lock not poisoned")
+            .deregister(self.version);
     }
 }
 
@@ -527,9 +564,28 @@ impl Session {
         self.dispatch(ast, params)
     }
 
-    /// Run a **query** on this session, returning a row cursor.
+    /// Run a **query** on this session, returning a row cursor. A single-table no-blocking-operator
+    /// read is served by a **lazy streaming** cursor (spec/design/streaming.md §4, S3): the read is
+    /// routed first (an autocommit read re-pins the latest committed, PG-faithful), then a lazy pull
+    /// pipeline runs over the pinned snapshot — one row at a time, bounded peak memory, early-exit —
+    /// and its snapshot version is registered in the reader-liveness watermark (streaming.md §5),
+    /// released when the cursor is closed or dropped. Every other shape falls back to the materialized
+    /// `dispatch` path → a buffered cursor.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         let ast = self.engine.parse(sql)?;
+        // Route the read before building the streaming cursor: an autocommit (non-block, writable
+        // access) read re-pins the latest committed so the snapshot is current (PG-faithful); a
+        // read-only session uses its existing pin, and an open block uses its working set.
+        if self.access != Access::ReadOnly && !self.engine.in_transaction() && !stmt_is_write(&ast)
+        {
+            self.refresh_committed();
+        }
+        if let Some(mut rows) = self.engine.try_streaming_query(&ast, params)? {
+            // Register the pinned snapshot version in the watermark (streaming.md §5); the returned
+            // guard deregisters on cursor close/drop, advancing `oldest_live_txid`.
+            rows.attach_pin(self.shared.reader_pin(self.base_version));
+            return Ok(rows);
+        }
         Rows::from_outcome(self.dispatch(ast, params)?)
     }
 

@@ -283,10 +283,26 @@ independently — the P6.4 precedent):
 - **S2 — the pull B-tree scan cursor.** Convert the scan from push (`scan_range(visit)`) to a pull
   cursor (frame stack over the persistent map) in Rust/Go; a generator in TS. Internal; the existing
   push `scan_range` can stay for the mutation paths initially. The §3 VDBE-prerequisite.
-- **S3 — stream the non-blocking pipeline + snapshot pinning.** Wire scan-cursor → resolve → `WHERE`
-  → project into the `Streaming` cursor for the single-table-no-blocking-op case (folding in the
-  existing LIMIT/PK/index short-circuit paths). Land the §5 snapshot pin + watermark registration +
-  `close`. The first real streaming + bounded peak memory + early-exit.
+- **S3 — stream the non-blocking pipeline + snapshot pinning.** ✅ **Landed (all three cores).** The
+  `query()` → `Rows` path now serves the single-table no-blocking-operator read (the PK-ordered /
+  LIMIT-short-circuit shape `streaming_scan_eligible` gates — shared with the eager `exec_streaming_scan`
+  so the two never drift) through a lazy **`Streaming`** cursor: scan-cursor (S2) → resolve touched
+  columns → `WHERE` → project, **one row per `next`**, accruing the identical cost units at the identical
+  sites as the eager path. The cursor **owns a frozen snapshot** (Rust: a snapshot `Engine` built from
+  the visible root + a copy of the session envelope, sharing the seam via `Rc` + the lifetime gauge;
+  Go/TS: a captured snapshot engine sharing the seam by reference), so the returned `Rows` is
+  self-contained and survives the transient `Database::query` session (§5). The §5 snapshot pin is
+  registered in the live-reader watermark (`reader_pin` on the shared core; deregistered on cursor
+  `close`/drop), and `close` releases it. **Scope this slice:** only the `query()`/`Rows` surface streams
+  — the conformance corpus drives `execute()` → a materialized `Outcome` (untouched, so the corpus is
+  green by construction); the index-order scan, streaming sort, and streaming join stay buffered (S4),
+  and a write-classified statement (incl. a `nextval`/`setval` SELECT, `stmt_is_write`) never streams. A
+  mid-drain error (a `54P01` cost abort, a `57014` cancellation, an arithmetic trap) surfaces during
+  iteration (Rust stashes it for `Rows::error()`; Go sets `Rows.Err()`; TS throws out of the iterator).
+  Verified per core by unit tests: `query()` == `execute()` rows + total cost under full drain, early
+  exit charges less, the snapshot pin + watermark, and the mid-drain abort. Prepared-statement streaming
+  and a `Database::query` watermark on the bare single-handle path are follow-ons (the bare path streams
+  but pins nothing — the single-handle reclamation is reconstruct-on-open-safe, §5).
 - **S4 — lazy output from the blocking operators.** Generalize `SortedRows::next()` so `Buffered`
   runs the blocking part then yields its buffer lazily (sort/distinct/agg/window/join/set-op),
   bounding output memory and enabling top-N pulls over the buffer.

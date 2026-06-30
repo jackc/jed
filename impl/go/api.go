@@ -127,27 +127,44 @@ func (db *engine) ExecuteSQL(sql string, params []Value) (Outcome, error) {
 	return executeParams(db, sql, params)
 }
 
-// QuerySQL is a one-shot: parse + run a query sql, binding params, returning a row cursor.
+// QuerySQL is a one-shot: parse + run a query sql, binding params, returning a row cursor. A
+// single-table no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md
+// §4, S3) — one row pulled at a time over a pinned snapshot, bounded peak memory, early-exit; every
+// other shape falls back to the materialized Execute path. (This is the bare single-handle engine; the
+// watermark pin lives on the shared-core Session.Query path.)
 func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
-	out, err := executeParams(db, sql, params)
+	stmt, err := db.parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	if rows, ok, err := db.tryStreamingQuery(stmt, params); err != nil {
+		return nil, err
+	} else if ok {
+		return rows, nil
+	}
+	out, err := db.ExecuteStmtParams(stmt, params)
 	if err != nil {
 		return nil, err
 	}
 	return rowsFromOutcome(out)
 }
 
-// Rows is a cursor over a query's rows (spec/design/api.md §4). It walks the materialized result
-// one row at a time (true streaming is deferred per CLAUDE.md §9 — the cursor contract is the
-// seam that lets the source become lazy later without a caller change), and exposes the column
-// names and the accrued execution cost.
+// Rows is a cursor over a query's rows (spec/design/api.md §4). It walks the pull source (cursor.go)
+// one row at a time, exposing the column names and the accrued execution cost. The source is buffered
+// for the materialized Execute path (the conformance corpus, byte-unchanged) and a lazy streaming
+// pull pipeline (S3, streaming.md §4) for a single-table no-blocking-op Query — the seam is the same
+// either way, so callers are unchanged.
 type Rows struct {
 	columnNames []string
 	columnTypes []string
-	// cursor is the pull source (cursor.go). As of S1 its only shape is buffered — the executor
-	// materializes the full result and the cursor walks it — but Rows is now defined against the
-	// cursor seam, so a future streaming source (spec/design/streaming.md §4) plugs in without any
-	// caller change.
-	cursor *cursor
+	// cursor is the pull source (cursor.go): a bufCursor over a materialized result, or a
+	// streamingCursor (S3, executor.go) running scan → resolve → WHERE → project lazily over a pinned
+	// snapshot (streaming.md §4).
+	cursor cursor
+	// onClose is the reader-liveness pin's deregister (the watermark, streaming.md §5) — set by
+	// Session.Query for a streaming cursor, called by Close (Go has no destructor; the ergonomic
+	// iterators close on loop exit). nil for a buffered cursor or a bare single-handle stream.
+	onClose func()
 	// current is the row the last successful Next produced; valid reports whether there is one.
 	current []Value
 	valid   bool
@@ -172,6 +189,10 @@ func rowsFromOutcome(out Outcome) (*Rows, error) {
 	}, nil
 }
 
+// attachPin records the reader-liveness pin's deregister for a streaming cursor (the watermark,
+// spec/design/streaming.md §5); Close calls it.
+func (r *Rows) attachPin(deregister func()) { r.onClose = deregister }
+
 // Next advances to the next row, returning false when the result is exhausted OR the captured
 // context has been canceled (Err then reports the cancellation).
 func (r *Rows) Next() bool {
@@ -183,7 +204,13 @@ func (r *Rows) Next() bool {
 		r.err = err
 		return false
 	}
-	row, ok := r.cursor.nextRow()
+	row, ok, err := r.cursor.nextRow()
+	if err != nil {
+		// A mid-drain streaming error (a 54P01 cost abort, a canceled ctx surfaced by the meter, or an
+		// arithmetic trap): stop iteration; Err() surfaces it (streaming.md §6).
+		r.err = err
+		return false
+	}
 	if !ok {
 		return false
 	}

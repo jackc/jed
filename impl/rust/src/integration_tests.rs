@@ -145,6 +145,8 @@ mod spec_constants;
 mod spill;
 #[path = "../tests/split_shape.rs"]
 mod split_shape;
+#[path = "../tests/streaming.rs"]
+mod streaming;
 #[path = "../tests/subquery.rs"]
 mod subquery;
 #[path = "../tests/timestamp.rs"]

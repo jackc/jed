@@ -42,13 +42,23 @@ impl PreparedStatement {
 
 /// A cursor over a query's rows (spec/design/api.md §4). It is a thin wrapper over a
 /// [`Cursor`](crate::cursor::Cursor) pull source and exposes the column names and the accrued
-/// execution cost. As of S1 the cursor's only shape is `Buffered` — the executor materializes the
-/// full result and `Rows` walks it one row at a time (today's behavior, byte-unchanged) — but
-/// `Rows` is now defined against the `Cursor` seam, so a future `Streaming` source
-/// (spec/design/streaming.md §4) plugs in without any caller change.
+/// execution cost. The cursor is `Buffered` for the materialized `execute()` path (the conformance
+/// corpus, byte-unchanged) and `Streaming` (S3, streaming.md §4) for a single-table no-blocking-op
+/// `query()` — a lazy pull pipeline that yields one row at a time over a pinned snapshot. The seam
+/// is the same either way, so callers are unchanged.
 pub struct Rows {
     column_names: Vec<String>,
     cursor: Cursor,
+    /// A mid-drain error from a streaming cursor (a `54P01` cost abort, `57014` cancellation, or an
+    /// arithmetic trap). The `Iterator` yields `Option`, so an error mid-drain stops iteration and is
+    /// stashed here; [`Rows::error`] / the ergonomic collectors surface it after draining
+    /// (streaming.md §6). Always `None` for the buffered cursor (its work is already done).
+    error: Option<EngineError>,
+    /// The reader-liveness pin (the watermark registration, spec/design/streaming.md §5), released on
+    /// `close`/`Drop`. Opaque (`Box<dyn Any>`) so `api.rs` stays free of the shared-core type; its
+    /// `Drop` deregisters. `None` for a buffered cursor or a bare single-handle stream (no shared core
+    /// to register against).
+    _pin: Option<Box<dyn std::any::Any>>,
 }
 
 impl Rows {
@@ -62,6 +72,8 @@ impl Rows {
             } => Ok(Rows {
                 column_names,
                 cursor: Cursor::buffered(rows, cost),
+                error: None,
+                _pin: None,
             }),
             Outcome::Statement { .. } => Err(EngineError::new(
                 SqlState::SyntaxError,
@@ -70,23 +82,54 @@ impl Rows {
         }
     }
 
+    /// Wrap a lazy streaming pull source as a `Rows` cursor (S3, spec/design/streaming.md §4).
+    pub(crate) fn from_streaming(
+        column_names: Vec<String>,
+        source: Box<dyn crate::cursor::RowStream>,
+    ) -> Rows {
+        Rows {
+            column_names,
+            cursor: Cursor::streaming(source),
+            error: None,
+            _pin: None,
+        }
+    }
+
+    /// Attach the reader-liveness pin (the watermark registration, streaming.md §5) — the shared core
+    /// registers the snapshot version and hands the deregistering guard here, so it is released when
+    /// the cursor is closed or dropped.
+    pub(crate) fn attach_pin(&mut self, pin: Box<dyn std::any::Any>) {
+        self._pin = Some(pin);
+    }
+
     /// The output column names of the query result.
     pub fn column_names(&self) -> &[String] {
         &self.column_names
     }
 
     /// The deterministic execution cost accrued by the query (CLAUDE.md §13). Final once the
-    /// cursor is drained (streaming.md §6); for today's buffered cursor it is final immediately.
+    /// cursor is drained (streaming.md §6); for a buffered cursor it is final immediately.
     pub fn cost(&self) -> i64 {
         self.cursor.cost()
     }
 
-    /// Release any read snapshot the cursor pins (spec/design/streaming.md §5). Idempotent; a no-op
-    /// for the S1 buffered cursor (it pins nothing), and the seam where a future streaming cursor
-    /// deregisters its reader-liveness pin. Draining the cursor to exhaustion is the other release
-    /// path. Rust additionally releases on `Drop`.
+    /// Surface a mid-drain streaming error (streaming.md §6): `Err` if iteration stopped on an error,
+    /// else `Ok`. The `Iterator` impl yields `Option`, so a streaming consumer that needs the error
+    /// (the ergonomic collectors do) calls this after draining. Always `Ok` for a buffered cursor.
+    pub fn error(&mut self) -> Result<()> {
+        match self.error.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Release the read snapshot the cursor pins (spec/design/streaming.md §5): drops the watermark
+    /// pin (deregistering, advancing the reclamation watermark) and marks the cursor closed.
+    /// Idempotent; a no-op for a buffered cursor (it pins nothing). Draining to exhaustion and `Drop`
+    /// are the other release paths.
     pub fn close(&mut self) {
         self.cursor.close();
+        self._pin = None;
     }
 }
 
@@ -94,7 +137,17 @@ impl Iterator for Rows {
     type Item = Vec<Value>;
 
     fn next(&mut self) -> Option<Vec<Value>> {
-        self.cursor.next_row()
+        if self.error.is_some() {
+            return None;
+        }
+        match self.cursor.next_row() {
+            Ok(row) => row,
+            Err(e) => {
+                // Stash the mid-drain error (streaming.md §6) and end iteration; `error()` surfaces it.
+                self.error = Some(e);
+                None
+            }
+        }
     }
 }
 
@@ -263,9 +316,18 @@ impl Engine {
         self.execute_stmt_params(ast, params)
     }
 
-    /// One-shot: parse + run a **query** `sql`, binding `params`, returning a row cursor.
+    /// One-shot: parse + run a **query** `sql`, binding `params`, returning a row cursor. A
+    /// single-table no-blocking-operator read is served by a **lazy streaming** cursor
+    /// (spec/design/streaming.md §4, S3) — one row pulled at a time over a pinned snapshot, bounded
+    /// peak memory, early-exit; every other shape falls back to the materialized `execute()` path.
+    /// (This is the bare single-handle [`Engine`]; the watermark pin lives on the shared-core
+    /// [`Session`](crate::Session) path.)
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
-        Rows::from_outcome(Engine::execute(self, sql, params)?)
+        let ast = self.parse(sql)?;
+        if let Some(rows) = self.try_streaming_query(&ast, params)? {
+            return Ok(rows);
+        }
+        Rows::from_outcome(self.execute_stmt_params(ast, params)?)
     }
 
     /// Run a multi-statement `sql` **script** on the default session (spec/design/session.md §4.2):

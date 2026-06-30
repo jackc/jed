@@ -50,28 +50,45 @@ export class PreparedStatement {
 export class Rows implements Iterable<Value[]> {
   readonly columnNames: string[];
   private readonly cursor: Cursor;
+  // The reader-liveness pin's deregister (the watermark, streaming.md §5) — set by Session.query for a
+  // streaming cursor, called by close (JS has no destructor; the ergonomic iterators close on loop
+  // exit). undefined for a buffered cursor or a bare single-handle stream.
+  private onClose?: () => void;
 
   constructor(columnNames: string[], cursor: Cursor) {
     this.columnNames = columnNames;
     this.cursor = cursor;
   }
 
+  // attachPin records the reader-liveness pin's deregister for a streaming cursor (the watermark,
+  // streaming.md §5); close calls it.
+  attachPin(deregister: () => void): void {
+    this.onClose = deregister;
+  }
+
   // cost is the deterministic execution cost accrued by the query (CLAUDE.md §13). Final once the
-  // cursor is drained (streaming.md §6); for today's buffered cursor it is final immediately.
+  // cursor is drained (streaming.md §6); for a buffered cursor it is final immediately.
   get cost(): bigint {
     return this.cursor.cost();
   }
 
-  // close releases any read snapshot the cursor pins (streaming.md §5). Idempotent; a no-op for the
-  // S1 buffered cursor (it pins nothing), and the seam where a future streaming cursor deregisters
-  // its reader-liveness pin. Draining the iterator to exhaustion is the other release path.
+  // close releases the read snapshot the cursor pins (streaming.md §5): it closes the underlying
+  // cursor (returning its generator) and deregisters the reader-liveness watermark pin (if any),
+  // advancing oldestLiveTxid. Idempotent; a no-op for a buffered cursor (it pins nothing). The
+  // ergonomic iterators close on loop exit; a raw streaming Rows must be closed (JS has no destructor).
   close(): void {
     this.cursor.close();
+    if (this.onClose) {
+      this.onClose();
+      this.onClose = undefined;
+    }
   }
 
   [Symbol.iterator](): Iterator<Value[]> {
     const cursor = this.cursor;
     return {
+      // nextRow may throw mid-drain for a streaming cursor (a 54P01 cost abort or an arithmetic trap);
+      // the throw propagates out of the for..of as the statement's error (streaming.md §6).
       next(): IteratorResult<Value[]> {
         const row = cursor.nextRow();
         return row !== undefined
@@ -89,7 +106,7 @@ export function rowsFromOutcome(out: Outcome): Rows {
       "query called on a statement that produces no rows; use execute",
     );
   }
-  return new Rows(out.columnNames, new Cursor(out.rows, out.cost));
+  return new Rows(out.columnNames, Cursor.buffered(out.rows, out.cost));
 }
 
 // prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
@@ -98,9 +115,16 @@ export function prepare(db: Engine, sql: string): PreparedStatement {
   return new PreparedStatement(db, db.parse(sql));
 }
 
-// query is a one-shot: parse + run a query sql, binding params, returning a row cursor.
+// query is a one-shot: parse + run a query sql, binding params, returning a row cursor. A single-table
+// no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md §4, S3) —
+// one row pulled at a time over a pinned snapshot, bounded peak memory, early-exit; every other shape
+// falls back to the materialized execute() path. (This is the bare single-handle Engine; the watermark
+// pin lives on the shared-core Session.query path.)
 export function query(db: Engine, sql: string, params: Value[] = []): Rows {
-  return rowsFromOutcome(db.executeStmtParams(db.parse(sql), params));
+  const stmt = db.parse(sql);
+  const streamed = db.tryStreamingQuery(stmt, params);
+  if (streamed !== null) return new Rows(streamed.columnNames, streamed.cursor);
+  return rowsFromOutcome(db.executeStmtParams(stmt, params));
 }
 
 // querySql is an alias for query, symmetric with the Rust/Go QuerySQL naming (api.md §6).
