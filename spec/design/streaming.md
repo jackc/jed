@@ -328,10 +328,11 @@ independently — the P6.4 precedent):
   `stmt_rng` threads the per-statement entropy through the blocking part **and** the deferred
   projection, so a projection-list `uuidv7()`/`now()` draws the identical sequence whichever drive runs
   it. **Scope this slice:** the **top-level set-operation / `WITH`** read landed separately (S6, below);
-  and the special input-streaming `SELECT` paths reach the lazy cursor as `Final` (eager-built on the
+  the **`exec_streaming_sort` output** went lazy via the `SortedRows` pull iterator separately (S7,
+  below); and the other special input-streaming `SELECT` paths (`exec_streaming_scan` /
+  `exec_index_order_scan` / `exec_streaming_join`) reach the lazy cursor as `Final` (eager-built on the
   first pull, then yielded lazily — no regression, since they are LIMIT-gated or already stream their
-  input). Making a large `exec_streaming_sort` output lazy via the `SortedRows` pull iterator directly
-  (rather than buffering it as `Final`) is the remaining follow-on.
+  input).
 - **S5 — lazy small-inline-column decode — superseded.** Spun out and **promoted** to its own
   storage-core reshape in [lazy-record.md](lazy-record.md); see §8. *No longer a slice of this item.*
 - **S6 — lazy DEFERRED set-operation / `WITH`.** ✅ **Landed (all three cores).** The `query()` → `Rows`
@@ -353,8 +354,30 @@ independently — the P6.4 precedent):
   `WITH` are **not** taken (they must hold the write gate) — they fall back to the materialized dispatch.
   Verified per core by unit tests (`query()` == `execute()` rows + cost across every set-op kind +
   recursive/aggregate/join `WITH`, the run-fully-on-first-pull cost, the snapshot pin + watermark, the
-  mid-drain abort, the data-modifying-`WITH` fallback). The only remaining streaming follow-on is the
-  S4 `exec_streaming_sort`-output laziness noted above.
+  mid-drain abort, the data-modifying-`WITH` fallback).
+- **S7 — lazy `exec_streaming_sort` output.** ✅ **Landed (all three cores).** The streaming external
+  sort (`spec/design/spill.md` §5) buffered its **input** through the `Sorter` already, but its
+  **output** was an `Emitter::Final` — the full windowed result `Vec` was built (and `row_produced` +
+  the projection charged) up front on the first pull, so an early exit over it charged the **same** as a
+  full drain. This slice makes the output lazy: `exec_streaming_sort` runs the **blocking part** (scan +
+  sort + the `OFFSET` skip) and returns an **`Emitter::Sorted`** — the `SortedRows` pull iterator
+  positioned at the first output row, plus the windowed `remaining` count — and the emitter drive (eager
+  in `exec_select_plan`; lazy in `BufferedScan` / `bufferedScanCursor` / a `bufferedRows` generator)
+  pulls the next sorted row, charges `row_produced`, and evaluates the projection list **per pull**. So
+  the output `Vec` is **never built**, and a caller that stops early skips the `row_produced` +
+  projection of every windowed row it never pulls — the **top-N-over-the-sort early-exit win** the
+  `Final` form could not offer. The collation-aware path (which cannot use the `C`-ordered `Sorter`)
+  wraps its in-memory-sorted survivors as an in-memory `SortedRows`, so it flows through the **same**
+  lazy emitter. Under **full drain** the rows + total cost are byte-identical to the eager sort (the same
+  `page_read` block, `storage_row_read` per scanned row, filter `operator_eval`, and `row_produced` per
+  windowed row — the sort itself is unmetered, cost.md §3; spill.md §6), so the corpus stays green by
+  construction. An early exit (or a `LIMIT`-stopped merge) drops the `SortedRows`, whose `Merger`
+  cleanup releases any undrained spill run files (Rust on `Drop`; Go via the cursor's `close`; TS via the
+  generator's `finally`). Verified per core by unit tests (`query()` == `execute()` rows + cost across a
+  battery of sort shapes incl. `OFFSET`/`LIMIT`/projection-expr/filter/empty; the early-exit-charges-less
+  win; and the spilling-merge path streaming lazily + leaving no temp file on early exit). This was the
+  last `exec_select_emit`-path output-laziness follow-on; the remaining streaming follow-ons are
+  prepared-statement streaming and a `Database::query` watermark on the bare single-handle path (§3/§5).
 
 Built Rust-first, then Go/TS in lockstep; the streaming loop structure is mirrored across cores (§6).
 
