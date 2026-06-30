@@ -1048,6 +1048,29 @@ impl Session {
         self.engine.to_image(page_size, txid)
     }
 
+    /// The backing database's latest committed transaction id (the on-disk meta `txid`). Reads the
+    /// shared committed cell (the file's state), not the session's pinned base. In-crate storage tests
+    /// use this; hosts use [`Database::txid`].
+    pub(crate) fn txid(&self) -> u64 {
+        self.shared.committed_version()
+    }
+
+    /// The backing database's page payload size. In-crate storage tests; hosts use [`Database::page_size`].
+    pub(crate) fn page_size(&self) -> u32 {
+        self.shared.page_size()
+    }
+
+    /// The backing file's on-disk page high-water (`0` in-memory). Reads the shared storage state, so
+    /// it reflects every committed write. In-crate storage tests; hosts use [`Database::page_count`].
+    pub(crate) fn page_count(&self) -> u32 {
+        self.shared.page_count()
+    }
+
+    /// The backing file path (`None` in-memory). In-crate storage tests; hosts use [`Database::path`].
+    pub(crate) fn path(&self) -> Option<std::path::PathBuf> {
+        self.shared.path()
+    }
+
     /// Set the per-database default collation for new `text` columns (collation.md §4). White-box
     /// config used by the collation tests; `2C000` for an unknown collation. The default is committed
     /// *snapshot* state (persisted as the `is_default` flag), so outside a block this **commits** —

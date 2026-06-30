@@ -10,7 +10,7 @@
 //! `XX001` or the byte-identical correct result — corruption is **caught or inert, never silent**.
 //! Mirrored in Go (checksum_test.go) and TS (tests/checksum.test.ts).
 
-use jed::{DatabaseOptions, Engine, Outcome, Result, execute};
+use jed::{Database, DatabaseOptions, Outcome, Result, Session, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -36,36 +36,36 @@ fn tmp(name: &str) -> std::path::PathBuf {
 
 /// The full scan result as rendered strings, or the error if any page read failed.
 fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
-    let mut db = Engine::open(path)?;
-    let out = match execute(&mut db, "SELECT id, body FROM t ORDER BY id")? {
+    let mut db = Database::open(path)?.session(SessionOptions::default());
+    let out = match db.execute("SELECT id, body FROM t ORDER BY id", &[])? {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
             .collect(),
         _ => panic!("expected a query result"),
     };
-    db.close()?;
+    drop(db);
     Ok(out)
 }
 
 /// Seed a file whose tree spans every body-page kind at `page_size = 256`: a multi-leaf B-tree
 /// (interior root) of ~30 rows, with row 1 a 600-char incompressible body that spills out-of-line.
 fn seed(path: &std::path::Path) {
-    let mut db = Engine::create(
+    let mut db = Database::create(
         path,
         DatabaseOptions {
             page_size: PAGE_SIZE,
         },
     )
-    .unwrap();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
+    .unwrap().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[]).unwrap();
     let big = filler_text(600);
     let mut sql = format!("INSERT INTO t VALUES (1, '{big}')");
     for id in 2..=30 {
         sql.push_str(&format!(", ({id}, 'row{id}')"));
     }
-    execute(&mut db, &sql).unwrap();
-    db.close().unwrap();
+    db.execute(&sql, &[]).unwrap();
+    drop(db);
 }
 
 #[test]

@@ -11,7 +11,7 @@
 //! Mirrored by impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
 
 use jed::value::Value;
-use jed::{DatabaseOptions, Engine, Outcome, execute};
+use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
 use std::path::{Path, PathBuf};
 
 fn tmp(name: &str) -> PathBuf {
@@ -28,8 +28,8 @@ fn load_unicode() {
     jed::load_unicode_data(&bytes).expect("load unicode.jucd");
 }
 
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
@@ -53,7 +53,7 @@ fn loaded_collations_is_the_real_set() {
     // `is_default` (an engine property, not a per-db one). `C` is built in and never listed. The pin
     // is UCA/UCD 17.0.0 (spec/collation/17.0.0).
     load_unicode();
-    let db = Engine::new();
+    let db = Database::new_in_memory().session(SessionOptions::default());
     let v = db.loaded_collations();
     let names: Vec<&str> = v.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["es", "unicode"]);
@@ -73,7 +73,7 @@ fn loaded_collation_used_in_an_expression() {
     // under the root (ä sorts near a), the opposite of the C byte order where it is false. A transient
     // query COLLATE does not make the database REFERENCE the collation, so db.collations() stays empty.
     load_unicode();
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(db.collations().len(), 0);
     assert_eq!(
         query(&mut db, "SELECT 'ä' < 'z' COLLATE \"unicode\""),
@@ -86,7 +86,7 @@ fn es_orders_enye_as_a_distinct_letter() {
     // The `es` tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
     // whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
     load_unicode();
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         query(&mut db, "SELECT 'nz' < 'ña' COLLATE \"es\""),
         vec![vec![Value::Bool(true)]]
@@ -101,9 +101,9 @@ fn es_orders_enye_as_a_distinct_letter() {
 fn unknown_collation_is_42704() {
     // A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
     load_unicode();
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
-        execute(&mut db, "SELECT 'x' COLLATE \"no-such-collation\"")
+        db.execute("SELECT 'x' COLLATE \"no-such-collation\"", &[])
             .unwrap_err()
             .code(),
         "42704"
@@ -116,13 +116,10 @@ fn per_column_collation_orders_implicitly_and_is_referenced() {
     // explicit COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references
     // unicode, db.collations() (the per-file view) lists exactly it.
     load_unicode();
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\")",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\")", &[])
     .unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')", &[]).unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM t ORDER BY name")),
         vec!["a", "ä", "z"]
@@ -146,19 +143,16 @@ fn implicit_conflict_is_42p22() {
     // Two columns with DIFFERENT implicit (loaded) collations compared with no explicit COLLATE →
     // 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
     load_unicode();
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (a text COLLATE \"unicode\", b text COLLATE \"es\", c text COLLATE \"C\")",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (a text COLLATE \"unicode\", b text COLLATE \"es\", c text COLLATE \"C\")", &[])
     .unwrap();
-    execute(&mut db, "INSERT INTO t VALUES ('a','z','b')").unwrap();
+    db.execute("INSERT INTO t VALUES ('a','z','b')", &[]).unwrap();
     assert_eq!(
-        execute(&mut db, "SELECT a < b FROM t").unwrap_err().code(),
+        db.execute("SELECT a < b FROM t", &[]).unwrap_err().code(),
         "42P22"
     );
     assert_eq!(
-        execute(&mut db, "SELECT a < c FROM t").unwrap_err().code(),
+        db.execute("SELECT a < c FROM t", &[]).unwrap_err().code(),
         "42P22"
     );
     // An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
@@ -174,15 +168,15 @@ fn implicit_conflict_is_42p22() {
 #[test]
 fn non_text_collate_is_42804_unknown_name_42704() {
     load_unicode();
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
-        execute(&mut db, "CREATE TABLE t (a i32 COLLATE \"unicode\")")
+        db.execute("CREATE TABLE t (a i32 COLLATE \"unicode\")", &[])
             .unwrap_err()
             .code(),
         "42804"
     );
     assert_eq!(
-        execute(&mut db, "CREATE TABLE t (a text COLLATE \"nope\")")
+        db.execute("CREATE TABLE t (a text COLLATE \"nope\")", &[])
             .unwrap_err()
             .code(),
         "42704"
@@ -196,28 +190,22 @@ fn default_collation_inherited_by_unannotated_column() {
     // set_default_collation moves the per-database default to a LOADED collation (no import); an
     // un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
     load_unicode();
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(db.default_collation(), "C");
-    execute(
-        &mut db,
-        "CREATE TABLE before (id i32 PRIMARY KEY, name text)",
-    )
+    db.execute("CREATE TABLE before (id i32 PRIMARY KEY, name text)", &[])
     .unwrap();
     db.set_default_collation("unicode").unwrap();
     assert_eq!(db.default_collation(), "unicode");
-    execute(
-        &mut db,
-        "CREATE TABLE after (id i32 PRIMARY KEY, name text)",
-    )
+    db.execute("CREATE TABLE after (id i32 PRIMARY KEY, name text)", &[])
     .unwrap();
-    execute(&mut db, "INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
+    db.execute("INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')", &[]).unwrap();
     // `after.name` inherited unicode → ä sorts next to a even with no COLLATE clause.
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM after ORDER BY name")),
         vec!["a", "ä", "z"]
     );
     // `before.name` was frozen at C → byte order.
-    execute(&mut db, "INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
+    db.execute("INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')", &[]).unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM before ORDER BY name")),
         vec!["a", "z", "ä"]
@@ -231,7 +219,7 @@ fn default_collation_inherited_by_unannotated_column() {
 #[test]
 fn set_default_unknown_is_42704() {
     load_unicode();
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         db.set_default_collation("nope").unwrap_err().code(),
         "42704"
@@ -247,19 +235,16 @@ fn collated_primary_key_is_stored_in_collation_order() {
     // physically iterates in COLLATION order. unicode (loaded, no import): a < A < b < Z; C bytes:
     // A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
     load_unicode();
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (name text COLLATE \"unicode\" PRIMARY KEY)",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (name text COLLATE \"unicode\" PRIMARY KEY)", &[])
     .unwrap();
-    execute(&mut db, "INSERT INTO t VALUES ('Z'),('a'),('b'),('A')").unwrap();
+    db.execute("INSERT INTO t VALUES ('Z'),('a'),('b'),('A')", &[]).unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM t")),
         vec!["a", "A", "b", "Z"]
     );
-    execute(&mut db, "CREATE TABLE c (name text PRIMARY KEY)").unwrap();
-    execute(&mut db, "INSERT INTO c VALUES ('Z'),('a'),('b'),('A')").unwrap();
+    db.execute("CREATE TABLE c (name text PRIMARY KEY)", &[]).unwrap();
+    db.execute("INSERT INTO c VALUES ('Z'),('a'),('b'),('A')", &[]).unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM c")),
         vec!["A", "Z", "a", "b"]
@@ -271,15 +256,12 @@ fn collated_unique_dedups_by_byte_identity() {
     // A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
     // DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
     load_unicode();
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\" UNIQUE)",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\" UNIQUE)", &[])
     .unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')", &[]).unwrap();
     assert_eq!(
-        execute(&mut db, "INSERT INTO t VALUES (4,'a')")
+        db.execute("INSERT INTO t VALUES (4,'a')", &[])
             .unwrap_err()
             .code(),
         "23505"
@@ -300,22 +282,16 @@ fn reference_only_file_round_trip() {
     load_unicode();
     let path = tmp("collation_refonly_roundtrip.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
     db.set_default_collation("unicode").unwrap(); // loaded — no import
-    execute(
-        &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\", plain text)",
-    )
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\", plain text)", &[])
     .unwrap();
-    execute(
-        &mut db,
-        "INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')",
-    )
+    db.execute("INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')", &[])
     .unwrap();
     db.commit().unwrap();
-    db.close().unwrap();
+    drop(db);
 
-    let mut re = Engine::open(&path).unwrap();
+    let mut re = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(re.default_collation(), "unicode");
     // The database still references unicode (per-file view) — resolved from the vendored set.
     let refs = re.collations();
@@ -332,6 +308,6 @@ fn reference_only_file_round_trip() {
         texts(query(&mut re, "SELECT plain FROM t ORDER BY plain")),
         vec!["a", "ä", "z"]
     );
-    re.close().unwrap();
+    drop(re);
     let _ = std::fs::remove_file(&path);
 }

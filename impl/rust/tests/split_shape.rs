@@ -10,17 +10,17 @@
 
 use std::path::PathBuf;
 
-use jed::{DatabaseOptions, Engine, Outcome, execute};
+use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
 }
 
-fn run(db: &mut Engine, sql: &str) -> Outcome {
-    execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+fn run(db: &mut Session, sql: &str) -> Outcome {
+    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
+fn cost(db: &mut Session, sql: &str) -> i64 {
     match run(db, sql) {
         Outcome::Statement { cost, .. } => cost,
         Outcome::Query { cost, .. } => cost,
@@ -30,10 +30,10 @@ fn cost(db: &mut Engine, sql: &str) -> i64 {
 /// A 121-row table at the fixture page size (256): id bigint pk, v integer = id % 7.
 /// Ascending inserts pks 0..120 in order; shuffled inserts the permutation (i*37) mod
 /// 121 — deterministic, identical in every core.
-fn split_shape_db(name: &str, shuffled: bool) -> Engine {
+fn split_shape_db(name: &str, shuffled: bool) -> Session {
     let path = tmp(name);
     let _ = std::fs::remove_file(&path);
-    let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)");
     for i in 0..121 {
         let pk = if shuffled { (i * 37) % 121 } else { i };

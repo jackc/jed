@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{DatabaseOptions, Engine, Outcome, execute};
+use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
 
 const PS: u64 = 256;
 
@@ -32,8 +32,8 @@ fn slot_txid(bytes: &[u8], slot: usize) -> u64 {
     be64(bytes, slot * ps + 12)
 }
 
-fn ids(db: &mut Engine) -> Vec<i64> {
-    match execute(db, "SELECT id FROM t").unwrap() {
+fn ids(db: &mut Session) -> Vec<i64> {
+    match db.execute("SELECT id FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| match &r[0] {
@@ -46,8 +46,8 @@ fn ids(db: &mut Engine) -> Vec<i64> {
 }
 
 /// The `pad` text of the row with `id`, or `None` if absent.
-fn pad_of(db: &mut Engine, id: i64) -> Option<String> {
-    match execute(db, &format!("SELECT pad FROM t WHERE id = {id}")).unwrap() {
+fn pad_of(db: &mut Session, id: i64) -> Option<String> {
+    match db.execute(&format!("SELECT pad FROM t WHERE id = {id}"), &[]).unwrap() {
         Outcome::Query { rows, .. } => rows.first().map(|r| match &r[0] {
             Value::Text(s) => s.clone(),
             v => panic!("expected a text pad, got {v:?}"),
@@ -56,22 +56,19 @@ fn pad_of(db: &mut Engine, id: i64) -> Option<String> {
     }
 }
 
-fn setup(path: &PathBuf, rows: i64) -> Engine {
+fn setup(path: &PathBuf, rows: i64) -> Session {
     let _ = std::fs::remove_file(path);
-    let mut db = Engine::create(
+    let mut db = Database::create(
         path,
         DatabaseOptions {
             page_size: PS as u32,
         },
     )
-    .unwrap();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
+    .unwrap().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[]).unwrap();
     let base = "x".repeat(40);
     for i in 1..=rows {
-        execute(
-            &mut db,
-            &format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"),
-        )
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"), &[])
         .unwrap();
     }
     db
@@ -89,17 +86,14 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     // `page_count`, not the file length — the file is preallocated in chunks ahead of it,
     // spec/design/pager.md §7.)
     for k in 0..60 {
-        execute(
-            &mut db,
-            &format!("UPDATE t SET pad = 'a{k}-{pad}' WHERE id = 15"),
-        )
+        db.execute(&format!("UPDATE t SET pad = 'a{k}-{pad}' WHERE id = 15"), &[])
         .unwrap();
     }
     let pc_after_churn1 = db.page_count();
-    db.close().unwrap();
+    drop(db);
 
     // Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
-    let mut db = Engine::open(&path).unwrap();
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(
         db.page_count(),
         pc_after_churn1,
@@ -107,10 +101,7 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     );
 
     // The very first post-reopen commit reuses a free page rather than extending the high-water.
-    execute(
-        &mut db,
-        &format!("UPDATE t SET pad = 'b0-{pad}' WHERE id = 15"),
-    )
+    db.execute(&format!("UPDATE t SET pad = 'b0-{pad}' WHERE id = 15"), &[])
     .unwrap();
     assert_eq!(
         db.page_count(),
@@ -121,10 +112,7 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     // A whole second churn — shorter than the first, so the reclaimed pool covers it — extends the
     // high-water not at all: the page count after equals the count after the first churn.
     for k in 1..40 {
-        execute(
-            &mut db,
-            &format!("UPDATE t SET pad = 'b{k}-{pad}' WHERE id = 15"),
-        )
+        db.execute(&format!("UPDATE t SET pad = 'b{k}-{pad}' WHERE id = 15"), &[])
         .unwrap();
     }
     assert_eq!(
@@ -139,8 +127,8 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
         Some(&format!("b39-{pad}")[..])
     );
     assert_eq!(ids(&mut db), (1..=30).collect::<Vec<_>>());
-    db.close().unwrap();
-    let mut db = Engine::open(&path).unwrap();
+    drop(db);
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(
         pad_of(&mut db, 15).as_deref(),
         Some(&format!("b39-{pad}")[..])
@@ -157,31 +145,25 @@ fn heavy_insert_delete_churn_reopens_correctly_with_reuse() {
     let pad = "z".repeat(40);
     // Repeatedly add then drop a high id, leaking pages each round.
     for k in 0..40 {
-        execute(
-            &mut db,
-            &format!("INSERT INTO t VALUES (1000, 'k{k}-{pad}')"),
-        )
+        db.execute(&format!("INSERT INTO t VALUES (1000, 'k{k}-{pad}')"), &[])
         .unwrap();
-        execute(&mut db, "DELETE FROM t WHERE id = 1000").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1000", &[]).unwrap();
     }
-    db.close().unwrap();
+    drop(db);
 
     // Reopen (free-list reconstructed) and churn again, now reusing reclaimed pages.
-    let mut db = Engine::open(&path).unwrap();
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
     for k in 0..40 {
-        execute(
-            &mut db,
-            &format!("INSERT INTO t VALUES (2000, 'm{k}-{pad}')"),
-        )
+        db.execute(&format!("INSERT INTO t VALUES (2000, 'm{k}-{pad}')"), &[])
         .unwrap();
-        execute(&mut db, "DELETE FROM t WHERE id = 2000").unwrap();
+        db.execute("DELETE FROM t WHERE id = 2000", &[]).unwrap();
     }
     // Add a couple of permanent rows through the reused pages, then verify on a fresh open.
-    execute(&mut db, &format!("INSERT INTO t VALUES (26, 'p-{pad}')")).unwrap();
-    execute(&mut db, &format!("INSERT INTO t VALUES (27, 'q-{pad}')")).unwrap();
-    db.close().unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (26, 'p-{pad}')"), &[]).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (27, 'q-{pad}')"), &[]).unwrap();
+    drop(db);
 
-    let mut db = Engine::open(&path).unwrap();
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(ids(&mut db), (1..=27).collect::<Vec<_>>());
 }
 
@@ -191,28 +173,19 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     let mut db = setup(&path, 20);
     let pad = "w".repeat(40);
     for k in 0..30 {
-        execute(
-            &mut db,
-            &format!("UPDATE t SET pad = 'c{k}-{pad}' WHERE id = 10"),
-        )
+        db.execute(&format!("UPDATE t SET pad = 'c{k}-{pad}' WHERE id = 10"), &[])
         .unwrap();
     }
-    db.close().unwrap();
+    drop(db);
 
     // Reopen so the free-list holds the churn's dead pages, then do two commits that *reuse* them.
-    let mut db = Engine::open(&path).unwrap();
-    execute(
-        &mut db,
-        &format!("UPDATE t SET pad = 'A-{pad}' WHERE id = 10"),
-    )
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    db.execute(&format!("UPDATE t SET pad = 'A-{pad}' WHERE id = 10"), &[])
     .unwrap(); // prior snapshot
     let orig11 = pad_of(&mut db, 11).expect("row 11 exists");
-    execute(
-        &mut db,
-        &format!("UPDATE t SET pad = 'B-{pad}' WHERE id = 11"),
-    )
+    db.execute(&format!("UPDATE t SET pad = 'B-{pad}' WHERE id = 11"), &[])
     .unwrap(); // newest commit
-    db.close().unwrap();
+    drop(db);
 
     // Corrupt the newest meta slot's checksum (a torn write of the commit that reused free pages).
     let mut img = std::fs::read(&path).unwrap();
@@ -229,7 +202,7 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     // The loader falls back to the prior snapshot — intact even though the torn commit reused
     // (overwrote) free pages, because those pages were dead and the prior snapshot never referenced
     // them. Row 11's update vanishes; row 10's prior-commit value and every row survive.
-    let mut db = Engine::open(&path).unwrap();
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(
         db.txid(),
         prior_txid,
