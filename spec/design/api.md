@@ -291,8 +291,9 @@ iterator; this is so even for the `Buffered` cursor, whose blocking part runs on
 (not at `query()`). **`execute()` still returns a fully materialized `Outcome`** (the conformance
 harness drives it, so every `# cost:` value is unchanged — the lazy cursor is a `query()`-only
 optimization, internal machinery whose only contract is identical rows + total cost under full
-drain). A top-level set-operation / `WITH` read and prepared-statement streaming are the remaining
-follow-ons. The internally-streamed
+drain). A top-level set-operation / pure-query `WITH` read now streams too (a lazy **deferred** cursor,
+[streaming.md §7](streaming.md) S6: it defers the whole run to the first pull and yields the result one
+row at a time); prepared-statement streaming is the remaining cursor follow-on. The internally-streamed
 *operators* landed earlier
 ([spill.md](spill.md)): the `ORDER BY` external merge sort + its streaming single-table feed are
 in, with the spilling hash aggregate / `DISTINCT` / hash JOIN as deferred follow-ons (CLAUDE.md
@@ -462,11 +463,12 @@ input-size cap cross-core.
   in [streaming.md](streaming.md) and landing in slices (§4); **S3 + S4 have landed (all three
   cores):** a `query()` → `Rows` over the single-table no-blocking-operator read is a lazy `Streaming`
   pull source (S3), and a blocking read (non-PK `ORDER BY` / `DISTINCT` / aggregate / window / join) is
-  a lazy `Buffered` cursor that buffers its input but yields the output one row at a time (S4) — both
-  pin their snapshot for their life (`execute()` stays materialized — the corpus drives it). The
-  internally-streamed *operators* (the `ORDER BY` external merge sort spilling under `work_mem`,
-  [spill.md](spill.md)) landed earlier. What stays deferred is top-level set-operation / `WITH`
-  streaming, prepared-statement streaming, the spilling hash aggregate / `DISTINCT` / hash JOIN
+  a lazy `Buffered` cursor that buffers its input but yields the output one row at a time (S4); and a
+  top-level set operation / pure-query `WITH` is a lazy **deferred** cursor that defers its run to the
+  first pull (S6) — all pin their snapshot for their life (`execute()` stays materialized — the corpus
+  drives it). The internally-streamed *operators* (the `ORDER BY` external merge sort spilling under
+  `work_mem`, [spill.md](spill.md)) landed earlier. What stays deferred is prepared-statement streaming,
+  the lazy `exec_streaming_sort` output (S4), the spilling hash aggregate / `DISTINCT` / hash JOIN
   ([spill.md §7](spill.md)), and lazy small-inline-column decode ([streaming.md §8](streaming.md)).
 - **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL

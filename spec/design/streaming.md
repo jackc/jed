@@ -327,15 +327,34 @@ independently — the P6.4 precedent):
   buffered early-exit charges less, the snapshot pin + watermark, the mid-drain abort). The shared
   `stmt_rng` threads the per-statement entropy through the blocking part **and** the deferred
   projection, so a projection-list `uuidv7()`/`now()` draws the identical sequence whichever drive runs
-  it. **Scope this slice:** a **top-level set-operation / `WITH`** read still falls back to the
-  materialized `execute()` path → a buffered cursor (their output carries no per-row top-level
-  projection, so the lazy win is only lazy-yield — a mechanical follow-on); and the special
-  input-streaming `SELECT` paths reach the lazy cursor as `Final` (eager-built on the first pull, then
-  yielded lazily — no regression, since they are LIMIT-gated or already stream their input). Making a
-  large `exec_streaming_sort` output lazy via the `SortedRows` pull iterator directly (rather than
-  buffering it as `Final`) is the remaining follow-on.
+  it. **Scope this slice:** the **top-level set-operation / `WITH`** read landed separately (S6, below);
+  and the special input-streaming `SELECT` paths reach the lazy cursor as `Final` (eager-built on the
+  first pull, then yielded lazily — no regression, since they are LIMIT-gated or already stream their
+  input). Making a large `exec_streaming_sort` output lazy via the `SortedRows` pull iterator directly
+  (rather than buffering it as `Final`) is the remaining follow-on.
 - **S5 — lazy small-inline-column decode — superseded.** Spun out and **promoted** to its own
   storage-core reshape in [lazy-record.md](lazy-record.md); see §8. *No longer a slice of this item.*
+- **S6 — lazy DEFERRED set-operation / `WITH`.** ✅ **Landed (all three cores).** The `query()` → `Rows`
+  path now serves a **top-level set operation** (`UNION`/`INTERSECT`/`EXCEPT`) or **pure-query `WITH`**
+  through a lazy **deferred** cursor (`DeferredResult` in Rust, `deferredCursor` in Go, an inline
+  `RowSource` in TS), wired after the `Buffered` lane (`try_deferred_query` / `tryDeferredQuery`). These
+  are blocking shapes whose output is **already projected AND charged** (a set op combines + dedups
+  already-projected rows; a `WITH`'s output is its body's), so there is **no per-row top-level projection
+  to defer** — the only streaming win is **lazy-yield**: the cursor owns a frozen snapshot engine (§5),
+  resolves the output column names by **planning only** up front (unmetered + deterministic, so the names
+  match the deferred run's), then on its **first pull** runs the whole eager **`run_set_op` / `run_with`
+  verbatim** (so the rows + total cost are byte-identical to `execute()` *by construction* — there is no
+  re-implemented execution path to drift) and yields the materialized result one row at a time. A
+  `54P01`/`54P02` cost/lifetime abort, a cancellation, or an arithmetic trap surfaces **during
+  iteration** (the run is on the first pull), not at `query()` (§6); the snapshot pin registers in the
+  watermark like S3/S4. Because the whole query runs on the first pull, an early exit charges the **same**
+  as a full drain (the lazy-yield-only nature, unlike S3/S4's early-exit win) — pinned by a per-core unit
+  test. A **data-modifying `WITH`** (a write, `stmt_is_write`) and a `nextval`/`setval`-calling set-op/
+  `WITH` are **not** taken (they must hold the write gate) — they fall back to the materialized dispatch.
+  Verified per core by unit tests (`query()` == `execute()` rows + cost across every set-op kind +
+  recursive/aggregate/join `WITH`, the run-fully-on-first-pull cost, the snapshot pin + watermark, the
+  mid-drain abort, the data-modifying-`WITH` fallback). The only remaining streaming follow-on is the
+  S4 `exec_streaming_sort`-output laziness noted above.
 
 Built Rust-first, then Go/TS in lockstep; the streaming loop structure is mirrored across cores (§6).
 
