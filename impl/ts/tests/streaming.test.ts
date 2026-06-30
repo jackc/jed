@@ -10,8 +10,11 @@
 // aggregate, window, join) whose input buffers but whose OUTPUT is yielded one row at a time.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { Database, EngineError, type Session } from "../src/lib.ts";
+import { createDatabase, Database, EngineError, type Session } from "../src/lib.ts";
 import type { Value } from "../src/value.ts";
 
 // seededKV builds an in-memory shared db with t(id i32 PK, v i32) holding 1..=n (v = id * 10).
@@ -328,6 +331,129 @@ test("buffered mid-drain cost abort throws during iteration", () => {
     assert.equal((caught as EngineError).code(), "54P01", "the abort is a cost-limit error");
   } finally {
     s.close();
+  }
+});
+
+// ---- the lazy streaming-SORT output ("sorted" Emitter; streaming.md §4/§7) ------------------------
+
+// Every streaming-external-sort shape (a single-table non-PK ORDER BY): query() (the lazy "sorted" drive
+// — pulling the SortedRows iterator one row at a time) must equal execute() (the eager drive of the SAME
+// emitter) on rows AND total cost under full drain (§6).
+test("sorted output matches eager rows and cost", () => {
+  const db = seededKV(40);
+  const s = db.session();
+  try {
+    for (const sql of [
+      "SELECT v FROM t ORDER BY v", // non-PK sort, full output
+      "SELECT v FROM t ORDER BY v DESC", // descending
+      "SELECT v FROM t ORDER BY v LIMIT 7", // top-N window
+      "SELECT v FROM t ORDER BY v LIMIT 7 OFFSET 5", // LIMIT + OFFSET window
+      "SELECT v FROM t ORDER BY v OFFSET 35", // OFFSET near the end (tail window)
+      "SELECT id, v + 1 FROM t ORDER BY v", // a projection expression (operator_eval per row)
+      "SELECT v FROM t WHERE id > 20 ORDER BY v", // a residual WHERE filter
+      "SELECT v FROM t WHERE id > 99999 ORDER BY v", // empty result
+    ]) {
+      const eager = eagerResult(s, sql);
+      const stream = streamResult(s, sql);
+      assert.deepEqual(stream.rows, eager.rows, `rows mismatch: ${sql}`);
+      assert.equal(stream.cost, eager.cost, `cost mismatch: ${sql}`);
+    }
+  } finally {
+    s.close();
+  }
+});
+
+// Early exit over the lazy streaming-sort output (§4/§7) — the headline win of this slice. The sort's
+// INPUT is blocking (every row scanned + sorted on the first pull), but the OUTPUT is now yielded from
+// the SortedRows iterator one row at a time, so a caller that stops after a prefix skips the rowProduced +
+// projection of every windowed row it never pulls — charging LESS than a full drain. (Before this slice
+// the sort output was a "final" Emitter, fully built + charged on the first pull, so an early exit charged
+// the SAME — this test is what distinguishes the new behavior.)
+test("sorted output early exit charges less", () => {
+  const db = seededKV(1000);
+  const s = db.session();
+  try {
+    const sql = "SELECT v FROM t ORDER BY v"; // non-PK ORDER BY, no LIMIT → a 1000-row lazy sorted output
+    const full = streamResult(s, sql);
+    assert.equal(full.rows.length, 1000);
+
+    const cursor = s.query(sql);
+    const prefix: bigint[] = [];
+    for (const r of cursor) {
+      const v = r[0]!;
+      prefix.push(v.kind === "int" ? v.int : -1n);
+      if (prefix.length === 3) break;
+    }
+    const partial = cursor.cost;
+    cursor.close();
+
+    assert.deepEqual(prefix, [10n, 20n, 30n], "early pull yields the sorted prefix");
+    assert.ok(
+      partial < full.cost,
+      `early exit over the lazy sort output must charge less (partial=${partial}, full=${full.cost})`,
+    );
+  } finally {
+    s.close();
+  }
+});
+
+// The lazy streaming-sort output over the SPILLING merge path (SortedRows over a Merger): a file-backed
+// database under a tiny workMem forces many spilled runs + a k-way merge. A full lazy drain must match the
+// eager result (rows + cost — spill is invariant, spill.md §6), and an early exit must yield exactly the
+// prefix while leaving NO spill temp file behind (the generator's finally — reached on early return —
+// releases any undrained runs, §5).
+test("sorted output spilling merge streams lazily", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-sorted-lazy-"));
+  try {
+    const db = createDatabase(join(dir, "db.jed"), {});
+    const w = db.writeSession();
+    w.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
+    for (let id = 0; id < 200; id++) {
+      const k = (id * 48271) % 100; // scrambled key with many duplicates
+      w.execute(`INSERT INTO t VALUES (${id}, ${k})`);
+    }
+    w.commit();
+
+    const sql = "SELECT id, k FROM t ORDER BY k, id";
+
+    // Eager oracle: a default-workMem session never spills 200 small rows (in-memory sort).
+    const oracle = db.session();
+    const eager = eagerResult(oracle, sql);
+    oracle.close();
+
+    // Full lazy drain under a tiny workMem (forces spill + merge): rows + cost match the oracle.
+    const s = db.session();
+    s.setWorkMem(128); // ~2-3 rows per run → dozens of runs + a deep merge
+    const stream = streamResult(s, sql);
+    s.close();
+    assert.deepEqual(stream.rows, eager.rows, "spilling lazy drain rows must match eager");
+    assert.equal(stream.cost, eager.cost, "spilling lazy drain cost must match eager");
+    assert.equal(
+      readdirSync(dir).filter((n) => n.startsWith("jed-spill-")).length,
+      0,
+      "a full drain leaves no spill file",
+    );
+
+    // Early exit over the merge: pull a prefix, then close the cursor. The generator's finally releases
+    // the undrained merge's run files, so none leak.
+    const s2 = db.session();
+    s2.setWorkMem(128);
+    const cursor = s2.query(sql);
+    const got: Value[][] = [];
+    for (const r of cursor) {
+      got.push(r);
+      if (got.length === 5) break;
+    }
+    cursor.close();
+    s2.close();
+    assert.deepEqual(got, eager.rows.slice(0, 5), "early pull yields the sorted prefix");
+    assert.equal(
+      readdirSync(dir).filter((n) => n.startsWith("jed-spill-")).length,
+      0,
+      "an early exit leaves no spill file",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

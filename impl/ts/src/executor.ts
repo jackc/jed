@@ -139,7 +139,7 @@ import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
-import { DEFAULT_WORK_MEM, type RowCompare, type SpillSink, Sorter } from "./spill.ts";
+import { DEFAULT_WORK_MEM, type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -394,7 +394,11 @@ type SelectResult = {
 //     up front — the §3 asymmetry), so emission charges only rowProduced per windowed row.
 //   - "final": the rows are a fully-formed result (the special input-streaming paths already projected
 //     AND charged them) — emission hands them out with no further charge.
-type EmitMode = "project" | "identity" | "final";
+//   - "sorted": the streaming external sort's output, yielded LAZILY from the `sorted` pull iterator
+//     (positioned past the OFFSET) — emission pulls the next sorted row, charges rowProduced, and
+//     evaluates the projection list per windowed row, [0, end). So the output array is never built and a
+//     caller's early exit skips the projection (and rowProduced) of the rows it never pulls (§4/§7).
+type EmitMode = "project" | "identity" | "final" | "sorted";
 
 // Emitter describes how a SelectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
 // SELECT runs its blocking part (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into a buffer, then
@@ -403,18 +407,28 @@ type EmitMode = "project" | "identity" | "final";
 // query() path — a bufferedRows generator yields it row by row, bounding output memory and
 // short-circuiting a caller's early exit). Both drives charge the identical units at the identical
 // sites (streaming.md §6). For "project"/"identity" the buffer is windowed to [start, end); for
-// "final" start/end span the whole result.
+// "final" start/end span the whole result; for "sorted" `sorted` is the streaming-sort output pull
+// iterator (positioned past the OFFSET) and [0, end) is the window.
 type Emitter = {
   rows: Value[][];
   start: number;
   end: number;
   mode: EmitMode;
+  // Set only for "sorted": the streaming-sort output pull iterator, positioned past the OFFSET.
+  sorted?: SortedRows;
 };
 
 // finalEmitter wraps an already-projected-and-charged result (the special input-streaming paths) as a
 // "final" Emitter — emission hands the rows out with no further charge (spec/design/streaming.md §4).
 function finalEmitter(rows: Value[][]): Emitter {
   return { rows, start: 0, end: rows.length, mode: "final" };
+}
+
+// sortedEmitter wraps the streaming external sort's output (positioned past the OFFSET, with `remaining`
+// windowed rows still to emit) as a "sorted" Emitter — emission pulls + projects + charges rowProduced
+// per row, so the output array is never built (spec/design/streaming.md §4/§7).
+function sortedEmitter(sorted: SortedRows, remaining: number): Emitter {
+  return { rows: [], start: 0, end: remaining, mode: "sorted", sorted };
 }
 
 // Engine is the whole database: catalog + per-table in-memory stores. Single
@@ -1873,8 +1887,9 @@ function* streamRows(
 // (spec/design/streaming.md §4, S4): a function* generator whose body runs the BLOCKING part
 // (engine.execSelectEmit) on its first .next() — buffering the input (correctly: a sort/group/dedup/
 // join must see it all) and charging the scan/sort/group/dedup cost — then YIELDS its buffer one row at
-// a time. A "project" row is projected (charging rowProduced + projection) on emission; an "identity"/
-// "final" row is handed out (already projected). So building the generator runs no work (a 54P01 cost
+// a time. A "project" row is projected (charging rowProduced + projection) on emission; a "sorted" row
+// is pulled from the SortedRows iterator and projected (the streaming-sort output, streaming.md §4/§7);
+// an "identity"/"final" row is handed out (already projected). So building the generator runs no work (a 54P01 cost
 // abort surfaces during the first pull, not at query() — streaming.md §6), peak output memory is one
 // row, a caller's early exit (abandoning the generator) skips the projection of the rows it never pulls,
 // and a fully-drained query observes the same rows + total cost as the eager path (streaming.md §6).
@@ -1889,6 +1904,24 @@ function* bufferedRows(
   if (em.mode === "final") {
     // Already projected + charged — hand each row out (no further cost).
     for (const row of em.rows) yield row;
+    return;
+  }
+  if (em.mode === "sorted") {
+    // The streaming sort's lazy output: pull the next windowed row from the SortedRows iterator, charge
+    // rowProduced, and project it (streaming.md §4/§7). The try/finally releases any undrained spill runs
+    // when the generator is returned early (a caller's early exit) or completes (§5).
+    const sorted = em.sorted!;
+    try {
+      for (let i = 0; i < em.end; i++) {
+        const row = sorted.next();
+        if (row === null) break;
+        meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
+        meter.charge(COSTS.rowProduced);
+        yield plan.projections.map((p) => evalExpr(p, row, env, meter));
+      }
+    } finally {
+      sorted.close();
+    }
     return;
   }
   for (let i = em.start; i < em.end; i++) {
@@ -9797,19 +9830,22 @@ export class Engine {
   }
 
   // execStreamingSort is the streaming external sort for a single-table ORDER BY (spec/design/spill.md
-  // §4/§5). It streams scan→filter→sorter, so the input is never materialized in the executor heap;
-  // the sorter spills sorted runs to disk under workMem (file-backed databases) and k-way-merges them
-  // at finish, then the window/projection loop pulls the sorted rows one at a time. Results + cost are
-  // byte-identical to the eager sort: the same pageRead block, storageRowRead per scanned row, filter
-  // operator_eval, and rowProduced per windowed row accrue — only the sort, which is unmetered
-  // (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
-  // non-DISTINCT, with an ORDER BY and no index bound.
+  // §4/§5, streaming.md §4/§7). It streams scan→filter→sorter, so the input is never materialized in the
+  // executor heap; the sorter spills sorted runs to disk under workMem (file-backed databases) and
+  // k-way-merges them at finish. It runs the BLOCKING part (scan + sort + the OFFSET skip) and returns a
+  // "sorted" Emitter holding the SortedRows pull iterator positioned at the first output row — so the
+  // window's rowProduced + projection is charged LAZILY by the caller's emitter drive, one row per pull
+  // (the §4/§7 output-laziness follow-on: the output array is never built and an early exit skips the
+  // rows it never pulls). Results + cost under full drain are byte-identical to the eager sort: the same
+  // pageRead block, storageRowRead per scanned row, filter operator_eval, and rowProduced per windowed
+  // row accrue — only the sort, which is unmetered (cost.md §3), now spills. Gated (by the caller) to a
+  // single table, no join, non-aggregate, non-DISTINCT, with an ORDER BY and no index bound.
   private execStreamingSort(
     plan: SelectPlan,
     env: EvalEnv,
     meter: Meter,
     params: Value[],
-  ): SelectResult {
+  ): Emitter {
     const store = this.lkpStore(plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead + valueDecompress block
@@ -9827,11 +9863,17 @@ export class Engine {
     const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
     meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
+    // Build the sorted source in ORDER BY order, deferring the window's rowProduced + projection to the
+    // lazy emitter drive (the caller). Two ways to sort, both yielding a SortedRows pull iterator over
+    // the survivors:
+    //
     // A collated ORDER BY cannot use the C-ordered Sorter / spill (collated keys are slice 1e), and
     // collation is in-memory only this slice — so materialize the survivors and sort them with the
-    // collation-aware decorate sorter (spec/design/collation.md §8). The metered costs (storageRowRead
-    // per scanned row, rowProduced per windowed output) are identical to the Sorter path; the sort
-    // itself is unmetered like every sort (cost.md §3).
+    // collation-aware decorate sorter (spec/design/collation.md §8), then wrap the sorted array as an
+    // in-memory SortedRows. The metered costs (storageRowRead per scanned row, rowProduced per windowed
+    // output) are identical to the Sorter path; the sort itself is unmetered like every sort (cost.md §3).
+    let total: bigint;
+    let sorted: SortedRows;
     if (plan.order.some((k) => k.collation !== null)) {
       const rows: Row[] = [];
       if (!empty) {
@@ -9847,74 +9889,46 @@ export class Engine {
         });
       }
       sortRows(rows, plan.order);
-      const total = BigInt(rows.length);
-      const offset = plan.offset ?? 0n;
-      const start = offset < total ? offset : total;
-      let end = total;
-      if (plan.limit !== null && plan.limit < total - start) {
-        end = start + plan.limit;
+      total = BigInt(rows.length);
+      sorted = new SortedRows(rows, null);
+    } else {
+      // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
+      // in-range row is read (charging storageRowRead), its touched columns resolved (large-values.md
+      // §14), the WHERE applied (charging operator_eval), and a survivor pushed into the sorter, which
+      // spills when it exceeds the budget.
+      const sorter = this.newSorterFor(plan.order);
+      if (!empty) {
+        store.scanRange(bound, (_key, rawRow) => {
+          meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+          meter.charge(COSTS.storageRowRead);
+          const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
+          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
+            return true;
+          }
+          sorter.push(row);
+          return true; // never stop early — the sort must see every row
+        });
       }
-      const out: Value[][] = [];
-      for (let i = start; i < end; i++) {
-        const row = rows[Number(i)]!;
-        meter.guard();
-        meter.charge(COSTS.rowProduced);
-        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
-      }
-      return {
-        columnNames: plan.columnNames,
-        columnTypes: plan.columnTypes,
-        rows: out,
-        cost: meter.accrued,
-      };
-    }
-
-    // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
-    // in-range row is read (charging storageRowRead), its touched columns resolved (large-values.md
-    // §14), the WHERE applied (charging operator_eval), and a survivor pushed into the sorter, which
-    // spills when it exceeds the budget.
-    const sorter = this.newSorterFor(plan.order);
-    if (!empty) {
-      store.scanRange(bound, (_key, rawRow) => {
-        meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-        meter.charge(COSTS.storageRowRead);
-        const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
-          return true;
-        }
-        sorter.push(row);
-        return true; // never stop early — the sort must see every row
-      });
+      total = BigInt(sorter.total);
+      sorted = sorter.finish();
     }
 
     // LIMIT / OFFSET window over the sort's total row count (known without materializing the output).
-    // Clamp in the bigint domain before indexing (CLAUDE.md §8).
-    const total = BigInt(sorter.total);
+    // Clamp in the bigint domain (CLAUDE.md §8). The OFFSET skip is part of the blocking part (unwindowed
+    // — no rowProduced), done now so `sorted` is positioned at the first output row; the emitter drive
+    // then yields exactly `end-start` rows, charging rowProduced + projection per pull (streaming.md
+    // §4/§7).
     const offset = plan.offset ?? 0n;
     const start = offset < total ? offset : total;
     let end = total;
     if (plan.limit !== null && plan.limit < total - start) end = start + plan.limit;
-
-    const sorted = sorter.finish();
     try {
       for (let i = 0n; i < start; i++) sorted.next(); // skip the OFFSET rows (unwindowed)
-      const out: Value[][] = [];
-      for (let i = start; i < end; i++) {
-        const row = sorted.next();
-        if (row === null) break;
-        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
-        meter.charge(COSTS.rowProduced);
-        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
-      }
-      return {
-        columnNames: plan.columnNames,
-        columnTypes: plan.columnTypes,
-        rows: out,
-        cost: meter.accrued,
-      };
-    } finally {
-      sorted.close(); // a LIMIT may stop the merge early — release any undrained run files
+    } catch (e) {
+      sorted.close(); // release any spilled runs if the OFFSET skip throws
+      throw e;
     }
+    return sortedEmitter(sorted, Number(end - start));
   }
 
   // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
@@ -10159,6 +10173,25 @@ export class Engine {
   // time instead; both charge the identical units in the identical order, so totals agree (§6).
   private drainEmitterEager(em: Emitter, plan: SelectPlan, env: EvalEnv, meter: Meter): Value[][] {
     if (em.mode === "final") return em.rows;
+    if (em.mode === "sorted") {
+      // The streaming sort's lazy output: pull every windowed row from the SortedRows iterator, charging
+      // rowProduced + the projection per row — exactly the eager window loop execStreamingSort ran before
+      // its output went lazy (streaming.md §4/§7).
+      const sorted = em.sorted!;
+      try {
+        const out: Value[][] = [];
+        for (let i = 0; i < em.end; i++) {
+          const row = sorted.next();
+          if (row === null) break;
+          meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+          meter.charge(COSTS.rowProduced);
+          out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+        }
+        return out;
+      } finally {
+        sorted.close(); // a LIMIT/error may stop the merge early — release any undrained runs
+      }
+    }
     const out: Value[][] = [];
     for (let i = em.start; i < em.end; i++) {
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -10223,7 +10256,10 @@ export class Engine {
       // A derived table takes the eager path (grammar.md §42).
       plan.rels[0]!.derived === undefined
     ) {
-      return finalEmitter(this.execStreamingSort(plan, env, meter, params).rows);
+      // The streaming sort yields its output LAZILY (streaming.md §4/§7) — execStreamingSort runs the
+      // scan + sort + OFFSET skip and returns a "sorted" Emitter over the SortedRows pull iterator; the
+      // window's rowProduced + projection is charged by the emitter drive.
+      return this.execStreamingSort(plan, env, meter, params);
     }
 
     // Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
