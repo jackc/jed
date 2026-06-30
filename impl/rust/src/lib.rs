@@ -27,6 +27,7 @@ mod catalog;
 mod collation;
 mod cost;
 mod costs;
+mod cursor;
 mod date;
 mod datetime_fn;
 mod decimal;

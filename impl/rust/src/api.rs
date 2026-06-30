@@ -4,6 +4,7 @@
 
 use crate::ast::Statement;
 use crate::cancel::CancellationToken;
+use crate::cursor::Cursor;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Engine, Outcome};
 use crate::parser::Parser;
@@ -39,14 +40,15 @@ impl PreparedStatement {
     }
 }
 
-/// A cursor over a query's rows (spec/design/api.md §4). It iterates the **materialized** result
-/// one row at a time (true streaming is deferred per CLAUDE.md §9 — the iterator contract is the
-/// seam that lets the source become lazy later without a caller change), and exposes the column
-/// names and the accrued execution cost.
+/// A cursor over a query's rows (spec/design/api.md §4). It is a thin wrapper over a
+/// [`Cursor`](crate::cursor::Cursor) pull source and exposes the column names and the accrued
+/// execution cost. As of S1 the cursor's only shape is `Buffered` — the executor materializes the
+/// full result and `Rows` walks it one row at a time (today's behavior, byte-unchanged) — but
+/// `Rows` is now defined against the `Cursor` seam, so a future `Streaming` source
+/// (spec/design/streaming.md §4) plugs in without any caller change.
 pub struct Rows {
     column_names: Vec<String>,
-    iter: std::vec::IntoIter<Vec<Value>>,
-    cost: i64,
+    cursor: Cursor,
 }
 
 impl Rows {
@@ -59,8 +61,7 @@ impl Rows {
                 ..
             } => Ok(Rows {
                 column_names,
-                iter: rows.into_iter(),
-                cost,
+                cursor: Cursor::buffered(rows, cost),
             }),
             Outcome::Statement { .. } => Err(EngineError::new(
                 SqlState::SyntaxError,
@@ -74,9 +75,18 @@ impl Rows {
         &self.column_names
     }
 
-    /// The deterministic execution cost accrued by the query (CLAUDE.md §13).
+    /// The deterministic execution cost accrued by the query (CLAUDE.md §13). Final once the
+    /// cursor is drained (streaming.md §6); for today's buffered cursor it is final immediately.
     pub fn cost(&self) -> i64 {
-        self.cost
+        self.cursor.cost()
+    }
+
+    /// Release any read snapshot the cursor pins (spec/design/streaming.md §5). Idempotent; a no-op
+    /// for the S1 buffered cursor (it pins nothing), and the seam where a future streaming cursor
+    /// deregisters its reader-liveness pin. Draining the cursor to exhaustion is the other release
+    /// path. Rust additionally releases on `Drop`.
+    pub fn close(&mut self) {
+        self.cursor.close();
     }
 }
 
@@ -84,7 +94,7 @@ impl Iterator for Rows {
     type Item = Vec<Value>;
 
     fn next(&mut self) -> Option<Vec<Value>> {
-        self.iter.next()
+        self.cursor.next_row()
     }
 }
 

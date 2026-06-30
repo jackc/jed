@@ -339,6 +339,7 @@ only and the engine has no wire protocol).
 | rows iterate | `impl Iterator<Item = Vec<Value>>` | `for rows.Next() { rows.Row() }` | `for (const row of rows)` |
 | rows columns | `rows.column_names()` | `rows.ColumnNames()` | `rows.columnNames` |
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
+| rows close ([streaming.md §5](streaming.md)) | `rows.close()` + `Drop` | `rows.Close()` | `rows.close()` |
 | rows affected (§4) | `Outcome::Statement { rows_affected: Option<i64>, .. }` | `outcome.RowsAffected, outcome.HasRowsAffected` | `outcome.rowsAffected: number \| null` |
 | set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
 | set input-size limit (§8) | `db.set_max_sql_length(bytes)` | `db.SetMaxSQLLength(bytes)` | `db.setMaxSqlLength(bytes)` |

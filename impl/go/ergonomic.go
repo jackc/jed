@@ -202,10 +202,10 @@ func (row *Row) Scan(dest ...any) error {
 // and it does not let dest escape — so it is allocation-free (api.md §11). NULL into a plain
 // scalar pointer is an error; use *jed.Null[T], *any, or a Scanner to accept NULL.
 func (r *Rows) Scan(dest ...any) error {
-	if r.idx == 0 || r.idx > len(r.rows) {
+	if !r.valid {
 		return errors.New("jed: Scan called without a successful Next")
 	}
-	row := r.rows[r.idx-1]
+	row := r.current
 	if len(dest) != len(row) {
 		return fmt.Errorf("jed: Scan got %d destination(s) for a %d-column row", len(dest), len(row))
 	}
@@ -221,10 +221,10 @@ func (r *Rows) Scan(dest ...any) error {
 // know the schema statically. Scalars map to Go primitives; rich types map to their jed value
 // type (a richer container mapping is an api.md §11 follow-up).
 func (r *Rows) Values() ([]any, error) {
-	if r.idx == 0 || r.idx > len(r.rows) {
+	if !r.valid {
 		return nil, errors.New("jed: Values called without a successful Next")
 	}
-	row := r.rows[r.idx-1]
+	row := r.current
 	out := make([]any, len(row))
 	for i, v := range row {
 		out[i] = valueToAny(v)
@@ -236,9 +236,13 @@ func (r *Rows) Values() ([]any, error) {
 // faults once the cursor streams). Check it after the loop.
 func (r *Rows) Err() error { return r.err }
 
-// Close releases the cursor. A no-op over today's materialized result, but the contract the
-// streaming cursor needs — and what All()/Collect close automatically on loop exit.
-func (r *Rows) Close() error { return nil }
+// Close releases the cursor (its pinned read snapshot once streaming — streaming.md §5). A no-op
+// over today's materialized result, but the contract the streaming cursor needs — and what
+// All()/Collect close automatically on loop exit.
+func (r *Rows) Close() error {
+	r.cursor.close()
+	return nil
+}
 
 // ColumnTypes is the canonical jed type name of each output column (parallel to ColumnNames).
 func (r *Rows) ColumnTypes() []string { return r.columnTypes }
@@ -318,10 +322,10 @@ func (r *Rows) Value(col int) Value {
 }
 
 func (r *Rows) col(col int) (Value, error) {
-	if r.idx == 0 || r.idx > len(r.rows) {
+	if !r.valid {
 		return Value{}, errors.New("jed: column access without a successful Next")
 	}
-	row := r.rows[r.idx-1]
+	row := r.current
 	if col < 0 || col >= len(row) {
 		return Value{}, fmt.Errorf("jed: column %d out of range (row has %d)", col, len(row))
 	}
@@ -381,10 +385,10 @@ func Collect[T any](rows *Rows, fn func(*Rows) (T, error)) iter.Seq2[T, error] {
 // RowTo scans a single-column row into a T (for `SELECT count(*)`-shaped queries).
 func RowTo[T any](rows *Rows) (T, error) {
 	var out T
-	if rows.idx == 0 || rows.idx > len(rows.rows) {
+	if !rows.valid {
 		return out, errors.New("jed: RowTo without a successful Next")
 	}
-	row := rows.rows[rows.idx-1]
+	row := rows.current
 	if len(row) != 1 {
 		return out, fmt.Errorf("jed: RowTo expected 1 column, got %d", len(row))
 	}
@@ -397,7 +401,7 @@ func RowTo[T any](rows *Rows) (T, error) {
 // reflects once per row, which is fine off the hot loop — use Scan / typed accessors when it isn't.
 func RowToStructByName[T any](rows *Rows) (T, error) {
 	var out T
-	if rows.idx == 0 || rows.idx > len(rows.rows) {
+	if !rows.valid {
 		return out, errors.New("jed: RowToStructByName without a successful Next")
 	}
 	rv := reflect.ValueOf(&out).Elem()
@@ -417,7 +421,7 @@ func RowToStructByName[T any](rows *Rows) (T, error) {
 		}
 		byName[strings.ToLower(name)] = i
 	}
-	row := rows.rows[rows.idx-1]
+	row := rows.current
 	for ci, cname := range rows.columnNames {
 		fi, ok := byName[strings.ToLower(cname)]
 		if !ok {

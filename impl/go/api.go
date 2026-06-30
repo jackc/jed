@@ -143,9 +143,14 @@ func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 type Rows struct {
 	columnNames []string
 	columnTypes []string
-	rows        [][]Value
-	idx         int
-	cost        int64
+	// cursor is the pull source (cursor.go). As of S1 its only shape is buffered — the executor
+	// materializes the full result and the cursor walks it — but Rows is now defined against the
+	// cursor seam, so a future streaming source (spec/design/streaming.md §4) plugs in without any
+	// caller change.
+	cursor *cursor
+	// current is the row the last successful Next produced; valid reports whether there is one.
+	current []Value
+	valid   bool
 	// ctx is captured at Query time (ergonomic.go); Next polls it so a canceled context aborts
 	// iteration. Today the result is already materialized, so this is the forward-compatible hook
 	// for the streaming cursor (CLAUDE.md §9) — the deeper integration threads ctx through the
@@ -163,14 +168,14 @@ func rowsFromOutcome(out Outcome) (*Rows, error) {
 	return &Rows{
 		columnNames: out.ColumnNames,
 		columnTypes: out.ColumnTypes,
-		rows:        out.Rows,
-		cost:        out.Cost,
+		cursor:      bufferedCursor(out.Rows, out.Cost),
 	}, nil
 }
 
 // Next advances to the next row, returning false when the result is exhausted OR the captured
 // context has been canceled (Err then reports the cancellation).
 func (r *Rows) Next() bool {
+	r.valid = false
 	if r.err != nil {
 		return false
 	}
@@ -178,18 +183,20 @@ func (r *Rows) Next() bool {
 		r.err = err
 		return false
 	}
-	if r.idx >= len(r.rows) {
+	row, ok := r.cursor.nextRow()
+	if !ok {
 		return false
 	}
-	r.idx++
+	r.current = row
+	r.valid = true
 	return true
 }
 
 // Row returns the current row (valid after a Next that returned true).
-func (r *Rows) Row() []Value { return r.rows[r.idx-1] }
+func (r *Rows) Row() []Value { return r.current }
 
 // ColumnNames are the output column names of the query result.
 func (r *Rows) ColumnNames() []string { return r.columnNames }
 
 // Cost is the deterministic execution cost accrued by the query (CLAUDE.md §13).
-func (r *Rows) Cost() int64 { return r.cost }
+func (r *Rows) Cost() int64 { return r.cursor.costAccrued() }

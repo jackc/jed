@@ -5,6 +5,7 @@
 
 import type { Statement } from "./ast.ts";
 import { throwIfAborted } from "./cancel.ts";
+import { Cursor } from "./cursor.ts";
 import {
   type JsParam,
   type Row as ErgoRow,
@@ -40,28 +41,41 @@ export class PreparedStatement {
   }
 }
 
-// Rows is a cursor over a query's rows (spec/design/api.md §4). It is iterable (for..of yields one
-// Value[] per row) over the MATERIALIZED result — true streaming is deferred per CLAUDE.md §9; the
-// iterable contract is the seam that lets the source become lazy later without a caller change —
-// and exposes the column names and the accrued execution cost.
+// Rows is a cursor over a query's rows (spec/design/api.md §4). It is a thin wrapper over a Cursor
+// pull source (cursor.ts) and is iterable (for..of yields one Value[] per row). As of S1 the
+// cursor's only shape is buffered — the executor materializes the full result and Rows walks it —
+// but Rows is now defined against the Cursor seam, so a future streaming source (streaming.md §4)
+// plugs in without any caller change. It is SINGLE-PASS (matching the Rust/Go cores and the
+// streaming contract): once iterated it is drained.
 export class Rows implements Iterable<Value[]> {
   readonly columnNames: string[];
-  private readonly rows: Value[][];
-  readonly cost: bigint;
+  private readonly cursor: Cursor;
 
-  constructor(columnNames: string[], rows: Value[][], cost: bigint) {
+  constructor(columnNames: string[], cursor: Cursor) {
     this.columnNames = columnNames;
-    this.rows = rows;
-    this.cost = cost;
+    this.cursor = cursor;
+  }
+
+  // cost is the deterministic execution cost accrued by the query (CLAUDE.md §13). Final once the
+  // cursor is drained (streaming.md §6); for today's buffered cursor it is final immediately.
+  get cost(): bigint {
+    return this.cursor.cost();
+  }
+
+  // close releases any read snapshot the cursor pins (streaming.md §5). Idempotent; a no-op for the
+  // S1 buffered cursor (it pins nothing), and the seam where a future streaming cursor deregisters
+  // its reader-liveness pin. Draining the iterator to exhaustion is the other release path.
+  close(): void {
+    this.cursor.close();
   }
 
   [Symbol.iterator](): Iterator<Value[]> {
-    let i = 0;
-    const rows = this.rows;
+    const cursor = this.cursor;
     return {
       next(): IteratorResult<Value[]> {
-        return i < rows.length
-          ? { done: false, value: rows[i++]! }
+        const row = cursor.nextRow();
+        return row !== undefined
+          ? { done: false, value: row }
           : { done: true, value: undefined as unknown as Value[] };
       },
     };
@@ -75,7 +89,7 @@ export function rowsFromOutcome(out: Outcome): Rows {
       "query called on a statement that produces no rows; use execute",
     );
   }
-  return new Rows(out.columnNames, out.rows, out.cost);
+  return new Rows(out.columnNames, new Cursor(out.rows, out.cost));
 }
 
 // prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse

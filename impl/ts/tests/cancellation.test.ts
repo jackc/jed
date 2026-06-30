@@ -95,13 +95,15 @@ test("the signal is observed only at statement boundaries", () => {
   db.execute("INSERT INTO t VALUES (1)");
 
   const ac = new AbortController();
-  // First statement runs to completion synchronously while the signal is still live.
+  // First statement runs to completion synchronously while the signal is still live. The cursor is
+  // single-pass (cursor.ts), so drain it once into an array, then re-assert on the array.
   const rows = db.queryCancelable("SELECT id FROM t", [], ac.signal);
-  assert.strictEqual([...rows].length, 1);
+  const out = [...rows];
+  assert.strictEqual(out.length, 1);
 
-  // Abort now (between statements): the already-materialized cursor is unaffected, and the NEXT
+  // Abort now (between statements): the already-materialized result is unaffected, and the NEXT
   // cancelable call aborts at its boundary.
   ac.abort();
-  assert.strictEqual([...rows].length, 1, "an aborted signal does not retroactively void a result");
+  assert.strictEqual(out.length, 1, "an aborted signal does not retroactively void a result");
   assert.throws(() => db.queryCancelable("SELECT id FROM t", [], ac.signal), isCanceled);
 });
