@@ -1070,14 +1070,22 @@ function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
 }
 
 // OverflowPageOut is one overflow page produced while serializing a record's external value.
-type OverflowPageOut = { index: number; itemCount: number; nextPage: number; payload: Uint8Array };
+// Exported for the lazy-record white-box test (lazy_inline_values.test.ts); the barrel is unaffected.
+export type OverflowPageOut = {
+  index: number;
+  itemCount: number;
+  nextPage: number;
+  payload: Uint8Array;
+};
 
 // encodeRecord builds one record (key_len(u16) | key | payload), spilling over-large values out-of-
 // line per the disposition plan (large-values.md §12). For each externalized value, allocate overflow
 // page(s) via `take`, append them to `ovf`, and write a tag|first_page|len pointer instead of the
 // inline body. capacity is the page payload (the slab size + the spill-plan input). Shared by the
 // whole-image (serializeNode) and incremental (serializeDirty) writers, which differ only in `take`.
-function encodeRecord(
+// Exported for the lazy-record white-box test (lazy_inline_values.test.ts); the barrel (tooling.ts)
+// is unaffected — the L1 encodeValue/readInlineBody precedent.
+export function encodeRecord(
   colTypes: ColType[],
   key: Uint8Array,
   row: Row,
@@ -2483,7 +2491,8 @@ export function metaPage(
 // makePage is a catalog/B-tree page's full pageSize bytes (header + payload, zero-padded). toImage
 // copies it into the image; an incremental commit pwrites it directly (file.ts). Single-sources the
 // page byte layout.
-function makePage(
+// Exported for the lazy-record white-box test (lazy_inline_values.test.ts); the barrel is unaffected.
+export function makePage(
   ps: number,
   pageType: number,
   itemCount: number,
@@ -2967,14 +2976,19 @@ function decodeTableEntry(
 // rest when a dirty leaf re-encodes (resolveForEncode).
 function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   const tag = readU8(buf, cur);
-  // A present inline value (lazy-record.md §12, L2): a variable-length / structured body (the
-  // isSpillable set — §6) is DEFERRED as an owned-span unfetched (form 0x00), found by walking its
-  // byte extent without constructing it (inlineBodySpan); a fixed-width scalar is decoded eagerly
-  // (deferring it buys nothing — §6). resolveUnfetched reconstructs a touched one from the span,
-  // byte-identically (readInlineBody in construct mode).
+  // A present inline value (lazy-record.md §12, L3): a variable-length / structured body (the
+  // isSpillable set — §6) is DEFERRED as an unfetched (form 0x00) referencing the shared page block —
+  // FORM (a), zero-copy (§5a): keep the span as a SUBARRAY view of the faulted page block instead of
+  // copying it. A Uint8Array subarray shares (and keeps alive under GC) the page block's ArrayBuffer,
+  // so the leaf's one page block stays resident and is shared by every deferred value in it (the
+  // scan-emit clone is then a view copy, never a byte copy) — resident leaf memory tracks ≈ pageSize,
+  // the honest buffer-pool bound (§9). The block is read fresh per fault (BlockStore.readAt) and
+  // never mutated after decode (copy-on-write commits write new pages), so the view is stable. A
+  // fixed-width scalar is decoded eagerly (deferring it buys nothing — §6). resolveUnfetched
+  // reconstructs a touched one from the span, byte-identically (readInlineBody in construct mode).
   if (tag === 0x00) {
     if (isSpillable(ty)) {
-      const body = inlineBodySpan(ty, buf, cur).slice(); // own the bytes (form (b)); page may evict
+      const body = inlineBodySpan(ty, buf, cur);
       return {
         kind: "unfetched",
         ref: { form: 0x00, firstPage: 0, storedLen: 0, rawLen: 0, comp: body },

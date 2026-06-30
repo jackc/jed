@@ -105,14 +105,20 @@ export type Value =
   // it as NULL.
   | { kind: "unfetched"; ref: Unfetched };
 
-// The on-disk form of a lazily-loaded large value (spec/design/large-values.md §14;
-// spec/fileformat/format.md "Large values") — exactly the record's pointer fields, so the scan
-// layer can resolve it through the pager (and the cost walk can count its chain pages /
-// decompress slabs) without reading the value. `form` is the presence tag (0x02 external-plain
-// / 0x03 inline-compressed / 0x04 external-compressed); firstPage/storedLen describe the chain
-// for the external forms (the payload for plain, the LZ4 block for compressed); rawLen is the
-// decompressed length for the compressed forms; comp holds the resident LZ4 block for
-// inline-compressed.
+// The on-disk form of a lazily-loaded value (spec/design/large-values.md §14, generalized to every
+// variable-length value by lazy-record.md §5a/L3; spec/fileformat/format.md "Large values") — the
+// record's pointer fields (or, for the inline form, a view onto its body bytes), so the scan layer
+// can resolve it through the pager (and the cost walk can count its chain pages / decompress slabs)
+// without reading the value. `form` is the presence tag: 0x00 inline-deferred (an inline-plain value
+// whose decode is deferred — `comp` is the span after the 0x00 tag, kept as a SUBARRAY view of the
+// shared faulted page block, FORM (a), zero-copy §5a: the subarray shares (and keeps alive under GC)
+// that one block's ArrayBuffer, so a leaf's deferred values share its bytes rather than each owning
+// a copy — resident leaf memory ≈ pageSize, §9), 0x02 external-plain / 0x03 inline-compressed / 0x04
+// external-compressed the large-value forms; firstPage/storedLen describe the chain for the external
+// forms (the payload for plain, the LZ4 block for compressed); rawLen is the decompressed length for
+// the compressed forms; comp holds the resident LZ4 block for inline-compressed, or the body-span
+// view for inline-deferred. (A value read back from a spill run file owns a fresh copy in `comp` — a
+// degenerate form (a), since its page block is long gone — spill.ts.)
 export type Unfetched = {
   form: number;
   firstPage: number;

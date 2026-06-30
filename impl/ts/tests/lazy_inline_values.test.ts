@@ -1,21 +1,40 @@
-// L2 — defer inline values at fault (spec/design/lazy-record.md §12). On the demand-paged path
+// L2/L3 — defer inline values at fault (spec/design/lazy-record.md §12). On the demand-paged path
 // every variable-length / structured present value (text/bytea/decimal/json/jsonb/composite/
-// array/range) is loaded as an owned-span unfetched (form 0x00) instead of being eagerly decoded;
-// the scan layer resolves exactly the query's touched columns, an untouched one is dropped still
-// deferred. The reshape is cost-, result-, and byte-neutral (§8), so a demand-paged file and a
-// fully-resident in-memory database must observe identical rows and identical cost for every query
-// shape — that mode-identity is the leak-catcher (an unresolved deferral escapes the scan layer as
-// a loud poison throw, never silent NULL). Mirrors impl/rust/tests/lazy_inline_values.rs and
-// impl/go/lazy_inline_values_test.go.
+// array/range) is loaded as a deferred unfetched (form 0x00) — a zero-copy subarray view of the
+// shared page block (form (a), L3) — instead of being eagerly decoded; the scan layer resolves
+// exactly the query's touched columns, an untouched one is dropped still deferred. The reshape is
+// cost-, result-, and byte-neutral (§8) regardless of representation (form (a)/(b)), so a paged file
+// and a fully-resident in-memory database must observe identical rows and identical cost for every
+// query shape — that mode-identity is the leak-catcher (an unresolved deferral escapes the scan
+// layer as a loud poison throw, never silent NULL). Mirrors impl/rust/tests/lazy_inline_values.rs
+// and impl/go/lazy_inline_values_test.go.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { ColType } from "../src/catalog.ts";
+import { Decimal } from "../src/decimal.ts";
 import { DEFAULT_PAGE_SIZE } from "../src/executor.ts";
+import {
+  decodeLeafNode,
+  encodeRecord,
+  encodeValue,
+  makePage,
+  type OverflowPageOut,
+  resolveUnfetched,
+} from "../src/format.ts";
 import { close, create, Engine, execute, open } from "../src/tooling.ts";
-import { render } from "../src/value.ts";
+import {
+  arrayValue,
+  byteaValue,
+  decimalValue,
+  intValue,
+  render,
+  textValue,
+  type Value,
+} from "../src/value.ts";
 import { errCode } from "./util.ts";
 
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
@@ -265,4 +284,95 @@ test("untouched deferred column rides a spilling sort", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// L3, form (a) zero-copy block-shared deferral (spec/design/lazy-record.md §5a/§12). A faulted
+// leaf's deferred inline values are SUBARRAY views of the one shared page block, never per-value
+// copies (form (b), L2). This is the resident-memory dividend (§9): resident leaf bytes track
+// ≈ pageSize. The property is invisible to results and cost (§8), so it is asserted white-box:
+// every deferred value's `comp` subarray shares the page block's identical ArrayBuffer (a
+// `.slice()` copy would own a fresh ArrayBuffer of exactly its own length). Mirrors the Rust
+// faulted_leaf_shares_one_block_across_deferred_values and the Go equivalent.
+test("a faulted leaf shares one page block across its deferred values", () => {
+  const sc = (s: "i32" | "text" | "bytea" | "decimal"): ColType => ({ kind: "scalar", scalar: s });
+  const i32 = sc("i32");
+  // Variable-length / structured columns so every present value defers (§6); the i32 column stays
+  // eagerly decoded (deferring a fixed-width scalar buys nothing).
+  const colTypes: ColType[] = [
+    i32,
+    sc("text"),
+    sc("bytea"),
+    sc("decimal"),
+    { kind: "array", elem: i32 }, // i32[]
+  ];
+  const ps = 8192; // large page → every value stays inline-plain (no spill)
+  const capacity = ps - 16; // PAGE_HEADER
+
+  const rows: Value[][] = [];
+  for (let i = 0; i < 3; i++) {
+    rows.push([
+      intValue(BigInt(i)),
+      textValue(`name-${i}-padding-padding`),
+      byteaValue(new Uint8Array([i, i, i, i])),
+      decimalValue(Decimal.fromDigitsScale(false, "12345", 2)),
+      arrayValue([intValue(BigInt(i)), intValue(BigInt(i + 1))]),
+    ]);
+  }
+
+  // Encode the records into one leaf page payload (everything inline at this page size).
+  let takeSeq = 100;
+  const take = (): number => ++takeSeq;
+  const ovf: OverflowPageOut[] = [];
+  const parts: Uint8Array[] = [];
+  rows.forEach((row, i) => {
+    const key = new Uint8Array(4);
+    new DataView(key.buffer).setUint32(0, i, false);
+    parts.push(encodeRecord(colTypes, key, row, capacity, take, ovf));
+  });
+  assert.equal(ovf.length, 0, "values must stay inline (no overflow) for the form-(a) case");
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const payload = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    payload.set(p, at);
+    at += p.length;
+  }
+  const block = makePage(ps, 2 /* PAGE_LEAF */, rows.length, 0, payload);
+
+  // Fault the leaf: every deferrable present value becomes an inline-deferred unfetched (form (a)).
+  const node = decodeLeafNode(block, 2, colTypes);
+
+  let deferred = 0;
+  node.vals.forEach((row, ri) => {
+    row.forEach((v, ci) => {
+      if (v.kind !== "unfetched" || v.ref.form !== 0x00) return;
+      deferred++;
+      const comp = v.ref.comp!;
+      // Form (a): the body is a SUBARRAY view of the page block, so it shares the block's identical
+      // ArrayBuffer (one allocation, page_size bytes). A form-(b) `.slice()` copy owns a fresh
+      // ArrayBuffer of exactly its own length.
+      assert.ok(
+        comp.buffer === block.buffer,
+        `row ${ri} col ${ci}: deferred body must view the shared page block (form (a))`,
+      );
+      assert.equal(
+        comp.buffer.byteLength,
+        ps,
+        `row ${ri} col ${ci}: the shared block is the whole page`,
+      );
+      // It still resolves to exactly the eager value (form (a) is decode-neutral).
+      const got = resolveUnfetched(colTypes[ci]!, v.ref, () => {
+        throw new Error("inline values read no overflow pages");
+      });
+      assert.deepEqual(
+        encodeValue(colTypes[ci]!, got),
+        encodeValue(colTypes[ci]!, rows[ri]![ci]!),
+        `row ${ri} col ${ci}: resolved value differs from the eager value`,
+      );
+    });
+  });
+  // 3 rows × 4 deferrable columns (text/bytea/decimal/array) = 12 deferred values; the i32 column
+  // stays eager (§6).
+  assert.equal(deferred, 12, "every deferrable present value defers (form (a))");
 });
