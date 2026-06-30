@@ -59,8 +59,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use jed::{
-    Database, DatabaseOptions, OpenOptions, Outcome, PreparedStatement, Session, SessionOptions,
-    Value,
+    Database, DatabaseOptions, OpenOptions, Outcome, PreparedStatement, Rows, Session,
+    SessionOptions, Value,
 };
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -177,6 +177,40 @@ fn encode_query(ncols: usize, rows: impl Iterator<Item = Vec<Value>>) -> *mut u8
                 }
             }
         }
+    }
+    b.0[nrows_pos..nrows_pos + 4].copy_from_slice(&nrows.to_le_bytes());
+    b.finish()
+}
+
+/// Drain a streaming [`Rows`] cursor into a QUERY buffer, surfacing a **mid-drain** error (a `54P01`
+/// cost abort, `57014` cancellation, or arithmetic trap) as an ERROR buffer rather than a silently
+/// truncated result. Prepared queries stream (spec/design/streaming.md §7), so the per-row error can
+/// surface *during* the drain rather than at `query_prepared` — the partial buffer is discarded if it
+/// does. (The materialized [`ok_outcome`] path encodes a `Vec` iterator that never errors, so it stays
+/// on [`encode_query`].)
+fn ok_rows(mut rows: Rows) -> *mut u8 {
+    let ncols = rows.column_names().len();
+    let mut b = Buf::new(TAG_QUERY);
+    b.u32(ncols as u32);
+    let nrows_pos = b.0.len();
+    b.u32(0); // back-filled with the actual row count
+    let mut nrows: u32 = 0;
+    for row in &mut rows {
+        nrows += 1;
+        for v in row {
+            match v {
+                // A SQL NULL is the flag — NOT the rendered string "NULL".
+                Value::Null => b.u8(1),
+                other => {
+                    b.u8(0);
+                    b.str(&other.render());
+                }
+            }
+        }
+    }
+    // A mid-drain error stops the iterator; surface it (discarding the partial buffer `b`).
+    if let Err(e) = rows.error() {
+        return err_buf(e.code(), &e.message);
     }
     b.0[nrows_pos..nrows_pos + 4].copy_from_slice(&nrows.to_le_bytes());
     b.finish()
@@ -456,10 +490,9 @@ pub extern "C" fn jed_stmt_query(
             Err(b) => return b,
         };
         match conn.sess.query_prepared(stmt, &params) {
-            Ok(rows) => {
-                let ncols = rows.column_names().len();
-                encode_query(ncols, rows)
-            }
+            // query_prepared now streams (spec/design/streaming.md §7), so drain via ok_rows, which
+            // surfaces a mid-drain error instead of truncating.
+            Ok(rows) => ok_rows(rows),
             Err(e) => err_buf(e.code(), &e.message),
         }
     })
