@@ -13,7 +13,7 @@
 //! projection of the rows it never pulls (the top-N-over-the-buffer win, §4).
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
 
 /// Seed an in-memory shared db with `t(id i32 PK, v i32)` holding `1..=n` (v = id * 10).
 fn seeded(n: i64) -> Database {
@@ -364,6 +364,133 @@ fn buffered_mid_drain_cost_abort_surfaces() {
         .error()
         .expect_err("a mid-drain cost abort must surface");
     assert_eq!(err.code(), "54P01", "the abort is a cost-limit error");
+}
+
+// ---- the lazy streaming-SORT output (Emitter::Sorted; streaming.md §4/§7) ------------------------
+
+/// Every streaming-external-sort shape (a single-table non-PK `ORDER BY`): `query()` (the lazy
+/// `Emitter::Sorted` drive — pulling the `SortedRows` iterator one row at a time) must equal
+/// `execute()` (the eager drive of the SAME emitter) on rows AND total cost under full drain (§6).
+#[test]
+fn sorted_matches_eager_rows_and_cost() {
+    let db = seeded(40);
+    let mut s = db.session(SessionOptions::default());
+    for sql in [
+        "SELECT v FROM t ORDER BY v",         // non-PK sort, full output
+        "SELECT v FROM t ORDER BY v DESC",    // descending
+        "SELECT v FROM t ORDER BY v LIMIT 7", // top-N window
+        "SELECT v FROM t ORDER BY v LIMIT 7 OFFSET 5", // LIMIT + OFFSET window
+        "SELECT v FROM t ORDER BY v OFFSET 35", // OFFSET near the end (tail window)
+        "SELECT id, v + 1 FROM t ORDER BY v", // a projection expression (operator_eval per row)
+        "SELECT v FROM t WHERE id > 20 ORDER BY v", // a residual WHERE filter
+        "SELECT v FROM t WHERE id > 99999 ORDER BY v", // empty result
+    ] {
+        let (er, ec) = eager(&mut s, sql);
+        let (sr, sc) = streamed(&mut s, sql);
+        assert_eq!(sr, er, "rows mismatch: {sql}");
+        assert_eq!(sc, ec, "cost mismatch: {sql}");
+    }
+}
+
+/// Early exit over the lazy streaming-sort output (§4/§7) — the headline win of this slice. The sort's
+/// INPUT is blocking (every row is scanned + sorted on the first pull), but the OUTPUT is now yielded
+/// from the `SortedRows` iterator one row at a time, so a caller that stops after a prefix skips the
+/// `row_produced` + projection of every windowed row it never pulls — charging LESS than a full drain.
+/// (Before this slice the sort output was an `Emitter::Final`, fully built + charged on the first pull,
+/// so an early exit charged the SAME — this test is what distinguishes the new behavior.)
+#[test]
+fn sorted_early_exit_charges_less() {
+    let db = seeded(1000);
+    let mut s = db.session(SessionOptions::default());
+
+    // A non-PK ORDER BY with no LIMIT → the streaming external sort → a 1000-row lazy `Sorted` output.
+    let sql = "SELECT v FROM t ORDER BY v";
+    let (full_rows, full_cost) = streamed(&mut s, sql);
+    assert_eq!(full_rows.len(), 1000);
+
+    let mut rows = s.query(sql, &[]).unwrap();
+    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r[0].clone()).collect();
+    let partial_cost = rows.cost();
+    drop(rows);
+
+    assert_eq!(
+        prefix,
+        vec![Value::Int(10), Value::Int(20), Value::Int(30)],
+        "early pull yields the sorted prefix"
+    );
+    assert!(
+        partial_cost < full_cost,
+        "early exit over the lazy sort output must charge less (partial={partial_cost}, full={full_cost})"
+    );
+}
+
+/// The lazy streaming-sort output over the SPILLING merge path (`SortedRows::Merge`): a file-backed
+/// database under a tiny `work_mem` forces many spilled runs + a k-way merge. A full lazy drain must
+/// match the eager result (rows + cost — spill is invariant, spill.md §6), and an early exit must yield
+/// exactly the prefix while leaving NO spill temp file behind (the `Merger`'s `Drop` cleanup fires when
+/// the lazy cursor is dropped undrained — §5).
+#[test]
+fn sorted_spill_merge_streams_lazily() {
+    // Isolate the spill files in a unique subdir so the run-file count is not raced by other tests
+    // (spill runs land next to the database file — executor `new_sorter`).
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sorted_spill_lazy_dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.jed");
+
+    let count_spill_files = || -> usize {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("jed-spill-"))
+            .count()
+    };
+
+    let db = Database::create(&path, DatabaseOptions::default()).unwrap();
+    {
+        let mut w = db.write_session();
+        w.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])
+            .unwrap();
+        for id in 0..200i64 {
+            let k = (id * 48271) % 100; // scrambled key with many duplicates
+            w.execute(&format!("INSERT INTO t VALUES ({id}, {k})"), &[])
+                .unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    // Eager oracle: a default-work_mem session never spills 200 small rows (in-memory sort).
+    let sql = "SELECT id, k FROM t ORDER BY k, id";
+    let (er, ec) = eager(&mut db.session(SessionOptions::default()), sql);
+
+    // Full lazy drain under a tiny work_mem (forces spill + merge): rows + cost match the oracle.
+    {
+        let mut s = db.session(SessionOptions::default());
+        s.set_work_mem(128); // ~2-3 rows per run → dozens of runs + a deep merge
+        let (sr, sc) = streamed(&mut s, sql);
+        assert_eq!(sr, er, "spilling lazy drain rows must match eager");
+        assert_eq!(sc, ec, "spilling lazy drain cost must match eager");
+    }
+    assert_eq!(count_spill_files(), 0, "a full drain leaves no spill file");
+
+    // Early exit over the merge: pull a prefix, then drop the cursor. The undrained `Merger`'s `Drop`
+    // deletes its run files, so none leak.
+    {
+        let mut s = db.session(SessionOptions::default());
+        s.set_work_mem(128);
+        let mut rows = s.query(sql, &[]).unwrap();
+        let prefix: Vec<Vec<Value>> = (&mut rows).take(5).collect();
+        assert_eq!(
+            prefix,
+            er[..5].to_vec(),
+            "early pull yields the sorted prefix"
+        );
+        drop(rows);
+    }
+    assert_eq!(count_spill_files(), 0, "an early exit leaves no spill file");
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- the lazy DEFERRED cursor (a top-level set-op / WITH; streaming.md §7) ------------------------

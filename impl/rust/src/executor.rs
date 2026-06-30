@@ -172,9 +172,21 @@ enum Emitter {
         mode: EmitMode,
     },
     /// A fully-formed result the special input-streaming paths (`exec_streaming_scan` /
-    /// `exec_index_order_scan` / `exec_streaming_sort` / `exec_streaming_join`) already projected
-    /// AND charged `row_produced` for. Emission just hands the rows out — no further charge.
+    /// `exec_index_order_scan` / `exec_streaming_join`) already projected AND charged `row_produced`
+    /// for. Emission just hands the rows out — no further charge.
     Final { rows: Vec<Vec<Value>> },
+    /// The streaming external sort's output, yielded **lazily** from the [`SortedRows`] pull iterator
+    /// (spec/design/streaming.md §4/§7) — positioned past the `OFFSET`, with `remaining` windowed rows
+    /// still to emit. Each emission pulls the next sorted row, charges `row_produced`, and evaluates
+    /// the projection list (charging its `operator_eval`s). So the output `Vec` is **never built** and
+    /// a caller's early exit skips the projection (and `row_produced`) of the rows it never pulls — the
+    /// follow-on win over wrapping the materialized output as [`Emitter::Final`]. Under full drain the
+    /// rows + total cost are byte-identical to the eager path (it pulls every windowed row, charging
+    /// the same units at the same sites — §6).
+    Sorted {
+        sorted: crate::spill::SortedRows,
+        remaining: usize,
+    },
 }
 
 /// Whether an [`Emitter::Buffer`] row still needs projecting on emission (spec/design/streaming.md §4).
@@ -11180,21 +11192,25 @@ impl Engine {
         })
     }
 
-    /// Streaming external sort for a single-table `ORDER BY` (spec/design/spill.md §4/§5). Streams
-    /// scan→filter→[`Sorter`], so the input is never materialized in the executor heap; the sorter
-    /// spills sorted runs to disk under `work_mem` (file-backed databases) and k-way-merges them at
-    /// `finish`, then the window/projection loop pulls the sorted rows one at a time. Results + cost
-    /// are byte-identical to the eager sort: the same `page_read` block, `storage_row_read` per
-    /// scanned row, filter `operator_eval`, and `row_produced` per windowed row accrue — only the
-    /// sort, which is unmetered (cost.md §3), now spills. Gated (by the caller) to a single table, no
-    /// join, non-aggregate, non-DISTINCT, with an `ORDER BY` and no index bound.
+    /// Streaming external sort for a single-table `ORDER BY` (spec/design/spill.md §4/§5,
+    /// streaming.md §4/§7). Streams scan→filter→[`Sorter`], so the input is never materialized in the
+    /// executor heap; the sorter spills sorted runs to disk under `work_mem` (file-backed databases)
+    /// and k-way-merges them at `finish`. Runs the **blocking part** (scan + sort + the `OFFSET` skip)
+    /// and returns an [`Emitter::Sorted`] holding the [`SortedRows`] pull iterator positioned at the
+    /// first output row — so the window's `row_produced` + projection is charged **lazily** by the
+    /// caller's emitter drive, one row per pull (the §4/§7 output-laziness follow-on: the output `Vec`
+    /// is never built and an early exit skips the rows it never pulls). Results + cost under full drain
+    /// are byte-identical to the eager sort: the same `page_read` block, `storage_row_read` per scanned
+    /// row, filter `operator_eval`, and `row_produced` per windowed row accrue — only the sort, which
+    /// is unmetered (cost.md §3), now spills. Gated (by the caller) to a single table, no join,
+    /// non-aggregate, non-DISTINCT, with an `ORDER BY` and no index bound.
     fn exec_streaming_sort(
         &self,
         plan: &SelectPlan,
         env: &EvalEnv,
         meter: &mut Meter,
         params: &[Value],
-    ) -> Result<SelectResult> {
+    ) -> Result<Emitter> {
         let store = self.store(&plan.rels[0].table_name);
 
         // Resolve the scan bound (the PK pushdown, if any) and charge the page_read +
@@ -11217,12 +11233,17 @@ impl Engine {
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
 
+        // Build the sorted source in `ORDER BY` order, deferring the window's row_produced +
+        // projection to the lazy emitter drive (the caller). Two ways to sort, both yielding a
+        // `SortedRows` pull iterator over the survivors:
+        //
         // A collated ORDER BY cannot use the `C`-ordered Sorter / spill (collated keys are slice
         // 1e), and collation is in-memory only this slice — so materialize the survivors and sort
-        // them with the collation-aware decorate sorter (spec/design/collation.md §8). The metered
-        // costs (storage_row_read per scanned row, row_produced per windowed output) are identical
-        // to the Sorter path; the sort itself is unmetered like every sort (cost.md §3).
-        if plan.order.iter().any(|(_, _, _, c)| c.is_some()) {
+        // them with the collation-aware decorate sorter (spec/design/collation.md §8), then wrap the
+        // sorted `Vec` as an in-memory `SortedRows`. The metered costs (storage_row_read per scanned
+        // row, row_produced per windowed output) are identical to the Sorter path; the sort itself is
+        // unmetered like every sort (cost.md §3).
+        let (total, mut sorted) = if plan.order.iter().any(|(_, _, _, c)| c.is_some()) {
             let mut rows: Vec<Row> = Vec::new();
             if !empty {
                 store.scan_range(&bound, &mut |_key, row| {
@@ -11248,87 +11269,56 @@ impl Engine {
             }
             sort_rows(&mut rows, &plan.order)?;
             let total = rows.len() as i64;
-            let start = plan.offset.unwrap_or(0).min(total) as usize;
-            let end = match plan.limit {
-                Some(lim) if lim < total - start as i64 => start + lim as usize,
-                _ => total as usize,
-            };
-            let mut out: Vec<Vec<Value>> = Vec::with_capacity(end - start);
-            for row in &rows[start..end] {
-                meter.guard()?;
-                meter.charge(COSTS.row_produced);
-                let mut projected = Vec::with_capacity(plan.projections.len());
-                for p in &plan.projections {
-                    projected.push(p.eval(row, env, meter)?);
-                }
-                out.push(projected);
+            (total, crate::spill::SortedRows::InMemory(rows.into_iter()))
+        } else {
+            // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never
+            // short-circuits: every in-range row is read (charging storage_row_read), its touched
+            // columns resolved (large-values.md §14), the WHERE applied (charging operator_eval), and
+            // a survivor pushed into the sorter, which spills when it exceeds the budget. Only
+            // surviving rows are cloned.
+            let mut sorter = self.new_sorter(&plan.order);
+            if !empty {
+                store.scan_range(&bound, &mut |_key, row| {
+                    meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                    meter.charge(COSTS.storage_row_read);
+                    let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
+                        let mut r = row.clone();
+                        store.resolve_columns(&mut r, &plan.rel_masks[0])?;
+                        Some(r)
+                    } else {
+                        None
+                    };
+                    let row_ref = resolved.as_ref().unwrap_or(row);
+                    let keep = match &plan.filter {
+                        Some(f) => f.eval(row_ref, env, meter)?.is_true(),
+                        None => true,
+                    };
+                    if keep {
+                        sorter.push(resolved.unwrap_or_else(|| row.clone()))?;
+                    }
+                    Ok(true) // never stop early — the sort must see every row
+                })?;
             }
-            return Ok(SelectResult {
-                column_names: plan.column_names.clone(),
-                column_types: plan.column_types.clone(),
-                rows: out,
-                cost: meter.accrued,
-            });
-        }
-
-        // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
-        // every in-range row is read (charging storage_row_read), its touched columns resolved
-        // (large-values.md §14), the WHERE applied (charging operator_eval), and a survivor pushed
-        // into the sorter, which spills when it exceeds the budget. Only surviving rows are cloned.
-        let mut sorter = self.new_sorter(&plan.order);
-        if !empty {
-            store.scan_range(&bound, &mut |_key, row| {
-                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-                meter.charge(COSTS.storage_row_read);
-                let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
-                    let mut r = row.clone();
-                    store.resolve_columns(&mut r, &plan.rel_masks[0])?;
-                    Some(r)
-                } else {
-                    None
-                };
-                let row_ref = resolved.as_ref().unwrap_or(row);
-                let keep = match &plan.filter {
-                    Some(f) => f.eval(row_ref, env, meter)?.is_true(),
-                    None => true,
-                };
-                if keep {
-                    sorter.push(resolved.unwrap_or_else(|| row.clone()))?;
-                }
-                Ok(true) // never stop early — the sort must see every row
-            })?;
-        }
+            let total = sorter.total() as i64;
+            (total, sorter.finish()?)
+        };
 
         // LIMIT / OFFSET window over the sort's total row count (known without materializing the
-        // output). Clamp in the i64 domain before indexing (CLAUDE.md §8).
-        let total = sorter.total() as i64;
+        // output). Clamp in the i64 domain (CLAUDE.md §8). The OFFSET skip is part of the blocking
+        // part (unwindowed — no row_produced), done now so `sorted` is positioned at the first output
+        // row; the emitter drive then yields exactly `remaining` rows, charging row_produced +
+        // projection per pull (streaming.md §4/§7).
         let start = plan.offset.unwrap_or(0).min(total);
         let end = match plan.limit {
             Some(lim) if lim < total - start => start + lim,
             _ => total,
         };
-        let mut sorted = sorter.finish()?;
         for _ in 0..start {
             sorted.next()?; // skip the OFFSET rows (unwindowed — no row_produced)
         }
-        let mut out: Vec<Vec<Value>> = Vec::with_capacity((end - start) as usize);
-        for _ in start..end {
-            let row = sorted
-                .next()?
-                .expect("the sorter yields exactly `total` rows");
-            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-            meter.charge(COSTS.row_produced);
-            let mut projected = Vec::with_capacity(plan.projections.len());
-            for p in &plan.projections {
-                projected.push(p.eval(&row, env, meter)?);
-            }
-            out.push(projected);
-        }
-        Ok(SelectResult {
-            column_names: plan.column_names.clone(),
-            column_types: plan.column_types.clone(),
-            rows: out,
-            cost: meter.accrued,
+        Ok(Emitter::Sorted {
+            sorted,
+            remaining: (end - start) as usize,
         })
     }
 
@@ -11600,6 +11590,35 @@ impl Engine {
         let out_rows = match emitter {
             // Already projected + charged (the special input-streaming paths) — hand the rows out.
             Emitter::Final { rows } => rows,
+            // The streaming sort's lazy output: pull every windowed row from the `SortedRows`
+            // iterator, charging `row_produced` + the projection per row — exactly the eager window
+            // loop `exec_streaming_sort` ran before its output went lazy (streaming.md §4/§7).
+            Emitter::Sorted {
+                mut sorted,
+                remaining,
+            } => {
+                let env = EvalEnv {
+                    exec: self,
+                    params,
+                    outer,
+                    rng: &stmt_rng,
+                    ctes,
+                };
+                let mut out = Vec::with_capacity(remaining);
+                for _ in 0..remaining {
+                    let row = sorted
+                        .next()?
+                        .expect("the sorter yields exactly the windowed rows");
+                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                    meter.charge(COSTS.row_produced);
+                    let mut o = Vec::with_capacity(plan.projections.len());
+                    for p in &plan.projections {
+                        o.push(p.eval(&row, &env, &mut meter)?);
+                    }
+                    out.push(o);
+                }
+                out
+            }
             // The general blocking buffer: window it, charging `row_produced` per emitted row (and,
             // in `Project` mode, the projection list) — exactly the eager emission these branches ran
             // before the S4 split.
@@ -11729,9 +11748,10 @@ impl Engine {
             // A derived table takes the eager path (grammar.md §42).
             && plan.rels[0].derived.is_none()
         {
-            return Ok(Emitter::Final {
-                rows: self.exec_streaming_sort(plan, &env, meter, params)?.rows,
-            });
+            // The streaming sort yields its output LAZILY (streaming.md §4/§7) — `exec_streaming_sort`
+            // runs the scan + sort + OFFSET skip and returns an `Emitter::Sorted` over the `SortedRows`
+            // pull iterator; the window's row_produced + projection is charged by the emitter drive.
+            return self.exec_streaming_sort(plan, &env, meter, params);
         }
 
         // Streaming two-table join (cost.md §3 "JOIN"): the planner set `join_pk_ordered` only for a
@@ -19765,10 +19785,11 @@ impl crate::cursor::RowStream for StreamingScan {
 /// ([`exec_select_emit`](Engine::exec_select_emit)) to completion into an [`Emitter`] — buffering the
 /// input (correctly: a sort/group/dedup/join must see it all) and charging the scan/sort/group/dedup
 /// cost — then yields its buffer **one row at a time**: a `Project` row is projected (and charges
-/// `row_produced` + projection) on emission, an `Identity`/`Final` row is handed out (already
-/// projected). So peak *output* memory is one row, a caller's early exit skips the projection of the
-/// rows it never pulls, and a fully-drained query observes the same rows + total cost as the eager
-/// path (streaming.md §6).
+/// `row_produced` + projection) on emission, a `Sorted` row is pulled from the [`SortedRows`] iterator
+/// and projected (the streaming-sort output, streaming.md §4/§7), an `Identity`/`Final` row is handed
+/// out (already projected). So peak *output* memory is one row, a caller's early exit skips the
+/// projection of the rows it never pulls, and a fully-drained query observes the same rows + total cost
+/// as the eager path (streaming.md §6).
 struct BufferedScan {
     engine: Engine,
     plan: SelectPlan,
@@ -19794,6 +19815,14 @@ enum BufState {
     /// emission just hands the rows out.
     Final {
         iter: std::vec::IntoIter<Vec<Value>>,
+    },
+    /// The streaming sort's lazy output: the [`SortedRows`] pull iterator (positioned past the
+    /// `OFFSET`) and `remaining` windowed rows still to emit. Each `next_row` pulls the next sorted
+    /// row, charges `row_produced`, and projects it — so the output `Vec` is never built and an early
+    /// exit skips the rows it never pulls (streaming.md §4/§7).
+    Sorted {
+        sorted: crate::spill::SortedRows,
+        remaining: usize,
     },
     /// The buffer is exhausted (or the cursor was closed) — every further `next_row` is `None`.
     Done,
@@ -19830,6 +19859,7 @@ impl crate::cursor::RowStream for BufferedScan {
                 Emitter::Final { rows } => BufState::Final {
                     iter: rows.into_iter(),
                 },
+                Emitter::Sorted { sorted, remaining } => BufState::Sorted { sorted, remaining },
             };
         }
         match &mut self.state {
@@ -19837,6 +19867,33 @@ impl crate::cursor::RowStream for BufferedScan {
             BufState::Pending => unreachable!("the blocking part ran above"),
             // Already projected + charged — hand the next row out (no further cost).
             BufState::Final { iter } => Ok(iter.next()),
+            // The streaming sort's lazy output: pull the next windowed row, charge `row_produced`,
+            // and project it (streaming.md §4/§7). Disjoint-field borrows: `sorted`/`remaining` come
+            // from `self.state`, distinct from `self.meter`/`self.engine`/`self.plan`/`self.rng`/
+            // `self.params` the projection reads.
+            BufState::Sorted { sorted, remaining } => {
+                if *remaining == 0 {
+                    return Ok(None);
+                }
+                let row = sorted
+                    .next()?
+                    .expect("the sorter yields exactly the windowed rows");
+                *remaining -= 1;
+                self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
+                self.meter.charge(COSTS.row_produced);
+                let env = EvalEnv {
+                    exec: &self.engine,
+                    params: &self.params,
+                    outer: &[],
+                    rng: &self.rng,
+                    ctes: CteCtx::empty(),
+                };
+                let mut out = Vec::with_capacity(self.plan.projections.len());
+                for p in &self.plan.projections {
+                    out.push(p.eval(&row, &env, &mut self.meter)?);
+                }
+                Ok(Some(out))
+            }
             BufState::Buffer {
                 rows,
                 idx,
