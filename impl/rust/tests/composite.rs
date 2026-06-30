@@ -7,14 +7,14 @@
 //! `type '(…)'` (S6).
 
 use jed::types::Type;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn run(db: &mut Engine, sql: &str) {
-    execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+fn run(db: &mut Session, sql: &str) {
+    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
-fn err(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -22,8 +22,8 @@ fn err(db: &mut Engine, sql: &str) -> String {
 }
 
 /// Run a query and render its rows as `Vec<Vec<String>>` (each value via `render`).
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -34,7 +34,7 @@ fn query(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
 
 #[test]
 fn create_type_registers_fields() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TYPE addr AS (street text NOT NULL, zip i32)",
@@ -53,7 +53,7 @@ fn create_type_registers_fields() {
 
 #[test]
 fn drop_type_removes_it() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (a i32)");
     run(&mut db, "DROP TYPE addr");
     assert!(db.composite_type("addr").is_none());
@@ -62,7 +62,7 @@ fn drop_type_removes_it() {
 /// A nested composite value round-trips and renders with the inner record quoted.
 #[test]
 fn nested_composite_value_roundtrip() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE point AS (x i32, y i32)");
     run(&mut db, "CREATE TYPE seg AS (a point, b point)");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s seg)");
@@ -79,13 +79,13 @@ fn nested_composite_value_roundtrip() {
 /// Composite values survive a serialize → load round-trip (the v9 recursive value codec).
 #[test]
 fn composite_values_persist_through_image() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
     run(&mut db, "INSERT INTO p VALUES (1, ROW('Main', 90210))");
     run(&mut db, "INSERT INTO p VALUES (2, ROW('Oak', NULL))");
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Engine::from_image(&image).expect("reload");
+    let mut loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
     assert_eq!(
         query(&mut loaded, "SELECT id, home FROM p ORDER BY id"),
         vec![
@@ -99,7 +99,7 @@ fn composite_values_persist_through_image() {
 /// parenthesized column, a `ROW(…)` literal, and chains through a nested composite.
 #[test]
 fn field_access_selects_field() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(
         &mut db,
@@ -122,7 +122,7 @@ fn field_access_selects_field() {
 /// FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE.
 #[test]
 fn composite_equality_3vl() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE rec AS (a i32, b i32)");
     // Equal rows.
     assert_eq!(
@@ -150,7 +150,7 @@ fn composite_equality_3vl() {
 /// `ORDER BY` over the composite column sorts lexicographically.
 #[test]
 fn composite_column_compare_and_order() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
     run(&mut db, "INSERT INTO p VALUES (1, ROW('Oak', 30))");
@@ -178,7 +178,7 @@ fn composite_column_compare_and_order() {
 /// non-null values) and `IS NOT NULL` = TRUE.
 #[test]
 fn composite_is_null_non_recursive() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE point AS (x i32, y i32)");
     run(&mut db, "CREATE TYPE seg AS (a point, b point)");
     // The two inner rows are non-null values → the outer row is NOT all-(SQL-)null → IS NULL false,
@@ -203,7 +203,7 @@ fn composite_is_null_non_recursive() {
 
 #[test]
 fn nested_type_self_or_forward_reference_is_42704() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // Forward reference (point not yet defined) — and self-reference — are unknown types.
     assert_eq!(err(&mut db, "CREATE TYPE line AS (a point)"), "42704");
     assert_eq!(err(&mut db, "CREATE TYPE t AS (a t)"), "42704");
@@ -213,7 +213,7 @@ fn nested_type_self_or_forward_reference_is_42704() {
 /// serialize → load, byte-backed by the v9 catalog type-definition section.
 #[test]
 fn types_persist_through_image() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)",
@@ -223,7 +223,7 @@ fn types_persist_through_image() {
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
 
     let image = db.to_image(256, 1).unwrap();
-    let loaded = Engine::from_image(&image).expect("reload");
+    let loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
 
     let point = loaded.composite_type("point").expect("point persists");
     assert_eq!(point.fields.len(), 2);
@@ -249,7 +249,7 @@ fn types_persist_through_image() {
 /// `CREATE TYPE t AS (xs i32[])` registers an array-typed field.
 #[test]
 fn create_type_with_array_field_registers() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
     let ct = db.composite_type("poly").expect("type poly");
     assert_eq!(ct.fields.len(), 2);
@@ -264,7 +264,7 @@ fn create_type_with_array_field_registers() {
 /// entry + the recursive value codec); the in-memory type is rebuilt as an array.
 #[test]
 fn composite_with_array_field_image_roundtrip() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
     run(
@@ -273,7 +273,7 @@ fn composite_with_array_field_image_roundtrip() {
     );
     run(&mut db, "INSERT INTO t VALUES (2, ROW('b', NULL))");
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Engine::from_image(&image).expect("reload");
+    let mut loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
     let ct = loaded.composite_type("poly").expect("poly persists");
     assert_eq!(
         ct.fields[1].ty,
@@ -289,7 +289,7 @@ fn composite_with_array_field_image_roundtrip() {
 /// catalog field carries element code 14 + name, the value codec nests array-over-composite.
 #[test]
 fn composite_with_array_of_composite_field() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TYPE person AS (name text, homes addr[])");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, who person)");
@@ -300,7 +300,7 @@ fn composite_with_array_of_composite_field() {
         "INSERT INTO t VALUES (1, ROW('jo', '{\"(Main,1)\",\"(Oak,2)\"}'))",
     );
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Engine::from_image(&image).expect("reload");
+    let mut loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
     // The persisted array-of-composite field re-resolves and the value round-trips.
     assert_eq!(
         query(&mut loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"),
@@ -312,7 +312,7 @@ fn composite_with_array_of_composite_field() {
 /// dependency check looks through the array level (spec/design/array.md §12).
 #[test]
 fn drop_type_blocked_by_array_field_dependent() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TYPE person AS (name text, homes addr[])");
     assert_eq!(err(&mut db, "DROP TYPE addr"), "2BP01");
@@ -324,7 +324,7 @@ fn drop_type_blocked_by_array_field_dependent() {
 /// `DROP TYPE addr` is blocked while a *table column* is `addr[]` too (the same look-through).
 #[test]
 fn drop_type_blocked_by_array_column_dependent() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     assert_eq!(err(&mut db, "DROP TYPE addr"), "2BP01");
@@ -333,7 +333,7 @@ fn drop_type_blocked_by_array_column_dependent() {
 /// A type modifier on an array field is rejected (0A000), like an array column's.
 #[test]
 fn array_field_type_modifier_is_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(&mut db, "CREATE TYPE t AS (xs decimal(10,2)[])"),
         "0A000"
@@ -343,6 +343,6 @@ fn array_field_type_modifier_is_0a000() {
 /// An unknown element type in an array field is 42704.
 #[test]
 fn array_field_unknown_element_is_42704() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(err(&mut db, "CREATE TYPE t AS (xs nope[])"), "42704");
 }

@@ -1041,10 +1041,39 @@ impl Session {
         self.engine.rows_in_key_order(name)
     }
 
-    /// Set the default collation for new `text` columns on this session (collation.md §4). White-box
-    /// config used by the collation tests; `2C000` for an unknown collation.
+    /// White-box test helper: serialize this session's committed view to a from-scratch on-disk image
+    /// at `page_size` (CLAUDE.md §8 byte-level round-trip). Hosts use [`Database::to_image`]; this is
+    /// the in-crate convenience for tests that build + serialize on one session handle.
+    pub(crate) fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
+        self.engine.to_image(page_size, txid)
+    }
+
+    /// Set the per-database default collation for new `text` columns (collation.md §4). White-box
+    /// config used by the collation tests; `2C000` for an unknown collation. The default is committed
+    /// *snapshot* state (persisted as the `is_default` flag), so outside a block this **commits** —
+    /// take the writer gate, re-pin the latest committed, set, publish — exactly like an autocommit
+    /// write, so the change survives the next statement's re-pin and is visible to it.
     pub(crate) fn set_default_collation(&mut self, name: &str) -> Result<()> {
-        self.engine.set_default_collation(name)
+        if self.access == Access::ReadOnly {
+            return Err(EngineError::new(
+                SqlState::ReadOnlySqlTransaction,
+                "cannot set the default collation on a read-only session",
+            ));
+        }
+        if self.engine.in_transaction() {
+            // Part of the open block; it publishes when the block commits.
+            return self.engine.set_default_collation(name);
+        }
+        self.shared.acquire_writer();
+        self.gate_held = true;
+        self.refresh_committed();
+        let result = match self.engine.set_default_collation(name) {
+            Ok(()) => self.publish(),
+            Err(e) => Err(e),
+        };
+        self.shared.release_writer();
+        self.gate_held = false;
+        result
     }
 
     /// The session's current default collation name.

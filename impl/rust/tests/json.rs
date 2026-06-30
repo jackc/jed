@@ -5,22 +5,22 @@
 //! serialize + reload). The agreeing behavior (store + canonical/verbatim round-trip, NULL) lives
 //! in suites/json/json_storage.test.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn run(db: &mut Engine, sql: &str) {
-    execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+fn run(db: &mut Session, sql: &str) {
+    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
-fn err(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
         .to_string()
 }
 
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -34,7 +34,7 @@ fn query(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
 /// a jsonb PK (it has a jsonb btree opclass), so this is a documented divergence.
 #[test]
 fn jsonb_primary_key_is_unsupported() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(&mut db, "CREATE TABLE t (k jsonb PRIMARY KEY)"),
         "0A000"
@@ -45,17 +45,17 @@ fn jsonb_primary_key_is_unsupported() {
 /// json opclass at all, so PG rejects it too, but with its own undefined-function shape).
 #[test]
 fn json_primary_key_is_unsupported() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(err(&mut db, "CREATE TABLE t (k json PRIMARY KEY)"), "0A000");
 }
 
 /// A jsonb secondary index / UNIQUE is likewise `0A000` (no key encoding exercised yet).
 #[test]
 fn jsonb_index_and_unique_are_unsupported() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)");
     assert_eq!(err(&mut db, "CREATE INDEX i ON t (j)"), "0A000");
-    let mut db2 = Engine::new();
+    let mut db2 = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(
             &mut db2,
@@ -71,7 +71,7 @@ fn jsonb_index_and_unique_are_unsupported() {
 /// jsonb × jsonb ordering live in suites/json/json_compare.test.
 #[test]
 fn jsonb_cross_family_comparison_is_42804() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)");
     // jsonb vs an integer / a real text value (not an adaptable string literal): 42804.
     assert_eq!(err(&mut db, "SELECT id FROM t WHERE b = 5"), "42804");
@@ -87,7 +87,7 @@ fn jsonb_cross_family_comparison_is_42804() {
 /// (json↔jsonb, json/jsonb→text, text→json/jsonb) is oracle-clean in suites/json/json_casts.test.
 #[test]
 fn invalid_json_cast_source_is_42804() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(err(&mut db, "SELECT 5::jsonb"), "42804");
     assert_eq!(err(&mut db, "SELECT (1.5)::json"), "42804");
     assert_eq!(err(&mut db, "SELECT true::jsonb"), "42804");
@@ -99,7 +99,7 @@ fn invalid_json_cast_source_is_42804() {
 /// documented divergence (the jsonb operators are oracle-clean in suites/json/json_access.test).
 #[test]
 fn json_accessor_operators_are_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
     run(&mut db, "INSERT INTO t VALUES (1, '{\"a\":1}')");
     assert_eq!(err(&mut db, "SELECT j -> 'a' FROM t"), "0A000");
@@ -112,7 +112,7 @@ fn json_accessor_operators_are_deferred() {
 /// §4); the jsonb variants + `json_object_keys` are oracle-clean in suites/json/json_srf.test.
 #[test]
 fn json_array_elements_srf_is_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(&mut db, "SELECT * FROM json_array_elements('[1,2]'::json)"),
         "0A000"
@@ -131,7 +131,7 @@ fn json_array_elements_srf_is_deferred() {
 /// (scalars/jsonb/json/1-D arrays) is oracle-clean in suites/json/json_to_jsonb.test.
 #[test]
 fn to_jsonb_unsupported_sources_are_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(err(&mut db, "SELECT to_jsonb(1.5::f64)"), "0A000");
     assert_eq!(err(&mut db, "SELECT to_jsonb('2020-01-01'::date)"), "0A000");
     assert_eq!(
@@ -145,9 +145,9 @@ fn to_jsonb_unsupported_sources_are_deferred() {
 /// oracle; the multi-line output can't live in the line-based corpus.
 #[test]
 fn jsonb_pretty_matches_pg() {
-    let mut db = Engine::new();
-    let q = |db: &mut Engine, sql: &str| -> String {
-        match execute(db, sql).unwrap() {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let q = |db: &mut Session, sql: &str| -> String {
+        match db.execute(sql, &[]).unwrap() {
             Outcome::Query { rows, .. } => rows[0][0].render(),
             other => panic!("{other:?}"),
         }
@@ -173,7 +173,7 @@ fn jsonb_pretty_matches_pg() {
 /// cursor off the gathered chain). The rendered canonical form is preserved exactly.
 #[test]
 fn large_jsonb_spills_and_round_trips() {
-    let mut db = Engine::with_page_size(4096);
+    let mut db = Database::new_in_memory_with_page_size(4096).session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)");
     // A ~6000-byte string node — far above RECORD_MAX (~2034 at page 4096) — forces a spill.
     let big = "a".repeat(6000);
@@ -182,7 +182,7 @@ fn large_jsonb_spills_and_round_trips() {
     run(&mut db, "INSERT INTO t VALUES (2, '{\"k\": 42}')");
 
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Engine::from_image(&image).expect("load image");
+    let mut loaded = Database::from_image(&image).expect("load image").session(SessionOptions::default());
 
     let rows = query(&mut loaded, "SELECT id, j FROM t ORDER BY id");
     assert_eq!(rows[0][0], "1");
@@ -194,7 +194,7 @@ fn large_jsonb_spills_and_round_trips() {
 /// (insignificant whitespace included — the json verbatim contract, §4).
 #[test]
 fn large_json_spills_verbatim() {
-    let mut db = Engine::with_page_size(4096);
+    let mut db = Database::new_in_memory_with_page_size(4096).session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
     // Verbatim text with irregular internal spacing, padded past RECORD_MAX.
     let pad = " ".repeat(6000);
@@ -208,7 +208,7 @@ fn large_json_spills_verbatim() {
     );
 
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Engine::from_image(&image).expect("load image");
+    let mut loaded = Database::from_image(&image).expect("load image").session(SessionOptions::default());
     let rows = query(&mut loaded, "SELECT j FROM t WHERE id = 1");
     assert_eq!(rows[0][0], verbatim); // verbatim bytes, whitespace preserved
 }
@@ -219,7 +219,7 @@ fn large_json_spills_verbatim() {
 /// agreeing behavior (set/insert/no-op/22023/22P02) is oracle-clean in suites/json/json_set.test.
 #[test]
 fn jsonb_set_null_path_element_propagates_null() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         query(
             &mut db,
@@ -242,7 +242,7 @@ fn jsonb_set_null_path_element_propagates_null() {
 /// documented divergence (the json_array_elements precedent).
 #[test]
 fn json_each_srf_is_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(&mut db, "SELECT * FROM json_each('{\"a\":1}'::json)"),
         "0A000"
@@ -259,7 +259,7 @@ fn json_each_srf_is_deferred() {
 /// suites/json/json_builders.test.
 #[test]
 fn json_builder_deferred_element_source_is_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(err(&mut db, "SELECT to_json(1.5::f64)"), "0A000");
     assert_eq!(err(&mut db, "SELECT jsonb_build_array(1.5::f64)"), "0A000");
     assert_eq!(err(&mut db, "SELECT json_build_array(1.5::f64)"), "0A000");
@@ -274,7 +274,7 @@ fn json_builder_deferred_element_source_is_0a000() {
 /// The json-input behavior is oracle-clean in suites/json/json_ctor.test.
 #[test]
 fn json_serialize_jsonb_diverges_from_pg() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         query(&mut db, "SELECT JSON_SERIALIZE('{\"b\":2,\"a\":1}'::jsonb)")[0][0],
         "{\"a\": 1, \"b\": 2}" // jed: the jsonb canonical text; PG 18: NULL
@@ -286,7 +286,7 @@ fn json_serialize_jsonb_diverges_from_pg() {
 /// string, so this is a documented divergence (the basic scalars are oracle-clean in the suite).
 #[test]
 fn json_scalar_deferred_types_are_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(&mut db, "SELECT JSON_SCALAR('2020-01-01'::date)"),
         "0A000"
@@ -299,7 +299,7 @@ fn json_scalar_deferred_types_are_0a000() {
 /// oracle-clean in suites/json/json_builders.test.
 #[test]
 fn array_to_json_multidim_is_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(
             &mut db,
@@ -315,7 +315,7 @@ fn array_to_json_multidim_is_0a000() {
 /// suite).
 #[test]
 fn json_build_object_non_scalar_key_is_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(&mut db, "SELECT jsonb_build_object('2020-01-01'::date, 1)"),
         "0A000"
@@ -328,7 +328,7 @@ fn json_build_object_non_scalar_key_is_0a000() {
 /// oracle-clean in suites/json/json_agg.test.
 #[test]
 fn json_agg_deferred_element_source_is_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TABLE f (id i32 PRIMARY KEY, x f64)");
     run(&mut db, "INSERT INTO f VALUES (1, 1.5)");
     assert_eq!(err(&mut db, "SELECT jsonb_agg(x) FROM f"), "0A000");
@@ -341,7 +341,7 @@ fn json_agg_deferred_element_source_is_0a000() {
 /// documented divergences; the scalar-field behavior is oracle-clean in suites/json/json_populate.test.
 #[test]
 fn json_populate_non_composite_and_complex_field_divergences() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
     assert_eq!(
@@ -365,7 +365,7 @@ fn json_populate_non_composite_and_complex_field_divergences() {
 /// documented divergence; the scalar columns are oracle-clean in suites/json/json_record.test.
 #[test]
 fn json_record_composite_array_column_is_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     assert_eq!(
         err(
@@ -388,7 +388,7 @@ fn json_record_composite_array_column_is_0a000() {
 /// rename list on an SRF, so this is a documented divergence.
 #[test]
 fn srf_rename_only_column_list_is_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err(
             &mut db,
@@ -403,7 +403,7 @@ fn srf_rename_only_column_list_is_deferred() {
 /// the supported value types are oracle-clean in suites/json/json_object_agg.test.
 #[test]
 fn json_object_agg_deferred_value_source_is_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE f (id i32 PRIMARY KEY, k text, x f64)",
@@ -422,7 +422,7 @@ fn json_object_agg_deferred_value_source_is_0a000() {
 /// SRFs / accessor operators carry (json.md §4); it can't live in the PG-clean corpus.
 #[test]
 fn json_agg_canonicalizes_json_elements() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TABLE j (id i32 PRIMARY KEY, doc json)");
     run(&mut db, "INSERT INTO j VALUES (1, '{ \"a\" : 1 }')");
     // jed canonicalizes the element; PG would render the verbatim `[{ "a" : 1 }]`.
@@ -440,7 +440,7 @@ fn json_agg_canonicalizes_json_elements() {
 /// oracle-clean in suites/json/json_query_fns.test.
 #[test]
 fn json_query_fn_deferred_clauses_are_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for sql in [
         "SELECT JSON_VALUE('{\"a\":1}', '$.a' PASSING 1 AS x)",
         "SELECT JSON_VALUE('{\"a\":1}', '$.b' DEFAULT 'z' ON EMPTY)",
@@ -457,7 +457,7 @@ fn json_query_fn_deferred_clauses_are_0a000() {
 /// in suites/json/json_table.test.
 #[test]
 fn json_table_deferred_features_are_0a000() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for sql in [
         "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))",
         "SELECT * FROM JSON_TABLE('{}', '$' PASSING 1 AS y COLUMNS (x i32 PATH '$.x'))",
@@ -478,14 +478,14 @@ fn json_table_deferred_features_are_0a000() {
 
 #[test]
 fn jsonb_all_node_kinds_round_trip() {
-    let mut db = Engine::with_page_size(4096);
+    let mut db = Database::new_in_memory_with_page_size(4096).session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)");
     run(
         &mut db,
         "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, false, null], \"c\": \"x\"}')",
     );
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Engine::from_image(&image).expect("load image");
+    let mut loaded = Database::from_image(&image).expect("load image").session(SessionOptions::default());
     let rows = query(&mut loaded, "SELECT j FROM t WHERE id = 1");
     assert_eq!(
         rows[0][0],

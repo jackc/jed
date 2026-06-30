@@ -6,18 +6,18 @@
 //! impl/go/composite_pk_test.go and impl/ts/tests/composite_pk.test.ts.
 
 use jed::value::Value;
-use jed::{Engine, execute};
+use jed::{Database, Session, SessionOptions};
 
-fn db_with(sql: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(sql: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err_code(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
@@ -46,7 +46,7 @@ fn composite_key_orders_by_tuple() {
         "INSERT INTO t VALUES (1, 1, 20)",
         "INSERT INTO t VALUES (2, 0, 40)",
     ] {
-        execute(&mut db, stmt).unwrap();
+        db.execute(stmt, &[]).unwrap();
     }
     let rows = db.rows_in_key_order("t").unwrap();
     let tuples: Vec<(i64, i64)> = rows
@@ -67,7 +67,7 @@ fn uniqueness_is_the_whole_tuple() {
         "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
         "INSERT INTO t VALUES (1, 1)",
     ]);
-    execute(&mut db, "INSERT INTO t VALUES (1, 2)").unwrap(); // shared prefix: distinct row
+    db.execute("INSERT INTO t VALUES (1, 2)", &[]).unwrap(); // shared prefix: distinct row
     assert_eq!(err_code(&mut db, "INSERT INTO t VALUES (1, 1)"), "23505");
     assert_eq!(
         err_code(&mut db, "INSERT INTO t VALUES (5, 5), (5, 5)"),
@@ -82,7 +82,7 @@ fn uniqueness_is_the_whole_tuple() {
 /// (0A000): out-of-declaration-order list, non-keyable member type.
 #[test]
 fn ddl_errors_match_postgres_and_narrowings() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err_code(&mut db, "CREATE TABLE t (a i32, PRIMARY KEY (a, nosuch))"),
         "42703"
@@ -116,9 +116,9 @@ fn ddl_errors_match_postgres_and_narrowings() {
     // The list order is the KEY order — it may differ from declaration order (the original
     // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
     // keys by (b, a), so the stored scan order is b-major.
-    execute(&mut db, "CREATE TABLE t (a i32, b i32, PRIMARY KEY (b, a))").unwrap();
+    db.execute("CREATE TABLE t (a i32, b i32, PRIMARY KEY (b, a))", &[]).unwrap();
     assert_eq!(db.table("t").unwrap().pk_indices(), vec![1, 0]);
-    execute(&mut db, "INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)", &[]).unwrap();
     let rows = db.rows_in_key_order("t").unwrap();
     let bs: Vec<i64> = rows
         .iter()
@@ -132,17 +132,14 @@ fn ddl_errors_match_postgres_and_narrowings() {
         vec![10, 15, 20],
         "stored order is the (b, a) tuple order"
     );
-    execute(&mut db, "DROP TABLE t").unwrap();
+    db.execute("DROP TABLE t", &[]).unwrap();
     // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
     // scalar is keyable): a composite PK with a float member succeeds.
-    execute(
-        &mut db,
-        "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))",
-    )
+    db.execute("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))", &[])
     .unwrap();
     // The recursive composite container is NOT keyable (composite.md §6), so a composite PK member
     // is still the 0A000 narrowing.
-    execute(&mut db, "CREATE TYPE addr AS (street text, zip i32)").unwrap();
+    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[]).unwrap();
     assert_eq!(
         err_code(
             &mut db,
@@ -151,7 +148,7 @@ fn ddl_errors_match_postgres_and_narrowings() {
         "0A000"
     );
     // A single-column table constraint is the column-level form's equivalent.
-    execute(&mut db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))").unwrap();
+    db.execute("CREATE TABLE ok (a i32, PRIMARY KEY (a))", &[]).unwrap();
     let t = db.table("ok").unwrap();
     assert_eq!(t.primary_key_index(), Some(0));
     assert!(t.columns[0].not_null);
@@ -175,9 +172,9 @@ fn members_are_not_null_and_rekey() {
         "23502"
     );
     // Assigning a key member re-keys the row: (1,1) → (9,1) → (9,9); a non-member is in place.
-    execute(&mut db, "UPDATE t SET a = 9").unwrap();
-    execute(&mut db, "UPDATE t SET b = 9").unwrap();
-    execute(&mut db, "UPDATE t SET v = 11").unwrap();
+    db.execute("UPDATE t SET a = 9", &[]).unwrap();
+    db.execute("UPDATE t SET b = 9", &[]).unwrap();
+    db.execute("UPDATE t SET v = 11", &[]).unwrap();
     let rows = db.rows_in_key_order("t").unwrap();
     assert_eq!(rows.len(), 1);
     assert!(matches!(
@@ -196,7 +193,7 @@ fn mixed_uuid_int_components_order_correctly() {
         "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
         "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', -2)",
     ] {
-        execute(&mut db, stmt).unwrap();
+        db.execute(stmt, &[]).unwrap();
     }
     let rows = db.rows_in_key_order("t").unwrap();
     let ns: Vec<i64> = rows
@@ -220,7 +217,7 @@ fn round_trips_through_the_on_disk_image() {
         "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Engine::from_image(&image).unwrap();
+    let mut loaded = Database::from_image(&image).unwrap().session(SessionOptions::default());
 
     let t = loaded.table("t").unwrap();
     assert_eq!(t.pk_indices(), vec![0, 1]);
@@ -241,6 +238,6 @@ fn round_trips_through_the_on_disk_image() {
         err_code(&mut loaded, "INSERT INTO t VALUES (1, 2, 99)"),
         "23505"
     );
-    execute(&mut loaded, "INSERT INTO t VALUES (2, 2, 50)").unwrap();
+    loaded.execute("INSERT INTO t VALUES (2, 2, 50)", &[]).unwrap();
     assert_eq!(loaded.rows_in_key_order("t").unwrap().len(), 4);
 }

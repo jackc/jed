@@ -7,7 +7,7 @@
 //! inline — the cost delta is exactly the chain pages. Mirrored in Go
 //! (overflow_cost_test.go) and TS (tests/overflow_cost.test.ts).
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
 // page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
 // ceil(600/240) = 3 overflow pages; a 300-byte bytea into ceil(300/240) = 2. Payloads are
@@ -49,8 +49,8 @@ fn filler_bytes_hex(n: usize) -> String {
     out
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    match execute(db, sql).unwrap() {
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
@@ -58,28 +58,16 @@ fn cost(db: &mut Engine, sql: &str) -> i64 {
 
 /// Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain),
 /// `control` keeps every value inline. Row 2 is inline in both.
-fn two_tables() -> Engine {
-    let mut db = Engine::with_page_size(PAGE_SIZE);
+fn two_tables() -> Session {
+    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let big = filler_text(600);
-    execute(
-        &mut db,
-        "CREATE TABLE spill (id i32 PRIMARY KEY, body text)",
-    )
+    db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
     .unwrap();
-    execute(
-        &mut db,
-        &format!("INSERT INTO spill VALUES (1, '{big}'), (2, 'small')"),
-    )
+    db.execute(&format!("INSERT INTO spill VALUES (1, '{big}'), (2, 'small')"), &[])
     .unwrap();
-    execute(
-        &mut db,
-        "CREATE TABLE control (id i32 PRIMARY KEY, body text)",
-    )
+    db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
     .unwrap();
-    execute(
-        &mut db,
-        "INSERT INTO control VALUES (1, 'tiny'), (2, 'small')",
-    )
+    db.execute("INSERT INTO control VALUES (1, 'tiny'), (2, 'small')", &[])
     .unwrap();
     db
 }
@@ -111,27 +99,15 @@ fn limit_does_not_lower_the_block() {
     // The spilled record is row 2, so LIMIT 1 emits only the inline row 1 — yet the page_read
     // block (which never short-circuits — cost.md §3 "LIMIT short-circuit") still counts the
     // bound's chain pages.
-    let mut db = Engine::with_page_size(PAGE_SIZE);
+    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let big = filler_text(600);
-    execute(
-        &mut db,
-        "CREATE TABLE spill (id i32 PRIMARY KEY, body text)",
-    )
+    db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
     .unwrap();
-    execute(
-        &mut db,
-        &format!("INSERT INTO spill VALUES (1, 'small'), (2, '{big}')"),
-    )
+    db.execute(&format!("INSERT INTO spill VALUES (1, 'small'), (2, '{big}')"), &[])
     .unwrap();
-    execute(
-        &mut db,
-        "CREATE TABLE control (id i32 PRIMARY KEY, body text)",
-    )
+    db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
     .unwrap();
-    execute(
-        &mut db,
-        "INSERT INTO control VALUES (1, 'small'), (2, 'tiny')",
-    )
+    db.execute("INSERT INTO control VALUES (1, 'small'), (2, 'tiny')", &[])
     .unwrap();
     let spill = cost(&mut db, "SELECT * FROM spill LIMIT 1");
     let control = cost(&mut db, "SELECT * FROM control LIMIT 1");
@@ -179,25 +155,16 @@ fn untouched_columns_charge_nothing() {
 #[test]
 fn multiple_chains_sum() {
     // One record with two externalized values charges the sum of both chains: 3 + 2 = 5.
-    let mut db = Engine::with_page_size(PAGE_SIZE);
+    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let big_text = filler_text(600);
     let big_hex = filler_bytes_hex(300);
-    execute(
-        &mut db,
-        "CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)",
-    )
+    db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)", &[])
     .unwrap();
-    execute(
-        &mut db,
-        &format!("INSERT INTO spill VALUES (1, '{big_text}', '\\x{big_hex}')"),
-    )
+    db.execute(&format!("INSERT INTO spill VALUES (1, '{big_text}', '\\x{big_hex}')"), &[])
     .unwrap();
-    execute(
-        &mut db,
-        "CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)",
-    )
+    db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)", &[])
     .unwrap();
-    execute(&mut db, "INSERT INTO control VALUES (1, 'tiny', '\\xcafe')").unwrap();
+    db.execute("INSERT INTO control VALUES (1, 'tiny', '\\xcafe')", &[]).unwrap();
     let spill = cost(&mut db, "SELECT * FROM spill");
     let control = cost(&mut db, "SELECT * FROM control");
     assert_eq!(spill, control + TEXT_CHAIN_PAGES + BYTEA_CHAIN_PAGES);

@@ -2,19 +2,19 @@
 //! (spec/design/decimal.md). Assertions are on the **rendered** output — the cross-core
 //! contract — since decimal value-equality (1.5 == 1.50) is intentionally scale-insensitive.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 /// Run a query and render every cell to its canonical string (row-major).
-fn rendered(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn rendered(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -24,7 +24,7 @@ fn rendered(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
 }
 
 /// A single-cell query result, rendered.
-fn one(db: &mut Engine, sql: &str) -> String {
+fn one(db: &mut Session, sql: &str) -> String {
     let rows = rendered(db, sql);
     assert_eq!(rows.len(), 1, "{sql:?} should return one row");
     assert_eq!(rows[0].len(), 1, "{sql:?} should return one column");
@@ -48,7 +48,7 @@ fn on_disk_round_trip_preserves_decimals_and_typmod() {
         "INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
     ]);
     let image = db.to_image(8192, 1).unwrap();
-    let mut loaded = Engine::from_image(&image).unwrap();
+    let mut loaded = Database::from_image(&image).unwrap().session(SessionOptions::default());
     // values survive byte-for-byte (re-serialization is identical)
     assert_eq!(loaded.to_image(8192, 1).unwrap(), image);
     // and the reloaded numeric(10,2) typmod still coerces a new insert
@@ -57,7 +57,7 @@ fn on_disk_round_trip_preserves_decimals_and_typmod() {
         one(&mut loaded, "SELECT free FROM t WHERE id = 1"),
         "-12345.6789"
     );
-    execute(&mut loaded, "INSERT INTO t VALUES (4, 9.999, 9.999)").unwrap();
+    loaded.execute("INSERT INTO t VALUES (4, 9.999, 9.999)", &[]).unwrap();
     assert_eq!(
         one(&mut loaded, "SELECT money FROM t WHERE id = 4"),
         "10.00"
@@ -99,7 +99,7 @@ fn cost_ceiling_aborts_ahead_of_a_big_multiply() {
     ]);
     let big = format!("{}.5", "9".repeat(20000));
     db.set_max_cost(1000);
-    match execute(&mut db, &format!("SELECT {big} * {big} FROM t")) {
+    match db.execute(&format!("SELECT {big} * {big} FROM t"), &[]) {
         Err(e) => assert_eq!(e.code(), "54P01", "want the cost-limit abort"),
         Ok(_) => panic!("expected the cost ceiling to abort the multiply"),
     }
