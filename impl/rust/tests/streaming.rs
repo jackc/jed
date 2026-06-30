@@ -659,3 +659,183 @@ fn deferred_skips_data_modifying_with() {
     let (after, _) = eager(&mut s, "SELECT count(*) FROM t");
     assert_eq!(after, vec![vec![Value::Int(7)]]);
 }
+
+// ---- prepared-statement streaming (the prepared query path; streaming.md §7) ----------------------
+//
+// A prepared query (`prepare` + `query_prepared`) routes its parsed AST through the SAME lazy lanes
+// as the ad-hoc `query()` — so a prepared `SELECT` streams (single-table pull / blocking-buffer /
+// deferred set-op), pins its snapshot in the watermark, and offers the early-exit win, all identical
+// to a one-shot query. The prepared `$N`-bound variant is exercised alongside the parameterless one.
+
+/// A fully-drained prepared query yields the IDENTICAL rows + total cost as the ad-hoc `query()`
+/// (and thus `execute()`, §6), across every lane — streaming, buffered, and deferred.
+#[test]
+fn prepared_query_matches_streamed() {
+    let db = seeded(100);
+    let mut s = db.session(SessionOptions::default());
+    for sql in [
+        "SELECT id, v FROM t LIMIT 5", // streaming (LIMIT short-circuit)
+        "SELECT id, v FROM t ORDER BY id LIMIT 7", // streaming (PK-ordered)
+        "SELECT v FROM t ORDER BY v LIMIT 6", // buffered (non-PK sort, top-N)
+        "SELECT count(*) FROM t",      // buffered (aggregate)
+        "SELECT DISTINCT v FROM t ORDER BY v", // buffered (DISTINCT + sort)
+        "SELECT v FROM t WHERE id <= 3 UNION SELECT v FROM t WHERE id >= 98 ORDER BY v", // deferred (set op)
+        "WITH x AS (SELECT id, v FROM t WHERE v > 500) SELECT id, v FROM x ORDER BY id", // deferred (WITH)
+    ] {
+        let (er, ec) = streamed(&mut s, sql);
+        let stmt = s.prepare(sql).unwrap();
+        let mut rows = s.query_prepared(&stmt, &[]).unwrap();
+        let mut pr = Vec::new();
+        for r in &mut rows {
+            pr.push(r);
+        }
+        rows.error().unwrap();
+        let pc = rows.cost();
+        assert_eq!(pr, er, "prepared rows mismatch: {sql}");
+        assert_eq!(pc, ec, "prepared cost mismatch: {sql}");
+    }
+}
+
+/// A prepared query binds `$N` params and streams: the bound prepared run matches the ad-hoc bound
+/// `query()` on rows + cost.
+#[test]
+fn prepared_query_binds_params_and_streams() {
+    let db = seeded(100);
+    let mut s = db.session(SessionOptions::default());
+    let sql = "SELECT id, v FROM t WHERE id >= $1 ORDER BY id LIMIT 4";
+
+    let mut ad_hoc = s.query(sql, &[Value::Int(90)]).unwrap();
+    let ar: Vec<Vec<Value>> = (&mut ad_hoc).collect();
+    ad_hoc.error().unwrap();
+    let ac = ad_hoc.cost();
+
+    let stmt = s.prepare(sql).unwrap();
+    let mut rows = s.query_prepared(&stmt, &[Value::Int(90)]).unwrap();
+    let pr: Vec<Vec<Value>> = (&mut rows).collect();
+    rows.error().unwrap();
+    let pc = rows.cost();
+
+    assert_eq!(
+        pr,
+        vec![
+            vec![Value::Int(90), Value::Int(900)],
+            vec![Value::Int(91), Value::Int(910)],
+            vec![Value::Int(92), Value::Int(920)],
+            vec![Value::Int(93), Value::Int(930)],
+        ]
+    );
+    assert_eq!(pr, ar, "prepared bound rows match ad-hoc");
+    assert_eq!(pc, ac, "prepared bound cost matches ad-hoc");
+    // A prepared statement is reusable: a second run with a different param re-streams.
+    let mut rows2 = s.query_prepared(&stmt, &[Value::Int(1)]).unwrap();
+    let pr2: Vec<Vec<Value>> = (&mut rows2).take(2).collect();
+    drop(rows2);
+    assert_eq!(
+        pr2,
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)]
+        ]
+    );
+}
+
+/// Early exit (§6) on the prepared path: pulling only a prefix charges LESS than a full drain — the
+/// streaming win now reaches prepared queries, not only ad-hoc ones.
+#[test]
+fn prepared_query_early_exit_charges_less() {
+    let db = seeded(1000);
+    let mut s = db.session(SessionOptions::default());
+    let stmt = s.prepare("SELECT id FROM t ORDER BY id").unwrap();
+
+    let mut full = s.query_prepared(&stmt, &[]).unwrap();
+    let full_rows: Vec<Vec<Value>> = (&mut full).collect();
+    full.error().unwrap();
+    let full_cost = full.cost();
+    assert_eq!(full_rows.len(), 1000);
+
+    let mut rows = s.query_prepared(&stmt, &[]).unwrap();
+    let prefix: Vec<Value> = (&mut rows).take(3).map(|r| r[0].clone()).collect();
+    let partial_cost = rows.cost();
+    drop(rows);
+
+    assert_eq!(prefix, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    assert!(
+        partial_cost < full_cost,
+        "prepared early exit must charge less (partial={partial_cost}, full={full_cost})"
+    );
+}
+
+/// Snapshot pinning (§5) on the prepared path: an open prepared cursor pins its version in the
+/// watermark, sees only its open-time snapshot as a writer commits, and releases on close.
+#[test]
+fn prepared_query_pins_its_snapshot_and_watermark() {
+    let db = seeded(3);
+    assert_eq!(db.oldest_live_txid(), 1);
+
+    let mut reader = db.session(SessionOptions::default());
+    let stmt = reader.prepare("SELECT id FROM t ORDER BY id").unwrap();
+    let mut rows = reader.query_prepared(&stmt, &[]).unwrap();
+    let first = (&mut rows).next().unwrap();
+    assert_eq!(first, vec![Value::Int(1)]);
+    assert_eq!(db.oldest_live_txid(), 1, "open prepared cursor pins v1");
+
+    {
+        let mut w = db.write_session();
+        w.execute("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
+            .unwrap();
+        w.commit().unwrap();
+    }
+    assert_eq!(db.oldest_live_txid(), 1, "watermark held at the pin");
+
+    let rest: Vec<Value> = (&mut rows).map(|r| r[0].clone()).collect();
+    assert_eq!(rest, vec![Value::Int(2), Value::Int(3)], "frozen at open");
+    rows.error().unwrap();
+    rows.close();
+    drop(rows);
+    assert_eq!(db.oldest_live_txid(), 2, "closed cursor releases its pin");
+}
+
+/// A mid-drain cost abort (§6) on the prepared path: the `54P01` surfaces during iteration, not at
+/// `query_prepared()` — the prepared cursor defers its work like the ad-hoc one.
+#[test]
+fn prepared_query_mid_drain_cost_abort_surfaces() {
+    let db = seeded(1000);
+    let mut s = db.session(SessionOptions::default());
+    s.set_max_cost(50);
+    let stmt = s.prepare("SELECT id FROM t ORDER BY id").unwrap();
+    // Building the cursor is fine; the per-row meter guard aborts during the drain.
+    let mut rows = s.query_prepared(&stmt, &[]).unwrap();
+    let mut n = 0;
+    for _ in &mut rows {
+        n += 1;
+        if n > 10_000 {
+            panic!("the cost ceiling should have aborted the drain");
+        }
+    }
+    let err = rows
+        .error()
+        .expect_err("a mid-drain cost abort must surface");
+    assert_eq!(err.code(), "54P01");
+}
+
+/// The bare `Database::query_prepared` convenience streams too (it mints a transient session; the
+/// cursor owns its snapshot, so it is not stranded).
+#[test]
+fn database_query_prepared_convenience_streams() {
+    let mut db = seeded(50);
+    let stmt = db
+        .prepare("SELECT id, v FROM t ORDER BY id LIMIT 4")
+        .unwrap();
+    let mut rows = db.query_prepared(&stmt, &[]).unwrap();
+    let out: Vec<Vec<Value>> = (&mut rows).collect();
+    rows.error().unwrap();
+    assert_eq!(
+        out,
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)],
+            vec![Value::Int(4), Value::Int(40)],
+        ]
+    );
+}

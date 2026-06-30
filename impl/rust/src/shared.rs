@@ -577,6 +577,16 @@ impl Session {
     /// path.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         let ast = self.engine.parse(sql)?;
+        self.query_ast(ast, params)
+    }
+
+    /// Route an already-parsed query AST through the session's lazy lanes — the autocommit re-pin,
+    /// the streaming / buffered / deferred cursors, and the reader-liveness watermark pin — falling
+    /// back to the materialized `dispatch` for a shape no lazy lane covers (a write, a data-modifying
+    /// `WITH`). Shared by [`query`](Session::query) (parse-then-route) and
+    /// [`query_prepared`](Session::query_prepared) (route the prepared AST), so a prepared query
+    /// streams and pins its snapshot exactly like an ad-hoc one.
+    fn query_ast(&mut self, ast: Statement, params: &[Value]) -> Result<Rows> {
         // Route the read before building the streaming cursor: an autocommit (non-block, writable
         // access) read re-pins the latest committed so the snapshot is current (PG-faithful); a
         // read-only session uses its existing pin, and an open block uses its working set.
@@ -1060,9 +1070,12 @@ impl Session {
     ) -> Result<Outcome> {
         self.dispatch(stmt.ast().clone(), params)
     }
-    /// Run a prepared **query** on this session, returning a row cursor.
+    /// Run a prepared **query** on this session, returning a row cursor. The prepared AST routes
+    /// through the same lazy lanes as the ad-hoc [`query`](Session::query) (spec/design/streaming.md
+    /// §3/§4/§7) — streaming / buffered / deferred, with the snapshot pinned in the reader-liveness
+    /// watermark — so a prepared query streams identically to a one-shot one.
     pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
-        Rows::from_outcome(self.execute_prepared(stmt, params)?)
+        self.query_ast(stmt.ast().clone(), params)
     }
 }
 

@@ -33,10 +33,14 @@ impl PreparedStatement {
         db.execute_stmt_params(self.ast.clone(), params)
     }
 
-    /// Run this **query** statement against a low-level [`Engine`] handle. Internal: the public
-    /// path is [`Database::query_prepared`](crate::Database::query_prepared).
+    /// Run this **query** statement against a low-level [`Engine`] handle, routing the parsed AST
+    /// through the same lazy streaming / buffered / deferred lanes as the ad-hoc
+    /// [`Engine::query`](Engine::query) (spec/design/streaming.md §3/§4/§7) — so a prepared query
+    /// streams exactly like a one-shot one (a single-table read pulls row-at-a-time; a blocking read
+    /// buffers its input but yields its output lazily). Internal: the public path is
+    /// [`Database::query_prepared`](crate::Database::query_prepared).
     pub(crate) fn query(&self, db: &mut Engine, params: &[Value]) -> Result<Rows> {
-        Rows::from_outcome(self.execute(db, params)?)
+        db.query_ast(self.ast.clone(), params)
     }
 }
 
@@ -327,6 +331,16 @@ impl Engine {
     /// [`Session`](crate::Session) path.)
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         let ast = self.parse(sql)?;
+        self.query_ast(ast, params)
+    }
+
+    /// Route an already-parsed query AST through the lazy streaming / buffered / deferred lanes,
+    /// falling back to the materialized `execute_stmt_params` for a shape no lazy lane covers
+    /// (a write, a `nextval`/`setval` SELECT, a data-modifying `WITH`). Shared by [`query`](Engine::query)
+    /// (parse-then-route) and [`PreparedStatement::query`](crate::PreparedStatement) (route the prepared
+    /// AST), so a prepared query streams identically to an ad-hoc one. (The bare single-handle
+    /// [`Engine`]; the watermark pin lives on the shared-core [`Session`](crate::Session) path.)
+    pub(crate) fn query_ast(&mut self, ast: Statement, params: &[Value]) -> Result<Rows> {
         if let Some(rows) = self.try_streaming_query(&ast, params)? {
             return Ok(rows);
         }
