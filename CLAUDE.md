@@ -449,7 +449,13 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   aggregate / DISTINCT bounded by a memory budget, spilling when exceeded — the **`ORDER BY`
   external merge sort + its streaming single-table feed have landed**, [spec/design/spill.md](spec/design/spill.md),
   bounded by the `work_mem` handle setting; the spilling hash aggregate / `DISTINCT` / hash JOIN
-  are follow-ons). The binding constraint on
+  are follow-ons), and **lazy record decode** (a faulted leaf stays its **compact on-disk bytes**,
+  decoding each column **on demand** for the query's touched set instead of materializing every
+  value into an inflated `Value` tree — **design landed**, [spec/design/lazy-record.md](spec/design/lazy-record.md),
+  the last of the four lazy-decode levels and the successor to streaming.md's "S5"; it makes the
+  buffer-pool **byte budget honest** — resident leaf memory `≈ resident_leaves × page_size` rather
+  than the inflated decoded form — and is results/cost/byte-neutral above the seam, so no
+  `format_version` bump). The binding constraint on
   present work: **no code above the storage seam may harden a full-residency assumption** — no
   "load = read the whole file into one buffer," no operator that *requires* its entire input
   or output to fit in RAM. Today's whole-image load/commit and flat record chain are

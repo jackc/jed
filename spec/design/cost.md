@@ -182,7 +182,11 @@ plans). The set is per `(query, relation)` and purely syntactic: a column refere
 never-taken `CASE` branch is still touched. Consequences worth naming:
 
 - `SELECT small_col FROM t WHERE pk = $1` touches neither a spilled `body` column's chain nor a
-  compressed value's slabs — the large-values headline case (large-values.md §7).
+  compressed value's slabs — the large-values headline case (large-values.md §7). The **same static
+  mask** governs the planned [lazy-record.md](lazy-record.md) reshape (decode *only*
+  touched columns of a faulted leaf, not just resolve touched large values) — and because cost
+  meters **no per-column-decode unit**, that reshape moves no charge: it is cost-neutral by
+  construction.
 - `SELECT count(*) FROM t` and `EXISTS (SELECT 1 FROM t …)` touch **no** columns of `t`: they
   charge the structural node block and row reads only.
 - **`DELETE`** touches only its filter's columns — dropping a row never reads its chains.

@@ -334,24 +334,45 @@ independently — the P6.4 precedent):
   yielded lazily — no regression, since they are LIMIT-gated or already stream their input). Making a
   large `exec_streaming_sort` output lazy via the `SortedRows` pull iterator directly (rather than
   buffering it as `Final`) is the remaining follow-on.
-- **S5 (deferred, optional) — lazy small-inline-column decode** (§8) — the last PG/SQLite parity
-  item; cost-neutral, a separate slice.
+- **S5 — lazy small-inline-column decode — superseded.** Spun out and **promoted** to its own
+  storage-core reshape in [lazy-record.md](lazy-record.md); see §8. *No longer a slice of this item.*
 
 Built Rust-first, then Go/TS in lockstep; the streaming loop structure is mirrored across cores (§6).
 
-## 8. Deferred follow-on — lazy small-inline-column decode
+## 8. The last lazy-decode gap — promoted to its own reshape ([lazy-record.md](lazy-record.md))
 
 The one lazy-decode gap vs. PG/SQLite (§1, §2) is that a leaf decode materializes **every** inline
 value of a record, where PG (`slot_getsomeattrs`) and SQLite (`OP_Column`) decode only the columns
-referenced (up to the max needed). jed already computes the per-relation **touched-column mask** at
-plan time ([cost.md](cost.md) "The touched set") and already uses it to skip resolving untouched
-*large* values — so extending it to skip *decoding* untouched small inline values is a localized
-codec change behind the existing mask. It is:
+referenced (up to the max needed). This was originally specced here as a small "S5" follow-on: jed
+already computes the per-relation **touched-column mask** at plan time ([cost.md](cost.md) "The
+touched set") and already skips resolving untouched *large* values, so skipping the *decode* of
+untouched small inline values reads like a localized codec change behind the existing mask.
+
+**Implementing it surfaced a finding that promoted it from a tweak to a reshape, now specced in
+[lazy-record.md](lazy-record.md).** PG and SQLite decode lazily **in the shared page buffer** — the
+tuple stays resident and a column is deformed in place, so deferral is free. jed's decoded `Row` is
+instead **detached and owned**, and **every scan deep-clones the row out of the resident node**
+(`pmap` `Step::Emit(… vals[p].clone())`). So a decode-in-place S5 has nothing to decode in place;
+the narrow form is a wash on flat untouched columns and a slight **regression** on the common
+touched path, with a clear win only on untouched deep-tree columns (jsonb/array/composite) — for a
+larger, drift-prone per-type skip-walker across three cores. The root cause is the **eager decode +
+per-scan deep clone**, not the decode-skip.
+
+[lazy-record.md](lazy-record.md) attacks the root: keep a faulted leaf as its **compact on-disk
+bytes** and decode each column **on demand** (generalizing the [large-values.md §14](large-values.md)
+`Unfetched` path from large values to *every* value). That makes lazy column decode fall out
+**uniformly** (no per-type rule) and **for free** (no touched-path regression), and adds two wins
+the narrow S5 never reached — the per-scan clone becomes a refcount bump / flat copy instead of a
+deep-tree clone, and resident leaf memory drops from inflated `Value` trees to `≈ page_size` (the
+honest buffer-pool bound, CLAUDE.md §9). It remains:
 
 - **separate from streaming** (orthogonal; either can land without the other),
-- **cost-neutral** (jed meters no per-column-decode unit; the touched-set already governs the
-  `page_read` / `value_decompress` charges, which do not move), and
-- **deferred** — a real but minor perf optimization, not a prerequisite for the streaming cursor.
+- **cost-neutral and byte-neutral** (jed meters no per-column-decode unit and the on-disk format is
+  unchanged; the touched-set already governs the `page_read` / `value_decompress` charges, which do
+  not move — so each core lands it green independently), and
+- a **storage-core reshape, not a localized tweak** — sliced seam-first in
+  [lazy-record.md §12](lazy-record.md) (L0 spec, L1 no-construct decode seam, L2 defer-at-fault, L3
+  zero-copy block-shared).
 
 ## 9. Determinism & cross-core notes (summary)
 
