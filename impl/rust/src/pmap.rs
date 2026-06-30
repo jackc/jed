@@ -521,6 +521,167 @@ impl PMap {
         }
         Ok(())
     }
+
+    /// A **pull** cursor over the `(key, row)` pairs within `b`, in ascending (`reverse = false`) or
+    /// descending (`reverse = true`) key order — the pull-model equivalent of
+    /// [`scan_range`](PMap::scan_range) / [`scan_range_rev`](PMap::scan_range_rev) (the S2 pull
+    /// B-tree scan cursor, spec/design/streaming.md §3/§5). It owns the moved `b` and borrows `src`
+    /// for the life of the traversal; the first node faulted is the root (always resident). See
+    /// [`RangeCursor`].
+    pub(crate) fn range_cursor<'a>(
+        &self,
+        b: KeyBound,
+        src: Option<&'a dyn LeafSource>,
+        reverse: bool,
+    ) -> RangeCursor<'a> {
+        let mut stack = Vec::new();
+        if let Some(root) = &self.root {
+            stack.push(ScanFrame::new(root.clone(), &b));
+        }
+        RangeCursor {
+            stack,
+            bound: b,
+            src,
+            reverse,
+        }
+    }
+}
+
+/// One node on a [`RangeCursor`]'s explicit traversal stack: the node, its bound windows, and the
+/// half-open span `[lo, hi)` of *interleaved positions* still to process. A leaf's positions are its
+/// in-bound key indices `[ef, el)` directly. An interior node's positions run `[0, 2·nkeys + 1)`,
+/// where an **even** `p` is child `p/2` (descended iff `cf ≤ p/2 ≤ cl`) and an **odd** `p` is
+/// separator key `p/2` (emitted iff `ef ≤ p/2 < el`). This single interleaved sequence reproduces
+/// `scan_range`'s order — including the asymmetric inclusive-`lo` separator (`ef = cf − 1`, whose
+/// odd position `2·ef + 1 = 2·cf − 1` falls just before child `cf`) — and reverses cleanly by
+/// consuming `[lo, hi)` from the back, with no separate forward/reverse logic.
+struct ScanFrame {
+    node: Arc<Node>,
+    is_leaf: bool,
+    ef: usize,
+    el: usize,
+    cf: usize,
+    cl: usize,
+    lo: usize,
+    hi: usize,
+}
+
+impl ScanFrame {
+    fn new(node: Arc<Node>, b: &KeyBound) -> ScanFrame {
+        let (ef, el) = b.entry_window(&node);
+        if node.is_leaf() {
+            ScanFrame {
+                node,
+                is_leaf: true,
+                ef,
+                el,
+                cf: 0,
+                cl: 0,
+                lo: ef,
+                hi: el,
+            }
+        } else {
+            let (cf, cl) = b.child_window(&node);
+            let hi = 2 * node.keys.len() + 1;
+            ScanFrame {
+                node,
+                is_leaf: false,
+                ef,
+                el,
+                cf,
+                cl,
+                lo: 0,
+                hi,
+            }
+        }
+    }
+}
+
+/// A **pull** (stateful) cursor over a [`PMap`]'s `(key, row)` pairs within a [`KeyBound`] — the
+/// pull-model equivalent of [`PMap::scan_range`] (spec/design/streaming.md §3/§5, the S2 pull
+/// B-tree scan cursor). Where `scan_range` *pushes* each row to a `visit` callback and owns the
+/// control flow, this cursor lets the **caller** own it: each [`next`](RangeCursor::next) yields the
+/// next in-bound pair, advancing an explicit frame stack over the persistent map. That is the
+/// VDBE-forward shape (streaming.md §3): a stateful `OP_Next`/`OP_Rewind`-style cursor a future
+/// bytecode VM can drive, where a push callback cannot.
+///
+/// It yields the **exact same sequence** as `scan_range` (`reverse = false`) / `scan_range_rev`
+/// (`reverse = true`) — same rows, same order, faulting a clean leaf through `src` only when the
+/// traversal descends into it, so a caller that stops pulling early (drops the cursor) faults no
+/// leaves past where it stopped (the genuine LIMIT short-circuit, cost.md §3). It clones each
+/// `(key, row)` out (owned), like [`PMap::iter`], because under demand paging a faulted leaf may be
+/// evicted between `next` calls (pager.md §4).
+pub(crate) struct RangeCursor<'a> {
+    stack: Vec<ScanFrame>,
+    bound: KeyBound,
+    src: Option<&'a dyn LeafSource>,
+    reverse: bool,
+}
+
+impl RangeCursor<'_> {
+    /// The next in-bound `(key, row)` pair, or `None` when the traversal is exhausted. Each call
+    /// advances the frame stack until it emits a row, descends into (and faults) a child, or pops an
+    /// exhausted frame.
+    pub(crate) fn next(&mut self) -> Result<Option<(Vec<u8>, Row)>> {
+        enum Step {
+            Emit(Vec<u8>, Row),
+            Descend(usize),
+            Pop,
+        }
+        let reverse = self.reverse;
+        loop {
+            // Decide the next step from the top frame in a scoped borrow, so the descend/pop arms
+            // can re-borrow `self.stack` to fault + push or to pop.
+            let step = {
+                let frame = match self.stack.last_mut() {
+                    Some(f) => f,
+                    None => return Ok(None),
+                };
+                let mut step = Step::Pop;
+                while frame.lo < frame.hi {
+                    let p = if reverse {
+                        frame.hi -= 1;
+                        frame.hi
+                    } else {
+                        let x = frame.lo;
+                        frame.lo += 1;
+                        x
+                    };
+                    if frame.is_leaf {
+                        // A leaf's positions are its in-bound key indices [ef, el) directly.
+                        step = Step::Emit(frame.node.keys[p].clone(), frame.node.vals[p].clone());
+                        break;
+                    }
+                    if p & 1 == 0 {
+                        let i = p / 2;
+                        if frame.cf <= i && i <= frame.cl {
+                            step = Step::Descend(i);
+                            break;
+                        }
+                    } else {
+                        let j = p / 2;
+                        if frame.ef <= j && j < frame.el {
+                            step =
+                                Step::Emit(frame.node.keys[j].clone(), frame.node.vals[j].clone());
+                            break;
+                        }
+                    }
+                }
+                step
+            };
+            match step {
+                Step::Emit(k, v) => return Ok(Some((k, v))),
+                Step::Descend(i) => {
+                    let parent = self.stack.last().expect("top frame present for descend");
+                    let ch = child(&parent.node, i, self.src)?;
+                    self.stack.push(ScanFrame::new(ch, &self.bound));
+                }
+                Step::Pop => {
+                    self.stack.pop();
+                }
+            }
+        }
+    }
 }
 
 /// Build a node from its parts; if its payload overflows `cap`, split it 2-way and promote one
@@ -1314,5 +1475,129 @@ mod tests {
         })
         .unwrap();
         assert_eq!(got, vec![199, 198, 197]);
+    }
+
+    #[test]
+    fn range_cursor_matches_scan_range() {
+        // The S2 pull cursor (range_cursor) must yield the EXACT same (key, row) sequence as the push
+        // scan_range / scan_range_rev over a MULTI-LEVEL tree — the contract the streaming pipeline
+        // (S3) rests on. This is internal machinery, not corpus-expressible (CLAUDE.md §10), so it
+        // is unit-tested per core against the existing push scan.
+        let mut pm = PMap::new();
+        for n in 0..200u64 {
+            pm.insert(key(n), row(n as i64), W, CAP, None).unwrap();
+        }
+        assert!(pm.node_count() > 2, "test needs a multi-level tree");
+
+        let decode = |k: &[u8]| u64::from_be_bytes(k.try_into().unwrap());
+        let val = |r: &Row| match &r[0] {
+            Value::Int(v) => *v,
+            other => panic!("unexpected row value {other:?}"),
+        };
+
+        // Collect the push scan's sequence as (key, row-value) pairs.
+        let pushed = |b: &KeyBound, rev: bool| -> Vec<(u64, i64)> {
+            let mut out = Vec::new();
+            let mut visit = |k: &[u8], r: &Row| -> Result<bool> {
+                out.push((decode(k), val(r)));
+                Ok(true)
+            };
+            if rev {
+                pm.scan_range_rev(b, None, &mut visit).unwrap();
+            } else {
+                pm.scan_range(b, None, &mut visit).unwrap();
+            }
+            out
+        };
+        // Drain the pull cursor into the same shape.
+        let pulled = |b: KeyBound, rev: bool| -> Vec<(u64, i64)> {
+            let mut c = pm.range_cursor(b, None, rev);
+            let mut out = Vec::new();
+            while let Some((k, r)) = c.next().unwrap() {
+                out.push((decode(&k), val(&r)));
+            }
+            out
+        };
+
+        let bounds = || {
+            vec![
+                KeyBound::unbounded(),
+                KeyBound {
+                    lo: Some(key(50)),
+                    lo_inc: true,
+                    hi: Some(key(150)),
+                    hi_inc: true,
+                },
+                KeyBound {
+                    lo: Some(key(50)),
+                    lo_inc: false,
+                    hi: Some(key(150)),
+                    hi_inc: false,
+                },
+                KeyBound {
+                    lo: Some(key(195)),
+                    lo_inc: true,
+                    hi: None,
+                    hi_inc: false,
+                },
+                KeyBound {
+                    lo: Some(key(100)),
+                    lo_inc: true,
+                    hi: Some(key(100)),
+                    hi_inc: true,
+                },
+                KeyBound {
+                    lo: Some(key(73)),
+                    lo_inc: true,
+                    hi: Some(key(181)),
+                    hi_inc: false,
+                },
+                // An empty bound (lo > hi) yields nothing on both paths.
+                KeyBound {
+                    lo: Some(key(150)),
+                    lo_inc: true,
+                    hi: Some(key(50)),
+                    hi_inc: true,
+                },
+            ]
+        };
+
+        for (i, b) in bounds().into_iter().enumerate() {
+            for rev in [false, true] {
+                let push = pushed(&b, rev);
+                let pull = pulled(b_clone(&b), rev);
+                assert_eq!(
+                    push, pull,
+                    "cursor must match scan_range for bound #{i} rev={rev}"
+                );
+            }
+        }
+
+        // Early abandonment: pulling only N rows then dropping the cursor yields the first N of the
+        // full sequence (forward and reverse), proving the pull short-circuit (the streaming win).
+        for rev in [false, true] {
+            let full = pushed(&KeyBound::unbounded(), rev);
+            let mut c = pm.range_cursor(KeyBound::unbounded(), None, rev);
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                let (k, r) = c.next().unwrap().unwrap();
+                got.push((decode(&k), val(&r)));
+            }
+            assert_eq!(
+                got,
+                full[..3],
+                "early-abandoned cursor must be the prefix (rev={rev})"
+            );
+        }
+    }
+
+    // KeyBound is move-only here (no Clone derive); this rebuilds one for the second consumer.
+    fn b_clone(b: &KeyBound) -> KeyBound {
+        KeyBound {
+            lo: b.lo.clone(),
+            lo_inc: b.lo_inc,
+            hi: b.hi.clone(),
+            hi_inc: b.hi_inc,
+        }
     }
 }

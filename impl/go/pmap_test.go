@@ -279,3 +279,93 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 		t.Fatalf("reverse short-circuit got %v, want [199 198 197]", got)
 	}
 }
+
+// TestPMapRangeCursorMatchesScanRange checks the S2 pull cursor (rangeCursor) yields the EXACT same
+// (key, row) sequence as the push scanRange / scanRangeRev over a MULTI-LEVEL tree — the contract the
+// streaming pipeline (S3) rests on. Internal machinery, not corpus-expressible (CLAUDE.md §10), so it
+// is unit-tested per core against the existing push scan.
+func TestPMapRangeCursorMatchesScanRange(t *testing.T) {
+	var pm pMap
+	for n := uint64(0); n < 200; n++ {
+		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, nil)
+	}
+	if pm.nodeCount() <= 2 {
+		t.Fatal("test needs a multi-level tree")
+	}
+	decode := func(k []byte) uint64 { return binary.BigEndian.Uint64(k) }
+	val := func(r storedRow) int64 {
+		if r[0].Kind != ValInt {
+			t.Fatalf("unexpected row value %#v", r[0])
+		}
+		return r[0].Int
+	}
+	type pair struct {
+		k uint64
+		v int64
+	}
+	// Collect the push scan's sequence.
+	pushed := func(b keyBound, rev bool) []pair {
+		var out []pair
+		visit := func(k []byte, r storedRow) (bool, error) {
+			out = append(out, pair{decode(k), val(r)})
+			return true, nil
+		}
+		if rev {
+			pm.scanRangeRev(b, nil, visit)
+		} else {
+			pm.scanRange(b, nil, visit)
+		}
+		return out
+	}
+	// Drain the pull cursor into the same shape.
+	pulled := func(b keyBound, rev bool) []pair {
+		c := pm.rangeCursor(b, nil, rev)
+		var out []pair
+		for {
+			k, r, ok, err := c.next()
+			if err != nil {
+				t.Fatalf("cursor next: %v", err)
+			}
+			if !ok {
+				break
+			}
+			out = append(out, pair{decode(k), val(r)})
+		}
+		return out
+	}
+	bounds := []keyBound{
+		unboundedBound(),
+		{lo: pmKey(50), loInc: true, hi: pmKey(150), hiInc: true},
+		{lo: pmKey(50), loInc: false, hi: pmKey(150), hiInc: false},
+		{lo: pmKey(195), loInc: true, hi: nil, hiInc: false},
+		{lo: pmKey(100), loInc: true, hi: pmKey(100), hiInc: true},
+		{lo: pmKey(73), loInc: true, hi: pmKey(181), hiInc: false},
+		{lo: pmKey(150), loInc: true, hi: pmKey(50), hiInc: true}, // empty (lo > hi)
+	}
+	for i, b := range bounds {
+		for _, rev := range []bool{false, true} {
+			push := pushed(b, rev)
+			pull := pulled(b, rev)
+			if !reflect.DeepEqual(push, pull) {
+				t.Fatalf("cursor must match scanRange for bound #%d rev=%v:\n push=%v\n pull=%v", i, rev, push, pull)
+			}
+		}
+	}
+	// Early abandonment: pulling only 3 rows then dropping the cursor yields the first 3 of the full
+	// sequence (forward and reverse), proving the pull short-circuit (the streaming win).
+	for _, rev := range []bool{false, true} {
+		full := pushed(unboundedBound(), rev)
+		c := pm.rangeCursor(unboundedBound(), nil, rev)
+		var got []pair
+		for n := 0; n < 3; n++ {
+			k, r, ok, err := c.next()
+			if err != nil || !ok {
+				t.Fatalf("cursor next %d: ok=%v err=%v", n, ok, err)
+			}
+			got = append(got, pair{decode(k), val(r)})
+		}
+		if !reflect.DeepEqual(got, full[:3]) {
+			t.Fatalf("early-abandoned cursor must be the prefix (rev=%v): got %v want %v", rev, got, full[:3])
+		}
+	}
+}

@@ -456,6 +456,58 @@ export class PMap {
     };
     if (this.root !== null) walk(this.root);
   }
+
+  // scanRangeIter is the PULL-model equivalent of scanRange (the S2 pull B-tree scan cursor,
+  // spec/design/streaming.md §3/§5): instead of PUSHING each in-bound row to a visit callback, it
+  // YIELDS one [key, row] pair per pull, so the CALLER owns the control flow. In TS the natural pull
+  // form is a generator (not the explicit frame stack the Rust/Go cores use), but it yields the EXACT
+  // same sequence as scanRange, faulting a clean leaf through src only when the traversal descends
+  // into it (via walkIter's resolveChild) — so a consumer that stops early (breaks a for-of, or
+  // .return()s the generator) faults no leaves past where it stopped (the genuine LIMIT short-
+  // circuit, cost.md §3). It yields the stored row reference (like scanRange's callback); the GC keeps
+  // a faulted leaf's row alive as long as a pulled row references it, even after the pool evicts the
+  // leaf. A faulted-leaf read error in resolveChild propagates as a thrown exception.
+  *scanRangeIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+    if (this.root !== null) yield* walkIter(this.root, b, src);
+  }
+
+  // scanRangeRevIter is scanRangeIter in reverse — the pull-model equivalent of scanRangeRev,
+  // yielding the in-bound pairs in DESCENDING key order (the exact reverse of scanRangeIter).
+  *scanRangeRevIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+    if (this.root !== null) yield* walkRevIter(this.root, b, src);
+  }
+}
+
+// walkIter mirrors PMap.scanRange's recursive in-order walk, yielding [key, row] instead of calling a
+// visit callback — so it is identical by construction (same structure, same windowing, same descent
+// order, including the asymmetric inclusive-lo separator emitted before the descent loop).
+function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+  const [ef, el] = entryWindow(b, n);
+  if (isLeaf(n)) {
+    for (let i = ef; i < el; i++) yield [n.keys[i], n.vals[i]];
+    return;
+  }
+  const [cf, cl] = childWindow(b, n);
+  if (ef < cf) yield [n.keys[ef], n.vals[ef]];
+  for (let i = cf; i <= cl; i++) {
+    yield* walkIter(resolveChild(n.children[i], src), b, src);
+    if (i >= ef && i < el) yield [n.keys[i], n.vals[i]];
+  }
+}
+
+// walkRevIter mirrors PMap.scanRangeRev's reverse walk, yielding instead of pushing.
+function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+  const [ef, el] = entryWindow(b, n);
+  if (isLeaf(n)) {
+    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], n.vals[i]];
+    return;
+  }
+  const [cf, cl] = childWindow(b, n);
+  for (let i = cl; i >= cf; i--) {
+    if (i >= ef && i < el) yield [n.keys[i], n.vals[i]];
+    yield* walkRevIter(resolveChild(n.children[i], src), b, src);
+  }
+  if (ef < cf) yield [n.keys[ef], n.vals[ef]];
 }
 
 // pmapFromLoaded reconstructs a map from a loaded root (format.ts loadEngine).

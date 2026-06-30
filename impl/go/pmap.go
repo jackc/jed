@@ -561,6 +561,111 @@ func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, r
 	return err
 }
 
+// scanFrame is one node on a rangeCursor's explicit traversal stack: the node, its bound windows, and
+// the half-open span [lo, hi) of *interleaved positions* still to process. A leaf's positions are its
+// in-bound key indices [ef, el) directly. An interior node's positions run [0, 2·nkeys+1), where an
+// EVEN p is child p/2 (descended iff cf ≤ p/2 ≤ cl) and an ODD p is separator key p/2 (emitted iff
+// ef ≤ p/2 < el). This single interleaved sequence reproduces scanRange's order — including the
+// asymmetric inclusive-lo separator (ef = cf−1, whose odd position 2·ef+1 = 2·cf−1 falls just before
+// child cf) — and reverses cleanly by consuming [lo, hi) from the back, with no separate forward/
+// reverse logic.
+type scanFrame struct {
+	node           *pnode
+	isLeaf         bool
+	ef, el, cf, cl int
+	lo, hi         int
+}
+
+func newScanFrame(n *pnode, b keyBound) scanFrame {
+	ef, el := b.entryWindow(n)
+	if n.isLeaf() {
+		return scanFrame{node: n, isLeaf: true, ef: ef, el: el, lo: ef, hi: el}
+	}
+	cf, cl := b.childWindow(n)
+	return scanFrame{node: n, isLeaf: false, ef: ef, el: el, cf: cf, cl: cl, lo: 0, hi: 2*len(n.keys) + 1}
+}
+
+// rangeCursor is a PULL (stateful) cursor over a pMap's (key, row) pairs within a keyBound, in
+// ascending (reverse=false) or descending (reverse=true) key order — the pull-model equivalent of
+// scanRange / scanRangeRev (the S2 pull B-tree scan cursor, spec/design/streaming.md §3/§5). Where
+// scanRange PUSHES each row to a visit callback and owns the control flow, this cursor lets the
+// CALLER own it: each next() yields the next in-bound pair, advancing an explicit frame stack over
+// the persistent map. That is the VDBE-forward shape (streaming.md §3): a stateful next/rewind cursor
+// a future bytecode VM can drive, where a push callback cannot.
+//
+// It yields the EXACT same sequence as scanRange (reverse=false) / scanRangeRev (reverse=true) — same
+// rows, same order, faulting a clean leaf through src only when the traversal descends into it, so a
+// caller that stops pulling early faults no leaves past where it stopped (the genuine LIMIT short-
+// circuit, cost.md §3). The yielded row is the stored slice (a reference, like scanRange's callback
+// and rangeEntries' appended rows); the Go GC keeps a faulted leaf's backing array alive as long as a
+// pulled row references it, even after the buffer pool evicts the leaf (pager.md §4).
+type rangeCursor struct {
+	stack   []scanFrame
+	bound   keyBound
+	src     leafSource
+	reverse bool
+}
+
+// rangeCursor returns a pull cursor over the (key, row) pairs within b. The first node on the stack is
+// the root (always resident); descendants fault through src on descent. See rangeCursor (the type).
+func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool) *rangeCursor {
+	c := &rangeCursor{bound: b, src: src, reverse: reverse}
+	if m.root != nil {
+		c.stack = append(c.stack, newScanFrame(m.root, b))
+	}
+	return c
+}
+
+// next yields the next in-bound (key, row), or ok=false when the traversal is exhausted. Each call
+// advances the frame stack until it emits a row, descends into (and faults) a child, or pops an
+// exhausted frame.
+func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
+	for len(c.stack) > 0 {
+		// &c.stack[top] is stable through the inner loop (no append/pop there); the descend/pop arms
+		// below re-fetch the top after they mutate the stack, so no stale pointer is used across a
+		// reslice.
+		fr := &c.stack[len(c.stack)-1]
+		descend := -1
+		for fr.lo < fr.hi {
+			var p int
+			if c.reverse {
+				fr.hi--
+				p = fr.hi
+			} else {
+				p = fr.lo
+				fr.lo++
+			}
+			if fr.isLeaf {
+				// A leaf's positions are its in-bound key indices [ef, el) directly.
+				return fr.node.keys[p], fr.node.vals[p], true, nil
+			}
+			if p%2 == 0 {
+				i := p / 2
+				if fr.cf <= i && i <= fr.cl {
+					descend = i
+					break
+				}
+			} else {
+				j := p / 2
+				if fr.ef <= j && j < fr.el {
+					return fr.node.keys[j], fr.node.vals[j], true, nil
+				}
+			}
+		}
+		if descend >= 0 {
+			parent := c.stack[len(c.stack)-1].node
+			child, e := resolveChild(parent.children[descend], c.src)
+			if e != nil {
+				return nil, nil, false, e
+			}
+			c.stack = append(c.stack, newScanFrame(child, c.bound))
+			continue
+		}
+		c.stack = c.stack[:len(c.stack)-1]
+	}
+	return nil, nil, false, nil
+}
+
 // insOut is the result of inserting into a subtree: a whole rebuilt node, or a split.
 type insOut struct {
 	whole *pnode // non-nil ⇒ no split

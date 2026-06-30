@@ -204,3 +204,77 @@ test("pmap: reverse scan is the forward scan reversed", () => {
   });
   assert.deepEqual(got, [199, 198, 197]);
 });
+
+test("pmap: pull cursor (scanRangeIter) matches the push scan", () => {
+  // The S2 pull cursor (scanRangeIter / scanRangeRevIter) must yield the EXACT same (key, row)
+  // sequence as the push scanRange / scanRangeRev over a MULTI-LEVEL tree — the contract the streaming
+  // pipeline (S3) rests on. Internal machinery, not corpus-expressible (CLAUDE.md §10), so it is
+  // unit-tested per core against the existing push scan.
+  const pm = new PMap();
+  for (let n = 0; n < 200; n++) pm.insert(key(n), row(n), W, CAP, null);
+  assert.ok(pm.nodeCount() > 2, "test needs a multi-level tree");
+
+  const decode = (k: Uint8Array): number =>
+    Number(new DataView(k.buffer, k.byteOffset, 8).getBigUint64(0));
+  const val = (r: Row): number => {
+    const v = r[0]!;
+    assert.equal(v.kind, "int", "unexpected row value");
+    return Number((v as { kind: "int"; int: bigint }).int);
+  };
+  type Pair = [number, number];
+  // Collect the push scan's sequence as [key, row-value] pairs.
+  const pushed = (b: KeyBound, rev: boolean): Pair[] => {
+    const out: Pair[] = [];
+    const visit = (k: Uint8Array, r: Row): boolean => {
+      out.push([decode(k), val(r)]);
+      return true;
+    };
+    if (rev) pm.scanRangeRev(b, null, visit);
+    else pm.scanRange(b, null, visit);
+    return out;
+  };
+  // Drain the pull generator into the same shape.
+  const pulled = (b: KeyBound, rev: boolean): Pair[] => {
+    const out: Pair[] = [];
+    const it = rev ? pm.scanRangeRevIter(b, null) : pm.scanRangeIter(b, null);
+    for (const [k, r] of it) out.push([decode(k), val(r)]);
+    return out;
+  };
+  const bounds: KeyBound[] = [
+    unboundedBound(),
+    { lo: key(50), loInc: true, hi: key(150), hiInc: true },
+    { lo: key(50), loInc: false, hi: key(150), hiInc: false },
+    { lo: key(195), loInc: true, hi: null, hiInc: false },
+    { lo: key(100), loInc: true, hi: key(100), hiInc: true },
+    { lo: key(73), loInc: true, hi: key(181), hiInc: false },
+    { lo: key(150), loInc: true, hi: key(50), hiInc: true }, // empty (lo > hi)
+  ];
+  for (let i = 0; i < bounds.length; i++) {
+    for (const rev of [false, true]) {
+      assert.deepEqual(
+        pulled(bounds[i]!, rev),
+        pushed(bounds[i]!, rev),
+        `cursor must match scanRange for bound #${i} rev=${rev}`,
+      );
+    }
+  }
+
+  // Early abandonment: pulling only 3 rows then abandoning the generator yields the first 3 of the
+  // full sequence (forward and reverse), proving the pull short-circuit (the streaming win).
+  for (const rev of [false, true]) {
+    const full = pushed(unboundedBound(), rev);
+    const it = rev
+      ? pm.scanRangeRevIter(unboundedBound(), null)
+      : pm.scanRangeIter(unboundedBound(), null);
+    const out: Pair[] = [];
+    for (const [k, r] of it) {
+      out.push([decode(k), val(r)]);
+      if (out.length === 3) break; // break runs the generator's return path — no further faulting
+    }
+    assert.deepEqual(
+      out,
+      full.slice(0, 3),
+      `early-abandoned cursor must be the prefix (rev=${rev})`,
+    );
+  }
+});
