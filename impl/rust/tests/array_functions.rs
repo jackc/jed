@@ -3,10 +3,10 @@
 //! `array_lower`/`array_upper`/`cardinality`/`array_dims`) and builder (`array_append`/
 //! `array_prepend`/`array_cat`) functions. Every expected value is pinned against PostgreSQL 18.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn err(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -14,8 +14,8 @@ fn err(db: &mut Engine, sql: &str) -> String {
 }
 
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL" via `render`).
-fn val(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+fn val(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
             assert_eq!(rows[0].len(), 1, "{sql}: expected one column");
@@ -27,7 +27,7 @@ fn val(db: &mut Engine, sql: &str) -> String {
 
 #[test]
 fn introspection_custom_lower_bound_and_multidim() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         val(&mut db, "SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)"),
         "2"
@@ -59,7 +59,7 @@ fn introspection_custom_lower_bound_and_multidim() {
 
 #[test]
 fn error_cases() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // array_append/prepend reject a multidimensional array (22000).
     assert_eq!(
         err(
@@ -99,7 +99,7 @@ fn error_cases() {
 
 #[test]
 fn result_types_polymorphic() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // text[] flows through the builders; introspection returns i32/text regardless of element.
     assert_eq!(
         val(&mut db, "SELECT array_append(ARRAY['a','b'], 'c')"),

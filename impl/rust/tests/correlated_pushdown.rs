@@ -7,18 +7,15 @@
 //! re-scan), which return the SAME rows because v == id.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
 /// `o` is a handful of outer rows; `inr` is `n` rows (id i32 PRIMARY KEY, v i32; v == id), wide
 /// enough to span several leaves. The outer k-values are all present as inner ids.
-fn tables(n: i64) -> Engine {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)").unwrap();
-    execute(&mut db, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)").unwrap();
-    execute(
-        &mut db,
-        "INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)",
-    )
+fn tables(n: i64) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE o (id i32 PRIMARY KEY, k i32)", &[]).unwrap();
+    db.execute("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)", &[])
     .unwrap();
     let mut sql = String::from("INSERT INTO inr VALUES ");
     for i in 1..=n {
@@ -27,19 +24,19 @@ fn tables(n: i64) -> Engine {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    execute(&mut db, &sql).unwrap();
+    db.execute(&sql, &[]).unwrap();
     db
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    match execute(db, sql).unwrap() {
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
-fn ids(db: &mut Engine, sql: &str) -> Vec<i64> {
-    match execute(db, sql).unwrap() {
+fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()
             .map(|r| match r[0] {
@@ -106,7 +103,7 @@ fn correlated_miss_and_null_outer_seek_nothing() {
     let mut db = tables(1000);
     // An outer k with no matching inner id is a point-lookup miss (visits the leaf, reads no row); a
     // NULL outer k is a 3VL-empty bound (reads no page, no row). Neither re-scans the inner.
-    execute(&mut db, "INSERT INTO o VALUES (6, 999999), (7, NULL)").unwrap();
+    db.execute("INSERT INTO o VALUES (6, 999999), (7, NULL)", &[]).unwrap();
     let got = ids(
         &mut db,
         "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id = o.k)",

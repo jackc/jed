@@ -7,18 +7,18 @@
 //! shapes; this exercises the per-vector boundary and that the abort is independent of `max_cost`.
 
 use jed::parser::{MAX_EXPR_DEPTH, Parser};
-use jed::{Engine, execute};
+use jed::{Database, Session, SessionOptions};
 
-fn db() -> Engine {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1, 1)").unwrap();
+fn db() -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1)", &[]).unwrap();
     db
 }
 
 /// The SQLSTATE of running `sql`, or `"ok"` if it succeeded.
-fn code(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql) {
+fn code(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]) {
         Ok(_) => "ok".to_string(),
         Err(e) => e.code().to_string(),
     }

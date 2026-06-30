@@ -8,31 +8,31 @@
 //! `SELECT distinct` lookahead consequence — → 42703; an untyped $1 → 42P18).
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute, execute_params};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    execute(db, sql)
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    db.execute(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err_code(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
         .code()
@@ -43,8 +43,8 @@ fn err_code(db: &mut Engine, sql: &str) -> String {
 
 #[test]
 fn literal_select_returns_one_row_costing_one_row_produced() {
-    let mut db = Engine::new();
-    let out = execute(&mut db, "SELECT 1").unwrap();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let out = db.execute("SELECT 1", &[]).unwrap();
     match &out {
         Outcome::Query {
             column_names, rows, ..
@@ -60,7 +60,7 @@ fn literal_select_returns_one_row_costing_one_row_produced() {
 
 #[test]
 fn expression_select_charges_its_operator_evals() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(query(&mut db, "SELECT 1 + 2"), vec![vec![Value::Int(3)]]);
     // 1 operator_eval (the `+` node) + 1 row_produced.
     assert_eq!(cost(&mut db, "SELECT 1 + 2"), 2);
@@ -68,7 +68,7 @@ fn expression_select_charges_its_operator_evals() {
 
 #[test]
 fn where_filters_the_virtual_row() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         query(&mut db, "SELECT 1 WHERE false"),
         Vec::<Vec<Value>>::new()
@@ -84,7 +84,7 @@ fn where_filters_the_virtual_row() {
 
 #[test]
 fn aggregates_fold_the_single_group() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // The virtual row is the one input row of the whole-table group (aggregates.md §4).
     assert_eq!(query(&mut db, "SELECT count(*)"), vec![vec![Value::Int(1)]]);
     assert_eq!(cost(&mut db, "SELECT count(*)"), 2); // 1 aggregate_accumulate + 1 row_produced
@@ -104,7 +104,7 @@ fn aggregates_fold_the_single_group() {
 
 #[test]
 fn distinct_and_limit_apply_to_the_single_row() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         query(&mut db, "SELECT DISTINCT 1"),
         vec![vec![Value::Int(1)]]
@@ -120,7 +120,7 @@ fn distinct_and_limit_apply_to_the_single_row() {
 
 #[test]
 fn set_operation_operands() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     let mut got: Vec<i64> = query(&mut db, "SELECT 1 UNION SELECT 2")
         .into_iter()
         .map(|r| match r[0] {
@@ -162,7 +162,7 @@ fn subqueries_uncorrelated_and_correlated() {
 #[test]
 fn insert_select_source() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-    let out = execute(&mut db, "INSERT INTO t SELECT 3").unwrap();
+    let out = db.execute("INSERT INTO t SELECT 3", &[]).unwrap();
     assert_eq!(out.cost(), 1); // exactly the embedded SELECT's cost
     assert_eq!(
         query(&mut db, "SELECT id FROM t"),
@@ -174,8 +174,8 @@ fn insert_select_source() {
 
 #[test]
 fn star_with_no_tables_is_42601_with_pg_message() {
-    let mut db = Engine::new();
-    let err = execute(&mut db, "SELECT *").unwrap_err();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let err = db.execute("SELECT *", &[]).unwrap_err();
     assert_eq!(err.code(), "42601");
     assert_eq!(
         err.message,
@@ -185,7 +185,7 @@ fn star_with_no_tables_is_42601_with_pg_message() {
 
 #[test]
 fn bare_columns_resolve_nothing() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(err_code(&mut db, "SELECT nope"), "42703");
     // The DISTINCT two-token lookahead is unchanged: at end of input the word is a column
     // reference, not the modifier (grammar.md §34 — previously died at the FROM expect).
@@ -198,11 +198,11 @@ fn bare_columns_resolve_nothing() {
 
 #[test]
 fn untyped_param_is_42p18_and_a_sibling_operand_types_it() {
-    let mut db = Engine::new();
-    let err = execute_params(&mut db, "SELECT $1", &[Value::Int(7)]).unwrap_err();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let err = db.execute("SELECT $1", &[Value::Int(7)]).unwrap_err();
     assert_eq!(err.code(), "42P18");
     // The sibling-operand rule (grammar.md §5) works without a FROM.
-    let out = execute_params(&mut db, "SELECT $1 + 1", &[Value::Int(7)]).unwrap();
+    let out = db.execute("SELECT $1 + 1", &[Value::Int(7)]).unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(8)]]),
         other => panic!("expected a query result, got {other:?}"),

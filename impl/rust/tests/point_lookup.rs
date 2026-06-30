@@ -5,12 +5,12 @@
 //! node_count) is an in-crate unit test in `pmap.rs`.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
 /// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id), wide enough to span several leaves.
-fn big_table(n: i64) -> Engine {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
+fn big_table(n: i64) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
         if i > 1 {
@@ -18,19 +18,19 @@ fn big_table(n: i64) -> Engine {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    execute(&mut db, &sql).unwrap();
+    db.execute(&sql, &[]).unwrap();
     db
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    match execute(db, sql).unwrap() {
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
-fn ids(db: &mut Engine, sql: &str) -> Vec<i64> {
-    match execute(db, sql).unwrap() {
+fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()
             .map(|r| match r[0] {
@@ -105,12 +105,12 @@ fn limit_short_circuit_is_sublinear() {
 
     // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
     // reached under a LIMIT that excludes it (matches the eager window-before-project).
-    let mut dz = Engine::new();
-    execute(&mut dz, "CREATE TABLE z (id i32 PRIMARY KEY, c i32)").unwrap();
-    execute(&mut dz, "INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)").unwrap();
+    let mut dz = Database::new_in_memory().session(SessionOptions::default());
+    dz.execute("CREATE TABLE z (id i32 PRIMARY KEY, c i32)", &[]).unwrap();
+    dz.execute("INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)", &[]).unwrap();
     assert_eq!(ids(&mut dz, "SELECT 100 / c FROM z LIMIT 1"), vec![20]);
     assert!(
-        execute(&mut dz, "SELECT 100 / c FROM z LIMIT 2").is_err(),
+        dz.execute("SELECT 100 / c FROM z LIMIT 2", &[]).is_err(),
         "LIMIT 2 reaches the c=0 row and must trap"
     );
 }

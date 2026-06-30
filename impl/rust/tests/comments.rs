@@ -3,22 +3,20 @@
 //! `1--2` is `1`); `/* */` block comments NEST per PG / the SQL standard; an
 //! unterminated block is 42601; comment openers inside a string literal are text.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn setup() -> Engine {
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)",
-    )
-    .unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1, 10, '--x /*y*/')").unwrap();
+fn setup() -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)", &[])
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, '--x /*y*/')", &[])
+        .unwrap();
     db
 }
 
 /// Run a query expected to produce exactly one value; return it rendered.
-fn one(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql).unwrap() {
+fn one(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}");
             assert_eq!(rows[0].len(), 1, "{sql}");
@@ -88,7 +86,7 @@ fn unterminated_block_comment_is_42601() {
         "SELECT v FROM t /* outer /* inner */ still open",
         "SELECT v FROM t /*/", // the close cannot overlap the open
     ] {
-        assert_eq!(execute(&mut db, sql).unwrap_err().code(), "42601", "{sql}");
+        assert_eq!(db.execute(sql, &[]).unwrap_err().code(), "42601", "{sql}");
     }
 }
 
@@ -97,7 +95,7 @@ fn stray_close_is_not_comment_syntax() {
     let mut db = setup();
     // `*/` with no opener lexes as `*` `/` and fails at parse.
     assert_eq!(
-        execute(&mut db, "SELECT v */ 1 FROM t").unwrap_err().code(),
+        db.execute("SELECT v */ 1 FROM t", &[]).unwrap_err().code(),
         "42601"
     );
 }
@@ -106,6 +104,6 @@ fn stray_close_is_not_comment_syntax() {
 fn comment_only_input_is_no_statement() {
     let mut db = setup();
     for sql in ["-- nothing here", "/* nothing here */", "  /* a */ -- b"] {
-        assert_eq!(execute(&mut db, sql).unwrap_err().code(), "42601", "{sql}");
+        assert_eq!(db.execute(sql, &[]).unwrap_err().code(), "42601", "{sql}");
     }
 }

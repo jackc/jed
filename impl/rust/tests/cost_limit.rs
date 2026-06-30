@@ -6,12 +6,12 @@
 //! primary-key lookup survives a ceiling a full scan would blow, and that the abort threads through
 //! SELECT / DELETE / UPDATE and a pathological expression.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
 /// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id).
-fn table(n: i64) -> Engine {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
+fn table(n: i64) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
         if i > 1 {
@@ -19,20 +19,20 @@ fn table(n: i64) -> Engine {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    execute(&mut db, &sql).unwrap();
+    db.execute(&sql, &[]).unwrap();
     db
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    match execute(db, sql).unwrap() {
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
 /// Assert running `sql` aborts with `54P01` (cost limit exceeded).
-fn assert_aborts(db: &mut Engine, sql: &str) {
-    match execute(db, sql) {
+fn assert_aborts(db: &mut Session, sql: &str) {
+    match db.execute(sql, &[]) {
         Err(e) => assert_eq!(
             e.code(),
             "54P01",
@@ -119,7 +119,7 @@ fn abort_threads_through_delete_and_update() {
     // Nothing was mutated (the aborted statements rolled back).
     db.set_max_cost(0);
     assert_eq!(cost(&mut db, "SELECT v FROM t"), scan_cost);
-    let n = match execute(&mut db, "SELECT v FROM t").unwrap() {
+    let n = match db.execute("SELECT v FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => rows.len(),
         _ => unreachable!(),
     };
@@ -147,7 +147,7 @@ fn empty_bound_under_a_tiny_ceiling_succeeds() {
     // one page_read, so it is NOT zero-cost.)
     let mut db = table(10);
     db.set_max_cost(1);
-    match execute(&mut db, "SELECT v FROM t WHERE id > 5 AND id < 5").unwrap() {
+    match db.execute("SELECT v FROM t WHERE id > 5 AND id < 5", &[]).unwrap() {
         Outcome::Query { rows, cost, .. } => {
             assert!(rows.is_empty());
             assert_eq!(

@@ -8,31 +8,31 @@
 //! generated_row cost contract + the max_cost ceiling, and the deferred-form errors.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute, execute_params};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    execute(db, sql)
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    db.execute(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err_code(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
         .code()
@@ -49,9 +49,9 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 
 #[test]
 fn zero_step_is_invalid_parameter_value() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     let e =
-        execute(&mut db, "SELECT * FROM generate_series(1, 5, 0)").expect_err("expected an error");
+        db.execute("SELECT * FROM generate_series(1, 5, 0)", &[]).expect_err("expected an error");
     assert_eq!(e.code(), "22023");
     assert_eq!(e.message, "step size cannot be equal to zero");
 }
@@ -60,7 +60,7 @@ fn zero_step_is_invalid_parameter_value() {
 
 #[test]
 fn alias_forms_and_qualified_column() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // PG's single-column function-alias rule: `AS g` (or the implicit `g`) renames the output
     // column to `g`, so the column is `g.g`, and `g.generate_series` is 42703 (no such column).
     assert_eq!(
@@ -68,7 +68,7 @@ fn alias_forms_and_qualified_column() {
         ints(&[1, 2, 3])
     );
     assert_eq!(
-        execute(&mut db, "SELECT * FROM generate_series(1, 3) AS g")
+        db.execute("SELECT * FROM generate_series(1, 3) AS g", &[])
             .unwrap()
             .column_names(),
         &["g"]
@@ -98,12 +98,8 @@ fn alias_forms_and_qualified_column() {
 
 #[test]
 fn param_argument() {
-    let mut db = Engine::new();
-    let out = execute_params(
-        &mut db,
-        "SELECT * FROM generate_series(1, $1)",
-        &[Value::Int(3)],
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let out = db.execute("SELECT * FROM generate_series(1, $1)", &[Value::Int(3)])
     .unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, ints(&[1, 2, 3])),
@@ -120,10 +116,7 @@ fn sibling_reference_works_implicitly_lateral() {
     // A FROM-sibling reference inside the SRF args IS visible — an SRF is implicitly lateral
     // (grammar.md §44; the rows are pinned by suites/joins/lateral.test). The prior non-LATERAL
     // 42P01 rejection is lifted: generate_series(1, t.n) re-runs per t row (1 row, n=3 ⇒ 3 rows).
-    let out = execute(
-        &mut db,
-        "SELECT * FROM t CROSS JOIN generate_series(1, t.n)",
-    )
+    let out = db.execute("SELECT * FROM t CROSS JOIN generate_series(1, t.n)", &[])
     .unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows.len(), 3),
@@ -135,7 +128,7 @@ fn sibling_reference_works_implicitly_lateral() {
 
 #[test]
 fn generated_row_cost_and_ceiling() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // 4 generated_row + 4 row_produced.
     assert_eq!(cost(&mut db, "SELECT * FROM generate_series(1, 4)"), 8);
     // A runaway series aborts deterministically once accrued cost reaches the ceiling (54P01),
@@ -151,11 +144,8 @@ fn generated_row_cost_and_ceiling() {
 
 #[test]
 fn mixed_width_promotes_to_the_wider_type() {
-    let mut db = Engine::new();
-    let out = execute(
-        &mut db,
-        "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let out = db.execute("SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))", &[])
     .unwrap();
     assert_eq!(out.column_types(), &["i32"]);
     match out {
@@ -168,7 +158,7 @@ fn mixed_width_promotes_to_the_wider_type() {
 
 #[test]
 fn i64_overflow_while_stepping_stops_cleanly() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // Stepping past i64::MAX must STOP, not trap: the last representable element is emitted then
     // the series ends (matching PostgreSQL). start = MAX-1, step 2 → just {MAX-1}.
     assert_eq!(
@@ -184,7 +174,7 @@ fn i64_overflow_while_stepping_stops_cleanly() {
 
 #[test]
 fn deferred_and_bad_call_errors() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // SELECT-list SRF is deferred — `generate_series` is not a scalar function.
     assert_eq!(err_code(&mut db, "SELECT generate_series(1, 5)"), "42883");
     // Column-alias list on a table function is deferred.

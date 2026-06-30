@@ -6,24 +6,24 @@
 //! 23503 enforcement at every write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the
 //! corpus's job. Mirrored in impl/go/foreign_key_test.go and impl/ts/tests/foreign_key.test.ts.
 
-use jed::{Engine, execute};
+use jed::{Database, Session, SessionOptions};
 
-fn db_with(sql: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(sql: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn err(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
 }
 
-fn fk_names(db: &Engine, table: &str) -> Vec<String> {
+fn fk_names(db: &Session, table: &str) -> Vec<String> {
     db.table(table)
         .unwrap()
         .foreign_keys
@@ -70,7 +70,7 @@ fn strict_same_type_pairing() {
         "42804"
     );
     // The same type is accepted.
-    execute(&mut db, "CREATE TABLE c3 (x i32 REFERENCES p)").unwrap();
+    db.execute("CREATE TABLE c3 (x i32 REFERENCES p)", &[]).unwrap();
 }
 
 /// The referential actions CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE
@@ -100,10 +100,7 @@ fn referential_actions_narrowed() {
         "0A000"
     );
     // NO ACTION / RESTRICT (and the default) are fine.
-    execute(
-        &mut db,
-        "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)",
-    )
+    db.execute("CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)", &[])
     .unwrap();
 }
 
@@ -121,10 +118,7 @@ fn parent_update_end_state_swap_allowed() {
     ]);
     // Swap 100 ⇄ 200 across the two parent rows: the end state still contains {100, 200}, so both
     // children remain valid. jed accepts this (PG would reject the transient collision).
-    execute(
-        &mut db,
-        "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END",
-    )
+    db.execute("UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END", &[])
     .unwrap();
     // But genuinely removing a referenced value still traps 23503.
     assert_eq!(

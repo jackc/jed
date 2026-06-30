@@ -12,10 +12,10 @@
 //!   * a non-datetime / non-literal-text source to a datetime target — jed `0A000` (text→datetime is
 //!     a valid PG cast; int→datetime is PG `42846`) (timezones.md §9.3, casts.toml).
 
-use jed::{Engine, execute};
+use jed::{Database, Session, SessionOptions};
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql) {
+fn err_code(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
@@ -24,7 +24,7 @@ fn err_code(db: &mut Engine, sql: &str) -> String {
 /// EXTRACT(julian …) is a deferred field on every type: jed 0A000, PG returns a value.
 #[test]
 fn extract_julian_is_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err_code(
             &mut db,
@@ -41,7 +41,7 @@ fn extract_julian_is_deferred() {
 /// date_part is deferred — it returns double precision and jed has no float type: jed 42883.
 #[test]
 fn date_part_is_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err_code(
             &mut db,
@@ -55,7 +55,7 @@ fn date_part_is_deferred() {
 /// numeric ±Infinity.
 #[test]
 fn extract_from_infinity_traps() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err_code(&mut db, "SELECT EXTRACT(year FROM timestamp 'infinity')"),
         "22003"
@@ -74,7 +74,7 @@ fn extract_from_infinity_traps() {
 /// works by literal adaptation (`'…'::timestamp`), so it is NOT tested here.
 #[test]
 fn non_datetime_source_to_datetime_is_deferred() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // int → timestamp: jed 0A000, PG 42846.
     assert_eq!(
         err_code(&mut db, "SELECT CAST(1 + 1 AS timestamp)"),

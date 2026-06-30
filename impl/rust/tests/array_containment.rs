@@ -6,10 +6,10 @@
 //! arrays with `i64[]` casts (matching element types); the element hint comes from the FIRST array
 //! operand (§5 #8), so a typed array adapts a bare-literal sibling only when it is the left operand.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn err(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -17,8 +17,8 @@ fn err(db: &mut Engine, sql: &str) -> String {
 }
 
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL").
-fn val(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+fn val(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
             assert_eq!(rows[0].len(), 1, "{sql}: expected one column");
@@ -30,7 +30,7 @@ fn val(db: &mut Engine, sql: &str) -> String {
 
 #[test]
 fn contains_basic() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2,3] @> ARRAY[2]"), "true");
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2,3] @> ARRAY[2,4]"), "false");
     // Order and duplicates are irrelevant (set semantics).
@@ -52,7 +52,7 @@ fn contains_basic() {
 
 #[test]
 fn contained_by_is_swapped_contains() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(val(&mut db, "SELECT ARRAY[2] <@ ARRAY[1,2,3]"), "true");
     assert_eq!(val(&mut db, "SELECT ARRAY[2,4] <@ ARRAY[1,2,3]"), "false");
     assert_eq!(val(&mut db, "SELECT '{}'::i64[] <@ ARRAY[1]"), "true");
@@ -60,7 +60,7 @@ fn contained_by_is_swapped_contains() {
 
 #[test]
 fn overlaps_basic() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] && ARRAY[2,3]"), "true");
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] && ARRAY[3,4]"), "false");
     // The empty array overlaps nothing.
@@ -69,7 +69,7 @@ fn overlaps_basic() {
 
 #[test]
 fn strict_null_element_matching() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // A non-NULL element is found past a NULL element in the container.
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2,NULL] @> ARRAY[2]"), "true");
     // STRICT equality — a NULL element matches NOTHING, including another NULL (the inverse of the
@@ -96,7 +96,7 @@ fn strict_null_element_matching() {
 
 #[test]
 fn null_whole_array_propagates() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // A NULL whole-array operand → NULL (strict / propagates), unlike the non-strict builders.
     assert_eq!(val(&mut db, "SELECT NULL::i64[] @> ARRAY[1]"), "NULL");
     assert_eq!(val(&mut db, "SELECT ARRAY[1] @> NULL::i64[]"), "NULL");
@@ -106,7 +106,7 @@ fn null_whole_array_propagates() {
 
 #[test]
 fn literal_adaptation_to_element_type() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // The untyped `ARRAY[…]` constructor adapts to the typed (i32[]) array's element type when the
     // typed array is the LEFT operand (the element hint comes from the first array operand, §5 #8).
     assert_eq!(val(&mut db, "SELECT '{1,2,3}'::i32[] @> ARRAY[2]"), "true");
@@ -115,7 +115,7 @@ fn literal_adaptation_to_element_type() {
 
 #[test]
 fn precedence_and_associativity() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // @> shares ||'s precedence rung (left-assoc, tighter than `=`): `a || b @> c` is `(a||b) @> c`.
     assert_eq!(
         val(&mut db, "SELECT ARRAY[1,2] || ARRAY[3] @> ARRAY[3]"),
@@ -129,7 +129,7 @@ fn precedence_and_associativity() {
 
 #[test]
 fn type_errors() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // A non-array operand or an element-type mismatch is 42883.
     assert_eq!(err(&mut db, "SELECT 5 @> ARRAY[1]"), "42883");
     assert_eq!(err(&mut db, "SELECT ARRAY[1] @> 5"), "42883");
@@ -139,7 +139,7 @@ fn type_errors() {
 
 #[test]
 fn lexing_lone_punctuation() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // A lone `@` / `&` is a 42601 syntax error (jed has no unary-@ / bitwise-and).
     assert_eq!(err(&mut db, "SELECT 1 @ 2"), "42601");
     assert_eq!(err(&mut db, "SELECT 1 & 2"), "42601");

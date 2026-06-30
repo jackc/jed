@@ -6,14 +6,14 @@
 //! and (b) finer assertions on the composite-specific NULL rules. Every expected value is pinned
 //! against PostgreSQL 18.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn run(db: &mut Engine, sql: &str) {
-    execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+fn run(db: &mut Session, sql: &str) {
+    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
-fn err(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -21,8 +21,8 @@ fn err(db: &mut Engine, sql: &str) -> String {
 }
 
 /// One-column, one-row query → the rendered value ("NULL" for SQL-NULL).
-fn val(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+fn val(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
             assert_eq!(rows[0].len(), 1, "{sql}: expected one column");
@@ -33,15 +33,15 @@ fn val(db: &mut Engine, sql: &str) -> String {
 }
 
 /// A multi-row, one-column query → the rendered values.
-fn col(db: &mut Engine, sql: &str) -> Vec<String> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+fn col(db: &mut Session, sql: &str) -> Vec<String> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows.iter().map(|r| r[0].render()).collect(),
         other => panic!("{sql}: expected a query result, got {other:?}"),
     }
 }
 
-fn addr_db() -> Engine {
-    let mut db = Engine::new();
+fn addr_db() -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     db
 }
@@ -220,10 +220,7 @@ fn quantified_over_composite_uses_total_order_not_3vl() {
 fn unnest_composite_array() {
     let mut db = addr_db();
     // One composite row per element, typed at the composite element type.
-    let out = execute(
-        &mut db,
-        r#"SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])"#,
-    )
+    let out = db.execute(r#"SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])"#, &[])
     .unwrap();
     match &out {
         Outcome::Query {

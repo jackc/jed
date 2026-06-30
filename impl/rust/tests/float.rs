@@ -3,18 +3,18 @@
 //! tag tolerates layout, but these finite values render identically), the total order, the trap
 //! model, strict-island coercion, the casts, the canonical-order-fold SUM/AVG, and a transcendental.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn rendered(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn rendered(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -23,22 +23,22 @@ fn rendered(db: &mut Engine, sql: &str) -> Vec<Vec<String>> {
     }
 }
 
-fn one(db: &mut Engine, sql: &str) -> String {
+fn one(db: &mut Session, sql: &str) -> String {
     let rows = rendered(db, sql);
     assert_eq!(rows.len(), 1, "{sql:?} should return one row");
     assert_eq!(rows[0].len(), 1, "{sql:?} should return one column");
     rows[0][0].clone()
 }
 
-fn col_types(db: &mut Engine, sql: &str) -> Vec<String> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn col_types(db: &mut Session, sql: &str) -> Vec<String> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { column_types, .. } => column_types,
         Outcome::Statement { .. } => panic!("expected a query for {sql:?}"),
     }
 }
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err_code(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql:?} should have failed"))
         .code()
@@ -69,7 +69,7 @@ fn aliases_resolve_and_rejected_spellings_fail() {
     let mut db3 = db_with(&["CREATE TABLE t (a float4, b float8)"]);
     assert_eq!(col_types(&mut db3, "SELECT * FROM t"), vec!["f32", "f64"]);
     // The `float(p)` precision typmod is still rejected.
-    assert!(execute(&mut db, "CREATE TABLE u (x float(10))").is_err());
+    assert!(db.execute("CREATE TABLE u (x float(10))", &[]).is_err());
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn distinct_and_group_by_collapse_neg_zero_and_nan() {
 
 #[test]
 fn rendering_of_special_values() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(one(&mut db, "SELECT float 'Infinity'"), "Infinity");
     assert_eq!(one(&mut db, "SELECT float '-Infinity'"), "-Infinity");
     assert_eq!(one(&mut db, "SELECT float 'NaN'"), "NaN");

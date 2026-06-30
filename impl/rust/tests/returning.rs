@@ -6,47 +6,47 @@
 //! impl/ts/tests/returning.test.ts.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute, execute_params};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn run(db: &mut Engine, sql: &str) -> Outcome {
-    execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+fn run(db: &mut Session, sql: &str) -> Outcome {
+    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
+fn cost(db: &mut Session, sql: &str) -> i64 {
     match run(db, sql) {
         Outcome::Statement { cost, .. } => cost,
         Outcome::Query { cost, .. } => cost,
     }
 }
 
-fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
+fn rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match run(db, sql) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn names(db: &mut Engine, sql: &str) -> Vec<String> {
+fn names(db: &mut Session, sql: &str) -> Vec<String> {
     match run(db, sql) {
         Outcome::Query { column_names, .. } => column_names,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err_code(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
 }
 
-fn setup() -> Engine {
-    let mut db = Engine::new();
+fn setup() -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in [
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
         "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
     ] {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
@@ -321,22 +321,14 @@ fn returning_ceiling_abort_is_all_or_nothing() {
 fn returning_bind_params() {
     let mut db = setup();
     // A $N in the RETURNING list types from context like anywhere else (api.md §5).
-    let out = execute_params(
-        &mut db,
-        "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1",
-        &[Value::Int(5)],
-    )
+    let out = db.execute("INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", &[Value::Int(5)])
     .unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![int(8)]]),
         Outcome::Statement { .. } => panic!("expected a query result"),
     }
     // A parameter no context types is 42P18.
-    let err = execute_params(
-        &mut db,
-        "INSERT INTO t VALUES (81, 3, 0) RETURNING $1",
-        &[Value::Int(5)],
-    )
+    let err = db.execute("INSERT INTO t VALUES (81, 3, 0) RETURNING $1", &[Value::Int(5)])
     .expect_err("an untypable parameter must fail");
     assert_eq!(err.code().to_string(), "42P18");
 }
@@ -348,7 +340,7 @@ fn returning_grows_the_touched_set() {
     // ceil(100000/8180) = 13 slabs.
     let big = format!("INSERT INTO big VALUES (1, 0, '{}')", "x".repeat(100_000));
     let fresh = || {
-        let mut db = Engine::new();
+        let mut db = Database::new_in_memory().session(SessionOptions::default());
         run(
             &mut db,
             "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",
@@ -481,7 +473,7 @@ fn old_new_naming_and_star() {
 fn old_new_shadowed_by_table_name() {
     // A target table literally named old (or new) keeps the ordinary table-qualified
     // meaning — the row-version pseudo-relation is suppressed (PG-probed).
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db, "CREATE TABLE old (x i32)");
     assert_eq!(
         rows(&mut db, "INSERT INTO old VALUES (1) RETURNING old.x"),
@@ -541,7 +533,7 @@ fn old_new_touched_set() {
     // nothing. Compressed 100k text at page_size 8192 = 13 slabs.
     let big = format!("INSERT INTO big VALUES (1, 0, '{}')", "x".repeat(100_000));
     let fresh = || {
-        let mut db = Engine::new();
+        let mut db = Database::new_in_memory().session(SessionOptions::default());
         run(
             &mut db,
             "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",

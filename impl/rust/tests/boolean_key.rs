@@ -5,17 +5,17 @@
 //! (tests/fileformat_golden.rs); these are the behavioral checks.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql) {
+fn err_code(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
 }
 
-fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
-    match execute(db, sql).unwrap() {
+fn rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows,
         other => panic!("expected query, got {other:?}"),
     }
@@ -24,9 +24,9 @@ fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
 /// A boolean PRIMARY KEY is accepted (the gate lifted) and CRUD works.
 #[test]
 fn boolean_primary_key_crud() {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY, v i32)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)").unwrap();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (k boolean PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)", &[]).unwrap();
 
     // Point lookup on the boolean PK resolves to the right row.
     assert_eq!(
@@ -48,16 +48,10 @@ fn boolean_primary_key_crud() {
 /// A boolean member of a COMPOSITE primary key concatenates with the other component.
 #[test]
 fn boolean_composite_primary_key() {
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))", &[])
     .unwrap();
-    execute(
-        &mut db,
-        "INSERT INTO t VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)",
-    )
+    db.execute("INSERT INTO t VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)", &[])
     .unwrap();
     // (1,FALSE) and (1,TRUE) are distinct keys; the same (a,b) again conflicts.
     assert_eq!(
@@ -78,14 +72,11 @@ fn boolean_composite_primary_key() {
 /// A secondary index on a (nullable) boolean column is accepted and serves equality.
 #[test]
 fn boolean_secondary_index() {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)").unwrap();
-    execute(
-        &mut db,
-        "INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)", &[])
     .unwrap();
-    execute(&mut db, "CREATE INDEX i ON t (flag)").unwrap();
+    db.execute("CREATE INDEX i ON t (flag)", &[]).unwrap();
     let mut ids: Vec<i64> = rows(&mut db, "SELECT id FROM t WHERE flag = TRUE")
         .into_iter()
         .map(|r| match r[0] {

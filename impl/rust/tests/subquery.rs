@@ -8,23 +8,23 @@
 //! (21000 / 42601 / 0A000). See spec/design/grammar.md §26.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute, execute_params};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    execute(db, sql)
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    db.execute(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
-fn ab() -> Engine {
+fn ab() -> Session {
     db_with(&[
         "CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
         "CREATE TABLE b (id i32 PRIMARY KEY, k i32)",
@@ -33,14 +33,14 @@ fn ab() -> Engine {
     ])
 }
 
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn ints(db: &mut Engine, sql: &str) -> Vec<i64> {
+fn ints(db: &mut Session, sql: &str) -> Vec<i64> {
     query(db, sql)
         .into_iter()
         .map(|r| match r[0] {
@@ -84,7 +84,7 @@ fn correlated_inner_error_raised_over_empty_outer() {
         "INSERT INTO f VALUES (1, 1)",
     ]);
     assert_eq!(
-        execute(&mut db, "SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e")
+        db.execute("SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e", &[])
             .unwrap_err()
             .code(),
         "42601"
@@ -138,8 +138,8 @@ fn delete_correlated_subquery_cost_is_per_row() {
 fn param_inside_subquery_inner_context() {
     let mut db = ab();
     let i = |v: i64| Value::Int(v);
-    let run = |db: &mut Engine, sql: &str, p: &[Value]| -> Vec<i64> {
-        match execute_params(db, sql, p).unwrap() {
+    let run = |db: &mut Session, sql: &str, p: &[Value]| -> Vec<i64> {
+        match db.execute(sql, p).unwrap() {
             Outcome::Query { rows, .. } => rows
                 .into_iter()
                 .map(|r| match r[0] {
@@ -186,11 +186,7 @@ fn param_inside_subquery_uninferable_is_42p18() {
     // with a value bound (the type, not the value, is what's missing). PG diverges (defaults text).
     let mut db = ab();
     assert_eq!(
-        execute_params(
-            &mut db,
-            "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)",
-            &[Value::Int(10)]
-        )
+        db.execute("SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", &[Value::Int(10)])
         .unwrap_err()
         .code(),
         "42P18"

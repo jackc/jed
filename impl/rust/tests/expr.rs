@@ -4,26 +4,26 @@
 //! corpus (spec/conformance/suites/expr/) with finer-grained per-feature assertions.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 /// Run a query and return its rows.
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
 /// Run a single-row, single-column query and return the lone value.
-fn scalar(db: &mut Engine, sql: &str) -> Value {
+fn scalar(db: &mut Session, sql: &str) -> Value {
     let rows = query(db, sql);
     assert_eq!(rows.len(), 1, "{sql:?}: expected one row");
     assert_eq!(rows[0].len(), 1, "{sql:?}: expected one column");

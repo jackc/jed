@@ -9,33 +9,30 @@
 //! COLUMN), so it exercises the per-row `evalCast` path, not the resolve-time literal fold.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
 /// Build a one-column text table `t(id i32 pk, s text)` seeded with `rows` (id = 1.., s = each str).
-fn seeded(rows: &[&str]) -> Engine {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)").unwrap();
+fn seeded(rows: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[]).unwrap();
     for (i, s) in rows.iter().enumerate() {
-        execute(
-            &mut db,
-            &format!("INSERT INTO t VALUES ({}, '{}')", i + 1, s),
-        )
+        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i + 1, s), &[])
         .unwrap();
     }
     db
 }
 
 /// The scalar value of `SELECT <expr> FROM t WHERE id = <id>`.
-fn at(db: &mut Engine, expr: &str, id: usize) -> Value {
-    match execute(db, &format!("SELECT {expr} FROM t WHERE id = {id}")).unwrap() {
+fn at(db: &mut Session, expr: &str, id: usize) -> Value {
+    match db.execute(&format!("SELECT {expr} FROM t WHERE id = {id}"), &[]).unwrap() {
         Outcome::Query { rows, .. } => rows[0][0].clone(),
         other => panic!("expected query, got {other:?}"),
     }
 }
 
 /// The SQLSTATE of a query expected to error per row.
-fn err_at(db: &mut Engine, expr: &str, id: usize) -> String {
-    match execute(db, &format!("SELECT {expr} FROM t WHERE id = {id}")) {
+fn err_at(db: &mut Session, expr: &str, id: usize) -> String {
+    match db.execute(&format!("SELECT {expr} FROM t WHERE id = {id}"), &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {expr} (id {id})"),
     }
@@ -113,8 +110,8 @@ fn text_to_float_overflow_and_malformed() {
 
 #[test]
 fn text_to_float_null_propagates() {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1, NULL)").unwrap();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL)", &[]).unwrap();
     assert_eq!(at(&mut db, "s :: float8", 1), Value::Null);
 }

@@ -6,24 +6,24 @@
 //! cost-ceiling termination of a non-terminating recursion (`54P01`, a host-API `max_cost`) and the
 //! inert materialization hint.
 
-use jed::{Engine, execute};
+use jed::{Database, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    execute(db, sql)
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    db.execute(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
 /// A 3-row, single-node table `t(id, n)` = {(1,10),(2,20),(3,30)}.
-fn t3() -> Engine {
+fn t3() -> Session {
     db_with(&[
         "CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
         "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
@@ -59,12 +59,9 @@ fn materialized_hint_forces_buffering() {
 /// doing real work. A per-iteration meter would never fire here, so the corpus cannot express it.
 #[test]
 fn recursive_unbounded_aborts_at_cost_ceiling() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.set_max_cost(1000);
-    let err = execute(
-        &mut db,
-        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c",
-    )
+    let err = db.execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c", &[])
     .expect_err("an unbounded recursion must abort, not loop forever");
     assert_eq!(err.code(), "54P01", "got {}", err.message);
 }
@@ -73,13 +70,10 @@ fn recursive_unbounded_aborts_at_cost_ceiling() {
 /// *actual* accrued cost, not a per-iteration figure).
 #[test]
 fn recursive_under_ceiling_succeeds() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     // The 5-row counter accrues 29 (the corpus cost contract); a ceiling above it lets it through.
     db.set_max_cost(1000);
-    let r = execute(
-        &mut db,
-        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c",
-    )
+    let r = db.execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c", &[])
     .expect("a terminating recursion under the ceiling must succeed");
     assert_eq!(r.cost(), 29);
 }
@@ -88,12 +82,12 @@ fn recursive_under_ceiling_succeeds() {
 /// single-reference recursive CTE still iterates to a fixpoint rather than inlining its body.
 #[test]
 fn recursive_hint_is_inert() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for hint in ["", "MATERIALIZED ", "NOT MATERIALIZED "] {
         let sql = format!(
             "WITH RECURSIVE c(n) AS {hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"
         );
-        let r = execute(&mut db, &sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
+        let r = db.execute(&sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
         // Three rows regardless of the hint; the recursive cost is identical (the hint is ignored).
         match r {
             jed::Outcome::Query { rows, cost, .. } => {
@@ -113,10 +107,7 @@ fn recursive_hint_is_inert() {
 fn nested_with_does_not_inherit_enclosing_ctes() {
     // (a) No base table named `e`: the inner reference to the enclosing CTE `e` is unresolved → 42P01.
     let mut db = t3();
-    let err = execute(
-        &mut db,
-        "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s",
-    )
+    let err = db.execute("WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s", &[])
     .expect_err("an enclosing CTE is invisible inside a nested WITH (cte.md §7)");
     assert_eq!(err.code(), "42P01", "{}", err.message);
 
@@ -127,10 +118,7 @@ fn nested_with_does_not_inherit_enclosing_ctes() {
         "CREATE TABLE e (v i32 PRIMARY KEY)",
         "INSERT INTO e VALUES (7), (8)",
     ]);
-    let r = execute(
-        &mut db,
-        "WITH e AS (SELECT 1 AS v) SELECT v FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s ORDER BY v",
-    )
+    let r = db.execute("WITH e AS (SELECT 1 AS v) SELECT v FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s ORDER BY v", &[])
     .expect("the base table e resolves inside the nested WITH");
     match r {
         jed::Outcome::Query { rows, .. } => assert_eq!(

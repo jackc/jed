@@ -6,14 +6,14 @@
 //! bounded) vs `WHERE a.k = c` (not the PK, full scan), which return the SAME row because k == id.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
 /// `a` is `n` rows (id i32 PRIMARY KEY, k i32; k == id), wide enough to span several leaves; `b`
 /// is three small rows whose k-values exist as a's k-values, so the join matches.
-fn tables(n: i64) -> Engine {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE a (id i32 PRIMARY KEY, k i32)").unwrap();
-    execute(&mut db, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)").unwrap();
+fn tables(n: i64) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE a (id i32 PRIMARY KEY, k i32)", &[]).unwrap();
+    db.execute("CREATE TABLE b (id i32 PRIMARY KEY, k i32)", &[]).unwrap();
     let mut sql = String::from("INSERT INTO a VALUES ");
     for i in 1..=n {
         if i > 1 {
@@ -21,20 +21,20 @@ fn tables(n: i64) -> Engine {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    execute(&mut db, &sql).unwrap();
-    execute(&mut db, "INSERT INTO b VALUES (1, 500), (2, 600), (3, 700)").unwrap();
+    db.execute(&sql, &[]).unwrap();
+    db.execute("INSERT INTO b VALUES (1, 500), (2, 600), (3, 700)", &[]).unwrap();
     db
 }
 
-fn cost(db: &mut Engine, sql: &str) -> i64 {
-    match execute(db, sql).unwrap() {
+fn cost(db: &mut Session, sql: &str) -> i64 {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
-fn ids(db: &mut Engine, sql: &str) -> Vec<i64> {
-    match execute(db, sql).unwrap() {
+fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()
             .map(|r| match r[0] {

@@ -6,25 +6,25 @@
 //! is the corpus's job. Mirrored in impl/go/on_conflict_test.go and
 //! impl/ts/tests/on_conflict.test.ts.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(sql: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(sql: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn err(db: &mut Engine, sql: &str) -> String {
-    execute(db, sql)
+fn err(db: &mut Session, sql: &str) -> String {
+    db.execute(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
 }
 
-fn affected(db: &mut Engine, sql: &str) -> Option<i64> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn affected(db: &mut Session, sql: &str) -> Option<i64> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement outcome from {sql:?}"),
     }

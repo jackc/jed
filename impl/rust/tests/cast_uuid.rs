@@ -6,17 +6,17 @@
 //! checks here run alongside (CLAUDE.md §10 — the per-core test covers only what the corpus cannot).
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn err_code(db: &mut Engine, sql: &str) -> String {
-    match execute(db, sql) {
+fn err_code(db: &mut Session, sql: &str) -> String {
+    match db.execute(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
 }
 
-fn one(db: &mut Engine, sql: &str) -> Value {
-    match execute(db, sql).unwrap() {
+fn one(db: &mut Session, sql: &str) -> Value {
+    match db.execute(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows[0][0].clone(),
         other => panic!("expected query, got {other:?}"),
     }
@@ -30,7 +30,7 @@ const UUID16: [u8; 16] = [
 /// uuid → bytea is the 16 raw bytes (PG: 42846 — jed adds this cast).
 #[test]
 fn uuid_to_bytea_is_the_16_bytes() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         one(
             &mut db,
@@ -44,7 +44,7 @@ fn uuid_to_bytea_is_the_16_bytes() {
 /// hyphen-less hex; the result renders as the canonical lowercase uuid.
 #[test]
 fn bytea_to_uuid_is_the_16_bytes() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         one(
             &mut db,
@@ -58,7 +58,7 @@ fn bytea_to_uuid_is_the_16_bytes() {
 /// there is no PG code to match, so jed reuses invalid_text_representation).
 #[test]
 fn bytea_to_uuid_wrong_length_traps_22p02() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(err_code(&mut db, "SELECT '\\xabcd'::bytea::uuid"), "22P02"); // 2 bytes
     assert_eq!(err_code(&mut db, "SELECT '\\x'::bytea::uuid"), "22P02"); // empty (0 bytes)
     // 17 bytes (one too many)
@@ -75,17 +75,11 @@ fn bytea_to_uuid_wrong_length_traps_22p02() {
 /// equals the bytea column, and the bytea column → uuid equals the uuid column. NULL adapts.
 #[test]
 fn uuid_bytea_round_trip_through_columns() {
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)", &[])
     .unwrap();
-    execute(
-        &mut db,
-        "INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000', \
-         '\\x550e8400e29b41d4a716446655440000'), (2, NULL, NULL)",
-    )
+    db.execute("INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000', \
+         '\\x550e8400e29b41d4a716446655440000'), (2, NULL, NULL)", &[])
     .unwrap();
     assert_eq!(
         one(&mut db, "SELECT u::bytea FROM t WHERE id = 1"),
@@ -110,18 +104,12 @@ fn uuid_bytea_round_trip_through_columns() {
 /// runtime text→uuid parses PG-flexibly (22P02 on malformed), uuid→text renders canonical lowercase.
 #[test]
 fn text_uuid_smoke() {
-    let mut db = Engine::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)",
-    )
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)", &[])
     .unwrap();
     // an UPPERCASE text value casts to the same 16 bytes and renders lowercase
-    execute(
-        &mut db,
-        "INSERT INTO t VALUES (1, '550E8400-E29B-41D4-A716-446655440000', \
-         '550e8400-e29b-41d4-a716-446655440000')",
-    )
+    db.execute("INSERT INTO t VALUES (1, '550E8400-E29B-41D4-A716-446655440000', \
+         '550e8400-e29b-41d4-a716-446655440000')", &[])
     .unwrap();
     assert_eq!(
         one(&mut db, "SELECT s::uuid FROM t WHERE id = 1"),
@@ -132,7 +120,7 @@ fn text_uuid_smoke() {
         Value::Text("550e8400-e29b-41d4-a716-446655440000".to_string())
     );
     // a malformed runtime text → uuid traps 22P02 (not a literal — the column path)
-    execute(&mut db, "INSERT INTO t VALUES (2, 'not-a-uuid', NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'not-a-uuid', NULL)", &[]).unwrap();
     assert_eq!(
         err_code(&mut db, "SELECT s::uuid FROM t WHERE id = 2"),
         "22P02"

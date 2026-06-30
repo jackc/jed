@@ -3,25 +3,25 @@
 //! context and supplied values are coerced two-phase before any row is touched.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute, execute_params};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(sql: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(sql: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
-fn rows(db: &mut Engine, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
-    match execute_params(db, sql, params).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn rows(db: &mut Session, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+    match db.execute(sql, params).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         _ => panic!("expected a query result"),
     }
 }
 
-fn err_code(db: &mut Engine, sql: &str, params: &[Value]) -> String {
-    execute_params(db, sql, params)
+fn err_code(db: &mut Session, sql: &str, params: &[Value]) -> String {
+    db.execute(sql, params)
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
         .code()
@@ -43,7 +43,7 @@ fn param_adopts_narrow_column_type_and_traps_overflow() {
     // `$1` compared against an i16 column is typed i16; a value out of i16 range traps
     // 22003 at bind, before any scan.
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, s i16)"]);
-    execute(&mut db, "INSERT INTO t VALUES (1, 100)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 100)", &[]).unwrap();
     assert_eq!(
         err_code(
             &mut db,
@@ -60,11 +60,7 @@ fn param_adopts_narrow_column_type_and_traps_overflow() {
 #[test]
 fn insert_values_params_round_trip() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, name text)"]);
-    execute_params(
-        &mut db,
-        "INSERT INTO t VALUES ($1, $2)",
-        &[Value::Int(7), Value::Text("alice".into())],
-    )
+    db.execute("INSERT INTO t VALUES ($1, $2)", &[Value::Int(7), Value::Text("alice".into())])
     .unwrap();
     let got = rows(
         &mut db,
@@ -107,11 +103,7 @@ fn update_set_and_where_params() {
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t VALUES (1, 10), (2, 20)",
     ]);
-    execute_params(
-        &mut db,
-        "UPDATE t SET v = $1 WHERE id = $2",
-        &[Value::Int(99), Value::Int(2)],
-    )
+    db.execute("UPDATE t SET v = $1 WHERE id = $2", &[Value::Int(99), Value::Int(2)])
     .unwrap();
     let got = rows(&mut db, "SELECT v FROM t WHERE id = $1", &[Value::Int(2)]);
     assert_eq!(got, vec![vec![Value::Int(99)]]);
@@ -123,7 +115,7 @@ fn delete_where_param() {
         "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1), (2), (3)",
     ]);
-    execute_params(&mut db, "DELETE FROM t WHERE id = $1", &[Value::Int(2)]).unwrap();
+    db.execute("DELETE FROM t WHERE id = $1", &[Value::Int(2)]).unwrap();
     let got = rows(&mut db, "SELECT id FROM t", &[]);
     assert_eq!(got, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
 }
@@ -225,7 +217,7 @@ fn param_in_in_list() {
 
 #[test]
 fn ddl_with_params_traps_42601() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
         err_code(
             &mut db,
@@ -290,7 +282,7 @@ fn lexer_rejects_bad_param_tokens() {
         "SELECT id FROM t WHERE id = $01",
     ] {
         assert_eq!(
-            execute(&mut db, sql).err().map(|e| e.code().to_string()),
+            db.execute(sql, &[]).err().map(|e| e.code().to_string()),
             Some("42601".to_string()),
             "{sql:?} should be 42601"
         );

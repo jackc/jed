@@ -5,9 +5,9 @@
 //! call (CLAUDE.md §10); the splitter's own boundary correctness is unit-tested in `src/split.rs`.
 
 use jed::value::Value;
-use jed::{Database, Engine, Outcome, SessionOptions, TxStatus};
+use jed::{Database, Outcome, Session, SessionOptions, TxStatus};
 
-fn count(db: &mut Engine) -> i64 {
+fn count(db: &mut Session) -> i64 {
     match db.execute("SELECT count(*) FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => match rows[0][0] {
             Value::Int(n) => n,
@@ -21,7 +21,7 @@ fn count(db: &mut Engine) -> i64 {
 fn script_summary_counts_and_commits_atomically_when_idle() {
     // An Idle session wraps the whole run in one implicit transaction; the summary carries only
     // counts (rows_affected_total sums the DML command tags — DDL and SELECT contribute nothing).
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     let summary = db
         .execute_script(
             "CREATE TABLE t (id i32 PRIMARY KEY, v i32);
@@ -45,7 +45,7 @@ fn script_summary_counts_and_commits_atomically_when_idle() {
 fn script_is_all_or_nothing_on_error() {
     // The third INSERT duplicates PK 1 (23505). Because the run is one implicit transaction, the
     // first two inserts roll back too — the table is left empty and the session returns to Idle.
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
@@ -64,7 +64,7 @@ fn script_is_all_or_nothing_on_error() {
 fn script_select_rows_are_discarded_but_the_statement_is_counted() {
     // A SELECT in a script runs (its cost accrues, it counts as a statement) but its rows are
     // discarded and it adds nothing to rows_affected_total.
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     let summary = db
         .execute_script(
             "CREATE TABLE t (id i32 PRIMARY KEY);
@@ -81,7 +81,7 @@ fn script_select_rows_are_discarded_but_the_statement_is_counted() {
 fn empty_script_is_a_no_op_success() {
     // Whitespace/comment-only input yields no statements — a clean zero summary, no transaction left
     // open.
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     let summary = db
         .execute_script("  -- just a comment\n /* and a block */ ;;; ")
         .unwrap();
@@ -95,7 +95,7 @@ fn empty_script_is_a_no_op_success() {
 fn in_script_transaction_control_is_feature_not_supported() {
     // The implicit wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK inside a script is 0A000 and
     // the partial run rolls back (the v1 narrowing — partitioning is deferred, §4.2/§11).
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
@@ -116,7 +116,7 @@ fn script_joins_an_open_transaction_without_committing() {
     // Run while the session is already Open: the script joins that transaction (no wrapper, no
     // auto-commit). The caller still owns the boundary, so the staged rows are visible inside the
     // block but vanish on the caller's ROLLBACK.
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
@@ -137,7 +137,7 @@ fn script_joins_an_open_transaction_without_committing() {
 fn script_error_inside_an_open_transaction_leaves_it_failed_for_the_caller() {
     // Joining an open block, a mid-run error poisons the block (Failed) and returns the error —
     // execute_script does NOT roll back a transaction it does not own; the caller does.
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 

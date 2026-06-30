@@ -4,18 +4,18 @@
 //! end-state-valid key swap / cascade that PG rejects on the per-row transient) live here
 //! rather than the oracle corpus, the same divergence UNIQUE carries (indexes.md §8).
 
-use jed::{Engine, Value, execute};
+use jed::{Database, Session, SessionOptions, Value};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 /// The (id, a, b) i32/i16 rows in storage-key order, as i64s, for end-state assertions.
-fn ids_abs(db: &Engine) -> Vec<(i64, i64, i64)> {
+fn ids_abs(db: &Session) -> Vec<(i64, i64, i64)> {
     db.rows_in_key_order("t")
         .unwrap()
         .iter()
@@ -26,7 +26,7 @@ fn ids_abs(db: &Engine) -> Vec<(i64, i64, i64)> {
         .collect()
 }
 
-fn setup() -> Engine {
+fn setup() -> Session {
     db_with(&[
         "CREATE TABLE t (id i32 PRIMARY KEY, a i16, b i16)",
         "INSERT INTO t VALUES (1, 10, 11)",
@@ -37,9 +37,9 @@ fn setup() -> Engine {
 
 #[test]
 fn update_missing_table_traps() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
-        execute(&mut db, "UPDATE nope SET a = 1")
+        db.execute("UPDATE nope SET a = 1", &[])
             .unwrap_err()
             .code(),
         "42P01"
@@ -50,7 +50,7 @@ fn update_missing_table_traps() {
 fn update_unknown_column_traps() {
     let mut db = setup();
     assert_eq!(
-        execute(&mut db, "UPDATE t SET nope = 1")
+        db.execute("UPDATE t SET nope = 1", &[])
             .unwrap_err()
             .code(),
         "42703"
@@ -63,7 +63,7 @@ fn update_unknown_column_traps() {
 #[test]
 fn update_pk_swap_is_end_state_valid() {
     let mut db = setup();
-    execute(&mut db, "UPDATE t SET id = 3 - id WHERE id <= 2").unwrap();
+    db.execute("UPDATE t SET id = 3 - id WHERE id <= 2", &[]).unwrap();
     // (1,10,11)→(2,10,11) and (2,20,22)→(1,20,22); id 3 untouched.
     assert_eq!(ids_abs(&db), vec![(1, 20, 22), (2, 10, 11), (3, 30, 33)]);
 }
@@ -74,7 +74,7 @@ fn update_pk_swap_is_end_state_valid() {
 #[test]
 fn update_pk_increment_cascade_succeeds() {
     let mut db = setup();
-    execute(&mut db, "UPDATE t SET id = id + 1").unwrap();
+    db.execute("UPDATE t SET id = id + 1", &[]).unwrap();
     assert_eq!(ids_abs(&db), vec![(2, 10, 11), (3, 20, 22), (4, 30, 33)]);
 }
 
@@ -83,7 +83,7 @@ fn update_pk_increment_cascade_succeeds() {
 fn update_pk_collision_with_existing_traps() {
     let mut db = setup();
     assert_eq!(
-        execute(&mut db, "UPDATE t SET id = 3 WHERE id = 1")
+        db.execute("UPDATE t SET id = 3 WHERE id = 1", &[])
             .unwrap_err()
             .code(),
         "23505"

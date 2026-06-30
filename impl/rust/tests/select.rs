@@ -3,25 +3,25 @@
 //! conformance corpus with finer-grained per-feature assertions.
 
 use jed::value::Value;
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(stmts: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(stmts: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 /// Run a query and return its rows as nested Value vectors.
-fn query(db: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
-    match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
-fn setup() -> Engine {
+fn setup() -> Session {
     db_with(&[
         "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
         "INSERT INTO t VALUES (1, 10)",
@@ -91,7 +91,7 @@ fn limit_offset_window_reduces_produced_cost() {
         "INSERT INTO t VALUES (4, 40)",
         "INSERT INTO t VALUES (5, 50)",
     ]);
-    let cost = execute(&mut db, "SELECT id FROM t ORDER BY v LIMIT 2")
+    let cost = db.execute("SELECT id FROM t ORDER BY v LIMIT 2", &[])
         .unwrap()
         .cost();
     assert_eq!(cost, 8);
@@ -101,11 +101,11 @@ fn limit_offset_window_reduces_produced_cost() {
 fn unknown_column_traps() {
     let mut db = setup();
     assert_eq!(
-        execute(&mut db, "SELECT nope FROM t").unwrap_err().code(),
+        db.execute("SELECT nope FROM t", &[]).unwrap_err().code(),
         "42703"
     );
     assert_eq!(
-        execute(&mut db, "SELECT id FROM t WHERE nope = 1")
+        db.execute("SELECT id FROM t WHERE nope = 1", &[])
             .unwrap_err()
             .code(),
         "42703"
