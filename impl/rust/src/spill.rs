@@ -485,7 +485,12 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
         // jsonpath is literal-only (non-storable), so it never rides a spilling sort.
         Value::JsonPath(_) => unreachable!("a jsonpath value never reaches the spill codec"),
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
-        // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
+        // it opaquely (the pointer/inline block) so it round-trips, never resolving it. The same
+        // pass-through covers an inline-deferred value (lazy-record.md §5b) — tag 21.
+        Value::Unfetched(Unfetched::Inline { body }) => {
+            w.write_all(&[21])?;
+            write_bytes(w, body)
+        }
         Value::Unfetched(Unfetched::External { first_page, len }) => {
             w.write_all(&[9])?;
             write_u32(w, *first_page)?;
@@ -576,6 +581,9 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
         7 => Value::Timestamp(read_i64(r)?),
         8 => Value::Timestamptz(read_i64(r)?),
         17 => Value::Date(read_u32(r)? as i32),
+        21 => Value::Unfetched(Unfetched::Inline {
+            body: read_bytes(r)?,
+        }),
         9 => Value::Unfetched(Unfetched::External {
             first_page: read_u32(r)?,
             len: read_u32(r)?,

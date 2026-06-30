@@ -4589,9 +4589,13 @@ impl Engine {
         // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
         // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
         let mut seen_prefixes: HashSet<Vec<u8>> = HashSet::new();
-        for (key, row) in table_entries {
+        for (key, mut row) in table_entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
+            // The build reads the indexed *key* columns directly; resolve a faulted row's inline
+            // values (lazy-record.md §5b — always inline for a key column, so cost-free) before
+            // encoding its entry keys.
+            store.resolve_inline_columns(&mut row)?;
             if def.unique
                 && let Some(prefix) = index_prefix_key(&columns, &colls, &def, &row)?
                 && !seen_prefixes.insert(prefix)
@@ -6757,6 +6761,10 @@ impl Engine {
                 Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
             };
             if keep {
+                // The FK parent-side probe + index-entry removal below read this row's key/index
+                // columns directly; resolve its inline-deferred values (lazy-record.md §5b — a key
+                // column is always inline, so cost-free) so those paths see resident values.
+                store.resolve_inline_columns(&mut row)?;
                 matched.push((k, row));
             }
         }
@@ -7140,6 +7148,10 @@ impl Engine {
             if !matched {
                 continue;
             }
+            // The OLD row is retained for index-entry removal (its key/index columns are read
+            // directly below); resolve its inline-deferred values (lazy-record.md §5b — a key
+            // column is always inline, so cost-free) so that maintenance sees resident values.
+            store.resolve_inline_columns(&mut row)?;
             let mut new_row = row.clone();
             for plan in &plans {
                 let raw = plan.source.eval(&row, &env, &mut meter)?;

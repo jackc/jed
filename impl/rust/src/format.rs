@@ -933,6 +933,10 @@ pub(crate) fn record_scan_units(
             }
             if let Value::Unfetched(u) = v {
                 match u {
+                    // Inline-deferred values live in the record — no chain page, no decompress slab
+                    // (lazy-record.md §8: cost is invariant; a deferred inline value costs nothing,
+                    // matching the resident plan's `Disp::Inline`).
+                    Unfetched::Inline { .. } => {}
                     Unfetched::External { len, .. } => {
                         units.pages += (*len as usize).div_ceil(cap);
                     }
@@ -3351,9 +3355,8 @@ fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize, mode: DecodeMode)
 /// `0x00` present tag; this advances `pos` past the body exactly as [`read_inline_body`] in
 /// `Construct` mode would — the same length reads, tag dispatch, and recursion — so the returned
 /// span equals the bytes a construct decode consumes, *by construction* (the zero-drift property).
-/// L2 will use this to defer an inline value as its compact on-disk bytes; at L1 it is the seam,
-/// exercised by the cross-check test `inline_body_span_matches_decode`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// L2 uses this to defer an inline value as its compact on-disk bytes ([`read_value_lazy`]); it is
+/// also exercised directly by the cross-check test `inline_body_span_matches_decode`.
 pub(crate) fn inline_body_span<'a>(
     ty: &ColType,
     buf: &'a [u8],
@@ -3697,10 +3700,20 @@ fn read_overflow_chain(
 /// the rest when a dirty leaf re-encodes (`resolve_for_encode`).
 fn read_value_lazy(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     match read_u8(buf, pos)? {
-        // A composite's inline body has no nested overflow pointers (its fields are inline —
-        // composite.md §4), so it is read eagerly even in the lazy path. (L2 will defer inline
-        // values too via `inline_body_span` — lazy-record.md §12.)
-        0x00 => read_inline_body(ty, buf, pos, DecodeMode::Construct),
+        // A present inline value (lazy-record.md §12, L2): a variable-length / structured body
+        // (the `is_spillable` set — §6) is **deferred** as an owned-span `Unfetched::Inline`, found
+        // by walking its byte extent without constructing it (`inline_body_span`); a fixed-width
+        // scalar is decoded eagerly (deferring it buys nothing — §6). The deep-tree clone and the
+        // eager decode of an untouched column are gone; `resolve_unfetched` reconstructs a touched
+        // one from the span, byte-identically (`read_inline_body` in `Construct` mode).
+        0x00 => {
+            if is_spillable(ty) {
+                let body = inline_body_span(ty, buf, pos)?.to_vec();
+                Ok(Value::Unfetched(Unfetched::Inline { body }))
+            } else {
+                read_inline_body(ty, buf, pos, DecodeMode::Construct)
+            }
+        }
         0x01 => Ok(Value::Null),
         TAG_EXTERNAL => {
             let first_page = read_u32(buf, pos)?;
@@ -3757,6 +3770,15 @@ pub(crate) fn resolve_unfetched(
 ) -> Result<Value> {
     let mut sink = Vec::new();
     match u {
+        // Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
+        // decompression. Re-run the decoder over the captured span in `Construct` mode; it must
+        // consume exactly the span (the zero-drift invariant of §6, debug-checked here).
+        Unfetched::Inline { body } => {
+            let mut p = 0;
+            let v = read_inline_body(ty, body, &mut p, DecodeMode::Construct)?;
+            debug_assert_eq!(p, body.len(), "inline deferral span over/under-consumed");
+            Ok(v)
+        }
         Unfetched::External { first_page, len } => {
             let payload = read_overflow_chain(*first_page, *len as usize, fetch, &mut sink)?;
             value_from_payload(ty, &payload)
@@ -3826,6 +3848,8 @@ fn mark_chains(
                     reached.extend(chain_pages(*first_page, *stored_len as usize, fetch)?);
                 }
                 Unfetched::InlineComp { .. } => {}
+                // Inline-deferred values are resident in the record — no chain to mark.
+                Unfetched::Inline { .. } => {}
             }
         }
     }

@@ -19,7 +19,7 @@ use crate::catalog::ColType;
 use crate::error::Result;
 use crate::paging::SharedPaging;
 use crate::pmap::{KeyBound, LeafSource, Node, PMap};
-use crate::value::Value;
+use crate::value::{Unfetched, Value};
 
 /// A stored row: one value per column, in column order.
 pub type Row = Vec<Value>;
@@ -377,6 +377,32 @@ impl TableStore {
     pub(crate) fn resolve_all(&self, row: &mut Row) -> Result<()> {
         let all = vec![true; self.col_types.len()];
         self.resolve_columns(row, &all)
+    }
+
+    /// Materialize only the **inline-deferred** values in `row` — the `Unfetched::Inline` form L2
+    /// introduces (spec/design/lazy-record.md §5b) — leaving the large-value forms (External /
+    /// InlineComp / ExternalComp) deferred for the §14 touched-set path. The internal
+    /// index/FK-maintenance write paths read a faulted row's *key* columns directly (not via a
+    /// touched-set mask); a key column is always inline (a value too large to be a key cannot be
+    /// one), so this restores exactly the pre-L2 picture those paths were written against — inline
+    /// values resident, large values deferred. It is **cost-free**: an inline value's bytes are
+    /// already owned, so resolution reads no overflow page and decompresses nothing, and inline
+    /// values carry no metered units (cost.md §3). Used in place of [`resolve_all`], which would
+    /// instead read an untouched *spilled* column's chain (unmetered I/O the §14 contract forbids
+    /// on these paths).
+    pub(crate) fn resolve_inline_columns(&self, row: &mut Row) -> Result<()> {
+        for (i, v) in row.iter_mut().enumerate() {
+            if matches!(v, Value::Unfetched(Unfetched::Inline { .. }))
+                && let Value::Unfetched(u) = v
+            {
+                // An inline form reads no overflow pages — the fetch is never invoked.
+                let fetch = |_p: u32| -> Result<Vec<u8>> {
+                    unreachable!("inline-deferred resolution reads no overflow pages")
+                };
+                *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch)?;
+            }
+        }
+        Ok(())
     }
 
     /// Stream the rows whose primary key lies within `b` to `visit`, in key order, stopping (without

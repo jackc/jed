@@ -101,6 +101,8 @@ mod join_pushdown;
 mod json;
 #[path = "../tests/jsonpath.rs"]
 mod jsonpath;
+#[path = "../tests/lazy_inline_values.rs"]
+mod lazy_inline_values;
 #[path = "../tests/lazy_large_values.rs"]
 mod lazy_large_values;
 #[path = "../tests/lifetime_cost.rs"]

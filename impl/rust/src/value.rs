@@ -115,6 +115,13 @@ pub enum Value {
 /// decompress slabs) without reading the value.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Unfetched {
+    /// `0x00` inline-plain, **deferred** (spec/design/lazy-record.md §5b, L2): the value's bytes
+    /// are resident in the record, but its decode is deferred until the column is touched. `body`
+    /// owns the on-disk value body (the bytes after the `0x00` present tag — form (b), the
+    /// owned-span representation); resolution re-runs the decoder over it in `Construct` mode. Only
+    /// variable-length / structured types defer (text/bytea/decimal/json/jsonb/composite/array/
+    /// range); fixed-width scalars stay eagerly decoded even on the lazy path (§6).
+    Inline { body: Vec<u8> },
     /// `0x02` external-plain: the chain carries `len` payload bytes from `first_page`.
     External { first_page: u32, len: u32 },
     /// `0x03` inline-compressed: the LZ4 block is resident (it lives in the record), but
