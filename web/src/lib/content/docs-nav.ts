@@ -19,6 +19,7 @@ export const DOCS_NAV: readonly DocSection[] = [
     title: 'Embedding API',
     links: [
       { title: 'Opening a database', href: '/docs/api/opening-a-database/' },
+      { title: 'Queries & parameters', href: '/docs/api/queries/' },
       { title: 'Transactions', href: '/docs/api/transactions/' },
       { title: 'Running scripts', href: '/docs/api/scripts/' },
       { title: 'Authorization', href: '/docs/api/authorization/' },

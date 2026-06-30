@@ -706,6 +706,14 @@ optimization), so every run routes through the full session envelope. Verified b
 the param mapping, the rich-type→text mapping, and the on-Session/Transaction surface).
 
 **All three cores now carry both halves** — cancellation *and* an idiomatic arg/scan ergonomic layer
-(Go `database/sql`/pgx, Rust `rusqlite`, TS better-sqlite3). The remaining ledgered work is the
-container-type native mapping (follow-up (a) above), the shared `ReadHandle`/`WriteHandle` surface
-(§2.5), and the `/web` API pages once a coherent three-core `CodeTabs` page is worth cutting.
+(Go `database/sql`/pgx, Rust `rusqlite`, TS better-sqlite3).
+
+**Landed (`/web`, the "Queries & parameters" doc page):** with all three cores carrying the ergonomic
+surface, the website's per-language `CodeTabs` page is cut (CLAUDE.md §10): `web/src/routes/docs/api/
+queries/+page.md` documents binding parameters and reading typed rows, with one idiomatic example per
+language under `web/examples/queries/{rust.rs,go.go,ts.ts}` (rusqlite `run`/`query_row`/`query_map`;
+`database/sql` `Exec`/`QueryRow`/`Scan` + `RowToStructByName`; better-sqlite3 `prepare`/`run`/`get`/
+`iterate`). The page is in the Embedding-API nav and guarded by a `web/e2e/docs.spec.ts` test that the
+three language variants each render their idiom. The remaining ledgered work is the container-type
+native mapping (follow-up (a) above) and the same ergonomic surface on the shared `ReadHandle`/
+`WriteHandle` (§2.5).

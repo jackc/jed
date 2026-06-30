@@ -265,6 +265,24 @@ test('the indexes page runs the GIN = array-equality scan live', async ({ page }
   await expect(panel.getByTestId('result-rows')).not.toContainText('intro');
 });
 
+test('the queries API page wires up the idiomatic example for each language', async ({ page }) => {
+  await page.goto('/docs/api/queries/');
+  // Default (Rust): the rusqlite-style run/query_row methods.
+  await expect(page.getByTestId('code-rust')).toBeVisible();
+  await expect(page.getByTestId('code-rust')).toContainText('db.run');
+  await expect(page.getByTestId('code-rust')).toContainText('query_row');
+
+  // Go: the database/sql-style Exec/QueryRow + struct mapping.
+  await page.getByTestId('lang-go').click();
+  await expect(page.getByTestId('code-go')).toContainText('db.Exec');
+  await expect(page.getByTestId('code-go')).toContainText('RowToStructByName');
+
+  // TypeScript: the better-sqlite3-style prepare/get/iterate.
+  await page.getByTestId('lang-ts').click();
+  await expect(page.getByTestId('code-ts')).toContainText('db.prepare');
+  await expect(page.getByTestId('code-ts')).toContainText('jed-ts');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
   await page.goto('/docs/reference/errors/');
   // 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.
