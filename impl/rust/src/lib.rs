@@ -31,6 +31,7 @@ mod date;
 mod datetime_fn;
 mod decimal;
 mod encoding;
+mod ergonomic;
 mod error;
 mod executor;
 mod file;
@@ -77,6 +78,10 @@ pub use api::{PreparedStatement, Rows, Transaction};
 pub use cancel::CancellationToken;
 pub use collation::{load_unicode_data, loaded_collation};
 pub use decimal::Decimal;
+// The rusqlite-style ergonomic layer (spec/design/api.md §11): native-typed params + typed row
+// scanning over the raw `Database`/`Session`/`Transaction` handles. Additive — the raw `&[Value]`
+// path is unchanged.
+pub use ergonomic::{FromValue, Params, Row, ToValue};
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Outcome, ScriptSummary,

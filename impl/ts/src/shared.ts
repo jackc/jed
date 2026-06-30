@@ -59,6 +59,12 @@ import {
 } from "./executor.ts";
 import { type Rows, rowsFromOutcome, Transaction } from "./api.ts";
 import { throwIfAborted } from "./cancel.ts";
+import {
+  type JsParam,
+  type Row as ErgoRow,
+  type RunResult,
+  Statement as ErgoStatement,
+} from "./ergonomic.ts";
 import { engineError } from "./errors.ts";
 import { persistImpl } from "./persist.ts";
 import type { Statement } from "./ast.ts";
@@ -296,6 +302,28 @@ export class Database {
       s.close();
     }
   }
+
+  // --- better-sqlite3-style ergonomic methods (spec/design/api.md §11): a reusable prepared
+  // Statement, or one-shot run/get/all over native JS params + rows-as-objects. Like execute/query
+  // above, each one-shot mints a fresh autocommit session under the hood (via the Statement). ---
+
+  // prepare returns a reusable Statement bound to this handle (better-sqlite3's db.prepare).
+  prepare(sql: string): ErgoStatement {
+    return new ErgoStatement(this, sql);
+  }
+  // run is the one-shot Statement.run: execute a statement with native params, return its command tag.
+  run(sql: string, ...params: JsParam[]): RunResult {
+    return new ErgoStatement(this, sql).run(...params);
+  }
+  // get is the one-shot Statement.get: the first row of a query as an object, or undefined.
+  get(sql: string, ...params: JsParam[]): ErgoRow | undefined {
+    return new ErgoStatement(this, sql).get(...params);
+  }
+  // all is the one-shot Statement.all: every row of a query as an object.
+  all(sql: string, ...params: JsParam[]): ErgoRow[] {
+    return new ErgoStatement(this, sql).all(...params);
+  }
+
   // executeScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
   // §4.2): the whole run is one implicit transaction (all-or-nothing).
   executeScript(sql: string): ScriptSummary {
@@ -400,6 +428,27 @@ export class Session {
   queryCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Rows {
     throwIfAborted(signal);
     return this.query(sql, params);
+  }
+
+  // --- better-sqlite3-style ergonomic methods (spec/design/api.md §11): a reusable prepared
+  // Statement, or one-shot run/get/all over native JS params + rows-as-objects, on this durable
+  // session (so an open block / session variables persist across calls, unlike the Database shims). ---
+
+  // prepare returns a reusable Statement bound to this session (better-sqlite3's db.prepare).
+  prepare(sql: string): ErgoStatement {
+    return new ErgoStatement(this, sql);
+  }
+  // run is the one-shot Statement.run: execute a statement with native params, return its command tag.
+  run(sql: string, ...params: JsParam[]): RunResult {
+    return new ErgoStatement(this, sql).run(...params);
+  }
+  // get is the one-shot Statement.get: the first row of a query as an object, or undefined.
+  get(sql: string, ...params: JsParam[]): ErgoRow | undefined {
+    return new ErgoStatement(this, sql).get(...params);
+  }
+  // all is the one-shot Statement.all: every row of a query as an object.
+  all(sql: string, ...params: JsParam[]): ErgoRow[] {
+    return new ErgoStatement(this, sql).all(...params);
   }
 
   private dispatch(stmt: Statement, params: Value[]): Outcome {

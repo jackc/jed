@@ -5,6 +5,12 @@
 
 import type { Statement } from "./ast.ts";
 import { throwIfAborted } from "./cancel.ts";
+import {
+  type JsParam,
+  type Row as ErgoRow,
+  type RunResult,
+  Statement as ErgoStatement,
+} from "./ergonomic.ts";
 import type { Engine, Outcome } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
@@ -133,6 +139,27 @@ export class Transaction {
   queryCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Rows {
     throwIfAborted(signal);
     return this.query(sql, params);
+  }
+
+  // --- better-sqlite3-style ergonomic methods (spec/design/api.md §11): a reusable prepared
+  // Statement, or one-shot run/get/all over native JS params + rows-as-objects, within this
+  // transaction (each statement joins the open block). ---
+
+  // prepare returns a reusable Statement bound to this transaction (better-sqlite3's db.prepare).
+  prepare(sql: string): ErgoStatement {
+    return new ErgoStatement(this, sql);
+  }
+  // run is the one-shot Statement.run: execute a statement with native params, return its command tag.
+  run(sql: string, ...params: JsParam[]): RunResult {
+    return new ErgoStatement(this, sql).run(...params);
+  }
+  // get is the one-shot Statement.get: the first row of a query as an object, or undefined.
+  get(sql: string, ...params: JsParam[]): ErgoRow | undefined {
+    return new ErgoStatement(this, sql).get(...params);
+  }
+  // all is the one-shot Statement.all: every row of a query as an object.
+  all(sql: string, ...params: JsParam[]): ErgoRow[] {
+    return new ErgoStatement(this, sql).all(...params);
   }
 
   // commit publishes the transaction durably (per synchronous). Idempotent after the transaction

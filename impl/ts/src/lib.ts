@@ -714,6 +714,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
 // --- primary embedding API ---
 export { Database, Session } from "./shared.ts";
 export { PreparedStatement, Rows, Transaction } from "./api.ts";
+// The better-sqlite3-style ergonomic layer (spec/design/api.md §11): db.prepare(sql) → a Statement
+// with run/get/all/iterate over native JS params + rows-as-objects. Additive — the raw Value[] path
+// is unchanged.
+export { Statement } from "./ergonomic.ts";
+export type { JsParam, JsValue, Row, RunResult } from "./ergonomic.ts";
 export { createDatabase, openDatabase } from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
 export type { CollationInfo, Outcome, SessionOptions, TxStatus } from "./executor.ts";

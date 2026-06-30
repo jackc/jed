@@ -507,11 +507,20 @@ no engine or executor change beyond the cancellation hook (below). Like the rest
 a **per-impl surface, NOT the shared corpus** (§1, [conformance.md](conformance.md) §1.2) — each
 core spells it idiomatically; this section fixes the **shape** so the cores stay recognizable.
 
-The design was worked out against the Go core first (`impl/go/ergonomic.go`); Rust/TS mirror the
-shape. It rests on a fact already true of the engine: **parameters are typed by context, not by the
-value supplied** (§5), so a "loosely-typed" `Value` built from a native value (`int64 → IntValue`)
-is still coerced two-phase to the inferred type — the conversion layer **adds no path around the
-strict type system**, it only saves the caller from hand-building `Value`s.
+The design was worked out against the Go core first (`impl/go/ergonomic.go`, `database/sql`/pgx-
+shaped). The other cores do **not** transliterate it — each takes its language's *de facto*
+embedded-SQL idiom, because the reason to add a per-language surface is to give *that* language's
+users the best experience, not to keep the surfaces uniform (CLAUDE.md §2). So: **Go** =
+`database/sql`/pgx (`...any` args, `Scan(&dest)`, struct mapping, `iter.Seq`); **Rust** = `rusqlite`
+traits (`ToValue`/`FromValue`, tuple/array `Params`, `row.get::<T>`); **TS** = better-sqlite3
+(`db.prepare(sql)` → a `Statement` with `run`/`get`/`all`/`iterate`, rows-as-objects). What is
+shared is the **contract**, not the spelling: native params in + typed rows out, over the one
+`Value` currency, additive over §2–§5, a per-impl surface (not the corpus). The §11.1–§11.3
+descriptions below are the *Go* shape (the first landing); the Rust/TS subsections in §11.5 give
+their idiomatic equivalents. It rests on a fact already true of the engine: **parameters are typed
+by context, not by the value supplied** (§5), so a "loosely-typed" `Value` built from a native value
+(`int64 → IntValue`) is still coerced two-phase to the inferred type — the conversion layer **adds
+no path around the strict type system**, it only saves the caller from hand-building `Value`s.
 
 ### 11.1 Three layers over one `Value` currency
 
@@ -632,13 +641,31 @@ at the boundary. `None` (the default) ⇒ zero overhead, the §8 cost determinis
 `Database`, the un-cancelled-completes regression, and the transaction roll-back) plus the white-box
 mid-scan-via-meter test inline in `src/shared.rs` (it reaches the private session state to bypass the
 boundary poll and prove the *meter* aborts the running scan). The Rust **arg/scan ergonomic layer**
-(an `IntoValue` arg bound, a `FromValue`/`row.get::<T>` scan path, `rusqlite`-style) is the remaining
-half, not yet built. **Follow-ups, ledgered:** (a) richer native mapping for container types in
-`Values` (today they degrade to the raw `Value`); (b) the same surface on the shared
-`ReadHandle`/`WriteHandle` (§2.5); (c) thread the poll deeper so even a non-`Guard`-metered tight loop
-(if any) is interruptible — today every unbounded-work point is already a `Guard` site, so this is
-belt-and-suspenders; (d) the Rust arg/scan layer above. Update the `/web` API pages in the
-same change as the ergonomic surface stabilizes across cores (CLAUDE.md §10).
+has since landed (next paragraph). **Follow-ups, ledgered:** (a) richer native mapping for container
+types (today they degrade to the raw `Value` in Go / the canonical text in TS); (b) the same surface
+on the shared `ReadHandle`/`WriteHandle` (§2.5); (c) thread the poll deeper so even a non-`Guard`-
+metered tight loop (if any) is interruptible — today every unbounded-work point is already a `Guard`
+site, so this is belt-and-suspenders. Update the `/web` API pages in the same change as the
+ergonomic surface stabilizes across cores (CLAUDE.md §10).
+
+**Landed (Rust, arg/scan — `impl/rust/src/ergonomic.rs`, `rusqlite`-style):** the rusqlite idiom,
+**additive** — the raw `&[Value]` `execute`/`query` are unchanged (the FFI wraps and the conformance
+harness depend on them), so the ergonomic methods are a *new, non-colliding* set rather than a
+generic-ized signature. Three pieces mirror rusqlite's `ToSql`/`FromSql`/`Row`: **`ToValue`** (native
+→ `Value`: the int/float primitives, `bool`, `&str`/`String`, byte slices, `Decimal`, `Option<T>` as
+the nullable binder, and `Value`/`&Value` as the identity) and **`Params`** (a *set* — `()`, tuples
+to 12-arity, `[T; N]`/`&[T]`/`Vec<T>`, so a raw `&[Value]` is still a `Params` via `Value: ToValue`);
+**`FromValue`** (column `Value` → native, with `Option<T>` the only NULL-accepting target — a bare
+scalar rejects NULL with `22004`, a narrowing overflow is `22003`, a family mismatch `42804`) and
+**`Row`** (`get::<T>(idx)` / `get_by_name::<T>(name)` / `value(idx)` for the raw `Value`; a bad
+index/name is `42703`). The methods on **`Database`, `Session`, *and* `Transaction`** are `run`
+(native params → affected-row count), `query_rows` (→ `Vec<Row>`), `query_map` (map each row → `T`),
+and `query_row` (→ `Option<T>`, the idiomatic-Rust "maybe a row" rather than rusqlite's no-rows
+error). `run` is the write verb because the raw `execute` name is kept for the `&[Value]` path. A
+small macro keeps the three handles' method bodies identical (inherent methods can't share a trait
+without shadowing the raw pair). Verified by `impl/rust/tests/ergonomic.rs` (the param shapes, typed
+`get`, the `Option`/error-code conversions, `query_map`/`query_row`, and the on-Session/Transaction
+surface).
 
 **Landed (TS, cancellation — `impl/ts/src/cancel.ts`):** the cancellation mirror, and the
 **deliberate per-language divergence** §11.4 calls out. The handle is the platform **`AbortSignal`**
@@ -658,6 +685,27 @@ handler ran). Mid-statement cancellation in TS would need an async streaming cur
 `Database`/`Session`, the un-aborted-completes regression, the transaction roll-back, and a
 boundary-only-semantics test proving an abort after a synchronous query has no retroactive effect).
 **Cancellation is now mirrored across all three cores** (Go meter poll via `context.Context`, Rust
-meter poll via `CancellationToken`, TS boundary via `AbortSignal`); the remaining ergonomic work is
-the arg/scan layers (Rust above; TS still on the raw `Value[]` surface) and the `/web` docs once that
-surface stabilizes.
+meter poll via `CancellationToken`, TS boundary via `AbortSignal`).
+
+**Landed (TS, ergonomic — `impl/ts/src/ergonomic.ts`, better-sqlite3-style):** the better-sqlite3
+idiom, **additive** — the raw `Value[]` `execute`/`query` are unchanged. `db.prepare(sql)` (on
+**`Database`, `Session`, *and* `Transaction`**) returns a **`Statement`** with `run(...params)` (→ a
+`RunResult` `{changes, cost}`), `get(...params)` (→ the first row as an object, or `undefined`),
+`all(...params)` (→ object rows), and `*iterate(...params)` (lazy object rows); the same four verbs
+exist as one-shot shorthands on the handle (`db.run`/`get`/`all`). Params and columns spread/return
+**plain JS values**: a param maps `bigint`→int, an integer-valued `number`→int (so `run(1)` binds an
+integer — JS can't tell `1` from `1.0`), other `number`→f64, `boolean`/`string`/`Uint8Array`/`Decimal`
+to their types, `null`/`undefined`→NULL, a raw `Value` passes through; a result maps int→**`bigint`**
+(i64 is exact — jed's identity), `bool`/`f32`/`f64`/`text`/`bytea` to their JS natives, and every
+other type (decimal, uuid, the temporal types, array/range/json/composite) to its **canonical text**
+— lossless and predictable, with the raw `query` path kept for the engine `Value` itself (a
+structured mapping is a follow-up). Rows are objects keyed by output column name (last wins on a
+duplicate). The `Statement` re-parses per call (the parser is cheap; parse caching is a future
+optimization), so every run routes through the full session envelope. Verified by
+`impl/ts/tests/ergonomic.test.ts` (the affected-count, rows-as-objects + scalar mapping, `iterate`,
+the param mapping, the rich-type→text mapping, and the on-Session/Transaction surface).
+
+**All three cores now carry both halves** — cancellation *and* an idiomatic arg/scan ergonomic layer
+(Go `database/sql`/pgx, Rust `rusqlite`, TS better-sqlite3). The remaining ledgered work is the
+container-type native mapping (follow-up (a) above), the shared `ReadHandle`/`WriteHandle` surface
+(§2.5), and the `/web` API pages once a coherent three-core `CodeTabs` page is worth cutting.

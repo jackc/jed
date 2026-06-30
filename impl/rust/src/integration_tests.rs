@@ -69,6 +69,8 @@ mod depth_limit;
 mod drop_table;
 #[path = "../tests/encoding.rs"]
 mod encoding;
+#[path = "../tests/ergonomic.rs"]
+mod ergonomic;
 #[path = "../tests/execute_script.rs"]
 mod execute_script;
 #[path = "../tests/expr.rs"]
