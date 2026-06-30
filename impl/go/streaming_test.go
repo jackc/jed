@@ -13,6 +13,9 @@ package jed
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -396,6 +399,156 @@ func TestBufferedMidDrainCostAbort(t *testing.T) {
 		t.Fatalf("abort = %v, want a 54P01 cost-limit error", err)
 	}
 	_ = rows.Close()
+}
+
+// ---- the lazy streaming-SORT output (emitSorted; streaming.md §4/§7) ------------------------------
+
+// Every streaming-external-sort shape (a single-table non-PK ORDER BY): Query (the lazy emitSorted
+// drive — pulling the sortedRows iterator one row at a time) must equal Execute (the eager drive of the
+// SAME emitter) on rows AND total cost under full drain (§6).
+func TestSortedMatchesEager(t *testing.T) {
+	db := seededKV(t, 40)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	for _, sql := range []string{
+		"SELECT v FROM t ORDER BY v",                  // non-PK sort, full output
+		"SELECT v FROM t ORDER BY v DESC",             // descending
+		"SELECT v FROM t ORDER BY v LIMIT 7",          // top-N window
+		"SELECT v FROM t ORDER BY v LIMIT 7 OFFSET 5", // LIMIT + OFFSET window
+		"SELECT v FROM t ORDER BY v OFFSET 35",        // OFFSET near the end (tail window)
+		"SELECT id, v + 1 FROM t ORDER BY v",          // a projection expression (operator_eval per row)
+		"SELECT v FROM t WHERE id > 20 ORDER BY v",    // a residual WHERE filter
+		"SELECT v FROM t WHERE id > 99999 ORDER BY v", // empty result
+	} {
+		er, ec := eagerResult(t, s, sql)
+		sr, sc := streamResult(t, s, sql)
+		if !rowsEqual(sr, er) {
+			t.Fatalf("rows mismatch %q:\n eager=%v\n stream=%v", sql, er, sr)
+		}
+		if sc != ec {
+			t.Fatalf("cost mismatch %q: eager=%d stream=%d", sql, ec, sc)
+		}
+	}
+}
+
+// Early exit over the lazy streaming-sort output (§4/§7) — the headline win of this slice. The sort's
+// INPUT is blocking (every row scanned + sorted on the first pull), but the OUTPUT is now yielded from
+// the sortedRows iterator one row at a time, so a caller that stops after a prefix skips the row_produced
+// + projection of every windowed row it never pulls — charging LESS than a full drain. (Before this
+// slice the sort output was an emitFinal, fully built + charged on the first pull, so an early exit
+// charged the SAME — this test is what distinguishes the new behavior.)
+func TestSortedEarlyExitChargesLess(t *testing.T) {
+	db := seededKV(t, 1000)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+
+	sql := "SELECT v FROM t ORDER BY v" // non-PK ORDER BY, no LIMIT → a 1000-row lazy Sorted output
+	fullRows, fullCost := streamResult(t, s, sql)
+	if len(fullRows) != 1000 {
+		t.Fatalf("full drain = %d rows, want 1000", len(fullRows))
+	}
+
+	rows, err := s.Query(sql, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefix []int64
+	for i := 0; i < 3 && rows.Next(); i++ {
+		prefix = append(prefix, rows.Row()[0].Int)
+	}
+	partial := rows.Cost()
+	_ = rows.Close()
+
+	if fmt.Sprint(prefix) != fmt.Sprint([]int64{10, 20, 30}) {
+		t.Fatalf("early pull prefix = %v, want [10 20 30]", prefix)
+	}
+	if partial >= fullCost {
+		t.Fatalf("early exit over the lazy sort output must charge less: partial=%d full=%d", partial, fullCost)
+	}
+}
+
+// The lazy streaming-sort output over the SPILLING merge path (sortedRows.merge): a file-backed database
+// under a tiny workMem forces many spilled runs + a k-way merge. A full lazy drain must match the eager
+// result (rows + cost — spill is invariant, spill.md §6), and an early exit must yield exactly the prefix
+// while leaving NO spill temp file behind (the cursor's close releases undrained runs — Go has no
+// destructor, §5).
+func TestSortedSpillMergeStreamsLazily(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sorted_spill_lazy.jed")
+
+	countSpillFiles := func() int {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "jed-spill-") {
+				n++
+			}
+		}
+		return n
+	}
+
+	db, err := CreateDatabase(path, DatabaseOptions{PageSize: DefaultPageSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := db.WriteSession()
+	if _, err := w.Execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", nil); err != nil {
+		t.Fatal(err)
+	}
+	for id := int64(0); id < 200; id++ {
+		k := (id * 48271) % 100 // scrambled key with many duplicates
+		if _, err := w.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, k), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Eager oracle: a default-workMem session never spills 200 small rows (in-memory sort).
+	sql := "SELECT id, k FROM t ORDER BY k, id"
+	oracle := db.Session(SessionOptions{})
+	er, ec := eagerResult(t, oracle, sql)
+	oracle.Close()
+
+	// Full lazy drain under a tiny workMem (forces spill + merge): rows + cost match the oracle.
+	s := db.Session(SessionOptions{})
+	s.SetWorkMem(128) // ~2-3 rows per run → dozens of runs + a deep merge
+	sr, sc := streamResult(t, s, sql)
+	if !rowsEqual(sr, er) {
+		t.Fatalf("spilling lazy drain rows must match eager")
+	}
+	if sc != ec {
+		t.Fatalf("spilling lazy drain cost must match eager: stream=%d eager=%d", sc, ec)
+	}
+	s.Close()
+	if n := countSpillFiles(); n != 0 {
+		t.Fatalf("a full drain leaked %d spill files", n)
+	}
+
+	// Early exit over the merge: pull a prefix, then close the cursor. close releases the undrained
+	// merge's run files, so none leak.
+	s2 := db.Session(SessionOptions{})
+	s2.SetWorkMem(128)
+	rows, err := s2.Query(sql, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]Value
+	for i := 0; i < 5 && rows.Next(); i++ {
+		got = append(got, rows.Row())
+	}
+	if !rowsEqual(got, er[:5]) {
+		t.Fatalf("early pull prefix must match the eager order")
+	}
+	_ = rows.Close()
+	s2.Close()
+	if n := countSpillFiles(); n != 0 {
+		t.Fatalf("an early exit leaked %d spill files", n)
+	}
 }
 
 // ---- the lazy DEFERRED cursor (a top-level set-op / WITH; streaming.md §7) ------------------------

@@ -13716,9 +13716,11 @@ func (db *engine) tryBufferedQuery(stmt statement, params []Value) (*Rows, bool,
 // nextRow it runs the blocking part (execSelectEmit) to completion into an emitter — buffering the input
 // (correctly: a sort/group/dedup/join must see it all) and charging the scan/sort/group/dedup cost —
 // then yields its buffer ONE row at a time: an emitProject row is projected (and charges row_produced +
-// projection) on emission, an emitIdentity/emitFinal row is handed out (already projected). So peak
-// output memory is one row, a caller's early exit skips the projection of the rows it never pulls, and a
-// fully-drained query observes the same rows + total cost as the eager path (streaming.md §6).
+// projection) on emission, an emitSorted row is pulled from the `sorted` iterator and projected (the
+// streaming-sort output, streaming.md §4/§7), an emitIdentity/emitFinal row is handed out (already
+// projected). So peak output memory is one row, a caller's early exit skips the projection of the rows
+// it never pulls, and a fully-drained query observes the same rows + total cost as the eager path
+// (streaming.md §6).
 type bufferedScanCursor struct {
 	eng    *engine
 	plan   *selectPlan
@@ -13759,6 +13761,39 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		row := c.em.final[c.idx]
 		c.idx++
 		return row, true, nil
+	case emitSorted:
+		// The streaming sort's lazy output: pull the next windowed row, charge row_produced, and
+		// project it (streaming.md §4/§7). The output slice is never built; an early exit (close)
+		// releases any undrained spill runs.
+		if c.idx >= c.em.end {
+			c.done = true
+			c.em.sorted.close()
+			return nil, false, nil
+		}
+		row, ok, err := c.em.sorted.next()
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			c.done = true
+			c.em.sorted.close()
+			return nil, false, nil
+		}
+		c.idx++
+		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+			return nil, false, err
+		}
+		c.meter.Charge(costs.RowProduced)
+		env := &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}}
+		projected := make([]Value, len(c.plan.projections))
+		for i, p := range c.plan.projections {
+			v, perr := p.eval(row, env, c.meter)
+			if perr != nil {
+				return nil, false, perr
+			}
+			projected[i] = v
+		}
+		return projected, true, nil
 	case emitIdentity:
 		// Pre-projected (the DISTINCT dedup) — charge only row_produced per emitted row.
 		if c.idx >= c.em.end {
@@ -13799,8 +13834,14 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 func (c *bufferedScanCursor) costAccrued() int64 { return c.meter.Accrued }
 
 // close marks the cursor done; the pinned snapshot is owned by eng and reclaimed by the GC, and the
-// watermark deregister (if any) lives on the Rows (streaming.md §5). Idempotent.
-func (c *bufferedScanCursor) close() { c.done = true }
+// watermark deregister (if any) lives on the Rows (streaming.md §5). A `Sorted` emitter additionally
+// releases any undrained spill run files (Go has no destructor — streaming.md §5). Idempotent.
+func (c *bufferedScanCursor) close() {
+	c.done = true
+	if c.ran && c.em.mode == emitSorted && c.em.sorted != nil {
+		c.em.sorted.close()
+	}
+}
 
 // tryDeferredQuery tries to serve stmt as a lazy DEFERRED query (spec/design/streaming.md §4/§7) — the
 // Query path for a top-level set operation (UNION/INTERSECT/EXCEPT) or pure-query WITH. These are
@@ -14134,14 +14175,17 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 }
 
 // execStreamingSort is the streaming external sort for a single-table ORDER BY (spec/design/spill.md
-// §4/§5). It streams scan→filter→sorter, so the input is never materialized in the executor heap;
-// the sorter spills sorted runs to disk under workMem (file-backed databases) and k-way-merges them
-// at finish, then the window/projection loop pulls the sorted rows one at a time. Results + cost are
-// byte-identical to the eager sort: the same page_read block, storage_row_read per scanned row,
-// filter operator_eval, and row_produced per windowed row accrue — only the sort, which is unmetered
-// (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
-// non-DISTINCT, with an ORDER BY and no index bound.
-func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
+// §4/§5, streaming.md §4/§7). It streams scan→filter→sorter, so the input is never materialized in the
+// executor heap; the sorter spills sorted runs to disk under workMem (file-backed databases) and
+// k-way-merges them at finish. It runs the BLOCKING part (scan + sort + the OFFSET skip) and returns an
+// emitSorted emitter holding the `sorted` pull iterator positioned at the first output row — so the
+// window's row_produced + projection is charged LAZILY by the caller's emitter drive, one row per pull
+// (the §4/§7 output-laziness follow-on: the output slice is never built and an early exit skips the rows
+// it never pulls). Results + cost under full drain are byte-identical to the eager sort: the same
+// page_read block, storage_row_read per scanned row, filter operator_eval, and row_produced per windowed
+// row accrue — only the sort, which is unmetered (cost.md §3), now spills. Gated (by the caller) to a
+// single table, no join, non-aggregate, non-DISTINCT, with an ORDER BY and no index bound.
+func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (emitter, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read + value_decompress
@@ -14155,16 +14199,21 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 	if !empty {
 		var err error
 		if overlap, slabs, err = store.OverlapScanUnits(b, plan.relMasks[0]); err != nil {
-			return selectResult{}, err
+			return emitter{}, err
 		}
 	}
 	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 
+	// Build the sorted source in ORDER BY order, deferring the window's row_produced + projection to
+	// the lazy emitter drive (the caller). Two ways to sort, both yielding a `sortedRows` pull iterator
+	// over the survivors:
+	//
 	// A collated ORDER BY cannot use the C-ordered Sorter / spill (collated keys are slice 1e), and
 	// collation is in-memory only this slice — so materialize the survivors and sort them with the
-	// collation-aware decorate sorter (spec/design/collation.md §8). The metered costs
-	// (storage_row_read per scanned row, row_produced per windowed output) are identical to the
-	// Sorter path; the sort itself is unmetered like every sort (cost.md §3).
+	// collation-aware decorate sorter (spec/design/collation.md §8), then wrap the sorted slice as an
+	// in-memory `sortedRows`. The metered costs (storage_row_read per scanned row, row_produced per
+	// windowed output) are identical to the Sorter path; the sort itself is unmetered like every sort
+	// (cost.md §3).
 	collated := false
 	for _, k := range plan.order {
 		if k.collation != nil {
@@ -14172,8 +14221,10 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 			break
 		}
 	}
+	var total int64
+	var sorted *sortedRows
 	if collated {
-		var rows [][]Value
+		var rows []storedRow
 		if !empty {
 			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil {
@@ -14198,82 +14249,62 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				return true, nil
 			})
 			if err != nil {
-				return selectResult{}, err
+				return emitter{}, err
 			}
 		}
 		if err := sortRows(rows, plan.order); err != nil {
-			return selectResult{}, err
+			return emitter{}, err
 		}
-		total := int64(len(rows))
-		start := int64(0)
-		if plan.offset != nil {
-			if *plan.offset < total {
-				start = *plan.offset
-			} else {
-				start = total
-			}
-		}
-		end := total
-		if plan.limit != nil && *plan.limit < total-start {
-			end = start + *plan.limit
-		}
-		out := make([][]Value, 0, end-start)
-		for i := start; i < end; i++ {
-			if err := meter.Guard(); err != nil {
-				return selectResult{}, err
-			}
-			meter.Charge(costs.RowProduced)
-			projected := make([]Value, len(plan.projections))
-			for j, p := range plan.projections {
-				v, err := p.eval(rows[i], env, meter)
-				if err != nil {
-					return selectResult{}, err
+		total = int64(len(rows))
+		sorted = &sortedRows{mem: rows}
+	} else {
+		// Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
+		// every in-range row is read (charging storage_row_read), its touched columns resolved
+		// (large-values.md §14), the WHERE applied (charging operator_eval), and a survivor pushed into
+		// the sorter, which spills when it exceeds the budget.
+		s := db.newSorterFor(plan.order)
+		if !empty {
+			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
+				if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+					return false, err
 				}
-				projected[j] = v
-			}
-			out = append(out, projected)
-		}
-		return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
-	}
-
-	// Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
-	// every in-range row is read (charging storage_row_read), its touched columns resolved
-	// (large-values.md §14), the WHERE applied (charging operator_eval), and a survivor pushed into
-	// the sorter, which spills when it exceeds the budget.
-	s := db.newSorterFor(plan.order)
-	if !empty {
-		err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-				return false, err
-			}
-			meter.Charge(costs.StorageRowRead)
-			row, err := store.resolveColumns(row, plan.relMasks[0])
+				meter.Charge(costs.StorageRowRead)
+				row, err := store.resolveColumns(row, plan.relMasks[0])
+				if err != nil {
+					return false, err
+				}
+				keep := true
+				if plan.filter != nil {
+					v, err := plan.filter.eval(row, env, meter)
+					if err != nil {
+						return false, err
+					}
+					keep = v.IsTrue()
+				}
+				if keep {
+					if err := s.push(row); err != nil {
+						return false, err
+					}
+				}
+				return true, nil // never stop early — the sort must see every row
+			})
 			if err != nil {
-				return false, err
+				return emitter{}, err
 			}
-			keep := true
-			if plan.filter != nil {
-				v, err := plan.filter.eval(row, env, meter)
-				if err != nil {
-					return false, err
-				}
-				keep = v.IsTrue()
-			}
-			if keep {
-				if err := s.push(row); err != nil {
-					return false, err
-				}
-			}
-			return true, nil // never stop early — the sort must see every row
-		})
+		}
+		total = int64(s.total)
+		var err error
+		sorted, err = s.finish()
 		if err != nil {
-			return selectResult{}, err
+			return emitter{}, err
 		}
 	}
 
-	// LIMIT / OFFSET window over the sort's total row count (known without materializing the
-	// output). Clamp in the i64 domain before indexing (CLAUDE.md §8).
-	total := int64(s.total)
+	// LIMIT / OFFSET window over the sort's total row count (known without materializing the output).
+	// Clamp in the i64 domain (CLAUDE.md §8). The OFFSET skip is part of the blocking part (unwindowed —
+	// no row_produced), done now so `sorted` is positioned at the first output row; the emitter drive
+	// then yields exactly `end-start` rows, charging row_produced + projection per pull (streaming.md
+	// §4/§7).
 	var start int64
 	if plan.offset != nil && *plan.offset < total {
 		start = *plan.offset
@@ -14284,40 +14315,13 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 	if plan.limit != nil && *plan.limit < total-start {
 		end = start + *plan.limit
 	}
-	sorted, err := s.finish()
-	if err != nil {
-		return selectResult{}, err
-	}
-	defer sorted.close() // a LIMIT may stop the merge early — release any undrained run files
 	for i := int64(0); i < start; i++ {
 		if _, _, err := sorted.next(); err != nil { // skip the OFFSET rows (unwindowed)
-			return selectResult{}, err
+			sorted.close()
+			return emitter{}, err
 		}
 	}
-	out := make([][]Value, 0, end-start)
-	for i := start; i < end; i++ {
-		row, ok, err := sorted.next()
-		if err != nil {
-			return selectResult{}, err
-		}
-		if !ok {
-			break
-		}
-		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
-			return selectResult{}, err
-		}
-		meter.Charge(costs.RowProduced)
-		projected := make([]Value, len(plan.projections))
-		for j, p := range plan.projections {
-			v, err := p.eval(row, env, meter)
-			if err != nil {
-				return selectResult{}, err
-			}
-			projected[j] = v
-		}
-		out = append(out, projected)
-	}
-	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+	return emitter{sorted: sorted, start: 0, end: end - start, mode: emitSorted}, nil
 }
 
 // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
@@ -14612,6 +14616,12 @@ const (
 	// emitFinal: the rows are a fully-formed result (the special input-streaming paths already
 	// projected AND charged them) — emission hands them out with no further charge.
 	emitFinal
+	// emitSorted: the streaming external sort's output, yielded LAZILY from the `sorted` pull iterator
+	// (positioned past the OFFSET) — emission pulls the next sorted row, charges row_produced, and
+	// evaluates the projection list per windowed row, [0, end). So the output slice is never built and a
+	// caller's early exit skips the projection (and row_produced) of the rows it never pulls
+	// (streaming.md §4/§7).
+	emitSorted
 )
 
 // emitter describes how a selectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
@@ -14626,12 +14636,15 @@ const (
 //     front — the §3 asymmetry), windowed to [start, end) — emission charges only row_produced.
 //   - emitFinal: `final` is a fully-formed result (the special input-streaming paths already projected
 //     AND charged it) — emission hands it out with no further charge.
+//   - emitSorted: `sorted` is the streaming-sort output pull iterator (positioned past the OFFSET),
+//     [0, end) windowed — emission pulls + projects + charges row_produced per row (streaming.md §4/§7).
 type emitter struct {
-	src   []storedRow // emitProject: unprojected rows
-	final [][]Value   // emitIdentity / emitFinal: already-projected rows
-	start int64
-	end   int64
-	mode  emitMode
+	src    []storedRow // emitProject: unprojected rows
+	final  [][]Value   // emitIdentity / emitFinal: already-projected rows
+	sorted *sortedRows // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
+	start  int64
+	end    int64
+	mode   emitMode
 }
 
 // drainEager builds the full output slice from the emitter — the materialized Execute drive
@@ -14641,6 +14654,36 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 	switch em.mode {
 	case emitFinal:
 		return em.final, nil
+	case emitSorted:
+		// The streaming sort's lazy output: pull every windowed row from the `sorted` iterator,
+		// charging row_produced + the projection per row — exactly the eager window loop
+		// execStreamingSort ran before its output went lazy (streaming.md §4/§7).
+		defer em.sorted.close() // a LIMIT/error may stop the merge early — release any undrained runs
+		env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+		out := make([][]Value, 0, em.end)
+		for i := int64(0); i < em.end; i++ {
+			row, ok, err := em.sorted.next()
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				break
+			}
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				return nil, err
+			}
+			meter.Charge(costs.RowProduced)
+			projected := make([]Value, len(plan.projections))
+			for j, p := range plan.projections {
+				v, perr := p.eval(row, env, meter)
+				if perr != nil {
+					return nil, perr
+				}
+				projected[j] = v
+			}
+			out = append(out, projected)
+		}
+		return out, nil
 	case emitIdentity:
 		out := make([][]Value, 0, em.end-em.start)
 		for _, row := range em.final[em.start:em.end] {
@@ -14732,11 +14775,10 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		plan.rels[0].cte == nil &&
 		// A derived table takes the eager path (grammar.md §42).
 		plan.rels[0].derived == nil {
-		res, err := db.execStreamingSort(plan, env, meter, params)
-		if err != nil {
-			return emitter{}, err
-		}
-		return emitter{final: res.rows, mode: emitFinal}, nil
+		// The streaming sort yields its output LAZILY (streaming.md §4/§7) — execStreamingSort runs the
+		// scan + sort + OFFSET skip and returns an emitSorted emitter over the `sorted` pull iterator;
+		// the window's row_produced + projection is charged by the emitter drive.
+		return db.execStreamingSort(plan, env, meter, params)
 	}
 
 	// Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
