@@ -34,10 +34,13 @@ export class PreparedStatement {
     return this.db.executeStmtParams(this.ast, params);
   }
 
-  // query runs this query statement, returning a row cursor. A non-query statement is a 42601
+  // query runs this query statement, returning a row cursor. The prepared AST routes through the same
+  // lazy streaming / buffered / deferred lanes as the ad-hoc query (spec/design/streaming.md §3/§4/§7)
+  // — so a prepared query streams exactly like a one-shot one (a single-table read pulls row-at-a-time;
+  // a blocking read buffers its input but yields its output lazily). A non-query statement is a 42601
   // (use execute).
   query(params: Value[] = []): Rows {
-    return rowsFromOutcome(this.execute(params));
+    return queryStmt(this.db, this.ast, params);
   }
 }
 
@@ -124,7 +127,16 @@ export function prepare(db: Engine, sql: string): PreparedStatement {
 // at a time. (This is the bare single-handle Engine; the watermark pin lives on the shared-core
 // Session.query path.)
 export function query(db: Engine, sql: string, params: Value[] = []): Rows {
-  const stmt = db.parse(sql);
+  return queryStmt(db, db.parse(sql), params);
+}
+
+// queryStmt routes an already-parsed query AST through the lazy streaming / buffered / deferred lanes,
+// falling back to the materialized executeStmtParams for a shape no lazy lane covers (a write, a
+// nextval/setval SELECT, a data-modifying WITH). Shared by query (parse-then-route) and a prepared query
+// (PreparedStatement.query, route the prepared AST), so a prepared query streams identically to an
+// ad-hoc one. (This is the bare single-handle Engine; the watermark pin lives on the shared-core
+// Session.query path.)
+function queryStmt(db: Engine, stmt: Statement, params: Value[] = []): Rows {
   const streamed = db.tryStreamingQuery(stmt, params);
   if (streamed !== null) return new Rows(streamed.columnNames, streamed.cursor);
   const buffered = db.tryBufferedQuery(stmt, params);

@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createDatabase, Database, EngineError, type Session } from "../src/lib.ts";
+import { Engine, execute, intValue, prepare, query } from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
 
 // seededKV builds an in-memory shared db with t(id i32 PK, v i32) holding 1..=n (v = id * 10).
@@ -609,4 +610,131 @@ test("deferred path skips a data-modifying WITH", () => {
   } finally {
     s.close();
   }
+});
+
+// ---- prepared-statement streaming (the low-level PreparedStatement; streaming.md §7) --------------
+//
+// A prepared query (prepare(db, sql) + stmt.query(params)) routes its parsed AST through the SAME lazy
+// lanes as the ad-hoc query(db, sql, params) — so a prepared SELECT streams (single-table pull /
+// blocking-buffer / deferred set-op) and offers the early-exit win, identical to a one-shot query. The
+// low-level PreparedStatement binds to a bare Engine (the watermark pin lives on the shared-core
+// Session path — the bare Engine pins nothing, like the ad-hoc query(db,…) free function).
+
+// seededEngine builds a bare in-memory Engine with t(id i32 PK, v i32) holding 1..=n (v = id * 10).
+function seededEngine(n: number): Engine {
+  const db = new Engine();
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  for (let i = 1; i <= n; i++) execute(db, `INSERT INTO t VALUES (${i}, ${i * 10})`);
+  return db;
+}
+
+// drainPrepared: a prepared query's rows, fully drained, + final cost.
+function drainPrepared(
+  db: Engine,
+  sql: string,
+  params: Value[] = [],
+): { rows: Value[][]; cost: bigint } {
+  const cursor = prepare(db, sql).query(params);
+  const rows: Value[][] = [];
+  for (const r of cursor) rows.push(r);
+  const cost = cursor.cost;
+  cursor.close();
+  return { rows, cost };
+}
+
+// A fully-drained prepared query yields the IDENTICAL rows + total cost as the materialized executeStmtParams
+// (the eager oracle, §6), across every lane — streaming, buffered, and deferred.
+test("prepared query matches eager rows and cost", () => {
+  const db = seededEngine(100);
+  for (const sql of [
+    "SELECT id, v FROM t LIMIT 5", // streaming (LIMIT short-circuit)
+    "SELECT id, v FROM t ORDER BY id LIMIT 7", // streaming (PK-ordered)
+    "SELECT v FROM t ORDER BY v LIMIT 6", // buffered (non-PK sort, top-N)
+    "SELECT count(*) FROM t", // buffered (aggregate)
+    "SELECT DISTINCT v FROM t ORDER BY v", // buffered (DISTINCT + sort)
+    "SELECT v FROM t WHERE id <= 3 UNION SELECT v FROM t WHERE id >= 98 ORDER BY v", // deferred (set op)
+    "WITH x AS (SELECT id, v FROM t WHERE v > 500) SELECT id, v FROM x ORDER BY id", // deferred (WITH)
+  ]) {
+    const eager = db.executeStmtParams(db.parse(sql), []);
+    assert.equal(eager.kind, "query", `not a query: ${sql}`);
+    if (eager.kind !== "query") throw new Error("unreachable");
+    const prepared = drainPrepared(db, sql);
+    assert.deepEqual(prepared.rows, eager.rows, `prepared rows mismatch: ${sql}`);
+    assert.equal(prepared.cost, eager.cost, `prepared cost mismatch: ${sql}`);
+  }
+});
+
+// A prepared query binds $N params and streams: the bound prepared run matches the ad-hoc bound query()
+// on rows + cost, and the statement is reusable across runs with different params.
+test("prepared query binds params and streams", () => {
+  const db = seededEngine(100);
+  const sql = "SELECT id, v FROM t WHERE id >= $1 ORDER BY id LIMIT 4";
+
+  const adHocCursor = query(db, sql, [intValue(90n)]);
+  const adHoc: Value[][] = [];
+  for (const r of adHocCursor) adHoc.push(r);
+  const adHocCost = adHocCursor.cost;
+  adHocCursor.close();
+
+  const prepared = drainPrepared(db, sql, [intValue(90n)]);
+  const want = [
+    [90n, 900n],
+    [91n, 910n],
+    [92n, 920n],
+    [93n, 930n],
+  ];
+  assert.deepEqual(
+    prepared.rows.map((r) => r.map((v) => (v.kind === "int" ? v.int : -1n))),
+    want,
+  );
+  assert.deepEqual(prepared.rows, adHoc, "prepared bound rows match ad-hoc");
+  assert.equal(prepared.cost, adHocCost, "prepared bound cost matches ad-hoc");
+  // Reusable: a second run with a different param re-streams.
+  const reused = drainPrepared(db, sql, [intValue(1n)]);
+  assert.equal(reused.rows[0]![0]!.kind === "int" ? reused.rows[0]![0]!.int : -1n, 1n);
+});
+
+// Early exit (§6) on the prepared path: pulling only a prefix charges LESS than a full drain — the
+// streaming win now reaches prepared queries.
+test("prepared query early exit charges less", () => {
+  const db = seededEngine(1000);
+  const full = drainPrepared(db, "SELECT id FROM t ORDER BY id");
+  assert.equal(full.rows.length, 1000);
+
+  const cursor = prepare(db, "SELECT id FROM t ORDER BY id").query();
+  const prefix: bigint[] = [];
+  for (const r of cursor) {
+    const v = r[0]!;
+    if (v.kind === "int") prefix.push(v.int);
+    if (prefix.length === 3) break;
+  }
+  const partial = cursor.cost;
+  cursor.close();
+
+  assert.deepEqual(prefix, [1n, 2n, 3n]);
+  assert.ok(
+    partial < full.cost,
+    `prepared early exit must charge less (partial=${partial}, full=${full.cost})`,
+  );
+});
+
+// A mid-drain cost abort (§6) on the prepared path: the 54P01 throws during iteration, not at
+// stmt.query() — the prepared cursor defers its work like the ad-hoc one.
+test("prepared query mid-drain cost abort surfaces", () => {
+  const db = seededEngine(1000);
+  db.setMaxCost(50n);
+  // Building the cursor is fine; the per-row meter guard aborts during the drain.
+  const cursor = prepare(db, "SELECT id FROM t ORDER BY id").query();
+  let code = "";
+  try {
+    let n = 0;
+    for (const _ of cursor) {
+      if (++n > 10000) throw new Error("the cost ceiling should have aborted the drain");
+    }
+  } catch (e) {
+    if (e instanceof EngineError) code = e.code();
+    else throw e;
+  }
+  cursor.close();
+  assert.equal(code, "54P01", "a mid-drain cost abort must surface");
 });
