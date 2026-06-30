@@ -30,7 +30,7 @@
 
 use crate::catalog::ColType;
 use crate::error::{EngineError, Result};
-use crate::format::{encode_range_body, read_range_body};
+use crate::format::{DecodeMode, encode_range_body, read_range_body};
 use crate::range::{range_contains, range_overlaps, range_total_cmp, range_union};
 use crate::sqlstate::SqlState;
 use crate::types::{ScalarType, Type};
@@ -139,7 +139,7 @@ impl GistOpclass {
         match self {
             GistOpclass::Range(s) => {
                 let elem = ColType::Scalar(*s);
-                match read_range_body(&elem, buf, pos)? {
+                match read_range_body(&elem, buf, pos, DecodeMode::Construct)? {
                     Value::Range(rv) => Ok(GistBoundKey::Range(rv)),
                     _ => Err(corrupt("gist: bound is not a range")),
                 }

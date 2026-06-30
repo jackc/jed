@@ -529,8 +529,10 @@ fn encode_jsonb_body(node: &JsonNode, out: &mut Vec<u8>) {
 
 /// Deserialize a `jsonb` node from `buf` at `pos` (inverse of [`encode_jsonb_body`]). A nonzero
 /// flag nibble, the reserved `NTAG_STRING_DICT` (no dictionary slice yet), or an unknown kind is
-/// `XX001` data_corrupted (spec/design/json.md §3.1/§6.3).
-fn decode_jsonb_body(buf: &[u8], pos: &mut usize) -> Result<JsonNode> {
+/// `XX001` data_corrupted (spec/design/json.md §3.1/§6.3). In [`DecodeMode::Skip`] the tree is
+/// walked identically (every tag / varint / recursion) but no [`JsonNode`] is built — the
+/// returned node is an unobserved placeholder, discarded by the caller (lazy-record.md §6).
+fn decode_jsonb_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<JsonNode> {
     let tag = read_u8(buf, pos)?;
     if tag & 0xf0 != 0 {
         return Err(corrupt("jsonb node tag has a reserved flag bit set"));
@@ -539,25 +541,41 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize) -> Result<JsonNode> {
         x if x == NTAG_NULL => Ok(JsonNode::Null),
         x if x == NTAG_FALSE => Ok(JsonNode::Bool(false)),
         x if x == NTAG_TRUE => Ok(JsonNode::Bool(true)),
-        x if x == NTAG_NUMBER => match decode_decimal_body(buf, pos)? {
+        x if x == NTAG_NUMBER => match decode_decimal_body(buf, pos, mode)? {
             Value::Decimal(d) => Ok(JsonNode::Number(d)),
-            _ => unreachable!("decode_decimal_body returns a decimal"),
+            // Skip mode advanced the decimal body without building it; the placeholder node is
+            // discarded by the caller (lazy-record.md §6).
+            _ => Ok(JsonNode::Null),
         },
-        x if x == NTAG_STRING => Ok(JsonNode::String(decode_jsonb_string(buf, pos)?)),
+        x if x == NTAG_STRING => Ok(match decode_jsonb_string(buf, pos, mode)? {
+            Some(s) => JsonNode::String(s),
+            None => JsonNode::Null, // skip-mode placeholder
+        }),
         x if x == NTAG_STRING_DICT => Err(corrupt(
             "jsonb string-dictionary reference before the dictionary slice",
         )),
         x if x == NTAG_ARRAY => {
             let count = read_uvarint(buf, pos)? as usize;
-            let mut elems = Vec::with_capacity(count.min(1024));
+            let mut elems = if mode.constructs() {
+                Vec::with_capacity(count.min(1024))
+            } else {
+                Vec::new()
+            };
             for _ in 0..count {
-                elems.push(decode_jsonb_body(buf, pos)?);
+                let e = decode_jsonb_body(buf, pos, mode)?;
+                if mode.constructs() {
+                    elems.push(e);
+                }
             }
             Ok(JsonNode::Array(elems))
         }
         x if x == NTAG_OBJECT => {
             let count = read_uvarint(buf, pos)? as usize;
-            let mut members = Vec::with_capacity(count.min(1024));
+            let mut members = if mode.constructs() {
+                Vec::with_capacity(count.min(1024))
+            } else {
+                Vec::new()
+            };
             for _ in 0..count {
                 // Each member's key is a string node (NTAG_STRING / reserved NTAG_STRING_DICT).
                 let ktag = read_u8(buf, pos)?;
@@ -565,7 +583,7 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize) -> Result<JsonNode> {
                     return Err(corrupt("jsonb object key tag has a reserved flag bit set"));
                 }
                 let key = match ktag & 0x0f {
-                    x if x == NTAG_STRING => decode_jsonb_string(buf, pos)?,
+                    x if x == NTAG_STRING => decode_jsonb_string(buf, pos, mode)?,
                     x if x == NTAG_STRING_DICT => {
                         return Err(corrupt(
                             "jsonb string-dictionary reference before the dictionary slice",
@@ -573,8 +591,11 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize) -> Result<JsonNode> {
                     }
                     _ => return Err(corrupt("jsonb object key is not a string node")),
                 };
-                let val = decode_jsonb_body(buf, pos)?;
-                members.push((key, val));
+                let val = decode_jsonb_body(buf, pos, mode)?;
+                if mode.constructs() {
+                    // Construct mode always yields a key (skip returns None and is never here).
+                    members.push((key.expect("construct mode yields a jsonb key"), val));
+                }
             }
             Ok(JsonNode::Object(members))
         }
@@ -583,10 +604,16 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize) -> Result<JsonNode> {
 }
 
 /// Read a `NTAG_STRING` payload (`varint len ‖ UTF-8 bytes`) after its tag has been consumed.
-fn decode_jsonb_string(buf: &[u8], pos: &mut usize) -> Result<String> {
+/// [`DecodeMode::Skip`] advances past the bytes and returns `None` (no `String` built, no UTF-8
+/// validation — lazy-record.md §6); `Construct` returns `Some(string)`.
+fn decode_jsonb_string(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Option<String>> {
     let len = read_uvarint(buf, pos)? as usize;
-    let bytes = take(buf, pos, len)?.to_vec();
-    String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 jsonb string"))
+    let bytes = take(buf, pos, len)?;
+    if !mode.constructs() {
+        return Ok(None);
+    }
+    let s = String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("non-UTF-8 jsonb string"))?;
+    Ok(Some(s))
 }
 
 /// The scalar value codec (the body of [`encode_value`] for a `ColType::Scalar`).
@@ -1007,27 +1034,31 @@ fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
         }
         ColType::Scalar(s) if s.is_jsonb() => {
             let mut pos = 0usize;
-            Ok(Value::Jsonb(decode_jsonb_body(payload, &mut pos)?))
+            Ok(Value::Jsonb(decode_jsonb_body(
+                payload,
+                &mut pos,
+                DecodeMode::Construct,
+            )?))
         }
         ColType::Scalar(s) if s.is_decimal() => {
             let mut pos = 0usize;
-            decode_decimal_body(payload, &mut pos)
+            decode_decimal_body(payload, &mut pos, DecodeMode::Construct)
         }
         // A composite's payload is its body (bitmap + present-field bodies); decode it with a
         // fresh cursor (spec/design/composite.md §4).
         ColType::Composite { .. } => {
             let mut pos = 0usize;
-            read_composite_body(ty, payload, &mut pos)
+            read_composite_body(ty, payload, &mut pos, DecodeMode::Construct)
         }
         // An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
         ColType::Array(elem) => {
             let mut pos = 0usize;
-            read_array_body(elem, payload, &mut pos)
+            read_array_body(elem, payload, &mut pos, DecodeMode::Construct)
         }
         // A range's payload is its body; decode it with a fresh cursor (spec/design/ranges.md §4).
         ColType::Range(elem) => {
             let mut pos = 0usize;
-            read_range_body(elem, payload, &mut pos)
+            read_range_body(elem, payload, &mut pos, DecodeMode::Construct)
         }
         _ => Err(corrupt("a non-spillable type was stored external")),
     }
@@ -3237,6 +3268,30 @@ fn decode_record(
     Ok((key, row, ovf))
 }
 
+/// Whether the value decoder **constructs** each leaf [`Value`] or merely **advances the cursor**
+/// past its body (spec/design/lazy-record.md §6). Both modes run the identical cursor-advancing
+/// reads — the same length / tag / count reads and the same recursion — so a `Skip` walk finds
+/// every column boundary identically to a `Construct` decode *by construction*: the zero-drift
+/// property the lazy-record reshape rests on. `Skip` omits only the expensive leaf construction
+/// (`String::from_utf8`, `Decimal::from_codec`, the `JsonNode` / `Vec<Value>` tree) and the
+/// content validation bundled with it; fixed-width scalars are cheap and stay eager either way
+/// (§6). A `Skip`-mode return is an unobserved placeholder — callers use only the advanced cursor
+/// (see [`inline_body_span`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DecodeMode {
+    /// Build the `Value` — the eager path, byte-identical to before this seam.
+    Construct,
+    /// Advance the cursor past the body without building the `Value`.
+    Skip,
+}
+
+impl DecodeMode {
+    /// Whether this mode constructs the `Value` (`Construct`) rather than only advancing (`Skip`).
+    fn constructs(self) -> bool {
+        matches!(self, DecodeMode::Construct)
+    }
+}
+
 /// Read one value via the value codec (inverse of `encode_value`). The presence tag is read first:
 /// `0x00` an inline body, `0x01` NULL, `0x02` an external pointer (`u32 first_page` + `u32 len`)
 /// whose payload is gathered from the overflow chain via `fetch` and reconstructed by type
@@ -3250,7 +3305,7 @@ fn read_value(
     ovf_out: &mut Vec<u32>,
 ) -> Result<Value> {
     match read_u8(buf, pos)? {
-        0x00 => read_inline_body(ty, buf, pos),
+        0x00 => read_inline_body(ty, buf, pos, DecodeMode::Construct),
         0x01 => Ok(Value::Null),
         TAG_EXTERNAL => {
             let first = read_u32(buf, pos)?;
@@ -3281,13 +3336,32 @@ fn read_value(
 
 /// The present-value body (after a `0x00` tag) for any [`ColType`]: a scalar via
 /// [`read_inline_scalar`], or a composite via [`read_composite_body`] (spec/design/composite.md §4).
-fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+/// `mode` selects construct vs. skip ([`DecodeMode`]).
+fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Value> {
     match ty {
-        ColType::Scalar(s) => read_inline_scalar(*s, buf, pos),
-        ColType::Composite { .. } => read_composite_body(ty, buf, pos),
-        ColType::Array(elem) => read_array_body(elem, buf, pos),
-        ColType::Range(elem) => read_range_body(elem, buf, pos),
+        ColType::Scalar(s) => read_inline_scalar(*s, buf, pos, mode),
+        ColType::Composite { .. } => read_composite_body(ty, buf, pos, mode),
+        ColType::Array(elem) => read_array_body(elem, buf, pos, mode),
+        ColType::Range(elem) => read_range_body(elem, buf, pos, mode),
     }
+}
+
+/// Walk a present inline value body in [`DecodeMode::Skip`] and return its byte span **without
+/// constructing the value** (spec/design/lazy-record.md §6). The caller has already consumed the
+/// `0x00` present tag; this advances `pos` past the body exactly as [`read_inline_body`] in
+/// `Construct` mode would — the same length reads, tag dispatch, and recursion — so the returned
+/// span equals the bytes a construct decode consumes, *by construction* (the zero-drift property).
+/// L2 will use this to defer an inline value as its compact on-disk bytes; at L1 it is the seam,
+/// exercised by the cross-check test `inline_body_span_matches_decode`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn inline_body_span<'a>(
+    ty: &ColType,
+    buf: &'a [u8],
+    pos: &mut usize,
+) -> Result<&'a [u8]> {
+    let start = *pos;
+    read_inline_body(ty, buf, pos, DecodeMode::Skip)?;
+    Ok(&buf[start..*pos])
 }
 
 /// A range value's present **body** (after the `0x00` tag): inverse of [`encode_range_body`]
@@ -3296,26 +3370,42 @@ fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> 
 /// element's value-codec body (no presence tag). A reserved flag bit set is `XX001`. Note: an
 /// infinite bound's inclusivity bit is canonically 0, but the body that produced the bytes already
 /// enforced that — read whatever bits are present and rebuild the `RangeVal` faithfully.
-pub(crate) fn read_range_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+pub(crate) fn read_range_body(
+    elem: &ColType,
+    buf: &[u8],
+    pos: &mut usize,
+    mode: DecodeMode,
+) -> Result<Value> {
     let flags = read_u8(buf, pos)?;
     if flags & !0x1f != 0 {
         return Err(corrupt("range flags has a reserved bit set"));
     }
     if flags & 0x01 != 0 {
-        return Ok(Value::Range(RangeVal::empty()));
+        return Ok(if mode.constructs() {
+            Value::Range(RangeVal::empty())
+        } else {
+            Value::Null // skip-mode placeholder (no bounds follow)
+        });
     }
     let lb_inf = flags & 0x02 != 0;
     let ub_inf = flags & 0x04 != 0;
+    // Each present bound is advanced past in both modes (the recursion is the cursor advance);
+    // only construct mode boxes it into the `RangeVal`.
     let lower = if lb_inf {
         None
     } else {
-        Some(Box::new(read_inline_body(elem, buf, pos)?))
+        let v = read_inline_body(elem, buf, pos, mode)?;
+        mode.constructs().then(|| Box::new(v))
     };
     let upper = if ub_inf {
         None
     } else {
-        Some(Box::new(read_inline_body(elem, buf, pos)?))
+        let v = read_inline_body(elem, buf, pos, mode)?;
+        mode.constructs().then(|| Box::new(v))
     };
+    if !mode.constructs() {
+        return Ok(Value::Null);
+    }
     Ok(Value::Range(RangeVal {
         empty: false,
         lower,
@@ -3329,18 +3419,25 @@ pub(crate) fn read_range_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Re
 /// (spec/design/array.md §4). Reads `ndim`/`flags`/per-dim `(len, lb)`, then the optional null
 /// bitmap and the present element bodies (row-major). Accepts `ndim` 0 (empty) through 6 (`MAXDIM`);
 /// a higher `ndim` or an element-count overflow is `XX001`.
-fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Value> {
     let ndim = read_u8(buf, pos)? as usize;
     let flags = read_u8(buf, pos)?;
     if flags & !0x01 != 0 {
         return Err(corrupt("array flags has a reserved bit set"));
     }
     if ndim == 0 {
-        return Ok(Value::Array(ArrayVal::empty())); // empty array
+        return Ok(if mode.constructs() {
+            Value::Array(ArrayVal::empty()) // empty array
+        } else {
+            Value::Null // skip-mode placeholder
+        });
     }
     if ndim > 6 {
         return Err(corrupt("array ndim exceeds the maximum of 6"));
     }
+    // `dims`/`lbounds`/`bitmap` are small and structural — `n` drives the element loop and the
+    // bitmap drives null handling — so they are read in both modes (not the expensive leaf
+    // construction §6 skips).
     let mut dims = Vec::with_capacity(ndim);
     let mut lbounds = Vec::with_capacity(ndim);
     let mut n: usize = 1;
@@ -3359,14 +3456,26 @@ fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value>
     } else {
         Vec::new()
     };
-    let mut elements = Vec::with_capacity(n);
+    let mut elements = if mode.constructs() {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
     for i in 0..n {
         let is_null = has_nulls && (bitmap[i / 8] & (0x80 >> (i % 8)) != 0);
         if is_null {
-            elements.push(Value::Null);
+            if mode.constructs() {
+                elements.push(Value::Null);
+            }
         } else {
-            elements.push(read_inline_body(elem, buf, pos)?);
+            let v = read_inline_body(elem, buf, pos, mode)?; // advance in both modes
+            if mode.constructs() {
+                elements.push(v);
+            }
         }
+    }
+    if !mode.constructs() {
+        return Ok(Value::Null);
     }
     Ok(Value::Array(ArrayVal {
         dims,
@@ -3379,20 +3488,37 @@ fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value>
 /// field's body in declaration order (inverse of [`encode_composite_body`], spec/design/composite.md
 /// §4). A field whose bitmap bit is set is `Value::Null` and consumes no body bytes; otherwise its
 /// body is read recursively (no per-field presence tag).
-fn read_composite_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+fn read_composite_body(
+    ty: &ColType,
+    buf: &[u8],
+    pos: &mut usize,
+    mode: DecodeMode,
+) -> Result<Value> {
     let ColType::Composite { fields, .. } = ty else {
         return Err(corrupt("read_composite_body on a non-composite type"));
     };
     let nbytes = fields.len().div_ceil(8);
-    let bitmap = take(buf, pos, nbytes)?.to_vec();
-    let mut vals = Vec::with_capacity(fields.len());
+    let bitmap = take(buf, pos, nbytes)?.to_vec(); // structural — drives null handling
+    let mut vals = if mode.constructs() {
+        Vec::with_capacity(fields.len())
+    } else {
+        Vec::new()
+    };
     for (i, f) in fields.iter().enumerate() {
         let is_null = bitmap[i / 8] & (0x80 >> (i % 8)) != 0;
         if is_null {
-            vals.push(Value::Null);
+            if mode.constructs() {
+                vals.push(Value::Null);
+            }
         } else {
-            vals.push(read_inline_body(&f.ty, buf, pos)?);
+            let v = read_inline_body(&f.ty, buf, pos, mode)?; // advance in both modes
+            if mode.constructs() {
+                vals.push(v);
+            }
         }
+    }
+    if !mode.constructs() {
+        return Ok(Value::Null);
     }
     Ok(Value::Composite(vals))
 }
@@ -3400,33 +3526,53 @@ fn read_composite_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Valu
 /// The present-value body of a **scalar** (after a `0x00` tag): a fixed-width integer, a `u16`
 /// length + UTF-8 bytes for `text`, a single `bool-byte`, the decimal body, etc.
 /// (spec/fileformat/format.md *Value codec*).
-fn read_inline_scalar(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+fn read_inline_scalar(
+    ty: ScalarType,
+    buf: &[u8],
+    pos: &mut usize,
+    mode: DecodeMode,
+) -> Result<Value> {
     if ty.is_text() {
         let len = read_u16(buf, pos)? as usize;
-        let bytes = take(buf, pos, len)?.to_vec();
-        let s = String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 text value"))?;
+        let bytes = take(buf, pos, len)?;
+        if !mode.constructs() {
+            return Ok(Value::Null); // skip: no alloc, no UTF-8 validation (lazy-record.md §6)
+        }
+        let s = String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("non-UTF-8 text value"))?;
         Ok(Value::Text(s))
     } else if ty.is_bool() {
+        // Fixed-width (1 byte) — decoded eagerly even on the lazy path (§6); the validity check is
+        // cheap and harmless in either mode.
         match read_u8(buf, pos)? {
             0x00 => Ok(Value::Bool(false)),
             0x01 => Ok(Value::Bool(true)),
             _ => Err(corrupt("invalid boolean value byte")),
         }
     } else if ty.is_decimal() {
-        decode_decimal_body(buf, pos)
+        decode_decimal_body(buf, pos, mode)
     } else if ty.is_bytea() {
         let len = read_u16(buf, pos)? as usize;
-        let bytes = take(buf, pos, len)?.to_vec();
-        Ok(Value::Bytea(bytes))
+        let bytes = take(buf, pos, len)?;
+        if !mode.constructs() {
+            return Ok(Value::Null); // skip: no alloc
+        }
+        Ok(Value::Bytea(bytes.to_vec()))
     } else if ty.is_json() {
         // json: verbatim text, length-prefixed exactly like text (spec/design/json.md §4).
         let len = read_u16(buf, pos)? as usize;
-        let bytes = take(buf, pos, len)?.to_vec();
-        let s = String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 json value"))?;
+        let bytes = take(buf, pos, len)?;
+        if !mode.constructs() {
+            return Ok(Value::Null); // skip: no alloc, no UTF-8 validation
+        }
+        let s = String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("non-UTF-8 json value"))?;
         Ok(Value::Json(s))
     } else if ty.is_jsonb() {
         // jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
-        Ok(Value::Jsonb(decode_jsonb_body(buf, pos)?))
+        let node = decode_jsonb_body(buf, pos, mode)?;
+        if !mode.constructs() {
+            return Ok(Value::Null); // skip: tree walked, not built
+        }
+        Ok(Value::Jsonb(node))
     } else if ty.is_uuid() {
         // Fixed 16 raw bytes, no length prefix (must branch before the integer path —
         // decode_int would sign-flip and width_bytes is 16 there too).
@@ -3490,14 +3636,24 @@ fn read_inline_scalar(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Val
 /// Decode a decimal value's body — `flags` (sign), `u16` scale, `u16` ndigits, then that many
 /// base-10⁴ groups (spec/fileformat/format.md). Shared by the inline path and by external
 /// reconstruction (a spilled decimal's chain payload is exactly this body — large-values.md §12).
-fn decode_decimal_body(buf: &[u8], pos: &mut usize) -> Result<Value> {
+fn decode_decimal_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Value> {
     let flags = read_u8(buf, pos)?;
     let neg = flags & 1 != 0;
     let scale = read_u16(buf, pos)? as u32;
     let ndigits = read_u16(buf, pos)? as usize;
-    let mut groups = Vec::with_capacity(ndigits);
+    let mut groups = if mode.constructs() {
+        Vec::with_capacity(ndigits)
+    } else {
+        Vec::new()
+    };
     for _ in 0..ndigits {
-        groups.push(read_u16(buf, pos)?);
+        let g = read_u16(buf, pos)?; // advance in both modes
+        if mode.constructs() {
+            groups.push(g);
+        }
+    }
+    if !mode.constructs() {
+        return Ok(Value::Null); // skip-mode placeholder (no Decimal built)
     }
     Ok(Value::Decimal(Decimal::from_codec(neg, scale, &groups)))
 }
@@ -3542,8 +3698,9 @@ fn read_overflow_chain(
 fn read_value_lazy(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     match read_u8(buf, pos)? {
         // A composite's inline body has no nested overflow pointers (its fields are inline —
-        // composite.md §4), so it is read eagerly even in the lazy path.
-        0x00 => read_inline_body(ty, buf, pos),
+        // composite.md §4), so it is read eagerly even in the lazy path. (L2 will defer inline
+        // values too via `inline_body_span` — lazy-record.md §12.)
+        0x00 => read_inline_body(ty, buf, pos, DecodeMode::Construct),
         0x01 => Ok(Value::Null),
         TAG_EXTERNAL => {
             let first_page = read_u32(buf, pos)?;
@@ -4072,5 +4229,174 @@ mod tests {
             "live overflow pages ({ovf_pages}) are reachable, not free ({} free)",
             loaded.free_pages.len()
         );
+    }
+
+    // --- L1: the no-construct decode seam (spec/design/lazy-record.md §6/§12) ---
+
+    /// The skip walk advances the cursor identically to the eager construct decode, for **every**
+    /// value type (scalars incl. text/bytea/decimal/json/jsonb, and the array/composite/range
+    /// containers). `inline_body_span` must land `pos` at exactly the position
+    /// `read_inline_body(Construct)` reaches and return precisely the body bytes — the zero-drift
+    /// property the lazy-record reshape rests on (§6). A construct decode of those same bytes must
+    /// also still round-trip to the original value (the eager path is unchanged).
+    #[test]
+    fn inline_body_span_matches_decode() {
+        let i32c = || ColType::Scalar(ScalarType::Int32);
+        let textc = ColType::Scalar(ScalarType::Text);
+        let field = |name: &str, ty: ColType| ColField {
+            name: name.to_string(),
+            ty,
+            typmod: None,
+            varchar_len: None,
+            not_null: false,
+        };
+
+        // A jsonb document touching every node kind: object, nested array, number, string, bool,
+        // null, and an empty string.
+        let doc = JsonNode::Object(vec![
+            (
+                "a".to_string(),
+                JsonNode::Number(Decimal::from_digits_scale(false, "1234", 2)),
+            ),
+            (
+                "b".to_string(),
+                JsonNode::Array(vec![
+                    JsonNode::Bool(true),
+                    JsonNode::Null,
+                    JsonNode::String("x".to_string()),
+                ]),
+            ),
+            ("c".to_string(), JsonNode::String(String::new())),
+        ]);
+
+        let comp_ty = ColType::Composite {
+            name: "pair".to_string(),
+            fields: vec![field("a", i32c()), field("b", textc.clone())],
+        };
+
+        let cases: Vec<(ColType, Value)> = vec![
+            (ColType::Scalar(ScalarType::Int16), Value::Int(-12345)),
+            (i32c(), Value::Int(70000)),
+            (ColType::Scalar(ScalarType::Int64), Value::Int(i64::MIN)),
+            (textc.clone(), Value::Text("hello, jed".to_string())),
+            (textc.clone(), Value::Text(String::new())), // empty text
+            (ColType::Scalar(ScalarType::Bool), Value::Bool(true)),
+            (ColType::Scalar(ScalarType::Bool), Value::Bool(false)),
+            (
+                ColType::Scalar(ScalarType::Decimal),
+                Value::Decimal(Decimal::from_digits_scale(true, "9876543210", 4)),
+            ),
+            (
+                ColType::Scalar(ScalarType::Bytea),
+                Value::Bytea(vec![0, 1, 2, 255, 254]),
+            ),
+            (ColType::Scalar(ScalarType::Uuid), Value::Uuid([7u8; 16])),
+            (
+                ColType::Scalar(ScalarType::Timestamp),
+                Value::Timestamp(1_700_000_000_000_000),
+            ),
+            (
+                ColType::Scalar(ScalarType::Timestamptz),
+                Value::Timestamptz(-42),
+            ),
+            (ColType::Scalar(ScalarType::Date), Value::Date(-19000)),
+            (
+                ColType::Scalar(ScalarType::Interval),
+                Value::Interval(Interval {
+                    months: 14,
+                    days: -3,
+                    micros: 123456,
+                }),
+            ),
+            (
+                ColType::Scalar(ScalarType::Float64),
+                Value::Float64(std::f64::consts::PI),
+            ),
+            (ColType::Scalar(ScalarType::Float32), Value::Float32(-2.5)),
+            (
+                ColType::Scalar(ScalarType::Json),
+                Value::Json("{\"k\": 1}".to_string()),
+            ),
+            (ColType::Scalar(ScalarType::Jsonb), Value::Jsonb(doc)),
+            // Array of i32 with a NULL element (exercises the has-nulls bitmap branch).
+            (
+                ColType::Array(Box::new(i32c())),
+                Value::Array(ArrayVal::one_dim(vec![
+                    Value::Int(1),
+                    Value::Null,
+                    Value::Int(3),
+                ])),
+            ),
+            // Array of text (variable-length elements recurse through read_inline_body).
+            (
+                ColType::Array(Box::new(textc.clone())),
+                Value::Array(ArrayVal::one_dim(vec![
+                    Value::Text("a".to_string()),
+                    Value::Text("bb".to_string()),
+                ])),
+            ),
+            // Empty array (ndim = 0 short-circuit).
+            (
+                ColType::Array(Box::new(i32c())),
+                Value::Array(ArrayVal::empty()),
+            ),
+            // Composite with a present field and (next) a NULL field.
+            (
+                comp_ty.clone(),
+                Value::Composite(vec![Value::Int(5), Value::Text("hi".to_string())]),
+            ),
+            (
+                comp_ty.clone(),
+                Value::Composite(vec![Value::Null, Value::Text("only b".to_string())]),
+            ),
+            // Range: bounded [1,5), the empty range, and unbounded-below (-inf,9).
+            (
+                ColType::Range(Box::new(i32c())),
+                Value::Range(RangeVal {
+                    empty: false,
+                    lower: Some(Box::new(Value::Int(1))),
+                    upper: Some(Box::new(Value::Int(5))),
+                    lower_inc: true,
+                    upper_inc: false,
+                }),
+            ),
+            (
+                ColType::Range(Box::new(i32c())),
+                Value::Range(RangeVal::empty()),
+            ),
+            (
+                ColType::Range(Box::new(i32c())),
+                Value::Range(RangeVal {
+                    empty: false,
+                    lower: None,
+                    upper: Some(Box::new(Value::Int(9))),
+                    lower_inc: false,
+                    upper_inc: false,
+                }),
+            ),
+        ];
+
+        for (ty, v) in &cases {
+            let enc = encode_value(ty, v);
+            assert_eq!(enc[0], 0x00, "present values carry the 0x00 tag: {v:?}");
+
+            // Construct decode: consumes the whole body and round-trips to the original value.
+            let mut pc = 1usize;
+            let got = read_inline_body(ty, &enc, &mut pc, DecodeMode::Construct)
+                .expect("construct decode");
+            assert_eq!(
+                pc,
+                enc.len(),
+                "construct decode consumes the whole body: {v:?}"
+            );
+            assert_eq!(&got, v, "construct decode round-trips: {v:?}");
+
+            // Skip walk: lands at the identical cursor and returns exactly the body bytes — with no
+            // value constructed.
+            let mut ps = 1usize;
+            let span = inline_body_span(ty, &enc, &mut ps).expect("skip walk");
+            assert_eq!(ps, pc, "skip advance equals construct advance: {v:?}");
+            assert_eq!(span, &enc[1..], "the span is exactly the body bytes: {v:?}");
+        }
     }
 }
