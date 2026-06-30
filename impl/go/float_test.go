@@ -22,7 +22,7 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		v := Float64Value(f)
 		enc := encodeValue(scalarColType(scalarFloat64), v)
 		pos := 0
-		got, err := readInlineBody(scalarColType(scalarFloat64), enc[1:], &pos) // skip the 0x00 presence tag
+		got, err := readInlineBody(scalarColType(scalarFloat64), enc[1:], &pos, decodeConstruct) // skip the 0x00 presence tag
 		if err != nil {
 			t.Fatalf("f64 decode %v: %v", f, err)
 		}
@@ -48,7 +48,7 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		v := Float32Value(f)
 		enc := encodeValue(scalarColType(scalarFloat32), v)
 		pos := 0
-		got, err := readInlineBody(scalarColType(scalarFloat32), enc[1:], &pos)
+		got, err := readInlineBody(scalarColType(scalarFloat32), enc[1:], &pos, decodeConstruct)
 		if err != nil {
 			t.Fatalf("f32 decode %v: %v", f, err)
 		}

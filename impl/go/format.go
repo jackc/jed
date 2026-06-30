@@ -502,7 +502,7 @@ func encodeJsonbBody(node *JsonNode, out []byte) []byte {
 // decodeJsonbBody deserializes a jsonb node from buf at pos (inverse of encodeJsonbBody). A nonzero
 // flag nibble, the reserved ntagStringDict (no dictionary slice yet), or an unknown kind is XX001
 // data_corrupted (spec/design/json.md §3.1/§6.3).
-func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
+func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return JsonNode{}, err
@@ -518,15 +518,21 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 	case ntagTrue:
 		return JsonNode{Kind: JBool, B: true}, nil
 	case ntagNumber:
-		dv, err := decodeDecimalBody(buf, pos)
+		dv, err := decodeDecimalBody(buf, pos, mode)
 		if err != nil {
 			return JsonNode{}, err
 		}
+		if !mode.constructs() {
+			return JsonNode{}, nil // skip-mode placeholder (decimal body advanced, not built)
+		}
 		return JsonNode{Kind: JNumber, Num: *dv.Dec}, nil
 	case ntagString:
-		s, err := decodeJsonbString(buf, pos)
+		s, err := decodeJsonbString(buf, pos, mode)
 		if err != nil {
 			return JsonNode{}, err
+		}
+		if !mode.constructs() {
+			return JsonNode{}, nil // skip-mode placeholder
 		}
 		return JsonNode{Kind: JString, S: s}, nil
 	case ntagStringDict:
@@ -536,13 +542,18 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 		if err != nil {
 			return JsonNode{}, err
 		}
-		elems := make([]JsonNode, 0, minCap(count))
+		var elems []JsonNode
+		if mode.constructs() {
+			elems = make([]JsonNode, 0, minCap(count))
+		}
 		for i := uint64(0); i < count; i++ {
-			child, err := decodeJsonbBody(buf, pos)
+			child, err := decodeJsonbBody(buf, pos, mode)
 			if err != nil {
 				return JsonNode{}, err
 			}
-			elems = append(elems, child)
+			if mode.constructs() {
+				elems = append(elems, child)
+			}
 		}
 		return JsonNode{Kind: JArray, Arr: elems}, nil
 	case ntagObject:
@@ -550,7 +561,10 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 		if err != nil {
 			return JsonNode{}, err
 		}
-		members := make([]JsonMember, 0, minCap(count))
+		var members []JsonMember
+		if mode.constructs() {
+			members = make([]JsonMember, 0, minCap(count))
+		}
 		for i := uint64(0); i < count; i++ {
 			// Each member's key is a string node (ntagString / reserved ntagStringDict).
 			ktag, err := readU8(buf, pos)
@@ -568,15 +582,17 @@ func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
 			default:
 				return JsonNode{}, newError(DataCorrupted, "jsonb object key is not a string node")
 			}
-			key, err := decodeJsonbString(buf, pos)
+			key, err := decodeJsonbString(buf, pos, mode)
 			if err != nil {
 				return JsonNode{}, err
 			}
-			val, err := decodeJsonbBody(buf, pos)
+			val, err := decodeJsonbBody(buf, pos, mode)
 			if err != nil {
 				return JsonNode{}, err
 			}
-			members = append(members, JsonMember{Key: key, Val: val})
+			if mode.constructs() {
+				members = append(members, JsonMember{Key: key, Val: val})
+			}
 		}
 		return JsonNode{Kind: JObject, Obj: members}, nil
 	default:
@@ -595,7 +611,7 @@ func minCap(count uint64) int {
 
 // decodeJsonbString reads a ntagString payload (varint len ‖ UTF-8 bytes) after its tag has been
 // consumed.
-func decodeJsonbString(buf []byte, pos *int) (string, error) {
+func decodeJsonbString(buf []byte, pos *int, mode decodeMode) (string, error) {
 	n, err := readUvarint(buf, pos)
 	if err != nil {
 		return "", err
@@ -603,6 +619,9 @@ func decodeJsonbString(buf []byte, pos *int) (string, error) {
 	sb, err := take(buf, pos, int(n))
 	if err != nil {
 		return "", err
+	}
+	if !mode.constructs() {
+		return "", nil // skip: advance past the bytes, no copy / no UTF-8 validation
 	}
 	if !utf8.Valid(sb) {
 		return "", newError(DataCorrupted, "non-UTF-8 jsonb string")
@@ -2061,18 +2080,18 @@ func valueFromPayload(ty colType, payload []byte) (Value, error) {
 	if ty.Elem != nil {
 		// An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
 		pos := 0
-		return readArrayBody(ty, payload, &pos)
+		return readArrayBody(ty, payload, &pos, decodeConstruct)
 	}
 	if ty.RangeElem != nil {
 		// A range's payload is its body; decode it with a fresh cursor (spec/design/ranges.md §4).
 		pos := 0
-		return readRangeBody(*ty.RangeElem, payload, &pos)
+		return readRangeBody(*ty.RangeElem, payload, &pos, decodeConstruct)
 	}
 	if ty.Composite {
 		// A composite's payload is its body (bitmap + present-field bodies); decode it with a fresh
 		// cursor (spec/design/composite.md §4).
 		pos := 0
-		return readCompositeBody(ty, payload, &pos)
+		return readCompositeBody(ty, payload, &pos, decodeConstruct)
 	}
 	switch {
 	case ty.Scalar.IsText():
@@ -2089,14 +2108,14 @@ func valueFromPayload(ty colType, payload []byte) (Value, error) {
 		return JsonValue(string(payload)), nil
 	case ty.Scalar.IsJsonb():
 		pos := 0
-		n, err := decodeJsonbBody(payload, &pos)
+		n, err := decodeJsonbBody(payload, &pos, decodeConstruct)
 		if err != nil {
 			return Value{}, err
 		}
 		return JsonbValue(n), nil
 	case ty.Scalar.IsDecimal():
 		pos := 0
-		return decodeDecimalBody(payload, &pos)
+		return decodeDecimalBody(payload, &pos, decodeConstruct)
 	default:
 		return Value{}, newError(DataCorrupted, "a non-spillable type was stored external")
 	}
@@ -3375,8 +3394,9 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 	switch tag {
 	case 0x00:
 		// A composite's inline body has no nested overflow pointers (its fields are inline —
-		// composite.md §4), so it is read eagerly even in the lazy path.
-		return readInlineBody(ty, buf, pos)
+		// composite.md §4), so it is read eagerly even in the lazy path. (L2 will defer inline
+		// values too via inlineBodySpan — lazy-record.md §12.)
+		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case 0x01:
 		return NullValue(), nil
 	case tagExternal:
@@ -3577,7 +3597,7 @@ func readValue(ty colType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 	}
 	switch tag {
 	case 0x00:
-		return readInlineBody(ty, buf, pos)
+		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case 0x01:
 		return NullValue(), nil
 	case tagExternal:
@@ -3645,26 +3665,62 @@ func readValue(ty colType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 	}
 }
 
+// decodeMode selects whether the value decoder CONSTRUCTS each leaf Value (decodeConstruct) or
+// merely ADVANCES the cursor past its body (decodeSkip) — spec/design/lazy-record.md §6. Both modes
+// run the identical cursor-advancing reads (the same length / tag / count reads and the same
+// recursion), so a skip walk finds every column boundary identically to a construct decode by
+// construction: the zero-drift property the lazy-record reshape rests on. Skip omits only the
+// expensive leaf construction (the string copy + UTF-8 validation, the Decimal, the JsonNode /
+// []Value tree) and the content validation bundled with it; fixed-width scalars are cheap and stay
+// eager either way (§6). A skip-mode return is an unobserved placeholder — callers use only the
+// advanced cursor (see inlineBodySpan).
+type decodeMode int
+
+const (
+	decodeConstruct decodeMode = iota
+	decodeSkip
+)
+
+// constructs reports whether the mode builds the Value (decodeConstruct) rather than only advancing
+// past it (decodeSkip).
+func (m decodeMode) constructs() bool { return m == decodeConstruct }
+
 // readInlineBody reads the present-value body (after a 0x00 tag) for any ColType: a scalar via
-// readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4).
-func readInlineBody(ty colType, buf []byte, pos *int) (Value, error) {
+// readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4). mode selects
+// construct vs. skip (decodeMode).
+func readInlineBody(ty colType, buf []byte, pos *int, mode decodeMode) (Value, error) {
 	if ty.Elem != nil {
-		return readArrayBody(ty, buf, pos)
+		return readArrayBody(ty, buf, pos, mode)
 	}
 	if ty.RangeElem != nil {
-		return readRangeBody(*ty.RangeElem, buf, pos)
+		return readRangeBody(*ty.RangeElem, buf, pos, mode)
 	}
 	if ty.Composite {
-		return readCompositeBody(ty, buf, pos)
+		return readCompositeBody(ty, buf, pos, mode)
 	}
-	return readInlineScalar(ty.Scalar, buf, pos)
+	return readInlineScalar(ty.Scalar, buf, pos, mode)
+}
+
+// inlineBodySpan walks a present inline value body in decodeSkip and returns its byte span WITHOUT
+// constructing the value (spec/design/lazy-record.md §6). The caller has already consumed the 0x00
+// present tag; this advances *pos past the body exactly as readInlineBody in construct mode would —
+// the same length reads, tag dispatch, and recursion — so the returned span equals the bytes a
+// construct decode consumes, by construction (the zero-drift property). L2 will use this to defer an
+// inline value as its compact on-disk bytes; at L1 it is the seam, exercised by the cross-check
+// test inlineBodySpanMatchesDecode.
+func inlineBodySpan(ty colType, buf []byte, pos *int) ([]byte, error) {
+	start := *pos
+	if _, err := readInlineBody(ty, buf, pos, decodeSkip); err != nil {
+		return nil, err
+	}
+	return buf[start:*pos], nil
 }
 
 // readRangeBody reads a range value's present body (after the 0x00 tag): inverse of encodeRangeBody
 // (spec/design/ranges.md §4). Reads the flags byte; an EMPTY range stops there. Otherwise the finite
 // lower bound (!LB_INF) then the finite upper bound (!UB_INF) are each read as the element's
 // value-codec body (no presence tag). A reserved flag bit set is XX001.
-func readRangeBody(elem colType, buf []byte, pos *int) (Value, error) {
+func readRangeBody(elem colType, buf []byte, pos *int, mode decodeMode) (Value, error) {
 	flags, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
@@ -3673,24 +3729,36 @@ func readRangeBody(elem colType, buf []byte, pos *int) (Value, error) {
 		return Value{}, newError(DataCorrupted, "range flags has a reserved bit set")
 	}
 	if flags&0x01 != 0 {
+		if !mode.constructs() {
+			return NullValue(), nil // skip-mode placeholder (no bounds follow)
+		}
 		return RangeValue(emptyRangeVal()), nil
 	}
 	lbInf := flags&0x02 != 0
 	ubInf := flags&0x04 != 0
+	// Each present bound is advanced past in both modes (the recursion is the cursor advance); only
+	// construct mode keeps it.
 	var lower, upper *Value
 	if !lbInf {
-		v, err := readInlineBody(elem, buf, pos)
+		v, err := readInlineBody(elem, buf, pos, mode)
 		if err != nil {
 			return Value{}, err
 		}
-		lower = &v
+		if mode.constructs() {
+			lower = &v
+		}
 	}
 	if !ubInf {
-		v, err := readInlineBody(elem, buf, pos)
+		v, err := readInlineBody(elem, buf, pos, mode)
 		if err != nil {
 			return Value{}, err
 		}
-		upper = &v
+		if mode.constructs() {
+			upper = &v
+		}
+	}
+	if !mode.constructs() {
+		return NullValue(), nil
 	}
 	return RangeValue(&RangeVal{
 		Empty:    false,
@@ -3705,7 +3773,7 @@ func readRangeBody(elem colType, buf []byte, pos *int) (Value, error) {
 // encodeArrayBody (spec/design/array.md §4). Reads ndim/flags/per-dim (len, lb), then the optional
 // null bitmap and the present element bodies (row-major). Accepts ndim 0 (empty) through 6 (MAXDIM);
 // a higher ndim or an element-count overflow is XX001.
-func readArrayBody(ty colType, buf []byte, pos *int) (Value, error) {
+func readArrayBody(ty colType, buf []byte, pos *int, mode decodeMode) (Value, error) {
 	if ty.Elem == nil {
 		return Value{}, newError(DataCorrupted, "readArrayBody on a non-array type")
 	}
@@ -3721,12 +3789,17 @@ func readArrayBody(ty colType, buf []byte, pos *int) (Value, error) {
 		return Value{}, newError(DataCorrupted, "array flags has a reserved bit set")
 	}
 	if ndim == 0 {
+		if !mode.constructs() {
+			return NullValue(), nil // skip-mode placeholder
+		}
 		// An empty array (ndim 0) — all-empty slices.
 		return arrayValueOf(emptyArray()), nil
 	}
 	if ndim > 6 {
 		return Value{}, newError(DataCorrupted, "array ndim exceeds the maximum of 6")
 	}
+	// dims/lbounds/bitmap are small and structural (n drives the loop, bitmap drives null handling),
+	// so they are read in both modes — not the expensive leaf construction §6 skips.
 	dims := make([]int, ndim)
 	lbounds := make([]int32, ndim)
 	n := 1
@@ -3754,17 +3827,27 @@ func readArrayBody(ty colType, buf []byte, pos *int) (Value, error) {
 			return Value{}, err
 		}
 	}
-	elems := make([]Value, n)
+	var elems []Value
+	if mode.constructs() {
+		elems = make([]Value, n)
+	}
 	for i := 0; i < n; i++ {
 		if hasNulls && bitmap[i/8]&(0x80>>uint(i%8)) != 0 {
-			elems[i] = NullValue()
+			if mode.constructs() {
+				elems[i] = NullValue()
+			}
 		} else {
-			v, err := readInlineBody(*ty.Elem, buf, pos)
+			v, err := readInlineBody(*ty.Elem, buf, pos, mode) // advance in both modes
 			if err != nil {
 				return Value{}, err
 			}
-			elems[i] = v
+			if mode.constructs() {
+				elems[i] = v
+			}
 		}
+	}
+	if !mode.constructs() {
+		return NullValue(), nil
 	}
 	return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
 }
@@ -3773,26 +3856,36 @@ func readArrayBody(ty colType, buf []byte, pos *int) (Value, error) {
 // each present field's body in declaration order (inverse of encodeCompositeBody,
 // spec/design/composite.md §4). A field whose bitmap bit is set is NULL and consumes no body bytes;
 // otherwise its body is read recursively (no per-field presence tag).
-func readCompositeBody(ty colType, buf []byte, pos *int) (Value, error) {
+func readCompositeBody(ty colType, buf []byte, pos *int, mode decodeMode) (Value, error) {
 	if !ty.Composite {
 		return Value{}, newError(DataCorrupted, "readCompositeBody on a non-composite type")
 	}
 	nbytes := (len(ty.Fields) + 7) / 8
-	bitmap, err := take(buf, pos, nbytes)
+	bitmap, err := take(buf, pos, nbytes) // structural — drives null handling
 	if err != nil {
 		return Value{}, err
 	}
-	vals := make([]Value, len(ty.Fields))
+	var vals []Value
+	if mode.constructs() {
+		vals = make([]Value, len(ty.Fields))
+	}
 	for i := range ty.Fields {
 		if bitmap[i/8]&(0x80>>uint(i%8)) != 0 {
-			vals[i] = NullValue()
+			if mode.constructs() {
+				vals[i] = NullValue()
+			}
 		} else {
-			v, err := readInlineBody(ty.Fields[i].Type, buf, pos)
+			v, err := readInlineBody(ty.Fields[i].Type, buf, pos, mode) // advance in both modes
 			if err != nil {
 				return Value{}, err
 			}
-			vals[i] = v
+			if mode.constructs() {
+				vals[i] = v
+			}
 		}
+	}
+	if !mode.constructs() {
+		return NullValue(), nil
 	}
 	return CompositeValue(vals), nil
 }
@@ -3800,7 +3893,7 @@ func readCompositeBody(ty colType, buf []byte, pos *int) (Value, error) {
 // readInlineScalar reads the present-value body of a SCALAR (after a 0x00 tag): a fixed-width integer,
 // a u16 length + UTF-8 bytes for text, a single bool-byte, the decimal body, etc. (format.md *Value
 // codec*).
-func readInlineScalar(ty scalarType, buf []byte, pos *int) (Value, error) {
+func readInlineScalar(ty scalarType, buf []byte, pos *int, mode decodeMode) (Value, error) {
 	switch {
 	case ty.IsText():
 		n, err := readU16(buf, pos)
@@ -3811,11 +3904,16 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		if !mode.constructs() {
+			return NullValue(), nil // skip: no copy, no UTF-8 validation (lazy-record.md §6)
+		}
 		if !utf8.Valid(sb) {
 			return Value{}, newError(DataCorrupted, "non-UTF-8 text value")
 		}
 		return TextValue(string(sb)), nil
 	case ty.IsBool():
+		// Fixed-width (1 byte) — decoded eagerly even on the lazy path (§6); the validity check is
+		// cheap and harmless in either mode.
 		b, err := readU8(buf, pos)
 		if err != nil {
 			return Value{}, err
@@ -3829,7 +3927,7 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int) (Value, error) {
 			return Value{}, newError(DataCorrupted, "invalid boolean value byte")
 		}
 	case ty.IsDecimal():
-		return decodeDecimalBody(buf, pos)
+		return decodeDecimalBody(buf, pos, mode)
 	case ty.IsBytea():
 		n, err := readU16(buf, pos)
 		if err != nil {
@@ -3838,6 +3936,9 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int) (Value, error) {
 		bb, err := take(buf, pos, int(n))
 		if err != nil {
 			return Value{}, err
+		}
+		if !mode.constructs() {
+			return NullValue(), nil // skip: no copy
 		}
 		// ByteaValue copies the bytes into a string, so the value owns its content.
 		return ByteaValue(bb), nil
@@ -3851,15 +3952,21 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		if !mode.constructs() {
+			return NullValue(), nil // skip: no copy, no UTF-8 validation
+		}
 		if !utf8.Valid(sb) {
 			return Value{}, newError(DataCorrupted, "non-UTF-8 json value")
 		}
 		return JsonValue(string(sb)), nil
 	case ty.IsJsonb():
 		// jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
-		node, err := decodeJsonbBody(buf, pos)
+		node, err := decodeJsonbBody(buf, pos, mode)
 		if err != nil {
 			return Value{}, err
+		}
+		if !mode.constructs() {
+			return NullValue(), nil // skip: tree walked, not built
 		}
 		return JsonbValue(node), nil
 	case ty.IsUuid():
@@ -3935,7 +4042,7 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int) (Value, error) {
 // decodeDecimalBody decodes a decimal value's body — flags (sign), u16 scale, u16 ndigits, then that
 // many base-10^4 groups (format.md). Shared by the inline path and by external reconstruction (a
 // spilled decimal's chain payload is exactly this body — large-values.md §12).
-func decodeDecimalBody(buf []byte, pos *int) (Value, error) {
+func decodeDecimalBody(buf []byte, pos *int, mode decodeMode) (Value, error) {
 	flags, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
@@ -3948,13 +4055,21 @@ func decodeDecimalBody(buf []byte, pos *int) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	groups := make([]uint16, ndigits)
-	for i := range groups {
-		g, err := readU16(buf, pos)
+	var groups []uint16
+	if mode.constructs() {
+		groups = make([]uint16, ndigits)
+	}
+	for i := 0; i < int(ndigits); i++ {
+		g, err := readU16(buf, pos) // advance in both modes
 		if err != nil {
 			return Value{}, err
 		}
-		groups[i] = g
+		if mode.constructs() {
+			groups[i] = g
+		}
+	}
+	if !mode.constructs() {
+		return NullValue(), nil // skip-mode placeholder (no Decimal built)
 	}
 	return DecimalValue(decimalFromCodec(flags&1 != 0, uint32(scale), groups)), nil
 }

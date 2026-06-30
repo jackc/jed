@@ -114,7 +114,7 @@ func (op gistOpclass) encodeComp(b gistBound) []byte {
 // readComp reads one self-delimiting component bound starting at *pos, advancing it past the bound.
 func (op gistOpclass) readComp(buf []byte, pos *int) (gistBound, error) {
 	if !op.scalar {
-		v, err := readRangeBody(op.elem, buf, pos)
+		v, err := readRangeBody(op.elem, buf, pos, decodeConstruct)
 		if err != nil {
 			return gistBound{}, err
 		}
