@@ -9585,6 +9585,77 @@ export class Engine {
     return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
   }
 
+  // tryDeferredQuery tries to serve stmt as a lazy DEFERRED query (spec/design/streaming.md §4/§7) — the
+  // query() path for a top-level set operation (UNION/INTERSECT/EXCEPT) or pure-query WITH. These are
+  // blocking shapes whose output is already projected AND charged (no per-row top-level projection to
+  // defer), so the only streaming win is lazy-yield (streaming.md §7): the cursor defers the whole
+  // runSetOp / runWith to its FIRST pull — so a 54P01 cost abort, a 54P02 lifetime abort, or an
+  // arithmetic trap surfaces DURING iteration, not at query() (§6) — then yields the buffered result one
+  // row at a time over a frozen snapshot (§5). Returns null for any non-set-op/WITH statement, or a
+  // write-classified one (a data-modifying WITH, a nextval/setval call — stmtIsWrite), which falls back
+  // to the materialized dispatch path. Under full drain the rows + total cost are byte-identical to the
+  // eager execute() path (it drives the SAME runSetOp / runWith, §6), so the corpus — which drives
+  // execute() — stays green by construction; per-core unit tests pin query() == execute().
+  tryDeferredQuery(stmt: Statement, params: Value[]): { columnNames: string[]; cursor: Cursor } | null {
+    // A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write gate
+    // and never streams (streaming.md §7 / sequences.md §4).
+    if (stmtIsWrite(stmt)) return null;
+    if (stmt.kind !== "setOp" && stmt.kind !== "with") return null;
+    // Resolve the output column names up front (the Rows cursor exposes them before the first pull).
+    // Planning is unmetered + deterministic, so the names read here are IDENTICAL to what the deferred
+    // run produces (it reuses runSetOp/runWith verbatim, so there is no rows/cost drift). A planning
+    // error (42P01/42804/…) surfaces at query(), matching the eager path.
+    const columnNames = this.deferredColumnNames(stmt);
+    const snap = this.snapshotEngine();
+    // Run the whole set op / WITH on the FIRST pull (streaming.md §7), reusing the eager runSetOp /
+    // runWith verbatim so the rows + cost match execute() exactly.
+    const run = stmt.kind === "setOp" ? () => snap.runSetOp(stmt, params) : () => snap.runWith(stmt, params);
+    let ran = false;
+    let rows: Value[][] = [];
+    let idx = 0;
+    let cost = 0n; // 0 until the first pull runs the query, then SelectResult.cost (final)
+    let done = false;
+    const source: RowSource = {
+      nextRow: () => {
+        if (done) return undefined;
+        if (!ran) {
+          // A mid-run cost abort / arithmetic trap throws HERE (during iteration), not at query() (§6).
+          const r = run();
+          rows = r.rows;
+          cost = r.cost;
+          ran = true;
+        }
+        if (idx >= rows.length) {
+          done = true;
+          return undefined;
+        }
+        return rows[idx++]!;
+      },
+      cost: () => cost,
+      close: () => {
+        done = true;
+        rows = [];
+      },
+    };
+    return { columnNames, cursor: Cursor.streaming(source) };
+  }
+
+  // deferredColumnNames resolves the output column names of a top-level set operation / pure-query WITH
+  // by planning only (no execution) — fills a deferred cursor's Rows metadata before its first pull
+  // (tryDeferredQuery). Mirrors the planning prefix of runSetOp / runWith exactly so the names match the
+  // deferred run's. Bound params are not needed: column names never depend on bound values.
+  private deferredColumnNames(stmt: SetOp | WithQuery): string[] {
+    const ptypes = new ParamTypes();
+    if (stmt.kind === "setOp") {
+      return this.planQuery(stmt, null, [], ptypes).columnNames;
+    }
+    // The planning prefix of runWith (cte.md): plan the CTE bindings, then the body with them visible.
+    const bindings = this.planCteBindings(stmt.ctes, stmt.recursive, ptypes);
+    const bodyQuery = cteBodyAsQuery(stmt.body); // pure-query WITH (DML excluded by stmtIsWrite)
+    if (bodyQuery === null) throw new Error("a pure-query WITH is required here");
+    return this.planQuery(bodyQuery, null, bindings, ptypes).columnNames;
+  }
+
   private execStreamingScan(
     plan: SelectPlan,
     env: EvalEnv,

@@ -2,15 +2,17 @@ import type { Value } from "./value.ts";
 
 // Cursor is the pull source a Rows cursor drives (spec/design/streaming.md §4).
 //
-// Two shapes, chosen by the plan (streaming.md §4):
+// Two cursor shapes (buffered / streaming), chosen by the plan (streaming.md §4/§7):
 //   - buffered — a fully materialized result, walked one row at a time. The executor ran the query to
-//     completion (the execute() path the conformance corpus drives, byte-unchanged); cost is final.
-//     Every blocking plan (sort/aggregate/join/set-op/DISTINCT/window) and every non-streamable shape
-//     lands here.
-//   - streaming (S3, executor.ts) — a lazy pull pipeline for the single-table no-blocking-op scan,
-//     backed by a function* generator (the natural pull form in JS): scan → resolve → WHERE → project,
-//     ONE row per nextRow over a pinned snapshot, accruing cost as it is pulled (streaming.md §6). Peak
-//     memory is one row; a caller that stops early faults no further leaves.
+//     completion (the execute() path the conformance corpus drives, byte-unchanged); cost is final. The
+//     query() fallback for the shapes no lazy RowSource covers yet (a data-modifying WITH).
+//   - streaming — a lazy pull RowSource (this module stays free of executor internals), in three
+//     executor-side flavors: the S3 single-table no-blocking-op scan (a streamRows generator: scan →
+//     resolve → WHERE → project, ONE row per nextRow over a pinned snapshot); the S4 BUFFERED blocking
+//     plan (a bufferedRows generator that buffers its input on the first pull, then yields the output a
+//     row at a time); and the DEFERRED top-level set operation / pure-query WITH (streaming.md §7) that
+//     defers the whole run to the first pull, then yields the result a row at a time. All three accrue
+//     cost as the cursor is pulled (streaming.md §6) and may throw mid-drain.
 //
 // A Cursor is SINGLE-PASS — nextRow advances and never rewinds — so Rows is single-pass too, matching
 // the Rust (Iterator) and Go (Next) cores and the streaming contract (a stream cannot be re-read).

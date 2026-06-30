@@ -417,8 +417,9 @@ export class Session {
   // yields the output one row at a time. The read is routed first (an autocommit read re-pins the latest
   // committed, PG-faithful), then the lazy cursor runs over the pinned snapshot — bounded peak output
   // memory, early-exit — and its snapshot version is registered in the reader-liveness watermark
-  // (streaming.md §5), released on close. A set-operation / WITH top level falls back to the materialized
-  // dispatch path → a buffered cursor.
+  // (streaming.md §5), released on close. A top-level set operation / pure-query WITH is served by a lazy
+  // DEFERRED cursor (streaming.md §7) that defers the whole run to the first pull and yields the result
+  // one row at a time; a data-modifying WITH (a write) still falls back to the materialized dispatch path.
   query(sql: string, params: Value[] = []): Rows {
     const stmt = this.engine.parse(sql);
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
@@ -440,6 +441,11 @@ export class Session {
     if (streamed !== null) return pin(streamed);
     const buffered = this.engine.tryBufferedQuery(stmt, params);
     if (buffered !== null) return pin(buffered);
+    // A top-level set operation / pure-query WITH is served by a lazy DEFERRED cursor (streaming.md §7):
+    // it defers the whole run to the first pull and yields the result one row at a time; it is a live
+    // reader too and pins its snapshot in the watermark.
+    const deferred = this.engine.tryDeferredQuery(stmt, params);
+    if (deferred !== null) return pin(deferred);
     return rowsFromOutcome(this.dispatch(stmt, params));
   }
 
