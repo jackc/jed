@@ -269,13 +269,20 @@ meta slots; every commit thereafter is incremental and alternates the slot.
 
 `Rows` iterates over the query's rows **one at a time** and exposes the column names and the
 accrued `cost`. The cursor is the seam that keeps the API from hardening a full-residency
-assumption (the [storage.md](storage.md) §1 binding rule): today the executor **materializes**
-all rows before the cursor walks them, but the caller-visible contract (yield row, then row,
-then column metadata) is exactly what a future streaming/pull executor satisfies — so
-streaming can land later without changing any caller. True streaming and spill-to-disk
-operators are landing operator-by-operator ([spill.md](spill.md)): the `ORDER BY` external
-merge sort + its streaming single-table feed have landed; the spilling hash aggregate /
-`DISTINCT` / hash JOIN are deferred follow-ons (CLAUDE.md §9, Phase 6).
+assumption (the [storage.md](storage.md) §1 binding rule): the caller-visible contract (yield
+row, then row, then column metadata) is exactly what a pull/streaming executor satisfies — so
+streaming lands *behind* the cursor without changing any caller. The **true streaming cursor**
+is specified in [streaming.md](streaming.md) and landing in slices: `Rows` becomes a **pull
+source** (`Cursor`) where the non-blocking single-table pipeline streams row-at-a-time and the
+blocking operators buffer-then-stream their output. Two contract notes that come with it: a
+streaming cursor **pins its read snapshot for its life** (PG-faithful — [streaming.md
+§5](streaming.md), [transactions.md §5/§8](transactions.md)), so it must be drained or
+`close`d to release; and `cost` is **final only after the cursor is fully drained** (it accrues
+as rows are pulled — [streaming.md §6](streaming.md); the conformance harness drains fully, so
+every `# cost:` value is unchanged). The internally-streamed *operators* landed earlier
+([spill.md](spill.md)): the `ORDER BY` external merge sort + its streaming single-table feed are
+in, with the spilling hash aggregate / `DISTINCT` / hash JOIN as deferred follow-ons (CLAUDE.md
+§9, Phase 6).
 
 A statement result carries `cost` and the **affected-row count**: an INSERT, UPDATE, or
 DELETE without RETURNING reports how many rows it touched — PostgreSQL's command-tag count
@@ -436,10 +443,13 @@ input-size cap cross-core.
 
 ## 9. Non-goals this slice
 
-- **No streaming rows at the cursor** — the cursor still walks materialized rows (§4). (The
-  *operators* are being bounded internally — the `ORDER BY` external merge sort spills to disk
-  under `work_mem` ([spill.md](spill.md)) — but the `Rows` cursor itself is fed a materialized
-  result; a fully pull-based cursor is the further step.)
+- **Streaming rows at the cursor — IN, not a non-goal.** The fully pull-based cursor is now
+  specified in [streaming.md](streaming.md) and landing in slices (§4): the cursor becomes a
+  `Cursor` pull source, the non-blocking pipeline streams, and a cursor pins its snapshot for its
+  life. The internally-streamed *operators* (the `ORDER BY` external merge sort spilling under
+  `work_mem`, [spill.md](spill.md)) landed earlier. What stays deferred is the spilling hash
+  aggregate / `DISTINCT` / hash JOIN ([spill.md §7](spill.md)) and lazy small-inline-column decode
+  ([streaming.md §8](streaming.md)).
 - **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL
   `BEGIN`/`COMMIT`/`ROLLBACK` are specified in [transactions.md](transactions.md) and **landed in

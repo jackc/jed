@@ -97,6 +97,10 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   with eviction above the block seam, the `cache_bytes` budget, and logical-cost invisibility.
 - [spill.md](spill.md) — streaming + spill-to-disk operators: the `ORDER BY` external merge sort
   bounded by `work_mem` (the hash aggregate / DISTINCT / hash join are follow-ons).
+- [streaming.md](streaming.md) — the true streaming result cursor (design): making `Rows` a pull
+  source — non-blocking pipeline streams lazily, blocking operators buffer-then-stream — with
+  PG-faithful snapshot pinning, the cost-invariant-under-full-drain contract, and the VDBE-forward
+  pull scan cursor (the lazy page/large-value decode it builds on already landed).
 - [large-values.md](large-values.md) — out-of-line overflow chains + transparent LZ4 compression
   for over-`RECORD_MAX` values, and the `value_compress`/`value_decompress` cost units.
 - [transactions.md](transactions.md) — the single-writer / immutable-snapshot model and the SQL
