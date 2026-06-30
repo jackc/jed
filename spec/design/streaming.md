@@ -376,8 +376,33 @@ independently — the P6.4 precedent):
   generator's `finally`). Verified per core by unit tests (`query()` == `execute()` rows + cost across a
   battery of sort shapes incl. `OFFSET`/`LIMIT`/projection-expr/filter/empty; the early-exit-charges-less
   win; and the spilling-merge path streaming lazily + leaving no temp file on early exit). This was the
-  last `exec_select_emit`-path output-laziness follow-on; the remaining streaming follow-ons are
-  prepared-statement streaming and a `Database::query` watermark on the bare single-handle path (§3/§5).
+  last `exec_select_emit`-path output-laziness follow-on; the remaining streaming follow-on is a
+  `Database::query` watermark on the bare single-handle path (§3/§5) — **prepared-statement streaming
+  landed in S8 (below).**
+- **S8 — prepared-statement streaming.** ✅ **Landed (all three cores).** A **prepared** query
+  (`prepare` + `query_prepared` / `QueryValues` / `PreparedStatement.query`) used to **materialize** —
+  it ran the eager `execute`/`dispatch` path and wrapped the resulting `Outcome` in a buffered `Rows`,
+  so a prepared `SELECT` got none of S3/S4/S6/S7's laziness (no row-at-a-time pull, no early-exit win,
+  no snapshot pin on the session path). The fix is a pure routing change: each core extracts a shared
+  **route-an-already-parsed-AST** helper — `query_ast` (Rust `Engine` + `Session`), `queryStmt` (Go
+  `engine` + `Session`), `queryStmt` (TS `Engine`) — holding the streaming / buffered / deferred lane
+  dispatch (plus, on the `Session` path, the autocommit re-pin and the reader-liveness watermark pin)
+  that the ad-hoc `query()` already used. Both `query()` (parse-then-route) and the prepared query
+  (route the prepared AST) call it, so **a prepared query now streams identically to a one-shot one** —
+  same lazy lanes, same early-exit win, same snapshot pin, the `54P01`/`57014`/trap surfacing **during
+  iteration** (the lazy lanes defer their work to the first pull, not to `query_prepared`). Under full
+  drain the rows + total cost are byte-identical to the materialized path (the same lanes the corpus's
+  `execute()` already exercises), so the corpus stays green by construction; it is per-core unit-tested
+  only (`prepared_query_*` / `TestPreparedQuery*` / `"prepared query …"`: matches-eager across every
+  lane, binds `$N` params, the early-exit-charges-less win, the session-path snapshot pin + watermark,
+  and the mid-drain cost abort). **Cross-core shape note:** Rust/Go expose a low-level prepared query on
+  *both* the bare `Engine` and the shared-core `Session` (the latter pins); TS's low-level
+  `PreparedStatement` binds only to a bare `Engine` (its session-bound prepared path is the ergonomic
+  `Statement`, which already re-parsed + routed through `Session.query`, so it streamed before this
+  slice). The **WASM C-ABI** `jed_stmt_query` drains the now-streaming cursor through a new `ok_rows`
+  helper that surfaces a mid-drain error as an `ERROR` buffer instead of a silently truncated result
+  (the one correctness obligation the streaming change introduces at that boundary); the Ruby native
+  extension exposes only `jed_execute` (materialized), so it is unaffected. No `format_version` bump.
 
 Built Rust-first, then Go/TS in lockstep; the streaming loop structure is mirrored across cores (§6).
 

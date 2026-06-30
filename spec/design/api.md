@@ -293,7 +293,9 @@ harness drives it, so every `# cost:` value is unchanged — the lazy cursor is 
 optimization, internal machinery whose only contract is identical rows + total cost under full
 drain). A top-level set-operation / pure-query `WITH` read now streams too (a lazy **deferred** cursor,
 [streaming.md §7](streaming.md) S6: it defers the whole run to the first pull and yields the result one
-row at a time); prepared-statement streaming is the remaining cursor follow-on. The internally-streamed
+row at a time); and a **prepared** query streams identically to an ad-hoc one — `prepare` + `query_prepared`
+routes the prepared AST through the same lazy lanes ([streaming.md §7](streaming.md) S8), so a prepared
+`SELECT` pulls row-at-a-time, pins its snapshot, and gets the early-exit win. The internally-streamed
 *operators* landed earlier
 ([spill.md](spill.md)): the `ORDER BY` external merge sort + its streaming single-table feed are
 in, with the spilling hash aggregate / `DISTINCT` / hash JOIN as deferred follow-ons (CLAUDE.md
@@ -465,13 +467,13 @@ input-size cap cross-core.
   pull source (S3), and a blocking read (non-PK `ORDER BY` / `DISTINCT` / aggregate / window / join) is
   a lazy `Buffered` cursor that buffers its input but yields the output one row at a time (S4); and a
   top-level set operation / pure-query `WITH` is a lazy **deferred** cursor that defers its run to the
-  first pull (S6), and the `exec_streaming_sort` output is yielded lazily from the `SortedRows` pull
-  iterator (S7) — all pin their snapshot for their life (`execute()` stays materialized — the corpus
-  drives it). The internally-streamed *operators* (the `ORDER BY` external merge sort spilling under
-  `work_mem`, [spill.md](spill.md)) landed earlier. What stays deferred is prepared-statement streaming,
-  a `Database::query` watermark on the bare single-handle path, the spilling hash aggregate / `DISTINCT`
-  / hash JOIN ([spill.md §7](spill.md)), and lazy small-inline-column decode
-  ([streaming.md §8](streaming.md)).
+  first pull (S6), the `exec_streaming_sort` output is yielded lazily from the `SortedRows` pull
+  iterator (S7), and a **prepared** query (`prepare` + `query_prepared`) routes its AST through those
+  same lazy lanes (S8) — all pin their snapshot for their life (`execute()` stays materialized — the
+  corpus drives it). The internally-streamed *operators* (the `ORDER BY` external merge sort spilling
+  under `work_mem`, [spill.md](spill.md)) landed earlier. What stays deferred is a `Database::query`
+  watermark on the bare single-handle path, the spilling hash aggregate / `DISTINCT` / hash JOIN
+  ([spill.md §7](spill.md)), and lazy small-inline-column decode ([streaming.md §8](streaming.md)).
 - **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL
   `BEGIN`/`COMMIT`/`ROLLBACK` are specified in [transactions.md](transactions.md) and **landed in
