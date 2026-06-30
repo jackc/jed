@@ -111,7 +111,7 @@ function encodeComp(op: GistOpclass, b: GistBound): Uint8Array {
 // readComp reads one self-delimiting component bound starting at cur.pos, advancing it past the bound.
 function readComp(op: GistOpclass, buf: Uint8Array, cur: { pos: number }): GistBound {
   if (!op.scalar) {
-    const v = readRangeBody(op.elem, buf, cur);
+    const v = readRangeBody(op.elem, buf, cur, "construct");
     if (v.kind !== "range") throw engineError("data_corrupted", "gist: bound is not a range");
     return { rng: v };
   }

@@ -311,7 +311,7 @@ function pageCrc(page: Uint8Array): number {
 // §4) is the shared presence tag then a body of `null-bitmap ‖ each present field's value-codec body`
 // (no per-field tag — the bitmap carries presence): see encodeCompositeBody. Recurses for nested
 // composites.
-function encodeValue(ty: ColType, v: Value): Uint8Array {
+export function encodeValue(ty: ColType, v: Value): Uint8Array {
   if (ty.kind === "scalar") return encodeScalar(ty.scalar, v);
   if (ty.kind === "array") {
     // An array column (spec/design/array.md §4): the shared presence tag then the array body.
@@ -543,7 +543,7 @@ function jsonbBodyBytes(node: JsonNode): Uint8Array {
 // decodeJsonbBody deserializes a jsonb node from `buf` at `cur` (inverse of encodeJsonbBody). A
 // nonzero flag nibble, the reserved NTAG_STRING_DICT (no dictionary slice yet), or an unknown kind
 // is XX001 data_corrupted (spec/design/json.md §3.1/§6.3).
-function decodeJsonbBody(buf: Uint8Array, cur: Cursor): JsonNode {
+function decodeJsonbBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): JsonNode {
   const tag = readU8(buf, cur);
   if ((tag & 0xf0) !== 0) {
     throw engineError("data_corrupted", "jsonb node tag has a reserved flag bit set");
@@ -556,13 +556,17 @@ function decodeJsonbBody(buf: Uint8Array, cur: Cursor): JsonNode {
     case NTAG_TRUE:
       return { kind: "bool", value: true };
     case NTAG_NUMBER: {
-      const v = decodeDecimalBody(buf, cur);
+      const v = decodeDecimalBody(buf, cur, mode);
+      if (mode === "skip") return { kind: "null" }; // placeholder (decimal body advanced, not built)
       if (v.kind !== "decimal")
         throw engineError("data_corrupted", "jsonb number is not a decimal");
       return { kind: "number", dec: v.dec };
     }
-    case NTAG_STRING:
-      return { kind: "string", value: decodeJsonbString(buf, cur) };
+    case NTAG_STRING: {
+      const s = decodeJsonbString(buf, cur, mode);
+      if (mode === "skip") return { kind: "null" }; // placeholder
+      return { kind: "string", value: s };
+    }
     case NTAG_STRING_DICT:
       throw engineError(
         "data_corrupted",
@@ -571,7 +575,10 @@ function decodeJsonbBody(buf: Uint8Array, cur: Cursor): JsonNode {
     case NTAG_ARRAY: {
       const count = readUvarint(buf, cur);
       const elements: JsonNode[] = [];
-      for (let i = 0; i < count; i++) elements.push(decodeJsonbBody(buf, cur));
+      for (let i = 0; i < count; i++) {
+        const e = decodeJsonbBody(buf, cur, mode);
+        if (mode === "construct") elements.push(e);
+      }
       return { kind: "array", elements };
     }
     case NTAG_OBJECT: {
@@ -593,9 +600,9 @@ function decodeJsonbBody(buf: Uint8Array, cur: Cursor): JsonNode {
         if (k !== NTAG_STRING) {
           throw engineError("data_corrupted", "jsonb object key is not a string node");
         }
-        const key = decodeJsonbString(buf, cur);
-        const value = decodeJsonbBody(buf, cur);
-        members.push({ key, value });
+        const key = decodeJsonbString(buf, cur, mode);
+        const value = decodeJsonbBody(buf, cur, mode);
+        if (mode === "construct") members.push({ key, value });
       }
       return { kind: "object", members };
     }
@@ -605,10 +612,12 @@ function decodeJsonbBody(buf: Uint8Array, cur: Cursor): JsonNode {
 }
 
 // decodeJsonbString reads a NTAG_STRING payload (varint len ‖ UTF-8 bytes) after its tag has been
-// consumed. Decodes UTF-8 BYTES (not UTF-16 units) back to a JS string; non-UTF-8 is XX001.
-function decodeJsonbString(buf: Uint8Array, cur: Cursor): string {
+// consumed. Decodes UTF-8 BYTES (not UTF-16 units) back to a JS string; non-UTF-8 is XX001. In "skip"
+// mode it advances past the bytes and returns "" (no decode / no validation — lazy-record.md §6).
+function decodeJsonbString(buf: Uint8Array, cur: Cursor, mode: DecodeMode): string {
   const len = readUvarint(buf, cur);
   const bytes = take(buf, cur, len);
+  if (mode === "skip") return "";
   try {
     return UTF8_DECODE.decode(bytes);
   } catch {
@@ -1026,15 +1035,15 @@ function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
   if (ty.kind === "composite") {
     // A composite's payload is its body (bitmap + present-field bodies); decode it with a fresh
     // cursor (spec/design/composite.md §4).
-    return readCompositeBody(ty, payload, { pos: 0 });
+    return readCompositeBody(ty, payload, { pos: 0 }, "construct");
   }
   if (ty.kind === "array") {
     // An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
-    return readArrayBody(ty, payload, { pos: 0 });
+    return readArrayBody(ty, payload, { pos: 0 }, "construct");
   }
   if (ty.kind === "range") {
     // A range's payload is its body; decode it with a fresh cursor (spec/design/ranges.md §4).
-    return readRangeBody(ty.elem, payload, { pos: 0 });
+    return readRangeBody(ty.elem, payload, { pos: 0 }, "construct");
   }
   const s = ty.scalar;
   if (isText(s)) {
@@ -1052,8 +1061,8 @@ function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
       throw engineError("data_corrupted", "non-UTF-8 json value");
     }
   }
-  if (isJsonb(s)) return jsonbValue(decodeJsonbBody(payload, { pos: 0 }));
-  if (s === "decimal") return decodeDecimalBody(payload, { pos: 0 });
+  if (isJsonb(s)) return jsonbValue(decodeJsonbBody(payload, { pos: 0 }, "construct"));
+  if (s === "decimal") return decodeDecimalBody(payload, { pos: 0 }, "construct");
   throw engineError("data_corrupted", "a non-spillable type was stored external");
 }
 
@@ -2956,8 +2965,9 @@ function decodeTableEntry(
 function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   const tag = readU8(buf, cur);
   // A composite's inline body has no nested overflow pointers (its fields are inline —
-  // composite.md §4), so it is read eagerly even in the lazy path.
-  if (tag === 0x00) return readInlineBody(ty, buf, cur);
+  // composite.md §4), so it is read eagerly even in the lazy path. (L2 will defer inline values too
+  // via inlineBodySpan — lazy-record.md §12.)
+  if (tag === 0x00) return readInlineBody(ty, buf, cur, "construct");
   if (tag === 0x01) return nullValue();
   if (tag === TAG_EXTERNAL) {
     const first = readU32(buf, cur);
@@ -3101,7 +3111,7 @@ function readValue(
   ovfOut: number[],
 ): Value {
   const tag = readU8(buf, cur);
-  if (tag === 0x00) return readInlineBody(ty, buf, cur);
+  if (tag === 0x00) return readInlineBody(ty, buf, cur, "construct");
   if (tag === 0x01) return nullValue();
   if (tag === TAG_EXTERNAL) {
     const first = readU32(buf, cur);
@@ -3128,13 +3138,38 @@ function readValue(
   throw engineError("data_corrupted", "invalid value presence tag");
 }
 
+// DecodeMode selects whether the value decoder CONSTRUCTS each leaf Value ("construct") or merely
+// ADVANCES the cursor past its body ("skip") — spec/design/lazy-record.md §6. Both modes run the
+// identical cursor-advancing reads (the same length / tag / count reads and the same recursion), so a
+// skip walk finds every column boundary identically to a construct decode by construction: the
+// zero-drift property the lazy-record reshape rests on. "skip" omits only the expensive leaf
+// construction (the UTF-8 decode, the Decimal, the JsonNode / Value[] tree) and the content
+// validation bundled with it; fixed-width scalars are cheap and stay eager either way (§6). A
+// "skip"-mode return is an unobserved placeholder — callers use only the advanced cursor (see
+// inlineBodySpan). A plain string-literal union (no enum), so it erases under type-stripping.
+type DecodeMode = "construct" | "skip";
+
 // readInlineBody reads the present-value body (after a 0x00 tag) for any ColType: a scalar via
-// readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4).
-function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
-  if (ty.kind === "composite") return readCompositeBody(ty, buf, cur);
-  if (ty.kind === "array") return readArrayBody(ty, buf, cur);
-  if (ty.kind === "range") return readRangeBody(ty.elem, buf, cur);
-  return readInlineScalar(ty.scalar, buf, cur);
+// readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4). mode selects
+// construct vs. skip (DecodeMode).
+export function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor, mode: DecodeMode): Value {
+  if (ty.kind === "composite") return readCompositeBody(ty, buf, cur, mode);
+  if (ty.kind === "array") return readArrayBody(ty, buf, cur, mode);
+  if (ty.kind === "range") return readRangeBody(ty.elem, buf, cur, mode);
+  return readInlineScalar(ty.scalar, buf, cur, mode);
+}
+
+// inlineBodySpan walks a present inline value body in "skip" mode and returns its byte span (a
+// zero-copy subarray view) WITHOUT constructing the value (spec/design/lazy-record.md §6). The caller
+// has already consumed the 0x00 present tag; this advances cur past the body exactly as readInlineBody
+// in "construct" mode would — the same length reads, tag dispatch, and recursion — so the returned
+// span equals the bytes a construct decode consumes, by construction (the zero-drift property). L2
+// will use this to defer an inline value as its compact on-disk bytes; at L1 it is the seam,
+// exercised by the cross-check test.
+export function inlineBodySpan(ty: ColType, buf: Uint8Array, cur: Cursor): Uint8Array {
+  const start = cur.pos;
+  readInlineBody(ty, buf, cur, "skip");
+  return buf.subarray(start, cur.pos);
 }
 
 // readRangeBody reads a range value's present BODY (after the 0x00 tag): inverse of encodeRangeBody
@@ -3143,15 +3178,22 @@ function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
 // value-codec body (no presence tag). A reserved flag bit set is XX001. An infinite bound's
 // inclusivity bit is canonically 0, but the body that produced the bytes already enforced that —
 // rebuild the range value faithfully from the bits present.
-export function readRangeBody(elem: ColType, buf: Uint8Array, cur: Cursor): Value {
+export function readRangeBody(
+  elem: ColType,
+  buf: Uint8Array,
+  cur: Cursor,
+  mode: DecodeMode,
+): Value {
   const flags = readU8(buf, cur);
   if ((flags & ~0x1f) !== 0)
     throw engineError("data_corrupted", "range flags has a reserved bit set");
-  if ((flags & 0x01) !== 0) return emptyRangeValue();
+  if ((flags & 0x01) !== 0) return mode === "skip" ? nullValue() : emptyRangeValue();
   const lbInf = (flags & 0x02) !== 0;
   const ubInf = (flags & 0x04) !== 0;
-  const lower = lbInf ? null : readInlineBody(elem, buf, cur);
-  const upper = ubInf ? null : readInlineBody(elem, buf, cur);
+  // Each present bound is advanced past in both modes (the recursion is the cursor advance).
+  const lower = lbInf ? null : readInlineBody(elem, buf, cur, mode);
+  const upper = ubInf ? null : readInlineBody(elem, buf, cur, mode);
+  if (mode === "skip") return nullValue();
   return rangeValue(lower, upper, (flags & 0x08) !== 0, (flags & 0x10) !== 0);
 }
 
@@ -3159,14 +3201,16 @@ export function readRangeBody(elem: ColType, buf: Uint8Array, cur: Cursor): Valu
 // (spec/design/array.md §4). Reads ndim/flags/per-dim (len, lb), then the optional null bitmap and
 // the present element bodies (row-major). Accepts ndim 0 (empty) through 6 (MAXDIM); a higher ndim or
 // an element-count overflow is XX001.
-function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
+function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor, mode: DecodeMode): Value {
   if (ty.kind !== "array") throw engineError("data_corrupted", "readArrayBody on a non-array type");
   const ndim = readU8(buf, cur);
   const flags = readU8(buf, cur);
   if ((flags & ~0x01) !== 0)
     throw engineError("data_corrupted", "array flags has a reserved bit set");
-  if (ndim === 0) return emptyArray(); // empty array
+  if (ndim === 0) return mode === "skip" ? nullValue() : emptyArray(); // empty array
   if (ndim > 6) throw engineError("data_corrupted", "array ndim exceeds the maximum of 6");
+  // dims/lbounds/bitmap are small and structural (n drives the loop, bitmap drives null handling), so
+  // they are read in both modes — not the expensive leaf construction §6 skips.
   const dims: number[] = new Array(ndim);
   const lbounds: number[] = new Array(ndim);
   let n = 1;
@@ -3179,11 +3223,17 @@ function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   const hasNulls = (flags & 0x01) !== 0;
   let bitmap: Uint8Array | null = null;
   if (hasNulls) bitmap = take(buf, cur, Math.ceil(n / 8));
-  const elements: Value[] = new Array(n);
+  const elements: Value[] | null = mode === "construct" ? new Array(n) : null;
   for (let i = 0; i < n; i++) {
     const isNull = hasNulls && (bitmap![i >> 3]! & (0x80 >> (i % 8))) !== 0;
-    elements[i] = isNull ? nullValue() : readInlineBody(ty.elem, buf, cur);
+    if (isNull) {
+      if (elements) elements[i] = nullValue();
+    } else {
+      const v = readInlineBody(ty.elem, buf, cur, mode); // advance in both modes
+      if (elements) elements[i] = v;
+    }
   }
+  if (!elements) return nullValue();
   return { kind: "array", dims, lbounds, elements };
 }
 
@@ -3191,27 +3241,34 @@ function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
 // each present field's body in declaration order (inverse of encodeCompositeBody,
 // spec/design/composite.md §4). A field whose bitmap bit is set is NULL and consumes no body bytes;
 // otherwise its body is read recursively (no per-field presence tag).
-function readCompositeBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
+function readCompositeBody(ty: ColType, buf: Uint8Array, cur: Cursor, mode: DecodeMode): Value {
   if (ty.kind !== "composite")
     throw engineError("data_corrupted", "readCompositeBody on a non-composite type");
   const fields = ty.fields;
   const nbytes = Math.ceil(fields.length / 8);
-  const bitmap = take(buf, cur, nbytes);
-  const vals: Value[] = new Array(fields.length);
+  const bitmap = take(buf, cur, nbytes); // structural — drives null handling
+  const vals: Value[] | null = mode === "construct" ? new Array(fields.length) : null;
   for (let i = 0; i < fields.length; i++) {
     const isNull = (bitmap[i >> 3]! & (0x80 >> (i % 8))) !== 0;
-    vals[i] = isNull ? nullValue() : readInlineBody(fields[i]!.type, buf, cur);
+    if (isNull) {
+      if (vals) vals[i] = nullValue();
+    } else {
+      const v = readInlineBody(fields[i]!.type, buf, cur, mode); // advance in both modes
+      if (vals) vals[i] = v;
+    }
   }
+  if (!vals) return nullValue();
   return compositeValue(vals);
 }
 
 // readInlineScalar reads the present-value body of a SCALAR (after a 0x00 tag): a fixed-width
 // integer, a u16 length + UTF-8 bytes for text, a single bool-byte, the decimal body, etc.
 // (format.md *Value codec*).
-function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
+function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor, mode: DecodeMode): Value {
   if (isText(ty)) {
     const n = readU16(buf, cur);
     const bytes = take(buf, cur, n);
+    if (mode === "skip") return nullValue(); // skip: no decode, no UTF-8 validation (lazy-record.md §6)
     try {
       return textValue(UTF8_DECODE.decode(bytes));
     } catch {
@@ -3219,21 +3276,26 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
     }
   }
   if (isBool(ty)) {
+    // Fixed-width (1 byte) — decoded eagerly even on the lazy path (§6); the validity check is cheap
+    // and harmless in either mode.
     const b = readU8(buf, cur);
     if (b === 0x00) return boolValue(false);
     if (b === 0x01) return boolValue(true);
     throw engineError("data_corrupted", "invalid boolean value byte");
   }
-  if (ty === "decimal") return decodeDecimalBody(buf, cur);
+  if (ty === "decimal") return decodeDecimalBody(buf, cur, mode);
   if (isBytea(ty)) {
     const n = readU16(buf, cur);
+    const bytes = take(buf, cur, n);
+    if (mode === "skip") return nullValue(); // skip: no copy
     // .slice() copies out of the page buffer so the value owns its bytes (no UTF-8 check).
-    return byteaValue(take(buf, cur, n).slice());
+    return byteaValue(bytes.slice());
   }
   if (isJson(ty)) {
     // json: verbatim text, length-prefixed exactly like text (spec/design/json.md §4).
     const n = readU16(buf, cur);
     const bytes = take(buf, cur, n);
+    if (mode === "skip") return nullValue(); // skip: no decode, no UTF-8 validation
     try {
       return jsonValue(UTF8_DECODE.decode(bytes));
     } catch {
@@ -3242,7 +3304,9 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
   }
   if (isJsonb(ty)) {
     // jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
-    return jsonbValue(decodeJsonbBody(buf, cur));
+    const node = decodeJsonbBody(buf, cur, mode);
+    if (mode === "skip") return nullValue(); // skip: tree walked, not built
+    return jsonbValue(node);
   }
   if (isUuid(ty)) {
     // Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
@@ -3293,12 +3357,16 @@ function readIntBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): bigint {
 // decodeDecimalBody decodes a decimal value's body — flags (sign), u16 scale, u16 ndigits, then that
 // many base-10^4 groups (format.md). Shared by the inline path and by external reconstruction (a
 // spilled decimal's chain payload is exactly this body — large-values.md §12).
-function decodeDecimalBody(buf: Uint8Array, cur: Cursor): Value {
+function decodeDecimalBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): Value {
   const flags = readU8(buf, cur);
   const scale = readU16(buf, cur);
   const ndigits = readU16(buf, cur);
-  const groups: number[] = new Array(ndigits);
-  for (let i = 0; i < ndigits; i++) groups[i] = readU16(buf, cur);
+  const groups: number[] | null = mode === "construct" ? new Array(ndigits) : null;
+  for (let i = 0; i < ndigits; i++) {
+    const g = readU16(buf, cur); // advance in both modes
+    if (groups) groups[i] = g;
+  }
+  if (!groups) return nullValue(); // skip-mode placeholder (no Decimal built)
   return decimalValue(Decimal.fromCodec((flags & 1) !== 0, scale, groups));
 }
 
