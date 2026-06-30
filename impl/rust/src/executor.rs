@@ -2628,6 +2628,16 @@ impl Engine {
     ///   statement or in the durable write — restores the captured state (rollback-on-error),
     ///   discarding partial work and any rowid allocations (§7). For an in-memory database
     ///   `persist` is a no-op, so autocommit is pure in-memory visibility.
+    /// Mark the open explicit block (if any) as failed — the `Failed` state in which every later
+    /// statement but COMMIT/ROLLBACK is `25P02` (§6). Used by the shared-core read-only session, whose
+    /// access check rejects an in-block write with `25006` before the statement reaches the executor;
+    /// PostgreSQL aborts the transaction on such a write, so the session poisons the block here.
+    pub(crate) fn fail_open_block(&mut self) {
+        if let Some(tx) = self.session.tx.as_mut() {
+            tx.failed = true;
+        }
+    }
+
     pub fn execute_stmt_params(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
         match stmt {
             Statement::Begin { writable } => return self.begin_tx(writable),

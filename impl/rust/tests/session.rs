@@ -1,13 +1,13 @@
-//! Session surface (spec/design/session.md §2): the `Engine`-owned **stateful default session**
-//! (the bare single-handle path), and — after the §2.4 convergence — **additional** sessions minted
-//! by `db.session(opts)` over a shared [`Database`] core (each owns its private `Engine`, shares
-//! committed storage through the core, carries an independent envelope, and runs autocommit with the
-//! lazy gate — no swap). Also the explicit `Idle`/`Open`/`Failed` transaction state machine. These
-//! are per-core API behaviors the shared corpus cannot express (it is single-handle SQL-in/rows-out
-//! — CLAUDE.md §10), so they live here.
+//! Session surface (spec/design/session.md §2): a **stateful session** minted by `db.session(opts)`
+//! over a shared [`Database`] core (each owns its private engine, shares committed storage through
+//! the core, carries an independent envelope, and runs autocommit with the lazy gate — no swap) —
+//! holding an open block across separate calls (the PG/SQLite connection model), and **additional**
+//! sessions running independently. Also the explicit `Idle`/`Open`/`Failed` transaction state
+//! machine. These are per-core API behaviors the shared corpus cannot express (it is single-handle
+//! SQL-in/rows-out — CLAUDE.md §10), so they live here.
 
 use jed::value::Value;
-use jed::{Database, Engine, Outcome, SessionOptions, TxStatus};
+use jed::{Database, Outcome, SessionOptions, TxStatus};
 
 fn rows(o: Outcome) -> Vec<Vec<Value>> {
     match o {
@@ -18,9 +18,9 @@ fn rows(o: Outcome) -> Vec<Vec<Value>> {
 
 #[test]
 fn default_session_is_stateful_across_calls() {
-    // The Engine-owned default session holds an open BEGIN block across *separate* calls
-    // (the PG/SQLite connection model, §2.1), and `db.status()` exposes the explicit state machine.
-    let mut db = Engine::new();
+    // A session holds an open BEGIN block across *separate* calls (the PG/SQLite connection model,
+    // §2.1), and `db.status()` exposes the explicit state machine.
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(db.status(), TxStatus::Idle);
 
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
@@ -42,7 +42,7 @@ fn default_session_is_stateful_across_calls() {
 fn failed_block_is_the_failed_state() {
     // A statement error inside a block poisons it: status is `Failed`, every later statement but
     // ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("BEGIN", &[]).unwrap();
     assert_eq!(
         db.execute("SELECT * FROM missing", &[])

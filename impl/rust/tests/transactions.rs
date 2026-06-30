@@ -1,23 +1,24 @@
-//! Phase 5 (P5.2): explicit transactions — the host `Transaction` API (spec/design/api.md §2.2 /
-//! §6, transactions.md §4.4). The SQL `BEGIN`/`COMMIT`/`ROLLBACK` surface and its visibility /
+//! Phase 5 (P5.2): explicit transactions — the host `Session` transaction API (spec/design/api.md
+//! §2.2 / §6, transactions.md §4.4). The SQL `BEGIN`/`COMMIT`/`ROLLBACK` surface and its visibility /
 //! rollback / read-only / failed-block semantics are pinned by the shared conformance corpus
 //! (suites/transactions/); these per-core tests cover the programmatic surface the corpus does
-//! not exercise: `db.begin(writable)`, the `db.view`/`db.update` closure wrappers, the Drop
-//! rollback safety net, and `db.commit`/`db.rollback` as the same mechanism.
+//! not exercise: `s.begin(writable)`, the `s.view`/`s.update` closure wrappers, the Drop
+//! rollback safety net, and `s.commit`/`s.rollback` as the same mechanism.
 
-use jed::{Engine, Outcome, execute};
+use jed::{Database, Outcome, Session, SessionOptions};
 
-fn db_with(sql: &[&str]) -> Engine {
-    let mut db = Engine::new();
+fn db_with(sql: &[&str]) -> Session {
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 /// Count rows of `SELECT * FROM t` against the committed/visible state.
-fn count(db: &mut Engine, table: &str) -> usize {
-    match execute(db, &format!("SELECT * FROM {table}")).unwrap() {
+fn count(db: &mut Session, table: &str) -> usize {
+    match db.execute(&format!("SELECT * FROM {table}"), &[]).unwrap() {
         Outcome::Query { rows, .. } => rows.len(),
         _ => panic!("expected a query result"),
     }
@@ -26,15 +27,15 @@ fn count(db: &mut Engine, table: &str) -> usize {
 #[test]
 fn begin_execute_commit_is_visible() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-    let mut tx = db.begin(true).unwrap();
-    tx.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
-    tx.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+    db.begin(true).unwrap();
+    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
     // read-your-writes within the transaction
-    match tx.query("SELECT id FROM t", &[]).unwrap().count() {
+    match db.query("SELECT id FROM t", &[]).unwrap().count() {
         2 => {}
         n => panic!("expected 2 rows visible inside the tx, got {n}"),
     }
-    tx.commit().unwrap();
+    db.commit().unwrap();
     assert_eq!(count(&mut db, "t"), 2);
 }
 
@@ -44,25 +45,32 @@ fn begin_execute_rollback_discards() {
         "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
     ]);
-    let mut tx = db.begin(true).unwrap();
-    tx.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
-    tx.rollback().unwrap();
+    db.begin(true).unwrap();
+    db.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+    db.rollback().unwrap();
     assert_eq!(count(&mut db, "t"), 1);
 }
 
 #[test]
-fn dropping_an_unfinished_tx_rolls_back() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id i32 PRIMARY KEY)",
-        "INSERT INTO t VALUES (1)",
-    ]);
+fn dropping_a_session_with_an_open_block_rolls_back() {
+    // The bbolt safety net: an unfinished transaction never silently commits. With the Session API
+    // the guard is the Session itself — dropping a session that left a block open rolls the block
+    // back, so a fresh session over the same shared core sees only the pre-block committed state.
+    let db = Database::new_in_memory();
     {
-        let mut tx = db.begin(true).unwrap();
-        tx.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
-        // tx dropped here without commit/rollback — the bbolt safety net rolls it back
+        let mut s = db.session(SessionOptions::default());
+        s.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap();
+        s.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
     }
-    assert!(!db.in_transaction(), "tx must be closed after drop");
-    assert_eq!(count(&mut db, "t"), 1);
+    {
+        let mut s = db.session(SessionOptions::default());
+        s.begin(true).unwrap();
+        s.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+        // s dropped here without commit/rollback — the safety net rolls the block back
+    }
+    let mut s = db.session(SessionOptions::default());
+    assert!(!s.in_transaction(), "no block is open on a fresh session");
+    assert_eq!(count(&mut s, "t"), 1);
 }
 
 #[test]
@@ -121,12 +129,12 @@ fn view_is_read_only() {
 #[test]
 fn nested_begin_is_25001() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-    let mut tx = db.begin(true).unwrap();
-    tx.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    db.begin(true).unwrap();
+    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
     // a SQL BEGIN inside an already-open transaction is 25001
-    assert_eq!(tx.execute("BEGIN", &[]).err().unwrap().code(), "25001");
+    assert_eq!(db.execute("BEGIN", &[]).err().unwrap().code(), "25001");
     // the original block survives the rejected nested BEGIN
-    tx.commit().unwrap();
+    db.commit().unwrap();
     assert_eq!(count(&mut db, "t"), 1);
 }
 
@@ -136,7 +144,7 @@ fn commit_and_rollback_are_noops_in_autocommit() {
     // no open transaction: both are lenient no-op successes (transactions.md §4.2)
     db.commit().unwrap();
     db.rollback().unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
     db.rollback().unwrap(); // does not undo the autocommitted insert
     assert_eq!(count(&mut db, "t"), 1);
 }

@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{DatabaseOptions, Engine, OpenOptions, Outcome, execute};
+use jed::{Database, DatabaseOptions, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -16,17 +16,17 @@ fn create_commit_reopen_round_trips() {
     let path = tmp("round_trip.jed");
     let _ = std::fs::remove_file(&path);
 
-    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
+    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
     assert_eq!(db.txid(), 1); // the initial empty image is committed at create
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", &[]).unwrap();
     db.commit().unwrap();
     let after_commit = db.txid();
-    db.close().unwrap();
+    drop(db);
 
-    let mut db = Engine::open(&path).unwrap();
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(db.txid(), after_commit);
-    match execute(&mut db, "SELECT id, v FROM t").unwrap() {
+    match db.execute("SELECT id, v FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(
             rows,
             vec![
@@ -42,16 +42,16 @@ fn create_commit_reopen_round_trips() {
 fn open_missing_file_is_58p01() {
     let path = tmp("does_not_exist.jed");
     let _ = std::fs::remove_file(&path);
-    assert_eq!(Engine::open(&path).err().unwrap().code(), "58P01");
+    assert_eq!(Database::open(&path).err().unwrap().code(), "58P01");
 }
 
 #[test]
 fn create_over_existing_file_is_58p02() {
     let path = tmp("already_here.jed");
     let _ = std::fs::remove_file(&path);
-    Engine::create(&path, DatabaseOptions::default()).unwrap();
+    Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
     assert_eq!(
-        Engine::create(&path, DatabaseOptions::default())
+        Database::create(&path, DatabaseOptions::default())
             .err()
             .unwrap()
             .code(),
@@ -63,14 +63,14 @@ fn create_over_existing_file_is_58p02() {
 fn create_with_custom_page_size_round_trips() {
     let path = tmp("page256.jed");
     let _ = std::fs::remove_file(&path);
-    let db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+    let db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
     assert_eq!(db.page_size(), 256);
-    db.close().unwrap();
+    drop(db);
 
     // The file's recorded page size survives reopen, and the on-disk u32 at offset 8 is 256.
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 256);
-    let db = Engine::open(&path).unwrap();
+    let db = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(db.page_size(), 256);
 }
 
@@ -81,13 +81,13 @@ fn autocommit_persists_each_write_across_close() {
     // original "no autocommit" model this test used to assert.
     let path = tmp("autocommit.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap(); // autocommitted, no explicit commit
-    db.close().unwrap();
+    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // autocommitted, no explicit commit
+    drop(db);
 
-    let mut db = Engine::open(&path).unwrap();
-    match execute(&mut db, "SELECT id FROM t").unwrap() {
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    match db.execute("SELECT id FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => {
             assert_eq!(
                 rows,
@@ -102,9 +102,9 @@ fn autocommit_persists_each_write_across_close() {
 #[test]
 fn commit_and_rollback_are_noops_under_autocommit() {
     // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
     db.commit().unwrap();
     db.rollback().unwrap(); // does NOT undo the autocommitted insert
     match db.query("SELECT id FROM t", &[]).unwrap().next() {
@@ -115,18 +115,16 @@ fn commit_and_rollback_are_noops_under_autocommit() {
 
 #[test]
 fn prepare_execute_and_query_with_params() {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
     let insert = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
-    insert
-        .execute(&mut db, &[Value::Int(1), Value::Int(100)])
+    db.execute_prepared(&insert, &[Value::Int(1), Value::Int(100)])
         .unwrap();
-    insert
-        .execute(&mut db, &[Value::Int(2), Value::Int(200)])
+    db.execute_prepared(&insert, &[Value::Int(2), Value::Int(200)])
         .unwrap();
 
     let select = db.prepare("SELECT id, v FROM t WHERE v = $1").unwrap();
-    let mut rows = select.query(&mut db, &[Value::Int(200)]).unwrap();
+    let mut rows = db.query_prepared(&select, &[Value::Int(200)]).unwrap();
     assert_eq!(rows.column_names(), &["id".to_string(), "v".to_string()]);
     let collected: Vec<Vec<Value>> = rows.by_ref().collect();
     assert_eq!(collected, vec![vec![Value::Int(2), Value::Int(200)]]);
@@ -135,9 +133,9 @@ fn prepare_execute_and_query_with_params() {
 
 #[test]
 fn one_shot_query_iterates_rows() {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)", &[]).unwrap();
     let ids: Vec<Value> = db
         .query("SELECT id FROM t", &[])
         .unwrap()
@@ -148,7 +146,7 @@ fn one_shot_query_iterates_rows() {
 
 #[test]
 fn query_on_non_query_statement_errors() {
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert!(
         db.query("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
             .is_err()
@@ -157,16 +155,17 @@ fn query_on_non_query_statement_errors() {
 
 #[test]
 fn errors_surface_with_sqlstate() {
-    let db = Engine::new();
+    let db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(db.prepare("SELCT 1").err().unwrap().code(), "42601");
 }
 
 #[test]
 fn commit_on_in_memory_is_noop_success() {
-    let mut db = Engine::new();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
-    db.commit().unwrap(); // no path -> no-op, not an error
-    assert_eq!(db.txid(), 0);
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap();
+    let before = db.txid();
+    db.commit().unwrap(); // no open block -> a no-op success, not an error
+    assert_eq!(db.txid(), before, "a no-op commit advances nothing");
     assert!(db.path().is_none());
 }
 
@@ -179,14 +178,14 @@ fn incremental_commit_round_trips_to_canonical_image() {
     // db's, byte-for-byte (spec/fileformat/format.md, *Allocation & incremental commit*).
     let path = tmp("incremental_canonical.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (5, 50)").unwrap();
+    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (5, 50)", &[]).unwrap();
     db.commit().unwrap();
     let canonical = db.to_image(db.page_size(), db.txid()).unwrap();
-    db.close().unwrap();
+    drop(db);
 
-    let reopened = Engine::open(&path).unwrap();
+    let reopened = Database::open(&path).unwrap().session(SessionOptions::default());
     assert_eq!(
         reopened
             .to_image(reopened.page_size(), reopened.txid())
@@ -203,52 +202,52 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     // 25006, and the file bytes are never touched.
     let path = tmp("readonly.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
-    db.close().unwrap();
+    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    drop(db);
     let before = std::fs::read(&path).unwrap();
 
-    let mut db = Engine::open_with_options(
+    let mut db = Database::open_with_options(
         &path,
         OpenOptions {
             read_only: true,
             ..OpenOptions::default()
         },
     )
-    .unwrap();
+    .unwrap().session(SessionOptions::default());
     assert!(db.read_only());
 
     // Reads work — bare and inside an explicit block (plain BEGIN defaults to READ ONLY here).
-    match execute(&mut db, "SELECT id FROM t").unwrap() {
+    match db.execute("SELECT id FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
         _ => panic!("expected a query"),
     }
-    execute(&mut db, "BEGIN").unwrap();
-    execute(&mut db, "SELECT id FROM t").unwrap();
-    execute(&mut db, "COMMIT").unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    db.execute("SELECT id FROM t", &[]).unwrap();
+    db.execute("COMMIT", &[]).unwrap();
 
     // Autocommit writes are 25006 (the implicit transaction is read-only)...
     assert_eq!(
-        execute(&mut db, "INSERT INTO t VALUES (2)")
+        db.execute("INSERT INTO t VALUES (2)", &[])
             .unwrap_err()
             .code(),
         "25006"
     );
     // ...as are writes inside a block (which then poisons, like any in-block error)...
-    execute(&mut db, "BEGIN").unwrap();
+    db.execute("BEGIN", &[]).unwrap();
     assert_eq!(
-        execute(&mut db, "DELETE FROM t").unwrap_err().code(),
+        db.execute("DELETE FROM t", &[]).unwrap_err().code(),
         "25006"
     );
     assert_eq!(
-        execute(&mut db, "SELECT id FROM t").unwrap_err().code(),
+        db.execute("SELECT id FROM t", &[]).unwrap_err().code(),
         "25P02"
     );
-    execute(&mut db, "ROLLBACK").unwrap();
+    db.execute("ROLLBACK", &[]).unwrap();
     // ...and an explicit READ WRITE request, via SQL or the host API.
     assert_eq!(
-        execute(&mut db, "BEGIN READ WRITE").unwrap_err().code(),
+        db.execute("BEGIN READ WRITE", &[]).unwrap_err().code(),
         "25006"
     );
     assert_eq!(db.begin(true).err().unwrap().code(), "25006");
@@ -261,15 +260,15 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
             .code(),
         "25006"
     );
-    db.close().unwrap();
+    drop(db);
 
     // The file is byte-identical after the whole read-only session.
     assert_eq!(std::fs::read(&path).unwrap(), before);
 
     // A normal reopen is writable again.
-    let mut db = Engine::open(&path).unwrap();
+    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
     assert!(!db.read_only());
-    execute(&mut db, "INSERT INTO t VALUES (2)").unwrap();
+    db.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
 }
 
 #[test]
@@ -278,32 +277,32 @@ fn rows_affected_reports_dml_counts() {
     // how many rows they touched (PostgreSQL's command-tag count); a DML statement that
     // matched nothing reports Some(0); DDL and transaction control report None; DML with
     // RETURNING is a query outcome (its row count is the result's length).
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     let affected = |out: Outcome| match out {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement outcome"),
     };
 
-    let ddl = execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
+    let ddl = db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
     assert_eq!(affected(ddl), None);
-    let ins = execute(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    let ins = db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", &[]).unwrap();
     assert_eq!(affected(ins), Some(3));
-    let upd = execute(&mut db, "UPDATE t SET v = v + 1 WHERE id <= 2").unwrap();
+    let upd = db.execute("UPDATE t SET v = v + 1 WHERE id <= 2", &[]).unwrap();
     assert_eq!(affected(upd), Some(2));
-    let del = execute(&mut db, "DELETE FROM t WHERE id = 3").unwrap();
+    let del = db.execute("DELETE FROM t WHERE id = 3", &[]).unwrap();
     assert_eq!(affected(del), Some(1));
-    let none = execute(&mut db, "DELETE FROM t WHERE id = 99").unwrap();
+    let none = db.execute("DELETE FROM t WHERE id = 99", &[]).unwrap();
     assert_eq!(affected(none), Some(0));
-    let begin = execute(&mut db, "BEGIN").unwrap();
+    let begin = db.execute("BEGIN", &[]).unwrap();
     assert_eq!(affected(begin), None);
-    let commit = execute(&mut db, "COMMIT").unwrap();
+    let commit = db.execute("COMMIT", &[]).unwrap();
     assert_eq!(affected(commit), None);
 
     // INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
-    execute(&mut db, "CREATE TABLE dst (id i32 PRIMARY KEY)").unwrap();
-    let ins_sel = execute(&mut db, "INSERT INTO dst SELECT id FROM t").unwrap();
+    db.execute("CREATE TABLE dst (id i32 PRIMARY KEY)", &[]).unwrap();
+    let ins_sel = db.execute("INSERT INTO dst SELECT id FROM t", &[]).unwrap();
     assert_eq!(affected(ins_sel), Some(2));
-    match execute(&mut db, "DELETE FROM dst RETURNING id").unwrap() {
+    match db.execute("DELETE FROM dst RETURNING id", &[]).unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(rows.len(), 2),
         _ => panic!("RETURNING must yield a query outcome"),
     }
@@ -313,20 +312,20 @@ fn rows_affected_reports_dml_counts() {
 fn table_names_lists_tables_sorted_excluding_indexes() {
     // The catalog-read surface (api.md §6): canonical names, sorted ascending by
     // lowercased name; secondary indexes are relations but not tables.
-    let mut db = Engine::new();
+    let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(db.table_names(), Vec::<String>::new());
-    execute(&mut db, "CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)").unwrap();
-    execute(&mut db, "CREATE TABLE apple (id i32 PRIMARY KEY)").unwrap();
-    execute(&mut db, "CREATE INDEX zed_v_idx ON Zed (v)").unwrap();
+    db.execute("CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("CREATE TABLE apple (id i32 PRIMARY KEY)", &[]).unwrap();
+    db.execute("CREATE INDEX zed_v_idx ON Zed (v)", &[]).unwrap();
     // Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
     assert_eq!(
         db.table_names(),
         vec!["apple".to_string(), "Zed".to_string()]
     );
     // The visible snapshot includes an open transaction's working set.
-    execute(&mut db, "BEGIN").unwrap();
-    execute(&mut db, "CREATE TABLE mid (id i32 PRIMARY KEY)").unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    db.execute("CREATE TABLE mid (id i32 PRIMARY KEY)", &[]).unwrap();
     assert_eq!(db.table_names(), vec!["apple", "mid", "Zed"]);
-    execute(&mut db, "ROLLBACK").unwrap();
+    db.execute("ROLLBACK", &[]).unwrap();
     assert_eq!(db.table_names(), vec!["apple", "Zed"]);
 }

@@ -615,6 +615,10 @@ impl Database {
         // committed version in the watermark like a read session. A writable core mints the autocommit
         // lazy-gate session.
         let (access, pinned) = if self.0.read_only() {
+            // The engine enforces read-only too, so `begin_tx` rejects an explicit `BEGIN READ WRITE`
+            // (25006) and downgrades a plain `BEGIN` to a read-only block (the access check above only
+            // catches direct writes).
+            engine.read_only = true;
             self.0
                 .live
                 .lock()
@@ -776,6 +780,12 @@ impl Session {
     fn dispatch(&mut self, ast: Statement, params: &[Value]) -> Result<Outcome> {
         if self.access == Access::ReadOnly {
             if stmt_is_write(&ast) {
+                // A write in a read-only transaction aborts it (PostgreSQL, §6): poison the open
+                // block so every later statement but COMMIT/ROLLBACK is `25P02`. (Autocommit — no
+                // open block — has nothing to poison.)
+                if self.engine.in_transaction() {
+                    self.engine.fail_open_block();
+                }
                 return Err(EngineError::new(
                     SqlState::ReadOnlySqlTransaction,
                     "cannot execute a write statement against a read-only snapshot",
@@ -841,7 +851,19 @@ impl Session {
                 .register(self.base_version);
             self.pinned = Some(self.base_version);
         }
-        self.engine.begin_tx(writable)
+        match self.engine.begin_tx(writable) {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                // begin_tx rejected (e.g. `BEGIN READ WRITE` on a read-only session → 25006): release
+                // the writer gate this begin eagerly acquired so the session is not left holding it
+                // (the rw=false branch acquires no gate and begin_tx does not error there).
+                if self.gate_held {
+                    self.shared.release_writer();
+                    self.gate_held = false;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// End the open block (spec/design/session.md §2.4). `commit`: a clean writable block publishes
@@ -1069,6 +1091,12 @@ impl Session {
     /// The backing file path (`None` in-memory). In-crate storage tests; hosts use [`Database::path`].
     pub(crate) fn path(&self) -> Option<std::path::PathBuf> {
         self.shared.path()
+    }
+
+    /// Whether the backing database was opened read-only. In-crate storage/host tests; hosts use
+    /// [`Database::read_only`].
+    pub(crate) fn read_only(&self) -> bool {
+        self.shared.read_only()
     }
 
     /// Set the per-database default collation for new `text` columns (collation.md §4). White-box
