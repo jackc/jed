@@ -110,15 +110,18 @@ func (s *PreparedStatement) Execute(params []Value) (Outcome, error) {
 	return s.db.ExecuteStmtParams(s.ast, params)
 }
 
-// QueryValues runs this query statement, returning a row cursor. A non-query statement is a 42601
-// (use Execute). This is the raw []Value path; the ergonomic Query(ctx, args...) in ergonomic.go
-// owns the Query name (api.md §11).
+// QueryValues runs this query statement, returning a row cursor. The prepared AST routes through the
+// same lazy streaming / buffered / deferred lanes as the ad-hoc Query (spec/design/streaming.md §3/§4/§7)
+// — so a prepared query streams exactly like a one-shot one. When prepared on a Session (sess set) it
+// routes through the session (the pinned snapshot + watermark, the converged §2.4 semantics); a bare
+// engine prepared statement routes through the engine. A non-query statement is a 42601 (use Execute).
+// This is the raw []Value path; the ergonomic Query(ctx, args...) in ergonomic.go owns the Query name
+// (api.md §11).
 func (s *PreparedStatement) QueryValues(params []Value) (*Rows, error) {
-	out, err := s.Execute(params)
-	if err != nil {
-		return nil, err
+	if s.sess != nil {
+		return s.sess.queryStmt(s.ast, params)
 	}
-	return rowsFromOutcome(out)
+	return s.db.queryStmt(s.ast, params)
 }
 
 // ExecuteSQL is a one-shot: parse + execute sql, binding params, returning the outcome. (The
@@ -140,6 +143,16 @@ func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
+	return db.queryStmt(stmt, params)
+}
+
+// queryStmt routes an already-parsed query AST through the lazy streaming / buffered / deferred lanes,
+// falling back to the materialized ExecuteStmtParams for a shape no lazy lane covers (a write, a
+// nextval/setval SELECT, a data-modifying WITH). Shared by QuerySQL (parse-then-route) and a prepared
+// query (PreparedStatement.QueryValues, route the prepared AST), so a prepared query streams identically
+// to an ad-hoc one. (This is the bare single-handle engine; the watermark pin lives on the shared-core
+// Session.Query path.)
+func (db *engine) queryStmt(stmt statement, params []Value) (*Rows, error) {
 	if rows, ok, err := db.tryStreamingQuery(stmt, params); err != nil {
 		return nil, err
 	} else if ok {

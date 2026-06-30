@@ -730,3 +730,265 @@ func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 		t.Fatalf("post-write count = %v, want 7", after)
 	}
 }
+
+// ---- prepared-statement streaming (the prepared query path; streaming.md §7) ----------------------
+//
+// A prepared query (Prepare + QueryValues) routes its parsed AST through the SAME lazy lanes as the
+// ad-hoc Query — so a prepared SELECT streams (single-table pull / blocking-buffer / deferred set-op),
+// pins its snapshot in the watermark, and offers the early-exit win, all identical to a one-shot query.
+
+// preparedStreamResult: a prepared query's rows, fully drained, + final cost.
+func preparedStreamResult(t *testing.T, s *Session, sql string, params []Value) ([][]Value, int64) {
+	t.Helper()
+	stmt, err := s.Prepare(sql)
+	if err != nil {
+		t.Fatalf("prepare %q: %v", sql, err)
+	}
+	rows, err := stmt.QueryValues(params)
+	if err != nil {
+		t.Fatalf("query prepared %q: %v", sql, err)
+	}
+	var out [][]Value
+	for rows.Next() {
+		out = append(out, rows.Row())
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("drain prepared %q: %v", sql, err)
+	}
+	cost := rows.Cost()
+	_ = rows.Close()
+	return out, cost
+}
+
+// A fully-drained prepared query yields the IDENTICAL rows + total cost as the ad-hoc Query (and thus
+// Execute, §6), across every lane — streaming, buffered, and deferred.
+func TestPreparedQueryMatchesStreamed(t *testing.T) {
+	db := seededKV(t, 100)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	for _, sql := range []string{
+		"SELECT id, v FROM t LIMIT 5",                                                   // streaming (LIMIT short-circuit)
+		"SELECT id, v FROM t ORDER BY id LIMIT 7",                                       // streaming (PK-ordered)
+		"SELECT v FROM t ORDER BY v LIMIT 6",                                            // buffered (non-PK sort, top-N)
+		"SELECT count(*) FROM t",                                                        // buffered (aggregate)
+		"SELECT DISTINCT v FROM t ORDER BY v",                                           // buffered (DISTINCT + sort)
+		"SELECT v FROM t WHERE id <= 3 UNION SELECT v FROM t WHERE id >= 98 ORDER BY v", // deferred (set op)
+		"WITH x AS (SELECT id, v FROM t WHERE v > 500) SELECT id, v FROM x ORDER BY id", // deferred (WITH)
+	} {
+		er, ec := streamResult(t, s, sql)
+		pr, pc := preparedStreamResult(t, s, sql, nil)
+		if !rowsEqual(pr, er) {
+			t.Fatalf("prepared rows mismatch %q:\n stream=%v\n prepared=%v", sql, er, pr)
+		}
+		if pc != ec {
+			t.Fatalf("prepared cost mismatch %q: stream=%d prepared=%d", sql, ec, pc)
+		}
+	}
+}
+
+// A prepared query binds $N params and streams: the bound prepared run matches the ad-hoc bound Query
+// on rows + cost, and the statement is reusable across runs with different params.
+func TestPreparedQueryBindsParamsAndStreams(t *testing.T) {
+	db := seededKV(t, 100)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	sql := "SELECT id, v FROM t WHERE id >= $1 ORDER BY id LIMIT 4"
+
+	adHoc, ac := streamResultParams(t, s, sql, []Value{IntValue(90)})
+	pr, pc := preparedStreamResult(t, s, sql, []Value{IntValue(90)})
+	want := [][]int64{{90, 900}, {91, 910}, {92, 920}, {93, 930}}
+	if !intRowsEqual(pr, want) {
+		t.Fatalf("prepared bound rows = %v, want %v", pr, want)
+	}
+	if !rowsEqual(pr, adHoc) || pc != ac {
+		t.Fatalf("prepared bound run must match ad-hoc: rowsEqual=%v cost prepared=%d adhoc=%d", rowsEqual(pr, adHoc), pc, ac)
+	}
+	// Reusable: a second run with a different param re-streams.
+	pr2, _ := preparedStreamResult(t, s, sql, []Value{IntValue(1)})
+	if len(pr2) != 4 || pr2[0][0].Int != 1 {
+		t.Fatalf("reused prepared run = %v, want first id 1", pr2)
+	}
+}
+
+// Early exit (§6) on the prepared path: pulling only a prefix charges LESS than a full drain — the
+// streaming win now reaches prepared queries.
+func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
+	db := seededKV(t, 1000)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	stmt, err := s.Prepare("SELECT id FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := stmt.QueryValues(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for full.Next() {
+	}
+	if err := full.Err(); err != nil {
+		t.Fatal(err)
+	}
+	fullCost := full.Cost()
+	_ = full.Close()
+
+	rows, err := stmt.QueryValues(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefix []int64
+	for i := 0; i < 3 && rows.Next(); i++ {
+		prefix = append(prefix, rows.Row()[0].Int)
+	}
+	partial := rows.Cost()
+	_ = rows.Close()
+	if len(prefix) != 3 || prefix[0] != 1 || prefix[1] != 2 || prefix[2] != 3 {
+		t.Fatalf("early pull prefix = %v, want [1 2 3]", prefix)
+	}
+	if partial >= fullCost {
+		t.Fatalf("prepared early exit must charge less: partial=%d full=%d", partial, fullCost)
+	}
+}
+
+// Snapshot pinning (§5) on the prepared path: an open prepared cursor pins its version in the
+// watermark, sees only its open-time snapshot as a writer commits, and releases on close.
+func TestPreparedQueryPinsSnapshot(t *testing.T) {
+	db := seededKV(t, 3)
+	if db.OldestLiveTxid() != 1 {
+		t.Fatalf("seed oldest=%d", db.OldestLiveTxid())
+	}
+	reader := db.Session(SessionOptions{})
+	defer reader.Close()
+	stmt, err := reader.Prepare("SELECT id FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := stmt.QueryValues(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() || rows.Row()[0].Int != 1 {
+		t.Fatal("first row != 1")
+	}
+	if db.OldestLiveTxid() != 1 {
+		t.Fatalf("open prepared cursor must pin v1, oldest=%d", db.OldestLiveTxid())
+	}
+
+	w := db.WriteSession()
+	if _, err := w.Execute("INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db.OldestLiveTxid() != 1 {
+		t.Fatalf("watermark must hold at the pin, oldest=%d", db.OldestLiveTxid())
+	}
+
+	var rest []int64
+	for rows.Next() {
+		rest = append(rest, rows.Row()[0].Int)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 2 || rest[0] != 2 || rest[1] != 3 {
+		t.Fatalf("frozen snapshot rest = %v, want [2 3]", rest)
+	}
+	_ = rows.Close()
+	if db.OldestLiveTxid() != 2 {
+		t.Fatalf("closed prepared cursor must release its pin, oldest=%d", db.OldestLiveTxid())
+	}
+}
+
+// A mid-drain cost abort (§6) on the prepared path: the 54P01 surfaces during iteration via Err(),
+// not at QueryValues() — the prepared cursor defers its work like the ad-hoc one.
+func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
+	db := seededKV(t, 1000)
+	s := db.Session(SessionOptions{MaxCost: 50})
+	defer s.Close()
+	stmt, err := s.Prepare("SELECT id FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := stmt.QueryValues(nil)
+	if err != nil {
+		t.Fatalf("query (build) must not abort: %v", err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+		if n > 10000 {
+			t.Fatal("the cost ceiling should have aborted the drain")
+		}
+	}
+	err = rows.Err()
+	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54P01" {
+		t.Fatalf("abort = %v, want a 54P01 cost-limit error", err)
+	}
+	_ = rows.Close()
+}
+
+// The bare Database.Prepare convenience streams too (it mints a transient session that the prepared
+// statement owns; the cursor pins its snapshot, so it is not stranded).
+func TestDatabaseQueryPreparedConvenienceStreams(t *testing.T) {
+	db := seededKV(t, 50)
+	stmt, err := db.Prepare("SELECT id, v FROM t ORDER BY id LIMIT 4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := stmt.QueryValues(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]int64
+	for rows.Next() {
+		r := rows.Row()
+		got = append(got, []int64{r[0].Int, r[1].Int})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	want := [][]int64{{1, 10}, {2, 20}, {3, 30}, {4, 40}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// streamResultParams: the streaming (Query) rows + cost for a parameterized query, fully drained.
+func streamResultParams(t *testing.T, s *Session, sql string, params []Value) ([][]Value, int64) {
+	t.Helper()
+	rows, err := s.Query(sql, params)
+	if err != nil {
+		t.Fatalf("query %q: %v", sql, err)
+	}
+	var out [][]Value
+	for rows.Next() {
+		out = append(out, rows.Row())
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("drain %q: %v", sql, err)
+	}
+	cost := rows.Cost()
+	_ = rows.Close()
+	return out, cost
+}
+
+// intRowsEqual compares int-valued rows against a want matrix.
+func intRowsEqual(got [][]Value, want [][]int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if len(got[i]) != len(want[i]) {
+			return false
+		}
+		for j := range got[i] {
+			if got[i][j].Int != want[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
