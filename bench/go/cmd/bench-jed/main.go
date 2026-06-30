@@ -114,7 +114,9 @@ func (s *jedStmt) Exec(args []any) error {
 }
 
 func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
-	rows, err := s.stmt.Query(bindArgs(args))
+	// QueryValues is the raw []Value prepared-statement path; the bare `Query` name is now the
+	// ergonomic ctx/variadic form (impl/go/ergonomic.go, the cancellation work).
+	rows, err := s.stmt.QueryValues(bindArgs(args))
 	if err != nil {
 		return 0, err
 	}
