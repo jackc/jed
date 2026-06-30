@@ -11023,6 +11023,84 @@ impl Engine {
         Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
     }
 
+    /// Try to serve `ast` as a lazy **deferred** query (spec/design/streaming.md §4/§7) — the
+    /// `query()` path for a top-level **set operation** (`UNION`/`INTERSECT`/`EXCEPT`) or a
+    /// **pure-query `WITH`**. These are blocking shapes whose output is already projected AND charged
+    /// (no per-row top-level projection to defer), so the only streaming win is **lazy-yield**
+    /// (streaming.md §7): the cursor defers the whole `run_set_op` / `run_with` to its FIRST pull — so a
+    /// `54P01` cost abort, a `54P02` lifetime abort, a `57014` cancellation, or an arithmetic trap
+    /// surfaces *during iteration*, not at `query()` (§6) — then yields the buffered result one row at a
+    /// time over a frozen snapshot (§5). Returns `None` for any non-set-op/WITH statement, or a
+    /// write-classified one (a data-modifying `WITH`, or a `nextval`/`setval` call — [`stmt_is_write`]),
+    /// which falls back to the materialized `dispatch` path. Under **full drain** the rows + total cost
+    /// are byte-identical to the eager `execute()` path (it drives the SAME `run_set_op` / `run_with`,
+    /// §6), so the corpus — which drives `execute()` — stays green by construction; per-core unit tests
+    /// pin `query()` == `execute()`.
+    pub(crate) fn try_deferred_query(
+        &self,
+        ast: &Statement,
+        params: &[Value],
+    ) -> Result<Option<Rows>> {
+        // A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write
+        // gate and never streams (streaming.md §7 / sequences.md §4).
+        if stmt_is_write(ast) {
+            return Ok(None);
+        }
+        let query = match ast {
+            Statement::SetOp(so) => DeferredQuery::SetOp(so.clone()),
+            Statement::With(wq) => DeferredQuery::With(wq.clone()),
+            _ => return Ok(None),
+        };
+        // Resolve the output column names up front (the `Rows` cursor exposes them before the first
+        // pull). Planning is unmetered + deterministic, so the names read here are the IDENTICAL names
+        // the deferred run produces (the run on first pull reuses `run_set_op`/`run_with` verbatim, so
+        // there is no rows/cost drift). A planning error (42P01/42804/…) surfaces at `query()`,
+        // matching the eager path.
+        let column_names = self.deferred_column_names(ast)?;
+        let stream = DeferredResult {
+            engine: self.snapshot_engine(),
+            query: Some(query),
+            params: params.to_vec(),
+            state: DeferredState::Pending,
+            cost: 0,
+        };
+        Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
+    }
+
+    /// The output column names of a top-level set operation / pure-query `WITH`, resolved by planning
+    /// only (no execution) — fills a [`DeferredResult`] cursor's metadata before its first pull
+    /// ([`try_deferred_query`]). Mirrors the planning prefix of `run_set_op` / `run_with` exactly so the
+    /// names match the deferred run's. Bound params are not needed: column names never depend on bound
+    /// values.
+    fn deferred_column_names(&self, ast: &Statement) -> Result<Vec<String>> {
+        let mut ptypes = ParamTypes::default();
+        let names = match ast {
+            Statement::SetOp(so) => self
+                .plan_query(
+                    &QueryExpr::SetOp(Box::new(so.clone())),
+                    None,
+                    &[],
+                    &mut ptypes,
+                )?
+                .column_names()
+                .to_vec(),
+            Statement::With(wq) => {
+                // The planning prefix of `run_with` (cte.md): plan the CTE bindings, then the body with
+                // them visible. The body's column names are the WITH's output names.
+                let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
+                let body_q = wq
+                    .body
+                    .as_query()
+                    .expect("a pure-query WITH (DML excluded by stmt_is_write)");
+                self.plan_query(body_q, None, &bindings, &mut ptypes)?
+                    .column_names()
+                    .to_vec()
+            }
+            _ => unreachable!("try_deferred_query only calls this for SetOp / With"),
+        };
+        Ok(names)
+    }
+
     /// Streaming secondary-index-order scan (spec/design/cost.md §3 "secondary-index order"): an
     /// `ORDER BY` the PK scan does NOT satisfy but a B-tree index does, with a `LIMIT` (the gate —
     /// `plan.index_order` is `Some`). Walks the index store forward in key order (the indexed
@@ -19801,6 +19879,79 @@ impl crate::cursor::RowStream for BufferedScan {
         // The pinned snapshot is owned by `self.engine` and released on `Drop`; mark done so any
         // further `next_row` is a no-op (streaming.md §5, idempotent).
         self.state = BufState::Done;
+    }
+}
+
+/// A top-level set operation / pure-query `WITH` deferred to a lazy cursor (spec/design/streaming.md
+/// §4/§7). Its output is already projected + charged, so there is no per-row projection to defer — the
+/// cursor's only job is to run the whole query on the FIRST pull and yield the result one row at a
+/// time. Owned by a [`DeferredResult`]; run via the eager `run_set_op` / `run_with` verbatim so the
+/// rows + cost match `execute()` exactly (§6).
+enum DeferredQuery {
+    SetOp(SetOp),
+    With(WithQuery),
+}
+
+/// The lazy **deferred** pull pipeline behind a `query()` [`Rows`](crate::Rows) cursor for a top-level
+/// set operation / pure-query `WITH` (spec/design/streaming.md §7). It owns a frozen snapshot
+/// [`Engine`] (§5), the owned query AST, and the bound params; on its FIRST
+/// [`next_row`](crate::cursor::RowStream::next_row) it runs the whole `run_set_op` / `run_with` to
+/// completion (so a cost abort / cancellation / trap surfaces *during iteration*, not at `query()` —
+/// §6), records the accrued cost, and yields the materialized result **one row at a time**. The input
+/// is still buffered (a set op dedups / a `WITH` materializes — it must), so the win here is only
+/// lazy-yield: the work is deferred to the first pull and the result rows are handed out incrementally
+/// rather than wrapped in an eager `Outcome`. Under full drain the rows + total cost are byte-identical
+/// to the eager path (it drives the SAME `run_*`, §6).
+struct DeferredResult {
+    engine: Engine,
+    /// The query to run, taken on the first pull (`None` afterwards).
+    query: Option<DeferredQuery>,
+    params: Vec<Value>,
+    state: DeferredState,
+    /// The accrued cost — 0 until the first pull runs the query, then `SelectResult::cost` (final).
+    cost: i64,
+}
+
+/// The lazy emission state of a [`DeferredResult`] (spec/design/streaming.md §7).
+enum DeferredState {
+    /// The query has not run yet — the first `next_row` runs it (streaming.md §7).
+    Pending,
+    /// The materialized result, walked one row at a time.
+    Yielding(std::vec::IntoIter<Vec<Value>>),
+    /// Exhausted (or the cursor was closed) — every further `next_row` is `None`.
+    Done,
+}
+
+impl crate::cursor::RowStream for DeferredResult {
+    fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+        // Run the whole set op / WITH on the FIRST pull (streaming.md §7), reusing the eager
+        // `run_set_op` / `run_with` verbatim so the rows + cost match `execute()` exactly. A mid-run
+        // cost abort / cancellation / arithmetic trap surfaces HERE (during iteration), not at
+        // `query()` (streaming.md §6). `query.take()` releases its borrow before the `&self.engine`
+        // run, so the later `self.cost`/`self.state` writes do not alias.
+        if let Some(query) = self.query.take() {
+            let r = match query {
+                DeferredQuery::SetOp(so) => self.engine.run_set_op(so, &self.params)?,
+                DeferredQuery::With(wq) => self.engine.run_with(wq, &self.params)?,
+            };
+            self.cost = r.cost;
+            self.state = DeferredState::Yielding(r.rows.into_iter());
+        }
+        match &mut self.state {
+            DeferredState::Yielding(iter) => Ok(iter.next()),
+            DeferredState::Pending | DeferredState::Done => Ok(None),
+        }
+    }
+
+    fn cost(&self) -> i64 {
+        self.cost
+    }
+
+    fn close(&mut self) {
+        // The frozen snapshot is owned by `self.engine` and released on `Drop`; drop any pending query
+        // + unread rows so a further `next_row` is a no-op (streaming.md §5, idempotent).
+        self.query = None;
+        self.state = DeferredState::Done;
     }
 }
 

@@ -321,8 +321,9 @@ impl Engine {
     /// (spec/design/streaming.md §4, S3); a blocking read (`ORDER BY`/`DISTINCT`/aggregate/window/
     /// join) is served by a **lazy buffered** cursor (S4) that buffers the input but yields the output
     /// one row at a time. Both pull over a pinned snapshot with bounded peak *output* memory and a
-    /// caller early-exit; a set-operation / `WITH` top level falls back to the materialized `execute()`
-    /// path. (This is the bare single-handle [`Engine`]; the watermark pin lives on the shared-core
+    /// caller early-exit; a top-level set operation / pure-query `WITH` is served by a **lazy deferred**
+    /// cursor (streaming.md §7) that defers the run to the first pull and yields the result one row at a
+    /// time. (This is the bare single-handle [`Engine`]; the watermark pin lives on the shared-core
     /// [`Session`](crate::Session) path.)
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         let ast = self.parse(sql)?;
@@ -330,6 +331,9 @@ impl Engine {
             return Ok(rows);
         }
         if let Some(rows) = self.try_buffered_query(&ast, params)? {
+            return Ok(rows);
+        }
+        if let Some(rows) = self.try_deferred_query(&ast, params)? {
             return Ok(rows);
         }
         Rows::from_outcome(self.execute_stmt_params(ast, params)?)

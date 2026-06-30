@@ -3,15 +3,18 @@
 //! The cursor comes in two shapes, chosen by the plan (streaming.md §4):
 //! - **`Buffered`** — a fully materialized result, walked one row at a time. The executor ran the
 //!   query to completion (the `execute()` path that the conformance corpus drives, so it is byte-
-//!   unchanged) and the accrued `cost` is already final. Every blocking plan (sort/aggregate/join/
-//!   set-op/DISTINCT/window) and every non-streamable shape lands here.
-//! - **`Streaming`** (S3) — a lazy pull pipeline for the single-table, no-blocking-operator scan:
-//!   it owns a [pull B-tree scan cursor](crate::storage::StoreScan) over a pinned snapshot
-//!   (streaming.md §5) and runs scan → resolve → `WHERE` → project **one row per `next_row`**,
-//!   accruing cost as it is pulled (streaming.md §6). Peak memory is one row; a caller that stops
-//!   early faults no further leaves and produces no further rows. The work lives behind the
-//!   [`RowStream`] trait (implemented by the executor's `StreamingScan`), so this module stays free
-//!   of executor internals.
+//!   unchanged) and the accrued `cost` is already final. This is the `query()` fallback for the shapes
+//!   no lazy `RowStream` covers yet (a data-modifying `WITH`).
+//! - **`Streaming`** — a lazy pull source behind the [`RowStream`] trait (so this module stays free of
+//!   executor internals), in three executor-side flavors: the **`StreamingScan`** (S3) for the
+//!   single-table, no-blocking-operator scan — it owns a [pull B-tree scan cursor](crate::storage::StoreScan)
+//!   over a pinned snapshot (streaming.md §5) and runs scan → resolve → `WHERE` → project **one row per
+//!   `next_row`**; the **`BufferedScan`** (S4) for a blocking plan (sort/aggregate/join/DISTINCT/window)
+//!   — it buffers its input on the first pull, then yields the output a row at a time; and the
+//!   **`DeferredResult`** for a top-level set operation / pure-query `WITH` (streaming.md §7) — it
+//!   defers the whole run to the first pull, then yields the result a row at a time. All three accrue
+//!   cost as the cursor is pulled (streaming.md §6), so a caller that stops early does — and charges —
+//!   less, and a fully-drained query observes the same rows + total cost as the eager path.
 
 use crate::error::Result;
 use crate::value::Value;

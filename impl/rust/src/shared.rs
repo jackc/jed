@@ -571,8 +571,10 @@ impl Session {
     /// autocommit read re-pins the latest committed, PG-faithful), then the lazy cursor runs over the
     /// pinned snapshot — bounded peak output memory, early-exit — and its snapshot version is
     /// registered in the reader-liveness watermark (streaming.md §5), released when the cursor is
-    /// closed or dropped. A set-operation / `WITH` top level falls back to the materialized `dispatch`
-    /// path → a buffered cursor.
+    /// closed or dropped. A top-level set operation / pure-query `WITH` is served by a **lazy deferred**
+    /// cursor (streaming.md §7) that defers the whole run to the first pull and yields the result one
+    /// row at a time; a data-modifying `WITH` (a write) still falls back to the materialized `dispatch`
+    /// path.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         let ast = self.engine.parse(sql)?;
         // Route the read before building the streaming cursor: an autocommit (non-block, writable
@@ -591,6 +593,12 @@ impl Session {
         if let Some(mut rows) = self.engine.try_buffered_query(&ast, params)? {
             // A lazy buffered cursor (S4, streaming.md §4) is a live reader too — pin its snapshot
             // version in the watermark, released on cursor close/drop.
+            rows.attach_pin(self.shared.reader_pin(self.base_version));
+            return Ok(rows);
+        }
+        if let Some(mut rows) = self.engine.try_deferred_query(&ast, params)? {
+            // A lazy deferred set-op / WITH cursor (streaming.md §7) is a live reader too — pin its
+            // snapshot version in the watermark, released on cursor close/drop.
             rows.attach_pin(self.shared.reader_pin(self.base_version));
             return Ok(rows);
         }
