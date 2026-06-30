@@ -88,13 +88,23 @@ export const querySql = query;
 // Transaction is an open explicit transaction (spec/design/api.md §2.2, transactions.md §4.4).
 // Statements run through execute/query; commit/rollback end it. JS has no destructor, so a raw
 // `begin` caller must end it explicitly — `view`/`update` do that automatically (and are preferred).
+// TxEnd lets a Transaction route commit/rollback through a host (a Session) that does more than the
+// raw Engine swap — e.g. publishing the working set to the shared core and releasing the writer gate.
+// When absent, commit/rollback fall back to the bare Engine swap (the one-handle Engine API).
+export interface TxEnd {
+  commit(): void;
+  rollback(): void;
+}
+
 export class Transaction {
   private readonly db: Engine;
   private done: boolean;
+  private readonly end?: TxEnd;
 
-  constructor(db: Engine) {
+  constructor(db: Engine, end?: TxEnd) {
     this.db = db;
     this.done = false;
+    this.end = end;
   }
 
   // execute runs a (possibly mutating) statement within this transaction, binding params. A write
@@ -114,7 +124,8 @@ export class Transaction {
   commit(): void {
     if (this.done) return;
     this.done = true;
-    this.db.commitTx();
+    if (this.end) this.end.commit();
+    else this.db.commitTx();
   }
 
   // rollback discards the transaction's working set. Idempotent after the transaction has ended, so
@@ -122,7 +133,8 @@ export class Transaction {
   rollback(): void {
     if (this.done) return;
     this.done = true;
-    this.db.rollbackTx();
+    if (this.end) this.end.rollback();
+    else this.db.rollbackTx();
   }
 }
 

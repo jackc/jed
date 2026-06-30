@@ -162,7 +162,7 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
         },
     )
     .unwrap();
-    let core = db.core().clone();
+    let core = db.clone();
 
     let writer = {
         let core = core.clone();

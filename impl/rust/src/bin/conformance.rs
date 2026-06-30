@@ -15,7 +15,7 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{Database, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, SharedCore, Value};
+use jed::{Database, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1388,7 +1388,7 @@ fn run_concurrency_file_threaded(text: &str) -> Result<(), String> {
 /// threaded run consistent with the schedule must produce. `gate_holder` is the live writer's sid
 /// (the single-writer gate), and `blocked` is the at-most-one writer queued on it.
 fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
-    let db = SharedCore::new_in_memory();
+    let db = Database::new_in_memory();
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let mut gate_holder: Option<String> = None; // the live writer holding the gate
     let mut blocked: Option<String> = None; // a writer queued on the gate (Layer 2 `blocks`)
@@ -1517,7 +1517,7 @@ struct Worker {
 /// A read session's worker thread: pins a snapshot, runs records against it, and on `close` returns
 /// (dropping the handle, which deregisters → advances the watermark).
 #[cfg(test)]
-fn read_worker(db: SharedCore, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
+fn read_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
     let mut h = db.read_session();
     let _ = tx.send(Ok(())); // ack the open: the snapshot is pinned + registered
     while let Ok(cmd) = rx.recv() {
@@ -1540,7 +1540,7 @@ fn read_worker(db: SharedCore, sid: String, rx: Receiver<Cmd>, tx: Sender<Result
 /// A write session's worker thread: acquires the writer gate, runs records against the working set,
 /// and on `commit`/`rollback` ends the transaction (publishing or discarding) then returns.
 #[cfg(test)]
-fn write_worker(db: SharedCore, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
+fn write_worker(db: Database, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
     let mut h = db.write_session();
     let _ = tx.send(Ok(())); // ack the open: the writer gate is held, working set captured
     while let Ok(cmd) = rx.recv() {
@@ -1568,7 +1568,7 @@ fn write_worker(db: SharedCore, sid: String, rx: Receiver<Cmd>, tx: Sender<Resul
 /// the gate-releasing step, when its `write()` returns and it sends the deferred ack.
 #[cfg(test)]
 struct Driver {
-    db: SharedCore,
+    db: Database,
     workers: HashMap<String, Worker>,
     gate_holder: Option<String>,
     blocked: Option<(String, Worker)>,
@@ -1578,14 +1578,14 @@ struct Driver {
 impl Driver {
     fn new() -> Self {
         Driver {
-            db: SharedCore::new_in_memory(),
+            db: Database::new_in_memory(),
             workers: HashMap::new(),
             gate_holder: None,
             blocked: None,
         }
     }
 
-    /// Spawn a per-session worker thread. `SharedCore` is `Send + Sync` — proven by moving a clone into
+    /// Spawn a per-session worker thread. `Database` is `Send + Sync` — proven by moving a clone into
     /// the thread, where the handle is created, used, and dropped (only the shared core crosses over).
     fn spawn(&self, mode: &str, sid: &str) -> Result<Worker, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -1845,7 +1845,7 @@ fn recv_reply(rx: &Receiver<Result<(), String>>) -> Result<Result<(), String>, S
 mod concurrency_threaded_tests {
     //! Run every `# format: concurrency` suite file in the stepped-THREADED mode (§4.3): one OS
     //! thread per session, the schedule order enforced by a turn token. The point is `cargo test`
-    //! under the race detector / TSan — real concurrent-path coverage of SharedCore that the
+    //! under the race detector / TSan — real concurrent-path coverage of Database that the
     //! single-threaded sequential walk cannot give. The asserted result is identical to sequential
     //! (the schedule is timing-free, §2), so a divergence here is a genuine concurrency bug.
 

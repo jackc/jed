@@ -31,9 +31,14 @@ func main() {
 		fmt.Println("denied:", err) // 42501 permission denied for table report
 	}
 
-	// Grant/Revoke adjust one object at a time, and revoke always wins. Revoke EXECUTE on a volatile
-	// function to pin a session's determinism — calls to it then fail 42501.
-	db.Revoke(jed.PrivSetEmpty.With(jed.PrivExecute), "uuidv4")
+	// Grant/Revoke adjust one object at a time on a session's envelope, and revoke always wins. Revoke
+	// EXECUTE on a volatile function to pin a session's determinism — calls to it then fail 42501.
+	locked := db.Session(jed.SessionOptions{})
+	defer locked.Close()
+	locked.Revoke(jed.PrivSetEmpty.With(jed.PrivExecute), "uuidv4")
+	if _, err := locked.Execute("SELECT uuidv4()", nil); err != nil {
+		fmt.Println("denied:", err) // 42501
+	}
 }
 
 func mustExec(db *jed.Database, sql string) {

@@ -57,7 +57,7 @@ import {
   type SessionOptions,
   type TxStatus,
 } from "./executor.ts";
-import { type Rows, rowsFromOutcome } from "./api.ts";
+import { type Rows, rowsFromOutcome, Transaction } from "./api.ts";
 import { engineError } from "./errors.ts";
 import { persistImpl } from "./persist.ts";
 import type { Statement } from "./ast.ts";
@@ -145,26 +145,23 @@ class SharedCore {
   }
 }
 
-// Database is the host-facing database handle (spec/design/session.md §2.1/§2.4): the shared core PLUS
-// one long-lived default Session whose delegators (execute/query/begin/.../executeScript + the
-// envelope setters) drive it, so the single-handle surface is stateful like a PG/SQLite connection.
-// The same Database is also the concurrency core — readSession/writeSession/session mint independent
-// per-caller handles over it (TS is single-threaded, so no Rust-style !Send split is needed).
+// Database is the host-facing database handle (spec/design/session.md §2.1/§2.4): the shared core. It
+// mints independent per-caller handles (readSession/writeSession/session); the durable per-connection
+// state (transactions across calls, session variables, the envelope) lives on a Session, never on the
+// Database. It also offers bare convenience methods (execute/query/executeScript/view/update) that mint
+// a FRESH autocommit session per call and discard it: committed data persists through the shared core,
+// but no session-local state carries to the next call. (TS is single-threaded, so no Rust-style !Send
+// split is needed.)
 export class Database {
   private core: SharedCore;
-  // def is the long-lived default session the bare delegators drive (§2.1) — a configured autocommit
-  // session over core (the lazy-gate rule). Assigned by `over` right after construction.
-  private def!: Session;
 
   private constructor(core: SharedCore) {
     this.core = core;
   }
 
-  // over wraps a shared core with a fresh default session (the lazy-gate autocommit session of §2.4).
+  // over wraps a shared core as the host handle.
   private static over(core: SharedCore): Database {
-    const db = new Database(core);
-    db.def = db.session({});
-    return db;
+    return new Database(core);
   }
 
   // newInMemory builds a fresh, empty in-memory database plus its default session (committed version 0).
@@ -254,121 +251,67 @@ export class Database {
     return new Session(this.core, engine, "rw", snap.txid, null);
   }
 
-  // --- The default-session delegators (the back-compat single-handle bridge, §2.1): each forwards to
-  // the long-lived default Session. (TS Session has no view/update closures — the documented api.ts
-  // module-cycle deferral, session.md §10 slice 1; drive a block via begin/commit or SQL BEGIN.) ---
+  // --- Bare convenience methods (CLAUDE.md §2 / spec/design/session.md §2.4): each mints a FRESH
+  // autocommit session, runs the statement, and discards it. Committed data persists through the shared
+  // core; session-local state (an open block, session variables, currval, session-local temp tables)
+  // does NOT carry to the next call — for durable connection state mint an explicit session(). ---
 
-  // execute runs a (possibly mutating) statement on the default session, binding $N params.
+  // execute runs a (possibly mutating) statement on a fresh autocommit session, binding $N params.
   execute(sql: string, params: Value[] = []): Outcome {
-    return this.def.execute(sql, params);
+    const s = this.session({});
+    try {
+      return s.execute(sql, params);
+    } finally {
+      s.close();
+    }
   }
-  // query runs a query on the default session, returning a row cursor.
+  // query runs a query on a fresh autocommit session, returning a row cursor (the rows are
+  // materialized, so the cursor stays valid after the session is closed).
   query(sql: string, params: Value[] = []): Rows {
-    return this.def.query(sql, params);
+    const s = this.session({});
+    try {
+      return s.query(sql, params);
+    } finally {
+      s.close();
+    }
   }
-  // executeScript runs a multi-statement script on the default session (spec/design/session.md §4.2).
+  // executeScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
+  // §4.2): the whole run is one implicit transaction (all-or-nothing).
   executeScript(sql: string): ScriptSummary {
-    return this.def.executeScript(sql);
+    const s = this.session({});
+    try {
+      return s.executeScript(sql);
+    } finally {
+      s.close();
+    }
   }
-  // begin opens an explicit transaction block on the default session (§2.2; the host-API BEGIN).
-  begin(writable: boolean): void {
-    this.def.begin(writable);
+  // view runs fn in a READ ONLY transaction on a fresh session (scoped sugar, §2.2).
+  view<R>(fn: (tx: Transaction) => R): R {
+    const s = this.session({});
+    try {
+      return s.view(fn);
+    } finally {
+      s.close();
+    }
   }
-  // commit commits the default session's open block (publish + release the gate; no-op if none).
-  commit(): void {
-    this.def.commit();
+  // update runs fn in a READ WRITE transaction on a fresh session (scoped sugar, §2.2): the closure's
+  // statements commit together, or roll back together on a thrown error.
+  update<R>(fn: (tx: Transaction) => R): R {
+    const s = this.session({});
+    try {
+      return s.update(fn);
+    } finally {
+      s.close();
+    }
   }
-  // rollback rolls back the default session's open block (discard the working set; no-op if none).
-  rollback(): void {
-    this.def.rollback();
-  }
-  // status reports the default session's transaction status (Idle/Open/Failed, §2.2).
-  status(): TxStatus {
-    return this.def.status();
-  }
-  // inTransaction reports whether an explicit transaction block is open on the default session.
-  inTransaction(): boolean {
-    return this.def.inTransaction();
-  }
-  // close releases the default session and closes the backing file (file-backed only). Idempotent.
+  // close closes the backing file (file-backed only). The bare convenience methods autocommit, so
+  // there is never uncommitted work to discard. Idempotent.
   close(): void {
-    this.def.close();
     const st = this.core.storage;
     if (st !== null && st.paging !== null) {
       st.paging.close();
       st.paging = null;
     }
-  }
-
-  // The envelope (spec/design/session.md §3), delegating to the default session.
-  get maxCost(): bigint {
-    return this.def.maxCost;
-  }
-  setMaxCost(limit: bigint): void {
-    this.def.setMaxCost(limit);
-  }
-  setLifetimeMaxCost(limit: bigint): void {
-    this.def.setLifetimeMaxCost(limit);
-  }
-  lifetimeMaxCost(): bigint {
-    return this.def.lifetimeMaxCost();
-  }
-  lifetimeCost(): bigint {
-    return this.def.lifetimeCost();
-  }
-  get maxSqlLength(): number {
-    return this.def.maxSqlLength;
-  }
-  setMaxSqlLength(bytes: number): void {
-    this.def.setMaxSqlLength(bytes);
-  }
-  get workMem(): number {
-    return this.def.workMem;
-  }
-  setWorkMem(bytes: number): void {
-    this.def.setWorkMem(bytes);
-  }
-  setDefaultPrivileges(privs: PrivilegeSet): void {
-    this.def.setDefaultPrivileges(privs);
-  }
-  grant(privs: PrivilegeSet, object: string): void {
-    this.def.grant(privs, object);
-  }
-  revoke(privs: PrivilegeSet, object: string): void {
-    this.def.revoke(privs, object);
-  }
-  get privileges(): Privileges {
-    return this.def.privileges;
-  }
-  get allowDdl(): boolean {
-    return this.def.allowDdl;
-  }
-  setAllowDdl(allow: boolean): void {
-    this.def.setAllowDdl(allow);
-  }
-  setVar(name: string, value: string): void {
-    this.def.setVar(name, value);
-  }
-  resetVar(name: string): void {
-    this.def.resetVar(name);
-  }
-  var(name: string): string | undefined {
-    return this.def.var(name);
-  }
-  setTimeZone(zone: string): void {
-    this.def.setTimeZone(zone);
-  }
-  setRandomSource(f: RandomFill): void {
-    this.def.setRandomSource(f);
-  }
-  clearRandomSource(): void {
-    this.def.clearRandomSource();
-  }
-  setClockSource(f: ClockFunc): void {
-    this.def.setClockSource(f);
-  }
-  clearClockSource(): void {
-    this.def.clearClockSource();
   }
 }
 
@@ -575,6 +518,42 @@ export class Session {
     this.closed = true;
     if (this.engine.session.tx !== null) this.endBlock(false);
     else this.finishBlock();
+  }
+
+  // view runs fn in a READ ONLY transaction on this session (bbolt-style, §2.2): open a read block,
+  // run fn(tx), commit on success / roll back on a thrown error. A write inside is 25006.
+  view<R>(fn: (tx: Transaction) => R): R {
+    return this.withBlock(false, fn);
+  }
+
+  // update runs fn in a READ WRITE transaction on this session (bbolt-style, §2.2): open a write block
+  // (eager gate), run fn(tx), publish on success / roll back on a thrown error — the safe default over
+  // a raw begin.
+  update<R>(fn: (tx: Transaction) => R): R {
+    return this.withBlock(true, fn);
+  }
+
+  private withBlock<R>(writable: boolean, fn: (tx: Transaction) => R): R {
+    this.beginBlock(writable);
+    // The Transaction's commit/rollback route through this session (publish + gate release), not the
+    // bare Engine swap, and are idempotent — so the wrapper's trailing commit/rollback is a no-op when
+    // the closure already ended the block.
+    const tx = new Transaction(this.engine, {
+      commit: () => {
+        if (this.engine.session.tx !== null) this.endBlock(true);
+      },
+      rollback: () => {
+        if (this.engine.session.tx !== null) this.endBlock(false);
+      },
+    });
+    try {
+      const result = fn(tx);
+      tx.commit();
+      return result;
+    } catch (e) {
+      tx.rollback();
+      throw e;
+    }
   }
 
   // executeScript runs a multi-statement script on this session (spec/design/session.md §4.2): split

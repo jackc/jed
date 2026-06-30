@@ -175,19 +175,15 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 	return c
 }
 
-// Database is the host-facing database handle (spec/design/session.md §2.1/§2.4). It is the
-// goroutine-safe shared core PLUS one long-lived default Session: the bare convenience methods
-// (Execute/Query/Begin/View/Update/ExecuteScript/Status/… and the envelope setters) delegate to that
-// default session, so it is stateful (an open BEGIN block, session variables, the time zone, the cost
-// meters persist across calls) exactly like a PostgreSQL/SQLite connection. The same *Database is
-// also the concurrency core — every goroutine uses it and ReadSession/WriteSession/Session mint
-// independent per-goroutine handles over it (Go needs no Rust-style !Send split). NewDatabase /
-// OpenDatabase / CreateDatabase return it.
+// Database is the host-facing database handle (spec/design/session.md §2.1/§2.4): the goroutine-safe
+// shared core. It mints independent per-goroutine handles (ReadSession/WriteSession/Session); the
+// durable per-connection state (transactions across calls, session variables, the envelope) lives on
+// a Session, never on the *Database. It also offers bare convenience methods
+// (Execute/Query/ExecuteScript/View/Update) that mint a FRESH autocommit session per call and discard
+// it: committed data persists through the shared core, but no session-local state carries to the next
+// call. NewDatabase / OpenDatabase / CreateDatabase return it.
 type Database struct {
 	core *sharedCore
-	// def is the long-lived default session the bare delegators drive (§2.1) — a configured autocommit
-	// session over core (the lazy-gate rule), so its writes coexist with additional sessions.
-	def *Session
 }
 
 // NewDatabase builds a fresh, empty in-memory database plus its default session (committed version 0).
@@ -223,11 +219,9 @@ func openDatabaseWithOptions(path string, opts openOptions) (*Database, error) {
 	return databaseOver(sharedCoreFromEngine(e)), nil
 }
 
-// databaseOver wraps a shared core with a fresh default session (the lazy-gate autocommit session).
+// databaseOver wraps a shared core as the host handle.
 func databaseOver(c *sharedCore) *Database {
-	db := &Database{core: c}
-	db.def = db.Session(SessionOptions{})
-	return db
+	return &Database{core: c}
 }
 
 // Version is the committed version currently published (the monotonic commit counter,
@@ -311,96 +305,73 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid}
 }
 
-// --- The default-session delegators (the back-compat single-handle bridge, §2.1): each forwards to
-// the long-lived default Session, so the single-handle surface is stateful like a PG/SQLite connection. ---
+// --- Bare convenience methods (CLAUDE.md §2 / spec/design/session.md §2.4): each mints a FRESH
+// autocommit session, runs the statement, and discards it. Committed data persists through the shared
+// core; session-local state (an open block, session variables, currval, session-local temp tables)
+// does NOT carry to the next call — for durable connection state mint an explicit Session. ---
 
-// Execute runs a (possibly mutating) statement on the default session, binding $N params.
+// Execute runs a (possibly mutating) statement on a fresh autocommit session, binding $N params.
 func (db *Database) Execute(sql string, params []Value) (Outcome, error) {
-	return db.def.Execute(sql, params)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return s.Execute(sql, params)
 }
 
-// Query runs a query on the default session, returning a row cursor.
+// Query runs a query on a fresh autocommit session, returning a row cursor (the rows are
+// materialized, so the cursor stays valid after the session is closed).
 func (db *Database) Query(sql string, params []Value) (*Rows, error) {
-	return db.def.Query(sql, params)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return s.Query(sql, params)
 }
 
-// Prepare parses sql once into a reusable prepared statement on the default session (§2.4).
-func (db *Database) Prepare(sql string) (*PreparedStatement, error) { return db.def.Prepare(sql) }
-
-// ExecuteScript runs a multi-statement script on the default session (spec/design/session.md §4.2).
+// ExecuteScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
+// §4.2): the whole run is one implicit transaction (all-or-nothing).
 func (db *Database) ExecuteScript(sql string) (ScriptSummary, error) {
-	return db.def.ExecuteScript(sql)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return s.ExecuteScript(sql)
 }
 
-// Begin opens an explicit transaction block on the default session (§2.2; the host-API BEGIN).
-func (db *Database) Begin(writable bool) error { return db.def.Begin(writable) }
+// View runs fn in a READ ONLY transaction on a fresh session (scoped sugar, §2.2).
+func (db *Database) View(fn func(tx *Transaction) error) error {
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return s.View(fn)
+}
 
-// Commit commits the default session's open block (publish + release the gate; no-op if none).
-func (db *Database) Commit() error { return db.def.Commit() }
+// Update runs fn in a READ WRITE transaction on a fresh session (scoped sugar, §2.2): the closure's
+// statements commit together, or roll back together on error.
+func (db *Database) Update(fn func(tx *Transaction) error) error {
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return s.Update(fn)
+}
 
-// Rollback rolls back the default session's open block (discard the working set; no-op if none).
-func (db *Database) Rollback() error { return db.def.Rollback() }
+// Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). The statement
+// is bound to its own fresh session that it owns for its lifetime (a prepared statement is a held,
+// connection-bound resource); drop it to release the session.
+func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
+	return db.Session(SessionOptions{}).Prepare(sql)
+}
 
-// View runs fn in a READ ONLY transaction on the default session (scoped sugar, §2.2).
-func (db *Database) View(fn func(tx *Transaction) error) error { return db.def.View(fn) }
+// UpgradeCollations runs the COLLATION UPGRADE migration on the live database (collation.md §12),
+// returning the number of re-pinned collations. Mints a fresh write session for the migration.
+func (db *Database) UpgradeCollations() (int, error) {
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return s.UpgradeCollations()
+}
 
-// Update runs fn in a READ WRITE transaction on the default session (scoped sugar, §2.2).
-func (db *Database) Update(fn func(tx *Transaction) error) error { return db.def.Update(fn) }
-
-// Status reports the default session's transaction status (Idle/Open/Failed, §2.2).
-func (db *Database) Status() TxStatus { return db.def.Status() }
-
-// InTransaction reports whether an explicit transaction block is open on the default session.
-func (db *Database) InTransaction() bool { return db.def.InTransaction() }
-
-// Close releases the default session and closes the backing file (file-backed only). Idempotent.
+// Close closes the backing file (file-backed only). The bare convenience methods autocommit, so there
+// is never uncommitted work to discard. Idempotent.
 func (db *Database) Close() error {
-	db.def.Close()
 	if st := db.core.storage; st != nil && st.paging != nil {
 		_ = st.paging.close()
 		st.paging = nil
 	}
 	return nil
 }
-
-// The envelope (spec/design/session.md §3), delegating to the default session.
-func (db *Database) MaxCost() int64                          { return db.def.MaxCost() }
-func (db *Database) SetMaxCost(limit int64)                  { db.def.SetMaxCost(limit) }
-func (db *Database) LifetimeMaxCost() int64                  { return db.def.LifetimeMaxCost() }
-func (db *Database) SetLifetimeMaxCost(limit int64)          { db.def.SetLifetimeMaxCost(limit) }
-func (db *Database) LifetimeCost() int64                     { return db.def.LifetimeCost() }
-func (db *Database) MaxSQLLength() int                       { return db.def.MaxSQLLength() }
-func (db *Database) SetMaxSQLLength(b int)                   { db.def.SetMaxSQLLength(b) }
-func (db *Database) WorkMem() int                            { return db.def.WorkMem() }
-func (db *Database) SetWorkMem(b int)                        { db.def.SetWorkMem(b) }
-func (db *Database) SetDefaultPrivileges(privs PrivilegeSet) { db.def.SetDefaultPrivileges(privs) }
-func (db *Database) Grant(privs PrivilegeSet, object string) { db.def.Grant(privs, object) }
-func (db *Database) Revoke(privs PrivilegeSet, object string) {
-	db.def.Revoke(privs, object)
-}
-func (db *Database) Privileges() *Privileges         { return db.def.Privileges() }
-func (db *Database) AllowDDL() bool                  { return db.def.AllowDDL() }
-func (db *Database) SetAllowDDL(allow bool)          { db.def.SetAllowDDL(allow) }
-func (db *Database) SetVar(name, value string) error { return db.def.SetVar(name, value) }
-func (db *Database) ResetVar(name string) error      { return db.def.ResetVar(name) }
-func (db *Database) Var(name string) (string, bool)  { return db.def.Var(name) }
-func (db *Database) SetTimeZone(zone string) error   { return db.def.SetTimeZone(zone) }
-func (db *Database) SetRandomSource(f RandomSource)  { db.def.SetRandomSource(f) }
-func (db *Database) ClearRandomSource()              { db.def.ClearRandomSource() }
-func (db *Database) SetClockSource(f ClockSource)    { db.def.SetClockSource(f) }
-func (db *Database) ClearClockSource()               { db.def.ClearClockSource() }
-
-// The temp-table envelope + the collation-upgrade host op (spec/design/temp-tables.md §5/§7,
-// collation.md §12), delegating to the default session.
-func (db *Database) ResetPrivileges()           { db.def.ResetPrivileges() }
-func (db *Database) SetAllowTempDDL(allow bool) { db.def.SetAllowTempDDL(allow) }
-func (db *Database) SetAllowSharedTempDDL(allow bool) {
-	db.def.SetAllowSharedTempDDL(allow)
-}
-func (db *Database) SetTempBuffers(bytes int)        { db.def.SetTempBuffers(bytes) }
-func (db *Database) SetSharedTempMem(bytes int)      { db.def.SetSharedTempMem(bytes) }
-func (db *Database) ResetVars()                      { db.def.ResetVars() }
-func (db *Database) UpgradeCollations() (int, error) { return db.def.UpgradeCollations() }
 
 // accessMode is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1).
 // Distinct from the privilege envelope (§5.3): accessReadOnly is the coarse snapshot read-only mode

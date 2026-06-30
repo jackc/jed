@@ -3,9 +3,9 @@
 // over a shared Database core (each owns its private Engine, shares committed storage through the
 // core, carries an independent envelope, autocommit with the lazy gate — no swap), plus the explicit
 // Idle/Open/Failed transaction state machine. Per-core API behaviors the shared corpus cannot
-// express (it is single-handle SQL-in/rows-out — CLAUDE.md §10). Mirrors impl/rust/tests/session.rs
-// (TS drives an additional session's transactions via SQL BEGIN/COMMIT through Session.execute — the
-// view/update closure sugar is a TS follow-on, since it would import the api.ts Transaction).
+// express (it is single-handle SQL-in/rows-out — CLAUDE.md §10). Mirrors impl/rust/tests/session.rs,
+// including the view/update closure sugar (now landed on the TS Session, routing the api.ts
+// Transaction's commit/rollback through the session so the working set is published).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -105,4 +105,52 @@ test("additional session cost ceiling is enforced", () => {
 
   a.execute("SELECT * FROM t"); // a unaffected
   assert.strictEqual(a.maxCost, 0n);
+});
+
+test("additional session update closure commits to shared storage", () => {
+  // s.update opens a write block, runs the closure, and publishes on success — another session over
+  // the shared core sees the committed rows. Mirrors impl/rust/tests/session.rs.
+  const db = Database.newInMemory();
+  const a = db.session({});
+  a.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+
+  const s = db.session({});
+  s.update((tx) => {
+    tx.execute("INSERT INTO t VALUES (1)");
+    tx.execute("INSERT INTO t VALUES (2)");
+  });
+
+  assert.deepStrictEqual(queryRows(a.execute("SELECT count(*) FROM t")), [[intValue(2n)]]);
+  assert.strictEqual(a.status(), "Idle");
+});
+
+test("session update rolls back on a thrown error and releases the gate", () => {
+  const db = Database.newInMemory();
+  const s = db.session({});
+  s.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+  assert.throws(() =>
+    s.update((tx) => {
+      tx.execute("INSERT INTO t VALUES (1)");
+      throw new Error("boom");
+    }),
+  );
+  // The block rolled back (the row is gone), the session is back to Idle, and the writer gate is free
+  // (a fresh write succeeds).
+  assert.deepStrictEqual(queryRows(s.execute("SELECT count(*) FROM t")), [[intValue(0n)]]);
+  assert.strictEqual(s.status(), "Idle");
+  s.update((tx) => tx.execute("INSERT INTO t VALUES (9)"));
+  assert.deepStrictEqual(queryRows(s.execute("SELECT count(*) FROM t")), [[intValue(1n)]]);
+});
+
+test("Database view and update mint a fresh session per call", () => {
+  // The bare Database.view/update convenience each mint a fresh autocommit session, run the closure as
+  // one transaction, and discard the session — committed data persists through the shared core.
+  const db = Database.newInMemory();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+  db.update((tx) => {
+    tx.execute("INSERT INTO t VALUES (1)");
+    tx.execute("INSERT INTO t VALUES (2)");
+  });
+  const n = db.view((tx) => [...tx.query("SELECT count(*) FROM t")][0][0]);
+  assert.deepStrictEqual(n, intValue(2n));
 });

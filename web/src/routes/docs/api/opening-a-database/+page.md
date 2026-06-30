@@ -13,10 +13,12 @@ A jed database is a single file on disk. Open or create one, run SQL against it,
 you're done. Pass a path for a durable file, or open a transient **in-memory** database for tests
 and scratch work.
 
-Opening or creating returns a **`Database`** — the handle you run SQL through. It carries a default
-session, so `execute`, `query`, `commit`, and the transaction calls work directly on it; for
-concurrent readers or an untrusted, locked-down caller, mint a separate **session** from the same
-handle (see [Authorization](/docs/api/authorization) and [Resource limits](/docs/api/resource-limits)).
+Opening or creating returns a **`Database`** — the handle you run SQL through. Its `execute`, `query`,
+`executeScript`, and the `update` / `view` transaction helpers each run on a **fresh session** and
+commit it, so a bare statement autocommits. For durable per-connection state — a transaction spanning
+several calls, session variables, or a configured/untrusted caller — mint a separate **session** from
+the same handle (see [Authorization](/docs/api/authorization) and
+[Resource limits](/docs/api/resource-limits)).
 
 Use the **language selector** in the top bar to switch this example between Rust, Go, and
 TypeScript.
@@ -25,9 +27,10 @@ TypeScript.
 
 ## Durability
 
-Writes accumulate until you **commit**. Closing a database discards uncommitted changes — commit is
-always explicit. An in-memory database's commit is a no-op (there is no file to flush). Commits are
-durable: the new state lands on disk before the call returns.
+A bare `execute` **autocommits durably**: it runs on a fresh session that commits before the call
+returns, so the new state is on disk (an in-memory database has nothing to flush). To apply several
+statements **atomically**, run them in one `update` closure — or on a single session's explicit
+`begin` / `commit` block, where a `rollback` (or dropping the session) discards the uncommitted work.
 
 ## In-memory databases
 
@@ -40,8 +43,9 @@ browser — the same engine, no file. Create one with `Database::new_in_memory()
 jed is built to evaluate **untrusted, user-supplied SQL** safely: a query — even a hostile one —
 cannot reach outside the database, corrupt memory, or exhaust resources. The built-in function
 surface is pure (no filesystem, network, process, or clock access beyond a host-injected seam), and
-three limits bound the work any one statement can do. Two are caller-set **per-handle settings** you
-configure once on whatever handle serves untrusted queries:
+three limits bound the work any one statement can do. Two are caller-set **per-session settings** you
+configure on the session that serves untrusted queries — pass them when you mint it, or set them on
+the session:
 
 - **Cost ceiling — `set_max_cost(limit)`** / `SetMaxCost` / `setMaxCost`. Bounds the deterministic
   *execution* cost; a query that reaches the ceiling aborts with `54P01`. `0` (the default) is

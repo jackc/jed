@@ -19,9 +19,12 @@ fn main() -> jed::Result<()> {
     assert_eq!(denied.unwrap_err().code(), "42501"); // permission denied for table report
     untrusted.close(); // release the session (and its reader pin)
 
-    // grant/revoke adjust one object at a time, and revoke always wins. Revoke EXECUTE on a volatile
-    // function to pin a session's determinism — calls to it then fail 42501.
-    db.revoke(PrivilegeSet::EMPTY.with(Privilege::Execute), "uuidv4");
+    // grant/revoke adjust one object at a time on a session's envelope, and revoke always wins. Revoke
+    // EXECUTE on a volatile function to pin a session's determinism — calls to it then fail 42501.
+    let mut locked = db.session(SessionOptions::default());
+    locked.revoke(PrivilegeSet::EMPTY.with(Privilege::Execute), "uuidv4");
+    assert_eq!(locked.execute("SELECT uuidv4()", &[]).unwrap_err().code(), "42501");
+    locked.close();
 
     Ok(())
 }

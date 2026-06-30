@@ -20,8 +20,15 @@ try {
 }
 untrusted.close(); // release the session (and its reader pin)
 
-// grant/revoke adjust one object at a time, and revoke always wins. Revoke EXECUTE on a volatile
-// function to pin a session's determinism — calls to it then fail 42501.
-db.revoke(PrivilegeSet.empty().with('execute'), 'uuidv4');
+// grant/revoke adjust one object at a time on a session's envelope, and revoke always wins. Revoke
+// EXECUTE on a volatile function to pin a session's determinism — calls to it then fail 42501.
+const locked = db.session({});
+locked.revoke(PrivilegeSet.empty().with('execute'), 'uuidv4');
+try {
+  locked.execute('SELECT uuidv4()');
+} catch (e) {
+  console.log('denied'); // 42501
+}
+locked.close();
 
 db.close();

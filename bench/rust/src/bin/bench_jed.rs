@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use jed::{Database, DatabaseOptions, PreparedStatement, Session, SessionOptions, SharedCore, Value};
+use jed::{Database, DatabaseOptions, PreparedStatement, Session, SessionOptions, Value};
 use jed_bench::{
     Arg, BoxResult, Checksum, ConcurrentOutcome, Config, Engine, main_with, read_sidecar,
 };
@@ -135,7 +135,7 @@ impl Engine for JedEngine {
         Ok(read_sidecar(&self.data_dir, &self.dataset, "jed"))
     }
 
-    // concurrent_read opens ONE SharedCore over the dataset file and runs each param block
+    // concurrent_read opens ONE Database over the dataset file and runs each param block
     // on its own thread + reader Session (the slice-7 convergence, session.md §2.4/§10) —
     // every Session shares the core's committed snapshot + buffer pool and reads without
     // blocking (§3). The first pass warms the shared pool; the second is wall-clock-timed.
@@ -147,7 +147,7 @@ impl Engine for JedEngine {
         expect_rows: Option<usize>,
     ) -> BoxResult<Option<ConcurrentOutcome>> {
         let path = format!("{}/{}.jed", self.data_dir, self.dataset);
-        let core = SharedCore::open(&path).map_err(|e| e.to_string())?;
+        let core = Database::open(&path).map_err(|e| e.to_string())?;
         let sql = sql.to_string();
 
         // Pass 1 — warmup, untimed.

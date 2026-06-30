@@ -55,7 +55,7 @@
 // wrapping the safe core (CLAUDE.md §13; ruby.md §4).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use jed::{Database, DatabaseOptions, OpenOptions, Outcome, Value};
+use jed::{Database, DatabaseOptions, OpenOptions, Outcome, Session, SessionOptions, Value};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -128,9 +128,24 @@ fn err_buf(state: &str, msg: &str) -> *mut u8 {
     b.finish()
 }
 
-/// Encode a freshly-opened database handle into a HANDLE buffer (its pointer as a u64).
+/// A persistent gem connection: the shared core (kept so `jed_close` can close the backing file) plus
+/// the one long-lived [`Session`] the gem drives. `Database` no longer owns a default session, so the
+/// connection owns its own — this is what makes `jed_execute("BEGIN")` … `jed_commit()` span calls,
+/// exactly like a PostgreSQL/SQLite connection.
+struct Conn {
+    db: Database,
+    sess: Session,
+}
+
+/// Wrap a freshly-opened core as a gem connection (minting its long-lived autocommit session).
+fn new_conn(db: Database) -> Conn {
+    let sess = db.session(SessionOptions::default());
+    Conn { db, sess }
+}
+
+/// Encode a freshly-opened connection into a HANDLE buffer (its pointer as a u64).
 fn ok_handle(db: Database) -> *mut u8 {
-    let ptr = Box::into_raw(Box::new(db)) as usize as u64;
+    let ptr = Box::into_raw(Box::new(new_conn(db))) as usize as u64;
     let mut b = Buf::new(TAG_HANDLE);
     b.u64(ptr);
     b.finish()
@@ -322,8 +337,8 @@ pub extern "C" fn jed_abi_version() -> u32 {
 /// Open a new in-memory database. Infallible; returns an opaque handle (null only on an internal
 /// panic, which cannot happen for `Database::new_in_memory`).
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_open_memory() -> *mut Database {
-    match catch_unwind(|| Box::into_raw(Box::new(Database::new_in_memory()))) {
+pub extern "C" fn jed_open_memory() -> *mut Conn {
+    match catch_unwind(|| Box::into_raw(Box::new(new_conn(Database::new_in_memory())))) {
         Ok(p) => p,
         Err(_) => std::ptr::null_mut(),
     }
@@ -370,7 +385,7 @@ pub extern "C" fn jed_open(path: *const c_char, read_only: u8) -> *mut u8 {
 /// `SELECT`, a STATEMENT buffer for DDL/DML, or an ERROR buffer. Free the buffer with [`jed_free`].
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_execute(
-    db: *mut Database,
+    db: *mut Conn,
     sql: *const c_char,
     params: *const u8,
     params_len: u32,
@@ -381,7 +396,7 @@ pub extern "C" fn jed_execute(
         }
         // SAFETY: `db` is a live handle returned by jed_open_memory/jed_create/jed_open and not yet
         // passed to jed_close; the gem holds exactly one &mut for the call's duration.
-        let db = unsafe { &mut *db };
+        let conn = unsafe { &mut *db };
         let sql = match cstr(sql) {
             Ok(s) => s,
             Err(b) => return b,
@@ -390,7 +405,7 @@ pub extern "C" fn jed_execute(
             Ok(v) => v,
             Err(b) => return b,
         };
-        match db.execute(sql, &params) {
+        match conn.sess.execute(sql, &params) {
             Ok(outcome) => ok_outcome(&outcome),
             Err(e) => err_buf(e.code(), &e.message),
         }
@@ -400,14 +415,14 @@ pub extern "C" fn jed_execute(
 /// Commit the database's current (autocommit or explicit) transaction, making prior writes durable
 /// per the `synchronous` setting. Returns a UNIT buffer on success or an ERROR buffer.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_commit(db: *mut Database) -> *mut u8 {
+pub extern "C" fn jed_commit(db: *mut Conn) -> *mut u8 {
     guard(|| {
         if db.is_null() {
             return err_buf("XX000", "null database handle");
         }
         // SAFETY: see jed_execute.
-        let db = unsafe { &mut *db };
-        match db.commit() {
+        let conn = unsafe { &mut *db };
+        match conn.sess.commit() {
             Ok(()) => Buf::new(TAG_UNIT).finish(),
             Err(e) => err_buf(e.code(), &e.message),
         }
@@ -451,15 +466,16 @@ pub extern "C" fn jed_load_time_zone_data(ptr: *const u8, len: u32) -> *mut u8 {
 /// — durability is explicit, api.md §2.3). Idempotent only in the sense that a handle must be closed
 /// exactly once: the gem guards against a double `jed_close`.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_close(db: *mut Database) {
+pub extern "C" fn jed_close(db: *mut Conn) {
     if db.is_null() {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `db` was produced by Box::into_raw in jed_open_memory/ok_handle and is closed
         // exactly once (the gem enforces single-close); we reconstruct the Box to drop it.
-        let boxed = unsafe { Box::from_raw(db) };
-        let _ = boxed.close();
+        let Conn { db, sess } = *unsafe { Box::from_raw(db) };
+        drop(sess); // roll back any open block + deregister the snapshot pin
+        let _ = db.close(); // close the backing file (file-backed only)
     }));
 }
 

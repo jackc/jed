@@ -12,11 +12,12 @@
 jed has a **single writer**: at most one write transaction at a time, with readers never blocked
 except during the brief commit. A transaction's changes apply all-or-nothing.
 
-In **Rust and Go**, the `update` helper runs a read-write transaction that commits on success and
-rolls back if your code signals an error — the safest default; there's a read-only `view` helper too.
-The explicit `begin` / `commit` / `rollback` form is available in every language for finer control,
-and is how **TypeScript** drives a block (it has no closure helper). All of these run on the
-`Database` handle directly, or on any session you've minted from it.
+The `update` helper runs a read-write transaction that commits on success and rolls back if your code
+signals an error — the safest default; there's a read-only `view` helper too. Both are available in
+every language (Rust, Go, **and** TypeScript), on the `Database` handle (where each call mints a fresh
+session) or on a session you've minted. For finer control, the explicit `begin` / `commit` /
+`rollback` form lives on a **session** — mint one with `db.session(...)` and drive the block across
+calls.
 
 <CodeTabs topic="transactions" />
 

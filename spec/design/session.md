@@ -47,33 +47,42 @@ state*: the time zone is the `TimeZone` GUC, session variables are user GUCs (`S
 `current_setting()` / `SET TIME ZONE`) rather than inventing parallel vocabulary. jed is
 embedded with no wire connection to establish, so "connection" would be less honest.
 
-**Back-compat is total.** A bare `Database` owns **one long-lived default session** (§2.1) with
-default settings, so `Database::new()`, `open`/`create`, the free `execute(db, sql)`, and every
-conformance harness keep working unchanged ([api.md §2.4](api.md)). The explicit `db.session(opts)`
-is additive — reached only when a host wants a second, independently-configured envelope. (There is
-no interface-stability constraint yet — nothing depends on this surface — so the refinement takes
-the clean shape, not a compatible one.)
+**Update — the persistent default session was removed.** An earlier revision had a bare `Database`
+own **one long-lived default session** (the "back-compat bridge" the narrative below describes).
+That persistent session is **gone.** `Database` is now simply the shared core, and its bare
+convenience methods (`execute`/`query`/`execute_script`/`view`/`update`) **mint a fresh session per
+call** and discard it — committed data persists through the core, but no session-local state (an
+open `BEGIN` block, session variables, `currval`, session-local temp tables) carries across calls.
+Durable per-connection state, and the connection-style setters/transaction calls
+(`set_var`/`set_max_cost`/`grant`/`begin`/`commit`/`rollback`/…), live **only on an explicit
+`Session`** minted with `db.session(opts)` / `read_session()` / `write_session()`. In Rust this also
+let `Database` absorb the old `Send + Sync` `SharedCore` (it is now `Send + Sync + Clone` itself; the
+separate `SharedCore` type and `db.core()` are gone). The sections below are kept for the design
+rationale; where they say "the default session," read "a fresh per-call session, with durable state
+on an explicit `Session`."
 
 ## 2. The shape and lifecycle
 
 ```
-Database ─ committed storage (Snapshot, txid), shared by every session
-  │ owns one                                db.session(opts) ─▶ additional Session(s)
+Database ─ the shared core: committed storage (Snapshot, txid) + the session minters
+  │  db.execute / query / execute_script / view / update  (each mints a FRESH session, runs, drops)
+  │  db.session(opts) / read_session() / write_session() ─▶ Session(s)
   ▼
-default Session ─ stateful: txn status · vars · time zone · cost meters · currval
-  │   db.execute / db.query / db.execute_script   (run on it; split_statements is library-level)
-  └─  begin / view / update  +  SQL BEGIN / COMMIT / ROLLBACK  ─▶  Idle ⇄ Open ⇄ Failed
+Session ─ stateful: txn status · vars · time zone · cost meters · currval · privileges
+      begin / view / update  +  SQL BEGIN / COMMIT / ROLLBACK  ─▶  Idle ⇄ Open ⇄ Failed
 ```
 
-### 2.1 The default session, and where state lives
+### 2.1 The convenience methods, and where state lives
 
-`Database` owns **exactly one long-lived default `Session`.** The bare convenience methods —
-`db.execute`, `db.query`, `db.begin`/`view`/`update`, `db.execute_script` (§4) — are **defined as**
-operating on that default session, so it is **stateful**: an open `BEGIN` block, session variables,
-the time zone, and the cost meters all persist across calls on it, exactly like a PostgreSQL /
-SQLite connection. `db.session(opts) -> Session` mints **additional, independent** sessions with
-their own state and envelope (`opts` is the `SessionOptions` of §3; an absent field takes its
-default).
+`Database` is the shared core and owns **no** persistent session. The bare convenience methods —
+`db.execute`, `db.query`, `db.view`/`update`, `db.execute_script` (§4) — each **mint a fresh
+autocommit session, run on it, and drop it**. So they are *not* stateful across calls: an open
+`BEGIN` block, session variables, the time zone, the cost meters, and `currval` do **not** carry
+from one bare call to the next (committed data does — it lives on the core). For a stateful,
+connection-style handle, `db.session(opts) -> Session` mints an **independent** session with its own
+state and envelope (`opts` is the `SessionOptions` of §3; an absent field takes its default); the
+connection-style setters (`set_var`/`set_max_cost`/`grant`/…) and the cross-call `begin`/`commit`/
+`rollback` block live **only** there.
 
 State ownership splits cleanly — the load-bearing rule:
 

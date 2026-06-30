@@ -81,14 +81,14 @@ pub use executor::{
     SessionOptions, TxStatus,
 };
 // The low-level single-threaded `Engine` is NOT part of the public embedding API — the converged
-// §2.4 handles ([`Database`] / [`Session`] / [`SharedCore`]) are. It stays reachable in-crate (the
+// §2.4 handles ([`Database`] / [`Session`]) are. It stays reachable in-crate (the
 // integration tests) under `jed::Engine` via this crate-private re-export, and to the in-repo CLI
 // via the doc-hidden `tooling` seam below. External wraps/benches drive [`Database`] instead.
 pub(crate) use executor::Engine;
 pub use file::{DatabaseOptions, OpenOptions};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{ClockSource, RandomSource, advancing_clock, fixed_clock, seeded_random_source};
-pub use shared::{Database, Session, SharedCore};
+pub use shared::{Database, Session};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
 pub use timezone::{load_time_zone_data, resolve_zone};
@@ -108,7 +108,7 @@ pub mod tooling {
     // The low-level single-threaded handle + its one-shot conveniences. The in-repo REPL (`cli/`)
     // drives the engine through these and needs the catalog introspection (`Engine::table` /
     // `table_names`) the public `Database` deliberately does not expose. NOT the embedding API —
-    // a host links against `Database` / `Session` / `SharedCore`.
+    // a host links against `Database` / `Session`.
     pub use crate::executor::Engine;
 
     /// One-shot parse + execute against a low-level [`Engine`] (the zero-parameter convenience).

@@ -51,9 +51,9 @@
 //! load-bearing, is the deferred follow-on (transactions.md §8).
 //!
 //! The host-facing single handle is [`Database`] (the back-compat bridge — §2.1): a `!Send` owned
-//! handle = the [`SharedCore`] + one long-lived default [`Session`], whose delegators
+//! handle = the [`Database`] + one long-lived default [`Session`], whose delegators
 //! (`execute`/`query`/`begin`/…/`execute_script`) drive that default session. `new`/`open`/`create`
-//! return it. The [`SharedCore`] (the `Send + Sync` core, the old `Database`) is reached via
+//! return it. The [`Database`] (the `Send + Sync` core, the old `Database`) is reached via
 //! [`Database::core`] for genuine concurrency (it is what crosses threads and mints sessions).
 
 use std::collections::BTreeMap;
@@ -135,7 +135,7 @@ struct Storage {
     read_only: bool,
 }
 
-/// The thread-safe core shared by every [`SharedCore`] clone (CLAUDE.md §3). Holds the published
+/// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
 /// committed roots, the single-writer gate, the live-reader registry, and (file-backed) the
 /// storage identity.
 struct Shared {
@@ -261,25 +261,30 @@ impl Shared {
     }
 }
 
-/// The thread-safe, cheaply-clonable **shared core** (CLAUDE.md §3, spec/design/session.md §2.4 —
-/// the old `Database`). `Send + Sync + Clone`; every thread holds its own clone of the same `Shared`
-/// core. It is what crosses threads and mints independently-usable [`Session`]s
-/// ([`read_session`](SharedCore::read_session) / [`write_session`](SharedCore::write_session) /
-/// [`session`](SharedCore::session)). The host-facing single handle is [`Database`] (the back-compat
-/// bridge over a `SharedCore` + a default `Session`); reach this core via [`Database::core`].
+/// The host-facing database handle (CLAUDE.md §3, spec/design/session.md §2.4): a thread-safe,
+/// cheaply-clonable **shared core**. `Send + Sync + Clone`; every thread holds its own clone of the
+/// same `Shared` core. It mints independently-usable [`Session`]s
+/// ([`read_session`](Database::read_session) / [`write_session`](Database::write_session) /
+/// [`session`](Database::session)) — the durable per-connection state (transactions across calls,
+/// session variables, the envelope) lives on a `Session`, never on the `Database`. It also offers
+/// bare convenience methods ([`execute`](Database::execute) / [`query`](Database::query) /
+/// [`execute_script`](Database::execute_script) / [`view`](Database::view) /
+/// [`update`](Database::update)) that mint a **fresh** autocommit session per call and discard it:
+/// committed data persists through the shared core, but no session-local state carries to the next
+/// call.
 #[derive(Clone)]
-pub struct SharedCore(Arc<Shared>);
+pub struct Database(Arc<Shared>);
 
-impl Default for SharedCore {
+impl Default for Database {
     fn default() -> Self {
         Self::new_in_memory()
     }
 }
 
-impl SharedCore {
+impl Database {
     /// A fresh, empty in-memory shared core (committed version 0, no backing file).
-    pub fn new_in_memory() -> SharedCore {
-        SharedCore(Arc::new(Shared {
+    pub fn new_in_memory() -> Database {
+        Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(Snapshot::default()),
                 shared_temp: Arc::new(Snapshot::default()),
@@ -296,7 +301,7 @@ impl SharedCore {
     /// (path/page size/pager/page accounting) into [`Storage`]. The committed snapshot's stores
     /// already carry the shared `Arc<SharedPaging>`, so every pinned/cloned snapshot faults clean
     /// pages through the one pool (spec/design/pager.md).
-    fn from_file_engine(engine: Engine) -> SharedCore {
+    fn from_file_engine(engine: Engine) -> Database {
         let paging = engine
             .paging
             .clone()
@@ -308,7 +313,7 @@ impl SharedCore {
             paging,
             read_only: engine.read_only,
         };
-        SharedCore(Arc::new(Shared {
+        Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
                 shared_temp: Arc::new(engine.shared_temp_committed),
@@ -325,8 +330,8 @@ impl SharedCore {
     /// no backing file (so a write republishes in memory, never persisting). Used by the conformance
     /// harness's `# fixture:` path to run records against a pre-built on-disk state that SQL cannot
     /// construct (the collation version-skew read-safety guard, collation.md §12).
-    fn from_memory_engine(engine: Engine) -> SharedCore {
-        SharedCore(Arc::new(Shared {
+    fn from_memory_engine(engine: Engine) -> Database {
+        Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
                 shared_temp: Arc::new(engine.shared_temp_committed),
@@ -340,27 +345,27 @@ impl SharedCore {
 
     /// Reconstruct an **in-memory** shared core from a database image (`XX001` on a malformed image).
     /// The shared-core analogue of [`Engine::from_image`].
-    pub fn from_image(image: &[u8]) -> Result<SharedCore> {
-        Ok(SharedCore::from_memory_engine(Engine::from_image(image)?))
+    pub fn from_image(image: &[u8]) -> Result<Database> {
+        Ok(Database::from_memory_engine(Engine::from_image(image)?))
     }
 
     /// Create a **new** file-backed shared database at `path` (spec/design/api.md §2). `58P02` if the
     /// path already exists. The page size is locked into the file. (The shared-core analogue of
     /// [`Engine::create`].)
-    pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<SharedCore> {
-        Ok(SharedCore::from_file_engine(Engine::create(path, opts)?))
+    pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Database> {
+        Ok(Database::from_file_engine(Engine::create(path, opts)?))
     }
 
     /// Open an **existing** file-backed shared database at `path` with default open settings.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<SharedCore> {
-        SharedCore::open_with_options(path, OpenOptions::default())
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
+        Database::open_with_options(path, OpenOptions::default())
     }
 
     /// Open an **existing** file-backed shared database at `path` with explicit open settings
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
-    pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<SharedCore> {
-        Ok(SharedCore::from_file_engine(Engine::open_with_options(
+    pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
+        Ok(Database::from_file_engine(Engine::open_with_options(
             path, opts,
         )?))
     }
@@ -493,7 +498,7 @@ enum Access {
 /// The unified per-caller handle (spec/design/session.md §2.4): the §3 envelope + a private
 /// [`Engine`] + an access mode. Independently usable; a read-only session runs concurrently with —
 /// and never blocks — the one writer. `!Send` (the `Engine` holds `Rc`/`RefCell` state), so a
-/// session is created and used on one thread; the `Send + Sync` [`SharedCore`] is what crosses
+/// session is created and used on one thread; the `Send + Sync` [`Database`] is what crosses
 /// threads and mints a session per thread.
 pub struct Session {
     shared: Arc<Shared>,
@@ -957,290 +962,75 @@ impl Drop for Session {
     }
 }
 
-/// The host-facing single database handle (spec/design/session.md §2.1/§2.4) — the **back-compat
-/// bridge**. It owns the [`SharedCore`] plus one long-lived **default [`Session`]**; the bare
-/// convenience methods (`execute`/`query`/`begin`/`view`/`update`/`execute_script`/`status`/… and the
-/// envelope setters) delegate to that default session, so it is **stateful** — an open `BEGIN` block,
-/// session variables, the time zone, and the cost meters persist across calls, exactly like a
-/// PostgreSQL / SQLite connection. [`new_in_memory`](Database::new_in_memory) / [`open`](Database::open)
-/// / [`create`](Database::create) return it.
-///
-/// `!Send` (it owns a `!Send` [`Session`]), so the single handle lives on one thread — the standard
-/// connection model. For genuine concurrency (many readers alongside a writer) reach the
-/// `Send + Sync` [`SharedCore`] via [`core`](Database::core) and mint additional independently-usable
-/// sessions ([`read_session`](Database::read_session) / [`write_session`](Database::write_session) /
-/// [`session`](Database::session)), each on its own thread.
-pub struct Database {
-    core: SharedCore,
-    /// The long-lived default session the bare delegators drive (§2.1). A configured autocommit
-    /// session over `core` (the lazy-gate rule), so its writes coexist with additional sessions.
-    default: Session,
-}
-
-impl Default for Database {
-    fn default() -> Self {
-        Self::new_in_memory()
-    }
-}
-
 impl Database {
-    /// A fresh, empty in-memory database plus its default session (committed version 0, no file).
-    pub fn new_in_memory() -> Database {
-        Database::over(SharedCore::new_in_memory())
-    }
+    // --- Bare convenience methods (CLAUDE.md §2 / spec/design/session.md §2.4): each mints a FRESH
+    // autocommit session, runs the statement, and drops it. Committed data persists through the
+    // shared core; session-local state (an open block, session variables, `currval`, session-local
+    // temp tables) does NOT carry to the next call — for durable connection state mint an explicit
+    // [`session`](Database::session) / [`read_session`](Database::read_session) /
+    // [`write_session`](Database::write_session). ---
 
-    /// Create a **new** file-backed database at `path` (spec/design/api.md §2). `58P02` if the path
-    /// already exists; the page size is locked into the file.
-    pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Database> {
-        Ok(Database::over(SharedCore::create(path, opts)?))
-    }
-
-    /// Open an **existing** file-backed database at `path` with default open settings.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
-        Ok(Database::over(SharedCore::open(path)?))
-    }
-
-    /// Open an **existing** file-backed database at `path` with explicit open settings (buffer-pool
-    /// budget, read-only mode, work-mem).
-    pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
-        Ok(Database::over(SharedCore::open_with_options(path, opts)?))
-    }
-
-    /// Reconstruct an **in-memory** database from an existing image (`XX001` if malformed). Its
-    /// default session writes republish in memory and never persist.
-    pub fn from_image(image: &[u8]) -> Result<Database> {
-        Ok(Database::over(SharedCore::from_image(image)?))
-    }
-
-    /// Wrap a shared core with a fresh default session (the lazy-gate autocommit session of §2.4).
-    fn over(core: SharedCore) -> Database {
-        let default = core.session(SessionOptions::default());
-        Database { core, default }
-    }
-
-    /// The `Send + Sync` [`SharedCore`] (spec/design/session.md §2.4): clone it across threads and mint
-    /// additional independently-usable sessions for genuine concurrency.
-    pub fn core(&self) -> &SharedCore {
-        &self.core
-    }
-
-    /// The committed version currently published (the monotonic commit counter, transactions.md §8).
-    pub fn version(&self) -> u64 {
-        self.core.version()
-    }
-
-    /// The oldest still-live snapshot version (transactions.md §8) — the reclamation watermark.
-    pub fn oldest_live_txid(&self) -> u64 {
-        self.core.oldest_live_txid()
-    }
-
-    /// Mint an **additional configured** session over this database (spec/design/session.md §2.1),
-    /// independent of the default session, with its own envelope from `opts`.
-    pub fn session(&self, opts: SessionOptions) -> Session {
-        self.core.session(opts)
-    }
-
-    /// Mint a **READ ONLY** session pinned to a consistent snapshot (spec/design/session.md §2.4).
-    pub fn read_session(&self) -> Session {
-        self.core.read_session()
-    }
-
-    /// Mint a **READ WRITE** session with an eager open write block (spec/design/session.md §2.4).
-    pub fn write_session(&self) -> Session {
-        self.core.write_session()
-    }
-
-    // --- The default-session delegators (the back-compat single-handle bridge, §2.1): each forwards
-    // to the long-lived default `Session`. ---
-
-    /// Run a (possibly mutating) statement on the default session, binding `$N` params.
+    /// Run a (possibly mutating) statement, binding `$N` params, on a fresh autocommit session.
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
-        self.default.execute(sql, params)
+        self.session(SessionOptions::default()).execute(sql, params)
     }
-    /// Run a query on the default session, returning a row cursor.
+
+    /// Run a query on a fresh autocommit session, returning a row cursor.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
-        self.default.query(sql, params)
+        self.session(SessionOptions::default()).query(sql, params)
     }
-    /// Run a multi-statement script on the default session (spec/design/session.md §4.2).
+
+    /// Run a multi-statement script on a fresh autocommit session (spec/design/session.md §4.2): the
+    /// whole run is one implicit transaction (all-or-nothing).
     pub fn execute_script(&mut self, sql: &str) -> Result<ScriptSummary> {
-        self.default.execute_script(sql)
+        self.session(SessionOptions::default()).execute_script(sql)
     }
-    /// Open an explicit transaction block on the default session (§2.2; the host-API `BEGIN`).
-    pub fn begin(&mut self, writable: bool) -> Result<()> {
-        self.default.begin(writable)
-    }
-    /// Commit the default session's open block (publish + release the gate; lenient no-op if none).
-    pub fn commit(&mut self) -> Result<()> {
-        self.default.commit()
-    }
-    /// Roll back the default session's open block (discard the working set; no-op if none).
-    pub fn rollback(&mut self) -> Result<()> {
-        self.default.rollback()
-    }
-    /// Run `f` in a READ ONLY transaction on the default session (scoped, panic-safe sugar, §2.2).
+
+    /// Run `f` in a READ ONLY transaction on a fresh session (scoped, panic-safe sugar, §2.2).
     pub fn view<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
-        self.default.view(f)
+        self.session(SessionOptions::default()).view(f)
     }
-    /// Run `f` in a READ WRITE transaction on the default session (scoped, panic-safe sugar, §2.2).
+
+    /// Run `f` in a READ WRITE transaction on a fresh session (scoped, panic-safe sugar, §2.2): the
+    /// closure's statements commit together, or roll back together on error/panic.
     pub fn update<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
-        self.default.update(f)
-    }
-    /// The default session's transaction status (`Idle`/`Open`/`Failed`, §2.2).
-    pub fn status(&self) -> TxStatus {
-        self.default.status()
-    }
-    /// Whether an explicit transaction block is open on the default session.
-    pub fn in_transaction(&self) -> bool {
-        self.default.in_transaction()
+        self.session(SessionOptions::default()).update(f)
     }
 
-    // --- The envelope (spec/design/session.md §3), delegating to the default session. ---
-
-    /// Set the execution-cost ceiling (§5.2); `<= 0` ⇒ unlimited.
-    pub fn set_max_cost(&mut self, limit: i64) {
-        self.default.set_max_cost(limit);
-    }
-    /// The current execution-cost ceiling.
-    pub fn max_cost(&self) -> i64 {
-        self.default.max_cost()
-    }
-    /// Set the per-session cumulative cost budget (§5.4); `<= 0` ⇒ unlimited.
-    pub fn set_lifetime_max_cost(&mut self, limit: i64) {
-        self.default.set_lifetime_max_cost(limit);
-    }
-    /// The current per-session cumulative cost budget (`0` ⇒ unlimited).
-    pub fn lifetime_max_cost(&self) -> i64 {
-        self.default.lifetime_max_cost()
-    }
-    /// The default session's running cumulative execution cost so far (§5.4).
-    pub fn lifetime_cost(&self) -> i64 {
-        self.default.lifetime_cost()
-    }
-    /// Set the maximum input SQL length in bytes; `0` ⇒ unlimited.
-    pub fn set_max_sql_length(&mut self, bytes: usize) {
-        self.default.set_max_sql_length(bytes);
-    }
-    /// The current input-SQL byte limit.
-    pub fn max_sql_length(&self) -> usize {
-        self.default.max_sql_length()
-    }
-    /// Set the work-memory budget in bytes; `0` ⇒ unlimited.
-    pub fn set_work_mem(&mut self, bytes: usize) {
-        self.default.set_work_mem(bytes);
-    }
-    /// The current work-memory budget.
-    pub fn work_mem(&self) -> usize {
-        self.default.work_mem()
-    }
-    /// Replace the default table-privilege set (§5.3).
-    pub fn set_default_privileges(&mut self, privs: PrivilegeSet) {
-        self.default.set_default_privileges(privs);
-    }
-    /// Grant `privs` on a specific object (§5.3).
-    pub fn grant(&mut self, privs: PrivilegeSet, object: &str) {
-        self.default.grant(privs, object);
-    }
-    /// Revoke `privs` from a specific object (§5.3).
-    pub fn revoke(&mut self, privs: PrivilegeSet, object: &str) {
-        self.default.revoke(privs, object);
-    }
-    /// Read-only access to the authorization envelope (§5.3).
-    pub fn privileges(&self) -> &Privileges {
-        self.default.privileges()
-    }
-    /// Set whether DDL is permitted on the default session (§5.3).
-    pub fn set_allow_ddl(&mut self, allow: bool) {
-        self.default.set_allow_ddl(allow);
-    }
-    /// Whether DDL is permitted on the default session.
-    pub fn allow_ddl(&self) -> bool {
-        self.default.allow_ddl()
-    }
-    /// Set a session variable (§6.1) — a non-dotted name is `42704`.
-    pub fn set_var(&mut self, name: &str, value: &str) -> Result<()> {
-        self.default.set_var(name, value)
-    }
-    /// Clear a session variable (§6.1).
-    pub fn reset_var(&mut self, name: &str) -> Result<()> {
-        self.default.reset_var(name)
-    }
-    /// Read a session variable's value (§6.1), or `None` if unset.
-    pub fn var(&self, name: &str) -> Option<String> {
-        self.default.var(name)
-    }
-    /// Set the session **time zone** (§6.2); an unrecognized zone is `22023`.
-    pub fn set_time_zone(&mut self, zone: &str) -> Result<()> {
-        self.default.set_time_zone(zone)
-    }
-    /// Inject a random source for the uuid generators (entropy.md §6).
-    pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
-        self.default.set_random_source(f);
-    }
-    /// Clear the injected random source (return to the OS CSPRNG).
-    pub fn clear_random_source(&mut self) {
-        self.default.clear_random_source();
-    }
-    /// Inject a clock source for `uuidv7` / the clock functions (entropy.md §6).
-    pub fn set_clock_source(&mut self, f: crate::seam::ClockSource) {
-        self.default.set_clock_source(f);
-    }
-    /// Clear the injected clock source (return to the wall clock).
-    pub fn clear_clock_source(&mut self) {
-        self.default.clear_clock_source();
-    }
-    /// Reset the default session's authorization envelope to fully permissive (§5.3).
-    pub fn reset_privileges(&mut self) {
-        self.default.reset_privileges();
-    }
-    /// Set whether session-local temporary-table DDL is permitted on the default session
-    /// (temp-tables.md §5).
-    pub fn set_allow_temp_ddl(&mut self, allow: bool) {
-        self.default.set_allow_temp_ddl(allow);
-    }
-    /// Set whether database-wide shared temporary-table DDL is permitted on the default session.
-    pub fn set_allow_shared_temp_ddl(&mut self, allow: bool) {
-        self.default.set_allow_shared_temp_ddl(allow);
-    }
-    /// Set the default session's temporary-table storage budget in bytes; `0` ⇒ unlimited.
-    pub fn set_temp_buffers(&mut self, bytes: usize) {
-        self.default.set_temp_buffers(bytes);
-    }
-    /// Set the database-wide shared-temp storage budget in bytes; `0` ⇒ unlimited.
-    pub fn set_shared_temp_mem(&mut self, bytes: usize) {
-        self.default.set_shared_temp_mem(bytes);
-    }
-    /// Clear every session variable on the default session (§6.1).
-    pub fn reset_vars(&mut self) {
-        self.default.reset_vars();
-    }
     /// Run the COLLATION UPGRADE migration on the live database (collation.md §12), returning the
-    /// number of re-pinned collations.
+    /// number of re-pinned collations. Mints a fresh write session for the migration.
     pub fn upgrade_collations(&mut self) -> Result<usize> {
-        self.default.upgrade_collations()
+        self.session(SessionOptions::default()).upgrade_collations()
     }
+
     /// Parse `sql` once into a reusable [`PreparedStatement`] (spec/design/api.md §2.4); run it with
     /// [`execute_prepared`](Database::execute_prepared) / [`query_prepared`](Database::query_prepared).
+    /// The statement owns only the parsed AST, so it outlives the session used to parse it.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
-        self.default.prepare(sql)
+        self.session(SessionOptions::default()).prepare(sql)
     }
-    /// Run a [`PreparedStatement`] on the default session, binding `$N` params (the prepared
+
+    /// Run a [`PreparedStatement`] on a fresh autocommit session, binding `$N` params (the prepared
     /// analogue of [`execute`](Database::execute)).
     pub fn execute_prepared(
         &mut self,
         stmt: &PreparedStatement,
         params: &[Value],
     ) -> Result<Outcome> {
-        self.default.execute_prepared(stmt, params)
+        self.session(SessionOptions::default())
+            .execute_prepared(stmt, params)
     }
-    /// Run a prepared **query** on the default session, returning a row cursor.
+
+    /// Run a prepared **query** on a fresh autocommit session, returning a row cursor.
     pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
-        self.default.query_prepared(stmt, params)
+        self.session(SessionOptions::default())
+            .query_prepared(stmt, params)
     }
-    /// Release the handle (spec/design/api.md §2.3): roll back any open explicit transaction on the
-    /// default session (its in-progress work is discarded) and drop. Under autocommit every prior
-    /// statement is already durable, so `close` never drops committed work. Idempotent.
-    pub fn close(mut self) -> Result<()> {
-        self.default.close();
+
+    /// Release this handle (spec/design/api.md §2.3). The bare convenience methods autocommit, so
+    /// there is never uncommitted work to discard; another clone of the shared core may still be
+    /// live, so the backing file is released when the last handle drops. Idempotent.
+    pub fn close(self) -> Result<()> {
         Ok(())
     }
 }
