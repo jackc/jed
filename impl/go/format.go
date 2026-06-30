@@ -3396,19 +3396,23 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 	}
 	switch tag {
 	case 0x00:
-		// A present inline value (lazy-record.md §12, L2): a variable-length / structured body (the
-		// isSpillable set — §6) is DEFERRED as an owned-span Unfetched (Form 0x00), found by walking
-		// its byte extent without constructing it (inlineBodySpan); a fixed-width scalar is decoded
-		// eagerly (deferring it buys nothing — §6). resolveUnfetched reconstructs a touched one from
-		// the span, byte-identically (readInlineBody in construct mode).
+		// A present inline value (lazy-record.md §12, L3): a variable-length / structured body (the
+		// isSpillable set — §6) is DEFERRED as an Unfetched (Form 0x00) referencing the shared page
+		// block — FORM (a), zero-copy (§5a): keep the span as a SLICE of the faulted page block
+		// instead of copying it. A Go slice keeps its backing array alive under GC, so the leaf's one
+		// page block stays resident and is shared by every deferred value in it (the scan-emit clone
+		// is then a slice-header copy, never a byte copy) — resident leaf memory tracks ≈ pageSize,
+		// the honest buffer-pool bound (§9). The block is read fresh per fault (blockstore.readAt)
+		// and never mutated after decode (copy-on-write commits write new pages), so the view is
+		// stable. A fixed-width scalar is decoded eagerly (deferring it buys nothing — §6).
+		// resolveUnfetched reconstructs a touched one from the span, byte-identically (readInlineBody
+		// in construct mode).
 		if isSpillable(ty) {
 			span, err := inlineBodySpan(ty, buf, pos)
 			if err != nil {
 				return Value{}, err
 			}
-			body := make([]byte, len(span)) // own the bytes (form (b)); the page block may be evicted
-			copy(body, span)
-			return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: 0x00, Comp: body}}, nil
+			return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: 0x00, Comp: span}}, nil
 		}
 		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case 0x01:

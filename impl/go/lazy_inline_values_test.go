@@ -1,16 +1,18 @@
 package jed
 
-// L2 — defer inline values at fault (spec/design/lazy-record.md §12). On the demand-paged path
+// L2/L3 — defer inline values at fault (spec/design/lazy-record.md §12). On the demand-paged path
 // every variable-length / structured present value (text/bytea/decimal/json/jsonb/composite/
-// array/range) is loaded as an owned-span Unfetched (Form 0x00) instead of being eagerly decoded;
-// the scan layer resolves exactly the query's touched columns, an untouched one is dropped still
-// deferred. The reshape is cost-, result-, and byte-neutral (§8), so a demand-paged file and a
+// array/range) is loaded as a deferred Unfetched (Form 0x00) — a zero-copy slice of the shared page
+// block (form (a), L3) — instead of being eagerly decoded; the scan layer resolves exactly the
+// query's touched columns, an untouched one is dropped still deferred. The reshape is cost-,
+// result-, and byte-neutral (§8) regardless of representation (form (a)/(b)), so a paged file and a
 // fully-resident in-memory database must observe identical rows and identical cost for every query
 // shape — that mode-identity is the leak-catcher (an unresolved deferral escapes the scan layer as
 // a loud poison panic, never silent NULL). Mirrors impl/rust/tests/lazy_inline_values.rs and
 // impl/ts/tests/lazy_inline_values.test.ts.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -300,5 +302,92 @@ func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
 		if want, got := costOf(t, mem, sql), costOf(t, paged, sql); want != got {
 			t.Fatalf("cost differs for %q: want %d got %d", sql, want, got)
 		}
+	}
+}
+
+// TestLazyInlineFaultedLeafSharesPageBlock — L3, form (a) zero-copy block-shared deferral
+// (spec/design/lazy-record.md §5a/§12). A faulted leaf's deferred inline values are SLICES of the
+// one shared page block, never per-value copies (form (b), L2). This is the resident-memory
+// dividend (§9): resident leaf bytes track ≈ pageSize, not the sum of the decoded values. The
+// property is invisible to results and cost (§8), so it is asserted white-box: a Go sub-slice's cap
+// reaches the end of its backing array, so cap(view) > len(view), whereas a make()+copy body has
+// cap == len. Mirrors the Rust faulted_leaf_shares_one_block_across_deferred_values and the TS
+// equivalent.
+func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
+	i32 := scalarColType(scalarInt32)
+	// Variable-length / structured columns so every present value defers (§6); the i32 column stays
+	// eagerly decoded (deferring a fixed-width scalar buys nothing).
+	colTypes := []colType{
+		i32,
+		scalarColType(scalarText),
+		scalarColType(scalarBytea),
+		scalarColType(scalarDecimal),
+		{Elem: &i32}, // i32[]
+	}
+	const ps = 8192 // large page → every value stays inline-plain (no spill)
+	capacity := ps - pageHeader
+
+	rows := make([]storedRow, 3)
+	for i := range rows {
+		rows[i] = storedRow{
+			IntValue(int64(i)),
+			TextValue(fmt.Sprintf("name-%d-padding-padding", i)),
+			ByteaValue([]byte{byte(i), byte(i), byte(i), byte(i)}),
+			DecimalValue(decimalFromDigitsScale(false, "12345", 2)),
+			arrayValueOf(oneDimArray([]Value{IntValue(int64(i)), IntValue(int64(i + 1))})),
+		}
+	}
+
+	// Encode the records into one leaf page payload (everything inline at this page size).
+	takeSeq := uint32(100)
+	take := func() uint32 { takeSeq++; return takeSeq }
+	var ovf []overflowPageOut
+	var payload []byte
+	for i, row := range rows {
+		key := make([]byte, 4)
+		binary.BigEndian.PutUint32(key, uint32(i))
+		payload = append(payload, encodeRecord(colTypes, key, row, capacity, take, &ovf)...)
+	}
+	if len(ovf) != 0 {
+		t.Fatalf("values must stay inline (no overflow) for the form-(a) case, got %d overflow pages", len(ovf))
+	}
+	block := makePage(ps, pageLeaf, uint32(len(rows)), 0, payload)
+
+	// Fault the leaf: every deferrable present value becomes an inline-deferred Unfetched (form (a)).
+	node, err := decodeLeafNode(block, 2, colTypes)
+	if err != nil {
+		t.Fatalf("decodeLeafNode: %v", err)
+	}
+
+	deferred := 0
+	for ri, row := range node.vals {
+		for ci, v := range row {
+			if v.Kind != ValUnfetched || v.Unf.Form != 0x00 {
+				continue
+			}
+			deferred++
+			comp := v.Unf.Comp
+			// Form (a): the body is a SLICE of the page block, so its cap reaches the page's end
+			// (zero-fill tail) and exceeds its len. A form-(b) copy (make+copy) has cap == len.
+			if cap(comp) <= len(comp) {
+				t.Fatalf("row %d col %d: deferred body is a copy (cap %d == len %d), not a block view (form (a))",
+					ri, ci, cap(comp), len(comp))
+			}
+			// It still resolves to exactly the eager value (form (a) is decode-neutral).
+			got, err := resolveUnfetched(colTypes[ci], v.Unf, func(uint32) ([]byte, error) {
+				return nil, fmt.Errorf("inline values read no overflow pages")
+			})
+			if err != nil {
+				t.Fatalf("row %d col %d: resolve: %v", ri, ci, err)
+			}
+			if !bytes.Equal(encodeValue(colTypes[ci], got), encodeValue(colTypes[ci], rows[ri][ci])) {
+				t.Fatalf("row %d col %d: resolved value differs from the eager value", ri, ci)
+			}
+		}
+	}
+	// 3 rows × 4 deferrable columns (text/bytea/decimal/array) = 12 deferred values; the i32 column
+	// stays eager (§6).
+	if deferred != 12 {
+		t.Fatalf("expected 12 deferred values, got %d", deferred)
 	}
 }
