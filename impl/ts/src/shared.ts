@@ -58,6 +58,7 @@ import {
   type TxStatus,
 } from "./executor.ts";
 import { Rows, rowsFromOutcome, Transaction } from "./api.ts";
+import type { Cursor } from "./cursor.ts";
 import { throwIfAborted } from "./cancel.ts";
 import {
   type JsParam,
@@ -411,29 +412,34 @@ export class Session {
   }
 
   // query runs a query on this session, returning a row cursor. A single-table no-blocking-operator
-  // read is served by a lazy STREAMING cursor (spec/design/streaming.md §4, S3): the read is routed
-  // first (an autocommit read re-pins the latest committed, PG-faithful), then a lazy pull pipeline runs
-  // over the pinned snapshot — one row at a time, bounded peak memory, early-exit — and its snapshot
-  // version is registered in the reader-liveness watermark (streaming.md §5), released on close. Every
-  // other shape falls back to the materialized dispatch path → a buffered cursor.
+  // read is served by a lazy STREAMING cursor (spec/design/streaming.md §4, S3); a blocking read
+  // (ORDER BY/DISTINCT/aggregate/window/join) by a lazy BUFFERED cursor (S4) that buffers its input but
+  // yields the output one row at a time. The read is routed first (an autocommit read re-pins the latest
+  // committed, PG-faithful), then the lazy cursor runs over the pinned snapshot — bounded peak output
+  // memory, early-exit — and its snapshot version is registered in the reader-liveness watermark
+  // (streaming.md §5), released on close. A set-operation / WITH top level falls back to the materialized
+  // dispatch path → a buffered cursor.
   query(sql: string, params: Value[] = []): Rows {
     const stmt = this.engine.parse(sql);
-    // Route the read before building the streaming cursor: an autocommit (non-block, writable access)
-    // read re-pins the latest committed so the snapshot is current; a read-only session uses its
-    // existing pin, and an open block uses its working set.
+    // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
+    // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
+    // pin, and an open block uses its working set.
     if (this.access !== "ro" && this.engine.session.tx === null && !stmtIsWrite(stmt)) {
       this.refreshCommitted();
     }
-    const streamed = this.engine.tryStreamingQuery(stmt, params);
-    if (streamed !== null) {
-      // Register the pinned snapshot version in the watermark (streaming.md §5); the deregister runs on
-      // cursor close (JS has no destructor), advancing oldestLiveTxid.
+    // pin registers the cursor's snapshot version in the watermark (streaming.md §5); the deregister
+    // runs on cursor close (JS has no destructor), advancing oldestLiveTxid.
+    const pin = (built: { columnNames: string[]; cursor: Cursor }): Rows => {
       const version = this.baseVersion;
       this.core.register(version);
-      const rows = new Rows(streamed.columnNames, streamed.cursor);
+      const rows = new Rows(built.columnNames, built.cursor);
       rows.attachPin(() => this.core.deregister(version));
       return rows;
-    }
+    };
+    const streamed = this.engine.tryStreamingQuery(stmt, params);
+    if (streamed !== null) return pin(streamed);
+    const buffered = this.engine.tryBufferedQuery(stmt, params);
+    if (buffered !== null) return pin(buffered);
     return rowsFromOutcome(this.dispatch(stmt, params));
   }
 

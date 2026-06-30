@@ -1,11 +1,15 @@
 package jed
 
-// S3: the lazy STREAMING result cursor (spec/design/streaming.md §3/§4/§5/§6). The conformance corpus
-// drives the materialized Execute path, so streaming — which only affects Query → Rows — is internal
+// S3/S4: the lazy result cursor (spec/design/streaming.md §3/§4/§5/§6). The conformance corpus drives
+// the materialized Execute path, so the lazy cursor — which only affects Query → Rows — is internal
 // machinery the corpus cannot reach (CLAUDE.md §10). These per-core tests pin the contract: a
-// fully-drained streaming query yields the IDENTICAL rows + total cost as the eager path (§6); a
-// caller that stops early reads (and charges) less (the early-exit win, §6); the cursor pins its
-// snapshot for its life (§5); and a mid-drain error surfaces (§6).
+// fully-drained query yields the IDENTICAL rows + total cost as the eager path (§6); a caller that
+// stops early reads (and charges) less (the early-exit win, §6); the cursor pins its snapshot for its
+// life (§5); and a mid-drain error surfaces (§6).
+//
+// The first group covers the S3 streamingCursor (single-table no-blocking-operator scan); the second
+// (Buffered* tests) covers the S4 bufferedScanCursor — a blocking plan (non-PK ORDER BY, DISTINCT,
+// aggregate, window, join) whose input buffers but whose OUTPUT is yielded one row at a time.
 
 import (
 	"fmt"
@@ -246,4 +250,150 @@ func TestDatabaseQueryConvenienceStreams(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
+}
+
+// ---- S4: the lazy BUFFERED cursor (a blocking plan; streaming.md §4) ------------------------------
+
+// Every blocking shape (aggregate / non-PK ORDER BY / DISTINCT / window / join / GROUP BY): Query (the
+// lazy buffered cursor) must equal Execute (eager) on rows AND total cost under full drain (§6). These
+// all route through tryBufferedQuery → bufferedScanCursor, not the streaming fast lane.
+func TestBufferedMatchesEager(t *testing.T) {
+	db := seededKV(t, 40)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	for _, sql := range []string{
+		"SELECT count(*) FROM t",                                        // whole-table aggregate (Final, 1 row)
+		"SELECT sum(v), avg(v), min(id) FROM t",                         // multi-aggregate
+		"SELECT v FROM t ORDER BY v",                                    // ORDER BY the PK scan does NOT satisfy (Final sort)
+		"SELECT v FROM t ORDER BY v DESC LIMIT 6",                       // top-N over a non-PK sort
+		"SELECT DISTINCT v FROM t ORDER BY v",                           // no-PK DISTINCT then sort (Identity)
+		"SELECT id, v + 1 FROM t GROUP BY id, v ORDER BY id",            // GROUP BY + projection expr (Project)
+		"SELECT id, v FROM t GROUP BY id, v HAVING v > 200 ORDER BY id", // HAVING
+		"SELECT a.id, b.v FROM t a JOIN t b USING (id) ORDER BY a.id",   // join + ORDER BY (Project)
+		"SELECT sum(v) OVER (ORDER BY id) FROM t ORDER BY id",           // window function
+	} {
+		er, ec := eagerResult(t, s, sql)
+		sr, sc := streamResult(t, s, sql)
+		if !rowsEqual(sr, er) {
+			t.Fatalf("rows mismatch %q:\n eager=%v\n stream=%v", sql, er, sr)
+		}
+		if sc != ec {
+			t.Fatalf("cost mismatch %q: eager=%d stream=%d", sql, ec, sc)
+		}
+	}
+}
+
+// Early exit over a buffered cursor in Project mode (§4): the blocking part (scan + group + sort) runs
+// in full on the first pull, but a caller that stops after a prefix skips the PROJECTION of every row it
+// never pulls — so it charges LESS than a full drain. The top-N-over-the-buffer win.
+func TestBufferedEarlyExitChargesLess(t *testing.T) {
+	db := seededKV(t, 1000)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+
+	sql := "SELECT id, v + 1 FROM t GROUP BY id, v ORDER BY id"
+	fullRows, fullCost := streamResult(t, s, sql)
+	if len(fullRows) != 1000 {
+		t.Fatalf("full drain = %d rows, want 1000", len(fullRows))
+	}
+
+	rows, err := s.Query(sql, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefix [][]int64
+	for i := 0; i < 3 && rows.Next(); i++ {
+		r := rows.Row()
+		prefix = append(prefix, []int64{r[0].Int, r[1].Int})
+	}
+	partial := rows.Cost()
+	_ = rows.Close()
+
+	want := [][]int64{{1, 11}, {2, 21}, {3, 31}}
+	if fmt.Sprint(prefix) != fmt.Sprint(want) {
+		t.Fatalf("early pull prefix = %v, want %v", prefix, want)
+	}
+	if partial >= fullCost {
+		t.Fatalf("early exit over a buffered cursor must charge less: partial=%d full=%d", partial, fullCost)
+	}
+}
+
+// Snapshot pinning (§5) for the buffered cursor: it captures its snapshot at Query time (the blocking
+// part materializes from THAT snapshot on first pull), so a concurrent writer's rows never appear; the
+// watermark holds at the cursor's version until it is closed.
+func TestBufferedCursorPinsSnapshot(t *testing.T) {
+	db := seededKV(t, 3) // version 1, ids 1..=3
+	if db.OldestLiveTxid() != 1 {
+		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
+	}
+	reader := db.Session(SessionOptions{})
+	defer reader.Close()
+
+	// A blocking query (ORDER BY v — not PK order) → the buffered cursor. Pull one row (runs the
+	// blocking part over the v1 snapshot), keep the cursor live.
+	rows, err := reader.Query("SELECT v FROM t ORDER BY v", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() || rows.Row()[0].Int != 10 {
+		t.Fatalf("first row != 10")
+	}
+	if db.OldestLiveTxid() != 1 {
+		t.Fatalf("open buffered cursor must pin v1, oldest=%d", db.OldestLiveTxid())
+	}
+
+	w := db.WriteSession()
+	if _, err := w.Execute("INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
+		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
+	}
+
+	// Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
+	var rest []int64
+	for rows.Next() {
+		rest = append(rest, rows.Row()[0].Int)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 2 || rest[0] != 20 || rest[1] != 30 {
+		t.Fatalf("frozen snapshot rest = %v, want [20 30]", rest)
+	}
+
+	_ = rows.Close()
+	if db.OldestLiveTxid() != 2 {
+		t.Fatalf("closed buffered cursor must release its pin, oldest=%d", db.OldestLiveTxid())
+	}
+}
+
+// A mid-drain cost-ceiling abort (§6) for the buffered cursor: building the cursor does NOT run the
+// blocking part (deferred to the first pull), so Query succeeds and the 54P01 surfaces during iteration.
+func TestBufferedMidDrainCostAbort(t *testing.T) {
+	db := seededKV(t, 1000)
+	s := db.Session(SessionOptions{MaxCost: 50})
+	defer s.Close()
+	rows, err := s.Query("SELECT v FROM t ORDER BY v", nil)
+	if err != nil {
+		t.Fatalf("query (build) must not abort: %v", err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+		if n > 10000 {
+			t.Fatal("the cost ceiling should have aborted the drain")
+		}
+	}
+	err = rows.Err()
+	if err == nil {
+		t.Fatal("a mid-drain cost abort must surface via Err()")
+	}
+	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54P01" {
+		t.Fatalf("abort = %v, want a 54P01 cost-limit error", err)
+	}
+	_ = rows.Close()
 }

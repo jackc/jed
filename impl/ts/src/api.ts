@@ -116,14 +116,18 @@ export function prepare(db: Engine, sql: string): PreparedStatement {
 }
 
 // query is a one-shot: parse + run a query sql, binding params, returning a row cursor. A single-table
-// no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md §4, S3) —
-// one row pulled at a time over a pinned snapshot, bounded peak memory, early-exit; every other shape
-// falls back to the materialized execute() path. (This is the bare single-handle Engine; the watermark
-// pin lives on the shared-core Session.query path.)
+// no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md §4, S3); a
+// blocking read (ORDER BY/DISTINCT/aggregate/window/join) by a lazy BUFFERED cursor (S4) that buffers
+// the input but yields the output one row at a time. Both pull over a pinned snapshot with bounded peak
+// output memory and a caller early-exit; a set-operation / WITH top level falls back to the materialized
+// execute() path. (This is the bare single-handle Engine; the watermark pin lives on the shared-core
+// Session.query path.)
 export function query(db: Engine, sql: string, params: Value[] = []): Rows {
   const stmt = db.parse(sql);
   const streamed = db.tryStreamingQuery(stmt, params);
   if (streamed !== null) return new Rows(streamed.columnNames, streamed.cursor);
+  const buffered = db.tryBufferedQuery(stmt, params);
+  if (buffered !== null) return new Rows(buffered.columnNames, buffered.cursor);
   return rowsFromOutcome(db.executeStmtParams(stmt, params));
 }
 

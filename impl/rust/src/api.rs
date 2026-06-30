@@ -318,13 +318,18 @@ impl Engine {
 
     /// One-shot: parse + run a **query** `sql`, binding `params`, returning a row cursor. A
     /// single-table no-blocking-operator read is served by a **lazy streaming** cursor
-    /// (spec/design/streaming.md §4, S3) — one row pulled at a time over a pinned snapshot, bounded
-    /// peak memory, early-exit; every other shape falls back to the materialized `execute()` path.
-    /// (This is the bare single-handle [`Engine`]; the watermark pin lives on the shared-core
+    /// (spec/design/streaming.md §4, S3); a blocking read (`ORDER BY`/`DISTINCT`/aggregate/window/
+    /// join) is served by a **lazy buffered** cursor (S4) that buffers the input but yields the output
+    /// one row at a time. Both pull over a pinned snapshot with bounded peak *output* memory and a
+    /// caller early-exit; a set-operation / `WITH` top level falls back to the materialized `execute()`
+    /// path. (This is the bare single-handle [`Engine`]; the watermark pin lives on the shared-core
     /// [`Session`](crate::Session) path.)
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         let ast = self.parse(sql)?;
         if let Some(rows) = self.try_streaming_query(&ast, params)? {
+            return Ok(rows);
+        }
+        if let Some(rows) = self.try_buffered_query(&ast, params)? {
             return Ok(rows);
         }
         Rows::from_outcome(self.execute_stmt_params(ast, params)?)

@@ -1,9 +1,16 @@
-//! S3: the lazy STREAMING result cursor (spec/design/streaming.md §3/§4/§5/§6). The conformance
-//! corpus drives the materialized `execute()` path, so streaming — which only affects `query()` →
+//! S3/S4: the lazy result cursor (spec/design/streaming.md §3/§4/§5/§6). The conformance corpus
+//! drives the materialized `execute()` path, so the lazy cursor — which only affects `query()` →
 //! `Rows` — is internal machinery the corpus cannot reach (CLAUDE.md §10). These per-core tests pin
-//! the contract: a fully-drained streaming query yields the IDENTICAL rows + total cost as the eager
-//! path (§6); a caller that stops early reads (and charges) less (the early-exit win, §6); the cursor
-//! pins its snapshot for its life (§5); and a mid-drain error surfaces (§6).
+//! the contract: a fully-drained query yields the IDENTICAL rows + total cost as the eager path (§6);
+//! a caller that stops early reads (and charges) less (the early-exit win, §6); the cursor pins its
+//! snapshot for its life (§5); and a mid-drain error surfaces (§6).
+//!
+//! The first group covers the **S3 `Streaming`** cursor — the single-table no-blocking-operator scan
+//! (PK-ordered / LIMIT short-circuit). The second group (suffixed `buffered_`) covers the **S4
+//! `Buffered`** cursor — a blocking plan (non-PK `ORDER BY`, `DISTINCT`, aggregate, window, join)
+//! whose input buffers but whose OUTPUT is yielded one row at a time (the `SortedRows::next()` pattern
+//! generalized): same rows + total cost under full drain, but a caller's early exit skips the
+//! projection of the rows it never pulls (the top-N-over-the-buffer win, §4).
 
 use jed::value::Value;
 use jed::{Database, Outcome, Session, SessionOptions};
@@ -220,4 +227,141 @@ fn database_query_convenience_streams() {
             vec![Value::Int(4), Value::Int(40)],
         ]
     );
+}
+
+// ---- S4: the lazy BUFFERED cursor (a blocking plan; streaming.md §4) ------------------------------
+
+/// Every blocking shape (aggregate / non-PK `ORDER BY` / `DISTINCT` / window / join / `GROUP BY`):
+/// `query()` (the lazy `Buffered` cursor) must equal `execute()` (eager) on rows AND total cost under
+/// full drain (§6). These all route through `try_buffered_query` → `BufferedScan`, not the streaming
+/// fast lane.
+#[test]
+fn buffered_matches_eager_rows_and_cost() {
+    let db = seeded(40);
+    let mut s = db.session(SessionOptions::default());
+    for sql in [
+        "SELECT count(*) FROM t", // whole-table aggregate (Final, 1 row)
+        "SELECT sum(v), avg(v), min(id) FROM t", // multi-aggregate
+        "SELECT v FROM t ORDER BY v", // ORDER BY the PK scan does NOT satisfy (Final sort)
+        "SELECT v FROM t ORDER BY v DESC LIMIT 6", // top-N over a non-PK sort
+        "SELECT DISTINCT v FROM t ORDER BY v", // no-PK DISTINCT then sort (Identity)
+        "SELECT id, v + 1 FROM t GROUP BY id, v ORDER BY id", // GROUP BY + projection expr (Project)
+        "SELECT id, v FROM t GROUP BY id, v HAVING v > 200 ORDER BY id", // HAVING
+        "SELECT a.id, b.v FROM t a JOIN t b USING (id) ORDER BY a.id", // join + ORDER BY (Project)
+        "SELECT sum(v) OVER (ORDER BY id) FROM t ORDER BY id", // window function
+    ] {
+        let (er, ec) = eager(&mut s, sql);
+        let (sr, sc) = streamed(&mut s, sql);
+        assert_eq!(sr, er, "rows mismatch: {sql}");
+        assert_eq!(sc, ec, "cost mismatch: {sql}");
+    }
+}
+
+/// Early exit over a `Buffered` cursor in `Project` mode (§4): the blocking part (scan + group + sort)
+/// runs in full on the first pull, but a caller that stops after a prefix skips the PROJECTION of
+/// every row it never pulls — so it charges LESS (`row_produced` + projection per skipped row) than a
+/// full drain. The top-N-over-the-buffer win the materialized path cannot offer.
+#[test]
+fn buffered_early_exit_charges_less() {
+    let db = seeded(1000);
+    let mut s = db.session(SessionOptions::default());
+
+    // A GROUP BY with one group per row + a projection expression → a 1000-row Project buffer.
+    let sql = "SELECT id, v + 1 FROM t GROUP BY id, v ORDER BY id";
+    let (full_rows, full_cost) = streamed(&mut s, sql);
+    assert_eq!(full_rows.len(), 1000);
+
+    let mut rows = s.query(sql, &[]).unwrap();
+    let prefix: Vec<Vec<Value>> = (&mut rows).take(3).collect();
+    let partial_cost = rows.cost();
+    drop(rows);
+
+    assert_eq!(
+        prefix,
+        vec![
+            vec![Value::Int(1), Value::Int(11)],
+            vec![Value::Int(2), Value::Int(21)],
+            vec![Value::Int(3), Value::Int(31)],
+        ],
+        "early pull yields the prefix"
+    );
+    assert!(
+        partial_cost < full_cost,
+        "early exit over a buffered cursor must charge less (partial={partial_cost}, full={full_cost})"
+    );
+}
+
+/// Snapshot pinning (§5) for the `Buffered` cursor: it captures its snapshot at `query()` time (the
+/// blocking part materializes from THAT snapshot on first pull), so a concurrent writer's rows never
+/// appear; the watermark holds at the cursor's version until it is closed.
+#[test]
+fn buffered_cursor_pins_its_snapshot_and_watermark() {
+    let db = seeded(3); // version 1, ids 1..=3
+    assert_eq!(db.oldest_live_txid(), 1);
+
+    let mut reader = db.session(SessionOptions::default());
+    // A blocking query (ORDER BY v — not PK order) → the buffered cursor. Pull one row (this runs the
+    // blocking part over the v1 snapshot), keep the cursor live.
+    let mut rows = reader.query("SELECT v FROM t ORDER BY v", &[]).unwrap();
+    let first = (&mut rows).next().unwrap();
+    assert_eq!(first, vec![Value::Int(10)]);
+    assert_eq!(
+        db.oldest_live_txid(),
+        1,
+        "open buffered cursor pins its version"
+    );
+
+    // A concurrent writer commits two more rows (version 2) while the cursor is open.
+    {
+        let mut w = db.write_session();
+        w.execute("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
+            .unwrap();
+        w.commit().unwrap();
+    }
+    assert_eq!(db.version(), 2);
+    assert_eq!(
+        db.oldest_live_txid(),
+        1,
+        "watermark held at the cursor's pin"
+    );
+
+    // Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
+    let rest: Vec<Value> = (&mut rows).map(|r| r[0].clone()).collect();
+    assert_eq!(
+        rest,
+        vec![Value::Int(20), Value::Int(30)],
+        "frozen at open-time root"
+    );
+    rows.error().unwrap();
+
+    rows.close();
+    drop(rows);
+    assert_eq!(
+        db.oldest_live_txid(),
+        2,
+        "closed buffered cursor releases its pin"
+    );
+}
+
+/// A mid-drain cost-ceiling abort (§6) for the `Buffered` cursor: building the cursor does NOT run the
+/// blocking part (it is deferred to the first pull), so `query()` succeeds and the `54P01` surfaces
+/// during iteration — exactly as for the streaming cursor.
+#[test]
+fn buffered_mid_drain_cost_abort_surfaces() {
+    let db = seeded(1000);
+    let mut s = db.session(SessionOptions::default());
+    s.set_max_cost(50);
+    // Building the buffered cursor must not throw (the blocking scan runs on first pull).
+    let mut rows = s.query("SELECT v FROM t ORDER BY v", &[]).unwrap();
+    let mut n = 0;
+    for _ in &mut rows {
+        n += 1;
+        if n > 10_000 {
+            panic!("the cost ceiling should have aborted the drain");
+        }
+    }
+    let err = rows
+        .error()
+        .expect_err("a mid-drain cost abort must surface");
+    assert_eq!(err.code(), "54P01", "the abort is a cost-limit error");
 }

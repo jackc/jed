@@ -13634,6 +13634,155 @@ func (c *streamingCursor) costAccrued() int64 { return c.meter.Accrued }
 // the watermark deregister (if any) lives on the Rows (streaming.md §5). Idempotent.
 func (c *streamingCursor) close() { c.done = true }
 
+// tryBufferedQuery tries to serve stmt as a lazy BUFFERED query (spec/design/streaming.md §4, S4) — the
+// Query path for a top-level read SELECT with a BLOCKING operator (a non-PK-ordered ORDER BY, DISTINCT,
+// aggregate / GROUP BY, window, or a join) that the streamable fast lane (tryStreamingQuery) does not
+// cover. The blocking part still buffers its input (correctly — it must), but the OUTPUT is yielded one
+// row at a time via bufferedScanCursor: the cursor runs the blocking part on its first pull (so a 54P01
+// cost abort or an arithmetic trap surfaces DURING iteration, not at Query — streaming.md §6), then
+// emits its buffer lazily — bounding peak output memory and letting a caller's early exit skip the
+// projection of rows it never pulls (the top-N-over-the-buffer win). Returns (nil, false, nil) for a
+// non-SELECT / write-classified statement, a streamable plan (served by the fast lane), or a set-op /
+// WITH top level (a deferred S4 follow-on, streaming.md §7) — those fall back to the materialized
+// Execute path → a buffered cursor. Under full drain the rows + total cost are byte-identical to the
+// eager path (the same emitter driven row by row, streaming.md §6).
+func (db *engine) tryBufferedQuery(stmt statement, params []Value) (*Rows, bool, error) {
+	if stmt.Select == nil || stmtIsWrite(stmt) {
+		return nil, false, nil
+	}
+	ptypes := &paramTypes{}
+	plan, err := db.planQuery(queryExpr{Select: stmt.Select}, nil, nil, ptypes)
+	if err != nil {
+		return nil, false, err
+	}
+	// A streamable plan is the fast lane's job (tryStreamingQuery), tried first; this is the blocking
+	// (buffered) shapes only.
+	if plan.sel == nil || streamingScanEligible(plan.sel) {
+		return nil, false, nil
+	}
+	sp := plan.sel
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return nil, false, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return nil, false, err
+	}
+	// Fold globally-uncorrelated subqueries to constants so the per-row projection re-enters nothing —
+	// keeping the cursor self-contained (streaming.md §5). The fold's own cost was already charged to
+	// the shared lifetime gauge; it is added to the cursor's reported cost below.
+	var subqueryCost int64
+	if err := db.foldUncorrelatedInSelect(sp, bound, cteCtx{}, &subqueryCost); err != nil {
+		return nil, false, err
+	}
+	snap := db.snapshotEngine()
+	meter := snap.session.newMeter()
+	meter.Accrued = subqueryCost // the folded constant cost (lifetime already charged)
+	c := &bufferedScanCursor{
+		eng:    snap,
+		plan:   sp,
+		params: bound,
+		rng:    newStmtRng(),
+		meter:  meter,
+	}
+	return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: c}, true, nil
+}
+
+// bufferedScanCursor is the lazy BUFFERED pull pipeline behind a Query Rows cursor for a plan with a
+// blocking operator (spec/design/streaming.md §4, S4) — the generalization of the spilling sorter's
+// pull iterator to every blocking shape. It owns a frozen snapshot engine (eval's exec — so the cursor
+// is self-contained and outlives the handle, streaming.md §5), the resolved + folded plan, bound
+// params, a per-statement entropy cell, its own cost meter, and the lazy emission state. On its FIRST
+// nextRow it runs the blocking part (execSelectEmit) to completion into an emitter — buffering the input
+// (correctly: a sort/group/dedup/join must see it all) and charging the scan/sort/group/dedup cost —
+// then yields its buffer ONE row at a time: an emitProject row is projected (and charges row_produced +
+// projection) on emission, an emitIdentity/emitFinal row is handed out (already projected). So peak
+// output memory is one row, a caller's early exit skips the projection of the rows it never pulls, and a
+// fully-drained query observes the same rows + total cost as the eager path (streaming.md §6).
+type bufferedScanCursor struct {
+	eng    *engine
+	plan   *selectPlan
+	params []Value
+	rng    *stmtRng
+	meter  *costMeter
+	ran    bool    // has the blocking part run? (it runs on the first nextRow)
+	em     emitter // the emission descriptor, valid once ran
+	idx    int64   // next row index: [em.start, em.end) for buffer modes, [0, len) for emitFinal
+	done   bool    // exhausted or closed — then nextRow is a no-op
+}
+
+func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
+	if c.done {
+		return nil, false, nil
+	}
+	// Run the blocking part on the FIRST pull (streaming.md §4 — a blocking cursor runs the blocking
+	// part then yields its buffer lazily). A mid-blocking cost abort / cancellation / trap surfaces HERE
+	// (during iteration), not at Query time (streaming.md §6).
+	if !c.ran {
+		em, err := c.eng.execSelectEmit(c.plan, nil, c.params, cteCtx{}, c.rng, c.meter)
+		if err != nil {
+			return nil, false, err
+		}
+		c.em = em
+		c.ran = true
+		if em.mode != emitFinal {
+			c.idx = em.start
+		}
+	}
+	switch c.em.mode {
+	case emitFinal:
+		// Already projected + charged — hand the next row out (no further cost).
+		if c.idx >= int64(len(c.em.final)) {
+			c.done = true
+			return nil, false, nil
+		}
+		row := c.em.final[c.idx]
+		c.idx++
+		return row, true, nil
+	case emitIdentity:
+		// Pre-projected (the DISTINCT dedup) — charge only row_produced per emitted row.
+		if c.idx >= c.em.end {
+			c.done = true
+			return nil, false, nil
+		}
+		row := c.em.final[c.idx]
+		c.idx++
+		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+			return nil, false, err
+		}
+		c.meter.Charge(costs.RowProduced)
+		return row, true, nil
+	default: // emitProject — project the buffer row on emission (charging row_produced + projection)
+		if c.idx >= c.em.end {
+			c.done = true
+			return nil, false, nil
+		}
+		row := c.em.src[c.idx]
+		c.idx++
+		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+			return nil, false, err
+		}
+		c.meter.Charge(costs.RowProduced)
+		env := &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}}
+		projected := make([]Value, len(c.plan.projections))
+		for i, p := range c.plan.projections {
+			v, perr := p.eval(row, env, c.meter)
+			if perr != nil {
+				return nil, false, perr
+			}
+			projected[i] = v
+		}
+		return projected, true, nil
+	}
+}
+
+func (c *bufferedScanCursor) costAccrued() int64 { return c.meter.Accrued }
+
+// close marks the cursor done; the pinned snapshot is owned by eng and reclaimed by the GC, and the
+// watermark deregister (if any) lives on the Rows (streaming.md §5). Idempotent.
+func (c *bufferedScanCursor) close() { c.done = true }
+
 func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 
@@ -14278,8 +14427,106 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 }
 
 func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
-	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
+	// Run the blocking part to an emitter, then drive the emission EAGERLY into a slice (the
+	// materialized Execute path the conformance corpus drives — byte-unchanged). The lazy Query path
+	// drives the SAME emitter row by row via bufferedCursor (streaming.md §4); both charge the
+	// identical units at the identical sites, so the totals agree (streaming.md §6).
+	rng := newStmtRng()
 	meter := db.session.newMeter()
+	em, err := db.execSelectEmit(plan, outer, params, ctes, rng, meter)
+	if err != nil {
+		return selectResult{}, err
+	}
+	out, err := em.drainEager(db, plan, outer, params, ctes, rng, meter)
+	if err != nil {
+		return selectResult{}, err
+	}
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+}
+
+// emitMode is how a bufferedCursor / drainEager emits an emitter's rows (spec/design/streaming.md §4).
+type emitMode int
+
+const (
+	// emitProject: the buffer rows are unprojected — emission evaluates the projection list (charging
+	// its operator_evals) plus row_produced per windowed row.
+	emitProject emitMode = iota
+	// emitIdentity: the buffer rows are already the projected output (the DISTINCT dedup projected
+	// them up front — the §3 asymmetry), so emission charges only row_produced per windowed row.
+	emitIdentity
+	// emitFinal: the rows are a fully-formed result (the special input-streaming paths already
+	// projected AND charged them) — emission hands them out with no further charge.
+	emitFinal
+)
+
+// emitter describes how a selectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
+// SELECT runs its blocking part (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into a buffer, then
+// emits a row at a time. execSelectEmit returns this so the emission can be driven EAGERLY (the
+// materialized Execute path — execSelectPlan's drainEager builds a slice) or LAZILY (the Query path —
+// bufferedCursor yields it row by row, bounding output memory and short-circuiting a caller's early
+// exit). Both drives charge the identical units at the identical sites (streaming.md §6).
+//   - emitProject: `src` holds the UNPROJECTED rows, windowed to [start, end) — emission evaluates the
+//     projection list (charging its operator_evals) + row_produced per row.
+//   - emitIdentity: `final` holds the already-projected rows (the DISTINCT dedup projected them up
+//     front — the §3 asymmetry), windowed to [start, end) — emission charges only row_produced.
+//   - emitFinal: `final` is a fully-formed result (the special input-streaming paths already projected
+//     AND charged it) — emission hands it out with no further charge.
+type emitter struct {
+	src   []storedRow // emitProject: unprojected rows
+	final [][]Value   // emitIdentity / emitFinal: already-projected rows
+	start int64
+	end   int64
+	mode  emitMode
+}
+
+// drainEager builds the full output slice from the emitter — the materialized Execute drive
+// (spec/design/streaming.md §4). The lazy Query drive (bufferedCursor) emits the same rows one at a
+// time instead; both charge the identical units in the identical order, so totals agree (§6).
+func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) ([][]Value, error) {
+	switch em.mode {
+	case emitFinal:
+		return em.final, nil
+	case emitIdentity:
+		out := make([][]Value, 0, em.end-em.start)
+		for _, row := range em.final[em.start:em.end] {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				return nil, err
+			}
+			meter.Charge(costs.RowProduced)
+			out = append(out, row)
+		}
+		return out, nil
+	default: // emitProject
+		env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+		out := make([][]Value, 0, em.end-em.start)
+		for _, row := range em.src[em.start:em.end] {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				return nil, err
+			}
+			meter.Charge(costs.RowProduced)
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, perr := p.eval(row, env, meter)
+				if perr != nil {
+					return nil, perr
+				}
+				projected[i] = v
+			}
+			out = append(out, projected)
+		}
+		return out, nil
+	}
+}
+
+// execSelectEmit runs a selectPlan's blocking part and returns an emitter describing how to emit its
+// output rows (spec/design/streaming.md §4, S4): the scan / join / WHERE / window / ORDER BY / GROUP
+// BY / DISTINCT all run here (charging their cost into meter), producing either a windowed buffer
+// (projected lazily on emission) or, for the special input-streaming paths, a fully-formed result. The
+// caller drives the emission — eagerly (execSelectPlan, the materialized Execute path) or lazily
+// (bufferedCursor, the Query path). The shared rng threads the per-statement entropy through both the
+// blocking part and the (possibly deferred) projection (streaming.md §6).
+func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
+	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 
 	// Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
 	// blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
@@ -14296,7 +14543,11 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 	// A pkOrdered DISTINCT streams too: the dedup runs in scan order (the sort elided), so it
 	// short-circuits a top-N like the non-DISTINCT case. A no-ORDER-BY DISTINCT keeps the eager path.
 	if streamingScanEligible(plan) {
-		return db.execStreamingScan(plan, env, meter, params)
+		res, err := db.execStreamingScan(plan, env, meter, params)
+		if err != nil {
+			return emitter{}, err
+		}
+		return emitter{final: res.rows, mode: emitFinal}, nil
 	}
 
 	// Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
@@ -14304,7 +14555,11 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 	// whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
 	// point-lookup; the eager sort is elided.
 	if plan.indexOrder != nil {
-		return db.execIndexOrderScan(plan, plan.indexOrder, env, meter)
+		res, err := db.execIndexOrderScan(plan, plan.indexOrder, env, meter)
+		if err != nil {
+			return emitter{}, err
+		}
+		return emitter{final: res.rows, mode: emitFinal}, nil
 	}
 
 	// Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
@@ -14322,7 +14577,11 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 		plan.rels[0].cte == nil &&
 		// A derived table takes the eager path (grammar.md §42).
 		plan.rels[0].derived == nil {
-		return db.execStreamingSort(plan, env, meter, params)
+		res, err := db.execStreamingSort(plan, env, meter, params)
+		if err != nil {
+			return emitter{}, err
+		}
+		return emitter{final: res.rows, mode: emitFinal}, nil
 	}
 
 	// Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
@@ -14330,7 +14589,11 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 	// nested loop drives the outer in PK order so the output is already ordered — the sort is elided
 	// and the loop short-circuits a top-N.
 	if plan.joinPkOrdered {
-		return db.execStreamingJoin(plan, env, meter, params, outer, env.rng)
+		res, err := db.execStreamingJoin(plan, env, meter, params, outer, env.rng)
+		if err != nil {
+			return emitter{}, err
+		}
+		return emitter{final: res.rows, mode: emitFinal}, nil
 	}
 
 	// Materialize each relation once, in primary-key order (base tables drain a scanSource — the
@@ -14345,7 +14608,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 		}
 		rows, err := db.materializeRel(plan, ri, params, outer, env.rng, env.ctes, meter)
 		if err != nil {
-			return selectResult{}, err
+			return emitter{}, err
 		}
 		materialized[ri] = rows
 	}
@@ -14386,7 +14649,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 				latOuter[len(outer)] = left
 				rightRows, err := db.materializeRel(plan, k+1, params, latOuter, env.rng, env.ctes, meter)
 				if err != nil {
-					return selectResult{}, err
+					return emitter{}, err
 				}
 				leftMatched := false
 				for _, right := range rightRows {
@@ -14397,7 +14660,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 					if on != nil {
 						v, err := on.eval(combined, env, meter)
 						if err != nil {
-							return selectResult{}, err
+							return emitter{}, err
 						}
 						keep = v.IsTrue()
 					}
@@ -14430,7 +14693,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 				if on != nil {
 					v, err := on.eval(combined, env, meter)
 					if err != nil {
-						return selectResult{}, err
+						return emitter{}, err
 					}
 					keep = v.IsTrue()
 				}
@@ -14472,7 +14735,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 		if plan.filter != nil {
 			v, err := plan.filter.eval(row, env, meter)
 			if err != nil {
-				return selectResult{}, err
+				return emitter{}, err
 			}
 			keep = v.IsTrue()
 		}
@@ -14490,7 +14753,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 	// (non-aggregate) windows here.
 	if plan.hasWindow && !plan.isAgg {
 		if err := applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter); err != nil {
-			return selectResult{}, err
+			return emitter{}, err
 		}
 	}
 
@@ -14505,10 +14768,10 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 		// appended column and the slot-based sort below is unchanged — the window-key precedent. The
 		// evaluation is metered per node (cost.md §3); a no-op for a column/ordinal-only ORDER BY.
 		if err := materializeOrderExprs(rows, plan.orderExprs, env, meter); err != nil {
-			return selectResult{}, err
+			return emitter{}, err
 		}
 		if err := sortRows(rows, plan.order); err != nil {
-			return selectResult{}, err
+			return emitter{}, err
 		}
 	}
 
@@ -14529,12 +14792,11 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 		return start, end
 	}
 
-	// Build the output rows. The two paths differ in pipeline order
-	// (spec/design/grammar.md §11): without DISTINCT the window slices the sorted source
-	// rows and ONLY the windowed rows are projected; with DISTINCT every (sorted) filtered
-	// row is projected — dedup must see them all — duplicates drop by first occurrence, and
-	// the window then slices the DISTINCT rows.
-	var out [][]Value
+	// Build the emitter. The two paths differ in pipeline order (spec/design/grammar.md §11): without
+	// DISTINCT the window slices the sorted source rows and ONLY the windowed rows are projected (on
+	// emission); with DISTINCT every (sorted) filtered row is projected — dedup must see them all —
+	// duplicates drop by first occurrence, and the window then slices the DISTINCT rows.
+	var em emitter
 	if plan.isAgg {
 		// Aggregate query — group + accumulate (aggregates.md §5). Bucket the post-WHERE rows by
 		// their group-key values; the bucket key is the value-canonical distinctRowKey (it
@@ -14585,12 +14847,12 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 		if len(plan.groupExprs) > 0 {
 			for ri := range rows {
 				if err := meter.Guard(); err != nil {
-					return selectResult{}, err
+					return emitter{}, err
 				}
 				for _, ge := range plan.groupExprs {
 					v, gerr := ge.eval(rows[ri], env, meter)
 					if gerr != nil {
-						return selectResult{}, gerr
+						return emitter{}, gerr
 					}
 					rows[ri] = append(rows[ri], v)
 				}
@@ -14609,7 +14871,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 			}
 			for _, row := range rows {
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per folded row (CLAUDE.md §13)
-					return selectResult{}, err
+					return emitter{}, err
 				}
 				keys := make([]Value, len(gset.keyCols))
 				for i, gk := range gset.keyCols {
@@ -14632,7 +14894,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 					if spec.filter != nil {
 						fv, ferr := spec.filter.eval(row, env, meter)
 						if ferr != nil {
-							return selectResult{}, ferr
+							return emitter{}, ferr
 						}
 						if !fv.IsTrue() {
 							continue
@@ -14648,7 +14910,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 						for ki, k := range spec.hypo.keys {
 							kv, kerr := k.eval(row, env, meter)
 							if kerr != nil {
-								return selectResult{}, kerr
+								return emitter{}, kerr
 							}
 							tuple[ki] = kv
 						}
@@ -14660,7 +14922,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 					if spec.operand != nil {
 						var verr error
 						if v, verr = spec.operand.eval(row, env, meter); verr != nil {
-							return selectResult{}, verr
+							return emitter{}, verr
 						}
 					}
 					// DISTINCT: skip a NULL (never folded by any aggregate) and any value already
@@ -14678,7 +14940,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 						seen[dk] = true
 					}
 					if ferr := groups[gi].accs[i].fold(v, meter); ferr != nil {
-						return selectResult{}, ferr
+						return emitter{}, ferr
 					}
 				}
 			}
@@ -14702,7 +14964,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 					if fe := plan.aggSpecs[si].osaFrac; fe != nil {
 						fv, ferr := fe.eval(srow, env, &costMeter{})
 						if ferr != nil {
-							return selectResult{}, ferr
+							return emitter{}, ferr
 						}
 						a.osaFrac = &fv
 					}
@@ -14715,20 +14977,20 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 						for ai, arg := range hp.args {
 							av, aerr := arg.eval(srow, env, &costMeter{})
 							if aerr != nil {
-								return selectResult{}, aerr
+								return emitter{}, aerr
 							}
 							hyp[ai] = av
 						}
 						v, ferr := finalizeHypothetical(a.plan, a.hypoRows, hyp, hp.sorts)
 						if ferr != nil {
-							return selectResult{}, ferr
+							return emitter{}, ferr
 						}
 						srow = append(srow, v)
 						continue
 					}
 					v, ferr := a.finalize()
 					if ferr != nil {
-						return selectResult{}, ferr
+						return emitter{}, ferr
 					}
 					srow = append(srow, v)
 				}
@@ -14746,7 +15008,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 			for _, srow := range groupRows {
 				v, herr := plan.having.eval(srow, env, meter)
 				if herr != nil {
-					return selectResult{}, herr
+					return emitter{}, herr
 				}
 				if v.IsTrue() {
 					kept = append(kept, srow)
@@ -14761,17 +15023,17 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 		// below sorts on are unchanged (they precede the appended results).
 		if plan.hasWindow {
 			if err := applyWindowStage(groupRows, plan.windowSpecs, plan.windowKeys, env, meter); err != nil {
-				return selectResult{}, err
+				return emitter{}, err
 			}
 		}
 		// ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
 		// expression key is materialized against the grouped row and appended — grammar.md §10).
 		if len(plan.order) > 0 {
 			if err := materializeOrderExprs(groupRows, plan.orderExprs, env, meter); err != nil {
-				return selectResult{}, err
+				return emitter{}, err
 			}
 			if err := sortRows(groupRows, plan.order); err != nil {
-				return selectResult{}, err
+				return emitter{}, err
 			}
 		}
 		if plan.distinct {
@@ -14787,7 +15049,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 				for i, p := range plan.projections {
 					v, perr := p.eval(srow, env, meter)
 					if perr != nil {
-						return selectResult{}, perr
+						return emitter{}, perr
 					}
 					projected[i] = v
 				}
@@ -14796,34 +15058,15 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 					distinctRows = append(distinctRows, projected)
 				}
 			}
+			// The dedup already projected every grouped row (the §3 asymmetry, charged above), so
+			// emission is Identity — window + charge row_produced, deferred to the drive (streaming.md §4).
 			start, end := windowBounds(int64(len(distinctRows)))
-			out = make([][]Value, 0, end-start)
-			for _, row := range distinctRows[start:end] {
-				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
-					return selectResult{}, err
-				}
-				meter.Charge(costs.RowProduced)
-				out = append(out, row)
-			}
+			em = emitter{final: distinctRows, start: start, end: end, mode: emitIdentity}
 		} else {
-			// Window + project; only an emitted row charges row_produced + its projection cost.
+			// Window then project on emission; only an emitted row charges row_produced + projection
+			// cost. Deferred to the drive (streaming.md §4).
 			start, end := windowBounds(int64(len(groupRows)))
-			out = make([][]Value, 0, end-start)
-			for _, srow := range groupRows[start:end] {
-				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
-					return selectResult{}, err
-				}
-				meter.Charge(costs.RowProduced)
-				projected := make([]Value, len(plan.projections))
-				for i, p := range plan.projections {
-					v, perr := p.eval(srow, env, meter)
-					if perr != nil {
-						return selectResult{}, perr
-					}
-					projected[i] = v
-				}
-				out = append(out, projected)
-			}
+			em = emitter{src: groupRows, start: start, end: end, mode: emitProject}
 		}
 	} else if plan.distinct {
 		// Project every filtered row (charging projection cost per row, the §3 asymmetry),
@@ -14837,7 +15080,7 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 			for i, p := range plan.projections {
 				v, err := p.eval(row, env, meter)
 				if err != nil {
-					return selectResult{}, err
+					return emitter{}, err
 				}
 				projected[i] = v
 			}
@@ -14846,45 +15089,20 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 				distinctRows = append(distinctRows, projected)
 			}
 		}
-		// LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge
-		// RowProduced (spec/design/cost.md §3).
+		// LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge RowProduced
+		// (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
+		// asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
 		start, end := windowBounds(int64(len(distinctRows)))
-		out = make([][]Value, 0, end-start)
-		for _, row := range distinctRows[start:end] {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
-				return selectResult{}, err
-			}
-			meter.Charge(costs.RowProduced)
-			out = append(out, row)
-		}
+		em = emitter{final: distinctRows, start: start, end: end, mode: emitIdentity}
 	} else {
-		// Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by
-		// LIMIT accrue no row_produced/projection cost (they were still scanned + filtered
-		// above). Producing a row, and each projection-list evaluation, accrue cost.
-		// (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
+		// Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by LIMIT
+		// accrue no row_produced/projection cost (they were still scanned + filtered above). Producing
+		// a row, and each projection-list evaluation, accrue cost on emission — deferred to the drive
+		// (streaming.md §4). (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
 		start, end := windowBounds(int64(len(rows)))
-		windowed := rows[start:end]
-		out = make([][]Value, 0, len(windowed))
-		for _, row := range windowed {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
-				return selectResult{}, err
-			}
-			meter.Charge(costs.RowProduced)
-			projected := make([]Value, len(plan.projections))
-			for i, p := range plan.projections {
-				v, err := p.eval(row, env, meter)
-				if err != nil {
-					return selectResult{}, err
-				}
-				projected[i] = v
-			}
-			out = append(out, projected)
-		}
+		em = emitter{src: rows, start: start, end: end, mode: emitProject}
 	}
-
-	// The scan/eval cost (correlated subqueries fold their per-row cost in via the evaluator;
-	// globally-uncorrelated ones are folded once before exec, their cost added at runQueryExpr).
-	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+	return em, nil
 }
 
 // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------

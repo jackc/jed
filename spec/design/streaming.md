@@ -303,9 +303,37 @@ independently — the P6.4 precedent):
   exit charges less, the snapshot pin + watermark, and the mid-drain abort. Prepared-statement streaming
   and a `Database::query` watermark on the bare single-handle path are follow-ons (the bare path streams
   but pins nothing — the single-handle reclamation is reconstruct-on-open-safe, §5).
-- **S4 — lazy output from the blocking operators.** Generalize `SortedRows::next()` so `Buffered`
-  runs the blocking part then yields its buffer lazily (sort/distinct/agg/window/join/set-op),
-  bounding output memory and enabling top-N pulls over the buffer.
+- **S4 — lazy output from the blocking operators.** ✅ **Landed (all three cores).** The `query()` →
+  `Rows` path now serves a **blocking** read — a non-PK-ordered `ORDER BY`, `DISTINCT`, aggregate /
+  `GROUP BY`, window, or a join — through a lazy **`Buffered`** cursor (`BufferedScan` in Rust,
+  `bufferedScanCursor` in Go, a `bufferedRows` generator in TS), the generalization of the spilling
+  sorter's pull iterator to every blocking shape. The seam is a new `exec_select_emit` extracted from
+  `exec_select_plan`: it runs the **blocking part** (scan / join / `WHERE` / window / `ORDER BY` /
+  `GROUP BY` / `DISTINCT`) and returns an **`Emitter`** — either a windowed **`Buffer`** (the
+  intermediate rows, with a per-mode `Project` | `Identity` flag: `Project` evaluates the projection
+  list on emission; `Identity` is the already-projected DISTINCT dedup output) or a **`Final`** result
+  (the special input-streaming paths — `exec_streaming_scan`/`exec_index_order_scan`/
+  `exec_streaming_sort`/`exec_streaming_join` — which already projected + charged). `exec_select_plan`
+  **drives the same `Emitter` eagerly** (the materialized `execute()` path the corpus drives — rebuilt
+  identically, byte-unchanged), and the lazy cursor **drives it row by row**: it owns a frozen snapshot
+  engine (§5; sharing the seam + the lifetime gauge, like S3), runs the blocking part on its **first
+  pull** (so a `54P01` cost abort / cancellation / arithmetic trap surfaces *during iteration*, not at
+  `query()` — §6), then emits its buffer one row at a time. The win: **bounded peak *output* memory**
+  (the output `Vec`/slice is never built on `query()`) and **top-N pulls over the buffer** — a caller
+  that stops early skips the projection (`row_produced` + projection `operator_eval`s) of the rows it
+  never pulls. Under **full drain** the rows + total cost are **byte-identical** to the eager path (the
+  same `Emitter`, charged at the same sites in the same order — §6), so the corpus stays green by
+  construction; verified per core by unit tests (`query()` == `execute()` rows + cost under full drain,
+  buffered early-exit charges less, the snapshot pin + watermark, the mid-drain abort). The shared
+  `stmt_rng` threads the per-statement entropy through the blocking part **and** the deferred
+  projection, so a projection-list `uuidv7()`/`now()` draws the identical sequence whichever drive runs
+  it. **Scope this slice:** a **top-level set-operation / `WITH`** read still falls back to the
+  materialized `execute()` path → a buffered cursor (their output carries no per-row top-level
+  projection, so the lazy win is only lazy-yield — a mechanical follow-on); and the special
+  input-streaming `SELECT` paths reach the lazy cursor as `Final` (eager-built on the first pull, then
+  yielded lazily — no regression, since they are LIMIT-gated or already stream their input). Making a
+  large `exec_streaming_sort` output lazy via the `SortedRows` pull iterator directly (rather than
+  buffering it as `Final`) is the remaining follow-on.
 - **S5 (deferred, optional) — lazy small-inline-column decode** (§8) — the last PG/SQLite parity
   item; cost-neutral, a separate slice.
 

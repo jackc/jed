@@ -565,12 +565,14 @@ impl Session {
     }
 
     /// Run a **query** on this session, returning a row cursor. A single-table no-blocking-operator
-    /// read is served by a **lazy streaming** cursor (spec/design/streaming.md §4, S3): the read is
-    /// routed first (an autocommit read re-pins the latest committed, PG-faithful), then a lazy pull
-    /// pipeline runs over the pinned snapshot — one row at a time, bounded peak memory, early-exit —
-    /// and its snapshot version is registered in the reader-liveness watermark (streaming.md §5),
-    /// released when the cursor is closed or dropped. Every other shape falls back to the materialized
-    /// `dispatch` path → a buffered cursor.
+    /// read is served by a **lazy streaming** cursor (spec/design/streaming.md §4, S3); a blocking
+    /// read (`ORDER BY`/`DISTINCT`/aggregate/window/join) by a **lazy buffered** cursor (S4) that
+    /// buffers its input but yields the output one row at a time. The read is routed first (an
+    /// autocommit read re-pins the latest committed, PG-faithful), then the lazy cursor runs over the
+    /// pinned snapshot — bounded peak output memory, early-exit — and its snapshot version is
+    /// registered in the reader-liveness watermark (streaming.md §5), released when the cursor is
+    /// closed or dropped. A set-operation / `WITH` top level falls back to the materialized `dispatch`
+    /// path → a buffered cursor.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         let ast = self.engine.parse(sql)?;
         // Route the read before building the streaming cursor: an autocommit (non-block, writable
@@ -583,6 +585,12 @@ impl Session {
         if let Some(mut rows) = self.engine.try_streaming_query(&ast, params)? {
             // Register the pinned snapshot version in the watermark (streaming.md §5); the returned
             // guard deregisters on cursor close/drop, advancing `oldest_live_txid`.
+            rows.attach_pin(self.shared.reader_pin(self.base_version));
+            return Ok(rows);
+        }
+        if let Some(mut rows) = self.engine.try_buffered_query(&ast, params)? {
+            // A lazy buffered cursor (S4, streaming.md §4) is a live reader too — pin its snapshot
+            // version in the watermark, released on cursor close/drop.
             rows.attach_pin(self.shared.reader_pin(self.base_version));
             return Ok(rows);
         }
@@ -1168,6 +1176,11 @@ mod cancel_internal_tests {
     /// poll threads through `new_meter` into the running statement. Then clear it and confirm the same
     /// query completes (the poll is the only difference). This reaches the private session state the
     /// public `tests/cancellation.rs` cannot.
+    ///
+    /// Since S4 (streaming.md §6) `query()` returns a LAZY cursor — a bare scan buffers its input on the
+    /// first pull — so building the cursor no longer runs the scan; the meter `guard` trips during the
+    /// drain and the `57014` surfaces via `Rows::error()`, not at `query()` time. (This is the very
+    /// surface-during-iteration contract S4 adds; the cancel-threads-through-the-meter proof is unchanged.)
     #[test]
     fn cancel_mid_scan_aborts_via_meter() {
         let mut db = Database::new_in_memory();
@@ -1184,11 +1197,12 @@ mod cancel_internal_tests {
         let token = CancellationToken::new();
         token.cancel();
         session.engine.session.cancel = Some(token);
-        // `Rows` is not `Debug`, so match rather than `expect_err` to pull out the error.
-        let err = match session.query("SELECT id FROM t", &[]) {
-            Err(e) => e,
-            Ok(_) => panic!("the meter guard must abort the running scan"),
-        };
+        // Building the lazy cursor is fine; the meter guard aborts during the drain (streaming.md §6).
+        let mut rows = session.query("SELECT id FROM t", &[]).unwrap();
+        for _ in &mut rows {}
+        let err = rows
+            .error()
+            .expect_err("the meter guard must abort the running scan");
         assert_eq!(err.code(), "57014", "the abort came from the meter guard");
 
         // Cleared: the same query completes and returns every row (the poll was the only difference).

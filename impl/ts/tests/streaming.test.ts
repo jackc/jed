@@ -1,9 +1,13 @@
-// S3: the lazy STREAMING result cursor (spec/design/streaming.md §3/§4/§5/§6). The conformance corpus
-// drives the materialized execute() path, so streaming — which only affects query() → Rows — is
-// internal machinery the corpus cannot reach (CLAUDE.md §10). These per-core tests pin the contract: a
-// fully-drained streaming query yields the IDENTICAL rows + total cost as the eager path (§6); a caller
-// that stops early reads (and charges) less (the early-exit win, §6); the cursor pins its snapshot for
-// its life (§5); and a mid-drain error surfaces (§6).
+// S3/S4: the lazy result cursor (spec/design/streaming.md §3/§4/§5/§6). The conformance corpus drives
+// the materialized execute() path, so the lazy cursor — which only affects query() → Rows — is internal
+// machinery the corpus cannot reach (CLAUDE.md §10). These per-core tests pin the contract: a
+// fully-drained query yields the IDENTICAL rows + total cost as the eager path (§6); a caller that stops
+// early reads (and charges) less (the early-exit win, §6); the cursor pins its snapshot for its life
+// (§5); and a mid-drain error surfaces (§6).
+//
+// The first group covers the S3 Streaming cursor (single-table no-blocking-operator scan); the second
+// (suffixed "buffered") covers the S4 Buffered cursor — a blocking plan (non-PK ORDER BY, DISTINCT,
+// aggregate, window, join) whose input buffers but whose OUTPUT is yielded one row at a time.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -197,4 +201,132 @@ test("database query convenience streams", () => {
     [3n, 30n],
     [4n, 40n],
   ]);
+});
+
+// ---- S4: the lazy BUFFERED cursor (a blocking plan; streaming.md §4) ------------------------------
+
+// Every blocking shape (aggregate / non-PK ORDER BY / DISTINCT / window / join / GROUP BY): query() (the
+// lazy buffered cursor) must equal execute() (eager) on rows AND total cost under full drain (§6). These
+// all route through tryBufferedQuery → a bufferedRows generator, not the streaming fast lane.
+test("buffered matches eager rows and cost", () => {
+  const db = seededKV(40);
+  const s = db.session();
+  try {
+    for (const sql of [
+      "SELECT count(*) FROM t", // whole-table aggregate (final, 1 row)
+      "SELECT sum(v), avg(v), min(id) FROM t", // multi-aggregate
+      "SELECT v FROM t ORDER BY v", // ORDER BY the PK scan does NOT satisfy (final sort)
+      "SELECT v FROM t ORDER BY v DESC LIMIT 6", // top-N over a non-PK sort
+      "SELECT DISTINCT v FROM t ORDER BY v", // no-PK DISTINCT then sort (identity)
+      "SELECT id, v + 1 FROM t GROUP BY id, v ORDER BY id", // GROUP BY + projection expr (project)
+      "SELECT id, v FROM t GROUP BY id, v HAVING v > 200 ORDER BY id", // HAVING
+      "SELECT a.id, b.v FROM t a JOIN t b USING (id) ORDER BY a.id", // join + ORDER BY (project)
+      "SELECT sum(v) OVER (ORDER BY id) FROM t ORDER BY id", // window function
+    ]) {
+      const eager = eagerResult(s, sql);
+      const stream = streamResult(s, sql);
+      assert.deepEqual(stream.rows, eager.rows, `rows mismatch: ${sql}`);
+      assert.equal(stream.cost, eager.cost, `cost mismatch: ${sql}`);
+    }
+  } finally {
+    s.close();
+  }
+});
+
+// Early exit over a buffered cursor in project mode (§4): the blocking part (scan + group + sort) runs
+// in full on the first pull, but a caller that stops after a prefix skips the PROJECTION of every row it
+// never pulls — so it charges LESS than a full drain. The top-N-over-the-buffer win.
+test("buffered early exit charges less", () => {
+  const db = seededKV(1000);
+  const s = db.session();
+  try {
+    const sql = "SELECT id, v + 1 FROM t GROUP BY id, v ORDER BY id";
+    const full = streamResult(s, sql);
+    assert.equal(full.rows.length, 1000);
+
+    const cursor = s.query(sql);
+    const prefix: bigint[][] = [];
+    for (const r of cursor) {
+      const a = r[0]!;
+      const b = r[1]!;
+      prefix.push([a.kind === "int" ? a.int : -1n, b.kind === "int" ? b.int : -1n]);
+      if (prefix.length === 3) break;
+    }
+    const partial = cursor.cost;
+    cursor.close();
+
+    assert.deepEqual(prefix, [
+      [1n, 11n],
+      [2n, 21n],
+      [3n, 31n],
+    ]);
+    assert.ok(
+      partial < full.cost,
+      `early exit over a buffered cursor must charge less (partial=${partial}, full=${full.cost})`,
+    );
+  } finally {
+    s.close();
+  }
+});
+
+// Snapshot pinning (§5) for the buffered cursor: it captures its snapshot at query() time (the blocking
+// part materializes from THAT snapshot on first pull), so a concurrent writer's rows never appear; the
+// watermark holds at the cursor's version until it is closed.
+test("buffered cursor pins its snapshot and watermark", () => {
+  const db = seededKV(3); // version 1, ids 1..=3
+  assert.equal(db.oldestLiveTxid(), 1n);
+
+  const reader = db.session();
+  try {
+    // A blocking query (ORDER BY v — not PK order) → the buffered cursor.
+    const cursor = reader.query("SELECT v FROM t ORDER BY v");
+    const it = cursor[Symbol.iterator]();
+    const first = it.next();
+    assert.equal(first.done, false);
+    assert.equal(first.value[0]!.kind === "int" ? first.value[0]!.int : -1n, 10n);
+    assert.equal(db.oldestLiveTxid(), 1n, "open buffered cursor pins its version");
+
+    const w = db.writeSession();
+    w.execute("INSERT INTO t VALUES (4, 40), (5, 50)");
+    w.commit();
+    assert.equal(db.version, 2n);
+    assert.equal(db.oldestLiveTxid(), 1n, "watermark held at the cursor's pin");
+
+    // Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
+    const rest: bigint[] = [];
+    for (let r = it.next(); !r.done; r = it.next()) {
+      const v = r.value[0]!;
+      if (v.kind === "int") rest.push(v.int);
+    }
+    assert.deepEqual(rest, [20n, 30n], "frozen at open-time root");
+
+    cursor.close();
+    assert.equal(db.oldestLiveTxid(), 2n, "closed buffered cursor releases its pin");
+  } finally {
+    reader.close();
+  }
+});
+
+// A mid-drain cost-ceiling abort (§6) for the buffered cursor: building the cursor does NOT run the
+// blocking part (deferred to the first pull), so query() succeeds and the 54P01 throws during iteration.
+test("buffered mid-drain cost abort throws during iteration", () => {
+  const db = seededKV(1000);
+  const s = db.session({ maxCost: 50n });
+  try {
+    const cursor = s.query("SELECT v FROM t ORDER BY v"); // building the cursor must not throw
+    let caught: unknown;
+    try {
+      let n = 0;
+      for (const _ of cursor) {
+        if (++n > 10000) throw new Error("the cost ceiling should have aborted the drain");
+      }
+    } catch (e) {
+      caught = e;
+    }
+    cursor.close();
+    assert.ok(caught instanceof EngineError, "a mid-drain cost abort must throw");
+    assert.equal((caught as EngineError).code(), "54P01", "the abort is a cost-limit error");
+  } finally {
+    s.close();
+  }
 });

@@ -2,15 +2,17 @@ package jed
 
 // cursor is the pull source a Rows cursor drives (spec/design/streaming.md §4).
 //
-// Two shapes, chosen by the plan (streaming.md §4):
+// Three shapes, chosen by the plan (streaming.md §4):
 //   - bufCursor — a fully materialized result, walked one row at a time. The executor ran the query
 //     to completion (the Execute path the conformance corpus drives, byte-unchanged); cost is final.
-//     Every blocking plan (sort/aggregate/join/set-op/DISTINCT/window) and every non-streamable shape
-//     lands here.
+//     A set-operation / WITH top level (a deferred S4 follow-on) and the materialized fallback land here.
 //   - streamingCursor (S3, executor.go) — a lazy pull pipeline for the single-table no-blocking-op
 //     scan: scan → resolve → WHERE → project, ONE row per nextRow over a pinned snapshot, accruing
 //     cost as it is pulled (streaming.md §6). Peak memory is one row; a caller that stops early faults
 //     no further leaves.
+//   - bufferedScanCursor (S4, executor.go) — a lazy pull pipeline for a blocking plan (non-PK ORDER BY,
+//     DISTINCT, aggregate, window, join): the input buffers (on the first pull) but the OUTPUT is
+//     yielded one row at a time, bounding peak output memory and short-circuiting a caller's early exit.
 type cursor interface {
 	// nextRow pulls the next output row, (row, true, nil) or (nil, false, nil) at end. A streaming
 	// cursor may return a non-nil error mid-drain (a 54P01 cost abort, a canceled context, or an

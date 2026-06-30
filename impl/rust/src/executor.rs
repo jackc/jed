@@ -151,6 +151,41 @@ struct SelectResult {
     cost: i64,
 }
 
+/// How a [`SelectPlan`]'s output is emitted (spec/design/streaming.md §4, S4). A SELECT runs its
+/// **blocking part** (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into an intermediate buffer,
+/// then emits a row at a time. [`exec_select_emit`](Engine::exec_select_emit) returns this so the
+/// emission can be driven **eagerly** (the materialized `execute()` path — [`exec_select_plan`]
+/// drains it into a `Vec`) or **lazily** (the `query()` path — `BufferedScan` yields it row by row,
+/// bounding output memory and short-circuiting a caller's early exit). Both drives charge the
+/// identical units at the identical sites, so a fully-drained query observes the same rows + total
+/// cost (streaming.md §6).
+enum Emitter {
+    /// The general blocking path's intermediate buffer, windowed to `[start, end)`. Each emitted
+    /// row charges `row_produced`; in [`EmitMode::Project`] it additionally evaluates the projection
+    /// list (charging its `operator_eval`s), and in [`EmitMode::Identity`] the buffer rows are
+    /// already the projected output (the DISTINCT dedup projected them up front — the §3 asymmetry)
+    /// so emission only charges `row_produced`.
+    Buffer {
+        rows: Vec<Vec<Value>>,
+        start: usize,
+        end: usize,
+        mode: EmitMode,
+    },
+    /// A fully-formed result the special input-streaming paths (`exec_streaming_scan` /
+    /// `exec_index_order_scan` / `exec_streaming_sort` / `exec_streaming_join`) already projected
+    /// AND charged `row_produced` for. Emission just hands the rows out — no further charge.
+    Final { rows: Vec<Vec<Value>> },
+}
+
+/// Whether an [`Emitter::Buffer`] row still needs projecting on emission (spec/design/streaming.md §4).
+#[derive(Clone, Copy)]
+enum EmitMode {
+    /// Evaluate the projection list against the buffer row (charging projection `operator_eval`s).
+    Project,
+    /// The buffer row is already the projected output (DISTINCT pre-projected for its dedup key).
+    Identity,
+}
+
 /// The default serialization page size (8 KiB — spec/design/storage.md §3), used for a fresh
 /// in-memory or newly-created database when no explicit size is given.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -10915,6 +10950,67 @@ impl Engine {
         Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
     }
 
+    /// Try to serve `ast` as a lazy **buffered** query (spec/design/streaming.md §4, S4) — the
+    /// `query()` path for a top-level read `SELECT` whose plan has a **blocking operator** (a
+    /// non-PK-ordered `ORDER BY`, `DISTINCT`, aggregate / `GROUP BY`, window, or a join) that the
+    /// streamable fast lane ([`try_streaming_query`]) does not cover. The blocking part still buffers
+    /// its input (correctly — it must), but the **output is yielded one row at a time** via
+    /// [`BufferedScan`]: the cursor runs the blocking part on its first pull (so a `54P01` cost abort
+    /// or an arithmetic trap surfaces *during iteration*, not at `query()` — streaming.md §6), then
+    /// emits its buffer lazily — bounding peak *output* memory and letting a caller's early exit skip
+    /// the projection of rows it never pulls (the top-N-over-the-buffer win). Returns `None` for a
+    /// non-`SELECT` / write-classified statement, or a streamable plan (served by the fast lane), or a
+    /// set-operation / `WITH` top level (a deferred S4 follow-on, streaming.md §7) — those fall back to
+    /// the materialized `execute()` path → a `Buffered` cursor. Under **full drain** the rows + total
+    /// cost are byte-identical to the eager path (the same `Emitter` driven row by row, streaming.md §6).
+    pub(crate) fn try_buffered_query(
+        &self,
+        ast: &Statement,
+        params: &[Value],
+    ) -> Result<Option<Rows>> {
+        let Statement::Select(sel) = ast else {
+            return Ok(None);
+        };
+        if stmt_is_write(ast) {
+            return Ok(None);
+        }
+        let qe = QueryExpr::Select(Box::new(sel.clone()));
+        let mut ptypes = ParamTypes::default();
+        let QueryPlan::Select(mut sp) = self.plan_query(&qe, None, &[], &mut ptypes)? else {
+            return Ok(None);
+        };
+        // A streamable plan is the fast lane's job (`try_streaming_query`), tried first; this path is
+        // only the blocking (buffered) shapes.
+        if streaming_scan_eligible(&sp) {
+            return Ok(None);
+        }
+        let bound_params = bind_params(params, &ptypes.finalize()?)?;
+        // Fold globally-uncorrelated subqueries to constants so the per-row projection re-enters
+        // nothing — keeping the cursor self-contained (streaming.md §5). The fold's own cost was
+        // already charged to the shared lifetime gauge by its sub-executions; it is added to the
+        // cursor's reported cost below (mirroring `run_query_expr`'s `r.cost += …`).
+        let mut subquery_cost: i64 = 0;
+        self.fold_uncorrelated_in_select(
+            &mut sp,
+            &bound_params,
+            CteCtx::empty(),
+            &mut subquery_cost,
+        )?;
+        let snap = self.snapshot_engine();
+        let mut meter = snap.session.new_meter();
+        meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
+        let column_names = sp.column_names.clone();
+        let stream = BufferedScan {
+            engine: snap,
+            plan: sp,
+            params: bound_params,
+            rng: std::cell::Cell::new(crate::seam::StmtRng::new()),
+            meter,
+            state: BufState::Pending,
+        };
+        Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
+    }
+
     /// Streaming secondary-index-order scan (spec/design/cost.md §3 "secondary-index order"): an
     /// `ORDER BY` the PK scan does NOT satisfy but a B-tree index does, with a `LIMIT` (the gate —
     /// `plan.index_order` is `Some`). Walks the index store forward in key order (the indexed
@@ -11404,15 +11500,90 @@ impl Engine {
         params: &[Value],
         ctes: CteCtx,
     ) -> Result<SelectResult> {
+        // Run the blocking part to an [`Emitter`], then drive the emission EAGERLY into a `Vec` (the
+        // materialized `execute()` path the conformance corpus drives — byte-unchanged). The lazy
+        // `query()` path drives the SAME `Emitter` row by row via `BufferedScan` (streaming.md §4);
+        // both charge the identical units at the identical sites, so the totals agree (streaming.md §6).
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let mut meter = self.session.new_meter();
+        let emitter = self.exec_select_emit(plan, outer, params, ctes, &stmt_rng, &mut meter)?;
+        let out_rows = match emitter {
+            // Already projected + charged (the special input-streaming paths) — hand the rows out.
+            Emitter::Final { rows } => rows,
+            // The general blocking buffer: window it, charging `row_produced` per emitted row (and,
+            // in `Project` mode, the projection list) — exactly the eager emission these branches ran
+            // before the S4 split.
+            Emitter::Buffer {
+                mut rows,
+                start,
+                end,
+                mode,
+            } => match mode {
+                EmitMode::Identity => {
+                    let mut out = Vec::with_capacity(end - start);
+                    for row in rows.drain(start..end) {
+                        meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                        meter.charge(COSTS.row_produced);
+                        out.push(row);
+                    }
+                    out
+                }
+                EmitMode::Project => {
+                    let env = EvalEnv {
+                        exec: self,
+                        params,
+                        outer,
+                        rng: &stmt_rng,
+                        ctes,
+                    };
+                    let mut out = Vec::with_capacity(end - start);
+                    for row in &rows[start..end] {
+                        meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                        meter.charge(COSTS.row_produced);
+                        let mut o = Vec::with_capacity(plan.projections.len());
+                        for p in &plan.projections {
+                            o.push(p.eval(row, &env, &mut meter)?);
+                        }
+                        out.push(o);
+                    }
+                    out
+                }
+            },
+        };
+        Ok(SelectResult {
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
+            rows: out_rows,
+            cost: meter.accrued,
+        })
+    }
+
+    /// Run a [`SelectPlan`]'s **blocking part** and return an [`Emitter`] describing how to emit its
+    /// output rows (spec/design/streaming.md §4, S4): the scan / join / `WHERE` / window / `ORDER BY`
+    /// / `GROUP BY` / `DISTINCT` all run here (charging their cost into `meter`), producing either an
+    /// intermediate `Buffer` (windowed, projected lazily on emission) or, for the special
+    /// input-streaming paths, a fully-formed `Final` result. The caller drives the emission — eagerly
+    /// ([`exec_select_plan`], the materialized `execute()` path) or lazily (`BufferedScan`, the
+    /// `query()` path) — so the output `Vec` is built once, by whichever drive is in use. The shared
+    /// `stmt_rng` threads the per-statement entropy through both the blocking part and the (possibly
+    /// deferred) projection, so a projection-list `uuidv7()`/`now()` draws the identical sequence
+    /// whichever drive runs it (streaming.md §6).
+    fn exec_select_emit(
+        &self,
+        plan: &SelectPlan,
+        outer: &[&[Value]],
+        params: &[Value],
+        ctes: CteCtx,
+        stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
+        meter: &mut Meter,
+    ) -> Result<Emitter> {
         let env = EvalEnv {
             exec: self,
             params,
             outer,
-            rng: &stmt_rng,
+            rng: stmt_rng,
             ctes,
         };
-        let mut meter = self.session.new_meter();
 
         // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
         // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with
@@ -11423,8 +11594,13 @@ impl Engine {
         // elided), so it short-circuits a top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY,
         // a no-ORDER-BY DISTINCT, aggregate, or join must see every row (sort/dedup/group/combine), so
         // it keeps the eager path below. page_read stays the full block; only the row reads short-circuit.
+        // (On the lazy `query()` path the streamable shape is served directly by `try_streaming_query`
+        // before reaching here — `BufferedScan` only ever drives the non-streamable plans — but the eager
+        // `execute()` path still routes through here, so the dispatch stays.)
         if streaming_scan_eligible(plan) {
-            return self.exec_streaming_scan(plan, &env, &mut meter, params);
+            return Ok(Emitter::Final {
+                rows: self.exec_streaming_scan(plan, &env, meter, params)?.rows,
+            });
         }
 
         // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
@@ -11432,7 +11608,9 @@ impl Engine {
         // query whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
         // point-lookup; the eager sort is elided.
         if let Some(io) = &plan.index_order {
-            return self.exec_index_order_scan(plan, io, &env, &mut meter);
+            return Ok(Emitter::Final {
+                rows: self.exec_index_order_scan(plan, io, &env, meter)?.rows,
+            });
         }
 
         // Streaming external sort (spec/design/spill.md §5): a single-table, no-join,
@@ -11461,7 +11639,9 @@ impl Engine {
             // A derived table takes the eager path (grammar.md §42).
             && plan.rels[0].derived.is_none()
         {
-            return self.exec_streaming_sort(plan, &env, &mut meter, params);
+            return Ok(Emitter::Final {
+                rows: self.exec_streaming_sort(plan, &env, meter, params)?.rows,
+            });
         }
 
         // Streaming two-table join (cost.md §3 "JOIN"): the planner set `join_pk_ordered` only for a
@@ -11469,7 +11649,11 @@ impl Engine {
         // a LIMIT. The nested loop drives the outer in PK order so the output is already ordered — the
         // sort is elided and the loop short-circuits a top-N.
         if plan.join_pk_ordered {
-            return self.exec_streaming_join(plan, &env, &mut meter, params, outer, &stmt_rng);
+            return Ok(Emitter::Final {
+                rows: self
+                    .exec_streaming_join(plan, &env, meter, params, outer, stmt_rng)?
+                    .rows,
+            });
         }
 
         // Materialize each relation once, in primary-key order (base tables drain a ScanSource — the
@@ -11484,9 +11668,8 @@ impl Engine {
                 materialized.push(Vec::new());
                 continue;
             }
-            materialized.push(
-                self.materialize_rel(plan, ri, params, outer, &stmt_rng, env.ctes, &mut meter)?,
-            );
+            materialized
+                .push(self.materialize_rel(plan, ri, params, outer, stmt_rng, env.ctes, meter)?);
         }
 
         // Left-deep nested-loop join. `running` holds the combined rows over the relations
@@ -11529,9 +11712,9 @@ impl Engine {
                         k + 1,
                         params,
                         &lat_outer,
-                        &stmt_rng,
+                        stmt_rng,
                         env.ctes,
-                        &mut meter,
+                        meter,
                     )?;
                     let mut left_matched = false;
                     for right in &right_rows {
@@ -11539,7 +11722,7 @@ impl Engine {
                         combined.extend_from_slice(right);
                         let keep = match on {
                             None => true,
-                            Some(pred) => pred.eval(&combined, &env, &mut meter)?.is_true(),
+                            Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                         };
                         if keep {
                             next.push(combined);
@@ -11564,7 +11747,7 @@ impl Engine {
                     combined.extend_from_slice(right);
                     let keep = match on {
                         None => true,
-                        Some(pred) => pred.eval(&combined, &env, &mut meter)?.is_true(),
+                        Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                     };
                     if keep {
                         next.push(combined);
@@ -11596,7 +11779,7 @@ impl Engine {
         for row in running {
             let keep = match &plan.filter {
                 None => true,
-                Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
+                Some(f) => f.eval(&row, &env, meter)?.is_true(),
             };
             if keep {
                 rows.push(row);
@@ -11616,7 +11799,7 @@ impl Engine {
                 &plan.window_specs,
                 &plan.window_keys,
                 &env,
-                &mut meter,
+                meter,
             )?;
         }
 
@@ -11631,7 +11814,7 @@ impl Engine {
             // post-WHERE (post-window) row and append the value, so its sort slot `final_width + k` reads
             // the appended column and the slot-based sort below is unchanged — the window-key precedent.
             // The evaluation is metered per node (cost.md §3); empty for a column/ordinal-only ORDER BY.
-            materialize_order_exprs(&mut rows, &plan.order_exprs, &env, &mut meter)?;
+            materialize_order_exprs(&mut rows, &plan.order_exprs, &env, meter)?;
             sort_rows(&mut rows, &plan.order)?;
         }
 
@@ -11653,7 +11836,7 @@ impl Engine {
         // source rows and ONLY the windowed rows are projected; with DISTINCT every
         // (sorted) filtered row is projected — dedup must see them all — duplicates drop
         // by first occurrence, and the window then slices the DISTINCT rows.
-        let out_rows = if plan.is_agg {
+        let emitter = if plan.is_agg {
             // Aggregate query — group + accumulate (aggregates.md §5). Fold every filtered row into
             // the accumulators — charging aggregate_accumulate per (row × aggregate) and the
             // operand's own operator_evals — then finalize to the synthetic row [agg_0..] and
@@ -11695,7 +11878,7 @@ impl Engine {
                 for row in rows.iter_mut() {
                     meter.guard()?;
                     for ge in &plan.group_exprs {
-                        let v = ge.eval(row, &env, &mut meter)?;
+                        let v = ge.eval(row, &env, meter)?;
                         row.push(v);
                     }
                 }
@@ -11732,7 +11915,7 @@ impl Engine {
                         // charged only for a row that passes. The pass/fold decision is deterministic
                         // (scan order is cross-core identical), so the metered cost is identical.
                         if let Some(f) = &spec.filter
-                            && !f.eval(row, &env, &mut meter)?.is_true()
+                            && !f.eval(row, &env, meter)?.is_true()
                         {
                             continue;
                         }
@@ -11745,7 +11928,7 @@ impl Engine {
                             let tuple = hp
                                 .keys
                                 .iter()
-                                .map(|k| k.eval(row, &env, &mut meter))
+                                .map(|k| k.eval(row, &env, meter))
                                 .collect::<Result<Vec<Value>>>()?;
                             if let Acc::Hypothetical { rows, .. } = &mut groups[gi].1[si] {
                                 rows.push(tuple);
@@ -11753,7 +11936,7 @@ impl Engine {
                             continue;
                         }
                         let v = match &spec.operand {
-                            Some(op) => op.eval(row, &env, &mut meter)?,
+                            Some(op) => op.eval(row, &env, meter)?,
                             None => Value::Null, // COUNT(*) ignores the value
                         };
                         // DISTINCT: skip a NULL (never folded by any aggregate) and any value already
@@ -11765,7 +11948,7 @@ impl Engine {
                         {
                             continue;
                         }
-                        groups[gi].1[si].fold(v, &mut meter)?;
+                        groups[gi].1[si].fold(v, meter)?;
                     }
                 }
                 // Build one synthetic row per group of this set: each master grouping column's value
@@ -11825,7 +12008,7 @@ impl Engine {
             if let Some(h) = &plan.having {
                 let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
                 for srow in group_rows {
-                    if h.eval(&srow, &env, &mut meter)?.is_true() {
+                    if h.eval(&srow, &env, meter)?.is_true() {
                         kept.push(srow);
                     }
                 }
@@ -11842,13 +12025,13 @@ impl Engine {
                     &plan.window_specs,
                     &plan.window_keys,
                     &env,
-                    &mut meter,
+                    meter,
                 )?;
             }
             // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
             // expression key is materialized against the grouped row and appended — grammar.md §10).
             if !plan.order.is_empty() {
-                materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, &mut meter)?;
+                materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, meter)?;
                 sort_rows(&mut group_rows, &plan.order)?;
             }
             if plan.distinct {
@@ -11863,34 +12046,31 @@ impl Engine {
                 for srow in &group_rows {
                     let mut out = Vec::with_capacity(plan.projections.len());
                     for p in &plan.projections {
-                        out.push(p.eval(srow, &env, &mut meter)?);
+                        out.push(p.eval(srow, &env, meter)?);
                     }
                     if seen.insert(out.clone()) {
                         distinct_rows.push(out);
                     }
                 }
+                // The dedup already projected every grouped row (the §3 asymmetry, charged above), so
+                // emission is Identity — window + charge row_produced, deferred to the drive (streaming.md §4).
                 let (start, end) = window_bounds(distinct_rows.len());
-                let mut out_rows = Vec::with_capacity(end - start);
-                for row in distinct_rows.drain(start..end) {
-                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                    meter.charge(COSTS.row_produced);
-                    out_rows.push(row);
+                Emitter::Buffer {
+                    rows: distinct_rows,
+                    start,
+                    end,
+                    mode: EmitMode::Identity,
                 }
-                out_rows
             } else {
-                // Window + project; only an emitted row charges row_produced + projection cost.
+                // Window then project on emission; only an emitted row charges row_produced +
+                // projection cost. Deferred to the drive (streaming.md §4).
                 let (start, end) = window_bounds(group_rows.len());
-                let mut out_rows = Vec::with_capacity(end - start);
-                for srow in &group_rows[start..end] {
-                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                    meter.charge(COSTS.row_produced);
-                    let mut out = Vec::with_capacity(plan.projections.len());
-                    for p in &plan.projections {
-                        out.push(p.eval(srow, &env, &mut meter)?);
-                    }
-                    out_rows.push(out);
+                Emitter::Buffer {
+                    rows: group_rows,
+                    start,
+                    end,
+                    mode: EmitMode::Project,
                 }
-                out_rows
             }
         } else if plan.distinct {
             // Project every filtered row (charging projection cost per row, the §3
@@ -11902,51 +12082,36 @@ impl Engine {
             for row in &rows {
                 let mut out = Vec::with_capacity(plan.projections.len());
                 for p in &plan.projections {
-                    out.push(p.eval(row, &env, &mut meter)?);
+                    out.push(p.eval(row, &env, meter)?);
                 }
                 if seen.insert(out.clone()) {
                     distinct_rows.push(out);
                 }
             }
-            // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge
-            // row_produced (spec/design/cost.md §3).
+            // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge row_produced
+            // (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
+            // asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
             let (start, end) = window_bounds(distinct_rows.len());
-            let mut out_rows = Vec::with_capacity(end - start);
-            for row in distinct_rows.drain(start..end) {
-                meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                meter.charge(COSTS.row_produced);
-                out_rows.push(row);
+            Emitter::Buffer {
+                rows: distinct_rows,
+                start,
+                end,
+                mode: EmitMode::Identity,
             }
-            out_rows
         } else {
-            // Window the sorted rows BEFORE projection, so rows skipped by OFFSET or
-            // excluded by LIMIT accrue no row_produced/projection cost (they were still
-            // scanned + filtered above). Producing a row, and each projection-list
-            // evaluation, accrue cost. (ORDER BY's sort comparisons are not metered —
-            // spec/design/cost.md §3.)
+            // Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by LIMIT
+            // accrue no row_produced/projection cost (they were still scanned + filtered above).
+            // Producing a row, and each projection-list evaluation, accrue cost on emission — deferred
+            // to the drive (streaming.md §4). (ORDER BY's sort comparisons are not metered — cost.md §3.)
             let (start, end) = window_bounds(rows.len());
-            let mut out_rows = Vec::with_capacity(end - start);
-            for row in &rows[start..end] {
-                meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                meter.charge(COSTS.row_produced);
-                let mut out = Vec::with_capacity(plan.projections.len());
-                for p in &plan.projections {
-                    out.push(p.eval(row, &env, &mut meter)?);
-                }
-                out_rows.push(out);
+            Emitter::Buffer {
+                rows,
+                start,
+                end,
+                mode: EmitMode::Project,
             }
-            out_rows
         };
-
-        Ok(SelectResult {
-            column_names: plan.column_names.clone(),
-            column_types: plan.column_types.clone(),
-            rows: out_rows,
-            // The scan/eval cost (correlated subqueries fold their per-row cost in via the
-            // evaluator). Globally-uncorrelated subqueries are folded once before exec and their
-            // cost is added at the `run_query_expr` level (spec/design/cost.md §3).
-            cost: meter.accrued,
-        })
+        Ok(emitter)
     }
 
     // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
@@ -19498,6 +19663,132 @@ impl crate::cursor::RowStream for StreamingScan {
         // The pinned snapshot is owned by `self.engine` / `self.scan` and released on `Drop`; mark
         // done so any further `next_row` is a no-op (streaming.md §5, idempotent).
         self.done = true;
+    }
+}
+
+/// The lazy **buffered** pull pipeline behind a `query()` [`Rows`](crate::Rows) cursor for a plan with
+/// a blocking operator (spec/design/streaming.md §4, S4) — the generalization of `SortedRows::next()`
+/// to every blocking shape. It owns a frozen snapshot [`Engine`] (eval's `exec`, so the cursor is
+/// self-contained and outlives the handle — streaming.md §5), the resolved + folded plan, bound
+/// params, a per-statement entropy cell, its own cost [`Meter`], and the lazy emission `state`. On its
+/// FIRST [`next_row`](crate::cursor::RowStream::next_row) it runs the blocking part
+/// ([`exec_select_emit`](Engine::exec_select_emit)) to completion into an [`Emitter`] — buffering the
+/// input (correctly: a sort/group/dedup/join must see it all) and charging the scan/sort/group/dedup
+/// cost — then yields its buffer **one row at a time**: a `Project` row is projected (and charges
+/// `row_produced` + projection) on emission, an `Identity`/`Final` row is handed out (already
+/// projected). So peak *output* memory is one row, a caller's early exit skips the projection of the
+/// rows it never pulls, and a fully-drained query observes the same rows + total cost as the eager
+/// path (streaming.md §6).
+struct BufferedScan {
+    engine: Engine,
+    plan: SelectPlan,
+    params: Vec<Value>,
+    rng: std::cell::Cell<crate::seam::StmtRng>,
+    meter: Meter,
+    state: BufState,
+}
+
+/// The lazy emission state of a [`BufferedScan`] (spec/design/streaming.md §4).
+enum BufState {
+    /// The blocking part has not run yet — the first `next_row` runs it (streaming.md §4).
+    Pending,
+    /// The general blocking buffer, windowed to `[idx, end)`. Each emission charges `row_produced`;
+    /// `project` rows additionally evaluate the projection list (`Identity` rows are pre-projected).
+    Buffer {
+        rows: Vec<Vec<Value>>,
+        idx: usize,
+        end: usize,
+        project: bool,
+    },
+    /// A fully-formed result from a special input-streaming path (already projected AND charged) —
+    /// emission just hands the rows out.
+    Final {
+        iter: std::vec::IntoIter<Vec<Value>>,
+    },
+    /// The buffer is exhausted (or the cursor was closed) — every further `next_row` is `None`.
+    Done,
+}
+
+impl crate::cursor::RowStream for BufferedScan {
+    fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+        // Run the blocking part on the FIRST pull (streaming.md §4 — `Buffered` runs the blocking part
+        // then yields its buffer lazily). A mid-blocking cost abort / cancellation / trap surfaces HERE
+        // (during iteration), not at `query()` time (streaming.md §6). Disjoint-field borrows: the
+        // emit reads `self.engine`/`self.plan`/`self.params`/`self.rng` and writes `self.meter`, all
+        // distinct from `self.state` it then assigns.
+        if matches!(self.state, BufState::Pending) {
+            let emitter = self.engine.exec_select_emit(
+                &self.plan,
+                &[],
+                &self.params,
+                CteCtx::empty(),
+                &self.rng,
+                &mut self.meter,
+            )?;
+            self.state = match emitter {
+                Emitter::Buffer {
+                    rows,
+                    start,
+                    end,
+                    mode,
+                } => BufState::Buffer {
+                    rows,
+                    idx: start,
+                    end,
+                    project: matches!(mode, EmitMode::Project),
+                },
+                Emitter::Final { rows } => BufState::Final {
+                    iter: rows.into_iter(),
+                },
+            };
+        }
+        match &mut self.state {
+            BufState::Done => Ok(None),
+            BufState::Pending => unreachable!("the blocking part ran above"),
+            // Already projected + charged — hand the next row out (no further cost).
+            BufState::Final { iter } => Ok(iter.next()),
+            BufState::Buffer {
+                rows,
+                idx,
+                end,
+                project,
+            } => {
+                if *idx >= *end {
+                    return Ok(None);
+                }
+                let i = *idx;
+                *idx += 1;
+                let project = *project;
+                self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
+                self.meter.charge(COSTS.row_produced);
+                if project {
+                    let env = EvalEnv {
+                        exec: &self.engine,
+                        params: &self.params,
+                        outer: &[],
+                        rng: &self.rng,
+                        ctes: CteCtx::empty(),
+                    };
+                    let mut out = Vec::with_capacity(self.plan.projections.len());
+                    for p in &self.plan.projections {
+                        out.push(p.eval(&rows[i], &env, &mut self.meter)?);
+                    }
+                    Ok(Some(out))
+                } else {
+                    Ok(Some(std::mem::take(&mut rows[i])))
+                }
+            }
+        }
+    }
+
+    fn cost(&self) -> i64 {
+        self.meter.accrued
+    }
+
+    fn close(&mut self) {
+        // The pinned snapshot is owned by `self.engine` and released on `Drop`; mark done so any
+        // further `next_row` is a no-op (streaming.md §5, idempotent).
+        self.state = BufState::Done;
     }
 }
 

@@ -129,15 +129,22 @@ func (db *engine) ExecuteSQL(sql string, params []Value) (Outcome, error) {
 
 // QuerySQL is a one-shot: parse + run a query sql, binding params, returning a row cursor. A
 // single-table no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md
-// §4, S3) — one row pulled at a time over a pinned snapshot, bounded peak memory, early-exit; every
-// other shape falls back to the materialized Execute path. (This is the bare single-handle engine; the
-// watermark pin lives on the shared-core Session.Query path.)
+// §4, S3); a blocking read (ORDER BY/DISTINCT/aggregate/window/join) by a lazy BUFFERED cursor (S4)
+// that buffers the input but yields the output one row at a time. Both pull over a pinned snapshot with
+// bounded peak output memory and a caller early-exit; a set-operation / WITH top level falls back to
+// the materialized Execute path. (This is the bare single-handle engine; the watermark pin lives on the
+// shared-core Session.Query path.)
 func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return nil, err
 	}
 	if rows, ok, err := db.tryStreamingQuery(stmt, params); err != nil {
+		return nil, err
+	} else if ok {
+		return rows, nil
+	}
+	if rows, ok, err := db.tryBufferedQuery(stmt, params); err != nil {
 		return nil, err
 	} else if ok {
 		return rows, nil

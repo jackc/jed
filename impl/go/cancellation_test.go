@@ -77,16 +77,23 @@ func TestCancelDuringExecution(t *testing.T) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
 	// Always-cancel: the first Guard during the scan aborts. The ctx path is untouched here, so a
-	// 57014 can only come from the meter consulting session.cancel.
+	// 57014 can only come from the meter consulting session.cancel. Since S4 (streaming.md §6) Query
+	// returns a LAZY cursor — a bare scan buffers its input on the first pull — so building the cursor
+	// no longer runs the scan; the meter Guard trips during the drain and the 57014 surfaces via Err().
 	s.engine.session.cancel = func() bool { return true }
-	_, err := s.Query("SELECT id FROM t", nil)
-	if code := cancelCode(t, err); code != "57014" {
+	rows, err := s.Query("SELECT id FROM t", nil)
+	if err != nil {
+		t.Fatalf("building the lazy cursor should not error, got %v", err)
+	}
+	for rows.Next() {
+	}
+	if code := cancelCode(t, rows.Err()); code != "57014" {
 		t.Fatalf("want 57014 from meter Guard, got %s", code)
 	}
 
 	// Cleared: the same query completes normally.
 	s.engine.session.cancel = nil
-	rows, err := s.Query("SELECT id FROM t", nil)
+	rows, err = s.Query("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatalf("uncanceled query should succeed, got %v", err)
 	}

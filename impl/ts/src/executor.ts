@@ -387,6 +387,36 @@ type SelectResult = {
   cost: bigint;
 };
 
+// EmitMode is how an Emitter's rows are emitted (spec/design/streaming.md §4, S4):
+//   - "project": the buffer rows are unprojected — emission evaluates the projection list (charging
+//     its operatorEvals) + rowProduced per windowed row.
+//   - "identity": the buffer rows are already the projected output (the DISTINCT dedup projected them
+//     up front — the §3 asymmetry), so emission charges only rowProduced per windowed row.
+//   - "final": the rows are a fully-formed result (the special input-streaming paths already projected
+//     AND charged them) — emission hands them out with no further charge.
+type EmitMode = "project" | "identity" | "final";
+
+// Emitter describes how a SelectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
+// SELECT runs its blocking part (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into a buffer, then
+// emits a row at a time. execSelectEmit returns this so the emission can be driven EAGERLY (the
+// materialized execute() path — execSelectPlan's drainEmitterEager builds the array) or LAZILY (the
+// query() path — a bufferedRows generator yields it row by row, bounding output memory and
+// short-circuiting a caller's early exit). Both drives charge the identical units at the identical
+// sites (streaming.md §6). For "project"/"identity" the buffer is windowed to [start, end); for
+// "final" start/end span the whole result.
+type Emitter = {
+  rows: Value[][];
+  start: number;
+  end: number;
+  mode: EmitMode;
+};
+
+// finalEmitter wraps an already-projected-and-charged result (the special input-streaming paths) as a
+// "final" Emitter — emission hands the rows out with no further charge (spec/design/streaming.md §4).
+function finalEmitter(rows: Value[][]): Emitter {
+  return { rows, start: 0, end: rows.length, mode: "final" };
+}
+
 // Engine is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands later. Names
 // are keyed case-insensitively (lowercased).
@@ -1836,6 +1866,36 @@ function* streamRows(
     // so no further leaf is faulted (the streaming early-exit win). The check is after the yield, so the
     // for-of pulls the next row only when another is actually needed.
     if (sp.limit !== null && produced >= sp.limit) return;
+  }
+}
+
+// bufferedRows is the lazy pull pipeline behind a BUFFERED cursor for a blocking plan
+// (spec/design/streaming.md §4, S4): a function* generator whose body runs the BLOCKING part
+// (engine.execSelectEmit) on its first .next() — buffering the input (correctly: a sort/group/dedup/
+// join must see it all) and charging the scan/sort/group/dedup cost — then YIELDS its buffer one row at
+// a time. A "project" row is projected (charging rowProduced + projection) on emission; an "identity"/
+// "final" row is handed out (already projected). So building the generator runs no work (a 54P01 cost
+// abort surfaces during the first pull, not at query() — streaming.md §6), peak output memory is one
+// row, a caller's early exit (abandoning the generator) skips the projection of the rows it never pulls,
+// and a fully-drained query observes the same rows + total cost as the eager path (streaming.md §6).
+function* bufferedRows(
+  engine: Engine,
+  plan: SelectPlan,
+  env: EvalEnv,
+  meter: Meter,
+  params: Value[],
+): Generator<Value[]> {
+  const em = engine.execSelectEmit(plan, env, meter, params);
+  if (em.mode === "final") {
+    // Already projected + charged — hand each row out (no further cost).
+    for (const row of em.rows) yield row;
+    return;
+  }
+  for (let i = em.start; i < em.end; i++) {
+    meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
+    meter.charge(COSTS.rowProduced);
+    if (em.mode === "identity") yield em.rows[i]!;
+    else yield plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter));
   }
 }
 
@@ -9460,6 +9520,61 @@ export class Engine {
     return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
   }
 
+  // tryBufferedQuery tries to serve stmt as a lazy BUFFERED query (spec/design/streaming.md §4, S4) —
+  // the query() path for a top-level read SELECT with a BLOCKING operator (a non-PK-ordered ORDER BY,
+  // DISTINCT, aggregate / GROUP BY, window, or a join) that the streamable fast lane (tryStreamingQuery)
+  // does not cover. The blocking part still buffers its input (correctly — it must), but the OUTPUT is
+  // yielded one row at a time via a bufferedRows generator: the generator runs the blocking part on its
+  // first pull (so a 54P01 cost abort or an arithmetic trap surfaces DURING iteration, not at query() —
+  // streaming.md §6), then emits its buffer lazily — bounding peak output memory and letting a caller's
+  // early exit skip the projection of rows it never pulls (the top-N-over-the-buffer win). Returns null
+  // for a non-SELECT / write-classified statement, a streamable plan (served by the fast lane), or a
+  // set-op / WITH top level (a deferred S4 follow-on, streaming.md §7) — those fall back to the
+  // materialized execute() path → a buffered cursor. Under full drain the rows + total cost are
+  // byte-identical to the eager path (the same Emitter driven row by row, streaming.md §6).
+  tryBufferedQuery(
+    stmt: Statement,
+    params: Value[],
+  ): { columnNames: string[]; cursor: Cursor } | null {
+    if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
+    const ptypes = new ParamTypes();
+    const plan = this.planQuery(stmt, null, [], ptypes);
+    // A streamable plan is the fast lane's job (tryStreamingQuery), tried first; this is the blocking
+    // (buffered) shapes only.
+    if (plan.kind !== "select" || streamingScanEligible(plan)) return null;
+    const sp = plan;
+    const bound = bindParams(params, ptypes.finalize());
+    // Fold globally-uncorrelated subqueries to constants so the per-row projection re-enters nothing —
+    // keeping the cursor self-contained (streaming.md §5). The fold's own cost was already charged to
+    // the shared lifetime gauge; it is added to the cursor's reported cost below.
+    const subqueryCost = { value: 0n };
+    this.foldUncorrelatedInSelect(sp, bound, EMPTY_CTE_CTX, subqueryCost);
+    const snap = this.snapshotEngine();
+    const meter = snap.session.newMeter();
+    meter.accrued = subqueryCost.value; // the folded constant cost (lifetime already charged)
+    const env: EvalEnv = {
+      params: bound,
+      outer: [],
+      runSubquery: (p, o) => snap.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      seam: snap.session.seam,
+      rng: new StmtRng(),
+      ctes: EMPTY_CTE_CTX,
+      exec: snap,
+    };
+    const gen = bufferedRows(snap, sp, env, meter, bound);
+    const source: RowSource = {
+      nextRow: () => {
+        const r = gen.next();
+        return r.done ? undefined : r.value;
+      },
+      cost: () => meter.accrued,
+      close: () => {
+        gen.return(undefined);
+      },
+    };
+    return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
+  }
+
   private execStreamingScan(
     plan: SelectPlan,
     env: EvalEnv,
@@ -9933,6 +10048,10 @@ export class Engine {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
+    // Run the blocking part to an Emitter, then drive the emission EAGERLY into an array (the
+    // materialized execute() path the conformance corpus drives — byte-unchanged). The lazy query()
+    // path drives the SAME Emitter row by row via a bufferedRows generator (streaming.md §4); both
+    // charge the identical units at the identical sites, so the totals agree (streaming.md §6).
     const env: EvalEnv = {
       params,
       outer,
@@ -9945,7 +10064,38 @@ export class Engine {
       exec: this,
     };
     const meter = this.session.newMeter();
+    const em = this.execSelectEmit(plan, env, meter, params);
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows: this.drainEmitterEager(em, plan, env, meter),
+      cost: meter.accrued,
+    };
+  }
 
+  // drainEmitterEager builds the full output array from the Emitter — the materialized execute() drive
+  // (spec/design/streaming.md §4). The lazy query() drive (bufferedRows) emits the same rows one at a
+  // time instead; both charge the identical units in the identical order, so totals agree (§6).
+  private drainEmitterEager(em: Emitter, plan: SelectPlan, env: EvalEnv, meter: Meter): Value[][] {
+    if (em.mode === "final") return em.rows;
+    const out: Value[][] = [];
+    for (let i = em.start; i < em.end; i++) {
+      meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+      meter.charge(COSTS.rowProduced);
+      if (em.mode === "identity") out.push(em.rows[i]!);
+      else out.push(plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter)));
+    }
+    return out;
+  }
+
+  // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
+  // output rows (spec/design/streaming.md §4, S4): the scan / join / WHERE / window / ORDER BY / GROUP
+  // BY / DISTINCT all run here (charging their cost into meter), producing either a windowed buffer
+  // (projected lazily on emission) or, for the special input-streaming paths, a fully-formed result.
+  // The caller drives the emission — eagerly (execSelectPlan, the materialized execute() path) or lazily
+  // (a bufferedRows generator, the query() path). The env's StmtRng threads the per-statement entropy
+  // through both the blocking part and the (possibly deferred) projection (streaming.md §6).
+  execSelectEmit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
     // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
     // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
     // LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
@@ -9955,7 +10105,7 @@ export class Engine {
     // top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY, a no-ORDER-BY DISTINCT, aggregate,
     // or join must see every row, so it keeps the eager path below. pageRead stays the full block.
     if (streamingScanEligible(plan)) {
-      return this.execStreamingScan(plan, env, meter, params);
+      return finalEmitter(this.execStreamingScan(plan, env, meter, params).rows);
     }
 
     // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
@@ -9963,7 +10113,7 @@ export class Engine {
     // whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
     // point-lookup; the eager sort is elided.
     if (plan.indexOrder !== null) {
-      return this.execIndexOrderScan(plan, plan.indexOrder, env, meter);
+      return finalEmitter(this.execIndexOrderScan(plan, plan.indexOrder, env, meter).rows);
     }
 
     // Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
@@ -9992,7 +10142,7 @@ export class Engine {
       // A derived table takes the eager path (grammar.md §42).
       plan.rels[0]!.derived === undefined
     ) {
-      return this.execStreamingSort(plan, env, meter, params);
+      return finalEmitter(this.execStreamingSort(plan, env, meter, params).rows);
     }
 
     // Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
@@ -10000,7 +10150,7 @@ export class Engine {
     // nested loop drives the outer in PK order so the output is already ordered — the sort is elided
     // and the loop short-circuits a top-N.
     if (plan.joinPkOrdered) {
-      return this.execStreamingJoin(plan, env, meter, params, outer);
+      return finalEmitter(this.execStreamingJoin(plan, env, meter, params, env.outer).rows);
     }
 
     // Materialize each relation once, in primary-key order (base tables drain a scanSource — the
@@ -10009,7 +10159,7 @@ export class Engine {
     // CORRELATED LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up
     // front — an empty placeholder holds its slot and the join loop re-materializes it per left row.
     const materialized: Row[][] = plan.rels.map((rel, ri) =>
-      rel.lateral === true ? [] : this.materializeRel(plan, ri, outer, env, params, meter),
+      rel.lateral === true ? [] : this.materializeRel(plan, ri, env.outer, env, params, meter),
     );
 
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
@@ -10042,7 +10192,7 @@ export class Engine {
       // lateral is 42P10), so there is no unmatched-right emission.
       if (plan.rels[k + 1]!.lateral === true) {
         for (const left of running) {
-          const rightRows = this.materializeRel(plan, k + 1, [...outer, left], env, params, meter);
+          const rightRows = this.materializeRel(plan, k + 1, [...env.outer, left], env, params, meter);
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
@@ -10125,7 +10275,6 @@ export class Engine {
     // rows and ONLY the windowed rows are projected; with DISTINCT every (sorted) filtered
     // row is projected — dedup must see them all — duplicates drop by first occurrence, and
     // the window then slices the DISTINCT rows.
-    let out: Value[][];
     if (plan.isAgg) {
       // Aggregate query — group + accumulate (aggregates.md §5). Bucket the post-WHERE rows by
       // their group-key values; the bucket key is the value-canonical distinctRowKey (it
@@ -10296,22 +10445,17 @@ export class Engine {
             distinctRows.push(tuple);
           }
         }
+        // The dedup already projected every grouped row (the §3 asymmetry, charged above), so emission
+        // is Identity — window + charge rowProduced, deferred to the drive (streaming.md §4).
         const [start, end] = windowBounds(distinctRows.length);
-        out = distinctRows.slice(start, end).map((tuple) => {
-          meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
-          meter.charge(COSTS.rowProduced);
-          return tuple;
-        });
-      } else {
-        // Window + project; only an emitted row charges rowProduced + its projection cost.
-        const [start, end] = windowBounds(groupRows.length);
-        out = groupRows.slice(start, end).map((srow) => {
-          meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
-          meter.charge(COSTS.rowProduced);
-          return plan.projections.map((p) => evalExpr(p, srow, env, meter));
-        });
+        return { rows: distinctRows, start, end, mode: "identity" };
       }
-    } else if (plan.distinct) {
+      // Window then project on emission; only an emitted row charges rowProduced + projection cost.
+      // Deferred to the drive (streaming.md §4).
+      const [start, end] = windowBounds(groupRows.length);
+      return { rows: groupRows, start, end, mode: "project" };
+    }
+    if (plan.distinct) {
       // Project every filtered row (charging projection cost per row, the §3 asymmetry),
       // keeping first occurrences. `seen` is membership-only: output order comes from the
       // deterministic source iteration, never from Set iteration (no order leak — §8/§10).
@@ -10325,34 +10469,17 @@ export class Engine {
           distinctRows.push(tuple);
         }
       }
-      // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge
-      // rowProduced (spec/design/cost.md §3).
+      // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge rowProduced
+      // (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
+      // asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
       const [start, end] = windowBounds(distinctRows.length);
-      out = distinctRows.slice(start, end).map((tuple) => {
-        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
-        meter.charge(COSTS.rowProduced);
-        return tuple;
-      });
-    } else {
-      // Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by
-      // LIMIT accrue no rowProduced/projection cost (they were still scanned + filtered
-      // above). Producing a row, and each projection-list evaluation, accrue cost.
-      // (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
-      const [start, end] = windowBounds(rows.length);
-      out = rows.slice(start, end).map((row) => {
-        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
-        meter.charge(COSTS.rowProduced);
-        return plan.projections.map((p) => evalExpr(p, row, env, meter));
-      });
+      return { rows: distinctRows, start, end, mode: "identity" };
     }
-    // The scan/eval cost (correlated subqueries fold their per-row cost in via the evaluator;
-    // globally-uncorrelated ones are folded once before exec, their cost added at runQueryExpr).
-    return {
-      columnNames: plan.columnNames,
-      columnTypes: plan.columnTypes,
-      rows: out,
-      cost: meter.accrued,
-    };
+    // Window the sorted rows BEFORE projection (above), so rows skipped by OFFSET or excluded by LIMIT
+    // accrue no rowProduced/projection cost; project on emission — deferred to the drive (streaming.md
+    // §4). (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
+    const [start, end] = windowBounds(rows.length);
+    return { rows, start, end, mode: "project" };
   }
 
   // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------

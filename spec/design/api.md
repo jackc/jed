@@ -274,20 +274,25 @@ row, then row, then column metadata) is exactly what a pull/streaming executor s
 streaming lands *behind* the cursor without changing any caller. The **true streaming cursor**
 is specified in [streaming.md](streaming.md) and landing in slices: `Rows` is a **pull source**
 (`Cursor`) where the non-blocking single-table pipeline streams row-at-a-time and the blocking
-operators buffer-then-stream their output. **Landed (S3, all three cores):** a `query()` →
+operators buffer-then-stream their output. **Landed (S3 + S4, all three cores):** a `query()` →
 `Rows` over the single-table no-blocking-operator read (the PK-ordered / LIMIT-short-circuit
-shape) is now a lazy `Streaming` cursor — scan → resolve → `WHERE` → project, one row per
-`next`, bounded peak memory, early-exit. Two contract notes that come with it: a streaming cursor
-**pins its read snapshot for its life** (PG-faithful — [streaming.md §5](streaming.md),
-[transactions.md §5/§8](transactions.md)), so it must be drained or `close`d to release; and
-`cost` is **final only after the cursor is fully drained** (it accrues as rows are pulled —
-[streaming.md §6](streaming.md)). A mid-drain error (a `54P01` cost abort, a `57014`
-cancellation, an arithmetic trap) surfaces during iteration — Rust stashes it for
-[`Rows::error()`](streaming.md), Go sets `Rows.Err()`, TS throws out of the iterator.
-**`execute()` still returns a fully materialized `Outcome`** (the conformance harness drives it,
-so every `# cost:` value is unchanged — streaming is a `query()`-only optimization, internal
-machinery whose only contract is identical rows + total cost under full drain). The buffering
-blocking operators (S4) and prepared-statement streaming are follow-ons. The internally-streamed
+shape) is a lazy `Streaming` cursor — scan → resolve → `WHERE` → project, one row per `next`
+(S3); and a **blocking** read (a non-PK `ORDER BY`, `DISTINCT`, aggregate / `GROUP BY`, window,
+or a join) is a lazy `Buffered` cursor (S4) that **buffers its input** (on the first pull) but
+**yields the output one row at a time** — bounding peak *output* memory and letting a caller's
+early exit skip the projection of the rows it never pulls. Both pull over a pinned snapshot. Two
+contract notes that come with them: the cursor **pins its read snapshot for its life**
+(PG-faithful — [streaming.md §5](streaming.md), [transactions.md §5/§8](transactions.md)), so it
+must be drained or `close`d to release; and `cost` is **final only after the cursor is fully
+drained** (it accrues as rows are pulled — [streaming.md §6](streaming.md)). A mid-drain error (a
+`54P01` cost abort, a `57014` cancellation, an arithmetic trap) surfaces during iteration — Rust
+stashes it for [`Rows::error()`](streaming.md), Go sets `Rows.Err()`, TS throws out of the
+iterator; this is so even for the `Buffered` cursor, whose blocking part runs on the first pull
+(not at `query()`). **`execute()` still returns a fully materialized `Outcome`** (the conformance
+harness drives it, so every `# cost:` value is unchanged — the lazy cursor is a `query()`-only
+optimization, internal machinery whose only contract is identical rows + total cost under full
+drain). A top-level set-operation / `WITH` read and prepared-statement streaming are the remaining
+follow-ons. The internally-streamed
 *operators* landed earlier
 ([spill.md](spill.md)): the `ORDER BY` external merge sort + its streaming single-table feed are
 in, with the spilling hash aggregate / `DISTINCT` / hash JOIN as deferred follow-ons (CLAUDE.md
@@ -454,12 +459,14 @@ input-size cap cross-core.
 ## 9. Non-goals this slice
 
 - **Streaming rows at the cursor — IN, not a non-goal.** The fully pull-based cursor is specified
-  in [streaming.md](streaming.md) and landing in slices (§4); **S3 has landed (all three cores):** a
-  `query()` → `Rows` over the single-table no-blocking-operator read is now a lazy `Streaming` pull
-  source that pins its snapshot for its life (`execute()` stays materialized — the corpus drives it).
-  The internally-streamed *operators* (the `ORDER BY` external merge sort spilling under `work_mem`,
-  [spill.md](spill.md)) landed earlier. What stays deferred is the blocking-operator buffer-then-stream
-  output (S4), prepared-statement streaming, the spilling hash aggregate / `DISTINCT` / hash JOIN
+  in [streaming.md](streaming.md) and landing in slices (§4); **S3 + S4 have landed (all three
+  cores):** a `query()` → `Rows` over the single-table no-blocking-operator read is a lazy `Streaming`
+  pull source (S3), and a blocking read (non-PK `ORDER BY` / `DISTINCT` / aggregate / window / join) is
+  a lazy `Buffered` cursor that buffers its input but yields the output one row at a time (S4) — both
+  pin their snapshot for their life (`execute()` stays materialized — the corpus drives it). The
+  internally-streamed *operators* (the `ORDER BY` external merge sort spilling under `work_mem`,
+  [spill.md](spill.md)) landed earlier. What stays deferred is top-level set-operation / `WITH`
+  streaming, prepared-statement streaming, the spilling hash aggregate / `DISTINCT` / hash JOIN
   ([spill.md §7](spill.md)), and lazy small-inline-column decode ([streaming.md §8](streaming.md)).
 - **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL

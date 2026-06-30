@@ -427,13 +427,9 @@ func (s *Session) Query(sql string, params []Value) (*Rows, error) {
 	if s.access != accessReadOnly && s.engine.session.tx == nil && !stmtIsWrite(stmt) {
 		s.refreshCommitted()
 	}
-	rows, ok, err := s.engine.tryStreamingQuery(stmt, params)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
-		// Register the pinned snapshot version in the reader-liveness watermark (streaming.md §5); the
-		// deregister runs on cursor Close (Go has no destructor), advancing oldestLiveTxid.
+	// pin registers the cursor's snapshot version in the reader-liveness watermark (streaming.md §5);
+	// the deregister runs on cursor Close (Go has no destructor), advancing oldestLiveTxid.
+	pin := func(rows *Rows) *Rows {
 		version := s.baseVersion
 		s.core.liveMu.Lock()
 		s.core.live[version]++
@@ -445,7 +441,19 @@ func (s *Session) Query(sql string, params []Value) (*Rows, error) {
 			}
 			s.core.liveMu.Unlock()
 		})
-		return rows, nil
+		return rows
+	}
+	// A single-table no-blocking-op read streams (S3); a blocking read uses the lazy buffered cursor
+	// (S4); both are live readers and pin their snapshot in the watermark.
+	if rows, ok, err := s.engine.tryStreamingQuery(stmt, params); err != nil {
+		return nil, err
+	} else if ok {
+		return pin(rows), nil
+	}
+	if rows, ok, err := s.engine.tryBufferedQuery(stmt, params); err != nil {
+		return nil, err
+	} else if ok {
+		return pin(rows), nil
 	}
 	out, err := s.dispatch(stmt, params)
 	if err != nil {
