@@ -131,8 +131,9 @@ func (db *engine) ExecuteSQL(sql string, params []Value) (Outcome, error) {
 // single-table no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md
 // §4, S3); a blocking read (ORDER BY/DISTINCT/aggregate/window/join) by a lazy BUFFERED cursor (S4)
 // that buffers the input but yields the output one row at a time. Both pull over a pinned snapshot with
-// bounded peak output memory and a caller early-exit; a set-operation / WITH top level falls back to
-// the materialized Execute path. (This is the bare single-handle engine; the watermark pin lives on the
+// bounded peak output memory and a caller early-exit; a top-level set operation / pure-query WITH is
+// served by a lazy DEFERRED cursor (streaming.md §7) that defers the run to the first pull and yields
+// the result one row at a time. (This is the bare single-handle engine; the watermark pin lives on the
 // shared-core Session.Query path.)
 func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 	stmt, err := db.parse(sql)
@@ -145,6 +146,11 @@ func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 		return rows, nil
 	}
 	if rows, ok, err := db.tryBufferedQuery(stmt, params); err != nil {
+		return nil, err
+	} else if ok {
+		return rows, nil
+	}
+	if rows, ok, err := db.tryDeferredQuery(stmt, params); err != nil {
 		return nil, err
 	} else if ok {
 		return rows, nil

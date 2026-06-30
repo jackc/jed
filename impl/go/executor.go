@@ -13802,6 +13802,142 @@ func (c *bufferedScanCursor) costAccrued() int64 { return c.meter.Accrued }
 // watermark deregister (if any) lives on the Rows (streaming.md §5). Idempotent.
 func (c *bufferedScanCursor) close() { c.done = true }
 
+// tryDeferredQuery tries to serve stmt as a lazy DEFERRED query (spec/design/streaming.md §4/§7) — the
+// Query path for a top-level set operation (UNION/INTERSECT/EXCEPT) or pure-query WITH. These are
+// blocking shapes whose output is already projected AND charged (no per-row top-level projection to
+// defer), so the only streaming win is lazy-yield (streaming.md §7): the cursor defers the whole
+// runSetOp / runWith to its FIRST pull — so a 54P01 cost abort, a 54P02 lifetime abort, a canceled
+// context, or an arithmetic trap surfaces during iteration, not at Query (§6) — then yields the
+// buffered result one row at a time over a frozen snapshot (§5). Returns (nil,false,nil) for any
+// non-set-op/WITH statement, or a write-classified one (a data-modifying WITH, a nextval/setval call —
+// stmtIsWrite), which falls back to the materialized dispatch path. Under full drain the rows + total
+// cost are byte-identical to the eager Execute path (it drives the SAME runSetOp / runWith, §6), so the
+// corpus — which drives Execute — stays green by construction; per-core unit tests pin Query == Execute.
+func (db *engine) tryDeferredQuery(stmt statement, params []Value) (*Rows, bool, error) {
+	// A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write gate
+	// and never streams (streaming.md §7 / sequences.md §4).
+	if stmtIsWrite(stmt) {
+		return nil, false, nil
+	}
+	var q deferredQuery
+	switch {
+	case stmt.SetOp != nil:
+		q = deferredQuery{setop: stmt.SetOp}
+	case stmt.With != nil:
+		q = deferredQuery{with: stmt.With}
+	default:
+		return nil, false, nil
+	}
+	// Resolve the output column metadata up front (the Rows cursor exposes it before the first pull).
+	// Planning is unmetered + deterministic, so the names/types read here are IDENTICAL to what the
+	// deferred run produces (the run reuses runSetOp/runWith verbatim, so there is no rows/cost drift).
+	// A planning error (42P01/42804/…) surfaces at Query, matching the eager path.
+	names, types, err := db.deferredColumnMeta(stmt)
+	if err != nil {
+		return nil, false, err
+	}
+	c := &deferredCursor{eng: db.snapshotEngine(), query: q, params: params}
+	return &Rows{columnNames: names, columnTypes: types, cursor: c}, true, nil
+}
+
+// deferredColumnMeta resolves the output column names + type names of a top-level set operation /
+// pure-query WITH by planning only (no execution) — fills a deferredCursor's Rows metadata before its
+// first pull (tryDeferredQuery). Mirrors the planning prefix of runSetOp / runWith exactly so the
+// metadata matches the deferred run's. Bound params are not needed: column names/types never depend on
+// bound values.
+func (db *engine) deferredColumnMeta(stmt statement) ([]string, []string, error) {
+	ptypes := &paramTypes{}
+	var plan queryPlan
+	var err error
+	switch {
+	case stmt.SetOp != nil:
+		plan, err = db.planQuery(queryExpr{SetOp: stmt.SetOp}, nil, nil, ptypes)
+	case stmt.With != nil:
+		// The planning prefix of runWith (cte.md): plan the CTE bindings, then the body with them
+		// visible. The body's columns are the WITH's output columns.
+		var bindings []*cteBinding
+		bindings, err = db.planCteBindings(stmt.With.Ctes, stmt.With.Recursive, ptypes)
+		if err == nil {
+			bodyQ := stmt.With.Body.AsQuery() // pure-query WITH (DML excluded by stmtIsWrite)
+			plan, err = db.planQuery(*bodyQ, nil, bindings, ptypes)
+		}
+	default:
+		return nil, nil, nil // unreachable: tryDeferredQuery only calls this for SetOp / With
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return plan.columnNames(), typeNames(plan.columnTypes()), nil
+}
+
+// deferredQuery is the deferred query payload for a top-level set operation / pure-query WITH (exactly
+// one field is set). Run via the eager runSetOp / runWith verbatim so the rows + cost match Execute
+// exactly (streaming.md §6).
+type deferredQuery struct {
+	setop *setOp
+	with  *withQuery
+}
+
+// deferredCursor is the lazy DEFERRED pull pipeline behind a Query Rows cursor for a top-level set
+// operation / pure-query WITH (spec/design/streaming.md §7). It owns a frozen snapshot engine (§5), the
+// query AST, and the bound params; on its FIRST nextRow it runs the whole runSetOp / runWith to
+// completion (so a cost abort / cancellation / trap surfaces during iteration, not at Query — §6),
+// records the accrued cost, and yields the materialized result ONE row at a time. The input is still
+// buffered (a set op dedups / a WITH materializes — it must), so the win here is only lazy-yield: the
+// work is deferred to the first pull and the result rows are handed out incrementally rather than
+// wrapped in an eager Outcome. Under full drain the rows + total cost are byte-identical to the eager
+// path (it drives the SAME runSetOp / runWith, §6).
+type deferredCursor struct {
+	eng    *engine
+	query  deferredQuery
+	params []Value
+	ran    bool      // has the query run? (it runs on the first nextRow)
+	rows   [][]Value // the materialized result, valid once ran
+	idx    int
+	cost   int64 // 0 until the first pull runs the query, then selectResult.cost (final)
+	done   bool  // exhausted or closed — then nextRow is a no-op
+}
+
+func (c *deferredCursor) nextRow() ([]Value, bool, error) {
+	if c.done {
+		return nil, false, nil
+	}
+	// Run the whole set op / WITH on the FIRST pull (streaming.md §7), reusing the eager runSetOp /
+	// runWith verbatim so the rows + cost match Execute exactly. A mid-run cost abort / cancellation /
+	// arithmetic trap surfaces HERE (during iteration), not at Query (streaming.md §6).
+	if !c.ran {
+		var r selectResult
+		var err error
+		if c.query.setop != nil {
+			r, err = c.eng.runSetOp(c.query.setop, c.params)
+		} else {
+			r, err = c.eng.runWith(c.query.with, c.params)
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		c.rows = r.rows
+		c.cost = r.cost
+		c.ran = true
+	}
+	if c.idx >= len(c.rows) {
+		c.done = true
+		return nil, false, nil
+	}
+	row := c.rows[c.idx]
+	c.idx++
+	return row, true, nil
+}
+
+func (c *deferredCursor) costAccrued() int64 { return c.cost }
+
+// close marks the cursor done + drops any unread rows; the frozen snapshot is owned by eng
+// (GC-reclaimed) and the watermark deregister lives on the Rows (streaming.md §5). Idempotent.
+func (c *deferredCursor) close() {
+	c.done = true
+	c.rows = nil
+}
+
 func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
 	store := db.lkpStore(plan.rels[0].tableName)
 

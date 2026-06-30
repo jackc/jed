@@ -455,6 +455,14 @@ func (s *Session) Query(sql string, params []Value) (*Rows, error) {
 	} else if ok {
 		return pin(rows), nil
 	}
+	// A top-level set operation / pure-query WITH is served by a lazy DEFERRED cursor (streaming.md §7):
+	// it defers the whole run to the first pull and yields the result one row at a time; it is a live
+	// reader too and pins its snapshot in the watermark.
+	if rows, ok, err := s.engine.tryDeferredQuery(stmt, params); err != nil {
+		return nil, err
+	} else if ok {
+		return pin(rows), nil
+	}
 	out, err := s.dispatch(stmt, params)
 	if err != nil {
 		return nil, err

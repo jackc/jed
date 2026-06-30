@@ -397,3 +397,183 @@ func TestBufferedMidDrainCostAbort(t *testing.T) {
 	}
 	_ = rows.Close()
 }
+
+// ---- the lazy DEFERRED cursor (a top-level set-op / WITH; streaming.md §7) ------------------------
+
+// Every top-level set operation / pure-query WITH: Query (the lazy deferredCursor) must equal Execute
+// (eager) on rows AND total cost under full drain (§6). These route through tryDeferredQuery, which
+// reuses the eager runSetOp / runWith verbatim, so the rows + cost are identical by construction (the
+// unordered shapes are deterministic here — same snapshot, same code path).
+func TestDeferredMatchesEager(t *testing.T) {
+	db := seededKV(t, 20)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	for _, sql := range []string{
+		// Set operations (every kind), with and without a trailing ORDER BY.
+		"SELECT v FROM t WHERE id <= 3 UNION SELECT v FROM t WHERE id >= 18 ORDER BY v",
+		"SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id",
+		"SELECT v FROM t WHERE id <= 10 INTERSECT SELECT v FROM t WHERE id >= 5 ORDER BY v",
+		"SELECT v FROM t EXCEPT SELECT v FROM t WHERE id <= 12 ORDER BY v",
+		"SELECT v FROM t WHERE id = 1 UNION SELECT v FROM t WHERE id = 2", // unordered, still deterministic
+		// Pure-query WITH: a CTE feeding a scan, an aggregate, and a join.
+		"WITH x AS (SELECT id, v FROM t WHERE v > 100) SELECT id, v FROM x ORDER BY id",
+		"WITH x AS (SELECT id FROM t) SELECT count(*) FROM x",
+		"WITH a AS (SELECT id, v FROM t WHERE id <= 5) SELECT a.id, a.v FROM a JOIN t USING (id) ORDER BY a.id",
+		// A recursive WITH (the working-table fixpoint runs entirely on the first pull).
+		"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 8) SELECT n FROM c ORDER BY n",
+		// A WITH whose body is itself a set operation.
+		"WITH x AS (SELECT v FROM t) SELECT v FROM x WHERE v <= 50 UNION SELECT v FROM x WHERE v >= 180 ORDER BY v",
+	} {
+		er, ec := eagerResult(t, s, sql)
+		sr, sc := streamResult(t, s, sql)
+		if !rowsEqual(sr, er) {
+			t.Fatalf("rows mismatch %q:\n eager=%v\n stream=%v", sql, er, sr)
+		}
+		if sc != ec {
+			t.Fatalf("cost mismatch %q: eager=%d stream=%d", sql, ec, sc)
+		}
+	}
+}
+
+// The deferred cursor's defining trait (§7): a set-op / WITH has no per-row top-level projection to
+// defer, so the WHOLE query runs on the FIRST pull — unlike S3/S4, an early exit charges the SAME as a
+// full drain (the only win is lazy-yield, not early-exit). This pins that the cost after one pull is
+// already final.
+func TestDeferredRunsFullyOnFirstPull(t *testing.T) {
+	db := seededKV(t, 100)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	sql := "SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id"
+
+	fullRows, fullCost := streamResult(t, s, sql)
+	if len(fullRows) != 200 {
+		t.Fatalf("full drain = %d rows, want 200", len(fullRows))
+	}
+
+	rows, err := s.Query(sql, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatal("expected at least one row")
+	}
+	afterOne := rows.Cost()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	if afterOne != fullCost {
+		t.Fatalf("a deferred set-op/WITH accrues its full cost on the first pull: afterOne=%d full=%d", afterOne, fullCost)
+	}
+}
+
+// Snapshot pinning (§5) for the deferred cursor: it captures its snapshot at Query time and runs the
+// set op on the first pull over THAT snapshot, so a concurrent writer's rows never appear; the
+// watermark holds at the cursor's version until it is closed.
+func TestDeferredCursorPinsSnapshot(t *testing.T) {
+	db := seededKV(t, 3) // version 1, ids 1..=3
+	if db.OldestLiveTxid() != 1 {
+		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
+	}
+	reader := db.Session(SessionOptions{})
+	defer reader.Close()
+
+	// A top-level UNION → the deferred cursor. Pull one row (runs the set op over the v1 snapshot),
+	// keep the cursor live.
+	rows, err := reader.Query("SELECT v FROM t WHERE id <= 2 UNION SELECT v FROM t WHERE id = 3 ORDER BY v", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() || rows.Row()[0].Int != 10 {
+		t.Fatalf("first row != 10")
+	}
+	if db.OldestLiveTxid() != 1 {
+		t.Fatalf("open deferred cursor must pin v1, oldest=%d", db.OldestLiveTxid())
+	}
+
+	w := db.WriteSession()
+	if _, err := w.Execute("INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db.Version() != 2 || db.OldestLiveTxid() != 1 {
+		t.Fatalf("watermark must hold at the cursor's pin: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
+	}
+
+	// Draining the rest sees ONLY the v1 snapshot (v = 20, 30) — not the writer's rows.
+	var rest []int64
+	for rows.Next() {
+		rest = append(rest, rows.Row()[0].Int)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 2 || rest[0] != 20 || rest[1] != 30 {
+		t.Fatalf("frozen snapshot rest = %v, want [20 30]", rest)
+	}
+
+	_ = rows.Close()
+	if db.OldestLiveTxid() != 2 {
+		t.Fatalf("closed deferred cursor must release its pin, oldest=%d", db.OldestLiveTxid())
+	}
+}
+
+// A mid-drain cost-ceiling abort (§6) for the deferred cursor: building the cursor does NOT run the
+// query (deferred to the first pull), so Query succeeds and the 54P01 surfaces during iteration.
+func TestDeferredMidDrainCostAbort(t *testing.T) {
+	db := seededKV(t, 1000)
+	s := db.Session(SessionOptions{MaxCost: 50})
+	defer s.Close()
+	rows, err := s.Query("SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id", nil)
+	if err != nil {
+		t.Fatalf("query (build) must not abort: %v", err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+		if n > 10000 {
+			t.Fatal("the cost ceiling should have aborted the drain")
+		}
+	}
+	err = rows.Err()
+	if err == nil {
+		t.Fatal("a mid-drain cost abort must surface via Err()")
+	}
+	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54P01" {
+		t.Fatalf("abort = %v, want a 54P01 cost-limit error", err)
+	}
+	_ = rows.Close()
+}
+
+// A data-modifying WITH (a write) must NOT take the deferred lazy path — it falls back to the
+// materialized dispatch (it takes the write gate and commits). Routed through Query, it still returns
+// the primary's RETURNING rows correctly.
+func TestDeferredSkipsDataModifyingWith(t *testing.T) {
+	db := seededKV(t, 5)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	// A writable CTE: INSERT … RETURNING fed to the primary. This is stmtIsWrite, so it bypasses
+	// tryDeferredQuery and runs through the write path — but Query still surfaces its rows.
+	rows, err := s.Query("WITH ins AS (INSERT INTO t VALUES (6, 60), (7, 70) RETURNING id) SELECT id FROM ins ORDER BY id", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int64
+	for rows.Next() {
+		got = append(got, rows.Row()[0].Int)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	if len(got) != 2 || got[0] != 6 || got[1] != 7 {
+		t.Fatalf("RETURNING rows = %v, want [6 7]", got)
+	}
+	// The write committed: the rows are now visible.
+	after, _ := eagerResult(t, s, "SELECT count(*) FROM t")
+	if len(after) != 1 || after[0][0].Int != 7 {
+		t.Fatalf("post-write count = %v, want 7", after)
+	}
+}
