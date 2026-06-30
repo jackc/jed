@@ -13,7 +13,13 @@
 > decision here changes, update [CLAUDE.md](../../CLAUDE.md) §9, [pager.md](pager.md) §3, and
 > [streaming.md §8](streaming.md) in the same edit.
 
-**Status: SPEC (no code).** This doc fixes the model and the slice sequence; nothing is built yet.
+**Status: BUILT (L0–L3 landed, all three cores).** L0 fixed the model and slice sequence; L1 added
+the no-construct decode seam; L2 deferred inline values at fault (form (b), owned span); L3 made the
+deferral **zero-copy block-shared** (form (a)) — a faulted leaf holds its page block once and every
+deferred value references it, so resident leaf memory tracks `≈ page_size` (§9). All cost/byte/
+result-neutral (§8), so no `format_version` bump and each core landed green independently (see
+TODO.md for the per-core commits). The remaining items are the §12 deferred follow-ons (keys as
+block slices, in-memory adoption, a per-column offset cache).
 It is the successor to streaming.md §8 "S5 — lazy small-inline-column decode," **promoted from a
 localized codec tweak to a storage-core reshape** after the finding in §2 — that the narrow S5
 fights jed's architecture for a fraction of the win, while the reshape attacks the root cause and
