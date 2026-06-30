@@ -19,8 +19,9 @@ func (tx *Transaction) Execute(sql string, params []Value) (Outcome, error) {
 	return tx.db.ExecuteSQL(sql, params)
 }
 
-// Query runs a query within this transaction, returning a row cursor.
-func (tx *Transaction) Query(sql string, params []Value) (*Rows, error) {
+// QueryValues runs a query within this transaction, returning a row cursor (the raw []Value
+// path; the ergonomic Query(ctx, sql, args...) in ergonomic.go owns the Query name — api.md §11).
+func (tx *Transaction) QueryValues(sql string, params []Value) (*Rows, error) {
 	return tx.db.QuerySQL(sql, params)
 }
 
@@ -109,9 +110,10 @@ func (s *PreparedStatement) Execute(params []Value) (Outcome, error) {
 	return s.db.ExecuteStmtParams(s.ast, params)
 }
 
-// Query runs this query statement, returning a row cursor. A non-query statement is a 42601
-// (use Execute).
-func (s *PreparedStatement) Query(params []Value) (*Rows, error) {
+// QueryValues runs this query statement, returning a row cursor. A non-query statement is a 42601
+// (use Execute). This is the raw []Value path; the ergonomic Query(ctx, args...) in ergonomic.go
+// owns the Query name (api.md §11).
+func (s *PreparedStatement) QueryValues(params []Value) (*Rows, error) {
 	out, err := s.Execute(params)
 	if err != nil {
 		return nil, err
@@ -140,20 +142,42 @@ func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 // names and the accrued execution cost.
 type Rows struct {
 	columnNames []string
+	columnTypes []string
 	rows        [][]Value
 	idx         int
 	cost        int64
+	// ctx is captured at Query time (ergonomic.go); Next polls it so a canceled context aborts
+	// iteration. Today the result is already materialized, so this is the forward-compatible hook
+	// for the streaming cursor (CLAUDE.md §9) — the deeper integration threads ctx through the
+	// cost meter's Guard() so the materialize itself aborts (spec/design/api.md §11).
+	ctx ctxIface
+	// err holds a terminal error reached during iteration (a canceled ctx, a future mid-stream
+	// fault). Surfaced by Err() after the loop — the bufio.Scanner / database/sql idiom.
+	err error
 }
 
 func rowsFromOutcome(out Outcome) (*Rows, error) {
 	if out.Kind != OutcomeQuery {
 		return nil, newError(SyntaxError, "Query called on a statement that produces no rows; use Execute")
 	}
-	return &Rows{columnNames: out.ColumnNames, rows: out.Rows, cost: out.Cost}, nil
+	return &Rows{
+		columnNames: out.ColumnNames,
+		columnTypes: out.ColumnTypes,
+		rows:        out.Rows,
+		cost:        out.Cost,
+	}, nil
 }
 
-// Next advances to the next row, returning false when the result is exhausted.
+// Next advances to the next row, returning false when the result is exhausted OR the captured
+// context has been canceled (Err then reports the cancellation).
 func (r *Rows) Next() bool {
+	if r.err != nil {
+		return false
+	}
+	if err := ctxErr(r.ctx); err != nil {
+		r.err = err
+		return false
+	}
 	if r.idx >= len(r.rows) {
 		return false
 	}

@@ -21,6 +21,8 @@ mod array_key;
 mod array_quantified;
 #[path = "../tests/boolean_key.rs"]
 mod boolean_key;
+#[path = "../tests/cancellation.rs"]
+mod cancellation;
 #[path = "../tests/cast_array_runtime.rs"]
 mod cast_array_runtime;
 #[path = "../tests/cast_bool_int.rs"]

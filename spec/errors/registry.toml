@@ -646,6 +646,22 @@ name = "object_not_in_prerequisite_state"
 class = "object not in prerequisite state"
 template = "{detail}"
 
+# --- operator intervention (class 57) ---------------------------------------
+# 57014 query_canceled — a running statement was canceled through the host's
+# cancellation handle (Go context.Context, Rust cancellation token, TS
+# AbortSignal — spec/design/api.md §11.4). The cancellation poll rides the cost
+# meter's Guard() checkpoint (cost.md §6), so a flipped token aborts a
+# long-running statement at the next metering point and rolls back like any
+# error (the 54P01 cost-abort path). PostgreSQL's exact code for a canceled
+# statement / statement_timeout (CLAUDE.md §1). Per-impl surface — timing-
+# dependent, so NOT in the shared conformance corpus (per-core unit-tested only,
+# CLAUDE.md §10).
+[[error]]
+code = "57014"
+name = "query_canceled"
+class = "operator intervention"
+template = "canceling statement due to user request"
+
 # --- system error / host filesystem (class 58) ------------------------------
 # Raised by the host API's file layer (spec/design/api.md), never by the SQL
 # executor: open/create/commit touch the filesystem. Per-impl surface — the

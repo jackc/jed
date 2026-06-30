@@ -84,6 +84,7 @@ export type SqlState =
   | "session_cost_limit_exceeded" // 54P02 — session exceeded the lifetime cost limit of {limit} (accrued {cost})
   | "temp_storage_limit_exceeded" // 54P03 — temporary table storage exceeded the limit of {limit} bytes
   | "object_not_in_prerequisite_state" // 55000 — {detail}
+  | "query_canceled" // 57014 — canceling statement due to user request
   | "io_error" // 58030 — I/O error: {detail}
   | "undefined_file" // 58P01 — database file does not exist: {path}
   | "duplicate_file" // 58P02 — database file already exists: {path}
@@ -165,6 +166,7 @@ const CODES: Record<SqlState, string> = {
   session_cost_limit_exceeded: "54P02",
   temp_storage_limit_exceeded: "54P03",
   object_not_in_prerequisite_state: "55000",
+  query_canceled: "57014",
   io_error: "58030",
   undefined_file: "58P01",
   duplicate_file: "58P02",
@@ -262,6 +264,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "54P02", name: "session_cost_limit_exceeded", class: "program limit exceeded" },
   { code: "54P03", name: "temp_storage_limit_exceeded", class: "program limit exceeded" },
   { code: "55000", name: "object_not_in_prerequisite_state", class: "object not in prerequisite state" },
+  { code: "57014", name: "query_canceled", class: "operator intervention" },
   { code: "58030", name: "io_error", class: "system error" },
   { code: "58P01", name: "undefined_file", class: "system error" },
   { code: "58P02", name: "duplicate_file", class: "system error" },

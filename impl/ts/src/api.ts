@@ -4,6 +4,7 @@
 // import cycle). Thin wrappers over the parser + executor — the conformance contract still binds.
 
 import type { Statement } from "./ast.ts";
+import { throwIfAborted } from "./cancel.ts";
 import type { Engine, Outcome } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
@@ -117,6 +118,21 @@ export class Transaction {
   // query runs a query within this transaction, returning a row cursor.
   query(sql: string, params: Value[] = []): Rows {
     return rowsFromOutcome(this.execute(sql, params));
+  }
+
+  // executeCancelable runs a statement within this transaction under an AbortSignal (spec/design/
+  // api.md §11.4): an already-aborted signal throws 57014 before any work, which — like any error —
+  // poisons the block (25P02 on the next statement). TS is synchronous, so the check is at this
+  // boundary only (cancel.ts).
+  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Outcome {
+    throwIfAborted(signal);
+    return this.execute(sql, params);
+  }
+
+  // queryCancelable is the query sibling of executeCancelable (spec/design/api.md §11.4).
+  queryCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Rows {
+    throwIfAborted(signal);
+    return this.query(sql, params);
   }
 
   // commit publishes the transaction durably (per synchronous). Idempotent after the transaction

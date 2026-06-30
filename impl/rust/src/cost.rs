@@ -22,6 +22,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use crate::cancel::CancellationToken;
 use crate::error::{EngineError, Result, SqlState};
 
 /// The session lifetime-budget handle a [`Meter`] carries (spec/design/session.md §5.4): a shared
@@ -59,6 +60,13 @@ pub struct Meter {
     /// also accrues into the session's cumulative total, and [`guard`](Meter::guard) aborts with
     /// `54P02` once that cumulative reaches the budget.
     lifetime: Option<Lifetime>,
+    /// An optional cancellation poll (spec/design/api.md §11.4): when present and its flag is set, the
+    /// next [`guard`](Meter::guard) aborts the statement with `57014 query_canceled`. It rides this same
+    /// chokepoint so a host's cancellation handle interrupts a long-running statement at the next
+    /// metering point — NOT only at the cursor boundary. `None` ⇒ no cancellation (the default; the
+    /// path every conformance / cost test takes — cost is unaffected, the §8 determinism contract
+    /// intact). The poll is a single relaxed atomic load ([`CancellationToken::is_cancelled`]).
+    cancel: Option<CancellationToken>,
 }
 
 impl Meter {
@@ -75,18 +83,22 @@ impl Meter {
             accrued: 0,
             limit,
             lifetime: None,
+            cancel: None,
         }
     }
 
     /// A fresh meter for a statement run on a session (spec/design/session.md §5.4): the per-statement
-    /// `limit` (`max_cost`) plus the session lifetime budget the meter live-charges into. Built by
+    /// `limit` (`max_cost`), the session lifetime budget the meter live-charges into, and the session's
+    /// optional cancellation poll (`57014`, spec/design/api.md §11.4). Built by
     /// [`Session::new_meter`](crate::executor) for every statement, so the session cumulative tracks
-    /// all execution cost and the `54P02` budget binds.
-    pub fn for_session(limit: i64, lifetime: Lifetime) -> Self {
+    /// all execution cost, the `54P02` budget binds, and an armed cancellation interrupts a running
+    /// statement at the next `guard`.
+    pub fn for_session(limit: i64, lifetime: Lifetime, cancel: Option<CancellationToken>) -> Self {
         Meter {
             accrued: 0,
             limit,
             lifetime: Some(lifetime),
+            cancel,
         }
     }
 
@@ -113,6 +125,18 @@ impl Meter {
     /// both are unlimited, so it is free on the hot path by default.
     #[inline]
     pub fn guard(&self) -> Result<()> {
+        // Cancellation is checked first and independently of the cost ceilings: a flipped token aborts
+        // regardless of accrued cost (spec/design/api.md §11.4). The `None` check short-circuits when no
+        // cancellation handle is armed, so the cost accrual and the cross-core abort points are unchanged
+        // (CLAUDE.md §8) — this never fires in the conformance / cost suites.
+        if let Some(cancel) = &self.cancel
+            && cancel.is_cancelled()
+        {
+            return Err(EngineError::new(
+                SqlState::QueryCanceled,
+                "canceling statement due to user request",
+            ));
+        }
         let stmt_over = self.limit > 0 && self.accrued >= self.limit;
         let life = match &self.lifetime {
             Some(l) if l.limit > 0 => Some((l.total.get(), l.limit)),

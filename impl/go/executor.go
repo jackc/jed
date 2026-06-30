@@ -1067,6 +1067,13 @@ type sessionState struct {
 	// counts; a pointer so the activate() VALUE swap of the session keeps the same counter. SESSION
 	// state, not snapshot state: it does NOT roll back when a transaction rolls back.
 	lifetimeTotal *int64
+	// cancel is the per-statement cancellation poll the ergonomic API arms for one statement
+	// (spec/design/api.md §11.4): nil unless a host cancellation handle (Go context.Context, …) is
+	// active. newMeter copies it into the statement's meter, whose Guard() polls it at each metering
+	// checkpoint, so a flipped handle aborts a long-running statement (57014) — not only at the
+	// cursor boundary. Set/cleared by engine.armCancel around a single statement (ergonomic.go); a
+	// single atomic load on the hot path.
+	cancel func() bool
 	// maxSQLLength is the maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 =
 	// unlimited; default DefaultMaxSQLLength (1 MiB). Over-limit input is rejected 54000 at parse,
 	// before lexing.
@@ -1826,7 +1833,7 @@ func (s *sessionState) LifetimeCost() int64 { return *s.lifetimeTotal }
 // (54P01) plus a handle to the session's cumulative total + budget (54P02). Every statement's meter
 // is minted here, so all execution cost live-charges into the cumulative.
 func (s *sessionState) newMeter() *costMeter {
-	return &costMeter{Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost}
+	return &costMeter{Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost, cancel: s.cancel}
 }
 
 // MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).

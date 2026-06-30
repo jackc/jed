@@ -44,6 +44,13 @@ type costMeter struct {
 	// lifetimeLimit is the session's cumulative cost budget, or 0 for unlimited (track-only). When
 	// positive, Guard aborts 54P02 once *lifetimeTotal reaches it.
 	lifetimeLimit int64
+	// cancel is an optional cancellation poll (spec/design/api.md §11.4): when set and it returns
+	// true, the next Guard aborts the statement with 57014 query_canceled. It rides this same
+	// chokepoint so a host's cancellation handle (Go context.Context, …) interrupts a long-running
+	// statement at the next metering point — NOT only at the cursor boundary. nil ⇒ no cancellation
+	// (the default; zero overhead, and the path every conformance / cost test takes — cost is
+	// unaffected, the §8 determinism contract intact). The poll is a single atomic load (armCancel).
+	cancel func() bool
 }
 
 // NewMeter returns a fresh meter with zero accrued cost, no ceiling, and no session context.
@@ -78,6 +85,13 @@ func (m *costMeter) Charge(units int64) {
 // points in every core, so the abort is deterministic and cross-core identical (spec/design/cost.md
 // §6, spec/design/session.md §5.4). A no-op (one or two comparisons) when both are unlimited.
 func (m *costMeter) Guard() error {
+	// Cancellation is checked first and independently of the cost ceilings: a flipped token aborts
+	// regardless of accrued cost (spec/design/api.md §11.4). The nil check short-circuits when no
+	// cancellation handle is armed, so the cost accrual and the cross-core abort points are
+	// unchanged (CLAUDE.md §8) — this never fires in the conformance/cost suites.
+	if m.cancel != nil && m.cancel() {
+		return newError(QueryCanceled, "canceling statement due to user request")
+	}
 	stmtOver := m.Limit > 0 && m.Accrued >= m.Limit
 	lifeOver := m.lifetimeTotal != nil && m.lifetimeLimit > 0 && *m.lifetimeTotal >= m.lifetimeLimit
 	if !stmtOver && !lifeOver {

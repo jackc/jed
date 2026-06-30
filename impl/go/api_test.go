@@ -143,7 +143,7 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := sel.Query([]Value{IntValue(200)})
+	rows, err := sel.QueryValues([]Value{IntValue(200)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	if _, err := db.Begin(true); !errors.As(err, &ee) || ee.Code() != "25006" {
 		t.Fatalf("Begin(true) on a read-only handle: %v", err)
 	}
-	if err := db.View(func(tx *Transaction) error { _, err := tx.Query("SELECT id FROM t", nil); return err }); err != nil {
+	if err := db.View(func(tx *Transaction) error { _, err := tx.QueryValues("SELECT id FROM t", nil); return err }); err != nil {
 		t.Fatalf("View on a read-only handle: %v", err)
 	}
 	err = db.Update(func(tx *Transaction) error { _, err := tx.Execute("DELETE FROM t", nil); return err })

@@ -377,10 +377,11 @@ order leaks (CLAUDE.md §8). Secondary indexes are relations but not tables; the
 and a message; `.code()` returns the SQLSTATE. Idiomatic surfacing: Rust `Result<T,
 EngineError>`, Go `(T, error)` with a `*EngineError`, TS `throw EngineError`. SQL errors keep
 their existing codes; the API adds the host-filesystem class-58 codes (`58P01`/`58P02`/
-`58030`, §2.1), the parameter code `42P18` (§5), and the transaction-state class-25 codes
-(`25001`/`25006`/`25P02`, transactions.md §6). The SQLSTATE class (first two chars) is a stable
-category (`22` data, `23` integrity, `25` transaction state, `42` syntax/access, `58` system,
-`XX` internal).
+`58030`, §2.1), the parameter code `42P18` (§5), the transaction-state class-25 codes
+(`25001`/`25006`/`25P02`, transactions.md §6), and the **cancellation** code `57014`
+`query_canceled` (§11, PG's exact code for a canceled statement / `statement_timeout`). The
+SQLSTATE class (first two chars) is a stable category (`22` data, `23` integrity, `25`
+transaction state, `42` syntax/access, `57` operator intervention, `58` system, `XX` internal).
 
 ## 8. Cost ceiling (`max_cost`)
 
@@ -494,3 +495,169 @@ kind of privileged, not-SQL-reachable host op: after loading a *newer* bundle, i
 for this database — rebuilding the collated keys whose pin is now skewed and re-pinning the stamp, so
 the affected tables are read-write again ([collation.md §12](collation.md)). Whole-database, atomic,
 idempotent (returns the count of collations re-pinned; persisted by the next explicit `commit`).
+
+## 11. Ergonomic bindings (per-core surface)
+
+§2–§5 fix the *typed* surface — `prepare`/`execute`/`query` over the engine's tagged `Value` and
+a row cursor of `Vec<Value>`/`[]Value`. That surface is exact and stays the floor; **this section
+adds the ergonomic layer host programmers actually want** — pass plain language-native values,
+scan into native destinations — modeled on `database/sql`/pgx (Go), `rusqlite` (Rust), the
+object-row APIs (TS). It is **additive**: a thin conversion layer over the same `Value` currency,
+no engine or executor change beyond the cancellation hook (below). Like the rest of this doc it is
+a **per-impl surface, NOT the shared corpus** (§1, [conformance.md](conformance.md) §1.2) — each
+core spells it idiomatically; this section fixes the **shape** so the cores stay recognizable.
+
+The design was worked out against the Go core first (`impl/go/ergonomic.go`); Rust/TS mirror the
+shape. It rests on a fact already true of the engine: **parameters are typed by context, not by the
+value supplied** (§5), so a "loosely-typed" `Value` built from a native value (`int64 → IntValue`)
+is still coerced two-phase to the inferred type — the conversion layer **adds no path around the
+strict type system**, it only saves the caller from hand-building `Value`s.
+
+### 11.1 Three layers over one `Value` currency
+
+- **Ergonomic (default).** `Query`/`Exec`/`QueryRow` take native args (`...any` in Go, an
+  `IntoValue` bound in Rust, JS values in TS) and a cancellation token (§11.4); the cursor's
+  `Scan` converts each column into a native destination.
+- **Typed fast path.** Per-type accessors (`Rows.Int(col)`/`Text(col)`/…) read one column with a
+  single kind-check, skipping `Scan`'s per-destination type switch — for hot loops over millions
+  of rows. (The `Scan` switch is itself only a few ns/column when it avoids reflection and lets the
+  destination slice stay non-escaping — but the accessor removes even that.)
+- **Raw.** `Rows.Value(col)` and the §2–§5 `Value`/`[]Value` methods stay, for full fidelity
+  (exact `decimal` bits, the float-verbatim rule, composite/array/range/json trees).
+
+### 11.2 Argument and Scan conversion
+
+**Args (native → `Value`).** A type switch with an escape hatch (`Valuer`): `nil`→NULL; `bool`;
+the integer widths (range-checked into `i64`); `f32`/`f64`; `string`→`text`; bytes→`bytea`;
+the host time type→a temporal `Value`; the engine's own `Decimal`/`Interval`/`uuid` types; a bare
+`Value` passes through. **The one impedance point is temporal**: Go's single `time.Time` (and the
+equivalents) maps to three jed types — it is bound as `timestamptz` and the §5 binder re-coerces to
+the inferred column type (`timestamp`/`date`); a host that needs an exact target casts (`$1 ::
+date`) or passes a `Value`.
+
+**Scan (`Value` → native `*T`).** The mirror, an **inline type switch with explicit cases for the
+common destinations** (`*i64/i32/i16/int`, `*string`, `*bool`, `*f64/f32`, `*[]byte`, the temporal
+type, the engine value types, `*any`) — **never reflection on this path**, and the destination must
+not escape (so it stays allocation-free). Narrowing integer destinations are range-checked
+(`22003`-style). **NULL into a plain scalar destination is an error**; the nullable targets are the
+language's idiom plus a generic `Null[T]` (Go) — which implements the `Scanner` hook so it needs no
+per-type case — and `*any` (→ the language's null). A `Scanner`/`ScanJed` hook covers custom types.
+
+`Values()` returns a whole row as native values (pgx's `Values` — for callers that don't know the
+schema), disambiguating `timestamp`/`timestamptz`/`date` via the column type (§4 `ColumnTypes`).
+Rich container types (composite/array/range/json) map to the engine value type for now; a richer
+native mapping is a follow-on.
+
+### 11.3 Iterators, single-row, struct mapping
+
+- **Iterators** (Go 1.23+ range-over-func; the equivalent elsewhere). `Rows.All()` yields the
+  cursor positioned at each row and **closes it on loop exit** — break, return, panic, or
+  exhaustion — eliminating the `defer close` boilerplate and the forget-to-close bug; the terminal
+  error is read via `Err()` after the loop (the `bufio.Scanner` idiom, because a single-value
+  `iter.Seq[Row]` has no slot for it). A generic `Collect(rows, fn)` yields `(T, error)` for the
+  fused case. Iterators are a **layer over** the explicit `Next`/`Scan`/`Err` cursor, not a
+  replacement — the explicit form is the documented base because it gives the terminal error a
+  clean home. Overhead is negligible for a row loop (one indirect `yield` call per row, no
+  per-row allocation when designed right), and aligns with the future streaming cursor (§4/§9),
+  where "fetch next, yield it" maps onto pull-per-row with no impedance.
+- **Single-row.** `QueryRow(...).Scan(dest…)` runs, scans the first row (ignoring extras, like
+  `database/sql`/pgx), closes the cursor, and returns `ErrNoRows` when empty.
+- **Struct mapping.** `RowToStructByName[T]` (generics/reflection, **off** the hot path) matches
+  column names to `db:"…"`-tagged fields; `RowTo[T]` scans a single-column row into a `T`. Both
+  compose with `Collect` for `for row, err := range Collect(rows, RowToStructByName[T])`.
+
+### 11.4 Cancellation (`context.Context` → `57014`)
+
+The ergonomic `Query`/`Exec`/`QueryRow` take a cancellation handle — Go `context.Context`
+(first parameter, pgx convention), Rust a cancellation token / `AtomicBool`, TS an `AbortSignal`.
+It is captured on the operation and **polled at the existing cost-meter checkpoint** (the single
+`Guard()` chokepoint already run at the unbounded-work points for `max_cost`, [cost.md](cost.md)
+§6) — so cancellation is **one more condition at a seam that already exists**, not a new
+cross-cutting concern. A flipped token aborts deterministically with **`57014 query_canceled`**
+(PostgreSQL's exact code for a canceled statement / `statement_timeout`), which **rolls back like
+any error** (autocommit write → table untouched; inside a block → poisons it, transactions.md §6),
+exactly as the `54P01` cost abort does.
+
+It is **not** in the conformance corpus — whether a cancel lands at row 1k or 5k is timing, hence
+nondeterministic — so it is **per-core unit-tested only**, the same treatment benchmarks get
+(CLAUDE.md §10). This does not weaken the determinism contract: a cancel yields an *error*, never
+wrong rows or a different cost; the contract is about queries that *complete*. Overhead is zero
+when the token cannot fire (Go's background context has a nil `Done` channel; skip the poll); for a
+live token, a one-goroutine watcher setting an atomic keeps the hot path to a single atomic load.
+
+**Per-core reality** (CLAUDE.md §2). Go and Rust have real threads, so a cancel from another
+thread interrupts a running statement at the next checkpoint. **TS cannot preempt synchronous
+execution** (one event loop; nothing else runs until the call returns), so an `AbortSignal` there
+is honored only at operation boundaries, not mid-statement — a deliberate best-experience-per-
+language divergence, not a uniform-shape failure.
+
+The meter `Guard()` is the primary mechanism; the cursor *also* captures the token and re-checks it
+in `Next()` — largely redundant over today's materialized result (the meter already aborted the
+run), but the forward-compatible hook for the streaming cursor (§4), where `Next()` becomes where
+work (and thus cancellation) happens.
+
+### 11.5 Status and naming
+
+**Landed (Go, `impl/go/ergonomic.go`):** the arg/scan conversion, `Query`/`Exec`/`QueryRow` on
+**`Database`, `Transaction`, *and* `PreparedStatement`** (the latter with no `sql` parameter — its
+SQL is fixed at `Prepare`), `Result` command tag, `Scan`/`Values`/`Err`/`Close`, the typed
+accessors, `All()`/`Collect`, `RowTo`/`RowToStructByName`, `Null[T]`, `Valuer`/`Scanner`. The
+conversion + cancellation logic lives once (`ergoQuery`/`ergoExec`); the per-type methods are
+one-liners over the raw `[]Value` primitives. **Cancellation is wired through the cost meter:** each
+operation arms a poll (`engine.armCancel`) on the `sessionState` of the engine that runs the
+statement, `sessionState.newMeter` copies it into the statement's meter, and the meter's `Guard()`
+checkpoint consults it — so a flipped `context.Context` aborts a long-running statement with the
+registered **`57014 query_canceled`** at the next metering point, not only at the cursor/entry
+boundary (`ctxErr`). The poll is `nil` (zero-overhead, untouched hot path, the §8 cost determinism
+intact) unless a cancelable ctx is active; a non-cancelable background ctx (nil `Done`) arms
+nothing. Verified by `impl/go/cancellation_test.go` (the meter-`Guard` unit test, the boundary
+abort, and a white-box mid-execution abort). The **`Queryer`** interface (`Query`/`QueryRow`/`Exec`)
+is satisfied by `Database` and `Transaction`, so a data-access function written against it runs
+unchanged on a handle or inside a transaction (pgx's `Querier`). The raw `[]Value` query method on
+each type was renamed **`QueryValues`** so the ergonomic `Query` owns the name (the raw-path
+`*Values` convention; `Execute([]Value)` keeps its name since `Exec` doesn't collide).
+**Landed (Rust, cancellation — `impl/rust/src/cancel.rs`):** the cancellation half of the mirror.
+A public **`CancellationToken`** (a clonable `Arc<AtomicBool>` with `cancel()` / `is_cancelled()`)
+is the Rust spelling of Go's `context.Context` cancellation — and *simpler*, because Rust has real
+threads (CLAUDE.md §2): the token **is** the shared atomic the Go core spins up a watcher goroutine
+to feed, so thread B flips the same token thread A is running under, no watcher needed. It is wired
+through the **same cost-meter seam**: `Meter` gains a `cancel: Option<CancellationToken>` checked
+**first** in `guard()` (`57014` before the `54P01`/`54P02` cost ceilings), `SessionState` gains a
+`cancel` field that `new_meter` copies into every statement's meter, and the cancelable methods —
+`execute_cancelable` / `query_cancelable` on **`Session`, `Database`, *and* `Transaction`** — arm a
+clone for the statement's duration (a cheap boundary `check()` first, then restore the prior token),
+so a flipped token aborts a long-running statement with `57014` at the next metering point, not only
+at the boundary. `None` (the default) ⇒ zero overhead, the §8 cost determinism untouched. Verified by
+`impl/rust/tests/cancellation.rs` (the `Meter::guard` unit test, the boundary abort on `Session`/
+`Database`, the un-cancelled-completes regression, and the transaction roll-back) plus the white-box
+mid-scan-via-meter test inline in `src/shared.rs` (it reaches the private session state to bypass the
+boundary poll and prove the *meter* aborts the running scan). The Rust **arg/scan ergonomic layer**
+(an `IntoValue` arg bound, a `FromValue`/`row.get::<T>` scan path, `rusqlite`-style) is the remaining
+half, not yet built. **Follow-ups, ledgered:** (a) richer native mapping for container types in
+`Values` (today they degrade to the raw `Value`); (b) the same surface on the shared
+`ReadHandle`/`WriteHandle` (§2.5); (c) thread the poll deeper so even a non-`Guard`-metered tight loop
+(if any) is interruptible — today every unbounded-work point is already a `Guard` site, so this is
+belt-and-suspenders; (d) the Rust arg/scan layer above. Update the `/web` API pages in the
+same change as the ergonomic surface stabilizes across cores (CLAUDE.md §10).
+
+**Landed (TS, cancellation — `impl/ts/src/cancel.ts`):** the cancellation mirror, and the
+**deliberate per-language divergence** §11.4 calls out. The handle is the platform **`AbortSignal`**
+(an `AbortController`) — the same primitive `fetch` and the web APIs use, so there is *no* custom
+token type (Rust ships `CancellationToken` only because JS has one built in). The cancelable methods
+`executeCancelable` / `queryCancelable` on **`Session`, `Database`, *and* `Transaction`** take an
+optional `AbortSignal` and throw the registered **`57014 query_canceled`** when it is already
+aborted. Crucially the check is at the **operation boundary only**, *not* the cost meter: TS runs on
+one event loop, so nothing (no timer, no other thread) runs *during* a synchronous `query()`/
+`execute()` — the signal's `aborted` state is frozen at entry, so a meter poll would re-read the same
+value N times. The meter and `SessionState` are therefore left **untouched** (the §8 cost determinism
+is trivially intact — no TS cost path changed), unlike the Go/Rust mid-statement poll. It is still
+useful: it skips work for an already-canceled operation (a client that disconnected before the
+handler ran). Mid-statement cancellation in TS would need an async streaming cursor that `await`s
+(§4); the boundary check is the forward-compatible seam. Verified by
+`impl/ts/tests/cancellation.test.ts` (the `throwIfAborted` unit test, the boundary abort on
+`Database`/`Session`, the un-aborted-completes regression, the transaction roll-back, and a
+boundary-only-semantics test proving an abort after a synchronous query has no retroactive effect).
+**Cancellation is now mirrored across all three cores** (Go meter poll via `context.Context`, Rust
+meter poll via `CancellationToken`, TS boundary via `AbortSignal`); the remaining ergonomic work is
+the arg/scan layers (Rust above; TS still on the raw `Value[]` surface) and the `/web` docs once that
+surface stabilizes.

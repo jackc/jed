@@ -1157,6 +1157,15 @@ pub struct SessionState {
     /// aborted statement counts automatically. **SessionState state, not snapshot state**: it does NOT roll
     /// back when a transaction rolls back (the compute was spent regardless).
     pub(crate) lifetime_total: std::rc::Rc<std::cell::Cell<i64>>,
+    /// An optional cancellation poll armed for the duration of one statement (spec/design/api.md §11.4):
+    /// the cancelable query/execute methods set it before running and restore it after, and
+    /// [`new_meter`](SessionState::new_meter) copies it into the statement's [`Meter`](crate::cost::Meter),
+    /// whose `guard` consults it — so a flipped [`CancellationToken`](crate::CancellationToken) aborts a
+    /// long-running statement with `57014` at the next metering point, not only at the cursor boundary.
+    /// `None` (the default) ⇒ no cancellation, so the hot path is untouched (CLAUDE.md §8). Because the
+    /// token shares an `Arc<AtomicBool>`, another thread can flip the same token while this single-threaded
+    /// handle runs the statement.
+    pub(crate) cancel: Option<crate::cancel::CancellationToken>,
     /// The maximum input SQL length, in **bytes**, accepted on this session (CLAUDE.md §13; api.md
     /// §8, cost.md §7). `0` ⇒ **unlimited**; default [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB). An
     /// over-limit statement is rejected `54000` at [`parse`](Engine::parse), before lexing.
@@ -1274,6 +1283,7 @@ impl SessionState {
             max_cost: opts.max_cost,
             lifetime_max_cost: opts.lifetime_max_cost,
             lifetime_total: std::rc::Rc::new(std::cell::Cell::new(0)),
+            cancel: None,
             max_sql_length: opts.max_sql_length,
             work_mem: opts.work_mem,
             seam: crate::seam::Seam::default(),
@@ -1363,6 +1373,7 @@ impl SessionState {
                 total: self.lifetime_total.clone(),
                 limit: self.lifetime_max_cost,
             },
+            self.cancel.clone(),
         )
     }
     /// Set the maximum input SQL length in bytes; `0` ⇒ unlimited.

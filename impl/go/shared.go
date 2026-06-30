@@ -317,9 +317,11 @@ func (db *Database) Execute(sql string, params []Value) (Outcome, error) {
 	return s.Execute(sql, params)
 }
 
-// Query runs a query on a fresh autocommit session, returning a row cursor (the rows are
-// materialized, so the cursor stays valid after the session is closed).
-func (db *Database) Query(sql string, params []Value) (*Rows, error) {
+// QueryValues runs a query on a fresh autocommit session, returning a row cursor (the rows are
+// materialized, so the cursor stays valid after the session is closed). This is the raw []Value
+// path; the ergonomic Query(ctx, sql, args...) (ergonomic.go, spec/design/api.md §11) is the
+// preferred surface and owns the Query name.
+func (db *Database) QueryValues(sql string, params []Value) (*Rows, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
 	return s.Query(sql, params)

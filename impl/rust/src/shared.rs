@@ -62,6 +62,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::api::{PreparedStatement, Rows, Transaction};
 use crate::ast::Statement;
+use crate::cancel::CancellationToken;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
     Engine, Outcome, ScriptSummary, SessionOptions, SessionState, Snapshot, TxStatus, stmt_is_write,
@@ -532,6 +533,46 @@ impl Session {
         Rows::from_outcome(self.dispatch(ast, params)?)
     }
 
+    /// Run a (possibly mutating) statement under a [`CancellationToken`] (spec/design/api.md §11.4):
+    /// arm `cancel` on this session for the statement's duration so a flipped token (from any thread)
+    /// aborts it with `57014 query_canceled` at the next cost-meter checkpoint — not only at the
+    /// boundary. The cheap boundary poll fires before any work; the in-statement meter `guard` does the
+    /// rest. The previous token (if a caller nested arming) is restored on return.
+    pub fn execute_cancelable(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancel: &CancellationToken,
+    ) -> Result<Outcome> {
+        self.armed(cancel, |s| s.execute(sql, params))
+    }
+
+    /// Run a **query** under a [`CancellationToken`] (spec/design/api.md §11.4) — the query sibling of
+    /// [`execute_cancelable`](Session::execute_cancelable).
+    pub fn query_cancelable(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancel: &CancellationToken,
+    ) -> Result<Rows> {
+        self.armed(cancel, |s| s.query(sql, params))
+    }
+
+    /// Arm `cancel` on the session, run `f`, then restore the prior token. The `replace` ends the
+    /// borrow of `session.cancel` before `f(self)` runs, so `f` reborrows the session freely; the
+    /// restore runs on both the `Ok` and `Err` paths (a panic poisons the session regardless).
+    fn armed<R>(
+        &mut self,
+        cancel: &CancellationToken,
+        f: impl FnOnce(&mut Session) -> Result<R>,
+    ) -> Result<R> {
+        cancel.check()?;
+        let prev = self.engine.session.cancel.replace(cancel.clone());
+        let r = f(self);
+        self.engine.session.cancel = prev;
+        r
+    }
+
     /// The lazy-gate dispatch (spec/design/session.md §2.4). A read-only session rejects writes
     /// (`25006`) and reads its pin; `BEGIN`/`COMMIT`/`ROLLBACK` open/end an explicit block (eager
     /// gate for a writable block); a statement inside an open block runs against the working set; an
@@ -980,6 +1021,30 @@ impl Database {
         self.session(SessionOptions::default()).query(sql, params)
     }
 
+    /// Run a statement on a fresh autocommit session under a [`CancellationToken`] (spec/design/api.md
+    /// §11.4): a flipped token (from any thread) aborts it `57014` at the next cost-meter checkpoint.
+    pub fn execute_cancelable(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancel: &CancellationToken,
+    ) -> Result<Outcome> {
+        self.session(SessionOptions::default())
+            .execute_cancelable(sql, params, cancel)
+    }
+
+    /// Run a query on a fresh autocommit session under a [`CancellationToken`] (spec/design/api.md
+    /// §11.4) — the query sibling of [`execute_cancelable`](Database::execute_cancelable).
+    pub fn query_cancelable(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancel: &CancellationToken,
+    ) -> Result<Rows> {
+        self.session(SessionOptions::default())
+            .query_cancelable(sql, params, cancel)
+    }
+
     /// Run a multi-statement script on a fresh autocommit session (spec/design/session.md §4.2): the
     /// whole run is one implicit transaction (all-or-nothing).
     pub fn execute_script(&mut self, sql: &str) -> Result<ScriptSummary> {
@@ -1032,5 +1097,47 @@ impl Database {
     /// live, so the backing file is released when the last handle drops. Idempotent.
     pub fn close(self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cancel_internal_tests {
+    use super::*;
+    use crate::cancel::CancellationToken;
+
+    /// White-box mid-execution proof (spec/design/api.md §11.4): arm the cancel poll DIRECTLY on the
+    /// running session (bypassing the cancelable wrappers' boundary `check`), run a multi-row scan, and
+    /// assert the abort comes from the meter `guard` (`57014`) — NOT the boundary. A 57014 here can only
+    /// come from the executor consulting `session.cancel` mid-statement, so this pins that the cancel
+    /// poll threads through `new_meter` into the running statement. Then clear it and confirm the same
+    /// query completes (the poll is the only difference). This reaches the private session state the
+    /// public `tests/cancellation.rs` cannot.
+    #[test]
+    fn cancel_mid_scan_aborts_via_meter() {
+        let mut db = Database::new_in_memory();
+        db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+            .unwrap();
+        for i in 1..=20 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})"), &[])
+                .unwrap();
+        }
+
+        let mut session = db.session(SessionOptions::default());
+        // An always-cancel poll set straight on the session: the boundary `check` in the cancelable
+        // wrappers is bypassed, so the only 57014 path left is the meter's `guard` during the scan.
+        let token = CancellationToken::new();
+        token.cancel();
+        session.engine.session.cancel = Some(token);
+        // `Rows` is not `Debug`, so match rather than `expect_err` to pull out the error.
+        let err = match session.query("SELECT id FROM t", &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("the meter guard must abort the running scan"),
+        };
+        assert_eq!(err.code(), "57014", "the abort came from the meter guard");
+
+        // Cleared: the same query completes and returns every row (the poll was the only difference).
+        session.engine.session.cancel = None;
+        let rows = session.query("SELECT id FROM t", &[]).unwrap();
+        assert_eq!(rows.count(), 20);
     }
 }

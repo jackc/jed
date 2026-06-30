@@ -58,6 +58,7 @@ import {
   type TxStatus,
 } from "./executor.ts";
 import { type Rows, rowsFromOutcome, Transaction } from "./api.ts";
+import { throwIfAborted } from "./cancel.ts";
 import { engineError } from "./errors.ts";
 import { persistImpl } from "./persist.ts";
 import type { Statement } from "./ast.ts";
@@ -275,6 +276,26 @@ export class Database {
       s.close();
     }
   }
+  // executeCancelable runs a statement on a fresh autocommit session under an AbortSignal
+  // (spec/design/api.md §11.4): an already-aborted signal throws 57014 before any work. TS is
+  // synchronous, so the check is at this boundary only (cancel.ts).
+  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Outcome {
+    const s = this.session({});
+    try {
+      return s.executeCancelable(sql, params, signal);
+    } finally {
+      s.close();
+    }
+  }
+  // queryCancelable is the query sibling of executeCancelable (spec/design/api.md §11.4).
+  queryCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Rows {
+    const s = this.session({});
+    try {
+      return s.queryCancelable(sql, params, signal);
+    } finally {
+      s.close();
+    }
+  }
   // executeScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
   // §4.2): the whole run is one implicit transaction (all-or-nothing).
   executeScript(sql: string): ScriptSummary {
@@ -363,6 +384,22 @@ export class Session {
   // query runs a query on this session, returning a row cursor.
   query(sql: string, params: Value[] = []): Rows {
     return rowsFromOutcome(this.dispatch(this.engine.parse(sql), params));
+  }
+
+  // executeCancelable runs a statement under an AbortSignal (spec/design/api.md §11.4): if the signal
+  // is already aborted it throws 57014 query_canceled before any work, else it runs normally. TS is
+  // synchronous (one event loop), so the signal cannot flip mid-statement — the check is at this
+  // boundary only, the deliberate per-language divergence from Go/Rust's mid-statement meter poll (the
+  // cancel.ts note). Useful for skipping work an already-canceled caller no longer wants.
+  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Outcome {
+    throwIfAborted(signal);
+    return this.execute(sql, params);
+  }
+
+  // queryCancelable is the query sibling of executeCancelable (spec/design/api.md §11.4).
+  queryCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Rows {
+    throwIfAborted(signal);
+    return this.query(sql, params);
   }
 
   private dispatch(stmt: Statement, params: Value[]): Outcome {

@@ -22,6 +22,7 @@ mod api;
 mod ast;
 mod blockstore;
 mod bufferpool;
+mod cancel;
 mod catalog;
 mod collation;
 mod cost;
@@ -73,6 +74,7 @@ mod integration_tests;
 // on (CLAUDE.md §2 — wrapping the Rust core wraps at this level); it stays public for them, but new
 // embedders should reach for Database/Session. `execute`/`execute_params` are its one-shot helpers.
 pub use api::{PreparedStatement, Rows, Transaction};
+pub use cancel::CancellationToken;
 pub use collation::{load_unicode_data, loaded_collation};
 pub use decimal::Decimal;
 pub use error::{EngineError, Result, SqlState};

@@ -3,6 +3,7 @@
 //! the parser + executor — the conformance contract still binds (the executor is unchanged).
 
 use crate::ast::Statement;
+use crate::cancel::CancellationToken;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Engine, Outcome};
 use crate::parser::Parser;
@@ -117,6 +118,38 @@ impl Transaction<'_> {
     /// Run a query within this transaction, returning a row cursor.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         self.db.query(sql, params)
+    }
+
+    /// Run a statement within this transaction under a [`CancellationToken`] (spec/design/api.md
+    /// §11.4): arm `cancel` for the statement's duration so a flipped token (from any thread) aborts it
+    /// `57014` at the next cost-meter checkpoint — which, like any error, poisons the block (`25P02`).
+    /// The prior token is restored on return.
+    pub fn execute_cancelable(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancel: &CancellationToken,
+    ) -> Result<Outcome> {
+        cancel.check()?;
+        let prev = self.db.session.cancel.replace(cancel.clone());
+        let r = self.db.execute(sql, params);
+        self.db.session.cancel = prev;
+        r
+    }
+
+    /// Run a query within this transaction under a [`CancellationToken`] (spec/design/api.md §11.4) —
+    /// the query sibling of [`execute_cancelable`](Transaction::execute_cancelable).
+    pub fn query_cancelable(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        cancel: &CancellationToken,
+    ) -> Result<Rows> {
+        cancel.check()?;
+        let prev = self.db.session.cancel.replace(cancel.clone());
+        let r = self.db.query(sql, params);
+        self.db.session.cancel = prev;
+        r
     }
 
     /// Commit the transaction — publish + make durable (per `synchronous`). Consumes the handle.
