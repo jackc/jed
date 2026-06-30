@@ -63,9 +63,11 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use crate::api::{PreparedStatement, Rows, Transaction};
 use crate::ast::Statement;
 use crate::cancel::CancellationToken;
+use crate::catalog::{CompositeType, Table};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
-    Engine, Outcome, ScriptSummary, SessionOptions, SessionState, Snapshot, TxStatus, stmt_is_write,
+    CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState, Snapshot, TxStatus,
+    stmt_is_write,
 };
 use crate::file::{DatabaseOptions, OpenOptions};
 use crate::privileges::{PrivilegeSet, Privileges};
@@ -134,6 +136,8 @@ struct Storage {
     paging: Arc<crate::paging::SharedPaging>,
     /// Opened read-only (api.md §2.1): every session is then read-only and a write is `25006`.
     read_only: bool,
+    /// The backing file path (a file-backed core always has one); surfaced by [`Database::path`].
+    path: Option<std::path::PathBuf>,
 }
 
 /// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
@@ -154,6 +158,11 @@ struct Shared {
     /// The storage identity for a **file-backed** database (§2.4); `None` is in-memory. Mutated only
     /// under the writer gate, so the `Mutex` never contends with the publish path.
     storage: Option<Mutex<Storage>>,
+    /// The page size minted sessions serialize/split at when this core is **in-memory** (`storage`
+    /// is `None`); the file's page size wins when file-backed (see [`Shared::page_size`]). The default
+    /// for a normal in-memory database; [`Database::new_in_memory_with_page_size`] sets it so the
+    /// byte-level fixtures/tests can build an in-memory tree at the size it will serialize to (§8).
+    mem_page_size: u32,
 }
 
 impl Shared {
@@ -223,7 +232,7 @@ impl Shared {
     fn page_size(&self) -> u32 {
         self.storage
             .as_ref()
-            .map_or(crate::executor::DEFAULT_PAGE_SIZE, |s| {
+            .map_or(self.mem_page_size, |s| {
                 s.lock().expect("storage lock not poisoned").page_size
             })
     }
@@ -234,6 +243,20 @@ impl Shared {
         self.storage
             .as_ref()
             .is_some_and(|s| s.lock().expect("storage lock not poisoned").read_only)
+    }
+
+    /// The on-disk page high-water for a file-backed core; `0` in-memory (no backing file).
+    fn page_count(&self) -> u32 {
+        self.storage
+            .as_ref()
+            .map_or(0, |s| s.lock().expect("storage lock not poisoned").page_count)
+    }
+
+    /// The backing file path for a file-backed core; `None` in-memory.
+    fn path(&self) -> Option<std::path::PathBuf> {
+        self.storage
+            .as_ref()
+            .and_then(|s| s.lock().expect("storage lock not poisoned").path.clone())
     }
 
     /// Durably persist `snap` to the backing file via an **incremental** copy-on-write commit
@@ -322,6 +345,15 @@ impl Default for Database {
 impl Database {
     /// A fresh, empty in-memory shared core (committed version 0, no backing file).
     pub fn new_in_memory() -> Database {
+        Database::new_in_memory_with_page_size(crate::executor::DEFAULT_PAGE_SIZE)
+    }
+
+    /// A fresh, empty in-memory shared core that serializes/splits at `page_size`. The page-backed
+    /// B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an in-memory tree must
+    /// be built at the size it will serialize to — this builds byte-level fixtures / tests a
+    /// non-default page size (the shared-core analogue of `Engine::with_page_size`); a normal
+    /// in-memory database uses [`Database::new_in_memory`] (the default page size).
+    pub fn new_in_memory_with_page_size(page_size: u32) -> Database {
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(Snapshot::default()),
@@ -331,6 +363,7 @@ impl Database {
             writer_free: Condvar::new(),
             live: Mutex::new(LiveRegistry::default()),
             storage: None,
+            mem_page_size: page_size,
         }))
     }
 
@@ -350,7 +383,9 @@ impl Database {
             free_pages: engine.free_pages.clone(),
             paging,
             read_only: engine.read_only,
+            path: engine.path.clone(),
         };
+        let mem_page_size = engine.page_size;
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
@@ -360,6 +395,7 @@ impl Database {
             writer_free: Condvar::new(),
             live: Mutex::new(LiveRegistry::default()),
             storage: Some(Mutex::new(storage)),
+            mem_page_size,
         }))
     }
 
@@ -369,6 +405,7 @@ impl Database {
     /// harness's `# fixture:` path to run records against a pre-built on-disk state that SQL cannot
     /// construct (the collation version-skew read-safety guard, collation.md §12).
     fn from_memory_engine(engine: Engine) -> Database {
+        let mem_page_size = engine.page_size;
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
@@ -378,6 +415,7 @@ impl Database {
             writer_free: Condvar::new(),
             live: Mutex::new(LiveRegistry::default()),
             storage: None,
+            mem_page_size,
         }))
     }
 
@@ -385,6 +423,81 @@ impl Database {
     /// The shared-core analogue of [`Engine::from_image`].
     pub fn from_image(image: &[u8]) -> Result<Database> {
         Ok(Database::from_memory_engine(Engine::from_image(image)?))
+    }
+
+    /// Serialize the whole committed state to a single, clean from-scratch on-disk image (the inverse
+    /// of [`from_image`](Database::from_image); spec/fileformat/format.md). `txid` is written into both
+    /// meta slots. Pins the committed snapshot (lock-free, never blocking a writer) and serializes it
+    /// at `page_size` — the shared-core analogue of `Engine::to_image`, used by the byte-level golden
+    /// round-trip tests (CLAUDE.md §8) and by hosts that snapshot an in-memory database to bytes.
+    pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
+        let (snap, _shared_temp) = self.0.pin();
+        snap.to_image(page_size, txid)
+    }
+
+    /// The canonical name of every persistent table in the latest committed snapshot, sorted
+    /// ascending by lowercased name (the catalog's standing order — no map-iteration order may leak,
+    /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6). Reads a pinned
+    /// snapshot lock-free; session-local / shared temp tables are not visible here (use
+    /// [`Session::table_names`] for a session's view).
+    pub fn table_names(&self) -> Vec<String> {
+        let (snap, _shared_temp) = self.0.pin();
+        snap.table_names()
+    }
+
+    /// The definition of persistent table `name` (case-insensitive) in the latest committed snapshot,
+    /// or `None` if there is no such table. Returns an owned clone (the pinned snapshot is transient).
+    /// The [`Table`] type is part of the doc-hidden `tooling` introspection seam, not the embedding
+    /// API — hosts use [`table_names`](Database::table_names); white-box tests / the CLI reach the
+    /// catalog detail through `tooling::Table`.
+    pub fn table(&self, name: &str) -> Option<Table> {
+        let (snap, _shared_temp) = self.0.pin();
+        snap.table(name).cloned()
+    }
+
+    /// The definition of composite type `name` (case-insensitive) in the latest committed snapshot,
+    /// or `None`. Like [`table`](Database::table), the [`CompositeType`] return is the doc-hidden
+    /// `tooling` introspection seam, not the embedding API.
+    pub fn composite_type(&self, name: &str) -> Option<CompositeType> {
+        let (snap, _shared_temp) = self.0.pin();
+        snap.composite_type(name).cloned()
+    }
+
+    /// The on-disk transaction id (commit counter) of the latest committed snapshot — the value
+    /// written into the meta slot (spec/fileformat/format.md). Equal to [`version`](Database::version);
+    /// the on-disk-format name for the same monotonic counter.
+    pub fn txid(&self) -> u64 {
+        self.version()
+    }
+
+    /// The page payload size this database serializes at (the file's fixed page size for a file-backed
+    /// core, else the in-memory page size).
+    pub fn page_size(&self) -> u32 {
+        self.0.page_size()
+    }
+
+    /// The on-disk page high-water for a file-backed database; `0` in-memory.
+    pub fn page_count(&self) -> u32 {
+        self.0.page_count()
+    }
+
+    /// The backing file path for a file-backed database; `None` in-memory.
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        self.0.path()
+    }
+
+    /// Whether this database was opened read-only (a write is `25006`). In-memory databases are
+    /// always writable.
+    pub fn read_only(&self) -> bool {
+        self.0.read_only()
+    }
+
+    /// White-box test helper (CLAUDE.md §10): all rows of persistent table `name` in primary-key
+    /// (encoded byte) order from the latest committed snapshot, every value fully materialized, or
+    /// `None` if absent. Not the embedding API — the SELECT path is the supported row access.
+    pub(crate) fn rows_in_key_order(&self, name: &str) -> Option<Vec<Vec<Value>>> {
+        let (snap, _shared_temp) = self.0.pin();
+        snap.rows_in_key_order(name)
     }
 
     /// Create a **new** file-backed shared database at `path` (spec/design/api.md §2). `58P02` if the
@@ -896,6 +1009,57 @@ impl Session {
     /// the latest base for a writable session).
     pub fn version(&self) -> u64 {
         self.base_version
+    }
+
+    /// The canonical name of every table visible to this session, sorted ascending by lowercased
+    /// name (CLAUDE.md §8). Unlike [`Database::table_names`], this sees the session's view — the open
+    /// transaction's working set if any, else the session's pinned committed snapshot. (Temp tables
+    /// are excluded, matching the persistent catalog listing.)
+    pub fn table_names(&self) -> Vec<String> {
+        self.engine.table_names()
+    }
+
+    /// The definition of table `name` (case-insensitive) as this session sees it — session-local
+    /// temp → shared temp → the session's main snapshot (temp-tables.md §3) — or `None`. The [`Table`]
+    /// type is the doc-hidden `tooling` introspection seam, not the embedding API (see
+    /// [`Database::table`]).
+    pub fn table(&self, name: &str) -> Option<&Table> {
+        self.engine.table(name)
+    }
+
+    /// The definition of composite type `name` (case-insensitive) as this session sees it, or `None`.
+    /// The [`CompositeType`] return is the doc-hidden `tooling` introspection seam (see
+    /// [`Database::composite_type`]).
+    pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
+        self.engine.composite_type(name)
+    }
+
+    /// White-box test helper (CLAUDE.md §10): all rows of table `name` in primary-key order as this
+    /// session sees them (the working set if a block is open, else the pinned snapshot), every value
+    /// materialized, or `None` if absent. Not the embedding API.
+    pub(crate) fn rows_in_key_order(&self, name: &str) -> Option<Vec<Vec<Value>>> {
+        self.engine.rows_in_key_order(name)
+    }
+
+    /// Set the default collation for new `text` columns on this session (collation.md §4). White-box
+    /// config used by the collation tests; `2C000` for an unknown collation.
+    pub(crate) fn set_default_collation(&mut self, name: &str) -> Result<()> {
+        self.engine.set_default_collation(name)
+    }
+
+    /// The session's current default collation name.
+    pub(crate) fn default_collation(&self) -> String {
+        self.engine.default_collation()
+    }
+
+    /// The collations available to this session (built-ins + any host-loaded set).
+    pub(crate) fn collations(&self) -> Vec<CollationInfo> {
+        self.engine.collations()
+    }
+
+    /// The host-loaded collations currently in effect (collation.md §9).
+    pub(crate) fn loaded_collations(&self) -> Vec<CollationInfo> {
+        self.engine.loaded_collations()
     }
 
     /// The transaction status (`Idle`/`Open`/`Failed`, spec/design/session.md §2.2).

@@ -309,6 +309,22 @@ impl Snapshot {
         self.tables.get(&name.to_ascii_lowercase())
     }
 
+    /// The canonical name of every table in this snapshot, sorted ascending by lowercased name (the
+    /// catalog's standing order — no map-iteration order may leak, CLAUDE.md §8). Secondary indexes
+    /// are not tables and are excluded (api.md §6).
+    pub fn table_names(&self) -> Vec<String> {
+        let mut named: Vec<(&str, &str)> = self
+            .tables
+            .iter()
+            .map(|(key, t)| (key.as_str(), t.name.as_str()))
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(b.0));
+        named
+            .into_iter()
+            .map(|(_, name)| name.to_string())
+            .collect()
+    }
+
     /// Look up a composite type definition by name (case-insensitive).
     pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
         self.types.get(&name.to_ascii_lowercase())
@@ -814,7 +830,7 @@ impl Snapshot {
     /// test/debug convenience (the SELECT path scans through `iter_in_key_order` directly, propagating
     /// I/O errors); every value is fully materialized — the helper's callers compare whole rows, so
     /// no unfetched reference may escape (large-values.md §14). The fault-`Result` is unwrapped here.
-    fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
+    pub(crate) fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
         self.stores.get(&name.to_ascii_lowercase()).map(|s| {
             let mut rows = s.iter_in_key_order().expect("test-helper read failed");
             for row in &mut rows {
@@ -2431,17 +2447,7 @@ impl Engine {
     /// by lowercased name (the catalog's standing order — no map-iteration order may leak,
     /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
     pub fn table_names(&self) -> Vec<String> {
-        let snap = self.read_snap();
-        let mut named: Vec<(&str, &str)> = snap
-            .tables
-            .iter()
-            .map(|(key, t)| (key.as_str(), t.name.as_str()))
-            .collect();
-        named.sort_by(|a, b| a.0.cmp(b.0));
-        named
-            .into_iter()
-            .map(|(_, name)| name.to_string())
-            .collect()
+        self.read_snap().table_names()
     }
 
     /// All rows of a table in primary-key (encoded byte) order, or None if the table does not exist.

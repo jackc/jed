@@ -110,7 +110,7 @@ pub use value::Value;
 #[doc(hidden)]
 pub mod tooling {
     // The CLI renders query results + dumps schema using these internal types.
-    pub use crate::catalog::Table;
+    pub use crate::catalog::{CompositeType, Table};
     pub use crate::types::{ScalarType, Type};
 
     // The low-level single-threaded handle + its one-shot conveniences. The in-repo REPL (`cli/`)
