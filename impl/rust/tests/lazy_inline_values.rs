@@ -1,8 +1,9 @@
-//! L2 — defer inline values at fault (spec/design/lazy-record.md §12). On the demand-paged path
+//! L2/L3 — defer inline values at fault (spec/design/lazy-record.md §12). On the demand-paged path
 //! every *variable-length / structured* present value (text/bytea/decimal/json/jsonb/composite/
-//! array/range) is loaded as an owned-span `Unfetched::Inline` instead of being eagerly decoded;
-//! the scan layer resolves exactly the query's touched columns, an untouched one is dropped still
-//! deferred. The reshape is cost-, result-, and byte-neutral (§8), so a demand-paged file and a
+//! array/range) is loaded as a deferred `Unfetched::Inline` (a zero-copy reference into the shared
+//! page block — form (a), L3) instead of being eagerly decoded; the scan layer resolves exactly the
+//! query's touched columns, an untouched one is dropped still deferred. The reshape is cost-,
+//! result-, and byte-neutral (§8) regardless of representation (form (a)/(b)), so a paged file and a
 //! fully-resident in-memory database must observe identical rows and identical cost for every
 //! query shape — that mode-identity is the leak-catcher (an unresolved deferral escapes the scan
 //! layer as a loud poison panic, never silent NULL). Mirrored in Go (lazy_inline_values_test.go)

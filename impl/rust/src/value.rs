@@ -14,6 +14,7 @@ use crate::decimal::Decimal;
 use crate::interval::{self, Interval};
 use crate::json::{self, JsonNode};
 use crate::timestamp;
+use std::sync::Arc;
 
 /// A runtime value: SQL NULL, an integer, a boolean, a text string, a decimal, or a byte string.
 ///
@@ -115,13 +116,22 @@ pub enum Value {
 /// decompress slabs) without reading the value.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Unfetched {
-    /// `0x00` inline-plain, **deferred** (spec/design/lazy-record.md §5b, L2): the value's bytes
-    /// are resident in the record, but its decode is deferred until the column is touched. `body`
-    /// owns the on-disk value body (the bytes after the `0x00` present tag — form (b), the
-    /// owned-span representation); resolution re-runs the decoder over it in `Construct` mode. Only
+    /// `0x00` inline-plain, **deferred** (spec/design/lazy-record.md §5a, L3): the value's bytes are
+    /// resident in the record, but its decode is deferred until the column is touched. **Form (a),
+    /// zero-copy block-shared:** `block` is the faulted leaf's whole page block (one `Arc<[u8]>`
+    /// shared by every deferred value in the leaf), and the body is `block[off .. off + len]` (the
+    /// bytes after the `0x00` present tag). The fault copies nothing per value — it parses spans and
+    /// hands out `Arc` clones — and the scan-emit clone is a refcount bump, so resident leaf memory
+    /// is `≈ page_size` (§9). Resolution re-runs the decoder over that span in `Construct` mode. Only
     /// variable-length / structured types defer (text/bytea/decimal/json/jsonb/composite/array/
-    /// range); fixed-width scalars stay eagerly decoded even on the lazy path (§6).
-    Inline { body: Vec<u8> },
+    /// range); fixed-width scalars stay eagerly decoded even on the lazy path (§6). (A value that
+    /// rides a spilling sort and is read back from a run file owns a fresh single-body `Arc` — a
+    /// degenerate form (a), since its page block may be long gone — `spill.rs`.)
+    Inline {
+        block: Arc<[u8]>,
+        off: u32,
+        len: u32,
+    },
     /// `0x02` external-plain: the chain carries `len` payload bytes from `first_page`.
     External { first_page: u32, len: u32 },
     /// `0x03` inline-compressed: the LZ4 block is resident (it lives in the record), but

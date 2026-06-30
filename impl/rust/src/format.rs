@@ -1910,9 +1910,15 @@ fn collect_leaf_overflow(
     match page.page_type {
         PAGE_LEAF => {
             let fetch = |p: u32| paging.pager().read_block(p);
+            let item_count = page.item_count;
+            // The reachability walk discards each row right after `mark_chains` (only an external
+            // chain matters here, never an inline-deferred body), so the form-(a) `Arc` wrap (L3)
+            // is dropped per leaf — it exists only to satisfy the lazy decoder's signature.
+            let shared: Arc<[u8]> = Arc::from(block.as_slice());
+            let payload = &shared[PAGE_HEADER..];
             let mut pos = 0usize;
-            for _ in 0..page.item_count {
-                let (_k, row, _w) = decode_record_lazy(col_types, page.payload, &mut pos)?;
+            for _ in 0..item_count {
+                let (_k, row, _w) = decode_record_lazy(col_types, &shared, payload, &mut pos)?;
                 mark_chains(&row, &fetch, reached)?;
             }
             Ok(())
@@ -1967,11 +1973,16 @@ fn read_skeleton_node(
         PAGE_LEAF => Ok((Child::OnDisk(page_idx), page.item_count as usize)),
         PAGE_INTERIOR => {
             let n = page.item_count as usize;
+            // Form (a) (lazy-record.md §5a, L3): an interior node is resident in the skeleton, and its
+            // separator rows carry deferred values too — share this interior block with them via one
+            // `Arc<[u8]>` (`payload` drives both the child-pointer reads and the separator decode).
+            let shared: Arc<[u8]> = Arc::from(block.as_slice());
+            let payload = &shared[PAGE_HEADER..];
             let mut pos = 0usize;
             let mut children = Vec::with_capacity(n + 1);
             let mut total = 0usize;
             for _ in 0..=n {
-                let cp = read_u32(page.payload, &mut pos)?;
+                let cp = read_u32(payload, &mut pos)?;
                 let (child, clen) = read_skeleton_node(paging, cp, col_types, reached)?;
                 children.push(child);
                 total += clen;
@@ -1985,7 +1996,7 @@ fn read_skeleton_node(
             // stays an unfetched reference; its chain is marked reachable by headers only.
             let fetch = |p: u32| paging.pager().read_block(p);
             for _ in 0..n {
-                let (key, row, w) = decode_record_lazy(col_types, page.payload, &mut pos)?;
+                let (key, row, w) = decode_record_lazy(col_types, &shared, payload, &mut pos)?;
                 weights.push(w as u32);
                 mark_chains(&row, &fetch, reached)?;
                 keys.push(key);
@@ -2678,9 +2689,15 @@ pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ColType]) -
         Vec::with_capacity(n),
         Vec::with_capacity(n),
     );
+    // Form (a) (lazy-record.md §5a, L3): wrap the page block in one `Arc<[u8]>` and share it across
+    // every deferred inline value in the leaf — each holds an `Arc` clone + `(off, len)`, so the
+    // leaf's bytes are held **once** (resident leaf memory `≈ page_size`, §9) rather than re-expanded
+    // into a decoded `Value` tree. A leaf with no deferred value drops this `Arc` at function exit.
+    let shared: Arc<[u8]> = Arc::from(block);
+    let payload = &shared[PAGE_HEADER..];
     let mut pos = 0usize;
     for _ in 0..n {
-        let (key, row, w) = decode_record_lazy(col_types, parsed.payload, &mut pos)?;
+        let (key, row, w) = decode_record_lazy(col_types, &shared, payload, &mut pos)?;
         weights.push(w as u32);
         keys.push(key);
         vals.push(row);
@@ -3698,18 +3715,29 @@ fn read_overflow_chain(
 /// record's pointer fields — no chain read, no decompression. The scan layer resolves the
 /// references for the columns a query touches ([`resolve_unfetched`]); the commit path resolves
 /// the rest when a dirty leaf re-encodes (`resolve_for_encode`).
-fn read_value_lazy(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+fn read_value_lazy(ty: &ColType, block: &Arc<[u8]>, buf: &[u8], pos: &mut usize) -> Result<Value> {
     match read_u8(buf, pos)? {
-        // A present inline value (lazy-record.md §12, L2): a variable-length / structured body
-        // (the `is_spillable` set — §6) is **deferred** as an owned-span `Unfetched::Inline`, found
-        // by walking its byte extent without constructing it (`inline_body_span`); a fixed-width
-        // scalar is decoded eagerly (deferring it buys nothing — §6). The deep-tree clone and the
-        // eager decode of an untouched column are gone; `resolve_unfetched` reconstructs a touched
-        // one from the span, byte-identically (`read_inline_body` in `Construct` mode).
+        // A present inline value (lazy-record.md §12, L3): a variable-length / structured body
+        // (the `is_spillable` set — §6) is **deferred** as an `Unfetched::Inline` referencing the
+        // shared page block by `(off, len)` — **form (a), zero-copy** (§5a): the span is found by
+        // walking its byte extent without constructing it (`inline_body_span`), then captured as an
+        // `Arc` clone of `block` (a refcount bump, no copy). A fixed-width scalar is decoded eagerly
+        // (deferring it buys nothing — §6). The deep-tree clone and the eager decode of an untouched
+        // column are gone; `resolve_unfetched` reconstructs a touched one from the span,
+        // byte-identically (`read_inline_body` in `Construct` mode). `buf` is the page payload
+        // (`block[PAGE_HEADER..]`, checked in `decode_record_lazy`), so the body's offset within the
+        // shared block is `PAGE_HEADER + body_start`.
         0x00 => {
             if is_spillable(ty) {
-                let body = inline_body_span(ty, buf, pos)?.to_vec();
-                Ok(Value::Unfetched(Unfetched::Inline { body }))
+                let body_start = *pos;
+                inline_body_span(ty, buf, pos)?; // advance the cursor past the body, no construction
+                let off = (PAGE_HEADER + body_start) as u32;
+                let len = (*pos - body_start) as u32;
+                Ok(Value::Unfetched(Unfetched::Inline {
+                    block: Arc::clone(block),
+                    off,
+                    len,
+                }))
             } else {
                 read_inline_body(ty, buf, pos, DecodeMode::Construct)
             }
@@ -3746,15 +3774,23 @@ fn read_value_lazy(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
 /// would need the unfetched bytes).
 fn decode_record_lazy(
     col_types: &[ColType],
+    block: &Arc<[u8]>,
     buf: &[u8],
     pos: &mut usize,
 ) -> Result<(Vec<u8>, Row, usize)> {
+    // `buf` must be the page payload of `block` (`block[PAGE_HEADER..]`) — `read_value_lazy` records
+    // a deferred value's offset within the shared block as `PAGE_HEADER + (its offset in buf)` (§5a).
+    debug_assert_eq!(
+        block.len(),
+        buf.len() + PAGE_HEADER,
+        "lazy decode: buf must be block[PAGE_HEADER..]"
+    );
     let start = *pos;
     let key_len = read_u16(buf, pos)? as usize;
     let key = take(buf, pos, key_len)?.to_vec();
     let mut row = Vec::with_capacity(col_types.len());
     for ty in col_types {
-        row.push(read_value_lazy(ty, buf, pos)?);
+        row.push(read_value_lazy(ty, block, buf, pos)?);
     }
     Ok((key, row, *pos - start))
 }
@@ -3770,10 +3806,12 @@ pub(crate) fn resolve_unfetched(
 ) -> Result<Value> {
     let mut sink = Vec::new();
     match u {
-        // Inline-deferred (lazy-record.md §5b, L2): the bytes are already owned — no chain read, no
-        // decompression. Re-run the decoder over the captured span in `Construct` mode; it must
-        // consume exactly the span (the zero-drift invariant of §6, debug-checked here).
-        Unfetched::Inline { body } => {
+        // Inline-deferred (lazy-record.md §5a, L3): the bytes are resident in the shared page block —
+        // no chain read, no decompression. Re-run the decoder over the captured span
+        // `block[off .. off + len]` in `Construct` mode; it must consume exactly the span (the
+        // zero-drift invariant of §6, debug-checked here).
+        Unfetched::Inline { block, off, len } => {
+            let body = &block[*off as usize..*off as usize + *len as usize];
             let mut p = 0;
             let v = read_inline_body(ty, body, &mut p, DecodeMode::Construct)?;
             debug_assert_eq!(p, body.len(), "inline deferral span over/under-consumed");
@@ -4421,6 +4459,107 @@ mod tests {
             let span = inline_body_span(ty, &enc, &mut ps).expect("skip walk");
             assert_eq!(ps, pc, "skip advance equals construct advance: {v:?}");
             assert_eq!(span, &enc[1..], "the span is exactly the body bytes: {v:?}");
+        }
+    }
+
+    // --- L3: zero-copy block-shared deferral (spec/design/lazy-record.md §5a/§12) ---
+
+    /// A faulted leaf holds its page block **once** as a shared `Arc<[u8]>`; every deferred inline
+    /// value in the leaf references that one block by `(off, len)` — **form (a)** — rather than
+    /// owning a private copy of its body (form (b), L2). This is the resident-memory dividend (§9):
+    /// resident leaf bytes track `≈ page_size`, not the sum of the decoded values. The property is
+    /// invisible to results and cost (§8), so it can only be asserted white-box — proven here
+    /// structurally: all the leaf's `Unfetched::Inline` values share **one** allocation
+    /// (`Arc::ptr_eq`), and that allocation is the whole page.
+    #[test]
+    fn faulted_leaf_shares_one_block_across_deferred_values() {
+        // Variable-length / structured columns so every present value defers (§6); the i32 column
+        // stays eagerly decoded (deferring a fixed-width scalar buys nothing).
+        let col_types = vec![
+            ColType::Scalar(ScalarType::Int32),
+            ColType::Scalar(ScalarType::Text),
+            ColType::Scalar(ScalarType::Bytea),
+            ColType::Scalar(ScalarType::Decimal),
+            ColType::Array(Box::new(ColType::Scalar(ScalarType::Int32))),
+        ];
+        let ps = 8192usize; // large page → every value stays inline-plain (no spill)
+        let cap = ps - PAGE_HEADER;
+
+        let rows: Vec<Vec<Value>> = (0..3i64)
+            .map(|i| {
+                vec![
+                    Value::Int(i),
+                    Value::Text(format!("name-{i}-padding-padding")),
+                    Value::Bytea(vec![i as u8; 16]),
+                    Value::Decimal(Decimal::from_digits_scale(false, "12345", 2)),
+                    Value::Array(ArrayVal::one_dim(vec![Value::Int(i), Value::Int(i + 1)])),
+                ]
+            })
+            .collect();
+
+        // Encode the records into one leaf page payload (everything inline at this page size).
+        let mut take_seq = 100u32;
+        let mut take = || {
+            let v = take_seq;
+            take_seq += 1;
+            v
+        };
+        let mut ovf = Vec::new();
+        let mut payload = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let key = (i as u32).to_be_bytes().to_vec();
+            payload.extend_from_slice(&encode_record(
+                &col_types, &key, row, cap, &mut take, &mut ovf,
+            ));
+        }
+        assert!(
+            ovf.is_empty(),
+            "values must stay inline (no overflow) for the form-(a) case"
+        );
+        let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
+
+        // Fault the leaf: every deferrable present value becomes Unfetched::Inline (form (a)).
+        let node = decode_leaf_node(&block, 2, &col_types).expect("decode leaf");
+
+        let mut blocks: Vec<&std::sync::Arc<[u8]>> = Vec::new();
+        for row in &node.vals {
+            for v in row {
+                if let Value::Unfetched(Unfetched::Inline { block, .. }) = v {
+                    blocks.push(block);
+                }
+            }
+        }
+        // 3 rows × 4 deferrable columns (text/bytea/decimal/array) = 12 deferred values; the i32
+        // column stays eager (§6).
+        assert_eq!(
+            blocks.len(),
+            12,
+            "every deferrable present value defers (form (a))"
+        );
+        // They all reference ONE allocation — zero-copy block sharing (§5a): N deferred values,
+        // one page block. This is the structural statement of "resident leaf bytes ≈ page_size".
+        for b in &blocks[1..] {
+            assert!(
+                std::sync::Arc::ptr_eq(blocks[0], b),
+                "all deferred values in a leaf share one page block (form (a))"
+            );
+        }
+        // The shared block is the whole page, not a per-value copy.
+        assert_eq!(blocks[0].len(), ps, "the shared block is the whole page");
+
+        // The deferred values still resolve to exactly the originals (form (a) is decode-neutral).
+        let fetch = |_p: u32| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
+        for (row_idx, row) in node.vals.iter().enumerate() {
+            for (col_idx, v) in row.iter().enumerate() {
+                if let Value::Unfetched(u) = v {
+                    let resolved =
+                        resolve_unfetched(&col_types[col_idx], u, &fetch).expect("resolve");
+                    assert_eq!(
+                        resolved, rows[row_idx][col_idx],
+                        "form (a) resolves to the eager value"
+                    );
+                }
+            }
         }
     }
 }

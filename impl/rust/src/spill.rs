@@ -486,10 +486,11 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
         Value::JsonPath(_) => unreachable!("a jsonpath value never reaches the spill codec"),
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it. The same
-        // pass-through covers an inline-deferred value (lazy-record.md §5b) — tag 21.
-        Value::Unfetched(Unfetched::Inline { body }) => {
+        // pass-through covers an inline-deferred value (lazy-record.md §5a) — tag 21: write just its
+        // body span out of the shared page block (the block itself never reaches the run file).
+        Value::Unfetched(Unfetched::Inline { block, off, len }) => {
             w.write_all(&[21])?;
-            write_bytes(w, body)
+            write_bytes(w, &block[*off as usize..*off as usize + *len as usize])
         }
         Value::Unfetched(Unfetched::External { first_page, len }) => {
             w.write_all(&[9])?;
@@ -581,9 +582,17 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
         7 => Value::Timestamp(read_i64(r)?),
         8 => Value::Timestamptz(read_i64(r)?),
         17 => Value::Date(read_u32(r)? as i32),
-        21 => Value::Unfetched(Unfetched::Inline {
-            body: read_bytes(r)?,
-        }),
+        // The page block this value once referenced is long gone, so reconstitute a degenerate
+        // form (a): a fresh single-body `Arc` it owns alone (off 0, full length) — lazy-record.md §5a.
+        21 => {
+            let body = read_bytes(r)?;
+            let len = body.len() as u32;
+            Value::Unfetched(Unfetched::Inline {
+                block: Arc::from(body),
+                off: 0,
+                len,
+            })
+        }
         9 => Value::Unfetched(Unfetched::External {
             first_page: read_u32(r)?,
             len: read_u32(r)?,
