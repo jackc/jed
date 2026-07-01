@@ -58,6 +58,15 @@ func newMeter() *costMeter {
 	return &costMeter{}
 }
 
+// unmetered reports that no enforcement is armed — no per-statement ceiling, no session lifetime
+// budget, and no cancellation poll — so Guard is a pure no-op. The vectorized fast paths (batch.go)
+// gate on this: with nothing to abort, they may bulk-charge a whole scan's units at once and skip
+// per-row Guard, and the accrued total still matches the row-at-a-time path exactly (CLAUDE.md §8).
+// A metered meter keeps the scalar path, so its deterministic abort row is unchanged.
+func (m *costMeter) unmetered() bool {
+	return m.Limit == 0 && m.lifetimeLimit == 0 && m.cancel == nil
+}
+
 // NewMeterWithLimit returns a fresh meter that aborts once accrued cost reaches limit
 // (limit <= 0 ⇒ unlimited), with no session lifetime budget. The ceiling is the session's
 // max_cost (spec/design/api.md §8). Used where there is no session cumulative to thread.

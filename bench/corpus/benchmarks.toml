@@ -48,6 +48,33 @@ seed = 4203
 expect_rows_per_iter = 1
 
 [[bench]]
+name = "full_scan_minmax"
+description = "Full-table MIN/MAX over 1M rows — exercises the Go core's vectorized integer fold (batch.go); a whole-table aggregate on every engine"
+dataset = "large"
+kind = "query"
+sql = "SELECT min(amount), max(amount) FROM orders"
+warmup = 3
+iterations = 20
+seed = 4220
+expect_rows_per_iter = 1
+
+[[bench]]
+name = "full_scan_agg_filter"
+description = "Full-table count + sum over 1M rows behind a WHERE filter — the Go core folds the survivors vectorized while the predicate stays scalar (batch.go, Stage 1)"
+dataset = "large"
+kind = "query"
+sql = "SELECT count(*), sum(amount) FROM orders WHERE amount > $1"
+warmup = 3
+iterations = 20
+seed = 4221
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99999
+
+[[bench]]
 name = "order_by_limit"
 description = "Top-100 by non-indexed column over 1M rows (full sort or top-k)"
 dataset = "large"

@@ -14726,6 +14726,16 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 
+	// Vectorized whole-table integer aggregate (batch.go, Stage 1 of the PAX/vectorization program):
+	// a single-table SUM/COUNT/MIN/MAX with no GROUP BY / DISTINCT / FILTER / HAVING / window /
+	// ORDER BY folds the column in a tight loop instead of the row-at-a-time group machinery below.
+	// Gated to the unmetered lane so a metered query's deterministic abort row stays the scalar
+	// path's; results and accrued cost are byte-identical either way (the conformance corpus proves
+	// both). Ineligible / metered ⇒ this is skipped and the general aggregate branch runs unchanged.
+	if meter.unmetered() && vectorizedAggEligible(plan) {
+		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
+	}
+
 	// Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
 	// blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
 	// LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
