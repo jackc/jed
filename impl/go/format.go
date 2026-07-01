@@ -987,7 +987,16 @@ func serializeNode(n *pnode, colTypes []colType, capacity int, nextIndex uint32,
 			payload = append(payload, encodeRecord(colTypes, n.keys[i], n.vals[i], capacity, take, &ovf)...)
 		}
 	} else {
-		payload = encodeLeafPAX(colTypes, n.keys, n.vals, capacity, take, &ovf)
+		// A leaf may be Packed here: a demand-paged reopen faults a single-leaf table's root leaf
+		// resident (readSkeleton), and toImage re-serializes it. Materialize through the seam
+		// (decodedRows reconstructs a Packed leaf, clones a Decoded one). Whole-image serialize is not
+		// a hot path (create's empty image / golden generator / toImage canonical), so the
+		// Decoded-case clone is acceptable (packed-leaf.md §7).
+		rows, err := n.decodedRows()
+		if err != nil {
+			return 0, 0, err
+		}
+		payload = encodeLeafPAX(colTypes, n.keys, rows, capacity, take, &ovf)
 	}
 	if len(payload) > capacity {
 		return 0, 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
@@ -3156,6 +3165,69 @@ func (l *paxLeaf) value(c, i int) ([]byte, error) {
 	return l.colVals[c][lo:hi], nil
 }
 
+// valueLen is the on-disk byte length of value (record i, column c) — the value directory's
+// prefix-sum span. Equals what readValueLazy advances by, so a record's weight is derivable from the
+// directories alone with no value decode (packed-leaf.md §3/§5).
+func (l *paxLeaf) valueLen(c, i int) int { return int(l.colOff[c][i+1] - l.colOff[c][i]) }
+
+// packedLeaf is a faulted leaf's block-backed resident form (packed-leaf.md §5): the parsed PAX
+// directories (views into the page block) plus the table's column types, retained instead of
+// discarded. It holds NO decoded storedRow — row/value reconstruct on demand via readValueLazy over
+// the O(1) column spans. Because dirs.keys/colVals are sub-slices of the page block, retaining them
+// keeps that block alive (Go GC — the equivalent of Rust's Arc<[u8]> pin), so a resident leaf is
+// ≈ pageSize for fixed-width and variable-length data alike (§9). colTypes is a shared slice header
+// (the table's list), so a resident leaf copies no column types.
+type packedLeaf struct {
+	dirs     *paxLeaf
+	colTypes []colType
+	n        int
+}
+
+// value reconstructs value (record i, column c) — the O(1) PAX column span decoded by the same
+// readValueLazy the eager fault ran (packed-leaf.md §4). A spillable body becomes an inline-deferred
+// Unfetched (a block view); a fixed-width scalar decodes eagerly. Byte-identical to the eager value,
+// moved from fault-time to touch-time (§8); a corrupt touched inline body surfaces XX001 here.
+func (p *packedLeaf) value(c, i int) (Value, error) {
+	vb, err := p.dirs.value(c, i)
+	if err != nil {
+		return Value{}, err
+	}
+	pos := 0
+	return readValueLazy(p.colTypes[c], vb, &pos)
+}
+
+// row reconstructs the whole value row i (every column). The rowAt whole-record path.
+func (p *packedLeaf) row(i int) (storedRow, error) {
+	row := make(storedRow, len(p.colTypes))
+	for c := range p.colTypes {
+		v, err := p.value(c, i)
+		if err != nil {
+			return nil, err
+		}
+		row[c] = v
+	}
+	return row, nil
+}
+
+// rowMasked reconstructs row i decoding ONLY the columns mask selects (the touched-column path,
+// packed-leaf.md §4/§6 — the OP_Column model). Untouched columns are left NULL and their bytes are
+// never read. S3-ready: built for the touched-column scan wiring, not yet driven by the executor.
+func (p *packedLeaf) rowMasked(i int, mask []bool) (storedRow, error) {
+	row := make(storedRow, len(p.colTypes))
+	for c := range p.colTypes {
+		if c < len(mask) && mask[c] {
+			v, err := p.value(c, i)
+			if err != nil {
+				return nil, err
+			}
+			row[c] = v
+		} else {
+			row[c] = NullValue()
+		}
+	}
+	return row, nil
+}
+
 // decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
 // path (spec/design/pager.md §4; paging.go faultLeaf). block is one page; page is its page id, stamped
 // on the node so a later incremental commit keeps it clean. Decoding is LAZY (large-values.md §14):
@@ -3171,34 +3243,30 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []colType) (*pnode, er
 		return nil, newError(DataCorrupted, "demand-paged a non-leaf page")
 	}
 	n := int(pg.itemCount)
-	leaf, err := parsePaxLeaf(pg.payload, n, len(colTypes))
+	k := len(colTypes)
+	leaf, err := parsePaxLeaf(pg.payload, n, k)
 	if err != nil {
 		return nil, err
 	}
-	keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
+	// Packed form (packed-leaf.md §5): retain the block (via the paxLeaf's block-view slices) + the
+	// PAX directories, decode NO values. parsePaxLeaf validated + parsed the directories in one pass
+	// with no value decode, so a malformed directory still surfaces data_corrupted here; a malformed
+	// value body surfaces XX001 only when the column is touched (§8). Keys and weights are derivable
+	// from the directories alone (§3): the weight is 2 + len(key) + Σ_c valueLen(c, i), exactly what
+	// the eager decode summed — so the resident leaf is ≈ pageSize (§9), never an inflated row vector.
+	keys, weights := make([][]byte, 0, n), make([]uint32, 0, n)
 	for i := 0; i < n; i++ {
 		key := make([]byte, len(leaf.keys[i]))
 		copy(key, leaf.keys[i])
-		row := make(storedRow, len(colTypes))
 		w := 2 + len(key)
-		for c, ty := range colTypes {
-			vb, err := leaf.value(c, i)
-			if err != nil {
-				return nil, err
-			}
-			p := 0
-			v, err := readValueLazy(ty, vb, &p)
-			if err != nil {
-				return nil, err
-			}
-			row[c] = v
-			w += len(vb)
+		for c := 0; c < k; c++ {
+			w += leaf.valueLen(c, i)
 		}
 		weights = append(weights, uint32(w))
 		keys = append(keys, key)
-		vals = append(vals, row)
 	}
-	return &pnode{keys: keys, vals: vals, weights: weights, page: pageID}, nil
+	packed := &packedLeaf{dirs: leaf, colTypes: colTypes, n: n}
+	return &pnode{keys: keys, weights: weights, packed: packed, page: pageID}, nil
 }
 
 // decodeTableEntry decodes one catalog table entry: the *Table (its pk list, checks, and

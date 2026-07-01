@@ -27,11 +27,68 @@ import (
 // only for the size-driven split/merge. Nodes are never mutated after construction. page is the
 // on-disk page index (0 when dirty), set once at the commit that first persists this node.
 type pnode struct {
-	keys     [][]byte
+	keys [][]byte
+	// The decoded value rows — populated for a Decoded node (in-memory / mutated / dirty leaves and
+	// EVERY interior node), nil/empty for a Packed leaf (which reconstructs on demand from packed).
+	// Read only through the rowAt / colAt / rowAtMasked / decodedRows seam, never indexed directly, so
+	// the two forms are interchangeable (packed-leaf.md §3/§4).
 	vals     []storedRow
 	weights  []uint32
 	children []childRef
-	page     uint32
+	// packed is the block-backed resident form of a demand-paged clean leaf (packed-leaf.md §5): the
+	// page block + PAX directories, from which vals are reconstructed on demand. nil for a Decoded
+	// node (interior nodes, in-memory/loaded leaves, and any dirty leaf — mutation materializes
+	// Packed→Decoded first, §7). A Packed leaf is always clean (page != 0), so it is never serialized.
+	packed *packedLeaf
+	page   uint32
+}
+
+// rowAt reconstructs value row i as a storedRow — the value-read seam (packed-leaf.md §4). A Decoded
+// node (always the case for interior nodes) returns the stored row (shared, read-only by convention);
+// a Packed leaf reconstructs it from the retained PAX directories on demand. Errors on a corrupt
+// touched inline body (XX001); the Decoded path never errors.
+func (n *pnode) rowAt(i int) (storedRow, error) {
+	if n.packed == nil {
+		return n.vals[i], nil
+	}
+	return n.packed.row(i)
+}
+
+// colAt reconstructs ONLY column c of row i — the touched-column path (packed-leaf.md §4/§6, the
+// OP_Column model PAX's colOff makes O(1)). S3-ready: built for the touched-column scan wiring, not
+// yet driven by the executor.
+func (n *pnode) colAt(i, c int) (Value, error) {
+	if n.packed == nil {
+		return n.vals[i][c], nil
+	}
+	return n.packed.value(c, i)
+}
+
+// rowAtMasked reconstructs row i decoding ONLY the columns mask selects (packed-leaf.md §4/§6). A
+// Decoded node returns the whole stored row; a Packed leaf leaves untouched columns NULL. S3-ready.
+func (n *pnode) rowAtMasked(i int, mask []bool) (storedRow, error) {
+	if n.packed == nil {
+		return n.vals[i], nil
+	}
+	return n.packed.rowMasked(i, mask)
+}
+
+// decodedRows returns every value row — the mutation-descent materialization (packed-leaf.md §7). A
+// Decoded node clones vals; a Packed leaf reconstructs every row so the rebuilt node is Decoded
+// (build / nodeInsert / nodeRemove / mergeAt then run unchanged). Interior nodes are always Decoded.
+func (n *pnode) decodedRows() ([]storedRow, error) {
+	if n.packed == nil {
+		return cloneVals(n.vals), nil
+	}
+	rows := make([]storedRow, n.packed.n)
+	for i := range rows {
+		r, err := n.packed.row(i)
+		if err != nil {
+			return nil, err
+		}
+		rows[i] = r
+	}
+	return rows, nil
 }
 
 // childRef is a B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md
@@ -130,7 +187,11 @@ func (m *pMap) Get(key []byte, src leafSource) (storedRow, bool, error) {
 	for n != nil {
 		i, found := n.search(key)
 		if found {
-			return n.vals[i], true, nil
+			row, err := n.rowAt(i)
+			if err != nil {
+				return nil, false, err
+			}
+			return row, true, nil
 		}
 		if n.isLeaf() {
 			return nil, false, nil
@@ -222,8 +283,14 @@ func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 			return nil
 		}
 		if n.isLeaf() {
-			keys = append(keys, n.keys...)
-			vals = append(vals, n.vals...)
+			for i := range n.keys {
+				row, err := n.rowAt(i)
+				if err != nil {
+					return err
+				}
+				keys = append(keys, n.keys[i])
+				vals = append(vals, row)
+			}
 			return nil
 		}
 		for i := range n.keys {
@@ -401,8 +468,12 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []stor
 		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
 			for i := ef; i < el; i++ {
+				row, err := n.rowAt(i)
+				if err != nil {
+					return err
+				}
 				keys = append(keys, n.keys[i])
-				vals = append(vals, n.vals[i])
+				vals = append(vals, row)
 			}
 			return nil
 		}
@@ -474,7 +545,11 @@ func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
 			for i := ef; i < el; i++ {
-				cont, err := visit(n.keys[i], n.vals[i])
+				row, err := n.rowAt(i)
+				if err != nil {
+					return false, err
+				}
+				cont, err := visit(n.keys[i], row)
 				if err != nil || !cont {
 					return cont, err
 				}
@@ -526,7 +601,11 @@ func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, r
 		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
 			for i := el - 1; i >= ef; i-- {
-				cont, err := visit(n.keys[i], n.vals[i])
+				row, err := n.rowAt(i)
+				if err != nil {
+					return false, err
+				}
+				cont, err := visit(n.keys[i], row)
 				if err != nil || !cont {
 					return cont, err
 				}
@@ -640,7 +719,11 @@ func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
 			}
 			if fr.isLeaf {
 				// A leaf's positions are its in-bound key indices [ef, el) directly.
-				return fr.node.keys[p], fr.node.vals[p], true, nil
+				row, err := fr.node.rowAt(p)
+				if err != nil {
+					return nil, nil, false, err
+				}
+				return fr.node.keys[p], row, true, nil
 			}
 			if p%2 == 0 {
 				i := p / 2
@@ -759,7 +842,10 @@ func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRe
 func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap, k int) (insOut, error) {
 	i, found := n.search(key)
 	if found {
-		vals := cloneVals(n.vals)
+		vals, err := n.decodedRows()
+		if err != nil {
+			return insOut{}, err
+		}
 		weights := cloneWeights(n.weights)
 		*old = vals[i]
 		*replaced = true
@@ -768,7 +854,11 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 		return build(cloneKeys(n.keys), vals, weights, cloneChildren(n.children), cap, k, i == len(n.keys)-1), nil
 	}
 	if n.isLeaf() {
-		return build(insertKeyAt(n.keys, i, key), insertValAt(n.vals, i, val), insertWeightAt(n.weights, i, weight), nil, cap, k, i == len(n.keys)), nil
+		rows, err := n.decodedRows()
+		if err != nil {
+			return insOut{}, err
+		}
+		return build(insertKeyAt(n.keys, i, key), insertValAt(rows, i, val), insertWeightAt(n.weights, i, weight), nil, cap, k, i == len(n.keys)), nil
 	}
 	// Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
 	// becomes a dirty resident node on the rebuilt path).
@@ -804,7 +894,11 @@ func maxKV(n *pnode, src leafSource) ([]byte, storedRow, uint32, error) {
 		}
 		n = child
 	}
-	return n.keys[len(n.keys)-1], n.vals[len(n.vals)-1], n.weights[len(n.weights)-1], nil
+	row, err := n.rowAt(len(n.keys) - 1)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return n.keys[len(n.keys)-1], row, n.weights[len(n.weights)-1], nil
 }
 
 // nodeRemove is the recursive delete (copy-on-write). Returns the rebuilt subtree (possibly
@@ -815,7 +909,11 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap, k int) (*pnode, store
 	i, found := n.search(key)
 	if found {
 		if n.isLeaf() {
-			vals, removed := removeValAt(n.vals, i)
+			rows, err := n.decodedRows()
+			if err != nil {
+				return nil, nil, false, err
+			}
+			vals, removed := removeValAt(rows, i)
 			return &pnode{keys: removeKeyAt(n.keys, i), vals: vals, weights: removeWeightAt(n.weights, i)}, removed, true, nil
 		}
 		removed := n.vals[i]
@@ -903,15 +1001,24 @@ func mergeAt(n *pnode, j int, src leafSource, cap, k int) (*pnode, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Materialize both children (a leaf may be Packed) before merging — the merged node is Decoded.
+	leftRows, err := left.decodedRows()
+	if err != nil {
+		return nil, err
+	}
+	rightRows, err := right.decodedRows()
+	if err != nil {
+		return nil, err
+	}
 
 	mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
 	mkeys = append(mkeys, left.keys...)
 	mkeys = append(mkeys, n.keys[j])
 	mkeys = append(mkeys, right.keys...)
-	mvals := make([]storedRow, 0, len(left.vals)+1+len(right.vals))
-	mvals = append(mvals, left.vals...)
+	mvals := make([]storedRow, 0, len(leftRows)+1+len(rightRows))
+	mvals = append(mvals, leftRows...)
 	mvals = append(mvals, n.vals[j])
-	mvals = append(mvals, right.vals...)
+	mvals = append(mvals, rightRows...)
 	mweights := make([]uint32, 0, len(left.weights)+1+len(right.weights))
 	mweights = append(mweights, left.weights...)
 	mweights = append(mweights, n.weights[j])

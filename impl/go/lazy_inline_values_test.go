@@ -354,14 +354,26 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	}
 	block := makePage(ps, pageLeaf, uint32(len(rows)), 0, payload)
 
-	// Fault the leaf: every deferrable present value becomes an inline-deferred Unfetched (form (a)).
+	// Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained and
+	// NO value is decoded (the decoded row vector is empty), so rows are reconstructed on demand.
+	// Reconstruction produces the same inline-deferred Unfetched (form (a)) the eager fault used to.
 	node, err := decodeLeafNode(block, 2, colTypes)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)
 	}
+	if node.packed == nil {
+		t.Fatalf("a faulted leaf is Packed (packed-leaf.md §5)")
+	}
+	if len(node.vals) != 0 {
+		t.Fatalf("a Packed leaf holds no decoded row vector (resident ≈ pageSize, §9); got %d", len(node.vals))
+	}
 
 	deferred := 0
-	for ri, row := range node.vals {
+	for ri := 0; ri < len(rows); ri++ {
+		row, err := node.rowAt(ri)
+		if err != nil {
+			t.Fatalf("rowAt %d: %v", ri, err)
+		}
 		for ci, v := range row {
 			if v.Kind != ValUnfetched || v.unfetched().Form != 0x00 {
 				continue
@@ -390,5 +402,84 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	// stays eager (§6).
 	if deferred != 12 {
 		t.Fatalf("expected 12 deferred values, got %d", deferred)
+	}
+}
+
+// TestPackedLeafReconstructsOnlyTouchedColumns — the touched-column path (packed-leaf.md §4/§6, the
+// PAX dividend): colAt / rowAtMasked reconstruct ONLY the requested columns of a Packed leaf,
+// byte-identically to the whole-row reconstruction, leaving untouched columns unread. Mirrors the
+// Rust packed_leaf_reconstructs_only_touched_columns. (colAt/rowAtMasked are S3-ready — built here,
+// not yet driven by the executor.)
+func TestPackedLeafReconstructsOnlyTouchedColumns(t *testing.T) {
+	colTypes := []colType{
+		scalarColType(scalarInt32),
+		scalarColType(scalarText),
+		scalarColType(scalarInt64),
+	}
+	const ps = 8192
+	capacity := ps - pageHeader
+	rows := make([]storedRow, 4)
+	for i := range rows {
+		rows[i] = storedRow{IntValue(int64(i)), TextValue(fmt.Sprintf("row-%d", i)), IntValue(int64(i) * 1000)}
+	}
+	takeSeq := uint32(100)
+	take := func() uint32 { takeSeq++; return takeSeq }
+	var ovf []overflowPageOut
+	keys := make([][]byte, len(rows))
+	for i := range rows {
+		key := make([]byte, 4)
+		binary.BigEndian.PutUint32(key, uint32(i))
+		keys[i] = key
+	}
+	payload := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf)
+	if len(ovf) != 0 {
+		t.Fatalf("values must stay inline, got %d overflow pages", len(ovf))
+	}
+	block := makePage(ps, pageLeaf, uint32(len(rows)), 0, payload)
+	node, err := decodeLeafNode(block, 2, colTypes)
+	if err != nil {
+		t.Fatalf("decodeLeafNode: %v", err)
+	}
+
+	// resolve a (possibly-deferred) value to its comparable eager bytes.
+	resolve := func(v Value, c int) []byte {
+		if v.Kind == ValUnfetched {
+			got, err := resolveUnfetched(colTypes[c], v.unfetched(), func(uint32) ([]byte, error) {
+				return nil, fmt.Errorf("inline values read no overflow pages")
+			})
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			v = got
+		}
+		return encodeValue(colTypes[c], v)
+	}
+
+	for i := range rows {
+		whole, err := node.rowAt(i)
+		if err != nil {
+			t.Fatalf("rowAt %d: %v", i, err)
+		}
+		// colAt(c) equals the whole row's column c.
+		for c := range colTypes {
+			one, err := node.colAt(i, c)
+			if err != nil {
+				t.Fatalf("colAt(%d,%d): %v", i, c, err)
+			}
+			if !bytes.Equal(resolve(one, c), resolve(whole[c], c)) {
+				t.Fatalf("row %d col %d: colAt differs from whole row", i, c)
+			}
+		}
+		// rowAtMasked decodes only the masked columns; the rest stay NULL (unread).
+		masked, err := node.rowAtMasked(i, []bool{false, true, false})
+		if err != nil {
+			t.Fatalf("rowAtMasked %d: %v", i, err)
+		}
+		if masked[0].Kind != ValNull || masked[2].Kind != ValNull {
+			t.Fatalf("row %d: unmasked columns must be NULL (unread), got %v / %v", i, masked[0].Kind, masked[2].Kind)
+		}
+		if !bytes.Equal(resolve(masked[1], 1), resolve(whole[1], 1)) {
+			t.Fatalf("row %d: masked column 1 differs from whole row", i)
+		}
 	}
 }
