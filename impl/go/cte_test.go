@@ -10,7 +10,7 @@ package jed
 import "testing"
 
 // cteT3 is a 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
-func cteT3(t *testing.T) *engine {
+func cteT3(t *testing.T) *Session {
 	return dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
@@ -19,9 +19,9 @@ func cteT3(t *testing.T) *engine {
 }
 
 // cteCost runs sql and returns its accrued cost.
-func cteCost(t *testing.T, db *engine, sql string) int64 {
+func cteCost(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
-	out, err := execute(db, sql)
+	out, err := db.Execute(sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -61,9 +61,9 @@ func TestCteMaterializedHintForcesBuffering(t *testing.T) {
 // cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism doing real
 // work. A per-iteration meter would never fire here, so the corpus cannot express it.
 func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetMaxCost(1000)
-	_, err := execute(db, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c")
+	_, err := db.Execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c", nil)
 	if err == nil {
 		t.Fatal("an unbounded recursion must abort, not loop forever")
 	}
@@ -76,7 +76,7 @@ func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
 // actual accrued cost, not a per-iteration figure); the 5-row counter accrues 29 (the corpus cost
 // contract).
 func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetMaxCost(1000)
 	if got := cteCost(t, db,
 		"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c"); got != 29 {
@@ -87,11 +87,11 @@ func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
 // A recursive CTE is ALWAYS materialized — NOT MATERIALIZED is inert (recursive-cte.md §1), so a
 // single-reference recursive CTE still iterates to a fixpoint (3 rows, cost 17) rather than inlining.
 func TestCteRecursiveHintIsInert(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	for _, hint := range []string{"", "MATERIALIZED ", "NOT MATERIALIZED "} {
 		sql := "WITH RECURSIVE c(n) AS " + hint +
 			"(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"
-		out, err := execute(db, sql)
+		out, err := db.Execute(sql, nil)
 		if err != nil {
 			t.Fatalf("hint %q: %v", hint, err)
 		}
@@ -112,7 +112,7 @@ func TestCteRecursiveHintIsInert(t *testing.T) {
 func TestNestedWithDoesNotInheritEnclosingCtes(t *testing.T) {
 	// (a) No base table named e: the inner reference to the enclosing CTE e is unresolved -> 42P01.
 	db := cteT3(t)
-	_, err := execute(db, "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s")
+	_, err := db.Execute("WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s", nil)
 	if ee, ok := err.(*EngineError); !ok || ee.Code() != "42P01" {
 		t.Fatalf("enclosing CTE inside a nested WITH: want 42P01, got %v", err)
 	}

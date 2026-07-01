@@ -12,9 +12,9 @@ package jed
 
 import "testing"
 
-func genErrCode(t *testing.T, db *engine, sql string) string {
+func genErrCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	if err == nil {
 		t.Fatalf("%q: expected an error", sql)
 	}
@@ -25,7 +25,7 @@ func genErrCode(t *testing.T, db *engine, sql string) string {
 	return ee.Code()
 }
 
-func genInts(t *testing.T, db *engine, sql string) []int64 {
+func genInts(t *testing.T, db dbHandle, sql string) []int64 {
 	t.Helper()
 	rows := query(t, db, sql)
 	out := make([]int64, len(rows))
@@ -51,8 +51,8 @@ func eqGenInts(t *testing.T, got, want []int64, ctx string) {
 }
 
 func TestGenerateSeriesZeroStep(t *testing.T) {
-	db := newEngine()
-	_, err := execute(db, "SELECT * FROM generate_series(1, 5, 0)")
+	db := NewDatabase().Session(SessionOptions{})
+	_, err := db.Execute("SELECT * FROM generate_series(1, 5, 0)", nil)
 	ee, ok := err.(*EngineError)
 	if !ok {
 		t.Fatalf("expected an EngineError, got %v", err)
@@ -66,10 +66,10 @@ func TestGenerateSeriesZeroStep(t *testing.T) {
 }
 
 func TestGenerateSeriesAliasAndQualified(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	// PG's single-column function-alias rule: `AS g` (or implicit `g`) renames the column to `g`.
 	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(1, 3) g"), []int64{1, 2, 3}, "implicit alias")
-	out, err := execute(db, "SELECT * FROM generate_series(1, 3) AS g")
+	out, err := db.Execute("SELECT * FROM generate_series(1, 3) AS g", nil)
 	if err != nil || len(out.ColumnNames) != 1 || out.ColumnNames[0] != "g" {
 		t.Errorf("aliased column name: %v (err %v)", out.ColumnNames, err)
 	}
@@ -81,8 +81,8 @@ func TestGenerateSeriesAliasAndQualified(t *testing.T) {
 }
 
 func TestGenerateSeriesParam(t *testing.T) {
-	db := newEngine()
-	out, err := executeParams(db, "SELECT * FROM generate_series(1, $1)", []Value{IntValue(3)})
+	db := NewDatabase().Session(SessionOptions{})
+	out, err := db.Execute("SELECT * FROM generate_series(1, $1)", []Value{IntValue(3)})
 	if err != nil {
 		t.Fatalf("param: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestGenerateSeriesParam(t *testing.T) {
 }
 
 func TestGenerateSeriesCostCeiling(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if c := costOf(t, db, "SELECT * FROM generate_series(1, 4)"); c != 8 {
 		t.Errorf("cost = %d, want 8", c)
 	}
@@ -107,8 +107,8 @@ func TestGenerateSeriesCostCeiling(t *testing.T) {
 }
 
 func TestGenerateSeriesMixedWidthPromotion(t *testing.T) {
-	db := newEngine()
-	out, err := execute(db, "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))")
+	db := NewDatabase().Session(SessionOptions{})
+	out, err := db.Execute("SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))", nil)
 	if err != nil {
 		t.Fatalf("mixed width: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestGenerateSeriesMixedWidthPromotion(t *testing.T) {
 }
 
 func TestGenerateSeriesI64OverflowStopsCleanly(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	// Stepping past i64::MAX must STOP, not trap: only the last representable element is emitted.
 	eqGenInts(t, genInts(t, db,
 		"SELECT * FROM generate_series(9223372036854775806, 9223372036854775807, 2)"),
@@ -126,7 +126,7 @@ func TestGenerateSeriesI64OverflowStopsCleanly(t *testing.T) {
 }
 
 func TestGenerateSeriesDeferredAndBadCalls(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	cases := []struct {
 		sql, code string
 	}{

@@ -15,18 +15,18 @@ package jed
 
 import "testing"
 
-func castErrCode(t *testing.T, db *engine, sql string) string {
+func castErrCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
 	return err.(*EngineError).Code()
 }
 
-func castOne(t *testing.T, db *engine, sql string) Value {
+func castOne(t *testing.T, db dbHandle, sql string) Value {
 	t.Helper()
-	out, err := execute(db, sql)
+	out, err := db.Execute(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func castOne(t *testing.T, db *engine, sql string) Value {
 
 // bool → i16 and bool → i64 are forbidden (PG has only bool → int4): jed 42804, PG 42846.
 func TestBoolToNonI32Forbidden(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	for _, sql := range []string{
 		"SELECT CAST(TRUE AS i16)",
 		"SELECT CAST(TRUE AS i64)",
@@ -72,7 +72,7 @@ func TestNonI32ToBoolForbidden(t *testing.T) {
 // An integer literal operand of a boolean target adapts to i32, so a magnitude beyond i32 range
 // traps 22003 (PG reports 42846 — it types the literal as int8 first). A documented divergence.
 func TestLiteralBeyondI32ToBoolOverflows(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	for _, sql := range []string{
 		"SELECT CAST(5000000000 AS boolean)",
 		"SELECT 5000000000::boolean",
@@ -86,7 +86,7 @@ func TestLiteralBeyondI32ToBoolOverflows(t *testing.T) {
 // The headline directions still work here (a quick per-core smoke check alongside the divergences;
 // the exhaustive behavior is in the corpus). true→1, false→0, 0→false, nonzero→true, NULL→NULL.
 func TestBoolI32RoundTripSmoke(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if v := castOne(t, db, "SELECT CAST(TRUE AS i32)"); v.Kind != ValInt || v.Int != 1 {
 		t.Fatalf("CAST(TRUE AS i32) = %v, want 1", v)
 	}

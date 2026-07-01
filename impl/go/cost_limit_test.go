@@ -14,7 +14,7 @@ import (
 )
 
 // rowTable builds a table of n rows (id i32 PRIMARY KEY, v i32; v == id).
-func rowTable(t *testing.T, n int) *engine {
+func rowTable(t *testing.T, n int) *Session {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("INSERT INTO t VALUES ")
@@ -27,18 +27,18 @@ func rowTable(t *testing.T, n int) *engine {
 	return dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", b.String())
 }
 
-func mustCost(t *testing.T, db *engine, sql string) int64 {
+func mustCost(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
-	out, err := execute(db, sql)
+	out, err := db.Execute(sql, nil)
 	if err != nil {
 		t.Fatalf("%s: unexpected error %v", sql, err)
 	}
 	return out.Cost
 }
 
-func assertAborts(t *testing.T, db *engine, sql string) {
+func assertAborts(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	if err == nil {
 		t.Fatalf("expected cost-limit abort, but %q succeeded", sql)
 	}
@@ -114,7 +114,7 @@ func TestCostLimitThreadsThroughDeleteAndUpdate(t *testing.T) {
 
 	// The aborts rolled back (autocommit): the table is untouched.
 	db.SetMaxCost(0)
-	out, err := execute(db, "SELECT v FROM t")
+	out, err := db.Execute("SELECT v FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestCostLimitEmptyBoundUnderTinyCeiling(t *testing.T) {
 	// a ceiling of 1 (a point-lookup MISS differs — it still visits a leaf, charging one page_read).
 	db := rowTable(t, 10)
 	db.SetMaxCost(1)
-	out, err := execute(db, "SELECT v FROM t WHERE id > 5 AND id < 5")
+	out, err := db.Execute("SELECT v FROM t WHERE id > 5 AND id < 5", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

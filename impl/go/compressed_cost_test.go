@@ -27,9 +27,9 @@ const (
 // inline-compressed (LZ4 shrinks it far under RECORD_MAX, so no chain), and `control` of the
 // same shape fully inline-plain. Row 2 is inline in both. Same tree shape (one leaf each), so
 // cost deltas isolate the compression units.
-func compressedTables(t *testing.T) *engine {
+func compressedTables(t *testing.T) *Session {
 	t.Helper()
-	db := withPageSize(compressedPageSize)
+	db := NewInMemoryWithPageSize(compressedPageSize).Session(SessionOptions{})
 	run600 := strings.Repeat("x", 600)
 	mustExec(t, db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO comp VALUES (1, '"+run600+"'), (2, 'small')")
@@ -57,7 +57,7 @@ func TestCompressedCostExternalCompressedChargesChainPlusSlabs(t *testing.T) {
 	// A 400-char half-filler/half-run text compresses to ~212 B — smaller than plain but still
 	// over RECORD_MAX → 0x04 external-compressed: ceil(212/240) = 1 chain page_read PLUS
 	// ceil(400/240) = 2 value_decompress slabs.
-	db := withPageSize(compressedPageSize)
+	db := NewInMemoryWithPageSize(compressedPageSize).Session(SessionOptions{})
 	mix := fillerText(200) + strings.Repeat("y", 200)
 	mustExec(t, db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO comp VALUES (1, '"+mix+"')")
@@ -87,7 +87,7 @@ func TestCompressedCostBoundedScanAndLimit(t *testing.T) {
 }
 
 func TestCompressedCostInsertMetersAttemptsAdoptedOrRejected(t *testing.T) {
-	db := withPageSize(compressedPageSize)
+	db := NewInMemoryWithPageSize(compressedPageSize).Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	// A fully-inline row attempts nothing: INSERT stays zero-cost.
 	if c := mustCost(t, db, "INSERT INTO t VALUES (1, 'small')"); c != 0 {
@@ -120,7 +120,7 @@ func TestCompressedCostDecimalPayloadsCompressToo(t *testing.T) {
 	// A long-coefficient decimal's body is a spillable payload like text/bytea
 	// (large-values.md §12/§13): 801 digits → 201 base-10⁴ groups → a 407-byte payload,
 	// ceil(407/240) = 2 slabs both ways.
-	db := withPageSize(compressedPageSize)
+	db := NewInMemoryWithPageSize(compressedPageSize).Session(SessionOptions{})
 	digits := strings.Repeat("12", 400) + ".5"
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)")
 	if c := mustCost(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, %s)", digits)); c != 2 {

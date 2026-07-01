@@ -13,27 +13,27 @@ import (
 	"testing"
 )
 
-func fkSetup(t *testing.T, sql ...string) *engine {
+func fkSetup(t *testing.T, sql ...string) *Session {
 	t.Helper()
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	for _, s := range sql {
-		if _, err := execute(db, s); err != nil {
+		if _, err := db.Execute(s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
 	return db
 }
 
-func fkErr(t *testing.T, db *engine, sql string) string {
+func fkErr(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
 	return err.(*EngineError).Code()
 }
 
-func fkNames(t *testing.T, db *engine, table string) []string {
+func fkNames(t *testing.T, db dbHandle, table string) []string {
 	t.Helper()
 	tab, ok := db.Table(table)
 	if !ok {
@@ -80,7 +80,7 @@ func TestForeignKeyStrictTypePairing(t *testing.T) {
 	if got := fkErr(t, db, "CREATE TABLE c2 (x text REFERENCES p)"); got != "42804" {
 		t.Fatalf("text→i32 pk: got %s, want 42804", got)
 	}
-	if _, err := execute(db, "CREATE TABLE c3 (x i32 REFERENCES p)"); err != nil {
+	if _, err := db.Execute("CREATE TABLE c3 (x i32 REFERENCES p)", nil); err != nil {
 		t.Fatalf("same-type FK should be accepted: %v", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
 			t.Fatalf("%q: got %s, want 0A000", sql, got)
 		}
 	}
-	if _, err := execute(db, "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)"); err != nil {
+	if _, err := db.Execute("CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)", nil); err != nil {
 		t.Fatalf("NO ACTION/RESTRICT should be accepted: %v", err)
 	}
 }
@@ -114,7 +114,7 @@ func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 		"CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
 		"INSERT INTO c VALUES (10, 100), (11, 200)",
 	)
-	if _, err := execute(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); err != nil {
+	if _, err := db.Execute("UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END", nil); err != nil {
 		t.Fatalf("referenced-value swap should succeed (end state): %v", err)
 	}
 	if got := fkErr(t, db, "UPDATE p SET code = 999 WHERE id = 1"); got != "23503" {

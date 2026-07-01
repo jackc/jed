@@ -19,9 +19,9 @@ func gistIDs(rows [][]Value) []int64 {
 	return out
 }
 
-func gistRangesDB(t *testing.T) *engine {
+func gistRangesDB(t *testing.T) *Session {
 	t.Helper()
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)")
 	run(t, db, "CREATE INDEX t_r_gist ON t USING gist (r)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), (5, 'empty'), (6, NULL)")
@@ -54,7 +54,7 @@ func TestGistCreateAndQuery(t *testing.T) {
 }
 
 func TestGistDivergences(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, s i32range, f f64, txt text)")
 	// A GiST index on a non-keyable, non-range type (float) → 42704 (no GiST opclass at all, §6).
 	if got := errCode(t, db, "CREATE INDEX ON t USING gist (f)"); got != "42704" {
@@ -86,7 +86,7 @@ func TestGistDivergences(t *testing.T) {
 // fixed-width keyable scalar accelerates `=` — the planner descends the resident R-tree and re-applies
 // `=` as the residual, identical rows to a full scan (duplicates and all) across INSERT/UPDATE/DELETE.
 func TestScalarGistEqualGather(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)")
 	run(t, db, "CREATE INDEX t_room_gist ON t USING gist (room)")
 	run(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 10), (7, NULL)")
@@ -188,9 +188,9 @@ func TestGistFileRoundTrip(t *testing.T) {
 
 // ---- GX3: EXCLUDE constraints (spec/design/gist.md §7) -----------------------------------------
 
-func bookingDB(t *testing.T) *engine {
+func bookingDB(t *testing.T) *Session {
 	t.Helper()
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, "+
 		"EXCLUDE USING gist (room WITH =, during WITH &&))")
 	return db
@@ -254,7 +254,7 @@ func TestExcludeUpdateEndStateSwap(t *testing.T) {
 
 // TestSingleColumnRangeExclude: a single-column range exclusion needs only GX1.
 func TestSingleColumnRangeExclude(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE rsv (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))")
 	run(t, db, "INSERT INTO rsv VALUES (1, '[1,5)')")
 	if got := errCode(t, db, "INSERT INTO rsv VALUES (2, '[3,8)')"); got != "23P01" {
@@ -289,7 +289,7 @@ func TestExcludeRescheduleViaUpdate(t *testing.T) {
 
 // TestExcludeTypeErrors: the WITH operator must pair with the column's GiST opclass.
 func TestExcludeTypeErrors(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if got := errCode(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH &&))"); got != "42704" {
 		t.Errorf("&& on non-range: got %s, want 42704", got)
 	}

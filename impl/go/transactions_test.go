@@ -1,18 +1,18 @@
 package jed
 
-// Phase 5 (P5.2): explicit transactions — the host Transaction API (spec/design/api.md §2.2 / §6,
-// transactions.md §4.4). The SQL BEGIN/COMMIT/ROLLBACK surface and its visibility / rollback /
+// Phase 5 (P5.2): explicit transactions — the host Session transaction API (spec/design/api.md §2.2 /
+// §6, transactions.md §4.4). The SQL BEGIN/COMMIT/ROLLBACK surface and its visibility / rollback /
 // read-only / failed-block semantics are pinned by the shared conformance corpus
 // (suites/transactions/); these per-core tests cover the programmatic surface the corpus does not
-// exercise: db.Begin(writable), the db.View/db.Update closure wrappers, and db.Commit/db.Rollback
-// as the same mechanism.
+// exercise: s.Begin(writable), the s.View/s.Update closure wrappers, the Close rollback safety net,
+// and s.Commit/s.Rollback as the same mechanism. Mirrors impl/rust/tests/transactions.rs.
 
 import "testing"
 
 // txCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
-func txCount(t *testing.T, db *engine, table string) int {
+func txCount(t *testing.T, db dbHandle, table string) int {
 	t.Helper()
-	out, err := execute(db, "SELECT * FROM "+table)
+	out, err := db.Execute("SELECT * FROM "+table, nil)
 	if err != nil {
 		t.Fatalf("count %s: %v", table, err)
 	}
@@ -20,20 +20,19 @@ func txCount(t *testing.T, db *engine, table string) int {
 }
 
 func TestBeginExecuteCommitIsVisible(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	tx, err := db.Begin(true)
-	if err != nil {
+	if err := db.Begin(true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+	if _, err := db.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+	if _, err := db.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatal(err)
 	}
 	// read-your-writes within the transaction
-	rows, err := tx.QueryValues("SELECT id FROM t", nil)
+	rows, err := db.Query("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +46,7 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("expected 2 rows visible inside the tx, got %d", n)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := db.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	if n := txCount(t, db, "t"); n != 2 {
@@ -56,17 +55,16 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 }
 
 func TestBeginExecuteRollbackDiscards(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
-	tx, err := db.Begin(true)
-	if err != nil {
+	if err := db.Begin(true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+	if _, err := db.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Rollback(); err != nil {
+	if err := db.Rollback(); err != nil {
 		t.Fatal(err)
 	}
 	if db.InTransaction() {
@@ -77,8 +75,44 @@ func TestBeginExecuteRollbackDiscards(t *testing.T) {
 	}
 }
 
+func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
+	// The bbolt safety net: an unfinished transaction never silently commits. Closing a session that
+	// left a block open rolls the block back, so a fresh session over the same shared core sees only
+	// the pre-block committed state.
+	db := NewDatabase()
+	func() {
+		s := db.Session(SessionOptions{})
+		defer s.Close()
+		if _, err := s.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	func() {
+		s := db.Session(SessionOptions{})
+		defer s.Close()
+		if err := s.Begin(true); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+			t.Fatal(err)
+		}
+		// s closed here without commit/rollback — the safety net rolls the block back
+	}()
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	if s.InTransaction() {
+		t.Fatal("no block is open on a fresh session")
+	}
+	if n := txCount(t, s, "t"); n != 1 {
+		t.Fatalf("rows = %d want 1", n)
+	}
+}
+
 func TestUpdateClosureCommitsOnNil(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	err := db.Update(func(tx *Transaction) error {
 		if _, e := tx.Execute("INSERT INTO t VALUES (1)", nil); e != nil {
@@ -99,7 +133,7 @@ func TestUpdateClosureCommitsOnNil(t *testing.T) {
 }
 
 func TestUpdateClosureRollsBackOnErr(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	err := db.Update(func(tx *Transaction) error {
@@ -123,7 +157,7 @@ func TestUpdateClosureRollsBackOnErr(t *testing.T) {
 }
 
 func TestViewIsReadOnly(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1), (2)")
 	// a read inside a View works
@@ -157,20 +191,19 @@ func TestViewIsReadOnly(t *testing.T) {
 }
 
 func TestNestedBeginIs25001(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	tx, err := db.Begin(true)
-	if err != nil {
+	if err := db.Begin(true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+	if _, err := db.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
 		t.Fatal(err)
 	}
 	// a SQL BEGIN inside an already-open transaction is 25001
-	if _, e := tx.Execute("BEGIN", nil); e == nil || e.(*EngineError).Code() != "25001" {
+	if _, e := db.Execute("BEGIN", nil); e == nil || e.(*EngineError).Code() != "25001" {
 		t.Fatalf("expected 25001, got %v", e)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := db.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	if n := txCount(t, db, "t"); n != 1 {
@@ -179,7 +212,7 @@ func TestNestedBeginIs25001(t *testing.T) {
 }
 
 func TestCommitRollbackAreNoopsInAutocommit(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	// no open transaction: both are lenient no-op successes (transactions.md §4.2)
 	if err := db.Commit(); err != nil {

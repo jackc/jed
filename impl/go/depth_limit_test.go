@@ -14,14 +14,14 @@ import (
 	"testing"
 )
 
-func depthDB(t *testing.T) *engine {
+func depthDB(t *testing.T) *Session {
 	t.Helper()
 	return dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 1)")
 }
 
 // codeOf returns the SQLSTATE of running sql, or "ok" if it succeeded.
-func codeOf(db *engine, sql string) string {
-	_, err := execute(db, sql)
+func codeOf(db dbHandle, sql string) string {
+	_, err := db.Execute(sql, nil)
 	if err == nil {
 		return "ok"
 	}

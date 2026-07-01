@@ -9,14 +9,14 @@ package jed
 
 import "testing"
 
-func privCode(t *testing.T, db *engine, sql string) string {
+func privCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	return sessCode(t, err)
 }
 
 func TestDefaultSessionIsFullyPermissive(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if !db.AllowDDL() {
 		t.Fatal("default session should allow DDL")
 	}
@@ -30,7 +30,7 @@ func TestDefaultSessionIsFullyPermissive(t *testing.T) {
 }
 
 func TestSetDefaultPrivilegesMakesAReadOnlySession(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	db.SetDefaultPrivileges(PrivSetEmpty.With(PrivSelect))
@@ -47,7 +47,7 @@ func TestSetDefaultPrivilegesMakesAReadOnlySession(t *testing.T) {
 }
 
 func TestGrantAddsAndRevokeWins(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 
 	db.SetDefaultPrivileges(PrivSetEmpty)
@@ -65,7 +65,7 @@ func TestGrantAddsAndRevokeWins(t *testing.T) {
 }
 
 func TestAllowDDLGateIsIndependentOfTablePrivileges(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	db.SetAllowDDL(false)
 	if got := privCode(t, db, "CREATE TABLE u (id i32 PRIMARY KEY)"); got != "42501" {
@@ -78,7 +78,7 @@ func TestAllowDDLGateIsIndependentOfTablePrivileges(t *testing.T) {
 }
 
 func TestFunctionExecuteIsRevocable(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if !db.Privileges().AllowsFunction("abs") {
 		t.Fatal("functions should default to EXECUTE on all")
 	}
@@ -125,7 +125,7 @@ func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
 }
 
 func TestMissingObjectIs42P01NotAuthorization(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetDefaultPrivileges(PrivSetEmpty)
 	if got := privCode(t, db, "SELECT * FROM does_not_exist"); got != "42P01" {
 		t.Fatalf("want 42P01 (existence before authorization), got %s", got)

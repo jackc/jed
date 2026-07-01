@@ -25,7 +25,7 @@ import (
 // inlineSeed builds the schema + rows exercising every deferrable type alongside a join partner
 // and a secondary index. The default page size keeps every value inline-plain, so on a paged
 // reopen each lands as an inline-deferred Unfetched — the L2 case (nothing spills).
-func inlineSeed(t *testing.T, db *engine) {
+func inlineSeed(t *testing.T, db dbHandle) {
 	t.Helper()
 	mustExec(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	mustExec(t, db, "CREATE TABLE t ("+
@@ -43,7 +43,7 @@ func inlineSeed(t *testing.T, db *engine) {
 
 // rowsSorted runs sql and returns its rows rendered to strings and sorted — an order-insensitive
 // multiset compare (a query without ORDER BY has unspecified order; sorting both sides is sound).
-func rowsSorted(t *testing.T, db *engine, sql string) []string {
+func rowsSorted(t *testing.T, db dbHandle, sql string) []string {
 	t.Helper()
 	rows := queryRows(t, db, sql)
 	out := make([]string, len(rows))
@@ -72,7 +72,7 @@ func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := newEngine()
+	mem := NewDatabase().Session(SessionOptions{})
 	inlineSeed(t, mem)
 	paged, err := open(path)
 	if err != nil {
@@ -145,7 +145,7 @@ func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := newEngine()
+	mem := NewDatabase().Session(SessionOptions{})
 	inlineSeed(t, mem)
 
 	mutations := []string{
@@ -249,7 +249,7 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 		t.Fatal("the clean row's body must resolve")
 	}
 	for _, sql := range []string{"SELECT body FROM t WHERE id = 1", "SELECT * FROM t ORDER BY id"} {
-		_, err := execute(db, sql)
+		_, err := db.Execute(sql, nil)
 		if err == nil {
 			t.Fatalf("touching the corrupted body must fail: %q", sql)
 		}
@@ -265,12 +265,12 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 // still equal the in-memory sort.
 func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l2_spill.jed")
-	mem := newEngine()
+	mem := NewDatabase().Session(SessionOptions{})
 	db, err := create(path, DatabaseOptions{PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range []*engine{mem, db} {
+	for _, e := range []dbHandle{mem, db} {
 		mustExec(t, e, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)")
 	}
 	for id := 0; id < 200; id++ {

@@ -12,13 +12,13 @@ package jed
 import "testing"
 
 // castScalar evaluates SELECT <expr> (single row/column) and renders the value.
-func castScalar(t *testing.T, db *engine, expr string) string {
+func castScalar(t *testing.T, db dbHandle, expr string) string {
 	t.Helper()
 	return castOne(t, db, "SELECT "+expr).Render()
 }
 
 // castErr returns the SQLSTATE of a statement expected to error.
-func castErr(t *testing.T, db *engine, sql string) string {
+func castErr(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
 	return castErrCode(t, db, sql)
 }
@@ -32,7 +32,7 @@ func TestArrayToTextIsExplicitOnly(t *testing.T) {
 	if got := castErr(t, db, "INSERT INTO t VALUES (1, ARRAY[1,2,3])"); got != "42804" {
 		t.Fatalf("INSERT array into text col: want 42804, got %s", got)
 	}
-	if _, err := execute(db, "INSERT INTO t VALUES (1, '{1,2,3}')"); err != nil {
+	if _, err := db.Execute("INSERT INTO t VALUES (1, '{1,2,3}')", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Implicit context: comparing a text column to an array value is a mismatch.
@@ -48,7 +48,7 @@ func TestArrayToTextIsExplicitOnly(t *testing.T) {
 // --- (b) the jed-only element casts uuid ⇄ bytea (succeed where PG errors) ------------------------
 
 func TestUuidArrayToByteaArrayAndBack(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	round := castScalar(t, db,
 		"((ARRAY['00000000-0000-0000-0000-000000000001']::uuid[])::bytea[])::uuid[] = "+
 			"ARRAY['00000000-0000-0000-0000-000000000001']::uuid[]")
@@ -64,13 +64,13 @@ func TestUuidArrayToByteaArrayAndBack(t *testing.T) {
 // --- (c) forbidden scalar element pair (42804) + composite-element array cast (0A000) -------------
 
 func TestArrayForbiddenElementPairs(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	// A scalar element pair with no cast → 42804 (PG reports 42846). i32 → timestamp has no cast.
 	if got := castErr(t, db, "SELECT (ARRAY[1,2,3]::i32[])::timestamp[]"); got != "42804" {
 		t.Fatalf("i32[] → timestamp[]: want 42804, got %s", got)
 	}
 	// A composite-element array cast is the deferred composite cast surface → 0A000.
-	if _, err := execute(db, "CREATE TYPE addr AS (street text, zip i32)"); err != nil {
+	if _, err := db.Execute("CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := castErr(t, db, "SELECT (ARRAY[ROW('Main',90210)::addr]::addr[])::text[]"); got != "0A000" {
@@ -86,7 +86,7 @@ func TestArrayForbiddenElementPairs(t *testing.T) {
 
 func TestRuntimeTextToFloatArrays(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
-	if _, err := execute(db, "INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')"); err != nil {
+	if _, err := db.Execute("INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", nil); err != nil {
 		t.Fatal(err)
 	}
 	got := castOne(t, db, "SELECT (s::float8[])::text FROM t WHERE id = 1").Render()

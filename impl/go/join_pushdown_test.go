@@ -15,7 +15,7 @@ import (
 
 // joinTables builds `a` (n rows id i32 PRIMARY KEY, k i32; k == id) wide enough to span several
 // leaves, and `b` (three small rows whose k-values exist as a's k-values, so the join matches).
-func joinTables(t *testing.T, n int) *engine {
+func joinTables(t *testing.T, n int) *Session {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("INSERT INTO a VALUES ")

@@ -7,9 +7,9 @@ package jed
 import "testing"
 
 // queryRows runs a parameterized query and returns its rows; t.Fatal on error.
-func queryRows(t *testing.T, db *engine, sql string, params ...Value) [][]Value {
+func queryRows(t *testing.T, db dbHandle, sql string, params ...Value) [][]Value {
 	t.Helper()
-	out, err := executeParams(db, sql, params)
+	out, err := db.Execute(sql, params)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -20,9 +20,9 @@ func queryRows(t *testing.T, db *engine, sql string, params ...Value) [][]Value 
 }
 
 // paramErrCode runs a parameterized statement expected to fail and returns its SQLSTATE.
-func paramErrCode(t *testing.T, db *engine, sql string, params ...Value) string {
+func paramErrCode(t *testing.T, db dbHandle, sql string, params ...Value) string {
 	t.Helper()
-	_, err := executeParams(db, sql, params)
+	_, err := db.Execute(sql, params)
 	if err == nil {
 		t.Fatalf("%q: expected an error", sql)
 	}
@@ -73,8 +73,7 @@ func TestParamAdoptsNarrowColumnTypeAndTrapsOverflow(t *testing.T) {
 
 func TestInsertValuesParamsRoundTrip(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, name text)")
-	if _, err := executeParams(db, "INSERT INTO t VALUES ($1, $2)",
-		[]Value{IntValue(7), TextValue("alice")}); err != nil {
+	if _, err := db.Execute("INSERT INTO t VALUES ($1, $2)", []Value{IntValue(7), TextValue("alice")}); err != nil {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id, name FROM t WHERE id = $1", IntValue(7))
@@ -101,8 +100,7 @@ func TestUpdateSetAndWhereParams(t *testing.T) {
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO t VALUES (1, 10), (2, 20)")
-	if _, err := executeParams(db, "UPDATE t SET v = $1 WHERE id = $2",
-		[]Value{IntValue(99), IntValue(2)}); err != nil {
+	if _, err := db.Execute("UPDATE t SET v = $1 WHERE id = $2", []Value{IntValue(99), IntValue(2)}); err != nil {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT v FROM t WHERE id = $1", IntValue(2))
@@ -115,7 +113,7 @@ func TestDeleteWhereParam(t *testing.T) {
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY)",
 		"INSERT INTO t VALUES (1), (2), (3)")
-	if _, err := executeParams(db, "DELETE FROM t WHERE id = $1", []Value{IntValue(2)}); err != nil {
+	if _, err := db.Execute("DELETE FROM t WHERE id = $1", []Value{IntValue(2)}); err != nil {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id FROM t")
@@ -187,7 +185,7 @@ func TestParamInInList(t *testing.T) {
 }
 
 func TestDDLWithParamsTraps42601(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if c := paramErrCode(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)", IntValue(1)); c != "42601" {
 		t.Fatalf("code = %s want 42601", c)
 	}
@@ -247,7 +245,7 @@ func TestLexerRejectsBadParamTokens(t *testing.T) {
 		"SELECT id FROM t WHERE id = $",
 		"SELECT id FROM t WHERE id = $01",
 	} {
-		if _, err := execute(db, sql); err == nil {
+		if _, err := db.Execute(sql, nil); err == nil {
 			t.Fatalf("%q: expected 42601", sql)
 		} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "42601" {
 			t.Fatalf("%q: code = %v want 42601", sql, err)

@@ -13,16 +13,16 @@ import "testing"
 // cost5 — "SELECT 1 + 1 + 1 + 1 + 1" — five 1s, four +, costs 5 (4 operator_eval + 1 row_produced).
 const cost5 = "SELECT 1 + 1 + 1 + 1 + 1"
 
-func lifeCode(t *testing.T, db *engine, sql string) string {
+func lifeCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	return sessCode(t, err)
 }
 
 func TestDefaultSessionHasNoBudgetButTracksTheCumulative(t *testing.T) {
 	// A fresh session is unlimited (budget 0) yet still TRACKS the cumulative cost — the gauge is
 	// always readable (§5.4), it just never aborts.
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if db.LifetimeMaxCost() != 0 {
 		t.Fatalf("fresh budget: want 0, got %d", db.LifetimeMaxCost())
 	}
@@ -42,7 +42,7 @@ func TestDefaultSessionHasNoBudgetButTracksTheCumulative(t *testing.T) {
 func TestBudgetAbortsInFlightThenRejectsAtAdmission(t *testing.T) {
 	// Set a budget of 3. The cumulative builds across statements; the one that drives it to the budget
 	// aborts 54P02 mid-flight, and every further statement is then rejected 54P02 at admission.
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetLifetimeMaxCost(3)
 	if db.LifetimeMaxCost() != 3 {
 		t.Fatalf("budget: want 3, got %d", db.LifetimeMaxCost())
@@ -69,7 +69,7 @@ func TestBudgetAbortsInFlightThenRejectsAtAdmission(t *testing.T) {
 func TestPartialCostOfAnAbortedStatementCounts(t *testing.T) {
 	// A single statement larger than the whole budget aborts mid-flight, and the partial work it did
 	// (up to the budget) still counts — the cumulative lands exactly at the budget (unit charges are 1).
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetLifetimeMaxCost(3)
 	if got := lifeCode(t, db, cost5); got != "54P02" { // would cost 5; aborts at 3
 		t.Fatalf("want 54P02, got %s", got)
@@ -83,7 +83,7 @@ func TestTheCumulativeIsSessionStateAndDoesNotRollBack(t *testing.T) {
 	// The cumulative is SESSION state, not snapshot state (§5.4): a ROLLBACK undoes a statement's DATA
 	// effects but NOT the compute it spent. Run work inside an explicit block, roll it back, and the
 	// cumulative still reflects every statement's cost.
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	sessExec(t, db, "BEGIN")
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
@@ -111,7 +111,7 @@ func TestAStatementAbortsAtWhicheverCeilingItReachesFirst(t *testing.T) {
 	// max_cost (54P01) and lifetime_max_cost (54P02) compose: a statement aborts at whichever it
 	// reaches first. With the per-statement ceiling tight and the budget far, the per-statement ceiling
 	// wins (54P01) — and its partial cost still counts toward the session budget.
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetLifetimeMaxCost(1000)
 	db.SetMaxCost(3)
 	if got := lifeCode(t, db, cost5); got != "54P01" { // max_cost 3 before the far budget
@@ -122,7 +122,7 @@ func TestAStatementAbortsAtWhicheverCeilingItReachesFirst(t *testing.T) {
 	}
 
 	// Now the session budget is the nearer ceiling: a tight budget, the per-statement ceiling far.
-	db2 := newEngine()
+	db2 := NewDatabase().Session(SessionOptions{})
 	db2.SetLifetimeMaxCost(3)
 	db2.SetMaxCost(1000)
 	if got := lifeCode(t, db2, cost5); got != "54P02" { // the budget is reached first
@@ -133,7 +133,7 @@ func TestAStatementAbortsAtWhicheverCeilingItReachesFirst(t *testing.T) {
 func TestAnExactTieBreaksToThePerStatementCeiling(t *testing.T) {
 	// When both ceilings are reached at the very same accrued value, the inner per-statement ceiling
 	// wins the tie (54P01) — the documented, deterministic, cross-core tie rule (§5.4, cost.go Guard).
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetLifetimeMaxCost(3)
 	db.SetMaxCost(3)
 	if got := lifeCode(t, db, cost5); got != "54P01" {
@@ -179,7 +179,7 @@ func TestAnAdditionalSessionCarriesItsOwnBudget(t *testing.T) {
 func TestAdmissionIsCheckedBeforeExistenceAndPrivileges(t *testing.T) {
 	// The budget admission check runs ahead of privileges AND existence (§5.4): once a session is
 	// exhausted, even a query naming a missing table is 54P02, not 42P01 — nothing runs.
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	db.SetLifetimeMaxCost(1)
 	// SELECT 1 costs 1, reaching the budget — it aborts 54P02 (and spends the budget).
 	if got := lifeCode(t, db, "SELECT 1"); got != "54P02" {

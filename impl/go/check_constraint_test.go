@@ -14,9 +14,9 @@ import (
 	"testing"
 )
 
-func checkErr(t *testing.T, db *engine, sql string) (string, string) {
+func checkErr(t *testing.T, db dbHandle, sql string) (string, string) {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -24,7 +24,7 @@ func checkErr(t *testing.T, db *engine, sql string) (string, string) {
 	return ee.Code(), ee.Message
 }
 
-func checkNames(t *testing.T, db *engine, table string) []string {
+func checkNames(t *testing.T, db dbHandle, table string) []string {
 	t.Helper()
 	tab, ok := db.Table(table)
 	if !ok {
@@ -144,9 +144,9 @@ func TestCheckDDLErrorsMatchPostgres(t *testing.T) {
 	mustExecCheck(t, db, "INSERT INTO odd VALUES (1, 2)")
 }
 
-func mustExecCheck(t *testing.T, db *engine, sql string) {
+func mustExecCheck(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := execute(db, sql); err != nil {
+	if _, err := db.Execute(sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -272,23 +272,23 @@ func TestCheckExpressionSurface(t *testing.T) {
 func TestCheckEvaluationIsMetered(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE c (a int CHECK (a > 0))")
 	// One interior node (>) × one row.
-	out, err := execute(db, "INSERT INTO c VALUES (1)")
+	out, err := db.Execute("INSERT INTO c VALUES (1)", nil)
 	if err != nil || out.Cost != 1 {
 		t.Fatalf("1-row insert cost = %d (%v), want 1", out.Cost, err)
 	}
 	// Two rows × one node.
-	out, err = execute(db, "INSERT INTO c VALUES (2), (3)")
+	out, err = db.Execute("INSERT INTO c VALUES (2), (3)", nil)
 	if err != nil || out.Cost != 2 {
 		t.Fatalf("2-row insert cost = %d (%v), want 2", out.Cost, err)
 	}
 	// UPDATE: page_read(1) + 3×storage_row_read + 3×(a + 1) + 3×(a > 0) = 10.
-	out, err = execute(db, "UPDATE c SET a = a + 1")
+	out, err = db.Execute("UPDATE c SET a = a + 1", nil)
 	if err != nil || out.Cost != 10 {
 		t.Fatalf("update cost = %d (%v), want 10", out.Cost, err)
 	}
 	// The ceiling aborts mid-validation deterministically.
 	db.SetMaxCost(2)
-	if _, err := execute(db, "INSERT INTO c VALUES (4), (5), (6)"); err == nil ||
+	if _, err := db.Execute("INSERT INTO c VALUES (4), (5), (6)", nil); err == nil ||
 		err.(*EngineError).Code() != "54P01" {
 		t.Fatalf("ceiling = %v, want 54P01", err)
 	}

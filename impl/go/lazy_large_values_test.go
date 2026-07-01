@@ -25,7 +25,7 @@ const lazyPageSize = 256
 // external-plain (incompressible 600-char filler → a 3-page chain), id 2 external-compressed
 // (half filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 // inline-compressed (a 600-char run), id 4 plain inline.
-func lazySeed(t *testing.T, db *engine) {
+func lazySeed(t *testing.T, db dbHandle) {
 	t.Helper()
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	plain := fillerText(600)
@@ -97,7 +97,7 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	// Touching the spilled column reads the chain: the corruption surfaces as XX001 —
 	// non-UTF-8 for the external-plain text, a malformed LZ4 block for external-compressed.
 	for _, id := range []int{1, 2} {
-		_, err := execute(db, fmt.Sprintf("SELECT body FROM t WHERE id = %d", id))
+		_, err := db.Execute(fmt.Sprintf("SELECT body FROM t WHERE id = %d", id), nil)
 		if err == nil {
 			t.Fatalf("id %d: a corrupted chain must fail when touched", id)
 		}
@@ -192,7 +192,7 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 // units equal the resident disposition plan's by construction.
 func TestLazyPagedAndResidentCostsMatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_cost.jed")
-	mem := withPageSize(lazyPageSize)
+	mem := NewInMemoryWithPageSize(lazyPageSize).Session(SessionOptions{})
 	lazySeed(t, mem)
 	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
 	if err != nil {

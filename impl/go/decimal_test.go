@@ -193,16 +193,16 @@ func TestDecimalBigMultiplicationExact(t *testing.T) {
 
 // --- end-to-end through Execute ---------------------------------------------
 
-func decExec(t *testing.T, db *engine, sql string) {
+func decExec(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := execute(db, sql); err != nil {
+	if _, err := db.Execute(sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
 
-func decDB(t *testing.T, stmts ...string) *engine {
+func decDB(t *testing.T, stmts ...string) *Session {
 	t.Helper()
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	for _, s := range stmts {
 		decExec(t, db, s)
 	}
@@ -210,7 +210,7 @@ func decDB(t *testing.T, stmts ...string) *engine {
 }
 
 // decOne runs a query expected to return a single cell, rendered.
-func decOne(t *testing.T, db *engine, sql string) string {
+func decOne(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
 	rows := query(t, db, sql)
 	if len(rows) != 1 || len(rows[0]) != 1 {
@@ -301,7 +301,7 @@ func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
 	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	big := strings.Repeat("9", 20000) + ".5"
 	db.SetMaxCost(1000)
-	_, err := execute(db, "SELECT "+big+" * "+big+" FROM t")
+	_, err := db.Execute("SELECT "+big+" * "+big+" FROM t", nil)
 	if err == nil {
 		t.Fatal("expected the cost ceiling to abort the multiply")
 	}

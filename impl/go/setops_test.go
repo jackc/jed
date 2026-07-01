@@ -6,7 +6,7 @@ package jed
 
 import "testing"
 
-func setopAB(t *testing.T) *engine {
+func setopAB(t *testing.T) *Session {
 	return dbWith(
 		t,
 		"CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
@@ -18,7 +18,7 @@ func setopAB(t *testing.T) *engine {
 
 func TestSetOpDispatchReturnsQuery(t *testing.T) {
 	db := setopAB(t)
-	out, err := execute(db, "SELECT k FROM a UNION SELECT k FROM b")
+	out, err := db.Execute("SELECT k FROM a UNION SELECT k FROM b", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

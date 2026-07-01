@@ -15,21 +15,21 @@ import (
 	"testing"
 )
 
-func siRun(t *testing.T, db *engine, sql string) Outcome {
+func siRun(t *testing.T, db dbHandle, sql string) Outcome {
 	t.Helper()
-	o, err := execute(db, sql)
+	o, err := db.Execute(sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 	return o
 }
 
-func siCost(t *testing.T, db *engine, sql string) int64 {
+func siCost(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
 	return siRun(t, db, sql).Cost
 }
 
-func siIds(t *testing.T, db *engine, sql string) []int64 {
+func siIds(t *testing.T, db dbHandle, sql string) []int64 {
 	t.Helper()
 	o := siRun(t, db, sql)
 	out := make([]int64, 0, len(o.Rows))
@@ -42,9 +42,9 @@ func siIds(t *testing.T, db *engine, sql string) []int64 {
 	return out
 }
 
-func siErr(t *testing.T, db *engine, sql string) string {
+func siErr(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := execute(db, sql)
+	_, err := db.Execute(sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -57,9 +57,9 @@ func siErr(t *testing.T, db *engine, sql string) string {
 
 // siDB20 is the 20-row fixture the planner/cost tests run against: v = i % 5 gives 4
 // rows per value, so an equality admits 4 of 20.
-func siDB20(t *testing.T) *engine {
+func siDB20(t *testing.T) *Session {
 	t.Helper()
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	siRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
 	for i := 1; i <= 20; i++ {
 		siRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, %d)", i, i%5, i))
@@ -72,7 +72,7 @@ func siDB20(t *testing.T) *engine {
 // allowed and named through; an explicit name round-trips as written. The catalog holds
 // indexes in ascending lowercased-name order.
 func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	siRun(t, db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)")
 	siRun(t, db, "CREATE INDEX ON T (B)")    // t_b_idx
 	siRun(t, db, "CREATE INDEX ON T (B)")    // t_b_idx1
@@ -101,7 +101,7 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 // table → columns (list order) → name collision; the relation namespace is shared with
 // tables; DROP mismatches are 42704/42809.
 func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	siRun(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)")
 	if got := siErr(t, db, "CREATE INDEX i ON nosuch (nope)"); got != "42P01" {
 		t.Fatalf("missing table: %s", got)

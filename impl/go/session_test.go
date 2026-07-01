@@ -9,9 +9,9 @@ package jed
 
 import "testing"
 
-func sessExec(t *testing.T, db *engine, sql string) {
+func sessExec(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := execute(db, sql); err != nil {
+	if _, err := db.Execute(sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -27,7 +27,7 @@ func sessCode(t *testing.T, err error) string {
 func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
 	// The Engine-owned default session holds an open BEGIN block across *separate* calls (the
 	// PG/SQLite connection model, §2.1); db.Status() exposes the explicit state machine.
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	if db.Status() != TxIdle {
 		t.Fatalf("fresh db: want Idle, got %v", db.Status())
 	}
@@ -49,16 +49,16 @@ func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
 func TestFailedBlockIsTheFailedState(t *testing.T) {
 	// A statement error inside a block poisons it: status is Failed, every later statement but
 	// ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	sessExec(t, db, "BEGIN")
-	_, err := execute(db, "SELECT * FROM missing")
+	_, err := db.Execute("SELECT * FROM missing", nil)
 	if got := sessCode(t, err); got != "42P01" {
 		t.Fatalf("want 42P01, got %s", got)
 	}
 	if db.Status() != TxFailed {
 		t.Fatalf("after error in block: want Failed, got %v", db.Status())
 	}
-	_, err = execute(db, "SELECT 1")
+	_, err = db.Execute("SELECT 1", nil)
 	if got := sessCode(t, err); got != "25P02" {
 		t.Fatalf("want 25P02, got %s", got)
 	}

@@ -8,7 +8,7 @@ package jed
 import "testing"
 
 // scalar runs a single-row, single-column query and returns the lone value.
-func scalar(t *testing.T, db *engine, sql string) Value {
+func scalar(t *testing.T, db dbHandle, sql string) Value {
 	t.Helper()
 	rows := query(t, db, sql)
 	if len(rows) != 1 || len(rows[0]) != 1 {

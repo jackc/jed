@@ -9,15 +9,15 @@ package jed
 
 import "testing"
 
-func addrDB(t *testing.T) *engine {
+func addrDB(t *testing.T) *Session {
 	t.Helper()
-	db := newEngine()
+	db := NewDatabase().Session(SessionOptions{})
 	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	return db
 }
 
 // val1 runs a one-row, one-column query and returns the rendered value ("NULL" for SQL-NULL).
-func val1(t *testing.T, db *engine, sql string) string {
+func val1(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
 	rows := queryRendered(t, db, sql)
 	if len(rows) != 1 || len(rows[0]) != 1 {
@@ -27,7 +27,7 @@ func val1(t *testing.T, db *engine, sql string) string {
 }
 
 // col1 runs a one-column query and returns the rendered values.
-func col1(t *testing.T, db *engine, sql string) []string {
+func col1(t *testing.T, db dbHandle, sql string) []string {
 	t.Helper()
 	rows := queryRendered(t, db, sql)
 	out := make([]string, len(rows))
@@ -90,7 +90,7 @@ func TestAF7QuantifiedOverCompositeTotalOrder(t *testing.T) {
 // The AF7 code change #1: unnest(composite[]).
 func TestAF7UnnestComposite(t *testing.T) {
 	db := addrDB(t)
-	out, err := execute(db, `SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`)
+	out, err := db.Execute(`SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`, nil)
 	if err != nil {
 		t.Fatalf("unnest composite: %v", err)
 	}
