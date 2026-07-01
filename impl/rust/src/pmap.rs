@@ -154,12 +154,13 @@ impl Node {
     }
 
     /// This node's serialized payload size (format.md): `Σ weights` plus, for an interior node,
-    /// `4·(N+1)` for its child pointers.
-    fn payload(&self) -> usize {
+    /// `4·(N+1)` for its child pointers, or for a LEAF (PAX v23) `directory_overhead(N, K)` for the
+    /// key/column/value directories. `k` is the tree's value-column count (0 for an index tree).
+    fn payload(&self, k: usize) -> usize {
         let entries: usize = self.weights.iter().map(|&w| w as usize).sum();
         entries
             + if self.is_leaf() {
-                0
+                crate::format::directory_overhead(self.keys.len(), k)
             } else {
                 4 * self.children.len()
             }
@@ -315,12 +316,13 @@ impl PMap {
         val: Row,
         weight: u32,
         cap: usize,
+        k: usize,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
         let mut old = None;
         let new_root = match &self.root {
             None => Node::new(vec![key], vec![val], vec![weight], Vec::new()),
-            Some(root) => match node_insert(root, key, val, weight, &mut old, src, cap)? {
+            Some(root) => match node_insert(root, key, val, weight, &mut old, src, cap, k)? {
                 Ins::Whole(n) => n,
                 Ins::Split {
                     left,
@@ -349,13 +351,14 @@ impl PMap {
         &mut self,
         key: &[u8],
         cap: usize,
+        k: usize,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
         let root = match self.root.as_ref() {
             None => return Ok(None),
             Some(r) => r.clone(),
         };
-        let (new_root, removed) = node_remove(&root, key, src, cap)?;
+        let (new_root, removed) = node_remove(&root, key, src, cap, k)?;
         if removed.is_some() {
             // The root may have drained to zero keys: an empty leaf becomes the empty map; an empty
             // internal node (one child) hands the root down a level (height shrinks). The root is
@@ -698,11 +701,16 @@ fn build(
     weights: Vec<u32>,
     children: Vec<Child>,
     cap: usize,
+    k: usize,
     right_edge: bool,
 ) -> Ins {
     let interior = !children.is_empty();
     let payload: usize = weights.iter().map(|&w| w as usize).sum::<usize>()
-        + if interior { 4 * children.len() } else { 0 };
+        + if interior {
+            4 * children.len()
+        } else {
+            crate::format::directory_overhead(keys.len(), k)
+        };
     // Under `RECORD_MAX = (cap-12)/2` a node with ≤ 2 keys never overflows (format.md), so a node
     // that overflows here always has ≥ 3 keys and splits cleanly. The `< 3` guard is purely
     // defensive against an oversized record (one larger than `RECORD_MAX`): it leaves the node
@@ -720,7 +728,11 @@ fn build(
     let mut prefix = 0usize;
     for m in 1..n {
         prefix += weights[m - 1] as usize;
-        let lp = if interior { 4 * (m + 1) } else { 0 } + prefix;
+        let lp = if interior {
+            4 * (m + 1)
+        } else {
+            crate::format::directory_overhead(m, k)
+        } + prefix;
         if lp <= cap {
             best = m;
         }
@@ -770,6 +782,7 @@ fn node_insert(
     old: &mut Option<Row>,
     src: Option<&dyn LeafSource>,
     cap: usize,
+    k: usize,
 ) -> Result<Ins> {
     match node.search(&key) {
         Ok(i) => {
@@ -783,6 +796,7 @@ fn node_insert(
                 weights,
                 node.children.clone(),
                 cap,
+                k,
                 i == node.keys.len() - 1,
             ))
         }
@@ -800,13 +814,14 @@ fn node_insert(
                     weights,
                     Vec::new(),
                     cap,
+                    k,
                     i == node.keys.len(),
                 ))
             } else {
                 // Fault the target child (a `Resident` interior, or an `OnDisk` leaf brought in for
                 // mutation — it becomes a dirty resident node on the rebuilt path).
                 let c = child(node, i, src)?;
-                match node_insert(&c, key, val, weight, old, src, cap)? {
+                match node_insert(&c, key, val, weight, old, src, cap, k)? {
                     Ins::Whole(c) => {
                         // This node's separators are unchanged, so it cannot overflow — rebuild whole.
                         let mut children = node.children.clone();
@@ -840,6 +855,7 @@ fn node_insert(
                             weights,
                             children,
                             cap,
+                            k,
                             i == node.keys.len(),
                         ))
                     }
@@ -851,8 +867,8 @@ fn node_insert(
 
 /// A non-root node is **underfull** when its payload is below half a page (`cap/2`), the threshold
 /// at which delete rebalances it (format.md "Delete"). The root is exempt.
-fn underfull(node: &Node, cap: usize) -> bool {
-    node.payload() < cap / 2
+fn underfull(node: &Node, cap: usize, k: usize) -> bool {
+    node.payload(k) < cap / 2
 }
 
 /// The rightmost `(key, val, weight)` of a subtree — its in-order predecessor entry. Holds an owned
@@ -879,6 +895,7 @@ fn node_remove(
     key: &[u8],
     src: Option<&dyn LeafSource>,
     cap: usize,
+    k: usize,
 ) -> Result<(Arc<Node>, Option<Row>)> {
     match node.search(key) {
         Ok(i) => {
@@ -895,7 +912,7 @@ fn node_remove(
                 // Fault the left subtree once; both the predecessor lookup and its deletion descend it.
                 let left_child = child(node, i, src)?;
                 let (pk, pv, pw) = max_kv(&left_child, src)?;
-                let (new_child, _) = node_remove(&left_child, &pk, src, cap)?;
+                let (new_child, _) = node_remove(&left_child, &pk, src, cap, k)?;
                 let mut keys = node.keys.clone();
                 let mut vals = node.vals.clone();
                 let mut weights = node.weights.clone();
@@ -905,7 +922,7 @@ fn node_remove(
                 weights[i] = pw;
                 children[i] = Child::Resident(new_child);
                 let rebuilt = Node::new(keys, vals, weights, children);
-                Ok((rebalance_child(&rebuilt, i, src, cap)?, Some(removed)))
+                Ok((rebalance_child(&rebuilt, i, src, cap, k)?, Some(removed)))
             }
         }
         Err(i) => {
@@ -913,7 +930,7 @@ fn node_remove(
                 Ok((node.clone(), None))
             } else {
                 let c = child(node, i, src)?;
-                let (new_child, removed) = node_remove(&c, key, src, cap)?;
+                let (new_child, removed) = node_remove(&c, key, src, cap, k)?;
                 if removed.is_none() {
                     return Ok((node.clone(), None));
                 }
@@ -925,7 +942,7 @@ fn node_remove(
                     node.weights.clone(),
                     children,
                 );
-                Ok((rebalance_child(&rebuilt, i, src, cap)?, removed))
+                Ok((rebalance_child(&rebuilt, i, src, cap, k)?, removed))
             }
         }
     }
@@ -940,9 +957,10 @@ fn rebalance_child(
     i: usize,
     src: Option<&dyn LeafSource>,
     cap: usize,
+    k: usize,
 ) -> Result<Arc<Node>> {
     // `children[i]` was just rebuilt resident by `node_remove`, so inspecting it faults nothing.
-    if !underfull(node.children[i].resident(), cap) {
+    if !underfull(node.children[i].resident(), cap, k) {
         return Ok(node.clone());
     }
     let j = if i + 1 < node.children.len() {
@@ -950,7 +968,7 @@ fn rebalance_child(
     } else {
         i - 1
     };
-    merge_at(node, j, src, cap)
+    merge_at(node, j, src, cap, k)
 }
 
 /// Merge `children[j]`, separator `j`, and `children[j+1]` into one node `M`. If `M` fits, it
@@ -962,6 +980,7 @@ fn merge_at(
     j: usize,
     src: Option<&dyn LeafSource>,
     cap: usize,
+    k: usize,
 ) -> Result<Arc<Node>> {
     // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
     // still be an `OnDisk` leaf the delete never touched.
@@ -986,7 +1005,7 @@ fn merge_at(
     let mut children = node.children.clone();
 
     // Merge-overflow: balanced split (format.md — no edited position exists here).
-    match build(mkeys, mvals, mweights, mchildren, cap, false) {
+    match build(mkeys, mvals, mweights, mchildren, cap, k, false) {
         Ins::Whole(merged) => {
             keys.remove(j);
             vals.remove(j);
@@ -1150,6 +1169,8 @@ mod tests {
     // A small page cap so a few-thousand-entry map is several levels deep — exercises split,
     // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256).
     const CAP: usize = 240;
+    /// `row` has one value column — the PAX leaf directory overhead scales with it (format.md v23).
+    const K: usize = 1;
 
     fn row(n: i64) -> Row {
         vec![Value::Int(n)]
@@ -1194,7 +1215,7 @@ mod tests {
             }
             let payload: usize = node.weights.iter().map(|&w| w as usize).sum::<usize>()
                 + if node.is_leaf() {
-                    0
+                    crate::format::directory_overhead(node.keys.len(), K)
                 } else {
                     4 * node.children.len()
                 };
@@ -1217,7 +1238,7 @@ mod tests {
 
         for k in shuffled(n) {
             assert_eq!(
-                pm.insert(key(k), row(k as i64), W, CAP, None).unwrap(),
+                pm.insert(key(k), row(k as i64), W, CAP, K, None).unwrap(),
                 bt.insert(key(k), row(k as i64))
             );
         }
@@ -1233,7 +1254,7 @@ mod tests {
         // Overwrite returns the old value and does not change len.
         let before = pm.len();
         assert_eq!(
-            pm.insert(key(7), row(777), W, CAP, None).unwrap(),
+            pm.insert(key(7), row(777), W, CAP, K, None).unwrap(),
             bt.insert(key(7), row(777))
         );
         assert_eq!(pm.len(), before);
@@ -1241,35 +1262,40 @@ mod tests {
 
         // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
         for (step, k) in shuffled(n).into_iter().enumerate() {
-            assert_eq!(pm.remove(&key(k), CAP, None).unwrap(), bt.remove(&key(k)));
+            assert_eq!(
+                pm.remove(&key(k), CAP, K, None).unwrap(),
+                bt.remove(&key(k))
+            );
             if step % 257 == 0 {
                 check_invariants(&pm);
             }
         }
         assert!(pm.is_empty());
         assert_eq!(pm.iter(None).unwrap().len(), 0);
-        assert_eq!(pm.remove(&key(123), CAP, None).unwrap(), None);
+        assert_eq!(pm.remove(&key(123), CAP, K, None).unwrap(), None);
     }
 
     #[test]
     fn clone_is_an_independent_snapshot() {
         let mut base = PMap::new();
         for k in 0..2000 {
-            base.insert(key(k), row(k as i64), W, CAP, None).unwrap();
+            base.insert(key(k), row(k as i64), W, CAP, K, None).unwrap();
         }
         let snap = base.clone();
 
         let mut other = base.clone();
         for k in 0..2000 {
             other
-                .insert(key(k), row(-(k as i64)), W, CAP, None)
+                .insert(key(k), row(-(k as i64)), W, CAP, K, None)
                 .unwrap(); // overwrite every value
         }
         for k in 2000..3000 {
-            other.insert(key(k), row(k as i64), W, CAP, None).unwrap(); // and grow it
+            other
+                .insert(key(k), row(k as i64), W, CAP, K, None)
+                .unwrap(); // and grow it
         }
         for k in 0..500 {
-            other.remove(&key(k), CAP, None).unwrap(); // and shrink it
+            other.remove(&key(k), CAP, K, None).unwrap(); // and shrink it
         }
 
         // `snap` still sees the original contents, untouched.
@@ -1295,28 +1321,29 @@ mod tests {
         let mut pm = PMap::new();
         assert!(pm.is_empty());
         assert_eq!(pm.get(&key(1), None).unwrap(), None);
-        assert_eq!(pm.remove(&key(1), CAP, None).unwrap(), None);
-        assert_eq!(pm.insert(key(1), row(1), W, CAP, None).unwrap(), None);
+        assert_eq!(pm.remove(&key(1), CAP, K, None).unwrap(), None);
+        assert_eq!(pm.insert(key(1), row(1), W, CAP, K, None).unwrap(), None);
         assert_eq!(pm.get(&key(1), None).unwrap(), Some(row(1)));
-        assert_eq!(pm.remove(&key(1), CAP, None).unwrap(), Some(row(1)));
+        assert_eq!(pm.remove(&key(1), CAP, K, None).unwrap(), Some(row(1)));
         assert!(pm.is_empty());
         assert!(pm.root.is_none());
     }
 
     /// Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and
-    /// the non-empty-halves guarantee. With weight 110 (≤ 114 cap), a node holds ~2 entries.
+    /// the non-empty-halves guarantee. With weight 100 (≤ RECORD_MAX(240,1) = 106 — the PAX leaf
+    /// reserves 12+16·K, format.md v23), a two-record leaf fits but a third overflows.
     #[test]
     fn wide_values_keep_nodes_valid() {
         use std::collections::BTreeMap;
         let mut pm = PMap::new();
         let mut bt: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
         for k in shuffled(300) {
-            pm.insert(key(k), row(k as i64), 110, CAP, None).unwrap();
+            pm.insert(key(k), row(k as i64), 100, CAP, K, None).unwrap();
             bt.insert(key(k), row(k as i64));
             check_invariants(&pm);
         }
         for k in shuffled(300) {
-            pm.remove(&key(k), CAP, None).unwrap();
+            pm.remove(&key(k), CAP, K, None).unwrap();
             bt.remove(&key(k));
             check_invariants(&pm);
         }
@@ -1330,7 +1357,7 @@ mod tests {
         // node_count — the property single-leaf conformance tables cannot show.
         let mut pm = PMap::new();
         for n in 0..200u64 {
-            pm.insert(key(n), row(n as i64), W, CAP, None).unwrap();
+            pm.insert(key(n), row(n as i64), W, CAP, K, None).unwrap();
         }
         assert!(pm.node_count() > 1, "test needs a multi-leaf tree");
 
@@ -1395,7 +1422,7 @@ mod tests {
         // exercise. 200 entries at CAP 240 build several levels.
         let mut pm = PMap::new();
         for n in 0..200u64 {
-            pm.insert(key(n), row(n as i64), W, CAP, None).unwrap();
+            pm.insert(key(n), row(n as i64), W, CAP, K, None).unwrap();
         }
         assert!(pm.node_count() > 2, "test needs a multi-level tree");
 
@@ -1482,7 +1509,7 @@ mod tests {
         // is unit-tested per core against the existing push scan.
         let mut pm = PMap::new();
         for n in 0..200u64 {
-            pm.insert(key(n), row(n as i64), W, CAP, None).unwrap();
+            pm.insert(key(n), row(n as i64), W, CAP, K, None).unwrap();
         }
         assert!(pm.node_count() > 2, "test needs a multi-level tree");
 

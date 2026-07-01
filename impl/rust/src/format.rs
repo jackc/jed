@@ -81,7 +81,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
 /// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
 /// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
-const FORMAT_VERSION: u16 = 22;
+const FORMAT_VERSION: u16 = 23;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -776,10 +776,23 @@ pub(crate) fn any_spillable_masked(col_types: &[ColType], mask: &[bool]) -> bool
 }
 
 /// The largest a single record may serialize to and still satisfy the B-tree split contract —
-/// `RECORD_MAX = (C-12)/2` where `C = cap` is the page payload (spec/fileformat/format.md
-/// "Why the record cap"). The spill planner reduces a record to ≤ this by externalizing values.
-fn record_max(cap: usize) -> usize {
-    cap.saturating_sub(INTERIOR_RESERVE) / 2
+/// `RECORD_MAX(K) = (C − max(12, 12+16·K))/2` where `C = cap` is the page payload and `K` the
+/// value-column count (spec/fileformat/format.md "Why the record cap"). A PAX leaf's two-record
+/// floor carries `directory_overhead(2,K) = 12+16·K`, so the cap tightens by `8·K`; `K = 0` (index
+/// trees, interior separators) recovers the historical `(C-12)/2`. The spill planner reduces a
+/// record to ≤ this by externalizing values.
+fn record_max(cap: usize, k: usize) -> usize {
+    cap.saturating_sub(INTERIOR_RESERVE + 16 * k) / 2
+}
+
+/// The extra bytes a PAX (column-major) leaf's payload carries beyond `Σ record_size`
+/// (spec/fileformat/format.md "Leaf node"): the key directory (`N+1` u32), the column directory
+/// (`K+1` u32), and each column's value directory (`N+1` u32), less the `N` per-record `key_len`
+/// u16 prefixes PAX drops. Interior nodes stay row-major and do not use this.
+///
+/// `directory_overhead(N,K) = 4·(N+1) + 4·(K+1) + 4·(N+1)·K − 2·N`
+pub(crate) fn directory_overhead(n: usize, k: usize) -> usize {
+    4 * (n + 1) + 4 * (k + 1) + 4 * (n + 1) * k - 2 * n
 }
 
 /// A value's planned on-disk disposition (spec/design/large-values.md §2/§12/§13). The compressed
@@ -818,7 +831,7 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
     let mut disp: Vec<Disp> = (0..row.len()).map(|_| Disp::Inline).collect();
     let mut cur = inline.clone();
     let mut size = 2 + key.len() + inline.iter().sum::<usize>();
-    let max = record_max(cap);
+    let max = record_max(cap, col_types.len());
     let mut compress_units = 0usize;
     if size <= max {
         return RecordPlan {
@@ -1262,33 +1275,38 @@ fn serialize_node(
     *next_index += 1;
 
     let n = node.keys.len() as u32;
-    let mut payload = Vec::new();
-    let page_type = if node.children.is_empty() {
-        PAGE_LEAF
-    } else {
-        for &cp in &child_pages {
-            payload.extend_from_slice(&cp.to_be_bytes());
-        }
-        PAGE_INTERIOR
-    };
-    // Encode records, spilling over-large values to overflow pages allocated after this node's
-    // index (post-order traversal + column order → deterministic, golden-pinnable layout).
+    // Encode records, spilling over-large values to overflow pages allocated after this node's index
+    // (post-order traversal + record-then-column order → deterministic, golden-pinnable). A LEAF is
+    // column-major (PAX v23 — encode_leaf_pax); an INTERIOR node stays row-major.
     let mut ovf = Vec::new();
     let mut take = || {
         let i = *next_index;
         *next_index += 1;
         i
     };
-    for i in 0..node.keys.len() {
-        payload.extend_from_slice(&encode_record(
-            col_types,
-            &node.keys[i],
-            &node.vals[i],
-            cap,
-            &mut take,
-            &mut ovf,
-        ));
-    }
+    let (page_type, payload) = if node.children.is_empty() {
+        let rows: Vec<&[Value]> = node.vals.iter().map(Vec::as_slice).collect();
+        (
+            PAGE_LEAF,
+            encode_leaf_pax(col_types, &node.keys, &rows, cap, &mut take, &mut ovf),
+        )
+    } else {
+        let mut payload = Vec::new();
+        for &cp in &child_pages {
+            payload.extend_from_slice(&cp.to_be_bytes());
+        }
+        for i in 0..node.keys.len() {
+            payload.extend_from_slice(&encode_record(
+                col_types,
+                &node.keys[i],
+                &node.vals[i],
+                cap,
+                &mut take,
+                &mut ovf,
+            ));
+        }
+        (PAGE_INTERIOR, payload)
+    };
     if payload.len() > cap {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
@@ -1533,38 +1551,49 @@ fn serialize_dirty(
         child_pages.push(cp);
     }
     let n = node.keys.len() as u32;
-    let mut payload = Vec::new();
-    let page_type = if node.children.is_empty() {
-        PAGE_LEAF
-    } else {
-        for &cp in &child_pages {
-            payload.extend_from_slice(&cp.to_be_bytes());
-        }
-        PAGE_INTERIOR
-    };
     // Encode records, spilling over-large values to overflow pages drawn from the same allocator
     // (free-list first, then high-water — large-values.md §12). A dirty node may carry rows the
     // lazy load left unfetched (a sibling row's mutation dirtied them): resolve those through the
     // pager first — unmetered commit work, large-values.md §14 — so the re-encode re-plans the
-    // resident row exactly as an eager writer would (chains are rewritten fresh; sharing an
-    // unchanged chain is the deferred byte-layout follow-on). Scoped so the `&mut alloc` borrow
-    // ends before this node's own page is allocated.
+    // resident row exactly as an eager writer would. A LEAF is column-major (PAX v23); an INTERIOR
+    // node stays row-major. Scoped so the `&mut alloc` borrow ends before this node's own page is
+    // allocated.
     let mut ovf = Vec::new();
-    {
+    let (page_type, payload) = {
         let mut take = || alloc.take();
-        for i in 0..node.keys.len() {
-            let resolved = resolve_for_encode(&node.vals[i], col_types, paging)?;
-            let row = resolved.as_ref().unwrap_or(&node.vals[i]);
-            payload.extend_from_slice(&encode_record(
-                col_types,
-                &node.keys[i],
-                row,
-                cap,
-                &mut take,
-                &mut ovf,
-            ));
+        if node.children.is_empty() {
+            // Resolve rows, then assemble column-major. `resolved[i]` owns a materialized row (only
+            // when it was unfetched); otherwise the reference borrows `node.vals[i]` — no clone.
+            let resolved: Vec<Option<Vec<Value>>> = (0..node.keys.len())
+                .map(|i| resolve_for_encode(&node.vals[i], col_types, paging))
+                .collect::<Result<_>>()?;
+            let rows: Vec<&[Value]> = (0..node.keys.len())
+                .map(|i| resolved[i].as_deref().unwrap_or(&node.vals[i]))
+                .collect();
+            (
+                PAGE_LEAF,
+                encode_leaf_pax(col_types, &node.keys, &rows, cap, &mut take, &mut ovf),
+            )
+        } else {
+            let mut payload = Vec::new();
+            for &cp in &child_pages {
+                payload.extend_from_slice(&cp.to_be_bytes());
+            }
+            for i in 0..node.keys.len() {
+                let resolved = resolve_for_encode(&node.vals[i], col_types, paging)?;
+                let row = resolved.as_ref().unwrap_or(&node.vals[i]);
+                payload.extend_from_slice(&encode_record(
+                    col_types,
+                    &node.keys[i],
+                    row,
+                    cap,
+                    &mut take,
+                    &mut ovf,
+                ));
+            }
+            (PAGE_INTERIOR, payload)
         }
-    }
+    };
     if payload.len() > cap {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
@@ -1910,15 +1939,20 @@ fn collect_leaf_overflow(
     match page.page_type {
         PAGE_LEAF => {
             let fetch = |p: u32| paging.pager().read_block(p);
-            let item_count = page.item_count;
+            let n = page.item_count as usize;
+            let k = col_types.len();
             // The reachability walk discards each row right after `mark_chains` (only an external
             // chain matters here, never an inline-deferred body), so the form-(a) `Arc` wrap (L3)
             // is dropped per leaf — it exists only to satisfy the lazy decoder's signature.
             let shared: Arc<[u8]> = Arc::from(block.as_slice());
             let payload = &shared[PAGE_HEADER..];
-            let mut pos = 0usize;
-            for _ in 0..item_count {
-                let (_k, row, _w) = decode_record_lazy(col_types, &shared, payload, &mut pos)?;
+            let dirs = parse_pax_leaf(payload, n, k)?;
+            for i in 0..n {
+                let mut row = Vec::with_capacity(k);
+                for (c, ty) in col_types.iter().enumerate() {
+                    let mut pos = dirs.value_off(n, c, i);
+                    row.push(read_value_lazy(ty, &shared, payload, &mut pos)?);
+                }
                 mark_chains(&row, &fetch, reached)?;
             }
             Ok(())
@@ -2032,16 +2066,31 @@ fn read_tree(
     match page.page_type {
         PAGE_LEAF => {
             let n = page.item_count as usize;
+            let k = col_types.len();
+            let dirs = parse_pax_leaf(page.payload, n, k)?;
             let (mut keys, mut vals, mut weights) = (
                 Vec::with_capacity(n),
                 Vec::with_capacity(n),
                 Vec::with_capacity(n),
             );
-            let mut pos = 0usize;
-            for _ in 0..n {
-                let (key, row, ovf) =
-                    decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
-                weights.push(record_size(col_types, &key, &row, cap) as u32);
+            for i in 0..n {
+                let key = dirs.key(page.payload, i)?.to_vec();
+                let mut row = Vec::with_capacity(k);
+                let mut ovf = Vec::new();
+                let mut w = 2 + key.len();
+                for (c, ty) in col_types.iter().enumerate() {
+                    let mut pos = dirs.value_off(n, c, i);
+                    let before = pos;
+                    row.push(read_value(
+                        ty,
+                        page.payload,
+                        &mut pos,
+                        Some(&fetch),
+                        &mut ovf,
+                    )?);
+                    w += pos - before;
+                }
+                weights.push(w as u32);
                 reached.extend(ovf);
                 keys.push(key);
                 vals.push(row);
@@ -2203,31 +2252,127 @@ fn encode_record(
     out.extend_from_slice(&(key.len() as u16).to_be_bytes());
     out.extend_from_slice(key);
     for (i, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
-        match &plan.disp[i] {
-            Disp::Inline => out.extend_from_slice(&encode_value(ty, val)),
-            Disp::External => {
-                let payload = value_payload(ty, val);
-                let first = write_overflow_chain(&payload, cap, take, ovf);
-                out.push(TAG_EXTERNAL);
-                out.extend_from_slice(&first.to_be_bytes());
-                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&encode_disposed_value(
+            ty,
+            val,
+            &plan.disp[i],
+            cap,
+            take,
+            ovf,
+        ));
+    }
+    out
+}
+
+/// Encode one value's on-disk body given its resolved disposition — the value codec, unchanged
+/// across the row-major and PAX leaf layouts (large-values.md §12/§13). An inline-plain value is
+/// `encode_value`; the large-value forms carry a pointer / inline block and allocate overflow chains
+/// via `take`.
+fn encode_disposed_value(
+    ty: &ColType,
+    val: &Value,
+    disp: &Disp,
+    cap: usize,
+    take: &mut dyn FnMut() -> u32,
+    ovf: &mut Vec<OverflowPageOut>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match disp {
+        Disp::Inline => out.extend_from_slice(&encode_value(ty, val)),
+        Disp::External => {
+            let payload = value_payload(ty, val);
+            let first = write_overflow_chain(&payload, cap, take, ovf);
+            out.push(TAG_EXTERNAL);
+            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        }
+        Disp::InlineComp(comp) => {
+            let raw_len = value_payload(ty, val).len();
+            out.push(TAG_INLINE_COMP);
+            out.extend_from_slice(&(raw_len as u32).to_be_bytes());
+            out.extend_from_slice(&(comp.len() as u16).to_be_bytes());
+            out.extend_from_slice(comp);
+        }
+        Disp::ExternalComp(comp) => {
+            // The chain carries the COMPRESSED block (its page count follows comp size).
+            let raw_len = value_payload(ty, val).len();
+            let first = write_overflow_chain(comp, cap, take, ovf);
+            out.push(TAG_EXTERNAL_COMP);
+            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
+            out.extend_from_slice(&(raw_len as u32).to_be_bytes());
+        }
+    }
+    out
+}
+
+/// Build a PAX (column-major) leaf payload from records in ascending key order (format.md v23
+/// "Leaf node"). Values are encoded in (record, column) order — so each external value's overflow
+/// chain is allocated via `take` in exactly the row-major order, keeping overflow page indices
+/// golden-pinned — then assembled column-major: key directory (`N+1` u32 prefix-sum) ‖ key blob ‖
+/// column directory (`K+1` u32 absolute offsets, `col_start[K]` = payload end) ‖ per column a value
+/// directory (`N+1` u32 prefix-sum) then the column's `N` value bodies.
+fn encode_leaf_pax(
+    col_types: &[ColType],
+    keys: &[Vec<u8>],
+    rows: &[&[Value]],
+    cap: usize,
+    take: &mut dyn FnMut() -> u32,
+    ovf: &mut Vec<OverflowPageOut>,
+) -> Vec<u8> {
+    let n = keys.len();
+    let k = col_types.len();
+    // Encode each value in (record, column) order; overflow chains allocate here, matching row-major.
+    let mut val_bytes: Vec<Vec<Vec<u8>>> = (0..k).map(|_| Vec::with_capacity(n)).collect();
+    for (i, &row) in rows.iter().enumerate() {
+        let plan = plan_dispositions(col_types, &keys[i], row, cap);
+        for (c, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
+            val_bytes[c].push(encode_disposed_value(
+                ty,
+                val,
+                &plan.disp[c],
+                cap,
+                take,
+                ovf,
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    // key directory (prefix-sum) + key blob.
+    let mut off = 0u32;
+    for i in 0..=n {
+        out.extend_from_slice(&off.to_be_bytes());
+        if i < n {
+            off += keys[i].len() as u32;
+        }
+    }
+    for key in keys {
+        out.extend_from_slice(key);
+    }
+    // column directory: absolute payload offset of each region.
+    let base_after_col_dir = out.len() + 4 * (k + 1);
+    let mut col_start = vec![0usize; k + 1];
+    let mut cur = base_after_col_dir;
+    for c in 0..k {
+        col_start[c] = cur;
+        let region: usize = 4 * (n + 1) + val_bytes[c].iter().map(Vec::len).sum::<usize>();
+        cur += region;
+    }
+    col_start[k] = cur;
+    for &cs in &col_start {
+        out.extend_from_slice(&(cs as u32).to_be_bytes());
+    }
+    // each column region: value directory (prefix-sum) then value bodies.
+    for c in 0..k {
+        let mut voff = 0u32;
+        for i in 0..=n {
+            out.extend_from_slice(&voff.to_be_bytes());
+            if i < n {
+                voff += val_bytes[c][i].len() as u32;
             }
-            Disp::InlineComp(comp) => {
-                let raw_len = value_payload(ty, val).len();
-                out.push(TAG_INLINE_COMP);
-                out.extend_from_slice(&(raw_len as u32).to_be_bytes());
-                out.extend_from_slice(&(comp.len() as u16).to_be_bytes());
-                out.extend_from_slice(comp);
-            }
-            Disp::ExternalComp(comp) => {
-                // The chain carries the COMPRESSED block (its page count follows comp size).
-                let raw_len = value_payload(ty, val).len();
-                let first = write_overflow_chain(comp, cap, take, ovf);
-                out.push(TAG_EXTERNAL_COMP);
-                out.extend_from_slice(&first.to_be_bytes());
-                out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
-                out.extend_from_slice(&(raw_len as u32).to_be_bytes());
-            }
+        }
+        for vb in &val_bytes[c] {
+            out.extend_from_slice(vb);
         }
     }
     out
@@ -2672,6 +2817,81 @@ fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
     Ok(image[off..off + ps].to_vec())
 }
 
+/// A parsed PAX (column-major) leaf's directories (spec/fileformat/format.md v23 "Leaf node"). All
+/// offsets index into the page payload; value bytes are read in place (`value_off`) so the lazy
+/// decoder's zero-copy form still references the shared page block.
+struct PaxDirs {
+    key_blob: usize,        // payload offset where the key blob starts
+    key_off: Vec<u32>,      // N+1 prefix-sum into the key blob
+    col_start: Vec<u32>, // K+1 absolute payload offsets of each column region; col_start[K] = end
+    col_off: Vec<Vec<u32>>, // K value directories (N+1 prefix-sum into each column's values)
+}
+
+impl PaxDirs {
+    /// Key `i`'s span within `payload`.
+    fn key<'a>(&self, payload: &'a [u8], i: usize) -> Result<&'a [u8]> {
+        let lo = self.key_blob + self.key_off[i] as usize;
+        let hi = self.key_blob + self.key_off[i + 1] as usize;
+        if lo > hi || hi > payload.len() {
+            return Err(corrupt("PAX leaf key directory out of range"));
+        }
+        Ok(&payload[lo..hi])
+    }
+
+    /// The payload offset where value `(record i, column c)`'s codec bytes begin.
+    fn value_off(&self, n: usize, c: usize, i: usize) -> usize {
+        self.col_start[c] as usize + 4 * (n + 1) + self.col_off[c][i] as usize
+    }
+}
+
+/// Parse a PAX leaf payload's three directories (spec/fileformat/format.md v23 "Leaf node"). Column
+/// regions are validated contiguous, in order, and within the payload; a malformed directory is
+/// `data_corrupted`. The page body is zero-padded to the page size, so the authoritative content end
+/// is `col_start[K]`, not `payload.len()`.
+fn parse_pax_leaf(payload: &[u8], n: usize, k: usize) -> Result<PaxDirs> {
+    let mut pos = 0usize;
+    let mut key_off = Vec::with_capacity(n + 1);
+    for _ in 0..=n {
+        key_off.push(read_u32(payload, &mut pos)?);
+    }
+    let key_blob = pos;
+    pos = key_blob + key_off[n] as usize;
+    if pos > payload.len() {
+        return Err(corrupt("PAX leaf key blob overruns page"));
+    }
+    let mut col_start = Vec::with_capacity(k + 1);
+    for _ in 0..=k {
+        col_start.push(read_u32(payload, &mut pos)?);
+    }
+    if col_start[0] as usize != pos {
+        return Err(corrupt("PAX leaf column directory start mismatch"));
+    }
+    let mut col_off = Vec::with_capacity(k);
+    for c in 0..k {
+        let start = col_start[c] as usize;
+        let mut p = start;
+        let mut voff = Vec::with_capacity(n + 1);
+        for _ in 0..=n {
+            voff.push(read_u32(payload, &mut p)?);
+        }
+        let val_base = start + 4 * (n + 1);
+        let end = col_start[c + 1] as usize;
+        if val_base > end || end > payload.len() || val_base + voff[n] as usize != end {
+            return Err(corrupt("PAX leaf column region out of range"));
+        }
+        col_off.push(voff);
+    }
+    if col_start[k] as usize > payload.len() {
+        return Err(corrupt("PAX leaf payload overruns page"));
+    }
+    Ok(PaxDirs {
+        key_blob,
+        key_off,
+        col_start,
+        col_off,
+    })
+}
+
 /// Decode a single **leaf** page block into a resident node, for the demand-paging fault path
 /// (spec/design/pager.md §4; paging.rs `fault_leaf`). `block` is one page; `page` is its page id,
 /// stamped on the node so a later incremental commit keeps it clean. Decoding is **lazy**
@@ -2684,6 +2904,7 @@ pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ColType]) -
         return Err(corrupt("demand-paged a non-leaf page"));
     }
     let n = parsed.item_count as usize;
+    let k = col_types.len();
     let (mut keys, mut vals, mut weights) = (
         Vec::with_capacity(n),
         Vec::with_capacity(n),
@@ -2695,9 +2916,17 @@ pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ColType]) -
     // into a decoded `Value` tree. A leaf with no deferred value drops this `Arc` at function exit.
     let shared: Arc<[u8]> = Arc::from(block);
     let payload = &shared[PAGE_HEADER..];
-    let mut pos = 0usize;
-    for _ in 0..n {
-        let (key, row, w) = decode_record_lazy(col_types, &shared, payload, &mut pos)?;
+    let dirs = parse_pax_leaf(payload, n, k)?;
+    for i in 0..n {
+        let key = dirs.key(payload, i)?.to_vec();
+        let mut row = Vec::with_capacity(k);
+        let mut w = 2 + key.len();
+        for (c, ty) in col_types.iter().enumerate() {
+            let mut pos = dirs.value_off(n, c, i);
+            let before = pos;
+            row.push(read_value_lazy(ty, &shared, payload, &mut pos)?);
+            w += pos - before;
+        }
         weights.push(w as u32);
         keys.push(key);
         vals.push(row);
@@ -4497,7 +4726,7 @@ mod tests {
             })
             .collect();
 
-        // Encode the records into one leaf page payload (everything inline at this page size).
+        // Encode the records into one PAX leaf page payload (everything inline at this page size).
         let mut take_seq = 100u32;
         let mut take = || {
             let v = take_seq;
@@ -4505,13 +4734,11 @@ mod tests {
             v
         };
         let mut ovf = Vec::new();
-        let mut payload = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
-            let key = (i as u32).to_be_bytes().to_vec();
-            payload.extend_from_slice(&encode_record(
-                &col_types, &key, row, cap, &mut take, &mut ovf,
-            ));
-        }
+        let keys: Vec<Vec<u8>> = (0..rows.len())
+            .map(|i| (i as u32).to_be_bytes().to_vec())
+            .collect();
+        let row_refs: Vec<&[Value]> = rows.iter().map(Vec::as_slice).collect();
+        let payload = encode_leaf_pax(&col_types, &keys, &row_refs, cap, &mut take, &mut ovf);
         assert!(
             ovf.is_empty(),
             "values must stay inline (no overflow) for the form-(a) case"
