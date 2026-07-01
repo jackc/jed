@@ -13807,6 +13807,25 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		}
 		c.meter.Charge(costs.RowProduced)
 		return row, true, nil
+	case emitColumnar:
+		// Columnar projection (packed-leaf.md §11 Track A2): gather this row from the dense lanes — a
+		// bare-column projection with no full-width row — charging only row_produced (a bare column ref
+		// evaluates to a zero-cost slot read, so there is no projection operator_eval to charge).
+		if c.idx >= c.em.end {
+			c.done = true
+			return nil, false, nil
+		}
+		i := c.idx
+		c.idx++
+		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+			return nil, false, err
+		}
+		c.meter.Charge(costs.RowProduced)
+		projected := make([]Value, len(c.em.projCols))
+		for j, cc := range c.em.projCols {
+			projected[j] = c.em.cols[cc][i]
+		}
+		return projected, true, nil
 	default: // emitProject — project the buffer row on emission (charging row_produced + projection)
 		if c.idx >= c.em.end {
 			c.done = true
@@ -14622,6 +14641,14 @@ const (
 	// caller's early exit skips the projection (and row_produced) of the rows it never pulls
 	// (streaming.md §4/§7).
 	emitSorted
+	// emitColumnar: the columnar projection fast path (batch.go projectColumnar, packed-leaf.md §11
+	// Track A2). `cols` holds the pre-gathered dense per-column lanes and `projCols` the projection's
+	// column indices into them; emission builds output row i as [cols[projCols[0]][i], …] — a bare-column
+	// projection with no full-width storedRow, charging row_produced per windowed row exactly like
+	// emitProject (a bare column ref evaluates to row[index] with zero operator_eval, so the lane read
+	// is cost-identical). Lazy like emitProject: a caller's early exit skips the row_produced of the rows
+	// it never pulls.
+	emitColumnar
 )
 
 // emitter describes how a selectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
@@ -14638,13 +14665,18 @@ const (
 //     AND charged it) — emission hands it out with no further charge.
 //   - emitSorted: `sorted` is the streaming-sort output pull iterator (positioned past the OFFSET),
 //     [0, end) windowed — emission pulls + projects + charges row_produced per row (streaming.md §4/§7).
+//   - emitColumnar: `cols` are the dense per-column lanes and `projCols` the projection's column indices
+//     into them, [start, end) windowed — emission gathers output row i from the lanes (a bare-column
+//     projection, no full-width row) and charges row_produced per row (packed-leaf.md §11 Track A2).
 type emitter struct {
-	src    []storedRow // emitProject: unprojected rows
-	final  [][]Value   // emitIdentity / emitFinal: already-projected rows
-	sorted *sortedRows // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
-	start  int64
-	end    int64
-	mode   emitMode
+	src      []storedRow // emitProject: unprojected rows
+	final    [][]Value   // emitIdentity / emitFinal: already-projected rows
+	sorted   *sortedRows // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
+	cols     [][]Value   // emitColumnar: the dense per-column lanes (indexed by table ordinal)
+	projCols []int       // emitColumnar: projection column indices into cols (one per output column)
+	start    int64
+	end      int64
+	mode     emitMode
 }
 
 // drainEager builds the full output slice from the emitter — the materialized Execute drive
@@ -14694,6 +14726,24 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 			out = append(out, row)
 		}
 		return out, nil
+	case emitColumnar:
+		// Columnar projection (packed-leaf.md §11 Track A2): gather each windowed output row from the
+		// dense lanes — a bare-column projection with no full-width row — charging row_produced per row,
+		// exactly the emitProject drive over a bare-column projection (whose p.eval is a zero-cost slot
+		// read).
+		out := make([][]Value, 0, em.end-em.start)
+		for i := em.start; i < em.end; i++ {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				return nil, err
+			}
+			meter.Charge(costs.RowProduced)
+			projected := make([]Value, len(em.projCols))
+			for j, c := range em.projCols {
+				projected[j] = em.cols[c][i]
+			}
+			out = append(out, projected)
+		}
+		return out, nil
 	default: // emitProject
 		env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 		out := make([][]Value, 0, em.end-em.start)
@@ -14735,6 +14785,23 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// general aggregate branch runs unchanged.
 	if meter.unmetered() && db.vectorizedAggEligible(plan) {
 		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
+	}
+
+	// Columnar projection fast path (batch.go, packed-leaf.md §11 Track A2): a bare-column projection
+	// over a single-table full/PK-bounded scan with no filter / ORDER BY / LIMIT / OFFSET / blocking
+	// operator gathers only its projected columns into dense lanes and emits from them — never the
+	// full-width storedRow the materialize path below allocates per record (the allocation dividend on a
+	// wide table). Gated to the unmetered lane (so a metered query's per-eval Guards stay the row path's)
+	// and to file-backed stores with no spillable projected column (projectColumnar declines otherwise,
+	// falling through to the identical-cost row path). Cost-neutral by construction.
+	if meter.unmetered() && db.vectorizedProjectEligible(plan) {
+		em, ok, err := db.projectColumnar(plan, params, outer, meter)
+		if err != nil {
+			return emitter{}, err
+		}
+		if ok {
+			return em, nil
+		}
 	}
 
 	// Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no

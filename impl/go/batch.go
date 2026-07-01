@@ -27,6 +27,13 @@ package jed
 //     zero-copy) and declines to the row path on any filter / spillable column, so the fold kernels
 //     stay the same code either way (foldAggColumnar mirrors foldAggBatch, reading lane[i] instead of
 //     survivors[i][idx]).
+//   - A2 PROJECTION FEED (packed-leaf.md §11 Track A2): the same columnar gather for a bare-column
+//     PROJECTION scan (`SELECT c0, c3 FROM t [WHERE pk = …]`, no filter/ORDER BY/LIMIT/aggregate) —
+//     projectColumnar gathers the projected columns into lanes and returns an emitColumnar emitter that
+//     builds each output row directly from the lanes, so the materialize path's full-width storedRow per
+//     record is never allocated (the projection's B/op dividend, the sibling of the aggregate one). Same
+//     file-backed / non-spillable gate; the emitColumnar drive charges row_produced per emitted row
+//     exactly like the emitProject drive over a bare-column projection (a zero-cost slot read).
 //
 // The load-bearing invariant is that BOTH the result multiset AND the deterministic cost
 // (CLAUDE.md §8/§13) stay byte-identical to the scalar path; the conformance corpus asserts
@@ -368,6 +375,119 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Val
 		return nil, false, err
 	}
 	return srows, true, nil
+}
+
+// vectorizedProjectEligible reports whether plan is a shape projectColumnar specializes: a bare-column
+// projection over a single base table with no join / aggregate / window / DISTINCT / ORDER BY / residual
+// filter / LIMIT / OFFSET and no index/GIN/GiST bound — i.e. a plain `SELECT c0, c3, … FROM t [WHERE
+// pk = …]` whose output is the scan-order rows narrowed to a column subset. Pure plan inspection (charges
+// nothing), so a bail is free and the general materialize path runs with identical results + cost; the
+// store / paging / spillable / column-range gates live in projectColumnar, which declines to that path.
+// LIMIT/OFFSET is excluded deliberately: a LIMIT with no ORDER BY streams with an early exit
+// (streamingScanEligible), which projectColumnar's whole-table gather must not steal.
+func (db *engine) vectorizedProjectEligible(plan *selectPlan) bool {
+	if plan.isAgg || plan.hasWindow || plan.distinct {
+		return false
+	}
+	// One base table, no join.
+	if len(plan.rels) != 1 || len(plan.joins) != 0 {
+		return false
+	}
+	rel := &plan.rels[0]
+	if rel.srf != nil || rel.cte != nil || rel.derived != nil || rel.lateral {
+		return false
+	}
+	// No ORDER BY / LIMIT / OFFSET (those route to a streaming / sort / index path) and no residual
+	// filter (a filtered scan needs a row for the predicate — filter vectorization is a follow-on).
+	if len(plan.order) != 0 || plan.limit != nil || plan.offset != nil || plan.filter != nil {
+		return false
+	}
+	// Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics.
+	if len(plan.relBounds) > 0 {
+		if sb := plan.relBounds[0]; sb != nil && (sb.index != nil || sb.gin != nil || sb.gist != nil) {
+			return false
+		}
+	}
+	// Every projection must be a bare column reference: a bare reColumn evaluates to row[index] with zero
+	// operator_eval, so gathering it from a dense lane is cost-identical. An expression projection
+	// (`c0 + 1`, a function call) charges operator_eval and needs a row — it keeps the row path.
+	if len(plan.projections) == 0 {
+		return false
+	}
+	for _, p := range plan.projections {
+		if p.kind != reColumn {
+			return false
+		}
+	}
+	return true
+}
+
+// projectColumnar runs the A2 columnar gather for a vectorizedProjectEligible plan (packed-leaf.md §11
+// Track A2): it scans only the projected (touched) columns of the single base relation into dense
+// per-column lanes (never a full-width storedRow), charges the identical scan cost block, and returns an
+// emitColumnar emitter that gathers each output row from the lanes on emission. Returns ok=false
+// (declining to the caller's row path) for an in-memory store (its Decoded leaves share rows zero-copy,
+// so a lane gather would only add allocation with no packed-leaf win to offset it), a spillable projected
+// column (the columnar feed has no value-resolution step), or a projection column that is out of range /
+// unmasked (a safety net, never expected — a projected column is touched, hence masked). Cost-neutral by
+// construction: same page_read (same node visits) / value_decompress (0 — no spillable touched column) /
+// storage_row_read (× rowCount) as the row path, then row_produced per emitted row charged by the
+// emitColumnar drive — exactly the emitProject drive over a bare-column projection.
+func (db *engine) projectColumnar(plan *selectPlan, params []Value, outer []storedRow, meter *costMeter) (emitter, bool, error) {
+	rel := &plan.rels[0]
+	store := db.lkpStore(rel.tableName)
+	if store == nil {
+		return emitter{}, false, nil
+	}
+	// File-backed only (see aggColumnar): an in-memory store's row path is already zero-copy.
+	if store.paging == nil {
+		return emitter{}, false, nil
+	}
+	mask := plan.relMasks[0]
+	// No projected column may spill — so the feed's value_decompress slab count is 0 and no unfetched
+	// value is left unresolved (the columnar feed has no resolveColumns step).
+	if anySpillableMasked(store.colTypes, mask) {
+		return emitter{}, false, nil
+	}
+	// Each projected column must be a valid, masked table ordinal — else its gathered lane would be nil.
+	// For a single base table a projection's reColumn index is a 0-based table ordinal in [0, K); a
+	// projected column is always touched (hence masked), so this holds — the check also declines a
+	// (never-expected) synthetic slot or non-zero relation offset.
+	projCols := make([]int, len(plan.projections))
+	for i, p := range plan.projections {
+		idx := p.index
+		if idx < 0 || idx >= len(mask) || !mask[idx] {
+			return emitter{}, false, nil
+		}
+		projCols[i] = idx
+	}
+
+	// Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
+	// empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely (0 pages/rows).
+	cols := make([][]Value, len(mask))
+	rowCount, pages, slabs := 0, 0, 0
+	scan := true
+	b := unboundedBound()
+	if len(plan.relBounds) > 0 {
+		if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
+			var empty bool
+			if b, empty = db.buildKeyBound(sb.pk, params, outer); empty {
+				scan = false
+			}
+		}
+	}
+	if scan {
+		var err error
+		if cols, rowCount, pages, slabs, err = store.ColumnarScanMasked(b, mask); err != nil {
+			return emitter{}, false, err
+		}
+	}
+	// Charge the scan cost block identically to materializeRel + scanSource: page_read × nodes,
+	// value_decompress × slabs (0 here), storage_row_read × rowCount. On the unmetered lane (the caller
+	// gates) this bulk charge reproduces the scanSource's per-row accrual (Guard is a no-op).
+	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs) + costs.StorageRowRead*int64(rowCount))
+
+	return emitter{cols: cols, projCols: projCols, start: 0, end: int64(rowCount), mode: emitColumnar}, true, nil
 }
 
 // aggWindowBounds computes the LIMIT/OFFSET [start,end) window over n synthetic rows, mirroring the

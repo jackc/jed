@@ -120,8 +120,10 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 // DEFAULT page size so their tree shapes (hence the page_read node counts) are identical; the depth
 // comes from the row count, not a shrunk page. Filter-free aggregates take the A2 columnar path on the
 // paged (file-backed) database and the row path on the resident one; both the result rows AND the
-// deterministic cost must agree. A few filtered / grouped-with-WHERE shapes exercise the row path over
-// the same multi-level tree for good measure.
+// deterministic cost must agree. Bare-column PROJECTIONS take the A2 columnar projection path
+// (projectColumnar → emitColumnar) over the same tree — so the interior-separator gather is exercised
+// for projections too, not only aggregates. A few filtered / grouped-with-WHERE shapes exercise the row
+// path over the same multi-level tree for good measure.
 func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 	seed := func(t *testing.T, db dbHandle) {
 		t.Helper()
@@ -174,6 +176,13 @@ func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 		"SELECT k, count(*) FROM m GROUP BY k",
 		"SELECT k, sum(a) FROM m GROUP BY k",
 		"SELECT k, sum(a), count(b) FROM m GROUP BY k",
+		// Bare-column projections — the A2 columnar projection path (emitColumnar) over the multi-level
+		// tree; the interior separators are gathered into the lanes alongside the leaf records.
+		"SELECT a FROM m",                                 // single-column projection (interior + leaf a values)
+		"SELECT k, a, b FROM m",                           // multi-column projection incl. the nullable b lane
+		"SELECT id FROM m",                                // the PK column projected (a stored column like any other)
+		"SELECT a FROM m WHERE id = 2500",                 // PK point → columnar with a point bound
+		"SELECT k, b FROM m WHERE id >= 100 AND id < 400", // PK range → columnar with a range bound
 		// Filtered / bounded — the row path over the same multi-level tree (columnar declines on filter).
 		"SELECT sum(a) FROM m WHERE id >= 100 AND id < 400",
 		"SELECT k, count(*) FROM m WHERE k >= 3 GROUP BY k",
