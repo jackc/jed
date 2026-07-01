@@ -83,6 +83,11 @@ type sharedCore struct {
 	// in-memory (persist is then a no-op). Its mutable page accounting is touched only under the writer
 	// gate, so its own mutex is uncontended; paging itself is goroutine-safe (sharedPaging).
 	storage *storage
+	// memPageSize is the page size minted sessions serialize/split at when this core is IN-MEMORY
+	// (storage == nil); the file's page size wins when file-backed. The default for a normal in-memory
+	// database; NewInMemoryWithPageSize sets it so byte-level fixtures/tests build at the size they
+	// serialize to (CLAUDE.md §8).
+	memPageSize uint32
 }
 
 // storage is the storage identity of a file-backed database (spec/design/session.md §2.4): the open
@@ -96,7 +101,8 @@ type storage struct {
 	pageCount uint32     // on-disk high-water; persisted in the meta slot
 	freePages []uint32   // reconstruct-on-open free-list (P6.2) — reused lowest-first, trivially watermark-safe
 	paging    *sharedPaging
-	readOnly  bool // opened read-only (api.md §2.1): every session is then read-only, a write is 25006
+	readOnly  bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006
+	path      string // the backing file path (surfaced by Database.Path / Session.Path)
 }
 
 // persist durably publishes snap to the backing file via an incremental copy-on-write commit
@@ -155,7 +161,25 @@ func (c *sharedCore) pageSize() uint32 {
 	if c.storage != nil {
 		return c.storage.pageSize
 	}
-	return DefaultPageSize
+	return c.memPageSize
+}
+
+// pageCount is the on-disk page high-water for a file-backed core; 0 in-memory.
+func (c *sharedCore) pageCount() uint32 {
+	if c.storage != nil {
+		c.storage.mu.Lock()
+		defer c.storage.mu.Unlock()
+		return c.storage.pageCount
+	}
+	return 0
+}
+
+// path is the backing file path for a file-backed core; "" in-memory.
+func (c *sharedCore) path() string {
+	if c.storage != nil {
+		return c.storage.path
+	}
+	return ""
 }
 
 // sharedCoreFromEngine lifts a freshly opened/created file-backed *Engine (file.go) into a shared
@@ -163,7 +187,7 @@ func (c *sharedCore) pageSize() uint32 {
 // pager / page accounting) becomes the storage. The committed snapshot's stores already carry the
 // shared paging, so every pinned snapshot faults clean pages through the one pool (pager.md).
 func sharedCoreFromEngine(e *engine) *sharedCore {
-	c := &sharedCore{live: make(map[uint64]int)}
+	c := &sharedCore{live: make(map[uint64]int), memPageSize: e.pageSize}
 	c.roots.Store(&roots{committed: e.committed, sharedTemp: e.sharedTempCommitted})
 	c.storage = &storage{
 		pageSize:  e.pageSize,
@@ -171,6 +195,7 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 		freePages: e.freePages,
 		paging:    e.paging,
 		readOnly:  e.readOnly,
+		path:      e.path,
 	}
 	return c
 }
@@ -186,9 +211,18 @@ type Database struct {
 	core *sharedCore
 }
 
-// NewDatabase builds a fresh, empty in-memory database plus its default session (committed version 0).
+// NewDatabase builds a fresh, empty in-memory database (committed version 0).
 func NewDatabase() *Database {
-	c := &sharedCore{live: make(map[uint64]int)}
+	return NewInMemoryWithPageSize(DefaultPageSize)
+}
+
+// NewInMemoryWithPageSize builds a fresh, empty in-memory database that serializes/splits at
+// pageSize. The page-backed B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an
+// in-memory tree must be built at the size it will serialize to — this builds byte-level fixtures /
+// tests a non-default page size (the shared-core analogue of withPageSize); a normal in-memory
+// database uses NewDatabase (the default page size).
+func NewInMemoryWithPageSize(pageSize uint32) *Database {
+	c := &sharedCore{live: make(map[uint64]int), memPageSize: pageSize}
 	c.roots.Store(&roots{committed: newSnapshot(), sharedTemp: newSnapshot()})
 	return databaseOver(c)
 }
@@ -244,6 +278,62 @@ func (s *Database) OldestLiveTxid() uint64 {
 	return oldest
 }
 
+// committedEngine builds a transient read engine over the latest committed snapshot for catalog
+// introspection (the shared-core analogue of Rust's Engine::from_snapshot). Not a session — it pins
+// nothing and never writes.
+func (s *Database) committedEngine() *engine {
+	rt := s.core.roots.Load()
+	return &engine{
+		committed:           rt.committed,
+		pageSize:            s.core.pageSize(),
+		session:             newSession(),
+		sharedTempCommitted: rt.sharedTemp,
+		sharedTempMem:       defaultSharedTempMem,
+	}
+}
+
+// TableNames is the canonical name of every persistent table in the latest committed snapshot, sorted
+// ascending by lowercased name (CLAUDE.md §8). Secondary indexes are excluded (api.md §6).
+func (s *Database) TableNames() []string { return s.committedEngine().TableNames() }
+
+// Table is the definition of persistent table name (case-insensitive) in the latest committed
+// snapshot. The *catTable is the doc-hidden introspection type, not the embedding API — hosts use
+// TableNames; white-box tests reach the detail through it.
+func (s *Database) Table(name string) (*catTable, bool) { return s.committedEngine().Table(name) }
+
+// CompositeType is the definition of composite type name in the latest committed snapshot, or nil.
+func (s *Database) CompositeType(name string) *compositeType {
+	return s.committedEngine().CompositeType(name)
+}
+
+// RowsInKeyOrder is a white-box test helper (CLAUDE.md §10): all rows of persistent table name in
+// primary-key order from the latest committed snapshot. Not the embedding API.
+func (s *Database) RowsInKeyOrder(name string) []storedRow {
+	return s.committedEngine().RowsInKeyOrder(name)
+}
+
+// ToImage serializes the whole committed state to a from-scratch on-disk image (the inverse of
+// LoadEngine; spec/fileformat/format.md), used by the byte-level golden round-trip tests and by
+// hosts snapshotting an in-memory database to bytes.
+func (s *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+	return s.core.roots.Load().committed.ToImage(pageSize, txid)
+}
+
+// Txid is the latest committed transaction id (the on-disk meta txid); equal to Version.
+func (s *Database) Txid() uint64 { return s.core.roots.Load().committed.txid }
+
+// PageSize is the page payload size this database serializes at.
+func (s *Database) PageSize() uint32 { return s.core.pageSize() }
+
+// PageCount is the on-disk page high-water for a file-backed database; 0 in-memory.
+func (s *Database) PageCount() uint32 { return s.core.pageCount() }
+
+// Path is the backing file path for a file-backed database; "" in-memory.
+func (s *Database) Path() string { return s.core.path() }
+
+// ReadOnly reports whether this database was opened read-only. In-memory databases are writable.
+func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
+
 // ReadSession opens a READ ONLY session over a consistent snapshot (spec/design/session.md §2.4,
 // transactions.md §10). Pins the committed roots now (a lock-free Load) and registers the version in
 // the live set; the session serves reads from that snapshot for its life — lock-free, never blocked
@@ -259,6 +349,7 @@ func (s *Database) ReadSession() *Session {
 	// immutable pinned snapshots directly — no clone. Both roots are pinned together (temp-tables.md §5),
 	// so the reader sees a consistent file + shared-temp view.
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: defaultSharedTempMem}
+	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
 	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
 }
 
@@ -297,6 +388,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
 	// version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
 	if s.core.readOnlyMode() {
+		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
 		s.core.liveMu.Lock()
 		s.core.live[snap.txid]++
 		s.core.liveMu.Unlock()
@@ -497,10 +589,10 @@ func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
 // and releases it.
 func (s *Session) dispatch(stmt statement, params []Value) (Outcome, error) {
 	if s.access == accessReadOnly {
-		if stmtIsWrite(stmt) {
-			return Outcome{}, newError(ReadOnlySqlTransaction,
-				"cannot execute a write statement against a read-only snapshot")
-		}
+		// Every read-only session sets engine.readOnly, so the executor enforces it (PostgreSQL
+		// hot-standby — api.md §2.1): an autocommit write / an in-block write / an explicit BEGIN READ
+		// WRITE all fail 25006, and an in-block write poisons the block (25P02 thereafter, §6). No gate
+		// / publish is needed for a read-only session.
 		return s.engine.ExecuteStmtParams(stmt, params)
 	}
 	switch {
@@ -564,7 +656,15 @@ func (s *Session) beginBlock(writable, modeSet bool) (Outcome, error) {
 		s.pinned = true
 		s.pinVersion = s.baseVersion
 	}
-	return s.engine.beginTx(writable, modeSet)
+	out, err := s.engine.beginTx(writable, modeSet)
+	if err != nil && s.gateHeld {
+		// beginTx rejected (e.g. BEGIN READ WRITE on a read-only session → 25006): release the writer
+		// gate this begin eagerly acquired so the session is not left holding it (the read-only branch
+		// acquires no gate and beginTx does not error there).
+		s.core.writeMu.Unlock()
+		s.gateHeld = false
+	}
+	return out, err
 }
 
 // endBlock ends the open block (spec/design/session.md §2.4). Commit: a clean writable block
@@ -735,6 +835,94 @@ func (s *Session) Status() TxStatus { return txStatusOf(s.engine.session.tx) }
 
 // InTransaction reports whether an explicit transaction block is open on this session.
 func (s *Session) InTransaction() bool { return s.engine.session.tx != nil }
+
+// --- Catalog / storage introspection (spec/design/api.md §6). Catalog reads delegate to the
+// session's engine (its visible snapshot — the open block's working set if any, else the pinned
+// committed); file-storage reads go through the shared core (the authoritative state, reflecting every
+// committed write). The *catTable / *compositeType returns are the doc-hidden introspection types. ---
+
+// TableNames is the canonical name of every table visible to this session, sorted ascending by
+// lowercased name (CLAUDE.md §8). Temp tables are excluded, matching the persistent listing.
+func (s *Session) TableNames() []string { return s.engine.TableNames() }
+
+// Table is the definition of table name (case-insensitive) as this session sees it, or false.
+func (s *Session) Table(name string) (*catTable, bool) { return s.engine.Table(name) }
+
+// CompositeType is the definition of composite type name as this session sees it, or nil.
+func (s *Session) CompositeType(name string) *compositeType { return s.engine.CompositeType(name) }
+
+// RowsInKeyOrder is a white-box test helper (CLAUDE.md §10): all rows of table name in primary-key
+// order as this session sees them. Not the embedding API.
+func (s *Session) RowsInKeyOrder(name string) []storedRow { return s.engine.RowsInKeyOrder(name) }
+
+// ToImage serializes the session's committed view to a from-scratch on-disk image (byte-level golden
+// round-trip, CLAUDE.md §8).
+func (s *Session) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+	return s.engine.ToImage(pageSize, txid)
+}
+
+// Txid is the backing database's latest committed transaction id (the on-disk meta txid) — the shared
+// committed cell, not the session's pinned base.
+func (s *Session) Txid() uint64 { return s.core.roots.Load().committed.txid }
+
+// OldestLiveTxid is the oldest still-live snapshot version (the reclamation watermark, §8).
+func (s *Session) OldestLiveTxid() uint64 {
+	oldest := s.core.roots.Load().committed.txid
+	s.core.liveMu.Lock()
+	defer s.core.liveMu.Unlock()
+	for v := range s.core.live {
+		if v < oldest {
+			oldest = v
+		}
+	}
+	return oldest
+}
+
+// PageSize is the backing database's page payload size.
+func (s *Session) PageSize() uint32 { return s.core.pageSize() }
+
+// PageCount is the backing file's on-disk page high-water (0 in-memory) — the shared storage state,
+// reflecting every committed write.
+func (s *Session) PageCount() uint32 { return s.core.pageCount() }
+
+// Path is the backing file path ("" in-memory).
+func (s *Session) Path() string { return s.core.path() }
+
+// ReadOnly reports whether the backing database was opened read-only.
+func (s *Session) ReadOnly() bool { return s.core.readOnlyMode() }
+
+// DefaultCollation is the session's current default collation name.
+func (s *Session) DefaultCollation() string { return s.engine.DefaultCollation() }
+
+// Collations are the collations available to this session (built-ins + any host-loaded set).
+func (s *Session) Collations() []collationInfo { return s.engine.Collations() }
+
+// LoadedCollations are the host-loaded collations currently in effect (collation.md §9).
+func (s *Session) LoadedCollations() []collationInfo { return s.engine.LoadedCollations() }
+
+// SetDefaultCollation sets the per-database default collation for new text columns (collation.md §4);
+// 2C000 for an unknown collation. The default is committed snapshot state (persisted as the is_default
+// flag), so outside a block this COMMITS — take the gate, re-pin the latest committed, set, publish —
+// so the change survives the next statement's re-pin and is visible to it (exactly like an autocommit
+// write). A read-only session rejects it (25006).
+func (s *Session) SetDefaultCollation(name string) error {
+	if s.access == accessReadOnly {
+		return newError(ReadOnlySqlTransaction, "cannot set the default collation on a read-only session")
+	}
+	if s.engine.session.tx != nil {
+		return s.engine.SetDefaultCollation(name) // part of the open block; publishes on its commit
+	}
+	s.core.writeMu.Lock()
+	s.gateHeld = true
+	s.refreshCommitted()
+	err := s.engine.SetDefaultCollation(name)
+	if err == nil {
+		err = s.publish()
+	}
+	s.core.writeMu.Unlock()
+	s.gateHeld = false
+	return err
+}
 
 // --- The relocated envelope (spec/design/session.md §3): each setter/getter delegates to the
 // private engine's sessionState. ---
