@@ -88,10 +88,11 @@ pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Outcome, ScriptSummary,
     SessionOptions, TxStatus,
 };
-// The low-level single-threaded `Engine` is NOT part of the public embedding API — the converged
-// §2.4 handles ([`Database`] / [`Session`]) are. It stays reachable in-crate (the
-// integration tests) under `jed::Engine` via this crate-private re-export, and to the in-repo CLI
-// via the doc-hidden `tooling` seam below. External wraps/benches drive [`Database`] instead.
+// The low-level single-threaded `Engine` is a purely INTERNAL concern — not the public embedding
+// API and not reachable by any external crate. The converged §2.4 handles ([`Database`] /
+// [`Session`]) are the only surface; every consumer (the integration tests, the `cli/` REPL, the
+// conformance bin, the Ruby/WASM wraps) drives those. This crate-private re-export keeps `crate::
+// Engine` resolvable for the engine's own modules + doc links; nothing outside the crate can name it.
 pub(crate) use executor::Engine;
 pub use file::{DatabaseOptions, OpenOptions};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
@@ -104,34 +105,16 @@ pub use value::Value;
 
 /// Internal building blocks for the in-repo tools (the `src/bin/{build,gen}_*` codegen/bundle binaries
 /// and the `cli/` REPL). NOT part of the stable embedding API — `#[doc(hidden)]`, and only those
-/// in-repo crates use it. They need deep access to internals the façade deliberately hides: the bundle
-/// builders to the collation / time-zone tables, the CLI to a few catalog / type / value details it
-/// renders.
+/// in-repo crates use it. It exposes a few catalog / type introspection types the façade deliberately
+/// keeps out of the embedding surface — the CLI dumps schema and renders values with them, reaching
+/// them off the public [`Database`] / [`Session`] handles (`table_names`/`table`), never a low-level
+/// `Engine` (which is fully internal).
 #[doc(hidden)]
 pub mod tooling {
-    // The CLI renders query results + dumps schema using these internal types.
+    // The CLI renders query results + dumps schema using these internal types (returned by
+    // `Database::table` / `Session::table`).
     pub use crate::catalog::{CompositeType, Table};
     pub use crate::types::{ScalarType, Type};
-
-    // The low-level single-threaded handle + its one-shot conveniences. The in-repo REPL (`cli/`)
-    // drives the engine through these and needs the catalog introspection (`Engine::table` /
-    // `table_names`) the public `Database` deliberately does not expose. NOT the embedding API —
-    // a host links against `Database` / `Session`.
-    pub use crate::executor::Engine;
-
-    /// One-shot parse + execute against a low-level [`Engine`] (the zero-parameter convenience).
-    pub fn execute(db: &mut Engine, sql: &str) -> crate::Result<crate::Outcome> {
-        crate::execute(db, sql)
-    }
-
-    /// One-shot parse + execute against a low-level [`Engine`], binding `$N` parameters.
-    pub fn execute_params(
-        db: &mut Engine,
-        sql: &str,
-        params: &[crate::Value],
-    ) -> crate::Result<crate::Outcome> {
-        crate::execute_params(db, sql, params)
-    }
 
     pub mod collation {
         pub use crate::collation::{

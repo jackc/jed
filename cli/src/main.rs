@@ -14,8 +14,7 @@ mod tui;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use jed::tooling::Engine;
-use jed::{DatabaseOptions, OpenOptions};
+use jed::{Database, DatabaseOptions, OpenOptions, SessionOptions};
 
 use args::Source;
 use session::Session;
@@ -125,17 +124,20 @@ fn run() -> u8 {
     }
 }
 
-fn open_database(a: &args::Args) -> Result<(Engine, String), u8> {
+fn open_database(a: &args::Args) -> Result<(jed::Session, String), u8> {
     let Some(path) = &a.db_path else {
-        return Ok((Engine::new(), "memory".to_string()));
+        return Ok((
+            Database::new_in_memory().session(SessionOptions::default()),
+            "memory".to_string(),
+        ));
     };
     let result = if a.create {
         let opts = DatabaseOptions {
             page_size: a.page_size.unwrap_or(jed::DEFAULT_PAGE_SIZE),
         };
-        Engine::create(path, opts)
+        Database::create(path, opts)
     } else if a.readonly {
-        Engine::open_with_options(
+        Database::open_with_options(
             path,
             OpenOptions {
                 read_only: true,
@@ -143,7 +145,7 @@ fn open_database(a: &args::Args) -> Result<(Engine, String), u8> {
             },
         )
     } else {
-        Engine::open(path)
+        Database::open(path)
     };
     match result {
         Ok(db) => {
@@ -152,7 +154,7 @@ fn open_database(a: &args::Args) -> Result<(Engine, String), u8> {
             } else {
                 path.display().to_string()
             };
-            Ok((db, source))
+            Ok((db.session(SessionOptions::default()), source))
         }
         Err(e) => {
             eprintln!("ERROR {}: {}", e.code(), e.message);

@@ -320,16 +320,13 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::tooling::{Engine, execute};
+    
 
     fn app() -> App {
-        let mut db = Engine::new();
-        execute(
-            &mut db,
-            "CREATE TABLE Users (id i32 PRIMARY KEY, score i32)",
-        )
+        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        db.execute("CREATE TABLE Users (id i32 PRIMARY KEY, score i32)", &[])
         .unwrap();
-        execute(&mut db, "CREATE TABLE selections (sel i32 PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE selections (sel i32 PRIMARY KEY)", &[]).unwrap();
         App::new(Session::new(db, "memory".to_string()))
     }
 

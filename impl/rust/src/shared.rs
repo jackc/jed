@@ -551,6 +551,7 @@ impl Database {
             .register(version);
         let mut engine = Engine::from_snapshot((*snap).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
+        engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
         // Seed the engine with the pinned shared-temp snapshot (temp-tables.md §5): the reader sees the
         // shared temp tables committed as of its pinned version, consistent with its file snapshot.
         engine.shared_temp_committed = (*shared_temp).clone();
@@ -779,18 +780,10 @@ impl Session {
     /// gate, publishes, and releases it.
     fn dispatch(&mut self, ast: Statement, params: &[Value]) -> Result<Outcome> {
         if self.access == Access::ReadOnly {
-            if stmt_is_write(&ast) {
-                // A write in a read-only transaction aborts it (PostgreSQL, §6): poison the open
-                // block so every later statement but COMMIT/ROLLBACK is `25P02`. (Autocommit — no
-                // open block — has nothing to poison.)
-                if self.engine.in_transaction() {
-                    self.engine.fail_open_block();
-                }
-                return Err(EngineError::new(
-                    SqlState::ReadOnlySqlTransaction,
-                    "cannot execute a write statement against a read-only snapshot",
-                ));
-            }
+            // Every read-only session sets `engine.read_only`, so the executor itself enforces it
+            // (PostgreSQL hot-standby — api.md §2.1): an autocommit write / an in-block write / an
+            // explicit `BEGIN READ WRITE` all fail `25006`, and an in-block write poisons the block
+            // (`25P02` thereafter, §6). No gate / publish is needed for a read-only session.
             return self.engine.execute_stmt_params(ast, params);
         }
         match &ast {

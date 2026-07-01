@@ -3,7 +3,6 @@
 //! names, and function names of the grammar. Pure candidate logic — the popup state and
 //! key handling live in `app.rs`, the rendering in `draw.rs`.
 
-use jed::tooling::Engine;
 
 /// The grammar's word list (keywords, canonical type names, aggregate functions) —
 /// completed in the case style of the typed prefix (all-uppercase prefix → uppercase).
@@ -106,7 +105,7 @@ pub fn current_word(line: &str, col: usize) -> (usize, String) {
 /// catalog names first (tables, then columns — completed in their canonical spelling),
 /// then grammar words (case-styled after the prefix). An empty prefix matches nothing —
 /// Tab at a non-word position should stay an ordinary key.
-pub fn candidates(db: &Engine, prefix: &str) -> Vec<String> {
+pub fn candidates(db: &jed::Session, prefix: &str) -> Vec<String> {
     if prefix.is_empty() {
         return Vec::new();
     }
@@ -154,16 +153,12 @@ pub fn candidates(db: &Engine, prefix: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::tooling::execute;
 
-    fn db() -> Engine {
-        let mut db = Engine::new();
-        execute(
-            &mut db,
-            "CREATE TABLE Users (id i32 PRIMARY KEY, score i32)",
-        )
+    fn db() -> jed::Session {
+        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        db.execute("CREATE TABLE Users (id i32 PRIMARY KEY, score i32)", &[])
         .unwrap();
-        execute(&mut db, "CREATE TABLE selections (sel i32 PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE selections (sel i32 PRIMARY KEY)", &[]).unwrap();
         db
     }
 

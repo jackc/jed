@@ -197,7 +197,7 @@ fn literal(ty: &ScalarType, field: &Field) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::tooling::{Engine, execute};
+    
 
     fn f(value: &str) -> Field {
         Field {
@@ -229,12 +229,9 @@ mod tests {
         assert!(parse("a,b\"c").is_err());
     }
 
-    fn demo_table() -> Engine {
-        let mut db = Engine::new();
-        execute(
-            &mut db,
-            "CREATE TABLE t (id i32 PRIMARY KEY, name text, score numeric(5,2), ok boolean DEFAULT true)",
-        )
+    fn demo_table() -> jed::Session {
+        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        db.execute("CREATE TABLE t (id i32 PRIMARY KEY, name text, score numeric(5,2), ok boolean DEFAULT true)", &[])
         .unwrap();
         db
     }
@@ -311,8 +308,8 @@ mod tests {
             let table = db.table("t").unwrap();
             import_statement(table, &records).unwrap().unwrap()
         };
-        execute(&mut db, &sql).unwrap();
-        match execute(&mut db, "SELECT count(*) FROM t").unwrap() {
+        db.execute(&sql, &[]).unwrap();
+        match db.execute("SELECT count(*) FROM t", &[]).unwrap() {
             jed::Outcome::Query { rows, .. } => assert_eq!(rows[0][0], jed::Value::Int(2)),
             _ => panic!("expected a query"),
         }

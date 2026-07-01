@@ -8,13 +8,12 @@
 use std::io::{self, Write};
 
 use jed::Value;
-use jed::tooling::Engine;
 use jed::tooling::Table;
 
 /// Write the whole database as SQL. Tables come out in the catalog's standing order
 /// (sorted by lowercased name — api.md §6); rows in primary-key order via `ORDER BY`
 /// (a no-PK table dumps in storage order, which replays into the same rowid order).
-pub fn dump(db: &mut Engine, out: &mut dyn Write) -> io::Result<()> {
+pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "BEGIN;")?;
     let names = db.table_names();
     for name in &names {
@@ -124,16 +123,15 @@ pub fn value_literal(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jed::tooling::execute;
 
-    fn dump_to_string(db: &mut Engine) -> String {
+    fn dump_to_string(db: &mut jed::Session) -> String {
         let mut buf = Vec::new();
         dump(db, &mut buf).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
-    fn rich_db() -> Engine {
-        let mut db = Engine::new();
+    fn rich_db() -> jed::Session {
+        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
         for sql in [
             "CREATE TABLE users (
                 id i32,
@@ -152,7 +150,7 @@ mod tests {
             "CREATE TABLE nopk (v i64)",
             "INSERT INTO nopk VALUES (10), (20)",
         ] {
-            execute(&mut db, sql).unwrap();
+            db.execute(sql, &[]).unwrap();
         }
         db
     }
@@ -189,16 +187,16 @@ mod tests {
     fn dump_replays_to_an_identical_dump() {
         let mut db = rich_db();
         let first = dump_to_string(&mut db);
-        let mut replayed = Engine::new();
+        let mut replayed = jed::Database::new_in_memory().session(jed::SessionOptions::default());
         for stmt in crate::splitter::split(&first).unwrap() {
-            execute(&mut replayed, &stmt.sql).unwrap();
+            replayed.execute(&stmt.sql, &[]).unwrap();
         }
         assert_eq!(dump_to_string(&mut replayed), first);
     }
 
     #[test]
     fn empty_database_dumps_an_empty_transaction() {
-        let mut db = Engine::new();
+        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
         assert_eq!(dump_to_string(&mut db), "BEGIN;\nCOMMIT;\n");
     }
 }
