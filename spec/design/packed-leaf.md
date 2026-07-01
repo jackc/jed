@@ -287,29 +287,45 @@ expanded row vectors.
 
 - **S0 — spec (this doc).** + the lazy-record.md §12 / CLAUDE.md §9 / pager.md §3 / TODO.md updates.
   *No code.*
-- **S1 — the `row_at` / `col_at` accessor seam (no observable change).** Introduce `Node::row_at(i)`
-  and the touched-column `col_at(i, c)` / `row_at_masked(i, mask)` (+ the borrow helper) and route the
-  `.vals[i]` read sites (6 in `format.rs`, 16 in `pmap.rs`, plus Go/TS) through them. Representation
-  stays all-Decoded, so `row_at = vals[i].clone()` — byte-identical. *Mergeable, no behavior change.*
-- **S2 — Packed leaf (the memory win).** `decode_leaf_node` retains `(block, PaxDirs)` and stores **no**
-  row vector; `row_at` / `col_at` reconstruct via `readValueLazy(colTypes[c], dirs.value(c, i))`;
-  mutation descent materializes Packed→Decoded (§7). Per-core unit tests: a faulted-leaf `row_at` equals
-  an eager `read_tree` decode over every type (incl. jsonb/composite/array/range/decimal); a `col_at`
-  touching only column `c` reconstructs no other column; an untouched corrupt inline body does not
-  surface its error, a touched one surfaces `XX001`; resident bytes of a wide-fixed-width scan drop to
-  `≈ page_size`. Built Rust-first.
-- **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** Thread the
-  query's touched-column mask into the scan so `col_at` decodes only referenced columns — the
-  `OP_Column` / `slot_getsomeattrs` model PAX's `colOff` makes O(1) (§6). Cost-neutral (no per-column
-  cost unit, §8). *This replaces the pre-PAX prototype's deferred S3 offset memo, which PAX obsoletes.*
-- **S4 — port S1–S3 to Go**, then **S5 — port S1–S3 to TS.** Mirror the Rust reshape idiomatically (Go
+- **S1 — the `row_at` / `col_at` accessor seam (no observable change).** ✅ **landed (Rust).** Introduce
+  `Node::row_at(i)` and the touched-column `col_at(i, c)` / `row_at_masked(i, mask)` (+ the `with_row`
+  borrow helper and `decoded_rows` for mutation materialization) and route the `.vals[i]` read sites in
+  `pmap.rs` through them (the `format.rs` serialize sites keep direct `vals` reads — `serialize_dirty`
+  only touches dirty/Decoded nodes; `serialize_node` materializes a Packed root leaf via the seam).
+  Representation stays all-Decoded, so `row_at = vals[i].clone()` — byte-identical. *Mergeable, no
+  behavior change.*
+- **S2 — Packed leaf (the memory win).** ✅ **landed (Rust).** `decode_leaf_node` retains `(block,
+  PaxDirs, Arc<col_types>, n)` and stores **no** row vector; `row_at` / `col_at` / `row_at_masked`
+  reconstruct via `read_value_lazy(col_types[c], dirs.value(c, i))`; mutation descent materializes
+  Packed→Decoded through `decoded_rows` (§7). The `col_at` / `row_at_masked` touched-column accessors
+  are built and unit-tested here even though the executor does not yet *drive* masked reconstruction —
+  that is the deferred S3 below. Unit tests: a faulted-leaf reconstruction shares one page block across
+  all its deferred inline values (resident `≈ page_size`, §9), and `col_at`/`row_at_masked` reconstruct
+  only the touched columns byte-identically to the whole row. Built Rust-first.
+- **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** *Deferred
+  follow-on (assessed 2026-07). The accessor (`col_at`/`row_at_masked`) is built (S2); what remains is
+  threading the query's touched-column mask through the pmap + storage scan API so the scan calls
+  `row_at_masked` instead of `row_at`.* **Why deferred:** in jed the expensive-decode dividend the
+  `OP_Column`/`slot_getsomeattrs` model promises is **already captured by lazy-record + S2** — every
+  spillable/structured value (text/bytea/decimal/json/composite/array/range) is *already* reconstructed
+  as a cheap `Unfetched::Inline` block-slice, so S3's remaining compute win is only skipping untouched
+  *fixed-width* decodes (a few bytes → an `i64`) plus a few `Arc` clones — marginal. Against that, S3
+  threads a `&[bool]` mask through the whole scan API of **all three cores** and, if `row_at_masked`
+  left untouched columns `Null`, would trade jed's fail-loud poison guard (§8 — an unresolved
+  `Unfetched` *panics* if read) for a **silent wrong result** on an incomplete mask (mitigable only with
+  a poison sentinel, widening the surface further). The headline win (resident `≈ page_size` for all
+  data) is fully delivered by S1+S2 without it. Revisit if a wide-table scan bench shows the fixed-width
+  decode is a real hot-path cost. Cost-neutral when built (no per-column cost unit, §8). *This also
+  subsumes the pre-PAX prototype's deferred S3 offset memo, which PAX obsoletes (§6).*
+- **S4 — port S1+S2 to Go**, then **S5 — port S1+S2 to TS.** Mirror the Rust reshape idiomatically (Go
   retains `*paxLeaf`; TS retains the parsed directories over a `Uint8Array.subarray`); each lands green
-  independently.
+  independently. The `col_at`/`row_at_masked` accessors are ported too (S3-ready), just not driven.
 
-Deferred follow-ons (none foreclosed): **nested-value structural memo** (skip re-parsing a single
-`jsonb`/array/composite value's *interior* on repeated access — the narrow residual of §6, not the
-column-location memo PAX already provides); **keys as block-slices** (zero-copy keys under Packed);
-**in-memory databases adopting deferral** only if a Memory pager backing lands ([pager.md §6](pager.md)).
+Deferred follow-ons (none foreclosed): **S3 touched-column scan wiring** (above); **nested-value
+structural memo** (skip re-parsing a single `jsonb`/array/composite value's *interior* on repeated
+access — the narrow residual of §6, not the column-location memo PAX already provides); **keys as
+block-slices** (zero-copy keys under Packed); **in-memory databases adopting deferral** only if a Memory
+pager backing lands ([pager.md §6](pager.md)).
 
 ---
 
