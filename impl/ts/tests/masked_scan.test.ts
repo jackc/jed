@@ -9,6 +9,13 @@
 // (masked reconstruction) and a fully-resident in-memory database (whole rows) must agree on both rows
 // and cost. A mask gap surfaces as a divergence here, never a silent wrong answer. Mirrors
 // impl/rust/tests/masked_scan.rs and impl/go/masked_scan_test.go.
+//
+// A bare-column PROJECTION additionally takes the A2/A3 COLUMNAR gather on the paged (file-backed)
+// database (projectColumnar → "columnar" emitter): only the touched columns are gathered into dense
+// lanes — never a full-width row — and a WHERE predicate (A3) is applied over the lanes into a selection
+// vector. So the projection cases below compare a paged-columnar path against the resident row path
+// (rows AND cost). The columnar AGGREGATE gather (Go rides its vectorized aggregate executor) is a
+// deferred TS follow-on — aggregate shapes here take the masked row path.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -50,6 +57,20 @@ function rowsSorted(db: Handle, sql: string): string[] {
 
 function costOf(db: Handle, sql: string): bigint {
   return db.execute(sql).cost;
+}
+
+// streamedSorted drains the LAZY query() cursor (the "columnar" bufferedRows arm), rendering + sorting
+// the rows and returning the final cost — exercises the lazy drive of the columnar projection path, which
+// the eager execute() helpers above do not reach. Fully drained, it must observe the same rows AND total
+// cost as the eager path (streaming.md §6).
+function streamedSorted(db: Database, sql: string): { rows: string[]; cost: bigint } {
+  const cursor = db.query(sql);
+  const rows: string[] = [];
+  for (const r of cursor) rows.push(r.map((v) => render(v)).join("\x1f"));
+  const cost = cursor.cost;
+  cursor.close();
+  rows.sort();
+  return { rows, cost };
 }
 
 test("paged masked scan matches resident across query shapes", () => {
@@ -126,6 +147,85 @@ test("paged masked scan matches resident across query shapes", () => {
         costOf(paged, sql),
         `cost differs (paged-masked vs resident): ${sql}`,
       );
+    }
+    paged.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Seed a MULTI-LEVEL B-tree (enough rows that the tree splits past a single leaf into a root interior
+// node carrying separator entries), so the A2/A3 columnar projection gather's interior-separator path — a
+// B-tree stores records in interior nodes too, gathered alongside the leaves — is exercised against the
+// in-memory row oracle. The single-leaf `w` table above never builds an interior node, so its columnar
+// walk only visits leaves. Both databases use the DEFAULT page size so their tree shapes (hence the
+// page_read node counts) are identical; the depth comes from the row count, not a shrunk page.
+function seedMultilevel(db: Handle): void {
+  db.execute("CREATE TABLE m (id i32 PRIMARY KEY, k i32, a i32, b i16)");
+  const ROWS = 5000;
+  const CHUNK = 1000;
+  for (let start = 0; start < ROWS; start += CHUNK) {
+    const parts: string[] = [];
+    for (let i = start; i < start + CHUNK && i < ROWS; i++) {
+      // k has 8 recurring buckets that span leaves; a stays small; b is NULL on every 7th row.
+      const b = i % 7 === 0 ? "NULL" : `${i % 100}`;
+      parts.push(`(${i},${i % 8},${i % 1000},${b})`);
+    }
+    db.execute(`INSERT INTO m VALUES ${parts.join(",")}`);
+  }
+}
+
+// Bare-column PROJECTIONS over a multi-level tree take the A2/A3 columnar projection path ("columnar"
+// emitter) on the paged (file-backed) database and the row path on the resident one — the interior
+// separators are gathered into the lanes alongside the leaf records, so a mis-indexed gather diverges from
+// the resident row path on rows or cost. FILTERED projections take the A3 columnar path: the predicate is
+// applied over the gathered lanes into a selection vector, and the emit visits only the selected lane
+// positions — so a mis-indexed selection vector (an off-by-one against the interior-node gather) diverges
+// loudly here. Both the EAGER (execute → "columnar") and LAZY (query() → bufferedRows "columnar") drives
+// are checked against the resident row path on rows AND cost.
+test("paged columnar multilevel matches resident", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-masked-multilevel-"));
+  try {
+    const path = join(dir, "multilevel.jed");
+    const filedb = createDatabase(path, {});
+    seedMultilevel(filedb);
+    filedb.close();
+
+    const mem = Database.newInMemory().session();
+    seedMultilevel(mem);
+    const paged = openDatabase(path);
+
+    const queries = [
+      // Bare-column projections — the columnar projection path (interior + leaf a/k/b values gathered).
+      "SELECT a FROM m",
+      "SELECT k, a, b FROM m",
+      "SELECT id FROM m", // the PK column projected
+      "SELECT a FROM m WHERE id = 2500", // PK point → columnar with a point bound
+      "SELECT k, b FROM m WHERE id >= 100 AND id < 400", // PK range → columnar with a range bound
+      // Filtered projections — the A3 columnar path over the multi-level tree (selection vector over the
+      // interior-separator + leaf gather).
+      "SELECT a FROM m WHERE k = 3", // one of 8 recurring buckets, spanning leaves
+      "SELECT id, a FROM m WHERE a >= 200 AND a < 800", // proper subset
+      "SELECT a FROM m WHERE a < 0", // empty selection vector
+      "SELECT k, a FROM m WHERE b IS NULL", // filter on the nullable column
+      "SELECT id FROM m WHERE a > 5 AND k < 4", // AND predicate over two columns
+    ];
+    for (const sql of queries) {
+      // Eager drive (execute → "columnar"): paged-columnar vs resident-row.
+      assert.deepEqual(
+        rowsSorted(mem, sql),
+        rowsSorted(paged, sql),
+        `rows differ (paged-columnar vs resident): ${sql}`,
+      );
+      assert.equal(
+        costOf(mem, sql),
+        costOf(paged, sql),
+        `cost differs (paged-columnar vs resident): ${sql}`,
+      );
+      // Lazy drive (query() → bufferedRows "columnar"), fully drained: same rows AND total cost.
+      const lazy = streamedSorted(paged, sql);
+      assert.deepEqual(rowsSorted(mem, sql), lazy.rows, `lazy-columnar rows differ: ${sql}`);
+      assert.equal(costOf(mem, sql), lazy.cost, `lazy-columnar cost differs: ${sql}`);
     }
     paged.close();
   } finally {

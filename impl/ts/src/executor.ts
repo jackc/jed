@@ -398,7 +398,7 @@ type SelectResult = {
 //     (positioned past the OFFSET) — emission pulls the next sorted row, charges rowProduced, and
 //     evaluates the projection list per windowed row, [0, end). So the output array is never built and a
 //     caller's early exit skips the projection (and rowProduced) of the rows it never pulls (§4/§7).
-type EmitMode = "project" | "identity" | "final" | "sorted";
+type EmitMode = "project" | "identity" | "final" | "sorted" | "columnar";
 
 // Emitter describes how a SelectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
 // SELECT runs its blocking part (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into a buffer, then
@@ -416,6 +416,15 @@ type Emitter = {
   mode: EmitMode;
   // Set only for "sorted": the streaming-sort output pull iterator, positioned past the OFFSET.
   sorted?: SortedRows;
+  // Set only for "columnar" (the projectColumnar fast path, packed-leaf.md §11 Track A2/A3): `cols` are
+  // the pre-gathered dense per-column lanes (indexed by table ordinal) and `projCols` the projection's
+  // column indices into them; emission builds output row j as [cols[projCols[0]][l], …] where l = sel[j]
+  // (the A3 selection vector's survivor — a filtered scan) or j (all rows, sel undefined) — a bare-column
+  // projection with no full-width row, charging rowProduced per windowed row exactly like "project" over
+  // a bare column ref (a zero-cost slot read). Windowed to [start, end).
+  cols?: Value[][];
+  projCols?: number[];
+  sel?: number[];
 };
 
 // finalEmitter wraps an already-projected-and-charged result (the special input-streaming paths) as a
@@ -1827,6 +1836,70 @@ function streamingScanEligible(plan: SelectPlan): boolean {
   );
 }
 
+// vectorizedProjectEligible reports whether plan is a shape projectColumnar specializes: a bare-column
+// projection over a single base table with no join / aggregate / window / DISTINCT / ORDER BY / LIMIT /
+// OFFSET and no index/GIN/GiST bound — a plain `SELECT c0, c3, … FROM t [WHERE …]` whose output is the
+// (optionally filtered) scan-order rows narrowed to a column subset. A residual filter is allowed (A3):
+// projectColumnar applies it over the lanes into a selection vector. Pure plan inspection (charges
+// nothing), so a bail is free and the general materialize path runs with identical results + cost; the
+// store / paging / spillable / column-range gates live in projectColumnar, which declines to that path.
+// LIMIT/OFFSET is excluded deliberately: a LIMIT with no ORDER BY streams with an early exit
+// (streamingScanEligible), which the whole-table gather must not steal.
+function vectorizedProjectEligible(plan: SelectPlan): boolean {
+  if (plan.isAgg || plan.hasWindow || plan.distinct) return false;
+  if (plan.rels.length !== 1 || plan.joins.length !== 0) return false;
+  const rel = plan.rels[0]!;
+  if (
+    rel.srf !== undefined ||
+    rel.cte !== undefined ||
+    rel.derived !== undefined ||
+    rel.lateral === true
+  ) {
+    return false;
+  }
+  // No ORDER BY / LIMIT / OFFSET (those route to a streaming / sort / index path). A residual filter is
+  // fine — projectColumnar vectorizes it (A3).
+  if (plan.order.length !== 0 || plan.limit !== null || plan.offset !== null) return false;
+  // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics.
+  const bk = plan.relBounds[0]?.kind;
+  if (bk === "index" || bk === "gin" || bk === "gist") return false;
+  // Every projection must be a bare column reference: a bare "column" evaluates to row[index] with zero
+  // operator_eval, so gathering it from a dense lane is cost-identical. An expression projection
+  // (`c0 + 1`, a function call) charges operator_eval and needs a row — it keeps the row path.
+  if (plan.projections.length === 0) return false;
+  return plan.projections.every((p) => p.kind === "column");
+}
+
+// filterColumnar evaluates filter over the gathered per-column lanes and returns the surviving row
+// indices (the selection vector) — filter vectorization (packed-leaf.md §11 Track A3). It reuses the
+// scalar evalExpr verbatim over a SINGLE reusable scratch row (the masked columns filled from the lanes
+// at that row index, untouched columns left NULL), so the predicate's operator_eval charges and its 3VL
+// survivor test (keep iff TRUE) are byte-identical to the scalar WHERE loop — and the result is identical
+// too, because the row path also feeds the filter a MASKED row (untouched columns NULL via
+// resolveColumns / rowAtMasked) and the filter references only masked columns (collectTouched includes
+// the filter), so a scratch row filled from the lanes is the same input. The one reusable scratch row is
+// the allocation win: no full-width row per scanned row, only the survivor indices. The caller has
+// verified no touched column spills, so every masked lane is a non-empty Value[] of length rowCount (an
+// untouched column's lane stays empty but is never read).
+function filterColumnar(
+  filter: RExpr,
+  cols: Value[][],
+  mask: boolean[],
+  rowCount: number,
+  env: EvalEnv,
+  meter: Meter,
+): number[] {
+  const sel: number[] = [];
+  const scratch: Row = new Array(mask.length).fill(nullValue());
+  for (let i = 0; i < rowCount; i++) {
+    for (let c = 0; c < mask.length; c++) {
+      if (mask[c]) scratch[c] = cols[c]![i]!;
+    }
+    if (isTrue(evalExpr(filter, scratch, env, meter))) sel.push(i);
+  }
+  return sel;
+}
+
 // streamRows is the lazy pull pipeline behind a streaming cursor (spec/design/streaming.md §3/§4, S3):
 // execStreamingScan's per-row loop as a function* generator (the natural pull form in JS). It scans the
 // snapshot store, resolves touched columns, applies WHERE, and projects — YIELDING ONE output row at a
@@ -1922,6 +1995,22 @@ function* bufferedRows(
       }
     } finally {
       sorted.close();
+    }
+    return;
+  }
+  if (em.mode === "columnar") {
+    // Columnar projection (packed-leaf.md §11 Track A2/A3): gather each row from the dense lanes — a
+    // bare-column projection with no full-width row — charging only rowProduced (a bare column ref is a
+    // zero-cost slot read). A set `sel` (the A3 filter's survivors) maps output row j to lane position
+    // sel[j]. An early exit skips the rowProduced of the rows it never pulls.
+    const cols = em.cols!;
+    const projCols = em.projCols!;
+    const sel = em.sel;
+    for (let j = em.start; j < em.end; j++) {
+      meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
+      meter.charge(COSTS.rowProduced);
+      const l = sel === undefined ? j : sel[j]!;
+      yield projCols.map((c) => cols[c]![l]!);
     }
     return;
   }
@@ -10210,6 +10299,23 @@ export class Engine {
         sorted.close(); // a LIMIT/error may stop the merge early — release any undrained runs
       }
     }
+    if (em.mode === "columnar") {
+      // Columnar projection (packed-leaf.md §11 Track A2/A3): gather each windowed output row from the
+      // dense lanes — a bare-column projection with no full-width row — charging rowProduced per row,
+      // exactly the "project" drive over a bare-column projection (whose eval is a zero-cost slot read). A
+      // set `sel` (the A3 filter's survivors) maps output row j to lane position sel[j].
+      const cols = em.cols!;
+      const projCols = em.projCols!;
+      const sel = em.sel;
+      const out: Value[][] = [];
+      for (let j = em.start; j < em.end; j++) {
+        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+        meter.charge(COSTS.rowProduced);
+        const l = sel === undefined ? j : sel[j]!;
+        out.push(projCols.map((c) => cols[c]![l]!));
+      }
+      return out;
+    }
     const out: Value[][] = [];
     for (let i = em.start; i < em.end; i++) {
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -10218,6 +10324,82 @@ export class Engine {
       else out.push(plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter)));
     }
     return out;
+  }
+
+  // projectColumnar runs the A2/A3 columnar gather for a vectorizedProjectEligible plan (packed-leaf.md
+  // §11 Track A2/A3): it scans only the touched columns of the single base relation into dense per-column
+  // lanes (never a full-width Row), charges the identical scan cost block, applies any WHERE predicate over
+  // the lanes into a selection vector (A3), and returns a "columnar" Emitter that gathers each surviving
+  // output row from the lanes on emission. Returns null (declining to the caller's row path) for an
+  // in-memory store (its Decoded leaves share rows zero-copy, so a lane gather would only add allocation),
+  // a spillable touched column (the columnar feed has no value-resolution step — this also covers a filter
+  // over a spillable column), or a projection column out of range / unmasked (a safety net, never expected
+  // — a projected column is touched, hence masked). Cost-neutral by construction: the same page_read (same
+  // node visits) / value_decompress (0) / storage_row_read (× rowCount) / operator_eval (the filter over
+  // each scanned row) as the row path, then rowProduced per emitted (surviving) row charged by the emitter
+  // drive — exactly the "project" drive over a bare-column projection.
+  private projectColumnar(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Emitter | null {
+    const rel = plan.rels[0]!;
+    const store = this.lkpStore(rel.tableName);
+    // File-backed only: an in-memory store's row path is already zero-copy.
+    if (!store.isFileBacked()) return null;
+    const mask = plan.relMasks[0]!;
+    // No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched value
+    // is left unresolved. The mask includes the filter's columns (collectTouched), so this also declines a
+    // filter over a spillable column to the row path.
+    if (store.anySpillableTouched(mask)) return null;
+    // Each projected column must be a valid, masked table ordinal — else its gathered lane would be empty.
+    const projCols: number[] = [];
+    for (const p of plan.projections) {
+      if (p.kind !== "column") return null;
+      const idx = p.index;
+      if (idx < 0 || idx >= mask.length || !mask[idx]) return null;
+      projCols.push(idx);
+    }
+
+    // Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
+    // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely (0 pages/rows).
+    let cols: Value[][] = mask.map(() => []);
+    let rowCount = 0;
+    let pages = 0;
+    const slabs = 0;
+    let doScan = true;
+    let b = unboundedBound();
+    const relBound = plan.relBounds[0];
+    if (relBound !== null && relBound !== undefined && relBound.kind === "pk") {
+      const bb = buildKeyBound(relBound.pk, params, env.outer);
+      if (bb === null) doScan = false;
+      else b = bb;
+    }
+    if (doScan) {
+      const r = store.columnarScanMasked(b, mask);
+      cols = r.cols;
+      rowCount = r.rowCount;
+      pages = r.pages;
+    }
+    // Charge the scan cost block identically to materializeRel + scanSource: page_read × nodes,
+    // value_decompress × slabs (0 here), storage_row_read × rowCount. On the unmetered lane (the caller
+    // gates) this bulk charge reproduces the per-row accrual (guard is a no-op).
+    meter.charge(
+      COSTS.pageRead * BigInt(pages) +
+        COSTS.valueDecompress * BigInt(slabs) +
+        COSTS.storageRowRead * BigInt(rowCount),
+    );
+
+    // A3: apply the WHERE predicate over the lanes into a selection vector (undefined ⇒ all rows survive).
+    let sel: number[] | undefined;
+    let nEmit = rowCount;
+    if (plan.filter !== null) {
+      sel = filterColumnar(plan.filter, cols, mask, rowCount, env, meter);
+      nEmit = sel.length;
+    }
+
+    return { rows: [], start: 0, end: nEmit, mode: "columnar", cols, projCols, sel };
   }
 
   // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
@@ -10286,6 +10468,19 @@ export class Engine {
     // and the loop short-circuits a top-N.
     if (plan.joinPkOrdered) {
       return finalEmitter(this.execStreamingJoin(plan, env, meter, params, env.outer).rows);
+    }
+
+    // Columnar projection fast path (packed-leaf.md §11 Track A2/A3): a bare-column projection over a
+    // single-table full/PK-bounded scan with no ORDER BY / LIMIT / OFFSET / blocking operator gathers only
+    // its touched columns into dense lanes and emits from them — never the full-width row the materialize
+    // path below allocates per record (the allocation dividend on a wide table). A WHERE predicate (A3) is
+    // applied over the lanes into a selection vector rather than forcing the row path. Gated to the
+    // unmetered lane (so a metered query's per-eval guards stay the row path's) and to file-backed stores
+    // with no spillable touched column (projectColumnar declines otherwise, falling through to the
+    // identical-cost row path). Cost-neutral by construction.
+    if (meter.isUnmetered() && vectorizedProjectEligible(plan)) {
+      const em = this.projectColumnar(plan, env, meter, params);
+      if (em !== null) return em;
     }
 
     // Materialize each relation once, in primary-key order (base tables drain a scanSource — the

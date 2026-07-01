@@ -451,6 +451,48 @@ export class PMap {
     return { keys, vals, nodes };
   }
 
+  // columnarScan walks the bounded scan gathering ONLY the columns mask selects into dense per-column
+  // lanes (cols[c] of length rowCount for each selected c, empty otherwise), never building a full-width
+  // Row — the A2/A3 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation dividend A1 leaves
+  // on the table). It mirrors rangeEntriesCounted's traversal EXACTLY (same node visits ⇒ the same
+  // page_read count; same in-order entry sequence, interior separators included as a B-tree stores
+  // records there too), but reads each admitted row's selected columns via colAt — an O(1) PAX column
+  // span on a Packed leaf, vals[i][c] on a Decoded node — so a wide-table single-column scan never
+  // materializes the untouched columns NOR a full-width row. Each cols[c] is in scan order, so it equals
+  // the column-c stride of the row feed. rowCount is the admitted entry count.
+  columnarScan(
+    b: KeyBound,
+    src: LeafSource | null,
+    mask: boolean[],
+  ): { cols: Value[][]; rowCount: number; nodes: number } {
+    const k = mask.length;
+    const cols: Value[][] = Array.from({ length: k }, () => []);
+    let rowCount = 0;
+    let nodes = 0;
+    const gather = (n: PNode, i: number): void => {
+      for (let c = 0; c < k; c++) {
+        if (mask[c]) cols[c]!.push(colAt(n, i, c));
+      }
+      rowCount++;
+    };
+    const walk = (n: PNode): void => {
+      nodes++;
+      const [ef, el] = entryWindow(b, n);
+      if (isLeaf(n)) {
+        for (let i = ef; i < el; i++) gather(n, i);
+        return;
+      }
+      const [cf, cl] = childWindow(b, n);
+      if (ef < cf) gather(n, ef);
+      for (let i = cf; i <= cl; i++) {
+        walk(resolveChild(n.children[i], src));
+        if (i >= ef && i < el) gather(n, i);
+      }
+    };
+    if (this.root !== null) walk(this.root);
+    return { cols, rowCount, nodes };
+  }
+
   // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
   // charges (cost.md §3). Mirrors rangeEntries' traversal exactly (same childWindow prune, root
   // always visited), counting an OnDisk leaf as one node WITHOUT faulting it (pager.md §5). The

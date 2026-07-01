@@ -74,6 +74,17 @@ export class Meter {
     if (this.lifetime !== undefined) this.lifetime.total += units;
   }
 
+  // isUnmetered reports whether NO cost ceiling is armed — no per-statement maxCost and no session
+  // lifetime budget — so guard() is a no-op. The gate for the Track A2/A3 columnar fast path
+  // (packed-leaf.md §11): it charges the scan block in bulk (not per row with an intervening guard),
+  // which reproduces the row path's exact total only when there is nothing to abort against; a metered
+  // query keeps the row path so its deterministic 54P01/54P02 abort row is unchanged. (Cancellation is
+  // boundary-only in the TS core — an AbortSignal checked at the cursor yield, not a per-guard poll — so
+  // it never moves the deterministic cost abort and is not part of this gate.)
+  isUnmetered(): boolean {
+    return this.limit <= 0n && (this.lifetime === undefined || this.lifetime.limit <= 0n);
+  }
+
   // guard enforces the ceilings: it throws if the per-statement maxCost (54P01) OR the session
   // lifetimeMaxCost (54P02) has been REACHED (>=, CLAUDE.md §13 — "the instant accrued cost reaches
   // it, execution aborts"). When both are over, the one REACHED FIRST wins — the ceiling crossed at

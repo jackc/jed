@@ -293,6 +293,36 @@ export class TableStore {
     return this.rangeScanWithUnitsMasked(unboundedBound(), mask);
   }
 
+  // columnarScanMasked gathers the mask-selected columns of a bounded scan into dense per-column lanes
+  // (cols[c], length rowCount, for each selected c) PLUS the (page_read, value_decompress) cost block —
+  // the A2/A3 columnar feed for the vectorized projection path (packed-leaf.md §11 Track A2/A3). It never
+  // materializes a full-width Row: a wide-table projection touches a few columns instead of allocating
+  // the whole row per record (the B/op win the masked row feed leaves on the table). Invoked ONLY when no
+  // touched column can spill (the caller gates on !anySpillableTouched), so the value_decompress slab
+  // count is always 0 and no unfetched value needs resolving. Cost is byte-identical to
+  // scanWithUnitsMasked(mask) over the same bound: the same node visits (page_read, computed in the same
+  // single descent) and the same slab count (0). The caller charges storageRowRead × rowCount.
+  columnarScanMasked(
+    b: KeyBound,
+    mask: boolean[],
+  ): { cols: Value[][]; rowCount: number; pages: number; slabs: number } {
+    const { cols, rowCount, nodes } = this.rows.columnarScan(b, this.leafSrc(), mask);
+    return { cols, rowCount, pages: nodes, slabs: 0 };
+  }
+
+  // isFileBacked reports whether this store has a demand-paging pool — the gate for the Track A2/A3
+  // columnar gather (packed-leaf.md §11): an in-memory store's Decoded leaves already share their rows
+  // zero-copy on the row path, so a lane gather would only add allocation with no packed-leaf win.
+  isFileBacked(): boolean {
+    return this.paging !== null;
+  }
+
+  // anySpillableTouched reports whether any column mask selects can spill/compress — the gate the
+  // columnar gather declines on (its lanes carry no unfetched values, and the feed has no resolve step).
+  anySpillableTouched(mask: boolean[]): boolean {
+    return anySpillableMasked(this.colTypes, mask);
+  }
+
   // getWithUnits is the fused single-descent point lookup: the row at key (if any) PLUS the
   // (page_read, value_decompress) block its point bound charges — the index fetch path's get +
   // overlapScanUnits in one descent.
@@ -392,11 +422,7 @@ export class TableStore {
   // so this store (a snapshot clone) pins its pages for the cursor's life (transactions.md §5); a leaf
   // faults through the pool only on descent, so a caller that stops early faults no leaves past the
   // stop (the LIMIT short-circuit, cost.md §3).
-  scanIter(
-    b: KeyBound,
-    reverse: boolean,
-    recon: boolean[] | null,
-  ): Generator<[Uint8Array, Row]> {
+  scanIter(b: KeyBound, reverse: boolean, recon: boolean[] | null): Generator<[Uint8Array, Row]> {
     const src = this.leafSrc();
     return reverse
       ? this.rows.scanRangeRevIter(b, src, recon)
