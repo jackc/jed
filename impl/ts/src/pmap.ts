@@ -15,6 +15,23 @@
 // commit (P6.1 part B). Delete rebalances by merge-then-maybe-split (no borrow — format.md "Delete").
 
 import type { Row } from "./storage.ts";
+import type { Value } from "./value.ts";
+
+// PackedLeaf is the block-backed resident form of a demand-paged clean leaf (packed-leaf.md §5): the
+// page block + the parsed PAX directories, reconstructing rows on demand instead of storing a decoded
+// row vector. Its methods close over the format-layer value codec (readValueLazy over a
+// Uint8Array.subarray of the page block, GC-pinned), so pmap calls them through this interface rather
+// than importing the format layer — avoiding a format↔pmap import cycle (like directoryOverhead
+// below). Built by format.ts decodeLeafNode.
+export interface PackedLeaf {
+  readonly n: number;
+  // Reconstruct the whole value row i.
+  row(i: number): Row;
+  // Reconstruct only column c of row i — the touched-column path (S3-ready, not yet driven).
+  col(i: number, c: number): Value;
+  // Reconstruct row i decoding only the columns mask selects; untouched columns are NULL (S3-ready).
+  rowMasked(i: number, mask: boolean[]): Row;
+}
 
 // One B-tree node. `children` is empty for a leaf; otherwise children.length === keys.length+1.
 // keys.length === vals.length === weights.length always. weights[i] is entry i's on-disk record
@@ -22,11 +39,48 @@ import type { Row } from "./storage.ts";
 // the commit that first persists this node. Exported so the serializer (format.ts) can read/build it.
 export type PNode = {
   keys: Uint8Array[];
+  // The decoded value rows — populated for a Decoded node (in-memory / mutated / dirty leaves and
+  // EVERY interior node), empty for a Packed leaf (which reconstructs on demand from `packed`). Read
+  // only through the rowAt / colAt / rowAtMasked / decodedRows seam, never indexed directly, so the
+  // two forms are interchangeable (packed-leaf.md §3/§4).
   vals: Row[];
   weights: number[];
   children: Child[];
+  // The block-backed resident form of a demand-paged clean leaf (packed-leaf.md §5); undefined for a
+  // Decoded node (interior nodes, in-memory/loaded leaves, and any dirty leaf — mutation materializes
+  // Packed→Decoded first, §7). A Packed leaf is always clean (page != 0), so it is never serialized.
+  packed?: PackedLeaf;
   page: number;
 };
+
+// rowAt reconstructs value row i — the value-read seam (packed-leaf.md §4). A Decoded node (always the
+// case for interior nodes) returns the stored row (read-only by convention); a Packed leaf
+// reconstructs it from the retained PAX directories. Throws on a corrupt touched inline body (XX001).
+export function rowAt(n: PNode, i: number): Row {
+  return n.packed ? n.packed.row(i) : n.vals[i]!;
+}
+
+// colAt reconstructs ONLY column c of row i — the touched-column path (packed-leaf.md §4/§6, the
+// OP_Column model). S3-ready: built for the touched-column scan wiring, not yet driven.
+export function colAt(n: PNode, i: number, c: number): Value {
+  return n.packed ? n.packed.col(i, c) : n.vals[i]![c]!;
+}
+
+// rowAtMasked reconstructs row i decoding ONLY the columns mask selects (packed-leaf.md §4/§6). A
+// Decoded node returns the whole stored row; a Packed leaf leaves untouched columns NULL. S3-ready.
+export function rowAtMasked(n: PNode, i: number, mask: boolean[]): Row {
+  return n.packed ? n.packed.rowMasked(i, mask) : n.vals[i]!;
+}
+
+// decodedRows returns every value row — the mutation-descent materialization (packed-leaf.md §7). A
+// Decoded node clones vals; a Packed leaf reconstructs every row so the rebuilt node is Decoded
+// (build / nodeInsert / nodeRemove / mergeAt then run unchanged). Interior nodes are always Decoded.
+export function decodedRows(n: PNode): Row[] {
+  if (!n.packed) return n.vals.slice();
+  const rows: Row[] = new Array(n.packed.n);
+  for (let i = 0; i < n.packed.n; i++) rows[i] = n.packed.row(i);
+  return rows;
+}
 
 // A B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
 // clean leaf need not be resident: an interior node keeps an OnDisk page id for such a child and the
@@ -213,7 +267,7 @@ export class PMap {
     let n = this.root;
     while (n !== null) {
       const { index, found } = search(n, key);
-      if (found) return n.vals[index];
+      if (found) return rowAt(n, index);
       if (isLeaf(n)) return undefined;
       n = resolveChild(n.children[index], src);
     }
@@ -288,7 +342,7 @@ export class PMap {
       if (isLeaf(n)) {
         for (let i = 0; i < n.keys.length; i++) {
           keys.push(n.keys[i]);
-          vals.push(n.vals[i]);
+          vals.push(rowAt(n, i));
         }
         return;
       }
@@ -366,7 +420,7 @@ export class PMap {
       if (isLeaf(n)) {
         for (let i = ef; i < el; i++) {
           keys.push(n.keys[i]);
-          vals.push(n.vals[i]);
+          vals.push(rowAt(n, i));
         }
         return;
       }
@@ -420,7 +474,7 @@ export class PMap {
       const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
         for (let i = ef; i < el; i++) {
-          if (!visit(n.keys[i], n.vals[i])) return false;
+          if (!visit(n.keys[i], rowAt(n, i))) return false;
         }
         return true;
       }
@@ -451,7 +505,7 @@ export class PMap {
       const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
         for (let i = el - 1; i >= ef; i--) {
-          if (!visit(n.keys[i], n.vals[i])) return false;
+          if (!visit(n.keys[i], rowAt(n, i))) return false;
         }
         return true;
       }
@@ -493,7 +547,7 @@ export class PMap {
 function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
   const [ef, el] = entryWindow(b, n);
   if (isLeaf(n)) {
-    for (let i = ef; i < el; i++) yield [n.keys[i], n.vals[i]];
+    for (let i = ef; i < el; i++) yield [n.keys[i], rowAt(n, i)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
@@ -508,7 +562,7 @@ function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Ui
 function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
   const [ef, el] = entryWindow(b, n);
   if (isLeaf(n)) {
-    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], n.vals[i]];
+    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], rowAt(n, i)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
@@ -612,7 +666,7 @@ function nodeInsert(
 ): InsOut {
   const { index, found } = search(n, key);
   if (found) {
-    const vals = n.vals.slice();
+    const vals = decodedRows(n);
     const weights = n.weights.slice();
     ctx.old = vals[index];
     ctx.replaced = true;
@@ -631,7 +685,7 @@ function nodeInsert(
   if (isLeaf(n)) {
     return build(
       insertAt(n.keys, index, key),
-      insertAt(n.vals, index, val),
+      insertAt(decodedRows(n), index, val),
       insertAt(n.weights, index, weight),
       [],
       cap,
@@ -669,7 +723,7 @@ function nodeInsert(
 function maxKV(n: PNode, src: LeafSource | null): { key: Uint8Array; val: Row; weight: number } {
   while (!isLeaf(n)) n = resolveChild(n.children[n.children.length - 1], src);
   const i = n.keys.length - 1;
-  return { key: n.keys[i], val: n.vals[i], weight: n.weights[i] };
+  return { key: n.keys[i], val: rowAt(n, i), weight: n.weights[i] };
 }
 
 type RemOut = { ok: boolean; node: PNode; removed: Row | undefined };
@@ -688,12 +742,13 @@ function nodeRemove(
   const { index, found } = search(n, key);
   if (found) {
     if (isLeaf(n)) {
-      const removed = n.vals[index];
+      const rows = decodedRows(n);
+      const removed = rows[index];
       return {
         ok: true,
         node: {
           keys: removeAt(n.keys, index),
-          vals: removeAt(n.vals, index),
+          vals: removeAt(rows, index),
           weights: removeAt(n.weights, index),
           children: [],
           page: 0,
@@ -760,8 +815,9 @@ function mergeAt(n: PNode, j: number, src: LeafSource | null, cap: number, k: nu
   // still be an OnDisk leaf the delete never touched.
   const left = resolveChild(n.children[j], src);
   const right = resolveChild(n.children[j + 1], src);
+  // Materialize both children (a leaf may be Packed) before merging — the merged node is Decoded.
   const mkeys = [...left.keys, n.keys[j], ...right.keys];
-  const mvals = [...left.vals, n.vals[j], ...right.vals];
+  const mvals = [...decodedRows(left), n.vals[j], ...decodedRows(right)];
   const mweights = [...left.weights, n.weights[j], ...right.weights];
   const mchildren: Child[] = isLeaf(left) ? [] : [...left.children, ...right.children];
 

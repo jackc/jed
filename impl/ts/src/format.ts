@@ -45,9 +45,9 @@ import {
   serializeGistTree,
 } from "./gist.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
-import { onDiskRef, residentRef } from "./pmap.ts";
+import { decodedRows, onDiskRef, residentRef } from "./pmap.ts";
 import { rangeForElement } from "./range.ts";
-import type { Child, PNode } from "./pmap.ts";
+import type { Child, PackedLeaf, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import { TableStore, type Row } from "./storage.ts";
 import {
@@ -1903,7 +1903,11 @@ function serializeNode(
     }
     payload = w.toBytes();
   } else {
-    payload = encodeLeafPax(colTypes, n.keys, n.vals, capacity, take, ovf);
+    // A leaf may be Packed here: a demand-paged reopen faults a single-leaf table's root leaf resident
+    // (readSkeleton), and toImage re-serializes it. Materialize through the seam (decodedRows
+    // reconstructs a Packed leaf, clones a Decoded one). Whole-image serialize is not a hot path
+    // (create's empty image / golden generator / toImage canonical), so the clone is acceptable (§7).
+    payload = encodeLeafPax(colTypes, n.keys, decodedRows(n), capacity, take, ovf);
   }
   if (payload.length > capacity) {
     throw engineError(
@@ -2845,25 +2849,44 @@ export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ColTyp
     throw engineError("data_corrupted", "demand-paged a non-leaf page");
   const n = pg.itemCount;
   const k = colTypes.length;
+  // Packed form (packed-leaf.md §5): retain the page payload (a subarray view of the block — GC keeps
+  // the block alive, the equivalent of Rust's Arc<[u8]>) + the parsed PAX directories, and decode NO
+  // values. parsePaxLeaf validated + parsed the directories with no value decode, so a malformed
+  // directory still surfaces data_corrupted here; a malformed value body surfaces XX001 only when the
+  // column is touched (§8). Keys and weights are derived from the directories alone (§3): the weight is
+  // 2 + key.length + Σ_c valueLen(c, i), exactly what the eager decode summed — so a resident leaf is
+  // ≈ pageSize (§9), never an inflated row vector.
   const dirs = parsePaxLeaf(pg.payload, n, k);
+  const payload = pg.payload;
   const keys: Uint8Array[] = [];
-  const vals: Row[] = [];
   const weights: number[] = [];
   for (let i = 0; i < n; i++) {
-    const key = paxKey(pg.payload, dirs, i).slice(); // copy out of the borrowed page slice
-    const row: Row = new Array(k);
+    const key = paxKey(payload, dirs, i).slice(); // copy out of the borrowed page slice
     let w = 2 + key.length;
-    for (let c = 0; c < k; c++) {
-      const cur = { pos: paxValueOff(dirs, n, c, i) };
-      const before = cur.pos;
-      row[c] = readValueLazy(colTypes[c]!, pg.payload, cur);
-      w += cur.pos - before;
-    }
+    for (let c = 0; c < k; c++) w += dirs.colOff[c]![i + 1]! - dirs.colOff[c]![i]!;
     weights.push(w);
     keys.push(key);
-    vals.push(row);
   }
-  return { keys, vals, weights, children: [], page };
+  // Reconstruct-on-demand seam (closes over the directories + payload; readValueLazy is the SAME codec
+  // the eager fault ran). A spillable body becomes an inline-deferred Unfetched (a block view); a
+  // fixed-width scalar decodes eagerly — byte-identical to the eager value, moved to touch-time (§8).
+  const col = (i: number, c: number): Value =>
+    readValueLazy(colTypes[c]!, payload, { pos: paxValueOff(dirs, n, c, i) });
+  const packed: PackedLeaf = {
+    n,
+    col,
+    row(i: number): Row {
+      const row: Row = new Array(k);
+      for (let c = 0; c < k; c++) row[c] = col(i, c);
+      return row;
+    },
+    rowMasked(i: number, mask: boolean[]): Row {
+      const row: Row = new Array(k);
+      for (let c = 0; c < k; c++) row[c] = mask[c] ? col(i, c) : nullValue();
+      return row;
+    },
+  };
+  return { keys, vals: [], weights, children: [], packed, page };
 }
 
 type Cursor = { pos: number };

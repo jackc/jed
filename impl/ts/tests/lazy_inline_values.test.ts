@@ -25,6 +25,7 @@ import {
   type OverflowPageOut,
   resolveUnfetched,
 } from "../src/format.ts";
+import { colAt, rowAt, rowAtMasked } from "../src/pmap.ts";
 import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
 import {
   arrayValue,
@@ -329,11 +330,20 @@ test("a faulted leaf shares one page block across its deferred values", () => {
   assert.equal(ovf.length, 0, "values must stay inline (no overflow) for the form-(a) case");
   const block = makePage(ps, 2 /* PAGE_LEAF */, rows.length, 0, payload);
 
-  // Fault the leaf: every deferrable present value becomes an inline-deferred unfetched (form (a)).
+  // Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained and NO
+  // value is decoded (the decoded row vector is empty); rows reconstruct on demand, producing the same
+  // inline-deferred unfetched (form (a)) block views the eager fault used to.
   const node = decodeLeafNode(block, 2, colTypes);
+  assert.ok(node.packed !== undefined, "a faulted leaf is Packed (packed-leaf.md §5)");
+  assert.equal(
+    node.vals.length,
+    0,
+    "a Packed leaf holds no decoded row vector (resident ≈ pageSize, §9)",
+  );
 
   let deferred = 0;
-  node.vals.forEach((row, ri) => {
+  rows.forEach((_r, ri) => {
+    const row = rowAt(node, ri);
     row.forEach((v, ci) => {
       if (v.kind !== "unfetched" || v.ref.form !== 0x00) return;
       deferred++;
@@ -364,4 +374,59 @@ test("a faulted leaf shares one page block across its deferred values", () => {
   // 3 rows × 4 deferrable columns (text/bytea/decimal/array) = 12 deferred values; the i32 column
   // stays eager (§6).
   assert.equal(deferred, 12, "every deferrable present value defers (form (a))");
+});
+
+// The touched-column path (packed-leaf.md §4/§6, the PAX dividend): colAt / rowAtMasked reconstruct
+// ONLY the requested columns of a Packed leaf, byte-identically to the whole-row reconstruction,
+// leaving untouched columns unread. Mirrors the Rust packed_leaf_reconstructs_only_touched_columns
+// and the Go equivalent. (colAt/rowAtMasked are S3-ready — built here, not yet driven by the executor.)
+test("a Packed leaf reconstructs only the touched columns", () => {
+  const sc = (s: "i32" | "text" | "i64"): ColType => ({ kind: "scalar", scalar: s });
+  const colTypes: ColType[] = [sc("i32"), sc("text"), sc("i64")];
+  const ps = 8192;
+  const capacity = ps - 16;
+  const rows: Value[][] = [];
+  for (let i = 0; i < 4; i++) {
+    rows.push([intValue(BigInt(i)), textValue(`row-${i}`), intValue(BigInt(i * 1000))]);
+  }
+  let takeSeq = 100;
+  const take = (): number => ++takeSeq;
+  const ovf: OverflowPageOut[] = [];
+  const keys = rows.map((_, i) => {
+    const key = new Uint8Array(4);
+    new DataView(key.buffer).setUint32(0, i, false);
+    return key;
+  });
+  const payload = encodeLeafPax(colTypes, keys, rows, capacity, take, ovf);
+  assert.equal(ovf.length, 0);
+  const block = makePage(ps, PAGE_LEAF, rows.length, 0, payload);
+  const node = decodeLeafNode(block, 2, colTypes);
+
+  // Resolve a (possibly-deferred) value to its comparable eager bytes.
+  const resolve = (v: Value, c: number): Uint8Array => {
+    const got =
+      v.kind === "unfetched"
+        ? resolveUnfetched(colTypes[c]!, v.ref, () => {
+            throw new Error("inline values read no overflow pages");
+          })
+        : v;
+    return encodeValue(colTypes[c]!, got);
+  };
+
+  for (let i = 0; i < rows.length; i++) {
+    const whole = rowAt(node, i);
+    // colAt(c) equals the whole row's column c.
+    for (let c = 0; c < colTypes.length; c++) {
+      assert.deepEqual(
+        resolve(colAt(node, i, c), c),
+        resolve(whole[c]!, c),
+        `row ${i} col ${c}: colAt differs from whole row`,
+      );
+    }
+    // rowAtMasked decodes only the masked columns; the rest stay NULL (unread).
+    const masked = rowAtMasked(node, i, [false, true, false]);
+    assert.equal(masked[0]!.kind, "null", "unmasked column must be NULL (unread)");
+    assert.equal(masked[2]!.kind, "null", "unmasked column must be NULL (unread)");
+    assert.deepEqual(resolve(masked[1]!, 1), resolve(whole[1]!, 1));
+  }
 });
