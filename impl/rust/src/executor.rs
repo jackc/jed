@@ -11826,6 +11826,262 @@ impl Engine {
         }))
     }
 
+    /// Whether `plan` is a shape [`exec_vectorized_agg`](Engine::exec_vectorized_agg) specializes: a
+    /// single-base-table `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` with no `DISTINCT` / `FILTER` / `HAVING` /
+    /// window / `ORDER BY`, over a full or primary-key-bounded scan, that is EITHER whole-table (no
+    /// `GROUP BY`) OR grouped by a single bare integer column. Mostly pure plan inspection — it charges
+    /// nothing, so a bail is free and the general path runs with identical results + cost; the
+    /// single-key case additionally reads the group-key column's static type from the table store (a
+    /// one-time lookup, not per row) to confirm it is a scalar integer (so the int64-keyed bucket is a
+    /// bijection of the value-canonical group key — see [`group_by_int_key`]).
+    fn vectorized_agg_eligible(&self, plan: &SelectPlan) -> bool {
+        if !plan.is_agg {
+            return false;
+        }
+        // One base table, no join.
+        if plan.rels.len() != 1 || !plan.joins.is_empty() {
+            return false;
+        }
+        let rel = &plan.rels[0];
+        if rel.srf.is_some() || rel.cte.is_some() || rel.derived.is_some() || rel.lateral {
+            return false;
+        }
+        // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan
+        // mechanics and residual filter, so it keeps the scalar path.
+        if matches!(
+            plan.rel_bounds[0],
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+        ) {
+            return false;
+        }
+        // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no
+        // materialized expression keys (`GROUP BY a + b`), and no GROUPING() calls.
+        if plan.group_sets.len() != 1
+            || !plan.group_exprs.is_empty()
+            || !plan.grouping_specs.is_empty()
+        {
+            return false;
+        }
+        let gset = &plan.group_sets[0];
+        match gset.key_cols.len() {
+            // Whole-table aggregation: the () grand-total group, no master grouping columns.
+            0 => {
+                if !plan.group_keys.is_empty() {
+                    return false;
+                }
+            }
+            // Single-key GROUP BY: the sole master grouping column is this key, its synthetic slot is
+            // 0, and the key is a bare scalar-INTEGER column of the base table (so the int64 bucket key
+            // is a bijection of the scalar path's value-canonical group key).
+            1 => {
+                if plan.group_keys.len() != 1 || plan.group_keys[0] != gset.key_cols[0] {
+                    return false;
+                }
+                if gset.slot_src.len() != 1 || gset.slot_src[0] != Some(0) {
+                    return false;
+                }
+                let store = self.store(&rel.table_name);
+                let ord = gset.key_cols[0].wrapping_sub(rel.offset);
+                match store.col_types().get(ord) {
+                    Some(ColType::Scalar(s)) if s.is_integer() => {}
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+        // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window
+        // bounds below, so it need not bail.
+        if plan.distinct || plan.having.is_some() || plan.has_window || !plan.order.is_empty() {
+            return false;
+        }
+        if plan.agg_specs.is_empty() {
+            return false;
+        }
+        plan.agg_specs.iter().all(vectorized_spec_eligible)
+    }
+
+    /// Run a [`vectorized_agg_eligible`](Engine::vectorized_agg_eligible) plan and return the already-
+    /// grouped output as an [`Emitter::Buffer`] with [`EmitMode::Project`] under the query's
+    /// LIMIT/OFFSET window — exactly the emitter the scalar aggregate branch returns, so emission +
+    /// cost are identical either way. It reuses the scalar scan ([`materialize_rel`](Engine::materialize_rel))
+    /// + `WHERE` for exact cost + survivor determination, then folds each aggregate over the survivors
+    /// with the shared [`Acc`] (byte-identical acc state, hence finalize). A file-backed store gathers
+    /// only its touched columns columnar ([`agg_columnar`](Engine::agg_columnar) — never a full-width
+    /// row, the allocation dividend); an in-memory store (or a columnar decline) folds over the
+    /// materialized rows. Only runs on the unmetered lane (the caller gates).
+    fn exec_vectorized_agg(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<Emitter> {
+        let gset = &plan.group_sets[0];
+
+        // A2/A3 columnar fast path (packed-leaf.md §11 Track A2/A3): a file-backed aggregate gathers
+        // only its touched columns into dense lanes and folds columnar — never a full-width row. A
+        // WHERE predicate (A3) is applied over the lanes into a selection vector rather than forcing
+        // the row path. Declines (None) to the row path below for an in-memory store or a spillable
+        // touched column. Cost-neutral by construction (agg_columnar charges the identical scan block).
+        let srows = match self.agg_columnar(plan, gset, env, meter)? {
+            Some(srows) => srows,
+            None => {
+                // Row path: scan the single base relation through the same path the eager executor
+                // uses, so the page_read / value_decompress / storage_row_read block is charged
+                // identically (materialize_rel), then apply the residual WHERE per scanned row through
+                // the ordinary evaluator (its operator_eval charges + 3VL survivor test byte-identical
+                // to the scalar WHERE loop).
+                let rows =
+                    self.materialize_rel(plan, 0, env.params, env.outer, env.rng, env.ctes, meter)?;
+                let survivors: Vec<Row> = match &plan.filter {
+                    None => rows,
+                    Some(f) => {
+                        let mut out: Vec<Row> = Vec::new();
+                        for r in rows {
+                            if f.eval(&r, env, meter)?.is_true() {
+                                out.push(r);
+                            }
+                        }
+                        out
+                    }
+                };
+                let src = LaneSrc::Rows(&survivors);
+                if gset.key_cols.is_empty() {
+                    vec![fold_agg_whole(
+                        &plan.agg_specs,
+                        &src,
+                        survivors.len(),
+                        meter,
+                    )?]
+                } else {
+                    group_by_int_key(
+                        &plan.agg_specs,
+                        gset.key_cols[0],
+                        &src,
+                        survivors.len(),
+                        meter,
+                    )?
+                }
+            }
+        };
+
+        // LIMIT/OFFSET window over the synthetic rows, mirroring the scalar branch's window_bounds
+        // (clamped in the i64 domain before indexing). Emit as Buffer{Project} — the drive charges
+        // row_produced + the projection over each windowed synthetic row exactly as for a scalar
+        // aggregate result.
+        let n = srows.len();
+        let start = plan.offset.unwrap_or(0).min(n as i64) as usize;
+        let end = match plan.limit {
+            Some(lim) if lim < (n - start) as i64 => start + lim as usize,
+            _ => n,
+        };
+        Ok(Emitter::Buffer {
+            rows: srows,
+            start,
+            end,
+            mode: EmitMode::Project,
+        })
+    }
+
+    /// Run the A2/A3 columnar gather for a vectorized aggregate (packed-leaf.md §11 Track A2/A3): scan
+    /// only the touched columns of the single base relation into dense per-column lanes (never a
+    /// full-width row), charge the identical scan cost block, apply any `WHERE` predicate over the
+    /// lanes into a selection vector (A3), and fold each aggregate columnar over the survivors —
+    /// returning the finalized synthetic rows (the whole-table grand total or one per group). Returns
+    /// `None` (declining to the caller's row path) when the store is in-memory (its Decoded leaves
+    /// share their rows zero-copy, so a lane gather would only add allocation), when a touched column
+    /// can spill (the columnar feed has no value-resolution step — this also covers a filter over a
+    /// spillable column), or when a needed column ordinal is out of range / unmasked (a safety net,
+    /// never expected for an eligible plan). Cost-neutral by construction: same page_read /
+    /// value_decompress (0) / storage_row_read / operator_eval (the filter) / aggregate_accumulate /
+    /// row_produced as the row path.
+    fn agg_columnar(
+        &self,
+        plan: &SelectPlan,
+        gset: &GroupSetPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        let rel = &plan.rels[0];
+        let store = self.store(&rel.table_name);
+        // File-backed only: an in-memory store's row path is already zero-copy.
+        if !store.is_file_backed() {
+            return Ok(None);
+        }
+        let mask = &plan.rel_masks[0];
+        // No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched
+        // value is left unresolved. An eligible aggregate touches only integer operands + an integer
+        // key (plus the filter's columns); this declines a filter or operand over a spillable column.
+        if crate::format::any_spillable_masked(store.col_types(), mask) {
+            return Ok(None);
+        }
+        // Every column the fold reads (each aggregate operand + the group key) must be a valid, masked
+        // table ordinal — else its gathered lane would be empty. This also declines a (never-expected)
+        // non-zero relation offset.
+        let need = |idx: usize| idx < mask.len() && mask[idx];
+        for spec in &plan.agg_specs {
+            if let Some(RExpr::Column(idx)) = &spec.operand
+                && !need(*idx)
+            {
+                return Ok(None);
+            }
+        }
+        if let Some(&kc) = gset.key_cols.first()
+            && !need(kc)
+        {
+            return Ok(None);
+        }
+
+        // Determine the scan bound exactly as materialize_rel does: a PK-range bound, or the full scan.
+        // An empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely.
+        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); mask.len()];
+        let mut row_count = 0usize;
+        let mut pages = 0usize;
+        let slabs = 0usize;
+        let mut do_scan = true;
+        let mut b = KeyBound::unbounded();
+        if let Some(ScanBound::Pk(bp)) = &plan.rel_bounds[0] {
+            match build_key_bound(bp, env.params, env.outer) {
+                Some(bb) => b = bb,
+                None => do_scan = false,
+            }
+        }
+        if do_scan {
+            let (c, rc, p, _s) = store.columnar_scan_masked(&b, mask)?;
+            cols = c;
+            row_count = rc;
+            pages = p;
+        }
+        // Charge the scan cost block identically to materialize_rel + ScanSource: page_read × nodes,
+        // value_decompress × slabs (0 here), storage_row_read × row_count. On the unmetered lane the
+        // caller gates, so this bulk charge reproduces the per-row accrual (guard is a no-op).
+        meter.charge(
+            COSTS.page_read * pages as i64
+                + COSTS.value_decompress * slabs as i64
+                + COSTS.storage_row_read * row_count as i64,
+        );
+
+        // A3: apply the WHERE predicate over the lanes into a selection vector (None ⇒ all survive).
+        let (sel, nsurv) = match &plan.filter {
+            Some(filter) => {
+                let s = filter_columnar(filter, &cols, mask, row_count, env, meter)?;
+                let n = s.len();
+                (Some(s), n)
+            }
+            None => (None, row_count),
+        };
+
+        let src = LaneSrc::Cols {
+            cols: &cols,
+            sel: sel.as_deref(),
+        };
+        let srows = if gset.key_cols.is_empty() {
+            vec![fold_agg_whole(&plan.agg_specs, &src, nsurv, meter)?]
+        } else {
+            group_by_int_key(&plan.agg_specs, gset.key_cols[0], &src, nsurv, meter)?
+        };
+        Ok(Some(srows))
+    }
+
     /// Run a [`SelectPlan`]'s **blocking part** and return an [`Emitter`] describing how to emit its
     /// output rows (spec/design/streaming.md §4, S4): the scan / join / `WHERE` / window / `ORDER BY`
     /// / `GROUP BY` / `DISTINCT` all run here (charging their cost into `meter`), producing either an
@@ -11852,6 +12108,19 @@ impl Engine {
             rng: stmt_rng,
             ctes,
         };
+
+        // Vectorized single-table aggregate (batch, the PAX/vectorization program's executor track): a
+        // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either
+        // whole-table or grouped by a single integer column, folds columnar / int64-bucketed instead
+        // of the row-at-a-time group machinery below. Gated to the unmetered lane so a metered query's
+        // deterministic abort row stays the scalar path's; results and accrued cost are byte-identical
+        // either way (the conformance corpus proves both). Ineligible / metered ⇒ this is skipped and
+        // the general aggregate branch runs unchanged. (An aggregate plan skips every streaming
+        // fast-path below — they all require `!is_agg` — so this front-position placement is only for
+        // clarity, mirroring the Go core's ordering.)
+        if meter.is_unmetered() && self.vectorized_agg_eligible(plan) {
+            return self.exec_vectorized_agg(plan, &env, meter);
+        }
 
         // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
         // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with
@@ -19906,6 +20175,164 @@ fn filter_columnar(
         }
     }
     Ok(sel)
+}
+
+/// Whether one aggregate is a specialized numeric kernel the vectorized aggregate path folds: a plain
+/// (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) `COUNT(*)` / `COUNT(col)` /
+/// `SUM(i16|i32)` / `SUM`|`AVG(f32|f64)` / `MIN(col)` / `MAX(col)` whose operand (where it has one) is
+/// a bare column reference. `SUM(i64|decimal)` and `AVG(decimal)` are deferred (their fold charges
+/// running-sum-dependent decimal_work); `MIN`/`MAX` fold ANY type through `value_cmp`. Reusing the
+/// shared [`Acc::fold`] keeps the fold byte-identical to the scalar path (the scalar grouped path folds
+/// through the same `Acc::fold`), so only the group/scan machinery differs.
+fn vectorized_spec_eligible(spec: &AggSpec) -> bool {
+    if spec.distinct || spec.filter.is_some() || spec.osa.is_some() || spec.hypo.is_some() {
+        return false;
+    }
+    match spec.plan {
+        AggPlan::CountStar => spec.operand.is_none(),
+        AggPlan::Count
+        | AggPlan::SumInt
+        | AggPlan::SumFloat(_)
+        | AggPlan::AvgFloat(_)
+        | AggPlan::Min
+        | AggPlan::Max => matches!(spec.operand, Some(RExpr::Column(_))),
+        _ => false,
+    }
+}
+
+/// The bare-column ordinal an eligible aggregate reads (its operand `RExpr::Column(idx)`), or `None`
+/// for `COUNT(*)` (which folds no value). Eligibility ([`vectorized_spec_eligible`]) guarantees the
+/// operand is either absent or a bare column, so this is total over an eligible spec.
+fn operand_col(spec: &AggSpec) -> Option<usize> {
+    match &spec.operand {
+        Some(RExpr::Column(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// The survivor value source for the vectorized fold — the ONE seam that differs between the row path
+/// (a `Vec<Row>` of full rows) and the columnar path (dense per-column lanes + an optional A3 selection
+/// vector). `at(j, col)` reads survivor `j`'s value in column `col`, so the fold kernels below are
+/// written once and run either way. Cost is unaffected: both feed the same values in scan order.
+enum LaneSrc<'a> {
+    /// The row path: survivors are full rows; `at(j, col)` is `rows[j][col]`.
+    Rows(&'a [Row]),
+    /// The columnar path: `cols[col]` is a dense lane; `sel` (A3) maps survivor `j` to lane index
+    /// `sel[j]` (or `j` itself when there is no filter).
+    Cols {
+        cols: &'a [Vec<Value>],
+        sel: Option<&'a [i32]>,
+    },
+}
+
+impl LaneSrc<'_> {
+    #[inline]
+    fn at(&self, j: usize, col: usize) -> &Value {
+        match self {
+            LaneSrc::Rows(rows) => &rows[j][col],
+            LaneSrc::Cols { cols, sel } => {
+                let i = match sel {
+                    Some(s) => s[j] as usize,
+                    None => j,
+                };
+                &cols[col][i]
+            }
+        }
+    }
+}
+
+/// Fold one WHOLE-TABLE grand-total group over `nsurv` survivors from `src`, returning the finalized
+/// aggregate results `[agg_0, …]` (the synthetic row for a `()` group — no key columns). It builds one
+/// [`Acc`] per spec and folds each survivor's operand value through the shared [`Acc::fold`] (identical
+/// acc state, hence [`Acc::finalize`], to the scalar path), charging `aggregate_accumulate` once per
+/// (survivor × spec) in bulk — the identical total to the scalar loop (which charges per row × spec),
+/// and cost-safe because the caller gates to the unmetered lane (no per-row guard to preserve).
+fn fold_agg_whole(
+    specs: &[AggSpec],
+    src: &LaneSrc,
+    nsurv: usize,
+    meter: &mut Meter,
+) -> Result<Vec<Value>> {
+    let mut accs: Vec<Acc> = specs.iter().map(Acc::from_spec).collect();
+    for (si, spec) in specs.iter().enumerate() {
+        meter.charge(COSTS.aggregate_accumulate * nsurv as i64);
+        let oc = operand_col(spec);
+        for j in 0..nsurv {
+            let v = match oc {
+                Some(c) => src.at(j, c).clone(),
+                None => Value::Null, // COUNT(*) folds no value
+            };
+            accs[si].fold(v, meter)?;
+        }
+    }
+    accs.into_iter().map(Acc::finalize).collect()
+}
+
+/// Bucket `nsurv` survivors from `src` by their single INTEGER group-key column and fold each aggregate
+/// per group, returning the finalized synthetic rows `[key, agg_0, …]` in scan-order-of-first-
+/// appearance. The bucket is a `HashMap<i64, usize>` over the raw key (a bijection of the scalar path's
+/// value-canonical group key for a fixed-width integer column) plus one sentinel group for NULL keys
+/// (the value-canonical key groups all NULLs together). The fold reuses [`Acc::fold`] (byte-identical
+/// acc state); `aggregate_accumulate` is charged once per (survivor × spec) in bulk — the identical
+/// total to the scalar loop. The bucketing itself is unmetered (cost.md §3), so the `i64` map is a free
+/// internal choice. The caller has verified the key lane (and each operand lane) is populated.
+fn group_by_int_key(
+    specs: &[AggSpec],
+    key_col: usize,
+    src: &LaneSrc,
+    nsurv: usize,
+    meter: &mut Meter,
+) -> Result<Vec<Vec<Value>>> {
+    let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
+    let mut index: HashMap<i64, usize> = HashMap::new();
+    let mut null_gi: Option<usize> = None;
+
+    meter.charge(COSTS.aggregate_accumulate * nsurv as i64 * specs.len() as i64);
+    for j in 0..nsurv {
+        let kv = src.at(j, key_col);
+        let gi = match kv {
+            Value::Int(k) => match index.get(k) {
+                Some(&g) => g,
+                None => {
+                    let g = groups.len();
+                    index.insert(*k, g);
+                    groups.push((kv.clone(), specs.iter().map(Acc::from_spec).collect()));
+                    g
+                }
+            },
+            // A NULL integer key (the only other case for an integer column) buckets into one sentinel
+            // group, exactly as the scalar path groups all NULLs together.
+            _ => match null_gi {
+                Some(g) => g,
+                None => {
+                    let g = groups.len();
+                    null_gi = Some(g);
+                    groups.push((Value::Null, specs.iter().map(Acc::from_spec).collect()));
+                    g
+                }
+            },
+        };
+        let accs = &mut groups[gi].1;
+        for (si, spec) in specs.iter().enumerate() {
+            let v = match operand_col(spec) {
+                Some(c) => src.at(j, c).clone(),
+                None => Value::Null,
+            };
+            accs[si].fold(v, meter)?;
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(key, accs)| {
+            let mut srow: Vec<Value> = Vec::with_capacity(1 + accs.len());
+            srow.push(key);
+            for a in accs {
+                srow.push(a.finalize()?);
+            }
+            Ok(srow)
+        })
+        .collect()
 }
 
 /// The lazy pull pipeline behind a streaming [`Rows`](crate::Rows) cursor (spec/design/streaming.md

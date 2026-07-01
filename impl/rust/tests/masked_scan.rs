@@ -14,8 +14,12 @@
 //! database (`project_columnar` → `Emitter::Columnar`): only the touched columns are gathered into dense
 //! lanes — never a full-width row — and a `WHERE` predicate (A3) is applied over the lanes into a
 //! selection vector. So the projection cases below compare a paged-columnar path against the resident
-//! row path (rows AND cost). The columnar **aggregate** gather (Go rides its vectorized aggregate
-//! executor) is a deferred Rust follow-on — aggregate shapes here take the masked row path.
+//! row path (rows AND cost). A single-base-table SUM/COUNT/MIN/MAX/AVG (whole-table or grouped by a
+//! single integer column) likewise takes the vectorized aggregate executor: on the paged database it
+//! gathers its touched columns columnar (`agg_columnar` → `fold_agg_whole`/`group_by_int_key`), on the
+//! in-memory database it folds int64-bucketed over the materialized rows — both byte-identical to the
+//! scalar group machinery on rows AND cost (the conformance corpus proves the in-memory row path; this
+//! battery proves the paged columnar path against the resident oracle).
 
 use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
 
@@ -139,7 +143,8 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
         "SELECT c0, c6 FROM w WHERE c7 = 5 OR c7 = 8", // OR predicate, multi-column projection
         "SELECT c0 FROM w WHERE c0 > 1000",         // zero survivors
         "SELECT id FROM w WHERE id > 0",            // every row survives
-        // Aggregates touching one operand column (row path both ways; masked reconstruction still applies).
+        // Aggregates touching one operand column — the vectorized aggregate executor: columnar gather on
+        // the paged database, int64-bucketed row fold on the resident one; both must agree on rows + cost.
         "SELECT count(*) FROM w",
         "SELECT sum(c2) FROM w",
         "SELECT sum(c1) FROM w",
@@ -198,7 +203,7 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
 /// the page_read node counts) are identical; the depth comes from the row count, not a shrunk page.
 fn seed_multilevel(db: &mut Session) {
     db.execute(
-        "CREATE TABLE m (id i32 PRIMARY KEY, k i32, a i32, b i16)",
+        "CREATE TABLE m (id i32 PRIMARY KEY, k i32, a i32, b i16, f f64)",
         &[],
     )
     .unwrap();
@@ -212,13 +217,22 @@ fn seed_multilevel(db: &mut Session) {
             if i > start {
                 sql.push(',');
             }
-            // k has 8 recurring buckets that span leaves; a stays small; b is NULL on every 7th row.
+            // k has 8 recurring buckets that span leaves; a stays small; b is NULL on every 7th row; f is
+            // an exactly-representable f64 (`.5` fraction) so the float SUM/AVG columnar fold matches the
+            // resident fold on the last ULP (both run the shared canonical-order FloatFold — float.md §7).
             let b = if i % 7 == 0 {
                 "NULL".to_string()
             } else {
                 format!("{}", i % 100)
             };
-            sql.push_str(&format!("({},{},{},{})", i, i % 8, i % 1000, b));
+            sql.push_str(&format!(
+                "({},{},{},{},{}.5)",
+                i,
+                i % 8,
+                i % 1000,
+                b,
+                i % 50
+            ));
             i += 1;
         }
         db.execute(&sql, &[]).unwrap();
@@ -269,6 +283,24 @@ fn paged_columnar_multilevel_matches_resident() {
         "SELECT a FROM m WHERE a < 0", // empty selection vector
         "SELECT k, a FROM m WHERE b IS NULL", // filter on the nullable column
         "SELECT id FROM m WHERE a > 5 AND k < 4", // AND predicate over two columns
+        // Whole-table aggregates — the columnar aggregate gather (fold_agg_whole over the interior +
+        // leaf lanes), a WHERE (A3) applied over the lanes into a selection vector before the fold.
+        "SELECT count(*) FROM m",
+        "SELECT sum(a) FROM m",
+        "SELECT sum(a), count(b), count(*) FROM m", // multi-spec, nullable operand
+        "SELECT min(a), max(a) FROM m",
+        "SELECT sum(f), avg(f) FROM m", // float SUM/AVG lane gather + canonical-order FloatFold
+        "SELECT sum(a) FROM m WHERE k = 3", // filtered whole-table agg
+        "SELECT count(*) FROM m WHERE a >= 500", // filtered COUNT(*)
+        "SELECT sum(a) FROM m WHERE a < 0", // empty selection vector → NULL sum
+        // Single-integer-key GROUP BY — the columnar grouped fold (group_by_int_key over the lanes), the
+        // key + operand columns gathered, buckets in scan-order-of-first-appearance.
+        "SELECT k, count(*) FROM m GROUP BY k",
+        "SELECT k, sum(a) FROM m GROUP BY k",
+        "SELECT k, sum(a), count(b) FROM m GROUP BY k", // grouped multi-spec, nullable operand
+        "SELECT k, avg(f) FROM m GROUP BY k",           // grouped float AVG
+        "SELECT k, sum(a) FROM m WHERE a >= 200 GROUP BY k", // filtered grouped
+        "SELECT k, count(*) FROM m GROUP BY k LIMIT 3", // grouped + LIMIT window over synthetic rows
     ];
     for sql in queries {
         // Eager drive (execute → Emitter::Columnar): paged-columnar vs resident-row.
