@@ -1285,7 +1285,13 @@ fn serialize_node(
         i
     };
     let (page_type, payload) = if node.children.is_empty() {
-        let rows: Vec<&[Value]> = node.vals.iter().map(Vec::as_slice).collect();
+        // A leaf may be **Packed** here: a demand-paged reopen faults a single-leaf table's root leaf
+        // resident (read_skeleton), and `to_image` re-serializes it. Materialize through the accessor
+        // seam (`decoded_rows` reconstructs a Packed leaf, clones a Decoded one) so encode can borrow
+        // the rows. Whole-image serialize is not a hot path (create's empty image / golden generator /
+        // `to_image` canonical), so the Decoded-case clone is acceptable (packed-leaf.md §7).
+        let leaf_rows = node.decoded_rows()?;
+        let rows: Vec<&[Value]> = leaf_rows.iter().map(Vec::as_slice).collect();
         (
             PAGE_LEAF,
             encode_leaf_pax(col_types, &node.keys, &rows, cap, &mut take, &mut ovf),
@@ -1842,7 +1848,7 @@ impl Engine {
                 snap.store_mut(&name).attach_paging(paging.clone());
                 // The store resolved each column's `ColType` from the (types-first) catalog at
                 // `put_table` (spec/design/composite.md §3).
-                let col_types = snap.store(&name).col_types().to_vec();
+                let col_types = Arc::new(snap.store(&name).col_types().to_vec());
                 if root_data_page != 0 {
                     let (root, len) =
                         read_skeleton(&paging, root_data_page, &col_types, &mut reached)?;
@@ -1893,7 +1899,10 @@ impl Engine {
                             }
                         } else {
                             istore.attach_paging(paging.clone());
-                            let (root, len) = read_skeleton(&paging, iroot, &[], &mut reached)?;
+                            // An index tree has zero value columns (empty-payload records); its
+                            // Packed leaves reconstruct empty rows from a shared empty col-type list.
+                            let (root, len) =
+                                read_skeleton(&paging, iroot, &Arc::new(Vec::new()), &mut reached)?;
                             istore.set_tree(Some(root), len);
                         }
                     } else {
@@ -1980,7 +1989,7 @@ fn collect_leaf_overflow(
 fn read_skeleton(
     paging: &SharedPaging,
     root_page: u32,
-    col_types: &[ColType],
+    col_types: &Arc<Vec<ColType>>,
     reached: &mut HashSet<u32>,
 ) -> Result<(Arc<Node>, usize)> {
     let (child, len) = read_skeleton_node(paging, root_page, col_types, reached)?;
@@ -2842,6 +2851,76 @@ impl PaxDirs {
     fn value_off(&self, n: usize, c: usize, i: usize) -> usize {
         self.col_start[c] as usize + 4 * (n + 1) + self.col_off[c][i] as usize
     }
+
+    /// The on-disk byte length of value `(record i, column c)` — the value directory's prefix-sum
+    /// span. Equals what `read_value_lazy` advances the cursor by, so a record's weight is derivable
+    /// from the directories alone, with **no value decode** (packed-leaf.md §3/§5).
+    fn value_len(&self, c: usize, i: usize) -> usize {
+        (self.col_off[c][i + 1] - self.col_off[c][i]) as usize
+    }
+}
+
+/// A faulted leaf's **packed** resident form (packed-leaf.md §5): the whole page block plus the PAX
+/// directories `parse_pax_leaf` already produces, retained instead of discarded. Holds **no** decoded
+/// row vector — [`row`](PackedLeaf::row) / [`value`](PackedLeaf::value) reconstruct on demand via the
+/// same [`read_value_lazy`] the eager fault ran, over the O(1) column spans PAX writes on disk. The
+/// `block` `Arc` is the buffer-pool pin (§7): a reconstructed `Unfetched::Inline` value clones it, so
+/// its bytes outlive pool eviction. Resident cost is `≈ page_size` (§9) — the page block, the thin
+/// directory `u32` arrays, and a shared `Arc` to the table's column types.
+pub(crate) struct PackedLeaf {
+    /// The whole page image (one `page_size` buffer). Shared across every reconstructed inline value.
+    block: Arc<[u8]>,
+    /// Offset of the payload within `block` — always `PAGE_HEADER` (the value directories index the
+    /// payload; the shared block is needed whole so `Unfetched::Inline` offsets are block-relative).
+    payload_off: usize,
+    /// The parsed PAX directories (key / column / per-column value directories).
+    dirs: PaxDirs,
+    /// The table's resolved value column types — shared (`Arc`) across all this table's leaves, so a
+    /// resident leaf adds no per-leaf column-type copy (§9).
+    col_types: Arc<Vec<ColType>>,
+    /// Record count (`= keys.len()`), for the value-directory index arithmetic.
+    n: usize,
+}
+
+impl PackedLeaf {
+    /// Reconstruct value `(record i, column c)` — the O(1) PAX column span decoded by the **same**
+    /// [`read_value_lazy`] the eager fault ran (packed-leaf.md §4). A spillable body becomes an
+    /// `Unfetched::Inline` block-slice (zero-copy, pinned by `block`); a fixed-width scalar decodes
+    /// eagerly. Byte-identical to the value the eager decode produced — moved from fault-time to
+    /// touch-time (§8). A corrupt *touched* inline body surfaces `XX001` here.
+    pub(crate) fn value(&self, c: usize, i: usize) -> Result<Value> {
+        let payload = &self.block[self.payload_off..];
+        let mut pos = self.dirs.value_off(self.n, c, i);
+        read_value_lazy(&self.col_types[c], &self.block, payload, &mut pos)
+    }
+
+    /// Reconstruct the whole value row `i` (every column). The `row_at` whole-record path.
+    pub(crate) fn row(&self, i: usize) -> Result<Vec<Value>> {
+        (0..self.col_types.len())
+            .map(|c| self.value(c, i))
+            .collect()
+    }
+
+    /// Reconstruct only the columns `mask` selects (the touched-column path, packed-leaf.md §4/§6 —
+    /// the `OP_Column`/`slot_getsomeattrs` model). An untouched column is left `Value::Null` and its
+    /// bytes are never read, so a corrupt untouched body does not surface (§8). `mask.len()` must be
+    /// the column count; a shorter mask leaves the tail untouched.
+    pub(crate) fn row_masked(&self, i: usize, mask: &[bool]) -> Result<Vec<Value>> {
+        let k = self.col_types.len();
+        let mut row = vec![Value::Null; k];
+        for c in 0..k {
+            if mask.get(c).copied().unwrap_or(false) {
+                row[c] = self.value(c, i)?;
+            }
+        }
+        Ok(row)
+    }
+
+    /// The shared page block — the buffer-pool pin (§7). Exposed for the fault-path invariant tests.
+    #[cfg(test)]
+    pub(crate) fn block(&self) -> &Arc<[u8]> {
+        &self.block
+    }
 }
 
 /// Parse a PAX leaf payload's three directories (spec/fileformat/format.md v23 "Leaf node"). Column
@@ -2898,40 +2977,45 @@ fn parse_pax_leaf(payload: &[u8], n: usize, k: usize) -> Result<PaxDirs> {
 /// (large-values.md §14): an external/compressed value becomes an [`Unfetched`] reference — no
 /// chain read, no decompression — resolved later only for the columns a query touches. Each
 /// weight is the bytes the record occupies on the page (exactly the writer's `record_size`).
-pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ColType]) -> Result<Node> {
+pub(crate) fn decode_leaf_node(
+    block: &[u8],
+    page: u32,
+    col_types: Arc<Vec<ColType>>,
+) -> Result<Node> {
     let parsed = parse_page(block)?;
     if parsed.page_type != PAGE_LEAF {
         return Err(corrupt("demand-paged a non-leaf page"));
     }
     let n = parsed.item_count as usize;
     let k = col_types.len();
-    let (mut keys, mut vals, mut weights) = (
-        Vec::with_capacity(n),
-        Vec::with_capacity(n),
-        Vec::with_capacity(n),
-    );
-    // Form (a) (lazy-record.md §5a, L3): wrap the page block in one `Arc<[u8]>` and share it across
-    // every deferred inline value in the leaf — each holds an `Arc` clone + `(off, len)`, so the
-    // leaf's bytes are held **once** (resident leaf memory `≈ page_size`, §9) rather than re-expanded
-    // into a decoded `Value` tree. A leaf with no deferred value drops this `Arc` at function exit.
+    // Packed form (packed-leaf.md §5): retain the page block + the PAX directories, decode **no**
+    // values. `parse_pax_leaf` validates + parses the directories in one pass with no value decode,
+    // so a malformed *directory* still surfaces `data_corrupted` here; a malformed value *body*
+    // surfaces `XX001` only when the column is touched (§8). Keys and weights are derivable from the
+    // directories alone (§3) — the weight is `2 + key_len + Σ_c value_len(c, i)`, exactly what the
+    // eager decode summed — so the resident leaf is `≈ page_size` (§9), never an inflated row vector.
     let shared: Arc<[u8]> = Arc::from(block);
     let payload = &shared[PAGE_HEADER..];
     let dirs = parse_pax_leaf(payload, n, k)?;
+    let mut keys = Vec::with_capacity(n);
+    let mut weights = Vec::with_capacity(n);
     for i in 0..n {
         let key = dirs.key(payload, i)?.to_vec();
-        let mut row = Vec::with_capacity(k);
         let mut w = 2 + key.len();
-        for (c, ty) in col_types.iter().enumerate() {
-            let mut pos = dirs.value_off(n, c, i);
-            let before = pos;
-            row.push(read_value_lazy(ty, &shared, payload, &mut pos)?);
-            w += pos - before;
+        for c in 0..k {
+            w += dirs.value_len(c, i);
         }
         weights.push(w as u32);
         keys.push(key);
-        vals.push(row);
     }
-    Ok(Node::leaf_loaded(keys, vals, weights, page))
+    let packed = PackedLeaf {
+        block: Arc::clone(&shared),
+        payload_off: PAGE_HEADER,
+        dirs,
+        col_types,
+        n,
+    };
+    Ok(Node::leaf_loaded_packed(keys, weights, packed, page))
 }
 
 /// Decode one catalog table entry: the `Table` (its pk list, checks, and index definitions
@@ -4745,17 +4829,29 @@ mod tests {
         );
         let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
 
-        // Fault the leaf: every deferrable present value becomes Unfetched::Inline (form (a)).
-        let node = decode_leaf_node(&block, 2, &col_types).expect("decode leaf");
+        // Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained
+        // and NO value is decoded, so the decoded row vector is empty and rows are reconstructed on
+        // demand by `row_at`. Reconstruction produces the same Unfetched::Inline block-slices the
+        // eager fault used to, so the form-(a) sharing property still holds.
+        let node = decode_leaf_node(&block, 2, Arc::new(col_types.clone())).expect("decode leaf");
+        assert!(node.packed.is_some(), "a faulted leaf is Packed");
+        assert!(
+            node.vals.is_empty(),
+            "a Packed leaf holds no decoded row vector (resident bytes ≈ page_size, §9)"
+        );
 
-        let mut blocks: Vec<&std::sync::Arc<[u8]>> = Vec::new();
-        for row in &node.vals {
-            for v in row {
-                if let Value::Unfetched(Unfetched::Inline { block, .. }) = v {
-                    blocks.push(block);
-                }
-            }
-        }
+        // Reconstruct every row on demand and gather the deferred inline values' backing blocks.
+        let recon: Vec<Vec<Value>> = (0..rows.len())
+            .map(|i| node.row_at(i).expect("reconstruct row"))
+            .collect();
+        let blocks: Vec<&std::sync::Arc<[u8]>> = recon
+            .iter()
+            .flatten()
+            .filter_map(|v| match v {
+                Value::Unfetched(Unfetched::Inline { block, .. }) => Some(block),
+                _ => None,
+            })
+            .collect();
         // 3 rows × 4 deferrable columns (text/bytea/decimal/array) = 12 deferred values; the i32
         // column stays eager (§6).
         assert_eq!(
@@ -4763,30 +4859,105 @@ mod tests {
             12,
             "every deferrable present value defers (form (a))"
         );
-        // They all reference ONE allocation — zero-copy block sharing (§5a): N deferred values,
-        // one page block. This is the structural statement of "resident leaf bytes ≈ page_size".
-        for b in &blocks[1..] {
+        // They all reference ONE allocation — the Packed leaf's own page block (§5a/§7): a
+        // reconstructed inline value clones the leaf's block `Arc`, so eviction cannot free it.
+        let leaf_block = node.packed.as_ref().unwrap().block();
+        for b in &blocks {
             assert!(
-                std::sync::Arc::ptr_eq(blocks[0], b),
-                "all deferred values in a leaf share one page block (form (a))"
+                std::sync::Arc::ptr_eq(leaf_block, b),
+                "all reconstructed inline values share the Packed leaf's one page block"
             );
         }
         // The shared block is the whole page, not a per-value copy.
-        assert_eq!(blocks[0].len(), ps, "the shared block is the whole page");
+        assert_eq!(leaf_block.len(), ps, "the shared block is the whole page");
 
-        // The deferred values still resolve to exactly the originals (form (a) is decode-neutral).
+        // The reconstructed values still resolve to exactly the originals (reconstruction is
+        // decode-neutral — the byte-identical result the eager path produced, moved to touch-time §8).
         let fetch = |_p: u32| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
-        for (row_idx, row) in node.vals.iter().enumerate() {
+        for (row_idx, row) in recon.iter().enumerate() {
             for (col_idx, v) in row.iter().enumerate() {
-                if let Value::Unfetched(u) = v {
-                    let resolved =
-                        resolve_unfetched(&col_types[col_idx], u, &fetch).expect("resolve");
-                    assert_eq!(
-                        resolved, rows[row_idx][col_idx],
-                        "form (a) resolves to the eager value"
-                    );
-                }
+                let resolved = match v {
+                    Value::Unfetched(u) => {
+                        resolve_unfetched(&col_types[col_idx], u, &fetch).expect("resolve")
+                    }
+                    other => other.clone(),
+                };
+                assert_eq!(
+                    resolved, rows[row_idx][col_idx],
+                    "reconstruction resolves to the eager value"
+                );
             }
+        }
+    }
+
+    /// The touched-column path (packed-leaf.md §4/§6, the PAX dividend): `col_at`/`row_at_masked`
+    /// reconstruct **only** the requested columns of a Packed leaf, byte-identically to the whole-row
+    /// reconstruction, and leave the untouched columns unread. Proven by comparing each masked/single
+    /// reconstruction against the full `row_at`.
+    #[test]
+    fn packed_leaf_reconstructs_only_touched_columns() {
+        let col_types = vec![
+            ColType::Scalar(ScalarType::Int32),
+            ColType::Scalar(ScalarType::Text),
+            ColType::Scalar(ScalarType::Int64),
+        ];
+        let ps = 8192usize;
+        let cap = ps - PAGE_HEADER;
+        let rows: Vec<Vec<Value>> = (0..4i64)
+            .map(|i| {
+                vec![
+                    Value::Int(i),
+                    Value::Text(format!("row-{i}")),
+                    Value::Int(i * 1000),
+                ]
+            })
+            .collect();
+        let mut take_seq = 100u32;
+        let mut take = || {
+            let v = take_seq;
+            take_seq += 1;
+            v
+        };
+        let mut ovf = Vec::new();
+        let keys: Vec<Vec<u8>> = (0..rows.len())
+            .map(|i| (i as u32).to_be_bytes().to_vec())
+            .collect();
+        let row_refs: Vec<&[Value]> = rows.iter().map(Vec::as_slice).collect();
+        let payload = encode_leaf_pax(&col_types, &keys, &row_refs, cap, &mut take, &mut ovf);
+        assert!(ovf.is_empty());
+        let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
+        let node = decode_leaf_node(&block, 2, Arc::new(col_types.clone())).expect("decode leaf");
+
+        let fetch = |_p: u32| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
+        let resolve = |v: &Value, c: usize| -> Value {
+            match v {
+                Value::Unfetched(u) => {
+                    resolve_unfetched(&col_types[c], u, &fetch).expect("resolve")
+                }
+                other => other.clone(),
+            }
+        };
+        for i in 0..rows.len() {
+            let whole = node.row_at(i).expect("row_at");
+            // `col_at(c)` equals the whole row's column `c`.
+            for c in 0..col_types.len() {
+                let one = node.col_at(i, c).expect("col_at");
+                assert_eq!(resolve(&one, c), resolve(&whole[c], c));
+            }
+            // `row_at_masked` decodes only the masked columns; the rest stay Null (unread).
+            let mask = [false, true, false];
+            let masked = node.row_at_masked(i, &mask).expect("row_at_masked");
+            assert_eq!(
+                masked[0],
+                Value::Null,
+                "unmasked column is not reconstructed"
+            );
+            assert_eq!(
+                masked[2],
+                Value::Null,
+                "unmasked column is not reconstructed"
+            );
+            assert_eq!(resolve(&masked[1], 1), resolve(&whole[1], 1));
         }
     }
 }

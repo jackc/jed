@@ -30,7 +30,7 @@ pub type Row = Vec<Value>;
 /// mutation of `rows`). A store with no `paging` (in-memory) builds none and never faults.
 struct PagedSource<'a> {
     paging: &'a SharedPaging,
-    col_types: &'a [ColType],
+    col_types: &'a Arc<Vec<ColType>>,
 }
 
 impl LeafSource for PagedSource<'_> {
@@ -78,7 +78,7 @@ impl StoreScan {
 /// to be mutated alongside it.
 fn make_src<'a>(
     paging: &'a Option<Arc<SharedPaging>>,
-    col_types: &'a [ColType],
+    col_types: &'a Arc<Vec<ColType>>,
 ) -> Option<PagedSource<'a>> {
     paging.as_ref().map(|p| PagedSource {
         paging: p,

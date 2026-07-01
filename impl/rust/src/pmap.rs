@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use crate::error::Result;
+use crate::format::PackedLeaf;
 use crate::storage::Row;
+use crate::value::Value;
 
 /// A B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
 /// clean leaf need not be resident: an interior node keeps `OnDisk(page_id)` for such a child and
@@ -85,9 +87,20 @@ fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node
 /// `Arc`; a mutation clones only the root→leaf path and shares every untouched subtree.
 pub(crate) struct Node {
     pub(crate) keys: Vec<Vec<u8>>,
+    /// The decoded value rows, one per key — populated for a **Decoded** node (in-memory / mutated /
+    /// dirty leaves, and *every* interior node), **empty** for a **Packed** leaf (which reconstructs
+    /// on demand from `packed`). Read only through the [`row_at`](Node::row_at) /
+    /// [`col_at`](Node::col_at) / [`with_row`](Node::with_row) / [`decoded_rows`](Node::decoded_rows)
+    /// seam, never indexed directly, so the two forms are interchangeable (packed-leaf.md §3/§4).
     pub(crate) vals: Vec<Row>,
     pub(crate) weights: Vec<u32>,
     pub(crate) children: Vec<Child>,
+    /// The **Packed** (block-backed) resident form of a demand-paged clean leaf (packed-leaf.md §5):
+    /// the page block + the PAX directories, from which `vals` are reconstructed on demand. `None` for
+    /// a Decoded node — every interior node, an in-memory/`from_image` leaf, and any dirty (mutated)
+    /// leaf (mutation materializes Packed→Decoded first, §7). A Packed leaf is always clean (`page` ≠
+    /// `0`), so it is never serialized.
+    pub(crate) packed: Option<PackedLeaf>,
     /// On-disk page index, or `0` when dirty (never persisted / changed since). Set once by the
     /// incremental commit that first persists this node (format.rs `serialize_dirty`, P6.1 part B);
     /// page 0 is a meta slot, never a node, so it doubles as the dirty sentinel. A clean node lets an
@@ -108,6 +121,7 @@ impl Node {
             vals,
             weights,
             children,
+            packed: None,
             page: AtomicU32::new(0),
         })
     }
@@ -127,24 +141,28 @@ impl Node {
             vals,
             weights,
             children,
+            packed: None,
             page: AtomicU32::new(page),
         })
     }
 
-    /// A **leaf** node value reconstructed from disk at `page` for the demand-paging fault path
-    /// (format.rs `decode_leaf_node`). Returns the bare `Node` — the buffer pool wraps it in an `Arc`
-    /// (paging.rs). A leaf has no children.
-    pub(crate) fn leaf_loaded(
+    /// A **Packed** leaf reconstructed from disk at `page` for the demand-paging fault path
+    /// (format.rs `decode_leaf_node`, packed-leaf.md §5). Holds `keys` + `weights` (both derivable
+    /// from the PAX directories with no value decode, §3) and the `packed` block; `vals` is **empty**
+    /// and rows are reconstructed on demand through the accessor seam. Returns the bare `Node` — the
+    /// buffer pool wraps it in an `Arc` (paging.rs). A leaf has no children.
+    pub(crate) fn leaf_loaded_packed(
         keys: Vec<Vec<u8>>,
-        vals: Vec<Row>,
         weights: Vec<u32>,
+        packed: PackedLeaf,
         page: u32,
     ) -> Node {
         Node {
             keys,
-            vals,
+            vals: Vec::new(),
             weights,
             children: Vec::new(),
+            packed: Some(packed),
             page: AtomicU32::new(page),
         }
     }
@@ -174,20 +192,45 @@ impl Node {
 
     /// Reconstruct value row `i` as an owned [`Row`] — the value-read seam (packed-leaf.md §4).
     /// A **Decoded** node (always the case for interior nodes) clones `vals[i]`; a **Packed** leaf
-    /// (S2) reconstructs the row from the retained PAX directories on demand. Fallible so the Packed
+    /// reconstructs the whole row from the retained PAX directories on demand. Fallible so the Packed
     /// reconstruction can surface a corrupt *touched* inline body (`XX001`, packed-leaf.md §8); the
-    /// Decoded path never errors. This is `S1`: all nodes are Decoded, so `row_at == vals[i].clone()`
-    /// — byte-identical to the direct index it replaces.
+    /// Decoded path never errors.
     pub(crate) fn row_at(&self, i: usize) -> Result<Row> {
-        Ok(self.vals[i].clone())
+        match &self.packed {
+            None => Ok(self.vals[i].clone()),
+            Some(p) => p.row(i),
+        }
+    }
+
+    /// Reconstruct **only** column `c` of row `i` — the touched-column path (packed-leaf.md §4/§6,
+    /// the `OP_Column`/`slot_getsomeattrs` model PAX's `colOff` makes O(1)). A **Decoded** node clones
+    /// `vals[i][c]`; a **Packed** leaf decodes the single column span and reads no other column.
+    pub(crate) fn col_at(&self, i: usize, c: usize) -> Result<Value> {
+        match &self.packed {
+            None => Ok(self.vals[i][c].clone()),
+            Some(p) => p.value(c, i),
+        }
+    }
+
+    /// Reconstruct row `i` decoding **only** the columns `mask` selects (packed-leaf.md §4/§6). A
+    /// **Decoded** node returns the whole `vals[i]` (already decoded — masking buys nothing); a
+    /// **Packed** leaf leaves untouched columns `Null` and never reads their bytes.
+    pub(crate) fn row_at_masked(&self, i: usize, mask: &[bool]) -> Result<Row> {
+        match &self.packed {
+            None => Ok(self.vals[i].clone()),
+            Some(p) => p.row_masked(i, mask),
+        }
     }
 
     /// Borrow value row `i` for the duration of `f`, avoiding an owned clone on the Decoded hot path
     /// (the scan/visit callbacks that only need a `&Row`). A **Decoded** node lends `&vals[i]`
-    /// directly; a **Packed** leaf (S2) reconstructs into a temporary and lends that (the
+    /// directly; a **Packed** leaf reconstructs into a temporary and lends that (the
     /// "materialize-then-lend" borrow helper, packed-leaf.md §4).
     fn with_row<R>(&self, i: usize, f: impl FnOnce(&Row) -> Result<R>) -> Result<R> {
-        f(&self.vals[i])
+        match &self.packed {
+            None => f(&self.vals[i]),
+            Some(p) => f(&p.row(i)?),
+        }
     }
 
     /// Every value row, owned — the mutation-descent materialization (packed-leaf.md §7). A
@@ -195,7 +238,10 @@ impl Node {
     /// is Decoded (`build`/`node_insert`/`node_remove`/`merge_at` then run unchanged). Interior
     /// nodes are always Decoded, so this is a plain clone for them.
     pub(crate) fn decoded_rows(&self) -> Result<Vec<Row>> {
-        Ok(self.vals.clone())
+        match &self.packed {
+            None => Ok(self.vals.clone()),
+            Some(p) => (0..self.keys.len()).map(|i| p.row(i)).collect(),
+        }
     }
 }
 
@@ -1229,7 +1275,11 @@ mod tests {
     fn check_invariants(pm: &PMap) {
         fn walk(node: &Node, is_root: bool, cap: usize) {
             assert!(!node.keys.is_empty() || is_root, "non-root node is empty");
-            assert_eq!(node.keys.len(), node.vals.len());
+            // A Decoded node's `vals` parallels `keys`; a Packed leaf holds no row vector (§3). These
+            // in-memory tests build only Decoded nodes, so `packed` is always `None` here.
+            if node.packed.is_none() {
+                assert_eq!(node.keys.len(), node.vals.len());
+            }
             assert_eq!(node.keys.len(), node.weights.len());
             if !node.is_leaf() {
                 assert_eq!(
