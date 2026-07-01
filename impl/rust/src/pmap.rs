@@ -171,6 +171,32 @@ impl Node {
     fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         self.keys.binary_search_by(|k| k.as_slice().cmp(key))
     }
+
+    /// Reconstruct value row `i` as an owned [`Row`] — the value-read seam (packed-leaf.md §4).
+    /// A **Decoded** node (always the case for interior nodes) clones `vals[i]`; a **Packed** leaf
+    /// (S2) reconstructs the row from the retained PAX directories on demand. Fallible so the Packed
+    /// reconstruction can surface a corrupt *touched* inline body (`XX001`, packed-leaf.md §8); the
+    /// Decoded path never errors. This is `S1`: all nodes are Decoded, so `row_at == vals[i].clone()`
+    /// — byte-identical to the direct index it replaces.
+    pub(crate) fn row_at(&self, i: usize) -> Result<Row> {
+        Ok(self.vals[i].clone())
+    }
+
+    /// Borrow value row `i` for the duration of `f`, avoiding an owned clone on the Decoded hot path
+    /// (the scan/visit callbacks that only need a `&Row`). A **Decoded** node lends `&vals[i]`
+    /// directly; a **Packed** leaf (S2) reconstructs into a temporary and lends that (the
+    /// "materialize-then-lend" borrow helper, packed-leaf.md §4).
+    fn with_row<R>(&self, i: usize, f: impl FnOnce(&Row) -> Result<R>) -> Result<R> {
+        f(&self.vals[i])
+    }
+
+    /// Every value row, owned — the mutation-descent materialization (packed-leaf.md §7). A
+    /// **Decoded** node clones `vals`; a **Packed** leaf reconstructs every row so the rebuilt node
+    /// is Decoded (`build`/`node_insert`/`node_remove`/`merge_at` then run unchanged). Interior
+    /// nodes are always Decoded, so this is a plain clone for them.
+    pub(crate) fn decoded_rows(&self) -> Result<Vec<Row>> {
+        Ok(self.vals.clone())
+    }
 }
 
 /// The result of inserting into a subtree: either the rebuilt subtree, or a node that overflowed
@@ -295,7 +321,7 @@ impl PMap {
         };
         loop {
             match cur.search(key) {
-                Ok(i) => return Ok(Some(cur.vals[i].clone())),
+                Ok(i) => return Ok(Some(cur.row_at(i)?)),
                 Err(i) => {
                     if cur.is_leaf() {
                         return Ok(None);
@@ -649,7 +675,7 @@ impl RangeCursor {
                     };
                     if frame.is_leaf {
                         // A leaf's positions are its in-bound key indices [ef, el) directly.
-                        step = Step::Emit(frame.node.keys[p].clone(), frame.node.vals[p].clone());
+                        step = Step::Emit(frame.node.keys[p].clone(), frame.node.row_at(p)?);
                         break;
                     }
                     if p & 1 == 0 {
@@ -661,8 +687,7 @@ impl RangeCursor {
                     } else {
                         let j = p / 2;
                         if frame.ef <= j && j < frame.el {
-                            step =
-                                Step::Emit(frame.node.keys[j].clone(), frame.node.vals[j].clone());
+                            step = Step::Emit(frame.node.keys[j].clone(), frame.node.row_at(j)?);
                             break;
                         }
                     }
@@ -786,7 +811,7 @@ fn node_insert(
 ) -> Result<Ins> {
     match node.search(&key) {
         Ok(i) => {
-            let mut vals = node.vals.clone();
+            let mut vals = node.decoded_rows()?;
             *old = Some(std::mem::replace(&mut vals[i], val));
             let mut weights = node.weights.clone();
             weights[i] = weight;
@@ -803,7 +828,7 @@ fn node_insert(
         Err(i) => {
             if node.is_leaf() {
                 let mut keys = node.keys.clone();
-                let mut vals = node.vals.clone();
+                let mut vals = node.decoded_rows()?;
                 let mut weights = node.weights.clone();
                 keys.insert(i, key);
                 vals.insert(i, val);
@@ -828,7 +853,7 @@ fn node_insert(
                         children[i] = Child::Resident(c);
                         Ok(Ins::Whole(Node::new(
                             node.keys.clone(),
-                            node.vals.clone(),
+                            node.decoded_rows()?,
                             node.weights.clone(),
                             children,
                         )))
@@ -841,7 +866,7 @@ fn node_insert(
                         right,
                     } => {
                         let mut keys = node.keys.clone();
-                        let mut vals = node.vals.clone();
+                        let mut vals = node.decoded_rows()?;
                         let mut weights = node.weights.clone();
                         let mut children = node.children.clone();
                         keys.insert(i, mk);
@@ -881,7 +906,7 @@ fn max_kv(node: &Arc<Node>, src: Option<&dyn LeafSource>) -> Result<(Vec<u8>, Ro
     }
     Ok((
         n.keys.last().unwrap().clone(),
-        n.vals.last().unwrap().clone(),
+        n.row_at(n.keys.len() - 1)?,
         *n.weights.last().unwrap(),
     ))
 }
@@ -901,20 +926,20 @@ fn node_remove(
         Ok(i) => {
             if node.is_leaf() {
                 let mut keys = node.keys.clone();
-                let mut vals = node.vals.clone();
+                let mut vals = node.decoded_rows()?;
                 let mut weights = node.weights.clone();
                 keys.remove(i);
                 let removed = vals.remove(i);
                 weights.remove(i);
                 Ok((Node::new(keys, vals, weights, Vec::new()), Some(removed)))
             } else {
-                let removed = node.vals[i].clone();
+                let removed = node.row_at(i)?;
                 // Fault the left subtree once; both the predecessor lookup and its deletion descend it.
                 let left_child = child(node, i, src)?;
                 let (pk, pv, pw) = max_kv(&left_child, src)?;
                 let (new_child, _) = node_remove(&left_child, &pk, src, cap, k)?;
                 let mut keys = node.keys.clone();
-                let mut vals = node.vals.clone();
+                let mut vals = node.decoded_rows()?;
                 let mut weights = node.weights.clone();
                 let mut children = node.children.clone();
                 keys[i] = pk;
@@ -938,7 +963,7 @@ fn node_remove(
                 children[i] = Child::Resident(new_child);
                 let rebuilt = Node::new(
                     node.keys.clone(),
-                    node.vals.clone(),
+                    node.decoded_rows()?,
                     node.weights.clone(),
                     children,
                 );
@@ -988,19 +1013,19 @@ fn merge_at(
     let right = child(node, j + 1, src)?;
 
     let mut mkeys = left.keys.clone();
-    let mut mvals = left.vals.clone();
+    let mut mvals = left.decoded_rows()?;
     let mut mweights = left.weights.clone();
     mkeys.push(node.keys[j].clone());
-    mvals.push(node.vals[j].clone());
+    mvals.push(node.row_at(j)?);
     mweights.push(node.weights[j]);
     mkeys.extend(right.keys.iter().cloned());
-    mvals.extend(right.vals.iter().cloned());
+    mvals.extend(right.decoded_rows()?);
     mweights.extend(right.weights.iter().copied());
     let mut mchildren = left.children.clone();
     mchildren.extend(right.children.iter().cloned());
 
     let mut keys = node.keys.clone();
-    let mut vals = node.vals.clone();
+    let mut vals = node.decoded_rows()?;
     let mut weights = node.weights.clone();
     let mut children = node.children.clone();
 
@@ -1038,14 +1063,14 @@ fn merge_at(
 fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Row)>) -> Result<()> {
     if node.is_leaf() {
         for i in 0..node.keys.len() {
-            out.push((node.keys[i].clone(), node.vals[i].clone()));
+            out.push((node.keys[i].clone(), node.row_at(i)?));
         }
         return Ok(());
     }
     for i in 0..node.keys.len() {
         let c = child(node, i, src)?;
         collect(&c, src, out)?;
-        out.push((node.keys[i].clone(), node.vals[i].clone()));
+        out.push((node.keys[i].clone(), node.row_at(i)?));
     }
     let last = child(node, node.keys.len(), src)?;
     collect(&last, src, out)?;
@@ -1071,19 +1096,19 @@ fn collect_range(
     let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
         for i in ef..el {
-            out.push((node.keys[i].clone(), node.vals[i].clone()));
+            out.push((node.keys[i].clone(), node.row_at(i)?));
         }
         return Ok(());
     }
     let (cf, cl) = b.child_window(node);
     if ef < cf {
-        out.push((node.keys[ef].clone(), node.vals[ef].clone()));
+        out.push((node.keys[ef].clone(), node.row_at(ef)?));
     }
     for i in cf..=cl {
         let ch = child(node, i, src)?;
         collect_range(&ch, b, src, out, nodes)?;
         if i >= ef && i < el {
-            out.push((node.keys[i].clone(), node.vals[i].clone()));
+            out.push((node.keys[i].clone(), node.row_at(i)?));
         }
     }
     Ok(())
@@ -1101,14 +1126,14 @@ fn walk_range_visit(
     let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
         for i in ef..el {
-            if !visit(&node.keys[i], &node.vals[i])? {
+            if !node.with_row(i, |row| visit(&node.keys[i], row))? {
                 return Ok(false);
             }
         }
         return Ok(true);
     }
     let (cf, cl) = b.child_window(node);
-    if ef < cf && !visit(&node.keys[ef], &node.vals[ef])? {
+    if ef < cf && !node.with_row(ef, |row| visit(&node.keys[ef], row))? {
         return Ok(false);
     }
     for i in cf..=cl {
@@ -1116,7 +1141,7 @@ fn walk_range_visit(
         if !walk_range_visit(&ch, b, src, visit)? {
             return Ok(false);
         }
-        if i >= ef && i < el && !visit(&node.keys[i], &node.vals[i])? {
+        if i >= ef && i < el && !node.with_row(i, |row| visit(&node.keys[i], row))? {
             return Ok(false);
         }
     }
@@ -1139,7 +1164,7 @@ fn walk_range_visit_rev(
     let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
         for i in (ef..el).rev() {
-            if !visit(&node.keys[i], &node.vals[i])? {
+            if !node.with_row(i, |row| visit(&node.keys[i], row))? {
                 return Ok(false);
             }
         }
@@ -1147,7 +1172,7 @@ fn walk_range_visit_rev(
     }
     let (cf, cl) = b.child_window(node);
     for i in (cf..=cl).rev() {
-        if i >= ef && i < el && !visit(&node.keys[i], &node.vals[i])? {
+        if i >= ef && i < el && !node.with_row(i, |row| visit(&node.keys[i], row))? {
             return Ok(false);
         }
         let ch = child(node, i, src)?;
@@ -1155,7 +1180,7 @@ fn walk_range_visit_rev(
             return Ok(false);
         }
     }
-    if ef < cf && !visit(&node.keys[ef], &node.vals[ef])? {
+    if ef < cf && !node.with_row(ef, |row| visit(&node.keys[ef], row))? {
         return Ok(false);
     }
     Ok(true)
