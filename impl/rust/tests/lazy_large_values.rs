@@ -50,11 +50,15 @@ fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<jed::Value>> {
 /// filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 /// inline-compressed (a 600-char run), id 4 plain inline.
 fn seed(db: &mut Session) {
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
+        .unwrap();
     let plain = filler_text(600);
     let extc = format!("{}{}", filler_text(200), "y".repeat(200));
     let inlc = "x".repeat(600);
-    db.execute(&format!("INSERT INTO t VALUES (1, '{plain}'), (2, '{extc}'), (3, '{inlc}'), (4, 'tiny')"), &[])
+    db.execute(
+        &format!("INSERT INTO t VALUES (1, '{plain}'), (2, '{extc}'), (3, '{inlc}'), (4, 'tiny')"),
+        &[],
+    )
     .unwrap();
 }
 
@@ -112,14 +116,17 @@ fn chains_are_read_only_when_touched() {
                 page_size: PAGE_SIZE,
             },
         )
-        .unwrap().session(SessionOptions::default());
+        .unwrap()
+        .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
     corrupt_overflow_payloads(&path);
 
     // Open walks live chains by headers only — corrupt payloads are invisible.
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
 
     // Untouching queries never read a chain or decompress a block.
     let ids = query_rows(&mut db, "SELECT id FROM t");
@@ -130,7 +137,8 @@ fn chains_are_read_only_when_touched() {
     // Touching the spilled column reads the chain: the corruption surfaces as XX001 —
     // non-UTF-8 for the external-plain text, a malformed LZ4 block for external-compressed.
     for id in [1, 2] {
-        let err = db.execute(&format!("SELECT body FROM t WHERE id = {id}"), &[])
+        let err = db
+            .execute(&format!("SELECT body FROM t WHERE id = {id}"), &[])
             .expect_err("a corrupted chain must fail when touched");
         assert_eq!(err.code(), "XX001", "id {id}");
     }
@@ -157,11 +165,14 @@ fn lazy_values_round_trip_exactly() {
                 page_size: PAGE_SIZE,
             },
         )
-        .unwrap().session(SessionOptions::default());
+        .unwrap()
+        .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     let rows = query_rows(&mut db, "SELECT body FROM t");
     let got: Vec<String> = rows.iter().map(|r| r[0].render()).collect();
     assert_eq!(
@@ -193,15 +204,21 @@ fn update_of_other_columns_preserves_spilled_values() {
                 page_size: PAGE_SIZE,
             },
         )
-        .unwrap().session(SessionOptions::default());
+        .unwrap()
+        .session(SessionOptions::default());
         db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
-        .unwrap();
-        db.execute(&format!("INSERT INTO t VALUES (1, '{big}', 10), (2, 'small', 20)"), &[])
+            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t VALUES (1, '{big}', 10), (2, 'small', 20)"),
+            &[],
+        )
         .unwrap();
         drop(db);
     }
     {
-        let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut db = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's
         // rewrite resolves nothing, row 1 resolves at commit.
         db.execute("UPDATE t SET n = 99 WHERE id = 2", &[]).unwrap();
@@ -209,7 +226,9 @@ fn update_of_other_columns_preserves_spilled_values() {
         db.execute("UPDATE t SET n = 11 WHERE id = 1", &[]).unwrap();
         drop(db);
     }
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     let rows = query_rows(&mut db, "SELECT body, n FROM t");
     assert_eq!(rows[0][0].render(), big);
     assert_eq!(rows[0][1].render(), "11");
@@ -226,7 +245,8 @@ fn update_of_other_columns_preserves_spilled_values() {
 fn paged_and_resident_costs_match() {
     let path = tmp("jed_lazy_cost.jed");
     let _ = std::fs::remove_file(&path);
-    let mut mem = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut mem =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     seed(&mut mem);
     {
         let mut db = Database::create(
@@ -235,11 +255,14 @@ fn paged_and_resident_costs_match() {
                 page_size: PAGE_SIZE,
             },
         )
-        .unwrap().session(SessionOptions::default());
+        .unwrap()
+        .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
-    let mut paged = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut paged = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     for sql in [
         "SELECT * FROM t",
         "SELECT id FROM t",

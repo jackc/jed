@@ -17,7 +17,8 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
@@ -33,7 +34,9 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 fn split_shape_db(name: &str, shuffled: bool) -> Session {
     let path = tmp(name);
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)");
     for i in 0..121 {
         let pk = if shuffled { (i * 37) % 121 } else { i };

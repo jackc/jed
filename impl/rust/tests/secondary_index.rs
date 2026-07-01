@@ -14,7 +14,8 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
@@ -188,7 +189,9 @@ fn round_trips_through_the_on_disk_image() {
     run(&mut db, "CREATE INDEX t_v_idx ON t (v)");
     run(&mut db, "INSERT INTO t VALUES (100, NULL, 0)");
     let img = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&img).unwrap().session(SessionOptions::default());
+    let mut loaded = Database::from_image(&img)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(loaded.to_image(8192, 1).unwrap(), img, "byte-stable reload");
     let t = loaded.table("t").unwrap();
     assert_eq!(t.indexes.len(), 1);
@@ -228,7 +231,9 @@ fn index_ddl_is_transactional() {
 fn file_backed_paged_reopen_uses_the_index() {
     let path = tmp("secondary_index_paged.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
@@ -240,7 +245,9 @@ fn file_backed_paged_reopen_uses_the_index() {
     let in_memory_cost = cost(&mut db, "SELECT id FROM t WHERE v = 3");
     drop(db);
 
-    let mut reopened = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut reopened = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     // The paged open reads the index tree as a skeleton; the logical cost is unchanged.
     assert_eq!(
         cost(&mut reopened, "SELECT id FROM t WHERE v = 3"),
@@ -254,7 +261,9 @@ fn file_backed_paged_reopen_uses_the_index() {
     run(&mut reopened, "UPDATE t SET v = 3 WHERE id = 4");
     run(&mut reopened, "DELETE FROM t WHERE id = 13");
     drop(reopened);
-    let mut again = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut again = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         ids(&mut again, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
         vec![3, 4, 8, 18]

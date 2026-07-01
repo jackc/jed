@@ -11,7 +11,8 @@ use jed::{Database, Session, SessionOptions};
 fn db_with(sql: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
@@ -116,9 +117,11 @@ fn ddl_errors_match_postgres_and_narrowings() {
     // The list order is the KEY order — it may differ from declaration order (the original
     // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
     // keys by (b, a), so the stored scan order is b-major.
-    db.execute("CREATE TABLE t (a i32, b i32, PRIMARY KEY (b, a))", &[]).unwrap();
+    db.execute("CREATE TABLE t (a i32, b i32, PRIMARY KEY (b, a))", &[])
+        .unwrap();
     assert_eq!(db.table("t").unwrap().pk_indices(), vec![1, 0]);
-    db.execute("INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)", &[])
+        .unwrap();
     let rows = db.rows_in_key_order("t").unwrap();
     let bs: Vec<i64> = rows
         .iter()
@@ -136,10 +139,11 @@ fn ddl_errors_match_postgres_and_narrowings() {
     // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
     // scalar is keyable): a composite PK with a float member succeeds.
     db.execute("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))", &[])
-    .unwrap();
+        .unwrap();
     // The recursive composite container is NOT keyable (composite.md §6), so a composite PK member
     // is still the 0A000 narrowing.
-    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[]).unwrap();
+    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[])
+        .unwrap();
     assert_eq!(
         err_code(
             &mut db,
@@ -148,7 +152,8 @@ fn ddl_errors_match_postgres_and_narrowings() {
         "0A000"
     );
     // A single-column table constraint is the column-level form's equivalent.
-    db.execute("CREATE TABLE ok (a i32, PRIMARY KEY (a))", &[]).unwrap();
+    db.execute("CREATE TABLE ok (a i32, PRIMARY KEY (a))", &[])
+        .unwrap();
     let t = db.table("ok").unwrap();
     assert_eq!(t.primary_key_index(), Some(0));
     assert!(t.columns[0].not_null);
@@ -217,7 +222,9 @@ fn round_trips_through_the_on_disk_image() {
         "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image).unwrap().session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .unwrap()
+        .session(SessionOptions::default());
 
     let t = loaded.table("t").unwrap();
     assert_eq!(t.pk_indices(), vec![0, 1]);
@@ -238,6 +245,8 @@ fn round_trips_through_the_on_disk_image() {
         err_code(&mut loaded, "INSERT INTO t VALUES (1, 2, 99)"),
         "23505"
     );
-    loaded.execute("INSERT INTO t VALUES (2, 2, 50)", &[]).unwrap();
+    loaded
+        .execute("INSERT INTO t VALUES (2, 2, 50)", &[])
+        .unwrap();
     assert_eq!(loaded.rows_in_key_order("t").unwrap().len(), 4);
 }

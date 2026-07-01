@@ -13,13 +13,17 @@ use jed::{Database, Outcome, Session, SessionOptions};
 fn db_with(stmts: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
@@ -50,8 +54,9 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 #[test]
 fn zero_step_is_invalid_parameter_value() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    let e =
-        db.execute("SELECT * FROM generate_series(1, 5, 0)", &[]).expect_err("expected an error");
+    let e = db
+        .execute("SELECT * FROM generate_series(1, 5, 0)", &[])
+        .expect_err("expected an error");
     assert_eq!(e.code(), "22023");
     assert_eq!(e.message, "step size cannot be equal to zero");
 }
@@ -99,8 +104,9 @@ fn alias_forms_and_qualified_column() {
 #[test]
 fn param_argument() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    let out = db.execute("SELECT * FROM generate_series(1, $1)", &[Value::Int(3)])
-    .unwrap();
+    let out = db
+        .execute("SELECT * FROM generate_series(1, $1)", &[Value::Int(3)])
+        .unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, ints(&[1, 2, 3])),
         other => panic!("expected a query result, got {other:?}"),
@@ -116,8 +122,9 @@ fn sibling_reference_works_implicitly_lateral() {
     // A FROM-sibling reference inside the SRF args IS visible — an SRF is implicitly lateral
     // (grammar.md §44; the rows are pinned by suites/joins/lateral.test). The prior non-LATERAL
     // 42P01 rejection is lifted: generate_series(1, t.n) re-runs per t row (1 row, n=3 ⇒ 3 rows).
-    let out = db.execute("SELECT * FROM t CROSS JOIN generate_series(1, t.n)", &[])
-    .unwrap();
+    let out = db
+        .execute("SELECT * FROM t CROSS JOIN generate_series(1, t.n)", &[])
+        .unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows.len(), 3),
         other => panic!("expected a query result, got {other:?}"),
@@ -145,8 +152,12 @@ fn generated_row_cost_and_ceiling() {
 #[test]
 fn mixed_width_promotes_to_the_wider_type() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    let out = db.execute("SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))", &[])
-    .unwrap();
+    let out = db
+        .execute(
+            "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))",
+            &[],
+        )
+        .unwrap();
     assert_eq!(out.column_types(), &["i32"]);
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, ints(&[1, 2, 3, 4, 5])),

@@ -13,7 +13,8 @@ use jed::{Database, Outcome, Session, SessionOptions};
 fn db_with(stmts: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
@@ -34,7 +35,10 @@ fn ab() -> Session {
 }
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
@@ -186,7 +190,10 @@ fn param_inside_subquery_uninferable_is_42p18() {
     // with a value bound (the type, not the value, is what's missing). PG diverges (defaults text).
     let mut db = ab();
     assert_eq!(
-        db.execute("SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", &[Value::Int(10)])
+        db.execute(
+            "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)",
+            &[Value::Int(10)]
+        )
         .unwrap_err()
         .code(),
         "42P18"

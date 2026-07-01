@@ -9,7 +9,8 @@ use jed::{Database, Session, SessionOptions, Value};
 fn db_with(stmts: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
@@ -39,9 +40,7 @@ fn setup() -> Session {
 fn update_missing_table_traps() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     assert_eq!(
-        db.execute("UPDATE nope SET a = 1", &[])
-            .unwrap_err()
-            .code(),
+        db.execute("UPDATE nope SET a = 1", &[]).unwrap_err().code(),
         "42P01"
     );
 }
@@ -50,9 +49,7 @@ fn update_missing_table_traps() {
 fn update_unknown_column_traps() {
     let mut db = setup();
     assert_eq!(
-        db.execute("UPDATE t SET nope = 1", &[])
-            .unwrap_err()
-            .code(),
+        db.execute("UPDATE t SET nope = 1", &[]).unwrap_err().code(),
         "42703"
     );
 }
@@ -63,7 +60,8 @@ fn update_unknown_column_traps() {
 #[test]
 fn update_pk_swap_is_end_state_valid() {
     let mut db = setup();
-    db.execute("UPDATE t SET id = 3 - id WHERE id <= 2", &[]).unwrap();
+    db.execute("UPDATE t SET id = 3 - id WHERE id <= 2", &[])
+        .unwrap();
     // (1,10,11)→(2,10,11) and (2,20,22)→(1,20,22); id 3 untouched.
     assert_eq!(ids_abs(&db), vec![(1, 20, 22), (2, 10, 11), (3, 30, 33)]);
 }

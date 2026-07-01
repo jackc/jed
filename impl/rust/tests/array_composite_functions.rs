@@ -9,7 +9,8 @@
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
@@ -22,7 +23,10 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 /// One-column, one-row query → the rendered value ("NULL" for SQL-NULL).
 fn val(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
             assert_eq!(rows[0].len(), 1, "{sql}: expected one column");
@@ -34,7 +38,10 @@ fn val(db: &mut Session, sql: &str) -> String {
 
 /// A multi-row, one-column query → the rendered values.
 fn col(db: &mut Session, sql: &str) -> Vec<String> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows.iter().map(|r| r[0].render()).collect(),
         other => panic!("{sql}: expected a query result, got {other:?}"),
     }
@@ -220,8 +227,9 @@ fn quantified_over_composite_uses_total_order_not_3vl() {
 fn unnest_composite_array() {
     let mut db = addr_db();
     // One composite row per element, typed at the composite element type.
-    let out = db.execute(r#"SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])"#, &[])
-    .unwrap();
+    let out = db
+        .execute(r#"SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])"#, &[])
+        .unwrap();
     match &out {
         Outcome::Query {
             column_names,

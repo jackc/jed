@@ -10,7 +10,8 @@ use jed::types::Type;
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
@@ -23,7 +24,10 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 /// Run a query and render its rows as `Vec<Vec<String>>` (each value via `render`).
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -85,7 +89,9 @@ fn composite_values_persist_through_image() {
     run(&mut db, "INSERT INTO p VALUES (1, ROW('Main', 90210))");
     run(&mut db, "INSERT INTO p VALUES (2, ROW('Oak', NULL))");
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .expect("reload")
+        .session(SessionOptions::default());
     assert_eq!(
         query(&mut loaded, "SELECT id, home FROM p ORDER BY id"),
         vec![
@@ -223,7 +229,9 @@ fn types_persist_through_image() {
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
 
     let image = db.to_image(256, 1).unwrap();
-    let loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
+    let loaded = Database::from_image(&image)
+        .expect("reload")
+        .session(SessionOptions::default());
 
     let point = loaded.composite_type("point").expect("point persists");
     assert_eq!(point.fields.len(), 2);
@@ -273,7 +281,9 @@ fn composite_with_array_field_image_roundtrip() {
     );
     run(&mut db, "INSERT INTO t VALUES (2, ROW('b', NULL))");
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .expect("reload")
+        .session(SessionOptions::default());
     let ct = loaded.composite_type("poly").expect("poly persists");
     assert_eq!(
         ct.fields[1].ty,
@@ -300,7 +310,9 @@ fn composite_with_array_of_composite_field() {
         "INSERT INTO t VALUES (1, ROW('jo', '{\"(Main,1)\",\"(Oak,2)\"}'))",
     );
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image).expect("reload").session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .expect("reload")
+        .session(SessionOptions::default());
     // The persisted array-of-composite field re-resolves and the value round-trips.
     assert_eq!(
         query(&mut loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"),

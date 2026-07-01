@@ -10,7 +10,8 @@ use jed::value::Value;
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
 fn exec(db: &mut Session, sql: &str) {

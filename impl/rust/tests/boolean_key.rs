@@ -25,8 +25,10 @@ fn rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn boolean_primary_key_crud() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (k boolean PRIMARY KEY, v i32)", &[]).unwrap();
-    db.execute("INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)", &[]).unwrap();
+    db.execute("CREATE TABLE t (k boolean PRIMARY KEY, v i32)", &[])
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)", &[])
+        .unwrap();
 
     // Point lookup on the boolean PK resolves to the right row.
     assert_eq!(
@@ -49,9 +51,15 @@ fn boolean_primary_key_crud() {
 #[test]
 fn boolean_composite_primary_key() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))", &[])
+    db.execute(
+        "CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
+        &[],
+    )
     .unwrap();
-    db.execute("INSERT INTO t VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)", &[])
+    db.execute(
+        "INSERT INTO t VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)",
+        &[],
+    )
     .unwrap();
     // (1,FALSE) and (1,TRUE) are distinct keys; the same (a,b) again conflicts.
     assert_eq!(
@@ -73,8 +81,12 @@ fn boolean_composite_primary_key() {
 #[test]
 fn boolean_secondary_index() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)", &[]).unwrap();
-    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)", &[])
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)",
+        &[],
+    )
     .unwrap();
     db.execute("CREATE INDEX i ON t (flag)", &[]).unwrap();
     let mut ids: Vec<i64> = rows(&mut db, "SELECT id FROM t WHERE flag = TRUE")

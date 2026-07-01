@@ -14,7 +14,8 @@
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
@@ -26,7 +27,10 @@ fn err(db: &mut Session, sql: &str) -> String {
 }
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -52,7 +56,9 @@ fn range_image_roundtrip() {
     run(&mut db, "INSERT INTO t VALUES (4, '(,)', '(5,)')"); // canonical [6,)
     run(&mut db, "INSERT INTO t VALUES (5, NULL, '[1,1]')"); // canonical [1,2)
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image).expect("load image").session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .expect("load image")
+        .session(SessionOptions::default());
     assert_eq!(
         query(&mut loaded, "SELECT id, r, br FROM t ORDER BY id"),
         vec![
@@ -88,7 +94,8 @@ fn canonical_name_and_aliases() {
     // (PG agrees a range has no gin opclass but reports int4range — the naming divergence, per-core).
     let mut db3 = Database::new_in_memory().session(SessionOptions::default());
     run(&mut db3, "CREATE TABLE u (id i32 PRIMARY KEY, r int4range)");
-    let msg = db3.execute("CREATE INDEX ON u USING gin (r)", &[])
+    let msg = db3
+        .execute("CREATE INDEX ON u USING gin (r)", &[])
         .expect_err("a gin index over a plain range column is rejected")
         .message;
     assert!(msg.contains("i32range"), "message names i32range: {msg}");

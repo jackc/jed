@@ -59,7 +59,8 @@ fn dropping_a_session_with_an_open_block_rolls_back() {
     let db = Database::new_in_memory();
     {
         let mut s = db.session(SessionOptions::default());
-        s.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap();
+        s.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+            .unwrap();
         s.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
     }
     {

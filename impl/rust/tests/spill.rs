@@ -27,7 +27,8 @@ fn run(db: &mut Session, sql: &str) -> (Vec<Vec<Value>>, i64) {
 /// has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL ordering),
 /// and a variable-length `s` (so a spilled run carries variable-width values).
 fn seed(db: &mut Session, n: i64) {
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)", &[])
+        .unwrap();
     for id in 0..n {
         // A scrambled key with duplicates; every 7th row's key is NULL.
         let k = if id % 7 == 0 {
@@ -36,7 +37,8 @@ fn seed(db: &mut Session, n: i64) {
             ((id * 48271) % 100).to_string()
         };
         let s = "x".repeat((id % 17) as usize); // 0..16 chars, variable width
-        db.execute(&format!("INSERT INTO t VALUES ({id}, {k}, '{s}')"), &[]).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({id}, {k}, '{s}')"), &[])
+            .unwrap();
     }
 }
 
@@ -63,7 +65,9 @@ fn spilling_sort_matches_in_memory_rows_and_cost() {
     seed(&mut mem, 200);
 
     // A file-backed database with a tiny work_mem so every shape spills many runs and k-way-merges.
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
+    let mut db = Database::create(&path, DatabaseOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     seed(&mut db, 200);
     db.set_work_mem(128); // ~2-3 rows per run → dozens of runs, deep merge
 
@@ -109,7 +113,9 @@ fn spill_leaves_no_temp_files() {
     };
     let before = count_spill_files();
 
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
+    let mut db = Database::create(&path, DatabaseOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     seed(&mut db, 150);
     db.set_work_mem(64); // force heavy spilling
 
@@ -134,10 +140,14 @@ fn spilling_sort_is_stable_on_ties() {
     let path = tmp("spill_stable.jed");
     let _ = std::fs::remove_file(&path);
 
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[]).unwrap();
+    let mut db = Database::create(&path, DatabaseOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])
+        .unwrap();
     for id in 0..100 {
-        db.execute(&format!("INSERT INTO t VALUES ({id}, 5)"), &[]).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({id}, 5)"), &[])
+            .unwrap();
     }
     db.set_work_mem(96); // force spilling so the merge tie-break is exercised
 

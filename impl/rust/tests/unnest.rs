@@ -10,7 +10,10 @@ use jed::value::Value;
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
@@ -40,7 +43,9 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 fn names_and_types_its_column_at_the_element_type() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     // An untyped ARRAY[…] literal is i64[] (jed's literal typing), so the column is i64.
-    let out = db.execute("SELECT * FROM unnest(ARRAY[10, 20, 30])", &[]).unwrap();
+    let out = db
+        .execute("SELECT * FROM unnest(ARRAY[10, 20, 30])", &[])
+        .unwrap();
     match &out {
         Outcome::Query {
             column_names,
@@ -53,10 +58,14 @@ fn names_and_types_its_column_at_the_element_type() {
         other => panic!("expected a query result, got {other:?}"),
     }
     // A typed '{…}'::i32[] literal pins the element type — the column is i32.
-    let out = db.execute("SELECT * FROM unnest('{1,2,3}'::i32[])", &[]).unwrap();
+    let out = db
+        .execute("SELECT * FROM unnest('{1,2,3}'::i32[])", &[])
+        .unwrap();
     assert_eq!(out.column_types(), &["i32"]);
     // A text[] argument → a text column.
-    let out = db.execute("SELECT * FROM unnest(ARRAY['a','b'])", &[]).unwrap();
+    let out = db
+        .execute("SELECT * FROM unnest(ARRAY['a','b'])", &[])
+        .unwrap();
     assert_eq!(out.column_types(), &["text"]);
 }
 
@@ -100,8 +109,12 @@ fn alias_renames_the_single_column() {
 #[test]
 fn correlated_outer_array_column_and_sibling_are_legal_args() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[]).unwrap();
-    db.execute("INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')", &[])
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')",
+        &[],
+    )
     .unwrap();
     // A correlated OUTER column (o.xs) resolves into the SRF arg of an enclosing-query subquery (the
     // SRF is the subquery's sole/first FROM item, so its args see the enclosing query).

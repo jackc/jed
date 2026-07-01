@@ -10,7 +10,8 @@ use jed::{Database, Outcome, Session, SessionOptions};
 /// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id), wide enough to span several leaves.
 fn big_table(n: i64) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+        .unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
         if i > 1 {
@@ -106,8 +107,10 @@ fn limit_short_circuit_is_sublinear() {
     // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
     // reached under a LIMIT that excludes it (matches the eager window-before-project).
     let mut dz = Database::new_in_memory().session(SessionOptions::default());
-    dz.execute("CREATE TABLE z (id i32 PRIMARY KEY, c i32)", &[]).unwrap();
-    dz.execute("INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)", &[]).unwrap();
+    dz.execute("CREATE TABLE z (id i32 PRIMARY KEY, c i32)", &[])
+        .unwrap();
+    dz.execute("INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)", &[])
+        .unwrap();
     assert_eq!(ids(&mut dz, "SELECT 100 / c FROM z LIMIT 1"), vec![20]);
     assert!(
         dz.execute("SELECT 100 / c FROM z LIMIT 2", &[]).is_err(),

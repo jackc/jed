@@ -11,7 +11,8 @@ use jed::{Database, Outcome, Session, SessionOptions};
 /// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id).
 fn table(n: i64) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+        .unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
         if i > 1 {
@@ -147,7 +148,10 @@ fn empty_bound_under_a_tiny_ceiling_succeeds() {
     // one page_read, so it is NOT zero-cost.)
     let mut db = table(10);
     db.set_max_cost(1);
-    match db.execute("SELECT v FROM t WHERE id > 5 AND id < 5", &[]).unwrap() {
+    match db
+        .execute("SELECT v FROM t WHERE id > 5 AND id < 5", &[])
+        .unwrap()
+    {
         Outcome::Query { rows, cost, .. } => {
             assert!(rows.is_empty());
             assert_eq!(

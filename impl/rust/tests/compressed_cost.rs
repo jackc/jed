@@ -41,19 +41,24 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 /// RECORD_MAX, so no chain); `control` is the same shape fully inline-plain. Row 2 is inline in
 /// both. Same tree shape (one leaf each), so cost deltas isolate the compression units.
 fn two_tables() -> Session {
-    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let run600 = "x".repeat(600);
-    db.execute("CREATE TABLE comp (id i32 PRIMARY KEY, body text)", &[]).unwrap();
-    db.execute(&format!("INSERT INTO comp VALUES (1, '{run600}'), (2, 'small')"), &[])
+    db.execute("CREATE TABLE comp (id i32 PRIMARY KEY, body text)", &[])
+        .unwrap();
+    db.execute(
+        &format!("INSERT INTO comp VALUES (1, '{run600}'), (2, 'small')"),
+        &[],
+    )
     .unwrap();
     db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
-    .unwrap();
+        .unwrap();
     // control row 1 is `plain` (5 chars), not a 4-char `tiny`: it must be at least as long as the
     // `small` probe value the correlated test compares against, so `probe.body = body` charges the
     // SAME varlen_compare (min(5, len) = 5) on both tables — keeping the comp−control delta the pure
     // compression cost, not a length-of-comparison artifact (cost.md §3 "varlen_compare").
     db.execute("INSERT INTO control VALUES (1, 'plain'), (2, 'small')", &[])
-    .unwrap();
+        .unwrap();
     db
 }
 
@@ -72,13 +77,17 @@ fn external_compressed_charges_chain_pages_plus_decompress_slabs() {
     // A 400-char half-filler/half-run text compresses to ~212 B — smaller than plain but still
     // over RECORD_MAX → 0x04 external-compressed: ceil(212/240) = 1 chain page_read PLUS
     // ceil(400/240) = 2 value_decompress slabs.
-    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let mix = format!("{}{}", filler_text(200), "y".repeat(200));
-    db.execute("CREATE TABLE comp (id i32 PRIMARY KEY, body text)", &[]).unwrap();
-    db.execute(&format!("INSERT INTO comp VALUES (1, '{mix}')"), &[]).unwrap();
+    db.execute("CREATE TABLE comp (id i32 PRIMARY KEY, body text)", &[])
+        .unwrap();
+    db.execute(&format!("INSERT INTO comp VALUES (1, '{mix}')"), &[])
+        .unwrap();
     db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
-    .unwrap();
-    db.execute("INSERT INTO control VALUES (1, 'tiny')", &[]).unwrap();
+        .unwrap();
+    db.execute("INSERT INTO control VALUES (1, 'tiny')", &[])
+        .unwrap();
     let comp = cost(&mut db, "SELECT * FROM comp");
     let control = cost(&mut db, "SELECT * FROM control");
     assert_eq!(comp, control + 1 + SLABS_400);
@@ -104,8 +113,10 @@ fn bounded_scan_charges_only_admitted_values_and_limit_does_not_lower() {
 
 #[test]
 fn insert_meters_compress_attempts_adopted_or_rejected() {
-    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[]).unwrap();
+    let mut db =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
+        .unwrap();
     // A fully-inline row attempts nothing: INSERT stays zero-cost.
     assert_eq!(cost(&mut db, "INSERT INTO t VALUES (1, 'small')"), 0);
     // An adopted compression (the "x" run) costs its ceil(600/240) = 3 attempt slabs ...
@@ -149,14 +160,17 @@ fn decimal_payloads_compress_too() {
     // like text/bytea (large-values.md §12/§13). 801 digits (an "12"-run plus ".5" so the
     // literal types as numeric) → 201 base-10⁴ groups → a 407-byte payload: over RECORD_MAX,
     // compressible (repeating groups), and ceil(407/240) = 2 slabs both ways.
-    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let digits = format!("{}.5", "12".repeat(400));
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, d numeric)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, d numeric)", &[])
+        .unwrap();
     let ins = cost(&mut db, &format!("INSERT INTO t VALUES (1, {digits})"));
     assert_eq!(ins, 2, "the compress attempt is metered");
     db.execute("CREATE TABLE control (id i32 PRIMARY KEY, d numeric)", &[])
-    .unwrap();
-    db.execute("INSERT INTO control VALUES (1, 7)", &[]).unwrap();
+        .unwrap();
+    db.execute("INSERT INTO control VALUES (1, 7)", &[])
+        .unwrap();
     let comp = cost(&mut db, "SELECT * FROM t");
     let control = cost(&mut db, "SELECT * FROM control");
     assert_eq!(comp, control + 2, "the decompress slabs are metered");
@@ -186,8 +200,9 @@ fn correlated_outer_reference_is_a_touch() {
     // outer table's storage — isolating the SLABS_600 the outer reference charges.
     let mut db = two_tables();
     db.execute("CREATE TABLE probe (id i32 PRIMARY KEY, body text)", &[])
-    .unwrap();
-    db.execute("INSERT INTO probe VALUES (1, 'small')", &[]).unwrap();
+        .unwrap();
+    db.execute("INSERT INTO probe VALUES (1, 'small')", &[])
+        .unwrap();
     let comp_q = cost(
         &mut db,
         "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)",

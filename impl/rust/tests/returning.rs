@@ -9,7 +9,8 @@ use jed::value::Value;
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
@@ -46,7 +47,8 @@ fn setup() -> Session {
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
         "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
     ] {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
@@ -321,15 +323,23 @@ fn returning_ceiling_abort_is_all_or_nothing() {
 fn returning_bind_params() {
     let mut db = setup();
     // A $N in the RETURNING list types from context like anywhere else (api.md §5).
-    let out = db.execute("INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", &[Value::Int(5)])
-    .unwrap();
+    let out = db
+        .execute(
+            "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1",
+            &[Value::Int(5)],
+        )
+        .unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![int(8)]]),
         Outcome::Statement { .. } => panic!("expected a query result"),
     }
     // A parameter no context types is 42P18.
-    let err = db.execute("INSERT INTO t VALUES (81, 3, 0) RETURNING $1", &[Value::Int(5)])
-    .expect_err("an untypable parameter must fail");
+    let err = db
+        .execute(
+            "INSERT INTO t VALUES (81, 3, 0) RETURNING $1",
+            &[Value::Int(5)],
+        )
+        .expect_err("an untypable parameter must fail");
     assert_eq!(err.code().to_string(), "42P18");
 }
 

@@ -12,7 +12,10 @@ use jed::{Database, Outcome, Session, SessionOptions};
 
 /// Run a single-row, single-column query and return the lone value.
 fn scalar(db: &mut Session, sql: &str) -> Value {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql:?}: expected one row");
             assert_eq!(rows[0].len(), 1, "{sql:?}: expected one column");
@@ -105,7 +108,8 @@ fn a_null_name_propagates_to_null() {
     // null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
     // a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, n text)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, n text)", &[])
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)", &[]).unwrap();
     db.set_var("myapp.x", "set").unwrap();
     assert_eq!(

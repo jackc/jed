@@ -11,13 +11,16 @@ use jed::{Database, Outcome, Session, SessionOptions};
 fn db_with(sql: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 fn err(db: &mut Session, sql: &str) -> (String, String) {
-    let e = db.execute(sql, &[]).expect_err(&format!("expected an error from {sql:?}"));
+    let e = db
+        .execute(sql, &[])
+        .expect_err(&format!("expected an error from {sql:?}"));
     (e.code().to_string(), e.message)
 }
 
@@ -106,9 +109,11 @@ fn ddl_errors_match_postgres() {
         "42P01"
     );
     // A forward reference is fine (checks resolve after all columns are known).
-    db.execute("CREATE TABLE fwd (CHECK (b > 0), b int)", &[]).unwrap();
+    db.execute("CREATE TABLE fwd (CHECK (b > 0), b int)", &[])
+        .unwrap();
     // A qualified reference to this table is fine.
-    db.execute("CREATE TABLE q (a int CHECK (q.a > 0))", &[]).unwrap();
+    db.execute("CREATE TABLE q (a int CHECK (q.a > 0))", &[])
+        .unwrap();
     // Duplicate explicit name.
     let (code, msg) = err(
         &mut db,
@@ -143,11 +148,13 @@ fn ddl_errors_match_postgres() {
         "42703"
     );
     // The DEFAULT is NOT checked against CHECK at CREATE TABLE.
-    db.execute("CREATE TABLE t7 (a int DEFAULT -5 CHECK (a > 0))", &[]).unwrap();
+    db.execute("CREATE TABLE t7 (a int DEFAULT -5 CHECK (a > 0))", &[])
+        .unwrap();
     // `CHECK ()` is a syntax error; so is a CHECK with no parenthesized expression.
     assert_eq!(err(&mut db, "CREATE TABLE x (a int, CHECK ())").0, "42601");
     // Columns may be NAMED check / constraint (the keywords stay non-reserved).
-    db.execute("CREATE TABLE odd (check int, constraint i16)", &[]).unwrap();
+    db.execute("CREATE TABLE odd (check int, constraint i16)", &[])
+        .unwrap();
     db.execute("INSERT INTO odd VALUES (1, 2)", &[]).unwrap();
 }
 
@@ -181,14 +188,16 @@ fn violations_match_postgres_order() {
     let (_, msg) = err(&mut db, "INSERT INTO t5 VALUES (-1)");
     assert!(msg.ends_with("violates check constraint aa"), "{msg}");
     // NULL passes a check (UNKNOWN is not FALSE).
-    db.execute("INSERT INTO t VALUES (NULL, NULL)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (NULL, NULL)", &[])
+        .unwrap();
     // NOT NULL fires before CHECK on the same row.
     assert_eq!(err(&mut db, "INSERT INTO tn VALUES (NULL)").0, "23502");
     // CHECK fires before the duplicate-key check.
     db.execute("INSERT INTO tu VALUES (1, 5)", &[]).unwrap();
     assert_eq!(err(&mut db, "INSERT INTO tu VALUES (1, -1)").0, "23514");
     // A runtime error inside a check propagates as itself.
-    db.execute("CREATE TABLE dz (a int CHECK (10 / a > 0))", &[]).unwrap();
+    db.execute("CREATE TABLE dz (a int CHECK (10 / a > 0))", &[])
+        .unwrap();
     assert_eq!(err(&mut db, "INSERT INTO dz VALUES (0)").0, "22012");
 }
 
@@ -244,7 +253,10 @@ fn expression_surface() {
          CHECK (abs(n) <= CAST(100 AS int)), \
          CONSTRAINT price_pos CHECK (price >= 0.50))",
     ]);
-    db.execute("INSERT INTO e VALUES (50, TRUE, 'ok then', 1.00), (NULL, TRUE, 'a', 0.50)", &[])
+    db.execute(
+        "INSERT INTO e VALUES (50, TRUE, 'ok then', 1.00), (NULL, TRUE, 'a', 0.50)",
+        &[],
+    )
     .unwrap();
     assert_eq!(
         err(&mut db, "INSERT INTO e VALUES (101, TRUE, 'a', 1.00)").0,
@@ -290,7 +302,9 @@ fn check_evaluation_is_metered() {
     }
     // The ceiling aborts mid-validation deterministically.
     db.set_max_cost(2);
-    let e = db.execute("INSERT INTO c VALUES (4), (5), (6)", &[]).unwrap_err();
+    let e = db
+        .execute("INSERT INTO c VALUES (4), (5), (6)", &[])
+        .unwrap_err();
     assert_eq!(e.code(), "54P01");
     db.set_max_cost(0);
     match db.execute("SELECT count(*) FROM c", &[]).unwrap() {
@@ -312,7 +326,9 @@ fn round_trips_through_the_on_disk_image() {
          (3, 100, 0.50, 'ok')",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image).unwrap().session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .unwrap()
+        .session(SessionOptions::default());
 
     let t = loaded.table("t").unwrap();
     let stored: Vec<(&str, &str)> = t
@@ -343,11 +359,15 @@ fn round_trips_through_the_on_disk_image() {
         err(&mut loaded, "INSERT INTO t VALUES (4, 1, 1.00, 'nope')").0,
         "23514"
     );
-    loaded.execute("INSERT INTO t VALUES (4, 1, 1.00, 'a''b')", &[]).unwrap();
+    loaded
+        .execute("INSERT INTO t VALUES (4, 1, 1.00, 'a''b')", &[])
+        .unwrap();
     // A second generation (load → image → load) is byte-stable: the text is written back
     // verbatim.
     let image2 = loaded.to_image(256, 1).unwrap();
-    let reloaded = Database::from_image(&image2).unwrap().session(SessionOptions::default());
+    let reloaded = Database::from_image(&image2)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         check_names(&reloaded, "t"),
         vec!["price_range", "t_b_check", "t_note_check"]

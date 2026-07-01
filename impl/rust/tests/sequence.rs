@@ -123,7 +123,8 @@ fn alter_restart_rolls_back() {
     assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(10));
 
     db.execute("BEGIN", &[]).unwrap();
-    db.execute("ALTER SEQUENCE s RESTART WITH 100", &[]).unwrap();
+    db.execute("ALTER SEQUENCE s RESTART WITH 100", &[])
+        .unwrap();
     assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(100)); // working
     db.execute("ROLLBACK", &[]).unwrap();
 
@@ -179,7 +180,8 @@ fn alter_options_roll_back() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s INCREMENT 1", &[]).unwrap();
     db.execute("BEGIN", &[]).unwrap();
-    db.execute("ALTER SEQUENCE s INCREMENT BY 100", &[]).unwrap();
+    db.execute("ALTER SEQUENCE s INCREMENT BY 100", &[])
+        .unwrap();
     db.execute("ROLLBACK", &[]).unwrap();
     // The INCREMENT edit rolled back, so the step is still 1: setval to 5, next is 6 (not 105).
     db.execute("SELECT setval('s', 5)", &[]).unwrap();
@@ -220,11 +222,18 @@ fn setval_alter_in_read_only_is_25006() {
 #[test]
 fn serial_desugars_to_owned_sequence() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)", &[])
+    db.execute(
+        "CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)",
+        &[],
+    )
     .unwrap();
     // Two inserts auto-number every serial column from 1 (each column's own sequence).
-    match db.execute("INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, b, s", &[])
-    .unwrap()
+    match db
+        .execute(
+            "INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, b, s",
+            &[],
+        )
+        .unwrap()
     {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 2);
@@ -244,14 +253,19 @@ fn serial_desugars_to_owned_sequence() {
 #[test]
 fn serial_not_null_and_explicit_override() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id serial PRIMARY KEY, v text)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id serial PRIMARY KEY, v text)", &[])
+        .unwrap();
     assert_eq!(
         err_code(&mut db, "INSERT INTO t (id, v) VALUES (NULL, 'x')"),
         "23502"
     );
     // Supply an explicit id — the sequence is untouched, so the next default is still 1.
-    db.execute("INSERT INTO t (id, v) VALUES (100, 'y')", &[]).unwrap();
-    match db.execute("INSERT INTO t (v) VALUES ('z') RETURNING id", &[]).unwrap() {
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'y')", &[])
+        .unwrap();
+    match db
+        .execute("INSERT INTO t (v) VALUES ('z') RETURNING id", &[])
+        .unwrap()
+    {
         Outcome::Query { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
         o => panic!("expected a query, got {o:?}"),
     }
@@ -274,7 +288,8 @@ fn serial_seq_name_collision_resolves() {
     db.execute("CREATE SEQUENCE t_id_seq", &[]).unwrap();
     db.execute("CREATE TABLE t (id serial)", &[]).unwrap();
     // The pre-existing t_id_seq forced the owned sequence to t_id_seq1.
-    db.execute("INSERT INTO t (id) VALUES (DEFAULT)", &[]).unwrap();
+    db.execute("INSERT INTO t (id) VALUES (DEFAULT)", &[])
+        .unwrap();
     // t_id_seq (the manual one) was never advanced; t_id_seq1 produced the row's 1.
     assert_eq!(one_int(&mut db, "SELECT nextval('t_id_seq1')"), Some(2));
     assert_eq!(one_int(&mut db, "SELECT nextval('t_id_seq')"), Some(1));
@@ -284,7 +299,8 @@ fn serial_seq_name_collision_resolves() {
 #[test]
 fn owned_sequence_drop_rules() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id serial PRIMARY KEY)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id serial PRIMARY KEY)", &[])
+        .unwrap();
     // Cannot drop the owned sequence directly.
     assert_eq!(err_code(&mut db, "DROP SEQUENCE t_id_seq"), "2BP01");
     // DROP TABLE auto-drops it — afterwards the sequence name is undefined (42P01).
@@ -301,13 +317,18 @@ fn owned_link_survives_reopen() {
     let path = tmp("serial_owned_reopen.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
-        db.execute("CREATE TABLE t (id serial PRIMARY KEY, v text)", &[]).unwrap();
+        let mut db = Database::create(&path, DatabaseOptions::default())
+            .unwrap()
+            .session(SessionOptions::default());
+        db.execute("CREATE TABLE t (id serial PRIMARY KEY, v text)", &[])
+            .unwrap();
         db.execute("INSERT INTO t (v) VALUES ('a')", &[]).unwrap();
         db.commit().unwrap();
     }
     {
-        let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut db = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         // The owner link round-tripped: still 2BP01 to drop the sequence directly.
         assert_eq!(err_code(&mut db, "DROP SEQUENCE t_id_seq"), "2BP01");
         // And DROP TABLE still auto-drops it.

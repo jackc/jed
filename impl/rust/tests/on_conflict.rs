@@ -11,7 +11,8 @@ use jed::{Database, Outcome, Session, SessionOptions};
 fn db_with(sql: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
@@ -24,7 +25,10 @@ fn err(db: &mut Session, sql: &str) -> String {
 }
 
 fn affected(db: &mut Session, sql: &str) -> Option<i64> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement outcome from {sql:?}"),
     }

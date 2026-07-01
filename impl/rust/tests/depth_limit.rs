@@ -11,7 +11,8 @@ use jed::{Database, Session, SessionOptions};
 
 fn db() -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1)", &[]).unwrap();
     db
 }

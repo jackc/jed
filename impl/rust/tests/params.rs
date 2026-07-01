@@ -8,13 +8,17 @@ use jed::{Database, Outcome, Session, SessionOptions};
 fn db_with(sql: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 fn rows(db: &mut Session, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
-    match db.execute(sql, params).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, params)
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows,
         _ => panic!("expected a query result"),
     }
@@ -60,7 +64,10 @@ fn param_adopts_narrow_column_type_and_traps_overflow() {
 #[test]
 fn insert_values_params_round_trip() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, name text)"]);
-    db.execute("INSERT INTO t VALUES ($1, $2)", &[Value::Int(7), Value::Text("alice".into())])
+    db.execute(
+        "INSERT INTO t VALUES ($1, $2)",
+        &[Value::Int(7), Value::Text("alice".into())],
+    )
     .unwrap();
     let got = rows(
         &mut db,
@@ -103,7 +110,10 @@ fn update_set_and_where_params() {
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t VALUES (1, 10), (2, 20)",
     ]);
-    db.execute("UPDATE t SET v = $1 WHERE id = $2", &[Value::Int(99), Value::Int(2)])
+    db.execute(
+        "UPDATE t SET v = $1 WHERE id = $2",
+        &[Value::Int(99), Value::Int(2)],
+    )
     .unwrap();
     let got = rows(&mut db, "SELECT v FROM t WHERE id = $1", &[Value::Int(2)]);
     assert_eq!(got, vec![vec![Value::Int(99)]]);
@@ -115,7 +125,8 @@ fn delete_where_param() {
         "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1), (2), (3)",
     ]);
-    db.execute("DELETE FROM t WHERE id = $1", &[Value::Int(2)]).unwrap();
+    db.execute("DELETE FROM t WHERE id = $1", &[Value::Int(2)])
+        .unwrap();
     let got = rows(&mut db, "SELECT id FROM t", &[]);
     assert_eq!(got, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
 }

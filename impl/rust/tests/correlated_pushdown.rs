@@ -13,9 +13,14 @@ use jed::{Database, Outcome, Session, SessionOptions};
 /// enough to span several leaves. The outer k-values are all present as inner ids.
 fn tables(n: i64) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE o (id i32 PRIMARY KEY, k i32)", &[]).unwrap();
-    db.execute("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)", &[]).unwrap();
-    db.execute("INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)", &[])
+    db.execute("CREATE TABLE o (id i32 PRIMARY KEY, k i32)", &[])
+        .unwrap();
+    db.execute("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)",
+        &[],
+    )
     .unwrap();
     let mut sql = String::from("INSERT INTO inr VALUES ");
     for i in 1..=n {
@@ -103,7 +108,8 @@ fn correlated_miss_and_null_outer_seek_nothing() {
     let mut db = tables(1000);
     // An outer k with no matching inner id is a point-lookup miss (visits the leaf, reads no row); a
     // NULL outer k is a 3VL-empty bound (reads no page, no row). Neither re-scans the inner.
-    db.execute("INSERT INTO o VALUES (6, 999999), (7, NULL)", &[]).unwrap();
+    db.execute("INSERT INTO o VALUES (6, 999999), (7, NULL)", &[])
+        .unwrap();
     let got = ids(
         &mut db,
         "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id = o.k)",

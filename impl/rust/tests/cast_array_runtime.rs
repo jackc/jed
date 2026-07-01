@@ -37,7 +37,8 @@ fn err(db: &mut Session, sql: &str) -> String {
 #[test]
 fn array_to_text_is_explicit_only() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, label text)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, label text)", &[])
+        .unwrap();
     // Assignment context: an array value into a text column is a datatype mismatch, NOT a silent
     // array_out (PG would assignment-cast it).
     assert_eq!(
@@ -45,7 +46,8 @@ fn array_to_text_is_explicit_only() {
         "42804"
     );
     // Implicit context: comparing a text column to an array value is a mismatch.
-    db.execute("INSERT INTO t VALUES (1, '{1,2,3}')", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (1, '{1,2,3}')", &[])
+        .unwrap();
     assert_eq!(
         err(&mut db, "SELECT id FROM t WHERE label = ARRAY[1,2,3]"),
         "42804"
@@ -88,7 +90,8 @@ fn forbidden_element_pairs() {
         "42804",
     );
     // A composite-element array cast is the deferred composite cast surface → 0A000.
-    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[]).unwrap();
+    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[])
+        .unwrap();
     assert_eq!(
         err(
             &mut db,
@@ -105,10 +108,15 @@ fn forbidden_element_pairs() {
 #[test]
 fn runtime_text_to_float_arrays() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[]).unwrap();
-    db.execute("INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", &[])
+        .unwrap();
     // text → f64[] (binary64-exact values render exactly).
-    let got = match db.execute("SELECT (s::float8[])::text FROM t WHERE id = 1", &[]).unwrap() {
+    let got = match db
+        .execute("SELECT (s::float8[])::text FROM t WHERE id = 1", &[])
+        .unwrap()
+    {
         Outcome::Query { rows, .. } => rows[0][0].render(),
         other => panic!("{other:?}"),
     };

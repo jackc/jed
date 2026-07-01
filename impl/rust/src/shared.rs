@@ -66,8 +66,8 @@ use crate::cancel::CancellationToken;
 use crate::catalog::{CompositeType, Table};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
-    CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState, Snapshot, TxStatus,
-    stmt_is_write,
+    CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState, Snapshot,
+    TxStatus, stmt_is_write,
 };
 use crate::file::{DatabaseOptions, OpenOptions};
 use crate::privileges::{PrivilegeSet, Privileges};
@@ -230,11 +230,9 @@ impl Shared {
     /// the physical pages `persist` writes — and so every core builds byte-identical file-backed
     /// databases (CLAUDE.md §8). In-memory this is the default, so it is a no-op there.
     fn page_size(&self) -> u32 {
-        self.storage
-            .as_ref()
-            .map_or(self.mem_page_size, |s| {
-                s.lock().expect("storage lock not poisoned").page_size
-            })
+        self.storage.as_ref().map_or(self.mem_page_size, |s| {
+            s.lock().expect("storage lock not poisoned").page_size
+        })
     }
 
     /// Whether this core is a read-only file-backed database (a write is `25006`). In-memory cores
@@ -247,9 +245,9 @@ impl Shared {
 
     /// The on-disk page high-water for a file-backed core; `0` in-memory (no backing file).
     fn page_count(&self) -> u32 {
-        self.storage
-            .as_ref()
-            .map_or(0, |s| s.lock().expect("storage lock not poisoned").page_count)
+        self.storage.as_ref().map_or(0, |s| {
+            s.lock().expect("storage lock not poisoned").page_count
+        })
     }
 
     /// The backing file path for a file-backed core; `None` in-memory.

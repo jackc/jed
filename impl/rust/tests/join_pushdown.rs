@@ -12,8 +12,10 @@ use jed::{Database, Outcome, Session, SessionOptions};
 /// is three small rows whose k-values exist as a's k-values, so the join matches.
 fn tables(n: i64) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE a (id i32 PRIMARY KEY, k i32)", &[]).unwrap();
-    db.execute("CREATE TABLE b (id i32 PRIMARY KEY, k i32)", &[]).unwrap();
+    db.execute("CREATE TABLE a (id i32 PRIMARY KEY, k i32)", &[])
+        .unwrap();
+    db.execute("CREATE TABLE b (id i32 PRIMARY KEY, k i32)", &[])
+        .unwrap();
     let mut sql = String::from("INSERT INTO a VALUES ");
     for i in 1..=n {
         if i > 1 {
@@ -22,7 +24,8 @@ fn tables(n: i64) -> Session {
         sql.push_str(&format!("({i},{i})"));
     }
     db.execute(&sql, &[]).unwrap();
-    db.execute("INSERT INTO b VALUES (1, 500), (2, 600), (3, 700)", &[]).unwrap();
+    db.execute("INSERT INTO b VALUES (1, 500), (2, 600), (3, 700)", &[])
+        .unwrap();
     db
 }
 

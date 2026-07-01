@@ -57,8 +57,10 @@ fn seed(path: &std::path::Path) {
             page_size: PAGE_SIZE,
         },
     )
-    .unwrap().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[]).unwrap();
+    .unwrap()
+    .session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
+        .unwrap();
     let big = filler_text(600);
     let mut sql = format!("INSERT INTO t VALUES (1, '{big}')");
     for id in 2..=30 {

@@ -10,7 +10,8 @@ use jed::value::Value;
 use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
 fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
@@ -203,7 +204,9 @@ fn scalar_gist_file_backed_round_trip() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_scalar_round_trip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
+        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+            .unwrap()
+            .session(SessionOptions::default());
         run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)");
         run(&mut db, "CREATE INDEX t_room_gist ON t USING gist (room)");
         for (id, room) in [(1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 10)] {
@@ -215,7 +218,9 @@ fn scalar_gist_file_backed_round_trip() {
         );
     }
     {
-        let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut db = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         assert_eq!(
             ids(&mut db, "SELECT id FROM t WHERE room = 20 ORDER BY id"),
             vec![2, 5]
@@ -227,7 +232,9 @@ fn scalar_gist_file_backed_round_trip() {
         );
     }
     {
-        let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut db = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         assert_eq!(
             ids(&mut db, "SELECT id FROM t WHERE room = 20 ORDER BY id"),
             vec![2, 5, 7]
@@ -287,7 +294,9 @@ fn gist_file_backed_round_trip() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_round_trip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
+        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+            .unwrap()
+            .session(SessionOptions::default());
         run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
         run(&mut db, "CREATE INDEX t_r_gist ON t USING gist (r)");
         for (id, lit) in [
@@ -311,7 +320,9 @@ fn gist_file_backed_round_trip() {
     }
     // Reopen: the persisted R-tree loads, the resident tree is rebuilt, the query still works.
     {
-        let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut db = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         assert_eq!(
             ids(
                 &mut db,
@@ -338,7 +349,9 @@ fn gist_file_backed_round_trip() {
     }
     // And once more, after the maintenance commit, to prove the rewritten tree persists.
     {
-        let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut db = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         assert_eq!(
             ids(
                 &mut db,
@@ -553,7 +566,9 @@ fn exclude_file_backed_round_trip() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_exclude_round_trip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
+        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+            .unwrap()
+            .session(SessionOptions::default());
         run(
             &mut db,
             "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, \
@@ -572,7 +587,9 @@ fn exclude_file_backed_round_trip() {
         db.commit().unwrap();
     }
     {
-        let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut db = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         // The persisted constraint still rejects a conflict after reopen.
         assert_eq!(
             err_code(&mut db, "INSERT INTO booking VALUES (4, 101, '[15,25)')"),

@@ -197,7 +197,6 @@ fn literal(ty: &ScalarType, field: &Field) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn f(value: &str) -> Field {
         Field {

@@ -8,7 +8,8 @@
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
@@ -20,7 +21,10 @@ fn err(db: &mut Session, sql: &str) -> String {
 }
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -182,7 +186,9 @@ fn large_jsonb_spills_and_round_trips() {
     run(&mut db, "INSERT INTO t VALUES (2, '{\"k\": 42}')");
 
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image).expect("load image").session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .expect("load image")
+        .session(SessionOptions::default());
 
     let rows = query(&mut loaded, "SELECT id, j FROM t ORDER BY id");
     assert_eq!(rows[0][0], "1");
@@ -208,7 +214,9 @@ fn large_json_spills_verbatim() {
     );
 
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image).expect("load image").session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .expect("load image")
+        .session(SessionOptions::default());
     let rows = query(&mut loaded, "SELECT j FROM t WHERE id = 1");
     assert_eq!(rows[0][0], verbatim); // verbatim bytes, whitespace preserved
 }
@@ -485,7 +493,9 @@ fn jsonb_all_node_kinds_round_trip() {
         "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, false, null], \"c\": \"x\"}')",
     );
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image).expect("load image").session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .expect("load image")
+        .session(SessionOptions::default());
     let rows = query(&mut loaded, "SELECT j FROM t WHERE id = 1");
     assert_eq!(
         rows[0][0],

@@ -3,7 +3,6 @@
 //! names, and function names of the grammar. Pure candidate logic — the popup state and
 //! key handling live in `app.rs`, the rendering in `draw.rs`.
 
-
 /// The grammar's word list (keywords, canonical type names, aggregate functions) —
 /// completed in the case style of the typed prefix (all-uppercase prefix → uppercase).
 /// Shared with the editor's syntax highlighter (highlight.rs).
@@ -157,8 +156,9 @@ mod tests {
     fn db() -> jed::Session {
         let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
         db.execute("CREATE TABLE Users (id i32 PRIMARY KEY, score i32)", &[])
-        .unwrap();
-        db.execute("CREATE TABLE selections (sel i32 PRIMARY KEY)", &[]).unwrap();
+            .unwrap();
+        db.execute("CREATE TABLE selections (sel i32 PRIMARY KEY)", &[])
+            .unwrap();
         db
     }
 

@@ -77,9 +77,12 @@ fn bytea_to_uuid_wrong_length_traps_22p02() {
 fn uuid_bytea_round_trip_through_columns() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)", &[])
-    .unwrap();
-    db.execute("INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000', \
-         '\\x550e8400e29b41d4a716446655440000'), (2, NULL, NULL)", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000', \
+         '\\x550e8400e29b41d4a716446655440000'), (2, NULL, NULL)",
+        &[],
+    )
     .unwrap();
     assert_eq!(
         one(&mut db, "SELECT u::bytea FROM t WHERE id = 1"),
@@ -106,10 +109,13 @@ fn uuid_bytea_round_trip_through_columns() {
 fn text_uuid_smoke() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)", &[])
-    .unwrap();
+        .unwrap();
     // an UPPERCASE text value casts to the same 16 bytes and renders lowercase
-    db.execute("INSERT INTO t VALUES (1, '550E8400-E29B-41D4-A716-446655440000', \
-         '550e8400-e29b-41d4-a716-446655440000')", &[])
+    db.execute(
+        "INSERT INTO t VALUES (1, '550E8400-E29B-41D4-A716-446655440000', \
+         '550e8400-e29b-41d4-a716-446655440000')",
+        &[],
+    )
     .unwrap();
     assert_eq!(
         one(&mut db, "SELECT s::uuid FROM t WHERE id = 1"),
@@ -120,7 +126,8 @@ fn text_uuid_smoke() {
         Value::Text("550e8400-e29b-41d4-a716-446655440000".to_string())
     );
     // a malformed runtime text → uuid traps 22P02 (not a literal — the column path)
-    db.execute("INSERT INTO t VALUES (2, 'not-a-uuid', NULL)", &[]).unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'not-a-uuid', NULL)", &[])
+        .unwrap();
     assert_eq!(
         err_code(&mut db, "SELECT s::uuid FROM t WHERE id = 2"),
         "22P02"

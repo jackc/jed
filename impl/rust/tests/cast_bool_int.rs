@@ -43,7 +43,8 @@ fn bool_to_non_i32_is_forbidden() {
 #[test]
 fn non_i32_to_bool_is_forbidden() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)", &[]).unwrap();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)", &[])
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5, 9)", &[]).unwrap();
     assert_eq!(
         err_code(&mut db, "SELECT CAST(s AS boolean) FROM t WHERE id = 1"),

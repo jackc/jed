@@ -47,7 +47,10 @@ fn ids(db: &mut Session) -> Vec<i64> {
 
 /// The `pad` text of the row with `id`, or `None` if absent.
 fn pad_of(db: &mut Session, id: i64) -> Option<String> {
-    match db.execute(&format!("SELECT pad FROM t WHERE id = {id}"), &[]).unwrap() {
+    match db
+        .execute(&format!("SELECT pad FROM t WHERE id = {id}"), &[])
+        .unwrap()
+    {
         Outcome::Query { rows, .. } => rows.first().map(|r| match &r[0] {
             Value::Text(s) => s.clone(),
             v => panic!("expected a text pad, got {v:?}"),
@@ -64,11 +67,16 @@ fn setup(path: &PathBuf, rows: i64) -> Session {
             page_size: PS as u32,
         },
     )
-    .unwrap().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[]).unwrap();
+    .unwrap()
+    .session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+        .unwrap();
     let base = "x".repeat(40);
     for i in 1..=rows {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"), &[])
+        db.execute(
+            &format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"),
+            &[],
+        )
         .unwrap();
     }
     db
@@ -86,14 +94,19 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     // `page_count`, not the file length — the file is preallocated in chunks ahead of it,
     // spec/design/pager.md §7.)
     for k in 0..60 {
-        db.execute(&format!("UPDATE t SET pad = 'a{k}-{pad}' WHERE id = 15"), &[])
+        db.execute(
+            &format!("UPDATE t SET pad = 'a{k}-{pad}' WHERE id = 15"),
+            &[],
+        )
         .unwrap();
     }
     let pc_after_churn1 = db.page_count();
     drop(db);
 
     // Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         db.page_count(),
         pc_after_churn1,
@@ -102,7 +115,7 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
 
     // The very first post-reopen commit reuses a free page rather than extending the high-water.
     db.execute(&format!("UPDATE t SET pad = 'b0-{pad}' WHERE id = 15"), &[])
-    .unwrap();
+        .unwrap();
     assert_eq!(
         db.page_count(),
         pc_after_churn1,
@@ -112,7 +125,10 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     // A whole second churn — shorter than the first, so the reclaimed pool covers it — extends the
     // high-water not at all: the page count after equals the count after the first churn.
     for k in 1..40 {
-        db.execute(&format!("UPDATE t SET pad = 'b{k}-{pad}' WHERE id = 15"), &[])
+        db.execute(
+            &format!("UPDATE t SET pad = 'b{k}-{pad}' WHERE id = 15"),
+            &[],
+        )
         .unwrap();
     }
     assert_eq!(
@@ -128,7 +144,9 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
     );
     assert_eq!(ids(&mut db), (1..=30).collect::<Vec<_>>());
     drop(db);
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         pad_of(&mut db, 15).as_deref(),
         Some(&format!("b39-{pad}")[..])
@@ -146,24 +164,30 @@ fn heavy_insert_delete_churn_reopens_correctly_with_reuse() {
     // Repeatedly add then drop a high id, leaking pages each round.
     for k in 0..40 {
         db.execute(&format!("INSERT INTO t VALUES (1000, 'k{k}-{pad}')"), &[])
-        .unwrap();
+            .unwrap();
         db.execute("DELETE FROM t WHERE id = 1000", &[]).unwrap();
     }
     drop(db);
 
     // Reopen (free-list reconstructed) and churn again, now reusing reclaimed pages.
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     for k in 0..40 {
         db.execute(&format!("INSERT INTO t VALUES (2000, 'm{k}-{pad}')"), &[])
-        .unwrap();
+            .unwrap();
         db.execute("DELETE FROM t WHERE id = 2000", &[]).unwrap();
     }
     // Add a couple of permanent rows through the reused pages, then verify on a fresh open.
-    db.execute(&format!("INSERT INTO t VALUES (26, 'p-{pad}')"), &[]).unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (27, 'q-{pad}')"), &[]).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (26, 'p-{pad}')"), &[])
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (27, 'q-{pad}')"), &[])
+        .unwrap();
     drop(db);
 
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(ids(&mut db), (1..=27).collect::<Vec<_>>());
 }
 
@@ -173,18 +197,23 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     let mut db = setup(&path, 20);
     let pad = "w".repeat(40);
     for k in 0..30 {
-        db.execute(&format!("UPDATE t SET pad = 'c{k}-{pad}' WHERE id = 10"), &[])
+        db.execute(
+            &format!("UPDATE t SET pad = 'c{k}-{pad}' WHERE id = 10"),
+            &[],
+        )
         .unwrap();
     }
     drop(db);
 
     // Reopen so the free-list holds the churn's dead pages, then do two commits that *reuse* them.
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute(&format!("UPDATE t SET pad = 'A-{pad}' WHERE id = 10"), &[])
-    .unwrap(); // prior snapshot
+        .unwrap(); // prior snapshot
     let orig11 = pad_of(&mut db, 11).expect("row 11 exists");
     db.execute(&format!("UPDATE t SET pad = 'B-{pad}' WHERE id = 11"), &[])
-    .unwrap(); // newest commit
+        .unwrap(); // newest commit
     drop(db);
 
     // Corrupt the newest meta slot's checksum (a torn write of the commit that reused free pages).
@@ -202,7 +231,9 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     // The loader falls back to the prior snapshot — intact even though the torn commit reused
     // (overwrote) free pages, because those pages were dead and the prior snapshot never referenced
     // them. Row 11's update vanishes; row 10's prior-commit value and every row survive.
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         db.txid(),
         prior_txid,

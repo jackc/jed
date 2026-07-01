@@ -59,16 +59,20 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 /// Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain),
 /// `control` keeps every value inline. Row 2 is inline in both.
 fn two_tables() -> Session {
-    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let big = filler_text(600);
     db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
-    .unwrap();
-    db.execute(&format!("INSERT INTO spill VALUES (1, '{big}'), (2, 'small')"), &[])
+        .unwrap();
+    db.execute(
+        &format!("INSERT INTO spill VALUES (1, '{big}'), (2, 'small')"),
+        &[],
+    )
     .unwrap();
     db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
-    .unwrap();
+        .unwrap();
     db.execute("INSERT INTO control VALUES (1, 'tiny'), (2, 'small')", &[])
-    .unwrap();
+        .unwrap();
     db
 }
 
@@ -99,16 +103,20 @@ fn limit_does_not_lower_the_block() {
     // The spilled record is row 2, so LIMIT 1 emits only the inline row 1 — yet the page_read
     // block (which never short-circuits — cost.md §3 "LIMIT short-circuit") still counts the
     // bound's chain pages.
-    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let big = filler_text(600);
     db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
-    .unwrap();
-    db.execute(&format!("INSERT INTO spill VALUES (1, 'small'), (2, '{big}')"), &[])
+        .unwrap();
+    db.execute(
+        &format!("INSERT INTO spill VALUES (1, 'small'), (2, '{big}')"),
+        &[],
+    )
     .unwrap();
     db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
-    .unwrap();
+        .unwrap();
     db.execute("INSERT INTO control VALUES (1, 'small'), (2, 'tiny')", &[])
-    .unwrap();
+        .unwrap();
     let spill = cost(&mut db, "SELECT * FROM spill LIMIT 1");
     let control = cost(&mut db, "SELECT * FROM control LIMIT 1");
     assert_eq!(spill, control + TEXT_CHAIN_PAGES);
@@ -155,16 +163,27 @@ fn untouched_columns_charge_nothing() {
 #[test]
 fn multiple_chains_sum() {
     // One record with two externalized values charges the sum of both chains: 3 + 2 = 5.
-    let mut db = Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db =
+        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
     let big_text = filler_text(600);
     let big_hex = filler_bytes_hex(300);
-    db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)", &[])
+    db.execute(
+        "CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)",
+        &[],
+    )
     .unwrap();
-    db.execute(&format!("INSERT INTO spill VALUES (1, '{big_text}', '\\x{big_hex}')"), &[])
+    db.execute(
+        &format!("INSERT INTO spill VALUES (1, '{big_text}', '\\x{big_hex}')"),
+        &[],
+    )
     .unwrap();
-    db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)", &[])
+    db.execute(
+        "CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)",
+        &[],
+    )
     .unwrap();
-    db.execute("INSERT INTO control VALUES (1, 'tiny', '\\xcafe')", &[]).unwrap();
+    db.execute("INSERT INTO control VALUES (1, 'tiny', '\\xcafe')", &[])
+        .unwrap();
     let spill = cost(&mut db, "SELECT * FROM spill");
     let control = cost(&mut db, "SELECT * FROM control");
     assert_eq!(spill, control + TEXT_CHAIN_PAGES + BYTEA_CHAIN_PAGES);

@@ -9,7 +9,8 @@ use jed::value::Value;
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    db.execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
@@ -377,7 +378,9 @@ fn round_trip_preserves_unique() {
     run(&mut db, "CREATE INDEX plain ON t (w)");
     run(&mut db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)");
     let image = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&image).unwrap().session(SessionOptions::default());
+    let mut loaded = Database::from_image(&image)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         index_names(&loaded, "t"),
         vec![("plain".to_string(), false), ("t_v_key".to_string(), true)]

@@ -1,7 +1,6 @@
 //! The schema sidebar: a flat, selectable rendering of the catalog via the host
 //! introspection surface — `table_names()` + `table(name)` (api.md §6; cli.md §6).
 
-
 pub struct SchemaLine {
     pub text: String,
     /// `Some(name)` on a table-header line — Enter inserts the name into the editor.

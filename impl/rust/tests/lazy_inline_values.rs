@@ -19,8 +19,10 @@ fn tmp(name: &str) -> std::path::PathBuf {
 /// Default page size (8192) keeps every value inline-plain, so on a paged reopen each lands as
 /// `Unfetched::Inline` — the L2 case (nothing spills; that is large-values.md §14's case).
 fn seed(db: &mut Session) {
-    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[]).unwrap();
-    db.execute("CREATE TABLE t (\
+    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[])
+        .unwrap();
+    db.execute(
+        "CREATE TABLE t (\
             id i32 PRIMARY KEY, \
             name text, \
             data bytea, \
@@ -28,7 +30,9 @@ fn seed(db: &mut Session) {
             doc jsonb, \
             tags i32[], \
             home addr, \
-            span i32range)", &[])
+            span i32range)",
+        &[],
+    )
     .unwrap();
     db.execute("CREATE INDEX t_name ON t (name)", &[]).unwrap();
     db.execute("INSERT INTO t VALUES \
@@ -38,7 +42,10 @@ fn seed(db: &mut Session) {
             (4, 'dave',   '\\x00ff',     9999.99,'{\"k\": 4, \"nested\": {\"a\": [1,2,3]}}', '{}',  ROW(NULL, 7),         '(,9)')", &[])
     .unwrap();
 
-    db.execute("CREATE TABLE u (id i32 PRIMARY KEY, t_id i32, note text)", &[])
+    db.execute(
+        "CREATE TABLE u (id i32 PRIMARY KEY, t_id i32, note text)",
+        &[],
+    )
     .unwrap();
     db.execute("INSERT INTO u VALUES (1, 1, 'first'), (2, 1, 'again'), (3, 3, 'lonely'), (4, 99, 'orphan')", &[])
     .unwrap();
@@ -48,7 +55,9 @@ fn seed(db: &mut Session) {
 /// `ORDER BY` has unspecified order, CLAUDE.md §8; sorting both sides is sound for equality either
 /// way).
 fn rows_sorted(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
-    let mut rs: Vec<Vec<String>> = match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+    let mut rs: Vec<Vec<String>> = match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
     {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -61,7 +70,10 @@ fn rows_sorted(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+    {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
@@ -82,13 +94,17 @@ fn paged_inline_values_match_resident_across_query_shapes() {
                 page_size: jed::DEFAULT_PAGE_SIZE,
             },
         )
-        .unwrap().session(SessionOptions::default());
+        .unwrap()
+        .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
-    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE).session(SessionOptions::default());
+    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE)
+        .session(SessionOptions::default());
     seed(&mut mem);
-    let mut paged = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut paged = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
 
     let queries = [
         // Whole-row and per-column projection (every deferred type resolves).
@@ -175,11 +191,13 @@ fn mutations_preserve_untouched_inline_values() {
                 page_size: jed::DEFAULT_PAGE_SIZE,
             },
         )
-        .unwrap().session(SessionOptions::default());
+        .unwrap()
+        .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
-    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE).session(SessionOptions::default());
+    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE)
+        .session(SessionOptions::default());
     seed(&mut mem);
 
     let mutations = [
@@ -205,7 +223,9 @@ fn mutations_preserve_untouched_inline_values() {
     }
     // Apply to the paged store across a reopen so each mutation runs against lazily-faulted rows.
     {
-        let mut paged = Database::open(&path).unwrap().session(SessionOptions::default());
+        let mut paged = Database::open(&path)
+            .unwrap()
+            .session(SessionOptions::default());
         for m in mutations {
             paged.execute(m, &[]).unwrap();
         }
@@ -213,7 +233,9 @@ fn mutations_preserve_untouched_inline_values() {
     }
 
     // A fresh paged reopen must read back exactly the resident final state.
-    let mut paged = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut paged = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     for sql in [
         "SELECT * FROM t",
         "SELECT id, name, amount, doc, tags, home, span, data FROM t ORDER BY id",
@@ -261,10 +283,14 @@ fn untouched_corrupt_inline_body_defers_its_error() {
                 page_size: jed::DEFAULT_PAGE_SIZE,
             },
         )
-        .unwrap().session(SessionOptions::default());
+        .unwrap()
+        .session(SessionOptions::default());
         db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
-        .unwrap();
-        db.execute(&format!("INSERT INTO t VALUES (1, '{marker}', 42), (2, 'clean', 7)"), &[])
+            .unwrap();
+        db.execute(
+            &format!("INSERT INTO t VALUES (1, '{marker}', 42), (2, 'clean', 7)"),
+            &[],
+        )
         .unwrap();
         drop(db);
     }
@@ -289,7 +315,9 @@ fn untouched_corrupt_inline_body_defers_its_error() {
         std::fs::write(&path, &bytes).unwrap();
     }
 
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     // Open faulted the leaf (skip-walk only); untouching queries never construct the body.
     assert_eq!(rows_sorted(&mut db, "SELECT id FROM t").len(), 2);
     assert_eq!(
@@ -302,11 +330,13 @@ fn untouched_corrupt_inline_body_defers_its_error() {
         vec![vec!["clean".to_string()]]
     );
     // Touching the corrupted body runs the real decode: XX001.
-    let err = db.execute("SELECT body FROM t WHERE id = 1", &[])
+    let err = db
+        .execute("SELECT body FROM t WHERE id = 1", &[])
         .expect_err("a corrupted inline body must fail when touched");
     assert_eq!(err.code(), "XX001");
     // It also surfaces through a whole-row projection that includes the body.
-    let err = db.execute("SELECT * FROM t ORDER BY id", &[])
+    let err = db
+        .execute("SELECT * FROM t ORDER BY id", &[])
         .expect_err("touching the body through SELECT * must fail");
     assert_eq!(err.code(), "XX001");
 
@@ -326,9 +356,14 @@ fn untouched_deferred_column_rides_a_spilling_sort() {
     let _ = std::fs::remove_file(&path);
     let mut mem = Database::new_in_memory().session(SessionOptions::default());
     {
-        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
+        let mut db = Database::create(&path, DatabaseOptions::default())
+            .unwrap()
+            .session(SessionOptions::default());
         for db in [&mut mem as &mut Session, &mut db] {
-            db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)", &[])
+            db.execute(
+                "CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)",
+                &[],
+            )
             .unwrap();
         }
         // 200 rows: a scrambled sort key `k`, plus deferred `label`/`doc` columns the queries below
@@ -344,7 +379,9 @@ fn untouched_deferred_column_rides_a_spilling_sort() {
         drop(db);
     }
 
-    let mut paged = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut paged = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     paged.set_work_mem(128); // ~2-3 rows per run → dozens of spilled runs + a deep k-way merge
 
     for sql in [

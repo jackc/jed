@@ -15,7 +15,10 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL" via `render`).
 fn val(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
             assert_eq!(rows[0].len(), 1, "{sql}: expected one column");

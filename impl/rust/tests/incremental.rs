@@ -47,13 +47,19 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     let path = tmp("incremental_small_growth.jed");
     let _ = std::fs::remove_file(&path);
     let ps = 256u64;
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[]).unwrap();
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+        .unwrap()
+        .session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+        .unwrap();
     // Enough rows for a multi-level tree at 256-byte pages (≈3 records/leaf). Each insert
     // autocommits, so the file already holds many leaked pages by the end of the loop.
     let pad = "x".repeat(48);
     for i in 1..=30 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, 'row-{i:02}-{pad}')"), &[])
+        db.execute(
+            &format!("INSERT INTO t VALUES ({i}, 'row-{i:02}-{pad}')"),
+            &[],
+        )
         .unwrap();
     }
 
@@ -71,7 +77,7 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     // dirty-page count.
     let pc_before = db.page_count();
     db.execute(&format!("INSERT INTO t VALUES (31, 'row-31-{pad}')"), &[])
-    .unwrap();
+        .unwrap();
     let appended = (db.page_count() - pc_before) as u64;
     assert!(
         appended >= 2,
@@ -88,7 +94,9 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
 
     // And it reopens to the full, correct contents (leaked pages and all).
     drop(db);
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(ids(&mut db), (1..=31).collect::<Vec<_>>());
 }
 
@@ -100,18 +108,27 @@ fn delete_heavy_history_reopens_correctly() {
     let path = tmp("incremental_deletes.jed");
     let _ = std::fs::remove_file(&path);
     let pad = "x".repeat(48);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[]).unwrap();
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+        .unwrap()
+        .session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+        .unwrap();
     for i in 1..=30 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, 'row-{i:02}-{pad}')"), &[])
+        db.execute(
+            &format!("INSERT INTO t VALUES ({i}, 'row-{i:02}-{pad}')"),
+            &[],
+        )
         .unwrap();
     }
     for i in 1..=20 {
-        db.execute(&format!("DELETE FROM t WHERE id = {i}"), &[]).unwrap();
+        db.execute(&format!("DELETE FROM t WHERE id = {i}"), &[])
+            .unwrap();
     }
     drop(db);
 
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(ids(&mut db), (21..=30).collect::<Vec<_>>());
 }
 
@@ -119,14 +136,17 @@ fn delete_heavy_history_reopens_correctly() {
 fn meta_slots_alternate_across_commits() {
     let path = tmp("incremental_alternation.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
+    let mut db = Database::create(&path, DatabaseOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
 
     // `create` seeds BOTH slots at txid 1, so two valid metas exist from the first moment.
     let img = std::fs::read(&path).unwrap();
     assert_eq!(slot_txid(&img, 0), 1);
     assert_eq!(slot_txid(&img, 1), 1);
 
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap(); // txid 2 → slot 0
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+        .unwrap(); // txid 2 → slot 0
     db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // txid 3 → slot 1
     drop(db);
 
@@ -135,7 +155,9 @@ fn meta_slots_alternate_across_commits() {
     assert_eq!(slot_txid(&img, 0), 2, "even txid lands in slot 0");
     assert_eq!(slot_txid(&img, 1), 3, "odd txid lands in slot 1");
 
-    let db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(db.txid(), 3, "open adopts the highest valid txid");
 }
 
@@ -143,8 +165,11 @@ fn meta_slots_alternate_across_commits() {
 fn torn_latest_commit_falls_back_to_prior_snapshot() {
     let path = tmp("incremental_torn_meta.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[]).unwrap(); // txid 2 (slot 0)
+    let mut db = Database::create(&path, DatabaseOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+        .unwrap(); // txid 2 (slot 0)
     db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // txid 3 (slot 1)
     db.execute("INSERT INTO t VALUES (2)", &[]).unwrap(); // txid 4 (slot 0) — the newest commit
     drop(db);
@@ -157,7 +182,9 @@ fn torn_latest_commit_falls_back_to_prior_snapshot() {
     img[32] ^= 0xFF; // flip a CRC byte of slot 0's meta header
     std::fs::write(&path, &img).unwrap();
 
-    let mut db = Database::open(&path).unwrap().session(SessionOptions::default());
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(db.txid(), 3, "fell back to the prior committed snapshot");
     assert_eq!(
         ids(&mut db),

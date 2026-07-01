@@ -11,21 +11,30 @@ use jed::value::Value;
 use jed::{Database, Outcome, Session, SessionOptions};
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => rows,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
 fn names(db: &mut Session, sql: &str) -> Vec<String> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { column_names, .. } => column_names,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 
 fn types(db: &mut Session, sql: &str) -> Vec<String> {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
         Outcome::Query { column_types, .. } => column_types,
         Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
@@ -137,8 +146,12 @@ fn column_type_unification() {
 fn params_typed_by_sibling_rows() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     // A $1 in a column with a concrete sibling literal is typed by the unified column type.
-    match db.execute("SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", &[Value::Int(7)])
-    .unwrap()
+    match db
+        .execute(
+            "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1",
+            &[Value::Int(7)],
+        )
+        .unwrap()
     {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(7)]]);

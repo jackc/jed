@@ -11,7 +11,8 @@ use jed::{Database, Session, SessionOptions};
 fn db_with(stmts: &[&str]) -> Session {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[]).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+        db.execute(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
@@ -61,8 +62,12 @@ fn materialized_hint_forces_buffering() {
 fn recursive_unbounded_aborts_at_cost_ceiling() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
     db.set_max_cost(1000);
-    let err = db.execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c", &[])
-    .expect_err("an unbounded recursion must abort, not loop forever");
+    let err = db
+        .execute(
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c",
+            &[],
+        )
+        .expect_err("an unbounded recursion must abort, not loop forever");
     assert_eq!(err.code(), "54P01", "got {}", err.message);
 }
 
@@ -87,7 +92,9 @@ fn recursive_hint_is_inert() {
         let sql = format!(
             "WITH RECURSIVE c(n) AS {hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"
         );
-        let r = db.execute(&sql, &[]).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
+        let r = db
+            .execute(&sql, &[])
+            .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
         // Three rows regardless of the hint; the recursive cost is identical (the hint is ignored).
         match r {
             jed::Outcome::Query { rows, cost, .. } => {

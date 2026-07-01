@@ -18,7 +18,10 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL").
 fn val(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)) {
+    match db
+        .execute(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+    {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}: expected one row");
             assert_eq!(rows[0].len(), 1, "{sql}: expected one column");
@@ -96,8 +99,12 @@ fn text_elements() {
 #[test]
 fn column_literal_adaptation() {
     let mut db = Database::new_in_memory().session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[]).unwrap();
-    db.execute("INSERT INTO t VALUES (1, ARRAY[10,20,30]), (2, ARRAY[40,50])", &[])
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, ARRAY[10,20,30]), (2, ARRAY[40,50])",
+        &[],
+    )
     .unwrap();
     // A bare integer literal adapts to the i32 element type; a bare ARRAY[…] adapts to a column.
     assert_eq!(
