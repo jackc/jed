@@ -1850,7 +1850,8 @@ function* streamRows(
   let passed = 0n;
   let produced = 0n;
   // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-  for (const [, rawRow] of store.scanIter(bound, sp.pkReverse)) {
+  // Read-only streaming SELECT feed: reconstruct only the touched columns (Track A1, packed-leaf.md §11).
+  for (const [, rawRow] of store.scanIter(bound, sp.pkReverse, sp.relMasks[0]!)) {
     meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
     meter.charge(COSTS.storageRowRead);
     // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
@@ -9768,9 +9769,11 @@ export class Engine {
         return limit === null ? true : BigInt(out.length) < limit;
       };
       // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
-      // (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
-      if (plan.pkReverse) store.scanRangeRev(bound, visit);
-      else store.scanRange(bound, visit);
+      // (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward. Read-only SELECT feed:
+      // reconstruct only the touched columns (Track A1, packed-leaf.md §11).
+      const recon = plan.relMasks[0]!;
+      if (plan.pkReverse) store.scanRangeRev(bound, recon, visit);
+      else store.scanRange(bound, recon, visit);
     }
     return {
       columnNames: plan.columnNames,
@@ -9805,7 +9808,8 @@ export class Engine {
     const out: Value[][] = [];
     if (limit !== 0n) {
       let passed = 0n;
-      istore.scanRange(unboundedBound(), (ekey) => {
+      // An index store has no payload columns, so its rows carry nothing to mask — whole-row scan.
+      istore.scanRange(unboundedBound(), null, (ekey) => {
         meter.guard(); // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
         // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3): the
         // entry key is `<index columns> ‖ storage_key`, and storage_key is exactly io.pkWidth bytes.
@@ -9885,7 +9889,8 @@ export class Engine {
     if (plan.order.some((k) => k.collation !== null)) {
       const rows: Row[] = [];
       if (!empty) {
-        store.scanRange(bound, (_key, rawRow) => {
+        // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
+        store.scanRange(bound, plan.relMasks[0]!, (_key, rawRow) => {
           meter.guard();
           meter.charge(COSTS.storageRowRead);
           const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
@@ -9906,7 +9911,8 @@ export class Engine {
       // spills when it exceeds the budget.
       const sorter = this.newSorterFor(plan.order);
       if (!empty) {
-        store.scanRange(bound, (_key, rawRow) => {
+        // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
+        store.scanRange(bound, plan.relMasks[0]!, (_key, rawRow) => {
           meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
           meter.charge(COSTS.storageRowRead);
           const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
@@ -10121,13 +10127,17 @@ export class Engine {
         rows = [];
         nodeCount = 0;
       } else {
-        const u = store.rangeScanWithUnits(b, plan.relMasks[ri]!);
+        // Read-only SELECT feed: reconstruct only the touched columns (Track A1) — a Packed leaf skips
+        // decoding the untouched ones. Cost- and result-identical for a consumer that reads only the
+        // touched set (packed-leaf.md §11).
+        const u = store.rangeScanWithUnitsMasked(b, plan.relMasks[ri]!);
         rows = u.entries.map((e) => e.row);
         nodeCount = u.pages;
         slabs = u.slabs;
       }
     } else {
-      const u = store.scanWithUnits(plan.relMasks[ri]!);
+      // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
+      const u = store.scanWithUnitsMasked(plan.relMasks[ri]!);
       rows = u.entries.map((e) => e.row);
       nodeCount = u.pages;
       slabs = u.slabs;

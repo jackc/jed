@@ -72,6 +72,15 @@ export function rowAtMasked(n: PNode, i: number, mask: boolean[]): Row {
   return n.packed ? n.packed.rowMasked(i, mask) : n.vals[i]!;
 }
 
+// rowAtMaybeMasked is the scan-feed value-read seam (packed-leaf.md §4/§11, Track A1): recon === null
+// reconstructs the WHOLE row (rowAt) — the whole-row default the mutation / FK / index-maintenance feeds
+// keep (they recompute keys from the old row) — while recon !== null reconstructs only its selected
+// columns (rowAtMasked), leaving the rest NULL, for a read-only SELECT feed so a Packed leaf skips
+// decoding the untouched columns. A Decoded node returns its whole row either way (already decoded).
+export function rowAtMaybeMasked(n: PNode, i: number, recon: boolean[] | null): Row {
+  return recon === null ? rowAt(n, i) : rowAtMasked(n, i, recon);
+}
+
 // decodedRows returns every value row — the mutation-descent materialization (packed-leaf.md §7). A
 // Decoded node clones vals; a Packed leaf reconstructs every row so the rebuilt node is Decoded
 // (build / nodeInsert / nodeRemove / mergeAt then run unchanged). Interior nodes are always Decoded.
@@ -399,7 +408,7 @@ export class PMap {
   // is in bound while both its adjacent children are pruned, so the entry window can start one slot
   // before the child window — emitted before the descent loop.
   rangeEntries(b: KeyBound, src: LeafSource | null): { keys: Uint8Array[]; vals: Row[] } {
-    const { keys, vals } = this.rangeEntriesCounted(b, src);
+    const { keys, vals } = this.rangeEntriesCounted(b, src, null);
     return { keys, vals };
   }
 
@@ -410,6 +419,7 @@ export class PMap {
   rangeEntriesCounted(
     b: KeyBound,
     src: LeafSource | null,
+    recon: boolean[] | null,
   ): { keys: Uint8Array[]; vals: Row[]; nodes: number } {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
@@ -420,7 +430,7 @@ export class PMap {
       if (isLeaf(n)) {
         for (let i = ef; i < el; i++) {
           keys.push(n.keys[i]);
-          vals.push(rowAt(n, i));
+          vals.push(rowAtMaybeMasked(n, i, recon));
         }
         return;
       }
@@ -468,13 +478,14 @@ export class PMap {
   scanRange(
     b: KeyBound,
     src: LeafSource | null,
+    recon: boolean[] | null,
     visit: (key: Uint8Array, row: Row) => boolean,
   ): void {
     const walk = (n: PNode): boolean => {
       const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
         for (let i = ef; i < el; i++) {
-          if (!visit(n.keys[i], rowAt(n, i))) return false;
+          if (!visit(n.keys[i], rowAtMaybeMasked(n, i, recon))) return false;
         }
         return true;
       }
@@ -499,13 +510,14 @@ export class PMap {
   scanRangeRev(
     b: KeyBound,
     src: LeafSource | null,
+    recon: boolean[] | null,
     visit: (key: Uint8Array, row: Row) => boolean,
   ): void {
     const walk = (n: PNode): boolean => {
       const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
         for (let i = el - 1; i >= ef; i--) {
-          if (!visit(n.keys[i], rowAt(n, i))) return false;
+          if (!visit(n.keys[i], rowAtMaybeMasked(n, i, recon))) return false;
         }
         return true;
       }
@@ -530,45 +542,63 @@ export class PMap {
   // circuit, cost.md §3). It yields the stored row reference (like scanRange's callback); the GC keeps
   // a faulted leaf's row alive as long as a pulled row references it, even after the pool evicts the
   // leaf. A faulted-leaf read error in resolveChild propagates as a thrown exception.
-  *scanRangeIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
-    if (this.root !== null) yield* walkIter(this.root, b, src);
+  *scanRangeIter(
+    b: KeyBound,
+    src: LeafSource | null,
+    recon: boolean[] | null,
+  ): Generator<[Uint8Array, Row]> {
+    if (this.root !== null) yield* walkIter(this.root, b, src, recon);
   }
 
   // scanRangeRevIter is scanRangeIter in reverse — the pull-model equivalent of scanRangeRev,
   // yielding the in-bound pairs in DESCENDING key order (the exact reverse of scanRangeIter).
-  *scanRangeRevIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
-    if (this.root !== null) yield* walkRevIter(this.root, b, src);
+  *scanRangeRevIter(
+    b: KeyBound,
+    src: LeafSource | null,
+    recon: boolean[] | null,
+  ): Generator<[Uint8Array, Row]> {
+    if (this.root !== null) yield* walkRevIter(this.root, b, src, recon);
   }
 }
 
 // walkIter mirrors PMap.scanRange's recursive in-order walk, yielding [key, row] instead of calling a
 // visit callback — so it is identical by construction (same structure, same windowing, same descent
 // order, including the asymmetric inclusive-lo separator emitted before the descent loop).
-function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+function* walkIter(
+  n: PNode,
+  b: KeyBound,
+  src: LeafSource | null,
+  recon: boolean[] | null,
+): Generator<[Uint8Array, Row]> {
   const [ef, el] = entryWindow(b, n);
   if (isLeaf(n)) {
-    for (let i = ef; i < el; i++) yield [n.keys[i], rowAt(n, i)];
+    for (let i = ef; i < el; i++) yield [n.keys[i], rowAtMaybeMasked(n, i, recon)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
   if (ef < cf) yield [n.keys[ef], n.vals[ef]];
   for (let i = cf; i <= cl; i++) {
-    yield* walkIter(resolveChild(n.children[i], src), b, src);
+    yield* walkIter(resolveChild(n.children[i], src), b, src, recon);
     if (i >= ef && i < el) yield [n.keys[i], n.vals[i]];
   }
 }
 
 // walkRevIter mirrors PMap.scanRangeRev's reverse walk, yielding instead of pushing.
-function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+function* walkRevIter(
+  n: PNode,
+  b: KeyBound,
+  src: LeafSource | null,
+  recon: boolean[] | null,
+): Generator<[Uint8Array, Row]> {
   const [ef, el] = entryWindow(b, n);
   if (isLeaf(n)) {
-    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], rowAt(n, i)];
+    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], rowAtMaybeMasked(n, i, recon)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
   for (let i = cl; i >= cf; i--) {
     if (i >= ef && i < el) yield [n.keys[i], n.vals[i]];
-    yield* walkRevIter(resolveChild(n.children[i], src), b, src);
+    yield* walkRevIter(resolveChild(n.children[i], src), b, src, recon);
   }
   if (ef < cf) yield [n.keys[ef], n.vals[ef]];
 }

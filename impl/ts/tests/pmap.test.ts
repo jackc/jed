@@ -183,8 +183,8 @@ test("pmap: reverse scan is the forward scan reversed", () => {
       out.push(decode(k));
       return true;
     };
-    if (rev) pm.scanRangeRev(b, null, visit);
-    else pm.scanRange(b, null, visit);
+    if (rev) pm.scanRangeRev(b, null, null, visit);
+    else pm.scanRange(b, null, null, visit);
     return out;
   };
   const bounds: KeyBound[] = [
@@ -207,7 +207,7 @@ test("pmap: reverse scan is the forward scan reversed", () => {
   // The reverse short-circuit stops from the HIGH end: stopping after 3 visits yields the 3 largest
   // keys descending, faulting no further.
   const got: number[] = [];
-  pm.scanRangeRev(unboundedBound(), null, (k) => {
+  pm.scanRangeRev(unboundedBound(), null, null, (k) => {
     got.push(decode(k));
     return got.length < 3;
   });
@@ -238,14 +238,14 @@ test("pmap: pull cursor (scanRangeIter) matches the push scan", () => {
       out.push([decode(k), val(r)]);
       return true;
     };
-    if (rev) pm.scanRangeRev(b, null, visit);
-    else pm.scanRange(b, null, visit);
+    if (rev) pm.scanRangeRev(b, null, null, visit);
+    else pm.scanRange(b, null, null, visit);
     return out;
   };
   // Drain the pull generator into the same shape.
   const pulled = (b: KeyBound, rev: boolean): Pair[] => {
     const out: Pair[] = [];
-    const it = rev ? pm.scanRangeRevIter(b, null) : pm.scanRangeIter(b, null);
+    const it = rev ? pm.scanRangeRevIter(b, null, null) : pm.scanRangeIter(b, null, null);
     for (const [k, r] of it) out.push([decode(k), val(r)]);
     return out;
   };
@@ -273,8 +273,8 @@ test("pmap: pull cursor (scanRangeIter) matches the push scan", () => {
   for (const rev of [false, true]) {
     const full = pushed(unboundedBound(), rev);
     const it = rev
-      ? pm.scanRangeRevIter(unboundedBound(), null)
-      : pm.scanRangeIter(unboundedBound(), null);
+      ? pm.scanRangeRevIter(unboundedBound(), null, null)
+      : pm.scanRangeIter(unboundedBound(), null, null);
     const out: Pair[] = [];
     for (const [k, r] of it) {
       out.push([decode(k), val(r)]);
