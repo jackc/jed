@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, loadEngine, toImage } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // A range column survives a whole-image serialize + reload (toImage → loadEngine), exercising
@@ -30,7 +30,7 @@ test("range image roundtrip", () => {
     "INSERT INTO t VALUES (4, '(,)', '(5,)')", // canonical [6,)
     "INSERT INTO t VALUES (5, NULL, '[1,1]')", // canonical [1,2)
   ]);
-  const loaded = loadEngine(toImage(db, 4096, 1n));
+  const loaded = Database.fromImage(db.toImage(4096, 1n));
   assert.deepEqual(query(loaded, "SELECT id, r, br FROM t ORDER BY id"), [
     ["1", "[1,5)", "[10,20)"],
     ["2", "[1,6)", "NULL"],
@@ -59,7 +59,7 @@ test("range canonical name and aliases", () => {
     "INSERT INTO k VALUES ('[1,5)', 1)",
   ]);
   assert.equal(
-    errCode(() => execute(db2, "INSERT INTO k VALUES ('[1,4]', 2)")),
+    errCode(() => db2.execute("INSERT INTO k VALUES ('[1,4]', 2)")),
     "23505",
   );
   // A still-rejected path reports the canonical i32range even when declared with the alias: GIN needs
@@ -68,7 +68,7 @@ test("range canonical name and aliases", () => {
   const db3 = dbWith(["CREATE TABLE u (id i32 PRIMARY KEY, r int4range)"]);
   let msg = "";
   try {
-    execute(db3, "CREATE INDEX ON u USING gin (r)");
+    db3.execute("CREATE INDEX ON u USING gin (r)");
     assert.fail("a gin index over a plain range column should be rejected");
   } catch (e) {
     msg = e instanceof Error ? e.message : String(e);
@@ -84,18 +84,18 @@ test("range canonical name and aliases", () => {
 test("range narrowings are 0A000", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, r i32range DEFAULT '[1,5)')")),
+    errCode(() => db.execute("CREATE TABLE b (id i32 PRIMARY KEY, r i32range DEFAULT '[1,5)')")),
     "0A000",
   );
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
   // A range ordered (btree) index now WORKS (the range-bounds key, encoding.md §2.11) — a positive
   // check that the former 0A000 narrowing is lifted.
-  execute(db, "CREATE INDEX ri ON t (r)");
+  db.execute("CREATE INDEX ri ON t (r)");
   // INSERT … SELECT into a range column is deferred (the VALUES + literal path is the input).
-  execute(db, "CREATE TABLE src (id i32 PRIMARY KEY, r i32range)");
-  execute(db, "INSERT INTO src VALUES (1, '[1,5)')");
+  db.execute("CREATE TABLE src (id i32 PRIMARY KEY, r i32range)");
+  db.execute("INSERT INTO src VALUES (1, '[1,5)')");
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO t SELECT id, r FROM src")),
+    errCode(() => db.execute("INSERT INTO t SELECT id, r FROM src")),
     "0A000",
   );
 });
@@ -111,20 +111,20 @@ test("range update deferrals are 0A000", () => {
     "INSERT INTO t VALUES (1, '[1,5)')",
   ]);
   assert.equal(
-    errCode(() => execute(db, "UPDATE t SET r = $1 WHERE id = 1")),
+    errCode(() => db.execute("UPDATE t SET r = $1 WHERE id = 1")),
     "0A000",
   );
   assert.equal(
     errCode(() =>
-      execute(db, "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'"),
+      db.execute("INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'"),
     ),
     "0A000",
   );
-  execute(db, "CREATE TYPE addr AS (street text, zip i32)");
-  execute(db, "CREATE TABLE p (id i32 PRIMARY KEY, a addr)");
-  execute(db, "INSERT INTO p VALUES (1, ROW('x', 5))");
+  db.execute("CREATE TYPE addr AS (street text, zip i32)");
+  db.execute("CREATE TABLE p (id i32 PRIMARY KEY, a addr)");
+  db.execute("INSERT INTO p VALUES (1, ROW('x', 5))");
   assert.equal(
-    errCode(() => execute(db, "UPDATE p SET a = ROW('y', 9) WHERE id = 1")),
+    errCode(() => db.execute("UPDATE p SET a = ROW('y', 9) WHERE id = 1")),
     "0A000",
   );
 });
@@ -135,19 +135,19 @@ test("range update deferrals are 0A000", () => {
 // ("operator does not exist") — a deliberate divergence, so this cannot live in the oracle corpus.
 // The agreeing same-element comparison (=/</ORDER BY) is covered by types/range.test.
 test("range cross-element comparison is 42804", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // A range over i32 vs a range over i64 — different element types, no implicit cross-range cast.
   assert.equal(
-    errCode(() => execute(db, "SELECT '[1,5)'::i32range = '[1,5)'::i64range")),
+    errCode(() => db.execute("SELECT '[1,5)'::i32range = '[1,5)'::i64range")),
     "42804",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT '[1,5)'::i32range < '[1,5)'::i64range")),
+    errCode(() => db.execute("SELECT '[1,5)'::i32range < '[1,5)'::i64range")),
     "42804",
   );
   // A range vs a bare scalar of its own element type is still a 42804 (a range is not its element).
   assert.equal(
-    errCode(() => execute(db, "SELECT '[1,5)'::i32range = 5")),
+    errCode(() => db.execute("SELECT '[1,5)'::i32range = 5")),
     "42804",
   );
 });
@@ -155,9 +155,9 @@ test("range cross-element comparison is 42804", () => {
 // A range-typed composite field is deferred (`0A000`) — only range *columns* are storable this
 // slice. The type name IS known, so it is `0A000`, not the `42704` an unknown type would give.
 test("composite range field is 0A000", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(
-    errCode(() => execute(db, "CREATE TYPE rec AS (lo i32, span i32range)")),
+    errCode(() => db.execute("CREATE TYPE rec AS (lo i32, span i32range)")),
     "0A000",
   );
 });
@@ -167,7 +167,7 @@ test("composite range field is 0A000", () => {
 // integer (range-checked at eval) where PG rejects the overload, and is stricter on the
 // unknown-string corner. The agreeing constructor behavior lives in expr/range_constructors.test.
 test("range constructor divergences", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
   // int4range/int8range). The result is identical to the PG-spelled alias.
   assert.deepEqual(query(db, "SELECT i32range(1, 5)"), [["[1,5)"]]);
@@ -177,27 +177,27 @@ test("range constructor divergences", () => {
   // the element domain is 22003 (the same assignment range-check INSERT applies).
   assert.deepEqual(query(db, "SELECT int4range(1::i64, 5::i64)"), [["[1,5)"]]);
   assert.equal(
-    errCode(() => execute(db, "SELECT int4range(3000000000::i64, 4000000000::i64)")),
+    errCode(() => db.execute("SELECT int4range(3000000000::i64, 4000000000::i64)")),
     "22003",
   );
   // (3) Conversely jed is STRICTER on the unknown-literal corner: a string literal is NOT a valid
   // integer/decimal bound (no unknown→number coercion), so it is 42883 — where PG coerces '1' to
   // integer. (A string DOES adapt to a temporal element, exercised in the corpus.)
   assert.equal(
-    errCode(() => execute(db, "SELECT int4range('1', 5)")),
+    errCode(() => db.execute("SELECT int4range('1', 5)")),
     "42883",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT numrange('1', 2)")),
+    errCode(() => db.execute("SELECT numrange('1', 2)")),
     "42883",
   );
   // Arity: only the 2-arg and 3-arg forms exist; anything else is no overload.
   assert.equal(
-    errCode(() => execute(db, "SELECT int4range(1)")),
+    errCode(() => db.execute("SELECT int4range(1)")),
     "42883",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT int4range(1, 2, '[]', 3)")),
+    errCode(() => db.execute("SELECT int4range(1, 2, '[]', 3)")),
     "42883",
   );
 });
@@ -206,36 +206,36 @@ test("range constructor divergences", () => {
 // value-producing rows) cannot express, plus the one real divergence (spec/design/range-functions.md
 // §3). The agreeing value behavior of all eight operators lives in expr/range_operators.test.
 test("range operator divergences", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // THE divergence: jed has no integer bit-shift, so the `<<` / `>>` tokens are RANGE-only. An
   // integer `<<` / `>>` is "operator does not exist" (42883) — PostgreSQL would compute a bit shift
   // (5 << 2 = 20). A documented divergence (jed owns its surface), so it cannot live in the corpus.
   assert.equal(
-    errCode(() => execute(db, "SELECT 5 << 2")),
+    errCode(() => db.execute("SELECT 5 << 2")),
     "42883",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT 5 >> 2")),
+    errCode(() => db.execute("SELECT 5 >> 2")),
     "42883",
   );
   // A range operator pairs only with a range over the SAME element type (this AGREES with PG's
   // "operator does not exist" 42883, but an error row is awkward in the value-oriented corpus).
   assert.equal(
-    errCode(() => execute(db, "SELECT '[1,5)'::int4range @> '[1,5)'::int8range")),
+    errCode(() => db.execute("SELECT '[1,5)'::int4range @> '[1,5)'::int8range")),
     "42883",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT '[1,5)'::int4range && '[1,5)'::int8range")),
+    errCode(() => db.execute("SELECT '[1,5)'::int4range && '[1,5)'::int8range")),
     "42883",
   );
   // The positional operators have no element overload — `range << element` is 42883 (only @>/<@ take
   // an element). And `-|-` on non-ranges is 42883 (it is range-only, like PG).
   assert.equal(
-    errCode(() => execute(db, "SELECT '[1,5)'::int4range << 5")),
+    errCode(() => db.execute("SELECT '[1,5)'::int4range << 5")),
     "42883",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT 1 -|- 2")),
+    errCode(() => db.execute("SELECT 1 -|- 2")),
     "42883",
   );
   // `-|-` lexes greedily and is NOT confused with `-` then a comment / minus: this is the adjacency

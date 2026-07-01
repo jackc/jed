@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // bool → i16 and bool → i64 are forbidden (PG has only bool → int4): jed 42804, PG 42846.
@@ -26,7 +26,7 @@ test("bool → non-i32 integer is forbidden (42804)", () => {
     "SELECT TRUE::bigint",
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "42804",
       sql,
     );
@@ -45,7 +45,7 @@ test("non-i32 integer → bool is forbidden (42804)", () => {
     "SELECT b::boolean FROM t WHERE id = 1",
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "42804",
       sql,
     );
@@ -58,7 +58,7 @@ test("integer literal beyond i32 range → bool overflows (22003)", () => {
   const db = dbWith([]);
   for (const sql of ["SELECT CAST(5000000000 AS boolean)", "SELECT 5000000000::boolean"]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "22003",
       sql,
     );

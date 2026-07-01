@@ -9,11 +9,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, executeParams, intValue } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { Database, intValue } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query } from "./util.ts";
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 function rows1(ns: number[]): string[][] {
@@ -21,23 +21,23 @@ function rows1(ns: number[]): string[][] {
 }
 
 test("step of zero is invalid_parameter_value (22023)", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM generate_series(1, 5, 0)")),
+    errCode(() => db.execute("SELECT * FROM generate_series(1, 5, 0)")),
     "22023",
   );
 });
 
 test("alias forms and qualified column", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // PG's single-column function-alias rule: `AS g` (or implicit `g`) renames the column to `g`.
   assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(1, 3) g"), rows1([1, 2, 3]));
-  const out = execute(db, "SELECT * FROM generate_series(1, 3) AS g");
+  const out = db.execute("SELECT * FROM generate_series(1, 3) AS g");
   assert.equal(out.kind, "query");
   if (out.kind === "query") assert.deepStrictEqual(out.columnNames, ["g"]);
   assert.deepStrictEqual(query(db, "SELECT g.g FROM generate_series(1, 3) AS g"), rows1([1, 2, 3]));
   assert.equal(
-    errCode(() => execute(db, "SELECT g.generate_series FROM generate_series(1, 3) AS g")),
+    errCode(() => db.execute("SELECT g.generate_series FROM generate_series(1, 3) AS g")),
     "42703",
   );
   assert.deepStrictEqual(
@@ -47,8 +47,8 @@ test("alias forms and qualified column", () => {
 });
 
 test("$N parameter argument", () => {
-  const db = new Engine();
-  const out = executeParams(db, "SELECT * FROM generate_series(1, $1)", [intValue(3n)]);
+  const db = Database.newInMemory().session();
+  const out = db.execute("SELECT * FROM generate_series(1, $1)", [intValue(3n)]);
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.deepStrictEqual(
@@ -61,33 +61,33 @@ test("a sibling reference works (an SRF is implicitly lateral, grammar.md §44)"
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, n i32)", "INSERT INTO t VALUES (1, 3)"]);
   // The rows are pinned by suites/joins/lateral.test; here we only assert the prior non-LATERAL
   // 42P01 rejection is lifted — generate_series(1, t.n) re-runs per t row (1 row, n=3 ⇒ 3 rows).
-  const out = execute(db, "SELECT * FROM t CROSS JOIN generate_series(1, t.n)");
+  const out = db.execute("SELECT * FROM t CROSS JOIN generate_series(1, t.n)");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.equal(out.rows.length, 3);
 });
 
 test("generated_row cost and the maxCost ceiling", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(cost(db, "SELECT * FROM generate_series(1, 4)"), 8n);
   db.setMaxCost(50n);
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM generate_series(1, 1000000000)")),
+    errCode(() => db.execute("SELECT * FROM generate_series(1, 1000000000)")),
     "54P01",
   );
   db.setMaxCost(0n);
 });
 
 test("mixed-width promotes to the wider type", () => {
-  const db = new Engine();
-  const out = execute(db, "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))");
+  const db = Database.newInMemory().session();
+  const out = db.execute("SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.deepStrictEqual(out.columnTypes, ["i32"]);
 });
 
 test("i64 overflow while stepping stops cleanly (bigint parity)", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // Stepping past i64::MAX must STOP, not run forever (bigint never overflows): only the last
   // representable element is emitted, matching Rust/Go's checked_add stop.
   assert.deepStrictEqual(
@@ -97,25 +97,25 @@ test("i64 overflow while stepping stops cleanly (bigint parity)", () => {
 });
 
 test("deferred-form and bad-call errors", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(
-    errCode(() => execute(db, "SELECT generate_series(1, 5)")),
+    errCode(() => db.execute("SELECT generate_series(1, 5)")),
     "42883",
   ); // SELECT-list SRF deferred
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM generate_series(1, 5) AS g(n)")),
+    errCode(() => db.execute("SELECT * FROM generate_series(1, 5) AS g(n)")),
     "0A000",
   ); // column-alias list
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM generate_series(1)")),
+    errCode(() => db.execute("SELECT * FROM generate_series(1)")),
     "42883",
   ); // wrong arity
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM generate_series('a', 5)")),
+    errCode(() => db.execute("SELECT * FROM generate_series('a', 5)")),
     "42883",
   ); // non-integer arg
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM nope(1, 5)")),
+    errCode(() => db.execute("SELECT * FROM nope(1, 5)")),
     "42883",
   ); // unknown table function
 });

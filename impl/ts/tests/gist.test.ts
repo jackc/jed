@@ -6,10 +6,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, loadEngine, toImage } from "../src/tooling.ts";
+import { Database, Session } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-function rangesDb(): Engine {
+function rangesDb(): Session {
   return dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
     "CREATE INDEX t_r_gist ON t USING gist (r)",
@@ -32,9 +32,9 @@ test("gist create and query (overlap / contains / maintenance)", () => {
   // The high cluster.
   assert.deepEqual(query(db, "SELECT id FROM t WHERE r && i32range(150,160) ORDER BY id"), [["4"]]);
   // Maintenance: DELETE drops the entry, then a fresh INSERT adds one.
-  execute(db, "DELETE FROM t WHERE id = 3");
+  db.execute("DELETE FROM t WHERE id = 3");
   assert.deepEqual(query(db, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"), [["1"]]);
-  execute(db, "INSERT INTO t VALUES (7, '[5,12)')");
+  db.execute("INSERT INTO t VALUES (7, '[5,12)')");
   assert.deepEqual(query(db, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"), [["7"]]);
 });
 
@@ -44,32 +44,32 @@ test("gist divergences (42704 / 0A000)", () => {
   ]);
   // A GiST index on a non-keyable, non-range type (float) → 42704 (no GiST opclass at all, §6).
   assert.equal(
-    errCode(() => execute(db, "CREATE INDEX ON t USING gist (f)")),
+    errCode(() => db.execute("CREATE INDEX ON t USING gist (f)")),
     "42704",
   );
   // A keyable-but-deferred scalar (text) → 0A000 (on the roadmap, the GIN element-staging precedent).
   assert.equal(
-    errCode(() => execute(db, "CREATE INDEX ON t USING gist (txt)")),
+    errCode(() => db.execute("CREATE INDEX ON t USING gist (txt)")),
     "0A000",
   );
   // An unknown access method → 42704.
   assert.equal(
-    errCode(() => execute(db, "CREATE INDEX ON t USING brin (r)")),
+    errCode(() => db.execute("CREATE INDEX ON t USING brin (r)")),
     "42704",
   );
   // UNIQUE and multi-column GiST → 0A000.
   assert.equal(
-    errCode(() => execute(db, "CREATE UNIQUE INDEX ON t USING gist (r)")),
+    errCode(() => db.execute("CREATE UNIQUE INDEX ON t USING gist (r)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "CREATE INDEX ON t USING gist (r, s)")),
+    errCode(() => db.execute("CREATE INDEX ON t USING gist (r, s)")),
     "0A000",
   );
   // A GiST index on a TEMP table → 0A000 (resident tree on the temp snapshot is deferred).
-  execute(db, "CREATE TEMP TABLE tmp (id i32 PRIMARY KEY, r i32range)");
+  db.execute("CREATE TEMP TABLE tmp (id i32 PRIMARY KEY, r i32range)");
   assert.equal(
-    errCode(() => execute(db, "CREATE INDEX ON tmp USING gist (r)")),
+    errCode(() => db.execute("CREATE INDEX ON tmp USING gist (r)")),
     "0A000",
   );
 });
@@ -80,7 +80,7 @@ test("gist whole-image roundtrip persists the R-tree", () => {
     "CREATE INDEX t_r_gist ON t USING gist (r)",
     "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), (5, '[50,60)'), (6, '[15,25)'), (7, 'empty'), (8, NULL)",
   ]);
-  const loaded = loadEngine(toImage(db, 256, 1n));
+  const loaded = Database.fromImage(db.toImage(256, 1n));
   // The persisted R-tree loads, the resident tree is rebuilt, the gather still works.
   assert.deepEqual(query(loaded, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"), [
     ["1"],
@@ -91,8 +91,8 @@ test("gist whole-image roundtrip persists the R-tree", () => {
     ["3"],
   ]);
   // Maintenance after reload, then a second round-trip.
-  execute(loaded, "INSERT INTO t VALUES (9, '[5,7)')");
-  const loaded2 = loadEngine(toImage(loaded, 256, 1n));
+  loaded.execute("INSERT INTO t VALUES (9, '[5,7)')");
+  const loaded2 = Database.fromImage(loaded.toImage(256, 1n));
   assert.deepEqual(query(loaded2, "SELECT id FROM t WHERE r && i32range(6,7) ORDER BY id"), [
     ["3"],
     ["9"],
@@ -118,15 +118,15 @@ test("scalar gist `=` gather and maintenance", () => {
   assert.deepEqual(query(db, "SELECT id FROM t WHERE room = NULL ORDER BY id"), []);
   assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 99 ORDER BY id"), []);
   // Maintenance: DELETE / INSERT / UPDATE the indexed column.
-  execute(db, "DELETE FROM t WHERE id = 3");
+  db.execute("DELETE FROM t WHERE id = 3");
   assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [["1"], ["6"]]);
-  execute(db, "INSERT INTO t VALUES (8, 10)");
+  db.execute("INSERT INTO t VALUES (8, 10)");
   assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [
     ["1"],
     ["6"],
     ["8"],
   ]);
-  execute(db, "UPDATE t SET room = 20 WHERE id = 1");
+  db.execute("UPDATE t SET room = 20 WHERE id = 1");
   assert.deepEqual(query(db, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [
     ["1"],
     ["2"],
@@ -142,15 +142,15 @@ test("scalar gist whole-image roundtrip persists the R-tree", () => {
     "CREATE INDEX t_room_gist ON t USING gist (room)",
     "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), (8, 50)",
   ]);
-  const loaded = loadEngine(toImage(db, 256, 1n));
+  const loaded = Database.fromImage(db.toImage(256, 1n));
   assert.deepEqual(query(loaded, "SELECT id FROM t WHERE room = 10 ORDER BY id"), [
     ["1"],
     ["3"],
     ["7"],
   ]);
   assert.deepEqual(query(loaded, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [["2"], ["5"]]);
-  execute(loaded, "INSERT INTO t VALUES (9, 20)");
-  const loaded2 = loadEngine(toImage(loaded, 256, 1n));
+  loaded.execute("INSERT INTO t VALUES (9, 20)");
+  const loaded2 = Database.fromImage(loaded.toImage(256, 1n));
   assert.deepEqual(query(loaded2, "SELECT id FROM t WHERE room = 20 ORDER BY id"), [
     ["2"],
     ["5"],
@@ -160,7 +160,7 @@ test("scalar gist whole-image roundtrip persists the R-tree", () => {
 
 // ---- GX3: EXCLUDE constraints (spec/design/gist.md §7) -----------------------------------------
 
-function bookingDb(): Engine {
+function bookingDb(): Session {
   return dbWith([
     "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, " +
       "EXCLUDE USING gist (room WITH =, during WITH &&))",
@@ -171,13 +171,13 @@ function bookingDb(): Engine {
 // during. Needs the scalar `=` opclass (room) + range_ops (during).
 test("exclude rejects conflict, admits compatible", () => {
   const db = bookingDb();
-  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)')");
+  db.execute("INSERT INTO booking VALUES (1, 101, '[10,20)')");
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO booking VALUES (2, 101, '[15,25)')")),
+    errCode(() => db.execute("INSERT INTO booking VALUES (2, 101, '[15,25)')")),
     "23P01",
   );
-  execute(db, "INSERT INTO booking VALUES (2, 101, '[20,30)')"); // same room, no overlap → ok
-  execute(db, "INSERT INTO booking VALUES (3, 102, '[10,20)')"); // diff room, overlap → ok
+  db.execute("INSERT INTO booking VALUES (2, 101, '[20,30)')"); // same room, no overlap → ok
+  db.execute("INSERT INTO booking VALUES (3, 102, '[10,20)')"); // diff room, overlap → ok
   assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), [["1"], ["2"], ["3"]]);
 });
 
@@ -187,24 +187,24 @@ test("exclude rejects conflict, admits compatible", () => {
 // clears the conflict. Needs the multi-column GiST index (PG needs btree_gist), so it lives here.
 test("exclude reschedule via update", () => {
   const db = bookingDb();
-  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[30,40)')");
-  execute(db, "UPDATE booking SET during = '[50,60)' WHERE id = 1");
+  db.execute("INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[30,40)')");
+  db.execute("UPDATE booking SET during = '[50,60)' WHERE id = 1");
   assert.equal(
-    errCode(() => execute(db, "UPDATE booking SET during = '[35,45)' WHERE id = 1")),
+    errCode(() => db.execute("UPDATE booking SET during = '[35,45)' WHERE id = 1")),
     "23P01",
   );
-  execute(db, "UPDATE booking SET room = 102, during = '[35,45)' WHERE id = 1");
+  db.execute("UPDATE booking SET room = 102, during = '[35,45)' WHERE id = 1");
   assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), [["1"], ["2"]]);
 });
 
 // A NULL excluded column (the NULL rule) or an empty range (empty && anything is FALSE) exempts a row.
 test("exclude null and empty range are exempt", () => {
   const db = bookingDb();
-  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)')");
-  execute(db, "INSERT INTO booking VALUES (2, NULL, '[10,20)')"); // NULL room → exempt
-  execute(db, "INSERT INTO booking VALUES (3, NULL, '[10,20)')");
-  execute(db, "INSERT INTO booking VALUES (4, 101, 'empty')"); // empty range → exempt
-  execute(db, "INSERT INTO booking VALUES (5, 101, 'empty')");
+  db.execute("INSERT INTO booking VALUES (1, 101, '[10,20)')");
+  db.execute("INSERT INTO booking VALUES (2, NULL, '[10,20)')"); // NULL room → exempt
+  db.execute("INSERT INTO booking VALUES (3, NULL, '[10,20)')");
+  db.execute("INSERT INTO booking VALUES (4, 101, 'empty')"); // empty range → exempt
+  db.execute("INSERT INTO booking VALUES (5, 101, 'empty')");
   assert.deepEqual(query(db, "SELECT id FROM booking ORDER BY id"), [
     ["1"],
     ["2"],
@@ -219,7 +219,7 @@ test("exclude in-batch insert conflict", () => {
   const db = bookingDb();
   assert.equal(
     errCode(() =>
-      execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[15,25)')"),
+      db.execute("INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[15,25)')"),
     ),
     "23P01",
   );
@@ -230,13 +230,13 @@ test("exclude in-batch insert conflict", () => {
 // genuine conflict traps 23P01.
 test("exclude update end-state swap succeeds", () => {
   const db = bookingDb();
-  execute(db, "INSERT INTO booking VALUES (1, 101, '[10,20)')");
-  execute(db, "INSERT INTO booking VALUES (2, 102, '[10,20)')");
-  execute(db, "UPDATE booking SET room = CASE WHEN room = 101 THEN 102 ELSE 101 END");
+  db.execute("INSERT INTO booking VALUES (1, 101, '[10,20)')");
+  db.execute("INSERT INTO booking VALUES (2, 102, '[10,20)')");
+  db.execute("UPDATE booking SET room = CASE WHEN room = 101 THEN 102 ELSE 101 END");
   assert.deepEqual(query(db, "SELECT id FROM booking WHERE room = 102 ORDER BY id"), [["1"]]);
   // After the swap row1=(102,[10,20)), row2=(101,[10,20)); moving row1 back to 101 collides w/ row2.
   assert.equal(
-    errCode(() => execute(db, "UPDATE booking SET room = 101 WHERE id = 1")),
+    errCode(() => db.execute("UPDATE booking SET room = 101 WHERE id = 1")),
     "23P01",
   );
 });
@@ -246,12 +246,12 @@ test("single-column range exclude", () => {
   const db = dbWith([
     "CREATE TABLE rsv (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))",
   ]);
-  execute(db, "INSERT INTO rsv VALUES (1, '[1,5)')");
+  db.execute("INSERT INTO rsv VALUES (1, '[1,5)')");
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO rsv VALUES (2, '[3,8)')")),
+    errCode(() => db.execute("INSERT INTO rsv VALUES (2, '[3,8)')")),
     "23P01",
   );
-  execute(db, "INSERT INTO rsv VALUES (2, '[5,10)')"); // adjacent, not overlapping → ok
+  db.execute("INSERT INTO rsv VALUES (2, '[5,10)')"); // adjacent, not overlapping → ok
   assert.deepEqual(query(db, "SELECT id FROM rsv ORDER BY id"), [["1"], ["2"]]);
 });
 
@@ -260,32 +260,31 @@ test("exclude type errors", () => {
   const db = dbWith(["CREATE TABLE z (id i32 PRIMARY KEY)"]);
   assert.equal(
     errCode(() =>
-      execute(db, "CREATE TABLE a (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH &&))"),
+      db.execute("CREATE TABLE a (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH &&))"),
     ),
     "42704",
   );
   assert.equal(
     errCode(() =>
-      execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, s text, EXCLUDE USING gist (s WITH =))"),
+      db.execute("CREATE TABLE b (id i32 PRIMARY KEY, s text, EXCLUDE USING gist (s WITH =))"),
     ),
     "0A000",
   );
   assert.equal(
     errCode(() =>
-      execute(db, "CREATE TABLE c (id i32 PRIMARY KEY, f f64, EXCLUDE USING gist (f WITH =))"),
+      db.execute("CREATE TABLE c (id i32 PRIMARY KEY, f f64, EXCLUDE USING gist (f WITH =))"),
     ),
     "42704",
   );
   assert.equal(
     errCode(() =>
-      execute(db, "CREATE TABLE d (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH <))"),
+      db.execute("CREATE TABLE d (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH <))"),
     ),
     "0A000",
   );
   assert.equal(
     errCode(() =>
-      execute(
-        db,
+      db.execute(
         "CREATE TEMP TABLE e (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))",
       ),
     ),
@@ -297,7 +296,7 @@ test("exclude type errors", () => {
 test("exclude backing index cannot be dropped", () => {
   const db = bookingDb();
   assert.equal(
-    errCode(() => execute(db, "DROP INDEX booking_room_during_excl")),
+    errCode(() => db.execute("DROP INDEX booking_room_during_excl")),
     "2BP01",
   );
 });
@@ -309,12 +308,12 @@ test("exclude whole-image roundtrip persists the constraint", () => {
       "EXCLUDE USING gist (room WITH =, during WITH &&))",
     "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), (3, 102, '[10,20)')",
   ]);
-  const loaded = loadEngine(toImage(db, 256, 1n));
+  const loaded = Database.fromImage(db.toImage(256, 1n));
   assert.equal(
-    errCode(() => execute(loaded, "INSERT INTO booking VALUES (4, 101, '[15,25)')")),
+    errCode(() => loaded.execute("INSERT INTO booking VALUES (4, 101, '[15,25)')")),
     "23P01",
   );
-  execute(loaded, "INSERT INTO booking VALUES (4, 103, '[10,20)')");
+  loaded.execute("INSERT INTO booking VALUES (4, 103, '[10,20)')");
   assert.deepEqual(query(loaded, "SELECT id FROM booking ORDER BY id"), [
     ["1"],
     ["2"],

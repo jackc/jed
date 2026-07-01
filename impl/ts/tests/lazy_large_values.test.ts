@@ -12,9 +12,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, Engine, execute, open } from "../src/tooling.ts";
+import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
 import { render } from "../src/value.ts";
-import { errCode, fillerText } from "./util.ts";
+import { type Handle, errCode, fillerText } from "./util.ts";
 
 const PAGE_SIZE = 256;
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
@@ -23,12 +23,12 @@ const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12
 // (incompressible 600-char filler → a 3-page chain), id 2 external-compressed (half filler /
 // half run → the ~212-byte block spills to a 1-page chain), id 3 inline-compressed (a
 // 600-char run), id 4 plain inline.
-function seed(db: Engine): void {
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
+function seed(db: Handle): void {
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   const plain = fillerText(600);
   const extc = fillerText(200) + "y".repeat(200);
   const inlc = "x".repeat(600);
-  execute(db, `INSERT INTO t VALUES (1, '${plain}'), (2, '${extc}'), (3, '${inlc}'), (4, 'tiny')`);
+  db.execute(`INSERT INTO t VALUES (1, '${plain}'), (2, '${extc}'), (3, '${inlc}'), (4, 'tiny')`);
 }
 
 // The v7 per-page checksum (format.md *Page header*) — replicated here (like fillerText) so the
@@ -72,27 +72,27 @@ function corruptOverflowPayloads(path: string): void {
   writeFileSync(path, bytes);
 }
 
-function rowsOf(db: Engine, sql: string) {
-  const o = execute(db, sql);
+function rowsOf(db: Handle, sql: string) {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;
 }
 
-function costOf(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function costOf(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 test("lazy: chains are read only when touched", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "touch.jed");
   try {
-    let db = create(path, { pageSize: PAGE_SIZE });
+    let db = createDatabase(path, { pageSize: PAGE_SIZE });
     seed(db);
-    close(db);
+    db.close();
     corruptOverflowPayloads(path);
 
     // Open walks live chains by headers only — corrupt payloads are invisible.
-    db = open(path);
+    db = openDatabase(path);
 
     // Untouching queries never read a chain or decompress a block.
     assert.equal(rowsOf(db, "SELECT id FROM t").length, 4);
@@ -102,7 +102,7 @@ test("lazy: chains are read only when touched", () => {
     // non-UTF-8 for the external-plain text, a malformed LZ4 block for external-compressed.
     for (const id of [1, 2]) {
       assert.equal(
-        errCode(() => execute(db, `SELECT body FROM t WHERE id = ${id}`)),
+        errCode(() => db.execute(`SELECT body FROM t WHERE id = ${id}`)),
         "XX001",
         `id ${id}`,
       );
@@ -111,7 +111,7 @@ test("lazy: chains are read only when touched", () => {
     // The inline-compressed and plain rows live in the (uncorrupted) leaf: still exact.
     assert.equal(render(rowsOf(db, "SELECT body FROM t WHERE id = 3")[0]![0]), "x".repeat(600));
     assert.equal(render(rowsOf(db, "SELECT body FROM t WHERE id = 4")[0]![0]), "tiny");
-    close(db);
+    db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -121,10 +121,10 @@ test("lazy: values round-trip exactly through the paged path", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "roundtrip.jed");
   try {
-    let db = create(path, { pageSize: PAGE_SIZE });
+    let db = createDatabase(path, { pageSize: PAGE_SIZE });
     seed(db);
-    close(db);
-    db = open(path);
+    db.close();
+    db = openDatabase(path);
     const got = rowsOf(db, "SELECT body FROM t").map((r) => render(r[0]));
     assert.deepEqual(got, [
       fillerText(600),
@@ -132,7 +132,7 @@ test("lazy: values round-trip exactly through the paged path", () => {
       "x".repeat(600),
       "tiny",
     ]);
-    close(db);
+    db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -143,27 +143,27 @@ test("lazy: UPDATE of other columns preserves spilled values", () => {
   const path = join(dir, "update.jed");
   const big = fillerText(600);
   try {
-    let db = create(path, { pageSize: PAGE_SIZE });
-    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
-    execute(db, `INSERT INTO t VALUES (1, '${big}', 10), (2, 'small', 20)`);
-    close(db);
+    let db = createDatabase(path, { pageSize: PAGE_SIZE });
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
+    db.execute(`INSERT INTO t VALUES (1, '${big}', 10), (2, 'small', 20)`);
+    db.close();
 
-    db = open(path);
+    db = openDatabase(path);
     // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's rewrite
     // resolves nothing, row 1 resolves at commit (large-values.md §14 — resolve-at-commit;
     // chain sharing stays the deferred follow-on).
-    execute(db, "UPDATE t SET n = 99 WHERE id = 2");
+    db.execute("UPDATE t SET n = 99 WHERE id = 2");
     // Rewrites row 1 itself: the rewrite materializes its body (part of the write work).
-    execute(db, "UPDATE t SET n = 11 WHERE id = 1");
-    close(db);
+    db.execute("UPDATE t SET n = 11 WHERE id = 1");
+    db.close();
 
-    db = open(path);
+    db = openDatabase(path);
     const rows = rowsOf(db, "SELECT body, n FROM t");
     assert.equal(render(rows[0]![0]), big);
     assert.equal(render(rows[0]![1]), "11");
     assert.equal(render(rows[1]![0]), "small");
     assert.equal(render(rows[1]![1]), "99");
-    close(db);
+    db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -176,13 +176,12 @@ test("lazy: paged and resident costs match", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "cost.jed");
   try {
-    const mem = new Engine();
-    mem.pageSize = PAGE_SIZE;
+    const mem = Database.inMemoryWithPageSize(PAGE_SIZE).session();
     seed(mem);
-    const filedb = create(path, { pageSize: PAGE_SIZE });
+    const filedb = createDatabase(path, { pageSize: PAGE_SIZE });
     seed(filedb);
-    close(filedb);
-    const paged = open(path);
+    filedb.close();
+    const paged = openDatabase(path);
     for (const sql of [
       "SELECT * FROM t",
       "SELECT id FROM t",
@@ -194,7 +193,7 @@ test("lazy: paged and resident costs match", () => {
     ]) {
       assert.equal(costOf(mem, sql), costOf(paged, sql), sql);
     }
-    close(paged);
+    paged.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

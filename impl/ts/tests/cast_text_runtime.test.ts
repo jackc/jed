@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // Build t(id i32 pk, s text) with one row per string (id = 1..).
@@ -36,7 +36,7 @@ test("runtime text cast uses jed's grammar (hex / underscore / NaN trap 22P02)",
   ]) {
     const db = seeded([s]);
     assert.equal(
-      errCode(() => execute(db, `SELECT ${expr} FROM t WHERE id = 1`)),
+      errCode(() => db.execute(`SELECT ${expr} FROM t WHERE id = 1`)),
       "22P02",
       `${s} :: ${expr}`,
     );
@@ -72,11 +72,11 @@ test("runtime text → float overflow (22003) and malformed (22P02)", () => {
   const db = seeded(["1e400", "abc"]);
   // a FINITE literal beyond binary64 range traps 22003 (not ±Inf — the finite-overflow rule)
   assert.equal(
-    errCode(() => execute(db, "SELECT s :: float8 FROM t WHERE id = 1")),
+    errCode(() => db.execute("SELECT s :: float8 FROM t WHERE id = 1")),
     "22003",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT s :: float8 FROM t WHERE id = 2")),
+    errCode(() => db.execute("SELECT s :: float8 FROM t WHERE id = 2")),
     "22P02",
   );
 });

@@ -8,22 +8,23 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, render } from "../src/tooling.ts";
+import { Database, Session, render } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 
-function exec(db: Engine, sql: string): void {
-  execute(db, sql);
+function exec(db: Handle, sql: string): void {
+  db.execute(sql);
 }
 
 // rows runs sql (which must yield a query result) and returns its rows rendered as strings.
-function rows(db: Engine, sql: string): string[][] {
-  const o = execute(db, sql);
+function rows(db: Handle, sql: string): string[][] {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows.map((r) => r.map(render));
 }
 
 // affected runs sql (which must yield a statement result) and returns its affected-row count.
-function affected(db: Engine, sql: string): number | null {
-  const o = execute(db, sql);
+function affected(db: Handle, sql: string): number | null {
+  const o = db.execute(sql);
   if (o.kind !== "statement") throw new Error(`expected a statement result for ${sql}`);
   return o.rowsAffected;
 }
@@ -33,8 +34,8 @@ function i32s(rs: string[][]): number[] {
   return rs.map((r) => Number(r[0])).sort((a, b) => a - b);
 }
 
-function setup(): Engine {
-  const db = new Engine();
+function setup(): Session {
+  const db = Database.newInMemory().session();
   exec(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   exec(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
   return db;

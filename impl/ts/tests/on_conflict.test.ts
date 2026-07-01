@@ -7,12 +7,12 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import type { Engine } from "../src/tooling.ts";
-import { dbWith, errCode } from "./util.ts";
+import { type Handle, dbWith, errCode } from "./util.ts";
 
-function affected(db: Engine, sql: string): number | null {
-  const out = execute(db, sql);
+function affected(db: Handle, sql: string): number | null {
+  const out = db.execute(sql);
   assert.equal(out.kind, "statement", `expected a statement outcome from ${sql}`);
   return out.kind === "statement" ? out.rowsAffected : null;
 }
@@ -24,8 +24,7 @@ test("ON CONFLICT DO UPDATE assigning a PK column is 0A000", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 10)"]);
   assert.equal(
     errCode(() =>
-      execute(
-        db,
+      db.execute(
         "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100",
       ),
     ),
@@ -43,7 +42,7 @@ test("ON CONFLICT DO UPDATE SET col = DEFAULT is 42703", () => {
   ]);
   assert.equal(
     errCode(() =>
-      execute(db, "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = DEFAULT"),
+      db.execute("INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = DEFAULT"),
     ),
     "42703",
   );
@@ -58,7 +57,7 @@ test("ON CONFLICT DO UPDATE assigning a GENERATED ALWAYS column is 428C9", () =>
   ]);
   assert.equal(
     errCode(() =>
-      execute(db, "INSERT INTO t (k, v) VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET id = 99"),
+      db.execute("INSERT INTO t (k, v) VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET id = 99"),
     ),
     "428C9",
   );

@@ -2880,6 +2880,14 @@ export class Engine {
     return this.executeStmtParams(stmt, []);
   }
 
+  // execute parses and runs one statement, binding $N params — the method form of the free `execute`
+  // helper, so the low-level Engine satisfies the same shape as Session/Database. The white-box
+  // storage/catalog tests that legitimately stay on the internal Engine reach it through the shared
+  // test helpers (util.ts's Handle); production hosts use Session/Database.
+  execute(sql: string, params: Value[] = []): Outcome {
+    return this.executeStmtParams(this.parse(sql), params);
+  }
+
   // executeStmtParams executes one parsed statement, binding params to its $N placeholders (an
   // empty array for an unparameterized statement). DDL statements take no parameters — supplying
   // any is a 42601 (spec/design/api.md §5).

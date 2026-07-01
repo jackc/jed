@@ -11,8 +11,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/tooling.ts";
-import { fillerBytesHex, fillerText } from "./util.ts";
+import { Database, Session } from "../src/tooling.ts";
+import { type Handle, fillerBytesHex, fillerText } from "./util.ts";
 
 // page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
 // ceil(600/240) = 3 overflow pages; a 300-byte bytea into ceil(300/240) = 2.
@@ -20,25 +20,24 @@ const PAGE_SIZE = 256;
 const TEXT_CHAIN_PAGES = 3n;
 const BYTEA_CHAIN_PAGES = 2n;
 
-function smallPageDb(): Engine {
-  const db = new Engine();
-  db.pageSize = PAGE_SIZE;
+function smallPageDb(): Session {
+  const db = Database.inMemoryWithPageSize(PAGE_SIZE).session();
   return db;
 }
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 // Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain), `control`
 // keeps every value inline. Row 2 is inline in both.
-function overflowTables(): Engine {
+function overflowTables(): Session {
   const db = smallPageDb();
   const big = fillerText(600);
-  execute(db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text)");
-  execute(db, `INSERT INTO spill VALUES (1, '${big}'), (2, 'small')`);
-  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)");
-  execute(db, "INSERT INTO control VALUES (1, 'tiny'), (2, 'small')");
+  db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)");
+  db.execute(`INSERT INTO spill VALUES (1, '${big}'), (2, 'small')`);
+  db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)");
+  db.execute("INSERT INTO control VALUES (1, 'tiny'), (2, 'small')");
   return db;
 }
 
@@ -68,10 +67,10 @@ test("LIMIT does not lower the block", () => {
   // chain pages.
   const db = smallPageDb();
   const big = fillerText(600);
-  execute(db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text)");
-  execute(db, `INSERT INTO spill VALUES (1, 'small'), (2, '${big}')`);
-  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)");
-  execute(db, "INSERT INTO control VALUES (1, 'small'), (2, 'tiny')");
+  db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)");
+  db.execute(`INSERT INTO spill VALUES (1, 'small'), (2, '${big}')`);
+  db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)");
+  db.execute("INSERT INTO control VALUES (1, 'small'), (2, 'tiny')");
   const spill = cost(db, "SELECT * FROM spill LIMIT 1");
   const control = cost(db, "SELECT * FROM control LIMIT 1");
   assert.strictEqual(spill, control + TEXT_CHAIN_PAGES);
@@ -119,10 +118,10 @@ test("multiple chains in one record sum", () => {
   const db = smallPageDb();
   const bigText = fillerText(600);
   const bigHex = fillerBytesHex(300);
-  execute(db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)");
-  execute(db, `INSERT INTO spill VALUES (1, '${bigText}', '\\x${bigHex}')`);
-  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)");
-  execute(db, "INSERT INTO control VALUES (1, 'tiny', '\\xcafe')");
+  db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)");
+  db.execute(`INSERT INTO spill VALUES (1, '${bigText}', '\\x${bigHex}')`);
+  db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)");
+  db.execute("INSERT INTO control VALUES (1, 'tiny', '\\xcafe')");
   const spill = cost(db, "SELECT * FROM spill");
   const control = cost(db, "SELECT * FROM control");
   assert.strictEqual(spill, control + TEXT_CHAIN_PAGES + BYTEA_CHAIN_PAGES);

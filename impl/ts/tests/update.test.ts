@@ -6,8 +6,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/tooling.ts";
-import { dbWith, errCode } from "./util.ts";
+import { Database } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode } from "./util.ts";
 
 function setup() {
   return dbWith([
@@ -19,7 +19,7 @@ function setup() {
 }
 
 // The (id, a, b) rows of t in storage-key order as "id/a/b" strings, for end-state asserts.
-function idsABC(db: Engine): string[] {
+function idsABC(db: Handle): string[] {
   return db.rowsInKeyOrder("t").map((r) =>
     r
       .map((c) => {
@@ -32,11 +32,11 @@ function idsABC(db: Engine): string[] {
 
 test("unknown column traps 42703; missing table traps 42P01", () => {
   assert.equal(
-    errCode(() => execute(setup(), "UPDATE t SET nope = 1")),
+    errCode(() => setup().execute("UPDATE t SET nope = 1")),
     "42703",
   );
   assert.equal(
-    errCode(() => execute(new Engine(), "UPDATE nope SET a = 1")),
+    errCode(() => Database.newInMemory().session().execute("UPDATE nope SET a = 1")),
     "42P01",
   );
 });
@@ -46,7 +46,7 @@ test("unknown column traps 42703; missing table traps 42P01", () => {
 // per-row check fails on the transient collision. Each row's non-key columns move with it.
 test("PK swap is end-state valid (jed accepts, PG rejects the transient)", () => {
   const db = setup();
-  execute(db, "UPDATE t SET id = 3 - id WHERE id <= 2");
+  db.execute("UPDATE t SET id = 3 - id WHERE id <= 2");
   assert.deepEqual(idsABC(db), ["1/20/22", "2/10/11", "3/30/33"]);
 });
 
@@ -54,7 +54,7 @@ test("PK swap is end-state valid (jed accepts, PG rejects the transient)", () =>
 // three rows — where PostgreSQL rejects the per-row transient (id 1 → 2 while 2 still exists).
 test("PK increment cascade succeeds", () => {
   const db = setup();
-  execute(db, "UPDATE t SET id = id + 1");
+  db.execute("UPDATE t SET id = id + 1");
   assert.deepEqual(idsABC(db), ["2/10/11", "3/20/22", "4/30/33"]);
 });
 
@@ -62,7 +62,7 @@ test("PK increment cascade succeeds", () => {
 test("PK collision with an existing row traps 23505", () => {
   const db = setup();
   assert.equal(
-    errCode(() => execute(db, "UPDATE t SET id = 3 WHERE id = 1")),
+    errCode(() => db.execute("UPDATE t SET id = 3 WHERE id = 1")),
     "23505",
   );
   assert.deepEqual(idsABC(db), ["1/10/11", "2/20/22", "3/30/33"]);

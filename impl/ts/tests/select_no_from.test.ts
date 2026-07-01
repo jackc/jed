@@ -9,16 +9,16 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute, executeParams, intValue } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { Database, EngineError, intValue } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query } from "./util.ts";
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 test("SELECT 1 returns one row costing one row_produced", () => {
-  const db = new Engine();
-  const out = execute(db, "SELECT 1");
+  const db = Database.newInMemory().session();
+  const out = db.execute("SELECT 1");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.deepStrictEqual(out.columnNames, ["?column?"]);
@@ -28,14 +28,14 @@ test("SELECT 1 returns one row costing one row_produced", () => {
 });
 
 test("an expression select charges its operator_evals", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.deepStrictEqual(query(db, "SELECT 1 + 2"), [["3"]]);
   // 1 operator_eval (the `+` node) + 1 row_produced.
   assert.equal(cost(db, "SELECT 1 + 2"), 2n);
 });
 
 test("WHERE filters the virtual row", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.deepStrictEqual(query(db, "SELECT 1 WHERE false"), []);
   // The constant filter is a leaf (no operator_eval) and no row is produced.
   assert.equal(cost(db, "SELECT 1 WHERE false"), 0n);
@@ -44,7 +44,7 @@ test("WHERE filters the virtual row", () => {
 });
 
 test("aggregates fold the single group", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // The virtual row is the one input row of the whole-table group (aggregates.md §4).
   assert.deepStrictEqual(query(db, "SELECT count(*)"), [["1"]]);
   assert.equal(cost(db, "SELECT count(*)"), 2n); // 1 aggregate_accumulate + 1 row_produced
@@ -57,14 +57,14 @@ test("aggregates fold the single group", () => {
 });
 
 test("DISTINCT and the LIMIT/OFFSET window apply to the single row", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.deepStrictEqual(query(db, "SELECT DISTINCT 1"), [["1"]]);
   assert.deepStrictEqual(query(db, "SELECT 1 LIMIT 0"), []);
   assert.deepStrictEqual(query(db, "SELECT 1 OFFSET 1"), []);
 });
 
 test("set operation operands", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const rows = query(db, "SELECT 1 UNION SELECT 2")
     .map((r) => r[0]!)
     .sort();
@@ -87,15 +87,15 @@ test("subqueries: uncorrelated fold and correlated outward resolution", () => {
 
 test("INSERT ... SELECT source", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-  const out = execute(db, "INSERT INTO t SELECT 3");
+  const out = db.execute("INSERT INTO t SELECT 3");
   assert.equal(out.cost, 1n); // exactly the embedded SELECT's cost
   assert.deepStrictEqual(query(db, "SELECT id FROM t"), [["3"]]);
 });
 
 test("SELECT * with no tables is 42601 with PostgreSQL's message", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   try {
-    execute(db, "SELECT *");
+    db.execute("SELECT *");
     assert.fail("SELECT *: expected an error");
   } catch (e) {
     assert.ok(e instanceof EngineError);
@@ -106,40 +106,40 @@ test("SELECT * with no tables is 42601 with PostgreSQL's message", () => {
 });
 
 test("bare columns resolve nothing", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(
-    errCode(() => execute(db, "SELECT nope")),
+    errCode(() => db.execute("SELECT nope")),
     "42703",
   );
   // The DISTINCT two-token lookahead is unchanged: at end of input the word is a column
   // reference, not the modifier (grammar.md §34 — previously died at the FROM expect).
   assert.equal(
-    errCode(() => execute(db, "SELECT distinct")),
+    errCode(() => db.execute("SELECT distinct")),
     "42703",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT from")),
+    errCode(() => db.execute("SELECT from")),
     "42703",
   );
   // GROUP BY / ORDER BY keys are table columns only — always 42703 on a lone FROM-less SELECT.
   assert.equal(
-    errCode(() => execute(db, "SELECT 1 GROUP BY nope")),
+    errCode(() => db.execute("SELECT 1 GROUP BY nope")),
     "42703",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT 1 ORDER BY nope")),
+    errCode(() => db.execute("SELECT 1 ORDER BY nope")),
     "42703",
   );
 });
 
 test("an untyped $1 is 42P18; a sibling operand types it", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(
-    errCode(() => executeParams(db, "SELECT $1", [intValue(7n)])),
+    errCode(() => db.execute("SELECT $1", [intValue(7n)])),
     "42P18",
   );
   // The sibling-operand rule (grammar.md §5) works without a FROM.
-  const out = executeParams(db, "SELECT $1 + 1", [intValue(7n)]);
+  const out = db.execute("SELECT $1 + 1", [intValue(7n)]);
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.equal(out.rows.length, 1);

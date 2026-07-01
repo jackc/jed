@@ -5,10 +5,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Engine, execute } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { Database, Session, type Engine } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query } from "./util.ts";
 
-function setup(): Engine {
+function setup(): Session {
   return dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)",
     "INSERT INTO t VALUES (1, 10, '--x /*y*/')",
@@ -16,7 +16,7 @@ function setup(): Engine {
 }
 
 // one runs a query expected to produce exactly one value; returns it rendered.
-function one(db: Engine, sql: string): string {
+function one(db: Handle, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -64,7 +64,7 @@ test("an unterminated block comment is 42601", () => {
     "SELECT v FROM t /*/", // the close cannot overlap the open
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "42601",
       sql,
     );
@@ -75,7 +75,7 @@ test("a stray close is not comment syntax", () => {
   const db = setup();
   // `*/` with no opener lexes as `*` `/` and fails at parse.
   assert.equal(
-    errCode(() => execute(db, "SELECT v */ 1 FROM t")),
+    errCode(() => db.execute("SELECT v */ 1 FROM t")),
     "42601",
   );
 });
@@ -84,7 +84,7 @@ test("comment-only input is no statement", () => {
   const db = setup();
   for (const sql of ["-- nothing here", "/* nothing here */", "  /* a */ -- b"]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "42601",
       sql,
     );

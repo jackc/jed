@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // A `jsonb` comparison with a NON-jsonb family is 42804 (jed's cross-family convention, like
@@ -17,11 +17,11 @@ test("jsonb cross-family comparison is 42804", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)"]);
   // jsonb vs an integer / a real text value (not an adaptable string literal): 42804.
   assert.equal(
-    errCode(() => execute(db, "SELECT id FROM t WHERE b = 5")),
+    errCode(() => db.execute("SELECT id FROM t WHERE b = 5")),
     "42804",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT id FROM t WHERE b = 'x'::text")),
+    errCode(() => db.execute("SELECT id FROM t WHERE b = 'x'::text")),
     "42804",
   );
 });
@@ -33,15 +33,15 @@ test("jsonb cross-family comparison is 42804", () => {
 test("invalid json cast source is 42804", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT 5::jsonb")),
+    errCode(() => db.execute("SELECT 5::jsonb")),
     "42804",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT (1.5)::json")),
+    errCode(() => db.execute("SELECT (1.5)::json")),
     "42804",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT true::jsonb")),
+    errCode(() => db.execute("SELECT true::jsonb")),
     "42804",
   );
 });
@@ -57,15 +57,15 @@ test("json accessor operators are deferred", () => {
     `INSERT INTO t VALUES (1, '{"a":1}')`,
   ]);
   assert.equal(
-    errCode(() => execute(db, "SELECT j -> 'a' FROM t")),
+    errCode(() => db.execute("SELECT j -> 'a' FROM t")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT j ->> 'a' FROM t")),
+    errCode(() => db.execute("SELECT j ->> 'a' FROM t")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT j #> '{a}' FROM t")),
+    errCode(() => db.execute("SELECT j #> '{a}' FROM t")),
     "0A000",
   );
 });
@@ -97,11 +97,11 @@ test("jsonb_pretty matches PG", () => {
 test("json_array_elements SRF is deferred", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM json_array_elements('[1,2]'::json)")),
+    errCode(() => db.execute("SELECT * FROM json_array_elements('[1,2]'::json)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM json_array_elements_text('[1,2]'::json)")),
+    errCode(() => db.execute("SELECT * FROM json_array_elements_text('[1,2]'::json)")),
     "0A000",
   );
 });
@@ -114,11 +114,11 @@ test("json_array_elements SRF is deferred", () => {
 test("json_each SRF is deferred", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM json_each('{"a":1}'::json)`)),
+    errCode(() => db.execute(`SELECT * FROM json_each('{"a":1}'::json)`)),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM json_each_text('{"a":1}'::json)`)),
+    errCode(() => db.execute(`SELECT * FROM json_each_text('{"a":1}'::json)`)),
     "0A000",
   );
 });
@@ -131,15 +131,15 @@ test("json_each SRF is deferred", () => {
 test("to_jsonb unsupported sources are deferred", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT to_jsonb(1.5::f64)")),
+    errCode(() => db.execute("SELECT to_jsonb(1.5::f64)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT to_jsonb('2020-01-01'::date)")),
+    errCode(() => db.execute("SELECT to_jsonb('2020-01-01'::date)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT to_jsonb(ARRAY[ARRAY[1,2],ARRAY[3,4]])")),
+    errCode(() => db.execute("SELECT to_jsonb(ARRAY[ARRAY[1,2],ARRAY[3,4]])")),
     "0A000",
   );
 });
@@ -152,19 +152,19 @@ test("to_jsonb unsupported sources are deferred", () => {
 test("json builder deferred element source is 0A000", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT to_json(1.5::f64)")),
+    errCode(() => db.execute("SELECT to_json(1.5::f64)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT jsonb_build_array(1.5::f64)")),
+    errCode(() => db.execute("SELECT jsonb_build_array(1.5::f64)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT json_build_array(1.5::f64)")),
+    errCode(() => db.execute("SELECT json_build_array(1.5::f64)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT jsonb_build_object('k', 1.5::f64)")),
+    errCode(() => db.execute("SELECT jsonb_build_object('k', 1.5::f64)")),
     "0A000",
   );
 });
@@ -177,7 +177,7 @@ test("json builder deferred element source is 0A000", () => {
 test("json_build_object non-scalar key is 0A000", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT jsonb_build_object('2020-01-01'::date, 1)")),
+    errCode(() => db.execute("SELECT jsonb_build_object('2020-01-01'::date, 1)")),
     "0A000",
   );
 });
@@ -193,11 +193,11 @@ test("json_agg deferred element source is 0A000", () => {
     "INSERT INTO f VALUES (1, 1.5)",
   ]);
   assert.equal(
-    errCode(() => execute(db, "SELECT jsonb_agg(x) FROM f")),
+    errCode(() => db.execute("SELECT jsonb_agg(x) FROM f")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT json_agg(x) FROM f")),
+    errCode(() => db.execute("SELECT json_agg(x) FROM f")),
     "0A000",
   );
 });
@@ -214,11 +214,11 @@ test("json_object_agg deferred value source is 0A000", () => {
     "INSERT INTO f VALUES (1, 'a', 1.5)",
   ]);
   assert.equal(
-    errCode(() => execute(db, "SELECT jsonb_object_agg(k, x) FROM f")),
+    errCode(() => db.execute("SELECT jsonb_object_agg(k, x) FROM f")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT json_object_agg(k, x) FROM f")),
+    errCode(() => db.execute("SELECT json_object_agg(k, x) FROM f")),
     "0A000",
   );
 });
@@ -255,7 +255,7 @@ test("jsonb_set null path element propagates null", () => {
 test("array_to_json multidim is 0A000", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]])")),
+    errCode(() => db.execute("SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]])")),
     "0A000",
   );
 });
@@ -279,11 +279,11 @@ test("JSON_SERIALIZE of jsonb diverges from pg", () => {
 test("JSON_SCALAR of deferred types is 0A000", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT JSON_SCALAR('2020-01-01'::date)")),
+    errCode(() => db.execute("SELECT JSON_SCALAR('2020-01-01'::date)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT JSON_SCALAR(1.5::f64)")),
+    errCode(() => db.execute("SELECT JSON_SCALAR(1.5::f64)")),
     "0A000",
   );
 });
@@ -295,11 +295,11 @@ test("JSON_SCALAR of deferred types is 0A000", () => {
 test("json_to_record composite/array column is 0A000", () => {
   const db = dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a addr)`)),
+    errCode(() => db.execute(`SELECT * FROM jsonb_to_record('{"a":1}') AS t(a addr)`)),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a i32[])`)),
+    errCode(() => db.execute(`SELECT * FROM jsonb_to_record('{"a":1}') AS t(a i32[])`)),
     "0A000",
   );
 });
@@ -315,12 +315,12 @@ test("json_populate non-composite base and array field divergences", () => {
     "CREATE TYPE poly AS (name text, pts i32[])",
   ]);
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM jsonb_populate_record(NULL::i32, '{"a":1}')`)),
+    errCode(() => db.execute(`SELECT * FROM jsonb_populate_record(NULL::i32, '{"a":1}')`)),
     "42804",
   );
   assert.equal(
     errCode(() =>
-      execute(db, `SELECT * FROM jsonb_populate_record(NULL::poly, '{"name":"x","pts":[1,2]}')`),
+      db.execute(`SELECT * FROM jsonb_populate_record(NULL::poly, '{"name":"x","pts":[1,2]}')`),
     ),
     "0A000",
   );
@@ -333,7 +333,7 @@ test("json_populate non-composite base and array field divergences", () => {
 test("srf rename-only column list is deferred", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)`)),
+    errCode(() => db.execute(`SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)`)),
     "0A000",
   );
 });
@@ -352,7 +352,7 @@ test("json query function deferred clauses are 0A000", () => {
     `SELECT JSON_QUERY('{"a":1}', '$.a' RETURNING int)`,
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "0A000",
       `${sql} should defer 0A000`,
     );
@@ -373,14 +373,14 @@ test("json_table deferred features are 0A000", () => {
     `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' OMIT QUOTES))`,
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "0A000",
       `${sql} should defer 0A000`,
     );
   }
   assert.equal(
     errCode(() =>
-      execute(db, `SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x nosuchtype PATH '$.x'))`),
+      db.execute(`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x nosuchtype PATH '$.x'))`),
     ),
     "42704",
   );

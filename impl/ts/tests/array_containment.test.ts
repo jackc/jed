@@ -8,11 +8,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/tooling.ts";
-import { errCode, query } from "./util.ts";
+import { Database } from "../src/tooling.ts";
+import { type Handle, errCode, query } from "./util.ts";
 
 // val runs a one-column, one-row scalar query and returns the rendered value.
-function val(db: Engine, sql: string): string {
+function val(db: Handle, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -20,7 +20,7 @@ function val(db: Engine, sql: string): string {
 }
 
 test("@> — contains basics", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const cases: [string, string][] = [
     ["SELECT ARRAY[1,2,3] @> ARRAY[2]", "true"],
     ["SELECT ARRAY[1,2,3] @> ARRAY[2,4]", "false"],
@@ -35,7 +35,7 @@ test("@> — contains basics", () => {
 });
 
 test("<@ / && — contained-by and overlap", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const cases: [string, string][] = [
     ["SELECT ARRAY[2] <@ ARRAY[1,2,3]", "true"],
     ["SELECT ARRAY[2,4] <@ ARRAY[1,2,3]", "false"],
@@ -48,7 +48,7 @@ test("<@ / && — contained-by and overlap", () => {
 });
 
 test("@> / && — STRICT element equality (a NULL element matches nothing)", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const cases: [string, string][] = [
     ["SELECT ARRAY[1,2,NULL] @> ARRAY[2]", "true"],
     ["SELECT ARRAY[1,2,NULL] @> '{NULL}'::i64[]", "false"],
@@ -61,7 +61,7 @@ test("@> / && — STRICT element equality (a NULL element matches nothing)", () 
 });
 
 test("@> / && — a NULL whole-array operand propagates to NULL", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const cases: [string, string][] = [
     ["SELECT NULL::i64[] @> ARRAY[1]", "NULL"],
     ["SELECT ARRAY[1] @> NULL::i64[]", "NULL"],
@@ -72,7 +72,7 @@ test("@> / && — a NULL whole-array operand propagates to NULL", () => {
 });
 
 test("@> — precedence and literal adaptation", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const cases: [string, string][] = [
     ["SELECT ARRAY[1,2] || ARRAY[3] @> ARRAY[3]", "true"], // (a||b) @> c — shares ||'s rung
     ["SELECT ARRAY[3] @> ARRAY[1 + 2]", "true"], // binds looser than +
@@ -84,7 +84,7 @@ test("@> — precedence and literal adaptation", () => {
 });
 
 test("@> / && — errors", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const cases: [string, string][] = [
     ["SELECT 5 @> ARRAY[1]", "42883"], // non-array operand
     ["SELECT ARRAY[1] @> 5", "42883"],
@@ -95,7 +95,7 @@ test("@> / && — errors", () => {
   ];
   for (const [sql, want] of cases)
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       want,
       sql,
     );

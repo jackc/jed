@@ -48,6 +48,7 @@
 // single-handle path and mints additional sessions.
 
 import {
+  type CollationInfo,
   DEFAULT_PAGE_SIZE,
   Engine,
   SessionState,
@@ -58,6 +59,9 @@ import {
   type TxStatus,
 } from "./executor.ts";
 import { Rows, rowsFromOutcome, Transaction } from "./api.ts";
+import { loadEngine, toImage as toImageBytes } from "./format.ts";
+import type { CompositeType, Table } from "./catalog.ts";
+import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
 import { throwIfAborted } from "./cancel.ts";
 import {
@@ -114,16 +118,20 @@ class SharedCore {
   // readOnly marks a read-only file-backed core (api.md §2.1): every session is then read-only, a
   // write is 25006.
   readOnly = false;
+  // memPageSize is the serialization page size for an in-memory core (no storage); DEFAULT_PAGE_SIZE
+  // unless inMemoryWithPageSize set it, so a byte-fixture / non-default-page-size test builds the tree
+  // at the size it will serialize to (CLAUDE.md §8). Ignored once storage is set (the file wins).
+  memPageSize = DEFAULT_PAGE_SIZE;
 
   constructor(snap: Snapshot) {
     this.committed = snap;
     this.sharedTempCommitted = new Snapshot();
   }
 
-  // pageSize is the file's page size for a file-backed core, else the in-memory default. Minted
-  // sessions adopt it so their stores' cap matches the physical pages (CLAUDE.md §8).
+  // pageSize is the file's page size for a file-backed core, else the in-memory serialization size.
+  // Minted sessions adopt it so their stores' cap matches the physical pages (CLAUDE.md §8).
   get pageSize(): number {
-    return this.storage?.pageSize ?? DEFAULT_PAGE_SIZE;
+    return this.storage?.pageSize ?? this.memPageSize;
   }
 
   // persist durably publishes snap to the backing store via an incremental copy-on-write commit
@@ -175,6 +183,16 @@ export class Database {
   // newInMemory builds a fresh, empty in-memory database plus its default session (committed version 0).
   static newInMemory(): Database {
     return Database.over(new SharedCore(new Snapshot(0n)));
+  }
+
+  // inMemoryWithPageSize builds a fresh in-memory database whose stores serialize/split at pageSize.
+  // The page-backed B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an in-memory
+  // tree must be built at the size it will serialize to — this builds byte-level fixtures / tests a
+  // non-default page size; a normal in-memory database uses newInMemory (the default page size).
+  static inMemoryWithPageSize(pageSize: number): Database {
+    const core = new SharedCore(new Snapshot(0n));
+    core.memPageSize = pageSize;
+    return Database.over(core);
   }
 
   // fromFileEngine lifts a freshly opened/created file-backed Engine (file.ts) into a host handle: its
@@ -362,6 +380,96 @@ export class Database {
     if (st !== null && st.paging !== null) {
       st.paging.close();
       st.paging = null;
+    }
+  }
+
+  // fromImage lifts a from-scratch on-disk image (spec/fileformat/format.md) into an in-memory host
+  // handle — the inverse of toImage, used by the byte-level golden round-trip tests and by a host
+  // rehydrating an in-memory database from bytes. (No backing file; commit is a no-op.)
+  static fromImage(image: Uint8Array): Database {
+    const e = loadEngine(image);
+    const core = new SharedCore(e.committed);
+    core.sharedTempCommitted = e.sharedTempCommitted;
+    return Database.over(core);
+  }
+
+  // --- Catalog / storage introspection (spec/design/api.md §6): reads the latest committed snapshot.
+  // The public host surface is tableNames(); table()/compositeType()/rowsInKeyOrder() return the
+  // doc-hidden introspection detail white-box tests reach for (CLAUDE.md §10). ---
+
+  private committedEngine(): Engine {
+    return databaseFromSnapshot(
+      this.core.committed,
+      this.core.sharedTempCommitted,
+      this.core.pageSize,
+    );
+  }
+  // tableNames is every persistent table in the committed snapshot, sorted ascending by lowercased
+  // name (CLAUDE.md §8); secondary indexes are excluded (api.md §6).
+  tableNames(): string[] {
+    return this.committedEngine().tableNames();
+  }
+  table(name: string): Table | undefined {
+    return this.committedEngine().table(name);
+  }
+  compositeType(name: string): CompositeType | undefined {
+    return this.committedEngine().compositeType(name);
+  }
+  rowsInKeyOrder(name: string): Row[] {
+    return this.committedEngine().rowsInKeyOrder(name);
+  }
+  // toImage serializes the whole committed state to a from-scratch on-disk image (the inverse of
+  // fromImage), used by the byte-level golden round-trip tests and by hosts snapshotting to bytes.
+  toImage(pageSize: number, txid: bigint): Uint8Array {
+    return toImageBytes(this.core.committed, pageSize, txid);
+  }
+  // txid is the latest committed transaction id (equal to version).
+  get txid(): bigint {
+    return this.core.committed.txid;
+  }
+  // pageSize is the page payload size this database serializes at.
+  get pageSize(): number {
+    return this.core.pageSize;
+  }
+  // pageCount is the on-disk page high-water for a file-backed database; 0 in-memory.
+  get pageCount(): number {
+    return this.core.storage?.pageCount ?? 0;
+  }
+  // path is the backing file path for a file-backed database; null in-memory.
+  get path(): string | null {
+    return this.core.storage?.path ?? null;
+  }
+  // readOnly reports whether this database was opened read-only. In-memory databases are writable.
+  get readOnly(): boolean {
+    return this.core.readOnly;
+  }
+  // collations / loadedCollations / defaultCollation report the collation catalog (collation.md §12).
+  collations(): CollationInfo[] {
+    return this.committedEngine().collations();
+  }
+  loadedCollations(): CollationInfo[] {
+    return this.committedEngine().loadedCollations();
+  }
+  defaultCollation(): string {
+    return this.committedEngine().defaultCollation();
+  }
+  // setDefaultCollation / upgradeCollations mint a fresh write session, apply the collation change
+  // (which commits through the shared core), and discard it — the bare-convenience form of the Session
+  // methods (collation.md §12).
+  setDefaultCollation(name: string): void {
+    const s = this.session({});
+    try {
+      s.setDefaultCollation(name);
+    } finally {
+      s.close();
+    }
+  }
+  upgradeCollations(): number {
+    const s = this.session({});
+    try {
+      return s.upgradeCollations();
+    } finally {
+      s.close();
     }
   }
 }
@@ -758,11 +866,29 @@ export class Session {
   setAllowDdl(allow: boolean): void {
     this.engine.session.allowDdl = allow;
   }
+  resetPrivileges(): void {
+    this.engine.resetPrivileges();
+  }
+  setAllowTempDdl(allow: boolean): void {
+    this.engine.setAllowTempDdl(allow);
+  }
+  setAllowSharedTempDdl(allow: boolean): void {
+    this.engine.setAllowSharedTempDdl(allow);
+  }
+  setTempBuffers(bytes: number): void {
+    this.engine.setTempBuffers(bytes);
+  }
+  setSharedTempMem(bytes: number): void {
+    this.engine.setSharedTempMem(bytes);
+  }
   setVar(name: string, value: string): void {
     this.engine.session.setVar(name, value);
   }
   resetVar(name: string): void {
     this.engine.session.resetVar(name);
+  }
+  resetVars(): void {
+    this.engine.session.resetVars();
   }
   var(name: string): string | undefined {
     return this.engine.session.var(name);
@@ -781,5 +907,92 @@ export class Session {
   }
   clearClockSource(): void {
     this.engine.session.seam.clock = undefined;
+  }
+
+  // --- Catalog / storage introspection (spec/design/api.md §6): reads this session's engine (its
+  // working set inside a block, else its last-pinned committed snapshot). ---
+
+  tableNames(): string[] {
+    return this.engine.tableNames();
+  }
+  table(name: string): Table | undefined {
+    return this.engine.table(name);
+  }
+  compositeType(name: string): CompositeType | undefined {
+    return this.engine.compositeType(name);
+  }
+  rowsInKeyOrder(name: string): Row[] {
+    return this.engine.rowsInKeyOrder(name);
+  }
+  // toImage serializes this session's committed state to a from-scratch on-disk image.
+  toImage(pageSize: number, txid: bigint): Uint8Array {
+    return toImageBytes(this.engine, pageSize, txid);
+  }
+  get txid(): bigint {
+    return this.engine.committed.txid;
+  }
+  get pageSize(): number {
+    return this.engine.pageSize;
+  }
+  get pageCount(): number {
+    return this.engine.pageCount;
+  }
+  get path(): string | null {
+    return this.engine.path;
+  }
+  get readOnly(): boolean {
+    return this.access === "ro";
+  }
+  collations(): CollationInfo[] {
+    return this.engine.collations();
+  }
+  loadedCollations(): CollationInfo[] {
+    return this.engine.loadedCollations();
+  }
+  defaultCollation(): string {
+    return this.engine.defaultCollation();
+  }
+  // setDefaultCollation sets the per-database default collation. It COMMITS (gate + refresh + publish):
+  // default_collation lives in the committed snapshot, so a bare set would be overwritten by the next
+  // autocommit statement's re-pin — the same subtlety the Rust/Go cores hit.
+  setDefaultCollation(name: string): void {
+    if (this.access === "ro") {
+      throw engineError(
+        "read_only_sql_transaction",
+        "cannot set the default collation on a read-only session",
+      );
+    }
+    if (this.engine.session.tx !== null) {
+      this.engine.setDefaultCollation(name);
+      return;
+    }
+    this.acquireGate();
+    try {
+      this.refreshCommitted();
+      this.engine.setDefaultCollation(name);
+      this.publish();
+    } finally {
+      this.releaseGate();
+    }
+  }
+  // upgradeCollations runs the COLLATION UPGRADE migration (collation.md §12), returning the number of
+  // re-pinned collations. A migration write: commit it (gate + refresh + publish) like setDefaultCollation.
+  upgradeCollations(): number {
+    if (this.access === "ro") {
+      throw engineError(
+        "read_only_sql_transaction",
+        "cannot upgrade collations on a read-only session",
+      );
+    }
+    if (this.engine.session.tx !== null) return this.engine.upgradeCollations();
+    this.acquireGate();
+    try {
+      this.refreshCommitted();
+      const n = this.engine.upgradeCollations();
+      this.publish();
+      return n;
+    } finally {
+      this.releaseGate();
+    }
   }
 }

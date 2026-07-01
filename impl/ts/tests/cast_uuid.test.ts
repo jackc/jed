@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 const CANON = "550e8400-e29b-41d4-a716-446655440000";
@@ -36,7 +36,7 @@ test("bytea → uuid wrong length traps 22P02", () => {
     "SELECT '\\x550e8400e29b41d4a71644665544000000'::bytea::uuid", // 17 bytes
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "22P02",
       sql,
     );
@@ -67,7 +67,7 @@ test("text ⇄ uuid smoke", () => {
   assert.deepEqual(query(db, "SELECT u::text FROM t WHERE id = 1"), [[CANON]]);
   // a malformed runtime text → uuid traps 22P02 (the column path, not a literal)
   assert.equal(
-    errCode(() => execute(db, "SELECT s::uuid FROM t WHERE id = 2")),
+    errCode(() => db.execute("SELECT s::uuid FROM t WHERE id = 2")),
     "22P02",
   );
 });

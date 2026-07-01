@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode } from "./util.ts";
 
 test("EXTRACT(julian …) is a deferred field (0A000)", () => {
@@ -22,7 +22,7 @@ test("EXTRACT(julian …) is a deferred field (0A000)", () => {
     "SELECT EXTRACT(julian FROM date '2024-03-15')",
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "0A000",
       sql,
     );
@@ -32,7 +32,7 @@ test("EXTRACT(julian …) is a deferred field (0A000)", () => {
 test("date_part is deferred (42883 — returns float8, jed has no float)", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT date_part('hour', timestamp '2024-03-15 13:00:00')")),
+    errCode(() => db.execute("SELECT date_part('hour', timestamp '2024-03-15 13:00:00')")),
     "42883",
   );
 });
@@ -40,11 +40,11 @@ test("date_part is deferred (42883 — returns float8, jed has no float)", () =>
 test("EXTRACT over an infinite timestamp traps (22003 — jed decimal is finite)", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT EXTRACT(year FROM timestamp 'infinity')")),
+    errCode(() => db.execute("SELECT EXTRACT(year FROM timestamp 'infinity')")),
     "22003",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT EXTRACT(epoch FROM timestamptz '-infinity')")),
+    errCode(() => db.execute("SELECT EXTRACT(epoch FROM timestamptz '-infinity')")),
     "22003",
   );
 });
@@ -52,11 +52,11 @@ test("EXTRACT over an infinite timestamp traps (22003 — jed decimal is finite)
 test("a non-datetime / non-literal-text source to a datetime target is deferred (0A000)", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT CAST(1 + 1 AS timestamp)")),
+    errCode(() => db.execute("SELECT CAST(1 + 1 AS timestamp)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT CAST(current_setting('x.y', true) AS timestamptz)")),
+    errCode(() => db.execute("SELECT CAST(current_setting('x.y', true) AS timestamptz)")),
     "0A000",
   );
 });

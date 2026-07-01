@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Engine, EngineError, execute, intValue } from "../src/tooling.ts";
+import { Database, EngineError, intValue, type Outcome } from "../src/tooling.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -21,7 +21,7 @@ function code(fn: () => unknown): string {
   throw new Error("expected an error, got none");
 }
 
-function queryRows(o: ReturnType<typeof execute>) {
+function queryRows(o: Outcome) {
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows;
 }
@@ -29,32 +29,32 @@ function queryRows(o: ReturnType<typeof execute>) {
 test("default session is stateful across calls", () => {
   // The Engine-owned default session holds an open BEGIN block across separate calls (the
   // PG/SQLite connection model, §2.1); db.status() exposes the explicit state machine.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.strictEqual(db.status(), "Idle");
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
-  execute(db, "BEGIN");
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+  db.execute("BEGIN");
   assert.strictEqual(db.status(), "Open");
-  execute(db, "INSERT INTO t VALUES (1)");
+  db.execute("INSERT INTO t VALUES (1)");
   assert.strictEqual(db.status(), "Open"); // still open across the separate call
-  execute(db, "COMMIT");
+  db.execute("COMMIT");
   assert.strictEqual(db.status(), "Idle");
 });
 
 test("failed block is the Failed state", () => {
   // A statement error inside a block poisons it: status is Failed, every later statement but
   // ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-  const db = new Engine();
-  execute(db, "BEGIN");
+  const db = Database.newInMemory().session();
+  db.execute("BEGIN");
   assert.strictEqual(
-    code(() => execute(db, "SELECT * FROM missing")),
+    code(() => db.execute("SELECT * FROM missing")),
     "42P01",
   );
   assert.strictEqual(db.status(), "Failed");
   assert.strictEqual(
-    code(() => execute(db, "SELECT 1")),
+    code(() => db.execute("SELECT 1")),
     "25P02",
   );
-  execute(db, "ROLLBACK");
+  db.execute("ROLLBACK");
   assert.strictEqual(db.status(), "Idle");
 });
 

@@ -8,20 +8,21 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute } from "../src/tooling.ts";
+import { Database, EngineError, Session } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 import { MAX_EXPR_DEPTH, parseSQL } from "../src/parser.ts";
 
-function depthDB(): Engine {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
-  execute(db, "INSERT INTO t VALUES (1, 1)");
+function depthDB(): Session {
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  db.execute("INSERT INTO t VALUES (1, 1)");
   return db;
 }
 
 // codeOf returns the SQLSTATE of running sql, or "ok" if it succeeded.
-function codeOf(db: Engine, sql: string): string {
+function codeOf(db: Handle, sql: string): string {
   try {
-    execute(db, sql);
+    db.execute(sql);
     return "ok";
   } catch (e) {
     return e instanceof EngineError ? e.code() : `non-engine:${e}`;

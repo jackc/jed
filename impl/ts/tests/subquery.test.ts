@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, execute, executeParams, intValue } from "../src/tooling.ts";
+import { Database, EngineError, intValue } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
@@ -26,8 +26,8 @@ function ab() {
 
 test("a subquery's cost is added once, the folded constant a leaf", () => {
   const db = ab();
-  const base = execute(db, "SELECT id FROM a WHERE k = 999").cost;
-  const withSub = execute(db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)").cost;
+  const base = db.execute("SELECT id FROM a WHERE k = 999").cost;
+  const withSub = db.execute("SELECT id FROM a WHERE k = (SELECT max(k) FROM b)").cost;
   // The folded constant is a leaf, so the only delta is the subquery's own cost (1 page_read +
   // 3 scan + 3 accumulate + 1 produced = 8), added exactly once.
   assert.strictEqual(withSub - base, 8n);
@@ -44,7 +44,7 @@ test("a subquery's inner error is raised over an empty outer (plan-once)", () =>
     "INSERT INTO f VALUES (1, 1)",
   ]);
   assert.strictEqual(
-    errCode(() => execute(db, "SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e")),
+    errCode(() => db.execute("SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e")),
     "42601",
   );
 });
@@ -58,8 +58,8 @@ test("a subquery's inner error is raised over an empty outer (plan-once)", () =>
 test("a correlated mutation subquery's cost is per row, not folded once", () => {
   // A correlated DELETE subquery re-runs per scanned row; an uncorrelated one folds once, so the
   // correlated cost exceeds the uncorrelated baseline — proving the per-row execution (CLAUDE.md §13).
-  const corr = execute(ab(), "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)").cost;
-  const uncorr = execute(ab(), "DELETE FROM a WHERE k IN (SELECT k FROM b)").cost;
+  const corr = ab().execute("DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)").cost;
+  const uncorr = ab().execute("DELETE FROM a WHERE k IN (SELECT k FROM b)").cost;
   assert.ok(corr > uncorr, `correlated ${corr} should exceed uncorrelated ${uncorr}`);
 });
 
@@ -69,7 +69,7 @@ test("a correlated mutation subquery's cost is per row, not folded once", () => 
 // inside and outside, and a correlated subquery may compare a $N against the outer row.
 
 function idsP(db: ReturnType<typeof ab>, sql: string, params: Value[]): bigint[] {
-  const o = executeParams(db, sql, params);
+  const o = db.execute(sql, params);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows.map((r) => (r[0]!.kind === "int" ? r[0]!.int : -1n));
 }
@@ -110,7 +110,7 @@ test("a $N with no type context anywhere is 42P18", () => {
   const db = ab();
   let code = "";
   try {
-    executeParams(db, "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", [intValue(10n)]);
+    db.execute("SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", [intValue(10n)]);
   } catch (e) {
     if (e instanceof EngineError) code = e.code();
     else throw e;

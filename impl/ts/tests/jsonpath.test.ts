@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode } from "./util.ts";
 
 // The still-deferred path-expression constructs — item methods .m(), arithmetic, like_regex /
@@ -25,7 +25,7 @@ test("jsonpath P1b constructs are 0A000", () => {
     "$x", // a path variable
   ]) {
     assert.equal(
-      errCode(() => execute(db, `SELECT '${path}'::jsonpath`)),
+      errCode(() => db.execute(`SELECT '${path}'::jsonpath`)),
       "0A000",
       `path \`${path}\` should defer 0A000`,
     );
@@ -41,17 +41,17 @@ test("jsonpath deferred constructs are 0A000", () => {
   const db = dbWith([]);
   // An item method.
   assert.equal(
-    errCode(() => execute(db, "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')")),
+    errCode(() => db.execute("SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')")),
     "0A000",
   );
   // like_regex inside a filter (a non-comparison predicate).
   assert.equal(
-    errCode(() => execute(db, `SELECT jsonb_path_exists('["x"]', '$[*] ? (@ like_regex "x")')`)),
+    errCode(() => db.execute(`SELECT jsonb_path_exists('["x"]', '$[*] ? (@ like_regex "x")')`)),
     "0A000",
   );
   // like_regex as a top-level predicate.
   assert.equal(
-    errCode(() => execute(db, `SELECT jsonb_path_match('["x"]', '$ like_regex "x"')`)),
+    errCode(() => db.execute(`SELECT jsonb_path_match('["x"]', '$ like_regex "x"')`)),
     "0A000",
   );
 });
@@ -61,11 +61,11 @@ test("jsonpath deferred constructs are 0A000", () => {
 test("jsonpath is not comparable", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT '$.a'::jsonpath = '$.a'::jsonpath")),
+    errCode(() => db.execute("SELECT '$.a'::jsonpath = '$.a'::jsonpath")),
     "42883",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT '$.a'::jsonpath < '$.b'::jsonpath")),
+    errCode(() => db.execute("SELECT '$.a'::jsonpath < '$.b'::jsonpath")),
     "42883",
   );
 });
@@ -75,7 +75,7 @@ test("jsonpath is not comparable", () => {
 test("jsonpath column is unsupported", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE t (p jsonpath)")),
+    errCode(() => db.execute("CREATE TABLE t (p jsonpath)")),
     "0A000",
   );
 });
@@ -86,15 +86,15 @@ test("jsonpath column is unsupported", () => {
 test("malformed jsonpath is 42601", () => {
   const db = dbWith([]);
   assert.equal(
-    errCode(() => execute(db, "SELECT '$.'::jsonpath")),
+    errCode(() => db.execute("SELECT '$.'::jsonpath")),
     "42601",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT '$['::jsonpath")),
+    errCode(() => db.execute("SELECT '$['::jsonpath")),
     "42601",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT '$[1 to'::jsonpath")),
+    errCode(() => db.execute("SELECT '$[1 to'::jsonpath")),
     "42601",
   );
 });

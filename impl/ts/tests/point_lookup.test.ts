@@ -5,7 +5,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, intValue } from "../src/tooling.ts";
+import { Database, Session, createDatabase, intValue, openDatabase } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 import { PMap, unboundedBound } from "../src/pmap.ts";
 import type { KeyBound } from "../src/pmap.ts";
 import type { Row } from "../src/storage.ts";
@@ -56,17 +57,17 @@ test("bounded range + overlap over a multi-leaf tree", () => {
 
 // --- end-to-end (public API): correctness across leaves + sublinear cost ---
 
-function bigTable(n: number): Engine {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+function bigTable(n: number): Session {
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
-  execute(db, "INSERT INTO t VALUES " + parts.join(","));
+  db.execute("INSERT INTO t VALUES " + parts.join(","));
   return db;
 }
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 function intOf(v: Value): number {
@@ -74,8 +75,8 @@ function intOf(v: Value): number {
   return Number(v.int);
 }
 
-function ids(db: Engine, sql: string): number[] {
-  const o = execute(db, sql);
+function ids(db: Handle, sql: string): number[] {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.map((r) => intOf(r[0]));
 }
@@ -121,11 +122,11 @@ test("LIMIT short-circuit is sublinear", () => {
 
   // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
   // reached under a LIMIT that excludes it.
-  const dz = new Engine();
-  execute(dz, "CREATE TABLE z (id i32 PRIMARY KEY, c i32)");
-  execute(dz, "INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)");
+  const dz = Database.newInMemory().session();
+  dz.execute("CREATE TABLE z (id i32 PRIMARY KEY, c i32)");
+  dz.execute("INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)");
   assert.deepStrictEqual(ids(dz, "SELECT 100 / c FROM z LIMIT 1"), [20]);
-  assert.throws(() => execute(dz, "SELECT 100 / c FROM z LIMIT 2"));
+  assert.throws(() => dz.execute("SELECT 100 / c FROM z LIMIT 2"));
 });
 
 test("mutation pushdown is sublinear", () => {

@@ -9,7 +9,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Engine, EngineError, execute } from "../src/tooling.ts";
+import { Database, EngineError } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 import type { Value } from "../src/value.ts";
 
 function code(fn: () => unknown): string {
@@ -23,8 +24,8 @@ function code(fn: () => unknown): string {
 }
 
 // scalar runs a single-row, single-column query and returns the lone value.
-function scalar(db: Engine, sql: string): Value {
-  const o = execute(db, sql);
+function scalar(db: Handle, sql: string): Value {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   assert.equal(o.rows.length, 1, sql);
   assert.equal(o.rows[0]!.length, 1, sql);
@@ -38,7 +39,7 @@ function assertText(v: Value, want: string): void {
 
 test("host set and read round trip", () => {
   // setVar stores; var reads it back through the host API; current_setting reads it in SQL.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(db.var("myapp.tenant"), undefined); // unset
   db.setVar("myapp.tenant", "acme");
   assert.equal(db.var("myapp.tenant"), "acme");
@@ -48,7 +49,7 @@ test("host set and read round trip", () => {
 test("set and reset reject a non-dotted name", () => {
   // A variable must be namespaced (dotted) — a non-dotted name is a built-in setting name, and v1
   // exposes none through this map (the time_zone built-in is its own slice), so it is 42704.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(
     code(() => db.setVar("bogus", "x")),
     "42704",
@@ -62,13 +63,13 @@ test("set and reset reject a non-dotted name", () => {
 });
 
 test("reset removes and is idempotent", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setVar("myapp.k", "v");
   db.resetVar("myapp.k");
   assert.equal(db.var("myapp.k"), undefined);
   // current_setting on the now-unset name is 42704 again.
   assert.equal(
-    code(() => execute(db, "SELECT current_setting('myapp.k')")),
+    code(() => db.execute("SELECT current_setting('myapp.k')")),
     "42704",
   );
   // Resetting an unset variable is a no-op (PG RESET of an unset custom variable).
@@ -77,7 +78,7 @@ test("reset removes and is idempotent", () => {
 
 test("names are case-insensitive but values are verbatim", () => {
   // The NAME folds to lowercase (PG GUC names are case-insensitive); the VALUE is preserved exactly.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setVar("myApp.Tenant", "AcmeCorp");
   assert.equal(db.var("myapp.tenant"), "AcmeCorp");
   assert.equal(db.var("MYAPP.TENANT"), "AcmeCorp");
@@ -85,15 +86,15 @@ test("names are case-insensitive but values are verbatim", () => {
 });
 
 test("missing_ok turns the unset error into NULL", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(
-    code(() => execute(db, "SELECT current_setting('myapp.unset')")),
+    code(() => db.execute("SELECT current_setting('myapp.unset')")),
     "42704",
   );
   assert.equal(scalar(db, "SELECT current_setting('myapp.unset', true)").kind, "null");
   // false behaves like the one-arg form.
   assert.equal(
-    code(() => execute(db, "SELECT current_setting('myapp.unset', false)")),
+    code(() => db.execute("SELECT current_setting('myapp.unset', false)")),
     "42704",
   );
 });
@@ -101,9 +102,9 @@ test("missing_ok turns the unset error into NULL", () => {
 test("a NULL name propagates to NULL", () => {
   // null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
   // a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, n text)");
-  execute(db, "INSERT INTO t VALUES (1, NULL)");
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, n text)");
+  db.execute("INSERT INTO t VALUES (1, NULL)");
   db.setVar("myapp.x", "set");
   assert.equal(scalar(db, "SELECT current_setting(n) FROM t WHERE id = 1").kind, "null");
 });
@@ -111,11 +112,11 @@ test("a NULL name propagates to NULL", () => {
 test("variables are session state, not snapshot state", () => {
   // Variables are SESSION state, not snapshot state (§6.1): a ROLLBACK undoes DATA but never a
   // session variable (PG SET SESSION). Set one outside, one inside a block, roll back — both survive.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setVar("myapp.outer", "a");
-  execute(db, "BEGIN");
+  db.execute("BEGIN");
   db.setVar("myapp.inner", "b");
-  execute(db, "ROLLBACK");
+  db.execute("ROLLBACK");
   assert.equal(db.var("myapp.outer"), "a");
   assert.equal(db.var("myapp.inner"), "b");
   assertText(scalar(db, "SELECT current_setting('myapp.inner')"), "b");
@@ -144,14 +145,14 @@ test("an additional session has independent variables", () => {
 
 test("resetVars clears every variable", () => {
   // resetVars is PG RESET ALL for the variable map.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setVar("myapp.a", "1");
   db.setVar("myapp.b", "2");
   db.resetVars();
   assert.equal(db.var("myapp.a"), undefined);
   assert.equal(db.var("myapp.b"), undefined);
   assert.equal(
-    code(() => execute(db, "SELECT current_setting('myapp.a')")),
+    code(() => db.execute("SELECT current_setting('myapp.a')")),
     "42704",
   );
 });

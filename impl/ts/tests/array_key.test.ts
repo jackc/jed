@@ -9,14 +9,14 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // (a) jed's array_cmp PK order for multidim / custom-lower-bound values (diverges from PG's ORDER BY).
 test("multidim / custom-lower-bound array key order (jed's array_cmp, not PG's ORDER BY)", () => {
   const db = dbWith(["CREATE TABLE m (k i32[] PRIMARY KEY)"]);
   for (const v of ["{1,2,3,4}", "{{1,2},{3,4}}", "{1,2,3}", "[2:4]={1,2,3}"]) {
-    execute(db, `INSERT INTO m VALUES ('${v}')`);
+    db.execute(`INSERT INTO m VALUES ('${v}')`);
   }
   const got = query(db, "SELECT k FROM m ORDER BY k").map((r) => r[0]);
   assert.deepEqual(got, ["{1,2,3}", "[2:4]={1,2,3}", "{1,2,3,4}", "{{1,2},{3,4}}"]);
@@ -28,7 +28,7 @@ test("multidim / custom-lower-bound array key order (jed's array_cmp, not PG's O
 test("float-element array key is keyable", () => {
   const db = dbWith(["CREATE TABLE m (k f64[] PRIMARY KEY)"]);
   for (const v of ["{1.5,2.5}", "{1.5}", "{-Infinity}", "{NaN}", "{1.5,2.0}"]) {
-    execute(db, `INSERT INTO m VALUES ('${v}')`);
+    db.execute(`INSERT INTO m VALUES ('${v}')`);
   }
   const got = query(db, "SELECT k FROM m ORDER BY k").map((r) => r[0]);
   assert.deepEqual(got, ["{-Infinity}", "{1.5}", "{1.5,2}", "{1.5,2.5}", "{NaN}"]);
@@ -43,7 +43,7 @@ test("float-element array multidim key order (jed's array_cmp)", () => {
     "{1.5,2.5,3.5}",
     "[2:4]={1.5,2.5,3.5}",
   ]) {
-    execute(db, `INSERT INTO m VALUES ('${v}')`);
+    db.execute(`INSERT INTO m VALUES ('${v}')`);
   }
   const got = query(db, "SELECT k FROM m ORDER BY k").map((r) => r[0]);
   assert.deepEqual(got, [
@@ -58,12 +58,12 @@ test("float-element array multidim key order (jed's array_cmp)", () => {
 // are accepted everywhere a key is taken.
 test("composite-element array keys are rejected (0A000); float-element arrays accepted", () => {
   const db = dbWith([]);
-  execute(db, "CREATE TYPE addr AS (street text, zip i32)");
+  db.execute("CREATE TYPE addr AS (street text, zip i32)");
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE bad (k addr[] PRIMARY KEY)")),
+    errCode(() => db.execute("CREATE TABLE bad (k addr[] PRIMARY KEY)")),
     "0A000",
   );
-  execute(db, "CREATE TABLE ok (id i32 PRIMARY KEY, k f32[] UNIQUE)");
-  execute(db, "CREATE TABLE ok2 (id i32 PRIMARY KEY, k f64[])");
-  execute(db, "CREATE INDEX ix ON ok2 (k)");
+  db.execute("CREATE TABLE ok (id i32 PRIMARY KEY, k f32[] UNIQUE)");
+  db.execute("CREATE TABLE ok2 (id i32 PRIMARY KEY, k f64[])");
+  db.execute("CREATE INDEX ix ON ok2 (k)");
 });

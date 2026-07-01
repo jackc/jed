@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // A boolean PRIMARY KEY is accepted (the gate lifted) and CRUD works.
@@ -33,7 +33,7 @@ test("boolean composite primary key", () => {
   ]);
   // (1,FALSE) and (1,TRUE) are distinct keys; the same (a,b) again conflicts.
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO t VALUES (1, TRUE, 99)")),
+    errCode(() => db.execute("INSERT INTO t VALUES (1, TRUE, 99)")),
     "23505",
   );
   // Key order: a ascending, then b false<true within an a-group.

@@ -4,30 +4,23 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import {
-  Engine,
-  EngineError,
-  execute,
-  executeParams,
-  intValue,
-  nullValue,
-} from "../src/tooling.ts";
+import { Database, EngineError, intValue, nullValue } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
-import { dbWith } from "./util.ts";
+import { type Handle, dbWith } from "./util.ts";
 
 function text(s: string): Value {
   return { kind: "text", text: s };
 }
 
-function rows(db: Engine, sql: string, params: Value[]): Value[][] {
-  const o = executeParams(db, sql, params);
+function rows(db: Handle, sql: string, params: Value[]): Value[][] {
+  const o = db.execute(sql, params);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows;
 }
 
-function paramErrCode(db: Engine, sql: string, params: Value[]): string {
+function paramErrCode(db: Handle, sql: string, params: Value[]): string {
   try {
-    executeParams(db, sql, params);
+    db.execute(sql, params);
   } catch (e) {
     if (e instanceof EngineError) return e.code();
     throw e;
@@ -58,7 +51,7 @@ test("param adopts narrow column type and traps overflow", () => {
 
 test("INSERT VALUES params round-trip", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, name text)"]);
-  executeParams(db, "INSERT INTO t VALUES ($1, $2)", [intValue(7n), text("alice")]);
+  db.execute("INSERT INTO t VALUES ($1, $2)", [intValue(7n), text("alice")]);
   const got = rows(db, "SELECT id, name FROM t WHERE id = $1", [intValue(7n)]);
   assert.equal(got.length, 1);
   assert.equal(got[0]![0]!.kind === "int" ? got[0]![0]!.int : -1n, 7n);
@@ -86,13 +79,13 @@ test("UPDATE SET and WHERE params", () => {
     "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
     "INSERT INTO t VALUES (1, 10), (2, 20)",
   ]);
-  executeParams(db, "UPDATE t SET v = $1 WHERE id = $2", [intValue(99n), intValue(2n)]);
+  db.execute("UPDATE t SET v = $1 WHERE id = $2", [intValue(99n), intValue(2n)]);
   assert.deepStrictEqual(ints(rows(db, "SELECT v FROM t WHERE id = $1", [intValue(2n)])), [99n]);
 });
 
 test("DELETE WHERE param", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1), (2), (3)"]);
-  executeParams(db, "DELETE FROM t WHERE id = $1", [intValue(2n)]);
+  db.execute("DELETE FROM t WHERE id = $1", [intValue(2n)]);
   assert.deepStrictEqual(ints(rows(db, "SELECT id FROM t", [])), [1n, 3n]);
 });
 
@@ -152,7 +145,7 @@ test("param in IN list", () => {
 });
 
 test("DDL with params traps 42601", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(paramErrCode(db, "CREATE TABLE t (id i32 PRIMARY KEY)", [intValue(1n)]), "42601");
 });
 
@@ -196,7 +189,7 @@ test("lexer rejects bad param tokens", () => {
   ]) {
     let code = "";
     try {
-      execute(db, sql);
+      db.execute(sql);
     } catch (e) {
       if (e instanceof EngineError) code = e.code();
     }

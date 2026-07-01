@@ -8,12 +8,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { pkIndices, primaryKeyIndex } from "../src/catalog.ts";
-import { Engine, execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { loadEngine, toImage } from "../src/format.ts";
-import { dbWith, errCode } from "./util.ts";
+import { type Handle, dbWith, errCode } from "./util.ts";
 
 // The visible tuple (first two columns) of each row, in stored key order.
-function tuples(db: Engine, table: string): [bigint, bigint][] {
+function tuples(db: Handle, table: string): [bigint, bigint][] {
   return db.rowsInKeyOrder(table).map((r) => {
     const a = r[0]!;
     const b = r[1]!;
@@ -41,7 +41,7 @@ test("composite key flags members and orders by tuple", () => {
     "INSERT INTO t VALUES (1, 1, 20)",
     "INSERT INTO t VALUES (2, 0, 40)",
   ]) {
-    execute(db, stmt);
+    db.execute(stmt);
   }
   assert.deepEqual(tuples(db, "t"), [
     [-1n, 9n],
@@ -57,13 +57,13 @@ test("uniqueness is over the whole tuple", () => {
     "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
     "INSERT INTO t VALUES (1, 1)",
   ]);
-  execute(db, "INSERT INTO t VALUES (1, 2)"); // shared prefix: distinct row
+  db.execute("INSERT INTO t VALUES (1, 2)"); // shared prefix: distinct row
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO t VALUES (1, 1)")),
+    errCode(() => db.execute("INSERT INTO t VALUES (1, 1)")),
     "23505",
   );
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO t VALUES (5, 5), (5, 5)")),
+    errCode(() => db.execute("INSERT INTO t VALUES (5, 5), (5, 5)")),
     "23505",
   );
   // The failed batch stored nothing (all-or-nothing).
@@ -81,7 +81,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   ];
   for (const [sql, want] of cases) {
     assert.equal(
-      errCode(() => execute(new Engine(), sql)),
+      errCode(() => Database.newInMemory().session().execute(sql)),
       want,
       sql,
     );
@@ -89,11 +89,11 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
   // scalar is keyable); only the recursive composite container is NOT (composite.md §6).
   {
-    const db = new Engine();
-    execute(db, "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))");
-    execute(db, "CREATE TYPE addr AS (street text, zip i32)");
+    const db = Database.newInMemory().session();
+    db.execute("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))");
+    db.execute("CREATE TYPE addr AS (street text, zip i32)");
     assert.equal(
-      errCode(() => execute(db, "CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))")),
+      errCode(() => db.execute("CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))")),
       "0A000",
     );
   }
@@ -101,17 +101,17 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
   // keys by (b, a), so the stored scan order is b-major.
   {
-    const rev = new Engine();
-    execute(rev, "CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))");
+    const rev = Database.newInMemory().session();
+    rev.execute("CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))");
     assert.deepEqual(pkIndices(rev.table("rev")!), [1, 0]);
-    execute(rev, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)");
+    rev.execute("INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)");
     const bs = rev.rowsInKeyOrder("rev").map((r) => (r[1]!.kind === "int" ? r[1]!.int : null));
     assert.deepEqual(bs, [10n, 15n, 20n], "stored order is the (b, a) tuple order");
   }
 
   // A single-column table constraint is the column-level form's equivalent.
-  const db = new Engine();
-  execute(db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))");
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE ok (a i32, PRIMARY KEY (a))");
   const t = db.table("ok")!;
   assert.equal(primaryKeyIndex(t), 0);
   assert.ok(t.columns[0]!.notNull);
@@ -123,18 +123,18 @@ test("members are NOT NULL and assigning one re-keys the row", () => {
     "INSERT INTO t VALUES (1, 1, 10)",
   ]);
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO t VALUES (1, NULL, 5)")),
+    errCode(() => db.execute("INSERT INTO t VALUES (1, NULL, 5)")),
     "23502",
   );
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO t (a, v) VALUES (2, 5)")),
+    errCode(() => db.execute("INSERT INTO t (a, v) VALUES (2, 5)")),
     "23502",
   );
   // Assigning a key member re-keys the row (§11 step 6): (1,1) → (9,1) → (9,9); a non-member
   // updates in place. No longer 0A000.
-  execute(db, "UPDATE t SET a = 9");
-  execute(db, "UPDATE t SET b = 9");
-  execute(db, "UPDATE t SET v = 11");
+  db.execute("UPDATE t SET a = 9");
+  db.execute("UPDATE t SET b = 9");
+  db.execute("UPDATE t SET v = 11");
   const rows = db.rowsInKeyOrder("t");
   assert.equal(rows.length, 1);
   const vals = rows[0]!.map((c) => {
@@ -151,7 +151,7 @@ test("mixed uuid + int components order correctly", () => {
     "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
     "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', -2)",
   ]) {
-    execute(db, stmt);
+    db.execute(stmt);
   }
   const ns = db.rowsInKeyOrder("t").map((r) => {
     const n = r[1]!;
@@ -166,8 +166,8 @@ test("round-trips through the on-disk image as a keyed table", () => {
     "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
     "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
   ]);
-  const image = toImage(db, 256, 1n);
-  const loaded = loadEngine(image);
+  const image = db.toImage(256, 1n);
+  const loaded = Database.fromImage(image);
 
   const t = loaded.table("t")!;
   assert.deepEqual(pkIndices(t), [0, 1]);
@@ -180,9 +180,9 @@ test("round-trips through the on-disk image as a keyed table", () => {
   ]);
 
   assert.equal(
-    errCode(() => execute(loaded, "INSERT INTO t VALUES (1, 2, 99)")),
+    errCode(() => loaded.execute("INSERT INTO t VALUES (1, 2, 99)")),
     "23505",
   );
-  execute(loaded, "INSERT INTO t VALUES (2, 2, 50)");
+  loaded.execute("INSERT INTO t VALUES (2, 2, 50)");
   assert.equal(loaded.rowsInKeyOrder("t").length, 4);
 });

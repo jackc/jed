@@ -8,10 +8,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Engine, execute } from "../src/tooling.ts";
-import { dbWith, errCode } from "./util.ts";
+import { Database, type Engine } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode } from "./util.ts";
 
-function fkNames(db: Engine, table: string): string[] {
+function fkNames(db: Handle, table: string): string[] {
   return db.table(table)!.fks.map((f) => f.name);
 }
 
@@ -38,14 +38,14 @@ test("FK naming and catalog order", () => {
 test("FK strict same-type pairing (42804)", () => {
   const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE c1 (x i64 REFERENCES p)")),
+    errCode(() => db.execute("CREATE TABLE c1 (x i64 REFERENCES p)")),
     "42804",
   );
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE c2 (x text REFERENCES p)")),
+    errCode(() => db.execute("CREATE TABLE c2 (x text REFERENCES p)")),
     "42804",
   );
-  execute(db, "CREATE TABLE c3 (x i32 REFERENCES p)"); // same type — accepted
+  db.execute("CREATE TABLE c3 (x i32 REFERENCES p)"); // same type — accepted
 });
 
 // CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE (0A000); NO ACTION and
@@ -53,18 +53,18 @@ test("FK strict same-type pairing (42804)", () => {
 test("FK referential actions narrowed (0A000)", () => {
   const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)")),
+    errCode(() => db.execute("CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)")),
+    errCode(() => db.execute("CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)")),
     "0A000",
   );
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)")),
+    errCode(() => db.execute("CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)")),
     "0A000",
   );
-  execute(db, "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)");
+  db.execute("CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)");
 });
 
 // jed validates the parent side against the statement's END STATE: a swap of two referenced UNIQUE
@@ -77,9 +77,9 @@ test("FK parent UPDATE end-state swap allowed", () => {
     "CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
     "INSERT INTO c VALUES (10, 100), (11, 200)",
   ]);
-  execute(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); // swap — end state valid
+  db.execute("UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); // swap — end state valid
   assert.equal(
-    errCode(() => execute(db, "UPDATE p SET code = 999 WHERE id = 1")),
+    errCode(() => db.execute("UPDATE p SET code = 999 WHERE id = 1")),
     "23503",
   );
 });

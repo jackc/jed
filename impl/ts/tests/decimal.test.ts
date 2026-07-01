@@ -5,11 +5,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Decimal, MAX_INT_DIGITS } from "../src/decimal.ts";
-import { loadEngine, toImage } from "../src/format.ts";
-import { execute } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
-
-const execD = execute;
+import { Database } from "../src/tooling.ts";
+import { dbWith, errCode, type Handle, query } from "./util.ts";
 
 // dec parses "[-]int[.frac]" into a Decimal (mirrors the lexer/parser).
 function dec(s: string): Decimal {
@@ -138,7 +135,7 @@ test("decimal big multiplication is exact (76 digits, no float)", () => {
 
 // --- end-to-end through execute ---------------------------------------------
 
-function one(db: ReturnType<typeof dbWith>, sql: string): string {
+function one(db: Handle, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -150,11 +147,11 @@ test("decimal on-disk round trip persists values + typmod", () => {
     "CREATE TABLE t (id i32 PRIMARY KEY, money numeric(10,2), free numeric)",
     "INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
   ]);
-  const image = toImage(db, 8192, 1n);
-  const loaded = loadEngine(image);
-  assert.deepStrictEqual(toImage(loaded, 8192, 1n), image, "re-serialization byte-identical");
+  const image = db.toImage(8192, 1n);
+  const loaded = Database.fromImage(image);
+  assert.deepStrictEqual(loaded.toImage(8192, 1n), image, "re-serialization byte-identical");
   assert.equal(one(loaded, "SELECT free FROM t WHERE id = 1"), "-12345.6789");
-  execD(loaded, "INSERT INTO t VALUES (4, 9.999, 9.999)");
+  loaded.execute("INSERT INTO t VALUES (4, 9.999, 9.999)");
   assert.equal(one(loaded, "SELECT money FROM t WHERE id = 4"), "10.00"); // typmod persisted
 });
 
@@ -207,7 +204,7 @@ test("decimal cost ceiling aborts ahead of a big multiply", () => {
   const big = "9".repeat(20000) + ".5";
   db.setMaxCost(1000n);
   assert.equal(
-    errCode(() => void execD(db, `SELECT ${big} * ${big} FROM t`)),
+    errCode(() => void db.execute(`SELECT ${big} * ${big} FROM t`)),
     "54P01",
   );
 });

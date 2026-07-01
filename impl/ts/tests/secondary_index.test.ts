@@ -9,27 +9,19 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import {
-  close,
-  create,
-  Engine,
-  EngineError,
-  execute,
-  loadEngine,
-  open,
-  toImage,
-} from "../src/tooling.ts";
+import { Database, EngineError, Session, createDatabase, openDatabase } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 import { pkIndices } from "../src/catalog.ts";
 
-function run(db: Engine, sql: string) {
-  return execute(db, sql);
+function run(db: Handle, sql: string) {
+  return db.execute(sql);
 }
 
-function cost(db: Engine, sql: string): bigint {
+function cost(db: Handle, sql: string): bigint {
   return run(db, sql).cost;
 }
 
-function ids(db: Engine, sql: string): bigint[] {
+function ids(db: Handle, sql: string): bigint[] {
   const o = run(db, sql);
   assert.equal(o.kind, "query", sql);
   return (o.kind === "query" ? o.rows : []).map((r) => {
@@ -50,8 +42,8 @@ function errCode(fn: () => unknown): string {
 
 // The 20-row fixture the planner/cost tests run against: v = i % 5 gives 4 rows per
 // value, so an equality admits 4 of 20.
-function db20(): Engine {
-  const db = new Engine();
+function db20(): Session {
+  const db = Database.newInMemory().session();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
@@ -63,7 +55,7 @@ test("auto-naming matches PostgreSQL", () => {
   // Lowercased <table>_<cols>_idx + the smallest free suffix (oracle-probed, indexes.md
   // §2); duplicates in the column list are allowed and named through; an explicit name
   // round-trips as written. The catalog holds indexes in ascending lowercased-name order.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   run(db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx1
@@ -85,7 +77,7 @@ test("DDL errors match PostgreSQL", () => {
   // Validation order is table → columns (list order) → name collision (oracle-probed,
   // indexes.md §2); the relation namespace is shared with tables; DROP mismatches are
   // 42704/42809.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   run(db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
   assert.equal(
     errCode(() => run(db, "CREATE INDEX i ON nosuch (nope)")),
@@ -176,9 +168,9 @@ test("round-trips through the on-disk image", () => {
   const db = db20();
   run(db, "CREATE INDEX t_v_idx ON t (v)");
   run(db, "INSERT INTO t VALUES (100, NULL, 0)");
-  const img = toImage(db, 8192, 1n);
-  const loaded = loadEngine(img);
-  assert.deepEqual(toImage(loaded, 8192, 1n), img, "byte-stable reload");
+  const img = db.toImage(8192, 1n);
+  const loaded = Database.fromImage(img);
+  assert.deepEqual(loaded.toImage(8192, 1n), img, "byte-stable reload");
   const t = loaded.table("t")!;
   assert.equal(t.indexes.length, 1);
   assert.equal(t.indexes[0]!.name, "t_v_idx");
@@ -216,24 +208,24 @@ test("file-backed paged reopen uses the index", () => {
   // (page_read is logical — buffer-pool-invisible), and stays maintainable.
   const dir = mkdtempSync(join(tmpdir(), "jed-"));
   const path = join(dir, "secondary_index_paged.jed");
-  const db = create(path, { pageSize: 256 });
+  const db = createDatabase(path, { pageSize: 256 });
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
   }
   run(db, "CREATE INDEX t_v_idx ON t (v)");
   const inMemoryCost = cost(db, "SELECT id FROM t WHERE v = 3");
-  close(db);
+  db.close();
 
-  const reopened = open(path);
+  const reopened = openDatabase(path);
   assert.equal(cost(reopened, "SELECT id FROM t WHERE v = 3"), inMemoryCost);
   assert.deepEqual(ids(reopened, "SELECT id FROM t WHERE v = 3 ORDER BY id"), [3n, 8n, 13n, 18n]);
   run(reopened, "UPDATE t SET v = 3 WHERE id = 4");
   run(reopened, "DELETE FROM t WHERE id = 13");
-  close(reopened);
-  const again = open(path);
+  reopened.close();
+  const again = openDatabase(path);
   assert.deepEqual(ids(again, "SELECT id FROM t WHERE v = 3 ORDER BY id"), [3n, 4n, 8n, 18n]);
-  close(again);
+  again.close();
   rmSync(dir, { recursive: true, force: true });
 });
 

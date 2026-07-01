@@ -8,24 +8,25 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/tooling.ts";
+import { Database, Session } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 import type { Value } from "../src/value.ts";
 
 // `o` is five outer rows whose k-values all exist as inner ids; `inr` is n rows (id i32 PRIMARY KEY,
 // v i32; v == id) wide enough to span several leaves.
-function correlatedTables(n: number): Engine {
-  const db = new Engine();
-  execute(db, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)");
-  execute(db, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)");
-  execute(db, "INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)");
+function correlatedTables(n: number): Session {
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE o (id i32 PRIMARY KEY, k i32)");
+  db.execute("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)");
+  db.execute("INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
-  execute(db, "INSERT INTO inr VALUES " + parts.join(","));
+  db.execute("INSERT INTO inr VALUES " + parts.join(","));
   return db;
 }
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 function intOf(v: Value): number {
@@ -33,8 +34,8 @@ function intOf(v: Value): number {
   return Number(v.int);
 }
 
-function ids(db: Engine, sql: string): number[] {
-  const o = execute(db, sql);
+function ids(db: Handle, sql: string): number[] {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.map((r) => intOf(r[0]!));
 }
@@ -80,7 +81,7 @@ test("correlated miss and NULL outer seek nothing", () => {
   const db = correlatedTables(1000);
   // An outer k with no matching inner id is a point-lookup miss (visits the leaf, reads no row); a
   // NULL outer k is a 3VL-empty bound (reads no page, no row). Neither re-scans the inner.
-  execute(db, "INSERT INTO o VALUES (6, 999999), (7, NULL)");
+  db.execute("INSERT INTO o VALUES (6, 999999), (7, NULL)");
   const q = "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id = o.k)";
   assert.deepStrictEqual(ids(db, q), [1, 2, 3, 4, 5]);
   assert.ok(

@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { typeScalar } from "../src/types.ts";
 import { dbWith, errCode } from "./util.ts";
 
@@ -38,28 +38,32 @@ test("case-insensitive table lookup", () => {
 test("duplicate table name traps 42P07", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
   assert.equal(
-    errCode(() => execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)")),
+    errCode(() => db.execute("CREATE TABLE t (id i32 PRIMARY KEY)")),
     "42P07",
   );
 });
 
 test("duplicate column name traps 42701", () => {
   assert.equal(
-    errCode(() => execute(new Engine(), "CREATE TABLE t (a i16, a i32)")),
+    errCode(() => Database.newInMemory().session().execute("CREATE TABLE t (a i16, a i32)")),
     "42701",
   );
 });
 
 test("unknown type traps 42704", () => {
   assert.equal(
-    errCode(() => execute(new Engine(), "CREATE TABLE t (a notatype)")),
+    errCode(() => Database.newInMemory().session().execute("CREATE TABLE t (a notatype)")),
     "42704",
   );
 });
 
 test("two primary keys trap 42P16", () => {
   assert.equal(
-    errCode(() => execute(new Engine(), "CREATE TABLE t (a i16 PRIMARY KEY, b i16 PRIMARY KEY)")),
+    errCode(() =>
+      Database.newInMemory()
+        .session()
+        .execute("CREATE TABLE t (a i16 PRIMARY KEY, b i16 PRIMARY KEY)"),
+    ),
     "42P16",
   );
 });

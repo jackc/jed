@@ -11,11 +11,12 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { create, Engine, execute } from "../src/tooling.ts";
+import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 import type { Value } from "../src/lib.ts";
 
-function runQuery(db: Engine, sql: string): { rows: Value[][]; cost: bigint } {
-  const out = execute(db, sql);
+function runQuery(db: Handle, sql: string): { rows: Value[][]; cost: bigint } {
+  const out = db.execute(sql);
   if (out.kind !== "query") throw new Error(`not a query: ${sql}`);
   return { rows: out.rows, cost: out.cost };
 }
@@ -23,12 +24,12 @@ function runQuery(db: Engine, sql: string): { rows: Value[][]; cost: bigint } {
 // seedSpill populates t(id i32 PK, k i32, s text) with n rows whose k is deliberately unsorted
 // and has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL
 // ordering), and a variable-length s (so a spilled run carries variable-width values).
-function seedSpill(db: Engine, n: number): void {
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)");
+function seedSpill(db: Handle, n: number): void {
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)");
   for (let id = 0; id < n; id++) {
     const k = id % 7 === 0 ? "NULL" : String((id * 48271) % 100);
     const s = "x".repeat(id % 17);
-    execute(db, `INSERT INTO t VALUES (${id}, ${k}, '${s}')`);
+    db.execute(`INSERT INTO t VALUES (${id}, ${k}, '${s}')`);
   }
 }
 
@@ -81,11 +82,11 @@ test("spilling sort matches the in-memory rows and cost", () => {
   try {
     // The source of truth: the same data + queries against a pure in-memory database, which never
     // spills (spill.md §2).
-    const mem = new Engine();
+    const mem = Database.newInMemory().session();
     seedSpill(mem, 200);
 
     // A file-backed database with a tiny workMem so every shape spills many runs and k-way-merges.
-    const db = create(join(dir, "spill_match.jed"), {});
+    const db = createDatabase(join(dir, "spill_match.jed"), {}).session();
     seedSpill(db, 200);
     db.setWorkMem(128); // ~2-3 rows per run → dozens of runs, deep merge
 
@@ -112,7 +113,7 @@ test("spilling sort matches the in-memory rows and cost", () => {
 test("spill leaves no temp files", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-clean-"));
   try {
-    const db = create(join(dir, "spill_cleanup.jed"), {});
+    const db = createDatabase(join(dir, "spill_cleanup.jed"), {}).session();
     seedSpill(db, 150);
     db.setWorkMem(64); // force heavy spilling
 
@@ -131,9 +132,9 @@ test("spilling sort is stable on ties", () => {
   // by (run, position) = input order (spill.md §6).
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-stable-"));
   try {
-    const db = create(join(dir, "spill_stable.jed"), {});
-    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
-    for (let id = 0; id < 100; id++) execute(db, `INSERT INTO t VALUES (${id}, 5)`);
+    const db = createDatabase(join(dir, "spill_stable.jed"), {}).session();
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
+    for (let id = 0; id < 100; id++) db.execute(`INSERT INTO t VALUES (${id}, 5)`);
     db.setWorkMem(96); // force spilling so the merge tie-break is exercised
 
     const { rows } = runQuery(db, "SELECT id FROM t ORDER BY k");

@@ -7,19 +7,19 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { Database, EngineError, Session } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query } from "./util.ts";
 
 // A 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
-function t3(): Engine {
+function t3(): Session {
   return dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
     "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
   ]);
 }
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 test("MATERIALIZED / NOT MATERIALIZED hints force the mode", () => {
@@ -46,14 +46,11 @@ test("MATERIALIZED / NOT MATERIALIZED hints force the mode", () => {
 // cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism doing real
 // work. A per-iteration meter would never fire here, so the corpus cannot express it.
 test("WITH RECURSIVE unbounded recursion aborts at the cost ceiling", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setMaxCost(1000n);
   assert.throws(
     () =>
-      execute(
-        db,
-        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c",
-      ),
+      db.execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c"),
     (e: unknown) => e instanceof EngineError && e.code() === "54P01",
     "an unbounded recursion must abort 54P01, not loop forever",
   );
@@ -62,7 +59,7 @@ test("WITH RECURSIVE unbounded recursion aborts at the cost ceiling", () => {
 // A recursion whose total cost fits under the ceiling runs to completion (the ceiling bounds the
 // actual accrued cost); the 5-row counter accrues 29 (the corpus cost contract).
 test("WITH RECURSIVE under the ceiling succeeds", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setMaxCost(1000n);
   assert.strictEqual(
     cost(
@@ -76,10 +73,9 @@ test("WITH RECURSIVE under the ceiling succeeds", () => {
 // A recursive CTE is ALWAYS materialized — NOT MATERIALIZED is inert (recursive-cte.md §1), so a
 // single-reference recursive CTE still iterates to a fixpoint (3 rows, cost 17) rather than inlining.
 test("WITH RECURSIVE materialization hint is inert", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   for (const hint of ["", "MATERIALIZED ", "NOT MATERIALIZED "]) {
-    const r = execute(
-      db,
+    const r = db.execute(
       `WITH RECURSIVE c(n) AS ${hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n`,
     );
     assert.equal(r.kind, "query", `hint ${JSON.stringify(hint)} kind`);
@@ -102,8 +98,7 @@ test("nested WITH does not inherit enclosing CTEs", () => {
   ]);
   assert.strictEqual(
     errCode(() =>
-      execute(
-        db,
+      db.execute(
         "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s",
       ),
     ),

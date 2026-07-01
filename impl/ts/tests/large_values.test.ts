@@ -10,8 +10,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, Engine, execute, loadEngine, open, toImage } from "../src/tooling.ts";
-import { fillerText } from "./util.ts";
+import { loadEngine } from "../src/format.ts";
+import { Database, Session, createDatabase, openDatabase } from "../src/tooling.ts";
+import { type Handle, fillerText } from "./util.ts";
 
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
 
@@ -24,8 +25,8 @@ function countPageType(image: Uint8Array, ps: number, ty: number): number {
 }
 
 // rowsOf runs a SELECT and returns the rows (asserting it is a query).
-function rowsOf(db: Engine, sql: string) {
-  const o = execute(db, sql);
+function rowsOf(db: Handle, sql: string) {
+  const o = db.execute(sql);
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;
@@ -38,25 +39,25 @@ function textOf(v: { kind: string; text?: string } | undefined): string | null {
 // A ~1250-byte text value forces a multi-page overflow chain at page 256 (RECORD_MAX = 114, cap = 240).
 const BIG = fillerText(1250); // incompressible, so Slice B keeps it external-plain
 
-function bigValueDB(): Engine {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
-  execute(db, `INSERT INTO t VALUES (1, '${BIG}')`);
-  execute(db, "INSERT INTO t VALUES (2, 'tiny')");
+function bigValueDB(): Session {
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)");
+  db.execute(`INSERT INTO t VALUES (1, '${BIG}')`);
+  db.execute("INSERT INTO t VALUES (2, 'tiny')");
   return db;
 }
 
 test("external value spans an overflow chain and round-trips byte-identically", () => {
   const db = bigValueDB();
-  const image = toImage(db, 256, 1n);
+  const image = db.toImage(256, 1n);
   assert.ok(
     countPageType(image, 256, PAGE_OVERFLOW) >= 2,
     "a large value spans several overflow pages",
   );
 
-  const loaded = loadEngine(image);
+  const loaded = Database.fromImage(image);
   // Re-serialization is byte-identical (deterministic spill + chain allocation).
-  assert.deepEqual(toImage(loaded, 256, 1n), image);
+  assert.deepEqual(loaded.toImage(256, 1n), image);
   const rows = rowsOf(loaded, "SELECT id, body FROM t ORDER BY id");
   assert.equal(rows.length, 2);
   assert.equal(textOf(rows[0]![1]), BIG);
@@ -64,10 +65,10 @@ test("external value spans an overflow chain and round-trips byte-identically", 
 });
 
 test("small values never spill", () => {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
-  execute(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
-  const image = toImage(db, 256, 1n);
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
+  db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+  const image = db.toImage(256, 1n);
   assert.equal(
     countPageType(image, 256, PAGE_OVERFLOW),
     0,
@@ -76,7 +77,9 @@ test("small values never spill", () => {
 });
 
 test("load reclaims only dead overflow pages", () => {
-  const image = toImage(bigValueDB(), 256, 1n);
+  const image = bigValueDB().toImage(256, 1n);
+  // freePages is a low-level storage introspection on the loaded Engine (the free-list reconstruction,
+  // a byte-level white-box check per CLAUDE.md §10), so this one assertion reads the internal handle.
   const loaded = loadEngine(image);
   const ovf = countPageType(image, 256, PAGE_OVERFLOW);
   assert.ok(ovf >= 2);
@@ -93,45 +96,45 @@ test("external value through the default demand-paged file path, with reclamatio
   const path = join(dir, "large_values.jed");
   const big = fillerText(1500); // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
   try {
-    let db = create(path, { pageSize: 256 });
-    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
-    execute(db, `INSERT INTO t VALUES (1, '${big}')`);
-    execute(db, "INSERT INTO t VALUES (2, 'small')");
-    close(db);
+    let db = createDatabase(path, { pageSize: 256 });
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)");
+    db.execute(`INSERT INTO t VALUES (1, '${big}')`);
+    db.execute("INSERT INTO t VALUES (2, 'small')");
+    db.close();
 
     // Reopen demand-paged (the default open): the big value reconstructs exactly through the
     // pager-backed chain read.
-    db = open(path);
+    db = openDatabase(path);
     let rows = rowsOf(db, "SELECT id, body FROM t ORDER BY id");
     assert.equal(rows.length, 2);
     assert.equal(textOf(rows[0]![1]), big);
     assert.equal(textOf(rows[1]![1]), "small");
-    close(db);
+    db.close();
 
     // Delete the big row; its chain is orphaned (leaked this session).
-    db = open(path);
-    execute(db, "DELETE FROM t WHERE id = 1");
-    close(db);
+    db = openDatabase(path);
+    db.execute("DELETE FROM t WHERE id = 1");
+    db.close();
 
     // Reopen: the free-list reconstruction collects only live chains, so the dead chain's pages are
     // now free. Re-inserting a large value reuses them — the high-water grows by a handful of pages,
     // not by a whole fresh chain (~7 pages).
-    db = open(path);
+    db = openDatabase(path);
     const before = db.pageCount;
-    execute(db, `INSERT INTO t VALUES (3, '${big}')`);
+    db.execute(`INSERT INTO t VALUES (3, '${big}')`);
     const after = db.pageCount;
-    close(db);
+    db.close();
     assert.ok(
       after <= before + 3,
       `re-insert did not reuse reclaimed pages (pageCount ${before} → ${after})`,
     );
 
     // Final correctness through the paged path.
-    db = open(path);
+    db = openDatabase(path);
     rows = rowsOf(db, "SELECT body FROM t WHERE id = 3");
     assert.equal(rows.length, 1);
     assert.equal(textOf(rows[0]![0]), big);
-    close(db);
+    db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Engine, EngineError, execute, PrivilegeSet } from "../src/tooling.ts";
+import { Database, EngineError, PrivilegeSet } from "../src/tooling.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -26,37 +26,37 @@ const COST5 = "SELECT 1 + 1 + 1 + 1 + 1";
 test("default session has no budget but tracks the cumulative", () => {
   // A fresh session is unlimited (budget 0) yet still TRACKS the cumulative cost — the gauge is
   // always readable (§5.4), it just never aborts.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.equal(db.lifetimeMaxCost(), 0n);
   assert.equal(db.lifetimeCost(), 0n);
-  execute(db, "SELECT 1"); // cost 1
+  db.execute("SELECT 1"); // cost 1
   assert.equal(db.lifetimeCost(), 1n);
-  execute(db, COST5); // cost 5
+  db.execute(COST5); // cost 5
   assert.equal(db.lifetimeCost(), 6n);
 });
 
 test("budget aborts in flight then rejects at admission", () => {
   // Set a budget of 3. The cumulative builds across statements; the one that drives it to the budget
   // aborts 54P02 mid-flight, and every further statement is then rejected 54P02 at admission.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setLifetimeMaxCost(3n);
   assert.equal(db.lifetimeMaxCost(), 3n);
-  execute(db, "SELECT 1"); // cumulative 1
-  execute(db, "SELECT 1"); // cumulative 2
+  db.execute("SELECT 1"); // cumulative 1
+  db.execute("SELECT 1"); // cumulative 2
   // The third SELECT 1 drives the cumulative to 3 and aborts 54P02; its partial cost counts, so the
   // cumulative is now exactly the budget.
   assert.equal(
-    code(() => execute(db, "SELECT 1")),
+    code(() => db.execute("SELECT 1")),
     "54P02",
   );
   assert.equal(db.lifetimeCost(), 3n);
   // Spent: every further statement is rejected at admission — even a trivial one, even a write.
   assert.equal(
-    code(() => execute(db, "SELECT 1")),
+    code(() => db.execute("SELECT 1")),
     "54P02",
   );
   assert.equal(
-    code(() => execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)")),
+    code(() => db.execute("CREATE TABLE t (id i32 PRIMARY KEY)")),
     "54P02",
   );
 });
@@ -64,10 +64,10 @@ test("budget aborts in flight then rejects at admission", () => {
 test("partial cost of an aborted statement counts", () => {
   // A single statement larger than the whole budget aborts mid-flight, and the partial work it did
   // (up to the budget) still counts — the cumulative lands exactly at the budget (unit charges are 1).
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setLifetimeMaxCost(3n);
   assert.equal(
-    code(() => execute(db, COST5)),
+    code(() => db.execute(COST5)),
     "54P02",
   ); // would cost 5; aborts at 3
   assert.equal(db.lifetimeCost(), 3n);
@@ -77,22 +77,22 @@ test("the cumulative is session state and does not roll back", () => {
   // The cumulative is SESSION state, not snapshot state (§5.4): a ROLLBACK undoes a statement's DATA
   // effects but NOT the compute it spent. Run work inside an explicit block, roll it back, and the
   // cumulative still reflects every statement's cost.
-  const db = new Engine();
-  execute(db, "BEGIN");
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
-  execute(db, "INSERT INTO t VALUES (1, 10)");
-  execute(db, COST5); // cost 5
+  const db = Database.newInMemory().session();
+  db.execute("BEGIN");
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  db.execute("INSERT INTO t VALUES (1, 10)");
+  db.execute(COST5); // cost 5
   const beforeRollback = db.lifetimeCost();
   assert.ok(beforeRollback >= 5n, "cumulative should include the block's cost");
-  execute(db, "ROLLBACK");
+  db.execute("ROLLBACK");
   // The table is gone (data rolled back) but the cumulative is unchanged (compute was spent).
   assert.equal(db.lifetimeCost(), beforeRollback);
   assert.equal(
-    code(() => execute(db, "SELECT v FROM t")),
+    code(() => db.execute("SELECT v FROM t")),
     "42P01",
   ); // table really did roll back
   // And the cumulative keeps building from there.
-  execute(db, "SELECT 1");
+  db.execute("SELECT 1");
   assert.equal(db.lifetimeCost(), beforeRollback + 1n);
 });
 
@@ -100,21 +100,21 @@ test("a statement aborts at whichever ceiling it reaches first", () => {
   // maxCost (54P01) and lifetimeMaxCost (54P02) compose: a statement aborts at whichever it reaches
   // first. With the per-statement ceiling tight and the budget far, the per-statement ceiling wins
   // (54P01) — and its partial cost still counts toward the session budget.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setLifetimeMaxCost(1000n);
   db.setMaxCost(3n);
   assert.equal(
-    code(() => execute(db, COST5)),
+    code(() => db.execute(COST5)),
     "54P01",
   ); // max_cost 3 before the far budget
   assert.equal(db.lifetimeCost(), 3n); // the 54P01 partial counted toward the session
 
   // Now the session budget is the nearer ceiling: a tight budget, the per-statement ceiling far.
-  const db2 = new Engine();
+  const db2 = Database.newInMemory().session();
   db2.setLifetimeMaxCost(3n);
   db2.setMaxCost(1000n);
   assert.equal(
-    code(() => execute(db2, COST5)),
+    code(() => db2.execute(COST5)),
     "54P02",
   ); // the budget is reached first
 });
@@ -122,11 +122,11 @@ test("a statement aborts at whichever ceiling it reaches first", () => {
 test("an exact tie breaks to the per-statement ceiling", () => {
   // When both ceilings are reached at the very same accrued value, the inner per-statement ceiling
   // wins the tie (54P01) — the documented, deterministic, cross-core tie rule (§5.4, cost.ts guard).
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setLifetimeMaxCost(3n);
   db.setMaxCost(3n);
   assert.equal(
-    code(() => execute(db, COST5)),
+    code(() => db.execute(COST5)),
     "54P01",
   );
 });
@@ -158,18 +158,18 @@ test("an additional session carries its own budget", () => {
 test("admission is checked before existence and privileges", () => {
   // The budget admission check runs ahead of privileges AND existence (§5.4): once a session is
   // exhausted, even a query naming a missing table is 54P02, not 42P01 — nothing runs.
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   db.setLifetimeMaxCost(1n);
   // SELECT 1 costs 1, reaching the budget — it aborts 54P02 (and spends the budget).
   assert.equal(
-    code(() => execute(db, "SELECT 1")),
+    code(() => db.execute("SELECT 1")),
     "54P02",
   );
   // Now exhausted: a missing table is rejected at admission (54P02) before the 42P01 existence check,
   // and likewise a restricted privilege envelope is never consulted.
   db.setDefaultPrivileges(PrivilegeSet.empty().with("select"));
   assert.equal(
-    code(() => execute(db, "SELECT * FROM does_not_exist")),
+    code(() => db.execute("SELECT * FROM does_not_exist")),
     "54P02",
   );
 });

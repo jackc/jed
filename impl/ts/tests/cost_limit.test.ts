@@ -7,30 +7,31 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, EngineError, execute } from "../src/tooling.ts";
+import { Database, EngineError, Session } from "../src/tooling.ts";
+import type { Handle } from "./util.ts";
 
-function rowTable(n: number): Engine {
-  const db = new Engine();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+function rowTable(n: number): Session {
+  const db = Database.newInMemory().session();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
-  execute(db, "INSERT INTO t VALUES " + parts.join(","));
+  db.execute("INSERT INTO t VALUES " + parts.join(","));
   return db;
 }
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
-function rowCount(db: Engine, sql: string): number {
-  const o = execute(db, sql);
+function rowCount(db: Handle, sql: string): number {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.length;
 }
 
-function assertAborts(db: Engine, sql: string): void {
+function assertAborts(db: Handle, sql: string): void {
   assert.throws(
-    () => execute(db, sql),
+    () => db.execute(sql),
     (e: unknown) => e instanceof EngineError && e.code() === "54P01",
     `expected a 54P01 cost-limit abort from: ${sql}`,
   );
@@ -38,8 +39,8 @@ function assertAborts(db: Engine, sql: string): void {
 
 test("cost limit is unlimited by default", () => {
   const db = rowTable(100);
-  assert.strictEqual(db.session.maxCost, 0n);
-  execute(db, "SELECT * FROM t"); // runs to completion, no ceiling
+  assert.strictEqual(db.maxCost, 0n);
+  db.execute("SELECT * FROM t"); // runs to completion, no ceiling
 });
 
 test("a ceiling above the cost succeeds, below aborts", () => {
@@ -105,7 +106,7 @@ test("a pathological expression aborts on one row (per-node eval guard)", () => 
 test("a provably-empty bound accrues 0 and survives a ceiling of 1", () => {
   const db = rowTable(10);
   db.setMaxCost(1n);
-  const o = execute(db, "SELECT v FROM t WHERE id > 5 AND id < 5");
+  const o = db.execute("SELECT v FROM t WHERE id > 5 AND id < 5");
   if (o.kind !== "query") throw new Error("expected a query result");
   assert.strictEqual(o.rows.length, 0);
   assert.strictEqual(o.cost, 0n);

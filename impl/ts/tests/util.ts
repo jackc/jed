@@ -1,13 +1,44 @@
 // Shared test helpers (not a `*.test.ts` file, so the runner does not execute it).
 
-import { Engine, EngineError, execute, render } from "../src/tooling.ts";
+import {
+  Database,
+  EngineError,
+  type Outcome,
+  render,
+  Session,
+  type Value,
+} from "../src/tooling.ts";
 
-// dbWith builds a database and runs the given setup statements, failing loudly.
-export function dbWith(stmts: string[]): Engine {
-  const db = new Engine();
+// Handle is the structural surface converted test helpers drive on a `db` parameter — satisfied by
+// both the public Session (a converted feature test's handle) and Database (a from-image / file-backed
+// handle). Feature tests route through the Database/Session envelope, never the low-level Engine.
+// (Session-only knobs like setMaxCost/status are called on concrete `const db = ...` vars, not through
+// a Handle-typed helper param, so they stay off this surface.)
+export type Handle = Pick<
+  Session,
+  | "execute"
+  | "executeScript"
+  | "tableNames"
+  | "table"
+  | "compositeType"
+  | "rowsInKeyOrder"
+  | "collations"
+  | "loadedCollations"
+  | "defaultCollation"
+  | "txid"
+  | "pageSize"
+  | "pageCount"
+  | "path"
+  | "readOnly"
+>;
+
+// dbWith builds an in-memory database and runs the given setup statements on a fresh session, failing
+// loudly. The returned Session is stateful across calls (an autocommit handle over the shared core).
+export function dbWith(stmts: string[]): Session {
+  const db = Database.newInMemory().session();
   for (const s of stmts) {
     try {
-      execute(db, s);
+      db.execute(s);
     } catch (e) {
       throw new Error(`setup ${JSON.stringify(s)}: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -16,8 +47,8 @@ export function dbWith(stmts: string[]): Engine {
 }
 
 // query runs a SELECT and returns its rows rendered as strings (NULL → "NULL").
-export function query(db: Engine, sql: string): string[][] {
-  const o = execute(db, sql);
+export function query(db: Handle, sql: string): string[][] {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows.map((r) => r.map(render));
 }

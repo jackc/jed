@@ -8,11 +8,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { Database } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query } from "./util.ts";
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 function rows1(ns: number[]): string[][] {
@@ -21,14 +21,14 @@ function rows1(ns: number[]): string[][] {
 
 // qOut runs a query and narrows the result to the query Outcome (so columnNames / columnTypes
 // are accessible without a union-member error).
-function qOut(db: Engine, sql: string) {
-  const o = execute(db, sql);
+function qOut(db: Handle, sql: string) {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o;
 }
 
 test("unnest names its column at the bound element type", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // An untyped ARRAY[…] literal is i64[] (jed's literal typing).
   const out = qOut(db, "SELECT * FROM unnest(ARRAY[10,20,30])");
   assert.deepStrictEqual(out.columnNames, ["unnest"]);
@@ -39,7 +39,7 @@ test("unnest names its column at the bound element type", () => {
 });
 
 test("unnest of the empty array or a NULL array yields zero rows", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   for (const sql of ["SELECT * FROM unnest('{}'::i32[])", "SELECT * FROM unnest(NULL::i32[])"]) {
     assert.deepStrictEqual(query(db, sql), [], sql);
     assert.equal(cost(db, sql), 0n, sql);
@@ -47,13 +47,13 @@ test("unnest of the empty array or a NULL array yields zero rows", () => {
 });
 
 test("unnest alias renames the single column", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.deepStrictEqual(
     query(db, "SELECT g.g FROM unnest(ARRAY[7,8]) AS g ORDER BY g.g"),
     rows1([7, 8]),
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT g.unnest FROM unnest(ARRAY[7,8]) AS g")),
+    errCode(() => db.execute("SELECT g.unnest FROM unnest(ARRAY[7,8]) AS g")),
     "42703",
   );
 });
@@ -81,7 +81,7 @@ test("unnest takes a correlated outer column AND an earlier sibling (implicitly 
     "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u",
     "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u",
   ]) {
-    const out = execute(db, sql);
+    const out = db.execute(sql);
     assert.equal(out.kind, "query");
     if (out.kind !== "query") return;
     assert.equal(out.rows.length, 3);
@@ -89,31 +89,31 @@ test("unnest takes a correlated outer column AND an earlier sibling (implicitly 
 });
 
 test("unnest strictness + deferred-form errors", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   for (const sql of [
     "SELECT * FROM unnest(5)",
     "SELECT * FROM unnest('hi')",
     "SELECT * FROM unnest(ARRAY[1], ARRAY[2])",
   ]) {
     assert.equal(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       "42883",
       sql,
     );
   }
   // A bare untyped NULL is indeterminate (jed's polymorphic posture); the SELECT-list SRF is deferred.
   assert.equal(
-    errCode(() => execute(db, "SELECT * FROM unnest(NULL)")),
+    errCode(() => db.execute("SELECT * FROM unnest(NULL)")),
     "42P18",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT unnest(ARRAY[1,2,3])")),
+    errCode(() => db.execute("SELECT unnest(ARRAY[1,2,3])")),
     "42883",
   );
 });
 
 test("unnest generated_row cost and the maxCost ceiling", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
   assert.equal(cost(db, "SELECT * FROM unnest('{1,2,3}'::i32[])"), 6n);
   // A large array aborts deterministically once accrued cost reaches the ceiling (54P01), before
@@ -121,7 +121,7 @@ test("unnest generated_row cost and the maxCost ceiling", () => {
   const big = Array.from({ length: 1000 }, (_, i) => String(i + 1)).join(",");
   db.setMaxCost(50n);
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM unnest('{${big}}'::i32[])`)),
+    errCode(() => db.execute(`SELECT * FROM unnest('{${big}}'::i32[])`)),
     "54P01",
   );
   db.setMaxCost(0n);

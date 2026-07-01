@@ -8,15 +8,15 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Engine, execute } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { Database, Session, type Engine } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query } from "./util.ts";
 
-function addrDb(): Engine {
+function addrDb(): Session {
   return dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
 }
 
 // val runs a one-row, one-column query and returns the rendered value ("NULL" for SQL-NULL).
-function val(db: Engine, sql: string): string {
+function val(db: Handle, sql: string): string {
   const rows = query(db, sql);
   assert.equal(rows.length, 1, sql);
   assert.equal(rows[0]!.length, 1, sql);
@@ -24,15 +24,15 @@ function val(db: Engine, sql: string): string {
 }
 
 // col runs a one-column query and returns the rendered values.
-function col(db: Engine, sql: string): string[] {
+function col(db: Handle, sql: string): string[] {
   return query(db, sql).map((r) => {
     assert.equal(r.length, 1, sql);
     return r[0]!;
   });
 }
 
-function qOut(db: Engine, sql: string) {
-  const o = execute(db, sql);
+function qOut(db: Handle, sql: string) {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o;
 }
@@ -106,7 +106,7 @@ test("AF7 unnest(composite[])", () => {
   );
   // A non-array argument is still 42883.
   assert.equal(
-    errCode(() => execute(db, `SELECT * FROM unnest('(a,1)'::addr)`)),
+    errCode(() => db.execute(`SELECT * FROM unnest('(a,1)'::addr)`)),
     "42883",
   );
 });
@@ -114,8 +114,8 @@ test("AF7 unnest(composite[])", () => {
 // The jed extension: ARRAY[ROW(…)] under a composite-column context (not in the PG corpus).
 test("AF7 ARRAY[ROW(…)] under a composite-column context", () => {
   const db = addrDb();
-  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
-  execute(db, "INSERT INTO t VALUES (1, ARRAY[ROW('Main', 90210), ROW('Side', 5)])");
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
+  db.execute("INSERT INTO t VALUES (1, ARRAY[ROW('Main', 90210), ROW('Side', 5)])");
   assert.equal(val(db, "SELECT (SELECT count(*) FROM unnest(o.items)) FROM t o ORDER BY id"), "2");
   assert.equal(val(db, "SELECT array_length(items, 1) FROM t ORDER BY id"), "2");
   // The other operand must be a typed composite literal (a bare ARRAY[ROW]/ROW does not adapt).

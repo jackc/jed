@@ -11,19 +11,16 @@ import { loadedCollation, loadUnicodeData } from "../collation.ts";
 import { loadTimeZoneData, resolveZone } from "../timezone.ts";
 import {
   advancingClock,
-  Engine,
+  Database,
   DEFAULT_MAX_SQL_LENGTH,
   EngineError,
-  execute,
   fixedClock,
-  loadEngine,
   type Outcome,
   type Privilege,
   PrivilegeSet,
   privilegeFromName,
   render,
   seededRandomSource,
-  Database,
   type Session,
   SUPPORTED_CAPABILITIES,
 } from "../tooling.ts";
@@ -131,10 +128,10 @@ function parseUpgradeCollationsDirective(line: string): boolean {
 // is the point), then reconstructs the database in memory via loadEngine. The handle is read-WRITE
 // so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 // read-only-handle error.
-function openFixture(rel: string): Engine {
+function openFixture(rel: string): Session {
   const bundle = join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
   if (existsSync(bundle)) loadUnicodeData(readFileSync(bundle)); // idempotent: the set is engine-global
-  return loadEngine(readFileSync(join(repoRoot(), "spec", rel)));
+  return Database.fromImage(readFileSync(join(repoRoot(), "spec", rel))).session();
 }
 
 function parseRequires(text: string): string[] {
@@ -205,11 +202,7 @@ function applySort(flat: string[], cols: number, sortmode: string): string[] {
   return flat;
 }
 
-function renderOutcome(
-  outcome: ReturnType<typeof execute>,
-  cols: number,
-  sortmode: string,
-): string[] {
+function renderOutcome(outcome: Outcome, cols: number, sortmode: string): string[] {
   if (outcome.kind !== "query") return [];
   const flat = outcome.rows.flatMap((row) => row.map((v) => render(v)));
   return applySort(flat, cols, sortmode);
@@ -541,7 +534,7 @@ function assertTypes(expected: string[] | null, actual: string[], sql: string): 
 
 // runFile runs all records in one .test file against a fresh database.
 function runFile(text: string): void {
-  let db = new Engine();
+  let db = Database.newInMemory().session();
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
   // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -753,9 +746,9 @@ function runFile(text: string): void {
       c.i++;
       const sql = takeSQL(lines, c);
       let err: unknown = null;
-      let outcome: ReturnType<typeof execute> | null = null;
+      let outcome: Outcome | null = null;
       try {
-        outcome = execute(db, sql);
+        outcome = db.execute(sql);
       } catch (e) {
         err = e;
       }
@@ -786,9 +779,9 @@ function runFile(text: string): void {
         expected.push(lines[c.i]!.trim());
         c.i++;
       }
-      let outcome: ReturnType<typeof execute>;
+      let outcome: Outcome;
       try {
-        outcome = execute(db, sql);
+        outcome = db.execute(sql);
       } catch (e) {
         throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
       }

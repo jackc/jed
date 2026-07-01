@@ -3,12 +3,12 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { errCode } from "./util.ts";
 
 test("delete from a missing table traps 42P01", () => {
   assert.equal(
-    errCode(() => execute(new Engine(), "DELETE FROM nope")),
+    errCode(() => Database.newInMemory().session().execute("DELETE FROM nope")),
     "42P01",
   );
 });

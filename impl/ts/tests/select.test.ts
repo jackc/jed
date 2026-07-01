@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function seed() {
@@ -31,13 +31,13 @@ test("LIMIT/OFFSET window reduces produced cost (slice before projection)", () =
   // reads every row before windowing; only windowed rows charge row_produced:
   // 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8 (spec/design/cost.md §3). (Ordering by
   // the PK instead short-circuits — pinned cross-core in query/limit_offset.test, cost 5.)
-  const o = execute(limitDB(), "SELECT id FROM t ORDER BY v LIMIT 2");
+  const o = limitDB().execute("SELECT id FROM t ORDER BY v LIMIT 2");
   assert.equal(o.cost, 8n);
 });
 
 test("unknown column traps 42703", () => {
   assert.equal(
-    errCode(() => execute(seed(), "SELECT nope FROM t")),
+    errCode(() => seed().execute("SELECT nope FROM t")),
     "42703",
   );
 });

@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 const scalar = (db: ReturnType<typeof dbWith>, expr: string): string =>
@@ -22,13 +22,13 @@ test("array → text is explicit-only (assignment / implicit context stays 42804
   // Assignment context: an array value into a text column is a datatype mismatch, NOT a silent
   // array_out (PG would assignment-cast it).
   assert.equal(
-    errCode(() => execute(db, "INSERT INTO t VALUES (1, ARRAY[1,2,3])")),
+    errCode(() => db.execute("INSERT INTO t VALUES (1, ARRAY[1,2,3])")),
     "42804",
   );
-  execute(db, "INSERT INTO t VALUES (1, '{1,2,3}')");
+  db.execute("INSERT INTO t VALUES (1, '{1,2,3}')");
   // Implicit context: comparing a text column to an array value is a mismatch.
   assert.equal(
-    errCode(() => execute(db, "SELECT id FROM t WHERE label = ARRAY[1,2,3]")),
+    errCode(() => db.execute("SELECT id FROM t WHERE label = ARRAY[1,2,3]")),
     "42804",
   );
   // The explicit cast, by contrast, succeeds.
@@ -48,7 +48,7 @@ test("uuid[] → bytea[] → uuid[] round-trips; wrong-width bytea[] → uuid[] 
     "true",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT (ARRAY['\\x00'::bytea])::uuid[]")),
+    errCode(() => db.execute("SELECT (ARRAY['\\x00'::bytea])::uuid[]")),
     "22P02",
   );
 });
@@ -59,17 +59,17 @@ test("forbidden array element pairs: 42804 (no scalar cast) / 0A000 (composite e
   const db = dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
   // A scalar element pair with no cast → 42804 (PG reports 42846). i32 → timestamp has no cast.
   assert.equal(
-    errCode(() => execute(db, "SELECT (ARRAY[1,2,3]::i32[])::timestamp[]")),
+    errCode(() => db.execute("SELECT (ARRAY[1,2,3]::i32[])::timestamp[]")),
     "42804",
   );
   // A composite-element array cast is the deferred composite cast surface → 0A000.
   assert.equal(
-    errCode(() => execute(db, "SELECT (ARRAY[ROW('Main',90210)::addr]::addr[])::text[]")),
+    errCode(() => db.execute("SELECT (ARRAY[ROW('Main',90210)::addr]::addr[])::text[]")),
     "0A000",
   );
   // A bind parameter into an array type stays the container-param narrowing (0A000).
   assert.equal(
-    errCode(() => execute(db, "SELECT $1::i32[]")),
+    errCode(() => db.execute("SELECT $1::i32[]")),
     "0A000",
   );
 });

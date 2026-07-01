@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/tooling.ts";
+import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 test("drop removes the table and its rows", () => {
@@ -15,7 +15,7 @@ test("drop removes the table and its rows", () => {
     "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
     "INSERT INTO t VALUES (1, 10), (2, 20)",
   ]);
-  const out = execute(db, "DROP TABLE t");
+  const out = db.execute("DROP TABLE t");
   assert.deepStrictEqual(out, { kind: "statement", cost: 0n, rowsAffected: null });
   assert.equal(db.table("t"), undefined);
   assert.deepStrictEqual(db.rowsInKeyOrder("t"), []);
@@ -52,21 +52,21 @@ test("dropping one table leaves the others intact", () => {
 test("DROP TABLE syntax errors trap 42601", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
   assert.equal(
-    errCode(() => execute(db, "DROP TABLE")),
+    errCode(() => db.execute("DROP TABLE")),
     "42601",
   ); // no table name
   assert.equal(
-    errCode(() => execute(db, "DROP TABLE t extra")),
+    errCode(() => db.execute("DROP TABLE t extra")),
     "42601",
   ); // trailing input
   // DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index is
   // 42704, not a syntax error; DROP of any other object kind is still unparsed.
   assert.equal(
-    errCode(() => execute(db, "DROP INDEX x")),
+    errCode(() => db.execute("DROP INDEX x")),
     "42704",
   );
   assert.equal(
-    errCode(() => execute(db, "DROP VIEW v")),
+    errCode(() => db.execute("DROP VIEW v")),
     "42601",
   );
 });

@@ -9,27 +9,27 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, executeParams, intValue } from "../src/tooling.ts";
-import { errCode, query } from "./util.ts";
+import { Database, intValue } from "../src/tooling.ts";
+import { type Handle, errCode, query } from "./util.ts";
 
-function names(db: Engine, sql: string): string[] {
-  const o = execute(db, sql);
+function names(db: Handle, sql: string): string[] {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.columnNames;
 }
 
-function types(db: Engine, sql: string): string[] {
-  const o = execute(db, sql);
+function types(db: Handle, sql: string): string[] {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.columnTypes;
 }
 
-function cost(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function cost(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 test("VALUES body — basic shape and default column name", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.deepStrictEqual(
     query(db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v ORDER BY column1"),
     [["1"], ["2"], ["3"]],
@@ -38,7 +38,7 @@ test("VALUES body — basic shape and default column name", () => {
 });
 
 test("VALUES body — multi-column default names and rename list", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   assert.deepStrictEqual(names(db, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v"), [
     "column1",
     "column2",
@@ -53,7 +53,7 @@ test("VALUES body — multi-column default names and rename list", () => {
 });
 
 test("VALUES body — per-column type unification across rows", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // int + int -> int (all bare integer literals are i64 in jed).
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (2)) AS v"), ["i64"]);
   // int + decimal -> decimal; the int value coerces.
@@ -69,8 +69,8 @@ test("VALUES body — per-column type unification across rows", () => {
 });
 
 test("VALUES body — a $N is typed by its sibling rows", () => {
-  const db = new Engine();
-  const o = executeParams(db, "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", [
+  const db = Database.newInMemory().session();
+  const o = db.execute("SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", [
     intValue(7n),
   ]);
   if (o.kind !== "query") throw new Error("expected a query");
@@ -81,7 +81,7 @@ test("VALUES body — a $N is typed by its sibling rows", () => {
 });
 
 test("VALUES body — intrinsic cost", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   // row_produced per VALUES row (3) + outer SELECT row_produced (3) = 6.
   assert.strictEqual(cost(db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v"), 6n);
   // (1+1) adds one operator_eval.
@@ -89,7 +89,7 @@ test("VALUES body — intrinsic cost", () => {
 });
 
 test("VALUES body — errors / narrowings", () => {
-  const db = new Engine();
+  const db = Database.newInMemory().session();
   const cases: [string, string][] = [
     ["SELECT * FROM (VALUES (1), (2, 3)) AS v", "42601"], // differing arity
     ["SELECT * FROM (VALUES (1), ('a')) AS v", "42804"], // types do not unify
@@ -101,7 +101,7 @@ test("VALUES body — errors / narrowings", () => {
   ];
   for (const [sql, code] of cases) {
     assert.strictEqual(
-      errCode(() => execute(db, sql)),
+      errCode(() => db.execute(sql)),
       code,
       sql,
     );

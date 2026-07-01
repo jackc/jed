@@ -25,7 +25,7 @@ import {
   type OverflowPageOut,
   resolveUnfetched,
 } from "../src/format.ts";
-import { close, create, Engine, execute, open } from "../src/tooling.ts";
+import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
 import {
   arrayValue,
   byteaValue,
@@ -35,59 +35,56 @@ import {
   textValue,
   type Value,
 } from "../src/value.ts";
-import { errCode } from "./util.ts";
+import { type Handle, errCode } from "./util.ts";
 
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 
 // Schema + rows exercising every deferrable type alongside a join partner and a secondary index.
 // The default page size keeps every value inline-plain, so on a paged reopen each lands as an
 // inline-deferred unfetched — the L2 case (nothing spills).
-function seed(db: Engine): void {
-  execute(db, "CREATE TYPE addr AS (street text, zip i32)");
-  execute(
-    db,
+function seed(db: Handle): void {
+  db.execute("CREATE TYPE addr AS (street text, zip i32)");
+  db.execute(
     "CREATE TABLE t (id i32 PRIMARY KEY, name text, data bytea, amount decimal(12,2), " +
       "doc jsonb, tags i32[], home addr, span i32range)",
   );
-  execute(db, "CREATE INDEX t_name ON t (name)");
-  execute(
-    db,
+  db.execute("CREATE INDEX t_name ON t (name)");
+  db.execute(
     "INSERT INTO t VALUES " +
       "(1, 'alice', '\\xdeadbeef', 100.50, '{\"k\": 1, \"tag\": \"x\"}', ARRAY[10, 20, 30], ROW('Main St', 90210), '[1,5)'), " +
       "(2, 'bob', '\\xcafe', 2.25, '{\"k\": 2}', ARRAY[1, NULL, 3], ROW('Oak Ave', 12345), '[10,20]'), " +
       "(3, 'carol', NULL, NULL, NULL, NULL, ROW('Elm', NULL), 'empty'), " +
       "(4, 'dave', '\\x00ff', 9999.99, '{\"k\": 4, \"nested\": {\"a\": [1,2,3]}}', '{}', ROW(NULL, 7), '(,9)')",
   );
-  execute(db, "CREATE TABLE u (id i32 PRIMARY KEY, t_id i32, note text)");
-  execute(
-    db,
+  db.execute("CREATE TABLE u (id i32 PRIMARY KEY, t_id i32, note text)");
+  db.execute(
     "INSERT INTO u VALUES (1, 1, 'first'), (2, 1, 'again'), (3, 3, 'lonely'), (4, 99, 'orphan')",
   );
 }
 
 // rowsSorted runs sql and returns its rows rendered to strings and sorted — an order-insensitive
 // multiset compare (a query without ORDER BY has unspecified order; sorting both sides is sound).
-function rowsSorted(db: Engine, sql: string): string[] {
-  const o = execute(db, sql);
+function rowsSorted(db: Handle, sql: string): string[] {
+  const o = db.execute(sql);
   if (o.kind !== "query") throw new Error(`expected a query: ${sql}`);
   return o.rows.map((r) => r.map((v) => render(v)).join("\x1f")).sort();
 }
 
-function costOf(db: Engine, sql: string): bigint {
-  return execute(db, sql).cost;
+function costOf(db: Handle, sql: string): bigint {
+  return db.execute(sql).cost;
 }
 
 test("paged inline values match resident across query shapes", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-shapes-"));
   try {
     const path = join(dir, "shapes.jed");
-    const filedb = create(path, {});
+    const filedb = createDatabase(path, {});
     seed(filedb);
-    close(filedb);
+    filedb.close();
 
-    const mem = new Engine();
+    const mem = Database.newInMemory().session();
     seed(mem);
-    const paged = open(path);
+    const paged = openDatabase(path);
 
     const queries = [
       "SELECT * FROM t",
@@ -141,7 +138,7 @@ test("paged inline values match resident across query shapes", () => {
         `cost differs (paged vs resident): ${sql}`,
       );
     }
-    close(paged);
+    paged.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -151,11 +148,11 @@ test("mutations preserve untouched inline values", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-mut-"));
   try {
     const path = join(dir, "mut.jed");
-    const filedb = create(path, {});
+    const filedb = createDatabase(path, {});
     seed(filedb);
-    close(filedb);
+    filedb.close();
 
-    const mem = new Engine();
+    const mem = Database.newInMemory().session();
     seed(mem);
 
     const mutations = [
@@ -166,13 +163,13 @@ test("mutations preserve untouched inline values", () => {
       "INSERT INTO t VALUES (5, 'erin', '\\xab', 1.00, '{\"k\":5}', ARRAY[9], ROW('New', 1), '[2,3)')",
       "UPDATE u SET note = 'edited' WHERE t_id = 1",
     ];
-    for (const m of mutations) execute(mem, m);
+    for (const m of mutations) mem.execute(m);
     {
-      const paged = open(path);
-      for (const m of mutations) execute(paged, m);
-      close(paged);
+      const paged = openDatabase(path);
+      for (const m of mutations) paged.execute(m);
+      paged.close();
     }
-    const paged = open(path);
+    const paged = openDatabase(path);
     for (const sql of [
       "SELECT * FROM t",
       "SELECT id, name, amount, doc, tags, home, span, data FROM t ORDER BY id",
@@ -180,7 +177,7 @@ test("mutations preserve untouched inline values", () => {
     ]) {
       assert.deepEqual(rowsSorted(paged, sql), rowsSorted(mem, sql), `final state differs: ${sql}`);
     }
-    close(paged);
+    paged.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -207,10 +204,10 @@ test("untouched corrupt inline body defers its error (read-on-touch)", () => {
   try {
     const path = join(dir, "corrupt.jed");
     const marker = "Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq"; // 32 chars, not in catalog text
-    const filedb = create(path, {});
-    execute(filedb, "CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
-    execute(filedb, `INSERT INTO t VALUES (1, '${marker}', 42), (2, 'clean', 7)`);
-    close(filedb);
+    const filedb = createDatabase(path, {});
+    filedb.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
+    filedb.execute(`INSERT INTO t VALUES (1, '${marker}', 42), (2, 'clean', 7)`);
+    filedb.close();
 
     // Corrupt the first content byte of the marker body to 0xFF (an invalid UTF-8 lead byte),
     // leaving the length prefix intact so the skip-walk advances identically, then repair the page
@@ -227,7 +224,7 @@ test("untouched corrupt inline body defers its error (read-on-touch)", () => {
     new DataView(page.buffer, page.byteOffset, page.byteLength).setUint32(12, pageCrc(page), false);
     writeFileSync(path, bytes);
 
-    const db = open(path);
+    const db = openDatabase(path);
     // Open faulted the leaf (skip-walk only); untouching queries never construct the body.
     assert.equal(rowsSorted(db, "SELECT id FROM t").length, 2);
     assert.deepEqual(rowsSorted(db, "SELECT id, n FROM t WHERE n = 42"), ["1\x1f42"]);
@@ -235,14 +232,14 @@ test("untouched corrupt inline body defers its error (read-on-touch)", () => {
     assert.deepEqual(rowsSorted(db, "SELECT body FROM t WHERE id = 2"), ["clean"]);
     // Touching the corrupted body runs the real decode: XX001.
     assert.equal(
-      errCode(() => execute(db, "SELECT body FROM t WHERE id = 1")),
+      errCode(() => db.execute("SELECT body FROM t WHERE id = 1")),
       "XX001",
     );
     assert.equal(
-      errCode(() => execute(db, "SELECT * FROM t ORDER BY id")),
+      errCode(() => db.execute("SELECT * FROM t ORDER BY id")),
       "XX001",
     );
-    close(db);
+    db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -252,20 +249,20 @@ test("untouched deferred column rides a spilling sort", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-spill-"));
   try {
     const path = join(dir, "spill.jed");
-    const mem = new Engine();
-    const filedb = create(path, {});
+    const mem = Database.newInMemory().session();
+    const filedb = createDatabase(path, {});
     for (const db of [mem, filedb]) {
-      execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)");
+      db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)");
     }
     for (let id = 0; id < 200; id++) {
       const k = (id * 48271) % 100;
       const row = `INSERT INTO t VALUES (${id}, ${k}, 'label-${id}-xxxxxxxxxx', '{"id": ${id}}')`;
-      execute(mem, row);
-      execute(filedb, row);
+      mem.execute(row);
+      filedb.execute(row);
     }
-    close(filedb);
+    filedb.close();
 
-    const paged = open(path);
+    const paged = openDatabase(path).session();
     paged.setWorkMem(128); // ~2-3 rows per run → dozens of spilled runs + a deep k-way merge
     for (const sql of [
       "SELECT id FROM t ORDER BY k, id",
@@ -280,7 +277,7 @@ test("untouched deferred column rides a spilling sort", () => {
       );
       assert.equal(costOf(paged, sql), costOf(mem, sql), `cost differs: ${sql}`);
     }
-    close(paged);
+    paged.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
