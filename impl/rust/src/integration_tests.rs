@@ -109,6 +109,8 @@ mod lazy_large_values;
 mod lifetime_cost;
 #[path = "../tests/lz4_vectors.rs"]
 mod lz4_vectors;
+#[path = "../tests/masked_scan.rs"]
+mod masked_scan;
 #[path = "../tests/on_conflict.rs"]
 mod on_conflict;
 #[path = "../tests/overflow_cost.rs"]

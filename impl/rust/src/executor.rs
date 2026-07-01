@@ -10839,10 +10839,12 @@ impl Engine {
                     None => true,
                 })
             };
+            // Read-only SELECT feed: reconstruct only the touched columns (Track A1, packed-leaf.md §11).
+            let recon = Some(plan.rel_masks[0].as_slice());
             if reverse {
-                store.scan_range_rev(&bound, &mut visit)?;
+                store.scan_range_rev(&bound, recon, &mut visit)?;
             } else {
-                store.scan_range(&bound, &mut visit)?;
+                store.scan_range(&bound, recon, &mut visit)?;
             }
         }
         Ok(SelectResult {
@@ -10950,9 +10952,12 @@ impl Engine {
             snap.store(&sp.rels[0].table_name)
                 .overlap_scan_units(&bound, &sp.rel_masks[0])?
         };
+        // Read-only streaming SELECT feed: reconstruct only the touched columns (Track A1). The cursor
+        // is `'static`, so it owns the mask.
+        let recon = Some(sp.rel_masks[0].clone());
         let scan = snap
             .store(&sp.rels[0].table_name)
-            .store_scan(bound, reverse);
+            .store_scan(bound, reverse, recon);
         let mut meter = snap.session.new_meter();
         meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
@@ -11188,7 +11193,8 @@ impl Engine {
                     None => true,
                 })
             };
-            istore.scan_range(&KeyBound::unbounded(), &mut visit)?;
+            // An index store has no payload columns, so its rows carry nothing to mask — whole-row scan.
+            istore.scan_range(&KeyBound::unbounded(), None, &mut visit)?;
         }
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
@@ -11252,7 +11258,9 @@ impl Engine {
         let (total, mut sorted) = if plan.order.iter().any(|(_, _, _, c)| c.is_some()) {
             let mut rows: Vec<Row> = Vec::new();
             if !empty {
-                store.scan_range(&bound, &mut |_key, row| {
+                // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
+                let recon = Some(plan.rel_masks[0].as_slice());
+                store.scan_range(&bound, recon, &mut |_key, row| {
                     meter.guard()?;
                     meter.charge(COSTS.storage_row_read);
                     let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
@@ -11284,7 +11292,9 @@ impl Engine {
             // surviving rows are cloned.
             let mut sorter = self.new_sorter(&plan.order);
             if !empty {
-                store.scan_range(&bound, &mut |_key, row| {
+                // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
+                let recon = Some(plan.rel_masks[0].as_slice());
+                store.scan_range(&bound, recon, &mut |_key, row| {
                     meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                     meter.charge(COSTS.storage_row_read);
                     let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
@@ -11509,8 +11519,11 @@ impl Engine {
         let (mut rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer) {
                 Some(b) => {
+                    // Read-only SELECT feed: reconstruct only the touched columns (Track A1) — a Packed
+                    // leaf skips decoding the untouched ones. Cost- and result-identical to the whole-row
+                    // scan for a consumer that reads only the touched set (packed-leaf.md §11).
                     let (entries, pages, slabs) =
-                        store.range_scan_with_units(&b, &plan.rel_masks[ri])?;
+                        store.range_scan_with_units_masked(&b, &plan.rel_masks[ri])?;
                     let rows = entries.into_iter().map(|(_, v)| v).collect();
                     (rows, (pages, slabs))
                 }
@@ -11555,7 +11568,8 @@ impl Engine {
                 (pairs.into_iter().map(|(_, v)| v).collect(), units)
             }
             None => {
-                let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
+                // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
+                let (entries, pages, slabs) = store.scan_with_units_masked(&plan.rel_masks[ri])?;
                 let rows = entries.into_iter().map(|(_, v)| v).collect();
                 (rows, (pages, slabs))
             }
