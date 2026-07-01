@@ -15,6 +15,7 @@ import (
 const (
 	pmCap = 240
 	pmW   = 15
+	pmK   = 1 // pmRow has one value column — the PAX leaf directory overhead (format.md v23)
 )
 
 func pmKey(n uint64) []byte {
@@ -59,8 +60,8 @@ func pmCheckInvariants(t *testing.T, pm *pMap) {
 		if !n.isLeaf() && len(n.children) != len(n.keys)+1 {
 			t.Fatal("interior child count")
 		}
-		if n.payload() > pmCap {
-			t.Fatalf("node payload %d exceeds cap %d", n.payload(), pmCap)
+		if n.payload(pmK) > pmCap {
+			t.Fatalf("node payload %d exceeds cap %d", n.payload(pmK), pmCap)
 		}
 		for _, c := range n.children {
 			walk(c.node, false) // fully resident in-memory tree
@@ -75,7 +76,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 	const n = 4000
 
 	for _, k := range pmShuffled(n) {
-		_, had, _ := pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, nil)
+		_, had, _ := pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmK, nil)
 		_, refHad := ref[string(pmKey(k))]
 		if had != refHad {
 			t.Fatalf("insert 'had' mismatch at %d: %v vs %v", k, had, refHad)
@@ -109,7 +110,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 
 	// Overwrite returns the old value and does not change len (kept in sync with the reference).
 	before := pm.Len()
-	old, replaced, _ := pm.Insert(pmKey(7), pmRow(777), pmW, pmCap, nil)
+	old, replaced, _ := pm.Insert(pmKey(7), pmRow(777), pmW, pmCap, pmK, nil)
 	if !replaced || !reflect.DeepEqual(old, pmRow(7)) {
 		t.Fatalf("overwrite: old=%v replaced=%v", old, replaced)
 	}
@@ -120,7 +121,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 
 	// Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
 	for step, k := range pmShuffled(n) {
-		got, ok, _ := pm.Remove(pmKey(k), pmCap, nil)
+		got, ok, _ := pm.Remove(pmKey(k), pmCap, pmK, nil)
 		want, wok := ref[string(pmKey(k))]
 		delete(ref, string(pmKey(k)))
 		if ok != wok || !reflect.DeepEqual(got, want) {
@@ -133,7 +134,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 	if pm.Len() != 0 {
 		t.Fatalf("not empty after removing all: len %d", pm.Len())
 	}
-	if _, ok, _ := pm.Remove(pmKey(123), pmCap, nil); ok {
+	if _, ok, _ := pm.Remove(pmKey(123), pmCap, pmK, nil); ok {
 		t.Fatal("remove of absent key reported present")
 	}
 }
@@ -141,20 +142,20 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 	var base pMap
 	for k := uint64(0); k < 2000; k++ {
-		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, nil)
+		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmK, nil)
 	}
 	snap := base // an O(1) value-copy snapshot
 
 	// Mutate a separate copy heavily; the snapshot must be untouched.
 	other := base
 	for k := uint64(0); k < 2000; k++ {
-		other.Insert(pmKey(k), pmRow(-int64(k)), pmW, pmCap, nil) // overwrite every value
+		other.Insert(pmKey(k), pmRow(-int64(k)), pmW, pmCap, pmK, nil) // overwrite every value
 	}
 	for k := uint64(2000); k < 3000; k++ {
-		other.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, nil) // grow
+		other.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmK, nil) // grow
 	}
 	for k := uint64(0); k < 500; k++ {
-		other.Remove(pmKey(k), pmCap, nil) // shrink
+		other.Remove(pmKey(k), pmCap, pmK, nil) // shrink
 	}
 
 	if snap.Len() != 2000 {
@@ -183,17 +184,19 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 }
 
 // Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the
-// non-empty-halves guarantee. With weight 110 (≤ 114 cap) a node holds ~2 entries.
+// non-empty-halves guarantee. With weight 100 (≤ RECORD_MAX(240,1) = 106 — the PAX leaf reserves
+// 12+16·K, format.md v23) a two-record leaf (2·100 + directoryOverhead(2,1)=28 = 228 ≤ 240) fits
+// but a third record overflows, so a node holds ~2 entries.
 func TestPMapWideValuesKeepNodesValid(t *testing.T) {
 	var pm pMap
 	ref := map[string]bool{}
 	for _, k := range pmShuffled(300) {
-		pm.Insert(pmKey(k), pmRow(int64(k)), 110, pmCap, nil)
+		pm.Insert(pmKey(k), pmRow(int64(k)), 100, pmCap, pmK, nil)
 		ref[string(pmKey(k))] = true
 		pmCheckInvariants(t, &pm)
 	}
 	for _, k := range pmShuffled(300) {
-		pm.Remove(pmKey(k), pmCap, nil)
+		pm.Remove(pmKey(k), pmCap, pmK, nil)
 		pmCheckInvariants(t, &pm)
 	}
 	if pm.Len() != 0 {
@@ -209,16 +212,16 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 	if _, ok, _ := pm.Get(pmKey(1), nil); ok {
 		t.Fatal("get on empty")
 	}
-	if _, ok, _ := pm.Remove(pmKey(1), pmCap, nil); ok {
+	if _, ok, _ := pm.Remove(pmKey(1), pmCap, pmK, nil); ok {
 		t.Fatal("remove on empty")
 	}
-	if _, replaced, _ := pm.Insert(pmKey(1), pmRow(1), pmW, pmCap, nil); replaced {
+	if _, replaced, _ := pm.Insert(pmKey(1), pmRow(1), pmW, pmCap, pmK, nil); replaced {
 		t.Fatal("first insert reported overwrite")
 	}
 	if v, ok, _ := pm.Get(pmKey(1), nil); !ok || !reflect.DeepEqual(v, pmRow(1)) {
 		t.Fatal("get after insert")
 	}
-	if v, ok, _ := pm.Remove(pmKey(1), pmCap, nil); !ok || !reflect.DeepEqual(v, pmRow(1)) {
+	if v, ok, _ := pm.Remove(pmKey(1), pmCap, pmK, nil); !ok || !reflect.DeepEqual(v, pmRow(1)) {
 		t.Fatal("remove returns the value")
 	}
 	if pm.Len() != 0 || pm.root != nil {
@@ -233,7 +236,7 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 	var pm pMap
 	for n := uint64(0); n < 200; n++ {
-		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, nil)
+		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmK, nil)
 	}
 	if pm.nodeCount() <= 2 {
 		t.Fatal("test needs a multi-level tree")
@@ -287,7 +290,7 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 func TestPMapRangeCursorMatchesScanRange(t *testing.T) {
 	var pm pMap
 	for n := uint64(0); n < 200; n++ {
-		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, nil)
+		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmK, nil)
 	}
 	if pm.nodeCount() <= 2 {
 		t.Fatal("test needs a multi-level tree")

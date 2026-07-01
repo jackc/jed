@@ -25,7 +25,14 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 22 # format_version 22: varchar(n) length limits (spec/design/types.md §15) — a text column
+VERSION = 23 # format_version 23: PAX leaf layout (format.md "Leaf node") — a B-tree LEAF page
+# (page_type 2) stores its records COLUMN-MAJOR: key directory (N+1 u32 prefix-sum) | key blob |
+# column directory (K+1 u32 region offsets, colStart[K] = payload end) | per column a value directory
+# (N+1 u32 prefix-sum) then that column's N value bodies. The per-value codec is byte-unchanged;
+# interior pages (page_type 3) stay row-major. The per-record key_len u16 is dropped, so a record's
+# split weight is unchanged (2 + key_len + Σ value_size) but a leaf's payload gains
+# directoryOverhead(N,K) and RECORD_MAX tightens to (C − (12+16K))/2. No catalog/interior/overflow
+# byte change. format_version 22: varchar(n) length limits (spec/design/types.md §15) — a text column
 # entry appends a u32 varchar_max_len in the typmod slot (type_code 4): 0 = unbounded, 1…10485760 =
 # the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is
 # unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded
@@ -2213,7 +2220,19 @@ end
 # --- out-of-line large values (large-values.md §12) -------------------------
 
 def spillable?(type) = %w[text bytea decimal].include?(type)
-def record_max(cap) = [(cap - 12) / 2, 0].max # RECORD_MAX = (C-12)/2 (format.md "Why the record cap")
+# RECORD_MAX(K) = (C − max(12, 12+16K))/2 (format.md "Why the record cap"): a PAX leaf's two-record
+# floor carries directoryOverhead(2,K) = 12+16K, so the cap tightens by 8K; K=0 (index/interior)
+# recovers the pre-v23 (C-12)/2.
+def record_max(cap, k) = [(cap - [12, 12 + 16 * k].max) / 2, 0].max
+
+# directoryOverhead(N,K): a PAX leaf's payload beyond Σ recordSize — the key directory (N+1 u32), the
+# column directory (K+1 u32), and each column's value directory (N+1 u32), less the N dropped
+# per-record key_len u16 (format.md "Leaf node"). Interior nodes stay row-major and do not use this.
+def directory_overhead(n, k) = 4 * (n + 1) + 4 * (k + 1) + 4 * (n + 1) * k - 2 * n
+
+# The value-column count of a node's records (0 for an index tree) — a leaf's PAX directory overhead
+# grows with it (format.md v23). Derived from the record plan's table, so no extra threading.
+def node_k(node) = node[:recs].empty? ? 0 : node[:recs][0][:table][:columns].size
 
 # A value's content payload P(v) — the bytes stored in the overflow chain when externalized: raw
 # UTF-8 / raw bytes for text/bytea, the decimal body for decimal (large-values.md §12).
@@ -2238,7 +2257,7 @@ def plan_record(table, key, row, cap)
   comps = Array.new(cols.size)
   cur = inline.dup
   size = 2 + key.bytesize + inline.sum
-  max = record_max(cap)
+  max = record_max(cap, cols.size)
   return [forms, comps, size] if size <= max
 
   # Pass 1 — compress (lz4.md): payload >= S_COMPRESS, largest inline-plain encoded size first,
@@ -2293,27 +2312,68 @@ end
 # Emit one record's on-disk bytes (key_len | key | values), spilling external columns to overflow
 # pages drawn via `alloc` (large-values.md §12/§13). `rec` is a plan hash
 # { key:, row:, table:, forms:, comps: } from plan_record.
+# One value's on-disk body given its disposition (the value codec, unchanged across row-major and PAX):
+# inline-plain is encode_value; the large-value forms carry a pointer / inline block and allocate
+# overflow chains via `alloc` (large-values.md §12/§13). `comp` is the LZ4 block for a compressed form.
+def emit_value(c, v, form, comp, cap, alloc, pages)
+  case form
+  when :external
+    payload = value_payload(c[:type], v)
+    first = write_overflow_chain(payload, cap, alloc, pages)
+    [TAG_EXTERNAL].pack("C") + u32(first) + u32(payload.bytesize)
+  when :inline_comp
+    payload = value_payload(c[:type], v)
+    [TAG_INLINE_COMP].pack("C") + u32(payload.bytesize) + u16(comp.bytesize) + comp
+  when :external_comp
+    payload = value_payload(c[:type], v)
+    first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
+    [TAG_EXTERNAL_COMP].pack("C") + u32(first) + u32(comp.bytesize) + u32(payload.bytesize)
+  else
+    encode_value(c[:type], v)
+  end
+end
+
+# Emit one record ROW-MAJOR (key_len | key | values) — for interior separators (format.md).
 def emit_record(rec, cap, alloc, pages)
   out = +"".b
   out << u16(rec[:key].bytesize) << rec[:key]
   rec[:table][:columns].each_with_index do |c, i|
-    case rec[:forms][i]
-    when :external
-      payload = value_payload(c[:type], rec[:row][i])
-      first = write_overflow_chain(payload, cap, alloc, pages)
-      out << [TAG_EXTERNAL].pack("C") << u32(first) << u32(payload.bytesize)
-    when :inline_comp
-      payload = value_payload(c[:type], rec[:row][i])
-      comp = rec[:comps][i]
-      out << [TAG_INLINE_COMP].pack("C") << u32(payload.bytesize) << u16(comp.bytesize) << comp
-    when :external_comp
-      payload = value_payload(c[:type], rec[:row][i])
-      comp = rec[:comps][i]
-      first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
-      out << [TAG_EXTERNAL_COMP].pack("C") << u32(first) << u32(comp.bytesize) << u32(payload.bytesize)
-    else
-      out << encode_value(c[:type], rec[:row][i])
+    out << emit_value(c, rec[:row][i], rec[:forms][i], rec[:comps][i], cap, alloc, pages)
+  end
+  out
+end
+
+# Emit a leaf's payload COLUMN-MAJOR (PAX, v23 — format.md "Leaf node"): values are encoded in
+# (record, column) order (so overflow chains allocate exactly as row-major), then assembled as
+# key dir | key blob | col dir | per column (value dir | value bodies). `recs` are record plans.
+def emit_leaf_pax(recs, cap, alloc, pages)
+  n = recs.size
+  cols = recs.empty? ? [] : recs[0][:table][:columns]
+  k = cols.size
+  keys = recs.map { |r| r[:key] }
+  val_bytes = Array.new(k) { Array.new(n) }
+  recs.each_with_index do |rec, i|
+    cols.each_with_index do |c, ci|
+      val_bytes[ci][i] = emit_value(c, rec[:row][ci], rec[:forms][ci], rec[:comps][ci], cap, alloc, pages)
     end
+  end
+  out = +"".b
+  off = 0
+  (0..n).each { |i| out << u32(off); off += keys[i].bytesize if i < n } # key directory
+  keys.each { |kb| out << kb }                                          # key blob
+  base_after_col_dir = out.bytesize + 4 * (k + 1)
+  col_start = []
+  cur = base_after_col_dir
+  (0...k).each do |c|
+    col_start[c] = cur
+    cur += 4 * (n + 1) + val_bytes[c].sum(&:bytesize)
+  end
+  col_start[k] = cur
+  (0..k).each { |c| out << u32(col_start[c]) }                          # column directory
+  (0...k).each do |c|
+    voff = 0
+    (0..n).each { |i| out << u32(voff); voff += val_bytes[c][i].bytesize if i < n } # value directory
+    val_bytes[c].each { |vb| out << vb }                               # value bodies
   end
   out
 end
@@ -2374,7 +2434,11 @@ def node_leaf?(node) = node[:children].empty?
 # the actual pointer bytes (with allocated overflow pages) are emitted later by serialize_tree.
 def node_payload(node)
   s = node[:recs].sum { |r| r[:size] }
-  s += 4 * node[:children].size unless node_leaf?(node) # (N+1) child pointers
+  if node_leaf?(node)
+    s += directory_overhead(node[:keys].size, node_k(node)) # PAX leaf directories (v23)
+  else
+    s += 4 * node[:children].size # (N+1) child pointers
+  end
   s
 end
 
@@ -2390,11 +2454,12 @@ def split_node(node, cap, right_edge)
   return [:whole, node] if payload <= cap
 
   interior = !node_leaf?(node)
+  k = node_k(node)
   n = node[:keys].size
   best = 1
   balanced = 0
   (1...n).each do |m|
-    lp = (interior ? 4 * (m + 1) : 0) + node[:recs][0, m].sum { |r| r[:size] }
+    lp = (interior ? 4 * (m + 1) : directory_overhead(m, k)) + node[:recs][0, m].sum { |r| r[:size] }
     best = m if lp <= cap
     balanced = m if balanced.zero? && 2 * lp >= payload
   end
@@ -2435,7 +2500,8 @@ end
 # Build a table's B-tree from its (key, record) pairs in key order. nil for an empty table.
 def build_tree(pairs, cap)
   root = nil
-  max = record_max(cap)
+  k = pairs.empty? ? 0 : pairs[0][1][:table][:columns].size
+  max = record_max(cap, k)
   pairs.each do |key, rec|
     # rec is a record plan; rec[:size] is the post-spill on-disk size. A record still over
     # RECORD_MAX after externalizing every spillable value is genuinely unsupported (0A000).
@@ -2470,11 +2536,11 @@ def serialize_tree(root, next_index, cap, pages)
     next_index += 1
     i
   end
-  recs = root[:recs].map { |r| emit_record(r, cap, alloc, pages) }
   n = root[:keys].size
   pages[index] = if node_leaf?(root)
-                   [PAGE_LEAF, n, recs.join.b, 0]
+                   [PAGE_LEAF, n, emit_leaf_pax(root[:recs], cap, alloc, pages), 0] # column-major (v23)
                  else
+                   recs = root[:recs].map { |r| emit_record(r, cap, alloc, pages) }
                    [PAGE_INTERIOR, n, child_pages.map { |cp| u32(cp) }.join.b + recs.join.b, 0]
                  end
   [index, next_index]
@@ -3157,6 +3223,29 @@ def decode_record(columns, buf, pos, fetch)
   [row, pos]
 end
 
+# Parse a PAX (column-major) leaf payload (v23 — format.md "Leaf node") into [keys, col_vals,
+# col_off]: keys[i] the i-th key, col_vals[c] column c's concatenated value bytes, col_off[c] its
+# N+1 prefix-sum value directory. n = item_count, k = value-column count.
+def parse_pax_leaf(payload, n, k)
+  pos = 0
+  key_off = (0..n).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
+  key_blob = pos
+  keys = (0...n).map { |i| payload.byteslice(key_blob + key_off[i], key_off[i + 1] - key_off[i]) }
+  pos = key_blob + key_off[n]
+  col_start = (0..k).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
+  raise "PAX leaf column directory start mismatch" unless col_start[0] == pos
+
+  col_vals = []
+  col_off = []
+  (0...k).each do |c|
+    start = col_start[c]
+    col_off[c] = (0..n).map { |i| payload.byteslice(start + i * 4, 4).unpack1("N") }
+    val_base = start + 4 * (n + 1)
+    col_vals[c] = payload.byteslice(val_base, col_start[c + 1] - val_base)
+  end
+  [keys, col_vals, col_off]
+end
+
 # In-order walk of a table's B-tree -> rows in ascending key order (format.md interior layout:
 # (N+1) child pointers, then N records). Independent of how the tree was built. An external value's
 # chain is followed through `fetch` (large-values.md §12).
@@ -3169,9 +3258,14 @@ def read_tree_rows(image, ps, root_page, columns)
     pg = read_page(image, ps, idx)
     case pg[:type]
     when PAGE_LEAF
-      pos = 0
-      pg[:item_count].times do
-        row, pos = decode_record(columns, pg[:payload], pos, fetch)
+      n = pg[:item_count]
+      _keys, col_vals, col_off = parse_pax_leaf(pg[:payload], n, columns.size)
+      (0...n).each do |i|
+        row = columns.each_with_index.map do |c, ci|
+          vb = col_vals[ci].byteslice(col_off[ci][i], col_off[ci][i + 1] - col_off[ci][i])
+          v, = decode_value(c[:type], vb, 0, fetch)
+          v
+        end
         rows << row
       end
     when PAGE_INTERIOR
@@ -3208,8 +3302,10 @@ def read_tree_keys(image, ps, root_page)
     end
     case pg[:type]
     when PAGE_LEAF
-      pos = 0
-      pg[:item_count].times { pos = read_rec.call(pos) }
+      # An index leaf is PAX with K=0 value columns (v23): its payload is just the key directory +
+      # key blob + a 1-entry column directory. parse_pax_leaf returns the keys.
+      leaf_keys, = parse_pax_leaf(pg[:payload], pg[:item_count], 0)
+      leaf_keys.each { |kk| keys << kk }
     when PAGE_INTERIOR
       n = pg[:item_count]
       children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }

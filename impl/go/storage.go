@@ -107,6 +107,10 @@ func (s *tableStore) weight(key []byte, row storedRow) uint32 {
 	return uint32(recordSize(s.colTypes, key, row, s.cap))
 }
 
+// paxK is the value-column count threaded into the B-tree split math — a leaf's PAX directory
+// overhead grows with it (format.md v23). An index store carries no value columns (K=0).
+func (s *tableStore) paxK() int { return len(s.colTypes) }
+
 // Insert adds a row under its encoded key. Returns (false, nil) if the key already exists
 // (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf through
 // the buffer pool (an I/O error then propagates).
@@ -117,7 +121,7 @@ func (s *tableStore) Insert(key []byte, row storedRow) (bool, error) {
 	} else if ok {
 		return false, nil
 	}
-	if _, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, src); err != nil {
+	if _, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, s.paxK(), src); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -142,14 +146,14 @@ func (s *tableStore) BumpRowidTo(n int64) {
 // Replace overwrites the row stored at an existing key (UPDATE). The key is
 // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
 func (s *tableStore) Replace(key []byte, row storedRow) error {
-	_, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, s.leafSrc())
+	_, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, s.paxK(), s.leafSrc())
 	return err
 }
 
 // Remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
 // delete descends into / rebalances against.
 func (s *tableStore) Remove(key []byte) (bool, error) {
-	_, ok, err := s.rows.Remove(key, s.cap, s.leafSrc())
+	_, ok, err := s.rows.Remove(key, s.cap, s.paxK(), s.leafSrc())
 	return ok, err
 }
 

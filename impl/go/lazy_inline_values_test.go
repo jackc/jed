@@ -338,16 +338,17 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 		}
 	}
 
-	// Encode the records into one leaf page payload (everything inline at this page size).
+	// Encode the records into one PAX leaf page payload (everything inline at this page size).
 	takeSeq := uint32(100)
 	take := func() uint32 { takeSeq++; return takeSeq }
 	var ovf []overflowPageOut
-	var payload []byte
-	for i, row := range rows {
+	keys := make([][]byte, len(rows))
+	for i := range rows {
 		key := make([]byte, 4)
 		binary.BigEndian.PutUint32(key, uint32(i))
-		payload = append(payload, encodeRecord(colTypes, key, row, capacity, take, &ovf)...)
+		keys[i] = key
 	}
+	payload := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf)
 	if len(ovf) != 0 {
 		t.Fatalf("values must stay inline (no overflow) for the form-(a) case, got %d overflow pages", len(ovf))
 	}

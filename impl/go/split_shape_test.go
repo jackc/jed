@@ -47,15 +47,17 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	// The same logical table costs nearly the same full scan whichever order built it:
 	// ascending packs ~full (append splits), shuffled lands ~2 nodes behind (balanced
 	// splits). Under the old always-largest-left rule the shuffled tree splintered into
-	// hundreds of near-empty nodes and this cost exploded.
+	// hundreds of near-empty nodes and this cost exploded. The counts rose from the pre-v23
+	// row-major layout (259/261/139/103) because a PAX leaf's per-column directory overhead
+	// (format.md v23) lowers leaf fan-out, so a scan touches a few more pages.
 	asc := splitShapeDB(t, false)
-	pin(asc, "SELECT count(*) FROM t", 259)
+	pin(asc, "SELECT count(*) FROM t", 268)
 	shuf := splitShapeDB(t, true)
-	pin(shuf, "SELECT count(*) FROM t", 261)
+	pin(shuf, "SELECT count(*) FROM t", 278)
 
 	// Sorted index build (indexes.md §1) packs the index tree like the ascending case;
 	// the build charges only its table scan, and the bounded lookup's cost pins the
 	// index path's shape (pk ≡ 3 mod 7 in [0,120] ⇒ 17 admitted rows for v = 3).
-	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 139)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 103)
+	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 156)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 100)
 }

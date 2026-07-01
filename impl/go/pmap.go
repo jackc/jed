@@ -72,13 +72,16 @@ func resolveChild(c childRef, src leafSource) (*pnode, error) {
 func (n *pnode) isLeaf() bool { return len(n.children) == 0 }
 
 // payload is this node's serialized size (format.md): Σ weights plus, for an interior node,
-// 4·(N+1) for its child pointers.
-func (n *pnode) payload() int {
+// 4·(N+1) for its child pointers, or for a LEAF node (PAX v23) directoryOverhead(N,K) for the
+// key/column/value directories. k is the value-column count of the tree (0 for an index tree).
+func (n *pnode) payload(k int) int {
 	total := 0
 	for _, w := range n.weights {
 		total += int(w)
 	}
-	if !n.isLeaf() {
+	if n.isLeaf() {
+		total += directoryOverhead(len(n.keys), k)
+	} else {
 		total += 4 * len(n.children)
 	}
 	return total
@@ -145,7 +148,7 @@ func (m *pMap) Get(key []byte, src leafSource) (storedRow, bool, error) {
 // capacity. Returns the previous row and true if key was present (an overwrite); otherwise nil and
 // false (a new insert, which grows the length). An overwrite can change the weight, so it too may
 // overflow and split.
-func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, src leafSource) (storedRow, bool, error) {
+func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap, k int, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
 		m.root = &pnode{keys: [][]byte{key}, vals: []storedRow{val}, weights: []uint32{weight}}
 		m.length++
@@ -153,7 +156,7 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, src lea
 	}
 	var old storedRow
 	replaced := false
-	out, err := nodeInsert(m.root, key, val, weight, &old, &replaced, src, cap)
+	out, err := nodeInsert(m.root, key, val, weight, &old, &replaced, src, cap, k)
 	if err != nil {
 		return nil, false, err
 	}
@@ -173,11 +176,11 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, src lea
 
 // Remove deletes key. Returns the removed row and true, or (nil,false) if absent (then the map is
 // unchanged). cap is the page payload capacity (the rebalance threshold).
-func (m *pMap) Remove(key []byte, cap int, src leafSource) (storedRow, bool, error) {
+func (m *pMap) Remove(key []byte, cap, k int, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
 		return nil, false, nil
 	}
-	newRoot, removed, ok, err := nodeRemove(m.root, key, src, cap)
+	newRoot, removed, ok, err := nodeRemove(m.root, key, src, cap, k)
 	if err != nil {
 		return nil, false, err
 	}
@@ -687,7 +690,7 @@ type insOut struct {
 // m yields two non-empty, fitting halves under the RECORD_MAX = (cap-12)/2 cap (format.md). The < 3
 // guard is defensive against an oversized record — it leaves the node whole, and the oversize is
 // surfaced as 0A000 when the node is serialized (format.go).
-func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRef, cap int, rightEdge bool) insOut {
+func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRef, cap, k int, rightEdge bool) insOut {
 	interior := len(children) > 0
 	payload := 0
 	for _, w := range weights {
@@ -695,6 +698,8 @@ func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRe
 	}
 	if interior {
 		payload += 4 * len(children)
+	} else {
+		payload += directoryOverhead(len(keys), k)
 	}
 	if payload <= cap || len(keys) < 3 {
 		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, children: children}}
@@ -709,6 +714,8 @@ func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRe
 		lp := prefix
 		if interior {
 			lp += 4 * (m + 1)
+		} else {
+			lp += directoryOverhead(m, k)
 		}
 		if lp <= cap {
 			best = m
@@ -749,7 +756,7 @@ func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRe
 // nodeInsert is the recursive insert. On overwrite it sets *old/*replaced and rebuilds the path with
 // the value+weight replaced (which may now overflow). On a new key it inserts into the leaf and
 // splits overflowing nodes back up the path.
-func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap int) (insOut, error) {
+func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap, k int) (insOut, error) {
 	i, found := n.search(key)
 	if found {
 		vals := cloneVals(n.vals)
@@ -758,10 +765,10 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 		*replaced = true
 		vals[i] = val
 		weights[i] = weight
-		return build(cloneKeys(n.keys), vals, weights, cloneChildren(n.children), cap, i == len(n.keys)-1), nil
+		return build(cloneKeys(n.keys), vals, weights, cloneChildren(n.children), cap, k, i == len(n.keys)-1), nil
 	}
 	if n.isLeaf() {
-		return build(insertKeyAt(n.keys, i, key), insertValAt(n.vals, i, val), insertWeightAt(n.weights, i, weight), nil, cap, i == len(n.keys)), nil
+		return build(insertKeyAt(n.keys, i, key), insertValAt(n.vals, i, val), insertWeightAt(n.weights, i, weight), nil, cap, k, i == len(n.keys)), nil
 	}
 	// Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
 	// becomes a dirty resident node on the rebuilt path).
@@ -769,7 +776,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 	if err != nil {
 		return insOut{}, err
 	}
-	sub, err := nodeInsert(childNode, key, val, weight, old, replaced, src, cap)
+	sub, err := nodeInsert(childNode, key, val, weight, old, replaced, src, cap, k)
 	if err != nil {
 		return insOut{}, err
 	}
@@ -784,7 +791,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 	children := cloneChildren(n.children)
 	children[i] = residentRef(sub.left)
 	children = insertChildAt(children, i+1, residentRef(sub.right))
-	return build(keys, vals, weights, children, cap, i == len(n.keys)), nil
+	return build(keys, vals, weights, children, cap, k, i == len(n.keys)), nil
 }
 
 // maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor. Faults the rightmost
@@ -804,7 +811,7 @@ func maxKV(n *pnode, src leafSource) ([]byte, storedRow, uint32, error) {
 // underfull — the caller rebalances it) and the removed row. A separator found in an interior node
 // is replaced by its in-order predecessor (drawn from the left subtree), which is then deleted from
 // that subtree; the touched child is rebalanced via rebalanceChild.
-func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, storedRow, bool, error) {
+func nodeRemove(n *pnode, key []byte, src leafSource, cap, k int) (*pnode, storedRow, bool, error) {
 	i, found := n.search(key)
 	if found {
 		if n.isLeaf() {
@@ -821,7 +828,7 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, storedRo
 		if err != nil {
 			return nil, nil, false, err
 		}
-		newChild, _, _, err := nodeRemove(leftChild, pk, src, cap)
+		newChild, _, _, err := nodeRemove(leftChild, pk, src, cap, k)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -831,7 +838,7 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, storedRo
 		children := cloneChildren(n.children)
 		keys[i], vals[i], weights[i], children[i] = pk, pv, pw, residentRef(newChild)
 		rebuilt := &pnode{keys: keys, vals: vals, weights: weights, children: children}
-		out, err := rebalanceChild(rebuilt, i, src, cap)
+		out, err := rebalanceChild(rebuilt, i, src, cap, k)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -844,7 +851,7 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, storedRo
 	if err != nil {
 		return nil, nil, false, err
 	}
-	newChild, removed, ok, err := nodeRemove(childNode, key, src, cap)
+	newChild, removed, ok, err := nodeRemove(childNode, key, src, cap, k)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -854,7 +861,7 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, storedRo
 	children := cloneChildren(n.children)
 	children[i] = residentRef(newChild)
 	rebuilt := &pnode{keys: cloneKeys(n.keys), vals: cloneVals(n.vals), weights: cloneWeights(n.weights), children: children}
-	out, err := rebalanceChild(rebuilt, i, src, cap)
+	out, err := rebalanceChild(rebuilt, i, src, cap, k)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -865,27 +872,27 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap int) (*pnode, storedRo
 // (prefer the right one), then split the merged node back if it overflows — the unified rebalance
 // (no borrow). The returned parent may itself have lost a key and become underfull; its own parent
 // handles that as the recursion unwinds.
-func rebalanceChild(n *pnode, i int, src leafSource, cap int) (*pnode, error) {
+func rebalanceChild(n *pnode, i int, src leafSource, cap, k int) (*pnode, error) {
 	// children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
 	childNode, err := resolveChild(n.children[i], src)
 	if err != nil {
 		return nil, err
 	}
-	if childNode.payload() >= cap/2 {
+	if childNode.payload(k) >= cap/2 {
 		return n, nil
 	}
 	j := i
 	if i+1 >= len(n.children) {
 		j = i - 1
 	}
-	return mergeAt(n, j, src, cap)
+	return mergeAt(n, j, src, cap, k)
 }
 
 // mergeAt merges children[j], separator j, and children[j+1] into one node M. If M fits, it replaces
 // the pair and the parent loses separator j and child j+1. If M overflows, it is split 2-way and the
 // two halves + the new separator replace the pair (the parent's key count is unchanged). M < 2·cap
 // always (format.md), so a single split restores fit.
-func mergeAt(n *pnode, j int, src leafSource, cap int) (*pnode, error) {
+func mergeAt(n *pnode, j int, src leafSource, cap, k int) (*pnode, error) {
 	// Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
 	// still be an OnDisk leaf the delete never touched.
 	left, err := resolveChild(n.children[j], src)
@@ -921,7 +928,7 @@ func mergeAt(n *pnode, j int, src leafSource, cap int) (*pnode, error) {
 	weights := cloneWeights(n.weights)
 	children := cloneChildren(n.children)
 
-	out := build(mkeys, mvals, mweights, mchildren, cap, false) // merge-overflow: balanced (format.md)
+	out := build(mkeys, mvals, mweights, mchildren, cap, k, false) // merge-overflow: balanced (format.md)
 	if out.whole != nil {
 		keys = removeKeyAt(keys, j)
 		vals, _ = removeValAt(vals, j)
