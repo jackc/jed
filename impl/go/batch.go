@@ -16,6 +16,17 @@ package jed
 //     distinctRowKey — and NULLs bucket together via a sentinel group), then folds each group's
 //     accumulators through the shared acc.fold (byte-identical acc state, hence finalize).
 //     Float SUM/AVG kernels round out the numeric folds (MIN/MAX were already type-agnostic).
+//   - A2 — COLUMNAR GATHER (packed-leaf.md §11 Track A2): a FILTER-FREE file-backed aggregate (either
+//     stage above) gathers ONLY its touched columns into dense per-column lanes straight off the
+//     Packed leaves (aggColumnar → ColumnarScanMasked → foldAggColumnar / groupByIntKeyColumnar),
+//     NEVER materializing a full-width storedRow. This is the allocation dividend the row feed leaves
+//     on the table: a wide-table single-column scan drops from O(rows × columns) to O(rows) allocation
+//     (a 64-column count(*) went from ~100 MB of all-NULL rows to a few KB). Cost-neutral by
+//     construction — it charges the same page_read / value_decompress / storage_row_read block the row
+//     feed does. Gated to file-backed stores (an in-memory store's row path already shares its rows
+//     zero-copy) and declines to the row path on any filter / spillable column, so the fold kernels
+//     stay the same code either way (foldAggColumnar mirrors foldAggBatch, reading lane[i] instead of
+//     survivors[i][idx]).
 //
 // The load-bearing invariant is that BOTH the result multiset AND the deterministic cost
 // (CLAUDE.md §8/§13) stay byte-identical to the scalar path; the conformance corpus asserts
@@ -173,8 +184,24 @@ func vectorizedSpecEligible(spec *aggSpec) bool {
 // lane (the caller gates).
 func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+	gset := &plan.groupSets[0]
 
-	// Scan the single base relation through the same path the eager executor uses, so the
+	// A2 columnar fast path (packed-leaf.md §11 Track A2): a FILTER-FREE file-backed aggregate gathers
+	// only its touched columns into dense lanes and folds columnar — never a full-width storedRow, the
+	// allocation dividend A1 leaves on the table. Declines (ok=false) to the row path below for an
+	// in-memory store, a spillable touched column, or a filtered plan (handled here by the plan.filter
+	// gate). Cost-neutral by construction (aggColumnar charges the identical scan block).
+	if plan.filter == nil {
+		srows, ok, err := db.aggColumnar(plan, gset, params, outer, meter)
+		if err != nil {
+			return emitter{}, err
+		}
+		if ok {
+			return db.emitAggSyntheticRows(plan, srows, env, meter)
+		}
+	}
+
+	// Row path: scan the single base relation through the same path the eager executor uses, so the
 	// page_read / value_decompress / storage_row_read block is charged identically (executor.go
 	// materializeRel).
 	rows, err := db.materializeRel(plan, 0, params, outer, rng, ctes, meter)
@@ -203,7 +230,6 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 	// finalize each group's accumulators. Whole-table (no key) folds columnar; a single-key GROUP BY
 	// buckets by int64 and folds per group. Either way finalize + the projection below read the accs
 	// positionally, exactly like the scalar synthetic row.
-	gset := &plan.groupSets[0]
 	var srows []storedRow
 	if len(gset.keyCols) == 0 {
 		accs := newAccsForSpecs(plan.aggSpecs)
@@ -223,12 +249,17 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 			return emitter{}, err
 		}
 	}
+	return db.emitAggSyntheticRows(plan, srows, env, meter)
+}
 
-	// Emit under the query's LIMIT/OFFSET window, exactly as the emitProject drive does: for each
-	// windowed synthetic row, Guard, row_produced, then the projection list (charging its
-	// operator_evals). Only emitted rows are projected + charged (the §3 asymmetry). Returned as
-	// emitFinal — already projected + charged — so neither the eager nor the lazy drive charges
-	// again. windowBounds mirrors the closure in execSelectEmit (clamped in the i64 domain).
+// emitAggSyntheticRows emits the synthetic grouped rows (a whole-table grand total or one per group)
+// under the query's LIMIT/OFFSET window, exactly as the emitProject drive does: for each windowed row,
+// Guard, row_produced, then the projection list (charging its operator_evals). Only emitted rows are
+// projected + charged (the §3 asymmetry). Returned as emitFinal — already projected + charged — so
+// neither the eager nor the lazy drive charges again; aggWindowBounds mirrors the execSelectEmit
+// windowBounds closure (clamped in the i64 domain). Shared verbatim by the row (foldAggBatch) and
+// columnar (aggColumnar) fold paths, so emission + cost are identical either way.
+func (db *engine) emitAggSyntheticRows(plan *selectPlan, srows []storedRow, env *evalEnv, meter *costMeter) (emitter, error) {
 	start, end := aggWindowBounds(plan, int64(len(srows)))
 	out := make([][]Value, 0, end-start)
 	for _, srow := range srows[start:end] {
@@ -247,6 +278,96 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 		out = append(out, projected)
 	}
 	return emitter{final: out, mode: emitFinal}, nil
+}
+
+// aggColumnar runs the A2 columnar gather for a FILTER-FREE vectorized aggregate (packed-leaf.md §11
+// Track A2): it scans only the touched columns of the single base relation into dense per-column lanes
+// (never a full-width storedRow), charges the identical scan cost block, and folds each aggregate
+// columnar, returning the finalized synthetic rows — the whole-table grand total or one row per group.
+// Returns ok=false (declining to the caller's row path) when the store is in-memory (its Decoded leaves
+// share their rows zero-copy on the row path, so a lane gather would only add allocation with no
+// packed-leaf win to offset it), when a touched column can spill (the columnar feed has no
+// value-resolution step), or when a needed column index is out of range / unmasked (a safety net,
+// never expected for an eligible filter-free plan — e.g. a non-zero relation offset). Cost-neutral by
+// construction: same page_read (same node visits), value_decompress (0 — no spillable touched column),
+// storage_row_read (× rowCount), aggregate_accumulate, and row_produced as the row path.
+func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Value, outer []storedRow, meter *costMeter) ([]storedRow, bool, error) {
+	rel := &plan.rels[0]
+	store := db.lkpStore(rel.tableName)
+	if store == nil {
+		return nil, false, nil
+	}
+	// File-backed only (see the doc comment): an in-memory store's row path is already zero-copy.
+	if store.paging == nil {
+		return nil, false, nil
+	}
+	mask := plan.relMasks[0]
+	// No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched
+	// value is left unresolved. An eligible aggregate touches only integer operands + an integer key,
+	// so this holds; the guard future-proofs a later eligible spillable operand into the row path.
+	if anySpillableMasked(store.colTypes, mask) {
+		return nil, false, nil
+	}
+	// Every column the fold reads (each aggregate operand + the group key) must be a valid, masked
+	// table ordinal — else its gathered lane would be nil. For a single base table these are 0-based
+	// table ordinals in [0, K); the check also declines a (never-expected) non-zero relation offset.
+	need := func(idx int) bool { return idx >= 0 && idx < len(mask) && mask[idx] }
+	for i := range plan.aggSpecs {
+		if op := plan.aggSpecs[i].operand; op != nil && !need(op.index) {
+			return nil, false, nil
+		}
+	}
+	if len(gset.keyCols) == 1 && !need(gset.keyCols[0]) {
+		return nil, false, nil
+	}
+
+	// Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
+	// empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely (0 pages/rows),
+	// matching materializeRel's `if !empty` guard.
+	cols := make([][]Value, len(mask))
+	rowCount, pages, slabs := 0, 0, 0
+	scan := true
+	b := unboundedBound()
+	if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
+		var empty bool
+		if b, empty = db.buildKeyBound(sb.pk, params, outer); empty {
+			scan = false
+		}
+	}
+	if scan {
+		var err error
+		if cols, rowCount, pages, slabs, err = store.ColumnarScanMasked(b, mask); err != nil {
+			return nil, false, err
+		}
+	}
+	// Charge the scan cost block identically to materializeRel + scanSource: page_read × nodes,
+	// value_decompress × slabs (0 here), storage_row_read × rowCount. On the unmetered lane (the caller
+	// gates) this bulk charge reproduces the scanSource's per-row accrual (Guard is a no-op).
+	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs) + costs.StorageRowRead*int64(rowCount))
+
+	if len(gset.keyCols) == 0 {
+		accs := newAccsForSpecs(plan.aggSpecs)
+		for i := range plan.aggSpecs {
+			spec := &plan.aggSpecs[i]
+			var lane []Value
+			if spec.operand != nil {
+				lane = cols[spec.operand.index]
+			}
+			if err := foldAggColumnar(accs[i], spec, lane, rowCount, meter); err != nil {
+				return nil, false, err
+			}
+		}
+		srow, err := finalizeGroup(nil, accs)
+		if err != nil {
+			return nil, false, err
+		}
+		return []storedRow{srow}, true, nil
+	}
+	srows, err := groupByIntKeyColumnar(plan, gset, cols, rowCount, meter)
+	if err != nil {
+		return nil, false, err
+	}
+	return srows, true, nil
 }
 
 // aggWindowBounds computes the LIMIT/OFFSET [start,end) window over n synthetic rows, mirroring the
@@ -355,6 +476,125 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 		out = append(out, srow)
 	}
 	return out, nil
+}
+
+// groupByIntKeyColumnar is the columnar twin of groupByIntKey (packed-leaf.md §11 Track A2): it buckets
+// the scanned rows by their single integer group-key column and folds each aggregate per group, reading
+// the pre-gathered dense lanes (cols[keyCols[0]] for the key, cols[operand.index] for each operand)
+// instead of striding a []storedRow — no full-width row. The buckets (a map[int64]int over the raw key
+// plus one sentinel NULL group), the scan-order-of-first-appearance emission, the bulk
+// aggregate_accumulate charge (× rowCount × specs), and acc.fold are byte-identical to groupByIntKey, so
+// the acc state + finalize + cost match. The caller (aggColumnar) has verified every needed lane is
+// populated (need()), so cols[keyCols[0]] and each cols[operand.index] are non-nil of length rowCount.
+func groupByIntKeyColumnar(plan *selectPlan, gset *groupSetPlan, cols [][]Value, rowCount int, meter *costMeter) ([]storedRow, error) {
+	keyLane := cols[gset.keyCols[0]]
+	type vgroup struct {
+		key  Value
+		accs []*acc
+	}
+	var groups []vgroup
+	index := make(map[int64]int)
+	nullGI := -1
+
+	meter.Charge(costs.AggregateAccumulate * int64(rowCount) * int64(len(plan.aggSpecs)))
+	for i := 0; i < rowCount; i++ {
+		kv := keyLane[i]
+		var gi int
+		if kv.Kind == ValNull {
+			if nullGI < 0 {
+				nullGI = len(groups)
+				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+			}
+			gi = nullGI
+		} else {
+			var ok bool
+			if gi, ok = index[kv.Int]; !ok {
+				gi = len(groups)
+				index[kv.Int] = gi
+				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+			}
+		}
+		accs := groups[gi].accs
+		for s := range plan.aggSpecs {
+			v := NullValue()
+			if op := plan.aggSpecs[s].operand; op != nil {
+				v = cols[op.index][i]
+			}
+			if ferr := accs[s].fold(v, meter); ferr != nil {
+				return nil, ferr
+			}
+		}
+	}
+
+	out := make([]storedRow, 0, len(groups))
+	for i := range groups {
+		srow, ferr := finalizeGroup([]Value{groups[i].key}, groups[i].accs)
+		if ferr != nil {
+			return nil, ferr
+		}
+		out = append(out, srow)
+	}
+	return out, nil
+}
+
+// foldAggColumnar is the columnar twin of foldAggBatch (packed-leaf.md §11 Track A2): it folds one
+// WHOLE-TABLE aggregate over a pre-gathered dense column lane (nil for COUNT(*), whose count needs no
+// values), reading the lane directly with no full-width storedRow. It reconstructs exactly the acc
+// state foldAggBatch would leave so acc.finalize is unchanged, and charges aggregate_accumulate once
+// per scanned row (× rowCount — here there is no filter, so rowCount == survivors), bulk on the
+// unmetered lane. The int/float/min/max kernels are identical to foldAggBatch's, striding lane[i]
+// instead of survivors[i][idx].
+func foldAggColumnar(a *acc, spec *aggSpec, lane []Value, rowCount int, meter *costMeter) error {
+	meter.Charge(costs.AggregateAccumulate * int64(rowCount))
+	switch spec.plan {
+	case planCountStar:
+		a.count += int64(rowCount)
+	case planCount:
+		for i := range lane {
+			if lane[i].Kind != ValNull {
+				a.count++
+			}
+		}
+	case planSumInt:
+		for i := range lane {
+			if lane[i].Kind == ValNull {
+				continue
+			}
+			// The identical i64 overflow trap (22003) as foldAggBatch / the scalar SUM fold, at the same
+			// running point in scan order.
+			s := a.sumInt + lane[i].Int
+			if (lane[i].Int > 0 && s < a.sumInt) || (lane[i].Int < 0 && s > a.sumInt) {
+				return overflowErr(scalarInt64)
+			}
+			a.sumInt = s
+			a.seen = true
+		}
+	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
+		for i := range lane {
+			if lane[i].Kind != ValNull {
+				a.floatSum.add(lane[i])
+			}
+		}
+	case planMin, planMax:
+		for i := range lane {
+			v := lane[i]
+			if v.Kind == ValNull {
+				continue
+			}
+			if !a.hasCur {
+				a.cur, a.hasCur = v, true
+				continue
+			}
+			c := valueCmp(a.cur, v)
+			keepCur := (spec.plan == planMin && c <= 0) || (spec.plan == planMax && c >= 0)
+			if !keepCur {
+				a.cur = v
+			}
+		}
+	default:
+		panic("foldAggColumnar: ineligible aggregate plan")
+	}
+	return nil
 }
 
 // foldAggBatch folds one WHOLE-TABLE aggregate over the survivor rows into acc, reconstructing

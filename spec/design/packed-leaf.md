@@ -313,8 +313,8 @@ expanded row vectors.
   width table, a scan touching one column pays a **width-linear** reconstruction tax (~32 B + a decode per
   *untouched* column); at 64 columns the touched-column path runs **~2.3–3.0× faster** (`count(*)` most,
   since it decodes nothing) with **B/op unchanged** — the decode-CPU dividend is large for wide tables,
-  negligible for narrow ones. (The *allocation* dividend — B/op, the still-full-width `storedRow` — needs
-  the columnar gather of Track A2, deferred.) **The silent-wrong-result risk is contained, not traded
+  negligible for narrow ones. (The *allocation* dividend — B/op, the still-full-width `storedRow` — is
+  captured by the columnar gather of Track A2, landed below.) **The silent-wrong-result risk is contained, not traded
   away:** untouched columns are left `Null` (no poison sentinel), which is safe because the mask is a
   **complete superset** of every column any consumer reads — the same invariant `resolveColumns` already
   relies on for deferred variable-length values, now load-bearing for fixed-width too and guarded by the
@@ -326,11 +326,33 @@ expanded row vectors.
 - **S4 — port S1+S2 to Go**, then **S5 — port S1+S2 to TS.** Mirror the Rust reshape idiomatically (Go
   retains `*paxLeaf`; TS retains the parsed directories over a `Uint8Array.subarray`); each lands green
   independently. The `col_at`/`row_at_masked` accessors are ported too (S3-ready), just not driven.
+- **Track A2 — columnar gather (the allocation dividend).** *Go core landed 2026-07 (per-core internal,
+  like A1 — results/cost/byte-neutral, no `format_version` bump); Rust + TS pending.* A1 removed the
+  untouched-column **decode** but still allocated a **full-width `storedRow`** per record (untouched
+  columns left `Null`), so the B/op stayed width-linear — a 64-column `count(*)` allocated ~100 MB of
+  all-`Null` rows. A2 gathers **only** the touched columns into dense per-column lanes straight off the
+  leaves (the new `pMap.columnarScan` → `colAt` per admitted entry, an O(1) PAX span on a Packed leaf;
+  interior-node separator entries gathered alongside the leaves, as a B-tree stores records there too),
+  **never** building a full-width row. Wired for the **filter-free vectorized aggregate** path only
+  (`batch.go aggColumnar` → `foldAggColumnar` / `groupByIntKeyColumnar`, mirroring the row-fed
+  `foldAggBatch` / `groupByIntKey` but reading `lane[i]` instead of `survivors[i][idx]`): a wide-table
+  single-column aggregate drops from O(rows × columns) to O(rows) allocation (bench: 64-column `count(*)`
+  ~100 MB → a few KB and ~19× faster; `sum(col)` ~12× less allocation, ~5× faster; both now **flat**
+  across table width). **Cost-neutral by construction** — `ColumnarScanMasked` charges the identical
+  `page_read` (same node visits) / `value_decompress` / `storage_row_read` block as the row feed, and
+  the fold charges the identical `aggregate_accumulate` — proven by the `masked_scan_test.go` paged-vs-
+  resident battery (single-leaf **and** a multi-level tree, whole-table + grouped kernels, rows AND cost).
+  **Gated to file-backed stores** (`store.paging != nil`; an in-memory store's row path already shares
+  its rows zero-copy, so a lane gather would only add allocation) and **declines to the row path** on any
+  `WHERE` filter or spillable touched column (so no value-resolution step is needed and the touched set
+  is integer-only). The **projection scan** (`SELECT col FROM t`, no aggregate) still materializes rows —
+  its columnar gather (a batched projection feed) is the next A2 follow-on. Filter vectorization (a
+  `selVec` so filtered aggregates also gather columnar) is Track A3.
 
 Deferred follow-ons (none foreclosed): **S3 touched-column scan wiring in Rust + TS** (landed in Go,
-above); **Track A2 — the columnar allocation dividend** (gather touched columns into dense batches via a
-`leafColumnSpan`, so a scan never materializes a full-width `storedRow` — the B/op win A1 leaves on the
-table); **nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
+above); **A2 columnar gather in Rust + TS** and the **batched projection-scan feed** (Go's A2 covers the
+filter-free aggregate path only); **Track A3 — filter vectorization** (a `selVec` predicate kernel so
+filtered aggregates gather columnar too); **nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
 *interior* on repeated access — the narrow residual of §6, not the column-location memo PAX already
 provides); **keys as block-slices** (zero-copy keys under Packed); **in-memory databases adopting
 deferral** only if a Memory pager backing lands ([pager.md §6](pager.md)).

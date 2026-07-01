@@ -301,6 +301,24 @@ func (s *tableStore) ScanWithUnitsMasked(mask []bool) ([]entry, int, int, error)
 	return s.RangeScanWithUnitsMasked(unboundedBound(), mask)
 }
 
+// ColumnarScanMasked gathers the mask-selected columns of a bounded scan into dense per-column lanes
+// (cols[c], length rowCount, for each selected c) PLUS the (page_read, value_decompress) cost block —
+// the A2 columnar feed for the filter-free vectorized aggregate path (packed-leaf.md §11 Track A2). It
+// never materializes a full-width storedRow: a wide-table single-column aggregate touches one column
+// instead of allocating the whole row per record (the B/op win RangeScanWithUnitsMasked leaves on the
+// table). It is invoked ONLY when no touched column can spill (the caller gates on !anySpillableMasked),
+// so the value_decompress slab count is always 0 and no unfetched value needs resolving — the general
+// spillable / filtered path stays on the row feed (materializeRel). Cost is byte-identical to
+// ScanWithUnitsMasked(mask) over the same bound: the same node visits (page_read, computed in the same
+// single descent) and the same slab count (0). The caller charges storage_row_read × rowCount.
+func (s *tableStore) ColumnarScanMasked(b keyBound, mask []bool) (cols [][]Value, rowCount, pages, slabs int, err error) {
+	cols, rowCount, pages, err = s.rows.columnarScan(b, s.leafSrc(), mask)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	return cols, rowCount, pages, 0, nil
+}
+
 // GetWithUnits is the fused single-descent point lookup: the row at key (if any) PLUS the
 // (page_read, value_decompress) block its point bound charges — the index fetch path's Get +
 // OverlapScanUnits in one descent.

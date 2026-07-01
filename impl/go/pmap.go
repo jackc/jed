@@ -517,6 +517,75 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][
 	return keys, vals, nodes, nil
 }
 
+// columnarScan walks the bounded scan gathering ONLY the columns mask selects into dense per-column
+// lanes (cols[c] of length rowCount for each selected c; nil otherwise), never building a full-width
+// storedRow — the A2 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation dividend A1
+// leaves on the table). It mirrors rangeEntriesCounted's traversal EXACTLY (same node visits ⇒ the
+// same page_read count; same in-order entry sequence, interior separators included as a B-tree stores
+// records there too), but reads each admitted row's selected columns via colAt — an O(1) PAX column
+// span on a Packed leaf, vals[i][c] on a Decoded node — so a wide-table single-column scan never
+// materializes the untouched columns NOR a full-width row. Each cols[c] is in scan order, so it equals
+// the column-c stride of rangeEntriesCounted's rows. rowCount is the admitted entry count.
+func (m *pMap) columnarScan(b keyBound, src leafSource, mask []bool) ([][]Value, int, int, error) {
+	k := len(mask)
+	cols := make([][]Value, k)
+	rowCount, nodes := 0, 0
+	var walk func(n *pnode) error
+	walk = func(n *pnode) error {
+		nodes++
+		ef, el := b.entryWindow(n)
+		gather := func(i int) error {
+			for c := 0; c < k; c++ {
+				if !mask[c] {
+					continue
+				}
+				v, err := n.colAt(i, c)
+				if err != nil {
+					return err
+				}
+				cols[c] = append(cols[c], v)
+			}
+			rowCount++
+			return nil
+		}
+		if n.isLeaf() {
+			for i := ef; i < el; i++ {
+				if err := gather(i); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		cf, cl := b.childWindow(n)
+		if ef < cf {
+			if err := gather(ef); err != nil {
+				return err
+			}
+		}
+		for i := cf; i <= cl; i++ {
+			child, err := resolveChild(n.children[i], src)
+			if err != nil {
+				return err
+			}
+			if err := walk(child); err != nil {
+				return err
+			}
+			if i >= ef && i < el {
+				if err := gather(i); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if m.root != nil {
+		if err := walk(m.root); err != nil {
+			return nil, 0, 0, err
+		}
+	}
+	return cols, rowCount, nodes, nil
+}
+
 // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
 // charges (spec/design/cost.md §3). It mirrors rangeEntries' traversal exactly (same childWindow
 // prune, root always visited), counting an OnDisk leaf as one node WITHOUT faulting it (the
