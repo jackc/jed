@@ -396,6 +396,14 @@ default), the primary key's ordinals in key order, CHECK constraints, and second
 ascending by **lowercased** name — the catalog's standing order, so no hash-map iteration
 order leaks (CLAUDE.md §8). Secondary indexes are relations but not tables; they are excluded.
 
+These catalog reads live on **both `Database` and `Session`** (a bare `Database` reads the
+committed snapshot; a `Session` reads its currently-visible state). The **low-level single-threaded
+core is an internal concern** — Rust `Engine` is `pub(crate)`, Go `engine` is unexported, TS `Engine`
+lives only in the internal `tooling.ts` barrel, never the public `lib.ts`. Every host consumer — the
+integration tests, the CLI, the conformance harness, and the C-ABI/WASM/Ruby wraps — drives
+`Database`/`Session`, never the core directly; the few genuinely white-box storage/byte tests that
+reach the core do so through each language's in-package/in-crate/internal-barrel seam.
+
 ## 7. Errors
 
 `EngineError` carries a `SqlState` (the 5-char SQLSTATE, [../errors/registry.toml](../errors/registry.toml))
