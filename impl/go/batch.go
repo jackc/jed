@@ -28,12 +28,22 @@ package jed
 //     stay the same code either way (foldAggColumnar mirrors foldAggBatch, reading lane[i] instead of
 //     survivors[i][idx]).
 //   - A2 PROJECTION FEED (packed-leaf.md §11 Track A2): the same columnar gather for a bare-column
-//     PROJECTION scan (`SELECT c0, c3 FROM t [WHERE pk = …]`, no filter/ORDER BY/LIMIT/aggregate) —
+//     PROJECTION scan (`SELECT c0, c3 FROM t [WHERE pk = …]`, no ORDER BY/LIMIT/aggregate) —
 //     projectColumnar gathers the projected columns into lanes and returns an emitColumnar emitter that
 //     builds each output row directly from the lanes, so the materialize path's full-width storedRow per
 //     record is never allocated (the projection's B/op dividend, the sibling of the aggregate one). Same
 //     file-backed / non-spillable gate; the emitColumnar drive charges row_produced per emitted row
 //     exactly like the emitProject drive over a bare-column projection (a zero-cost slot read).
+//   - A3 — FILTER VECTORIZATION (packed-leaf.md §11 Track A3): a WHERE predicate no longer forces the
+//     row path. filterColumnar evaluates plan.filter over the gathered lanes (via a single reusable
+//     scratch row) into a selection vector of survivor indices, so a FILTERED aggregate or projection
+//     also gathers columnar — the fold / emit then visits only the selected lane positions (never a
+//     full-width row). It reuses the scalar rExpr.eval verbatim, so the filter's operator_eval charges,
+//     its 3VL survivor test, AND its result stay byte-identical to the scalar filter loop — the row path
+//     already feeds the filter a masked row (untouched columns NULL), and the filter references only
+//     masked columns (collectTouched includes plan.filter), so a scratch row filled from the lanes is
+//     identical input. Same file-backed / non-spillable gate (a filter over a spillable column keeps the
+//     row path — the lanes carry no unfetched values).
 //
 // The load-bearing invariant is that BOTH the result multiset AND the deterministic cost
 // (CLAUDE.md §8/§13) stay byte-identical to the scalar path; the conformance corpus asserts
@@ -193,13 +203,14 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	gset := &plan.groupSets[0]
 
-	// A2 columnar fast path (packed-leaf.md §11 Track A2): a FILTER-FREE file-backed aggregate gathers
-	// only its touched columns into dense lanes and folds columnar — never a full-width storedRow, the
-	// allocation dividend A1 leaves on the table. Declines (ok=false) to the row path below for an
-	// in-memory store, a spillable touched column, or a filtered plan (handled here by the plan.filter
-	// gate). Cost-neutral by construction (aggColumnar charges the identical scan block).
-	if plan.filter == nil {
-		srows, ok, err := db.aggColumnar(plan, gset, params, outer, meter)
+	// A2/A3 columnar fast path (packed-leaf.md §11 Track A2/A3): a file-backed aggregate gathers only its
+	// touched columns into dense lanes and folds columnar — never a full-width storedRow, the allocation
+	// dividend A1 leaves on the table. A WHERE predicate (A3) is applied over the lanes into a selection
+	// vector rather than forcing the row path. Declines (ok=false) to the row path below for an in-memory
+	// store or a spillable touched column. Cost-neutral by construction (aggColumnar charges the identical
+	// scan + filter block).
+	{
+		srows, ok, err := db.aggColumnar(plan, gset, env, meter)
 		if err != nil {
 			return emitter{}, err
 		}
@@ -287,18 +298,20 @@ func (db *engine) emitAggSyntheticRows(plan *selectPlan, srows []storedRow, env 
 	return emitter{final: out, mode: emitFinal}, nil
 }
 
-// aggColumnar runs the A2 columnar gather for a FILTER-FREE vectorized aggregate (packed-leaf.md §11
-// Track A2): it scans only the touched columns of the single base relation into dense per-column lanes
-// (never a full-width storedRow), charges the identical scan cost block, and folds each aggregate
-// columnar, returning the finalized synthetic rows — the whole-table grand total or one row per group.
+// aggColumnar runs the A2/A3 columnar gather for a vectorized aggregate (packed-leaf.md §11 Track
+// A2/A3): it scans only the touched columns of the single base relation into dense per-column lanes
+// (never a full-width storedRow), charges the identical scan cost block, applies any WHERE predicate
+// over the lanes into a selection vector (A3), and folds each aggregate columnar over the survivors,
+// returning the finalized synthetic rows — the whole-table grand total or one row per group.
 // Returns ok=false (declining to the caller's row path) when the store is in-memory (its Decoded leaves
 // share their rows zero-copy on the row path, so a lane gather would only add allocation with no
 // packed-leaf win to offset it), when a touched column can spill (the columnar feed has no
-// value-resolution step), or when a needed column index is out of range / unmasked (a safety net,
-// never expected for an eligible filter-free plan — e.g. a non-zero relation offset). Cost-neutral by
-// construction: same page_read (same node visits), value_decompress (0 — no spillable touched column),
-// storage_row_read (× rowCount), aggregate_accumulate, and row_produced as the row path.
-func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Value, outer []storedRow, meter *costMeter) ([]storedRow, bool, error) {
+// value-resolution step — this also covers a filter over a spillable column), or when a needed column
+// index is out of range / unmasked (a safety net, never expected for an eligible plan — e.g. a non-zero
+// relation offset). Cost-neutral by construction: same page_read (same node visits), value_decompress
+// (0 — no spillable touched column), storage_row_read (× rowCount), operator_eval (the filter over each
+// scanned row), aggregate_accumulate (× survivors), and row_produced as the row path.
+func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv, meter *costMeter) ([]storedRow, bool, error) {
 	rel := &plan.rels[0]
 	store := db.lkpStore(rel.tableName)
 	if store == nil {
@@ -310,8 +323,10 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Val
 	}
 	mask := plan.relMasks[0]
 	// No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched
-	// value is left unresolved. An eligible aggregate touches only integer operands + an integer key,
-	// so this holds; the guard future-proofs a later eligible spillable operand into the row path.
+	// value is left unresolved. An eligible aggregate touches only integer operands + an integer key
+	// (plus the filter's columns, which the scratch row reads); this guard declines a filter or operand
+	// over a spillable (text/decimal/…) column to the row path, keeping the lanes free of unfetched
+	// values.
 	if anySpillableMasked(store.colTypes, mask) {
 		return nil, false, nil
 	}
@@ -337,7 +352,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Val
 	b := unboundedBound()
 	if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
 		var empty bool
-		if b, empty = db.buildKeyBound(sb.pk, params, outer); empty {
+		if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer); empty {
 			scan = false
 		}
 	}
@@ -352,6 +367,19 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Val
 	// gates) this bulk charge reproduces the scanSource's per-row accrual (Guard is a no-op).
 	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs) + costs.StorageRowRead*int64(rowCount))
 
+	// A3: apply the WHERE predicate over the lanes into a selection vector (nil ⇒ all rows survive). The
+	// filter's operator_eval charges + 3VL survivor test are byte-identical to the scalar filter loop
+	// (filterColumnar reuses plan.filter.eval), and nsurv is the survivor count the fold accumulates.
+	var sel []int32
+	nsurv := rowCount
+	if plan.filter != nil {
+		var err error
+		if sel, err = filterColumnar(plan.filter, cols, mask, rowCount, env, meter); err != nil {
+			return nil, false, err
+		}
+		nsurv = len(sel)
+	}
+
 	if len(gset.keyCols) == 0 {
 		accs := newAccsForSpecs(plan.aggSpecs)
 		for i := range plan.aggSpecs {
@@ -360,7 +388,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Val
 			if spec.operand != nil {
 				lane = cols[spec.operand.index]
 			}
-			if err := foldAggColumnar(accs[i], spec, lane, rowCount, meter); err != nil {
+			if err := foldAggColumnar(accs[i], spec, lane, sel, nsurv, meter); err != nil {
 				return nil, false, err
 			}
 		}
@@ -370,17 +398,50 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, params []Val
 		}
 		return []storedRow{srow}, true, nil
 	}
-	srows, err := groupByIntKeyColumnar(plan, gset, cols, rowCount, meter)
+	srows, err := groupByIntKeyColumnar(plan, gset, cols, sel, nsurv, meter)
 	if err != nil {
 		return nil, false, err
 	}
 	return srows, true, nil
 }
 
+// filterColumnar evaluates plan.filter over the gathered per-column lanes and returns the surviving row
+// indices (the selection vector) — filter vectorization (packed-leaf.md §11 Track A3). It reuses the
+// scalar rExpr.eval verbatim over a SINGLE reusable scratch row (the masked columns filled from the
+// lanes at that row index, untouched columns left NULL), so the predicate's operator_eval charges and
+// its 3VL survivor test (keep iff TRUE) are byte-identical to the scalar WHERE loop — and the result is
+// identical too, because the row path also feeds the filter a MASKED row (untouched columns NULL via
+// resolveColumns / rowAtMasked) and the filter references only masked columns (collectTouched includes
+// plan.filter), so a scratch row filled from the lanes is the same input. The one reusable scratch row
+// is the allocation win: no full-width storedRow per scanned row, only the int32 survivor indices. The
+// caller has verified no touched column spills, so every masked lane is a non-nil []Value of length
+// rowCount (an untouched column's lane stays nil but is never read — the filter references only touched
+// columns).
+func filterColumnar(filter *rExpr, cols [][]Value, mask []bool, rowCount int, env *evalEnv, meter *costMeter) ([]int32, error) {
+	sel := make([]int32, 0, rowCount)
+	scratch := make(storedRow, len(mask))
+	for i := 0; i < rowCount; i++ {
+		for c := range mask {
+			if mask[c] {
+				scratch[c] = cols[c][i]
+			}
+		}
+		v, err := filter.eval(scratch, env, meter)
+		if err != nil {
+			return nil, err
+		}
+		if v.IsTrue() {
+			sel = append(sel, int32(i))
+		}
+	}
+	return sel, nil
+}
+
 // vectorizedProjectEligible reports whether plan is a shape projectColumnar specializes: a bare-column
-// projection over a single base table with no join / aggregate / window / DISTINCT / ORDER BY / residual
-// filter / LIMIT / OFFSET and no index/GIN/GiST bound — i.e. a plain `SELECT c0, c3, … FROM t [WHERE
-// pk = …]` whose output is the scan-order rows narrowed to a column subset. Pure plan inspection (charges
+// projection over a single base table with no join / aggregate / window / DISTINCT / ORDER BY / LIMIT /
+// OFFSET and no index/GIN/GiST bound — i.e. a plain `SELECT c0, c3, … FROM t [WHERE …]` whose output is
+// the (optionally filtered) scan-order rows narrowed to a column subset. A residual filter is allowed
+// (A3): projectColumnar applies it over the lanes into a selection vector. Pure plan inspection (charges
 // nothing), so a bail is free and the general materialize path runs with identical results + cost; the
 // store / paging / spillable / column-range gates live in projectColumnar, which declines to that path.
 // LIMIT/OFFSET is excluded deliberately: a LIMIT with no ORDER BY streams with an early exit
@@ -397,9 +458,9 @@ func (db *engine) vectorizedProjectEligible(plan *selectPlan) bool {
 	if rel.srf != nil || rel.cte != nil || rel.derived != nil || rel.lateral {
 		return false
 	}
-	// No ORDER BY / LIMIT / OFFSET (those route to a streaming / sort / index path) and no residual
-	// filter (a filtered scan needs a row for the predicate — filter vectorization is a follow-on).
-	if len(plan.order) != 0 || plan.limit != nil || plan.offset != nil || plan.filter != nil {
+	// No ORDER BY / LIMIT / OFFSET (those route to a streaming / sort / index path). A residual filter is
+	// fine — projectColumnar vectorizes it (A3).
+	if len(plan.order) != 0 || plan.limit != nil || plan.offset != nil {
 		return false
 	}
 	// Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics.
@@ -422,18 +483,20 @@ func (db *engine) vectorizedProjectEligible(plan *selectPlan) bool {
 	return true
 }
 
-// projectColumnar runs the A2 columnar gather for a vectorizedProjectEligible plan (packed-leaf.md §11
-// Track A2): it scans only the projected (touched) columns of the single base relation into dense
-// per-column lanes (never a full-width storedRow), charges the identical scan cost block, and returns an
-// emitColumnar emitter that gathers each output row from the lanes on emission. Returns ok=false
-// (declining to the caller's row path) for an in-memory store (its Decoded leaves share rows zero-copy,
-// so a lane gather would only add allocation with no packed-leaf win to offset it), a spillable projected
-// column (the columnar feed has no value-resolution step), or a projection column that is out of range /
-// unmasked (a safety net, never expected — a projected column is touched, hence masked). Cost-neutral by
-// construction: same page_read (same node visits) / value_decompress (0 — no spillable touched column) /
-// storage_row_read (× rowCount) as the row path, then row_produced per emitted row charged by the
-// emitColumnar drive — exactly the emitProject drive over a bare-column projection.
-func (db *engine) projectColumnar(plan *selectPlan, params []Value, outer []storedRow, meter *costMeter) (emitter, bool, error) {
+// projectColumnar runs the A2/A3 columnar gather for a vectorizedProjectEligible plan (packed-leaf.md
+// §11 Track A2/A3): it scans only the touched columns of the single base relation into dense per-column
+// lanes (never a full-width storedRow), charges the identical scan cost block, applies any WHERE
+// predicate over the lanes into a selection vector (A3), and returns an emitColumnar emitter that gathers
+// each surviving output row from the lanes on emission. Returns ok=false (declining to the caller's row
+// path) for an in-memory store (its Decoded leaves share rows zero-copy, so a lane gather would only add
+// allocation with no packed-leaf win to offset it), a spillable touched column (the columnar feed has no
+// value-resolution step — this also covers a filter over a spillable column), or a projection column that
+// is out of range / unmasked (a safety net, never expected — a projected column is touched, hence
+// masked). Cost-neutral by construction: same page_read (same node visits) / value_decompress (0 — no
+// spillable touched column) / storage_row_read (× rowCount) / operator_eval (the filter over each scanned
+// row) as the row path, then row_produced per emitted (surviving) row charged by the emitColumnar drive —
+// exactly the emitProject drive over a bare-column projection.
+func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMeter) (emitter, bool, error) {
 	rel := &plan.rels[0]
 	store := db.lkpStore(rel.tableName)
 	if store == nil {
@@ -444,8 +507,9 @@ func (db *engine) projectColumnar(plan *selectPlan, params []Value, outer []stor
 		return emitter{}, false, nil
 	}
 	mask := plan.relMasks[0]
-	// No projected column may spill — so the feed's value_decompress slab count is 0 and no unfetched
-	// value is left unresolved (the columnar feed has no resolveColumns step).
+	// No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched value
+	// is left unresolved (the columnar feed has no resolveColumns step). The mask includes the filter's
+	// columns (collectTouched), so this also declines a filter over a spillable column to the row path.
 	if anySpillableMasked(store.colTypes, mask) {
 		return emitter{}, false, nil
 	}
@@ -471,7 +535,7 @@ func (db *engine) projectColumnar(plan *selectPlan, params []Value, outer []stor
 	if len(plan.relBounds) > 0 {
 		if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
 			var empty bool
-			if b, empty = db.buildKeyBound(sb.pk, params, outer); empty {
+			if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer); empty {
 				scan = false
 			}
 		}
@@ -487,7 +551,20 @@ func (db *engine) projectColumnar(plan *selectPlan, params []Value, outer []stor
 	// gates) this bulk charge reproduces the scanSource's per-row accrual (Guard is a no-op).
 	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs) + costs.StorageRowRead*int64(rowCount))
 
-	return emitter{cols: cols, projCols: projCols, start: 0, end: int64(rowCount), mode: emitColumnar}, true, nil
+	// A3: apply the WHERE predicate over the lanes into a selection vector (nil ⇒ all rows survive). The
+	// emitColumnar drive emits len(sel) rows, mapping output row j to lane position sel[j].
+	var sel []int32
+	nEmit := int64(rowCount)
+	if plan.filter != nil {
+		s, err := filterColumnar(plan.filter, cols, mask, rowCount, env, meter)
+		if err != nil {
+			return emitter{}, false, err
+		}
+		sel = s
+		nEmit = int64(len(sel))
+	}
+
+	return emitter{cols: cols, projCols: projCols, sel: sel, start: 0, end: nEmit, mode: emitColumnar}, true, nil
 }
 
 // aggWindowBounds computes the LIMIT/OFFSET [start,end) window over n synthetic rows, mirroring the
@@ -598,15 +675,17 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 	return out, nil
 }
 
-// groupByIntKeyColumnar is the columnar twin of groupByIntKey (packed-leaf.md §11 Track A2): it buckets
-// the scanned rows by their single integer group-key column and folds each aggregate per group, reading
-// the pre-gathered dense lanes (cols[keyCols[0]] for the key, cols[operand.index] for each operand)
-// instead of striding a []storedRow — no full-width row. The buckets (a map[int64]int over the raw key
-// plus one sentinel NULL group), the scan-order-of-first-appearance emission, the bulk
-// aggregate_accumulate charge (× rowCount × specs), and acc.fold are byte-identical to groupByIntKey, so
-// the acc state + finalize + cost match. The caller (aggColumnar) has verified every needed lane is
-// populated (need()), so cols[keyCols[0]] and each cols[operand.index] are non-nil of length rowCount.
-func groupByIntKeyColumnar(plan *selectPlan, gset *groupSetPlan, cols [][]Value, rowCount int, meter *costMeter) ([]storedRow, error) {
+// groupByIntKeyColumnar is the columnar twin of groupByIntKey (packed-leaf.md §11 Track A2/A3): it
+// buckets the SURVIVOR rows by their single integer group-key column and folds each aggregate per group,
+// reading the pre-gathered dense lanes (cols[keyCols[0]] for the key, cols[operand.index] for each
+// operand) instead of striding a []storedRow — no full-width row. sel is the A3 selection vector (nil ⇒
+// every scanned row survives); nsurv is the survivor count (len(sel), or rowCount when sel is nil). The
+// buckets (a map[int64]int over the raw key plus one sentinel NULL group), the scan-order-of-first-
+// appearance emission, the bulk aggregate_accumulate charge (× nsurv × specs), and acc.fold are
+// byte-identical to groupByIntKey, so the acc state + finalize + cost match. The caller (aggColumnar) has
+// verified every needed lane is populated (need()), so cols[keyCols[0]] and each cols[operand.index] are
+// non-nil of length rowCount.
+func groupByIntKeyColumnar(plan *selectPlan, gset *groupSetPlan, cols [][]Value, sel []int32, nsurv int, meter *costMeter) ([]storedRow, error) {
 	keyLane := cols[gset.keyCols[0]]
 	type vgroup struct {
 		key  Value
@@ -616,8 +695,12 @@ func groupByIntKeyColumnar(plan *selectPlan, gset *groupSetPlan, cols [][]Value,
 	index := make(map[int64]int)
 	nullGI := -1
 
-	meter.Charge(costs.AggregateAccumulate * int64(rowCount) * int64(len(plan.aggSpecs)))
-	for i := 0; i < rowCount; i++ {
+	meter.Charge(costs.AggregateAccumulate * int64(nsurv) * int64(len(plan.aggSpecs)))
+	for j := 0; j < nsurv; j++ {
+		i := j
+		if sel != nil {
+			i = int(sel[j])
+		}
 		kv := keyLane[i]
 		var gi int
 		if kv.Kind == ValNull {
@@ -657,47 +740,56 @@ func groupByIntKeyColumnar(plan *selectPlan, gset *groupSetPlan, cols [][]Value,
 	return out, nil
 }
 
-// foldAggColumnar is the columnar twin of foldAggBatch (packed-leaf.md §11 Track A2): it folds one
+// foldAggColumnar is the columnar twin of foldAggBatch (packed-leaf.md §11 Track A2/A3): it folds one
 // WHOLE-TABLE aggregate over a pre-gathered dense column lane (nil for COUNT(*), whose count needs no
-// values), reading the lane directly with no full-width storedRow. It reconstructs exactly the acc
-// state foldAggBatch would leave so acc.finalize is unchanged, and charges aggregate_accumulate once
-// per scanned row (× rowCount — here there is no filter, so rowCount == survivors), bulk on the
-// unmetered lane. The int/float/min/max kernels are identical to foldAggBatch's, striding lane[i]
-// instead of survivors[i][idx].
-func foldAggColumnar(a *acc, spec *aggSpec, lane []Value, rowCount int, meter *costMeter) error {
-	meter.Charge(costs.AggregateAccumulate * int64(rowCount))
+// values), reading the lane directly with no full-width storedRow. sel is the A3 selection vector (nil ⇒
+// every scanned row survives); nsurv is the survivor count (len(sel), or the lane length when sel is
+// nil). It reconstructs exactly the acc state foldAggBatch would leave so acc.finalize is unchanged, and
+// charges aggregate_accumulate once per SURVIVOR (× nsurv), bulk on the unmetered lane. The
+// int/float/min/max kernels are identical to foldAggBatch's, reading lane[sel[j]] (or lane[i] when
+// unfiltered) instead of survivors[i][idx]. laneAt centralizes the sel indirection so the kernels read
+// survivors in scan order either way (the overflow trap lands at the same running point).
+func foldAggColumnar(a *acc, spec *aggSpec, lane []Value, sel []int32, nsurv int, meter *costMeter) error {
+	meter.Charge(costs.AggregateAccumulate * int64(nsurv))
+	laneAt := func(j int) Value {
+		if sel != nil {
+			return lane[sel[j]]
+		}
+		return lane[j]
+	}
 	switch spec.plan {
 	case planCountStar:
-		a.count += int64(rowCount)
+		a.count += int64(nsurv)
 	case planCount:
-		for i := range lane {
-			if lane[i].Kind != ValNull {
+		for j := 0; j < nsurv; j++ {
+			if laneAt(j).Kind != ValNull {
 				a.count++
 			}
 		}
 	case planSumInt:
-		for i := range lane {
-			if lane[i].Kind == ValNull {
+		for j := 0; j < nsurv; j++ {
+			v := laneAt(j)
+			if v.Kind == ValNull {
 				continue
 			}
 			// The identical i64 overflow trap (22003) as foldAggBatch / the scalar SUM fold, at the same
 			// running point in scan order.
-			s := a.sumInt + lane[i].Int
-			if (lane[i].Int > 0 && s < a.sumInt) || (lane[i].Int < 0 && s > a.sumInt) {
+			s := a.sumInt + v.Int
+			if (v.Int > 0 && s < a.sumInt) || (v.Int < 0 && s > a.sumInt) {
 				return overflowErr(scalarInt64)
 			}
 			a.sumInt = s
 			a.seen = true
 		}
 	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
-		for i := range lane {
-			if lane[i].Kind != ValNull {
-				a.floatSum.add(lane[i])
+		for j := 0; j < nsurv; j++ {
+			if v := laneAt(j); v.Kind != ValNull {
+				a.floatSum.add(v)
 			}
 		}
 	case planMin, planMax:
-		for i := range lane {
-			v := lane[i]
+		for j := 0; j < nsurv; j++ {
+			v := laneAt(j)
 			if v.Kind == ValNull {
 				continue
 			}

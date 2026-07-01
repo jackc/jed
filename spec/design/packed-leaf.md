@@ -344,18 +344,18 @@ expanded row vectors.
   resident battery (single-leaf **and** a multi-level tree, whole-table + grouped kernels, rows AND cost).
   **Gated to file-backed stores** (`store.paging != nil`; an in-memory store's row path already shares
   its rows zero-copy, so a lane gather would only add allocation) and **declines to the row path** on any
-  `WHERE` filter or spillable touched column (so no value-resolution step is needed and the touched set
-  is integer-only). Filter vectorization (a `selVec` so filtered aggregates also gather columnar) is
-  Track A3.
+  spillable touched column (so no value-resolution step is needed and the lanes carry no unfetched
+  values). A `WHERE` filter is handled by **Track A3** below (a selection vector over the lanes), not a
+  decline.
 
 - **Track A2 — projection feed (the allocation dividend for bare-column projections).** *Go core landed
   2026-07 (per-core internal, like A1/A2 — results/cost/byte-neutral, no `format_version` bump); Rust + TS
   pending.* The sibling of the aggregate gather: a **bare-column projection** over a single-table
-  full/PK-bounded scan with no filter / ORDER BY / LIMIT / OFFSET / blocking operator (`SELECT c0, c3 FROM
-  t [WHERE pk = …]`) previously materialized a **full-width `storedRow`** per record just to project a few
+  full/PK-bounded scan with no ORDER BY / LIMIT / OFFSET / blocking operator (`SELECT c0, c3 FROM
+  t [WHERE …]`) previously materialized a **full-width `storedRow`** per record just to project a few
   columns — the same width-linear B/op the aggregate feed removed (`project_c0` bench: 64-column `SELECT
   c0 FROM t` allocated ~136 MB). `batch.go projectColumnar` (gated + shaped exactly like `aggColumnar`)
-  gathers **only** the projected columns into dense lanes via the same `ColumnarScanMasked`, then returns a
+  gathers **only** the touched columns into dense lanes via the same `ColumnarScanMasked`, then returns a
   new **`emitColumnar`** emitter that builds each output row directly from the lanes on emission — never a
   full-width row. Bench: `project_c0` **~136 MB → ~10 MB (≈13× less) and ~7× faster** at 64 columns, B/op
   now **flat across width** (a bare column ref is a zero-cost slot read, so the lane read is cost-identical
@@ -364,14 +364,36 @@ expanded row vectors.
   `emitProject` drive over a bare-column projection (lazy: an early exit skips the `row_produced` of rows
   it never pulls). Same **file-backed / non-spillable** gate; **declines** (falls through to the identical-cost
   materialize path) for an in-memory store, a spillable column, or any non-column projection — verified by
-  the `masked_scan_test.go` battery (the filtered projections would return wrong rows if columnar wrongly
-  fired on a filter, so the decline is guarded loudly; projection cases added to the multi-level tree for
-  the interior-separator gather).
+  the `masked_scan_test.go` battery (projection cases added to the multi-level tree for the
+  interior-separator gather). A `WHERE` filter is handled by **Track A3** below.
+
+- **Track A3 — filter vectorization (a selection vector over the lanes).** *Go core landed 2026-07
+  (per-core internal, like A1/A2 — results/cost/byte-neutral, no `format_version` bump); Rust + TS pending.*
+  A2 gathered only **filter-free** aggregates and projections; a `WHERE` predicate forced the full-width
+  row path. A3 lifts that: `batch.go filterColumnar` evaluates `plan.filter` over the gathered lanes into a
+  **selection vector** (`[]int32` of survivor indices), and the fold (`foldAggColumnar` /
+  `groupByIntKeyColumnar`) / emit (`emitColumnar`, which gains an optional `sel` field) visits **only** the
+  selected lane positions — so a **filtered** aggregate or projection also gathers columnar, never a
+  full-width row. The crux is cost- and result-identity, and it holds **by construction**: `filterColumnar`
+  reuses the scalar `rExpr.eval` **verbatim** over a *single reusable scratch row* (the masked columns
+  filled from the lanes at that row index, untouched columns left `Null`), so the predicate's
+  `operator_eval` charges, its 3VL survivor test (keep iff `TRUE`), and its **result** are byte-identical to
+  the scalar `WHERE` loop — because the row path *also* feeds the filter a **masked** row (untouched columns
+  `Null` via `resolveColumns` / `rowAtMasked`) and the filter references only masked columns
+  (`collectTouched` includes `plan.filter`), so a scratch row filled from the lanes is the same input. The
+  one reusable scratch row is the allocation win: no full-width `storedRow` per scanned row, only the
+  `int32` survivor indices. Same **file-backed / non-spillable** gate (a filter over a spillable
+  text/decimal column keeps the row path — the lanes carry no unfetched values). Bench (64-column table,
+  filter over 1 column, ~50% selectivity): `sum(c0) WHERE c0 > 500` **~128 MB → ~9 MB (≈14× less) and ~5.9×
+  faster**; `SELECT c0 WHERE c0 > 500` **~132 MB → ~10 MB (≈13.5× less) and ~6× faster**; B/op **flat across
+  width**. Verified by the `masked_scan_test.go` battery — the filtered aggregates + projections (single-leaf
+  and multi-level tree, partial/empty/full selectivity, AND/OR predicates, filtered GROUP BY) now take the
+  columnar path and must agree with the resident row path on rows **and** cost, so a mis-indexed selection
+  vector diverges loudly.
 
 Deferred follow-ons (none foreclosed): **S3 touched-column scan wiring in Rust + TS** (landed in Go,
-above); **A2 columnar gather + projection feed in Rust + TS** (Go's A2 covers the filter-free aggregate
-path and the bare-column projection path); **Track A3 — filter vectorization** (a `selVec` predicate kernel so
-filtered aggregates + projections gather columnar too); **nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
+above); **A2 columnar gather + projection feed + A3 filter vectorization in Rust + TS** (Go's columnar path
+now covers filter-free *and* filtered aggregates and bare-column projections); **nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
 *interior* on repeated access — the narrow residual of §6, not the column-location memo PAX already
 provides); **keys as block-slices** (zero-copy keys under Packed); **in-memory databases adopting
 deferral** only if a Memory pager backing lands ([pager.md §6](pager.md)).

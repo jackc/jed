@@ -79,6 +79,10 @@ func BenchmarkTrackAWideScan(b *testing.B) {
 		{"sum_c0", "SELECT sum(c0) FROM t"},      // vectorized agg, touches 1 col
 		{"count_star", "SELECT count(*) FROM t"}, // touches 0 cols (scan-feed control)
 		{"project_c0", "SELECT c0 FROM t"},       // projection scan, touches 1 col, emits N
+		// A3 filter vectorization: a WHERE predicate over the lanes (selection vector) instead of the
+		// full-width row path. ~50% selectivity so both branches do real work.
+		{"sum_c0_filt", "SELECT sum(c0) FROM t WHERE c0 > 500"}, // filtered agg, touches 1 col
+		{"project_c0_filt", "SELECT c0 FROM t WHERE c0 > 500"},  // filtered projection, touches 1 col
 	}
 
 	for _, w := range widths {

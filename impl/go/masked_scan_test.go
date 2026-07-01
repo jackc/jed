@@ -62,11 +62,18 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 		"SELECT c0 FROM w",
 		"SELECT c3, c7 FROM w",
 		"SELECT id, c5 FROM w",
-		// WHERE on one column, project another (touched set spans filter + projection).
+		// WHERE on one column, project another (touched set spans filter + projection). These take the
+		// A3 columnar projection path (projectColumnar applies the predicate over the lanes into a
+		// selection vector) — the filter no longer forces the row path. If the selection vector wrongly
+		// admitted a filtered-out row (or dropped a survivor), the paged rows/cost would diverge here.
 		"SELECT c1 FROM w WHERE c0 > 15",
 		"SELECT id FROM w WHERE c7 < 8",
 		"SELECT c6 FROM w WHERE c4 IS NULL",
 		"SELECT c2 FROM w WHERE c5 IS NOT NULL",
+		"SELECT c1 FROM w WHERE c0 > 5 AND c7 < 9",    // AND predicate — every node charged per row (no short-circuit)
+		"SELECT c0, c6 FROM w WHERE c7 = 5 OR c7 = 8", // OR predicate, multi-column projection
+		"SELECT c0 FROM w WHERE c0 > 1000",            // empty selection vector — zero survivors
+		"SELECT id FROM w WHERE id > 0",               // full selection vector — every row survives
 		// Vectorized aggregates (the columnar-gather fast-path feed, A2) touching one operand column.
 		// Filter-free shapes take the A2 columnar path on the paged database (paging != nil) and the
 		// row path on the resident one — they must agree on rows AND cost.
@@ -76,7 +83,12 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 		"SELECT sum(c3), count(c6) FROM w", // multi-spec whole-table columnar (planSumInt + planCount)
 		"SELECT count(c4) FROM w",          // COUNT over a nullable operand — the columnar null lane
 		"SELECT min(c5), max(c6) FROM w",
-		"SELECT sum(c0) FROM w WHERE c1 = 100", // filtered → row path (columnar declines on plan.filter)
+		"SELECT sum(c0) FROM w WHERE c1 = 100",                // filtered agg → A3 columnar (selection vector over the lanes)
+		"SELECT sum(c1) FROM w WHERE c0 > 15",                 // filtered SUM(i32) selecting a proper subset
+		"SELECT count(*) FROM w WHERE c7 < 8",                 // filtered COUNT(*) — count == len(selection vector)
+		"SELECT min(c5), max(c6) FROM w WHERE c4 IS NOT NULL", // filtered MIN/MAX over a nullable operand
+		"SELECT c0, sum(c1) FROM w WHERE c7 > 5 GROUP BY c0",  // filtered single-int-key GROUP BY (columnar bucketing over survivors)
+		"SELECT sum(c1) FROM w WHERE c0 > 1000",               // filter admits no rows → SUM over empty is NULL
 		// Single-integer-key GROUP BY (touched: the key + the operand).
 		"SELECT c0, sum(c2) FROM w GROUP BY c0",            // SUM(i64) key case → row path
 		"SELECT c0, sum(c1) FROM w GROUP BY c0",            // SUM(i32) → columnar group-by
@@ -122,8 +134,10 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 // paged (file-backed) database and the row path on the resident one; both the result rows AND the
 // deterministic cost must agree. Bare-column PROJECTIONS take the A2 columnar projection path
 // (projectColumnar → emitColumnar) over the same tree — so the interior-separator gather is exercised
-// for projections too, not only aggregates. A few filtered / grouped-with-WHERE shapes exercise the row
-// path over the same multi-level tree for good measure.
+// for projections too, not only aggregates. FILTERED aggregates / projections take the A3 columnar path:
+// the predicate is applied over the gathered lanes into a selection vector, and the fold / emit visits
+// only the selected lane positions — so a mis-indexed selection vector against the interior-separator
+// gather would diverge from the resident row path here.
 func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 	seed := func(t *testing.T, db dbHandle) {
 		t.Helper()
@@ -183,9 +197,18 @@ func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 		"SELECT id FROM m",                                // the PK column projected (a stored column like any other)
 		"SELECT a FROM m WHERE id = 2500",                 // PK point → columnar with a point bound
 		"SELECT k, b FROM m WHERE id >= 100 AND id < 400", // PK range → columnar with a range bound
-		// Filtered / bounded — the row path over the same multi-level tree (columnar declines on filter).
-		"SELECT sum(a) FROM m WHERE id >= 100 AND id < 400",
-		"SELECT k, count(*) FROM m WHERE k >= 3 GROUP BY k",
+		// Filtered aggregates / projections — the A3 columnar path over the multi-level tree: the predicate
+		// is applied over the gathered lanes into a selection vector, and the fold / emit visits only the
+		// selected lane positions. The survivors span interior separators + leaves, so a mis-indexed
+		// selection vector (an off-by-one against the interior-node gather) diverges from the resident row
+		// path on rows or cost.
+		"SELECT sum(a) FROM m WHERE id >= 100 AND id < 400",  // filtered whole-table SUM (PK-range residual)
+		"SELECT k, count(*) FROM m WHERE k >= 3 GROUP BY k",  // filtered single-int-key GROUP BY
+		"SELECT sum(a), count(b) FROM m WHERE a > 500",       // filtered multi-spec, nullable COUNT operand
+		"SELECT a FROM m WHERE k = 3",                        // filtered projection selecting one of 8 recurring buckets
+		"SELECT id, a FROM m WHERE a >= 200 AND a < 800",     // filtered multi-column projection, proper subset
+		"SELECT a FROM m WHERE a < 0",                        // filtered projection, empty selection vector
+		"SELECT k, sum(a) FROM m WHERE b IS NULL GROUP BY k", // filter on the nullable column, grouped
 	}
 	for _, sql := range queries {
 		if want, got := rowsSorted(t, mem, sql), rowsSorted(t, paged, sql); !eqStrings(want, got) {
