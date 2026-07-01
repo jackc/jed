@@ -14726,13 +14726,14 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 
-	// Vectorized whole-table integer aggregate (batch.go, Stage 1 of the PAX/vectorization program):
-	// a single-table SUM/COUNT/MIN/MAX with no GROUP BY / DISTINCT / FILTER / HAVING / window /
-	// ORDER BY folds the column in a tight loop instead of the row-at-a-time group machinery below.
-	// Gated to the unmetered lane so a metered query's deterministic abort row stays the scalar
-	// path's; results and accrued cost are byte-identical either way (the conformance corpus proves
-	// both). Ineligible / metered ⇒ this is skipped and the general aggregate branch runs unchanged.
-	if meter.unmetered() && vectorizedAggEligible(plan) {
+	// Vectorized single-table aggregate (batch.go, the PAX/vectorization program's executor track): a
+	// SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table
+	// or grouped by a single integer column, folds columnar / int64-bucketed instead of the
+	// row-at-a-time group machinery below. Gated to the unmetered lane so a metered query's
+	// deterministic abort row stays the scalar path's; results and accrued cost are byte-identical
+	// either way (the conformance corpus proves both). Ineligible / metered ⇒ this is skipped and the
+	// general aggregate branch runs unchanged.
+	if meter.unmetered() && db.vectorizedAggEligible(plan) {
 		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
 	}
 

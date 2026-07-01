@@ -95,3 +95,25 @@ NULL
 NULL
 NULL
 NULL
+
+# LIMIT / OFFSET apply to the whole-table aggregate's SINGLE grand-total row at emission, exactly
+# like any other query result. A `LIMIT 0` (or an OFFSET past the one row) emits ZERO rows — so no
+# row_produced is charged — even though the aggregate itself still scans + accumulates over the
+# whole table. 1 page + 3 scan + 3 accumulate + 0 produced = 7.
+# cost: 7
+query I nosort
+SELECT COUNT(*) FROM t LIMIT 0
+----
+
+# OFFSET 1 skips the one grand-total row -> zero rows, same cost as LIMIT 0 (nothing produced).
+# cost: 7
+query I nosort
+SELECT SUM(a) FROM t OFFSET 1
+----
+
+# A LIMIT at or above the one row keeps it (the row is produced). 1 + 3 + 3 + 1 = 8.
+# cost: 8
+query I nosort
+SELECT COUNT(*) FROM t LIMIT 5
+----
+3
