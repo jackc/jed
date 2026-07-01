@@ -570,6 +570,31 @@ impl PMap {
         Ok((out, nodes))
     }
 
+    /// Walk the bounded scan gathering ONLY the columns `mask` selects into dense per-column lanes
+    /// (`cols[c]` of length `row_count` for each selected `c`, empty otherwise), never building a
+    /// full-width [`Row`] — the A2/A3 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation
+    /// dividend A1 leaves on the table). It mirrors [`range_entries_counted`]'s traversal EXACTLY (same
+    /// node visits ⇒ the same `page_read` count; same in-order entry sequence, interior separators
+    /// included as a B-tree stores records there too), but reads each admitted row's selected columns via
+    /// [`Node::col_at`] — an O(1) PAX column span on a Packed leaf, `vals[i][c]` on a Decoded node — so a
+    /// wide-table single-column scan never materializes the untouched columns NOR a full-width row. Each
+    /// `cols[c]` is in scan order, so it equals the column-`c` stride of the row feed. Returns
+    /// `(cols, row_count, nodes)`.
+    pub(crate) fn columnar_scan(
+        &self,
+        b: &KeyBound,
+        src: Option<&dyn LeafSource>,
+        mask: &[bool],
+    ) -> Result<(Vec<Vec<Value>>, usize, usize)> {
+        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); mask.len()];
+        let mut row_count = 0usize;
+        let mut nodes = 0usize;
+        if let Some(root) = &self.root {
+            columnar_collect(root, b, src, mask, &mut cols, &mut row_count, &mut nodes)?;
+        }
+        Ok((cols, row_count, nodes))
+    }
+
     /// The number of B-tree nodes a bounded scan over `b` visits — the `page_read` it charges
     /// (cost.md §3). Mirrors `range_entries`' traversal exactly (same `child_window` prune, root
     /// always visited), counting an `OnDisk` leaf as one node WITHOUT faulting it (pager.md §5). The
@@ -1205,6 +1230,56 @@ fn collect_range(
         collect_range(&ch, b, src, recon, out, nodes)?;
         if i >= ef && i < el {
             out.push((node.keys[i].clone(), node.row_at_maybe_masked(i, recon)?));
+        }
+    }
+    Ok(())
+}
+
+/// Gather the columns `mask` selects of row `i` into the per-column lanes (the A2 columnar feed's
+/// per-entry step). Reads each selected column via [`Node::col_at`] — an O(1) PAX span on a Packed
+/// leaf — so no full-width row is built. The untouched lanes are left untouched.
+fn gather_cols(node: &Node, i: usize, mask: &[bool], cols: &mut [Vec<Value>]) -> Result<()> {
+    for (c, &m) in mask.iter().enumerate() {
+        if m {
+            cols[c].push(node.col_at(i, c)?);
+        }
+    }
+    Ok(())
+}
+
+/// The columnar twin of [`collect_range`] (packed-leaf.md §11 Track A2): the same windowed,
+/// interior-separator-inclusive walk (so the visited-node set — and the `page_read` cost — is
+/// identical), but gathers each admitted entry's selected columns into `cols` lanes via [`gather_cols`]
+/// instead of pushing a `(key, row)` pair. `row_count` counts the admitted entries.
+fn columnar_collect(
+    node: &Node,
+    b: &KeyBound,
+    src: Option<&dyn LeafSource>,
+    mask: &[bool],
+    cols: &mut [Vec<Value>],
+    row_count: &mut usize,
+    nodes: &mut usize,
+) -> Result<()> {
+    *nodes += 1;
+    let (ef, el) = b.entry_window(node);
+    if node.is_leaf() {
+        for i in ef..el {
+            gather_cols(node, i, mask, cols)?;
+            *row_count += 1;
+        }
+        return Ok(());
+    }
+    let (cf, cl) = b.child_window(node);
+    if ef < cf {
+        gather_cols(node, ef, mask, cols)?;
+        *row_count += 1;
+    }
+    for i in cf..=cl {
+        let ch = child(node, i, src)?;
+        columnar_collect(&ch, b, src, mask, cols, row_count, nodes)?;
+        if i >= ef && i < el {
+            gather_cols(node, i, mask, cols)?;
+            *row_count += 1;
         }
     }
     Ok(())

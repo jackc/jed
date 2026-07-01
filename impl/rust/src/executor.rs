@@ -187,6 +187,21 @@ enum Emitter {
         sorted: crate::spill::SortedRows,
         remaining: usize,
     },
+    /// The columnar projection fast path (`project_columnar`, packed-leaf.md §11 Track A2/A3). `cols`
+    /// holds the pre-gathered dense per-column lanes (indexed by table ordinal) and `proj_cols` the
+    /// projection's column indices into them; emission builds output row `j` as `[cols[proj_cols[0]][l],
+    /// …]` where `l = sel[j]` (the A3 selection vector's survivor — a filtered scan) or `j` (all rows,
+    /// `sel = None`) — a bare-column projection with no full-width row, charging `row_produced` per
+    /// windowed row exactly like the `Project` path over a bare column ref (a zero-cost slot read, so the
+    /// lane read is cost-identical). Windowed to `[start, end)`. Lazy on the `query()` path: an early exit
+    /// skips the `row_produced` of the rows it never pulls.
+    Columnar {
+        cols: Vec<Vec<Value>>,
+        proj_cols: Vec<usize>,
+        sel: Option<Vec<i32>>,
+        start: usize,
+        end: usize,
+    },
 }
 
 /// Whether an [`Emitter::Buffer`] row still needs projecting on emission (spec/design/streaming.md §4).
@@ -11678,6 +11693,33 @@ impl Engine {
                     out
                 }
             },
+            // Columnar projection (packed-leaf.md §11 Track A2/A3): gather each windowed output row from
+            // the dense lanes — a bare-column projection with no full-width row — charging row_produced per
+            // row, exactly the Project drive over a bare-column projection (whose eval is a zero-cost slot
+            // read). A non-None `sel` (the A3 filter's survivors) maps output row j to lane position sel[j].
+            Emitter::Columnar {
+                cols,
+                proj_cols,
+                sel,
+                start,
+                end,
+            } => {
+                let mut out = Vec::with_capacity(end - start);
+                for j in start..end {
+                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                    meter.charge(COSTS.row_produced);
+                    let l = match &sel {
+                        Some(s) => s[j] as usize,
+                        None => j,
+                    };
+                    let mut o = Vec::with_capacity(proj_cols.len());
+                    for &c in &proj_cols {
+                        o.push(cols[c][l].clone());
+                    }
+                    out.push(o);
+                }
+                out
+            }
         };
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
@@ -11685,6 +11727,103 @@ impl Engine {
             rows: out_rows,
             cost: meter.accrued,
         })
+    }
+
+    /// Run the A2/A3 columnar gather for a [`vectorized_project_eligible`] plan (packed-leaf.md §11 Track
+    /// A2/A3): scan only the touched columns of the single base relation into dense per-column lanes
+    /// (never a full-width [`Row`]), charge the identical scan cost block, apply any `WHERE` predicate over
+    /// the lanes into a selection vector (A3), and return an [`Emitter::Columnar`] that gathers each
+    /// surviving output row from the lanes on emission. Returns `None` (declining to the caller's row path)
+    /// for an in-memory store (its Decoded leaves share rows zero-copy, so a lane gather would only add
+    /// allocation), a spillable touched column (the columnar feed has no value-resolution step — this also
+    /// covers a filter over a spillable column), or a projection column out of range / unmasked (a safety
+    /// net, never expected — a projected column is touched, hence masked). Cost-neutral by construction:
+    /// the same `page_read` (same node visits) / `value_decompress` (0) / `storage_row_read` (× row_count)
+    /// / `operator_eval` (the filter over each scanned row) as the row path, then `row_produced` per emitted
+    /// (surviving) row charged by the emitter drive — exactly the `Project` drive over a bare-column
+    /// projection.
+    fn project_columnar(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        params: &[Value],
+        outer: &[&[Value]],
+        meter: &mut Meter,
+    ) -> Result<Option<Emitter>> {
+        let rel = &plan.rels[0];
+        let store = self.store(&rel.table_name);
+        // File-backed only: an in-memory store's row path is already zero-copy.
+        if !store.is_file_backed() {
+            return Ok(None);
+        }
+        let mask = &plan.rel_masks[0];
+        // No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched
+        // value is left unresolved. The mask includes the filter's columns (collect_touched), so this also
+        // declines a filter over a spillable column to the row path.
+        if crate::format::any_spillable_masked(store.col_types(), mask) {
+            return Ok(None);
+        }
+        // Each projected column must be a valid, masked table ordinal — else its gathered lane would be
+        // empty. A projected column is always touched (hence masked), so this holds; the check also
+        // declines a (never-expected) synthetic slot or non-column projection.
+        let mut proj_cols = Vec::with_capacity(plan.projections.len());
+        for p in &plan.projections {
+            let RExpr::Column(idx) = p else {
+                return Ok(None);
+            };
+            let idx = *idx;
+            if idx >= mask.len() || !mask[idx] {
+                return Ok(None);
+            }
+            proj_cols.push(idx);
+        }
+
+        // Determine the scan bound exactly as materialize_rel does: a PK-range bound, or the full scan. An
+        // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely (0 pages/rows).
+        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); mask.len()];
+        let mut row_count = 0usize;
+        let mut pages = 0usize;
+        let slabs = 0usize;
+        let mut do_scan = true;
+        let mut b = KeyBound::unbounded();
+        if let Some(ScanBound::Pk(bp)) = &plan.rel_bounds[0] {
+            match build_key_bound(bp, params, outer) {
+                Some(bb) => b = bb,
+                None => do_scan = false,
+            }
+        }
+        if do_scan {
+            let (c, rc, p, _s) = store.columnar_scan_masked(&b, mask)?;
+            cols = c;
+            row_count = rc;
+            pages = p;
+        }
+        // Charge the scan cost block identically to materialize_rel + ScanSource: page_read × nodes,
+        // value_decompress × slabs (0 here), storage_row_read × row_count. On the unmetered lane (the caller
+        // gates) this bulk charge reproduces the per-row accrual (guard is a no-op).
+        meter.charge(
+            COSTS.page_read * pages as i64
+                + COSTS.value_decompress * slabs as i64
+                + COSTS.storage_row_read * row_count as i64,
+        );
+
+        // A3: apply the WHERE predicate over the lanes into a selection vector (None ⇒ all rows survive).
+        let (sel, n_emit) = match &plan.filter {
+            Some(filter) => {
+                let s = filter_columnar(filter, &cols, mask, row_count, env, meter)?;
+                let n = s.len();
+                (Some(s), n)
+            }
+            None => (None, row_count),
+        };
+
+        Ok(Some(Emitter::Columnar {
+            cols,
+            proj_cols,
+            sel,
+            start: 0,
+            end: n_emit,
+        }))
     }
 
     /// Run a [`SelectPlan`]'s **blocking part** and return an [`Emitter`] describing how to emit its
@@ -11784,6 +11923,20 @@ impl Engine {
                     .exec_streaming_join(plan, &env, meter, params, outer, stmt_rng)?
                     .rows,
             });
+        }
+
+        // Columnar projection fast path (batch, packed-leaf.md §11 Track A2/A3): a bare-column projection
+        // over a single-table full/PK-bounded scan with no ORDER BY / LIMIT / OFFSET / blocking operator
+        // gathers only its touched columns into dense lanes and emits from them — never the full-width row
+        // the materialize path below allocates per record (the allocation dividend on a wide table). A
+        // WHERE predicate (A3) is applied over the lanes into a selection vector rather than forcing the row
+        // path. Gated to the unmetered lane (so a metered query's per-eval guards stay the row path's) and
+        // to file-backed stores with no spillable touched column (project_columnar declines otherwise,
+        // falling through to the identical-cost row path). Cost-neutral by construction.
+        if meter.is_unmetered() && vectorized_project_eligible(plan) {
+            if let Some(em) = self.project_columnar(plan, &env, params, outer, meter)? {
+                return Ok(em);
+            }
         }
 
         // Materialize each relation once, in primary-key order (base tables drain a ScanSource — the
@@ -19678,6 +19831,83 @@ fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
         && plan.rels[0].derived.is_none()
 }
 
+/// Whether `plan` is a shape [`project_columnar`](Engine::project_columnar) specializes: a bare-column
+/// projection over a single base table with no join / aggregate / window / DISTINCT / ORDER BY / LIMIT /
+/// OFFSET and no index/GIN/GiST bound — a plain `SELECT c0, c3, … FROM t [WHERE …]` whose output is the
+/// (optionally filtered) scan-order rows narrowed to a column subset. A residual filter is allowed (A3):
+/// `project_columnar` applies it over the lanes into a selection vector. Pure plan inspection (charges
+/// nothing), so a bail is free and the general materialize path runs with identical results + cost; the
+/// store / paging / spillable / column-range gates live in `project_columnar`, which declines to that
+/// path. LIMIT/OFFSET is excluded deliberately: a LIMIT with no ORDER BY streams with an early exit
+/// ([`streaming_scan_eligible`]), which the whole-table gather must not steal.
+fn vectorized_project_eligible(plan: &SelectPlan) -> bool {
+    if plan.is_agg || plan.has_window || plan.distinct {
+        return false;
+    }
+    if plan.rels.len() != 1 || !plan.joins.is_empty() {
+        return false;
+    }
+    let rel = &plan.rels[0];
+    if rel.srf.is_some() || rel.cte.is_some() || rel.derived.is_some() || rel.lateral {
+        return false;
+    }
+    // No ORDER BY / LIMIT / OFFSET (those route to a streaming / sort / index path). A residual filter is
+    // fine — project_columnar vectorizes it (A3).
+    if !plan.order.is_empty() || plan.limit.is_some() || plan.offset.is_some() {
+        return false;
+    }
+    // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics.
+    if matches!(
+        plan.rel_bounds[0],
+        Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+    ) {
+        return false;
+    }
+    // Every projection must be a bare column reference: a bare `RExpr::Column` evaluates to `row[index]`
+    // with zero operator_eval, so gathering it from a dense lane is cost-identical. An expression
+    // projection (`c0 + 1`, a function call) charges operator_eval and needs a row — it keeps the row path.
+    if plan.projections.is_empty() {
+        return false;
+    }
+    plan.projections
+        .iter()
+        .all(|p| matches!(p, RExpr::Column(_)))
+}
+
+/// Evaluate `filter` over the gathered per-column lanes and return the surviving row indices (the
+/// selection vector) — filter vectorization (packed-leaf.md §11 Track A3). It reuses the scalar
+/// [`RExpr::eval`] verbatim over a SINGLE reusable scratch row (the masked columns filled from the lanes
+/// at that row index, untouched columns left `Null`), so the predicate's `operator_eval` charges and its
+/// 3VL survivor test (keep iff `TRUE`) are byte-identical to the scalar `WHERE` loop — and the result is
+/// identical too, because the row path also feeds the filter a MASKED row (untouched columns `Null` via
+/// resolve_columns / row_at_masked) and the filter references only masked columns (`collect_touched`
+/// includes the filter), so a scratch row filled from the lanes is the same input. The one reusable
+/// scratch row is the allocation win: no full-width row per scanned row, only the `i32` survivor indices.
+/// The caller has verified no touched column spills, so every masked lane is a non-empty `Vec<Value>` of
+/// length `row_count` (an untouched column's lane stays empty but is never read).
+fn filter_columnar(
+    filter: &RExpr,
+    cols: &[Vec<Value>],
+    mask: &[bool],
+    row_count: usize,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Vec<i32>> {
+    let mut sel = Vec::new();
+    let mut scratch: Vec<Value> = vec![Value::Null; mask.len()];
+    for i in 0..row_count {
+        for (c, &m) in mask.iter().enumerate() {
+            if m {
+                scratch[c] = cols[c][i].clone();
+            }
+        }
+        if filter.eval(&scratch, env, meter)?.is_true() {
+            sel.push(i as i32);
+        }
+    }
+    Ok(sel)
+}
+
 /// The lazy pull pipeline behind a streaming [`Rows`](crate::Rows) cursor (spec/design/streaming.md
 /// §3/§4, S3): [`exec_streaming_scan`](Engine::exec_streaming_scan)'s per-row loop turned inside out
 /// so the CALLER pulls each row. It owns a frozen snapshot [`Engine`] (eval's `exec`, so the cursor
@@ -19844,6 +20074,17 @@ enum BufState {
         sorted: crate::spill::SortedRows,
         remaining: usize,
     },
+    /// The columnar projection fast path's lazy state (packed-leaf.md §11 Track A2/A3): the pre-gathered
+    /// dense lanes + the projection's column indices, windowed to `[idx, end)`, with the optional A3
+    /// selection vector. Each emission gathers output row `j` from the lanes at lane position `sel[j]`
+    /// (or `j`) and charges `row_produced` — an early exit skips the rows it never pulls.
+    Columnar {
+        cols: Vec<Vec<Value>>,
+        proj_cols: Vec<usize>,
+        sel: Option<Vec<i32>>,
+        idx: usize,
+        end: usize,
+    },
     /// The buffer is exhausted (or the cursor was closed) — every further `next_row` is `None`.
     Done,
 }
@@ -19880,6 +20121,19 @@ impl crate::cursor::RowStream for BufferedScan {
                     iter: rows.into_iter(),
                 },
                 Emitter::Sorted { sorted, remaining } => BufState::Sorted { sorted, remaining },
+                Emitter::Columnar {
+                    cols,
+                    proj_cols,
+                    sel,
+                    start,
+                    end,
+                } => BufState::Columnar {
+                    cols,
+                    proj_cols,
+                    sel,
+                    idx: start,
+                    end,
+                },
             };
         }
         match &mut self.state {
@@ -19944,6 +20198,34 @@ impl crate::cursor::RowStream for BufferedScan {
                 } else {
                     Ok(Some(std::mem::take(&mut rows[i])))
                 }
+            }
+            // Columnar projection (packed-leaf.md §11 Track A2/A3): gather this row from the dense lanes —
+            // a bare-column projection with no full-width row — charging only row_produced (a bare column
+            // ref is a zero-cost slot read). A non-None `sel` (the A3 filter's survivors) maps output row
+            // j to lane position sel[j].
+            BufState::Columnar {
+                cols,
+                proj_cols,
+                sel,
+                idx,
+                end,
+            } => {
+                if *idx >= *end {
+                    return Ok(None);
+                }
+                let j = *idx;
+                *idx += 1;
+                self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
+                self.meter.charge(COSTS.row_produced);
+                let l = match sel {
+                    Some(s) => s[j] as usize,
+                    None => j,
+                };
+                let mut out = Vec::with_capacity(proj_cols.len());
+                for &c in proj_cols.iter() {
+                    out.push(cols[c][l].clone());
+                }
+                Ok(Some(out))
             }
         }
     }

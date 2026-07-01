@@ -8,8 +8,14 @@
 //! table and a spread of query shapes each touching a different column subset, where a paged reopen
 //! (masked reconstruction) and a fully-resident in-memory database (whole rows) must agree on both rows
 //! and cost. A mask gap surfaces as a divergence here, never a silent wrong answer. Mirrors Go
-//! (masked_scan_test.go) and TS (tests/masked_scan.test.ts); the columnar-gather cases those cores add
-//! (A2/A3) are a deferred Rust follow-on — here every shape takes the masked ROW path.
+//! (masked_scan_test.go) and TS (tests/masked_scan.test.ts).
+//!
+//! A bare-column PROJECTION additionally takes the A2/A3 **columnar** gather on the paged (file-backed)
+//! database (`project_columnar` → `Emitter::Columnar`): only the touched columns are gathered into dense
+//! lanes — never a full-width row — and a `WHERE` predicate (A3) is applied over the lanes into a
+//! selection vector. So the projection cases below compare a paged-columnar path against the resident
+//! row path (rows AND cost). The columnar **aggregate** gather (Go rides its vectorized aggregate
+//! executor) is a deferred Rust follow-on — aggregate shapes here take the masked row path.
 
 use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
 
@@ -72,6 +78,24 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
+}
+
+/// The streaming (`query()`) result, fully drained + rendered + sorted, plus the final cost — exercises
+/// the LAZY drive (`BufferedScan` → `BufState::Columnar`) of the columnar projection path, which the
+/// eager `execute()` helpers above do not reach. Fully drained, it must observe the same rows AND total
+/// cost as the eager path (streaming.md §6).
+fn streamed_sorted(db: &mut Session, sql: &str) -> (Vec<Vec<String>>, i64) {
+    let mut rows = db
+        .query(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for r in &mut rows {
+        out.push(r.iter().map(|v| v.render()).collect());
+    }
+    rows.error().unwrap();
+    let c = rows.cost();
+    out.sort();
+    (out, c)
 }
 
 /// A paged reopen (masked reconstruction) and an in-memory seed (whole rows) must agree on rows AND
@@ -161,6 +185,115 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
             cost(&mut mem, sql),
             cost(&mut paged, sql),
             "cost differs (paged-masked vs resident) for `{sql}`"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Seed a MULTI-LEVEL B-tree (enough rows that the tree splits past a single leaf into a root interior
+/// node carrying separator entries), so the A2/A3 columnar projection gather's interior-separator path —
+/// a B-tree stores records in interior nodes too, gathered alongside the leaves — is exercised against
+/// the in-memory row oracle. The single-leaf `w` table above never builds an interior node, so its
+/// columnar walk only visits leaves. Both databases use the DEFAULT page size so their tree shapes (hence
+/// the page_read node counts) are identical; the depth comes from the row count, not a shrunk page.
+fn seed_multilevel(db: &mut Session) {
+    db.execute(
+        "CREATE TABLE m (id i32 PRIMARY KEY, k i32, a i32, b i16)",
+        &[],
+    )
+    .unwrap();
+    const ROWS: i32 = 5000;
+    const CHUNK: i32 = 1000;
+    let mut start = 0;
+    while start < ROWS {
+        let mut sql = String::from("INSERT INTO m VALUES ");
+        let mut i = start;
+        while i < start + CHUNK && i < ROWS {
+            if i > start {
+                sql.push(',');
+            }
+            // k has 8 recurring buckets that span leaves; a stays small; b is NULL on every 7th row.
+            let b = if i % 7 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("{}", i % 100)
+            };
+            sql.push_str(&format!("({},{},{},{})", i, i % 8, i % 1000, b));
+            i += 1;
+        }
+        db.execute(&sql, &[]).unwrap();
+        start += CHUNK;
+    }
+}
+
+/// Bare-column PROJECTIONS over a multi-level tree take the A2 columnar projection path (Emitter::Columnar)
+/// on the paged (file-backed) database and the row path on the resident one — the interior separators are
+/// gathered into the lanes alongside the leaf records, so a mis-indexed gather diverges from the resident
+/// row path on rows or cost. FILTERED projections take the A3 columnar path: the predicate is applied over
+/// the gathered lanes into a selection vector, and the emit visits only the selected lane positions — so a
+/// mis-indexed selection vector (an off-by-one against the interior-node gather) diverges loudly here.
+#[test]
+fn paged_columnar_multilevel_matches_resident() {
+    let path = tmp("jed_masked_multilevel.jed");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::create(
+            &path,
+            DatabaseOptions {
+                page_size: jed::DEFAULT_PAGE_SIZE,
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
+        seed_multilevel(&mut db);
+        drop(db);
+    }
+    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE)
+        .session(SessionOptions::default());
+    seed_multilevel(&mut mem);
+    let mut paged = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
+
+    let queries = [
+        // Bare-column projections — the columnar projection path (interior + leaf a/k/b values gathered).
+        "SELECT a FROM m",
+        "SELECT k, a, b FROM m",
+        "SELECT id FROM m",                // the PK column projected
+        "SELECT a FROM m WHERE id = 2500", // PK point → columnar with a point bound
+        "SELECT k, b FROM m WHERE id >= 100 AND id < 400", // PK range → columnar with a range bound
+        // Filtered projections — the A3 columnar path over the multi-level tree (selection vector over the
+        // interior-separator + leaf gather).
+        "SELECT a FROM m WHERE k = 3", // one of 8 recurring buckets, spanning leaves
+        "SELECT id, a FROM m WHERE a >= 200 AND a < 800", // proper subset
+        "SELECT a FROM m WHERE a < 0", // empty selection vector
+        "SELECT k, a FROM m WHERE b IS NULL", // filter on the nullable column
+        "SELECT id FROM m WHERE a > 5 AND k < 4", // AND predicate over two columns
+    ];
+    for sql in queries {
+        // Eager drive (execute → Emitter::Columnar): paged-columnar vs resident-row.
+        assert_eq!(
+            rows_sorted(&mut mem, sql),
+            rows_sorted(&mut paged, sql),
+            "rows differ (paged-columnar vs resident) for `{sql}`"
+        );
+        assert_eq!(
+            cost(&mut mem, sql),
+            cost(&mut paged, sql),
+            "cost differs (paged-columnar vs resident) for `{sql}`"
+        );
+        // Lazy drive (query → BufferedScan → BufState::Columnar), fully drained: must observe the same
+        // rows AND total cost as the resident eager path (streaming.md §6).
+        let (lazy_rows, lazy_cost) = streamed_sorted(&mut paged, sql);
+        assert_eq!(
+            rows_sorted(&mut mem, sql),
+            lazy_rows,
+            "lazy-columnar rows differ (paged query() vs resident) for `{sql}`"
+        );
+        assert_eq!(
+            cost(&mut mem, sql),
+            lazy_cost,
+            "lazy-columnar cost differs (paged query() vs resident) for `{sql}`"
         );
     }
     let _ = std::fs::remove_file(&path);

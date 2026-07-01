@@ -353,6 +353,27 @@ impl TableStore {
         self.range_scan_with_units_masked(&KeyBound::unbounded(), mask)
     }
 
+    /// Gather the mask-selected columns of a bounded scan into dense per-column lanes (`cols[c]`, length
+    /// `row_count`, for each selected `c`) PLUS the `(page_read, value_decompress)` cost block — the A2/A3
+    /// columnar feed for the vectorized projection path (packed-leaf.md §11 Track A2/A3). It never
+    /// materializes a full-width [`Row`]: a wide-table projection touches a few columns instead of
+    /// allocating the whole row per record (the B/op win the masked row feed leaves on the table). Invoked
+    /// ONLY when no touched column can spill (the caller gates on `!any_spillable_masked`), so the
+    /// `value_decompress` slab count is always 0 and no unfetched value needs resolving. Cost is
+    /// byte-identical to `scan_with_units_masked(mask)` over the same bound: the same node visits
+    /// (`page_read`, computed in the same single descent) and the same slab count (0). The caller charges
+    /// `storage_row_read × row_count`.
+    pub(crate) fn columnar_scan_masked(
+        &self,
+        b: &KeyBound,
+        mask: &[bool],
+    ) -> Result<(Vec<Vec<Value>>, usize, usize, usize)> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        let (cols, row_count, pages) = self.rows.columnar_scan(b, src_ref, mask)?;
+        Ok((cols, row_count, pages, 0))
+    }
+
     /// Fused single-descent point lookup: the row at `key` (if any) PLUS the
     /// `(page_read, value_decompress)` block its point bound charges — the index fetch path's
     /// [`get`](TableStore::get) + [`overlap_scan_units`](TableStore::overlap_scan_units) in one
@@ -506,6 +527,14 @@ impl TableStore {
     /// (spec/design/composite.md §4). Empty for an index store (records are the key alone).
     pub(crate) fn col_types(&self) -> &[ColType] {
         &self.col_types
+    }
+
+    /// Whether this store is file-backed (has a demand-paging pool) — the gate for the Track A2/A3
+    /// columnar gather (packed-leaf.md §11): an in-memory store's Decoded leaves already share their
+    /// rows zero-copy on the row path, so a lane gather would only add allocation with no packed-leaf
+    /// win to offset it.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        self.paging.is_some()
     }
 
     /// Install a loaded B-tree as this store's contents (format.rs `from_image`).
