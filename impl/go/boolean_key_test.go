@@ -47,7 +47,7 @@ func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 
 	// A full scan iterates in key (byte) order: false (0x00) before true (0x01).
 	rows := db.RowsInKeyOrder("t")
-	if len(rows) != 2 || rows[0][0].Bool != false || rows[1][0].Bool != true {
+	if len(rows) != 2 || rows[0][0].boolVal() != false || rows[1][0].boolVal() != true {
 		t.Fatalf("key order got %v, want [false, true]", rows)
 	}
 }
@@ -74,8 +74,8 @@ func TestBooleanCompositePrimaryKey(t *testing.T) {
 		t.Fatalf("got %d rows, want %d", len(rows), len(want))
 	}
 	for i, r := range rows {
-		if r[0].Int != want[i].a || r[1].Bool != want[i].b {
-			t.Fatalf("row %d = (%d,%v), want (%d,%v)", i, r[0].Int, r[1].Bool, want[i].a, want[i].b)
+		if r[0].Int != want[i].a || r[1].boolVal() != want[i].b {
+			t.Fatalf("row %d = (%d,%v), want (%d,%v)", i, r[0].Int, r[1].boolVal(), want[i].a, want[i].b)
 		}
 	}
 }

@@ -77,7 +77,7 @@ func TestInsertValuesParamsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id, name FROM t WHERE id = $1", IntValue(7))
-	if len(rows) != 1 || rows[0][0].Int != 7 || rows[0][1].Str != "alice" {
+	if len(rows) != 1 || rows[0][0].Int != 7 || rows[0][1].str() != "alice" {
 		t.Fatalf("got %v", rows)
 	}
 }

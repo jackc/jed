@@ -276,7 +276,7 @@ func (r *Rows) Text(col int) (string, error) {
 	if v.Kind != ValText {
 		return "", typeErr(v, "text")
 	}
-	return v.Str, nil
+	return v.str(), nil
 }
 
 // Bool returns column col as a bool.
@@ -288,7 +288,7 @@ func (r *Rows) Bool(col int) (bool, error) {
 	if v.Kind != ValBool {
 		return false, typeErr(v, "bool")
 	}
-	return v.Bool, nil
+	return v.boolVal(), nil
 }
 
 // Float returns column col as a float64 (either float width widens).
@@ -309,7 +309,7 @@ func (r *Rows) Bytes(col int) ([]byte, error) {
 	if v.Kind != ValBytea && v.Kind != ValUuid {
 		return nil, typeErr(v, "bytea")
 	}
-	return []byte(v.Str), nil
+	return []byte(v.str()), nil
 }
 
 // IsNull reports whether column col of the current row is SQL NULL.
@@ -601,17 +601,17 @@ func assignValue(v Value, dest any) error {
 		if v.Kind != ValBool {
 			return typeErr(v, "bool")
 		}
-		*d = v.Bool
+		*d = v.boolVal()
 	case *string:
 		if v.Kind != ValText {
 			return typeErr(v, "string")
 		}
-		*d = v.Str
+		*d = v.str()
 	case *[]byte:
 		if v.Kind != ValBytea && v.Kind != ValUuid {
 			return typeErr(v, "[]byte")
 		}
-		*d = []byte(v.Str)
+		*d = []byte(v.str())
 	case *float64:
 		f, err := asFloat(v)
 		if err != nil {
@@ -628,12 +628,12 @@ func assignValue(v Value, dest any) error {
 		if v.Kind != ValDecimal {
 			return typeErr(v, "decimal")
 		}
-		*d = *v.Dec
+		*d = *v.decimal()
 	case *Interval:
 		if v.Kind != ValInterval {
 			return typeErr(v, "interval")
 		}
-		*d = v.Iv
+		*d = v.interval()
 	case *time.Time:
 		t, err := asTime(v)
 		if err != nil {
@@ -653,17 +653,17 @@ func valueToAny(v Value) any {
 	case ValInt:
 		return v.Int
 	case ValBool:
-		return v.Bool
+		return v.boolVal()
 	case ValText:
-		return v.Str
+		return v.str()
 	case ValBytea:
-		return []byte(v.Str)
+		return []byte(v.str())
 	case ValUuid:
-		return renderUUID([]byte(v.Str))
+		return renderUUID([]byte(v.str()))
 	case ValDecimal:
-		return *v.Dec
+		return *v.decimal()
 	case ValInterval:
-		return v.Iv
+		return v.interval()
 	case ValFloat32:
 		return v.F32()
 	case ValFloat64:

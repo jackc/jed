@@ -327,7 +327,7 @@ func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, erro
 	copy(out, row)
 	for i := range out {
 		if mask[i] && out[i].Kind == ValUnfetched {
-			v, err := resolveUnfetched(s.colTypes[i], out[i].Unf, fetch)
+			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), fetch)
 			if err != nil {
 				return nil, err
 			}
@@ -349,7 +349,7 @@ func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, erro
 func (s *tableStore) resolveInlineColumns(row storedRow) (storedRow, error) {
 	needs := false
 	for _, v := range row {
-		if v.Kind == ValUnfetched && v.Unf.Form == 0x00 {
+		if v.Kind == ValUnfetched && v.unfetched().Form == 0x00 {
 			needs = true
 			break
 		}
@@ -360,9 +360,9 @@ func (s *tableStore) resolveInlineColumns(row storedRow) (storedRow, error) {
 	out := make(storedRow, len(row))
 	copy(out, row)
 	for i := range out {
-		if out[i].Kind == ValUnfetched && out[i].Unf.Form == 0x00 {
+		if out[i].Kind == ValUnfetched && out[i].unfetched().Form == 0x00 {
 			// An inline form reads no overflow pages — fetch is never invoked.
-			v, err := resolveUnfetched(s.colTypes[i], out[i].Unf, nil)
+			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), nil)
 			if err != nil {
 				return nil, err
 			}

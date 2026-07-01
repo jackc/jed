@@ -121,7 +121,7 @@ func (op gistOpclass) readComp(buf []byte, pos *int) (gistBound, error) {
 		if v.Kind != ValRange {
 			return gistBound{}, newError(DataCorrupted, "gist: bound is not a range")
 		}
-		return gistBound{rng: v.Range}, nil
+		return gistBound{rng: v.rangeVal()}, nil
 	}
 	mlen, err := gistReadU16(buf, pos)
 	if err != nil {

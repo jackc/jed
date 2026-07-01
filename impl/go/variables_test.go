@@ -35,7 +35,7 @@ func varErrCode(t *testing.T, db dbHandle, sql string) string {
 
 func mustText(t *testing.T, v Value, want string) {
 	t.Helper()
-	if v.Kind != ValText || v.Str != want {
+	if v.Kind != ValText || v.str() != want {
 		t.Fatalf("want text %q, got %v", want, v)
 	}
 }

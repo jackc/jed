@@ -363,11 +363,11 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	deferred := 0
 	for ri, row := range node.vals {
 		for ci, v := range row {
-			if v.Kind != ValUnfetched || v.Unf.Form != 0x00 {
+			if v.Kind != ValUnfetched || v.unfetched().Form != 0x00 {
 				continue
 			}
 			deferred++
-			comp := v.Unf.Comp
+			comp := v.unfetched().Comp
 			// Form (a): the body is a SLICE of the page block, so its cap reaches the page's end
 			// (zero-fill tail) and exceeds its len. A form-(b) copy (make+copy) has cap == len.
 			if cap(comp) <= len(comp) {
@@ -375,7 +375,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 					ri, ci, cap(comp), len(comp))
 			}
 			// It still resolves to exactly the eager value (form (a) is decode-neutral).
-			got, err := resolveUnfetched(colTypes[ci], v.Unf, func(uint32) ([]byte, error) {
+			got, err := resolveUnfetched(colTypes[ci], v.unfetched(), func(uint32) ([]byte, error) {
 				return nil, fmt.Errorf("inline values read no overflow pages")
 			})
 			if err != nil {

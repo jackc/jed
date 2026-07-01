@@ -59,7 +59,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 		t.Error("re-serialization of an external value is not byte-identical")
 	}
 	rows := loaded.RowsInKeyOrder("t")
-	if len(rows) != 2 || rows[0][1].Str != big || rows[1][1].Str != "tiny" {
+	if len(rows) != 2 || rows[0][1].str() != big || rows[1][1].str() != "tiny" {
 		t.Fatalf("external value did not survive the round trip: %+v", rows)
 	}
 }
@@ -120,7 +120,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id, body FROM t")
-	if len(rows) != 2 || rows[0][1].Str != big || rows[1][1].Str != "small" {
+	if len(rows) != 2 || rows[0][1].str() != big || rows[1][1].str() != "small" {
 		t.Fatalf("paged read of an external value is wrong: lens %d", len(rows))
 	}
 	if err := db.Close(); err != nil {
@@ -160,7 +160,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := queryRows(t, db, "SELECT body FROM t WHERE id = 3")
-	if len(got) != 1 || got[0][0].Str != big {
+	if len(got) != 1 || got[0][0].str() != big {
 		t.Fatalf("re-inserted big row is wrong")
 	}
 	if err := db.Close(); err != nil {

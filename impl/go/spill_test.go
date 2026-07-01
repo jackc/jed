@@ -73,11 +73,11 @@ func valueEqual(a, b Value) bool {
 	case ValInt, ValTimestamp, ValTimestamptz:
 		return a.Int == b.Int
 	case ValBool:
-		return a.Bool == b.Bool
+		return a.boolVal() == b.boolVal()
 	case ValText, ValBytea, ValUuid:
-		return a.Str == b.Str
+		return a.str() == b.str()
 	case ValDecimal:
-		return a.Dec.CmpValue(*b.Dec) == 0
+		return a.decimal().CmpValue(*b.decimal()) == 0
 	default:
 		return false
 	}

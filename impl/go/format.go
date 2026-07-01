@@ -254,7 +254,7 @@ func encodeValue(ty colType, v Value) []byte {
 			panic("BUG: a non-array value in an array column")
 		}
 		out := []byte{0x00} // present
-		return append(out, encodeArrayBody(*ty.Elem, v.Array)...)
+		return append(out, encodeArrayBody(*ty.Elem, v.arrayVal())...)
 	}
 	if ty.RangeElem != nil {
 		// A range column (spec/design/ranges.md §4): the shared presence tag then the range body.
@@ -265,7 +265,7 @@ func encodeValue(ty colType, v Value) []byte {
 			panic("BUG: a non-range value in a range column")
 		}
 		out := []byte{0x00} // present
-		return append(out, encodeRangeBody(*ty.RangeElem, v.Range)...)
+		return append(out, encodeRangeBody(*ty.RangeElem, v.rangeVal())...)
 	}
 	if !ty.Composite {
 		return encodeScalar(ty.Scalar, v)
@@ -277,7 +277,7 @@ func encodeValue(ty colType, v Value) []byte {
 		panic("BUG: a non-composite value in a composite column")
 	}
 	out := []byte{0x00} // present
-	return append(out, encodeCompositeBody(ty.Fields, *v.Comp)...)
+	return append(out, encodeCompositeBody(ty.Fields, *v.composite())...)
 }
 
 // encodeArrayBody is an array value's body (after the 0x00 present tag, spec/design/array.md §4):
@@ -525,7 +525,7 @@ func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
 		if !mode.constructs() {
 			return JsonNode{}, nil // skip-mode placeholder (decimal body advanced, not built)
 		}
-		return JsonNode{Kind: JNumber, Num: *dv.Dec}, nil
+		return JsonNode{Kind: JNumber, Num: *dv.decimal()}, nil
 	case ntagString:
 		s, err := decodeJsonbString(buf, pos, mode)
 		if err != nil {
@@ -651,37 +651,37 @@ func encodeScalar(ty scalarType, v Value) []byte {
 		panic("BUG: a jsonpath value reached the scalar codec")
 	case ValJson:
 		// json: the verbatim text body, length-prefixed exactly like text (spec/design/json.md §4).
-		out := make([]byte, 0, 3+len(v.Str))
+		out := make([]byte, 0, 3+len(v.str()))
 		out = append(out, 0x00) // present
-		out = appendU16(out, uint16(len(v.Str)))
-		return append(out, v.Str...)
+		out = appendU16(out, uint16(len(v.str())))
+		return append(out, v.str()...)
 	case ValJsonb:
 		// jsonb: present tag, then the self-delimiting tagged-node tree (spec/design/json.md §2).
 		out := []byte{0x00} // present
-		return encodeJsonbBody(v.Json, out)
+		return encodeJsonbBody(v.jsonb(), out)
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.
-		out := make([]byte, 0, 3+len(v.Str))
+		out := make([]byte, 0, 3+len(v.str()))
 		out = append(out, 0x00) // present
-		out = appendU16(out, uint16(len(v.Str)))
-		return append(out, v.Str...)
+		out = appendU16(out, uint16(len(v.str())))
+		return append(out, v.str()...)
 	case ValUuid:
 		// Fixed 16-byte body, NO length prefix (the first fixed-width non-integer value) —
 		// spec/fileformat/format.md. The 16 raw bytes live in Str.
 		out := make([]byte, 0, 1+16)
 		out = append(out, 0x00) // present
-		return append(out, v.Str...)
+		return append(out, v.str()...)
 	case ValBool:
 		b := byte(0x00)
-		if v.Bool {
+		if v.boolVal() {
 			b = 0x01
 		}
 		return []byte{0x00, b} // present tag + bool-byte (0x00 false, 0x01 true)
 	case ValDecimal:
 		// Decimal value codec (spec/fileformat/format.md): tag, flags (sign), u16 scale, u16
 		// ndigits, then that many big-endian base-10^4 coefficient groups (MS-first).
-		neg, scale, groups := v.Dec.ToCodec()
+		neg, scale, groups := v.decimal().ToCodec()
 		out := make([]byte, 0, 6+len(groups)*2)
 		out = append(out, 0x00) // present
 		var flags byte
@@ -700,9 +700,9 @@ func encodeScalar(ty scalarType, v Value) []byte {
 		// no sign-flip (a value codec, not an order-preserving key) — spec/fileformat/format.md.
 		out := make([]byte, 0, 1+16)
 		out = append(out, 0x00) // present
-		out = appendU32(out, uint32(v.Iv.Months))
-		out = appendU32(out, uint32(v.Iv.Days))
-		m := uint64(v.Iv.Micros)
+		out = appendU32(out, uint32(v.interval().Months))
+		out = appendU32(out, uint32(v.interval().Days))
+		m := uint64(v.interval().Micros)
 		out = append(out, byte(m>>56), byte(m>>48), byte(m>>40), byte(m>>32),
 			byte(m>>24), byte(m>>16), byte(m>>8), byte(m))
 		return out
@@ -1177,7 +1177,7 @@ func resolveForEncode(row storedRow, colTypes []colType, paging *sharedPaging) (
 	copy(out, row)
 	for i := range out {
 		if out[i].Kind == ValUnfetched {
-			v, err := resolveUnfetched(colTypes[i], out[i].Unf, fetch)
+			v, err := resolveUnfetched(colTypes[i], out[i].unfetched(), fetch)
 			if err != nil {
 				return nil, err
 			}
@@ -2056,17 +2056,17 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int
 			if !mask[i] || v.Kind != ValUnfetched {
 				continue
 			}
-			switch v.Unf.Form {
+			switch v.unfetched().Form {
 			case 0x00:
 				// Inline-deferred values live in the record — no chain page, no decompress slab
 				// (lazy-record.md §8: cost is invariant; matches the resident plan's dispInline).
 			case tagExternal:
-				pages += (int(v.Unf.StoredLen) + capacity - 1) / capacity
+				pages += (int(v.unfetched().StoredLen) + capacity - 1) / capacity
 			case tagInlineComp:
-				decompress += (int(v.Unf.RawLen) + capacity - 1) / capacity
+				decompress += (int(v.unfetched().RawLen) + capacity - 1) / capacity
 			case tagExternalComp:
-				pages += (int(v.Unf.StoredLen) + capacity - 1) / capacity
-				decompress += (int(v.Unf.RawLen) + capacity - 1) / capacity
+				pages += (int(v.unfetched().StoredLen) + capacity - 1) / capacity
+				decompress += (int(v.unfetched().RawLen) + capacity - 1) / capacity
 			}
 		}
 		return pages, decompress
@@ -2108,26 +2108,26 @@ func valuePayload(ty colType, v Value) []byte {
 	if ty.Elem != nil {
 		// An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies);
 		// a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
-		return encodeArrayBody(*ty.Elem, v.Array)
+		return encodeArrayBody(*ty.Elem, v.arrayVal())
 	}
 	if ty.RangeElem != nil {
 		// A range's payload is its body (the flags byte + present bound bodies, spec/design/ranges.md §4).
-		return encodeRangeBody(*ty.RangeElem, v.Range)
+		return encodeRangeBody(*ty.RangeElem, v.rangeVal())
 	}
 	if ty.Composite {
 		// A composite's payload is its body — the encoding minus the leading presence tag, i.e. the
 		// null bitmap + present-field bodies (spec/design/composite.md §4).
-		return encodeCompositeBody(ty.Fields, *v.Comp)
+		return encodeCompositeBody(ty.Fields, *v.composite())
 	}
 	switch {
 	case ty.Scalar.IsText(), ty.Scalar.IsBytea():
-		return []byte(v.Str)
+		return []byte(v.str())
 	// json's payload is the verbatim UTF-8 (no length prefix — the chain tracks its own length,
 	// exactly like text); jsonb's payload is the tagged-node tree body (spec/design/json.md §4/§2).
 	case ty.Scalar.IsJson():
-		return []byte(v.Str)
+		return []byte(v.str())
 	case ty.Scalar.IsJsonb():
-		return encodeJsonbBody(v.Json, nil)
+		return encodeJsonbBody(v.jsonb(), nil)
 	case ty.Scalar.IsDecimal():
 		return encodeScalar(ty.Scalar, v)[1:] // strip the leading presence tag
 	default:
@@ -3646,7 +3646,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: 0x00, Comp: span}}, nil
+			return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: span}}, nil
 		}
 		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case 0x01:
@@ -3660,7 +3660,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length}}, nil
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length}}, nil
 	case tagInlineComp:
 		rawLen, err := readU32(buf, pos)
 		if err != nil {
@@ -3676,7 +3676,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 		}
 		comp := make([]byte, len(compSlice))
 		copy(comp, compSlice)
-		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagInlineComp, RawLen: rawLen, Comp: comp}}, nil
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagInlineComp, RawLen: rawLen, Comp: comp}}, nil
 	case tagExternalComp:
 		first, err := readU32(buf, pos)
 		if err != nil {
@@ -3690,7 +3690,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: rawLen}}, nil
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: rawLen}}, nil
 	default:
 		return Value{}, newError(DataCorrupted, "invalid value presence tag")
 	}
@@ -3803,9 +3803,9 @@ func markChains(row storedRow, fetch func(uint32) ([]byte, error), reached map[u
 		if v.Kind != ValUnfetched {
 			continue
 		}
-		switch v.Unf.Form {
+		switch v.unfetched().Form {
 		case tagExternal, tagExternalComp:
-			pages, err := chainPages(v.Unf.FirstPage, int(v.Unf.StoredLen), fetch)
+			pages, err := chainPages(v.unfetched().FirstPage, int(v.unfetched().StoredLen), fetch)
 			if err != nil {
 				return err
 			}

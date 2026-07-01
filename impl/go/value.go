@@ -122,43 +122,70 @@ type Unfetched struct {
 // is a stored non-integer value; it compares by the C collation (UTF-8 byte / code-point
 // order — spec/design/types.md §11).
 type Value struct {
+	// Int holds every scalar that reduces to an i64, stored INLINE with no allocation — the hot
+	// path: integers (any int* width), a boolean (0/1 — the old Bool field folded in), timestamp /
+	// timestamptz / date microsecond/day instants, and the verbatim IEEE bits of a float
+	// (math.Float{32,64}bits, see Float{32,64}Value). Kind disambiguates which.
+	Int int64
+	// ref holds every NON-scalar payload behind a single interface word, so the whole struct is
+	// exactly 32 bytes (Int 8 + ref 16 + Kind 8) — two Values per cache line, no straddling. The
+	// six former pointer fields (Dec/Unf/Comp/Array/Range/Json) collapse here at ZERO added cost
+	// (they were already heap pointers, which sit in the interface data word directly); the former
+	// inline Iv (interval) and Str (text/bytea/uuid/json/jsonpath) box into it — a small header
+	// allocation for the string kinds, but the underlying bytes stay shared/zero-copy. The concrete
+	// dynamic type per Kind:
+	//   ValText/ValBytea/ValUuid/ValJson/ValJsonPath → string    (accessor str())
+	//   ValDecimal                                    → *Decimal  (accessor decimal())
+	//   ValInterval                                   → Interval  (accessor interval())
+	//   ValComposite                                  → *[]Value  (accessor composite())
+	//   ValArray                                      → *ArrayVal (accessor arrayVal())
+	//   ValRange                                      → *RangeVal (accessor rangeVal())
+	//   ValJsonb                                      → *JsonNode (accessor jsonb())
+	//   ValUnfetched                                  → *Unfetched (accessor unfetched())
+	// Value stays ==-comparable: an interface holding a pointer (or a comparable value like
+	// Interval/string) compares by that, exactly as the old pointer/inline fields did — but VALUE
+	// equality for decimal/interval/composite/array/range/jsonb is scale-/span-/structure-sensitive
+	// and MUST route through Eq3 / CmpValue / the DISTINCT value-canonical key, never raw `==` on
+	// ref (that compares pointers/headers). See spec/design/{decimal,interval,composite,array,
+	// ranges,json}.md. (A ValJson value's verbatim text lives in ref as a string, like text/bytea.)
+	ref any
+	// Kind tags which of the above the value is. A zero Value is ValNull. Kept a full ValueKind
+	// (its 8 bytes are free padding — narrowing to uint8 would not shrink the 32-byte struct), so no
+	// Kind call site changes.
 	Kind ValueKind
-	Int  int64
-	Bool bool
-	Str  string
-	// Dec holds an exact decimal value when Kind == ValDecimal. It is a POINTER so that Value
-	// stays comparable (the coefficient is a slice): `==` on two NON-decimal values still works
-	// (Dec is nil). Decimal VALUE-equality is scale-insensitive (1.5 == 1.50) and must go
-	// through Eq3 / CmpValue / the DISTINCT value-canonical key — never `==` on two decimal
-	// Values (that compares pointers). See spec/design/decimal.md §5.
-	Dec *Decimal
-	// Unf holds the unfetched large-value reference when Kind == ValUnfetched (a pointer for
-	// the same comparability reason as Dec — the LZ4 block is a slice).
-	Unf *Unfetched
-	// Iv holds the interval value when Kind == ValInterval. Stored inline (Interval is a small
-	// all-value struct, so Value stays ==-comparable). Field equality distinguishes '1 mon' from
-	// '30 days'; their VALUE equality (span-canonical) goes through Eq3 / the DISTINCT key, never
-	// `==` — exactly like decimal (spec/design/interval.md §2).
-	Iv Interval
-	// Comp holds the field values when Kind == ValComposite (spec/design/composite.md §2). A
-	// POINTER (*[]Value) so the flat Value struct stays ==-comparable — like Dec/Unf, never compare
-	// two composite Values with raw `==` (that compares pointers); composite equality/hashing go
-	// through Eq3 / the structural value-key path.
-	Comp *[]Value
-	// Array holds the shaped array value when Kind == ValArray (spec/design/array.md §2/§4). A
-	// POINTER (*ArrayVal) so the flat Value struct stays ==-comparable — like Comp; array
-	// equality/hashing go through Eq3 / the structural value-key path, never raw `==`.
-	Array *ArrayVal
-	// Range holds the range value when Kind == ValRange (spec/design/ranges.md §4). A POINTER
-	// (*RangeVal) so the flat Value struct stays ==-comparable — like Array; range equality/hashing
-	// go through Eq3 / the structural value-key path, never raw `==`.
-	Range *RangeVal
-	// Json holds the canonical jsonb tree when Kind == ValJsonb (spec/design/json.md §2). A POINTER
-	// (*JsonNode) so the flat Value struct stays ==-comparable — like Comp/Array; jsonb
-	// equality/hashing/comparison go through Eq3 / the value-key, never raw `==`. (A ValJson value's
-	// verbatim text lives in Str, like text/bytea.)
-	Json *JsonNode
 }
+
+// The typed accessors below are the single home for reading a non-scalar payload out of ref: each
+// asserts the concrete type its Kind promises. Callers must have already checked Kind — the
+// assertions panic on a mismatch (an engine bug, like the old ValUnfetched poison). Value-receiver
+// methods, so reading never allocates.
+
+// str returns the string body of a text/bytea/uuid/json/jsonpath value.
+func (v Value) str() string { return v.ref.(string) }
+
+// boolVal returns the boolean of a ValBool value (false/true stored as Int 0/1).
+func (v Value) boolVal() bool { return v.Int != 0 }
+
+// decimal returns the *Decimal of a ValDecimal value.
+func (v Value) decimal() *Decimal { return v.ref.(*Decimal) }
+
+// unfetched returns the *Unfetched of a ValUnfetched value (internal to the storage/scan layers).
+func (v Value) unfetched() *Unfetched { return v.ref.(*Unfetched) }
+
+// interval returns the Interval of a ValInterval value (a copy — Interval is a small value struct).
+func (v Value) interval() Interval { return v.ref.(Interval) }
+
+// composite returns the field-list pointer of a ValComposite value.
+func (v Value) composite() *[]Value { return v.ref.(*[]Value) }
+
+// arrayVal returns the *ArrayVal of a ValArray value.
+func (v Value) arrayVal() *ArrayVal { return v.ref.(*ArrayVal) }
+
+// rangeVal returns the *RangeVal of a ValRange value.
+func (v Value) rangeVal() *RangeVal { return v.ref.(*RangeVal) }
+
+// jsonb returns the *JsonNode of a ValJsonb value.
+func (v Value) jsonb() *JsonNode { return v.ref.(*JsonNode) }
 
 // RangeVal is a range value (spec/design/ranges.md §4). Either the distinguished Empty range
 // (Empty == true, both bounds nil) or a non-empty range with optional Lower/Upper bound values — a
@@ -178,7 +205,7 @@ type RangeVal struct {
 func emptyRangeVal() *RangeVal { return &RangeVal{Empty: true} }
 
 // RangeValue wraps a *RangeVal as a Value.
-func RangeValue(r *RangeVal) Value { return Value{Kind: ValRange, Range: r} }
+func RangeValue(r *RangeVal) Value { return Value{Kind: ValRange, ref: r} }
 
 // ArrayVal is a shaped array value (spec/design/array.md §4). Shape is a value property: Dims holds
 // the per-dimension element counts (row-major), Lbounds the per-dimension lower bounds (default 1,
@@ -217,21 +244,27 @@ func IntValue(n int64) Value { return Value{Kind: ValInt, Int: n} }
 // NullValue builds a NULL value.
 func NullValue() Value { return Value{Kind: ValNull} }
 
-// BoolValue builds a boolean value.
-func BoolValue(b bool) Value { return Value{Kind: ValBool, Bool: b} }
+// BoolValue builds a boolean value (false/true stored as Int 0/1).
+func BoolValue(b bool) Value {
+	var i int64
+	if b {
+		i = 1
+	}
+	return Value{Kind: ValBool, Int: i}
+}
 
 // TextValue builds a non-null text value.
-func TextValue(s string) Value { return Value{Kind: ValText, Str: s} }
+func TextValue(s string) Value { return Value{Kind: ValText, ref: s} }
 
 // DecimalValue builds a non-null decimal value.
-func DecimalValue(d Decimal) Value { return Value{Kind: ValDecimal, Dec: &d} }
+func DecimalValue(d Decimal) Value { return Value{Kind: ValDecimal, ref: &d} }
 
 // ByteaValue builds a non-null bytea value from raw bytes (stored as a byte-holding string).
-func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, Str: string(b)} }
+func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, ref: string(b)} }
 
 // UuidValue builds a non-null uuid value from its 16 raw bytes (stored as a byte-holding string,
 // like bytea, but tagged ValUuid). The caller must pass exactly 16 bytes (ParseUUID guarantees).
-func UuidValue(b []byte) Value { return Value{Kind: ValUuid, Str: string(b)} }
+func UuidValue(b []byte) Value { return Value{Kind: ValUuid, ref: string(b)} }
 
 // TimestampValue builds a non-null timestamp from its i64 microsecond instant.
 func TimestampValue(m int64) Value { return Value{Kind: ValTimestamp, Int: m} }
@@ -240,32 +273,32 @@ func TimestampValue(m int64) Value { return Value{Kind: ValTimestamp, Int: m} }
 func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m} }
 
 // IntervalValue builds a non-null interval value.
-func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} }
+func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, ref: iv} }
 
 // DateValue builds a non-null date from its i32 day count since 1970-01-01.
 func DateValue(d int32) Value { return Value{Kind: ValDate, Int: int64(d)} }
 
 // JsonValue builds a non-null json value from its verbatim UTF-8 text (spec/design/json.md §4).
-func JsonValue(s string) Value { return Value{Kind: ValJson, Str: s} }
+func JsonValue(s string) Value { return Value{Kind: ValJson, ref: s} }
 
 // JsonbValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
 // The node is held by pointer so Value stays ==-comparable; equality/ordering go through Eq3/Cmp.
-func JsonbValue(n JsonNode) Value { return Value{Kind: ValJsonb, Json: &n} }
+func JsonbValue(n JsonNode) Value { return Value{Kind: ValJsonb, ref: &n} }
 
 // JsonPathValue builds a non-null jsonpath value from its canonical normalized text
 // (spec/design/jsonpath.md, P1a). The text lives in Str, like a verbatim json value.
-func JsonPathValue(s string) Value { return Value{Kind: ValJsonPath, Str: s} }
+func JsonPathValue(s string) Value { return Value{Kind: ValJsonPath, ref: s} }
 
 // CompositeValue builds a non-null composite (row) value from its field values
 // (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
 // structural equality/ordering go through Eq3/Lt3/Gt3, never raw ==.
-func CompositeValue(fields []Value) Value { return Value{Kind: ValComposite, Comp: &fields} }
+func CompositeValue(fields []Value) Value { return Value{Kind: ValComposite, ref: &fields} }
 
 // ArrayValue builds a 1-D array value from its element list (spec/design/array.md §2).
-func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, Array: oneDimArray(elems)} }
+func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, ref: oneDimArray(elems)} }
 
 // ArrayValueOf builds an array value from an already-shaped ArrayVal (spec/design/array.md §4).
-func arrayValueOf(a *ArrayVal) Value { return Value{Kind: ValArray, Array: a} }
+func arrayValueOf(a *ArrayVal) Value { return Value{Kind: ValArray, ref: a} }
 
 // Float32Value builds a non-null f32 value from a Go f32 — the bits are stored verbatim
 // in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
@@ -410,7 +443,7 @@ func (v Value) IsNull() bool { return v.Kind == ValNull }
 func (v Value) IsNullTest(negated bool) bool {
 	switch v.Kind {
 	case ValComposite:
-		fields := *v.Comp
+		fields := *v.composite()
 		if negated {
 			// IS NOT NULL: every immediate field is a non-(SQL-)NULL value.
 			for _, f := range fields {
@@ -438,7 +471,7 @@ func (v Value) IsNullTest(negated bool) bool {
 
 // IsTrue reports whether the value is boolean TRUE: a WHERE expression keeps a row
 // only when it is TRUE; FALSE and NULL/unknown both reject (CLAUDE.md §4, Kleene).
-func (v Value) IsTrue() bool { return v.Kind == ValBool && v.Bool }
+func (v Value) IsTrue() bool { return v.Kind == ValBool && v.boolVal() }
 
 // ThreeValued is the result of a three-valued comparison (CLAUDE.md §4):
 // TRUE / FALSE / UNKNOWN. UNKNOWN arises whenever a NULL participates.
@@ -465,21 +498,21 @@ func (v Value) Render() string {
 	case ValNull:
 		return "NULL"
 	case ValBool:
-		if v.Bool {
+		if v.boolVal() {
 			return "true"
 		}
 		return "false"
 	case ValText:
-		return v.Str
+		return v.str()
 	case ValDecimal:
 		// Decimal renders as its canonical base-10 string, preserving display scale
 		// (the D tag — spec/design/decimal.md §6).
-		return v.Dec.Render()
+		return v.decimal().Render()
 	case ValBytea:
-		return "\\x" + hex.EncodeToString([]byte(v.Str))
+		return "\\x" + hex.EncodeToString([]byte(v.str()))
 	case ValUuid:
 		// Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
-		return renderUUID([]byte(v.Str))
+		return renderUUID([]byte(v.str()))
 	case ValTimestamp:
 		return renderTimestamp(v.Int)
 	case ValTimestamptz:
@@ -487,7 +520,7 @@ func (v Value) Render() string {
 	case ValDate:
 		return renderDate(int32(v.Int))
 	case ValInterval:
-		return renderInterval(v.Iv)
+		return renderInterval(v.interval())
 	case ValFloat32:
 		return renderFloat32(v.F32())
 	case ValFloat64:
@@ -496,26 +529,26 @@ func (v Value) Render() string {
 		// A composite renders as PG record_out: `(f1,f2,…)` with per-field quoting
 		// (spec/design/composite.md §8). The renderer recurses (a composite field's text is itself
 		// quoted because it contains parens/commas).
-		return recordOut(*v.Comp)
+		return recordOut(*v.composite())
 	case ValArray:
 		// An array renders as PG array_out: `{e1,e2,…}` (nested braces for a multidim value, an
 		// optional `[l:u]=` prefix when any lower bound ≠ 1), with per-element quoting and an
 		// unquoted `NULL` for a null element (spec/design/array.md §7).
-		return arrayOut(v.Array)
+		return arrayOut(v.arrayVal())
 	case ValRange:
 		// A range renders as PG range_out: `empty`, or `[lo,hi)` with bracket/inclusivity, an
 		// omitted bound for infinite, and per-bound quoting where the element text has special
 		// chars (e.g. a tsrange bound's space — spec/design/ranges.md §5).
-		return rangeOut(v.Range)
+		return rangeOut(v.rangeVal())
 	case ValJson:
 		// json renders its stored bytes verbatim (json_out — the identity, §4).
-		return v.Str
+		return v.str()
 	case ValJsonb:
 		// jsonb renders the canonical PG text (jsonb_out — §6.2).
-		return jsonbOut(v.Json)
+		return jsonbOut(v.jsonb())
 	case ValJsonPath:
 		// jsonpath renders its canonical normalized text (the stored Str).
-		return v.Str
+		return v.str()
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
@@ -545,11 +578,11 @@ func numericCmp(a, b Value) (int, bool) {
 			return 0, true
 		}
 	case a.Kind == ValDecimal && b.Kind == ValDecimal:
-		return a.Dec.CmpValue(*b.Dec), true
+		return a.decimal().CmpValue(*b.decimal()), true
 	case a.Kind == ValInt && b.Kind == ValDecimal:
-		return decimalFromInt64(a.Int).CmpValue(*b.Dec), true
+		return decimalFromInt64(a.Int).CmpValue(*b.decimal()), true
 	case a.Kind == ValDecimal && b.Kind == ValInt:
-		return a.Dec.CmpValue(decimalFromInt64(b.Int)), true
+		return a.decimal().CmpValue(decimalFromInt64(b.Int)), true
 	default:
 		return 0, false
 	}
@@ -580,16 +613,16 @@ func (v Value) Eq3(o Value) ThreeValued {
 		return bool3(floatTotalCmp(v.asF64(), o.asF64()) == 0)
 	}
 	if v.Kind == ValText && o.Kind == ValText {
-		return bool3(v.Str == o.Str)
+		return bool3(v.str() == o.str())
 	}
 	if v.Kind == ValBool || o.Kind == ValBool {
-		return bool3(v.Bool == o.Bool)
+		return bool3(v.boolVal() == o.boolVal())
 	}
 	if v.Kind == ValBytea || o.Kind == ValBytea {
-		return bool3(v.Str == o.Str)
+		return bool3(v.str() == o.str())
 	}
 	if v.Kind == ValUuid || o.Kind == ValUuid {
-		return bool3(v.Str == o.Str)
+		return bool3(v.str() == o.str())
 	}
 	// Timestamps compare by the i64 instant (infinity is just an extreme value).
 	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
@@ -604,14 +637,14 @@ func (v Value) Eq3(o Value) ThreeValued {
 	}
 	// Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
 	if v.Kind == ValInterval && o.Kind == ValInterval {
-		return bool3(v.Iv.SpanCmp(o.Iv) == 0)
+		return bool3(v.interval().SpanCmp(o.interval()) == 0)
 	}
 	// Composite `=` is element-wise 3VL (PG row comparison, spec/design/composite.md §5): FALSE if
 	// any field is FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE. So a FALSE field
 	// dominates a NULL field. Arity matches (the resolver only compares two composites of the same
 	// type). The recursion bottoms out in the field comparators.
 	if v.Kind == ValComposite && o.Kind == ValComposite {
-		a, b := *v.Comp, *o.Comp
+		a, b := *v.composite(), *o.composite()
 		anyUnknown := false
 		for i := range a {
 			switch a[i].Eq3(b[i]) {
@@ -630,20 +663,20 @@ func (v Value) Eq3(o Value) ThreeValued {
 	// length and every element pair equal-or-both-NULL → TRUE, else FALSE. NULL elements are
 	// comparable and mutually equal, so the result is ALWAYS definite (never UNKNOWN).
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return bool3(arrayEqual(v.Array, o.Array))
+		return bool3(arrayEqual(v.arrayVal(), o.arrayVal()))
 	}
 	// Range `=` is structural over the canonical form (PG range btree, NOT 3VL): two ranges are equal
 	// iff their canonical (empty + bounds + inclusivity) forms match — always definite
 	// (spec/design/ranges.md §6). rangeTotalCmp == 0 agrees with this structural equality (the stored
 	// form is canonical).
 	if v.Kind == ValRange && o.Kind == ValRange {
-		return bool3(rangeTotalCmp(v.Range, o.Range) == 0)
+		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) == 0)
 	}
 	// jsonb `=` is structural over the canonical tree — always definite (PG btree, not 3VL; no SQL
 	// NULLs inside a document, §5). Consistent with JsonNode.Cmp == 0. (json never reaches here — the
 	// resolver maps any json comparison to 42883; jsonb comparison resolves in J2.)
 	if v.Kind == ValJsonb && o.Kind == ValJsonb {
-		return bool3(jsonbValueEqual(v.Json, o.Json))
+		return bool3(jsonbValueEqual(v.jsonb(), o.jsonb()))
 	}
 	return Unknown
 }
@@ -709,16 +742,16 @@ func (v Value) Lt3(o Value) ThreeValued {
 		return bool3(floatTotalCmp(v.asF64(), o.asF64()) < 0)
 	}
 	if v.Kind == ValText && o.Kind == ValText {
-		return bool3(v.Str < o.Str)
+		return bool3(v.str() < o.str())
 	}
 	if v.Kind == ValBool || o.Kind == ValBool {
-		return bool3(!v.Bool && o.Bool)
+		return bool3(!v.boolVal() && o.boolVal())
 	}
 	if v.Kind == ValBytea || o.Kind == ValBytea {
-		return bool3(v.Str < o.Str)
+		return bool3(v.str() < o.str())
 	}
 	if v.Kind == ValUuid || o.Kind == ValUuid {
-		return bool3(v.Str < o.Str)
+		return bool3(v.str() < o.str())
 	}
 	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
 		return bool3(v.Int < o.Int)
@@ -730,30 +763,30 @@ func (v Value) Lt3(o Value) ThreeValued {
 		return bool3(v.Int < o.Int)
 	}
 	if v.Kind == ValInterval && o.Kind == ValInterval {
-		return bool3(v.Iv.SpanCmp(o.Iv) < 0)
+		return bool3(v.interval().SpanCmp(o.interval()) < 0)
 	}
 	// Composite `<` is lexicographic with PG row-comparison NULL propagation
 	// (spec/design/composite.md §5): the first field that is not equal decides via its own `<`; a
 	// field whose `=` is UNKNOWN (a NULL operand) makes the whole comparison UNKNOWN; all-equal rows
 	// are not `<`.
 	if v.Kind == ValComposite && o.Kind == ValComposite {
-		return compositeOrder3(*v.Comp, *o.Comp, false)
+		return compositeOrder3(*v.composite(), *o.composite(), false)
 	}
 	// Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL
 	// sorts after every non-NULL (NULLs mutually equal), shorter prefix first. Always definite.
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return bool3(arrayTotalCmp(v.Array, o.Array) < 0)
+		return bool3(arrayTotalCmp(v.arrayVal(), o.arrayVal()) < 0)
 	}
 	// Range `<` uses the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
 	// non-empty, then lower bound, then upper bound — accounting for infinity and inclusivity. Always
 	// definite (the btree total order), never UNKNOWN.
 	if v.Kind == ValRange && o.Kind == ValRange {
-		return bool3(rangeTotalCmp(v.Range, o.Range) < 0)
+		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) < 0)
 	}
 	// jsonb `<` uses PG's total btree order (spec/design/json.md §5): type rank, then per-kind
 	// ordering (containers by count first). Always definite, never UNKNOWN.
 	if v.Kind == ValJsonb && o.Kind == ValJsonb {
-		return bool3(v.Json.Cmp(o.Json) < 0)
+		return bool3(v.jsonb().Cmp(o.jsonb()) < 0)
 	}
 	return Unknown
 }
@@ -776,16 +809,16 @@ func (v Value) Gt3(o Value) ThreeValued {
 		return bool3(floatTotalCmp(v.asF64(), o.asF64()) > 0)
 	}
 	if v.Kind == ValText && o.Kind == ValText {
-		return bool3(v.Str > o.Str)
+		return bool3(v.str() > o.str())
 	}
 	if v.Kind == ValBool || o.Kind == ValBool {
-		return bool3(v.Bool && !o.Bool)
+		return bool3(v.boolVal() && !o.boolVal())
 	}
 	if v.Kind == ValBytea || o.Kind == ValBytea {
-		return bool3(v.Str > o.Str)
+		return bool3(v.str() > o.str())
 	}
 	if v.Kind == ValUuid || o.Kind == ValUuid {
-		return bool3(v.Str > o.Str)
+		return bool3(v.str() > o.str())
 	}
 	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
 		return bool3(v.Int > o.Int)
@@ -797,23 +830,23 @@ func (v Value) Gt3(o Value) ThreeValued {
 		return bool3(v.Int > o.Int)
 	}
 	if v.Kind == ValInterval && o.Kind == ValInterval {
-		return bool3(v.Iv.SpanCmp(o.Iv) > 0)
+		return bool3(v.interval().SpanCmp(o.interval()) > 0)
 	}
 	// Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
 	if v.Kind == ValComposite && o.Kind == ValComposite {
-		return compositeOrder3(*v.Comp, *o.Comp, true)
+		return compositeOrder3(*v.composite(), *o.composite(), true)
 	}
 	// Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return bool3(arrayTotalCmp(v.Array, o.Array) > 0)
+		return bool3(arrayTotalCmp(v.arrayVal(), o.arrayVal()) > 0)
 	}
 	// Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).
 	if v.Kind == ValRange && o.Kind == ValRange {
-		return bool3(rangeTotalCmp(v.Range, o.Range) > 0)
+		return bool3(rangeTotalCmp(v.rangeVal(), o.rangeVal()) > 0)
 	}
 	// jsonb `>` — the total-order mirror of `<` (spec/design/json.md §5).
 	if v.Kind == ValJsonb && o.Kind == ValJsonb {
-		return bool3(v.Json.Cmp(o.Json) > 0)
+		return bool3(v.jsonb().Cmp(o.jsonb()) > 0)
 	}
 	return Unknown
 }
@@ -832,12 +865,12 @@ func (v Value) NotDistinctFrom(o Value) bool {
 	// Two composites are "not distinct" iff structurally equal — NULL-safe, so a NULL field equals a
 	// NULL field (the value-level structural equality, not the 3VL Eq3).
 	if v.Kind == ValComposite && o.Kind == ValComposite {
-		return compositeValueEqual(*v.Comp, *o.Comp)
+		return compositeValueEqual(*v.composite(), *o.composite())
 	}
 	// Two arrays are "not distinct" iff structurally equal (the same btree equality as `=`; NULL
 	// elements are mutually equal — spec/design/array.md §5).
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return arrayEqual(v.Array, o.Array)
+		return arrayEqual(v.arrayVal(), o.arrayVal())
 	}
 	return v.Eq3(o) == True
 }
@@ -1123,9 +1156,9 @@ func elemTotalCmp(x, y Value) int {
 	case yn:
 		return -1
 	case x.Kind == ValComposite && y.Kind == ValComposite:
-		return compositeTotalCmp(*x.Comp, *y.Comp)
+		return compositeTotalCmp(*x.composite(), *y.composite())
 	case x.Kind == ValArray && y.Kind == ValArray:
-		return arrayTotalCmp(x.Array, y.Array)
+		return arrayTotalCmp(x.arrayVal(), y.arrayVal())
 	}
 	if x.Eq3(y) == True {
 		return 0
@@ -1553,7 +1586,7 @@ func to3(v Value) ThreeValued {
 	if v.Kind != ValBool {
 		return Unknown
 	}
-	return bool3(v.Bool)
+	return bool3(v.boolVal())
 }
 
 // boolAnd is Kleene AND: FALSE dominates (false AND unknown = false); TRUE only when

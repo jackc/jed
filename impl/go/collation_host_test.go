@@ -24,7 +24,7 @@ func texts(t *testing.T, rows [][]Value) []string {
 		if r[0].Kind != ValText {
 			t.Fatalf("expected text, got %v", r[0])
 		}
-		out[i] = r[0].Str
+		out[i] = r[0].str()
 	}
 	return out
 }

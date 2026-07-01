@@ -184,7 +184,7 @@ func scanRangeBound(s string, start int) (*string, int, bool) {
 // element types all store their orderable value in Int (integers/date/timestamps) or Dec (decimal).
 func rangeElemCmp(a, b Value) int {
 	if a.Kind == ValDecimal {
-		return a.Dec.CmpValue(*b.Dec)
+		return a.decimal().CmpValue(*b.decimal())
 	}
 	switch {
 	case a.Int < b.Int:
@@ -424,7 +424,7 @@ func pushRangeBound(out []byte, elem scalarType, v *Value, inc bool, isLower boo
 // (decimal-order-preserving, §2.5), the rest in Int via the int-be-signflip / day / instant codec.
 func encodeRangeElem(elem scalarType, v Value) []byte {
 	if v.Kind == ValDecimal {
-		return v.Dec.EncodeKey()
+		return v.decimal().EncodeKey()
 	}
 	return encodeInt(elem, v.Int)
 }

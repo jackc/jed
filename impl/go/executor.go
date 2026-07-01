@@ -4461,7 +4461,7 @@ func evalChecks(checks []namedCheck, relation string, row storedRow, env *evalEn
 		if err != nil {
 			return err
 		}
-		if v.Kind == ValBool && !v.Bool {
+		if v.Kind == ValBool && !v.boolVal() {
 			return newError(CheckViolation,
 				"new row for relation "+relation+" violates check constraint "+c.name)
 		}
@@ -5365,16 +5365,16 @@ func indexEntryKey(columns []catColumn, colls []*Collation, def indexDef, storag
 			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValBool:
 			out = append(out, 0x00)
-			out = append(out, encodeBool(v.Bool)...)
+			out = append(out, encodeBool(v.boolVal())...)
 		case ValUuid:
 			out = append(out, 0x00)
-			out = append(out, v.Str...)
+			out = append(out, v.str()...)
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValText:
 			// text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
-			b, err := collatedTextKey(colls[ci], v.Str)
+			b, err := collatedTextKey(colls[ci], v.str())
 			if err != nil {
 				return nil, err
 			}
@@ -5382,13 +5382,13 @@ func indexEntryKey(columns []catColumn, colls []*Collation, def indexDef, storag
 			out = append(out, b...)
 		case ValBytea:
 			out = append(out, 0x00)
-			out = append(out, encodeTerminated([]byte(v.Str))...)
+			out = append(out, encodeTerminated([]byte(v.str()))...)
 		case ValDecimal:
 			out = append(out, 0x00)
-			out = append(out, v.Dec.EncodeKey()...)
+			out = append(out, v.decimal().EncodeKey()...)
 		case ValInterval:
 			out = append(out, 0x00)
-			out = append(out, v.Iv.EncodeKey()...)
+			out = append(out, v.interval().EncodeKey()...)
 		case ValFloat64:
 			// float: the fixed-width float-order-preserving key (encoding.md §2.8).
 			out = append(out, 0x00)
@@ -5400,7 +5400,7 @@ func indexEntryKey(columns []catColumn, colls []*Collation, def indexDef, storag
 			// the recursive range-bounds container key (encoding.md §2.11)
 			out = append(out, 0x00)
 			elem, _ := columns[ci].Type.RangeElement()
-			out = append(out, encodeRangeKey(elem.ScalarTy(), v.Range)...)
+			out = append(out, encodeRangeKey(elem.ScalarTy(), v.rangeVal())...)
 		case ValArray:
 			// the recursive array-elements-terminated container key (encoding.md §2.14)
 			out = append(out, 0x00)
@@ -5452,7 +5452,7 @@ func gistEntries(columns []catColumn, def indexDef, storageKey []byte, row store
 		if rt, ok := col.Type.RangeElement(); ok {
 			// range_ops: the row range's value-codec bytes.
 			ops[i] = gistOpclass{scalar: false, elem: scalarColType(rt.Scalar)}
-			bound[i] = gistBound{rng: v.Range}
+			bound[i] = gistBound{rng: v.rangeVal()}
 			continue
 		}
 		// scalar `=` opclass: the value's order-preserving KEY bytes (gist.md §6). The column is a
@@ -5484,10 +5484,10 @@ func exclusionProbeQuery(columns []catColumn, exc exclusionConstraint, row store
 		}
 		switch el.Op {
 		case exclOverlaps:
-			if v.Range.Empty {
+			if v.rangeVal().Empty {
 				return nil, nil, false // empty && anything is FALSE → exempt
 			}
-			q = append(q, gistQuery{rng: v.Range})
+			q = append(q, gistQuery{rng: v.rangeVal()})
 			strats = append(strats, gistOverlaps)
 		case exclEqual:
 			k, err := encodeKeyValue(columns[ci].Type.ScalarTy(), v, nil)
@@ -5516,7 +5516,7 @@ func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b s
 		var ok bool
 		switch el.Op {
 		case exclOverlaps:
-			ok = rangeOverlaps(va.Range, vb.Range)
+			ok = rangeOverlaps(va.rangeVal(), vb.rangeVal())
 		case exclEqual:
 			ka, err := encodeKeyValue(columns[ci].Type.ScalarTy(), va, nil)
 			if err != nil {
@@ -5580,7 +5580,7 @@ func ginEntries(columns []catColumn, def indexDef, storageKey []byte, row stored
 	// == value-sort) generically over every admitted element type.
 	seen := make(map[string]bool)
 	var terms [][]byte
-	for _, el := range v.Array.Elements {
+	for _, el := range v.arrayVal().Elements {
 		if el.Kind == ValNull {
 			continue // a NULL element carries no term; a non-keyable element is impossible under the gate
 		}
@@ -5639,16 +5639,16 @@ func indexPrefixKey(columns []catColumn, colls []*Collation, def indexDef, row s
 			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValBool:
 			out = append(out, 0x00)
-			out = append(out, encodeBool(v.Bool)...)
+			out = append(out, encodeBool(v.boolVal())...)
 		case ValUuid:
 			out = append(out, 0x00)
-			out = append(out, v.Str...)
+			out = append(out, v.str()...)
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, encodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValText:
 			// text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
-			b, err := collatedTextKey(colls[ci], v.Str)
+			b, err := collatedTextKey(colls[ci], v.str())
 			if err != nil {
 				return nil, false, err
 			}
@@ -5656,13 +5656,13 @@ func indexPrefixKey(columns []catColumn, colls []*Collation, def indexDef, row s
 			out = append(out, b...)
 		case ValBytea:
 			out = append(out, 0x00)
-			out = append(out, encodeTerminated([]byte(v.Str))...)
+			out = append(out, encodeTerminated([]byte(v.str()))...)
 		case ValDecimal:
 			out = append(out, 0x00)
-			out = append(out, v.Dec.EncodeKey()...)
+			out = append(out, v.decimal().EncodeKey()...)
 		case ValInterval:
 			out = append(out, 0x00)
-			out = append(out, v.Iv.EncodeKey()...)
+			out = append(out, v.interval().EncodeKey()...)
 		case ValFloat64:
 			// float: the fixed-width float-order-preserving key (encoding.md §2.8).
 			out = append(out, 0x00)
@@ -5674,7 +5674,7 @@ func indexPrefixKey(columns []catColumn, colls []*Collation, def indexDef, row s
 			// the recursive range-bounds container key (encoding.md §2.11)
 			out = append(out, 0x00)
 			elem, _ := columns[ci].Type.RangeElement()
-			out = append(out, encodeRangeKey(elem.ScalarTy(), v.Range)...)
+			out = append(out, encodeRangeKey(elem.ScalarTy(), v.rangeVal())...)
 		case ValArray:
 			// the recursive array-elements-terminated container key (encoding.md §2.14)
 			out = append(out, 0x00)
@@ -5720,36 +5720,36 @@ func encodePkKey(table *catTable, pk []int, colls []*Collation, row storedRow) (
 		switch {
 		case table.Columns[i].Type.IsUuid():
 			// uuid: the bare 16 bytes (uuid-raw16, encoding.md §2.7).
-			key = append(key, row[i].Str...)
+			key = append(key, row[i].str()...)
 		case table.Columns[i].Type.IsBool():
 			// boolean: the bare 1-byte bool-byte (encoding.md §2.9).
-			key = append(key, encodeBool(row[i].Bool)...)
+			key = append(key, encodeBool(row[i].boolVal())...)
 		case table.Columns[i].Type.IsText():
 			// text: the C …-terminated-escape body (encoding.md §2.4), or the collation's UCA
 			// sort key for a non-C collated column (text-collated-sortkey, §2.12).
-			b, err := collatedTextKey(colls[i], row[i].Str)
+			b, err := collatedTextKey(colls[i], row[i].str())
 			if err != nil {
 				return nil, err
 			}
 			key = append(key, b...)
 		case table.Columns[i].Type.IsBytea():
 			// bytea: the variable-width bytea-terminated-escape body (encoding.md §2.6).
-			key = append(key, encodeTerminated([]byte(row[i].Str))...)
+			key = append(key, encodeTerminated([]byte(row[i].str()))...)
 		case table.Columns[i].Type.IsDecimal():
 			// decimal: the variable-width decimal-order-preserving body (encoding.md §2.5).
-			key = append(key, row[i].Dec.EncodeKey()...)
+			key = append(key, row[i].decimal().EncodeKey()...)
 		case table.Columns[i].Type.IsInterval():
 			// interval: the fixed 16-byte interval-span-i128 span key (encoding.md §2.10).
-			key = append(key, row[i].Iv.EncodeKey()...)
+			key = append(key, row[i].interval().EncodeKey()...)
 		case table.Columns[i].Type.IsRange():
 			// range: the recursive range-bounds container key (encoding.md §2.11, the first
 			// container key — empty/±∞/inclusivity framing around the element key).
 			elem, _ := table.Columns[i].Type.RangeElement()
-			key = append(key, encodeRangeKey(elem.ScalarTy(), row[i].Range)...)
+			key = append(key, encodeRangeKey(elem.ScalarTy(), row[i].rangeVal())...)
 		case table.Columns[i].Type.IsArray():
 			// array: the recursive array-elements-terminated container key (encoding.md §2.14, the
 			// second container key — element markers + terminator + shape suffix).
-			b, err := encodeArrayKey(table.Columns[i].Type.Array.ScalarTy(), row[i].Array)
+			b, err := encodeArrayKey(table.Columns[i].Type.Array.ScalarTy(), row[i].arrayVal())
 			if err != nil {
 				return nil, err
 			}
@@ -11757,7 +11757,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		if path.Kind == ValNull {
 			return nil, nil
 		}
-		compiled, err := compile(path.Str)
+		compiled, err := compile(path.str())
 		if err != nil {
 			return nil, err
 		}
@@ -12199,8 +12199,8 @@ func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedR
 		// A NULL array → zero rows (PG; the empty_on_null discipline).
 		return nil, nil
 	case ValArray:
-		out := make([]storedRow, 0, len(v.Array.Elements))
-		for _, e := range v.Array.Elements {
+		out := make([]storedRow, 0, len(v.arrayVal().Elements))
+		for _, e := range v.arrayVal().Elements {
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
@@ -12839,7 +12839,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 			return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
 		}
 		seen := make(map[string]bool)
-		for _, el := range qv.Array.Elements {
+		for _, el := range qv.arrayVal().Elements {
 			if el.Kind == ValNull {
 				hasNull = true // a NULL element carries no term
 				continue
@@ -12853,7 +12853,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 				terms = append(terms, t)
 			}
 		}
-		isEmpty = len(qv.Array.Elements) == 0
+		isEmpty = len(qv.arrayVal().Elements) == 0
 		slices.SortFunc(terms, bytes.Compare)
 	}
 
@@ -12977,7 +12977,7 @@ func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 		if qv.Kind != ValRange {
 			return nil, 0, 0, nil // a NULL (or non-range) query is never TRUE (both && and @>)
 		}
-		qr := qv.Range
+		qr := qv.rangeVal()
 		if qr.Empty {
 			switch gb.strategy {
 			case gistContains:
@@ -13328,23 +13328,23 @@ func encodeValueKey(pkType scalarType, v Value, coll *Collation) (key []byte, is
 	}
 	switch {
 	case pkType.IsBool():
-		return encodeBool(v.Bool), false, true
+		return encodeBool(v.boolVal()), false, true
 	case pkType.IsUuid():
-		return []byte(v.Str), false, true
+		return []byte(v.str()), false, true
 	case pkType.IsText():
-		return encodeTextBound(v.Str, coll)
+		return encodeTextBound(v.str(), coll)
 	case pkType.IsBytea():
-		return encodeTerminated([]byte(v.Str)), false, true
+		return encodeTerminated([]byte(v.str())), false, true
 	case pkType.IsDecimal():
 		if v.Kind != ValDecimal {
 			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
 		}
-		return v.Dec.EncodeKey(), false, true
+		return v.decimal().EncodeKey(), false, true
 	case pkType.IsInterval():
 		if v.Kind != ValInterval {
 			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
 		}
-		return v.Iv.EncodeKey(), false, true
+		return v.interval().EncodeKey(), false, true
 	case pkType.IsFloat():
 		// A float PK does NOT push down this slice (full-scan + residual filter, like the container
 		// keys) — drop the half-bound (sound widening), matching Rust encode_value_key's OutOfRange.
@@ -16077,7 +16077,7 @@ func quantifiedMembership(op binaryOp, all bool, lv, av Value, m *costMeter) (Va
 		return NullValue(), nil
 	}
 	anyNull := false
-	for _, e := range av.Array.Elements {
+	for _, e := range av.arrayVal().Elements {
 		m.Charge(costs.OperatorEval)
 		m.Charge(costs.DecimalWork * (decimalCmpWork(lv, e) - 1))
 		if err := m.Guard(); err != nil {
@@ -16172,15 +16172,15 @@ func valueToRExpr(v Value) *rExpr {
 	case ValInt:
 		return &rExpr{kind: reConstInt, cInt: v.Int}
 	case ValBool:
-		return &rExpr{kind: reConstBool, cBool: v.Bool}
+		return &rExpr{kind: reConstBool, cBool: v.boolVal()}
 	case ValText:
-		return &rExpr{kind: reConstText, cText: v.Str}
+		return &rExpr{kind: reConstText, cText: v.str()}
 	case ValDecimal:
-		return &rExpr{kind: reConstDecimal, cDec: *v.Dec}
+		return &rExpr{kind: reConstDecimal, cDec: *v.decimal()}
 	case ValBytea:
-		return &rExpr{kind: reConstBytea, cBytea: []byte(v.Str)}
+		return &rExpr{kind: reConstBytea, cBytea: []byte(v.str())}
 	case ValUuid:
-		return &rExpr{kind: reConstUuid, cBytea: []byte(v.Str)}
+		return &rExpr{kind: reConstUuid, cBytea: []byte(v.str())}
 	case ValTimestamp:
 		return &rExpr{kind: reConstTimestamp, cInt: v.Int}
 	case ValTimestamptz:
@@ -16188,27 +16188,27 @@ func valueToRExpr(v Value) *rExpr {
 	case ValDate:
 		return &rExpr{kind: reConstDate, cInt: v.Int}
 	case ValInterval:
-		return &rExpr{kind: reConstInterval, cIv: v.Iv}
+		return &rExpr{kind: reConstInterval, cIv: v.interval()}
 	case ValComposite:
 		// A folded composite value rebuilds as a ROW(...) of its per-field constant nodes
 		// (spec/design/composite.md), so the recursive structure round-trips.
-		nodes := make([]*rExpr, len(*v.Comp))
-		for i, f := range *v.Comp {
+		nodes := make([]*rExpr, len(*v.composite()))
+		for i, f := range *v.composite() {
 			nodes[i] = valueToRExpr(f)
 		}
 		return &rExpr{kind: reRow, sargs: nodes}
 	case ValArray:
 		// A folded array constant — preserve its full shape (dims/lbounds) in a const node.
-		return &rExpr{kind: reConstArray, cArray: v.Array}
+		return &rExpr{kind: reConstArray, cArray: v.arrayVal()}
 	case ValRange:
 		// A folded range constant (already canonical).
-		return &rExpr{kind: reConstRange, cRange: v.Range}
+		return &rExpr{kind: reConstRange, cRange: v.rangeVal()}
 	case ValJson:
-		return &rExpr{kind: reConstJson, cText: v.Str}
+		return &rExpr{kind: reConstJson, cText: v.str()}
 	case ValJsonPath:
-		return &rExpr{kind: reConstJsonPath, cText: v.Str}
+		return &rExpr{kind: reConstJsonPath, cText: v.str()}
 	case ValJsonb:
-		return &rExpr{kind: reConstJsonb, cJsonb: v.Json}
+		return &rExpr{kind: reConstJsonb, cJsonb: v.jsonb()}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
@@ -16232,7 +16232,7 @@ func distinctRowKey(row []Value) string {
 			b.WriteString(strconv.FormatInt(v.Int, 10))
 		case ValBool:
 			b.WriteByte('b')
-			if v.Bool {
+			if v.boolVal() {
 				b.WriteByte('1')
 			} else {
 				b.WriteByte('0')
@@ -16241,28 +16241,28 @@ func distinctRowKey(row []Value) string {
 			// Length-prefix the content so the separator byte cannot be confused with a
 			// text value that contains it (the value bytes are arbitrary UTF-8).
 			b.WriteByte('t')
-			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.Str)
+			b.WriteString(v.str())
 		case ValDecimal:
 			// Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket
 			// (spec/design/decimal.md §5).
 			b.WriteByte('d')
-			b.WriteString(v.Dec.CanonicalString())
+			b.WriteString(v.decimal().CanonicalString())
 		case ValBytea:
 			// Length-prefix the raw bytes (held in Str; a distinct 'y' tag, so a bytea never
 			// collides with a text value of the same bytes).
 			b.WriteByte('y')
-			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.Str)
+			b.WriteString(v.str())
 		case ValUuid:
 			// The 16 raw bytes (held in Str), under a distinct 'u' tag so a uuid never collides
 			// with a bytea/text of the same bytes. Fixed-width, but length-prefixed for symmetry.
 			b.WriteByte('u')
-			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.Str)
+			b.WriteString(v.str())
 		case ValTimestamp:
 			// The i64 microsecond instant (held in Int), under a distinct 's' tag. Two literals
 			// for the same instant (e.g. 12:00:00 and 12:00:00.0) share the int, so they bucket
@@ -16283,7 +16283,7 @@ func distinctRowKey(row []Value) string {
 			// span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
 			// GROUP BY bucket while each value still renders its own fields (spec/design/interval.md §2).
 			b.WriteByte('v')
-			b.WriteString(v.Iv.Span().String())
+			b.WriteString(v.interval().Span().String())
 		case ValFloat32, ValFloat64:
 			// Float DISTINCT / GROUP BY uses the §3 total order's equivalence classes: -0 → +0 and
 			// ALL NaNs collapse to one bucket (spec/design/float.md §3). Key on the CANONICAL form —
@@ -16297,15 +16297,15 @@ func distinctRowKey(row []Value) string {
 			// value-level structural equality, like decimal/interval), so two composites with the same
 			// field values share a DISTINCT/GROUP BY bucket; a nested composite recurses.
 			b.WriteByte('c')
-			b.WriteString(strconv.Itoa(len(*v.Comp)))
+			b.WriteString(strconv.Itoa(len(*v.composite())))
 			b.WriteByte(':')
-			b.WriteString(distinctRowKey(*v.Comp))
+			b.WriteString(distinctRowKey(*v.composite()))
 		case ValArray:
 			// An array keys structurally INCLUDING its shape (spec/design/array.md §5): the
 			// dims and lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers
 			// them), then each element's own key recursively. NULL elements key as 'n' (btree
 			// equality — NULLs mutually equal), so structurally-equal arrays share a bucket.
-			a := v.Array
+			a := v.arrayVal()
 			b.WriteByte('a')
 			b.WriteString(strconv.Itoa(len(a.Dims)))
 			for _, d := range a.Dims {
@@ -16324,7 +16324,7 @@ func distinctRowKey(row []Value) string {
 			// inclusivity, and the bound value's own key recursively. Because the stored form is canonical,
 			// two equal ranges produce the identical key (rangeTotalCmp == 0 ⇔ same key), so they share a
 			// DISTINCT/GROUP BY bucket. NULL ranges key as 'n' (the whole-value NULL above).
-			rv := v.Range
+			rv := v.rangeVal()
 			b.WriteByte('r')
 			if rv.Empty {
 				b.WriteByte('e')
@@ -16338,14 +16338,14 @@ func distinctRowKey(row []Value) string {
 			// consistent with the structural derive). Length-prefixed (arbitrary UTF-8 content).
 			// Never reached through SQL in J0 (json is non-comparable — 42883).
 			b.WriteByte('J')
-			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteString(strconv.Itoa(len(v.str())))
 			b.WriteByte(':')
-			b.WriteString(v.Str)
+			b.WriteString(v.str())
 		case ValJsonb:
 			// jsonb keys on its CANONICAL text under a distinct 'B' tag (the canonical form makes
 			// structural equality the value equality, §5; jsonbOut is byte-identical for equal trees,
 			// so equal jsonb values share a DISTINCT/GROUP BY bucket). Length-prefixed.
-			s := jsonbOut(v.Json)
+			s := jsonbOut(v.jsonb())
 			b.WriteByte('B')
 			b.WriteString(strconv.Itoa(len(s)))
 			b.WriteByte(':')
@@ -18371,10 +18371,10 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		if err := m.Guard(); err != nil {
 			return err
 		}
-		if v.Kind != ValComposite || v.Comp == nil || len(*v.Comp) != 2 {
+		if v.Kind != ValComposite || v.composite() == nil || len(*v.composite()) != 2 {
 			panic("BUG: object_agg operand is a 2-field Row")
 		}
-		fields := *v.Comp
+		fields := *v.composite()
 		kv, vv := fields[0], fields[1]
 		// The key coerces to text (text/integer/decimal/boolean); a NULL key → 22023, but with a
 		// DIFFERENT message from build_object's "key must not be null" (NULL handled here, before
@@ -18645,9 +18645,9 @@ func finalizePercentile(frac *Value, empty bool, compute func(p float64) (Value,
 	}
 	if frac.Kind == ValArray {
 		// Range-check every non-NULL element FIRST (before the empty-group check, PG).
-		fracs := make([]*float64, 0, len(frac.Array.Elements))
-		for i := range frac.Array.Elements {
-			el := frac.Array.Elements[i]
+		fracs := make([]*float64, 0, len(frac.arrayVal().Elements))
+		for i := range frac.arrayVal().Elements {
+			el := frac.arrayVal().Elements[i]
 			pf, err := fractionToF64(&el)
 			if err != nil {
 				return NullValue(), err
@@ -18698,7 +18698,7 @@ func expectInterval(v Value) Interval {
 	if v.Kind != ValInterval {
 		panic("percentile_cont(interval) buffered a non-interval")
 	}
-	return v.Iv
+	return v.interval()
 }
 
 // intervalLerp(lo, hi, pct) = lo + (hi - lo)·pct, PG's orderedsetaggs.c interval interpolation
@@ -18795,7 +18795,7 @@ func fractionToF64(frac *Value) (*float64, error) {
 		f := float64(frac.Int)
 		return &f, nil
 	case ValDecimal:
-		f, err := decimalToFloat64(*frac.Dec)
+		f, err := decimalToFloat64(*frac.decimal())
 		if err != nil {
 			return nil, err
 		}
@@ -18872,7 +18872,7 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 		if v.Kind != ValText {
 			panic("a collated WITHIN GROUP key buffers only text")
 		}
-		sk, err := sortKey(collation, v.Str)
+		sk, err := sortKey(collation, v.str())
 		if err != nil {
 			return err
 		}
@@ -18976,7 +18976,7 @@ func compareHypoKey(a, b Value, ks keySort) (int, error) {
 	default:
 		var base int
 		if ks.collation != nil && a.Kind == ValText && b.Kind == ValText {
-			c, err := collatedCmp(ks.collation, a.Str, b.Str)
+			c, err := collatedCmp(ks.collation, a.str(), b.str())
 			if err != nil {
 				return 0, err
 			}
@@ -19008,7 +19008,7 @@ func percentileInputF64(v Value) (float64, error) {
 	case ValFloat32, ValFloat64:
 		return v.asF64(), nil
 	case ValDecimal:
-		return decimalToFloat64(*v.Dec)
+		return decimalToFloat64(*v.decimal())
 	default:
 		panic("resolver restricts percentile_cont to a numeric operand")
 	}
@@ -22788,9 +22788,9 @@ func jsonOpSymbol(op binaryOp) string {
 func jsonArgNode(v Value) (JsonNode, error) {
 	switch v.Kind {
 	case ValJsonb:
-		return *v.Json, nil
+		return *v.jsonb(), nil
 	case ValJson:
-		return parsePreservingJSON(v.Str)
+		return parsePreservingJSON(v.str())
 	default:
 		panic("jsonArgNode: a json/jsonb function argument must be json/jsonb")
 	}
@@ -22807,19 +22807,19 @@ func valueToNode(v Value) (JsonNode, error) {
 	case ValNull: // an array element (a top-level NULL is strict-propagated)
 		return JsonNode{Kind: JNull}, nil
 	case ValBool:
-		return JsonNode{Kind: JBool, B: v.Bool}, nil
+		return JsonNode{Kind: JBool, B: v.boolVal()}, nil
 	case ValInt:
 		return JsonNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}, nil
 	case ValDecimal:
-		return JsonNode{Kind: JNumber, Num: *v.Dec}, nil
+		return JsonNode{Kind: JNumber, Num: *v.decimal()}, nil
 	case ValText:
-		return JsonNode{Kind: JString, S: v.Str}, nil
+		return JsonNode{Kind: JString, S: v.str()}, nil
 	case ValJsonb:
-		return *v.Json, nil
+		return *v.jsonb(), nil
 	case ValJson:
-		return jsonbIn(v.Str)
+		return jsonbIn(v.str())
 	case ValArray:
-		arr := v.Array
+		arr := v.arrayVal()
 		if arr.Ndim() > 1 {
 			return JsonNode{}, newError(FeatureNotSupported,
 				"to_jsonb of a multidimensional array is not supported yet")
@@ -22860,9 +22860,9 @@ func valueToNode(v Value) (JsonNode, error) {
 func elemJsonText(v Value) (string, error) {
 	switch v.Kind {
 	case ValJson:
-		return v.Str, nil
+		return v.str(), nil
 	case ValJsonb:
-		return jsonbOut(v.Json), nil
+		return jsonbOut(v.jsonb()), nil
 	default:
 		node, err := valueToNode(v)
 		if err != nil {
@@ -22881,13 +22881,13 @@ func objectKeyText(v Value, pos int) (string, error) {
 		return "", newError(InvalidParameterValue,
 			"argument "+strconv.Itoa(pos)+": key must not be null")
 	case ValText:
-		return v.Str, nil
+		return v.str(), nil
 	case ValInt:
 		return strconv.FormatInt(v.Int, 10), nil
 	case ValDecimal:
-		return v.Dec.Render(), nil
+		return v.decimal().Render(), nil
 	case ValBool:
-		if v.Bool {
+		if v.boolVal() {
 			return "true", nil
 		}
 		return "false", nil
@@ -23235,7 +23235,7 @@ func evalJsonpath(ctx, path Value) ([]JsonNode, bool, error) {
 		return nil, false, err
 	}
 	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
-	compiled, err := compile(path.Str)
+	compiled, err := compile(path.str())
 	if err != nil {
 		return nil, false, err
 	}
@@ -23320,13 +23320,13 @@ func resolveJSONObject(s *scope, name string, jsonResult bool, fc *funcCallExpr,
 // pointer) — nil if the value is not an array. Used by json_object (a NULL value → JSON null; a NULL
 // key → 22004).
 func valueToOptTextArray(v Value) []*string {
-	if v.Kind != ValArray || v.Array == nil {
+	if v.Kind != ValArray || v.arrayVal() == nil {
 		return nil
 	}
-	out := make([]*string, len(v.Array.Elements))
-	for i, e := range v.Array.Elements {
+	out := make([]*string, len(v.arrayVal().Elements))
+	for i, e := range v.arrayVal().Elements {
 		if e.Kind == ValText {
-			s := e.Str
+			s := e.str()
 			out[i] = &s
 		}
 	}
@@ -26378,7 +26378,7 @@ func valueToDecimal(v Value) Decimal {
 	if v.Kind == ValInt {
 		return decimalFromInt64(v.Int)
 	}
-	return *v.Dec
+	return *v.decimal()
 }
 
 // gcdI64 is the gcd of two int64 by the Euclidean algorithm, NON-NEGATIVE. ok is false iff the
@@ -27181,7 +27181,7 @@ func factorToFraction(v Value) (*big.Int, *big.Int, error) {
 	if v.Kind == ValInt {
 		return big.NewInt(v.Int), big.NewInt(1), nil
 	}
-	return parseFactorDecimal(v.Dec.Render())
+	return parseFactorDecimal(v.decimal().Render())
 }
 
 // temporalArithResult gives the result type of a temporal +/- (spec/design/interval.md §5).
@@ -28052,7 +28052,7 @@ func buildNestedArray(subs []Value) (Value, error) {
 	for i, sv := range subs {
 		switch sv.Kind {
 		case ValArray:
-			arrs[i] = sv.Array
+			arrs[i] = sv.arrayVal()
 		case ValNull:
 			return Value{}, arraySubscriptErr(mismatch)
 		default:
@@ -28100,26 +28100,26 @@ func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
 		if vals[0].Kind == ValNull {
 			return NullValue(), nil
 		}
-		if vals[0].Array.Ndim() == 0 {
+		if vals[0].arrayVal().Ndim() == 0 {
 			return NullValue(), nil // empty array → NULL (PG)
 		}
-		return IntValue(int64(vals[0].Array.Ndim())), nil
+		return IntValue(int64(vals[0].arrayVal().Ndim())), nil
 	case afCardinality:
 		if vals[0].Kind == ValNull {
 			return NullValue(), nil
 		}
-		return IntValue(int64(len(vals[0].Array.Elements))), nil // 0 for empty (NOT NULL)
+		return IntValue(int64(len(vals[0].arrayVal().Elements))), nil // 0 for empty (NOT NULL)
 	case afDims:
-		if vals[0].Kind == ValNull || vals[0].Array.Ndim() == 0 {
+		if vals[0].Kind == ValNull || vals[0].arrayVal().Ndim() == 0 {
 			return NullValue(), nil
 		}
-		return TextValue(arrayDimsText(vals[0].Array)), nil
+		return TextValue(arrayDimsText(vals[0].arrayVal())), nil
 	case afLength, afLower, afUpper:
 		// (anyarray, dim): propagate either NULL arg; NULL for an empty array or an out-of-range dim.
 		if vals[0].Kind == ValNull || vals[1].Kind == ValNull {
 			return NullValue(), nil
 		}
-		a := vals[0].Array
+		a := vals[0].arrayVal()
 		dim := vals[1].Int
 		if a.Ndim() == 0 || dim < 1 || dim > int64(a.Ndim()) {
 			return NullValue(), nil
@@ -28180,7 +28180,7 @@ func evalRangeFunc(fn rangeFunc, vals []Value) (Value, error) {
 	if vals[0].Kind == ValNull {
 		return NullValue(), nil
 	}
-	rv := vals[0].Range
+	rv := vals[0].rangeVal()
 	switch fn {
 	case rfLower:
 		if rv.Empty || rv.Lower == nil {
@@ -28233,7 +28233,7 @@ func evalRangeCtor(elem scalarType, vals []Value) (Value, error) {
 		case ValNull:
 			return Value{}, newError(DataException, "range constructor flags argument must not be null")
 		case ValText:
-			lowerInc, upperInc, err = parseBoundFlags(vals[2].Str)
+			lowerInc, upperInc, err = parseBoundFlags(vals[2].str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -28340,7 +28340,7 @@ func evalRangeSetOp(op rangeSetOp, l, r Value) (Value, error) {
 }
 
 // expectRange extracts the *RangeVal from a value the resolver guaranteed is a (non-NULL) range operand.
-func expectRange(v Value) *RangeVal { return v.Range }
+func expectRange(v Value) *RangeVal { return v.rangeVal() }
 
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
@@ -28360,9 +28360,9 @@ func arrayContainsValue(a, b Value) (Value, error) {
 	if a.Kind == ValNull || b.Kind == ValNull {
 		return NullValue(), nil
 	}
-	for _, eb := range b.Array.Elements {
+	for _, eb := range b.arrayVal().Elements {
 		found := false
-		for _, ea := range a.Array.Elements {
+		for _, ea := range a.arrayVal().Elements {
 			if strictElemEq(ea, eb) {
 				found = true
 				break
@@ -28382,8 +28382,8 @@ func arrayOverlapsValue(a, b Value) (Value, error) {
 	if a.Kind == ValNull || b.Kind == ValNull {
 		return NullValue(), nil
 	}
-	for _, ea := range a.Array.Elements {
-		for _, eb := range b.Array.Elements {
+	for _, ea := range a.arrayVal().Elements {
+		for _, eb := range b.arrayVal().Elements {
 			if strictElemEq(ea, eb) {
 				return BoolValue(true), nil
 			}
@@ -28399,7 +28399,7 @@ func arrayRemoveValue(arr, elem Value) (Value, error) {
 	if arr.Kind == ValNull {
 		return NullValue(), nil
 	}
-	a := arr.Array
+	a := arr.arrayVal()
 	if a.Ndim() > 1 {
 		return Value{}, newError(FeatureNotSupported, "removing elements from multidimensional arrays is not supported")
 	}
@@ -28426,7 +28426,7 @@ func arrayReplaceValue(arr, from, to Value) (Value, error) {
 	if arr.Kind == ValNull {
 		return NullValue(), nil
 	}
-	a := arr.Array
+	a := arr.arrayVal()
 	elements := make([]Value, len(a.Elements))
 	for i, e := range a.Elements {
 		if notDistinct(e, from) {
@@ -28446,7 +28446,7 @@ func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
 	if arr.Kind == ValNull {
 		return NullValue(), nil
 	}
-	a := arr.Array
+	a := arr.arrayVal()
 	if a.Ndim() > 1 {
 		return Value{}, newError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
 	}
@@ -28478,7 +28478,7 @@ func arrayPositionsValue(arr, elem Value) (Value, error) {
 	if arr.Kind == ValNull {
 		return NullValue(), nil
 	}
-	a := arr.Array
+	a := arr.arrayVal()
 	if a.Ndim() > 1 {
 		return Value{}, newError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
 	}
@@ -28509,10 +28509,10 @@ func arrayDimsText(a *ArrayVal) string {
 // side is non-strict: a NULL or empty array yields the 1-D singleton {elem} (lower bound 1). A 1-D
 // array grows by one element, preserving its lower bound; a multidimensional array is 22000.
 func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
-	if arr.Kind == ValNull || arr.Array.Ndim() == 0 {
+	if arr.Kind == ValNull || arr.arrayVal().Ndim() == 0 {
 		return arrayValueOf(oneDimArray([]Value{elem})), nil
 	}
-	a := arr.Array
+	a := arr.arrayVal()
 	if a.Ndim() != 1 {
 		return Value{}, newError(DataException, "argument must be empty or one-dimensional array")
 	}
@@ -28542,7 +28542,7 @@ func arrayCatValues(a, b Value) (Value, error) {
 	if b.Kind == ValNull {
 		return a, nil
 	}
-	av, bv := a.Array, b.Array
+	av, bv := a.arrayVal(), b.arrayVal()
 	if av.Ndim() == 0 {
 		return b, nil
 	}
@@ -28620,7 +28620,7 @@ func evalSubscript(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Value, 
 	if base.Kind != ValArray {
 		panic(fmt.Sprintf("subscript on a non-array value: %v", base.Kind))
 	}
-	a := base.Array
+	a := base.arrayVal()
 	if e.isSlice {
 		// Per-dimension (lower, upper); a scalar index i becomes 1:i (PG), an omitted bound defers
 		// to the array's own bound. A NULL bound → NULL. A nil lo/hi means "defer to the array bound".
@@ -29117,7 +29117,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		switch base.Kind {
 		case ValComposite:
-			return (*base.Comp)[e.index], nil
+			return (*base.composite())[e.index], nil
 		case ValNull:
 			return NullValue(), nil
 		default:
@@ -29180,7 +29180,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// A varchar(n) cast target silently truncates the resulting text to n code points (the
 		// explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
 		if e.varchar != nil && out.Kind == ValText {
-			return TextValue(truncateToChars(out.Str, int(*e.varchar))), nil
+			return TextValue(truncateToChars(out.str(), int(*e.varchar))), nil
 		}
 		return out, nil
 	case reArrayCast:
@@ -29197,19 +29197,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		if e.castElem == nil {
 			// array → text: render via array_out (PG-byte-exact §7).
-			return TextValue(arrayOut(v.Array)), nil
+			return TextValue(arrayOut(v.arrayVal())), nil
 		}
 		if v.Kind == ValText {
 			// runtime text → T[]: coerce the per-row string via array_in against the target element
 			// ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
-			return coerceStringToArray(v.Str, *e.castElem)
+			return coerceStringToArray(v.str(), *e.castElem)
 		}
 		// element-wise array → other-element-array: every non-null element through the scalar element
 		// cast to the target element (22003 per element on overflow); the shape (dims/lbounds) is
 		// preserved and a NULL element stays NULL. The target element is always a scalar (a same-
 		// element array is the identity, returned with no reArrayCast node at resolve).
 		scalar := e.castElem.Scalar
-		src := v.Array
+		src := v.arrayVal()
 		newElems := make([]Value, len(src.Elements))
 		for i, el := range src.Elements {
 			if el.Kind == ValNull {
@@ -29236,7 +29236,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		if e.result.IsInterval() {
-			r, err := v.Iv.Neg()
+			r, err := v.interval().Neg()
 			if err != nil {
 				return Value{}, err
 			}
@@ -29250,7 +29250,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if v.Kind == ValInt {
 				return DecimalValue(decimalFromInt64(v.Int).Negate()), nil
 			}
-			return DecimalValue(v.Dec.Negate()), nil
+			return DecimalValue(v.decimal().Negate()), nil
 		}
 		if v.Int == math.MinInt64 { // negating i64's minimum overflows i64
 			return Value{}, overflowErr(e.result)
@@ -29309,7 +29309,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					fnum, fden = fden, fnum
 				}
 			}
-			r, rerr := mulByFraction(iv.Iv, fnum, fden)
+			r, rerr := mulByFraction(iv.interval(), fnum, fden)
 			if rerr != nil {
 				return Value{}, rerr
 			}
@@ -29321,9 +29321,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if a.Kind == ValInterval && b.Kind == ValInterval {
 				var r Interval
 				if e.op == opAdd {
-					r, err = a.Iv.Add(b.Iv)
+					r, err = a.interval().Add(b.interval())
 				} else {
-					r, err = a.Iv.Sub(b.Iv)
+					r, err = a.interval().Sub(b.interval())
 				}
 				if err != nil {
 					return Value{}, err
@@ -29343,9 +29343,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			var instant int64
 			var iv Interval
 			if a.Kind == ValInterval {
-				instant, iv = b.Int, a.Iv
+				instant, iv = b.Int, a.interval()
 			} else {
-				instant, iv = a.Int, b.Iv
+				instant, iv = a.Int, b.interval()
 			}
 			r, terr := tsShift(instant, iv, e.op == opSub)
 			if terr != nil {
@@ -29398,11 +29398,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// result Unknown (no sort key).
 		if e.collation != nil && (e.op == opLt || e.op == opGt || e.op == opLe || e.op == opGe) {
 			if a.Kind == ValText && b.Kind == ValText {
-				m.Charge(costs.Collate * int64(utf8.RuneCountInString(a.Str)+utf8.RuneCountInString(b.Str)))
+				m.Charge(costs.Collate * int64(utf8.RuneCountInString(a.str())+utf8.RuneCountInString(b.str())))
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
-				c, err := collatedCmp(e.collation, a.Str, b.Str)
+				c, err := collatedCmp(e.collation, a.str(), b.str())
 				if err != nil {
 					return Value{}, err
 				}
@@ -29462,19 +29462,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if bv.Kind == ValNull || av.Kind == ValNull {
 			return NullValue(), nil
 		}
-		node := bv.Json // resolver guarantees a jsonb base for an accessor operator
+		node := bv.jsonb() // resolver guarantees a jsonb base for an accessor operator
 		// Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
 		// `#> #>>`. A NULL element inside the path array misses (PG).
 		var accessed *JsonNode
 		switch e.jgop {
 		case jgArrow, jgArrowText:
 			if av.Kind == ValText {
-				accessed = jsonGetField(node, av.Str)
+				accessed = jsonGetField(node, av.str())
 			} else { // ValInt — resolver guarantees a text/int arg for -> / ->>
 				accessed = jsonGetIndex(node, av.Int)
 			}
 		default: // jgHashArrow, jgHashArrowText — a text[] path
-			arr := av.Array
+			arr := av.arrayVal()
 			steps := make([]string, 0, len(arr.Elements))
 			nullStep := false
 			for _, el := range arr.Elements {
@@ -29482,7 +29482,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					nullStep = true
 					break
 				}
-				steps = append(steps, el.Str) // a text[] path has text/NULL elements
+				steps = append(steps, el.str()) // a text[] path has text/NULL elements
 			}
 			if nullStep {
 				accessed = nil
@@ -29523,7 +29523,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		// resolver guarantees jsonb operands for @> / <@.
-		return BoolValue(jsonContains(av.Json, bv.Json)), nil
+		return BoolValue(jsonContains(av.jsonb(), bv.jsonb())), nil
 	case reJsonHasKey:
 		// `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (json-sql-functions.md §1, J5).
 		// One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
@@ -29542,22 +29542,22 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if bv.Kind == ValNull || av.Kind == ValNull {
 			return NullValue(), nil
 		}
-		node := bv.Json // resolver guarantees a jsonb base for ? / ?| / ?&
+		node := bv.jsonb() // resolver guarantees a jsonb base for ? / ?| / ?&
 		var result bool
 		switch e.hasKey {
 		case hkOne:
-			result = jsonHasKey(node, av.Str) // resolver guarantees a text arg for ?
+			result = jsonHasKey(node, av.str()) // resolver guarantees a text arg for ?
 		default: // hkAny / hkAll — a text[] arg
 			// A NULL element never matches (PG): `?&` over an array with a NULL is false; `?|`
 			// simply skips it.
-			keys := make([]string, 0, len(av.Array.Elements))
+			keys := make([]string, 0, len(av.arrayVal().Elements))
 			hasNull := false
-			for _, el := range av.Array.Elements {
+			for _, el := range av.arrayVal().Elements {
 				if el.Kind == ValNull {
 					hasNull = true
 					continue
 				}
-				keys = append(keys, el.Str) // a text[] arg has text/NULL elements
+				keys = append(keys, el.str()) // a text[] arg has text/NULL elements
 			}
 			if e.hasKey == hkAny {
 				for _, k := range keys {
@@ -29596,7 +29596,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		// resolver guarantees jsonb operands for ||.
-		return JsonbValue(jsonConcat(av.Json, bv.Json)), nil
+		return JsonbValue(jsonConcat(av.jsonb(), bv.jsonb())), nil
 	case reJsonDelete:
 		// `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
 		// J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
@@ -29615,25 +29615,25 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if bv.Kind == ValNull || av.Kind == ValNull {
 			return NullValue(), nil
 		}
-		node := bv.Json // resolver guarantees a jsonb base for - / #-
+		node := bv.jsonb() // resolver guarantees a jsonb base for - / #-
 		// Extract a text[] argument's keys (a NULL element propagates to a NULL result, PG).
 		textArray := func(v Value) ([]string, bool) {
 			if v.Kind != ValArray {
 				return nil, false
 			}
-			keys := make([]string, 0, len(v.Array.Elements))
-			for _, el := range v.Array.Elements {
+			keys := make([]string, 0, len(v.arrayVal().Elements))
+			for _, el := range v.arrayVal().Elements {
 				if el.Kind != ValText {
 					return nil, false // a NULL element → NULL result
 				}
-				keys = append(keys, el.Str)
+				keys = append(keys, el.str())
 			}
 			return keys, true
 		}
 		var result JsonNode
 		switch e.delKind {
 		case dkKey:
-			result, err = jsonDeleteKey(node, av.Str) // resolver guarantees a text arg for - key
+			result, err = jsonDeleteKey(node, av.str()) // resolver guarantees a text arg for - key
 		case dkIndex:
 			result, err = jsonDeleteIndex(node, av.Int) // resolver guarantees an int arg for - index
 		case dkKeys:
@@ -29696,10 +29696,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil // a NULL operand → NULL (never raises)
 		case ValJsonb:
 			// jsonb is always well-formed with unique keys; only the kind can fail.
-			ok = jsonPredKindMatches(v.Json, e.jpKind)
+			ok = jsonPredKindMatches(v.jsonb(), e.jpKind)
 		case ValJson, ValText:
 			// A string / json operand: parse (preserving duplicate keys); malformed → false.
-			node, perr := parsePreservingJSON(v.Str)
+			node, perr := parsePreservingJSON(v.str())
 			if perr != nil {
 				ok = false
 			} else {
@@ -29721,7 +29721,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case ValText:
 			// Validate the string is well-formed JSON (22P02 on malformed), preserving duplicate keys
 			// so the optional UNIQUE KEYS check (22030) can see them.
-			node, perr := parsePreservingJSON(v.Str)
+			node, perr := parsePreservingJSON(v.str())
 			if perr != nil {
 				return Value{}, perr
 			}
@@ -29729,7 +29729,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
 			}
 			// The result is the verbatim input text as a `json` value (PG).
-			return JsonValue(v.Str), nil
+			return JsonValue(v.str()), nil
 		default:
 			panic("BUG: resolver restricts JSON() to a text operand")
 		}
@@ -29748,7 +29748,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if subject.Kind == ValNull || pattern.Kind == ValNull {
 			return NullValue(), nil
 		}
-		sub, pat := subject.Str, pattern.Str
+		sub, pat := subject.str(), pattern.str()
 		// ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16)
 		// before matching — 1:1 folding so _/length semantics survive.
 		if e.insensitive {
@@ -29777,7 +29777,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if subject.Kind == ValNull || pattern.Kind == ValNull {
 			return NullValue(), nil
 		}
-		sub := subject.Str
+		sub := subject.str()
 		var prop *propertyTable
 		if e.insensitive {
 			// ~* (insensitive): simple-lowercase the subject under the engine casing regime
@@ -29804,7 +29804,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 		} else {
 			// Non-constant pattern: compile now (charging regex_compile) and run.
-			pat := pattern.Str
+			pat := pattern.str()
 			if e.insensitive {
 				pat = foldLowerSimple(pat, prop)
 			}
@@ -29837,26 +29837,26 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			vals[i] = v
 		}
-		source, pattern := vals[0].Str, vals[1].Str
+		source, pattern := vals[0].str(), vals[1].str()
 		// Per-function argument layout (regex.md §8 / §8b); the numeric defaults match PG.
 		var replacement, flags string
 		start, nth, endoption, subexpr := int64(1), int64(1), int64(0), int64(0)
 		switch e.rxFunc {
 		case rxReplace:
-			replacement = vals[2].Str
+			replacement = vals[2].str()
 			if len(vals) > 3 {
-				flags = vals[3].Str
+				flags = vals[3].str()
 			}
 		case rxMatch, rxLike:
 			if len(vals) > 2 {
-				flags = vals[2].Str
+				flags = vals[2].str()
 			}
 		case rxCount:
 			if len(vals) > 2 {
 				start = vals[2].Int
 			}
 			if len(vals) > 3 {
-				flags = vals[3].Str
+				flags = vals[3].str()
 			}
 		case rxSubstr:
 			if len(vals) > 2 {
@@ -29866,7 +29866,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				nth = vals[3].Int
 			}
 			if len(vals) > 4 {
-				flags = vals[4].Str
+				flags = vals[4].str()
 			}
 			if len(vals) > 5 {
 				subexpr = vals[5].Int
@@ -29882,7 +29882,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				endoption = vals[4].Int
 			}
 			if len(vals) > 5 {
-				flags = vals[5].Str
+				flags = vals[5].str()
 			}
 			if len(vals) > 6 {
 				subexpr = vals[6].Int
@@ -30052,7 +30052,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
-		return TextValue(foldCase(v.Str, e.casingUpper, loadedProperty())), nil
+		return TextValue(foldCase(v.str(), e.casingUpper, loadedProperty())), nil
 	case reAtTimeZone:
 		m.Charge(costs.OperatorEval)
 		zv, err := e.lhs.eval(row, env, m)
@@ -30078,10 +30078,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return TimestampValue(micros), nil
 		}
-		zr, ok := ResolveZone(zv.Str)
+		zr, ok := ResolveZone(zv.str())
 		if !ok {
 			return Value{}, newError(InvalidParameterValue,
-				fmt.Sprintf("time zone %q not recognized", zv.Str))
+				fmt.Sprintf("time zone %q not recognized", zv.str()))
 		}
 		if e.atTzToTimestamptz {
 			return TimestamptzValue(localToInstantMicros(zr, micros)), nil
@@ -30108,7 +30108,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if uv.Kind == ValNull || vv.Kind == ValNull || (zv != nil && zv.Kind == ValNull) {
 			return NullValue(), nil
 		}
-		unitS := uv.Str
+		unitS := uv.str()
 		switch vv.Kind {
 		case ValTimestamp:
 			r, err := dateTruncMicros(unitS, vv.Int)
@@ -30117,7 +30117,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return TimestampValue(r), nil
 		case ValInterval:
-			r, err := dateTruncInterval(unitS, vv.Iv)
+			r, err := dateTruncInterval(unitS, vv.interval())
 			if err != nil {
 				return Value{}, err
 			}
@@ -30132,10 +30132,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			var zr ZoneRef
 			if zv != nil {
-				z, ok := ResolveZone(zv.Str)
+				z, ok := ResolveZone(zv.str())
 				if !ok {
 					return Value{}, newError(InvalidParameterValue,
-						fmt.Sprintf("time zone %q not recognized", zv.Str))
+						fmt.Sprintf("time zone %q not recognized", zv.str()))
 				}
 				zr = z
 			} else {
@@ -30170,7 +30170,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case ValDate:
 			src = extractSrc{kind: srcDate, days: int32(vv.Int)}
 		case ValInterval:
-			src = extractSrc{kind: srcIv, iv: vv.Iv}
+			src = extractSrc{kind: srcIv, iv: vv.interval()}
 		case ValTimestamptz:
 			mc := vv.Int
 			// `epoch` is zone-independent (the instant); every other field decomposes in the session
@@ -30217,7 +30217,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			if cv.Kind == ValBool && cv.Bool {
+			if cv.Kind == ValBool && cv.boolVal() {
 				rv, err := arm.result.eval(row, env, m)
 				if err != nil {
 					return Value{}, err
@@ -30244,7 +30244,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if v.Kind == ValNull {
 				return TextValue("NULL"), nil
 			}
-			return TextValue(quoteLiteralText(v.Str)), nil
+			return TextValue(quoteLiteralText(v.str())), nil
 		}
 		vals := make([]Value, 0, len(e.sargs))
 		for _, a := range e.sargs {
@@ -30274,13 +30274,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				return IntValue(n), nil
 			}
-			return DecimalValue(vals[0].Dec.Abs()), nil
+			return DecimalValue(vals[0].decimal().Abs()), nil
 		case sfRound:
 			var d Decimal
 			if vals[0].Kind == ValInt {
 				d = decimalFromInt64(vals[0].Int)
 			} else {
-				d = *vals[0].Dec
+				d = *vals[0].decimal()
 			}
 			places := int64(0)
 			if len(vals) > 1 {
@@ -30325,10 +30325,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			var zr ZoneRef
 			if len(vals) == 7 {
-				z, ok := ResolveZone(vals[6].Str)
+				z, ok := ResolveZone(vals[6].str())
 				if !ok {
 					return Value{}, newError(InvalidParameterValue,
-						fmt.Sprintf("time zone %q not recognized", vals[6].Str))
+						fmt.Sprintf("time zone %q not recognized", vals[6].str()))
 				}
 				zr = z
 			} else {
@@ -30339,12 +30339,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a
 			// non-RFC variant (and, for the timestamp, any version other than 1/7). The
 			// NULL-input case is already handled above.
-			if v, ok := uuidExtractVersion([]byte(vals[0].Str)); ok {
+			if v, ok := uuidExtractVersion([]byte(vals[0].str())); ok {
 				return IntValue(v), nil
 			}
 			return NullValue(), nil
 		case sfUuidExtractTimestamp:
-			if mc, ok := uuidExtractTimestampMicros([]byte(vals[0].Str)); ok {
+			if mc, ok := uuidExtractTimestampMicros([]byte(vals[0].str())); ok {
 				return TimestamptzValue(mc), nil
 			}
 			return NullValue(), nil
@@ -30362,7 +30362,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if len(vals) == 1 {
 				// The optional interval arg shifts the embedded instant via the existing
 				// calendar-aware timestamptz arithmetic (entropy.md §4).
-				s, err := tsShift(clock, vals[0].Iv, false)
+				s, err := tsShift(clock, vals[0].interval(), false)
 				if err != nil {
 					return Value{}, err
 				}
@@ -30386,13 +30386,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// per-statement pending state; currval is a pure session-state read. The NULL-arg case
 			// is handled by the blanket propagation above.
 			m.Charge(costs.SequenceAdvance)
-			n, err := env.exec.seqNextval(vals[0].Str)
+			n, err := env.exec.seqNextval(vals[0].str())
 			if err != nil {
 				return Value{}, err
 			}
 			return IntValue(n), nil
 		case sfCurrval:
-			n, err := env.exec.seqCurrval(vals[0].Str)
+			n, err := env.exec.seqCurrval(vals[0].str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -30403,9 +30403,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			m.Charge(costs.SequenceAdvance)
 			isCalled := true
 			if len(vals) > 2 {
-				isCalled = vals[2].Bool
+				isCalled = vals[2].boolVal()
 			}
-			n, err := env.exec.seqSetval(vals[0].Str, vals[1].Int, isCalled)
+			n, err := env.exec.seqSetval(vals[0].str(), vals[1].Int, isCalled)
 			if err != nil {
 				return Value{}, err
 			}
@@ -30421,8 +30421,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// session's variable map. The blanket NULL propagation above already returned NULL for a
 			// NULL name / missing_ok argument, so both are non-NULL here. An unset name is 42704 UNLESS
 			// the two-arg overload's missing_ok is true (→ NULL).
-			name := vals[0].Str
-			missingOK := len(vals) > 1 && vals[1].Bool
+			name := vals[0].str()
+			missingOK := len(vals) > 1 && vals[1].boolVal()
 			if v, ok := env.exec.session.vars[strings.ToLower(name)]; ok {
 				return TextValue(v), nil
 			}
@@ -30499,11 +30499,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			case ValInt:
 				node = JsonNode{Kind: JNumber, Num: decimalFromInt64(vals[0].Int)}
 			case ValDecimal:
-				node = JsonNode{Kind: JNumber, Num: *vals[0].Dec}
+				node = JsonNode{Kind: JNumber, Num: *vals[0].decimal()}
 			case ValBool:
-				node = JsonNode{Kind: JBool, B: vals[0].Bool}
+				node = JsonNode{Kind: JBool, B: vals[0].boolVal()}
 			case ValText:
-				node = JsonNode{Kind: JString, S: vals[0].Str}
+				node = JsonNode{Kind: JString, S: vals[0].str()}
 			default:
 				return Value{}, newError(FeatureNotSupported, "JSON_SCALAR of this type is not supported yet")
 			}
@@ -30514,23 +30514,23 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// case is handled by the blanket propagation above.
 			switch vals[0].Kind {
 			case ValJson:
-				return TextValue(vals[0].Str), nil
+				return TextValue(vals[0].str()), nil
 			case ValJsonb:
-				return TextValue(jsonbOut(vals[0].Json)), nil
+				return TextValue(jsonbOut(vals[0].jsonb())), nil
 			default:
 				panic("BUG: resolver restricts JSON_SERIALIZE to json/jsonb")
 			}
 		case sfLength:
 			// length(text) → i32 — the number of characters (Unicode code points). Go strings are
 			// UTF-8, so utf8.RuneCountInString counts code points (string-functions.md §3).
-			return IntValue(int64(utf8.RuneCountInString(vals[0].Str))), nil
+			return IntValue(int64(utf8.RuneCountInString(vals[0].str()))), nil
 		case sfOctetLength:
 			// octet_length(text) → i32 — the UTF-8 byte count (len of the Go string's bytes),
 			// distinct from length's code-point count (string-functions.md §3).
-			return IntValue(int64(len(vals[0].Str))), nil
+			return IntValue(int64(len(vals[0].str()))), nil
 		case sfBitLength:
 			// bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
-			return IntValue(int64(len(vals[0].Str)) * 8), nil
+			return IntValue(int64(len(vals[0].str())) * 8), nil
 		case sfSubstr:
 			// substr(text, start[, count]) → text — the function form of SUBSTRING.
 			var count *int64
@@ -30538,24 +30538,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				c := vals[2].Int
 				count = &c
 			}
-			r, err := substrChars(vals[0].Str, vals[1].Int, count)
+			r, err := substrChars(vals[0].str(), vals[1].Int, count)
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(r), nil
 		case sfLeft:
 			// left(text, n) → text — the first n characters (negative n drops the last |n|).
-			return TextValue(leftChars(vals[0].Str, vals[1].Int)), nil
+			return TextValue(leftChars(vals[0].str(), vals[1].Int)), nil
 		case sfRight:
 			// right(text, n) → text — the last n characters (negative n drops the first |n|).
-			return TextValue(rightChars(vals[0].Str, vals[1].Int)), nil
+			return TextValue(rightChars(vals[0].str(), vals[1].Int)), nil
 		case sfLpad:
 			// lpad(text, length[, fill]) → text — pad/truncate on the LEFT (default fill a space).
 			fill := " "
 			if len(vals) > 2 {
-				fill = vals[2].Str
+				fill = vals[2].str()
 			}
-			r, err := padChars(vals[0].Str, vals[1].Int, fill, true)
+			r, err := padChars(vals[0].str(), vals[1].Int, fill, true)
 			if err != nil {
 				return Value{}, err
 			}
@@ -30564,9 +30564,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// rpad(text, length[, fill]) → text — pad/truncate on the RIGHT (default fill a space).
 			fill := " "
 			if len(vals) > 2 {
-				fill = vals[2].Str
+				fill = vals[2].str()
 			}
-			r, err := padChars(vals[0].Str, vals[1].Int, fill, false)
+			r, err := padChars(vals[0].str(), vals[1].Int, fill, false)
 			if err != nil {
 				return Value{}, err
 			}
@@ -30575,44 +30575,44 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
 			set := " "
 			if len(vals) > 1 {
-				set = vals[1].Str
+				set = vals[1].str()
 			}
-			return TextValue(trimChars(vals[0].Str, set, true, true)), nil
+			return TextValue(trimChars(vals[0].str(), set, true, true)), nil
 		case sfLtrim:
 			// ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
 			set := " "
 			if len(vals) > 1 {
-				set = vals[1].Str
+				set = vals[1].str()
 			}
-			return TextValue(trimChars(vals[0].Str, set, true, false)), nil
+			return TextValue(trimChars(vals[0].str(), set, true, false)), nil
 		case sfRtrim:
 			// rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
 			set := " "
 			if len(vals) > 1 {
-				set = vals[1].Str
+				set = vals[1].str()
 			}
-			return TextValue(trimChars(vals[0].Str, set, false, true)), nil
+			return TextValue(trimChars(vals[0].str(), set, false, true)), nil
 		case sfReplace:
 			// replace(text, from, to) → text — substring replace-all; empty `from` is a no-op
 			// (strings.ReplaceAll would otherwise splice `to` between every character — §3).
-			from := vals[1].Str
+			from := vals[1].str()
 			if from == "" {
-				return TextValue(vals[0].Str), nil
+				return TextValue(vals[0].str()), nil
 			}
-			return TextValue(strings.ReplaceAll(vals[0].Str, from, vals[2].Str)), nil
+			return TextValue(strings.ReplaceAll(vals[0].str(), from, vals[2].str())), nil
 		case sfTranslate:
 			// translate(text, from, to) → text — per-character map/delete.
-			return TextValue(translateChars(vals[0].Str, vals[1].Str, vals[2].Str)), nil
+			return TextValue(translateChars(vals[0].str(), vals[1].str(), vals[2].str())), nil
 		case sfRepeat:
 			// repeat(text, n) → text — concatenate the string n times.
-			r, err := repeatText(vals[0].Str, vals[1].Int)
+			r, err := repeatText(vals[0].str(), vals[1].Int)
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(r), nil
 		case sfReverse:
 			// reverse(text) → text — the code points in reverse order.
-			runes := []rune(vals[0].Str)
+			runes := []rune(vals[0].str())
 			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
 				runes[i], runes[j] = runes[j], runes[i]
 			}
@@ -30620,24 +30620,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfStrpos:
 			// strpos(text, substring) → i32 — 1-based code-point position, else 0. strings.Index
 			// gives a BYTE offset; convert by counting code points in the prefix (empty sub → 1).
-			idx := strings.Index(vals[0].Str, vals[1].Str)
+			idx := strings.Index(vals[0].str(), vals[1].str())
 			if idx < 0 {
 				return IntValue(0), nil
 			}
-			return IntValue(int64(utf8.RuneCountInString(vals[0].Str[:idx])) + 1), nil
+			return IntValue(int64(utf8.RuneCountInString(vals[0].str()[:idx])) + 1), nil
 		case sfSplitPart:
 			// split_part(text, delimiter, n) → text — the n-th split field.
-			r, err := splitPart(vals[0].Str, vals[1].Str, vals[2].Int)
+			r, err := splitPart(vals[0].str(), vals[1].str(), vals[2].Int)
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(r), nil
 		case sfStartsWith:
 			// starts_with(text, prefix) → boolean — string begins with prefix.
-			return BoolValue(strings.HasPrefix(vals[0].Str, vals[1].Str)), nil
+			return BoolValue(strings.HasPrefix(vals[0].str(), vals[1].str())), nil
 		case sfAscii:
 			// ascii(text) → i32 — the code point of the first character (empty → 0).
-			for _, r := range vals[0].Str {
+			for _, r := range vals[0].str() {
 				return IntValue(int64(r)), nil // first rune
 			}
 			return IntValue(0), nil
@@ -30650,30 +30650,30 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(r), nil
 		case sfInitcap:
 			// initcap(text) → text — titlecase each word.
-			return TextValue(initcapASCII(vals[0].Str)), nil
+			return TextValue(initcapASCII(vals[0].str())), nil
 		case sfToHex:
 			// to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern.
 			return TextValue(strconv.FormatUint(uint64(vals[0].Int), 16)), nil
 		case sfEncode:
 			// encode(bytea, format) → text — hex / base64 / escape. bytea is held as raw bytes in Str.
-			r, err := encodeBytea([]byte(vals[0].Str), vals[1].Str)
+			r, err := encodeBytea([]byte(vals[0].str()), vals[1].str())
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(r), nil
 		case sfDecode:
 			// decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
-			r, err := decodeText(vals[0].Str, vals[1].Str)
+			r, err := decodeText(vals[0].str(), vals[1].str())
 			if err != nil {
 				return Value{}, err
 			}
 			return ByteaValue(r), nil
 		case sfQuoteLiteral:
 			// quote_literal(text) → text — wrap as a SQL string literal.
-			return TextValue(quoteLiteralText(vals[0].Str)), nil
+			return TextValue(quoteLiteralText(vals[0].str())), nil
 		case sfQuoteIdent:
 			// quote_ident(text) → text — wrap as a SQL identifier.
-			return TextValue(quoteIdentText(vals[0].Str)), nil
+			return TextValue(quoteIdentText(vals[0].str())), nil
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
@@ -30683,9 +30683,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1 (PG dsign tests x > 0 / x < 0, so NaN → 0).
 			if vals[0].Kind == ValDecimal {
 				s := int64(1)
-				if vals[0].Dec.IsZero() {
+				if vals[0].decimal().IsZero() {
 					s = 0
-				} else if vals[0].Dec.Neg {
+				} else if vals[0].decimal().Neg {
 					s = -1
 				}
 				return DecimalValue(decimalFromInt64(s)), nil
@@ -30706,7 +30706,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if v.Kind == ValInt {
 					return decimalFromInt64(v.Int)
 				}
-				return *v.Dec
+				return *v.decimal()
 			}
 			a, b := toDec(vals[0]), toDec(vals[1])
 			rr, err := a.Rem(b)
@@ -30811,7 +30811,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if vals[0].Kind == ValInt {
 				d = decimalFromInt64(vals[0].Int)
 			} else {
-				d = *vals[0].Dec
+				d = *vals[0].decimal()
 			}
 			switch e.sfunc {
 			case sfCeil:
@@ -30841,7 +30841,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if vals[0].Kind != ValDecimal {
 				return evalFloatFunc(e.sfunc, vals, e.result)
 			}
-			a := *vals[0].Dec
+			a := *vals[0].decimal()
 			var r Decimal
 			var err error
 			switch e.sfunc {
@@ -30854,7 +30854,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			case sfLog10:
 				r, err = a.DecLog10()
 			default: // sfPow
-				r, err = decPower(a, *vals[1].Dec)
+				r, err = decPower(a, *vals[1].decimal())
 			}
 			if err != nil {
 				return Value{}, err
@@ -30862,11 +30862,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return DecimalValue(r), nil
 		case sfLog:
 			// `log` is decimal-only: 1-arg = base-10 log, 2-arg = log(base, num) in any base.
-			a := *vals[0].Dec
+			a := *vals[0].decimal()
 			var r Decimal
 			var err error
 			if len(vals) > 1 {
-				r, err = decLog(a, *vals[1].Dec)
+				r, err = decLog(a, *vals[1].decimal())
 			} else {
 				r, err = a.DecLog10()
 			}
@@ -30876,14 +30876,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return DecimalValue(r), nil
 		case sfScale:
 			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
-			return IntValue(int64(vals[0].Dec.Scale)), nil
+			return IntValue(int64(vals[0].decimal().Scale)), nil
 		case sfMinScale:
 			// min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
-			return IntValue(int64(minScaleOf(*vals[0].Dec))), nil
+			return IntValue(int64(minScaleOf(*vals[0].decimal()))), nil
 		case sfTrimScale:
 			// trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
 			// digits are zeros, so RoundToScale does not round).
-			d := *vals[0].Dec
+			d := *vals[0].decimal()
 			return DecimalValue(d.RoundToScale(minScaleOf(d))), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
@@ -30974,7 +30974,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if v.IsNull() {
 				return NullValue(), nil
 			}
-			return IntValue(int64(countNulls(v.Array.Elements, wantNulls))), nil
+			return IntValue(int64(countNulls(v.arrayVal().Elements, wantNulls))), nil
 		}
 		vals := make([]Value, len(e.sargs))
 		for i, a := range e.sargs {
@@ -31000,8 +31000,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if v.IsNull() {
 				return NullValue(), nil
 			}
-			vals = make([]Value, len(v.Array.Elements))
-			copy(vals, v.Array.Elements)
+			vals = make([]Value, len(v.arrayVal().Elements))
+			copy(vals, v.arrayVal().Elements)
 		} else {
 			vals = make([]Value, len(e.sargs))
 			for i, a := range e.sargs {
@@ -31169,16 +31169,16 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if pathV.Kind != ValArray {
 			return NullValue(), nil
 		}
-		path := make([]string, 0, len(pathV.Array.Elements))
-		for _, el := range pathV.Array.Elements {
+		path := make([]string, 0, len(pathV.arrayVal().Elements))
+		for _, el := range pathV.arrayVal().Elements {
 			if el.Kind != ValText {
 				return NullValue(), nil // a NULL path element propagates
 			}
-			path = append(path, el.Str)
+			path = append(path, el.str())
 		}
-		node := *target.Json // resolver guarantees a jsonb target
-		valueNode := *valueV.Json
-		flag := flagV.Kind == ValBool && flagV.Bool
+		node := *target.jsonb() // resolver guarantees a jsonb target
+		valueNode := *valueV.jsonb()
+		flag := flagV.Kind == ValBool && flagV.boolVal()
 		var out JsonNode
 		if e.psMode == psSet {
 			out, err = setPath(&node, path, &valueNode, flag)
@@ -31444,9 +31444,9 @@ func evalDateArith(op binaryOp, a, b Value, result scalarType) (Value, error) {
 		var d int32
 		var iv Interval
 		if a.Kind == ValDate {
-			d, iv = int32(a.Int), b.Iv
+			d, iv = int32(a.Int), b.interval()
 		} else {
-			d, iv = int32(b.Int), a.Iv
+			d, iv = int32(b.Int), a.interval()
 		}
 		mid, merr := dateMidnightMicros(d)
 		if merr != nil {
@@ -31554,16 +31554,16 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 		// site — types.md §15). The resolver only produces a text→text reCast node when a length is
 		// present, so this arm is unreachable without one.
 		if target.IsText() {
-			return TextValue(v.Str), nil
+			return TextValue(v.str()), nil
 		}
 		if target.IsJson() {
-			if err := validateJSON(v.Str); err != nil {
+			if err := validateJSON(v.str()); err != nil {
 				return Value{}, err
 			}
-			return JsonValue(v.Str), nil
+			return JsonValue(v.str()), nil
 		}
 		if target.IsJsonb() {
-			n, err := jsonbIn(v.Str)
+			n, err := jsonbIn(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -31572,7 +31572,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 		// text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible uuid_in parser;
 		// a malformed string traps 22P02.
 		if target.IsUuid() {
-			b, err := decodeUUIDLiteral(v.Str)
+			b, err := decodeUUIDLiteral(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -31583,14 +31583,14 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 		// The resolver admits only int/decimal/float/bool targets for a text source (uuid/json/jsonb
 		// are the arms above). Malformed → 22P02, out of range → 22003 (per row).
 		if target.IsBool() {
-			b, err := parseBoolLiteral(v.Str)
+			b, err := parseBoolLiteral(v.str())
 			if err != nil {
 				return Value{}, err
 			}
 			return BoolValue(b), nil
 		}
 		if target.IsDecimal() {
-			d, err := parseDecimalLiteral(v.Str)
+			d, err := parseDecimalLiteral(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -31601,21 +31601,21 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 			return DecimalValue(d), nil
 		}
 		if target.IsFloat32() {
-			f, err := parseFloatLiteral(v.Str, scalarFloat32)
+			f, err := parseFloatLiteral(v.str(), scalarFloat32)
 			if err != nil {
 				return Value{}, err
 			}
 			return Float32Value(float32(f)), nil
 		}
 		if target.IsFloat64() {
-			f, err := parseFloatLiteral(v.Str, scalarFloat64)
+			f, err := parseFloatLiteral(v.str(), scalarFloat64)
 			if err != nil {
 				return Value{}, err
 			}
 			return Float64Value(f), nil
 		}
 		// An int target (i16/i32/i64): parseIntLiteral range-checks against target (22003).
-		n, err := parseIntLiteral(v.Str, target)
+		n, err := parseIntLiteral(v.str(), target)
 		if err != nil {
 			return Value{}, err
 		}
@@ -31625,10 +31625,10 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 	// cast slice (casts.toml/types.md §14).
 	if v.Kind == ValUuid {
 		if target.IsText() {
-			return TextValue(renderUUID([]byte(v.Str))), nil
+			return TextValue(renderUUID([]byte(v.str()))), nil
 		}
 		if target.IsBytea() {
-			return ByteaValue([]byte(v.Str)), nil
+			return ByteaValue([]byte(v.str())), nil
 		}
 		panic("BUG: resolver rejects this uuid cast target")
 	}
@@ -31636,11 +31636,11 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 	// length traps 22P02 (the wrong-width body — no PG code to match).
 	if v.Kind == ValBytea {
 		if target.IsUuid() {
-			if len(v.Str) != 16 {
+			if len(v.str()) != 16 {
 				return Value{}, newError(InvalidTextRepresentation,
-					fmt.Sprintf("invalid length for type uuid: %d bytes (expected 16)", len(v.Str)))
+					fmt.Sprintf("invalid length for type uuid: %d bytes (expected 16)", len(v.str())))
 			}
-			return UuidValue([]byte(v.Str)), nil
+			return UuidValue([]byte(v.str())), nil
 		}
 		panic("BUG: resolver rejects this bytea cast target")
 	}
@@ -31649,11 +31649,11 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 	if v.Kind == ValJson {
 		switch {
 		case target.IsText():
-			return TextValue(v.Str), nil
+			return TextValue(v.str()), nil
 		case target.IsJson():
-			return JsonValue(v.Str), nil
+			return JsonValue(v.str()), nil
 		case target.IsJsonb():
-			n, err := jsonbIn(v.Str)
+			n, err := jsonbIn(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -31666,9 +31666,9 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 	if v.Kind == ValJsonb {
 		switch {
 		case target.IsText():
-			return TextValue(jsonbOut(v.Json)), nil
+			return TextValue(jsonbOut(v.jsonb())), nil
 		case target.IsJson():
-			return JsonValue(jsonbOut(v.Json)), nil
+			return JsonValue(jsonbOut(v.jsonb())), nil
 		case target.IsJsonb():
 			return v, nil
 		default:
@@ -31682,7 +31682,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 		}
 		// boolean → i32 (the boolean cast slice, casts.toml): true → 1, false → 0. The resolver
 		// guarantees the only non-bool target is i32.
-		if v.Bool {
+		if v.boolVal() {
 			return IntValue(1), nil
 		}
 		return IntValue(0), nil
@@ -31739,27 +31739,27 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 	// v.Kind == ValDecimal
 	if target.IsFloat32() {
 		// decimal -> f32 (explicit, lossy; finite overflow -> 22003).
-		r, err := decimalToFloat32(*v.Dec)
+		r, err := decimalToFloat32(*v.decimal())
 		if err != nil {
 			return Value{}, err
 		}
 		return Float32Value(r), nil
 	}
 	if target.IsFloat64() {
-		r, err := decimalToFloat64(*v.Dec)
+		r, err := decimalToFloat64(*v.decimal())
 		if err != nil {
 			return Value{}, err
 		}
 		return Float64Value(r), nil
 	}
 	if target.IsDecimal() {
-		d, err := coerceDecimal(*v.Dec, typmod)
+		d, err := coerceDecimal(*v.decimal(), typmod)
 		if err != nil {
 			return Value{}, err
 		}
 		return DecimalValue(d), nil
 	}
-	n, ok := v.Dec.ToInt64Round()
+	n, ok := v.decimal().ToInt64Round()
 	if !ok || !target.InRange(n) {
 		return Value{}, overflowErr(target)
 	}
@@ -31769,7 +31769,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 // toDecimal widens a numeric value to Decimal (an integer operand of decimal arithmetic).
 func toDecimal(v Value) Decimal {
 	if v.Kind == ValDecimal {
-		return *v.Dec
+		return *v.decimal()
 	}
 	return decimalFromInt64(v.Int)
 }
@@ -31796,11 +31796,11 @@ func decimalArithWork(op binaryOp, a, b Decimal) int64 {
 func decimalCmpWork(a, b Value) int64 {
 	switch {
 	case a.Kind == ValDecimal && b.Kind == ValDecimal:
-		return workLinear(*a.Dec, *b.Dec)
+		return workLinear(*a.decimal(), *b.decimal())
 	case a.Kind == ValDecimal && b.Kind == ValInt:
-		return workLinear(*a.Dec, decimalFromInt64(b.Int))
+		return workLinear(*a.decimal(), decimalFromInt64(b.Int))
 	case a.Kind == ValInt && b.Kind == ValDecimal:
-		return workLinear(decimalFromInt64(a.Int), *b.Dec)
+		return workLinear(decimalFromInt64(a.Int), *b.decimal())
 	default:
 		return 1
 	}
@@ -31815,14 +31815,14 @@ func varlenCompareWork(a, b Value) int64 {
 	var n int
 	switch {
 	case a.Kind == ValText && b.Kind == ValText:
-		n = utf8.RuneCountInString(a.Str)
-		if m := utf8.RuneCountInString(b.Str); m < n {
+		n = utf8.RuneCountInString(a.str())
+		if m := utf8.RuneCountInString(b.str()); m < n {
 			n = m
 		}
 	case a.Kind == ValBytea && b.Kind == ValBytea:
-		n = len(a.Str)
-		if len(b.Str) < n {
-			n = len(b.Str)
+		n = len(a.str())
+		if len(b.str()) < n {
+			n = len(b.str())
 		}
 	default:
 		return 1
@@ -32006,14 +32006,14 @@ func rangeVVsBound(v, cur, off Value, subtract bool) (int, error) {
 		err error
 	)
 	if subtract {
-		b, err = cur.Dec.Sub(*off.Dec)
+		b, err = cur.decimal().Sub(*off.decimal())
 	} else {
-		b, err = cur.Dec.Add(*off.Dec)
+		b, err = cur.decimal().Add(*off.decimal())
 	}
 	if err != nil {
 		return 0, err
 	}
-	return v.Dec.CmpValue(b), nil
+	return v.decimal().CmpValue(b), nil
 }
 
 // frameCtx holds one partition's peer-group structure (window.md §3/§6), shared across every row's
@@ -32979,7 +32979,7 @@ func windowCollKeys(rows []storedRow, order []orderSlot) ([][][]byte, error) {
 				continue
 			}
 			if row[k.idx].Kind == ValText {
-				sk, err := sortKey(k.collation, row[k.idx].Str)
+				sk, err := sortKey(k.collation, row[k.idx].str())
 				if err != nil {
 					return nil, err
 				}
@@ -33059,7 +33059,7 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
 				continue
 			}
 			if row[k.idx].Kind == ValText {
-				sk, err := sortKey(k.collation, row[k.idx].Str)
+				sk, err := sortKey(k.collation, row[k.idx].str())
 				if err != nil {
 					return err
 				}
@@ -33159,15 +33159,15 @@ func valueCmp(a, b Value) int {
 	case a.Kind == ValInt && b.Kind == ValInt:
 		return cmpInt64(a.Int, b.Int)
 	case a.Kind == ValDecimal && b.Kind == ValDecimal:
-		return a.Dec.CmpValue(*b.Dec)
+		return a.decimal().CmpValue(*b.decimal())
 	case a.Kind == ValText && b.Kind == ValText:
-		return strings.Compare(a.Str, b.Str)
+		return strings.Compare(a.str(), b.str())
 	case a.Kind == ValBytea && b.Kind == ValBytea:
 		// bytea is held in Str (raw bytes); strings.Compare is unsigned byte order.
-		return strings.Compare(a.Str, b.Str)
+		return strings.Compare(a.str(), b.str())
 	case a.Kind == ValUuid && b.Kind == ValUuid:
 		// uuid's 16 raw bytes are held in Str; strings.Compare is unsigned byte order.
-		return strings.Compare(a.Str, b.Str)
+		return strings.Compare(a.str(), b.str())
 	case a.Kind == ValBool && b.Kind == ValBool:
 		return cmpInt64(newOrderKey(a), newOrderKey(b))
 	case a.Kind == ValTimestamp && b.Kind == ValTimestamp:
@@ -33178,7 +33178,7 @@ func valueCmp(a, b Value) int {
 		return cmpInt64(a.Int, b.Int)
 	case a.Kind == ValInterval && b.Kind == ValInterval:
 		// Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
-		return a.Iv.SpanCmp(b.Iv)
+		return a.interval().SpanCmp(b.interval())
 	case a.IsFloat() && b.IsFloat():
 		// The PG float8 TOTAL order: -0 = +0, NaN = NaN, NaN largest (spec/design/float.md §3).
 		// Mixed widths widen to f64 (lossless). Drives ORDER BY / MIN / MAX / DISTINCT / GROUP BY.
@@ -33189,7 +33189,7 @@ func valueCmp(a, b Value) int {
 		// so per-field NULL placement and nested composites are handled uniformly. The caller's
 		// `descending` flip in keyCmp reverses the whole tuple. A row-size tie-break keeps it total
 		// (same-type rows have equal arity, so it is only reached for safety).
-		x, y := *a.Comp, *b.Comp
+		x, y := *a.composite(), *b.composite()
 		for i := 0; i < len(x) && i < len(y); i++ {
 			if c := keyCmp(x[i], y[i], false, false); c != 0 {
 				return c
@@ -33200,7 +33200,7 @@ func valueCmp(a, b Value) int {
 		// An array sorts by the PG array_cmp total order (spec/design/array.md §5): element-wise over
 		// the flattened elements (NULLs-last per element, recursing through keyCmp), then fewer
 		// elements first, then smaller ndim, then per dimension (length, then lower bound).
-		x, y := a.Array, b.Array
+		x, y := a.arrayVal(), b.arrayVal()
 		for i := 0; i < len(x.Elements) && i < len(y.Elements); i++ {
 			if c := keyCmp(x.Elements[i], y.Elements[i], false, false); c != 0 {
 				return c
@@ -33225,12 +33225,12 @@ func valueCmp(a, b Value) int {
 		// A range sorts by the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
 		// non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
 		// identical to value.Lt3/Gt3's range arm so `<` and ORDER BY never disagree.
-		return rangeTotalCmp(a.Range, b.Range)
+		return rangeTotalCmp(a.rangeVal(), b.rangeVal())
 	case a.Kind == ValJsonb && b.Kind == ValJsonb:
 		// jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to
 		// value.Lt3/Gt3's jsonb arm so `<` and ORDER BY never disagree. (json never sorts — the
 		// resolver rejects it 42883.)
-		return a.Json.Cmp(b.Json)
+		return a.jsonb().Cmp(b.jsonb())
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -33251,7 +33251,7 @@ func cmpInt64(x, y int64) int {
 
 func newOrderKey(v Value) int64 {
 	if v.Kind == ValBool {
-		if v.Bool {
+		if v.boolVal() {
 			return 1
 		}
 		return 0
@@ -33374,7 +33374,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		return Value{}, typeError("cannot store an integer value in " + colTy.CanonicalName() + " column " + colName)
 	case ValDecimal:
 		if colTy.IsDecimal() {
-			d, err := coerceDecimal(*v.Dec, typmod)
+			d, err := coerceDecimal(*v.decimal(), typmod)
 			if err != nil {
 				return Value{}, err
 			}
@@ -33385,13 +33385,13 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 			// float.md §4); a value beyond the width's range traps 22003. Same literal-only rule as
 			// the integer case (INSERT...SELECT decimal values are gated by assignableTo).
 			if colTy.IsFloat32() {
-				f, err := decimalToFloat32(*v.Dec)
+				f, err := decimalToFloat32(*v.decimal())
 				if err != nil {
 					return Value{}, err
 				}
 				return Float32Value(f), nil
 			}
-			f, err := decimalToFloat64(*v.Dec)
+			f, err := decimalToFloat64(*v.decimal())
 			if err != nil {
 				return Value{}, err
 			}
@@ -33402,7 +33402,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		if colTy.IsText() {
 			// A varchar(n) column enforces its length on store (assignment semantics): over-length
 			// traps 22001, unless the excess is all spaces (truncate) — spec/design/types.md §15.
-			s, err := coerceVarcharStore(v.Str, varcharLen, colName)
+			s, err := coerceVarcharStore(v.str(), varcharLen, colName)
 			if err != nil {
 				return Value{}, err
 			}
@@ -33411,7 +33411,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		if colTy.IsBytea() {
 			// A string literal adapts to a bytea column, decoding the hex input form
 			// (types.md §6/§13); malformed hex traps 22P02.
-			b, err := decodeByteaLiteral(v.Str)
+			b, err := decodeByteaLiteral(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -33420,7 +33420,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		if colTy.IsUuid() {
 			// A string literal adapts to a uuid column via the PG-flexible input
 			// (types.md §6/§14); malformed input traps 22P02.
-			b, err := decodeUUIDLiteral(v.Str)
+			b, err := decodeUUIDLiteral(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -33429,14 +33429,14 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		if colTy.IsTimestamp() {
 			// A string literal adapts to a timestamp column (spec/design/timestamp.md);
 			// malformed input traps 22007, an out-of-range field 22008.
-			m, err := parseTimestamp(v.Str)
+			m, err := parseTimestamp(v.str())
 			if err != nil {
 				return Value{}, err
 			}
 			return TimestampValue(m), nil
 		}
 		if colTy.IsTimestamptz() {
-			m, err := parseTimestamptz(v.Str)
+			m, err := parseTimestamptz(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -33445,7 +33445,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		if colTy.IsDate() {
 			// A string literal adapts to a date column (spec/design/date.md); malformed input
 			// traps 22007, an out-of-range field 22008.
-			d, err := parseDate(v.Str)
+			d, err := parseDate(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -33456,7 +33456,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 			// spellings — sign/digits/e-notation/Infinity/NaN; spec/design/float.md §4). Malformed
 			// input traps 22P02, out of range 22003. So `INSERT ... VALUES ('NaN')` works (a bare
 			// decimal literal cannot spell NaN/Infinity).
-			f, err := parseFloatLiteral(v.Str, colTy)
+			f, err := parseFloatLiteral(v.str(), colTy)
 			if err != nil {
 				return Value{}, err
 			}
@@ -33468,7 +33468,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		if colTy.IsInterval() {
 			// A string literal adapts to an interval column (spec/design/interval.md);
 			// malformed input traps 22007, an out-of-range field 22008.
-			iv, err := parseInterval(v.Str)
+			iv, err := parseInterval(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -33477,14 +33477,14 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		if colTy.IsJson() {
 			// A string literal adapts to a json column (spec/design/json.md §4): validate,
 			// store verbatim; malformed → 22P02.
-			if err := validateJSON(v.Str); err != nil {
+			if err := validateJSON(v.str()); err != nil {
 				return Value{}, err
 			}
-			return JsonValue(v.Str), nil
+			return JsonValue(v.str()), nil
 		}
 		if colTy.IsJsonb() {
 			// A string literal adapts to a jsonb column (§2): parse + canonicalize; → 22P02.
-			node, err := jsonbIn(v.Str)
+			node, err := jsonbIn(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -33549,7 +33549,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		return Value{}, typeError("cannot store a jsonb value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
-			return BoolValue(v.Bool), nil
+			return BoolValue(v.boolVal()), nil
 		}
 		return Value{}, typeError("cannot store a boolean value in " + colTy.CanonicalName() + " column " + colName)
 	}
@@ -33584,7 +33584,7 @@ func storeRange(v Value, elem colType, notNull bool, colName string) (Value, err
 		}
 		return NullValue(), nil
 	case ValRange:
-		rv := v.Range
+		rv := v.rangeVal()
 		if rv.Empty {
 			return RangeValue(rv), nil
 		}
@@ -33633,7 +33633,7 @@ func storeArray(v Value, elem colType, notNull bool, colName string) (Value, err
 		}
 		return NullValue(), nil
 	case ValArray:
-		a := v.Array
+		a := v.arrayVal()
 		out := make([]Value, len(a.Elements))
 		for i, el := range a.Elements {
 			// Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[]
@@ -33663,7 +33663,7 @@ func storeComposite(v Value, typeName string, fields []colField, notNull bool, c
 		}
 		return NullValue(), nil
 	case ValComposite:
-		vals := *v.Comp
+		vals := *v.composite()
 		if len(vals) != len(fields) {
 			return Value{}, typeError(fmt.Sprintf(
 				"row has %d fields but composite type %s has %d", len(vals), typeName, len(fields),
@@ -34081,19 +34081,19 @@ func encodeKeyValue(ty scalarType, value Value, coll *Collation) ([]byte, error)
 	case ValInt:
 		return encodeInt(ty, value.Int), nil
 	case ValBool:
-		return encodeBool(value.Bool), nil
+		return encodeBool(value.boolVal()), nil
 	case ValUuid:
-		return []byte(value.Str), nil
+		return []byte(value.str()), nil
 	case ValTimestamp, ValTimestamptz, ValDate:
 		return encodeInt(ty, value.Int), nil
 	case ValText:
-		return collatedTextKey(coll, value.Str)
+		return collatedTextKey(coll, value.str())
 	case ValBytea:
-		return encodeTerminated([]byte(value.Str)), nil
+		return encodeTerminated([]byte(value.str())), nil
 	case ValDecimal:
-		return value.Dec.EncodeKey(), nil
+		return value.decimal().EncodeKey(), nil
 	case ValInterval:
-		return value.Iv.EncodeKey(), nil
+		return value.interval().EncodeKey(), nil
 	case ValFloat64:
 		return encodeFloat64Key(uint64(value.Int)), nil
 	case ValFloat32:
@@ -34115,13 +34115,13 @@ func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
 		if !ok {
 			panic("a range key value has a range column type")
 		}
-		return encodeRangeKey(elem.ScalarTy(), value.Range), nil
+		return encodeRangeKey(elem.ScalarTy(), value.rangeVal()), nil
 	}
 	if value.Kind == ValArray {
 		if ty.Array == nil {
 			panic("an array key value has an array column type")
 		}
-		return encodeArrayKey(ty.Array.ScalarTy(), value.Array)
+		return encodeArrayKey(ty.Array.ScalarTy(), value.arrayVal())
 	}
 	return encodeKeyValue(ty.ScalarTy(), value, coll)
 }

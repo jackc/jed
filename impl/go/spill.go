@@ -33,16 +33,16 @@ func valueBytes(v Value) int {
 	const base = 24
 	switch v.Kind {
 	case ValText, ValBytea, ValUuid:
-		return base + len(v.Str)
+		return base + len(v.str())
 	case ValDecimal:
-		if v.Dec != nil {
-			_, _, g := v.Dec.ToCodec()
+		if v.decimal() != nil {
+			_, _, g := v.decimal().ToCodec()
 			return base + len(g)*2
 		}
 		return base
 	case ValUnfetched:
-		if v.Unf != nil {
-			return base + len(v.Unf.Comp)
+		if v.unfetched() != nil {
+			return base + len(v.unfetched().Comp)
 		}
 		return base
 	default:
@@ -344,17 +344,17 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		spillWriteU64(w, uint64(v.Int))
 	case ValBool:
 		_ = w.WriteByte(2)
-		if v.Bool {
+		if v.boolVal() {
 			_ = w.WriteByte(1)
 		} else {
 			_ = w.WriteByte(0)
 		}
 	case ValText:
 		_ = w.WriteByte(3)
-		spillWriteBytes(w, []byte(v.Str))
+		spillWriteBytes(w, []byte(v.str()))
 	case ValDecimal:
 		_ = w.WriteByte(4)
-		neg, scale, groups := v.Dec.ToCodec()
+		neg, scale, groups := v.decimal().ToCodec()
 		if neg {
 			_ = w.WriteByte(1)
 		} else {
@@ -369,10 +369,10 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		}
 	case ValBytea:
 		_ = w.WriteByte(5)
-		spillWriteBytes(w, []byte(v.Str))
+		spillWriteBytes(w, []byte(v.str()))
 	case ValUuid:
 		_ = w.WriteByte(6)
-		_, _ = w.Write([]byte(v.Str)) // exactly 16 bytes
+		_, _ = w.Write([]byte(v.str())) // exactly 16 bytes
 	case ValTimestamp:
 		_ = w.WriteByte(7)
 		spillWriteU64(w, uint64(v.Int))
@@ -382,15 +382,15 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 	case ValInterval:
 		// Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
 		_ = w.WriteByte(12)
-		spillWriteU32(w, uint32(v.Iv.Months))
-		spillWriteU32(w, uint32(v.Iv.Days))
-		spillWriteU64(w, uint64(v.Iv.Micros))
+		spillWriteU32(w, uint32(v.interval().Months))
+		spillWriteU32(w, uint32(v.interval().Days))
+		spillWriteU64(w, uint64(v.interval().Micros))
 	case ValComposite:
 		// Composite — tag 15: field count then each field value, recursive (spec/design/composite.md).
 		// Internal merge-sort scratch format only, so the recursion needs no type context.
 		_ = w.WriteByte(15)
-		spillWriteU32(w, uint32(len(*v.Comp)))
-		for _, f := range *v.Comp {
+		spillWriteU32(w, uint32(len(*v.composite())))
+		for _, f := range *v.composite() {
 			spillWriteValue(w, f)
 		}
 	case ValArray:
@@ -398,7 +398,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		// recursive (spec/design/array.md). Internal merge-sort scratch format; the full shape
 		// round-trips (multidim + custom bounds).
 		_ = w.WriteByte(16)
-		a := v.Array
+		a := v.arrayVal()
 		spillWriteU32(w, uint32(a.Ndim()))
 		for d := 0; d < a.Ndim(); d++ {
 			spillWriteU32(w, uint32(a.Dims[d]))
@@ -413,7 +413,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		// recursion needs no element-type context — the bound Values round-trip themselves. A range
 		// column can ride a spilling sort as a carried (non-key) column even before range ORDER BY
 		// lands (R3), so it must spill faithfully now.
-		rv := v.Range
+		rv := v.rangeVal()
 		var flags byte
 		if rv.Empty {
 			flags |= 0x01
@@ -445,12 +445,12 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		// only; a json/jsonb column can ride a spilling sort as a carried column, so it must spill
 		// faithfully.
 		_ = w.WriteByte(19)
-		spillWriteBytes(w, []byte(v.Str))
+		spillWriteBytes(w, []byte(v.str()))
 	case ValJsonb:
 		// jsonb — tag 20: the canonical text (jsonbOut → jsonbIn round-trips exactly, since the
 		// output is canonical), spec/design/json.md.
 		_ = w.WriteByte(20)
-		spillWriteBytes(w, []byte(jsonbOut(v.Json)))
+		spillWriteBytes(w, []byte(jsonbOut(v.jsonb())))
 	case ValJsonPath:
 		// jsonpath is literal-only (non-storable), so it never rides a spilling sort.
 		panic("BUG: a jsonpath value never reaches the spill codec")
@@ -458,23 +458,23 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it. The same pass-through covers an
 		// inline-deferred value (lazy-record.md §5b) — tag 21.
-		switch v.Unf.Form {
+		switch v.unfetched().Form {
 		case 0x00:
 			_ = w.WriteByte(21)
-			spillWriteBytes(w, v.Unf.Comp)
+			spillWriteBytes(w, v.unfetched().Comp)
 		case tagExternal:
 			_ = w.WriteByte(9)
-			spillWriteU32(w, v.Unf.FirstPage)
-			spillWriteU32(w, v.Unf.StoredLen)
+			spillWriteU32(w, v.unfetched().FirstPage)
+			spillWriteU32(w, v.unfetched().StoredLen)
 		case tagInlineComp:
 			_ = w.WriteByte(10)
-			spillWriteU32(w, v.Unf.RawLen)
-			spillWriteBytes(w, v.Unf.Comp)
+			spillWriteU32(w, v.unfetched().RawLen)
+			spillWriteBytes(w, v.unfetched().Comp)
 		case tagExternalComp:
 			_ = w.WriteByte(11)
-			spillWriteU32(w, v.Unf.FirstPage)
-			spillWriteU32(w, v.Unf.StoredLen)
-			spillWriteU32(w, v.Unf.RawLen)
+			spillWriteU32(w, v.unfetched().FirstPage)
+			spillWriteU32(w, v.unfetched().StoredLen)
+			spillWriteU32(w, v.unfetched().RawLen)
 		}
 	}
 }
@@ -584,14 +584,14 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			return Value{}, err
 		}
 		length, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length}}, err
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length}}, err
 	case 10:
 		raw, err := spillReadU32(r)
 		if err != nil {
 			return Value{}, err
 		}
 		comp, err := spillReadBytes(r)
-		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagInlineComp, RawLen: raw, Comp: comp}}, err
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagInlineComp, RawLen: raw, Comp: comp}}, err
 	case 11:
 		first, err := spillReadU32(r)
 		if err != nil {
@@ -602,10 +602,10 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			return Value{}, err
 		}
 		raw, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: raw}}, err
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: raw}}, err
 	case 21:
 		body, err := spillReadBytes(r)
-		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: 0x00, Comp: body}}, err
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: body}}, err
 	case 12:
 		months, err := spillReadU32(r)
 		if err != nil {

@@ -33,7 +33,7 @@ func padOf(t *testing.T, db *engine, id int64) (string, bool) {
 	if len(rows) == 0 {
 		return "", false
 	}
-	return rows[0][0].Str, true
+	return rows[0][0].str(), true
 }
 
 func reclaimSetup(t *testing.T, path string, rows int) *engine {

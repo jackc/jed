@@ -93,10 +93,10 @@ func TestBoolI32RoundTripSmoke(t *testing.T) {
 	if v := castOne(t, db, "SELECT FALSE::int"); v.Kind != ValInt || v.Int != 0 {
 		t.Fatalf("FALSE::int = %v, want 0", v)
 	}
-	if v := castOne(t, db, "SELECT CAST(0 AS boolean)"); v.Kind != ValBool || v.Bool {
+	if v := castOne(t, db, "SELECT CAST(0 AS boolean)"); v.Kind != ValBool || v.boolVal() {
 		t.Fatalf("CAST(0 AS boolean) = %v, want false", v)
 	}
-	if v := castOne(t, db, "SELECT (-7)::boolean"); v.Kind != ValBool || !v.Bool {
+	if v := castOne(t, db, "SELECT (-7)::boolean"); v.Kind != ValBool || !v.boolVal() {
 		t.Fatalf("(-7)::boolean = %v, want true", v)
 	}
 	if v := castOne(t, db, "SELECT CAST(NULL AS boolean)"); v.Kind != ValNull {

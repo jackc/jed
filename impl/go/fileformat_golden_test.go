@@ -1066,7 +1066,7 @@ func TestDefaultSurvivesLoad(t *testing.T) {
 	rows := loaded.RowsInKeyOrder("t")
 	last := rows[len(rows)-1]
 	// id=3 takes every persisted default: n=0, note='none', maybe=NULL, req=7, plain=NULL.
-	if last[0].Int != 3 || last[1].Int != 0 || last[2].Str != "none" ||
+	if last[0].Int != 3 || last[1].Int != 0 || last[2].str() != "none" ||
 		last[3].Kind != ValNull || last[4].Int != 7 || last[6].Kind != ValNull {
 		t.Errorf("persisted defaults not applied: %v", last)
 	}
