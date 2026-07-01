@@ -246,9 +246,9 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 		var out []uint64
 		visit := func(k []byte, _ storedRow) (bool, error) { out = append(out, decode(k)); return true, nil }
 		if rev {
-			pm.scanRangeRev(b, nil, visit)
+			pm.scanRangeRev(b, nil, nil, visit)
 		} else {
-			pm.scanRange(b, nil, visit)
+			pm.scanRange(b, nil, nil, visit)
 		}
 		return out
 	}
@@ -273,7 +273,7 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 	// largest keys descending, faulting no further.
 	var got []uint64
 	n := 0
-	pm.scanRangeRev(unboundedBound(), nil, func(k []byte, _ storedRow) (bool, error) {
+	pm.scanRangeRev(unboundedBound(), nil, nil, func(k []byte, _ storedRow) (bool, error) {
 		got = append(got, decode(k))
 		n++
 		return n < 3, nil
@@ -314,15 +314,15 @@ func TestPMapRangeCursorMatchesScanRange(t *testing.T) {
 			return true, nil
 		}
 		if rev {
-			pm.scanRangeRev(b, nil, visit)
+			pm.scanRangeRev(b, nil, nil, visit)
 		} else {
-			pm.scanRange(b, nil, visit)
+			pm.scanRange(b, nil, nil, visit)
 		}
 		return out
 	}
 	// Drain the pull cursor into the same shape.
 	pulled := func(b keyBound, rev bool) []pair {
-		c := pm.rangeCursor(b, nil, rev)
+		c := pm.rangeCursor(b, nil, rev, nil)
 		var out []pair
 		for {
 			k, r, ok, err := c.next()
@@ -358,7 +358,7 @@ func TestPMapRangeCursorMatchesScanRange(t *testing.T) {
 	// sequence (forward and reverse), proving the pull short-circuit (the streaming win).
 	for _, rev := range []bool{false, true} {
 		full := pushed(unboundedBound(), rev)
-		c := pm.rangeCursor(unboundedBound(), nil, rev)
+		c := pm.rangeCursor(unboundedBound(), nil, rev, nil)
 		var got []pair
 		for n := 0; n < 3; n++ {
 			k, r, ok, err := c.next()

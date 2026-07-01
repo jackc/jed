@@ -73,6 +73,18 @@ func (n *pnode) rowAtMasked(i int, mask []bool) (storedRow, error) {
 	return n.packed.rowMasked(i, mask)
 }
 
+// rowAtMaybeMasked is the scan-feed value-read seam: a nil mask reconstructs the whole row (rowAt),
+// a non-nil mask reconstructs only its selected columns (rowAtMasked), leaving the rest NULL. The nil
+// guard is load-bearing — rowAtMasked treats a nil/short mask as "no column selected" (all NULL), so a
+// scan with no touched-set (mask == nil) must take the full-row path. Only Packed leaves honor the
+// mask; a Decoded node returns its whole stored row either way (packed-leaf.md §4).
+func (n *pnode) rowAtMaybeMasked(i int, mask []bool) (storedRow, error) {
+	if mask == nil {
+		return n.rowAt(i)
+	}
+	return n.rowAtMasked(i, mask)
+}
+
 // decodedRows returns every value row — the mutation-descent materialization (packed-leaf.md §7). A
 // Decoded node clones vals; a Packed leaf reconstructs every row so the rebuilt node is Decoded
 // (build / nodeInsert / nodeRemove / mergeAt then run unchanged). Interior nodes are always Decoded.
@@ -450,7 +462,7 @@ func (b keyBound) entryWindow(n *pnode) (int, int) {
 // is in bound while both its adjacent children are pruned, so the entry window can start one slot
 // before the child window — emitted before the descent loop.
 func (m *pMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []storedRow, error) {
-	keys, vals, _, err := m.rangeEntriesCounted(b, src)
+	keys, vals, _, err := m.rangeEntriesCounted(b, src, nil)
 	return keys, vals, err
 }
 
@@ -458,7 +470,7 @@ func (m *pMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []storedRow, 
 // visits — the page_read count overlapNodeCount would return, observed during the ONE windowed
 // walk instead of a second counting descent (the visited sets are identical by construction:
 // both window with childWindow).
-func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []storedRow, int, error) {
+func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][]byte, []storedRow, int, error) {
 	var keys [][]byte
 	var vals []storedRow
 	nodes := 0
@@ -468,7 +480,7 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []stor
 		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
 			for i := ef; i < el; i++ {
-				row, err := n.rowAt(i)
+				row, err := n.rowAtMaybeMasked(i, mask)
 				if err != nil {
 					return err
 				}
@@ -539,13 +551,13 @@ func (m *pMap) overlapNodeCount(b keyBound) int {
 // faulted (the LIMIT short-circuit is genuine, not a post-hoc truncation — spec/design/cost.md §3
 // "LIMIT short-circuit"). Like rangeEntries it prunes non-overlapping subtrees; unlike it, it streams
 // (one row at a time, no Vec) so a bounded result holds ~one leaf resident.
-func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
+func (m *pMap) scanRange(b keyBound, src leafSource, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
 			for i := ef; i < el; i++ {
-				row, err := n.rowAt(i)
+				row, err := n.rowAtMaybeMasked(i, mask)
 				if err != nil {
 					return false, err
 				}
@@ -595,13 +607,13 @@ func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 // from the high end). For an interior node it walks children from cl down to cf, emitting the
 // in-window separator BEFORE descending its child, and the asymmetric inclusive-lo separator
 // key[ef] (when ef<cf) LAST.
-func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
+func (m *pMap) scanRangeRev(b keyBound, src leafSource, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
 			for i := el - 1; i >= ef; i-- {
-				row, err := n.rowAt(i)
+				row, err := n.rowAtMaybeMasked(i, mask)
 				if err != nil {
 					return false, err
 				}
@@ -686,12 +698,14 @@ type rangeCursor struct {
 	bound   keyBound
 	src     leafSource
 	reverse bool
+	mask    []bool // touched-column set for leaf reconstruction; nil ⇒ whole row (rowAtMaybeMasked)
 }
 
 // rangeCursor returns a pull cursor over the (key, row) pairs within b. The first node on the stack is
-// the root (always resident); descendants fault through src on descent. See rangeCursor (the type).
-func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool) *rangeCursor {
-	c := &rangeCursor{bound: b, src: src, reverse: reverse}
+// the root (always resident); descendants fault through src on descent. mask is the query's touched
+// set (nil ⇒ whole row). See rangeCursor (the type).
+func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool, mask []bool) *rangeCursor {
+	c := &rangeCursor{bound: b, src: src, reverse: reverse, mask: mask}
 	if m.root != nil {
 		c.stack = append(c.stack, newScanFrame(m.root, b))
 	}
@@ -719,7 +733,7 @@ func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
 			}
 			if fr.isLeaf {
 				// A leaf's positions are its in-bound key indices [ef, el) directly.
-				row, err := fr.node.rowAt(p)
+				row, err := fr.node.rowAtMaybeMasked(p, c.mask)
 				if err != nil {
 					return nil, nil, false, err
 				}

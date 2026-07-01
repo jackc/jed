@@ -13538,7 +13538,7 @@ func (db *engine) tryStreamingQuery(stmt statement, params []Value) (*Rows, bool
 		done:     empty || (sp.limit != nil && *sp.limit == 0),
 	}
 	if !sc.done {
-		sc.scan = store.storeScan(b, sp.pkReverse)
+		sc.scan = store.storeScan(b, sp.pkReverse, sp.relMasks[0])
 	}
 	return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: sc}, true, nil
 }
@@ -14085,9 +14085,9 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		}
 		var err error
 		if plan.pkReverse {
-			err = store.ScanRangeRev(b, visit)
+			err = store.ScanRangeRev(b, plan.relMasks[0], visit)
 		} else {
-			err = store.ScanRange(b, visit)
+			err = store.ScanRange(b, plan.relMasks[0], visit)
 		}
 		if err != nil {
 			return selectResult{}, err
@@ -14118,7 +14118,7 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 	out := make([][]Value, 0)
 	if plan.limit == nil || *plan.limit > 0 {
 		var passed int64
-		err := istore.ScanRange(unboundedBound(), func(ekey []byte, _ storedRow) (bool, error) {
+		err := istore.ScanRange(unboundedBound(), nil, func(ekey []byte, _ storedRow) (bool, error) {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
 				return false, err
 			}
@@ -14226,7 +14226,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 	if collated {
 		var rows []storedRow
 		if !empty {
-			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
+			err := store.ScanRange(b, plan.relMasks[0], func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil {
 					return false, err
 				}
@@ -14264,7 +14264,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		// the sorter, which spills when it exceeds the budget.
 		s := db.newSorterFor(plan.order)
 		if !empty {
-			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
+			err := store.ScanRange(b, plan.relMasks[0], func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 					return false, err
 				}
@@ -14540,7 +14540,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	} else if sb != nil && sb.pk != nil {
 		b, empty := db.buildKeyBound(sb.pk, params, outer)
 		if !empty {
-			entries, pages, sl, err := store.RangeScanWithUnits(b, plan.relMasks[ri])
+			entries, pages, sl, err := store.RangeScanWithUnitsMasked(b, plan.relMasks[ri])
 			if err != nil {
 				return nil, err
 			}
@@ -14551,7 +14551,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			nodeCount, slabs = pages, sl
 		}
 	} else {
-		entries, pages, sl, err := store.ScanWithUnits(plan.relMasks[ri])
+		entries, pages, sl, err := store.ScanWithUnitsMasked(plan.relMasks[ri])
 		if err != nil {
 			return nil, err
 		}

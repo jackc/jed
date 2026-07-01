@@ -302,30 +302,38 @@ expanded row vectors.
   that is the deferred S3 below. Unit tests: a faulted-leaf reconstruction shares one page block across
   all its deferred inline values (resident `≈ page_size`, §9), and `col_at`/`row_at_masked` reconstruct
   only the touched columns byte-identically to the whole row. Built Rust-first.
-- **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** *Deferred
-  follow-on (assessed 2026-07). The accessor (`col_at`/`row_at_masked`) is built (S2); what remains is
-  threading the query's touched-column mask through the pmap + storage scan API so the scan calls
-  `row_at_masked` instead of `row_at`.* **Why deferred:** in jed the expensive-decode dividend the
-  `OP_Column`/`slot_getsomeattrs` model promises is **already captured by lazy-record + S2** — every
-  spillable/structured value (text/bytea/decimal/json/composite/array/range) is *already* reconstructed
-  as a cheap `Unfetched::Inline` block-slice, so S3's remaining compute win is only skipping untouched
-  *fixed-width* decodes (a few bytes → an `i64`) plus a few `Arc` clones — marginal. Against that, S3
-  threads a `&[bool]` mask through the whole scan API of **all three cores** and, if `row_at_masked`
-  left untouched columns `Null`, would trade jed's fail-loud poison guard (§8 — an unresolved
-  `Unfetched` *panics* if read) for a **silent wrong result** on an incomplete mask (mitigable only with
-  a poison sentinel, widening the surface further). The headline win (resident `≈ page_size` for all
-  data) is fully delivered by S1+S2 without it. Revisit if a wide-table scan bench shows the fixed-width
-  decode is a real hot-path cost. Cost-neutral when built (no per-column cost unit, §8). *This also
-  subsumes the pre-PAX prototype's deferred S3 offset memo, which PAX obsoletes (§6).*
+- **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** *Go core
+  landed 2026-07 (Track A1, a per-core internal optimization like the vectorized executor — results/cost/
+  byte-neutral, no `format_version` bump); Rust + TS pending (Go-first).* The scan feed threads the
+  query's touched-column mask (`relMasks`, a `[]bool` already computed at plan time and used by
+  `resolveColumns`) through the pmap traversals (`scanRange`/`scanRangeRev`/`rangeCursor`/
+  `rangeEntriesCounted`) and the SELECT eager feed (`materializeRel` → `ScanWithUnitsMasked`), so a Packed
+  leaf calls `row_at_masked` and skips decoding untouched columns.
+  **The "marginal" assessment was disproven by a wide-table scan bench.** On a file-backed, all-fixed-
+  width table, a scan touching one column pays a **width-linear** reconstruction tax (~32 B + a decode per
+  *untouched* column); at 64 columns the touched-column path runs **~2.3–3.0× faster** (`count(*)` most,
+  since it decodes nothing) with **B/op unchanged** — the decode-CPU dividend is large for wide tables,
+  negligible for narrow ones. (The *allocation* dividend — B/op, the still-full-width `storedRow` — needs
+  the columnar gather of Track A2, deferred.) **The silent-wrong-result risk is contained, not traded
+  away:** untouched columns are left `Null` (no poison sentinel), which is safe because the mask is a
+  **complete superset** of every column any consumer reads — the same invariant `resolveColumns` already
+  relies on for deferred variable-length values, now load-bearing for fixed-width too and guarded by the
+  paged-vs-resident battery (`impl/go/masked_scan_test.go`, a wide fixed-width table × a spread of query
+  shapes). Mutation / FK / index-maintenance reads keep the **whole-row** `ScanWithUnits`/`GetWithUnits`
+  (they recompute keys from the old row), so masking is scoped to read-only SELECT feeds. Cost-neutral (no
+  per-column cost unit, §8). *This also subsumes the pre-PAX prototype's deferred S3 offset memo, which PAX
+  obsoletes (§6).*
 - **S4 — port S1+S2 to Go**, then **S5 — port S1+S2 to TS.** Mirror the Rust reshape idiomatically (Go
   retains `*paxLeaf`; TS retains the parsed directories over a `Uint8Array.subarray`); each lands green
   independently. The `col_at`/`row_at_masked` accessors are ported too (S3-ready), just not driven.
 
-Deferred follow-ons (none foreclosed): **S3 touched-column scan wiring** (above); **nested-value
-structural memo** (skip re-parsing a single `jsonb`/array/composite value's *interior* on repeated
-access — the narrow residual of §6, not the column-location memo PAX already provides); **keys as
-block-slices** (zero-copy keys under Packed); **in-memory databases adopting deferral** only if a Memory
-pager backing lands ([pager.md §6](pager.md)).
+Deferred follow-ons (none foreclosed): **S3 touched-column scan wiring in Rust + TS** (landed in Go,
+above); **Track A2 — the columnar allocation dividend** (gather touched columns into dense batches via a
+`leafColumnSpan`, so a scan never materializes a full-width `storedRow` — the B/op win A1 leaves on the
+table); **nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
+*interior* on repeated access — the narrow residual of §6, not the column-location memo PAX already
+provides); **keys as block-slices** (zero-copy keys under Packed); **in-memory databases adopting
+deferral** only if a Memory pager backing lands ([pager.md §6](pager.md)).
 
 ---
 
