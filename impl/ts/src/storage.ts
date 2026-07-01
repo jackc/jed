@@ -110,7 +110,7 @@ export class TableStore {
   insert(key: Uint8Array, row: Row): boolean {
     const src = this.leafSrc();
     if (this.rows.get(key, src) !== undefined) return false;
-    this.rows.insert(key, row, this.weight(key, row), this.cap, src);
+    this.rows.insert(key, row, this.weight(key, row), this.cap, this.colTypes.length, src);
     return true;
   }
 
@@ -131,13 +131,20 @@ export class TableStore {
   // replace overwrites the row stored at an existing key (UPDATE). The key is
   // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
   replace(key: Uint8Array, row: Row): void {
-    this.rows.insert(key, row, this.weight(key, row), this.cap, this.leafSrc());
+    this.rows.insert(
+      key,
+      row,
+      this.weight(key, row),
+      this.cap,
+      this.colTypes.length,
+      this.leafSrc(),
+    );
   }
 
   // remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
   // delete descends into / rebalances against.
   remove(key: Uint8Array): boolean {
-    return this.rows.remove(key, this.cap, this.leafSrc()) !== undefined;
+    return this.rows.remove(key, this.cap, this.colTypes.length, this.leafSrc()) !== undefined;
   }
 
   // get looks up a row by its exact encoded key. May fault the holding leaf through the buffer pool.

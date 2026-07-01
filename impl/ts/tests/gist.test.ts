@@ -75,11 +75,17 @@ test("gist divergences (42704 / 0A000)", () => {
 });
 
 test("gist whole-image roundtrip persists the R-tree", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
-    "CREATE INDEX t_r_gist ON t USING gist (r)",
-    "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), (5, '[50,60)'), (6, '[15,25)'), (7, 'empty'), (8, NULL)",
-  ]);
+  // Build at page 256 (the round-trip target) so the in-memory tree splits for that page size —
+  // a PAX leaf's directory overhead (format.md v23) makes an 8-record leaf packed for 8192 overflow
+  // a 256-byte page. Matches how the Rust/Go gist round-trip tests create the DB (page_size: 256).
+  const db = dbWith(
+    [
+      "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
+      "CREATE INDEX t_r_gist ON t USING gist (r)",
+      "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), (5, '[50,60)'), (6, '[15,25)'), (7, 'empty'), (8, NULL)",
+    ],
+    256,
+  );
   const loaded = Database.fromImage(db.toImage(256, 1n));
   // The persisted R-tree loads, the resident tree is rebuilt, the gather still works.
   assert.deepEqual(query(loaded, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id"), [

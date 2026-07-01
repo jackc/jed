@@ -14,6 +14,8 @@ import type { Row } from "../src/storage.ts";
 // per-entry weight (8-byte key + a ~5-byte int value record), well under RECORD_MAX = (240-12)/2.
 const CAP = 240;
 const W = 15;
+// row() has one value column — the PAX leaf directory overhead scales with it (format.md v23).
+const K = 1;
 
 function key(n: number): Uint8Array {
   const b = new Uint8Array(8);
@@ -57,7 +59,13 @@ function checkInvariants(pm: PMap): void {
     }
     let payload = 0;
     for (const w of n.weights) payload += w;
-    if (n.children.length > 0) payload += 4 * n.children.length;
+    const nk = n.keys.length;
+    // A leaf carries the PAX directories (format.md v23 directoryOverhead(N,K)); an interior its
+    // N+1 child pointers.
+    payload +=
+      n.children.length > 0
+        ? 4 * n.children.length
+        : 4 * (nk + 1) + 4 * (K + 1) + 4 * (nk + 1) * K - 2 * nk;
     assert.ok(payload <= CAP, `node payload ${payload} exceeds cap ${CAP}`);
     for (const c of n.children) walk(c.node, false);
   };
@@ -70,7 +78,7 @@ test("pmap: insert/get/remove vs a reference map", () => {
   const n = 4000;
 
   for (const k of shuffled(n)) {
-    const had = pm.insert(key(k), row(k), W, CAP, null) !== undefined;
+    const had = pm.insert(key(k), row(k), W, CAP, K, null) !== undefined;
     const refHad = ref.has(keyStr(key(k)));
     assert.equal(had, refHad, `insert 'had' mismatch at ${k}`);
     ref.set(keyStr(key(k)), row(k));
@@ -93,33 +101,33 @@ test("pmap: insert/get/remove vs a reference map", () => {
 
   // Overwrite returns the old value and does not change size (kept in sync with the reference).
   const before = pm.size;
-  assert.deepEqual(pm.insert(key(7), row(777), W, CAP, null), row(7));
+  assert.deepEqual(pm.insert(key(7), row(777), W, CAP, K, null), row(7));
   ref.set(keyStr(key(7)), row(777));
   assert.equal(pm.size, before);
 
   // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
   let step = 0;
   for (const k of shuffled(n)) {
-    const got = pm.remove(key(k), CAP, null);
+    const got = pm.remove(key(k), CAP, K, null);
     const want = ref.get(keyStr(key(k)));
     ref.delete(keyStr(key(k)));
     assert.deepEqual(got, want, `remove mismatch at ${k}`);
     if (step++ % 257 === 0) checkInvariants(pm);
   }
   assert.equal(pm.size, 0);
-  assert.equal(pm.remove(key(123), CAP, null), undefined);
+  assert.equal(pm.remove(key(123), CAP, K, null), undefined);
 });
 
 test("pmap: clone is an independent snapshot", () => {
   const base = new PMap();
-  for (let k = 0; k < 2000; k++) base.insert(key(k), row(k), W, CAP, null);
+  for (let k = 0; k < 2000; k++) base.insert(key(k), row(k), W, CAP, K, null);
   const snap = base.clone();
 
   // Mutate a separate clone heavily; the snapshot must be untouched.
   const other = base.clone();
-  for (let k = 0; k < 2000; k++) other.insert(key(k), row(-k), W, CAP, null); // overwrite every value
-  for (let k = 2000; k < 3000; k++) other.insert(key(k), row(k), W, CAP, null); // grow
-  for (let k = 0; k < 500; k++) other.remove(key(k), CAP, null); // shrink
+  for (let k = 0; k < 2000; k++) other.insert(key(k), row(-k), W, CAP, K, null); // overwrite every value
+  for (let k = 2000; k < 3000; k++) other.insert(key(k), row(k), W, CAP, K, null); // grow
+  for (let k = 0; k < 500; k++) other.remove(key(k), CAP, K, null); // shrink
 
   assert.equal(snap.size, 2000);
   for (let k = 0; k < 2000; k++) assert.deepEqual(snap.get(key(k), null), row(k));
@@ -132,15 +140,16 @@ test("pmap: clone is an independent snapshot", () => {
 });
 
 // Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the
-// non-empty-halves guarantee. With weight 110 (≤ 114 cap) a node holds ~2 entries.
+// non-empty-halves guarantee. With weight 100 (≤ RECORD_MAX(240,1) = 106 — the PAX leaf reserves
+// 12+16·K, format.md v23) a two-record leaf fits but a third overflows.
 test("pmap: wide values keep nodes valid", () => {
   const pm = new PMap();
   for (const k of shuffled(300)) {
-    pm.insert(key(k), row(k), 110, CAP, null);
+    pm.insert(key(k), row(k), 100, CAP, K, null);
     checkInvariants(pm);
   }
   for (const k of shuffled(300)) {
-    pm.remove(key(k), CAP, null);
+    pm.remove(key(k), CAP, K, null);
     checkInvariants(pm);
   }
   assert.equal(pm.size, 0);
@@ -150,10 +159,10 @@ test("pmap: empty and single", () => {
   const pm = new PMap();
   assert.equal(pm.size, 0);
   assert.equal(pm.get(key(1), null), undefined);
-  assert.equal(pm.remove(key(1), CAP, null), undefined);
-  assert.equal(pm.insert(key(1), row(1), W, CAP, null), undefined);
+  assert.equal(pm.remove(key(1), CAP, K, null), undefined);
+  assert.equal(pm.insert(key(1), row(1), W, CAP, K, null), undefined);
   assert.deepEqual(pm.get(key(1), null), row(1));
-  assert.deepEqual(pm.remove(key(1), CAP, null), row(1));
+  assert.deepEqual(pm.remove(key(1), CAP, K, null), row(1));
   assert.equal(pm.size, 0);
 });
 
@@ -163,7 +172,7 @@ test("pmap: reverse scan is the forward scan reversed", () => {
   // edge that single-leaf conformance tables (the DESC-LIMIT corpus cases) cannot exercise. 200
   // entries at CAP build several levels.
   const pm = new PMap();
-  for (let n = 0; n < 200; n++) pm.insert(key(n), row(n), W, CAP, null);
+  for (let n = 0; n < 200; n++) pm.insert(key(n), row(n), W, CAP, K, null);
   assert.ok(pm.nodeCount() > 2, "test needs a multi-level tree");
 
   const decode = (k: Uint8Array): number =>
@@ -211,7 +220,7 @@ test("pmap: pull cursor (scanRangeIter) matches the push scan", () => {
   // pipeline (S3) rests on. Internal machinery, not corpus-expressible (CLAUDE.md §10), so it is
   // unit-tested per core against the existing push scan.
   const pm = new PMap();
-  for (let n = 0; n < 200; n++) pm.insert(key(n), row(n), W, CAP, null);
+  for (let n = 0; n < 200; n++) pm.insert(key(n), row(n), W, CAP, K, null);
   assert.ok(pm.nodeCount() > 2, "test needs a multi-level tree");
 
   const decode = (k: Uint8Array): number =>

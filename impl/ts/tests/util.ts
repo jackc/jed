@@ -34,8 +34,14 @@ export type Handle = Pick<
 
 // dbWith builds an in-memory database and runs the given setup statements on a fresh session, failing
 // loudly. The returned Session is stateful across calls (an autocommit handle over the shared core).
-export function dbWith(stmts: string[]): Session {
-  const db = Database.newInMemory().session();
+export function dbWith(stmts: string[], pageSize?: number): Session {
+  // A page-backed B-tree's fan-out tracks the page size, so an in-memory tree must be built at the
+  // size it will serialize to (format.md) — a test that round-trips through toImage(pageSize) must
+  // pass that pageSize here (matching how the Rust/Go tests create the DB), or a PAX leaf's directory
+  // overhead can overflow the smaller serialize target. Default page size otherwise.
+  const db = (
+    pageSize === undefined ? Database.newInMemory() : Database.inMemoryWithPageSize(pageSize)
+  ).session();
   for (const s of stmts) {
     try {
       db.execute(s);

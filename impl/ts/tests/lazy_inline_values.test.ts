@@ -19,7 +19,7 @@ import { Decimal } from "../src/decimal.ts";
 import { DEFAULT_PAGE_SIZE } from "../src/executor.ts";
 import {
   decodeLeafNode,
-  encodeRecord,
+  encodeLeafPax,
   encodeValue,
   makePage,
   type OverflowPageOut,
@@ -316,25 +316,17 @@ test("a faulted leaf shares one page block across its deferred values", () => {
     ]);
   }
 
-  // Encode the records into one leaf page payload (everything inline at this page size).
+  // Encode the records into one PAX leaf page payload (everything inline at this page size).
   let takeSeq = 100;
   const take = (): number => ++takeSeq;
   const ovf: OverflowPageOut[] = [];
-  const parts: Uint8Array[] = [];
-  rows.forEach((row, i) => {
+  const keys = rows.map((_, i) => {
     const key = new Uint8Array(4);
     new DataView(key.buffer).setUint32(0, i, false);
-    parts.push(encodeRecord(colTypes, key, row, capacity, take, ovf));
+    return key;
   });
+  const payload = encodeLeafPax(colTypes, keys, rows, capacity, take, ovf);
   assert.equal(ovf.length, 0, "values must stay inline (no overflow) for the form-(a) case");
-  let total = 0;
-  for (const p of parts) total += p.length;
-  const payload = new Uint8Array(total);
-  let at = 0;
-  for (const p of parts) {
-    payload.set(p, at);
-    at += p.length;
-  }
   const block = makePage(ps, 2 /* PAGE_LEAF */, rows.length, 0, payload);
 
   // Fault the leaf: every deferrable present value becomes an inline-deferred unfetched (form (a)).

@@ -96,7 +96,7 @@ import {
 } from "./value.ts";
 import type { JsonNode } from "./json.ts";
 
-const FORMAT_VERSION = 22; // on-disk format version (22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 23; // on-disk format version (23 = PAX leaf layout — spec/fileformat/format.md "Leaf node": a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The per-value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major. The per-record key_len u16 is dropped (the key directory carries lengths), so a record's split weight is unchanged (2 + key_len + Σ value_size) but a leaf's payload gains directoryOverhead(N,K); RECORD_MAX tightens to (C − (12+16K))/2. No catalog/interior/overflow byte change — only leaf payload byte-order moves. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -826,10 +826,21 @@ export function pagePayload(pageSize: number): number {
 }
 
 // recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
-// contract — RECORD_MAX = (C-12)/2 where C = capacity is the page payload (format.md "Why the record
-// cap"). The spill planner reduces a record to ≤ this by externalizing values.
-function recordMaxFor(capacity: number): number {
-  return Math.max(0, Math.floor((capacity - INTERIOR_RESERVE) / 2));
+// contract — RECORD_MAX(K) = (C − max(12, 12+16·K))/2 where C = capacity is the page payload and K
+// the value-column count (format.md "Why the record cap"). A PAX leaf's two-record floor carries
+// directoryOverhead(2,K) = 12+16·K, so the cap tightens by 8·K; K=0 (index trees, interior
+// separators) recovers the historical (C-12)/2. The spill planner reduces a record to ≤ this.
+function recordMaxFor(capacity: number, k: number): number {
+  return Math.max(0, Math.floor((capacity - (INTERIOR_RESERVE + 16 * k)) / 2));
+}
+
+// directoryOverhead is the extra bytes a PAX (column-major) leaf's payload carries beyond
+// Σ recordSize (format.md "Leaf node"): the key directory (N+1 u32), the column directory (K+1 u32),
+// and each column's value directory (N+1 u32), less the N per-record key_len u16 prefixes PAX drops.
+// Interior nodes stay row-major and do not use this.
+//   directoryOverhead(N,K) = 4·(N+1) + 4·(K+1) + 4·(N+1)·K − 2·N
+function directoryOverhead(n: number, k: number): number {
+  return 4 * (n + 1) + 4 * (k + 1) + 4 * (n + 1) * k - 2 * n;
 }
 
 // A value's planned on-disk disposition (large-values.md §2/§12/§13).
@@ -869,7 +880,7 @@ function planDispositions(
   };
   const cur = inline.slice();
   let size = 2 + key.length + inline.reduce((a, b) => a + b, 0);
-  const max = recordMaxFor(capacity);
+  const max = recordMaxFor(capacity, colTypes.length);
   if (size <= max) {
     plan.size = size;
     return plan;
@@ -1098,38 +1109,130 @@ export function encodeRecord(
   w.u16(key.length);
   w.bytes(key);
   for (let i = 0; i < colTypes.length; i++) {
-    switch (plan.disp[i]) {
-      case "external": {
-        const payload = valuePayload(colTypes[i]!, row[i]!);
-        const first = writeOverflowChain(payload, capacity, take, ovf);
-        w.u8(TAG_EXTERNAL);
-        w.u32(first);
-        w.u32(payload.length);
-        break;
-      }
-      case "inlineComp": {
-        const rawLen = valuePayload(colTypes[i]!, row[i]!).length;
-        const comp = plan.comp[i]!;
-        w.u8(TAG_INLINE_COMP);
-        w.u32(rawLen);
-        w.u16(comp.length);
-        w.bytes(comp);
-        break;
-      }
-      case "externalComp": {
-        // The chain carries the COMPRESSED block (its page count follows comp size).
-        const rawLen = valuePayload(colTypes[i]!, row[i]!).length;
-        const comp = plan.comp[i]!;
-        const first = writeOverflowChain(comp, capacity, take, ovf);
-        w.u8(TAG_EXTERNAL_COMP);
-        w.u32(first);
-        w.u32(comp.length);
-        w.u32(rawLen);
-        break;
-      }
-      default:
-        w.bytes(encodeValue(colTypes[i]!, row[i]!));
+    w.bytes(
+      encodeDisposedValue(
+        colTypes[i]!,
+        row[i]!,
+        plan.disp[i]!,
+        plan.comp[i] ?? null,
+        capacity,
+        take,
+        ovf,
+      ),
+    );
+  }
+  return w.toBytes();
+}
+
+// encodeDisposedValue encodes one value's on-disk body given its resolved disposition — the value
+// codec, unchanged across the row-major and PAX leaf layouts (large-values.md §12/§13). An
+// inline-plain value is encodeValue; the large-value forms carry a pointer / inline block and
+// allocate overflow chains via `take`. `comp` is the LZ4 block a compressed form carries.
+function encodeDisposedValue(
+  ty: ColType,
+  v: Value,
+  disp: ValueDisp,
+  comp: Uint8Array | null,
+  capacity: number,
+  take: () => number,
+  ovf: OverflowPageOut[],
+): Uint8Array {
+  const w = new ByteWriter();
+  switch (disp) {
+    case "external": {
+      const payload = valuePayload(ty, v);
+      const first = writeOverflowChain(payload, capacity, take, ovf);
+      w.u8(TAG_EXTERNAL);
+      w.u32(first);
+      w.u32(payload.length);
+      break;
     }
+    case "inlineComp": {
+      const rawLen = valuePayload(ty, v).length;
+      w.u8(TAG_INLINE_COMP);
+      w.u32(rawLen);
+      w.u16(comp!.length);
+      w.bytes(comp!);
+      break;
+    }
+    case "externalComp": {
+      // The chain carries the COMPRESSED block (its page count follows comp size).
+      const rawLen = valuePayload(ty, v).length;
+      const first = writeOverflowChain(comp!, capacity, take, ovf);
+      w.u8(TAG_EXTERNAL_COMP);
+      w.u32(first);
+      w.u32(comp!.length);
+      w.u32(rawLen);
+      break;
+    }
+    default:
+      w.bytes(encodeValue(ty, v));
+  }
+  return w.toBytes();
+}
+
+// encodeLeafPax builds a PAX (column-major) leaf payload from records in ascending key order
+// (format.md v23 "Leaf node"). Values encode in (record, column) order — so each external value's
+// overflow chain allocates via `take` in exactly the row-major order, keeping overflow page indices
+// golden-pinned — then assembled: key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory
+// (K+1 u32 absolute offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32
+// prefix-sum) then the column's N value bodies. Exported for the lazy-record white-box test
+// (lazy_inline_values.test.ts), like encodeRecord; the barrel (tooling.ts) is unaffected.
+export function encodeLeafPax(
+  colTypes: ColType[],
+  keys: Uint8Array[],
+  rows: Row[],
+  capacity: number,
+  take: () => number,
+  ovf: OverflowPageOut[],
+): Uint8Array {
+  const n = keys.length;
+  const k = colTypes.length;
+  // Encode each value in (record, column) order; overflow chains allocate here, matching row-major.
+  const valBytes: Uint8Array[][] = Array.from({ length: k }, () => new Array<Uint8Array>(n));
+  for (let i = 0; i < n; i++) {
+    const plan = planDispositions(colTypes, keys[i]!, rows[i]!, capacity);
+    for (let c = 0; c < k; c++) {
+      valBytes[c]![i] = encodeDisposedValue(
+        colTypes[c]!,
+        rows[i]![c]!,
+        plan.disp[c]!,
+        plan.comp[c] ?? null,
+        capacity,
+        take,
+        ovf,
+      );
+    }
+  }
+  const w = new ByteWriter();
+  // key directory (prefix-sum) + key blob.
+  let off = 0;
+  for (let i = 0; i <= n; i++) {
+    w.u32(off);
+    if (i < n) off += keys[i]!.length;
+  }
+  for (let i = 0; i < n; i++) w.bytes(keys[i]!);
+  const totalKeyBytes = off;
+  // column directory: absolute payload offset of each region (computed analytically).
+  const baseAfterColDir = 4 * (n + 1) + totalKeyBytes + 4 * (k + 1);
+  const colStart = new Array<number>(k + 1);
+  let cur = baseAfterColDir;
+  for (let c = 0; c < k; c++) {
+    colStart[c] = cur;
+    let region = 4 * (n + 1);
+    for (let i = 0; i < n; i++) region += valBytes[c]![i]!.length;
+    cur += region;
+  }
+  colStart[k] = cur;
+  for (let c = 0; c <= k; c++) w.u32(colStart[c]!);
+  // each column region: value directory (prefix-sum) then value bodies.
+  for (let c = 0; c < k; c++) {
+    let voff = 0;
+    for (let i = 0; i <= n; i++) {
+      w.u32(voff);
+      if (i < n) voff += valBytes[c]![i]!.length;
+    }
+    for (let i = 0; i < n; i++) w.bytes(valBytes[c]![i]!);
   }
   return w.toBytes();
 }
@@ -1784,20 +1887,24 @@ function serializeNode(
   const index = nextIndex;
   nextIndex++;
 
-  const w = new ByteWriter();
-  let pageType = PAGE_LEAF;
-  if (n.children.length > 0) {
-    pageType = PAGE_INTERIOR;
-    for (const cp of childPages) w.u32(cp);
-  }
   // Encode records, spilling over-large values to overflow pages allocated after this node's index
-  // (post-order traversal + column order → deterministic, golden-pinnable layout).
+  // (post-order traversal + record-then-column order → deterministic, golden-pinnable). A LEAF is
+  // column-major (PAX v23 — encodeLeafPax); an INTERIOR node stays row-major.
   const ovf: OverflowPageOut[] = [];
   const take = (): number => nextIndex++;
-  for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(encodeRecord(colTypes, n.keys[i]!, n.vals[i]!, capacity, take, ovf));
+  let pageType = PAGE_LEAF;
+  let payload: Uint8Array;
+  if (n.children.length > 0) {
+    pageType = PAGE_INTERIOR;
+    const w = new ByteWriter();
+    for (const cp of childPages) w.u32(cp);
+    for (let i = 0; i < n.keys.length; i++) {
+      w.bytes(encodeRecord(colTypes, n.keys[i]!, n.vals[i]!, capacity, take, ovf));
+    }
+    payload = w.toBytes();
+  } else {
+    payload = encodeLeafPax(colTypes, n.keys, n.vals, capacity, take, ovf);
   }
-  const payload = w.toBytes();
   if (payload.length > capacity) {
     throw engineError(
       "feature_not_supported",
@@ -2014,33 +2121,28 @@ function serializeDirty(
         : serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, paging),
     );
   }
-  const w = new ByteWriter();
-  let pageType = PAGE_LEAF;
-  if (n.children.length > 0) {
-    pageType = PAGE_INTERIOR;
-    for (const cp of childPages) w.u32(cp);
-  }
   // Encode records, spilling over-large values to overflow pages drawn from the same allocator
   // (free-list first, then high-water — large-values.md §12). A dirty node may carry rows the
   // lazy load left unfetched (a sibling row's mutation dirtied them): resolve those through the
   // pager first — unmetered commit work, large-values.md §14 — so the re-encode re-plans the
-  // resident row exactly as an eager writer would (chains are rewritten fresh; sharing an
-  // unchanged chain is the deferred byte-layout follow-on).
+  // resident row exactly as an eager writer would. A LEAF is column-major (PAX v23); an INTERIOR
+  // node stays row-major.
   const ovf: OverflowPageOut[] = [];
   const take = (): number => alloc.take();
-  for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(
-      encodeRecord(
-        colTypes,
-        n.keys[i]!,
-        resolveForEncode(n.vals[i]!, colTypes, paging),
-        capacity,
-        take,
-        ovf,
-      ),
-    );
+  const rows = n.vals.map((v) => resolveForEncode(v, colTypes, paging));
+  let pageType = PAGE_LEAF;
+  let payload: Uint8Array;
+  if (n.children.length > 0) {
+    pageType = PAGE_INTERIOR;
+    const w = new ByteWriter();
+    for (const cp of childPages) w.u32(cp);
+    for (let i = 0; i < n.keys.length; i++) {
+      w.bytes(encodeRecord(colTypes, n.keys[i]!, rows[i]!, capacity, take, ovf));
+    }
+    payload = w.toBytes();
+  } else {
+    payload = encodeLeafPax(colTypes, n.keys, rows, capacity, take, ovf);
   }
-  const payload = w.toBytes();
   if (payload.length > capacity) {
     throw engineError(
       "feature_not_supported",
@@ -2200,9 +2302,15 @@ function collectLeafOverflow(
   const pg = parsePage(paging.readBlock(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
     const fetch = (p: number): Uint8Array => paging.readBlock(p);
-    const cur = { pos: 0 };
-    for (let i = 0; i < pg.itemCount; i++) {
-      const { row } = decodeRecordLazy(colTypes, pg.payload, cur);
+    const n = pg.itemCount;
+    const k = colTypes.length;
+    const dirs = parsePaxLeaf(pg.payload, n, k);
+    for (let i = 0; i < n; i++) {
+      const row: Row = new Array(k);
+      for (let c = 0; c < k; c++) {
+        const cur = { pos: paxValueOff(dirs, n, c, i) };
+        row[c] = readValueLazy(colTypes[c]!, pg.payload, cur);
+      }
       markChains(row, fetch, reached);
     }
     return;
@@ -2421,13 +2529,23 @@ function readTree(
   const fetch = (p: number): Uint8Array => pageBlock(image, ps, p);
   if (pg.pageType === PAGE_LEAF) {
     const n = pg.itemCount;
+    const k = colTypes.length;
+    const dirs = parsePaxLeaf(pg.payload, n, k);
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
     const weights: number[] = [];
-    const cur = { pos: 0 };
     for (let i = 0; i < n; i++) {
-      const { key, row, ovf } = decodeRecord(colTypes, pg.payload, cur, fetch);
-      weights.push(recordSize(colTypes, key, row, capacity));
+      const key = paxKey(pg.payload, dirs, i).slice();
+      const row: Row = new Array(k);
+      const ovf: number[] = [];
+      let w = 2 + key.length;
+      for (let c = 0; c < k; c++) {
+        const cur = { pos: paxValueOff(dirs, n, c, i) };
+        const before = cur.pos;
+        row[c] = readValue(colTypes[c]!, pg.payload, cur, fetch, ovf);
+        w += cur.pos - before;
+      }
+      weights.push(w);
       for (const p of ovf) reached.add(p);
       keys.push(key);
       vals.push(row);
@@ -2664,17 +2782,84 @@ function parsePage(block: Uint8Array): Page {
 // unfetched reference — no chain read, no decompression — resolved later only for the columns a
 // query touches. Each weight is the bytes the record occupies on the page (exactly the writer's
 // recordSize).
+// A parsed PAX (column-major) leaf's directories (format.md v23 "Leaf node"). All offsets index into
+// the page payload; value bytes are read in place so the lazy decoder's zero-copy view still
+// references the shared page block.
+type PaxDirs = {
+  keyBlob: number; // payload offset where the key blob starts
+  keyOff: number[]; // N+1 prefix-sum into the key blob
+  colStart: number[]; // K+1 absolute payload offsets of each column region; colStart[K] = end
+  colOff: number[][]; // K value directories (N+1 prefix-sum into each column's values)
+};
+
+// parsePaxLeaf decodes a PAX leaf payload's three directories (format.md v23 "Leaf node"). Column
+// regions are validated contiguous, in order, and within the payload; a malformed directory is
+// data_corrupted. The page body is zero-padded to the page size, so the authoritative content end is
+// colStart[K], not payload.length.
+function parsePaxLeaf(payload: Uint8Array, n: number, k: number): PaxDirs {
+  const cur = { pos: 0 };
+  const keyOff: number[] = [];
+  for (let i = 0; i <= n; i++) keyOff.push(readU32(payload, cur));
+  const keyBlob = cur.pos;
+  cur.pos = keyBlob + keyOff[n]!;
+  if (cur.pos > payload.length)
+    throw engineError("data_corrupted", "PAX leaf key blob overruns page");
+  const colStart: number[] = [];
+  for (let i = 0; i <= k; i++) colStart.push(readU32(payload, cur));
+  if (colStart[0] !== cur.pos)
+    throw engineError("data_corrupted", "PAX leaf column directory start mismatch");
+  const colOff: number[][] = [];
+  for (let c = 0; c < k; c++) {
+    const start = colStart[c]!;
+    const cc = { pos: start };
+    const voff: number[] = [];
+    for (let i = 0; i <= n; i++) voff.push(readU32(payload, cc));
+    const valBase = start + 4 * (n + 1);
+    const end = colStart[c + 1]!;
+    if (valBase > end || end > payload.length || valBase + voff[n]! !== end)
+      throw engineError("data_corrupted", "PAX leaf column region out of range");
+    colOff.push(voff);
+  }
+  if (colStart[k]! > payload.length)
+    throw engineError("data_corrupted", "PAX leaf payload overruns page");
+  return { keyBlob, keyOff, colStart, colOff };
+}
+
+// Key i's span within the payload.
+function paxKey(payload: Uint8Array, d: PaxDirs, i: number): Uint8Array {
+  const lo = d.keyBlob + d.keyOff[i]!;
+  const hi = d.keyBlob + d.keyOff[i + 1]!;
+  if (lo > hi || hi > payload.length)
+    throw engineError("data_corrupted", "PAX leaf key directory out of range");
+  return payload.subarray(lo, hi);
+}
+
+// The payload offset where value (record i, column c)'s codec bytes begin.
+function paxValueOff(d: PaxDirs, n: number, c: number, i: number): number {
+  return d.colStart[c]! + 4 * (n + 1) + d.colOff[c]![i]!;
+}
+
 export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ColType[]): PNode {
   const pg = parsePage(block);
   if (pg.pageType !== PAGE_LEAF)
     throw engineError("data_corrupted", "demand-paged a non-leaf page");
+  const n = pg.itemCount;
+  const k = colTypes.length;
+  const dirs = parsePaxLeaf(pg.payload, n, k);
   const keys: Uint8Array[] = [];
   const vals: Row[] = [];
   const weights: number[] = [];
-  const cur = { pos: 0 };
-  for (let i = 0; i < pg.itemCount; i++) {
-    const { key, row, weight } = decodeRecordLazy(colTypes, pg.payload, cur);
-    weights.push(weight);
+  for (let i = 0; i < n; i++) {
+    const key = paxKey(pg.payload, dirs, i).slice(); // copy out of the borrowed page slice
+    const row: Row = new Array(k);
+    let w = 2 + key.length;
+    for (let c = 0; c < k; c++) {
+      const cur = { pos: paxValueOff(dirs, n, c, i) };
+      const before = cur.pos;
+      row[c] = readValueLazy(colTypes[c]!, pg.payload, cur);
+      w += cur.pos - before;
+    }
+    weights.push(w);
     keys.push(key);
     vals.push(row);
   }
