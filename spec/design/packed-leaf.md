@@ -302,9 +302,13 @@ expanded row vectors.
   that is the deferred S3 below. Unit tests: a faulted-leaf reconstruction shares one page block across
   all its deferred inline values (resident `≈ page_size`, §9), and `col_at`/`row_at_masked` reconstruct
   only the touched columns byte-identically to the whole row. Built Rust-first.
-- **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** *Go core
-  landed 2026-07 (Track A1, a per-core internal optimization like the vectorized executor — results/cost/
-  byte-neutral, no `format_version` bump); Rust + TS pending (Go-first).* The scan feed threads the
+- **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** *Landed
+  in all three cores 2026-07 (Track A1, a per-core internal optimization like the vectorized executor —
+  results/cost/byte-neutral, no `format_version` bump). Go first (`materializeRel`/`scanRange`/`storeScan`
+  masked feeds), then Rust (`row_at_maybe_masked` + a `recon` seam through `collect_range` /
+  `walk_range_visit` / `RangeCursor`; the whole-row scans stay for mutation/FK/index-maintenance) and TS
+  (`rowAtMaybeMasked` + a `recon` seam through `rangeEntriesCounted` / `scanRange` / the pull iterators),
+  each verified by a per-core paged-vs-resident `masked_scan` battery.* The scan feed threads the
   query's touched-column mask (`relMasks`, a `[]bool` already computed at plan time and used by
   `resolveColumns`) through the pmap traversals (`scanRange`/`scanRangeRev`/`rangeCursor`/
   `rangeEntriesCounted`) and the SELECT eager feed (`materializeRel` → `ScanWithUnitsMasked`), so a Packed
@@ -327,7 +331,10 @@ expanded row vectors.
   retains `*paxLeaf`; TS retains the parsed directories over a `Uint8Array.subarray`); each lands green
   independently. The `col_at`/`row_at_masked` accessors are ported too (S3-ready), just not driven.
 - **Track A2 — columnar gather (the allocation dividend).** *Go core landed 2026-07 (per-core internal,
-  like A1 — results/cost/byte-neutral, no `format_version` bump); Rust + TS pending.* A1 removed the
+  like A1 — results/cost/byte-neutral, no `format_version` bump). This AGGREGATE variant is **Go-only**: it
+  is wired into Go's vectorized aggregate executor (`execVectorizedAgg`, a Go-only Stage 0–2 fast path), so
+  a Rust/TS port would first need that executor — deferred as the sole remaining follow-on (the sibling
+  **projection** feed below, which needs no such executor, landed in all three cores).* A1 removed the
   untouched-column **decode** but still allocated a **full-width `storedRow`** per record (untouched
   columns left `Null`), so the B/op stayed width-linear — a 64-column `count(*)` allocated ~100 MB of
   all-`Null` rows. A2 gathers **only** the touched columns into dense per-column lanes straight off the
@@ -348,9 +355,12 @@ expanded row vectors.
   values). A `WHERE` filter is handled by **Track A3** below (a selection vector over the lanes), not a
   decline.
 
-- **Track A2 — projection feed (the allocation dividend for bare-column projections).** *Go core landed
-  2026-07 (per-core internal, like A1/A2 — results/cost/byte-neutral, no `format_version` bump); Rust + TS
-  pending.* The sibling of the aggregate gather: a **bare-column projection** over a single-table
+- **Track A2 — projection feed (the allocation dividend for bare-column projections).** *Landed in all
+  three cores 2026-07 (per-core internal, like A1 — results/cost/byte-neutral, no `format_version` bump).
+  Go first (`projectColumnar` → the `emitColumnar` drive), then Rust (`Emitter::Columnar` + `project_columnar`,
+  driven eagerly and lazily) and TS (a `"columnar"` `EmitMode` + `projectColumnar`, same two drives). Unlike
+  the aggregate gather, this needs no vectorized executor — it is a standalone emit mode.* The sibling of
+  the aggregate gather: a **bare-column projection** over a single-table
   full/PK-bounded scan with no ORDER BY / LIMIT / OFFSET / blocking operator (`SELECT c0, c3 FROM
   t [WHERE …]`) previously materialized a **full-width `storedRow`** per record just to project a few
   columns — the same width-linear B/op the aggregate feed removed (`project_c0` bench: 64-column `SELECT
@@ -368,7 +378,10 @@ expanded row vectors.
   interior-separator gather). A `WHERE` filter is handled by **Track A3** below.
 
 - **Track A3 — filter vectorization (a selection vector over the lanes).** *Go core landed 2026-07
-  (per-core internal, like A1/A2 — results/cost/byte-neutral, no `format_version` bump); Rust + TS pending.*
+  (per-core internal, like A1/A2 — results/cost/byte-neutral, no `format_version` bump). The **projection**
+  path landed in all three cores 2026-07 (`filterColumnar` + a `sel` selection vector threaded through the
+  columnar emit drive in each core); the **aggregate** path is **Go-only**, riding the Go-only vectorized
+  aggregate executor with the A2 aggregate gather above.*
   A2 gathered only **filter-free** aggregates and projections; a `WHERE` predicate forced the full-width
   row path. A3 lifts that: `batch.go filterColumnar` evaluates `plan.filter` over the gathered lanes into a
   **selection vector** (`[]int32` of survivor indices), and the fold (`foldAggColumnar` /
@@ -391,9 +404,11 @@ expanded row vectors.
   columnar path and must agree with the resident row path on rows **and** cost, so a mis-indexed selection
   vector diverges loudly.
 
-Deferred follow-ons (none foreclosed): **S3 touched-column scan wiring in Rust + TS** (landed in Go,
-above); **A2 columnar gather + projection feed + A3 filter vectorization in Rust + TS** (Go's columnar path
-now covers filter-free *and* filtered aggregates and bare-column projections); **nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
+Deferred follow-ons (none foreclosed): **the A2/A3 columnar AGGREGATE gather in Rust + TS** — the lone
+remaining port. A1 (touched-column scan wiring), the A2 projection feed, and A3 filter vectorization *for
+projections* have **landed in all three cores** (2026-07); the columnar aggregate gather stays Go-only
+because it is wired into Go's Go-only vectorized aggregate executor (`execVectorizedAgg`), so a Rust/TS
+port would first port that executor (a separate, larger effort). **Nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
 *interior* on repeated access — the narrow residual of §6, not the column-location memo PAX already
 provides); **keys as block-slices** (zero-copy keys under Packed); **in-memory databases adopting
 deferral** only if a Memory pager backing lands ([pager.md §6](pager.md)).
