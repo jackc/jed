@@ -7399,7 +7399,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 	var overlap, slabs int
 	if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
-		kb, empty := db.buildKeyBound(bp, bound, nil)
+		kb, empty := db.buildKeyBound(bp, bound, nil, nil)
 		if empty {
 			// A provably-empty bound affects zero rows — with RETURNING that is still a
 			// query result (empty rows), never a bare statement (grammar.md §32).
@@ -7748,7 +7748,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	var overlap, slabs int
 	if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
-		kb, empty := db.buildKeyBound(bp, bound, nil)
+		kb, empty := db.buildKeyBound(bp, bound, nil, nil)
 		if empty {
 			// A provably-empty bound affects zero rows — with RETURNING that is still a
 			// query result (empty rows), never a bare statement (grammar.md §32).
@@ -10489,6 +10489,23 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 			relBounds[i] = detectScanBound(filter, rel, db)
 		}
 	}
+	// Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
+	// indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk = a.x`)
+	// is re-materialized per outer row, seeking instead of full-scanning — O(N·M) → O(N·log M).
+	// Detected from the join's ON and the WHERE. Gated to a base table (an SRF / derived table / CTE /
+	// lateral item has no store to seek) that is the RIGHT/nullable side of an INNER/CROSS/LEFT join
+	// (a RIGHT/FULL preserved side cannot be bounded per outer row). rels[0] has no earlier relation;
+	// its join is sel.Joins[i-1]. A non-nil entry takes precedence over the once-materialized relBounds.
+	relINLBounds := make([]*scanBound, len(rels))
+	for i, rel := range rels {
+		if i == 0 || srfPlans[i] != nil || derivedPlans[i] != nil || rel.cte != nil || lateralFlags[i] {
+			continue
+		}
+		if k := sel.Joins[i-1].Kind; k != joinInner && k != joinCross && k != joinLeft {
+			continue
+		}
+		relINLBounds[i] = detectINLBound(joinPreds[i-1], filter, rel, db)
+	}
 	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
 	// grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
 	// grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
@@ -11004,6 +11021,7 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		!planRels[0].lateral && planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil &&
 		!planRels[1].lateral && planRels[1].srf == nil && planRels[1].cte == nil && planRels[1].derived == nil &&
 		(relBounds[0] == nil || (relBounds[0].index == nil && relBounds[0].gin == nil && relBounds[0].gist == nil)) &&
+		relINLBounds[0] == nil && relINLBounds[1] == nil &&
 		len(order) <= len(s.rels[0].table.PKIndices()) {
 		ok, reverse := db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
 		joinPkOrdered = ok && !reverse
@@ -11015,7 +11033,7 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, joinPkOrdered: joinPkOrdered, relBounds: relBounds, relMasks: relMasks,
+		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, joinPkOrdered: joinPkOrdered, relBounds: relBounds, relINLBounds: relINLBounds, relMasks: relMasks,
 	}, nil
 }
 
@@ -12514,6 +12532,114 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 	return nil
 }
 
+// detectINLBound detects an index-nested-loop scan bound for a join inner relation rel (cost.md §3
+// "JOIN"): a primary-key (or leading secondary-index column) comparison to a SIBLING column of an
+// EARLIER join relation, taken from the join's `on` predicate OR the `whereFilter`. Unlike
+// detectScanBound (constants only), this admits a bare sibling column (a reColumn whose global index
+// is < rel.offset), resolved per outer row from the current combined left-hand row — the join analog
+// of a correlated subquery's outer reference (query.correlated_pushdown). So the inner relation seeks
+// per outer row instead of full-scanning for every outer row: O(N·M) → O(N·log M).
+//
+// Returns non-nil only when the resulting bound has >= 1 sibling term (a reColumn src); a
+// constant-only bound is the ordinary once-materialized relBounds path. Constant terms on the same
+// key ride along and tighten the per-outer-row seek. The whole on/where stays the residual filter (a
+// superset), so the ROWS are unchanged; only the inner re-scan cost drops. Caller restricts this to
+// a base table that is the right/nullable side of an INNER/CROSS/LEFT join.
+func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *scanBound {
+	cutoff := rel.offset
+	collect := func(keyIdx int, ty scalarType, coll *Collation) []boundTerm {
+		colColl := ""
+		if coll != nil {
+			colColl = coll.Name
+		}
+		var terms []boundTerm
+		var walk func(e *rExpr)
+		walk = func(e *rExpr) {
+			if e == nil {
+				return
+			}
+			if e.kind == reAnd {
+				walk(e.lhs)
+				walk(e.rhs)
+				return
+			}
+			if t, ok := asBoundTerm(e, keyIdx, ty, colColl, cutoff); ok {
+				terms = append(terms, t)
+			}
+		}
+		walk(on)
+		walk(whereFilter)
+		return terms
+	}
+	hasSibling := func(terms []boundTerm) bool {
+		for _, t := range terms {
+			if t.src.kind == reColumn {
+				return true
+			}
+		}
+		return false
+	}
+	// Primary-key bound first (the row's own key — range-capable, strictly cheaper).
+	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
+		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
+			if coll, push := db.keyCollationCtx(rel.table.Columns[pkLocal]); push {
+				terms := collect(rel.offset+pkLocal, sty, coll)
+				if hasSibling(terms) {
+					return &scanBound{pk: &pkBoundPlan{pkType: sty, terms: terms, coll: coll}}
+				}
+			}
+		}
+	}
+	// Else a leading secondary-index equality bound to a sibling (indexes in ascending lowercased
+	// name order — the deterministic tie-break, matching detectScanBound).
+	for _, idx := range rel.table.Indexes {
+		if idx.Kind != indexBtree {
+			continue
+		}
+		ci := idx.Columns[0]
+		ty, ok := rel.table.Columns[ci].Type.AsScalar()
+		if !ok {
+			continue
+		}
+		unskippableTail := false
+		for _, c := range idx.Columns[1:] {
+			s, ok := rel.table.Columns[c].Type.AsScalar()
+			if !ok || !s.IsFixedWidth() {
+				unskippableTail = true
+				break
+			}
+		}
+		if unskippableTail {
+			continue
+		}
+		coll, push := db.keyCollationCtx(rel.table.Columns[ci])
+		if !push {
+			continue
+		}
+		terms := collect(rel.offset+ci, ty, coll)
+		var eqs []*rExpr
+		siblingEq := false
+		for _, t := range terms {
+			if t.op == opEq {
+				eqs = append(eqs, t.src)
+				if t.src.kind == reColumn {
+					siblingEq = true
+				}
+			}
+		}
+		if siblingEq {
+			tail := make([]scalarType, 0, len(idx.Columns)-1)
+			for _, c := range idx.Columns[1:] {
+				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
+			}
+			return &scanBound{index: &indexBoundPlan{
+				nameKey: strings.ToLower(idx.Name), colType: ty, eqs: eqs, coll: coll, tailTypes: tail,
+			}}
+		}
+	}
+	return nil
+}
+
 // keyCollationCtx reports the collation a key over col is STORED under, deciding whether — and how —
 // a comparison bound may push down to that key (spec/design/collation.md §8/§12). Three outcomes:
 //   - (nil, true)  — col is C (or non-text): the key is raw bytes (encoding.md §2.4), always
@@ -12786,13 +12912,13 @@ func rexprIsConstant(e *rExpr) bool {
 // feeds the rows through the same scanSource as any bounded scan (page_read block +
 // per-row storage_row_read). A provably empty bound (NULL / contradictory equalities /
 // out-of-range) returns nothing and charges nothing.
-func (db *engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []storedRow, mask []bool) (rows []storedRow, pages, slabs int, err error) {
+func (db *engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (rows []storedRow, pages, slabs int, err error) {
 	// Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
 	// true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
 	// integer can equal no stored value — all provably empty.
 	var agreed []byte
 	for _, src := range ib.eqs {
-		key, isNull, ok := encodeBoundKey(ib.colType, src, params, outer, ib.coll)
+		key, isNull, ok := encodeBoundKey(ib.colType, src, params, outer, ib.coll, left)
 		if isNull || !ok {
 			return nil, 0, 0, nil
 		}
@@ -13176,7 +13302,7 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType scalarType, coll *Collation)
 			walk(e.rhs)
 			return
 		}
-		if t, ok := asBoundTerm(e, pkIdx, pkType, colColl); ok {
+		if t, ok := asBoundTerm(e, pkIdx, pkType, colColl, -1); ok {
 			terms = append(terms, t)
 		}
 	}
@@ -13192,7 +13318,7 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType scalarType, coll *Collation)
 // matches) on one side and a const-source of the PK's own type on the other (a promoted comparison
 // — e.g. intpk = 2.5 → a reConstDecimal — does not match, so it stays residual). The op is flipped
 // when the PK is on the right.
-func asBoundTerm(e *rExpr, pkIdx int, pkType scalarType, colColl string) (boundTerm, bool) {
+func asBoundTerm(e *rExpr, pkIdx int, pkType scalarType, colColl string, siblingCutoff int) (boundTerm, bool) {
 	if e.kind != reCompare {
 		return boundTerm{}, false
 	}
@@ -13219,9 +13345,9 @@ func asBoundTerm(e *rExpr, pkIdx int, pkType scalarType, colColl string) (boundT
 	}
 	isPK := func(x *rExpr) bool { return x.kind == reColumn && x.index == pkIdx }
 	switch {
-	case isPK(e.lhs) && isConstSource(e.rhs, pkType):
+	case isPK(e.lhs) && isConstSource(e.rhs, pkType, siblingCutoff):
 		return boundTerm{op: e.op, src: e.rhs}, true
-	case isPK(e.rhs) && isConstSource(e.lhs, pkType):
+	case isPK(e.rhs) && isConstSource(e.lhs, pkType, siblingCutoff):
 		return boundTerm{op: flipCompare(e.op), src: e.lhs}, true
 	}
 	return boundTerm{}, false
@@ -13235,10 +13361,18 @@ func asBoundTerm(e *rExpr, pkIdx int, pkType scalarType, colColl string) (boundT
 // row's column and seeks instead of re-scanning the whole inner table per outer row (cost.md §3
 // "bounded scan", grammar.md §26). A type-mismatched outer reference is wrapped in a cast by the
 // resolver (as for a const literal), so it never arrives here bare — the type check stays implicit.
-func isConstSource(e *rExpr, pkType scalarType) bool {
+//
+// siblingCutoff opens the index-nested-loop door (cost.md §3 "JOIN"): when >= 0, a bare reColumn
+// whose GLOBAL index is < siblingCutoff — a column of an EARLIER join relation — is a valid bound
+// source, resolved per outer row from the combined left-hand row (like reOuterColumn, a bare sibling
+// column implies a type match — a mismatch is a cast, never bare). -1 (the ordinary once-materialized
+// bound) accepts only literals/params/outer references.
+func isConstSource(e *rExpr, pkType scalarType, siblingCutoff int) bool {
 	switch e.kind {
 	case reParam, reConstNull, reOuterColumn:
 		return true
+	case reColumn:
+		return siblingCutoff >= 0 && e.index < siblingCutoff
 	case reConstInt:
 		return pkType.IsInteger()
 	case reConstBool:
@@ -13287,10 +13421,10 @@ func flipCompare(op binaryOp) binaryOp {
 // sound, scan), never a wrong key.
 // outer carries the enclosing rows (innermost last) so a correlated reOuterColumn source resolves to
 // the current outer row's value; it is nil for a top-level statement.
-func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedRow) (keyBound, bool) {
+func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedRow, left storedRow) (keyBound, bool) {
 	b := unboundedBound()
 	for _, t := range bp.terms {
-		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll)
+		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll, left)
 		if isNull {
 			return keyBound{}, true
 		}
@@ -13323,7 +13457,7 @@ func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedR
 // type's range (no key can equal it), so the caller drops this bound. reParam/reOuterColumn resolve
 // to a runtime Value first (the param table / the enclosing outer row) and then encode through the
 // shared path.
-func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation) (key []byte, isNull bool, ok bool) {
+func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation, left storedRow) (key []byte, isNull bool, ok bool) {
 	switch src.kind {
 	case reConstNull:
 		return nil, true, false
@@ -13352,6 +13486,15 @@ func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []store
 		// A correlated reference: column index of the enclosing row level hops out — the same
 		// indexing the evaluator uses for reOuterColumn (innermost outer row is last).
 		return encodeValueKey(pkType, outer[len(outer)-src.level][src.index], coll)
+	case reColumn:
+		// Index-nested-loop: the GLOBAL column index of an earlier join relation, read from the
+		// current combined left-hand row (cost.md §3 "JOIN"). The join loop always passes a `left`
+		// wide enough (the running row spans columns [0, rel.offset), and a sibling index is <
+		// rel.offset); a stray out-of-range index widens to a full scan rather than panic.
+		if src.index >= len(left) {
+			return nil, false, false
+		}
+		return encodeValueKey(pkType, left[src.index], coll)
 	}
 	return nil, false, false
 }
@@ -13664,7 +13807,7 @@ func (db *engine) tryStreamingQuery(stmt statement, params []Value) (*Rows, bool
 	b := unboundedBound()
 	empty := false
 	if sp.relBounds[0] != nil && sp.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(sp.relBounds[0].pk, bound, nil)
+		b, empty = db.buildKeyBound(sp.relBounds[0].pk, bound, nil, nil)
 	}
 	snap := db.snapshotEngine()
 	store := snap.lkpStore(sp.rels[0].tableName)
@@ -14171,7 +14314,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	empty := false
 	overlap, slabs := 0, 0
 	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
+		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer, nil)
 	}
 	if !empty {
 		var err error
@@ -14294,7 +14437,7 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 	empty := false
 	overlap, slabs := 0, 0
 	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
+		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer, nil)
 	}
 	if !empty {
 		var err error
@@ -14470,7 +14613,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 	empty := false
 	overlap, slabs := 0, 0
 	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
+		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer, nil)
 	}
 	if !empty {
 		var err error
@@ -14609,11 +14752,11 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 // to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
 // ORDER BY.
 func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outer []storedRow, rng *stmtRng) (selectResult, error) {
-	leftRows, err := db.materializeRel(plan, 0, params, outer, rng, env.ctes, meter)
+	leftRows, err := db.materializeRel(plan, 0, params, outer, nil, rng, env.ctes, meter)
 	if err != nil {
 		return selectResult{}, err
 	}
-	rightRows, err := db.materializeRel(plan, 1, params, outer, rng, env.ctes, meter)
+	rightRows, err := db.materializeRel(plan, 1, params, outer, nil, rng, env.ctes, meter)
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -14708,7 +14851,7 @@ func rowsFromValues(in [][]Value) []storedRow {
 // body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
 // query's own outer and its parent=nil body simply ignores it (a parent=nil plan holds no
 // outerColumn, so the two are observably identical).
-func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
+func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
 	rel := plan.rels[ri]
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	// A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
@@ -14768,12 +14911,19 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	// A base table: scan in primary-key order via a scanSource (the page_read block + per-row
 	// storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead of a
 	// full walk; an empty bound reads nothing.
+	// An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
+	// bound and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
+	// once-materialized relBounds.
 	store := db.lkpStore(rel.tableName)
+	sb := plan.relINLBounds[ri]
+	if sb == nil {
+		sb = plan.relBounds[ri]
+	}
 	var rows []storedRow
 	var nodeCount, slabs int
-	if sb := plan.relBounds[ri]; sb != nil && sb.index != nil {
+	if sb != nil && sb.index != nil {
 		var err error
-		if rows, nodeCount, slabs, err = db.indexBoundRows(rel.tableName, sb.index, params, outer, plan.relMasks[ri]); err != nil {
+		if rows, nodeCount, slabs, err = db.indexBoundRows(rel.tableName, sb.index, params, outer, plan.relMasks[ri], left); err != nil {
 			return nil, err
 		}
 	} else if sb != nil && sb.gin != nil {
@@ -14814,7 +14964,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		}
 		nodeCount, slabs = pages, sl
 	} else if sb != nil && sb.pk != nil {
-		b, empty := db.buildKeyBound(sb.pk, params, outer)
+		b, empty := db.buildKeyBound(sb.pk, params, outer, left)
 		if !empty {
 			entries, pages, sl, err := store.RangeScanWithUnitsMasked(b, plan.relMasks[ri])
 			if err != nil {
@@ -15149,12 +15299,15 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// re-reads from these in-memory buffers, which are not stores and charge nothing. A CORRELATED
 	// LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up front — a
 	// placeholder (nil) holds its slot and the join loop re-materializes it per combined left row.
+	// An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row (its
+	// bound seeks per outer row), so it is not materialized up front either — a placeholder (nil)
+	// holds its slot and the join loop re-materializes it per left row.
 	materialized := make([][]storedRow, len(plan.rels))
 	for ri, rel := range plan.rels {
-		if rel.lateral {
+		if rel.lateral || plan.relINLBounds[ri] != nil {
 			continue
 		}
-		rows, err := db.materializeRel(plan, ri, params, outer, env.rng, env.ctes, meter)
+		rows, err := db.materializeRel(plan, ri, params, outer, nil, env.rng, env.ctes, meter)
 		if err != nil {
 			return emitter{}, err
 		}
@@ -15195,7 +15348,49 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				latOuter := make([]storedRow, len(outer)+1)
 				copy(latOuter, outer)
 				latOuter[len(outer)] = left
-				rightRows, err := db.materializeRel(plan, k+1, params, latOuter, env.rng, env.ctes, meter)
+				rightRows, err := db.materializeRel(plan, k+1, params, latOuter, nil, env.rng, env.ctes, meter)
+				if err != nil {
+					return emitter{}, err
+				}
+				leftMatched := false
+				for _, right := range rightRows {
+					combined := make(storedRow, 0, len(left)+len(right))
+					combined = append(combined, left...)
+					combined = append(combined, right...)
+					keep := true
+					if on != nil {
+						v, err := on.eval(combined, env, meter)
+						if err != nil {
+							return emitter{}, err
+						}
+						keep = v.IsTrue()
+					}
+					if keep {
+						next = append(next, combined)
+						leftMatched = true
+					}
+				}
+				if emitLeft && !leftMatched {
+					combined := make(storedRow, 0, len(left)+rightPad)
+					combined = append(combined, left...)
+					for i := 0; i < rightPad; i++ {
+						combined = append(combined, NullValue())
+					}
+					next = append(next, combined)
+				}
+			}
+			running = next
+			continue
+		}
+		// An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER combined
+		// left-hand row, its scan bounded per outer row by the SIBLING columns of that row (a
+		// per-outer-row seek instead of a full scan). Detection restricts this to the RIGHT/nullable
+		// side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL
+		// are excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays
+		// applied (the ON here, the WHERE below), so rows are unchanged.
+		if plan.relINLBounds[k+1] != nil {
+			for _, left := range running {
+				rightRows, err := db.materializeRel(plan, k+1, params, outer, left, env.rng, env.ctes, meter)
 				if err != nil {
 					return emitter{}, err
 				}
@@ -18218,6 +18413,14 @@ type selectPlan struct {
 	// index-nested-loop case (a follow-on). The residual filter stays the WHOLE `filter`, re-applied
 	// after the join — the bound only narrows which rows are scanned.
 	relBounds []*scanBound
+	// relINLBounds is the INDEX-NESTED-LOOP scan bounds, one per relation (cost.md §3 "JOIN").
+	// Non-nil for a join inner relation whose primary key / indexed column is compared to a SIBLING
+	// column of an earlier relation (`a JOIN b ON b.pk = a.x`) — a per-outer-row bound resolved from
+	// the combined left-hand row. When set, that relation is NOT materialized once up front; the join
+	// loop re-materializes it per left row (like a correlated LATERAL), seeking instead of
+	// full-scanning — O(N·M) → O(N·log M). nil ⇒ the ordinary once-materialized relBounds path. A
+	// non-nil entry takes precedence over relBounds for that relation.
+	relINLBounds []*scanBound
 	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
 	// §14): which of its columns this query statically references. Drives the chain-page_read /
 	// value_decompress portion of the scan's up-front cost block — an untouched spilled or

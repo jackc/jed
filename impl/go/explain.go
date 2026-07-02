@@ -203,7 +203,7 @@ func (db *engine) renderDmlScan(r *explainRender, table *catTable, name string, 
 		r.emit(d, "Filter", fmt.Sprintf("conjuncts=%d", conjunctCount(filter)))
 		d++
 	}
-	r.emit(d, "Scan "+name, db.scanDetail(name, db.dmlScanBound(table, filter), nil))
+	r.emit(d, "Scan "+name, db.scanDetail(name, db.dmlScanBound(table, filter), false, nil))
 }
 
 // dmlScanBound picks an UPDATE/DELETE target's scan bound with the executor's own detectors: the
@@ -356,7 +356,13 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 		r.emit(depth, "Subquery "+rel.tableName, withNote("-", note))
 		return db.renderQueryPlan(r, *rel.derived, depth+1)
 	default:
-		r.emit(depth, "Scan "+rel.tableName, withNote(db.scanDetail(rel.tableName, sp.relBounds[i], sp.relMasks[i]), note))
+		// An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
+		// bound in the access-path label (cost.md §3 "JOIN").
+		bound, inl := sp.relBounds[i], false
+		if sp.relINLBounds[i] != nil {
+			bound, inl = sp.relINLBounds[i], true
+		}
+		r.emit(depth, "Scan "+rel.tableName, withNote(db.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]), note))
 		return nil
 	}
 }
@@ -498,8 +504,8 @@ func withNote(detail, note string) string {
 
 // scanDetail renders a Scan node's attributes: the access path (from the relation's chosen scan
 // bound, nil = a full scan), then the touched-column count when the query references any column.
-func (db *engine) scanDetail(tableName string, b *scanBound, mask []bool) string {
-	parts := []string{db.accessPath(tableName, b)}
+func (db *engine) scanDetail(tableName string, b *scanBound, inl bool, mask []bool) string {
+	parts := []string{db.accessPath(tableName, b, inl)}
 	if n := countTrue(mask); n > 0 {
 		parts = append(parts, fmt.Sprintf("touched=%d", n))
 	}
@@ -508,14 +514,20 @@ func (db *engine) scanDetail(tableName string, b *scanBound, mask []bool) string
 
 // accessPath renders the chosen access path for a relation (spec/design/explain.md §5): a full scan,
 // a primary-key range bound, or a secondary-index / GIN / GiST bound (the last three by index name).
-func (db *engine) accessPath(tableName string, b *scanBound) string {
+// inl marks an index-nested-loop bound (cost.md §3 "JOIN") — a per-outer-row seek whose source is a
+// sibling column — with a leading label.
+func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
+	prefix := ""
+	if inl {
+		prefix = "Index-nested-loop "
+	}
 	switch {
 	case b == nil:
 		return "Full scan"
 	case b.pk != nil:
-		return "PK bound: " + renderBoundTerms(db.firstPKColName(tableName), b.pk.terms)
+		return prefix + "PK bound: " + renderBoundTerms(db.firstPKColName(tableName), b.pk.terms)
 	case b.index != nil:
-		return "Index bound: using " + b.index.nameKey
+		return prefix + "Index bound: using " + b.index.nameKey
 	case b.gin != nil:
 		return "GIN bound: using " + b.gin.nameKey
 	case b.gist != nil:
@@ -577,7 +589,10 @@ func renderBoundSrc(e *rExpr) string {
 	case reOuterColumn:
 		return "outer"
 	case reColumn:
-		return "col"
+		// An index-nested-loop bound source — a column of an earlier join relation resolved per outer
+		// row (cost.md §3 "JOIN"). Rendered generically (the global column index is not a user-facing
+		// name, like the correlated `outer` case above).
+		return "join"
 	default:
 		return renderBoundLit(e)
 	}

@@ -222,7 +222,7 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 	// Row path: scan the single base relation through the same path the eager executor uses, so the
 	// page_read / value_decompress / storage_row_read block is charged identically (executor.go
 	// materializeRel).
-	rows, err := db.materializeRel(plan, 0, params, outer, rng, ctes, meter)
+	rows, err := db.materializeRel(plan, 0, params, outer, nil, rng, ctes, meter)
 	if err != nil {
 		return emitter{}, err
 	}
@@ -352,7 +352,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	b := unboundedBound()
 	if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
 		var empty bool
-		if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer); empty {
+		if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer, nil); empty {
 			scan = false
 		}
 	}
@@ -535,7 +535,7 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 	if len(plan.relBounds) > 0 {
 		if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
 			var empty bool
-			if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer); empty {
+			if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer, nil); empty {
 				scan = false
 			}
 		}
