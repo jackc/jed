@@ -191,6 +191,30 @@ commit. `close` is idempotent.
 - One-shot convenience: `db.execute(sql, params)` / `db.query(sql, params)` are sugar for
   prepare-then-run (autocommit). The pre-API free function `execute(db, sql)` is kept unchanged
   (zero parameters) — the conformance harnesses depend on it.
+- **Plan cache.** A `PreparedStatement.query` caches its **resolved plan** (not just the parsed
+  AST) and reuses it across executes, so a repeated query skips planning entirely — the dominant
+  cost of a trivial-plan / high-frequency lookup (planning is ~⅔ of a point lookup's latency and
+  ~88% of its allocations). The cache is keyed on a **catalog generation** counter bumped by every
+  schema-changing DDL (`CREATE`/`DROP`/`ALTER` of a table, type, or index): a DDL between executes
+  invalidates the cached plan and the next execute re-plans (PostgreSQL invalidates prepared plans
+  on schema change the same way). To stay collision-free across a rolled-back in-transaction DDL,
+  the cache is **filled only from committed state**, making the committed generation strictly
+  monotonic; a statement first executed *inside* an open transaction re-plans until it commits. A
+  plan is cached only when reusing it is result/cost-**identical** to a fresh plan — so a plan with
+  an uncorrelated subquery (whose per-execution constant-fold bakes in one execution's params), a
+  precompiled-regex node (whose one-shot compile-cost flag mutates during eval), or a temp / SRF /
+  CTE / derived relation is **never** cached and re-plans each execute. The routing was also unified
+  to plan a scan-shaped query **once** (streaming and buffered were formerly two separate plans),
+  which speeds the ad-hoc `query()`/`Session.query` path too. The behavior is result/cost/byte-
+  neutral (planning is unmetered) — no on-disk format change, no conformance-corpus change.
+  - **Rust note:** the cached plan is held behind an `Rc` (the plan is `!Sync` via a regex `Cell`,
+    so `Arc` buys nothing), which makes the Rust `PreparedStatement` `!Send` (it was `Send + Sync`).
+    This is a non-regression in practice — the whole Rust query/cursor path is already thread-affine
+    (`Engine`/`Session`/`Rows` hold `Rc`s) — but it *is* an observable capability change: a host that
+    wants a prepared statement on another thread re-prepares there (a cheap re-parse). `Database`
+    stays `Send + Sync` (it mints a session per thread). Go and TS are unaffected (Go is GC'd; TS is
+    single-threaded), so this is the one place the cores' host-API auto-traits differ — recorded in
+    [cores.md](cores.md).
 
 ### 2.5 Concurrent sessions: parallel readers + a single writer
 
