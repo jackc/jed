@@ -118,6 +118,10 @@ CORRELATED_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi
                     query.subquery_scalar query.subquery_in query.subquery_exists
                     query.subquery_correlated query.correlated_pushdown expr.arithmetic types.i32
                     null.three_valued].freeze
+INL_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+             query.where_eq query.comparison_order query.order_by query.order_by_keys
+             query.qualified_column query.join_inner query.join_left query.index_nested_loop
+             query.point_lookup expr.arithmetic types.i32 null.three_valued].freeze
 INDEX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert dml.insert_multi_row
                dml.update dml.delete query.select query.where_eq query.comparison_order
                query.order_by expr.arithmetic expr.comparison_value types.i32
@@ -391,6 +395,63 @@ def gen_correlated(seed)
              "SELECT o.id FROM o WHERE o.k IN (SELECT inr.id FROM inr WHERE inr.id = o.k) ORDER BY o.id",
              "SELECT o.id FROM o WHERE o.k IN (SELECT inr.id FROM inr WHERE inr.id + 0 = o.k) ORDER BY o.id",
              exists_flat)
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: index-nested-loop join -----------------------------------------------------------
+# The join analog of `correlated`: a join INNER relation whose pk equals a SIBLING column of an
+# earlier relation (`inr.id = o.k`, in the ON or the WHERE) bounds the inner scan to a per-outer-row
+# seek (cost.md §3 "JOIN", query.index_nested_loop); the equivalent `inr.id + 0 = o.k` is a BinaryOp,
+# so the bare-column detector does NOT push it and the inner full-scans per outer row. Both forms must
+# return identical rows — for INNER and for a LEFT join (whose NULL-extension survives the per-outer
+# bound: an empty bound NULL-extends that outer row exactly as a full scan with no match would).
+def gen_index_nested_loop(seed)
+  rng = Random.new(seed)
+  inr = (1..15).to_a.sample(5, random: rng).sort.map { |id| [id, rng.rand(-20..20)] }
+  inr_by_id = inr.to_h
+  absent_pool = (1..30).to_a - inr.map(&:first)
+  o_ids = (1..7).to_a
+  # Outer keys: present (matches an inner pk), absent (no match), and a NULL (3VL — inr.id = NULL is
+  # never true, so the pair does not match and a LEFT join NULL-extends that outer row).
+  o = o_ids.each_with_index.map do |oid, i|
+    k = if i == o_ids.size - 1 then nil
+        elsif rng.rand < 0.6 then inr.map(&:first).sample(random: rng)
+        else absent_pool.sample(random: rng)
+        end
+    [oid, k]
+  end
+
+  # inr.id is the PRIMARY KEY, so `inr.id = o.k` matches AT MOST one inner row per outer row — hence
+  # each o.id yields exactly 0/1 output rows (INNER) or exactly 1 (LEFT), so ORDER BY o.id is a total
+  # order.
+  inner = o.sort_by(&:first).flat_map { |oid, ok| ok && inr_by_id.key?(ok) ? [[oid, inr_by_id[ok]]] : [] }
+  left  = o.sort_by(&:first).map { |oid, ok| [oid, ok && inr_by_id.key?(ok) ? inr_by_id[ok] : nil] }
+  flat = ->(rs) { rs.flat_map { |oid, v| [oid.to_s, v.nil? ? "NULL" : v.to_s] } }
+
+  out = header(seed, INL_REQ, "index-nested-loop join (bound the inner scan by an earlier relation's column)")
+  stmt(out, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO o VALUES #{o.map { |oid, k| "(#{oid}, #{k.nil? ? 'NULL' : k})" }.join(', ')}")
+  stmt(out, "INSERT INTO inr VALUES #{inr.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
+
+  ipair = lambda do |title, opt_sql, scan_sql, exp|
+    out << "# #{title}"
+    out << "# index-nested-loop (inner pk = sibling col -> per-outer-row seek)"
+    q(out, "II", opt_sql, flat.call(exp))
+    out << "# full inner scan per outer row (+0 defeats the bare-column bound) — MUST match"
+    q(out, "II", scan_sql, flat.call(exp))
+  end
+
+  ipair.call("INNER, bound inr by the ON `inr.id = o.k`",
+             "SELECT o.id, inr.v FROM o JOIN inr ON inr.id = o.k ORDER BY o.id",
+             "SELECT o.id, inr.v FROM o JOIN inr ON inr.id + 0 = o.k ORDER BY o.id", inner)
+  ipair.call("LEFT, bound the nullable inr by the ON (NULL-extension survives the per-outer bound)",
+             "SELECT o.id, inr.v FROM o LEFT JOIN inr ON inr.id = o.k ORDER BY o.id",
+             "SELECT o.id, inr.v FROM o LEFT JOIN inr ON inr.id + 0 = o.k ORDER BY o.id", left)
+  ipair.call("INNER, bound inr by the WHERE (ON true)",
+             "SELECT o.id, inr.v FROM o JOIN inr ON true WHERE inr.id = o.k ORDER BY o.id",
+             "SELECT o.id, inr.v FROM o JOIN inr ON true WHERE inr.id + 0 = o.k ORDER BY o.id", inner)
 
   out.join("\n") + "\n"
 end
@@ -1252,6 +1313,7 @@ SCENARIOS = {
   "limit" => method(:gen_limit),
   "join" => method(:gen_join),
   "correlated" => method(:gen_correlated),
+  "index_nested_loop" => method(:gen_index_nested_loop),
   "index" => method(:gen_index),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),

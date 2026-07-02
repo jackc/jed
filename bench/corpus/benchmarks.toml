@@ -176,6 +176,30 @@ gen = "int_uniform"
 min = 1
 max = 99996
 
+# Index-nested-loop join (spec/design/cost.md §3 "JOIN", query.index_nested_loop): a 1000-value
+# generate_series driver JOINs orders on the orders PRIMARY KEY (`o.id = g.g`), so the planner bounds
+# the inner `orders` scan to a per-outer-row PK seek instead of full-scanning the 1M-row table for
+# every driver value — O(N·M) → O(N·log M), the whole point of the optimization. Without it jed would
+# full-scan 1M rows × 1000 driver values (10^9 rows); with it, 1000 B-tree point lookups. PostgreSQL
+# plans the same nested-loop-with-index-scan, so the comparison is apples to apples. jed + PostgreSQL
+# only (SQLite has no generate_series).
+[[bench]]
+name = "index_nested_loop_join"
+description = "Index-nested-loop join: a 1000-value generate_series driver seeks orders by its PRIMARY KEY once per driver value (o.id = g.g) — the inner scan bounds to a per-outer-row point lookup instead of a full scan (cost.md §3 'JOIN'). jed + PostgreSQL only (SQLite has no generate_series)"
+dataset = "large"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT g.g, o.amount FROM generate_series($1, $1 + 999) AS g JOIN orders o ON o.id = g.g ORDER BY g.g"
+warmup = 100
+iterations = 1000
+seed = 4231
+expect_rows_per_iter = 1000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 999000
+
 # GIN-bounded scans over the `gin` dataset's 200k-row docs.tags bigint[] column behind a GIN
 # index (spec/design/gin.md §6). jed + PostgreSQL only (SQLite has no array type or GIN). The
 # query array is element-cast — ARRAY[$1::bigint, $2::bigint] — the one form both engines accept:
