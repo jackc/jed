@@ -65,66 +65,279 @@ func (db *engine) executeExplain(ex *explain, params []Value) (Outcome, error) {
 	}, nil
 }
 
-// planExplainInner resolves the inner statement into a queryPlan WITHOUT executing it. Slice 1
-// handles a read query (SELECT); DML and top-level set-op / WITH are later slices.
+// planExplainInner resolves the inner statement into a queryPlan WITHOUT executing it. It handles the
+// read-query forms — SELECT, a top-level set operation, and a read-only top-level WITH; DML is a later
+// slice. A top-level WITH is planned as a nested WITH expression (there are no enclosing CTEs to
+// inherit at the top level), which produces the same withPlan structure to render.
 func (db *engine) planExplainInner(inner *statement) (queryPlan, error) {
 	ptypes := &paramTypes{}
 	switch {
 	case inner.Select != nil:
 		return db.planQuery(queryExpr{Select: inner.Select}, nil, nil, ptypes)
+	case inner.SetOp != nil:
+		return db.planQuery(queryExpr{SetOp: inner.SetOp}, nil, nil, ptypes)
+	case inner.With != nil:
+		body := inner.With.Body.AsQuery()
+		if body == nil {
+			// A data-modifying primary (writable CTE) — a DML EXPLAIN, handled in a later slice.
+			return queryPlan{}, newError(FeatureNotSupported, "EXPLAIN of a data-modifying WITH is not yet supported")
+		}
+		wp, err := db.planWithExpr(&withExpr{Ctes: inner.With.Ctes, Recursive: inner.With.Recursive, Body: body}, nil, ptypes)
+		if err != nil {
+			return queryPlan{}, err
+		}
+		return queryPlan{with: wp}, nil
 	default:
 		return queryPlan{}, newError(FeatureNotSupported, "EXPLAIN of this statement is not yet supported")
 	}
 }
 
-// renderQueryPlan walks a queryPlan arm at the given depth. Slice 1 handles a SELECT plan; set-op /
-// VALUES / WITH arms are later slices.
+// renderQueryPlan walks a queryPlan arm at the given depth: a SELECT plan, a set operation, a VALUES
+// relation, or a WITH plan.
 func (db *engine) renderQueryPlan(r *explainRender, qp queryPlan, depth int) error {
 	switch {
 	case qp.sel != nil:
 		return db.renderSelectPlan(r, qp.sel, depth)
+	case qp.setop != nil:
+		return db.renderSetOpPlan(r, qp.setop, depth)
+	case qp.values != nil:
+		db.renderValuesPlan(r, qp.values, depth)
+		return nil
+	case qp.with != nil:
+		return db.renderWithPlan(r, qp.with, depth)
 	default:
 		return newError(FeatureNotSupported, "EXPLAIN of this query shape is not yet supported")
 	}
 }
 
-// renderSelectPlan emits a selectPlan's nodes in operator order (outermost first, each the pre-order
-// parent of the next): Limit, Distinct, Sort (only when the sort is not elided), Filter, then the FROM
-// tree. Slice 1 handles a single base-table scan; joins / aggregates / windows / non-base relations
-// are later slices.
+// renderSelectPlan emits a selectPlan's nodes in operator order — outermost first, each the pre-order
+// parent of the next, so the tree reads top-down as the executor's pipeline reads bottom-up: Limit,
+// Sort, Distinct, Window, Aggregate, Filter (WHERE), then the FROM tree. A Sort is emitted only when
+// the order is NOT elided; an elided ORDER BY (served by the scan / index / join order) is instead
+// noted on the FROM tree's top node (spec/design/explain.md §5).
 func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) error {
 	d := depth
 	if sp.limit != nil || sp.offset != nil {
 		r.emit(d, "Limit", limitDetail(sp.limit, sp.offset))
 		d++
 	}
+	orderNote := ""
+	if len(sp.order) > 0 {
+		switch {
+		case sp.pkOrdered:
+			orderNote = "pk ordered"
+			if sp.pkReverse {
+				orderNote += " (reverse)"
+			}
+		case sp.indexOrder != nil:
+			orderNote = "index order: " + sp.indexOrder.nameKey
+		case sp.joinPkOrdered:
+			orderNote = "join pk ordered"
+		default:
+			r.emit(d, "Sort", fmt.Sprintf("keys=%d", len(sp.order)))
+			d++
+		}
+	}
 	if sp.distinct {
 		r.emit(d, "Distinct", "-")
 		d++
 	}
-	if len(sp.order) > 0 && !sp.pkOrdered && sp.indexOrder == nil && !sp.joinPkOrdered {
-		r.emit(d, "Sort", fmt.Sprintf("keys=%d", len(sp.order)))
+	if sp.hasWindow {
+		r.emit(d, "Window", fmt.Sprintf("funcs=%d", len(sp.windowSpecs)))
+		d++
+	}
+	if sp.isAgg {
+		r.emit(d, "Aggregate", aggDetail(sp))
 		d++
 	}
 	if sp.filter != nil {
 		r.emit(d, "Filter", fmt.Sprintf("conjuncts=%d", conjunctCount(sp.filter)))
 		d++
 	}
-	return db.renderFrom(r, sp, d)
+	return db.renderFrom(r, sp, d, orderNote)
 }
 
-// renderFrom emits the FROM tree. Slice 1 supports exactly one base-table relation with no joins,
-// aggregation, or window stage; every other shape is a later slice (0A000 until then).
-func (db *engine) renderFrom(r *explainRender, sp *selectPlan, depth int) error {
-	if sp.isAgg || sp.hasWindow || len(sp.rels) != 1 || len(sp.joins) != 0 {
-		return newError(FeatureNotSupported, "EXPLAIN of this query shape is not yet supported")
+// renderFrom emits the FROM tree: a left-deep chain of Nested Loop joins over the plan's relations,
+// or a single relation leaf, or a Result node for a FROM-less query. orderNote, when non-empty,
+// records an elided ORDER BY on the tree's top node.
+func (db *engine) renderFrom(r *explainRender, sp *selectPlan, depth int, orderNote string) error {
+	n := len(sp.rels)
+	if n == 0 {
+		r.emit(depth, "Result", withNote("-", orderNote))
+		return nil
 	}
-	rel := sp.rels[0]
-	if rel.srf != nil || rel.cte != nil || rel.derived != nil {
-		return newError(FeatureNotSupported, "EXPLAIN of this relation kind is not yet supported")
+	return db.renderJoinTree(r, sp, n, depth, orderNote)
+}
+
+// renderJoinTree emits the left-deep join over the first n relations: the outermost node is the last
+// join (joins[n-2]), whose left subtree is the join over the first n-1 relations and whose right child
+// is rels[n-1]. note tags the outermost node with an elided ORDER BY.
+func (db *engine) renderJoinTree(r *explainRender, sp *selectPlan, n, depth int, note string) error {
+	if n == 1 {
+		return db.renderRelLeaf(r, sp, 0, depth, note)
 	}
-	r.emit(depth, "Scan "+rel.tableName, db.scanDetail(rel.tableName, sp.relBounds[0], sp.relMasks[0]))
-	return nil
+	j := sp.joins[n-2]
+	r.emit(depth, "Nested Loop", withNote(joinDetail(j), note))
+	if err := db.renderJoinTree(r, sp, n-1, depth+1, ""); err != nil {
+		return err
+	}
+	return db.renderRelLeaf(r, sp, n-1, depth+1, "")
+}
+
+// renderRelLeaf emits one relation: a base-table Scan (with its access path), an SRF, a CTE Scan, or a
+// Subquery (a derived table, whose inner plan recurses one level deeper). note tags a base Scan with
+// an elided ORDER BY (only a single base-table relation can carry one).
+func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, note string) error {
+	rel := sp.rels[i]
+	switch {
+	case rel.srf != nil:
+		r.emit(depth, "SRF "+rel.tableName, withNote("-", note))
+		return nil
+	case rel.cte != nil:
+		r.emit(depth, "CTE Scan "+rel.tableName, withNote("-", note))
+		return nil
+	case rel.derived != nil:
+		r.emit(depth, "Subquery "+rel.tableName, withNote("-", note))
+		return db.renderQueryPlan(r, *rel.derived, depth+1)
+	default:
+		r.emit(depth, "Scan "+rel.tableName, withNote(db.scanDetail(rel.tableName, sp.relBounds[i], sp.relMasks[i]), note))
+		return nil
+	}
+}
+
+// renderSetOpPlan emits a set operation: any trailing Limit / Sort on the combined result, the
+// Union / Intersect / Except node, then the left and right operand plans as children.
+func (db *engine) renderSetOpPlan(r *explainRender, sop *setOpPlan, depth int) error {
+	d := depth
+	if sop.limit != nil || sop.offset != nil {
+		r.emit(d, "Limit", limitDetail(sop.limit, sop.offset))
+		d++
+	}
+	if len(sop.order) > 0 {
+		r.emit(d, "Sort", fmt.Sprintf("keys=%d", len(sop.order)))
+		d++
+	}
+	r.emit(d, setOpNodeName(sop.op), setOpDetail(sop.all))
+	if err := db.renderQueryPlan(r, sop.lhs, d+1); err != nil {
+		return err
+	}
+	return db.renderQueryPlan(r, sop.rhs, d+1)
+}
+
+// renderValuesPlan emits a VALUES relation as a leaf node carrying its row count.
+func (db *engine) renderValuesPlan(r *explainRender, vp *valuesPlan, depth int) {
+	r.emit(depth, "Values", fmt.Sprintf("rows=%d", len(vp.rows)))
+}
+
+// renderWithPlan emits a WITH plan: the WITH node, each common-table expression as a CTE child (its
+// body one level deeper), then the main body plan.
+func (db *engine) renderWithPlan(r *explainRender, wp *withPlan, depth int) error {
+	r.emit(depth, "WITH", fmt.Sprintf("ctes=%d", len(wp.bindings)))
+	for i, b := range wp.bindings {
+		mode := cteInline
+		if i < len(wp.modes) {
+			mode = wp.modes[i]
+		}
+		r.emit(depth+1, "CTE "+b.name, cteDetail(b, mode))
+		if !b.isDml() {
+			if err := db.renderQueryPlan(r, b.plan, depth+2); err != nil {
+				return err
+			}
+		}
+	}
+	return db.renderQueryPlan(r, wp.body, depth+1)
+}
+
+// cteDetail renders a CTE binding's attributes: its materialization mode (inlined vs materialized —
+// the planner's choice) and whether it is recursive.
+func cteDetail(b *cteBinding, mode cteMode) string {
+	parts := []string{cteModeText(mode)}
+	if b.recursive != nil {
+		parts = append(parts, "recursive")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// cteModeText labels a CTE materialization mode.
+func cteModeText(m cteMode) string {
+	if m == cteMaterialize {
+		return "materialized"
+	}
+	return "inlined"
+}
+
+// aggDetail renders an Aggregate node's attributes: the grouping-key count, aggregate count, the
+// grouping-set count when there is more than one set, and the HAVING conjunct count.
+func aggDetail(sp *selectPlan) string {
+	parts := []string{fmt.Sprintf("groups=%d aggs=%d", len(sp.groupKeys), len(sp.aggSpecs))}
+	if len(sp.groupSets) > 1 {
+		parts = append(parts, fmt.Sprintf("sets=%d", len(sp.groupSets)))
+	}
+	if sp.having != nil {
+		parts = append(parts, fmt.Sprintf("having:conjuncts=%d", conjunctCount(sp.having)))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// joinDetail renders a Nested Loop node's attributes: the join kind and the ON predicate's conjunct
+// count (a CROSS join has no ON).
+func joinDetail(j planJoin) string {
+	kind := joinKindText(j.kind)
+	if j.on == nil {
+		return kind
+	}
+	return fmt.Sprintf("%s; on:conjuncts=%d", kind, conjunctCount(j.on))
+}
+
+// joinKindText is the label for a join kind.
+func joinKindText(k joinKind) string {
+	switch k {
+	case joinInner:
+		return "inner"
+	case joinCross:
+		return "cross"
+	case joinLeft:
+		return "left"
+	case joinRight:
+		return "right"
+	case joinFull:
+		return "full"
+	default:
+		return "?"
+	}
+}
+
+// setOpNodeName is the node label for a set-operation kind.
+func setOpNodeName(op setOpKind) string {
+	switch op {
+	case setOpUnion:
+		return "Union"
+	case setOpIntersect:
+		return "Intersect"
+	case setOpExcept:
+		return "Except"
+	default:
+		return "SetOp"
+	}
+}
+
+// setOpDetail renders a set operation's ALL / DISTINCT disposition.
+func setOpDetail(all bool) string {
+	if all {
+		return "all"
+	}
+	return "distinct"
+}
+
+// withNote appends an elided-ORDER-BY note to a node's detail (replacing a "-" sentinel).
+func withNote(detail, note string) string {
+	if note == "" {
+		return detail
+	}
+	if detail == "" || detail == "-" {
+		return "ordered: " + note
+	}
+	return detail + "; ordered: " + note
 }
 
 // scanDetail renders a Scan node's attributes: the access path (from the relation's chosen scan
