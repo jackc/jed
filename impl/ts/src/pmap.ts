@@ -493,6 +493,46 @@ export class PMap {
     return { cols, rowCount, nodes };
   }
 
+  // foldScan is the fold-during-walk twin of columnarScan (packed-leaf.md §11): the identical windowed,
+  // interior-separator-inclusive walk (so the visited-node set — and page_read — is identical), but
+  // calls visit(n, i) per admitted entry instead of gathering its columns into lanes. visit reads the
+  // entry's touched columns via colAt and folds them straight into an accumulator, so a whole-table /
+  // single-int-key aggregate is O(1) memory instead of O(rows). Returns the same { rowCount, nodes } as
+  // columnarScan, so the caller charges the same page_read / storage_row_read.
+  foldScan(
+    b: KeyBound,
+    src: LeafSource | null,
+    visit: (n: PNode, i: number) => void,
+  ): { rowCount: number; nodes: number } {
+    let rowCount = 0;
+    let nodes = 0;
+    const walk = (n: PNode): void => {
+      nodes++;
+      const [ef, el] = entryWindow(b, n);
+      if (isLeaf(n)) {
+        for (let i = ef; i < el; i++) {
+          visit(n, i);
+          rowCount++;
+        }
+        return;
+      }
+      const [cf, cl] = childWindow(b, n);
+      if (ef < cf) {
+        visit(n, ef);
+        rowCount++;
+      }
+      for (let i = cf; i <= cl; i++) {
+        walk(resolveChild(n.children[i], src));
+        if (i >= ef && i < el) {
+          visit(n, i);
+          rowCount++;
+        }
+      }
+    };
+    if (this.root !== null) walk(this.root);
+    return { rowCount, nodes };
+  }
+
   // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
   // charges (cost.md §3). Mirrors rangeEntries' traversal exactly (same childWindow prune, root
   // always visited), counting an OnDisk leaf as one node WITHOUT faulting it (pager.md §5). The

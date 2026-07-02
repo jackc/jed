@@ -311,6 +311,18 @@ export class TableStore {
     return { cols, rowCount, pages: nodes, slabs: 0 };
   }
 
+  // foldScanMasked is the fold-during-walk twin of columnarScanMasked (packed-leaf.md §11): it walks the
+  // bounded scan calling visit(n, i) per admitted row — which reads only the touched columns via colAt
+  // and folds them into an accumulator — so an aggregate never materializes a per-column lane (O(1)
+  // memory). Returns { rowCount, nodes } identical to the columnar scan, so the caller charges the same
+  // page_read / storage_row_read; value_decompress is 0 (the caller gates on !anySpillableTouched).
+  foldScanMasked(
+    b: KeyBound,
+    visit: (n: PNode, i: number) => void,
+  ): { rowCount: number; nodes: number } {
+    return this.rows.foldScan(b, this.leafSrc(), visit);
+  }
+
   // isFileBacked reports whether this store has a demand-paging pool — the gate for the Track A2/A3
   // columnar gather (packed-leaf.md §11): an in-memory store's Decoded leaves already share their rows
   // zero-copy on the row path, so a lane gather would only add allocation with no packed-leaf win.

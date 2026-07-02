@@ -139,7 +139,7 @@ import { type Privilege, type PrivilegeSet, Privileges } from "./privileges.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
-import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
+import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
 import { DEFAULT_WORK_MEM, type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
@@ -11390,10 +11390,6 @@ export class Engine {
 
     // Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
     // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely.
-    let cols: Value[][] = mask.map(() => []);
-    let rowCount = 0;
-    let pages = 0;
-    const slabs = 0;
     let doScan = true;
     let b = unboundedBound();
     const relBound = plan.relBounds[0];
@@ -11402,32 +11398,80 @@ export class Engine {
       if (bb === null) doScan = false;
       else b = bb;
     }
-    if (doScan) {
-      const r = store.columnarScanMasked(b, mask);
-      cols = r.cols;
-      rowCount = r.rowCount;
-      pages = r.pages;
-    }
-    // Charge the scan cost block identically to materializeRel + scanSource: pageRead × nodes,
-    // valueDecompress × slabs (0 here), storageRowRead × rowCount. On the unmetered lane the caller gates,
-    // so this bulk charge reproduces the per-row accrual (guard is a no-op).
-    meter.charge(
-      COSTS.pageRead * BigInt(pages) +
-        COSTS.valueDecompress * BigInt(slabs) +
-        COSTS.storageRowRead * BigInt(rowCount),
-    );
 
-    // A3: apply the WHERE predicate over the lanes into a selection vector (undefined ⇒ all survive).
-    let sel: number[] | undefined;
-    let nsurv = rowCount;
-    if (plan.filter !== null) {
-      sel = filterColumnar(plan.filter, cols, mask, rowCount, env, meter);
-      nsurv = sel.length;
+    const grouped = gset.keyCols.length === 1;
+    const keyCol = grouped ? gset.keyCols[0]! : 0;
+
+    // Fold each scanned row's touched columns straight into its accumulator during ONE tree walk — no
+    // per-column lane is materialized, so a whole-table / single-int-key aggregate is O(1) memory instead
+    // of the O(rows) whole-column gather the lane path paid (float.md §7, packed-leaf.md §11). A WHERE
+    // predicate (A3) is evaluated over a single reusable masked scratch row read via colAt (untouched
+    // columns NULL) — byte-identical input + operator_eval to the lane filter.
+    const whole: Acc[] = grouped ? [] : plan.aggSpecs.map((s) => newAccFromSpec(s));
+    const groups: { key: Value; accs: Acc[] }[] = [];
+    const index = new Map<bigint, number>();
+    let nullGi = -1;
+    const scratch: Row =
+      plan.filter !== null ? new Array(mask.length).fill(nullValue()) : [];
+    let nsurv = 0;
+    let rowCount = 0;
+    let pages = 0;
+
+    if (doScan) {
+      const visit = (n: PNode, i: number): void => {
+        if (plan.filter !== null) {
+          for (let c = 0; c < mask.length; c++) {
+            if (mask[c]) scratch[c] = colAt(n, i, c);
+          }
+          if (!isTrue(evalExpr(plan.filter, scratch, env, meter))) return;
+        }
+        nsurv++;
+        let accs: Acc[];
+        if (grouped) {
+          const kv = colAt(n, i, keyCol);
+          let gi: number;
+          if (kv.kind === "int") {
+            const g = index.get(kv.int);
+            if (g === undefined) {
+              gi = groups.length;
+              index.set(kv.int, gi);
+              groups.push({ key: kv, accs: plan.aggSpecs.map((s) => newAccFromSpec(s)) });
+            } else {
+              gi = g;
+            }
+          } else {
+            // A NULL integer key buckets into one sentinel group (matching the scalar/lane path).
+            if (nullGi < 0) {
+              nullGi = groups.length;
+              groups.push({ key: nullValue(), accs: plan.aggSpecs.map((s) => newAccFromSpec(s)) });
+            }
+            gi = nullGi;
+          }
+          accs = groups[gi]!.accs;
+        } else {
+          accs = whole;
+        }
+        for (let s = 0; s < plan.aggSpecs.length; s++) {
+          const spec = plan.aggSpecs[s]!;
+          const oc = operandCol(spec);
+          foldAcc(accs[s]!, oc === null ? nullValue() : colAt(n, i, oc), meter);
+        }
+      };
+      const r = store.foldScanMasked(b, visit);
+      rowCount = r.rowCount;
+      pages = r.nodes;
     }
-    const at: LaneAt = (j, col) => cols[col]![sel !== undefined ? sel[j]! : j]!;
-    return gset.keyCols.length === 0
-      ? [foldAggWhole(plan.aggSpecs, at, nsurv, meter)]
-      : groupByIntKey(plan.aggSpecs, gset.keyCols[0]!, at, nsurv, meter);
+
+    // Charge the identical cost totals (unmetered lane — charge order is invisible): the scan block
+    // (pageRead × nodes; valueDecompress × 0 — no spillable touched column gated above; storageRowRead ×
+    // rowCount) and aggregateAccumulate once per (survivor × spec). The filter's operator_eval was
+    // charged per scanned row inside the walk.
+    meter.charge(COSTS.pageRead * BigInt(pages) + COSTS.storageRowRead * BigInt(rowCount));
+    meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length));
+
+    return grouped
+      ? groups.map(({ key, accs }) => [key, ...accs.map((a) => finalizeAcc(a))])
+      : [whole.map((a) => finalizeAcc(a))];
   }
 
   // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
@@ -16742,8 +16786,10 @@ type WindowPlan =
   | "nthValue";
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
-// For float SUM/AVG the inputs are COLLECTED in `floats` (the canonical fold needs all values up
-// front — float.md §7), with `floatWidth` the input width fixed at resolve.
+// For float SUM/AVG the finite inputs fold into `floatTotal` in scan order (a STREAMING running total —
+// float.md §7, fold order ledgered non-deterministic), with the NaN/±Inf presence tracked in the flags
+// so the special-value resolution stays order-independent; `floatWidth` (fixed at resolve) re-rounds
+// `floatTotal` to binary32 each add when f32.
 type Acc = {
   plan: AggPlan;
   count: bigint;
@@ -16751,7 +16797,10 @@ type Acc = {
   sumDec: Decimal;
   seen: boolean;
   cur: Value | null;
-  floats: number[];
+  floatTotal: number;
+  floatNaN: boolean;
+  floatPosInf: boolean;
+  floatNegInf: boolean;
   floatWidth: ScalarType;
   // For the "jsonAgg" plan (B4): the accumulated element nodes (the array body, in scan order) and
   // the two flags fixed at resolve (asJson → json result; strict → skip a NULL-valued row).
@@ -16797,7 +16846,10 @@ function newAcc(
     sumDec: Decimal.fromBigInt(0n),
     seen: false,
     cur: null,
-    floats: [],
+    floatTotal: 0,
+    floatNaN: false,
+    floatPosInf: false,
+    floatNegInf: false,
     floatWidth,
     jsonNodes: [],
     jsonAsJson,
@@ -16852,14 +16904,14 @@ function newAccFromSpec(s: AggSpec): Acc {
 
 // cloneAcc deep-copies a running accumulator so the window stage can SNAPSHOT it at each peer-group
 // boundary and finalize the snapshot without consuming the running fold (spec/design/window.md §6;
-// the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values), so only the
-// float-fold buffer needs a real copy; `cur` is a Value (treated immutably by foldAcc/finalizeAcc).
+// the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values) and the float fold
+// is a scalar running total, so only the collected slices below need a real copy; `cur` is a Value
+// (treated immutably by foldAcc/finalizeAcc).
 function cloneAcc(a: Acc): Acc {
   // Ordered-set accumulators are never windowed (clone is the window-stage snapshot), but copy the
   // collected slices anyway so a clone never aliases the original.
   return {
     ...a,
-    floats: a.floats.slice(),
     jsonNodes: a.jsonNodes.slice(),
     jsonPairs: a.jsonPairs.slice(),
     osaVals: a.osaVals ? a.osaVals.slice() : undefined,
@@ -16914,13 +16966,21 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
       break;
     case "sumFloat":
     case "avgFloat":
-      // Float SUM/AVG: COLLECT the inputs for the canonical-order fold at finalize (float.md §7).
-      // NULL is skipped (every aggregate). The fold itself (sort + width-correct add) runs once at
-      // finalize, so per-row cost stays the structural aggregate_accumulate already charged.
+      // Float SUM/AVG: fold each finite input into the running total in scan order (float.md §7 —
+      // fold order ledgered non-deterministic); NaN/±Inf only set a flag (special-value resolution
+      // stays order-independent). NULL is skipped (every aggregate). When f32 the running total is
+      // re-rounded to binary32 each add (the width-correct fold).
       if (v.kind === "f32" || v.kind === "f64") {
-        a.floats.push(v.value);
         a.count += 1n;
         a.seen = true;
+        if (Number.isNaN(v.value)) a.floatNaN = true;
+        else if (v.value === Infinity) a.floatPosInf = true;
+        else if (v.value === -Infinity) a.floatNegInf = true;
+        else {
+          const x = canonFloat(v.value); // -0 → +0
+          a.floatTotal =
+            a.floatWidth === "f32" ? Math.fround(a.floatTotal + x) : a.floatTotal + x;
+        }
       }
       break;
     case "min":
@@ -17031,14 +17091,14 @@ function finalizeAcc(a: Acc): Value {
       return a.count === 0n ? nullValue() : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
     case "sumFloat": {
       if (!a.seen) return nullValue(); // empty / all-NULL group → NULL
-      const s = floatCanonicalSum(a.floats, a.floatWidth);
+      const s = resolveFloatFold(a);
       return a.floatWidth === "f32" ? float32Value(s) : float64Value(s);
     }
     case "avgFloat": {
       if (a.count === 0n) return nullValue();
       // AVG = SUM / count, the division ROUNDED ONCE at the input width (float.md §7). count is
       // exact; Number(count) is safe for any plausible group size.
-      const s = floatCanonicalSum(a.floats, a.floatWidth);
+      const s = resolveFloatFold(a);
       const avg = s / Number(a.count);
       const r = a.floatWidth === "f32" ? Math.fround(avg) : avg;
       return a.floatWidth === "f32" ? float32Value(r) : float64Value(r);
@@ -17381,40 +17441,23 @@ function percentileInputF64(v: Value): number {
   }
 }
 
-// floatCanonicalSum is the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (float.md §7), bit-identical
-// across cores and across any serial/parallel plan. Steps:
-//   1. Special values first (order-independent): any NaN → NaN; else if both +Inf and -Inf → NaN;
-//      else if +Inf present → +Inf; else if -Inf present → -Inf; else all-finite → step 2.
-//   2. Canonicalize each finite value -0 → +0, then SORT by the total order (floatTotalCmp).
-//   3. FOLD LEFT with width-correct IEEE addition (Math.fround each add for f32). A running
-//      total overflowing to ±Inf traps 22003 (the finite-overflow rule; PG yields ±Inf — a
-//      documented divergence). `caller` builds the f32/f64 Value.
-function floatCanonicalSum(values: number[], width: ScalarType): number {
-  let anyNaN = false;
-  let posInf = false;
-  let negInf = false;
-  const finite: number[] = [];
-  for (const v of values) {
-    if (Number.isNaN(v)) anyNaN = true;
-    else if (v === Infinity) posInf = true;
-    else if (v === -Infinity) negInf = true;
-    else finite.push(canonFloat(v)); // -0 → +0
-  }
-  if (anyNaN) return NaN;
-  if (posInf && negInf) return NaN;
-  if (posInf) return Infinity;
-  if (negInf) return -Infinity;
-  // All finite: sort by the total order (after -0 canonicalization, distinct values have distinct
-  // keys, so the sort is total and deterministic — every core sees the same sequence).
-  finite.sort(floatTotalCmp);
-  const f32 = width === "f32";
-  let acc = 0; // +0 start; adding to it preserves the first value's sign correctly under IEEE
-  for (const v of finite) {
-    acc = acc + v;
-    if (f32) acc = Math.fround(acc);
-    if (!Number.isFinite(acc)) throw overflow(width); // running total overflowed to ±Inf
-  }
-  return acc;
+// resolveFloatFold finalizes a float SUM's STREAMING scan-order running total (float.md §7; the fold
+// order is ledgered non-deterministic). The steps are all order-independent given the accumulated
+// state:
+//   1. Special values first: any NaN → NaN; else both +Inf and -Inf → NaN; else +Inf → +Inf; else
+//      -Inf → -Inf; else the finite running total.
+//   2. The running `floatTotal` IS the sum (already width-correct — f32 was re-rounded each add). If
+//      it reached ±Inf from finite inputs it is a finite-overflow 22003 (a final isFinite test is
+//      equivalent to a per-add one — finite + ±Inf cannot recover to finite; PG yields ±Inf, a
+//      documented divergence).
+function resolveFloatFold(a: Acc): number {
+  if (a.floatNaN) return NaN;
+  if (a.floatPosInf && a.floatNegInf) return NaN;
+  if (a.floatPosInf) return Infinity;
+  if (a.floatNegInf) return -Infinity;
+  const s = a.floatWidth === "f32" ? Math.fround(a.floatTotal) : a.floatTotal;
+  if (!Number.isFinite(s)) throw overflow(a.floatWidth); // running total overflowed to ±Inf
+  return s;
 }
 
 // itemsHaveAggregate reports whether any select item contains an aggregate call.
