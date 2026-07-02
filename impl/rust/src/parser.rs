@@ -140,6 +140,7 @@ impl Parser {
             Some("with") => self.parse_with_statement(),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
+            Some("explain") => self.parse_explain(),
             Some("begin") | Some("start") => self.parse_begin(),
             Some("commit") | Some("end") => self.parse_commit(),
             Some("rollback") => self.parse_rollback(),
@@ -218,6 +219,38 @@ impl Parser {
             Some("transaction") | Some("work")
         ) {
             self.advance();
+        }
+    }
+
+    /// `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). EXPLAIN is a positional leading
+    /// keyword — non-reserved, no lookahead — followed by an optional ANALYZE modifier and then a
+    /// restricted inner statement (a query or DML). ANALYZE is consumed positionally: no inner
+    /// statement begins with the word ANALYZE, so there is no ambiguity.
+    fn parse_explain(&mut self) -> Result<Statement> {
+        self.advance(); // EXPLAIN
+        let analyze = self.peek_keyword().as_deref() == Some("analyze");
+        if analyze {
+            self.advance();
+        }
+        let inner = self.parse_explain_inner()?;
+        Ok(Statement::Explain {
+            analyze,
+            inner: Box::new(inner),
+        })
+    }
+
+    /// The statement EXPLAIN wraps — restricted to a query (`SELECT` / `WITH`) or a DML statement
+    /// (`INSERT` / `UPDATE` / `DELETE`). DDL, transaction control, and a nested `EXPLAIN` have no
+    /// query plan to render and are rejected `42601`.
+    fn parse_explain_inner(&mut self) -> Result<Statement> {
+        match self.peek_keyword().as_deref() {
+            Some("select") => self.parse_query_expr(),
+            Some("with") => self.parse_with_statement(),
+            Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
+            Some("update") => Ok(Statement::Update(self.parse_update()?)),
+            Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
+            Some(other) => Err(syntax(format!("EXPLAIN does not support '{other}'"))),
+            None => Err(syntax("expected a statement after EXPLAIN")),
         }
     }
 

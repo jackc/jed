@@ -3005,7 +3005,22 @@ impl Engine {
         // common path pays nothing. The physical access-mode gate (`25006`) is checked earlier in
         // `execute_stmt_params`, so it wins when both apply.
         self.check_privileges(&stmt)?;
-        let out = match stmt {
+        let out = self.dispatch_stmt_body(stmt, params);
+        // Keep each GiST index's resident R-tree current: after a statement that mutated the main
+        // image, rebuild it from the (now-updated) leaf store so the next read descends a fresh tree
+        // (spec/design/gist.md §3/§4.1). A no-op for reads / temp-only writes (main_dirty unset).
+        if out.is_ok() {
+            self.rebuild_main_gist_trees_if_dirty()?;
+        }
+        out
+    }
+
+    /// Route one parsed statement to its executor (the equivalent-serial `dispatchStmtBody`): the raw
+    /// dispatch WITHOUT the lifetime/privilege admission and the GiST rebuild that wrap it in
+    /// [`Self::dispatch_stmt`]. Split out so `EXPLAIN ANALYZE` can execute its inner statement's body
+    /// directly — the admission + rebuild already ran on the enclosing EXPLAIN (spec/design/explain.md §3).
+    fn dispatch_stmt_body(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
+        match stmt {
             Statement::CreateTable(ct) => {
                 reject_params_for_ddl(params)?;
                 self.execute_create_table(ct)
@@ -3048,18 +3063,14 @@ impl Engine {
             Statement::With(wq) => self.execute_with(wq, params),
             Statement::Update(upd) => self.execute_update(upd, params, CteCtx::empty()),
             Statement::Delete(del) => self.execute_delete(del, params, CteCtx::empty()),
+            // EXPLAIN renders the inner statement's plan (spec/design/explain.md): plain EXPLAIN is
+            // plan-only, EXPLAIN ANALYZE runs the inner and reports its actual cost + row count.
+            Statement::Explain { analyze, inner } => self.execute_explain(analyze, *inner, params),
             // Transaction control is handled by `execute_stmt_params` before dispatch.
             Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {
                 unreachable!("transaction control is handled before dispatch")
             }
-        };
-        // Keep each GiST index's resident R-tree current: after a statement that mutated the main
-        // image, rebuild it from the (now-updated) leaf store so the next read descends a fresh tree
-        // (spec/design/gist.md §3/§4.1). A no-op for reads / temp-only writes (main_dirty unset).
-        if out.is_ok() {
-            self.rebuild_main_gist_trees_if_dirty()?;
         }
-        out
     }
 
     /// Analyze and run a CREATE TABLE: resolve each column's type name, enforce a
@@ -25210,6 +25221,707 @@ fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
     }
 }
 
+// ================================================================================================
+// EXPLAIN — render the planner's chosen plan as a deterministic, cross-core-identical result set
+// (spec/design/explain.md). The output is an ordinary query Outcome with three columns:
+//
+//   depth  i32   the plan node's nesting level (0-based), from a pre-order DFS of the plan tree
+//   node   text  the operator label (a fixed vocabulary — the §8 cross-core spelling contract)
+//   detail text  the node's attributes (access path, keys, counts); "-" when it has none
+//
+// Rows are emitted in pre-order, so the row order is deterministic by construction — the corpus
+// asserts an EXPLAIN with `nosort`. Every cell is non-empty and free of leading/trailing whitespace
+// (indentation is carried by `depth`, never whitespace), so an empty detail uses the "-" sentinel
+// (spec/design/explain.md §2). Plain EXPLAIN renders the plan WITHOUT executing the inner statement;
+// EXPLAIN ANALYZE runs it and reports the actual accrued cost + row count on an `Analyze` root (§3).
+// This mirrors the Go/TS core renderers token-for-token — the shared corpus pins the byte output.
+// ================================================================================================
+
+/// Accumulates the rendered plan rows.
+#[derive(Default)]
+struct ExplainRender {
+    rows: Vec<Vec<Value>>,
+}
+
+impl ExplainRender {
+    /// Append one plan row. An empty detail becomes the "-" sentinel so no cell renders blank.
+    fn emit(&mut self, depth: i64, node: impl Into<String>, detail: impl Into<String>) {
+        let mut detail = detail.into();
+        if detail.is_empty() {
+            detail = "-".to_string();
+        }
+        self.rows.push(vec![
+            Value::Int(depth),
+            Value::Text(node.into()),
+            Value::Text(detail),
+        ]);
+    }
+}
+
+impl Engine {
+    /// Plan the inner statement and render the plan (spec/design/explain.md). Plain EXPLAIN never
+    /// executes the inner statement; EXPLAIN ANALYZE (`analyze`) runs it and reports its actual cost.
+    /// The EXPLAIN statement's own cost is one `row_produced` per emitted plan row.
+    fn execute_explain(
+        &mut self,
+        analyze: bool,
+        inner: Statement,
+        params: &[Value],
+    ) -> Result<Outcome> {
+        if analyze {
+            return self.execute_explain_analyze(inner, params);
+        }
+        if !params.is_empty() {
+            // Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its
+            // bound value), so supplied parameters are neither needed nor bound.
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "bind parameters are not allowed in EXPLAIN",
+            ));
+        }
+        let mut r = ExplainRender::default();
+        self.render_explain(&mut r, &inner, 0)?;
+        Ok(self.explain_outcome(r.rows))
+    }
+
+    /// Render the plan AND run the inner statement, reporting the inner's ACTUAL accrued cost + row
+    /// count on an `Analyze` root node (spec/design/explain.md §3). The plan is rendered from the
+    /// pre-execution catalog; then the inner statement executes for real (a DML inner mutates, and
+    /// the outer autocommit commits it — EXPLAIN ANALYZE of a write IS a write, classified by
+    /// [`stmt_is_write`]). Privileges + the lifetime budget were already admitted on the EXPLAIN, and
+    /// the write gate / commit are the outer autocommit's, so the inner runs through the raw
+    /// [`Self::dispatch_stmt_body`]. The EXPLAIN statement's OWN cost is one `row_produced` per plan
+    /// row (independent of the inner cost, which appears only in the root).
+    fn execute_explain_analyze(&mut self, inner: Statement, params: &[Value]) -> Result<Outcome> {
+        // Render the plan tree first (plan-only, no execution — pre-mutation).
+        let mut body = ExplainRender::default();
+        self.render_explain(&mut body, &inner, 0)?;
+        // Execute the inner statement for real, capturing its actual accrued cost + row count.
+        let inner_out = self.dispatch_stmt_body(inner, params)?;
+        let actual_rows = match &inner_out {
+            // A DML statement without RETURNING reports its affected-row count; a query its row count.
+            Outcome::Statement { rows_affected, .. } => rows_affected.unwrap_or(0),
+            Outcome::Query { rows, .. } => rows.len() as i64,
+        };
+        let inner_cost = inner_out.cost();
+        // Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
+        let mut r = ExplainRender::default();
+        r.emit(
+            0,
+            "Analyze",
+            format!("cost={inner_cost} rows={actual_rows}"),
+        );
+        for row in body.rows {
+            let mut it = row.into_iter();
+            let depth = match it.next() {
+                Some(Value::Int(n)) => n,
+                _ => unreachable!("a plan row's depth cell is an Int"),
+            };
+            let node = it.next().expect("a plan row has a node cell");
+            let detail = it.next().expect("a plan row has a detail cell");
+            r.rows.push(vec![Value::Int(depth + 1), node, detail]);
+        }
+        Ok(self.explain_outcome(r.rows))
+    }
+
+    /// Wrap rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
+    /// `row_produced` per emitted plan row (a deterministic function of the plan-row count).
+    fn explain_outcome(&self, rows: Vec<Vec<Value>>) -> Outcome {
+        let mut meter = self.session.new_meter();
+        meter.charge(COSTS.row_produced * rows.len() as i64);
+        Outcome::Query {
+            column_names: vec![
+                "depth".to_string(),
+                "node".to_string(),
+                "detail".to_string(),
+            ],
+            column_types: vec!["i32".to_string(), "text".to_string(), "text".to_string()],
+            rows,
+            cost: meter.accrued,
+        }
+    }
+
+    /// Render the plan for the inner statement (spec/design/explain.md). A DML statement is rendered
+    /// plan-only (never executing, so an EXPLAIN of a DELETE deletes nothing); a read query is
+    /// planned by [`Self::plan_explain_inner`] and walked by [`Self::render_query_plan`].
+    fn render_explain(&self, r: &mut ExplainRender, inner: &Statement, depth: i64) -> Result<()> {
+        match inner {
+            Statement::Insert(ins) => self.explain_insert(r, ins, depth),
+            Statement::Update(upd) => self.explain_update(r, upd, depth),
+            Statement::Delete(del) => self.explain_delete(r, del, depth),
+            _ => {
+                let qp = self.plan_explain_inner(inner)?;
+                self.render_query_plan(r, &qp, depth)
+            }
+        }
+    }
+
+    /// Render an INSERT plan: the Insert root (with an ON CONFLICT note), then the row source — a
+    /// planned SELECT subtree (INSERT … SELECT) or a Values leaf (INSERT … VALUES). Resolves the
+    /// source but never writes.
+    fn explain_insert(&self, r: &mut ExplainRender, ins: &Insert, depth: i64) -> Result<()> {
+        if self.table(&ins.table).is_none() {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", ins.table),
+            ));
+        }
+        r.emit(depth, format!("Insert {}", ins.table), insert_detail(ins));
+        match &ins.source {
+            InsertSource::Select(sel) => {
+                let mut ptypes = ParamTypes::default();
+                let plan =
+                    self.plan_query(&QueryExpr::Select(sel.clone()), None, &[], &mut ptypes)?;
+                self.render_query_plan(r, &plan, depth + 1)
+            }
+            InsertSource::Values(rows) => {
+                r.emit(depth + 1, "Values", format!("rows={}", rows.len()));
+                Ok(())
+            }
+        }
+    }
+
+    /// Render an UPDATE plan: the Update root (with the assignment count), the residual Filter, then
+    /// the target scan with its chosen access path. Resolves the WHERE + the scan bound via the same
+    /// detectors the executor uses, but never writes.
+    fn explain_update(&self, r: &mut ExplainRender, upd: &Update, depth: i64) -> Result<()> {
+        let table = self.table(&upd.table).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", upd.table),
+            )
+        })?;
+        let filter = self.explain_dml_filter(table, upd.filter.as_ref())?;
+        r.emit(
+            depth,
+            format!("Update {}", upd.table),
+            format!("sets={}", upd.assignments.len()),
+        );
+        self.render_dml_scan(r, table, &upd.table, filter.as_ref(), depth + 1);
+        Ok(())
+    }
+
+    /// Render a DELETE plan: the Delete root, the residual Filter, then the target scan with its
+    /// chosen access path. Resolves the WHERE + the scan bound but never writes.
+    fn explain_delete(&self, r: &mut ExplainRender, del: &Delete, depth: i64) -> Result<()> {
+        let table = self.table(&del.table).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", del.table),
+            )
+        })?;
+        let filter = self.explain_dml_filter(table, del.filter.as_ref())?;
+        r.emit(depth, format!("Delete {}", del.table), "-");
+        self.render_dml_scan(r, table, &del.table, filter.as_ref(), depth + 1);
+        Ok(())
+    }
+
+    /// Resolve an UPDATE/DELETE WHERE predicate against a single-table scope (the same prologue the
+    /// executors use), or `None` for a bare (no-WHERE) statement.
+    fn explain_dml_filter(&self, table: &Table, where_: Option<&Expr>) -> Result<Option<RExpr>> {
+        match where_ {
+            None => Ok(None),
+            Some(p) => {
+                let scope = Scope::single(self, table);
+                let mut ptypes = ParamTypes::default();
+                Ok(Some(resolve_boolean_filter(&scope, p, &mut ptypes)?))
+            }
+        }
+    }
+
+    /// Emit the residual Filter (when present) and the target Scan for an UPDATE/DELETE, choosing the
+    /// access path with the SAME detectors the executor uses (PK bound, then GIN, then GiST —
+    /// UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The touched-set count
+    /// is a DML cost detail left to a follow-on, so it is not shown here (an empty mask).
+    fn render_dml_scan(
+        &self,
+        r: &mut ExplainRender,
+        table: &Table,
+        name: &str,
+        filter: Option<&RExpr>,
+        depth: i64,
+    ) {
+        let mut d = depth;
+        if let Some(f) = filter {
+            r.emit(d, "Filter", format!("conjuncts={}", conjunct_count(f)));
+            d += 1;
+        }
+        let bound = self.dml_scan_bound(table, filter);
+        r.emit(
+            d,
+            format!("Scan {name}"),
+            self.scan_detail(name, bound.as_ref(), &[]),
+        );
+    }
+
+    /// Pick an UPDATE/DELETE target's scan bound with the executor's own detectors: the single-column
+    /// PK range bound first, then a GIN bound, then a GiST bound; else a full scan (`None`). Mirrors
+    /// the inline detection in [`Self::execute_delete`] / [`Self::execute_update`].
+    fn dml_scan_bound(&self, table: &Table, filter: Option<&RExpr>) -> Option<ScanBound> {
+        let f = filter?;
+        if let Some(pk_idx) = table.primary_key_index() {
+            if let Some(pk_ty) = table.columns[pk_idx].ty.as_scalar() {
+                if let Some(coll) = key_collation_ctx(self, &table.columns[pk_idx]) {
+                    if let Some(pb) = detect_pk_bound(f, pk_idx, pk_ty, coll) {
+                        return Some(ScanBound::Pk(pb));
+                    }
+                }
+            }
+        }
+        if let Some(gb) = detect_gin_bound(f, &table.indexes, &table.columns, 0) {
+            return Some(ScanBound::Gin(gb));
+        }
+        if let Some(gp) = detect_gist_bound(f, &table.indexes, &table.columns, 0) {
+            return Some(ScanBound::Gist(gp));
+        }
+        None
+    }
+
+    /// Resolve the inner statement into a [`QueryPlan`] WITHOUT executing it — the read-query forms
+    /// (SELECT, a top-level set operation, and a read-only top-level WITH). A top-level WITH is
+    /// planned as a nested WITH expression (there are no enclosing CTEs to inherit at the top level),
+    /// which produces the same [`WithPlan`] to render.
+    fn plan_explain_inner(&self, inner: &Statement) -> Result<QueryPlan> {
+        let mut ptypes = ParamTypes::default();
+        match inner {
+            Statement::Select(sel) => self.plan_query(
+                &QueryExpr::Select(Box::new(sel.clone())),
+                None,
+                &[],
+                &mut ptypes,
+            ),
+            Statement::SetOp(so) => self.plan_query(
+                &QueryExpr::SetOp(Box::new(so.clone())),
+                None,
+                &[],
+                &mut ptypes,
+            ),
+            Statement::With(wq) => {
+                let Some(body) = wq.body.as_query() else {
+                    // A data-modifying primary (writable CTE) — a DML EXPLAIN, handled in a later slice.
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "EXPLAIN of a data-modifying WITH is not yet supported",
+                    ));
+                };
+                let we = WithExpr {
+                    ctes: wq.ctes.clone(),
+                    recursive: wq.recursive,
+                    body: Box::new(body.clone()),
+                };
+                let wp = self.plan_with_expr(&we, None, &mut ptypes)?;
+                Ok(QueryPlan::With(Box::new(wp)))
+            }
+            _ => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "EXPLAIN of this statement is not yet supported",
+            )),
+        }
+    }
+
+    /// Walk a [`QueryPlan`] arm at the given depth: a SELECT plan, a set operation, a VALUES
+    /// relation, or a WITH plan.
+    fn render_query_plan(&self, r: &mut ExplainRender, qp: &QueryPlan, depth: i64) -> Result<()> {
+        match qp {
+            QueryPlan::Select(sp) => self.render_select_plan(r, sp, depth),
+            QueryPlan::SetOp(sop) => self.render_set_op_plan(r, sop, depth),
+            QueryPlan::Values(vp) => {
+                self.render_values_plan(r, vp, depth);
+                Ok(())
+            }
+            QueryPlan::With(wp) => self.render_with_plan(r, wp, depth),
+        }
+    }
+
+    /// Emit a [`SelectPlan`]'s nodes in operator order — outermost first, each the pre-order parent
+    /// of the next, so the tree reads top-down as the pipeline reads bottom-up: Limit, Sort, Distinct,
+    /// Window, Aggregate, Filter (WHERE), then the FROM tree. A Sort is emitted only when the order is
+    /// NOT elided; an elided ORDER BY (served by scan / index / join order) is noted on the FROM tree's
+    /// top node instead (spec/design/explain.md §5).
+    fn render_select_plan(&self, r: &mut ExplainRender, sp: &SelectPlan, depth: i64) -> Result<()> {
+        let mut d = depth;
+        if sp.limit.is_some() || sp.offset.is_some() {
+            r.emit(d, "Limit", limit_detail(sp.limit, sp.offset));
+            d += 1;
+        }
+        let mut order_note = String::new();
+        if !sp.order.is_empty() {
+            if sp.pk_ordered {
+                order_note = "pk ordered".to_string();
+                if sp.pk_reverse {
+                    order_note.push_str(" (reverse)");
+                }
+            } else if let Some(io) = &sp.index_order {
+                order_note = format!("index order: {}", io.name_key);
+            } else if sp.join_pk_ordered {
+                order_note = "join pk ordered".to_string();
+            } else {
+                r.emit(d, "Sort", format!("keys={}", sp.order.len()));
+                d += 1;
+            }
+        }
+        if sp.distinct {
+            r.emit(d, "Distinct", "-");
+            d += 1;
+        }
+        if sp.has_window {
+            r.emit(d, "Window", format!("funcs={}", sp.window_specs.len()));
+            d += 1;
+        }
+        if sp.is_agg {
+            r.emit(d, "Aggregate", agg_detail(sp));
+            d += 1;
+        }
+        if let Some(f) = &sp.filter {
+            r.emit(d, "Filter", format!("conjuncts={}", conjunct_count(f)));
+            d += 1;
+        }
+        self.render_from(r, sp, d, &order_note)
+    }
+
+    /// Emit the FROM tree: a left-deep chain of Nested Loop joins over the plan's relations, or a
+    /// single relation leaf, or a Result node for a FROM-less query. `order_note`, when non-empty,
+    /// records an elided ORDER BY on the tree's top node.
+    fn render_from(
+        &self,
+        r: &mut ExplainRender,
+        sp: &SelectPlan,
+        depth: i64,
+        order_note: &str,
+    ) -> Result<()> {
+        let n = sp.rels.len();
+        if n == 0 {
+            r.emit(depth, "Result", with_note("-", order_note));
+            return Ok(());
+        }
+        self.render_join_tree(r, sp, n, depth, order_note)
+    }
+
+    /// Emit the left-deep join over the first `n` relations: the outermost node is the last join
+    /// (`joins[n-2]`), whose left subtree is the join over the first `n-1` relations and whose right
+    /// child is `rels[n-1]`. `note` tags the outermost node with an elided ORDER BY.
+    fn render_join_tree(
+        &self,
+        r: &mut ExplainRender,
+        sp: &SelectPlan,
+        n: usize,
+        depth: i64,
+        note: &str,
+    ) -> Result<()> {
+        if n == 1 {
+            return self.render_rel_leaf(r, sp, 0, depth, note);
+        }
+        let j = &sp.joins[n - 2];
+        r.emit(depth, "Nested Loop", with_note(join_detail(j), note));
+        self.render_join_tree(r, sp, n - 1, depth + 1, "")?;
+        self.render_rel_leaf(r, sp, n - 1, depth + 1, "")
+    }
+
+    /// Emit one relation: a base-table Scan (with its access path), an SRF, a CTE Scan, or a Subquery
+    /// (a derived table, whose inner plan recurses one level deeper). `note` tags a base Scan with an
+    /// elided ORDER BY (only a single base-table relation can carry one).
+    fn render_rel_leaf(
+        &self,
+        r: &mut ExplainRender,
+        sp: &SelectPlan,
+        i: usize,
+        depth: i64,
+        note: &str,
+    ) -> Result<()> {
+        let rel = &sp.rels[i];
+        if rel.srf.is_some() {
+            r.emit(
+                depth,
+                format!("SRF {}", rel.table_name),
+                with_note("-", note),
+            );
+            Ok(())
+        } else if rel.cte.is_some() {
+            r.emit(
+                depth,
+                format!("CTE Scan {}", rel.table_name),
+                with_note("-", note),
+            );
+            Ok(())
+        } else if let Some(derived) = &rel.derived {
+            r.emit(
+                depth,
+                format!("Subquery {}", rel.table_name),
+                with_note("-", note),
+            );
+            self.render_query_plan(r, derived, depth + 1)
+        } else {
+            let detail =
+                self.scan_detail(&rel.table_name, sp.rel_bounds[i].as_ref(), &sp.rel_masks[i]);
+            r.emit(
+                depth,
+                format!("Scan {}", rel.table_name),
+                with_note(detail, note),
+            );
+            Ok(())
+        }
+    }
+
+    /// Emit a set operation: any trailing Limit / Sort on the combined result, the Union / Intersect
+    /// / Except node, then the left and right operand plans as children.
+    fn render_set_op_plan(&self, r: &mut ExplainRender, sop: &SetOpPlan, depth: i64) -> Result<()> {
+        let mut d = depth;
+        if sop.limit.is_some() || sop.offset.is_some() {
+            r.emit(d, "Limit", limit_detail(sop.limit, sop.offset));
+            d += 1;
+        }
+        if !sop.order.is_empty() {
+            r.emit(d, "Sort", format!("keys={}", sop.order.len()));
+            d += 1;
+        }
+        r.emit(d, set_op_node_name(sop.op), set_op_detail(sop.all));
+        self.render_query_plan(r, &sop.lhs, d + 1)?;
+        self.render_query_plan(r, &sop.rhs, d + 1)
+    }
+
+    /// Emit a VALUES relation as a leaf node carrying its row count.
+    fn render_values_plan(&self, r: &mut ExplainRender, vp: &ValuesPlan, depth: i64) {
+        r.emit(depth, "Values", format!("rows={}", vp.rows.len()));
+    }
+
+    /// Emit a WITH plan: the WITH node, each common-table expression as a CTE child (its body one
+    /// level deeper), then the main body plan.
+    fn render_with_plan(&self, r: &mut ExplainRender, wp: &WithPlan, depth: i64) -> Result<()> {
+        r.emit(depth, "WITH", format!("ctes={}", wp.bindings.len()));
+        for (i, b) in wp.bindings.iter().enumerate() {
+            let mode = if i < wp.modes.len() {
+                wp.modes[i]
+            } else {
+                CteMode::Inline
+            };
+            r.emit(depth + 1, format!("CTE {}", b.name), cte_detail(b, mode));
+            // A data-modifying CTE has no query body to walk (writable-cte.md §3); only a query CTE
+            // recurses. This EXPLAIN slice reaches a WITH only through the read-only path, so a Dml
+            // binding does not currently arise, but the guard keeps the walk total.
+            if let CteSource::Query(plan) = &b.source {
+                self.render_query_plan(r, plan, depth + 2)?;
+            }
+        }
+        self.render_query_plan(r, &wp.body, depth + 1)
+    }
+
+    /// Render a Scan node's attributes: the access path (from the relation's chosen scan bound,
+    /// `None` = a full scan), then the touched-column count when the query references any column.
+    fn scan_detail(&self, table_name: &str, b: Option<&ScanBound>, mask: &[bool]) -> String {
+        let mut parts = vec![self.access_path(table_name, b)];
+        let n = count_true(mask);
+        if n > 0 {
+            parts.push(format!("touched={n}"));
+        }
+        parts.join("; ")
+    }
+
+    /// Render the chosen access path for a relation (spec/design/explain.md §5): a full scan, a
+    /// primary-key range bound, or a secondary-index / GIN / GiST bound (the last three by index name,
+    /// the stored lowercased name).
+    fn access_path(&self, table_name: &str, b: Option<&ScanBound>) -> String {
+        match b {
+            None => "Full scan".to_string(),
+            Some(ScanBound::Pk(pb)) => format!(
+                "PK bound: {}",
+                render_bound_terms(&self.first_pk_col_name(table_name), &pb.terms)
+            ),
+            Some(ScanBound::Index(ib)) => format!("Index bound: using {}", ib.name_key),
+            Some(ScanBound::Gin(gb)) => format!("GIN bound: using {}", gb.name_key),
+            Some(ScanBound::Gist(gp)) => format!("GiST bound: using {}", gp.name_key),
+        }
+    }
+
+    /// The name of a table's first primary-key column (in key order), or `pk` when the table is not
+    /// found or has no primary key (a defensive fallback — the plan-only path already resolved the
+    /// table, and a bounded scan implies a single-column PK).
+    fn first_pk_col_name(&self, table_name: &str) -> String {
+        if let Some(t) = self.table(table_name) {
+            if let Some(&i) = t.pk.first() {
+                if i < t.columns.len() {
+                    return t.columns[i].name.clone();
+                }
+            }
+        }
+        "pk".to_string()
+    }
+}
+
+/// Render an INSERT's ON CONFLICT disposition (or "-" when there is none).
+fn insert_detail(ins: &Insert) -> String {
+    match &ins.on_conflict {
+        None => "-".to_string(),
+        Some(oc) => match oc.action {
+            ConflictAction::DoUpdate { .. } => "on conflict do update".to_string(),
+            ConflictAction::DoNothing => "on conflict do nothing".to_string(),
+        },
+    }
+}
+
+/// Render a CTE binding's attributes: its materialization mode (inlined vs materialized — the
+/// planner's choice) and whether it is recursive.
+fn cte_detail(b: &CteBinding, mode: CteMode) -> String {
+    let mut parts = vec![cte_mode_text(mode).to_string()];
+    if b.recursive.is_some() {
+        parts.push("recursive".to_string());
+    }
+    parts.join("; ")
+}
+
+/// Label a CTE materialization mode.
+fn cte_mode_text(m: CteMode) -> &'static str {
+    match m {
+        CteMode::Materialize => "materialized",
+        CteMode::Inline => "inlined",
+    }
+}
+
+/// Render an Aggregate node's attributes: the grouping-key count, aggregate count, the grouping-set
+/// count when there is more than one set, and the HAVING conjunct count.
+fn agg_detail(sp: &SelectPlan) -> String {
+    let mut parts = vec![format!(
+        "groups={} aggs={}",
+        sp.group_keys.len(),
+        sp.agg_specs.len()
+    )];
+    if sp.group_sets.len() > 1 {
+        parts.push(format!("sets={}", sp.group_sets.len()));
+    }
+    if let Some(having) = &sp.having {
+        parts.push(format!("having:conjuncts={}", conjunct_count(having)));
+    }
+    parts.join("; ")
+}
+
+/// Render a Nested Loop node's attributes: the join kind and the ON predicate's conjunct count (a
+/// CROSS join has no ON).
+fn join_detail(j: &PlanJoin) -> String {
+    let kind = join_kind_text(j.kind);
+    match &j.on {
+        None => kind.to_string(),
+        Some(on) => format!("{kind}; on:conjuncts={}", conjunct_count(on)),
+    }
+}
+
+/// The label for a join kind.
+fn join_kind_text(k: JoinKind) -> &'static str {
+    match k {
+        JoinKind::Inner => "inner",
+        JoinKind::Cross => "cross",
+        JoinKind::Left => "left",
+        JoinKind::Right => "right",
+        JoinKind::Full => "full",
+    }
+}
+
+/// The node label for a set-operation kind.
+fn set_op_node_name(op: SetOpKind) -> &'static str {
+    match op {
+        SetOpKind::Union => "Union",
+        SetOpKind::Intersect => "Intersect",
+        SetOpKind::Except => "Except",
+    }
+}
+
+/// Render a set operation's ALL / DISTINCT disposition.
+fn set_op_detail(all: bool) -> &'static str {
+    if all { "all" } else { "distinct" }
+}
+
+/// Append an elided-ORDER-BY note to a node's detail (replacing a "-" sentinel).
+fn with_note(detail: impl Into<String>, note: &str) -> String {
+    let detail = detail.into();
+    if note.is_empty() {
+        return detail;
+    }
+    if detail.is_empty() || detail == "-" {
+        return format!("ordered: {note}");
+    }
+    format!("{detail}; ordered: {note}")
+}
+
+/// Render a primary-key bound's terms as `col <op> <src>` conjuncts joined by " and " — e.g.
+/// `id = $1`, `id >= 5 and id < 10`.
+fn render_bound_terms(col: &str, terms: &[BoundTerm]) -> String {
+    terms
+        .iter()
+        .map(|t| format!("{col} {} {}", bound_op_text(t.op), render_bound_src(&t.src)))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// The symbol for a bound comparison operator.
+fn bound_op_text(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "=",
+        CmpOp::Ne => "<>",
+        CmpOp::Lt => "<",
+        CmpOp::Gt => ">",
+        CmpOp::Le => "<=",
+        CmpOp::Ge => ">=",
+    }
+}
+
+/// Render a bound's const-source operand: a bind parameter as `$N` (1-based), a correlated
+/// outer-column reference as `outer`, or a literal. Integer / boolean / decimal literals render
+/// deterministically; a text literal renders verbatim unless it contains a newline (which would split
+/// the cell), in which case `<text>`; every other constant type renders `<value>` for now (a later
+/// slice widens this). A `float` bound source cannot arise here — float keys do not push down, so the
+/// determinism-ledger `<float>` token the Go/TS renderers reserve has no [`BoundSrc`] analogue.
+fn render_bound_src(src: &BoundSrc) -> String {
+    match src {
+        BoundSrc::Param(idx) => format!("${}", idx + 1),
+        BoundSrc::Outer { .. } => "outer".to_string(),
+        BoundSrc::Int(n) => n.to_string(),
+        BoundSrc::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+        BoundSrc::Decimal(d) => d.render(),
+        BoundSrc::Text(s) => {
+            if s.contains(['\n', '\r']) {
+                "<text>".to_string()
+            } else {
+                format!("'{s}'")
+            }
+        }
+        BoundSrc::Uuid(_)
+        | BoundSrc::Timestamp(_)
+        | BoundSrc::Date(_)
+        | BoundSrc::Bytea(_)
+        | BoundSrc::Interval(_)
+        | BoundSrc::Null => "<value>".to_string(),
+    }
+}
+
+/// Count the top-level AND conjuncts of a residual filter (a deterministic integer — the plan text
+/// carries the count, not the expression itself; a full expression printer is a later slice,
+/// spec/design/explain.md §5).
+fn conjunct_count(e: &RExpr) -> i64 {
+    match e {
+        RExpr::And(l, r) => conjunct_count(l) + conjunct_count(r),
+        _ => 1,
+    }
+}
+
+/// Render a Limit node's `limit=N` / `offset=M` attributes (an absent side is omitted).
+fn limit_detail(limit: Option<i64>, offset: Option<i64>) -> String {
+    let mut parts = Vec::new();
+    if let Some(l) = limit {
+        parts.push(format!("limit={l}"));
+    }
+    if let Some(o) = offset {
+        parts.push(format!("offset={o}"));
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Count the set entries in a touched-set mask.
+fn count_true(mask: &[bool]) -> usize {
+    mask.iter().filter(|&&b| b).count()
+}
+
 /// Whether a statement mutates the database (so autocommit must capture + durably persist it,
 /// and a READ ONLY transaction must reject it — spec/design/transactions.md §4.1/§4.3). Reads
 /// (`SELECT`, set operations) and transaction control run against the committed state / handle
@@ -25445,6 +26157,12 @@ fn apply_seq_alter(
 }
 
 pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
+    // EXPLAIN is a read: plain EXPLAIN plans without executing (even of a DML inner — it never
+    // mutates). Only EXPLAIN ANALYZE runs the inner statement, so it is a write iff the inner is
+    // (spec/design/explain.md §3).
+    if let Statement::Explain { analyze, inner } = stmt {
+        return *analyze && stmt_is_write(inner);
+    }
     matches!(
         stmt,
         Statement::CreateTable(_)
@@ -25675,6 +26393,10 @@ fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         Statement::With(wq) => collect_with_privs(wq, req, &locals),
         Statement::Update(upd) => collect_update_privs(upd, req, &locals),
         Statement::Delete(del) => collect_delete_privs(del, req, &locals),
+        // EXPLAIN requires the inner statement's privileges (EXPLAIN INSERT needs INSERT, matching
+        // PG). Plain EXPLAIN never executes, but authorization is checked on the inner regardless
+        // (spec/design/explain.md §1).
+        Statement::Explain { inner, .. } => collect_stmt_privs(inner, req),
         Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {}
     }
 }
@@ -26012,6 +26734,7 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
         Statement::Select(_) | Statement::SetOp(_) | Statement::With(_) => "SELECT",
+        Statement::Explain { .. } => "EXPLAIN",
         Statement::Begin { .. } => "BEGIN",
         Statement::Commit => "COMMIT",
         Statement::Rollback => "ROLLBACK",

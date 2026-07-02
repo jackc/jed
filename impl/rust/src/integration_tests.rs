@@ -73,6 +73,8 @@ mod encoding;
 mod ergonomic;
 #[path = "../tests/execute_script.rs"]
 mod execute_script;
+#[path = "../tests/explain.rs"]
+mod explain;
 #[path = "../tests/expr.rs"]
 mod expr;
 #[path = "../tests/file_sessions.rs"]
