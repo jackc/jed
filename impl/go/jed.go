@@ -192,6 +192,9 @@ var SupportedCapabilities = []string{
 	"query.order_by_join_scan",
 	"query.correlated_pushdown",
 	"query.join_pushdown",
+	// EXPLAIN — render the planner's chosen plan as a deterministic depth/node/detail result set,
+	// without executing the inner statement (spec/design/explain.md).
+	"query.explain",
 	// GIN-bounded scan — `col @> const` / `col && const` over a GIN-indexed array column narrows
 	// the SELECT scan to candidate rows (term gather → intersect/union → residual filter); the
 	// result is identical to the full scan (spec/design/gin.md §6).

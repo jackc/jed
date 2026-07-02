@@ -28,11 +28,24 @@ type statement struct {
 	With   *withQuery
 	Update *update
 	Delete *deleteStmt
+	// Explain is `EXPLAIN [ANALYZE] <statement>` — render the planner's chosen plan for the inner
+	// statement instead of running it (spec/design/explain.md). Non-nil only for an EXPLAIN. Plain
+	// EXPLAIN plans but never executes; EXPLAIN ANALYZE runs the inner and reports its actual cost.
+	Explain *explain
 	// Begin/Commit/Rollback are the explicit transaction-control statements (grammar.md §27,
 	// transactions.md §4.2). Non-nil only for that statement.
 	Begin    *begin
 	Commit   *commit
 	Rollback *rollback
+}
+
+// explain is a parsed `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). Inner is the wrapped
+// statement (restricted to a query or DML by the parser — never DDL, transaction control, or a nested
+// EXPLAIN). Analyze true ⇒ EXPLAIN ANALYZE: the inner statement is executed and its actual accrued
+// cost + row count are reported; false ⇒ the plan is rendered without executing the inner statement.
+type explain struct {
+	Analyze bool
+	Inner   *statement
 }
 
 // Begin is a BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE] / START TRANSACTION [...] statement

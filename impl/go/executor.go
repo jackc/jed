@@ -2530,6 +2530,12 @@ func checkedAddInt64(a, b int64) (sum int64, overflow bool) {
 // durably persist it, and a READ ONLY transaction must reject it — transactions.md §4.1/§4.3).
 // Reads (SELECT, set operations) and transaction control run with no data mutation.
 func stmtIsWrite(stmt statement) bool {
+	// EXPLAIN is a read: plain EXPLAIN plans without executing (even of a DML inner — it never
+	// mutates). Only EXPLAIN ANALYZE runs the inner statement, so it is a write iff the inner is
+	// (spec/design/explain.md §3).
+	if stmt.Explain != nil {
+		return stmt.Explain.Analyze && stmtIsWrite(*stmt.Explain.Inner)
+	}
 	if stmt.CreateTable != nil || stmt.DropTable != nil ||
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
@@ -2949,6 +2955,10 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 		collectUpdatePrivs(stmt.Update, req, locals)
 	case stmt.Delete != nil:
 		collectDeletePrivs(stmt.Delete, req, locals)
+	case stmt.Explain != nil:
+		// EXPLAIN requires the inner statement's privileges (EXPLAIN INSERT needs INSERT, matching
+		// PG). Plain EXPLAIN never executes, but authorization is checked on the inner regardless.
+		collectStmtPrivs(*stmt.Explain.Inner, req)
 	}
 }
 
@@ -3356,6 +3366,8 @@ func stmtKind(stmt statement) string {
 		return "UPDATE"
 	case stmt.Delete != nil:
 		return "DELETE"
+	case stmt.Explain != nil:
+		return "EXPLAIN"
 	default:
 		return "statement"
 	}
@@ -3463,6 +3475,8 @@ func (db *engine) dispatchStmtBody(stmt statement, params []Value) (Outcome, err
 		return db.executeUpdate(stmt.Update, params, cteCtx{})
 	case stmt.Delete != nil:
 		return db.executeDelete(stmt.Delete, params, cteCtx{})
+	case stmt.Explain != nil:
+		return db.executeExplain(stmt.Explain, params)
 	default:
 		return Outcome{}, newError(SyntaxError, "empty statement")
 	}

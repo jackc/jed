@@ -1,0 +1,120 @@
+# EXPLAIN renders the planner's chosen plan as a deterministic result set (spec/design/explain.md),
+# WITHOUT executing the inner statement. Columns are depth (i32, the pre-order nesting level), node
+# (the operator label), and detail (its attributes; "-" when none). Every cell is non-empty and has
+# no leading/trailing whitespace — indentation is the depth integer — so the rows are asserted with
+# `nosort` (the pre-order order is deterministic by construction, like composite record_out). The
+# plan text is a deterministic function of the plan structs (which drive the `# cost:` contract), so
+# every core renders byte-identical output. Slice 1: single-table SELECT.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.limit, query.distinct, query.order_by, query.explain, types.i32, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
+
+statement ok
+CREATE INDEX t_v_idx ON t (v)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'a')
+
+statement ok
+INSERT INTO t VALUES (2, 20, 'b')
+
+# A full scan: no WHERE bound. SELECT * touches every column (touched=3).
+query ITT nosort
+EXPLAIN SELECT * FROM t
+----
+0
+Scan t
+Full scan; touched=3
+
+# A primary-key point lookup bounds the scan; the WHERE stays the residual Filter (conjuncts=1).
+query ITT nosort
+EXPLAIN SELECT v FROM t WHERE id = 1
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+PK bound: id = 1; touched=2
+
+# A primary-key range bound (BETWEEN-style AND-chain): two residual conjuncts.
+query ITT nosort
+EXPLAIN SELECT * FROM t WHERE id >= 1 AND id < 5
+----
+0
+Filter
+conjuncts=2
+1
+Scan t
+PK bound: id >= 1 and id < 5; touched=3
+
+# A non-key equality uses the secondary index bound (lowest-name index with a first-column equality).
+query ITT nosort
+EXPLAIN SELECT v FROM t WHERE v = 10
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+Index bound: using t_v_idx; touched=1
+
+# A bind parameter renders symbolically as $N (plan-only — the value is never bound).
+query ITT nosort
+EXPLAIN SELECT v FROM t WHERE v = $1
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+Index bound: using t_v_idx; touched=1
+
+# ORDER BY on a non-key column needs a Sort node above the scan.
+query ITT nosort
+EXPLAIN SELECT * FROM t ORDER BY v
+----
+0
+Sort
+keys=1
+1
+Scan t
+Full scan; touched=3
+
+# ORDER BY on the primary key is served by the scan order — the Sort is elided (no Sort node).
+query ITT nosort
+EXPLAIN SELECT * FROM t ORDER BY id
+----
+0
+Scan t
+Full scan; touched=3
+
+# SELECT DISTINCT adds a Distinct node.
+query ITT nosort
+EXPLAIN SELECT DISTINCT v FROM t
+----
+0
+Distinct
+-
+1
+Scan t
+Full scan; touched=1
+
+# LIMIT / OFFSET add a Limit node carrying both counts.
+query ITT nosort
+EXPLAIN SELECT * FROM t LIMIT 5 OFFSET 2
+----
+0
+Limit
+limit=5 offset=2
+1
+Scan t
+Full scan; touched=3
+
+# EXPLAIN itself is not re-explainable, and DDL/transaction-control cannot follow EXPLAIN.
+statement error 42601
+EXPLAIN EXPLAIN SELECT * FROM t
+
+statement error 42601
+EXPLAIN CREATE TABLE u (id i32 PRIMARY KEY)

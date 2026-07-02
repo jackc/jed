@@ -209,6 +209,8 @@ func (p *parser) parseStatement() (statement, error) {
 			return statement{}, err
 		}
 		return statement{Delete: del}, nil
+	case "explain":
+		return p.parseExplain()
 	case "begin", "start":
 		return p.parseBegin()
 	case "commit", "end":
@@ -285,6 +287,58 @@ func (p *parser) parseRollback() (statement, error) {
 func (p *parser) consumeTransactionOrWork() {
 	if kw := p.peekKeyword(); kw == "transaction" || kw == "work" {
 		p.advance()
+	}
+}
+
+// parseExplain parses `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). EXPLAIN is a
+// positional leading keyword — non-reserved, no lookahead — followed by an optional ANALYZE modifier
+// and then a restricted inner statement (a query or DML). ANALYZE is consumed positionally: no inner
+// statement begins with the word ANALYZE, so there is no ambiguity.
+func (p *parser) parseExplain() (statement, error) {
+	p.advance() // EXPLAIN
+	analyze := false
+	if p.peekKeyword() == "analyze" {
+		p.advance()
+		analyze = true
+	}
+	inner, err := p.parseExplainInner()
+	if err != nil {
+		return statement{}, err
+	}
+	return statement{Explain: &explain{Analyze: analyze, Inner: &inner}}, nil
+}
+
+// parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH) or a
+// DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and a nested EXPLAIN have no
+// query plan to render and are rejected 42601.
+func (p *parser) parseExplainInner() (statement, error) {
+	switch p.peekKeyword() {
+	case "select":
+		return p.parseQueryExpr()
+	case "with":
+		return p.parseWithStatement()
+	case "insert":
+		ins, err := p.parseInsert()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Insert: ins}, nil
+	case "update":
+		upd, err := p.parseUpdate()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Update: upd}, nil
+	case "delete":
+		del, err := p.parseDelete()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Delete: del}, nil
+	case "":
+		return statement{}, newError(SyntaxError, "expected a statement after EXPLAIN")
+	default:
+		return statement{}, newError(SyntaxError, fmt.Sprintf("EXPLAIN does not support '%s'", p.peekKeyword()))
 	}
 }
 
