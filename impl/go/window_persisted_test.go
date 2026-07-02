@@ -56,6 +56,28 @@ func TestWindowRunningAggregateOverPersistedColumn(t *testing.T) {
 	}
 }
 
+// The windowed TOP-N optimization (spec/design/window.md §5.2) reads only the first OFFSET+LIMIT
+// scan rows, then folds the window over that prefix — over a persisted file it must still resolve the
+// operand column from the faulted leaves it touches (the touched-set mask). This is the on-disk
+// read-path check the in-memory corpus (window/topn.test) cannot express — the window_running_sum
+// benchmark's regression twin.
+func TestWindowTopNOverPersistedColumn(t *testing.T) {
+	db := seedPersistedWindow(t)
+	defer db.Close()
+
+	rows := queryRows(t, db, "SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id LIMIT 5")
+	if len(rows) != 5 {
+		t.Fatalf("got %d rows, want 5", len(rows))
+	}
+	var want int64
+	for i, r := range rows {
+		want += int64((i + 1) * 10)
+		if r[1].Kind != ValInt || r[1].Int != want {
+			t.Fatalf("row %d running sum = %s (kind %d), want %d — operand column read as NULL from disk?", i+1, r[1].Render(), r[1].Kind, want)
+		}
+	}
+}
+
 func TestWindowAggregateFilterAndOffsetOverPersistedColumn(t *testing.T) {
 	db := seedPersistedWindow(t)
 	defer db.Close()

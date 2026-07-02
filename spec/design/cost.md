@@ -706,6 +706,34 @@ Narrowings (each a follow-on): combining the index walk with a `WHERE` pushdown 
 reverse index walk — restricted to a unique index, the same tie-break trap), and a strict-prefix-of-a-
 multi-column-index `ORDER BY` all keep the eager path.
 
+### Windowed top-N — a backward window served from the LIMIT prefix
+
+A **window function** is normally a *blocking* operator (it materializes the whole partition — the
+"LIMIT short-circuit" note above lists it among the operators that keep the full scan). But when the
+window is **backward over the primary-key scan order** and the outer query has a `LIMIT`, the first
+`OFFSET+LIMIT` output rows depend only on the first `OFFSET+LIMIT` scan rows — so the stage reads only
+that prefix, folds the window over it, and stops. This is the window analog of the `LIMIT`
+short-circuit; it matches PostgreSQL/SQLite on `sum(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED
+PRECEDING AND CURRENT ROW) … ORDER BY id LIMIT 100`, which touches ~100 rows over a million-row table
+rather than a million. The full eligibility gate is in [window.md §5.2a](window.md); the cost-relevant
+shape is a single-table PK scan, a plain (non-grouped) window, an outer `ORDER BY` the PK satisfies
+(`pk_ordered`) with a `LIMIT`, and every window function backward (`row_number`/`rank`/`dense_rank`/
+`lag`, or an aggregate / `first_value` / `last_value` / `nth_value` whose frame end never looks
+forward). `cume_dist` / `percent_rank` / `ntile` (need the total partition size N) and `lead` (looks
+forward) disable it and keep the whole-table stage.
+
+- **Cost.** `storage_row_read`, the `WHERE`/window-argument `operator_eval`s, `window_result`, and
+  `window_frame_step` are charged over the survivor prefix (`min(N, OFFSET+LIMIT)` rows), not the whole
+  table; `row_produced` + projection over the emitted rows are unchanged. `page_read` stays the full
+  bound block up front (only per-row work short-circuits, like the streaming PK scan). The rows are
+  byte-identical to the eager whole-table fold — each emitted row's window value was computed from
+  exactly the rows it depends on. `window/topn.test` pins the lowered cost (and the `cume_dist`
+  fallback's higher, whole-table cost) cross-core.
+
+Narrowings (each a follow-on): a top-N served by a **secondary index** rather than the PK, a
+`PARTITION BY` whose keys are a scan-order prefix, and a fully **pipelined** (non-buffering) backward
+window all keep the eager whole-table stage for now.
+
 ### `SELECT DISTINCT` — the projection-vs-produce asymmetry
 
 `DISTINCT` ([grammar.md](grammar.md) §11) deduplicates the **projected** output, so it must

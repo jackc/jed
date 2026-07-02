@@ -63,6 +63,35 @@ test("window: running aggregate over a persisted operand column", () => {
   }
 });
 
+// The windowed TOP-N optimization (spec/design/window.md §5.2) reads only the first OFFSET+LIMIT scan
+// rows, then folds the window over that prefix — over a persisted file it must still resolve the
+// operand column from the faulted leaves it touches. The on-disk read-path check the in-memory corpus
+// (window/topn.test) cannot express — the window_running_sum benchmark's regression twin.
+test("window: top-N over a persisted operand column", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-window-"));
+  const path = join(dir, "topn.jed");
+  try {
+    const db = seedPersistedWindow(path);
+    const rows = rowsOf(
+      db,
+      "SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id LIMIT 5",
+    );
+    assert.equal(rows.length, 5);
+    let want = 0;
+    for (let i = 0; i < rows.length; i++) {
+      want += (i + 1) * 10;
+      assert.equal(
+        render(rows[i]![1]),
+        String(want),
+        `row ${i + 1} running sum — operand column read as NULL from disk?`,
+      );
+    }
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("window: FILTER and offset over a persisted operand column", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-window-"));
   const path = join(dir, "filter.jed");

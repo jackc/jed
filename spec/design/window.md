@@ -26,10 +26,14 @@
 > an aggregate *as* a key (`ORDER BY sum(x)`), resolved against the grouped row exactly as a
 > projection (a non-grouping column is `42803`); a compound key is materialized into a synthetic
 > window-key column before the window stage, so the slot-based machinery is unchanged (§5.1). The
-> window stage is also **optimized** (cost-lowering only, never correctness — §5.2/§8): specs sharing
-> an identical `PARTITION BY` + `ORDER BY` are partitioned and sorted **once**, and a no-`EXCLUDE`
+> window stage is also **optimized** (cost-lowering only, never correctness — §5.2/§5.2a/§8): specs
+> sharing an identical `PARTITION BY` + `ORDER BY` are partitioned and sorted **once**; a no-`EXCLUDE`
 > aggregate **slides** its frame accumulator (an expanding frame folds each row once for every
-> aggregate; a moving `count` un-folds the left edge) instead of re-folding each frame. The remaining
+> aggregate; a moving `count` un-folds the left edge) instead of re-folding each frame; and a
+> **backward** window over the PK scan order with an outer `LIMIT` serves a **top-N** from the first
+> `OFFSET+LIMIT` scan rows (§5.2a) instead of reading the whole table — the window analog of the
+> streaming `LIMIT` short-circuit, matching PostgreSQL/SQLite on `sum(x) OVER (ORDER BY id ROWS …) …
+> ORDER BY id LIMIT 100`. The remaining
 > `0A000` items — `RANGE` offsets over a timestamp / date ordering key (the deferred D4 follow-on,
 > §6/§11; a float key is now supported, the former D3) and a **correlated** window key (an
 > enclosing-query column in a `PARTITION BY` / `ORDER BY` — §11) — are deferred follow-ons, not gaps.
@@ -165,6 +169,17 @@ like `ORDER BY` and the aggregate bucketer — so its partition + per-partition 
 spilling sort (the [spill.md](spill.md) external-merge `Sorter` is reusable). The window stage
 adds **no on-disk format change** (`format_version` unchanged — all state is in-memory, the
 temp-table precedent) and **no key encoding**.
+
+**Exception — the windowed top-N** (§5.2, cost-lowering only). "Blocking" is the general case; when
+a `LIMIT` is answerable from a *bounded prefix* of the partition, the stage does **not** read the
+whole table. Concretely, when the window is **backward over the primary-key scan order** — no
+`PARTITION BY`, a window `ORDER BY` the PK satisfies (so scan order = partition order), a frame that
+never looks forward, and every function's value at scan position `k` depending only on rows at
+positions `≤ k` — and the outer query is `pk_ordered` with a `LIMIT`, then the first `OFFSET+LIMIT`
+scan rows determine the first `OFFSET+LIMIT` output rows exactly. The stage scans only that prefix,
+folds the window over it, and stops (the window analog of the streaming-scan `LIMIT` short-circuit,
+[cost.md](cost.md) §3). Rows are byte-identical to the full-table fold; only the metered cost drops,
+identically across cores. See §5.2.
 
 ## 3. The window definition — partition, order, and resolved order
 
@@ -342,6 +357,48 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
 4. The per-spec **finalize** (the `percent_rank`/`cume_dist`/`avg` division, the `Acc` finalize)
    is **unmetered**, like `AVG`'s division today.
 
+### 5.2a The windowed top-N (a `LIMIT` short-circuit)
+
+The stage above materializes the whole partition. When the query has a `LIMIT` and the window is
+**backward over the primary-key scan order**, that is wasteful: the first `OFFSET+LIMIT` output rows
+depend only on the first `OFFSET+LIMIT` scan rows, so reading the rest is pure overhead. PostgreSQL
+and SQLite pipeline this — a `sum(x) OVER (ORDER BY id ROWS …) … ORDER BY id LIMIT 100` over a
+million-row table touches ~100 rows, not a million. jed matches them with a **top-N short-circuit**
+(`exec_window_top_n`), the window analog of the streaming-scan `LIMIT` short-circuit ([cost.md](cost.md)
+§3).
+
+**Eligibility** (`window_top_n_eligible`, all required): a single base-table full/PK-bounded scan (no
+join / SRF / CTE / derived, no index/GIN/GiST bound — those read the full admitted set), a plain
+(non-grouped) window (`has_window && !is_agg`), **not** `DISTINCT`, a `LIMIT`, an outer `ORDER BY` the
+PK scan already satisfies (`pk_ordered` — so the scan order **is** the output order and no post-window
+sort reorders rows), no compound (materialized) window key and no general-expression outer `ORDER BY`
+(both append synthetic columns), and **every** window spec **prefix-safe**
+(`window_spec_prefix_safe`): no `PARTITION BY` (the whole scan is one partition, so scan order =
+partition order); a window `ORDER BY` the PK satisfies in the same direction as the `pk_ordered` scan
+(so the window's "preceding" is the scan's preceding — the per-partition sort is a no-op); and a
+**backward** plan —
+
+- `row_number` / `rank` / `dense_rank` (position or earlier-peer count) and `lag` (a look-**back**
+  offset) → always backward;
+- an aggregate / `first_value` / `last_value` / `nth_value` → backward **iff** its frame never looks
+  forward: the frame **end** is `UNBOUNDED PRECEDING` / `PRECEDING` / `CURRENT ROW`, and a
+  `RANGE`/`GROUPS` `CURRENT ROW` end (which spans the current **peer group**, so it pulls in later rows
+  when the ordering key is not unique) is admitted only when the window `ORDER BY` covers the **full
+  (unique) PK** — a `ROWS` `CURRENT ROW` end is the physical row, always safe; the default frame
+  (`RANGE UNBOUNDED PRECEDING TO CURRENT ROW`) is safe under the same uniqueness condition;
+- `percent_rank` / `cume_dist` / `ntile` (need the **total** partition size N) and `lead` (looks
+  **forward**) → **never** eligible; such a query falls through to the whole-table stage above.
+
+**Execution.** Stream the PK scan (respecting `pk_reverse`), apply `WHERE`, and collect survivors into
+a buffer until it holds `OFFSET+LIMIT` of them — then stop (a genuine early-out). Run the ordinary
+window stage (§5.2) over that prefix, and — since the buffer is already in the outer `ORDER BY` order —
+emit the `OFFSET..OFFSET+LIMIT` slice with **no sort**. The result is **byte-identical** to the eager
+whole-table path (each emitted row's window value was computed from exactly the rows it depends on);
+only the accrued cost is lower (§8): `storage_row_read`, the `WHERE`/window-argument `operator_eval`s,
+`window_result`, and `window_frame_step` are charged over the prefix, not the whole table — the same
+deliberate, cross-core-identical short-circuit the streaming `LIMIT` scan already makes. `page_read`
+stays the full bound block up front (only per-row work short-circuits, like the streaming scan).
+
 ### 5.3 Named windows and base-window extension (S5 / S9)
 
 The `WINDOW name AS ( … )` clause names reusable window definitions; an `OVER name` reference reuses
@@ -489,6 +546,15 @@ directive. A `sum(x) OVER (ORDER BY t)` running total over `N` rows adds the fra
 `N` (`window_result`) `+ Σ frame sizes` (`window_frame_step`) — for the running default frame,
 `1 + 2 + … + N` per partition.
 
+**The windowed top-N (§5.2a) lowers all of the per-row units** — for an eligible query with `LIMIT
+L` / `OFFSET O`, `N` above becomes `min(N, O+L)` (the survivor-prefix count): `storage_row_read`, the
+`WHERE`/argument `operator_eval`s, `window_result`, and `window_frame_step` are charged over the
+prefix, not the whole table, and `row_produced` + projection over the emitted `L` rows are unchanged.
+`page_read` stays the full bound block (only per-row work short-circuits). This is a **deliberate,
+cross-core-identical** cost change (every core caps at the same `O+L`), exactly like the streaming
+`LIMIT` short-circuit — pinned in `window/topn.test`. It only **lowers** the count and never changes
+a row.
+
 ## 9. Determinism (CLAUDE.md §8/§10)
 
 - **Fully resolved order** (§3): the within-partition sequence is `order_keys` then PK, always
@@ -565,4 +631,13 @@ Deliberate divergences from PostgreSQL, each registered in
   `count`/`count(*)` (the invertible un-fold); a **moving `sum`/`avg`/`min`/`max`/float still re-folds
   from scratch** — a safely-invertible decimal/float sum (guarding the result scale, the
   intermediate-overflow trap order, and float associativity) is the open follow-on.
+- **Windowed top-N** — ✅ **landed (§5.2a).** *Cost-lowering only, never correctness.* A backward
+  window over the PK-ordered scan with an outer `LIMIT` reads only the first `OFFSET+LIMIT` scan rows
+  (the window analog of the streaming `LIMIT` short-circuit) instead of the whole table. The **open
+  follow-ons** (all sound extensions of the same idea, not gaps): a top-N when the window `ORDER BY` is
+  served by a **secondary index** (not just the PK; the `index_order` scan's window twin); a
+  `PARTITION BY` whose keys are a **prefix of the scan order** (so partition boundaries are detectable
+  in the stream and each partition's top-N short-circuits); and a genuinely **pipelined** (row-at-a-time,
+  early-stopping) window operator for the backward case, rather than buffering the `OFFSET+LIMIT`
+  prefix. The current gate is deliberately conservative — no `PARTITION BY`, PK order only.
 - **`IGNORE NULLS`** on `lag`/`lead`/`first_value`/… (SQL:2011, PG does not support it) — out.

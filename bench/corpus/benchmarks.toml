@@ -323,14 +323,17 @@ iterations = 20
 seed = 4220
 expect_rows_per_iter = 1
 
-# Running (EXPANDING) window aggregate over the 1M-row table — the sliding-window optimization
-# (spec/design/window.md §5.2): the frame start is UNBOUNDED PRECEDING, so jed folds each row ONCE
-# as the right edge advances (O(n)) rather than re-folding each frame (the old O(n²)). The window is
-# blocking, so all 1M rows are computed; the ORDER BY id LIMIT 100 trims the output for a cheap
-# cross-engine answer checksum. sum(int)→bigint in every engine, so the running totals agree.
+# Running (EXPANDING) window aggregate — the WINDOWED TOP-N optimization (spec/design/window.md §5.2a,
+# cost.md §3). The frame (UNBOUNDED PRECEDING TO CURRENT ROW) is BACKWARD over the id order, the window
+# ORDER BY id = the PK = the outer ORDER BY, and there is a LIMIT 100 — so the first 100 output rows
+# depend only on the first 100 scan rows. jed reads only that prefix and folds the running sum over it
+# (the window analog of the streaming LIMIT short-circuit), matching PostgreSQL/SQLite, which pipeline
+# the same LIMIT through the window instead of computing all 1M rows. sum(int)→bigint in every engine,
+# so the running totals agree. (Before the top-N landed, jed folded all 1M rows and was ~15000× slower
+# than SQLite here — the regression this benchmark guards.)
 [[bench]]
 name = "window_running_sum"
-description = "Running SUM window over 1M rows (expanding frame — the O(n) sliding-window optimization)"
+description = "Running SUM window over 1M rows, ORDER BY id LIMIT 100 (the windowed top-N short-circuit)"
 dataset = "large"
 kind = "query"
 sql = "SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM orders ORDER BY id LIMIT 100"
@@ -339,13 +342,15 @@ iterations = 10
 seed = 4221
 expect_rows_per_iter = 100
 
-# MOVING window aggregate over the 1M-row table — the sliding-window optimization's invertible path
-# (window.md §5.2): a 10-row trailing COUNT(*) folds each entering row once and UN-folds each leaving
-# row once as the window slides (O(n)). All 1M rows are computed (blocking); ORDER BY id LIMIT 100
-# trims the output. The count is `id` for the first 9 rows, then 10 thereafter — engine-agreeing.
+# MOVING window aggregate — also the WINDOWED TOP-N optimization (window.md §5.2a). A 10-row trailing
+# COUNT(*) (ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) is BACKWARD over the id order, so with ORDER BY
+# id LIMIT 100 the first 100 outputs need only the first 100 scan rows: jed reads that prefix and
+# slides the count over it (fold each entering row, un-fold each leaving row — O(prefix)), rather than
+# computing all 1M rows. Matches PostgreSQL/SQLite, which push the LIMIT through the window. The count
+# is `id` for the first 9 rows, then 10 thereafter — engine-agreeing.
 [[bench]]
 name = "window_moving_count"
-description = "Moving 10-row COUNT(*) window over 1M rows (the invertible un-fold path of the sliding optimization)"
+description = "Moving 10-row COUNT(*) window over 1M rows, ORDER BY id LIMIT 100 (the windowed top-N short-circuit)"
 dataset = "large"
 kind = "query"
 sql = "SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM orders ORDER BY id LIMIT 100"

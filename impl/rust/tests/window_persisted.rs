@@ -75,6 +75,34 @@ fn running_aggregate_over_persisted_column() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The windowed TOP-N optimization (spec/design/window.md §5.2) reads only the first OFFSET+LIMIT
+/// scan rows, then folds the window over that prefix — over a persisted file it must still resolve the
+/// operand column from the faulted leaves it touches. The on-disk read-path check the in-memory corpus
+/// (window/topn.test) cannot express — the window_running_sum benchmark's regression twin.
+#[test]
+fn top_n_over_persisted_column() {
+    let path = std::env::temp_dir().join("jed_window_persisted_topn.jed");
+    let mut db = seed_persisted_window(&path);
+
+    let rows = query_rows(
+        &mut db,
+        "SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id LIMIT 5",
+    );
+    assert_eq!(rows.len(), 5);
+    let mut want: i64 = 0;
+    for (i, r) in rows.iter().enumerate() {
+        want += ((i + 1) * 10) as i64;
+        assert_eq!(
+            r[1].render(),
+            want.to_string(),
+            "row {} running sum — operand column read as NULL from disk?",
+            i + 1
+        );
+    }
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn filter_and_offset_over_persisted_column() {
     let path = std::env::temp_dir().join("jed_window_persisted_filter.jed");

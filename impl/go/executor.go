@@ -13477,6 +13477,105 @@ func streamingScanEligible(plan *selectPlan) bool {
 		plan.rels[0].derived == nil
 }
 
+// windowTopNEligible reports whether a plain (non-grouped) window query can serve its LIMIT with a
+// TOP-N over the primary-key scan — reading only the first OFFSET+LIMIT rows instead of the whole
+// table (spec/design/window.md §5.2 "windowed top-N", cost.md §3). It is the window analog of the
+// streaming-scan LIMIT short-circuit above, sound only when every window value at scan position k
+// depends solely on rows at positions <= k (a "backward" window over the scan order): then the first
+// OFFSET+LIMIT scan rows determine the first OFFSET+LIMIT output rows exactly.
+//
+// The gate (all must hold): a single base-table full/PK-bounded scan (no join/SRF/CTE/derived, no
+// index/GIN/GiST bound — those read the full admitted set), a plain window (`hasWindow && !isAgg`),
+// not DISTINCT, a LIMIT present, and an outer ORDER BY the PK scan already satisfies (`pkOrdered`, so
+// the scan order IS the output order and no post-window sort reorders rows). No compound
+// (materialized) window key (windowKeys) and no general-expression ORDER BY (orderExprs) — those
+// append synthetic columns; a bare PK-column window is the shape that streams. Finally EVERY window
+// spec must be prefix-safe (windowSpecPrefixSafe). Rows are byte-identical to the eager path; only
+// the accrued cost drops (fewer rows scanned/folded), the deliberate cost change (like the streaming
+// LIMIT short-circuit — cross-core identical because every core caps at the same OFFSET+LIMIT).
+func (db *engine) windowTopNEligible(plan *selectPlan) bool {
+	if !plan.hasWindow || plan.isAgg || plan.distinct || plan.limit == nil || !plan.pkOrdered {
+		return false
+	}
+	if len(plan.rels) != 1 || len(plan.joins) != 0 {
+		return false
+	}
+	rel := plan.rels[0]
+	if rel.srf != nil || rel.cte != nil || rel.derived != nil {
+		return false
+	}
+	if b := plan.relBounds[0]; b != nil && (b.index != nil || b.gin != nil || b.gist != nil) {
+		return false
+	}
+	if len(plan.windowKeys) != 0 || len(plan.orderExprs) != 0 {
+		return false
+	}
+	table, ok := db.lkpTable(rel.tableName)
+	if !ok {
+		return false
+	}
+	for i := range plan.windowSpecs {
+		if !db.windowSpecPrefixSafe(&plan.windowSpecs[i], plan, table, rel.offset) {
+			return false
+		}
+	}
+	return true
+}
+
+// windowSpecPrefixSafe reports whether one window function's value at scan position k depends solely
+// on rows at positions <= k, so truncating the input to the first OFFSET+LIMIT rows is exact
+// (spec/design/window.md §5.2). It requires: no PARTITION BY (the whole scan is one partition, so
+// scan order = partition order); a window ORDER BY the PRIMARY KEY satisfies in the SAME direction as
+// the outer pkOrdered scan (so the window's "preceding" is the scan's preceding — the sort is a
+// no-op); and a backward plan/frame.
+//
+//   - row_number / rank / dense_rank / lag → backward (position, earlier-peer count, or a look-BACK
+//     offset); never depend on later rows or the total partition size.
+//   - an aggregate / first_value / last_value / nth_value window → backward iff its FRAME does not
+//     look forward (frameBackwardSafe): the frame END must be UNBOUNDED PRECEDING / PRECEDING /
+//     CURRENT ROW, and a RANGE/GROUPS CURRENT-ROW end (which spans the current PEER GROUP) is safe
+//     only when the ordering key is unique (the full PK) so a peer group is a single row.
+//   - percent_rank / cume_dist / ntile depend on the total partition size N; lead looks FORWARD —
+//     all rejected.
+func (db *engine) windowSpecPrefixSafe(spec *windowSpec, plan *selectPlan, table *catTable, offset int) bool {
+	if len(spec.partition) != 0 || len(spec.order) == 0 {
+		return false
+	}
+	ok, rev := db.orderSatisfiedByPK(table, offset, spec.order)
+	if !ok || rev != plan.pkReverse {
+		return false
+	}
+	unique := len(spec.order) >= len(table.PKIndices()) // order covers the full (unique) PK ⇒ singleton peer groups
+	switch spec.plan {
+	case planRowNumber, planRank, planDenseRank, planLag:
+		return true
+	case planAgg, planFirstValue, planLastValue, planNthValue:
+		return frameBackwardSafe(spec.frame, unique)
+	default:
+		return false // planPercentRank, planCumeDist, planNtile (need N), planLead (looks forward)
+	}
+}
+
+// frameBackwardSafe reports whether a frame folds only rows at or before the current row in the scan
+// order (spec/design/window.md §5.2/§6). The frame END must not look forward; a RANGE/GROUPS
+// CURRENT-ROW end spans the current peer group, which pulls in later rows unless the ordering key is
+// unique. A ROWS frame uses physical position, so it never expands to peers. The default frame (nil,
+// with a window ORDER BY) is RANGE UNBOUNDED PRECEDING TO CURRENT ROW — safe only when the key is
+// unique.
+func frameBackwardSafe(frame *resolvedFrame, unique bool) bool {
+	if frame == nil {
+		return unique
+	}
+	switch frame.end.kind {
+	case boundUnboundedPreceding, boundPreceding:
+		return true // strictly before the current peer group
+	case boundCurrentRow:
+		return frame.mode == frameRows || unique // ROWS = the physical row; RANGE/GROUPS = the peer group
+	default:
+		return false // boundFollowing / boundUnboundedFollowing look forward
+	}
+}
+
 // snapshotEngine builds a frozen read-snapshot engine for a streaming cursor (spec/design/streaming.md
 // §5): the VISIBLE main / session-temp / shared-temp snapshots captured (the snapshots are immutable
 // copy-on-write, so sharing the pointers pins the roots cheaply and keeps them stable for the cursor's
@@ -14161,6 +14260,102 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		}
 	}
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+}
+
+// execWindowTopN serves a windowed top-N (spec/design/window.md §5.2, cost.md §3): a plain window
+// query whose LIMIT is answerable from the first OFFSET+LIMIT primary-key-scan rows (the gate is
+// windowTopNEligible). It streams the PK scan, applies WHERE, and collects survivors until it has
+// OFFSET+LIMIT of them — then runs the ordinary window stage over that PREFIX and emits the
+// OFFSET..OFFSET+LIMIT slice. Because every window value at scan position k depends only on rows at
+// positions <= k (windowSpecPrefixSafe), and the outer ORDER BY is the PK scan order (pkOrdered) so
+// no sort reorders rows, the rows are byte-identical to the eager whole-table path; only the accrued
+// cost is lower (fewer rows scanned, filtered, and folded) — the deliberate short-circuit, mirroring
+// execStreamingScan's LIMIT stop. page_read is the full block up front (only per-row work
+// short-circuits, like the streaming scan).
+func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (emitter, error) {
+	store := db.lkpStore(plan.rels[0].tableName)
+
+	// The scan bound (the PK pushdown, if any) + its page_read block, exactly as execStreamingScan.
+	b := unboundedBound()
+	empty := false
+	overlap, slabs := 0, 0
+	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
+		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
+	}
+	if !empty {
+		var err error
+		if overlap, slabs, err = store.OverlapScanUnits(b, plan.relMasks[0]); err != nil {
+			return emitter{}, err
+		}
+	}
+	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
+
+	limit := *plan.limit // non-nil (windowTopNEligible)
+	var offset int64
+	if plan.offset != nil {
+		offset = *plan.offset
+	}
+	capN := offset + limit
+	if capN < offset { // int64 overflow (offset+limit both enormous) ⇒ no effective cap, scan all
+		capN = int64(1) << 62
+	}
+
+	// Collect the first `cap` surviving rows in PK scan order (respecting pkReverse), charging
+	// storage_row_read per scanned row and the WHERE operator_evals — the streaming-scan feed, minus
+	// the projection (the window stage runs before projection). Stop the instant `cap` survivors are in
+	// hand: a genuine early-out, so the window fold sees only the prefix it needs.
+	var rows []storedRow
+	if !empty && limit > 0 {
+		visit := func(_ []byte, row storedRow) (bool, error) {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+				return false, err
+			}
+			meter.Charge(costs.StorageRowRead)
+			row, err := store.resolveColumns(row, plan.relMasks[0])
+			if err != nil {
+				return false, err
+			}
+			if plan.filter != nil {
+				v, err := plan.filter.eval(row, env, meter)
+				if err != nil {
+					return false, err
+				}
+				if !v.IsTrue() {
+					return true, nil
+				}
+			}
+			rows = append(rows, row)
+			return int64(len(rows)) < capN, nil // stop once the OFFSET+LIMIT window is filled
+		}
+		var err error
+		if plan.pkReverse {
+			err = store.ScanRangeRev(b, plan.relMasks[0], visit)
+		} else {
+			err = store.ScanRange(b, plan.relMasks[0], visit)
+		}
+		if err != nil {
+			return emitter{}, err
+		}
+	}
+
+	// The window stage over the collected prefix — identical to the eager path (§5.2), just fewer rows.
+	if err := applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter); err != nil {
+		return emitter{}, err
+	}
+
+	// The prefix is already in outer ORDER BY order (pkOrdered), so the sort is elided. Slice the
+	// OFFSET..OFFSET+LIMIT window and project on emission — only an emitted row charges row_produced +
+	// projection cost (the eager non-DISTINCT window path's emitProject, streaming.md §4).
+	n := int64(len(rows))
+	start := offset
+	if start > n {
+		start = n
+	}
+	end := n
+	if limit < n-start {
+		end = start + limit
+	}
+	return emitter{src: rows, start: start, end: end, mode: emitProject}, nil
 }
 
 // execIndexOrderScan is the streaming secondary-index-order scan (cost.md §3 "secondary-index
@@ -14925,6 +15120,14 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			return emitter{}, err
 		}
 		return emitter{final: res.rows, mode: emitFinal}, nil
+	}
+
+	// Windowed top-N (spec/design/window.md §5.2, cost.md §3): a plain window query whose LIMIT is
+	// answerable from the first OFFSET+LIMIT PK-scan rows (a backward window over the PK-ordered scan)
+	// scans only that prefix instead of the whole table — the window analog of the streaming LIMIT
+	// short-circuit. Ineligible window queries fall through to the eager whole-table materialize below.
+	if db.windowTopNEligible(plan) {
+		return db.execWindowTopN(plan, env, meter, params)
 	}
 
 	// Materialize each relation once, in primary-key order (base tables drain a scanSource — the

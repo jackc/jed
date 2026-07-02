@@ -1836,6 +1836,25 @@ function streamingScanEligible(plan: SelectPlan): boolean {
   );
 }
 
+// frameBackwardSafe reports whether a frame folds only rows at or before the current row in the scan
+// order (spec/design/window.md §5.2/§6). The frame END must not look forward; a RANGE/GROUPS
+// CURRENT-ROW end spans the current peer group, which pulls in later rows unless the ordering key is
+// unique. A ROWS frame uses physical position, so it never expands to peers. The default frame
+// (undefined/null, with a window ORDER BY) is RANGE UNBOUNDED PRECEDING TO CURRENT ROW — safe only
+// when the key is unique.
+function frameBackwardSafe(frame: ResolvedFrame | null | undefined, unique: boolean): boolean {
+  if (frame === null || frame === undefined) return unique;
+  switch (frame.end.kind) {
+    case "unboundedPreceding":
+    case "preceding":
+      return true; // strictly before the current peer group
+    case "currentRow":
+      return frame.mode === "rows" || unique; // ROWS = the physical row; RANGE/GROUPS = the peer group
+    default:
+      return false; // following / unboundedFollowing look forward
+  }
+}
+
 // vectorizedProjectEligible reports whether plan is a shape projectColumnar specializes: a bare-column
 // projection over a single base table with no join / aggregate / window / DISTINCT / ORDER BY / LIMIT /
 // OFFSET and no index/GIN/GiST bound — a plain `SELECT c0, c3, … FROM t [WHERE …]` whose output is the
@@ -10017,6 +10036,140 @@ export class Engine {
     };
   }
 
+  // windowTopNEligible reports whether a plain (non-grouped) window query can serve its LIMIT with a
+  // TOP-N over the primary-key scan — reading only the first OFFSET+LIMIT rows instead of the whole
+  // table (spec/design/window.md §5.2 "windowed top-N", cost.md §3). It is the window analog of the
+  // streamingScanEligible LIMIT short-circuit, sound only when every window value at scan position k
+  // depends solely on rows at positions <= k (a "backward" window over the scan order): then the first
+  // OFFSET+LIMIT scan rows determine the first OFFSET+LIMIT output rows exactly.
+  //
+  // The gate (all must hold): a single base-table full/PK-bounded scan (no join/SRF/CTE/derived, no
+  // index/GIN/GiST bound — those read the full admitted set), a plain window (hasWindow && !isAgg), not
+  // DISTINCT, a LIMIT present, and an outer ORDER BY the PK scan already satisfies (pkOrdered, so the
+  // scan order IS the output order and no post-window sort reorders rows). No compound (materialized)
+  // window key (windowKeys) and no general-expression ORDER BY (orderExprs) — those append synthetic
+  // columns; a bare PK-column window is the shape that streams. Finally EVERY window spec must be
+  // prefix-safe (windowSpecPrefixSafe). Rows are byte-identical to the eager path; only the accrued
+  // cost drops (fewer rows scanned/folded), the deliberate cost change (like the streaming LIMIT
+  // short-circuit — cross-core identical because every core caps at the same OFFSET+LIMIT).
+  private windowTopNEligible(plan: SelectPlan): boolean {
+    if (!plan.hasWindow || plan.isAgg || plan.distinct || plan.limit === null || !plan.pkOrdered) {
+      return false;
+    }
+    if (plan.rels.length !== 1 || plan.joins.length !== 0) return false;
+    const rel = plan.rels[0]!;
+    if (rel.srf !== undefined || rel.cte !== undefined || rel.derived !== undefined) return false;
+    const bk = plan.relBounds[0]?.kind;
+    if (bk === "index" || bk === "gin" || bk === "gist") return false;
+    if (plan.windowKeys.length !== 0 || plan.orderExprs.length !== 0) return false;
+    const table = this.lkpTable(rel.tableName);
+    if (table === undefined) return false;
+    return plan.windowSpecs.every((spec) => this.windowSpecPrefixSafe(spec, plan, table, rel.offset));
+  }
+
+  // windowSpecPrefixSafe reports whether one window function's value at scan position k depends solely
+  // on rows at positions <= k, so truncating the input to the first OFFSET+LIMIT rows is exact
+  // (spec/design/window.md §5.2). It requires: no PARTITION BY (the whole scan is one partition, so scan
+  // order = partition order); a window ORDER BY the PRIMARY KEY satisfies in the SAME direction as the
+  // outer pkOrdered scan (so the window's "preceding" is the scan's preceding — the sort is a no-op);
+  // and a backward plan/frame:
+  //   - rowNumber / rank / denseRank / lag → backward (position, earlier-peer count, or a look-BACK
+  //     offset); never depend on later rows or the total partition size.
+  //   - an aggregate / firstValue / lastValue / nthValue window → backward iff its FRAME does not look
+  //     forward (frameBackwardSafe).
+  //   - percentRank / cumeDist / ntile depend on the total partition size N; lead looks FORWARD — all
+  //     rejected.
+  private windowSpecPrefixSafe(
+    spec: WindowSpec,
+    plan: SelectPlan,
+    table: Table,
+    offset: number,
+  ): boolean {
+    if (spec.partition.length !== 0 || spec.order.length === 0) return false;
+    const dir = orderSatisfiedByPK(this.readSnap(), table, offset, spec.order);
+    if (dir === null || dir.reverse !== plan.pkReverse) return false;
+    // The order covers the full (unique) PK ⇒ singleton peer groups (needed for a RANGE/GROUPS
+    // CURRENT-ROW frame end, which otherwise spans forward peers).
+    const unique = spec.order.length >= pkIndices(table).length;
+    switch (spec.plan) {
+      case "rowNumber":
+      case "rank":
+      case "denseRank":
+      case "lag":
+        return true;
+      case "agg":
+      case "firstValue":
+      case "lastValue":
+      case "nthValue":
+        return frameBackwardSafe(spec.frame, unique);
+      default:
+        // percentRank / cumeDist / ntile need the total partition size N; lead looks forward.
+        return false;
+    }
+  }
+
+  // execWindowTopN serves a windowed top-N (spec/design/window.md §5.2, cost.md §3): a plain window
+  // query whose LIMIT is answerable from the first OFFSET+LIMIT primary-key-scan rows (the gate is
+  // windowTopNEligible). It streams the PK scan, applies WHERE, and collects survivors until it has
+  // OFFSET+LIMIT of them — then runs the ordinary window stage over that PREFIX and emits the
+  // OFFSET..OFFSET+LIMIT slice. Because every window value at scan position k depends only on rows at
+  // positions <= k (windowSpecPrefixSafe), and the outer ORDER BY is the PK scan order (pkOrdered) so
+  // no sort reorders rows, the rows are byte-identical to the eager whole-table path; only the accrued
+  // cost is lower (fewer rows scanned, filtered, and folded) — the deliberate short-circuit, mirroring
+  // execStreamingScan's LIMIT stop. pageRead is the full block up front (only per-row work
+  // short-circuits, like the streaming scan).
+  private execWindowTopN(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    const store = this.lkpStore(plan.rels[0]!.tableName);
+
+    // The scan bound (the PK pushdown, if any) + its pageRead block, exactly as execStreamingScan.
+    let bound: KeyBound = unboundedBound();
+    let empty = false;
+    const sb = plan.relBounds[0]!;
+    if (sb !== null) {
+      if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
+        throw new Error("the windowed top-N path is gated to PK/full scans");
+      const b = buildKeyBound(sb.pk, params, env.outer);
+      if (b === null) empty = true;
+      else bound = b;
+    }
+    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+
+    const limit = plan.limit!; // non-null (windowTopNEligible)
+    const offset = plan.offset ?? 0n;
+    const cap = offset + limit; // OFFSET+LIMIT survivors suffice (a backward window over the scan)
+
+    // Collect the first `cap` surviving rows in PK scan order (respecting pkReverse), charging
+    // storageRowRead per scanned row and the WHERE operator_evals — the streaming-scan feed, minus the
+    // projection (the window stage runs before projection). Stop the instant `cap` survivors are in
+    // hand: a genuine early-out, so the window fold sees only the prefix it needs.
+    const rows: Row[] = [];
+    if (!empty && limit !== 0n) {
+      const visit = (_key: Uint8Array, rawRow: Row): boolean => {
+        meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+        meter.charge(COSTS.storageRowRead);
+        const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
+        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) return true;
+        rows.push(row);
+        return BigInt(rows.length) < cap; // stop once the OFFSET+LIMIT window is filled
+      };
+      const recon = plan.relMasks[0]!;
+      if (plan.pkReverse) store.scanRangeRev(bound, recon, visit);
+      else store.scanRange(bound, recon, visit);
+    }
+
+    // The window stage over the collected prefix — identical to the eager path (§5.2), just fewer rows.
+    applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter);
+
+    // The prefix is already in outer ORDER BY order (pkOrdered), so the sort is elided. Slice the
+    // OFFSET..OFFSET+LIMIT window and project on emission — only an emitted row charges rowProduced +
+    // projection cost (the eager non-DISTINCT window path's "project", streaming.md §4).
+    const n = BigInt(rows.length);
+    const start = offset < n ? offset : n;
+    const end = limit < n - start ? start + limit : n;
+    return { rows, start: Number(start), end: Number(end), mode: "project" };
+  }
+
   // execIndexOrderScan is the streaming secondary-index-order scan (cost.md §3 "secondary-index
   // order"): an ORDER BY the PK scan does NOT satisfy but a B-tree index does, with a LIMIT (the gate
   // — plan.indexOrder non-null). It walks the index store forward in key order, peels the fixed-width
@@ -10799,6 +10952,14 @@ export class Engine {
     // and the loop short-circuits a top-N.
     if (plan.joinPkOrdered) {
       return finalEmitter(this.execStreamingJoin(plan, env, meter, params, env.outer).rows);
+    }
+
+    // Windowed top-N (spec/design/window.md §5.2, cost.md §3): a plain window query whose LIMIT is
+    // answerable from the first OFFSET+LIMIT PK-scan rows (a backward window over the PK-ordered scan)
+    // scans only that prefix instead of the whole table — the window analog of the streaming LIMIT
+    // short-circuit. Ineligible window queries fall through to the eager materialize below.
+    if (this.windowTopNEligible(plan)) {
+      return this.execWindowTopN(plan, env, meter, params);
     }
 
     // Columnar projection fast path (packed-leaf.md §11 Track A2/A3): a bare-column projection over a

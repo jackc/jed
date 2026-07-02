@@ -10921,6 +10921,198 @@ impl Engine {
         })
     }
 
+    /// Whether a plain (non-grouped) window query can serve its LIMIT with a TOP-N over the primary-key
+    /// scan — reading only the first OFFSET+LIMIT rows instead of the whole table (spec/design/window.md
+    /// §5.2 "windowed top-N", cost.md §3). It is the window analog of the streaming-scan LIMIT
+    /// short-circuit ([`streaming_scan_eligible`]), sound only when every window value at scan position
+    /// `k` depends solely on rows at positions `<= k` (a "backward" window over the scan order): then
+    /// the first OFFSET+LIMIT scan rows determine the first OFFSET+LIMIT output rows exactly.
+    ///
+    /// The gate (all must hold): a single base-table full/PK-bounded scan (no join/SRF/CTE/derived, no
+    /// index/GIN/GiST bound — those read the full admitted set), a plain window (`has_window &&
+    /// !is_agg`), not DISTINCT, a LIMIT present, and an outer ORDER BY the PK scan already satisfies
+    /// (`pk_ordered`, so the scan order IS the output order and no post-window sort reorders rows). No
+    /// compound (materialized) window key (`window_keys`) and no general-expression ORDER BY
+    /// (`order_exprs`) — those append synthetic columns; a bare PK-column window is the shape that
+    /// streams. Finally EVERY window spec must be prefix-safe ([`Engine::window_spec_prefix_safe`]).
+    /// Rows are byte-identical to the eager path; only the accrued cost drops (fewer rows scanned/
+    /// folded), the deliberate cost change (like the streaming LIMIT short-circuit — cross-core
+    /// identical because every core caps at the same OFFSET+LIMIT).
+    fn window_top_n_eligible(&self, plan: &SelectPlan) -> bool {
+        if !plan.has_window
+            || plan.is_agg
+            || plan.distinct
+            || plan.limit.is_none()
+            || !plan.pk_ordered
+        {
+            return false;
+        }
+        if plan.rels.len() != 1 || !plan.joins.is_empty() {
+            return false;
+        }
+        let rel = &plan.rels[0];
+        if rel.srf.is_some() || rel.cte.is_some() || rel.derived.is_some() {
+            return false;
+        }
+        if matches!(
+            plan.rel_bounds[0],
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+        ) {
+            return false;
+        }
+        if !plan.window_keys.is_empty() || !plan.order_exprs.is_empty() {
+            return false;
+        }
+        let Some(table) = self.table(&rel.table_name) else {
+            return false;
+        };
+        plan.window_specs
+            .iter()
+            .all(|spec| self.window_spec_prefix_safe(spec, plan, table, rel.offset))
+    }
+
+    /// Whether one window function's value at scan position `k` depends solely on rows at positions
+    /// `<= k`, so truncating the input to the first OFFSET+LIMIT rows is exact (spec/design/window.md
+    /// §5.2). It requires: no PARTITION BY (the whole scan is one partition, so scan order = partition
+    /// order); a window ORDER BY the PRIMARY KEY satisfies in the SAME direction as the outer
+    /// `pk_ordered` scan (so the window's "preceding" is the scan's preceding — the sort is a no-op);
+    /// and a backward plan/frame:
+    ///
+    ///   - `row_number` / `rank` / `dense_rank` / `lag` → backward (position, earlier-peer count, or a
+    ///     look-BACK offset); never depend on later rows or the total partition size.
+    ///   - an aggregate / `first_value` / `last_value` / `nth_value` window → backward iff its FRAME
+    ///     does not look forward ([`frame_backward_safe`]).
+    ///   - `percent_rank` / `cume_dist` / `ntile` depend on the total partition size N; `lead` looks
+    ///     FORWARD — all rejected.
+    fn window_spec_prefix_safe(
+        &self,
+        spec: &WindowSpec,
+        plan: &SelectPlan,
+        table: &Table,
+        offset: usize,
+    ) -> bool {
+        if !spec.partition.is_empty() || spec.order.is_empty() {
+            return false;
+        }
+        match order_satisfied_by_pk(table, offset, &spec.order, self) {
+            Some(rev) if rev == plan.pk_reverse => {}
+            _ => return false,
+        }
+        // The order covers the full (unique) PK ⇒ singleton peer groups (needed for a RANGE/GROUPS
+        // CURRENT-ROW frame end, which otherwise spans forward peers).
+        let unique = spec.order.len() >= table.pk_indices().len();
+        match spec.plan {
+            WindowPlan::RowNumber | WindowPlan::Rank | WindowPlan::DenseRank | WindowPlan::Lag => {
+                true
+            }
+            WindowPlan::Agg(_)
+            | WindowPlan::FirstValue
+            | WindowPlan::LastValue
+            | WindowPlan::NthValue => frame_backward_safe(&spec.frame, unique),
+            // PercentRank / CumeDist / Ntile need the total partition size N; Lead looks forward.
+            _ => false,
+        }
+    }
+
+    /// A windowed top-N (spec/design/window.md §5.2, cost.md §3): a plain window query whose LIMIT is
+    /// answerable from the first OFFSET+LIMIT primary-key-scan rows (the gate is
+    /// [`Engine::window_top_n_eligible`]). It streams the PK scan, applies WHERE, and collects
+    /// survivors until it has OFFSET+LIMIT of them — then runs the ordinary window stage over that
+    /// PREFIX and emits the OFFSET..OFFSET+LIMIT slice. Because every window value at scan position `k`
+    /// depends only on rows at positions `<= k` (`window_spec_prefix_safe`), and the outer ORDER BY is
+    /// the PK scan order (`pk_ordered`) so no sort reorders rows, the rows are byte-identical to the
+    /// eager whole-table path; only the accrued cost is lower (fewer rows scanned, filtered, and
+    /// folded) — the deliberate short-circuit, mirroring [`Engine::exec_streaming_scan`]'s LIMIT stop.
+    /// page_read is the full block up front (only per-row work short-circuits, like the streaming scan).
+    fn exec_window_top_n(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        params: &[Value],
+    ) -> Result<Emitter> {
+        let store = self.store(&plan.rels[0].table_name);
+        let reverse = plan.pk_reverse;
+
+        let (bound, empty) = match &plan.rel_bounds[0] {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer) {
+                Some(b) => (b, false),
+                None => (KeyBound::unbounded(), true),
+            },
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)) => {
+                unreachable!("the windowed top-N path is gated to PK/full scans")
+            }
+            None => (KeyBound::unbounded(), false),
+        };
+        let (overlap, slabs) = if empty {
+            (0, 0)
+        } else {
+            store.overlap_scan_units(&bound, &plan.rel_masks[0])?
+        };
+        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+
+        let limit = plan.limit.expect("window_top_n_eligible requires a LIMIT");
+        let offset = plan.offset.unwrap_or(0);
+        let cap = offset.saturating_add(limit); // OFFSET+LIMIT survivors suffice (backward window)
+
+        // Collect the first `cap` surviving rows in PK scan order (respecting `pk_reverse`), charging
+        // storage_row_read per scanned row and the WHERE operator_evals — the streaming-scan feed,
+        // minus the projection (the window stage runs before projection). Stop the instant `cap`
+        // survivors are in hand: a genuine early-out, so the window fold sees only the prefix it needs.
+        let mut rows: Vec<Row> = Vec::new();
+        if !empty && limit > 0 {
+            let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
+                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                meter.charge(COSTS.storage_row_read);
+                let resolved;
+                let row = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
+                    let mut r = row.clone();
+                    store.resolve_columns(&mut r, &plan.rel_masks[0])?;
+                    resolved = r;
+                    &resolved
+                } else {
+                    row
+                };
+                let keep = match &plan.filter {
+                    Some(f) => f.eval(row, env, meter)?.is_true(),
+                    None => true,
+                };
+                if !keep {
+                    return Ok(true);
+                }
+                rows.push(row.clone());
+                Ok((rows.len() as i64) < cap) // stop once the OFFSET+LIMIT window is filled
+            };
+            let recon = Some(plan.rel_masks[0].as_slice());
+            if reverse {
+                store.scan_range_rev(&bound, recon, &mut visit)?;
+            } else {
+                store.scan_range(&bound, recon, &mut visit)?;
+            }
+        }
+
+        // The window stage over the collected prefix — identical to the eager path (§5.2), just fewer
+        // rows.
+        apply_window_stage(&mut rows, &plan.window_specs, &plan.window_keys, env, meter)?;
+
+        // The prefix is already in outer ORDER BY order (`pk_ordered`), so the sort is elided. Slice
+        // the OFFSET..OFFSET+LIMIT window and project on emission — only an emitted row charges
+        // row_produced + projection cost (the eager non-DISTINCT window path's Project, streaming.md §4).
+        let len = rows.len() as i64;
+        let start = offset.min(len) as usize;
+        let end = if limit < len - start as i64 {
+            start + limit as usize
+        } else {
+            len as usize
+        };
+        Ok(Emitter::Buffer {
+            rows,
+            start,
+            end,
+            mode: EmitMode::Project,
+        })
+    }
+
     /// Build a frozen read-snapshot [`Engine`] for a streaming cursor (spec/design/streaming.md §5):
     /// the VISIBLE main / session-temp / shared-temp snapshots captured **by value** (copy-on-write
     /// `Arc` clones, so this pins the roots cheaply and they stay stable for the cursor's whole life,
@@ -12243,6 +12435,14 @@ impl Engine {
                     .exec_streaming_join(plan, &env, meter, params, outer, stmt_rng)?
                     .rows,
             });
+        }
+
+        // Windowed top-N (spec/design/window.md §5.2, cost.md §3): a plain window query whose LIMIT is
+        // answerable from the first OFFSET+LIMIT PK-scan rows (a backward window over the PK-ordered
+        // scan) scans only that prefix instead of the whole table — the window analog of the streaming
+        // LIMIT short-circuit. Ineligible window queries fall through to the eager materialize below.
+        if self.window_top_n_eligible(plan) {
+            return self.exec_window_top_n(plan, &env, meter, params);
         }
 
         // Columnar projection fast path (batch, packed-leaf.md §11 Track A2/A3): a bare-column projection
@@ -16934,6 +17134,26 @@ fn order_satisfied_by_pk(
         }
     }
     Some(reverse)
+}
+
+/// Whether a frame folds only rows at or before the current row in the scan order (spec/design/
+/// window.md §5.2/§6). The frame END must not look forward; a RANGE/GROUPS CURRENT-ROW end spans the
+/// current peer group, which pulls in later rows unless the ordering key is unique. A ROWS frame uses
+/// physical position, so it never expands to peers. The default frame (`None`, with a window ORDER BY)
+/// is RANGE UNBOUNDED PRECEDING TO CURRENT ROW — safe only when the key is unique.
+fn frame_backward_safe(frame: &Option<ResolvedFrame>, unique: bool) -> bool {
+    let Some(frame) = frame else {
+        return unique;
+    };
+    match &frame.end {
+        // Strictly before the current peer group.
+        ResolvedBound::UnboundedPreceding | ResolvedBound::Preceding(_) => true,
+        // ROWS = the physical current row; RANGE/GROUPS = the current peer group (forward peers unless
+        // the key is unique).
+        ResolvedBound::CurrentRow => matches!(frame.mode, crate::ast::FrameMode::Rows) || unique,
+        // Look forward.
+        ResolvedBound::Following(_) | ResolvedBound::UnboundedFollowing => false,
+    }
 }
 
 /// The fixed byte width of a table's stored primary key (`encode_pk_key` = the bare per-column
