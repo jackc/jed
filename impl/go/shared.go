@@ -513,15 +513,16 @@ func (s *Session) Query(sql string, params []Value) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.queryStmt(stmt, params)
+	return s.queryStmt(stmt, params, nil) // one-shot: no cross-call plan cache (still plans once)
 }
 
 // queryStmt routes an already-parsed query AST through the session's lazy lanes — the autocommit
-// re-pin, the streaming / buffered / deferred cursors, and the reader-liveness watermark pin —
-// falling back to the materialized dispatch for a shape no lazy lane covers (a write, a data-modifying
-// WITH). Shared by Query (parse-then-route) and a prepared query (PreparedStatement.QueryValues, route
-// the prepared AST), so a prepared query streams and pins its snapshot exactly like an ad-hoc one.
-func (s *Session) queryStmt(stmt statement, params []Value) (*Rows, error) {
+// re-pin, the plan-once scan (streaming/buffered) then deferred cursors, and the reader-liveness
+// watermark pin — falling back to the materialized dispatch for a shape no lazy lane covers (a write,
+// a data-modifying WITH). Shared by Query (parse-then-route, sc nil) and a prepared query
+// (PreparedStatement.QueryValues passes its scanCache), so a prepared query streams and pins its
+// snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
+func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
 	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit
 	// (non-block, writable access) read re-pins the latest committed so the snapshot is current
 	// (PG-faithful); a read-only session uses its existing pin, and an open block uses its working set.
@@ -545,13 +546,9 @@ func (s *Session) queryStmt(stmt statement, params []Value) (*Rows, error) {
 		return rows
 	}
 	// A single-table no-blocking-op read streams (S3); a blocking read uses the lazy buffered cursor
-	// (S4); both are live readers and pin their snapshot in the watermark.
-	if rows, ok, err := s.engine.tryStreamingQuery(stmt, params); err != nil {
-		return nil, err
-	} else if ok {
-		return pin(rows), nil
-	}
-	if rows, ok, err := s.engine.tryBufferedQuery(stmt, params); err != nil {
+	// (S4). One plan-once lane serves both; a prepared statement reuses its cached plan (sc). Both are
+	// live readers and pin their snapshot in the watermark.
+	if rows, ok, err := s.engine.tryScanQuery(stmt, params, sc); err != nil {
 		return nil, err
 	} else if ok {
 		return pin(rows), nil

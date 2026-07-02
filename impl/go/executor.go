@@ -106,7 +106,15 @@ const maxCompositeDepth = 32
 // across goroutines is P5.3b.)
 type snapshot struct {
 	// txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
-	txid   uint64
+	txid uint64
+	// catGen is the catalog generation — a monotonic counter bumped by every schema mutation
+	// (CREATE/DROP/ALTER of a table/type/index), carried forward across clone(). Unlike txid it does
+	// NOT move on data writes and is defined for in-memory databases too, so a prepared statement's
+	// plan cache keys its committed-plan validity on it: a cached plan is reusable iff the read
+	// snapshot's catGen still equals the plan's (spec/design/api.md §2.4). NOT bumped by sequence
+	// nextval (a data write on the nextval path), only by sequence DDL — a SELECT plan binds no
+	// sequence.
+	catGen uint64
 	tables map[string]*catTable
 	// types holds user-defined composite (row) types, keyed by lowercased name
 	// (spec/design/composite.md). A database-level object set, separate from tables; serialized
@@ -198,7 +206,7 @@ func (s *snapshot) clone() *snapshot {
 	for k, v := range s.gistTrees {
 		gistTrees[k] = v
 	}
-	return &snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees}
+	return &snapshot{txid: s.txid, catGen: s.catGen, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees}
 }
 
 // resolveCollation resolves a collation name for USE — query resolution and key encoding
@@ -410,14 +418,20 @@ func (s *snapshot) compositeType(name string) *compositeType {
 	return s.types[strings.ToLower(name)]
 }
 
+// bumpCatGen advances the catalog generation — called by every schema mutator (see catGen). A
+// SELECT plan cached against a prior generation is thereby invalidated on the next execute.
+func (s *snapshot) bumpCatGen() { s.catGen++ }
+
 // putType registers a composite type (CREATE TYPE). The lower-cased name is the key. The caller
 // has already resolved field types and checked for a duplicate.
 func (s *snapshot) putType(ct *compositeType) {
+	s.bumpCatGen()
 	s.types[strings.ToLower(ct.Name)] = ct
 }
 
 // removeType removes a composite type (DROP TYPE). The caller has checked there are no dependents.
 func (s *snapshot) removeType(key string) {
+	s.bumpCatGen()
 	delete(s.types, key)
 }
 
@@ -581,6 +595,7 @@ func (s *snapshot) removeForeignKey(tableKey, fkName string) {
 	if !ok {
 		return
 	}
+	s.bumpCatGen()
 	kept := make([]foreignKey, 0, len(old.ForeignKeys))
 	for _, fk := range old.ForeignKeys {
 		if !strings.EqualFold(fk.Name, fkName) {
@@ -728,6 +743,7 @@ func (s *snapshot) putTable(t *catTable, pageSize uint32) {
 // (spec/design/composite.md §4), so the store needs nothing from the catalog thereafter. The plain
 // putTable resolves against s.types and delegates here.
 func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize uint32) {
+	s.bumpCatGen()
 	key := strings.ToLower(t.Name)
 	s.stores[key] = newTableStore(pagePayload(pageSize), colTypes)
 	s.tables[key] = t
@@ -736,6 +752,7 @@ func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize ui
 // removeTable removes a table's definition, its store, and its indexes' stores (DROP
 // TABLE — the indexes have no independent life, spec/design/indexes.md §2).
 func (s *snapshot) removeTable(key string) {
+	s.bumpCatGen()
 	if t, ok := s.tables[key]; ok {
 		for _, idx := range t.Indexes {
 			delete(s.indexStores, strings.ToLower(idx.Name))
@@ -775,6 +792,7 @@ func (s *snapshot) storageBytes() uint64 {
 // spec/design/indexes.md §6) and create its zero-column store. The Table struct is
 // re-allocated (catalog Tables are never mutated in place — snapshots share them).
 func (s *snapshot) putIndex(tableKey string, def indexDef, pageSize uint32) {
+	s.bumpCatGen()
 	nameKey := strings.ToLower(def.Name)
 	s.indexStores[nameKey] = newTableStore(pagePayload(pageSize), nil)
 	old := s.tables[tableKey]
@@ -803,6 +821,7 @@ func (s *snapshot) setColumnDefaultExpr(tableKey string, column int, de *default
 	if !ok || column < 0 || column >= len(old.Columns) {
 		return
 	}
+	s.bumpCatGen()
 	t := *old
 	t.Columns = make([]catColumn, len(old.Columns))
 	copy(t.Columns, old.Columns)
@@ -880,6 +899,7 @@ func (s *snapshot) rebuildGistTrees() error {
 // removeIndex removes one secondary index (DROP INDEX): its definition from the owning
 // table and its store.
 func (s *snapshot) removeIndex(tableKey, nameKey string) {
+	s.bumpCatGen()
 	if old, ok := s.tables[tableKey]; ok {
 		t := *old
 		t.Indexes = nil
@@ -14154,32 +14174,95 @@ func (db *engine) snapshotEngine() *engine {
 	}
 }
 
-// tryStreamingQuery tries to serve stmt as a lazy STREAMING query (spec/design/streaming.md §3/§4, S3)
-// — the Query fast lane. Returns (rows, true, nil) when stmt is a top-level read SELECT whose plan is
-// the single-table no-blocking-operator streaming scan (the same shape execSelectPlan routes to
-// execStreamingScan); else (nil, false, nil), and the caller falls back to the materialized Execute
-// path → a buffered cursor. The conformance corpus drives Execute, so streaming is invisible to it;
-// this lane only affects Query and is unit-tested to yield the IDENTICAL rows + total cost under full
-// drain (streaming.md §6), while a caller that stops early reads (and charges) less. A write-classified
-// statement — incl. a nextval/setval SELECT (stmtIsWrite) — never streams (it must take the write gate
-// and publish, sequences.md §4), so the frozen snapshot never has to reproduce a sequence advance.
-func (db *engine) tryStreamingQuery(stmt statement, params []Value) (*Rows, bool, error) {
+// scanCache memoizes a prepared statement's resolved scan plan + finalized param types so a repeated
+// execute skips planning entirely (spec/design/api.md §2.4) — the biggest lever for the point-lookup
+// / high-frequency class (planning is ~⅔ of a point lookup's latency and ~88% of its allocations, and
+// the resulting GC inflates the tail). Valid only while catGen still equals the committed catalog
+// generation the plan was built against; any DDL bumps catGen and the next execute re-plans. Filled
+// only from committed state and only for a reusable plan (planCacheable + !paramTypes.uncacheable),
+// so reusing it is result/cost-identical to a fresh plan. Zero value (valid=false) is "empty". Not
+// safe for concurrent use — a prepared statement runs on one handle at a time.
+type scanCache struct {
+	valid  bool
+	catGen uint64
+	sp     *selectPlan
+	ptys   []scalarType
+}
+
+// planCacheable reports whether a resolved scan plan may be memoized on a prepared statement. The
+// subquery / precompiled-regex exclusion is tracked separately (paramTypes.uncacheable, set at the
+// node's birth — a folded uncorrelated subquery bakes in one execution's params, and a precompiled
+// regex carries a per-execution cost flag). Here the relations are vetted: a set-returning / CTE /
+// derived relation carries a nested plan or generator we do not vet for reuse, and a temp /
+// shared-temp table lives in a snapshot the cache key (committed.catGen) does not track — so a plan
+// referencing any of those is never cached (a point lookup / plain join over persistent base tables
+// has none).
+func (db *engine) planCacheable(sp *selectPlan) bool {
+	for i := range sp.rels {
+		r := &sp.rels[i]
+		if r.srf != nil || r.cte != nil || r.derived != nil {
+			return false
+		}
+		if db.isTempTable(r.tableName) || db.isSharedTempTable(r.tableName) {
+			return false
+		}
+	}
+	return true
+}
+
+// tryScanQuery serves stmt as a lazy STREAMING or BUFFERED query (spec/design/streaming.md §3/§4),
+// planning it EXACTLY ONCE and classifying streaming-vs-buffered from that single plan — the
+// plan-once replacement for the old tryStreamingQuery + tryBufferedQuery pair, each of which
+// re-planned the same statement. Returns (rows, true, nil) for a top-level read SELECT; (nil, false,
+// nil) for a shape no scan lane covers (a non-SELECT, a write — incl. a nextval/setval SELECT,
+// stmtIsWrite — or a top-level set-op / VALUES / WITH), so the caller falls through to the deferred /
+// materialized paths. When sc is non-nil (a prepared statement) a repeated execute over an unchanged
+// catalog reuses the cached plan and skips planning + the fold; ad-hoc callers pass nil and still
+// plan exactly once. The conformance corpus drives the materialized Execute path, so this lane stays
+// invisible to it (unit-tested to yield identical rows + total cost under full drain, streaming.md §6).
+func (db *engine) tryScanQuery(stmt statement, params []Value, sc *scanCache) (*Rows, bool, error) {
 	if stmt.Select == nil || stmtIsWrite(stmt) {
 		return nil, false, nil
 	}
+	// Cache HIT: the read snapshot's catalog is unchanged since the plan was cached (its catGen still
+	// matches), so reuse the resolved plan + finalized param types — no planQuery, no fold, no
+	// param-type walk. A cached plan carries no subquery to fold (planCacheable rejected any), so the
+	// shared plan is never mutated; params are still bound per execute inside buildScanRows.
+	rsnap := db.readSnap()
+	if sc != nil && sc.valid && sc.catGen == rsnap.catGen {
+		return db.buildScanRows(sc.sp, sc.ptys, params, false)
+	}
+	// MISS: plan once.
 	ptypes := &paramTypes{}
 	plan, err := db.planQuery(queryExpr{Select: stmt.Select}, nil, nil, ptypes)
 	if err != nil {
 		return nil, false, err
 	}
-	if plan.sel == nil || !streamingScanEligible(plan.sel) {
-		return nil, false, nil
+	if plan.sel == nil {
+		return nil, false, nil // set-op / VALUES / WITH — a scan lane does not cover it
 	}
 	sp := plan.sel
 	ptys, err := ptypes.finalize()
 	if err != nil {
 		return nil, false, err
 	}
+	// Fill the cache only from committed state — so committed.catGen is strictly increasing over the
+	// engine's life and never aliases a rolled-back working generation, making the catGen equality on
+	// a later HIT a sound "same catalog" identity check (a statement first executed inside an open
+	// transaction re-plans until the tx commits) — and only for a reusable plan.
+	if sc != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(sp) {
+		*sc = scanCache{valid: true, catGen: rsnap.catGen, sp: sp, ptys: ptys}
+	}
+	return db.buildScanRows(sp, ptys, params, true)
+}
+
+// buildScanRows binds params, optionally folds uncorrelated subqueries to constants (doFold — done on
+// a freshly-planned plan, skipped for a cached one which has no subquery), classifies the plan as
+// streaming or buffered via streamingScanEligible, and returns the matching lazy cursor. When doFold
+// is false, sp is a shared cached plan and stays strictly read-only. The streaming branch resolves
+// the PK scan bound + the up-front cost block; the buffered branch runs its blocking part lazily on
+// the first pull. Under full drain the rows + total cost are byte-identical to the eager path.
+func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Value, doFold bool) (*Rows, bool, error) {
 	bound, err := bindParams(params, ptys)
 	if err != nil {
 		return nil, false, err
@@ -14187,50 +14270,70 @@ func (db *engine) tryStreamingQuery(stmt statement, params []Value) (*Rows, bool
 	// Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
 	// uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
 	// fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
-	// added to the cursor's reported cost below (mirroring runQueryExpr's r.cost += …).
+	// added to the cursor's reported cost below (mirroring runQueryExpr's r.cost += …). A cached plan
+	// has no subquery, so the fold is skipped (it would be a no-op anyway) — cost stays identical.
 	var subqueryCost int64
-	if err := db.foldUncorrelatedInSelect(sp, bound, cteCtx{}, &subqueryCost); err != nil {
-		return nil, false, err
-	}
-
-	// Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical to
-	// execStreamingScan. An empty bound (e.g. pk = NULL) admits no row.
-	b := unboundedBound()
-	empty := false
-	if sp.relBounds[0] != nil && sp.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(sp.relBounds[0].pk, bound, nil, nil)
-	}
-	snap := db.snapshotEngine()
-	store := snap.lkpStore(sp.rels[0].tableName)
-	overlap, slabs := 0, 0
-	if !empty {
-		if overlap, slabs, err = store.OverlapScanUnits(b, sp.relMasks[0]); err != nil {
+	if doFold {
+		if err := db.foldUncorrelatedInSelect(sp, bound, cteCtx{}, &subqueryCost); err != nil {
 			return nil, false, err
 		}
 	}
+
+	if streamingScanEligible(sp) {
+		// Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
+		// (e.g. pk = NULL) admits no row.
+		b := unboundedBound()
+		empty := false
+		if sp.relBounds[0] != nil && sp.relBounds[0].pk != nil {
+			b, empty = db.buildKeyBound(sp.relBounds[0].pk, bound, nil, nil)
+		}
+		snap := db.snapshotEngine()
+		store := snap.lkpStore(sp.rels[0].tableName)
+		overlap, slabs := 0, 0
+		if !empty {
+			if overlap, slabs, err = store.OverlapScanUnits(b, sp.relMasks[0]); err != nil {
+				return nil, false, err
+			}
+		}
+		meter := snap.session.newMeter()
+		meter.Accrued = subqueryCost // the folded constant cost (lifetime already charged)
+		meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
+
+		var offset int64
+		if sp.offset != nil {
+			offset = *sp.offset
+		}
+		cur := &streamingCursor{
+			eng:      snap,
+			plan:     sp,
+			env:      &evalEnv{exec: snap, params: bound, outer: nil, rng: newStmtRng(), ctes: cteCtx{}},
+			meter:    meter,
+			offset:   offset,
+			limit:    sp.limit,
+			distinct: sp.distinct,
+			seen:     make(map[string]bool),
+			done:     empty || (sp.limit != nil && *sp.limit == 0),
+		}
+		if !cur.done {
+			cur.scan = store.storeScan(b, sp.pkReverse, sp.relMasks[0])
+		}
+		return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: cur}, true, nil
+	}
+
+	// Blocking (buffered) shape: buffers its input but yields the output one row at a time via
+	// bufferedScanCursor — bounding peak output memory and letting a caller's early exit skip the
+	// projection of rows it never pulls (the top-N-over-the-buffer win, streaming.md §4).
+	snap := db.snapshotEngine()
 	meter := snap.session.newMeter()
 	meter.Accrued = subqueryCost // the folded constant cost (lifetime already charged)
-	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
-
-	var offset int64
-	if sp.offset != nil {
-		offset = *sp.offset
+	c := &bufferedScanCursor{
+		eng:    snap,
+		plan:   sp,
+		params: bound,
+		rng:    newStmtRng(),
+		meter:  meter,
 	}
-	sc := &streamingCursor{
-		eng:      snap,
-		plan:     sp,
-		env:      &evalEnv{exec: snap, params: bound, outer: nil, rng: newStmtRng(), ctes: cteCtx{}},
-		meter:    meter,
-		offset:   offset,
-		limit:    sp.limit,
-		distinct: sp.distinct,
-		seen:     make(map[string]bool),
-		done:     empty || (sp.limit != nil && *sp.limit == 0),
-	}
-	if !sc.done {
-		sc.scan = store.storeScan(b, sp.pkReverse, sp.relMasks[0])
-	}
-	return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: sc}, true, nil
+	return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: c}, true, nil
 }
 
 // streamingCursor is the lazy pull pipeline behind a streaming Rows cursor (spec/design/streaming.md
@@ -14344,60 +14447,6 @@ func (c *streamingCursor) costAccrued() int64 { return c.meter.Accrued }
 func (c *streamingCursor) close() { c.done = true }
 
 // tryBufferedQuery tries to serve stmt as a lazy BUFFERED query (spec/design/streaming.md §4, S4) — the
-// Query path for a top-level read SELECT with a BLOCKING operator (a non-PK-ordered ORDER BY, DISTINCT,
-// aggregate / GROUP BY, window, or a join) that the streamable fast lane (tryStreamingQuery) does not
-// cover. The blocking part still buffers its input (correctly — it must), but the OUTPUT is yielded one
-// row at a time via bufferedScanCursor: the cursor runs the blocking part on its first pull (so a 54P01
-// cost abort or an arithmetic trap surfaces DURING iteration, not at Query — streaming.md §6), then
-// emits its buffer lazily — bounding peak output memory and letting a caller's early exit skip the
-// projection of rows it never pulls (the top-N-over-the-buffer win). Returns (nil, false, nil) for a
-// non-SELECT / write-classified statement, a streamable plan (served by the fast lane), or a set-op /
-// WITH top level (a deferred S4 follow-on, streaming.md §7) — those fall back to the materialized
-// Execute path → a buffered cursor. Under full drain the rows + total cost are byte-identical to the
-// eager path (the same emitter driven row by row, streaming.md §6).
-func (db *engine) tryBufferedQuery(stmt statement, params []Value) (*Rows, bool, error) {
-	if stmt.Select == nil || stmtIsWrite(stmt) {
-		return nil, false, nil
-	}
-	ptypes := &paramTypes{}
-	plan, err := db.planQuery(queryExpr{Select: stmt.Select}, nil, nil, ptypes)
-	if err != nil {
-		return nil, false, err
-	}
-	// A streamable plan is the fast lane's job (tryStreamingQuery), tried first; this is the blocking
-	// (buffered) shapes only.
-	if plan.sel == nil || streamingScanEligible(plan.sel) {
-		return nil, false, nil
-	}
-	sp := plan.sel
-	ptys, err := ptypes.finalize()
-	if err != nil {
-		return nil, false, err
-	}
-	bound, err := bindParams(params, ptys)
-	if err != nil {
-		return nil, false, err
-	}
-	// Fold globally-uncorrelated subqueries to constants so the per-row projection re-enters nothing —
-	// keeping the cursor self-contained (streaming.md §5). The fold's own cost was already charged to
-	// the shared lifetime gauge; it is added to the cursor's reported cost below.
-	var subqueryCost int64
-	if err := db.foldUncorrelatedInSelect(sp, bound, cteCtx{}, &subqueryCost); err != nil {
-		return nil, false, err
-	}
-	snap := db.snapshotEngine()
-	meter := snap.session.newMeter()
-	meter.Accrued = subqueryCost // the folded constant cost (lifetime already charged)
-	c := &bufferedScanCursor{
-		eng:    snap,
-		plan:   sp,
-		params: bound,
-		rng:    newStmtRng(),
-		meter:  meter,
-	}
-	return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: c}, true, nil
-}
-
 // bufferedScanCursor is the lazy BUFFERED pull pipeline behind a Query Rows cursor for a plan with a
 // blocking operator (spec/design/streaming.md §4, S4) — the generalization of the spilling sorter's
 // pull iterator to every blocking shape. It owns a frozen snapshot engine (eval's exec — so the cursor
@@ -23006,6 +23055,11 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	default: // rxCount, rxInstr
 		result = resolvedType{kind: rtInt, intTy: scalarInt32}
 	}
+	// A precompiled (constant-pattern) program carries the one-shot rxCompileCharged cost flag mutated
+	// on first eval, so a reused plan would under-charge the 2nd+ execute — never cache such a plan.
+	if prog != nil {
+		params.uncacheable = true
+	}
 	return &rExpr{kind: reRegexFunc, rxFunc: rfn, sargs: rargs, rxProgram: prog}, result, nil
 }
 
@@ -25470,6 +25524,13 @@ func missingFromEntry(qualifier string) error {
 // marks a parameter referenced before any context fixed its type.
 type paramTypes struct {
 	types []*scalarType
+	// uncacheable is set during resolution when a node is created that makes the resolved plan
+	// un-reusable across executions: an reSubquery (the uncorrelated-subquery fold rewrites it to a
+	// constant baking in THIS execution's bound params) or a precompiled-regex node (whose one-shot
+	// rxCompileCharged cost flag mutates during eval, so a reused plan would under-charge the 2nd+
+	// execute). A prepared statement's plan cache fills only when this stayed false — flagging at the
+	// node's birth is complete regardless of where in the plan tree it lands (spec/design/api.md §2.4).
+	uncacheable bool
 }
 
 // note records that $(idx0+1) appears with context type ty (nil = no context here). It unifies
@@ -25820,6 +25881,11 @@ func planSubquery(s *scope, inner queryExpr, params *paramTypes) (queryPlan, err
 	if !s.allowSubquery {
 		return queryPlan{}, newError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
 	}
+	// Any subquery makes the enclosing plan un-cacheable: the fold pass rewrites an uncorrelated one
+	// (or an uncorrelated one nested inside a correlated one) into a constant using THIS execution's
+	// bound params (foldUncorrelatedInSelect), so a reused plan would carry another execution's
+	// folded constants. Every subquery form (scalar/EXISTS/IN/quantified) funnels through here.
+	params.uncacheable = true
 	// A subquery inherits the enclosing scope's CTE bindings directly (cte.md §2): a CTE is
 	// visible inside a nested subquery without counting as a correlation level.
 	return s.catalog.planQuery(inner, s, s.ctes, params)
@@ -26881,6 +26947,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
+		}
+		// A precompiled (constant-pattern) program carries the one-shot rxCompileCharged cost flag
+		// mutated on first eval — a reused plan would under-charge the 2nd+ execute, so never cache it.
+		if prog != nil {
+			params.uncacheable = true
 		}
 		return &rExpr{kind: reRegex, lhs: rl, rhs: rr, negated: e.Regex.Negated, insensitive: e.Regex.Insensitive, rxProgram: prog},
 			resolvedType{kind: rtBool}, nil

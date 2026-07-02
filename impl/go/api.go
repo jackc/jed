@@ -89,6 +89,11 @@ type PreparedStatement struct {
 	db   *engine
 	sess *Session
 	ast  statement
+	// sc memoizes the resolved scan plan across QueryValues calls so a repeated execute skips
+	// planning (the plan cache, spec/design/api.md §2.4). Populated lazily on the first cacheable
+	// query execute and invalidated automatically when the catalog changes (scanCache.catGen). Zero
+	// value is empty. Query-only — Execute (writes / materialized shapes) never touches it.
+	sc scanCache
 }
 
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
@@ -119,9 +124,9 @@ func (s *PreparedStatement) Execute(params []Value) (Outcome, error) {
 // (api.md §11).
 func (s *PreparedStatement) QueryValues(params []Value) (*Rows, error) {
 	if s.sess != nil {
-		return s.sess.queryStmt(s.ast, params)
+		return s.sess.queryStmt(s.ast, params, &s.sc)
 	}
-	return s.db.queryStmt(s.ast, params)
+	return s.db.queryStmt(s.ast, params, &s.sc)
 }
 
 // ExecuteSQL is a one-shot: parse + execute sql, binding params, returning the outcome. (The
@@ -143,22 +148,18 @@ func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	return db.queryStmt(stmt, params)
+	return db.queryStmt(stmt, params, nil) // one-shot: no cross-call plan cache (still plans once)
 }
 
-// queryStmt routes an already-parsed query AST through the lazy streaming / buffered / deferred lanes,
-// falling back to the materialized ExecuteStmtParams for a shape no lazy lane covers (a write, a
-// nextval/setval SELECT, a data-modifying WITH). Shared by QuerySQL (parse-then-route) and a prepared
-// query (PreparedStatement.QueryValues, route the prepared AST), so a prepared query streams identically
-// to an ad-hoc one. (This is the bare single-handle engine; the watermark pin lives on the shared-core
-// Session.Query path.)
-func (db *engine) queryStmt(stmt statement, params []Value) (*Rows, error) {
-	if rows, ok, err := db.tryStreamingQuery(stmt, params); err != nil {
-		return nil, err
-	} else if ok {
-		return rows, nil
-	}
-	if rows, ok, err := db.tryBufferedQuery(stmt, params); err != nil {
+// queryStmt routes an already-parsed query AST through the lazy scan (streaming/buffered) then
+// deferred lanes, planning a scan-shaped SELECT exactly once (tryScanQuery), and falling back to the
+// materialized ExecuteStmtParams for a shape no lazy lane covers (a write, a nextval/setval SELECT, a
+// data-modifying WITH). Shared by QuerySQL (parse-then-route, sc nil) and a prepared query
+// (PreparedStatement.QueryValues passes its scanCache), so a prepared query streams identically to an
+// ad-hoc one but reuses its cached plan across executes. (This is the bare single-handle engine; the
+// watermark pin lives on the shared-core Session.Query path.)
+func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
+	if rows, ok, err := db.tryScanQuery(stmt, params, sc); err != nil {
 		return nil, err
 	} else if ok {
 		return rows, nil
