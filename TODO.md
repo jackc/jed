@@ -37,6 +37,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Core query / DML completeness
 
+- [x] **`EXPLAIN` / `EXPLAIN ANALYZE`** — render the planner's chosen plan as a deterministic
+  `depth`/`node`/`detail` result set (pre-order, `nosort`), without executing the inner statement;
+  `ANALYZE` runs it and reports the actual (deterministic) accrued cost + row count on an `Analyze`
+  root. Covers read queries + DML (plan-only, never mutates); `ANALYZE` of a write executes + commits.
+  The observability substrate for the cost-based planner. → [explain.md](spec/design/explain.md)
+  - [ ] _follow-on:_ estimated-cost columns (`est_rows`/`est_cost`) once a **plan-time cost
+    estimator** lands (the reason the structured-column shape was chosen — the doorway to a
+    cost-based planner); per-node cost attribution under `ANALYZE`; a full expression printer for the
+    residual filter / projections (currently a `conjuncts=N` count) + exact float-literal bound
+    rendering (each needs a determinism-ledger entry); an `EXPLAIN (…)` option list; a
+    streaming/buffered/deferred lane tag; the DML touched-set count; `EXPLAIN` of a data-modifying `WITH`.
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ LIKE `ESCAPE 'c'`; `SIMILAR TO` (deliberately excluded — the SQL-standard surface); set-returning `regexp_matches` / `regexp_split_to_table`; the Oracle-compat `regexp_count`/`instr`/`substr`/`like`; Unicode-property char classes (`\p{…}`); backreferences + lookaround (permanently out — they break the linear-time guarantee).
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions. → [functions.md §9](spec/design/functions.md)
