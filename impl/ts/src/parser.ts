@@ -306,6 +306,8 @@ class Parser {
         return this.parseUpdate();
       case "delete":
         return this.parseDelete();
+      case "explain":
+        return this.parseExplain();
       case "begin":
       case "start":
         return this.parseBegin();
@@ -375,6 +377,42 @@ class Parser {
   private consumeTransactionOrWork(): void {
     const kw = this.peekKeyword();
     if (kw === "transaction" || kw === "work") this.advance();
+  }
+
+  // parseExplain parses `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). EXPLAIN is a
+  // positional leading keyword — non-reserved, no lookahead — followed by an optional ANALYZE modifier
+  // and then a restricted inner statement (a query or DML). ANALYZE is consumed positionally: no inner
+  // statement begins with the word ANALYZE, so there is no ambiguity.
+  private parseExplain(): Statement {
+    this.advance(); // EXPLAIN
+    let analyze = false;
+    if (this.peekKeyword() === "analyze") {
+      this.advance();
+      analyze = true;
+    }
+    return { kind: "explain", analyze, inner: this.parseExplainInner() };
+  }
+
+  // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH) or a
+  // DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and a nested EXPLAIN have no
+  // query plan to render and are rejected 42601.
+  private parseExplainInner(): Statement {
+    switch (this.peekKeyword()) {
+      case "select":
+        return this.parseQueryExpr();
+      case "with":
+        return this.parseWithStatement();
+      case "insert":
+        return this.parseInsert();
+      case "update":
+        return this.parseUpdate();
+      case "delete":
+        return this.parseDelete();
+      case "":
+        throw engineError("syntax_error", "expected a statement after EXPLAIN");
+      default:
+        throw engineError("syntax_error", `EXPLAIN does not support '${this.peekKeyword()}'`);
+    }
   }
 
   // parseCreateTable parses `CREATE TABLE <name> ( <element> [, <element>]* )`, where

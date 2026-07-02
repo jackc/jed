@@ -19,6 +19,7 @@ import type {
   DropSequence,
   DropTable,
   DropType,
+  Explain,
   Expr,
   GroupItem,
   Insert,
@@ -3494,11 +3495,402 @@ export class Engine {
         return this.executeUpdate(stmt, params, EMPTY_CTE_CTX);
       case "delete":
         return this.executeDelete(stmt, params, EMPTY_CTE_CTX);
+      case "explain":
+        return this.executeExplain(stmt, params);
       default:
         // Transaction control (begin/commit/rollback) is handled by executeStmtParams before
         // dispatch; it never reaches here.
         throw engineError("syntax_error", "unexpected statement kind");
     }
+  }
+
+  // executeExplain plans the inner statement and renders the plan as a deterministic result set
+  // (spec/design/explain.md). Plain EXPLAIN never executes the inner statement — renderExplain produces
+  // the plan structs, which renderQueryPlan walks. The EXPLAIN statement's own cost is one rowProduced
+  // per emitted plan row. EXPLAIN ANALYZE (analyze true) delegates to executeExplainAnalyze, which also
+  // runs the inner statement.
+  private executeExplain(ex: Explain, params: Value[]): Outcome {
+    if (ex.analyze) {
+      return this.executeExplainAnalyze(ex.inner, params);
+    }
+    if (params.length > 0) {
+      // Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its bound
+      // value), so supplied parameters are neither needed nor bound.
+      throw engineError("syntax_error", "bind parameters are not allowed in EXPLAIN");
+    }
+    const r = new ExplainRender();
+    this.renderExplain(r, ex.inner, 0);
+    return this.explainOutcome(r.rows);
+  }
+
+  // executeExplainAnalyze renders the plan AND runs the inner statement, reporting the inner's ACTUAL
+  // accrued cost + row count on an "Analyze" root node (spec/design/explain.md §3). Because jed's cost
+  // meter is a deterministic cross-core contract, those figures are byte-identical across cores, so the
+  // output is corpus-assertable. The plan is rendered from the pre-execution catalog; then the inner
+  // statement executes for real (a DML inner mutates, and the outer autocommit commits it — EXPLAIN
+  // ANALYZE of a write IS a write, classified by stmtIsWrite). The EXPLAIN statement's OWN cost is one
+  // rowProduced per emitted plan row (independent of the inner cost, which appears only in the root).
+  private executeExplainAnalyze(inner: Statement, params: Value[]): Outcome {
+    // Render the plan tree first (plan-only, no execution — pre-mutation).
+    const body = new ExplainRender();
+    this.renderExplain(body, inner, 0);
+    // Execute the inner statement for real, capturing its actual accrued cost + row count. Privileges
+    // and the lifetime budget were already admitted on the EXPLAIN (dispatchStmt recurses into the
+    // inner), and the write gate / commit are handled by the outer autocommit.
+    const innerOut = this.dispatchStmtBody(inner, params);
+    const actualRows =
+      innerOut.kind === "statement"
+        ? BigInt(innerOut.rowsAffected ?? 0) // a DML statement without RETURNING
+        : BigInt(innerOut.rows.length);
+    // Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
+    const r = new ExplainRender();
+    r.emit(0, "Analyze", `cost=${innerOut.cost} rows=${actualRows}`);
+    for (const row of body.rows) {
+      r.rows.push({ depth: row.depth + 1, node: row.node, detail: row.detail });
+    }
+    return this.explainOutcome(r.rows);
+  }
+
+  // explainOutcome wraps rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
+  // rowProduced per emitted plan row (a deterministic function of the plan-row count).
+  private explainOutcome(rows: ExplainRow[]): Outcome {
+    const meter = this.session.newMeter();
+    meter.charge(COSTS.rowProduced * BigInt(rows.length));
+    return {
+      kind: "query",
+      columnNames: ["depth", "node", "detail"],
+      columnTypes: ["i32", "text", "text"],
+      rows: rows.map((row) => [
+        intValue(BigInt(row.depth)),
+        textValue(row.node),
+        textValue(row.detail),
+      ]),
+      cost: meter.accrued,
+    };
+  }
+
+  // renderExplain renders the plan for the inner statement (spec/design/explain.md). A DML statement is
+  // rendered by explainInsert/explainUpdate/explainDelete (plan-only — never executing, so an EXPLAIN of
+  // a DELETE deletes nothing); a read query is planned by planExplainInner and walked by renderQueryPlan.
+  private renderExplain(r: ExplainRender, inner: Statement, depth: number): void {
+    switch (inner.kind) {
+      case "insert":
+        this.explainInsert(r, inner, depth);
+        return;
+      case "update":
+        this.explainUpdate(r, inner, depth);
+        return;
+      case "delete":
+        this.explainDelete(r, inner, depth);
+        return;
+      default:
+        this.renderQueryPlan(r, this.planExplainInner(inner), depth);
+    }
+  }
+
+  // explainInsert renders an INSERT plan: the Insert root (with an ON CONFLICT note), then the row
+  // source — a planned SELECT subtree (INSERT … SELECT) or a Values leaf (INSERT … VALUES). It resolves
+  // the source but never writes.
+  private explainInsert(r: ExplainRender, ins: Insert, depth: number): void {
+    if (this.lkpTable(ins.table) === undefined) {
+      throw engineError("undefined_table", "table does not exist: " + ins.table);
+    }
+    r.emit(depth, "Insert " + ins.table, insertDetail(ins));
+    if (ins.source.kind === "select") {
+      const plan = this.planQuery(ins.source.select, null, [], new ParamTypes());
+      this.renderQueryPlan(r, plan, depth + 1);
+      return;
+    }
+    r.emit(depth + 1, "Values", `rows=${ins.source.rows.length}`);
+  }
+
+  // explainUpdate renders an UPDATE plan: the Update root (with the assignment count), the residual
+  // Filter, then the target scan with its chosen access path. It resolves the WHERE and the scan bound
+  // via the same detectors the executor uses, but never writes.
+  private explainUpdate(r: ExplainRender, upd: Update, depth: number): void {
+    const table = this.lkpTable(upd.table);
+    if (table === undefined) {
+      throw engineError("undefined_table", "table does not exist: " + upd.table);
+    }
+    const filter = this.explainDmlFilter(table, upd.filter);
+    r.emit(depth, "Update " + upd.table, `sets=${upd.assignments.length}`);
+    this.renderDmlScan(r, table, upd.table, filter, depth + 1);
+  }
+
+  // explainDelete renders a DELETE plan: the Delete root, the residual Filter, then the target scan
+  // with its chosen access path. It resolves the WHERE and the scan bound but never writes.
+  private explainDelete(r: ExplainRender, del: Delete, depth: number): void {
+    const table = this.lkpTable(del.table);
+    if (table === undefined) {
+      throw engineError("undefined_table", "table does not exist: " + del.table);
+    }
+    const filter = this.explainDmlFilter(table, del.filter);
+    r.emit(depth, "Delete " + del.table, "-");
+    this.renderDmlScan(r, table, del.table, filter, depth + 1);
+  }
+
+  // explainDmlFilter resolves an UPDATE/DELETE WHERE predicate against a single-table scope (the same
+  // prologue the executors use), or returns null for a bare (no-WHERE) statement.
+  private explainDmlFilter(table: Table, where: Expr | null): RExpr | null {
+    if (where === null) return null;
+    return resolveBooleanFilter(Scope.single(this, table), where, new ParamTypes());
+  }
+
+  // renderDmlScan emits the residual Filter (when present) and the target Scan for an UPDATE/DELETE,
+  // choosing the access path with the SAME detectors the executor uses (PK bound, then GIN, then GiST —
+  // UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The touched-set count is a
+  // DML cost detail left to EXPLAIN ANALYZE, so it is not shown here.
+  private renderDmlScan(
+    r: ExplainRender,
+    table: Table,
+    name: string,
+    filter: RExpr | null,
+    depth: number,
+  ): void {
+    let d = depth;
+    if (filter !== null) {
+      r.emit(d, "Filter", `conjuncts=${conjunctCount(filter)}`);
+      d++;
+    }
+    r.emit(d, "Scan " + name, this.scanDetail(name, this.dmlScanBound(table, filter), null));
+  }
+
+  // dmlScanBound picks an UPDATE/DELETE target's scan bound with the executor's own detectors: the
+  // single-column PK range bound first, then a GIN bound, then a GiST bound; else a full scan (null).
+  private dmlScanBound(table: Table, filter: RExpr | null): ScanBound | null {
+    const bp = mutationPkBound(table, filter, this.readSnap());
+    if (bp !== null) return { kind: "pk", pk: bp };
+    const gb = detectGinBound(filter, table.indexes, table.columns, 0);
+    if (gb !== null) return { kind: "gin", gin: gb };
+    const gp = detectGistBound(filter, table.indexes, table.columns, 0);
+    if (gp !== null) return { kind: "gist", gist: gp };
+    return null;
+  }
+
+  // planExplainInner resolves the inner statement into a QueryPlan WITHOUT executing it. It handles the
+  // read-query forms — SELECT, a top-level set operation, and a read-only top-level WITH; DML is
+  // rendered by explainInsert/Update/Delete. A top-level WITH is planned as a nested WITH expression
+  // (there are no enclosing CTEs to inherit at the top level), which produces the same WithPlan to
+  // render.
+  private planExplainInner(inner: Statement): QueryPlan {
+    const ptypes = new ParamTypes();
+    switch (inner.kind) {
+      case "select":
+      case "setOp":
+        return this.planQuery(inner, null, [], ptypes);
+      case "with": {
+        const body = cteBodyAsQuery(inner.body);
+        if (body === null) {
+          // A data-modifying primary (writable CTE) — a DML EXPLAIN, handled in a later slice.
+          throw engineError(
+            "feature_not_supported",
+            "EXPLAIN of a data-modifying WITH is not yet supported",
+          );
+        }
+        return this.planWithExpr(
+          { kind: "withExpr", ctes: inner.ctes, recursive: inner.recursive, body },
+          null,
+          ptypes,
+        );
+      }
+      default:
+        throw engineError("feature_not_supported", "EXPLAIN of this statement is not yet supported");
+    }
+  }
+
+  // renderQueryPlan walks a QueryPlan arm at the given depth: a SELECT plan, a set operation, a VALUES
+  // relation, or a WITH plan.
+  private renderQueryPlan(r: ExplainRender, qp: QueryPlan, depth: number): void {
+    switch (qp.kind) {
+      case "select":
+        this.renderSelectPlan(r, qp, depth);
+        return;
+      case "setOp":
+        this.renderSetOpPlan(r, qp, depth);
+        return;
+      case "values":
+        r.emit(depth, "Values", `rows=${qp.rows.length}`);
+        return;
+      case "with":
+        this.renderWithPlan(r, qp, depth);
+    }
+  }
+
+  // renderSelectPlan emits a SelectPlan's nodes in operator order — outermost first, each the pre-order
+  // parent of the next, so the tree reads top-down as the executor's pipeline reads bottom-up: Limit,
+  // Sort, Distinct, Window, Aggregate, Filter (WHERE), then the FROM tree. A Sort is emitted only when
+  // the order is NOT elided; an elided ORDER BY (served by the scan / index / join order) is instead
+  // noted on the FROM tree's top node (spec/design/explain.md §5).
+  private renderSelectPlan(r: ExplainRender, sp: SelectPlan, depth: number): void {
+    let d = depth;
+    if (sp.limit !== null || sp.offset !== null) {
+      r.emit(d, "Limit", limitDetail(sp.limit, sp.offset));
+      d++;
+    }
+    let orderNote = "";
+    if (sp.order.length > 0) {
+      if (sp.pkOrdered) {
+        orderNote = "pk ordered";
+        if (sp.pkReverse) orderNote += " (reverse)";
+      } else if (sp.indexOrder !== null) {
+        orderNote = "index order: " + sp.indexOrder.nameKey;
+      } else if (sp.joinPkOrdered) {
+        orderNote = "join pk ordered";
+      } else {
+        r.emit(d, "Sort", `keys=${sp.order.length}`);
+        d++;
+      }
+    }
+    if (sp.distinct) {
+      r.emit(d, "Distinct", "-");
+      d++;
+    }
+    if (sp.hasWindow) {
+      r.emit(d, "Window", `funcs=${sp.windowSpecs.length}`);
+      d++;
+    }
+    if (sp.isAgg) {
+      r.emit(d, "Aggregate", aggDetail(sp));
+      d++;
+    }
+    if (sp.filter !== null) {
+      r.emit(d, "Filter", `conjuncts=${conjunctCount(sp.filter)}`);
+      d++;
+    }
+    this.renderFrom(r, sp, d, orderNote);
+  }
+
+  // renderFrom emits the FROM tree: a left-deep chain of Nested Loop joins over the plan's relations,
+  // or a single relation leaf, or a Result node for a FROM-less query. orderNote, when non-empty,
+  // records an elided ORDER BY on the tree's top node.
+  private renderFrom(r: ExplainRender, sp: SelectPlan, depth: number, orderNote: string): void {
+    const n = sp.rels.length;
+    if (n === 0) {
+      r.emit(depth, "Result", withNote("-", orderNote));
+      return;
+    }
+    this.renderJoinTree(r, sp, n, depth, orderNote);
+  }
+
+  // renderJoinTree emits the left-deep join over the first n relations: the outermost node is the last
+  // join (joins[n-2]), whose left subtree is the join over the first n-1 relations and whose right child
+  // is rels[n-1]. note tags the outermost node with an elided ORDER BY.
+  private renderJoinTree(
+    r: ExplainRender,
+    sp: SelectPlan,
+    n: number,
+    depth: number,
+    note: string,
+  ): void {
+    if (n === 1) {
+      this.renderRelLeaf(r, sp, 0, depth, note);
+      return;
+    }
+    const j = sp.joins[n - 2]!;
+    r.emit(depth, "Nested Loop", withNote(joinDetail(j), note));
+    this.renderJoinTree(r, sp, n - 1, depth + 1, "");
+    this.renderRelLeaf(r, sp, n - 1, depth + 1, "");
+  }
+
+  // renderRelLeaf emits one relation: a base-table Scan (with its access path), an SRF, a CTE Scan, or a
+  // Subquery (a derived table, whose inner plan recurses one level deeper). note tags a base Scan with
+  // an elided ORDER BY (only a single base-table relation can carry one).
+  private renderRelLeaf(
+    r: ExplainRender,
+    sp: SelectPlan,
+    i: number,
+    depth: number,
+    note: string,
+  ): void {
+    const rel = sp.rels[i]!;
+    if (rel.srf !== undefined) {
+      r.emit(depth, "SRF " + rel.tableName, withNote("-", note));
+      return;
+    }
+    if (rel.cte !== undefined) {
+      r.emit(depth, "CTE Scan " + rel.tableName, withNote("-", note));
+      return;
+    }
+    if (rel.derived !== undefined) {
+      r.emit(depth, "Subquery " + rel.tableName, withNote("-", note));
+      this.renderQueryPlan(r, rel.derived, depth + 1);
+      return;
+    }
+    r.emit(
+      depth,
+      "Scan " + rel.tableName,
+      withNote(this.scanDetail(rel.tableName, sp.relBounds[i]!, sp.relMasks[i]!), note),
+    );
+  }
+
+  // renderSetOpPlan emits a set operation: any trailing Limit / Sort on the combined result, the
+  // Union / Intersect / Except node, then the left and right operand plans as children.
+  private renderSetOpPlan(r: ExplainRender, sop: SetOpPlan, depth: number): void {
+    let d = depth;
+    if (sop.limit !== null || sop.offset !== null) {
+      r.emit(d, "Limit", limitDetail(sop.limit, sop.offset));
+      d++;
+    }
+    if (sop.order.length > 0) {
+      r.emit(d, "Sort", `keys=${sop.order.length}`);
+      d++;
+    }
+    r.emit(d, setOpNodeName(sop.op), sop.all ? "all" : "distinct");
+    this.renderQueryPlan(r, sop.lhs, d + 1);
+    this.renderQueryPlan(r, sop.rhs, d + 1);
+  }
+
+  // renderWithPlan emits a WITH plan: the WITH node, each common-table expression as a CTE child (its
+  // body one level deeper), then the main body plan.
+  private renderWithPlan(r: ExplainRender, wp: WithPlan, depth: number): void {
+    r.emit(depth, "WITH", `ctes=${wp.bindings.length}`);
+    for (let i = 0; i < wp.bindings.length; i++) {
+      const b = wp.bindings[i]!;
+      const mode: CteMode = i < wp.modes.length ? wp.modes[i]! : "inline";
+      r.emit(depth + 1, "CTE " + b.name, cteDetail(b, mode));
+      // A data-modifying CTE has no query plan to render (a "dml" source); a plain / recursive CTE
+      // renders its body (the recursive anchor plan for a RECURSIVE CTE) one level deeper.
+      if (b.source.kind === "query") {
+        this.renderQueryPlan(r, b.source.plan, depth + 2);
+      }
+    }
+    this.renderQueryPlan(r, wp.body, depth + 1);
+  }
+
+  // scanDetail renders a Scan node's attributes: the access path (from the relation's chosen scan
+  // bound, null = a full scan), then the touched-column count when the query references any column.
+  private scanDetail(tableName: string, b: ScanBound | null, mask: boolean[] | null): string {
+    const parts = [this.accessPath(tableName, b)];
+    const n = countTrue(mask);
+    if (n > 0) parts.push(`touched=${n}`);
+    return parts.join("; ");
+  }
+
+  // accessPath renders the chosen access path for a relation (spec/design/explain.md §5): a full scan,
+  // a primary-key range bound, or a secondary-index / GIN / GiST bound (the last three by index name).
+  private accessPath(tableName: string, b: ScanBound | null): string {
+    if (b === null) return "Full scan";
+    switch (b.kind) {
+      case "pk":
+        return "PK bound: " + renderBoundTerms(this.firstPKColName(tableName), b.pk.terms);
+      case "index":
+        return "Index bound: using " + b.index.nameKey;
+      case "gin":
+        return "GIN bound: using " + b.gin.nameKey;
+      case "gist":
+        return "GiST bound: using " + b.gist.nameKey;
+    }
+  }
+
+  // firstPKColName returns the name of a table's first primary-key column (in key order), or "pk" when
+  // the table is not found or has no primary key (a defensive fallback — the plan-only path already
+  // resolved the table, and a bounded scan implies a PK).
+  private firstPKColName(tableName: string): string {
+    const t = this.lkpTable(tableName);
+    if (t !== undefined && t.pk.length > 0 && t.pk[0]! < t.columns.length) {
+      return t.columns[t.pk[0]!]!.name;
+    }
+    return "pk";
   }
 
   // rowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible
@@ -20607,6 +20999,12 @@ function serialPseudoType(name: string): ScalarType | undefined {
 // §4.1) — UNLESS the read-shaped statement calls a sequence-mutating function (nextval), which
 // makes it a write (spec/design/sequences.md §4).
 export function stmtIsWrite(stmt: Statement): boolean {
+  // EXPLAIN is a read: plain EXPLAIN plans without executing (even of a DML inner — it never mutates).
+  // Only EXPLAIN ANALYZE runs the inner statement, so it is a write iff the inner is
+  // (spec/design/explain.md §3).
+  if (stmt.kind === "explain") {
+    return stmt.analyze && stmtIsWrite(stmt.inner);
+  }
   return (
     stmt.kind === "createTable" ||
     stmt.kind === "dropTable" ||
@@ -20832,6 +21230,11 @@ function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
       break;
     case "delete":
       collectDeletePrivs(stmt, req, locals);
+      break;
+    case "explain":
+      // EXPLAIN requires the inner statement's privileges (EXPLAIN INSERT needs INSERT, matching PG).
+      // Plain EXPLAIN never executes, but authorization is checked on the inner regardless.
+      collectStmtPrivs(stmt.inner, req);
       break;
     default:
       // Transaction control (begin/commit/rollback) carries no privilege requirement.
@@ -21153,9 +21556,163 @@ function stmtKind(stmt: Statement): string {
       return "UPDATE";
     case "delete":
       return "DELETE";
+    case "explain":
+      return "EXPLAIN";
     default:
       return "statement";
   }
+}
+
+// --- EXPLAIN rendering (spec/design/explain.md) ------------------------------------------------
+// EXPLAIN renders the planner's chosen plan as a deterministic, cross-core-identical result set: an
+// ordinary query Outcome with three columns — depth (i32, the pre-order nesting level), node (the
+// operator label — a fixed vocabulary, the §8 spelling contract), detail ("-" when a node has none).
+// Every cell is non-empty and free of leading/trailing whitespace (the harness renders the actual cell
+// raw but TrimSpaces the expected line), so indentation is the depth integer, never whitespace (§2).
+// The renderer is hand-written per core (§5 forbids codegenning it); the corpus + explain.md are the
+// contract. The Engine methods above walk the plan; these module-level helpers spell each token.
+
+// ExplainRow is one rendered plan row before it becomes a Value triple in explainOutcome.
+type ExplainRow = { depth: number; node: string; detail: string };
+
+// ExplainRender accumulates the rendered plan rows. emit normalizes an empty detail to the "-"
+// sentinel so no cell renders blank (spec/design/explain.md §2).
+class ExplainRender {
+  rows: ExplainRow[] = [];
+  emit(depth: number, node: string, detail: string): void {
+    this.rows.push({ depth, node, detail: detail === "" ? "-" : detail });
+  }
+}
+
+// insertDetail renders an INSERT's ON CONFLICT disposition (or "-" when there is none).
+function insertDetail(ins: Insert): string {
+  if (ins.onConflict === null) return "-";
+  return ins.onConflict.doUpdate ? "on conflict do update" : "on conflict do nothing";
+}
+
+// cteDetail renders a CTE binding's attributes: its materialization mode (inlined vs materialized —
+// the planner's choice) and whether it is recursive.
+function cteDetail(b: CteBinding, mode: CteMode): string {
+  const parts = [mode === "materialize" ? "materialized" : "inlined"];
+  if (b.recursive !== null) parts.push("recursive");
+  return parts.join("; ");
+}
+
+// aggDetail renders an Aggregate node's attributes: the grouping-key count, aggregate count, the
+// grouping-set count when there is more than one set, and the HAVING conjunct count.
+function aggDetail(sp: SelectPlan): string {
+  const parts = [`groups=${sp.groupKeys.length} aggs=${sp.aggSpecs.length}`];
+  if (sp.groupSets.length > 1) parts.push(`sets=${sp.groupSets.length}`);
+  if (sp.having !== null) parts.push(`having:conjuncts=${conjunctCount(sp.having)}`);
+  return parts.join("; ");
+}
+
+// joinDetail renders a Nested Loop node's attributes: the join kind and the ON predicate's conjunct
+// count (a CROSS join has no ON). The JoinKind labels (inner/cross/left/right/full) are the spelling.
+function joinDetail(j: PlanJoin): string {
+  if (j.on === null) return j.kind;
+  return `${j.kind}; on:conjuncts=${conjunctCount(j.on)}`;
+}
+
+// setOpNodeName is the node label for a set-operation kind.
+function setOpNodeName(op: SetOpKind): string {
+  return op === "union" ? "Union" : op === "intersect" ? "Intersect" : "Except";
+}
+
+// withNote appends an elided-ORDER-BY note to a node's detail (replacing a "-" sentinel).
+function withNote(detail: string, note: string): string {
+  if (note === "") return detail;
+  if (detail === "" || detail === "-") return "ordered: " + note;
+  return detail + "; ordered: " + note;
+}
+
+// limitDetail renders a Limit node's `limit=N` / `offset=M` attributes (an absent side is omitted).
+function limitDetail(limit: bigint | null, offset: bigint | null): string {
+  const parts: string[] = [];
+  if (limit !== null) parts.push(`limit=${limit}`);
+  if (offset !== null) parts.push(`offset=${offset}`);
+  return parts.length === 0 ? "-" : parts.join(" ");
+}
+
+// countTrue counts the set entries in a touched-set mask (null ⇒ 0, the DML-scan case).
+function countTrue(mask: boolean[] | null): number {
+  if (mask === null) return 0;
+  let n = 0;
+  for (const b of mask) if (b) n++;
+  return n;
+}
+
+// renderBoundTerms renders a primary-key bound's terms as `col <op> <src>` conjuncts joined by
+// " and " — e.g. `id = $1`, `id >= 5 and id < 10`.
+function renderBoundTerms(col: string, terms: BoundTerm[]): string {
+  return terms.map((t) => `${col} ${boundOpText(t.op)} ${renderBoundSrc(t.src)}`).join(" and ");
+}
+
+// boundOpText is the symbol for a bound comparison operator.
+function boundOpText(op: BinaryOp): string {
+  switch (op) {
+    case "eq":
+      return "=";
+    case "ne":
+      return "<>";
+    case "lt":
+      return "<";
+    case "gt":
+      return ">";
+    case "le":
+      return "<=";
+    case "ge":
+      return ">=";
+    default:
+      return "?";
+  }
+}
+
+// renderBoundSrc renders a bound's const-source operand: a bind parameter as `$N` (1-based), a
+// correlated outer-column reference as `outer`, or a literal via renderBoundLit.
+function renderBoundSrc(e: RExpr | null): string {
+  if (e === null) return "?";
+  switch (e.kind) {
+    case "param":
+      return "$" + (e.index + 1);
+    case "outerColumn":
+      return "outer";
+    case "column":
+      return "col";
+    default:
+      return renderBoundLit(e);
+  }
+}
+
+// renderBoundLit renders a constant bound operand as a single-line token. Integer / boolean / decimal
+// literals render deterministically; a float renders as the fixed token `<float>` (its layout is a
+// determinism-ledger exception, kept out of the plan text — spec/design/explain.md §6); a text literal
+// renders verbatim unless it contains a newline (which would split the cell), in which case `<text>`;
+// every other constant type renders as `<value>` for now (a later slice widens this).
+function renderBoundLit(e: RExpr): string {
+  switch (e.kind) {
+    case "constInt":
+      return e.value.toString();
+    case "constBool":
+      return e.value ? "true" : "false";
+    case "constDecimal":
+      return e.value.render();
+    case "constText":
+      return /[\n\r]/.test(e.value) ? "<text>" : "'" + e.value + "'";
+    case "constFloat":
+      return "<float>";
+    default:
+      return "<value>";
+  }
+}
+
+// conjunctCount counts the top-level AND conjuncts of a residual filter (a deterministic integer —
+// the plan text carries the count, not the expression itself; a full expression printer is a later
+// slice, spec/design/explain.md §5).
+function conjunctCount(e: RExpr | null): number {
+  if (e === null) return 0;
+  if (e.kind === "and") return conjunctCount(e.lhs) + conjunctCount(e.rhs);
+  return 1;
 }
 
 // cloneStores captures the committed stores cheaply for rollback-on-error: each store is an O(1)
