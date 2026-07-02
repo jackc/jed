@@ -1,0 +1,114 @@
+# EXPLAIN of a DML statement (spec/design/explain.md §2) renders the plan WITHOUT executing it — an
+# EXPLAIN of a DELETE deletes nothing, an EXPLAIN of an INSERT inserts nothing. The DML root is
+# Insert / Update / Delete; INSERT … VALUES has a Values child, INSERT … SELECT renders its source
+# subplan, and UPDATE/DELETE render the residual Filter + the target Scan. The scan access path is
+# chosen by the same detectors the executor uses (PK bound, then GIN/GiST — never a secondary B-tree
+# index for a mutation), so the reported path matches what the statement would run.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.where_eq, query.point_lookup, query.explain, dml.explain, types.i32, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, tid i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'a')
+
+statement ok
+INSERT INTO t VALUES (2, 20, 'b')
+
+# INSERT … VALUES: an Insert root over a Values leaf carrying the row count.
+query ITT nosort
+EXPLAIN INSERT INTO t VALUES (3, 30, 'c'), (4, 40, 'd')
+----
+0
+Insert t
+-
+1
+Values
+rows=2
+
+# INSERT … SELECT renders its source query plan (here a PK-bounded scan) under the Insert root.
+query ITT nosort
+EXPLAIN INSERT INTO u SELECT id, v FROM t WHERE id = 1
+----
+0
+Insert u
+-
+1
+Filter
+conjuncts=1
+2
+Scan t
+PK bound: id = 1; touched=2
+
+# ON CONFLICT is noted on the Insert root.
+query ITT nosort
+EXPLAIN INSERT INTO t VALUES (5, 50, 'e') ON CONFLICT (id) DO NOTHING
+----
+0
+Insert t
+on conflict do nothing
+1
+Values
+rows=1
+
+# UPDATE with a PK predicate: the target scan bounds to a PK point lookup; sets=N on the root.
+query ITT nosort
+EXPLAIN UPDATE t SET v = 99 WHERE id = 1
+----
+0
+Update t
+sets=1
+1
+Filter
+conjuncts=1
+2
+Scan t
+PK bound: id = 1
+
+# A bare UPDATE (no WHERE) is a full scan with no Filter node.
+query ITT nosort
+EXPLAIN UPDATE t SET v = v + 1
+----
+0
+Update t
+sets=1
+1
+Scan t
+Full scan
+
+# DELETE with a PK predicate bounds to a PK point lookup.
+query ITT nosort
+EXPLAIN DELETE FROM t WHERE id = 2
+----
+0
+Delete t
+-
+1
+Filter
+conjuncts=1
+2
+Scan t
+PK bound: id = 2
+
+# DELETE on a non-key predicate is a full scan (a mutation never uses a secondary B-tree index).
+query ITT nosort
+EXPLAIN DELETE FROM t WHERE v = 10
+----
+0
+Delete t
+-
+1
+Filter
+conjuncts=1
+2
+Scan t
+Full scan
+
+# The no-mutation proof: after all the EXPLAINs above, t still has exactly its two original rows.
+query I nosort
+SELECT count(*) FROM t
+----
+2

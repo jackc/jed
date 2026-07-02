@@ -46,12 +46,8 @@ func (db *engine) executeExplain(ex *explain, params []Value) (Outcome, error) {
 		// bound value), so supplied parameters are neither needed nor bound.
 		return Outcome{}, newError(SyntaxError, "bind parameters are not allowed in EXPLAIN")
 	}
-	qp, err := db.planExplainInner(ex.Inner)
-	if err != nil {
-		return Outcome{}, err
-	}
 	var r explainRender
-	if err := db.renderQueryPlan(&r, qp, 0); err != nil {
+	if err := db.renderExplain(&r, ex.Inner); err != nil {
 		return Outcome{}, err
 	}
 	meter := db.session.newMeter()
@@ -63,6 +59,127 @@ func (db *engine) executeExplain(ex *explain, params []Value) (Outcome, error) {
 		Rows:        r.rows,
 		Cost:        meter.Accrued,
 	}, nil
+}
+
+// renderExplain renders the plan for the inner statement (spec/design/explain.md). A DML statement is
+// rendered by explainDml (plan-only — never executing, so an EXPLAIN of a DELETE deletes nothing); a
+// read query is planned by planExplainInner and walked by renderQueryPlan.
+func (db *engine) renderExplain(r *explainRender, inner *statement) error {
+	switch {
+	case inner.Insert != nil:
+		return db.explainInsert(r, inner.Insert, 0)
+	case inner.Update != nil:
+		return db.explainUpdate(r, inner.Update, 0)
+	case inner.Delete != nil:
+		return db.explainDelete(r, inner.Delete, 0)
+	default:
+		qp, err := db.planExplainInner(inner)
+		if err != nil {
+			return err
+		}
+		return db.renderQueryPlan(r, qp, 0)
+	}
+}
+
+// explainInsert renders an INSERT plan: the Insert root (with an ON CONFLICT note), then the row
+// source — a planned SELECT subtree (INSERT … SELECT) or a Values leaf (INSERT … VALUES). It resolves
+// the source but never writes.
+func (db *engine) explainInsert(r *explainRender, ins *insert, depth int) error {
+	if _, ok := db.lkpTable(ins.Table); !ok {
+		return newError(UndefinedTable, "table does not exist: "+ins.Table)
+	}
+	r.emit(depth, "Insert "+ins.Table, insertDetail(ins))
+	if ins.Select != nil {
+		ptypes := &paramTypes{}
+		plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, nil, ptypes)
+		if err != nil {
+			return err
+		}
+		return db.renderQueryPlan(r, plan, depth+1)
+	}
+	r.emit(depth+1, "Values", fmt.Sprintf("rows=%d", len(ins.Rows)))
+	return nil
+}
+
+// insertDetail renders an INSERT's ON CONFLICT disposition (or "-" when there is none).
+func insertDetail(ins *insert) string {
+	if ins.OnConflict == nil {
+		return "-"
+	}
+	if ins.OnConflict.DoUpdate {
+		return "on conflict do update"
+	}
+	return "on conflict do nothing"
+}
+
+// explainUpdate renders an UPDATE plan: the Update root (with the assignment count), the residual
+// Filter, then the target scan with its chosen access path. It resolves the WHERE and the scan bound
+// via the same detectors the executor uses, but never writes.
+func (db *engine) explainUpdate(r *explainRender, upd *update, depth int) error {
+	table, ok := db.lkpTable(upd.Table)
+	if !ok {
+		return newError(UndefinedTable, "table does not exist: "+upd.Table)
+	}
+	filter, err := db.explainDmlFilter(table, upd.Filter)
+	if err != nil {
+		return err
+	}
+	r.emit(depth, "Update "+upd.Table, fmt.Sprintf("sets=%d", len(upd.Assignments)))
+	db.renderDmlScan(r, table, upd.Table, filter, depth+1)
+	return nil
+}
+
+// explainDelete renders a DELETE plan: the Delete root, the residual Filter, then the target scan
+// with its chosen access path. It resolves the WHERE and the scan bound but never writes.
+func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int) error {
+	table, ok := db.lkpTable(del.Table)
+	if !ok {
+		return newError(UndefinedTable, "table does not exist: "+del.Table)
+	}
+	filter, err := db.explainDmlFilter(table, del.Filter)
+	if err != nil {
+		return err
+	}
+	r.emit(depth, "Delete "+del.Table, "-")
+	db.renderDmlScan(r, table, del.Table, filter, depth+1)
+	return nil
+}
+
+// explainDmlFilter resolves an UPDATE/DELETE WHERE predicate against a single-table scope (the same
+// prologue the executors use), or returns nil for a bare (no-WHERE) statement.
+func (db *engine) explainDmlFilter(table *catTable, where *exprNode) (*rExpr, error) {
+	if where == nil {
+		return nil, nil
+	}
+	return resolveBooleanFilter(singleScope(db, table), where, &paramTypes{})
+}
+
+// renderDmlScan emits the residual Filter (when present) and the target Scan for an UPDATE/DELETE,
+// choosing the access path with the SAME detectors the executor uses (PK bound, then GIN, then GiST —
+// UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The touched-set count is a
+// DML cost detail left to EXPLAIN ANALYZE, so it is not shown here.
+func (db *engine) renderDmlScan(r *explainRender, table *catTable, name string, filter *rExpr, depth int) {
+	d := depth
+	if filter != nil {
+		r.emit(d, "Filter", fmt.Sprintf("conjuncts=%d", conjunctCount(filter)))
+		d++
+	}
+	r.emit(d, "Scan "+name, db.scanDetail(name, db.dmlScanBound(table, filter), nil))
+}
+
+// dmlScanBound picks an UPDATE/DELETE target's scan bound with the executor's own detectors: the
+// single-column PK range bound first, then a GIN bound, then a GiST bound; else a full scan (nil).
+func (db *engine) dmlScanBound(table *catTable, filter *rExpr) *scanBound {
+	if bp := db.pkBoundFor(table, filter); bp != nil {
+		return &scanBound{pk: bp}
+	}
+	if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
+		return &scanBound{gin: gb}
+	}
+	if gp := detectGistBound(filter, table.Indexes, table.Columns, 0); gp != nil {
+		return &scanBound{gist: gp}
+	}
+	return nil
 }
 
 // planExplainInner resolves the inner statement into a queryPlan WITHOUT executing it. It handles the
