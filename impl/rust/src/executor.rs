@@ -12424,10 +12424,6 @@ impl Engine {
 
         // Determine the scan bound exactly as materialize_rel does: a PK-range bound, or the full scan.
         // An empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely.
-        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); mask.len()];
-        let mut row_count = 0usize;
-        let mut pages = 0usize;
-        let slabs = 0usize;
         let mut do_scan = true;
         let mut b = KeyBound::unbounded();
         if let Some(ScanBound::Pk(bp)) = &plan.rel_bounds[0] {
@@ -12436,39 +12432,116 @@ impl Engine {
                 None => do_scan = false,
             }
         }
-        if do_scan {
-            let (c, rc, p, _s) = store.columnar_scan_masked(&b, mask)?;
-            cols = c;
-            row_count = rc;
-            pages = p;
-        }
-        // Charge the scan cost block identically to materialize_rel + ScanSource: page_read × nodes,
-        // value_decompress × slabs (0 here), storage_row_read × row_count. On the unmetered lane the
-        // caller gates, so this bulk charge reproduces the per-row accrual (guard is a no-op).
-        meter.charge(
-            COSTS.page_read * pages as i64
-                + COSTS.value_decompress * slabs as i64
-                + COSTS.storage_row_read * row_count as i64,
-        );
 
-        // A3: apply the WHERE predicate over the lanes into a selection vector (None ⇒ all survive).
-        let (sel, nsurv) = match &plan.filter {
-            Some(filter) => {
-                let s = filter_columnar(filter, &cols, mask, row_count, env, meter)?;
-                let n = s.len();
-                (Some(s), n)
-            }
-            None => (None, row_count),
-        };
+        let grouped = !gset.key_cols.is_empty();
+        let key_col = gset.key_cols.first().copied().unwrap_or(0);
 
-        let src = LaneSrc::Cols {
-            cols: &cols,
-            sel: sel.as_deref(),
-        };
-        let srows = if gset.key_cols.is_empty() {
-            vec![fold_agg_whole(&plan.agg_specs, &src, nsurv, meter)?]
+        // Fold each scanned row's touched columns straight into its accumulator during ONE tree walk —
+        // no per-column lane is materialized, so a whole-table / single-int-key aggregate is O(1) memory
+        // instead of the O(rows) whole-column gather the lane path paid (float.md §7, packed-leaf.md
+        // §11). A WHERE predicate (A3) is evaluated over a single reusable masked scratch row read via
+        // col_at (untouched columns NULL) — byte-identical input + operator_eval to the lane filter.
+        let mut whole: Vec<Acc> = if grouped {
+            Vec::new()
         } else {
-            group_by_int_key(&plan.agg_specs, gset.key_cols[0], &src, nsurv, meter)?
+            plan.agg_specs.iter().map(Acc::from_spec).collect()
+        };
+        let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
+        let mut index: HashMap<i64, usize> = HashMap::new();
+        let mut null_gi: Option<usize> = None;
+        let mut scratch: Vec<Value> = if plan.filter.is_some() {
+            vec![Value::Null; mask.len()]
+        } else {
+            Vec::new()
+        };
+        let mut nsurv = 0usize;
+
+        let (row_count, pages) = if do_scan {
+            let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
+                if let Some(filter) = &plan.filter {
+                    for (c, &m) in mask.iter().enumerate() {
+                        if m {
+                            scratch[c] = node.col_at(i, c)?;
+                        }
+                    }
+                    if !filter.eval(&scratch, env, meter)?.is_true() {
+                        return Ok(());
+                    }
+                }
+                nsurv += 1;
+                let accs: &mut Vec<Acc> = if grouped {
+                    let gi = match node.col_at(i, key_col)? {
+                        Value::Int(k) => match index.get(&k) {
+                            Some(&g) => g,
+                            None => {
+                                let g = groups.len();
+                                index.insert(k, g);
+                                groups.push((
+                                    Value::Int(k),
+                                    plan.agg_specs.iter().map(Acc::from_spec).collect(),
+                                ));
+                                g
+                            }
+                        },
+                        // A NULL integer key buckets into one sentinel group (the value-canonical key
+                        // groups all NULLs together — matching the scalar/lane path).
+                        _ => match null_gi {
+                            Some(g) => g,
+                            None => {
+                                let g = groups.len();
+                                null_gi = Some(g);
+                                groups.push((
+                                    Value::Null,
+                                    plan.agg_specs.iter().map(Acc::from_spec).collect(),
+                                ));
+                                g
+                            }
+                        },
+                    };
+                    &mut groups[gi].1
+                } else {
+                    &mut whole
+                };
+                for (si, spec) in plan.agg_specs.iter().enumerate() {
+                    let v = match operand_col(spec) {
+                        Some(c) => node.col_at(i, c)?,
+                        None => Value::Null, // COUNT(*) folds no value
+                    };
+                    accs[si].fold(v, meter)?;
+                }
+                Ok(())
+            };
+            store.fold_scan_masked(&b, &mut visit)?
+        } else {
+            (0, 0)
+        };
+
+        // Charge the identical cost totals (unmetered lane — charge order is invisible): the scan block
+        // (page_read × nodes; value_decompress × 0 — no spillable touched column gated above;
+        // storage_row_read × row_count) and aggregate_accumulate once per (survivor × spec). The
+        // filter's operator_eval was charged per scanned row inside the walk.
+        meter.charge(COSTS.page_read * pages as i64 + COSTS.storage_row_read * row_count as i64);
+        meter.charge(COSTS.aggregate_accumulate * nsurv as i64 * plan.agg_specs.len() as i64);
+
+        let srows = if grouped {
+            groups
+                .into_iter()
+                .map(|(key, accs)| {
+                    let mut srow = Vec::with_capacity(1 + accs.len());
+                    srow.push(key);
+                    for a in accs {
+                        srow.push(a.finalize()?);
+                    }
+                    Ok(srow)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![
+                whole
+                    .into_iter()
+                    .map(Acc::finalize)
+                    .collect::<Result<Vec<_>>>()?,
+            ]
         };
         Ok(Some(srows))
     }
@@ -19467,10 +19540,10 @@ enum AggPlan {
     SumDecimal,
     /// AVG — accumulate a decimal sum + i64 count; result sum/count (decimal), NULL if count 0.
     Avg,
-    /// SUM(f32|f64) — the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (spec/design/float.md §7).
-    /// Carries the width so the result/fold round at the input width. Buffers the finite inputs.
+    /// SUM(f32|f64) — the STREAMING scan-order running total (spec/design/float.md §7; fold order
+    /// ledgered non-deterministic). Carries the width so the fold re-rounds at the input width.
     SumFloat(ScalarType),
-    /// AVG(f32|f64) — SUM (canonical fold) / count, one final rounding at the input width.
+    /// AVG(f32|f64) — SUM (streaming scan-order fold) / count, one final rounding at the input width.
     AvgFloat(ScalarType),
     Min,
     Max,
@@ -19591,13 +19664,15 @@ enum Acc {
         sum: Decimal,
         count: i64,
     },
-    /// Float SUM/AVG: buffer the canonical inputs (the §7 fold needs ALL values to sort), tracking
-    /// NaN / ±Inf presence so the special-value resolution is order-independent. `is_avg` selects
-    /// the final SUM vs SUM/count; `width` rounds at the input width. `count` is the non-NULL count.
+    /// Float SUM/AVG: a STREAMING scan-order running total of the finite inputs (float.md §7), with
+    /// NaN / ±Inf presence tracked so the special-value resolution stays order-independent. The fold
+    /// ORDER is ledgered non-deterministic (determinism_exceptions.toml `float-sum-order`) — O(1)
+    /// memory, no buffer/sort. `is_avg` selects the final SUM vs SUM/count; `width` re-rounds `total`
+    /// to binary32 each add when f32. `count` is the non-NULL count.
     FloatFold {
         width: ScalarType,
         is_avg: bool,
-        finite: Vec<f64>,
+        total: f64,
         count: i64,
         any_nan: bool,
         pos_inf: bool,
@@ -19711,7 +19786,7 @@ impl Acc {
             AggPlan::SumFloat(w) => Acc::FloatFold {
                 width: w,
                 is_avg: false,
-                finite: Vec::new(),
+                total: 0.0,
                 count: 0,
                 any_nan: false,
                 pos_inf: false,
@@ -19720,7 +19795,7 @@ impl Acc {
             AggPlan::AvgFloat(w) => Acc::FloatFold {
                 width: w,
                 is_avg: true,
-                finite: Vec::new(),
+                total: 0.0,
                 count: 0,
                 any_nan: false,
                 pos_inf: false,
@@ -19806,15 +19881,17 @@ impl Acc {
                 }
             }
             Acc::FloatFold {
-                finite,
+                width,
+                total,
                 count,
                 any_nan,
                 pos_inf,
                 neg_inf,
                 ..
             } => {
-                // Classify each non-NULL input order-independently (the §7 special-value pass).
-                // Convert a f32 to its exact f64 for buffering; the fold re-rounds per step.
+                // Classify each non-NULL input order-independently (the §7 special-value pass); fold
+                // each finite input into the running total in scan order (ledgered order-dependent).
+                // Convert a f32 to its exact f64 first.
                 let f = match value {
                     Value::Null => return Ok(()),
                     Value::Float32(f) => f as f64,
@@ -19831,8 +19908,15 @@ impl Acc {
                         *neg_inf = true;
                     }
                 } else {
-                    // Canonicalize -0 → +0 before buffering (so the sort/fold are deterministic).
-                    finite.push(if f == 0.0 { 0.0 } else { f });
+                    // Canonicalize -0 → +0, then add in scan order. When f32, re-round the running
+                    // total to binary32 each add (the §7 width-correct fold): `*total as f32`
+                    // recovers the f32-valued total exactly.
+                    let x = if f == 0.0 { 0.0 } else { f };
+                    if width.is_float32() {
+                        *total = (*total as f32 + x as f32) as f64;
+                    } else {
+                        *total += x;
+                    }
                 }
             }
             Acc::MinMax { cur, is_min } => {
@@ -19982,12 +20066,12 @@ impl Acc {
             Acc::FloatFold {
                 width,
                 is_avg,
-                finite,
+                total,
                 count,
                 any_nan,
                 pos_inf,
                 neg_inf,
-            } => finalize_float_fold(width, is_avg, finite, count, any_nan, pos_inf, neg_inf)?,
+            } => finalize_float_fold(width, is_avg, total, count, any_nan, pos_inf, neg_inf)?,
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
             // json_agg/jsonb_agg: NULL over an empty group; else the JSON array (json compact /
             // jsonb canonical).
@@ -37132,21 +37216,21 @@ fn cast_from_float(f: f64, target: ScalarType, typmod: Option<DecimalTypmod>) ->
     }
 }
 
-/// Finalize a float SUM/AVG as the order-independent CANONICAL-ORDER FOLD (spec/design/float.md §7),
-/// bit-identical across cores and across any serial/parallel plan. The steps, in order:
-/// 1. Special values FIRST (order-independent): empty/all-NULL group → NULL (an aggregate over no
-///    rows); any NaN → NaN; both +Inf and -Inf → NaN; else +Inf → +Inf; else -Inf → -Inf; else
-///    all-finite → step 2.
-/// 2. Sort the (already `-0`-canonicalized) finite inputs by the §3 total order — distinct values
-///    have distinct keys, so the sort is total/deterministic.
-/// 3. Fold left with width-correct IEEE add (a running total overflowing to ±Inf → 22003).
+/// Finalize a float SUM/AVG from the STREAMING scan-order running total (spec/design/float.md §7).
+/// The fold order is ledgered non-deterministic (`float-sum-order`); the steps here are all
+/// order-independent given the accumulated `total`:
+/// 1. Special values FIRST: empty/all-NULL group → NULL; any NaN → NaN; both +Inf and -Inf → NaN;
+///    else +Inf → +Inf; else -Inf → -Inf; else all-finite → step 2.
+/// 2. The running `total` IS the sum (already width-correct — f32 was re-rounded each add). If it
+///    reached ±Inf from finite inputs it is a finite-overflow 22003 (a final `is_infinite` test is
+///    equivalent to a per-add one — finite + ±Inf cannot recover to finite).
 ///
 /// AVG = SUM / count, ONE final rounding at the input width.
 #[allow(clippy::too_many_arguments)]
 fn finalize_float_fold(
     width: ScalarType,
     is_avg: bool,
-    mut finite: Vec<f64>,
+    total: f64,
     count: i64,
     any_nan: bool,
     pos_inf: bool,
@@ -37164,7 +37248,7 @@ fn finalize_float_fold(
     if count == 0 {
         return Ok(Value::Null);
     }
-    // Step 1 — special values, resolved before any finite sum (order-independent).
+    // Step 1 — special values, resolved before the finite sum (order-independent).
     if any_nan {
         return Ok(wrap(f64::NAN));
     }
@@ -37177,29 +37261,19 @@ fn finalize_float_fold(
     if neg_inf {
         return Ok(wrap(f64::NEG_INFINITY));
     }
-    // Step 2 — sort the finite inputs by the total order (all finite, so a plain partial_cmp is
-    // total here; -0 already canonicalized to +0 at fold time).
-    finite.sort_by(|a, b| crate::value::total_cmp_f64(*a, *b));
-    // Step 3 — fold left at the input width (round each add to the width). A running total that
-    // overflows to ±Inf from finite operands traps 22003 (the §3 finite-overflow rule).
+    // Step 2 — the running total is the sum; f32 already re-rounded each add so `total as f32` is
+    // exact. A ±Inf total is a finite-overflow 22003 (the §3 finite-overflow rule).
     let sum = if is_f32 {
-        let mut acc: f32 = 0.0;
-        for &v in &finite {
-            acc += v as f32;
-            if acc.is_infinite() {
-                return Err(overflow(ScalarType::Float32));
-            }
+        let acc = total as f32;
+        if acc.is_infinite() {
+            return Err(overflow(ScalarType::Float32));
         }
         acc as f64
     } else {
-        let mut acc: f64 = 0.0;
-        for &v in &finite {
-            acc += v;
-            if acc.is_infinite() {
-                return Err(overflow(ScalarType::Float64));
-            }
+        if total.is_infinite() {
+            return Err(overflow(ScalarType::Float64));
         }
-        acc
+        total
     };
     if !is_avg {
         return Ok(wrap(sum));

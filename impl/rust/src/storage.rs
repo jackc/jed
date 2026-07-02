@@ -374,6 +374,22 @@ impl TableStore {
         Ok((cols, row_count, pages, 0))
     }
 
+    /// The fold-during-walk twin of [`columnar_scan_masked`](TableStore::columnar_scan_masked)
+    /// (packed-leaf.md §11): walks the bounded scan calling `visit(node, i)` per admitted row — which
+    /// reads only the touched columns via [`crate::pmap::Node::col_at`] and folds them into an
+    /// accumulator — so an aggregate never materializes a per-column lane (O(1) memory). Returns
+    /// `(row_count, node_count)`, identical to the columnar scan, so the caller charges the same
+    /// `page_read` / `storage_row_read`; `value_decompress` is 0 (the caller gates on `!any_spillable`).
+    pub(crate) fn fold_scan_masked(
+        &self,
+        b: &KeyBound,
+        visit: &mut dyn FnMut(&crate::pmap::Node, usize) -> Result<()>,
+    ) -> Result<(usize, usize)> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows.fold_scan(b, src_ref, visit)
+    }
+
     /// Fused single-descent point lookup: the row at `key` (if any) PLUS the
     /// `(page_read, value_decompress)` block its point bound charges — the index fetch path's
     /// [`get`](TableStore::get) + [`overlap_scan_units`](TableStore::overlap_scan_units) in one

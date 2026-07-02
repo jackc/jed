@@ -595,6 +595,27 @@ impl PMap {
         Ok((cols, row_count, nodes))
     }
 
+    /// The fold-during-walk twin of [`columnar_scan`](PMap::columnar_scan) (packed-leaf.md §11): the
+    /// same windowed, interior-separator-inclusive walk (identical visited-node set → identical
+    /// `page_read`), but calls `visit(node, i)` per admitted entry — which reads only the row's touched
+    /// columns via [`Node::col_at`] and folds them straight into an accumulator — instead of gathering
+    /// a per-column lane. So a whole-table / single-int-key aggregate is O(1) memory, never O(rows).
+    /// Returns `(row_count, node_count)`, identical to `columnar_scan`, so the caller charges the same
+    /// `page_read` / `storage_row_read`.
+    pub(crate) fn fold_scan(
+        &self,
+        b: &KeyBound,
+        src: Option<&dyn LeafSource>,
+        visit: &mut dyn FnMut(&Node, usize) -> Result<()>,
+    ) -> Result<(usize, usize)> {
+        let mut row_count = 0usize;
+        let mut nodes = 0usize;
+        if let Some(root) = &self.root {
+            fold_walk(root, b, src, visit, &mut row_count, &mut nodes)?;
+        }
+        Ok((row_count, nodes))
+    }
+
     /// The number of B-tree nodes a bounded scan over `b` visits — the `page_read` it charges
     /// (cost.md §3). Mirrors `range_entries`' traversal exactly (same `child_window` prune, root
     /// always visited), counting an `OnDisk` leaf as one node WITHOUT faulting it (pager.md §5). The
@@ -1279,6 +1300,44 @@ fn columnar_collect(
         columnar_collect(&ch, b, src, mask, cols, row_count, nodes)?;
         if i >= ef && i < el {
             gather_cols(node, i, mask, cols)?;
+            *row_count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The fold-during-walk twin of [`columnar_collect`] (packed-leaf.md §11 Track A2): the identical
+/// windowed, interior-separator-inclusive walk (so the visited-node set — and `page_read` — is
+/// identical), but calls `visit(node, i)` per admitted entry instead of gathering its columns into
+/// lanes. `visit` reads the entry's touched columns via [`Node::col_at`]. `row_count` counts admitted
+/// entries; `nodes` counts visited nodes.
+fn fold_walk(
+    node: &Node,
+    b: &KeyBound,
+    src: Option<&dyn LeafSource>,
+    visit: &mut dyn FnMut(&Node, usize) -> Result<()>,
+    row_count: &mut usize,
+    nodes: &mut usize,
+) -> Result<()> {
+    *nodes += 1;
+    let (ef, el) = b.entry_window(node);
+    if node.is_leaf() {
+        for i in ef..el {
+            visit(node, i)?;
+            *row_count += 1;
+        }
+        return Ok(());
+    }
+    let (cf, cl) = b.child_window(node);
+    if ef < cf {
+        visit(node, ef)?;
+        *row_count += 1;
+    }
+    for i in cf..=cl {
+        let ch = child(node, i, src)?;
+        fold_walk(&ch, b, src, visit, row_count, nodes)?;
+        if i >= ef && i < el {
+            visit(node, i)?;
             *row_count += 1;
         }
     }
