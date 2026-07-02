@@ -390,16 +390,21 @@ A **secondary index** ([indexes.md](indexes.md)) gives a second bound kind at th
 per-relation pushdown seam. For each base relation of a **SELECT** scan (single-table, a JOIN
 base table, or a correlated subquery's inner table), the plan picks the **single-column PK
 bound first** (it is the row's own key — no second tree, range-capable, strictly cheaper);
-else, among the relation's indexes whose **first key column** has at least one **equality**
-conjunct `col = const-source` in the WHERE AND-chain (the same const-source rule as above —
-literal / `$N` / correlated outer column, type-matched), the index with the **lowest
-lowercased name**; else the full scan. Gated by the `ddl.secondary_index` capability, pinned
-cross-core in `spec/conformance/suites/query/index_scan.test`.
+else, among the relation's B-tree indexes, the **lowest lowercased name** one that yields a
+non-empty **access predicate** — a maximal **equality prefix** on the leading key columns
+plus an **optional range** on the next column (indexes.md §5.1; the same const-source rule as
+above — literal / `$N` / correlated outer / sibling column, type-matched); else the full
+scan. Gated by the `ddl.secondary_index` capability (a leading/trailing-column **range** by
+`query.index_range`, a **multi-column equality prefix** by `query.index_prefix`), pinned
+cross-core in `spec/conformance/suites/query/index_scan.test` (and `index_range.test` /
+`index_prefix.test`).
 
 The index-bounded scan accrues, in place of the full-scan block:
 
-- **`page_read` × the index-tree nodes** overlapping the equality prefix range (the same
-  overlap rule as the PK bound, applied to the index tree — a logical count, never faulted).
+- **`page_read` × the index-tree nodes** overlapping the access-predicate range (the same
+  overlap rule as the PK bound, applied to the index tree — a logical count, never faulted; an
+  equality prefix narrows the range, a trailing-column range widens it, exactly as a PK point
+  vs. range).
 - **Per admitted entry, the row fetch**: `page_read` × the **table-tree** nodes overlapping
   the *point* bound of that entry's row storage key (the root→row descent), plus that row's
   touched-column `value_decompress` slabs — i.e. each row fetch costs exactly what a PK point
@@ -407,12 +412,14 @@ The index-bounded scan accrues, in place of the full-scan block:
 - **`storage_row_read` per fetched row**, and the residual filter / projection /
   `row_produced` unchanged. The WHERE stays the residual filter; the bound only narrows
   which rows are fetched.
-- **A provably empty bound charges nothing**: an equality against NULL (3VL), contradictory
-  equalities (`a = 1 AND a = 2`), or an out-of-range integer admit no entry — no page, no row.
+- **A provably empty bound charges nothing**: a prefix equality against NULL (3VL),
+  contradictory equalities (`a = 1 AND a = 2`), a range against NULL, a contradictory range
+  (`a > 5 AND a < 5`), or an out-of-range integer admit no entry — no page, no row.
 
 Deterministic and byte-identical across cores: the index tree shape, the entry-key encoding,
-and the overlap rule are all §8 contracts. **Narrowings this slice** (indexes.md §5): first
-key column only, equality only, SELECT scans only (UPDATE/DELETE keep their PK pushdown), and
+and the overlap rule are all §8 contracts. **Narrowings this slice** (indexes.md §5): SELECT
+scans only (UPDATE/DELETE keep their PK pushdown), the range column and every trailing column
+**fixed-width** (indexes.md §5.1 — an equality-prefix column may be variable-width), and
 **no LIMIT-streaming combination** — an index-bounded scan with a LIMIT takes the eager path
 (reads the full admitted set; the short-circuit below stays PK/full-scan-only).
 

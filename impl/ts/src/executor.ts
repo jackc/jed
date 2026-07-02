@@ -5562,42 +5562,27 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { rows: Row[]; pages: number; slabs: number } {
-    // Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
-    // true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
-    // integer can equal no stored value — all provably empty.
-    let agreed: Uint8Array | null = null;
-    for (const src of ib.eqs) {
-      const bk = encodeBoundKey(ib.colType, src, params, outer, ib.coll, left);
-      if (bk.kind !== "key") return { rows: [], pages: 0, slabs: 0 };
-      if (agreed === null) agreed = bk.key;
-      else if (!bytesEq(agreed, bk.key)) return { rows: [], pages: 0, slabs: 0 };
-    }
-    return this.indexPointRows(tableName, ib, agreed!, mask);
+    const built = buildIndexBound(ib, params, outer, left);
+    if (built === null) return { rows: [], pages: 0, slabs: 0 }; // provably empty — charge nothing
+    return this.indexScanBound(tableName, ib.nameKey, ib.suffixTypes, built.bound, built.prefixLen, mask);
   }
 
-  // indexPointRows fetches the rows a SINGLE already-encoded index value admits — the prefix
-  // scan of the index B-tree plus, per admitted entry, the row's point lookup — returning them
-  // in index-entry order with the scan's up-front (pages, slabs). Factored out of indexBoundRows so
-  // both the single-value equality bound (indexBoundRows) and the OR / IN-list point-set bound
-  // (indexKeySetRows) drive the identical per-value fetch — same cost by construction (cost.md §3
-  // "index-bounded scan" / "OR / IN-list").
-  indexPointRows(
+  // indexScanBound range-scans the index B-tree over an already-built key bound and point-looks-up each
+  // admitted entry's row, returning them in index-entry order with the scan's up-front (pages, slabs)
+  // block — the index-tree nodes overlapping the range plus, per entry, the row's point lookup.
+  // prefixByteLen is the equality-prefix byte length skipped before the fixed-width suffix-skip that
+  // recovers each entry's row storage key (indexes.md §5.1). Shared by the access-predicate bound
+  // (indexBoundRows) and the OR / IN-list point-set (indexPointRows) so both drive the identical
+  // per-entry fetch — same cost by construction (cost.md §3 "index-bounded scan" / "OR / IN-list").
+  indexScanBound(
     tableName: string,
-    ib: IndexBound,
-    valueKey: Uint8Array,
+    nameKey: string,
+    suffixTypes: ScalarType[],
+    b: KeyBound,
+    prefixByteLen: number,
     mask: boolean[],
   ): { rows: Row[]; pages: number; slabs: number } {
-    // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
-    // is every entry extending the prefix: [prefix, byte-successor(prefix)).
-    const prefix = new Uint8Array(1 + valueKey.length);
-    prefix.set(valueKey, 1);
-    const b: KeyBound = {
-      lo: prefix,
-      loInc: true,
-      hi: prefixSuccessor(prefix),
-      hiInc: false,
-    };
-    const istore = this.lkpIndexStore(ib.nameKey);
+    const istore = this.lkpIndexStore(nameKey);
     // The index store has no payload columns, so its mask is empty and its fused scan
     // contributes only the index-tree page_read count (no spill/compress units).
     const iscan = istore.rangeScanWithUnits(b, []);
@@ -5606,10 +5591,11 @@ export class Engine {
     let slabs = 0;
     const rows: Row[] = [];
     for (const e of iscan.entries) {
-      // Skip the remaining key components (each self-delimiting — indexes.md §5); the
+      // Skip the equality prefix by its known byte length, then each remaining key component by width
+      // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1); the
       // suffix after them is the row's storage key (indexes.md §3).
-      let at = prefix.length;
-      for (const ty of ib.tailTypes) {
+      let at = prefixByteLen;
+      for (const ty of suffixTypes) {
         at += e.key[at] === 0x01 ? 1 : 1 + widthBytes(ty);
       }
       const rowKey = e.key.slice(at);
@@ -5620,6 +5606,26 @@ export class Engine {
       rows.push(u.row);
     }
     return { rows, pages, slabs };
+  }
+
+  // indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
+  // equality prefix scan [0x00‖value, byte-successor) over the index B-tree plus, per admitted entry,
+  // the row's point lookup. Used by the OR / IN-list secondary-index point-set (indexKeySetRows), where
+  // each distinct list value is one such point probe. suffixTypes are the trailing key components
+  // (columns[1..], fixed-width), width-skipped past the single leading slot.
+  indexPointRows(
+    tableName: string,
+    nameKey: string,
+    suffixTypes: ScalarType[],
+    valueKey: Uint8Array,
+    mask: boolean[],
+  ): { rows: Row[]; pages: number; slabs: number } {
+    // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
+    // is every entry extending the prefix: [prefix, byte-successor(prefix)).
+    const prefix = new Uint8Array(1 + valueKey.length);
+    prefix.set(valueKey, 1);
+    const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
+    return this.indexScanBound(tableName, nameKey, suffixTypes, b, prefix.length, mask);
   }
 
   // pkKeySetRows executes a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"):
@@ -5666,18 +5672,11 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { rows: Row[]; pages: number; slabs: number } {
-    const ib: IndexBound = {
-      nameKey: ks.nameKey,
-      colType: ks.colType,
-      eqs: [],
-      coll: ks.coll,
-      tailTypes: ks.tailTypes,
-    };
     const rows: Row[] = [];
     let pages = 0;
     let slabs = 0;
     for (const k of encodeKeySet(ks.colType, ks.srcs, params, outer, ks.coll, left)) {
-      const r = this.indexPointRows(tableName, ib, k, mask);
+      const r = this.indexPointRows(tableName, ks.nameKey, ks.tailTypes, k, mask);
       for (const row of r.rows) rows.push(row);
       pages += r.pages;
       slabs += r.slabs;
@@ -12242,31 +12241,101 @@ type GinBound = {
   colGlobal: number;
 };
 
-// IndexBound is the plan-time result of index analysis (indexes.md §5): the chosen index
-// (lowest lowercased name whose FIRST key column has an equality conjunct), that column's
-// storage type, and every equality const-source on it. At exec time the sources must
-// agree on one value (else the bound is provably empty) and the index is range-scanned
-// over that value's presence-tagged prefix.
-// tailTypes is the REMAINING key components' types (columns[1..]): an admitted entry's
-// row-key suffix sits after every component slot, so the fetch skips these (each slot is
-// self-delimiting — a 0x01 NULL tag alone, or 0x00 + the type's fixed width).
+// IndexEqCol is one column of an index access predicate's equality prefix (indexes.md §5.1): the
+// column's storage type, its key collation (non-null only for a Full-collated text column), and every
+// equality const-source bound to it. At exec time the sources must agree on one value (else the bound
+// is provably empty). A collated column encodes its probe via the UCA sort key (encoding.md §2.12) to
+// match the index's stored key form (collation.md §8).
+type IndexEqCol = { colType: ScalarType; coll: Collation | null; srcs: RExpr[] };
+
+// IndexRange is the optional trailing range of an index access predicate (indexes.md §5.1): a range
+// on the key column immediately after the equality prefix. Its column is fixed-width (never collated).
+type IndexRange = { colType: ScalarType; terms: BoundTerm[] };
+
+// IndexBound is the plan-time result of index analysis (indexes.md §5.1): the chosen index (lowest
+// lowercased name yielding a non-empty access predicate) and the predicate — a maximal EQUALITY PREFIX
+// on the leading key columns (eqCols) plus an OPTIONAL RANGE on the next column (range). At exec time
+// buildIndexBound turns these into a concrete index-key range: the equality prefix bytes P =
+// concatenated present slots, then the range (if any) intersected relative to P. suffixTypes are the
+// types of the index columns AFTER the equality prefix (columns[eqCols.length..]) — the range column
+// (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's row-key suffix is
+// recovered by width-skipping them past P.
 type IndexBound = {
   nameKey: string;
-  colType: ScalarType;
-  eqs: RExpr[];
-  // coll is the leading key column's resolved collation when it is collated AND Full — the equality
-  // probe encodes via its UCA sort key (encoding.md §2.12) to match the index's stored key form
-  // (spec/design/collation.md §8). null for a C (raw-byte) column. A Skewed collated index never
-  // produces an IndexBound (keyCollationCtx refuses it — collation.md §12).
-  coll: Collation | null;
-  tailTypes: ScalarType[];
+  eqCols: IndexEqCol[];
+  range: IndexRange | null;
+  suffixTypes: ScalarType[];
 };
+
+// buildIndexAccessPredicate constructs an index access predicate for idx over rel (indexes.md §5.1): a
+// maximal EQUALITY PREFIX on the leading key columns plus an OPTIONAL RANGE on the next column. It
+// walks the index's key columns in key order against the WHERE AND-chain, consuming a column with an
+// agreed equality conjunct into the prefix and stopping at the first column that has no equality
+// (taking its range conjuncts, if any, as the trailing range). null for a non-B-tree index, a Skewed
+// collated bound column (whose stored keys are at the file's pinned version — collation.md §12), no
+// bound at all, or an ineligible suffix (a column after the equality prefix that is not a fixed-width
+// scalar — the width-based key-suffix skip needs it). siblingCutoff opens the index-nested-loop door
+// (>= 0 admits a bare sibling "column" node with index < cutoff as a bound source, resolved per outer
+// row); -1 is the ordinary once-materialized bound.
+function buildIndexAccessPredicate(
+  filter: RExpr,
+  rel: ScopeRel,
+  idx: IndexDef,
+  siblingCutoff: number,
+  snap: Snapshot,
+): IndexBound | null {
+  if (idx.kind !== "btree") return null;
+  const eqCols: IndexEqCol[] = [];
+  let range: IndexRange | null = null;
+  for (const ci of idx.columns) {
+    // A non-scalar (range/array/composite) column cannot be seeked here — stop the prefix.
+    const ty = typeAsScalar(rel.table.columns[ci]!.type);
+    if (ty === undefined) break;
+    // The column's key collation form (collation.md §8/§12): a Skewed collated column refuses the
+    // bound (its stored keys are wrong for the loaded bundle) — stop the prefix here (the column then
+    // falls into the fixed-width suffix check below and rejects the whole index if it is text).
+    const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
+    if (ctx === null) break;
+    const colColl = ctx.coll !== null ? ctx.coll.name : null;
+    const eqs: RExpr[] = [];
+    const ranges: BoundTerm[] = [];
+    const walk = (e: RExpr): void => {
+      if (e.kind === "and") {
+        walk(e.lhs);
+        walk(e.rhs);
+        return;
+      }
+      const t = asBoundTerm(e, rel.offset + ci, ty, colColl, siblingCutoff);
+      if (t !== null) {
+        if (t.op === "eq") eqs.push(t.src);
+        else ranges.push(t);
+      }
+    };
+    walk(filter);
+    if (eqs.length > 0) {
+      eqCols.push({ colType: ty, coll: ctx.coll, srcs: eqs });
+      continue; // extend the equality prefix
+    }
+    if (ranges.length > 0) range = { colType: ty, terms: ranges };
+    break; // first non-equality column ends the prefix (with or without a trailing range)
+  }
+  if (eqCols.length === 0 && range === null) return null; // nothing bound
+  // Eligibility: every index column from the range column onward (columns[eqCols.length..]) is
+  // width-skipped past the known equality prefix, so each must be a fixed-width scalar. The
+  // equality-prefix columns may be any width — their slots are matched as the known prefix bytes.
+  const suffixTypes: ScalarType[] = [];
+  for (const c of idx.columns.slice(eqCols.length)) {
+    const s = typeAsScalar(rel.table.columns[c]!.type);
+    if (s === undefined || !isFixedWidth(s)) return null;
+    suffixTypes.push(s);
+  }
+  return { nameKey: idx.name.toLowerCase(), eqCols, range, suffixTypes };
+}
 
 // detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
 // single-column PK bound first; else, among the relation's indexes (held in ascending
-// lowercased-name order — the deterministic tie-break), the first whose FIRST key column
-// has at least one equality conjunct against a type-matched const-source; else null
-// (full scan).
+// lowercased-name order — the deterministic tie-break), the first that yields a non-empty
+// access predicate (buildIndexAccessPredicate); else null (full scan).
 function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBound | null {
   const pkLocal = primaryKeyIndex(rel.table);
   if (pkLocal >= 0) {
@@ -12285,46 +12354,12 @@ function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBoun
     }
   }
   for (const idx of rel.table.indexes) {
-    // Only an ordered B-tree is an ordered-equality bound. A GIN index is keyed by array terms
-    // (gin.md §6); a GiST index is keyed by a bounding [min,max] / range, NOT the whole value — a
-    // scalar GiST index's store key is [v,v]‖skey, not the ordered-index key form, so it must NOT be
-    // probed here (handled by the GiST pass below, gist.md §5/§6). Both are skipped.
-    if (idx.kind !== "btree") continue;
-    const ci = idx.columns[0]!;
-    // An ordered index whose leading (or any) key column is a non-scalar (range) does not pushdown —
-    // point-lookup is deferred for containers (ranges.md §10); the index is still maintained.
-    const ty = typeAsScalar(rel.table.columns[ci]!.type);
-    if (ty === undefined) continue;
-    // The tail-slot skip in indexBoundRows advances over each trailing key component by its FIXED
-    // width (widthBytes), which exists only for the fixed-width scalars. A tail column that is
-    // non-scalar (range/array/composite) OR a variable-width scalar (text/decimal/bytea/interval)
-    // has no fixed width, so the index cannot pushdown: fall through to the full scan + residual
-    // filter (rows identical, just no index bound).
-    if (
-      idx.columns.slice(1).some((c) => {
-        const ts = typeAsScalar(rel.table.columns[c]!.type);
-        return ts === undefined || !isFixedWidth(ts);
-      })
-    ) {
-      continue;
-    }
-    // The leading column's key collation form (as for the PK above). A Skewed collated index is
-    // skipped (ctx === null) — its stored keys are at the file's pinned version, wrong for the
-    // loaded one, so it must not be seeked (collation.md §12; the tripwire suites/collation/skew.test).
-    const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
-    if (ctx === null) continue;
-    const bp = detectPkBound(filter, rel.offset + ci, ty, ctx.coll);
-    const eqs: RExpr[] = [];
-    if (bp !== null) {
-      for (const t of bp.terms) if (t.op === "eq") eqs.push(t.src);
-    }
-    if (eqs.length > 0) {
-      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
-      return {
-        kind: "index",
-        index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, coll: ctx.coll, tailTypes },
-      };
-    }
+    // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing range
+    // over a B-tree index's leading key columns. null for a GIN/GiST index (handled by the passes
+    // below), an ineligible suffix, or no bound. Indexes are held in ascending lowercased-name order,
+    // so the first non-null wins — the deterministic tie-break.
+    const ib = buildIndexAccessPredicate(filter, rel, idx, -1, snap);
+    if (ib !== null) return { kind: "index", index: ib };
   }
   // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered loop
   // above already skipped the GiST index (its leading column is a non-scalar range).
@@ -12505,10 +12540,19 @@ function detectINLBound(
       }
     }
     if (siblingEq) {
-      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
+      // This slice keeps the index-nested-loop bound single-column-equality (a leading key column
+      // bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md §3
+      // "index-nested-loop"). suffixTypes are the trailing columns (columns[1..], fixed-width by the
+      // check above), width-skipped past the single equality slot.
+      const suffixTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
       return {
         kind: "index",
-        index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, coll: ctx.coll, tailTypes },
+        index: {
+          nameKey: idx.name.toLowerCase(),
+          eqCols: [{ colType: ty, coll: ctx.coll, srcs: eqs }],
+          range: null,
+          suffixTypes,
+        },
       };
     }
   }
@@ -13840,6 +13884,81 @@ function buildKeyBound(bp: PkBound, params: Value[], outer: Row[], left: Row): K
     }
   }
   return boundEmpty(b) ? null : b;
+}
+
+// buildIndexBound turns an index access predicate into a concrete index-key range at exec time
+// (indexes.md §5.1). It encodes the equality prefix into p (the concatenated present slots), then — if
+// there is a range column — starts from [P, P‖0x01) (the upper endpoint stops before the range
+// column's NULL slot, since a range is never true for NULL) and intersects each range term; otherwise
+// the range is [P, byte-successor(P)) (every entry extending P). null ⇒ the bound admits no key (a
+// NULL / disagreeing prefix equality, a NULL range endpoint, or a contradictory range). prefixLen =
+// p.length, the byte count the row-key suffix skip advances past the equality-prefix slots before
+// width-skipping the remaining components.
+function buildIndexBound(
+  ib: IndexBound,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): { bound: KeyBound; prefixLen: number } | null {
+  const parts: Uint8Array[] = [];
+  for (const ec of ib.eqCols) {
+    // Every equality const-source on this column must encode to ONE agreed value: a NULL is
+    // 3VL-never-true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
+    // integer can equal no stored value — all provably empty.
+    let agreed: Uint8Array | null = null;
+    for (const src of ec.srcs) {
+      const bk = encodeBoundKey(ec.colType, src, params, outer, ec.coll, left);
+      if (bk.kind !== "key") return null;
+      if (agreed === null) agreed = bk.key;
+      else if (!bytesEq(agreed, bk.key)) return null;
+    }
+    parts.push(new Uint8Array([0x00]));
+    parts.push(agreed!);
+  }
+  const p = concatBytes(parts);
+  if (ib.range === null) {
+    // Pure equality prefix: [P, byte-successor(P)).
+    const b: KeyBound = { lo: p, loInc: true, hi: prefixSuccessor(p), hiInc: false };
+    return boundEmpty(b) ? null : { bound: b, prefixLen: p.length };
+  }
+  // Equality prefix P + a range on the next column. Base: [P, P‖0x01) — present values only (the 0x01
+  // NULL tag sorts after every 0x00 present slot at this position).
+  const b: KeyBound = {
+    lo: p,
+    loInc: true,
+    hi: concatBytes([p, new Uint8Array([0x01])]),
+    hiInc: false,
+  };
+  for (const t of ib.range.terms) {
+    // The range column is fixed-width (indexes.md §5.1 eligibility), so it is never collated: the
+    // probe encodes with a null collation.
+    const bk = encodeBoundKey(ib.range.colType, t.src, params, outer, null, left);
+    if (bk.kind === "null") return null;
+    if (bk.kind === "outOfRange") continue; // drop this half-bound (a wider, still-sound scan)
+    const ps = concatBytes([p, new Uint8Array([0x00]), bk.key]); // P ‖ 0x00 ‖ encode(v)
+    switch (t.op) {
+      case "ge":
+        intersectLo(b, ps, true);
+        break;
+      case "gt": {
+        // `>` skips the whole `c = v` subtree: the smallest key after every P‖0x00‖v‖* entry.
+        const s = prefixSuccessor(ps);
+        if (s === null) return null; // no key exceeds max — empty (unreachable: ps starts 0x00)
+        intersectLo(b, s, true);
+        break;
+      }
+      case "lt":
+        intersectHi(b, ps, false);
+        break;
+      case "le": {
+        const s = prefixSuccessor(ps);
+        if (s !== null) intersectHi(b, s, false); // null ⇒ everything ≤ max, keep the base hi (P‖0x01)
+        break;
+      }
+      // "eq" never reaches range terms (folded into the equality prefix); "ne" never a bound term.
+    }
+  }
+  return boundEmpty(b) ? null : { bound: b, prefixLen: p.length };
 }
 
 // encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT uses —

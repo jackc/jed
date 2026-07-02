@@ -109,6 +109,12 @@ pub struct Param {
     pub start: i64,
     pub min_len: i64,
     pub max_len: i64,
+    /// int_window: `base` is the 0-based index of an EARLIER param; the value is that param's value +
+    /// int_uniform(off_min, off_max). Lets a bench express a selective fixed-width range around a
+    /// base param (both endpoints const-sources).
+    pub base: i64,
+    pub off_min: i64,
+    pub off_max: i64,
 }
 
 pub struct Bench {
@@ -200,6 +206,9 @@ pub fn load_corpus(corpus_dir: &str) -> BoxResult<Vec<Bench>> {
                     start: int_field(pt, "start"),
                     min_len: int_field(pt, "min_len"),
                     max_len: int_field(pt, "max_len"),
+                    base: int_field(pt, "base"),
+                    off_min: int_field(pt, "off_min"),
+                    off_max: int_field(pt, "off_max"),
                 });
             }
         }
@@ -338,6 +347,13 @@ impl ParamStream {
                     self.serials[i] += 1;
                 }
                 "int_uniform" => args.push(Arg::Int(self.prng.int_uniform(p.min, p.max))),
+                "int_window" => {
+                    let base = match args[p.base as usize] {
+                        Arg::Int(n) => n,
+                        _ => panic!("int_window base must be an int param"),
+                    };
+                    args.push(Arg::Int(base + self.prng.int_uniform(p.off_min, p.off_max)));
+                }
                 "text" => args.push(Arg::Text(self.prng.text(p.min_len, p.max_len))),
                 other => panic!("unknown param gen {other}"),
             }

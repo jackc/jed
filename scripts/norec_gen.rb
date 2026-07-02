@@ -131,6 +131,14 @@ INDEX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert d
                dml.update dml.delete query.select query.where_eq query.comparison_order
                query.order_by expr.arithmetic expr.comparison_value types.i32
                null.three_valued].freeze
+INDEX_RANGE_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                     dml.insert_multi_row query.select query.comparison_order query.order_by
+                     query.index_range expr.arithmetic expr.comparison_value types.i32
+                     null.three_valued].freeze
+INDEX_PREFIX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                      dml.insert_multi_row query.select query.where_eq query.comparison_order
+                      query.order_by query.index_prefix query.index_range expr.arithmetic
+                      expr.comparison_value types.i32 null.three_valued].freeze
 INDEX_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                      dml.insert_multi_row query.select query.order_by query.order_by_keys
                      query.limit query.offset query.order_by_index_scan types.i32
@@ -508,6 +516,88 @@ def gen_index(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim}")
   ipair.call("v = #{present} after DELETE removed id #{victim}", present,
              flat.call(with_v.call(present)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: secondary-index RANGE scan (index range fetch vs full scan) ----------------------
+# A range on a secondary-indexed column (`v > K`, `v BETWEEN`, spec/design/indexes.md §5.1,
+# query.index_range) range-scans the index tree; the equivalent `v + 0 > K` is a BinaryOp, so the
+# detector (bare column only) does NOT use the index and it full-scans. Both must return identical
+# rows — including that a range never matches a NULL v (3VL, the NULL slot sorts past the range).
+def gen_index_range(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, v, w): v the indexed column over a moderate domain (so ranges admit varied subsets); one v
+  # is NULL.
+  rows = ids.map { |id| [id, id == null_id ? nil : rng.rand(0..30), rng.rand(-50..50)] }
+  flat = ->(rs) { rs.flat_map { |id, _v, w| [id.to_s, w.to_s] } }
+
+  out = header(seed, INDEX_RANGE_REQ, "secondary-index range scan (index range fetch vs full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v, w| "(#{id}, #{v.nil? ? 'NULL' : v}, #{w})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_v_idx ON t (v)")
+
+  # An OPTIMIZED range form (bare indexed column -> index range scan) and the semantically-equivalent
+  # `v + 0` form (a BinaryOp, so the detector does NOT use the index -> full scan) must return
+  # identical rows. `x + 0` equals `x` but defeats the bound.
+  rpair = lambda do |title, pred, plus, sel|
+    exp = flat.call(rows.select { |r| sel.call(r) })
+    out << "# #{title}"
+    out << "# index range (bare indexed column -> index range scan)"
+    q(out, "II", "SELECT id, w FROM t WHERE #{pred} ORDER BY id", exp)
+    out << "# full scan (+0 defeats the range bound) — MUST match"
+    q(out, "II", "SELECT id, w FROM t WHERE #{plus} ORDER BY id", exp)
+  end
+
+  lo = rng.rand(2..15)
+  hi = lo + rng.rand(4..14)
+  rpair.call("v > #{lo}", "v > #{lo}", "v + 0 > #{lo}", ->(r) { r[1] && r[1] > lo })
+  rpair.call("v >= #{lo} AND v < #{hi}", "v >= #{lo} AND v < #{hi}",
+             "v + 0 >= #{lo} AND v + 0 < #{hi}", ->(r) { r[1] && r[1] >= lo && r[1] < hi })
+  rpair.call("v <= #{hi}", "v <= #{hi}", "v + 0 <= #{hi}", ->(r) { r[1] && r[1] <= hi })
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: secondary-index multi-column PREFIX bound (prefix fetch vs full scan) -------------
+# A maximal equality prefix on a multi-column index's leading key columns (`a = K1 AND b = K2`,
+# spec/design/indexes.md §5.1, query.index_prefix), optionally followed by a range on the next
+# column (`a = K1 AND b > K2`), seeks the tight key range; the equivalent `a + 0 = K1 AND b + 0 = K2`
+# has no bare-column term, so it full-scans. Both must return identical rows.
+def gen_index_prefix(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(14, random: rng).sort
+  # (id, a, b, w): a, b over a small domain so a prefix admits several rows; one b is NULL (an
+  # equality on b never matches it — 3VL; an a-only prefix still admits it, b being unbounded).
+  rows = ids.map { |id| [id, rng.rand(0..3), rng.rand(0..3), rng.rand(-50..50)] }
+  null_id = ids.sample(random: rng)
+  rows = rows.map { |id, a, b, w| id == null_id ? [id, a, nil, w] : [id, a, b, w] }
+  flat = ->(rs) { rs.flat_map { |id, _a, _b, w| [id.to_s, w.to_s] } }
+
+  out = header(seed, INDEX_PREFIX_REQ, "secondary-index multi-column prefix bound (prefix fetch vs full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, a, b, w| "(#{id}, #{a}, #{b.nil? ? 'NULL' : b}, #{w})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_ab_idx ON t (a, b)")
+
+  ppair = lambda do |title, opt, plus, sel|
+    exp = flat.call(rows.select { |r| sel.call(r) })
+    out << "# #{title}"
+    out << "# prefix bound (bare columns -> index prefix scan)"
+    q(out, "II", "SELECT id, w FROM t WHERE #{opt} ORDER BY id", exp)
+    out << "# full scan (+0 defeats the prefix bound) — MUST match"
+    q(out, "II", "SELECT id, w FROM t WHERE #{plus} ORDER BY id", exp)
+  end
+
+  ka = rng.rand(0..3)
+  kb = rng.rand(0..2)
+  ppair.call("a = #{ka} AND b = #{kb} (equality prefix)", "a = #{ka} AND b = #{kb}",
+             "a + 0 = #{ka} AND b + 0 = #{kb}", ->(r) { r[1] == ka && r[2] == kb })
+  ppair.call("a = #{ka} AND b > #{kb} (prefix + trailing range)", "a = #{ka} AND b > #{kb}",
+             "a + 0 = #{ka} AND b + 0 > #{kb}", ->(r) { r[1] == ka && r[2] && r[2] > kb })
+  ppair.call("a = #{ka} (leading equality only, b unbounded)", "a = #{ka}",
+             "a + 0 = #{ka}", ->(r) { r[1] == ka })
 
   out.join("\n") + "\n"
 end
@@ -1393,6 +1483,8 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index_nested_loop" => method(:gen_index_nested_loop),
   "index" => method(:gen_index),
+  "index_range" => method(:gen_index_range),
+  "index_prefix" => method(:gen_index_prefix),
   "or_in" => method(:gen_or_in),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),

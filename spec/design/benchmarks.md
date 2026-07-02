@@ -77,7 +77,7 @@ iterations  = 50000                 # timed iterations
 seed        = 4201                  # splitmix64 seed for this bench's param stream (§4)
 
 [[bench.param]]                     # one entry per $N, ascending
-gen = "int_uniform"                 # "int_uniform" | "serial" | "text"
+gen = "int_uniform"                 # "int_uniform" | "serial" | "text" | "int_window"
 min = 1                             # int_uniform: inclusive bounds
 max = 1000000
 ```
@@ -98,7 +98,11 @@ Optional keys:
 
 Param generators: `int_uniform` (`min`/`max`, drawn as `min + next() % (max-min+1)`),
 `serial` (`start`; a monotonic counter that does **not** consume the PRNG — collision-free
-ids), `text` (`min_len`/`max_len`; a length draw then per-char draws — §4).
+ids), `text` (`min_len`/`max_len`; a length draw then per-char draws — §4), and `int_window`
+(`base`/`off_min`/`off_max`; the value of an **earlier** param at index `base` plus
+`int_uniform(off_min, off_max)` — a selective fixed-width range around a base param, e.g.
+`col BETWEEN $1 AND $2` with `$2 = $1 + [off_min, off_max]`, both endpoints const-sources so
+the range pushes down to an index bound).
 
 **Placeholder policy.** SQL uses `$N` with first occurrences in ascending order. jed and
 PostgreSQL bind `$N` natively; SQLite harnesses mechanically rewrite `$N` → `?N` at

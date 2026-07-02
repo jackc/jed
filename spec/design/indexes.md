@@ -147,53 +147,96 @@ base table, or a correlated subquery's inner table), the plan picks, in order:
 1. The **single-column PK bound**, if the WHERE AND-chain bounds the relation's PK
    (unchanged — the PK is the row's own key; it needs no second tree, supports ranges,
    and is strictly cheaper).
-2. Else, an **index equality bound**: among the relation's indexes whose **first key
-   column** has at least one equality conjunct `col = const-source` (literal, `$N`
-   param, or correlated outer column — the same `const-source` rule as the PK bound,
-   type-matched so a promoted comparison stays residual), the index with the **lowest
-   lowercased name** (a deterministic choice; cost-based selection is a later concern).
+2. Else, an **index access-predicate bound**: among the relation's B-tree indexes, the
+   one with the **lowest lowercased name** (a deterministic choice; cost-based selection
+   is a later concern) that yields a non-empty **access predicate** — a maximal
+   **equality prefix** on the index's leading key columns plus an **optional range** on
+   the next key column (§5.1). Each prefix/range term is a `col <cmp> const-source`
+   conjunct, `const-source` being a literal, `$N` param, or correlated outer / sibling
+   column (the same rule as the PK bound, type-matched so a promoted comparison stays
+   residual).
 3. Else, the full scan.
 
-**Execution** of an index equality bound: every equality conjunct's value is encoded; if
-any is NULL (3VL — `col = NULL` is never true) or the values disagree (contradictory
-`a = 1 AND a = 2`) or an integer is out of the column type's range, the scan is provably
-**empty** and reads nothing. Otherwise the index tree is range-scanned over the prefix
-`0x00 ‖ encode(value)` (every entry whose first slot equals the value — the upper bound
-is the prefix's byte-successor); in each admitted entry the **remaining key components
-are skipped** (each is self-delimiting: a `0x01` NULL tag alone, or `0x00` + the
-component type's fixed width), the suffix after them names the row's storage key, and
-the row is fetched from the table tree by **point lookup**, in index-entry order
-(= component order, then storage-key order, so downstream order-determinism — ORDER BY
-tie-breaking, DISTINCT first-occurrence — is unchanged). The WHERE stays the
-**residual filter**, re-applied to every fetched row: the bound only narrows which rows
-are scanned, so the result is always correct even where the bound is a superset.
+#### 5.1 The access predicate — equality prefix + optional trailing range
+
+A B-tree keyed on `(c₁, c₂, …, c_k)` can seek any predicate of the form "an equality on
+a *prefix* of the key columns, then at most one *range* on the next column" — the
+classic B-tree **access predicate**. The plan builds it by walking the index's key
+columns **in key order** against the WHERE AND-chain (indexes.md §5's `const-source`
+rule per column, an `=`/`<`/`<=`/`>`/`>=` conjunct with the column on either side,
+`BETWEEN` desugared):
+
+- While column `cᵢ` has an **equality** conjunct `cᵢ = const-source`, consume it into the
+  **equality prefix** and advance. (Several equalities on one column must agree at exec
+  time; a co-present range on a prefix column stays purely residual.)
+- At the first column `c_{p}` with **no** equality but **one or more range** conjuncts
+  (`<`/`<=`/`>`/`>=`), take those as the **range** and **stop** (no key column past a
+  range can be seeked).
+- Stop at the first column with no usable term.
+
+The bound is used iff it is **non-empty** — at least one leading equality, or a leading
+range. The chosen index is the lowest-lowercased-name index that produces one.
+
+**Execution.** Let `P` be the encoded equality prefix — the `0x00 ‖ encode(vᵢ)` slot of
+each prefix column's agreed value, concatenated ([encoding.md §2.2](encoding.md) present
+slot). If any prefix equality is NULL (3VL — `col = NULL` is never true), the several
+equalities on one column disagree (`a = 1 AND a = 2`), or an integer is out of the
+column type's range, the scan is provably **empty** and reads nothing. Otherwise the
+index tree is **range-scanned**:
+
+- **No range column** (pure equality prefix): the range is `[P, byte-successor(P))` —
+  every entry extending `P`, whatever the trailing columns hold (they are unbounded, so
+  their NULLs are admitted and the residual filter decides them).
+- **A range column** `c_p`: the range starts at `[P, P ‖ 0x01)` — the upper endpoint
+  `P ‖ 0x01` stops **before** `c_p`'s NULL slot (tag `0x01` sorts after every present
+  `0x00` slot), because a range comparison is never true for a NULL `c_p` (3VL). Each
+  range term then tightens it against the term's slot `S = 0x00 ‖ encode(v)`:
+  `c_p ≥ v` → lower `P ‖ S` inclusive; `c_p > v` → lower `byte-successor(P ‖ S)`
+  inclusive (skip the whole `c_p = v` subtree); `c_p < v` → upper `P ‖ S` exclusive;
+  `c_p ≤ v` → upper `byte-successor(P ‖ S)` exclusive. A NULL range endpoint makes the
+  bound empty; an out-of-range integer endpoint drops only its own half-bound (a wider,
+  still-sound scan); a contradictory pair (`c_p > 5 AND c_p < 5`) is empty.
+
+In each admitted entry the row's storage key is recovered by skipping the **equality
+prefix by its known byte length** `len(P)` and then every remaining key component —
+the range column (if any) and all trailing columns — by width (each self-delimiting: a
+`0x01` NULL tag alone, or `0x00` + the component type's fixed width); the suffix after
+them names the row's storage key, which is fetched from the table tree by **point
+lookup**, in index-entry order (= key order, then storage-key order, so downstream
+order-determinism — ORDER BY tie-breaking, DISTINCT first-occurrence — is unchanged). The
+WHERE stays the **residual filter**, re-applied to every fetched row: the bound only
+narrows which rows are scanned, so the result is always correct even where the bound is a
+superset.
 
 **Narrowings this slice** (documented, relaxable, each a follow-on optimization slice
-with its own NoREC obligation — conformance.md §8): only the **first** key column is
-bound (no multi-column prefix), **equality only** (no index range scans), `UPDATE` /
-`DELETE` scans keep their PK pushdown but do **not** use indexes, and the **LIMIT
-streaming short-circuit does not combine** with an index bound (an index-bounded scan
-with LIMIT takes the eager path — its cost reads the full admitted set).
+with its own NoREC obligation — conformance.md §8): `UPDATE` / `DELETE` scans keep their
+PK pushdown but do **not** use indexes, and the **LIMIT streaming short-circuit does not
+combine** with an index bound (an index-bounded scan with LIMIT takes the eager path —
+its cost reads the full admitted set).
 
-An index is **eligible for the bound only when all of its trailing key columns are
-fixed-width** — the tail-skip above recovers the row's storage key by advancing over each
-trailing component by its component type's *fixed* width, which a **non-scalar**
-(range/array/composite) or a **variable-width scalar** (`text` / `decimal` / `bytea` /
-`interval`) tail column does not have. A multi-column index with such a tail column is
-therefore **not used for the bound**: the query takes the full scan + residual filter
-(rows identical, only the cost differs — `query/index_scan_vartail.test` pins this the cost
-way, and the fixed-width-tail control proves the gate is precise). The **leading** bound
-column itself may be variable-width — its value is matched as the encoded prefix
-`0x00 ‖ encode(value)`, never skipped by width (`collation/collated_pushdown.test`). Lifting
-this is a follow-on: skip a variable-width tail by its self-delimiting length, not a fixed
-width.
+An index is **eligible for the bound only when every key column from the range column
+onward** — i.e. all columns **after the equality prefix** — is a **fixed-width scalar**.
+The suffix-skip above recovers the row's storage key by advancing over each such
+component by its type's *fixed* width, which a **non-scalar** (range/array/composite) or
+a **variable-width scalar** (`text` / `decimal` / `bytea` / `interval`) does not have.
+The **equality-prefix columns may be any width** (including collated `text`) — their
+slots are matched as the known encoded prefix `P`, skipped by `len(P)`, never by width;
+so a multi-column index whose leading columns are variable-width is now usable **when the
+WHERE pins them by equality** (`a = 'x' AND b > 3` over `(a text, b i32)` seeks; a bare
+`b > 3` there does not, because `a`'s slot is then unknown and variable-width). An index
+whose range column or a trailing unbounded column is variable-width is **not used for the
+bound**: the query takes the full scan + residual filter (rows identical, only the cost
+differs — `query/index_scan_vartail.test` pins this the cost way). Lifting the
+fixed-width tail requirement is a follow-on: skip a variable-width component by its
+self-delimiting length, not a fixed width.
 
 ### Cost (the cross-core contract — cost.md §3)
 
 An index-bounded scan accrues, in place of the full-scan block:
 
-- `page_read` × the index-tree nodes overlapping the prefix range (the same
-  overlap-node rule as a PK bounded scan, applied to the index tree);
+- `page_read` × the index-tree nodes overlapping the access-predicate range (the same
+  overlap-node rule as a PK bounded scan, applied to the index tree — an equality prefix
+  narrows it, a range on the trailing column widens it, exactly like a PK point vs. range);
 - per admitted entry: `page_read` × the table-tree nodes overlapping the **point**
   bound of that row's storage key (the root-to-row descent), plus that row's
   touched-column `value_decompress` slabs (large-values.md §14);

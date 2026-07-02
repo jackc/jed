@@ -1,0 +1,146 @@
+# Index range scans (spec/design/indexes.md §5.1, cost.md §3 "index-bounded scan"): a SELECT
+# base-relation scan whose bound column has a RANGE conjunct (`col < c`, `col > c`, BETWEEN,
+# AND-combinations) over an index's LEADING key column range-scans the index tree over the
+# corresponding key range instead of a full scan. The range endpoints encode into the index key
+# space; the upper endpoint stops before the range column's NULL slot (a range is never true for
+# NULL, 3VL). A NULL endpoint / contradictory pair is a provably-empty bound. The WHERE stays the
+# residual filter, so rows NEVER change — only cost does. Cost is the cross-core contract: page_read
+# × (index nodes overlapping the range + per admitted entry the table-tree point-lookup nodes) +
+# storage_row_read per fetched row.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.comparison_order, query.order_by, query.limit, query.point_lookup, query.index_range, types.i32, null.three_valued, resource.cost_metering, expr.between
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+INSERT INTO t VALUES (1,10,101),(2,20,102),(3,30,103),(4,40,104),(5,50,105),(6,60,106),(7,70,107),(8,80,108),(9,90,109),(10,100,110)
+
+# the full-scan baseline (no index yet): page_read(1) + 10 rows + 10 filter evals + 5 produced = 26
+# cost: 26
+query I nosort
+SELECT id FROM t WHERE v > 55 ORDER BY id
+----
+6
+7
+8
+9
+10
+
+statement ok
+CREATE INDEX t_v_idx ON t (v)
+
+# the same query now index-range-bounds: index node(1) + 5 point lookups(5) + 5 rows
+# + 5 filter evals + 5 produced = 21 — identical rows, lower cost
+# cost: 21
+query I nosort
+SELECT id FROM t WHERE v > 55 ORDER BY id
+----
+6
+7
+8
+9
+10
+
+# a two-sided half-open range [30, 70): index(1) + 4 lookups(4) + 4 rows + 4×3 evals + 4 produced = 25
+# cost: 25
+query I nosort
+SELECT id FROM t WHERE v >= 30 AND v < 70 ORDER BY id
+----
+3
+4
+5
+6
+
+# BETWEEN desugars to v >= 20 AND v <= 50 (both inclusive): 1 + 4 + 4 + 12 + 4 = 25
+# cost: 25
+query I nosort
+SELECT id FROM t WHERE v BETWEEN 20 AND 50 ORDER BY id
+----
+2
+3
+4
+5
+
+# an upper-only range: index(1) + 2 lookups(2) + 2 rows + 2 evals + 2 produced = 9
+# cost: 9
+query I nosort
+SELECT id FROM t WHERE v <= 25 ORDER BY id
+----
+1
+2
+
+# a contradictory range is provably empty: no page, no row
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE v > 100 AND v < 10
+----
+
+# a range past every stored value descends the index (1 node) but admits nothing
+# cost: 1
+query I nosort
+SELECT id FROM t WHERE v > 1000
+----
+
+# --- a range excludes NULL (3VL) -------------------------------------------------
+
+statement ok
+UPDATE t SET v = NULL WHERE id = 5
+
+# id=5's v (was 50) is now NULL; the range [40, 60] admits only present values 40, 60 —
+# the NULL is excluded even though its index slot sorts after every present value:
+# index(1) + 2 lookups(2) + 2 rows + 2×3 evals + 2 produced = 13
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE v >= 40 AND v <= 60 ORDER BY id
+----
+4
+6
+
+# an unbounded-above range past 45: present v in {60,70,80,90,100}; the NULL (id 5) sorts
+# high but is excluded by the range's NULL-stop upper endpoint: 1 + 5 + 5 + 5 + 5 = 21
+# cost: 21
+query I nosort
+SELECT id FROM t WHERE v > 45 ORDER BY id
+----
+6
+7
+8
+9
+10
+
+# --- range + PK: the single-column PK range bound wins over the index -------------
+
+# WHERE bounds BOTH id (PK) and v (indexed); the PK bound is chosen (its own key, cheaper):
+# page_read(1, one leaf) + 3 rows in [7,9] + 3×5 evals (>=,<=,>,AND,AND) + 3 produced = 22
+# cost: 22
+query I nosort
+SELECT id FROM t WHERE id >= 7 AND id <= 9 AND v > 0 ORDER BY id
+----
+7
+8
+9
+
+# --- LIMIT does not stream over an index bound (eager path; only row_produced drops) --
+
+# 21 with 4 fewer produced = 17
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE v > 55 ORDER BY id LIMIT 1
+----
+6
+
+# --- dropping the index restores the full-scan cost — the rows never move ---------
+
+statement ok
+DROP INDEX t_v_idx
+
+# cost: 26
+query I nosort
+SELECT id FROM t WHERE v > 55 ORDER BY id
+----
+6
+7
+8
+9
+10

@@ -105,6 +105,12 @@ export interface Param {
   start: bigint;
   minLen: bigint;
   maxLen: bigint;
+  // int_window: base is the 0-based index of an EARLIER param; the value is that param's value +
+  // intUniform(offMin, offMax). Lets a bench express a selective fixed-width range around a base
+  // param (both endpoints const-sources).
+  base: bigint;
+  offMin: bigint;
+  offMax: bigint;
 }
 
 export interface Bench {
@@ -177,6 +183,9 @@ export function loadCorpus(corpusDir: string): Bench[] {
         start: big(p.start),
         minLen: big(p.min_len),
         maxLen: big(p.max_len),
+        base: big(p.base),
+        offMin: big(p.off_min),
+        offMax: big(p.off_max),
       });
     }
     benches.push({
@@ -252,18 +261,30 @@ export class ParamStream {
   }
 
   next(): Arg[] {
-    return this.params.map((p, i) => {
+    // Sequential (not .map) so int_window can reference an EARLIER arg in the same row.
+    const args: Arg[] = [];
+    this.params.forEach((p, i) => {
       switch (p.gen) {
         case "serial":
-          return this.serials[i]++;
+          args.push(this.serials[i]++);
+          break;
         case "int_uniform":
-          return this.prng.intUniform(p.min, p.max);
+          args.push(this.prng.intUniform(p.min, p.max));
+          break;
+        case "int_window": {
+          const base = args[Number(p.base)];
+          if (typeof base !== "bigint") throw new Error("int_window base must be an int param");
+          args.push(base + this.prng.intUniform(p.offMin, p.offMax));
+          break;
+        }
         case "text":
-          return this.prng.text(p.minLen, p.maxLen);
+          args.push(this.prng.text(p.minLen, p.maxLen));
+          break;
         default:
           throw new Error(`unknown param gen ${p.gen}`);
       }
     });
+    return args;
   }
 }
 

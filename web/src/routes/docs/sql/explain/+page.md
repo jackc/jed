@@ -19,6 +19,7 @@ INSERT INTO trip VALUES (1, 3), (2, 1), (3, 3);`;
 	const fullScan = `EXPLAIN SELECT name FROM city ORDER BY name;`;
 	const pkBound = `EXPLAIN SELECT name FROM city WHERE id = 3;`;
 	const indexBound = `EXPLAIN SELECT name FROM city WHERE region = 1;`;
+	const indexRange = `EXPLAIN SELECT name FROM city WHERE region > 1;`;
 	const pointSet = `EXPLAIN SELECT name FROM city WHERE id IN (1, 3, 5);`;
 	const indexNestedLoop = `EXPLAIN SELECT c.name
 FROM trip t JOIN city c ON c.id = t.city_id;`;
@@ -63,9 +64,19 @@ column and predicate. The original `WHERE` stays as the residual `Filter` above 
 
 ## A secondary-index bound
 
-An equality on an indexed non-key column uses the index — `Index bound: using <index>`.
+A predicate on an indexed non-key column uses the index — `Index bound: using <index>`. An
+**equality** (`region = 1`) seeks the matching entries:
 
 <LiveSql seed={seed} query={indexBound} rows={8} />
+
+A **range** on an indexed column (`region > 1`, `<`, `<=`, `>=`, `BETWEEN`) is bounded the same way —
+jed range-scans the index leaves instead of the whole table:
+
+<LiveSql seed={seed} query={indexRange} rows={8} />
+
+On a **composite** index over `(a, b, …)` the bound extends to a **multi-column prefix**: an equality
+on the leading columns, optionally followed by a range on the next (`a = 1 AND b > 3`). The `WHERE`
+always stays the residual filter, so the rows are identical to a full scan — only the work drops.
 
 ## An OR / IN-list of keys
 

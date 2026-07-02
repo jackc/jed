@@ -35,12 +35,18 @@ type Bench struct {
 
 // Param is one $N parameter generator.
 type Param struct {
-	Gen    string `toml:"gen"` // int_uniform | serial | text
+	Gen    string `toml:"gen"` // int_uniform | serial | text | int_window
 	Min    int64  `toml:"min"`
 	Max    int64  `toml:"max"`
 	Start  int64  `toml:"start"`
 	MinLen int64  `toml:"min_len"`
 	MaxLen int64  `toml:"max_len"`
+	// int_window: base is the 0-based index of an EARLIER param; the value is that param's value +
+	// int_uniform(off_min, off_max). Lets a bench express a selective fixed-width range around a base
+	// param (`col BETWEEN $1 AND $2` with $2 = $1 + [off_min, off_max]) — both endpoints const-sources.
+	Base   int64 `toml:"base"`
+	OffMin int64 `toml:"off_min"`
+	OffMax int64 `toml:"off_max"`
 }
 
 // SQLFor returns the bench's SQL for an engine, honoring sql_override.
@@ -128,6 +134,8 @@ func (s *ParamStream) Next() []any {
 			s.serials[i]++
 		case "int_uniform":
 			args[i] = s.prng.IntUniform(p.Min, p.Max)
+		case "int_window":
+			args[i] = args[p.Base].(int64) + s.prng.IntUniform(p.OffMin, p.OffMax)
 		case "text":
 			args[i] = s.prng.Text(p.MinLen, p.MaxLen)
 		default:

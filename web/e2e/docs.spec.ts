@@ -311,18 +311,18 @@ test('the explain page renders a live plan with the PK-bound access path', async
 
 test('the explain page shows the OR / IN-list merged point-set access path', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Fourth panel = EXPLAIN SELECT ... WHERE id IN (1, 3, 5): a union of point probes, labelled
+  // Fifth panel = EXPLAIN SELECT ... WHERE id IN (1, 3, 5): a union of point probes, labelled
   // "PK point set" (cost.md §3 "OR / IN-list").
-  const panel = page.getByTestId('live-sql').nth(3);
+  const panel = page.getByTestId('live-sql').nth(4);
   await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
   await expect(panel.getByTestId('result-rows')).toContainText('PK point set: id in (1, 3, 5)');
 });
 
 test('the explain page shows the index-nested-loop access path on a join', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Fifth panel = EXPLAIN SELECT ... FROM trip JOIN city ON city.id = trip.city_id: the inner city
+  // Sixth panel = EXPLAIN SELECT ... FROM trip JOIN city ON city.id = trip.city_id: the inner city
   // scan is a per-outer-row PK seek, labelled Index-nested-loop.
-  const panel = page.getByTestId('live-sql').nth(4);
+  const panel = page.getByTestId('live-sql').nth(5);
   await expect(panel.getByTestId('result-rows')).toContainText('Nested Loop');
   await expect(panel.getByTestId('result-rows')).toContainText(
     'Index-nested-loop PK bound: id = join'
@@ -331,8 +331,8 @@ test('the explain page shows the index-nested-loop access path on a join', async
 
 test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Seventh panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
-  const panel = page.getByTestId('live-sql').nth(6);
+  // Eighth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
+  const panel = page.getByTestId('live-sql').nth(7);
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('cost=');
 });

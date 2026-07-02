@@ -154,6 +154,35 @@ gen = "int_uniform"
 min = 1
 max = 100000
 
+# Secondary-index RANGE scan (spec/design/indexes.md §5.1, query.index_range): a selective
+# fixed-width range on the SECONDARY-INDEXED customer_id column (`BETWEEN $1 AND $2` with $2 = $1 +
+# [32,96], both endpoints bind-param const-sources) range-scans orders_customer_idx over ~640 rows
+# instead of full-scanning the 1M-row table. Before this feature a secondary-index range full-scanned;
+# now it seeks the index leaves for the range + point-looks-up each row. The int_window param keeps
+# the width small so the range is genuinely selective (a wide secondary-index range would pessimize
+# into a point-lookup storm — jed applies the bound structurally, no cost-based choice yet). All
+# engines; the cross-engine checksum is plan-independent.
+[[bench]]
+name = "index_range"
+description = "Selective range on a SECONDARY-INDEX column over 1M rows — an index range scan (customer_id BETWEEN $1 AND $1+[32,96]) vs. a full scan (indexes.md §5.1, query.index_range)"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
+warmup = 500
+iterations = 8000
+seed = 4241
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 99900
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 32
+off_max = 96
+
 [[bench]]
 name = "full_scan_agg"
 description = "Full-table aggregate over 1M rows (count + sum)"

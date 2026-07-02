@@ -1,0 +1,158 @@
+# Index multi-column prefix bounds (spec/design/indexes.md §5.1, cost.md §3 "index-bounded scan"):
+# an index-bounded SELECT scan binds MORE than the leading key column — a maximal EQUALITY PREFIX on
+# the index's leading key columns (`a = 1 AND b = 2` on index (a, b) seeks the (a=1, b=2) key range
+# instead of scanning all a=1 and residual-filtering b), optionally followed by a range on the next
+# column. The equality-prefix columns encode into a concatenated key prefix P and may be ANY width
+# including collated text (skipped by known byte length, not width), so a multi-column index whose
+# leading columns are variable-width becomes usable when the WHERE pins them by equality. The WHERE
+# stays the residual filter, so rows NEVER change — only cost drops (a tighter bound scans fewer index
+# entries). A prefix equality against NULL / a disagreement between two equalities on one column is a
+# provably-empty bound.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.update, query.select, query.where_eq, query.comparison_order, query.order_by, query.index_prefix, query.index_range, types.i32, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, c i32)
+
+statement ok
+INSERT INTO t VALUES (1,1,1,10),(2,1,2,20),(3,1,3,30),(4,2,1,40),(5,2,2,50),(6,2,3,60),(7,1,2,70),(8,3,1,80)
+
+# the full-scan baseline (no index yet): page_read(1) + 8 rows + 8×3 filter evals + 2 produced = 35
+# cost: 35
+query I nosort
+SELECT id FROM t WHERE a = 1 AND b = 2 ORDER BY id
+----
+2
+7
+
+statement ok
+CREATE INDEX t_ab_idx ON t (a, b)
+
+# the equality prefix (a=1, b=2) seeks the exact key range — index node(1) + 2 point lookups(2)
+# + 2 rows + 2×3 filter evals + 2 produced = 13. (A single-column bound on a=1 alone would scan
+# 4 entries; the prefix scans exactly 2.)
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE a = 1 AND b = 2 ORDER BY id
+----
+2
+7
+
+# equality prefix (a=1) + a trailing range (b > 1): index(1) + 3 lookups(3) + 3 rows
+# + 3×3 evals + 3 produced = 19
+# cost: 19
+query I nosort
+SELECT id FROM t WHERE a = 1 AND b > 1 ORDER BY id
+----
+2
+3
+7
+
+# equality prefix + a two-sided trailing range b in [2, 3): index(1) + 2(2) + 2 rows
+# + 2×5 evals (=, >=, <, AND, AND) + 2 produced = 17
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE a = 1 AND b >= 2 AND b < 3 ORDER BY id
+----
+2
+7
+
+# a leading-equality-only bound (a = 2), b unbounded: index(1) + 3(3) + 3 rows + 3 evals + 3 = 13
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE a = 2 ORDER BY id
+----
+4
+5
+6
+
+# two disagreeing equalities on the prefix's 2nd column is provably empty: no page, no row
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE a = 1 AND b = 2 AND b = 3
+----
+
+# a leading-equality-only bound admits every trailing value, NULL included (b is unbounded):
+# index(1) + 4(4) + 4 rows + 4 evals + 4 produced = 17
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE a = 1 ORDER BY id
+----
+1
+2
+3
+7
+
+# --- NULL handling in the trailing column ----------------------------------------
+
+statement ok
+UPDATE t SET b = NULL WHERE id = 3
+
+# a trailing RANGE excludes the NULL (id 3's b is now NULL): a=1 AND b>1 admits only b=2
+# (ids 2, 7) — index(1) + 2(2) + 2 rows + 2×3 evals + 2 produced = 13
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE a = 1 AND b > 1 ORDER BY id
+----
+2
+7
+
+# but a leading-equality-only bound still admits the NULL-b row (b unbounded): ids 1,2,3,7
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE a = 1 ORDER BY id
+----
+1
+2
+3
+7
+
+# --- a VARIABLE-WIDTH (text) equality-prefix column, then a fixed-width range -----
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, name text, v i32)
+
+statement ok
+INSERT INTO u VALUES (1,'alice',10),(2,'alice',20),(3,'bob',30),(4,'alice',40),(5,'bob',5),(6,'carol',15)
+
+statement ok
+CREATE INDEX u_nv_idx ON u (name, v)
+
+# the text prefix column encodes into P by known byte length (never width-skipped), so the index
+# is usable even though `name` is variable-width; then the fixed-width range v > 15 tightens it.
+# (Cost includes the text `=`'s varlen_compare over the 5-code-point 'alice': index(1)+2(2)+2 rows
+# + 2×[=(1)+varlen(4)+>(1)+AND(1)] + 2 produced = 21.)
+# cost: 21
+query I nosort
+SELECT id FROM u WHERE name = 'alice' AND v > 15 ORDER BY id
+----
+2
+4
+
+# a single text-equality prefix (name = 'bob', 3 code points): index(1)+2(2)+2 rows
+# + 2×[=(1)+varlen(2)] + 2 produced = 13
+# cost: 13
+query I nosort
+SELECT id FROM u WHERE name = 'bob' ORDER BY id
+----
+3
+5
+
+# text prefix + a two-sided fixed-width range v in [20, 40]
+# cost: 25
+query I nosort
+SELECT id FROM u WHERE name = 'alice' AND v >= 20 AND v <= 40 ORDER BY id
+----
+2
+4
+
+# a bare RANGE on the variable-width LEADING column is NOT eligible (the range column would be
+# width-skipped, but text has no fixed width) — so this takes the full scan + residual filter;
+# the rows are still correct
+# cost: 36
+query I nosort
+SELECT id FROM u WHERE name > 'alice' ORDER BY id
+----
+3
+5
+6

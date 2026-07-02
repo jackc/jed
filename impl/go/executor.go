@@ -12481,32 +12481,122 @@ type ginBoundPlan struct {
 	colGlobal int
 }
 
-// indexBoundPlan is the plan-time result of index analysis (indexes.md §5): the chosen
-// index (lowest lowercased name whose FIRST key column has an equality conjunct), that
-// column's storage type, and every equality const-source on it. At exec time the sources
-// must agree on one value (else the bound is provably empty) and the index is
-// range-scanned over that value's presence-tagged prefix.
-type indexBoundPlan struct {
-	nameKey string // the index store's key — the lowercased index name
+// indexEqCol is one column of an index access predicate's equality prefix (indexes.md §5.1):
+// the column's storage type, its key collation (nil unless it is a Full-collated text column),
+// and every equality const-source bound to it. At exec time the sources must agree on one value
+// (else the bound is provably empty). A collated column encodes its probe via the UCA sort key
+// (encoding.md §2.12) to match the index's stored key form (collation.md §8).
+type indexEqCol struct {
 	colType scalarType
-	eqs     []*rExpr
-	// coll is the leading key column's resolved collation when it is collated AND Full — the
-	// equality probe encodes via its UCA sort key (encoding.md §2.12) to match the index's stored
-	// key form (spec/design/collation.md §8). nil for a C (raw-byte) column. A Skewed collated index
-	// never produces an indexBoundPlan (keyCollationCtx refuses it — collation.md §12).
-	coll *Collation
-	// tailTypes is the REMAINING key components' types (columns[1:]): an admitted
-	// entry's row-key suffix sits after every component slot, so the fetch skips these
-	// (each slot is self-delimiting — a 0x01 NULL tag alone, or 0x00 + the type's fixed
-	// width).
-	tailTypes []scalarType
+	coll    *Collation
+	srcs    []*rExpr
+}
+
+// indexBoundPlan is the plan-time result of index analysis (indexes.md §5.1): the chosen index
+// (lowest lowercased name yielding a non-empty access predicate) and the predicate — a maximal
+// EQUALITY PREFIX on the leading key columns (eqCols) plus an OPTIONAL RANGE on the next column
+// (rangeTerms / rangeType). At exec time buildIndexBound turns these into a concrete index-key
+// range: the equality prefix bytes P = concatenated present slots, then the range (if any)
+// intersected relative to P. suffixTypes are the types of the index columns AFTER the equality
+// prefix (columns[len(eqCols):]) — the range column (if any) plus every trailing column — each
+// FIXED-WIDTH so an admitted entry's row-key suffix is recovered by width-skipping them past P.
+type indexBoundPlan struct {
+	nameKey     string // the index store's key — the lowercased index name
+	eqCols      []indexEqCol
+	rangeType   scalarType  // the range column's type (meaningful iff rangeTerms != nil)
+	rangeTerms  []boundTerm // range conjuncts on the column after the equality prefix (nil ⇒ none)
+	suffixTypes []scalarType
+}
+
+// buildIndexAccessPredicate constructs an index access predicate for idx over rel (indexes.md
+// §5.1): a maximal EQUALITY PREFIX on the leading key columns plus an OPTIONAL RANGE on the next
+// column. It walks the index's key columns in key order against the WHERE AND-chain, consuming a
+// column with an agreed equality conjunct into the prefix and stopping at the first column that
+// has no equality (taking its range conjuncts, if any, as the trailing range). Returns nil for a
+// non-B-tree index, a Skewed collated bound column (whose stored keys are at the file's pinned
+// version — collation.md §12), no bound at all, or an ineligible suffix (a column after the
+// equality prefix that is not a fixed-width scalar — the width-based key-suffix skip needs it).
+// siblingCutoff opens the index-nested-loop door (>= 0 admits a bare sibling reColumn as a bound
+// source, resolved per outer row); -1 is the ordinary once-materialized bound.
+func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx indexDef, siblingCutoff int) *indexBoundPlan {
+	if idx.Kind != indexBtree {
+		return nil
+	}
+	var eqCols []indexEqCol
+	var rangeType scalarType
+	var rangeTerms []boundTerm
+	for _, ci := range idx.Columns {
+		// A non-scalar (range/array/composite) column cannot be seeked here — stop the prefix.
+		ty, ok := rel.table.Columns[ci].Type.AsScalar()
+		if !ok {
+			break
+		}
+		// The column's key collation form (collation.md §8/§12): a Skewed collated column refuses the
+		// bound (its stored keys are wrong for the loaded bundle) — stop the prefix here (the column
+		// then falls into the fixed-width suffix check below and rejects the whole index if it is text).
+		coll, push := db.keyCollationCtx(rel.table.Columns[ci])
+		if !push {
+			break
+		}
+		colColl := ""
+		if coll != nil {
+			colColl = coll.Name
+		}
+		var eqs []*rExpr
+		var ranges []boundTerm
+		var walk func(e *rExpr)
+		walk = func(e *rExpr) {
+			if e == nil {
+				return
+			}
+			if e.kind == reAnd {
+				walk(e.lhs)
+				walk(e.rhs)
+				return
+			}
+			if t, ok := asBoundTerm(e, rel.offset+ci, ty, colColl, siblingCutoff); ok {
+				if t.op == opEq {
+					eqs = append(eqs, t.src)
+				} else {
+					ranges = append(ranges, t)
+				}
+			}
+		}
+		walk(filter)
+		if len(eqs) > 0 {
+			eqCols = append(eqCols, indexEqCol{colType: ty, coll: coll, srcs: eqs})
+			continue // extend the equality prefix
+		}
+		if len(ranges) > 0 {
+			rangeType = ty
+			rangeTerms = ranges
+		}
+		break // first non-equality column ends the prefix (with or without a trailing range)
+	}
+	if len(eqCols) == 0 && rangeTerms == nil {
+		return nil // nothing bound
+	}
+	// Eligibility: every index column from the range column onward (columns[len(eqCols):]) is
+	// width-skipped past the known equality prefix, so each must be a fixed-width scalar. The
+	// equality-prefix columns may be any width — their slots are matched as the known prefix bytes.
+	suffix := make([]scalarType, 0, len(idx.Columns)-len(eqCols))
+	for _, c := range idx.Columns[len(eqCols):] {
+		s, ok := rel.table.Columns[c].Type.AsScalar()
+		if !ok || !s.IsFixedWidth() {
+			return nil
+		}
+		suffix = append(suffix, s)
+	}
+	return &indexBoundPlan{
+		nameKey: strings.ToLower(idx.Name), eqCols: eqCols,
+		rangeType: rangeType, rangeTerms: rangeTerms, suffixTypes: suffix,
+	}
 }
 
 // detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
 // single-column PK bound first; else, among the relation's indexes (held in ascending
-// lowercased-name order — the deterministic tie-break), the first whose FIRST key column
-// has at least one equality conjunct against a type-matched const-source; else nil (full
-// scan).
+// lowercased-name order — the deterministic tie-break), the first that yields a non-empty
+// access predicate (buildIndexAccessPredicate); else nil (full scan).
 func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
 		// Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
@@ -12523,60 +12613,12 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 		}
 	}
 	for _, idx := range rel.table.Indexes {
-		// Only an ordered B-tree is an ordered-equality bound. A GIN index is keyed by array terms
-		// (gin.md §6); a GiST index is keyed by a bounding [min,max] / range, NOT the whole value — a
-		// scalar GiST index's store key is [v,v]‖skey, not the ordered-index key form, so it must NOT
-		// be probed here (handled by the GiST pass below, gist.md §5/§6). Both are skipped.
-		if idx.Kind != indexBtree {
-			continue
-		}
-		ci := idx.Columns[0]
-		// An ordered index whose leading (or any) key column is a non-scalar (range) does not
-		// pushdown — point-lookup is deferred for containers (ranges.md §10); the index is still
-		// maintained, the scan is just full + residual.
-		ty, ok := rel.table.Columns[ci].Type.AsScalar()
-		if !ok {
-			continue
-		}
-		// The tail-slot skip in indexBoundRows advances over each trailing key component by its
-		// FIXED width (WidthBytes), which exists only for the fixed-width scalars. A tail column
-		// that is non-scalar (range/array/composite) OR a variable-width scalar (text/decimal/
-		// bytea/interval) has no fixed width, so the index cannot pushdown: fall through to the
-		// full scan + residual filter (rows identical, just no index bound).
-		unskippableTail := false
-		for _, c := range idx.Columns[1:] {
-			s, ok := rel.table.Columns[c].Type.AsScalar()
-			if !ok || !s.IsFixedWidth() {
-				unskippableTail = true
-				break
-			}
-		}
-		if unskippableTail {
-			continue
-		}
-		// The leading column's key collation form (as for the PK above). A Skewed collated index is
-		// skipped (push=false) — its stored keys are at the file's pinned version, wrong for the
-		// loaded one, so it must not be seeked (collation.md §12; the tripwire suites/collation/skew.test).
-		coll, push := db.keyCollationCtx(rel.table.Columns[ci])
-		if !push {
-			continue
-		}
-		var eqs []*rExpr
-		if bp := detectPKBound(filter, rel.offset+ci, ty, coll); bp != nil {
-			for _, t := range bp.terms {
-				if t.op == opEq {
-					eqs = append(eqs, t.src)
-				}
-			}
-		}
-		if len(eqs) > 0 {
-			tail := make([]scalarType, 0, len(idx.Columns)-1)
-			for _, c := range idx.Columns[1:] {
-				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
-			}
-			return &scanBound{index: &indexBoundPlan{
-				nameKey: strings.ToLower(idx.Name), colType: ty, eqs: eqs, coll: coll, tailTypes: tail,
-			}}
+		// An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
+		// range over a B-tree index's leading key columns. Returns nil for a GIN/GiST index (handled
+		// by the passes below), an ineligible tail, or no bound. Indexes are held in ascending
+		// lowercased-name order, so the first non-nil wins — the deterministic tie-break.
+		if ib := db.buildIndexAccessPredicate(filter, rel, idx, -1); ib != nil {
+			return &scanBound{index: ib}
 		}
 	}
 	// GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered
@@ -12797,12 +12839,18 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 			}
 		}
 		if siblingEq {
+			// This slice keeps the index-nested-loop bound single-column-equality (a leading key
+			// column bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md
+			// §3 "index-nested-loop"). suffixTypes are the trailing columns (columns[1:], fixed-width
+			// by the unskippableTail check above), width-skipped past the single equality slot.
 			tail := make([]scalarType, 0, len(idx.Columns)-1)
 			for _, c := range idx.Columns[1:] {
 				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 			}
 			return &scanBound{index: &indexBoundPlan{
-				nameKey: strings.ToLower(idx.Name), colType: ty, eqs: eqs, coll: coll, tailTypes: tail,
+				nameKey:     strings.ToLower(idx.Name),
+				eqCols:      []indexEqCol{{colType: ty, coll: coll, srcs: eqs}},
+				suffixTypes: tail,
 			}}
 		}
 	}
@@ -13073,57 +13121,109 @@ func rexprIsConstant(e *rExpr) bool {
 	return true
 }
 
-// indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):
-// fetch the rows the equality admits, in index-entry order (= storage-key order among
-// equal values), and return them with the scan's up-front units (pages, slabs) — the
-// index-tree nodes overlapping the prefix range plus, per admitted entry, the table-tree
-// nodes of that row's point lookup and its touched-column decompress slabs. The caller
-// feeds the rows through the same scanSource as any bounded scan (page_read block +
-// per-row storage_row_read). A provably empty bound (NULL / contradictory equalities /
-// out-of-range) returns nothing and charges nothing.
+// indexBoundRows executes an index access-predicate bound (cost.md §3 "index-bounded scan",
+// indexes.md §5.1): build the concrete index-key range from the equality prefix + optional
+// trailing range, then fetch the rows it admits, in index-entry order (= key order, then
+// storage-key order), with the scan's up-front units (pages, slabs) — the index-tree nodes
+// overlapping the range plus, per admitted entry, the table-tree nodes of that row's point
+// lookup and its touched-column decompress slabs. The caller feeds the rows through the same
+// scanSource as any bounded scan. A provably empty bound (a NULL / contradictory equality, a
+// NULL / contradictory range, an out-of-range integer) returns nothing and charges nothing.
 func (db *engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (rows []storedRow, pages, slabs int, err error) {
-	// Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
-	// true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
-	// integer can equal no stored value — all provably empty.
-	var agreed []byte
-	for _, src := range ib.eqs {
-		key, isNull, ok := encodeBoundKey(ib.colType, src, params, outer, ib.coll, left)
-		if isNull || !ok {
-			return nil, 0, 0, nil
-		}
-		if agreed == nil {
-			agreed = key
-		} else if !bytes.Equal(agreed, key) {
-			return nil, 0, 0, nil
-		}
+	b, prefixByteLen, empty := db.buildIndexBound(ib, params, outer, left)
+	if empty {
+		return nil, 0, 0, nil
 	}
-	return db.indexPointRows(tableName, ib, agreed, mask)
+	return db.indexScanBound(tableName, ib.nameKey, ib.suffixTypes, b, prefixByteLen, mask)
 }
 
-// indexPointRows fetches the rows a SINGLE already-encoded index value admits — the prefix
-// scan of the index B-tree plus, per admitted entry, the row's point lookup — returning them
-// in index-entry order with the scan's up-front (pages, slabs) block. Factored out of
-// indexBoundRows so both the single-value equality bound (indexBoundRows) and the OR / IN-list
-// point-set bound (indexKeySetRows) drive the identical per-value fetch — same cost by
-// construction (cost.md §3 "index-bounded scan" / "OR / IN-list").
-func (db *engine) indexPointRows(tableName string, ib *indexBoundPlan, valueKey []byte, mask []bool) (rows []storedRow, pages, slabs int, err error) {
-	// The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
-	// is every entry extending the prefix: [prefix, byte-successor(prefix)).
-	prefix := append([]byte{0x00}, valueKey...)
-	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
-	istore := db.lkpIndexStore(ib.nameKey)
-	// The index store has no payload columns, so its mask is empty and its fused scan
-	// contributes only the index-tree page_read count (no spill/compress units).
+// buildIndexBound turns an index access predicate into a concrete index-key range at exec time
+// (indexes.md §5.1). It encodes the equality prefix into P (the concatenated present slots), then
+// — if there is a range column — starts from [P, P‖0x01) (the upper endpoint stops before the
+// range column's NULL slot, since a range is never true for NULL) and intersects each range term;
+// otherwise the range is [P, byte-successor(P)) (every entry extending P). empty=true ⇒ the bound
+// admits no key (a NULL / disagreeing prefix equality, a NULL range endpoint, or a contradictory
+// range). prefixByteLen = len(P), the byte count the row-key suffix skip advances past the
+// equality-prefix slots before width-skipping the remaining components.
+func (db *engine) buildIndexBound(ib *indexBoundPlan, params []Value, outer []storedRow, left storedRow) (b keyBound, prefixByteLen int, empty bool) {
+	var p []byte
+	for _, ec := range ib.eqCols {
+		// Every equality const-source on this column must encode to ONE agreed value: a NULL is
+		// 3VL-never-true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
+		// integer can equal no stored value — all provably empty.
+		var agreed []byte
+		for _, src := range ec.srcs {
+			key, isNull, ok := encodeBoundKey(ec.colType, src, params, outer, ec.coll, left)
+			if isNull || !ok {
+				return keyBound{}, 0, true
+			}
+			if agreed == nil {
+				agreed = key
+			} else if !bytes.Equal(agreed, key) {
+				return keyBound{}, 0, true
+			}
+		}
+		p = append(p, 0x00)
+		p = append(p, agreed...)
+	}
+	if ib.rangeTerms == nil {
+		b = keyBound{lo: p, loInc: true, hi: prefixSuccessor(p), hiInc: false}
+		return b, len(p), boundEmpty(b)
+	}
+	// Equality prefix P + a range on the next column. Base: [P, P‖0x01) — present values only
+	// (the 0x01 NULL tag sorts after every 0x00 present slot at this position).
+	b = keyBound{lo: append([]byte(nil), p...), loInc: true, hi: append(append([]byte(nil), p...), 0x01), hiInc: false}
+	for _, t := range ib.rangeTerms {
+		// The range column is fixed-width (indexes.md §5.1 eligibility), so it is never collated: the
+		// probe encodes with a nil collation.
+		key, isNull, ok := encodeBoundKey(ib.rangeType, t.src, params, outer, nil, left)
+		if isNull {
+			return keyBound{}, 0, true
+		}
+		if !ok {
+			continue // out-of-range endpoint: drop this half-bound (a wider, still-sound scan)
+		}
+		ps := append(append([]byte(nil), p...), 0x00) // P ‖ 0x00 (present tag)
+		ps = append(ps, key...)                       // P ‖ 0x00 ‖ encode(v)
+		switch t.op {
+		case opGe:
+			b = intersectLo(b, ps, true)
+		case opGt:
+			b = intersectLo(b, prefixSuccessor(ps), true) // skip the whole c = v subtree
+		case opLt:
+			b = intersectHi(b, ps, false)
+		case opLe:
+			b = intersectHi(b, prefixSuccessor(ps), false)
+		case opEq: // defensive — an equality never reaches rangeTerms, but treat it as [v, v]
+			b = intersectLo(b, ps, true)
+			b = intersectHi(b, prefixSuccessor(ps), false)
+		}
+	}
+	return b, len(p), boundEmpty(b)
+}
+
+// indexScanBound range-scans the index B-tree over an already-built key bound and point-looks-up
+// each admitted entry's row, returning them in index-entry order with the scan's up-front (pages,
+// slabs) block — the index-tree nodes overlapping the range plus, per entry, the row's point
+// lookup. prefixByteLen is the equality-prefix byte length skipped before the fixed-width
+// suffix-skip that recovers each entry's row storage key (indexes.md §5.1). Shared by the
+// access-predicate bound (indexBoundRows) and the OR / IN-list point-set (indexPointRows) so both
+// drive the identical per-entry fetch — same cost by construction.
+func (db *engine) indexScanBound(tableName, nameKey string, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (rows []storedRow, pages, slabs int, err error) {
+	istore := db.lkpIndexStore(nameKey)
+	// The index store has no payload columns, so its mask is empty and its fused scan contributes
+	// only the index-tree page_read count (no spill/compress units).
 	entries, pages, _, err := istore.RangeScanWithUnits(b, nil)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	store := db.lkpStore(tableName)
 	for _, e := range entries {
-		// Skip the remaining key components (each self-delimiting — indexes.md §5);
+		// Skip the equality prefix by its known byte length, then each remaining key component by
+		// width (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1);
 		// the suffix after them is the row's storage key (indexes.md §3).
-		at := len(prefix)
-		for _, ty := range ib.tailTypes {
+		at := prefixByteLen
+		for _, ty := range suffixTypes {
 			if at < len(e.Key) && e.Key[at] == 0x01 {
 				at++
 			} else {
@@ -13143,6 +13243,17 @@ func (db *engine) indexPointRows(tableName string, ib *indexBoundPlan, valueKey 
 		rows = append(rows, row)
 	}
 	return rows, pages, slabs, nil
+}
+
+// indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
+// equality prefix scan [0x00‖value, byte-successor) over the index B-tree plus, per admitted entry,
+// the row's point lookup. Used by the OR / IN-list secondary-index point-set (indexKeySetRows),
+// where each distinct list value is one such point probe. suffixTypes are the trailing key
+// components (columns[1:], fixed-width), width-skipped past the single leading slot.
+func (db *engine) indexPointRows(tableName, nameKey string, suffixTypes []scalarType, valueKey []byte, mask []bool) (rows []storedRow, pages, slabs int, err error) {
+	prefix := append([]byte{0x00}, valueKey...)
+	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
+	return db.indexScanBound(tableName, nameKey, suffixTypes, b, len(prefix), mask)
 }
 
 // encodeKeySet encodes an OR / IN-list's equality const-sources into the key space and returns
@@ -13208,9 +13319,8 @@ func (db *engine) pkKeySetRows(store *tableStore, ks *pkKeySetPlan, params []Val
 // column, distinct values probe disjoint row sets — no row is fetched twice. The per-probe
 // (pages, slabs) blocks sum, matching the PK point-set cost contract.
 func (db *engine) indexKeySetRows(tableName string, ks *indexKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (rows []storedRow, pages, slabs int, err error) {
-	ib := &indexBoundPlan{nameKey: ks.nameKey, colType: ks.colType, coll: ks.coll, tailTypes: ks.tailTypes}
 	for _, k := range encodeKeySet(ks.colType, ks.srcs, params, outer, ks.coll, left) {
-		r, p, sl, err := db.indexPointRows(tableName, ib, k, mask)
+		r, p, sl, err := db.indexPointRows(tableName, ks.nameKey, ks.tailTypes, k, mask)
 		if err != nil {
 			return nil, 0, 0, err
 		}

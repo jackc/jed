@@ -13623,40 +13623,74 @@ impl Engine {
         mask: &[bool],
         left: &[Value],
     ) -> Result<(Vec<Row>, (usize, usize))> {
-        // Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
-        // true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
-        // integer can equal no stored value — all provably empty.
-        let mut agreed: Option<Vec<u8>> = None;
-        for src in &ib.eqs {
-            let k =
-                match encode_bound_key(ib.col_type, src, params, outer, ib.coll.as_deref(), left) {
-                    BoundKey::Null | BoundKey::OutOfRange => return Ok((Vec::new(), (0, 0))),
-                    BoundKey::Key(k) => k,
-                };
-            match &agreed {
-                None => agreed = Some(k),
-                Some(prev) if *prev == k => {}
-                Some(_) => return Ok((Vec::new(), (0, 0))),
-            }
-        }
-        self.index_point_rows(
+        let Some((bound, prefix_len)) = build_index_bound(ib, params, outer, left) else {
+            return Ok((Vec::new(), (0, 0))); // provably empty — read nothing, charge nothing
+        };
+        self.index_scan_bound(
             table_name,
-            ib,
-            &agreed.expect("an index bound has at least one term"),
+            &ib.name_key,
+            &ib.suffix_types,
+            &bound,
+            prefix_len,
             mask,
         )
     }
 
-    /// Fetch the rows a SINGLE already-encoded index value admits — the prefix scan of the index
-    /// B-tree plus, per admitted entry, the row's point lookup — returning them in index-entry order
-    /// with the scan's up-front `(pages, slabs)` block. Factored out of [`Self::index_bound_rows`]
-    /// so both the single-value equality bound and the OR / IN-list point-set bound
-    /// ([`Self::index_key_set_rows`]) drive the identical per-value fetch — same cost by
+    /// Range-scan the index B-tree over an already-built key bound and point-look-up each admitted
+    /// entry's row, returning them in index-entry order with the scan's up-front `(pages, slabs)`
+    /// block — the index-tree nodes overlapping the range plus, per entry, the row's point lookup.
+    /// `prefix_byte_len` is the equality-prefix byte length skipped before the fixed-width
+    /// suffix-skip that recovers each entry's row storage key (indexes.md §5.1). Shared by the
+    /// access-predicate bound ([`Self::index_bound_rows`]) and the OR / IN-list point-set
+    /// ([`Self::index_point_rows`]) so both drive the identical per-entry fetch — same cost by
     /// construction (cost.md §3 "index-bounded scan" / "OR / IN-list").
+    fn index_scan_bound(
+        &self,
+        table_name: &str,
+        name_key: &str,
+        suffix_types: &[ScalarType],
+        bound: &KeyBound,
+        prefix_byte_len: usize,
+        mask: &[bool],
+    ) -> Result<(Vec<Row>, (usize, usize))> {
+        let istore = self.index_store(name_key);
+        // The index store has no payload columns, so its mask is empty and its fused scan
+        // contributes only the index-tree page_read count (no spill/compress units).
+        let (entries, mut pages, _) = istore.range_scan_with_units(bound, &[])?;
+        let store = self.store(table_name);
+        let mut slabs = 0usize;
+        let mut rows = Vec::with_capacity(entries.len());
+        for (ekey, _) in entries {
+            // Skip the equality prefix by its known byte length, then each remaining key component by
+            // width (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width,
+            // indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
+            let mut at = prefix_byte_len;
+            for &ty in suffix_types {
+                at += match ekey.get(at) {
+                    Some(0x01) => 1,
+                    _ => 1 + ty.width_bytes(),
+                };
+            }
+            let row_key = &ekey[at..];
+            let (row, n, s) = store.get_with_units(row_key, mask)?;
+            pages += n;
+            slabs += s;
+            rows.push(row.expect("an index entry references a stored row"));
+        }
+        Ok((rows, (pages, slabs)))
+    }
+
+    /// Fetch the rows a SINGLE already-encoded leading-column index value admits — the equality
+    /// prefix scan `[0x00‖value, byte-successor)` over the index B-tree plus, per admitted entry, the
+    /// row's point lookup. Used by the OR / IN-list secondary-index point-set
+    /// ([`Self::index_key_set_rows`]), where each distinct list value is one such point probe.
+    /// `suffix_types` are the trailing key components (`columns[1..]`, fixed-width), width-skipped
+    /// past the single leading slot.
     fn index_point_rows(
         &self,
         table_name: &str,
-        ib: &IndexBound,
+        name_key: &str,
+        suffix_types: &[ScalarType],
         value_key: &[u8],
         mask: &[bool],
     ) -> Result<(Vec<Row>, (usize, usize))> {
@@ -13670,30 +13704,8 @@ impl Engine {
             hi: prefix_successor(&prefix),
             hi_inc: false,
         };
-        let istore = self.index_store(&ib.name_key);
-        // The index store has no payload columns, so its mask is empty and its fused scan
-        // contributes only the index-tree page_read count (no spill/compress units).
-        let (entries, mut pages, _) = istore.range_scan_with_units(&bound, &[])?;
-        let store = self.store(table_name);
-        let mut slabs = 0usize;
-        let mut rows = Vec::with_capacity(entries.len());
-        for (ekey, _) in entries {
-            // Skip the remaining key components (each self-delimiting — indexes.md §5);
-            // the suffix after them is the row's storage key (indexes.md §3).
-            let mut at = prefix.len();
-            for &ty in &ib.tail_types {
-                at += match ekey.get(at) {
-                    Some(0x01) => 1,
-                    _ => 1 + ty.width_bytes(),
-                };
-            }
-            let row_key = &ekey[at..];
-            let (row, n, s) = store.get_with_units(row_key, mask)?;
-            pages += n;
-            slabs += s;
-            rows.push(row.expect("an index entry references a stored row"));
-        }
-        Ok((rows, (pages, slabs)))
+        let plen = prefix.len();
+        self.index_scan_bound(table_name, name_key, suffix_types, &bound, plen, mask)
     }
 
     /// Execute a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"): each distinct
@@ -13759,13 +13771,6 @@ impl Engine {
         mask: &[bool],
         left: &[Value],
     ) -> Result<(Vec<Row>, (usize, usize))> {
-        let ib = IndexBound {
-            name_key: ks.name_key.clone(),
-            col_type: ks.col_type,
-            eqs: Vec::new(),
-            coll: ks.coll.clone(),
-            tail_types: ks.tail_types.clone(),
-        };
         let mut rows: Vec<Row> = Vec::new();
         let mut pages = 0usize;
         let mut slabs = 0usize;
@@ -13777,7 +13782,8 @@ impl Engine {
             ks.coll.as_deref(),
             left,
         ) {
-            let (r, (p, s)) = self.index_point_rows(table_name, &ib, &k, mask)?;
+            let (r, (p, s)) =
+                self.index_point_rows(table_name, &ks.name_key, &ks.tail_types, &k, mask)?;
             rows.extend(r);
             pages += p;
             slabs += s;
@@ -17312,25 +17318,38 @@ struct GinBound {
     col_global: usize,
 }
 
-/// The plan-time result of index analysis (indexes.md §5): the chosen index (lowest
-/// lowercased name whose FIRST key column has an equality conjunct), that column's storage
-/// type, and every equality const-source on it. At exec time the sources must agree on one
-/// value (else the bound is provably empty) and the index is range-scanned over that
-/// value's presence-tagged prefix.
+/// One column of an index access predicate's equality prefix (indexes.md §5.1): the column's
+/// storage type, its key collation (`Some(coll)` only for a `Full`-collated text column), and every
+/// equality const-source bound to it. At exec time the sources must agree on one value (else the
+/// bound is provably empty). A collated column encodes its probe via the UCA sort key
+/// (encoding.md §2.12) to match the index's stored key form (collation.md §8).
+struct IndexEqCol {
+    col_type: ScalarType,
+    coll: Option<std::sync::Arc<Collation>>,
+    srcs: Vec<BoundSrc>,
+}
+
+/// The optional trailing range of an index access predicate (indexes.md §5.1): a range on the key
+/// column immediately after the equality prefix. Its column is fixed-width (never collated).
+struct IndexRange {
+    col_type: ScalarType,
+    terms: Vec<BoundTerm>,
+}
+
+/// The plan-time result of index analysis (indexes.md §5.1): the chosen index (lowest lowercased
+/// name yielding a non-empty access predicate) and the predicate — a maximal EQUALITY PREFIX on the
+/// leading key columns (`eq_cols`) plus an OPTIONAL RANGE on the next column (`range`). At exec time
+/// `build_index_bound` turns these into a concrete index-key range: the equality prefix bytes
+/// P = concatenated present slots, then the range (if any) intersected relative to P.
+/// `suffix_types` are the types of the index columns AFTER the equality prefix (`columns[eq..]`) —
+/// the range column (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's
+/// row-key suffix is recovered by width-skipping them past P.
 struct IndexBound {
     /// The index store's key — the lowercased index name.
     name_key: String,
-    col_type: ScalarType,
-    eqs: Vec<BoundSrc>,
-    /// The leading key column's resolved collation when it is collated AND `Full` — the equality
-    /// probe encodes via its UCA sort key (encoding.md §2.12) to match the index's stored key form
-    /// (spec/design/collation.md §8). `None` for a `C` (raw-byte) column. A `Skewed` collated index
-    /// never produces an `IndexBound` (`key_collation_ctx` refuses it — collation.md §12).
-    coll: Option<std::sync::Arc<Collation>>,
-    /// The REMAINING key components' types (`columns[1..]`): an admitted entry's row-key
-    /// suffix sits after every component slot, so the fetch skips these (each slot is
-    /// self-delimiting — a `0x01` NULL tag alone, or `0x00` + the type's fixed width).
-    tail_types: Vec<ScalarType>,
+    eq_cols: Vec<IndexEqCol>,
+    range: Option<IndexRange>,
+    suffix_types: Vec<ScalarType>,
 }
 
 /// The outcome of encoding a const-source into the PK key space.
@@ -17342,11 +17361,94 @@ enum BoundKey {
     Key(Vec<u8>),
 }
 
+/// Construct an index access predicate for `idx` over `rel` (indexes.md §5.1): a maximal EQUALITY
+/// PREFIX on the leading key columns plus an OPTIONAL RANGE on the next column. It walks the index's
+/// key columns in key order against the WHERE AND-chain, consuming a column with an agreed equality
+/// conjunct into the prefix and stopping at the first column that has no equality (taking its range
+/// conjuncts, if any, as the trailing range). Returns `None` for a non-B-tree index, a `Skewed`
+/// collated bound column (whose stored keys are at the file's pinned version — collation.md §12), no
+/// bound at all, or an ineligible suffix (a column after the equality prefix that is not a
+/// fixed-width scalar — the width-based key-suffix skip needs it). `sibling_cutoff` opens the
+/// index-nested-loop door (`Some(cut)` admits a bare sibling `Column(g)` with `g < cut` as a bound
+/// source, resolved per outer row); `None` is the ordinary once-materialized bound.
+fn build_index_access_predicate(
+    filter: &RExpr,
+    rel: &ScopeRel,
+    idx: &IndexDef,
+    sibling_cutoff: Option<usize>,
+    catalog: &Engine,
+) -> Option<IndexBound> {
+    if idx.kind != IndexKind::Btree {
+        return None;
+    }
+    let mut eq_cols: Vec<IndexEqCol> = Vec::new();
+    let mut range: Option<IndexRange> = None;
+    for &ci in &idx.columns {
+        // A non-scalar (range/array/composite) column cannot be seeked here — stop the prefix.
+        let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
+            break;
+        };
+        // The column's key collation form (collation.md §8/§12): a `Skewed` collated column refuses
+        // the bound (its stored keys are wrong for the loaded bundle) — stop the prefix here (the
+        // column then falls into the fixed-width suffix check below and rejects the whole index if it
+        // is text). A `C` or `Full`-collated column is admissible.
+        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
+            break;
+        };
+        let mut terms = Vec::new();
+        collect_bound_terms(
+            filter,
+            rel.offset + ci,
+            ty,
+            coll.as_ref().map(|c| c.name.as_str()),
+            sibling_cutoff,
+            &mut terms,
+        );
+        let (eqs, ranges): (Vec<BoundTerm>, Vec<BoundTerm>) =
+            terms.into_iter().partition(|t| matches!(t.op, CmpOp::Eq));
+        if !eqs.is_empty() {
+            eq_cols.push(IndexEqCol {
+                col_type: ty,
+                coll,
+                srcs: eqs.into_iter().map(|t| t.src).collect(),
+            });
+            continue; // extend the equality prefix
+        }
+        if !ranges.is_empty() {
+            range = Some(IndexRange {
+                col_type: ty,
+                terms: ranges,
+            });
+        }
+        break; // first non-equality column ends the prefix (with or without a trailing range)
+    }
+    if eq_cols.is_empty() && range.is_none() {
+        return None; // nothing bound
+    }
+    // Eligibility: every index column from the range column onward (`columns[eq_cols.len()..]`) is
+    // width-skipped past the known equality prefix, so each must be a fixed-width scalar. The
+    // equality-prefix columns may be any width — their slots are matched as the known prefix bytes.
+    let mut suffix_types = Vec::with_capacity(idx.columns.len() - eq_cols.len());
+    for &c in &idx.columns[eq_cols.len()..] {
+        let s = rel.table.columns[c].ty.as_scalar()?;
+        if !s.is_fixed_width() {
+            return None;
+        }
+        suffix_types.push(s);
+    }
+    Some(IndexBound {
+        name_key: idx.name.to_ascii_lowercase(),
+        eq_cols,
+        range,
+        suffix_types,
+    })
+}
+
 /// Pick one relation's scan bound (cost.md §3; indexes.md §5): the single-column PK bound
 /// first (the row's own key — range-capable and strictly cheaper); else, among the
 /// relation's indexes (held in ascending lowercased-name order — the deterministic
-/// tie-break), the first whose FIRST key column has at least one equality conjunct against
-/// a type-matched const-source; else `None` (full scan).
+/// tie-break), the first that yields a non-empty access predicate
+/// ([`build_index_access_predicate`]); else `None` (full scan).
 fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Engine) -> Option<ScanBound> {
     if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
         // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
@@ -17361,65 +17463,12 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Engine) -> Option
         return Some(ScanBound::Pk(b));
     }
     for idx in &rel.table.indexes {
-        // Only an ordered B-tree is an ordered-equality bound. A GIN index is keyed by array terms
-        // (gin.md §6); a GiST index is keyed by a bounding `[min, max]` / range, NOT the whole value
-        // — a scalar GiST index's store key is `[v, v]‖skey`, not the ordered-index key form, so it
-        // must NOT be probed here (handled by the GiST pass below, gist.md §5/§6). Both are skipped.
-        if idx.kind != IndexKind::Btree {
-            continue;
-        }
-        let ci = idx.columns[0];
-        // An ordered index whose leading (or any) key column is a non-scalar (range) does not
-        // pushdown — point-lookup is deferred for containers (ranges.md §10); the index is still
-        // maintained, the scan is just full + residual.
-        let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
-            continue;
-        };
-        // The tail-slot skip in `index_bound_rows` advances over each trailing key component by
-        // its FIXED width (`width_bytes`), which exists only for the fixed-width scalars. A tail
-        // column that is non-scalar (range/array/composite) OR a variable-width scalar
-        // (text/decimal/bytea/interval) has no fixed width, so the index cannot pushdown: fall
-        // through to the full scan + residual filter (rows identical, just no index bound).
-        if idx.columns[1..].iter().any(|&c| {
-            rel.table.columns[c]
-                .ty
-                .as_scalar()
-                .is_none_or(|s| !s.is_fixed_width())
-        }) {
-            continue;
-        }
-        // The leading column's key collation form (as for the PK above). A `Skewed` collated index
-        // is skipped (`None`) — its stored keys are at the file's pinned version, wrong for the
-        // loaded one, so it must not be seeked (collation.md §12; the regression tripwire
-        // suites/collation/skew.test). A `C` or `Full`-collated index is admissible.
-        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
-            continue;
-        };
-        let mut terms = Vec::new();
-        collect_bound_terms(
-            filter,
-            rel.offset + ci,
-            ty,
-            coll.as_ref().map(|c| c.name.as_str()),
-            None,
-            &mut terms,
-        );
-        let eqs: Vec<BoundSrc> = terms
-            .into_iter()
-            .filter(|t| matches!(t.op, CmpOp::Eq))
-            .map(|t| t.src)
-            .collect();
-        if !eqs.is_empty() {
-            return Some(ScanBound::Index(IndexBound {
-                name_key: idx.name.to_ascii_lowercase(),
-                col_type: ty,
-                eqs,
-                coll,
-                tail_types: idx.columns[1..]
-                    .iter()
-                    .map(|&c| rel.table.columns[c].ty.scalar())
-                    .collect(),
-            }));
+        // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
+        // range over a B-tree index's leading key columns. Returns `None` for a GIN/GiST index
+        // (handled by the passes below), an ineligible suffix, or no bound. Indexes are held in
+        // ascending lowercased-name order, so the first `Some` wins — the deterministic tie-break.
+        if let Some(ib) = build_index_access_predicate(filter, rel, idx, None, catalog) {
+            return Some(ScanBound::Index(ib));
         }
     }
     // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered
@@ -17642,12 +17691,19 @@ fn detect_inl_bound(
             .map(|t| t.src)
             .collect();
         if eqs.iter().any(|s| matches!(s, BoundSrc::Sibling(_))) {
+            // This slice keeps the index-nested-loop bound single-column-equality (a leading key
+            // column bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md
+            // §3 "index-nested-loop"). `suffix_types` are the trailing columns (columns[1..],
+            // fixed-width by the check above), width-skipped past the single equality slot.
             return Some(ScanBound::Index(IndexBound {
                 name_key: idx.name.to_ascii_lowercase(),
-                col_type: ty,
-                eqs,
-                coll,
-                tail_types: idx.columns[1..]
+                eq_cols: vec![IndexEqCol {
+                    col_type: ty,
+                    coll,
+                    srcs: eqs,
+                }],
+                range: None,
+                suffix_types: idx.columns[1..]
                     .iter()
                     .map(|&c| rel.table.columns[c].ty.scalar())
                     .collect(),
@@ -18918,6 +18974,101 @@ fn build_key_bound(
         }
     }
     if bound_empty(&b) { None } else { Some(b) }
+}
+
+/// Turn an index access predicate into a concrete index-key range at exec time (indexes.md §5.1).
+/// Encode the equality prefix into `p` (the concatenated present slots), then — if there is a range
+/// column — start from `[P, P‖0x01)` (the upper endpoint stops before the range column's NULL slot,
+/// since a range is never true for NULL) and intersect each range term; otherwise the range is
+/// `[P, byte-successor(P))` (every entry extending `P`). `None` ⇒ the bound admits no key (a NULL /
+/// disagreeing prefix equality, a NULL range endpoint, or a contradictory range). The returned
+/// `usize` is `len(P)`, the byte count the row-key suffix skip advances past the equality-prefix
+/// slots before width-skipping the remaining components.
+fn build_index_bound(
+    ib: &IndexBound,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> Option<(KeyBound, usize)> {
+    let mut p: Vec<u8> = Vec::new();
+    for ec in &ib.eq_cols {
+        // Every equality const-source on this column must encode to ONE agreed value: a NULL is
+        // 3VL-never-true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
+        // integer can equal no stored value — all provably empty.
+        let mut agreed: Option<Vec<u8>> = None;
+        for src in &ec.srcs {
+            let k =
+                match encode_bound_key(ec.col_type, src, params, outer, ec.coll.as_deref(), left) {
+                    BoundKey::Null | BoundKey::OutOfRange => return None,
+                    BoundKey::Key(k) => k,
+                };
+            match &agreed {
+                None => agreed = Some(k),
+                Some(prev) if *prev == k => {}
+                Some(_) => return None,
+            }
+        }
+        p.push(0x00);
+        p.extend_from_slice(&agreed.expect("an equality column has at least one source"));
+    }
+    let Some(rng) = &ib.range else {
+        // Pure equality prefix: [P, byte-successor(P)).
+        let b = KeyBound {
+            lo: Some(p.clone()),
+            lo_inc: true,
+            hi: prefix_successor(&p),
+            hi_inc: false,
+        };
+        return if bound_empty(&b) {
+            None
+        } else {
+            Some((b, p.len()))
+        };
+    };
+    // Equality prefix P + a range on the next column. Base: [P, P‖0x01) — present values only (the
+    // 0x01 NULL tag sorts after every 0x00 present slot at this position).
+    let mut hi_null = p.clone();
+    hi_null.push(0x01);
+    let mut b = KeyBound {
+        lo: Some(p.clone()),
+        lo_inc: true,
+        hi: Some(hi_null),
+        hi_inc: false,
+    };
+    for t in &rng.terms {
+        // The range column is fixed-width (indexes.md §5.1 eligibility), so it is never collated: the
+        // probe encodes with a `None` collation.
+        let key = match encode_bound_key(rng.col_type, &t.src, params, outer, None, left) {
+            BoundKey::Null => return None,
+            BoundKey::OutOfRange => continue, // drop this half-bound (a wider, still-sound scan)
+            BoundKey::Key(k) => k,
+        };
+        // P ‖ 0x00 ‖ encode(v) — the range column's present slot appended to the prefix.
+        let mut ps = p.clone();
+        ps.push(0x00);
+        ps.extend_from_slice(&key);
+        match t.op {
+            CmpOp::Ge => intersect_lo(&mut b, &ps, true),
+            // `>` skips the whole `c = v` subtree: the smallest key after every `P‖0x00‖v‖*` entry.
+            CmpOp::Gt => match prefix_successor(&ps) {
+                Some(s) => intersect_lo(&mut b, &s, true),
+                None => return None, // no key exceeds the max — empty (unreachable: ps starts 0x00)
+            },
+            CmpOp::Lt => intersect_hi(&mut b, &ps, false),
+            CmpOp::Le => match prefix_successor(&ps) {
+                Some(s) => intersect_hi(&mut b, &s, false),
+                None => {} // everything ≤ max — keep the base hi (P‖0x01)
+            },
+            // `=` never reaches range terms (filtered into the equality prefix); `<>` never becomes a
+            // bound term at all. Both contribute no half-bound.
+            CmpOp::Eq | CmpOp::Ne => {}
+        }
+    }
+    if bound_empty(&b) {
+        None
+    } else {
+        Some((b, p.len()))
+    }
 }
 
 /// Encode a const-source's value into the PK's storage key (the same codec INSERT uses — `encode_int`

@@ -107,8 +107,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ composite point-lookup / prefix pushdown (a composite-PK table full-scans today — an optimization slice with its NoREC obligation).
 - [x] **`FOREIGN KEY` constraints** — column-/table-level `REFERENCES`, composite + self-reference, same-type pairing (`42804`), MATCH SIMPLE, enforced at four write sites (`23503`), `format_version` 11. → [constraints.md §6](spec/design/constraints.md)
   - [ ] _follow-on:_ the referential **actions** `ON DELETE/UPDATE CASCADE | SET NULL | SET DEFAULT` (parse but `0A000` today); `MATCH FULL`; a **backing index** on the child FK columns (the parent-side check full-scans children today); FK type pairing relaxed to PG's comparable-types; `ALTER TABLE … ADD/DROP CONSTRAINT`.
-- [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — non-unique on-disk B-trees, maintained in the two-phase pass; the planner index-bounds a base scan on a first-column equality; `format_version` 5. → [indexes.md](spec/design/indexes.md)
-  - [ ] _follow-on (each its own slice + NoREC obligation):_ index ranges / multi-column prefixes; index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination; expression/ordered/partial keys; `IF NOT EXISTS`. (All scalar key types are now encodable; only the recursive `composite` container stays a `0A000` key.)
+- [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — non-unique on-disk B-trees, maintained in the two-phase pass; the planner index-bounds a base scan on an access predicate; `format_version` 5. → [indexes.md](spec/design/indexes.md)
+  - [x] **Index ranges + multi-column prefix bounds** — an index-bounded SELECT scan now binds a B-tree **access predicate**: a maximal **equality prefix** on the leading key columns plus an **optional range** on the next column (`v > 5`, `a = 1 AND b = 2`, `a = 1 AND b > 3`). Equality-prefix columns may be any width (including collated text, skipped by known byte length); the range column + trailing columns stay fixed-width. Caps `query.index_range` / `query.index_prefix`; all three cores, no format bump. → [indexes.md §5.1](spec/design/indexes.md)
+  - [ ] _follow-on (each its own slice + NoREC obligation):_ index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination; a variable-width range/tail column (self-delimiting skip, not fixed width); expression/ordered/partial keys; `IF NOT EXISTS`. (All scalar key types are now encodable; only the recursive `composite` container stays a `0A000` key.)
 - [x] **GIN inverted indexes** (`CREATE INDEX … USING gin`) — a second index *kind* via a type-generic operator-class seam: the **`array_ops`** opclass (one entry per distinct non-NULL element, `format_version` 12's `index_kind` byte, a `gin_entry` cost unit) accelerating `@>`/`&&`/`= ANY(col)`/array `=` for SELECT + GIN-bounded UPDATE/DELETE, over the fixed-width key-encodable element types. → [gin.md](spec/design/gin.md)
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the index recording empty/NULL-array rows) / `IN` over a scalar list; the **remaining** element types — the VARIABLE-width keyables (`text[]`, `bytea[]`, `decimal[]`) need GIN term framing; `float[]` and `interval[]` are now UNBLOCKED (fixed-width keys landed) but each is its own slice — plus composite-element arrays; multi-column GIN; correlated / array-column query operands; the ordered-index equality bound for UPDATE/DELETE; the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`** opclass and a future object/document opclass.
 - [x] **GiST index access method → `EXCLUDE` constraints** — a third index *kind* (`index_kind = 2`) whose payoff is PG exclusion constraints (`EXCLUDE USING gist (col WITH op)`, `23P01`); an operation-deterministic R-tree (a structural divergence — jed's own tree bytes), the `range_ops` + fixed-width scalar-`=` opclasses, multi-column GiST; `format_version` 21. → [gist.md](spec/design/gist.md), [constraints.md §5](spec/design/constraints.md)
@@ -166,12 +167,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   union (`pk = 1 OR pk BETWEEN 10 AND 20` — a mix of point and range probes); intersecting an IN-list
   with a co-present range conjunct (`pk IN (1..9) AND pk > 4`); a secondary-index point-set for
   UPDATE/DELETE (rides on the index-scans-for-DML item).
-- [ ] _already tracked in their home sections (all planner follow-ons):_ index **ranges** +
-  **multi-column prefix** bounds, **index scans for UPDATE/DELETE**, and the **LIMIT-streaming +
-  index-bound** combination (the Secondary-indexes item); **composite-PK prefix pushdown** (the
-  Composite `PRIMARY KEY` item); a **hash-join operator** (the spill item — nested-loop is the only
-  join today); the **ORDER BY + LIMIT top-k** heap (bench-driven perf). Each is a rule-based,
-  results-identical win.
+- [ ] _already tracked in their home sections (all planner follow-ons):_ **index scans for
+  UPDATE/DELETE** and the **LIMIT-streaming + index-bound** combination (the Secondary-indexes item;
+  index **ranges** + **multi-column prefix** bounds have since landed — indexes.md §5.1);
+  **composite-PK prefix pushdown** (the Composite `PRIMARY KEY` item); a **hash-join operator** (the
+  spill item — nested-loop is the only join today); the **ORDER BY + LIMIT top-k** heap (bench-driven
+  perf). Each is a rule-based, results-identical win.
 
 ### Cost as a plan input (the strategic investment — Path B)
 

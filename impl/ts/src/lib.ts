@@ -281,6 +281,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.correlated_pushdown",
   "query.join_pushdown",
   "query.index_nested_loop",
+  // Index range scans + multi-column prefix bounds (spec/design/indexes.md §5.1).
+  "query.index_range",
+  "query.index_prefix",
   // EXPLAIN — render the planner's chosen plan as a deterministic depth/node/detail result set,
   // without executing the inner statement (spec/design/explain.md).
   "query.explain",
