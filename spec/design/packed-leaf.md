@@ -330,11 +330,15 @@ expanded row vectors.
 - **S4 — port S1+S2 to Go**, then **S5 — port S1+S2 to TS.** Mirror the Rust reshape idiomatically (Go
   retains `*paxLeaf`; TS retains the parsed directories over a `Uint8Array.subarray`); each lands green
   independently. The `col_at`/`row_at_masked` accessors are ported too (S3-ready), just not driven.
-- **Track A2 — columnar gather (the allocation dividend).** *Go core landed 2026-07 (per-core internal,
-  like A1 — results/cost/byte-neutral, no `format_version` bump). This AGGREGATE variant is **Go-only**: it
-  is wired into Go's vectorized aggregate executor (`execVectorizedAgg`, a Go-only Stage 0–2 fast path), so
-  a Rust/TS port would first need that executor — deferred as the sole remaining follow-on (the sibling
-  **projection** feed below, which needs no such executor, landed in all three cores).* A1 removed the
+- **Track A2 — columnar gather (the allocation dividend).** *Landed in all three cores 2026-07 (per-core
+  internal, like A1 — results/cost/byte-neutral, no `format_version` bump). Go first; then the **vectorized
+  aggregate executor** itself was ported to Rust (`exec_vectorized_agg` / `agg_columnar`) and TS
+  (`execVectorizedAgg` / `aggColumnar`) so the AGGREGATE gather rides it there too — the executor is a
+  single-base-table SUM/COUNT/MIN/MAX/AVG (whole-table or single-integer-key GROUP BY) that folds
+  int64-bucketed on the row path (in-memory) or columnar on the file-backed path, reusing each core's
+  scalar `Acc`/fold/finalize so the fold is byte-identical (the scalar grouped path already folds through
+  the same accumulator). Conformance (in-memory) exercises the row path byte-identically; the file-backed
+  columnar path is proven by the paged-vs-resident batteries.* A1 removed the
   untouched-column **decode** but still allocated a **full-width `storedRow`** per record (untouched
   columns left `Null`), so the B/op stayed width-linear — a 64-column `count(*)` allocated ~100 MB of
   all-`Null` rows. A2 gathers **only** the touched columns into dense per-column lanes straight off the
@@ -378,10 +382,11 @@ expanded row vectors.
   interior-separator gather). A `WHERE` filter is handled by **Track A3** below.
 
 - **Track A3 — filter vectorization (a selection vector over the lanes).** *Go core landed 2026-07
-  (per-core internal, like A1/A2 — results/cost/byte-neutral, no `format_version` bump). The **projection**
-  path landed in all three cores 2026-07 (`filterColumnar` + a `sel` selection vector threaded through the
-  columnar emit drive in each core); the **aggregate** path is **Go-only**, riding the Go-only vectorized
-  aggregate executor with the A2 aggregate gather above.*
+  (per-core internal, like A1/A2 — results/cost/byte-neutral, no `format_version` bump). Landed in all three
+  cores 2026-07: the **projection** path first (`filterColumnar` + a `sel` selection vector threaded through
+  the columnar emit drive in each core), then the **aggregate** path once the vectorized aggregate executor
+  was ported to Rust + TS (each core's `filter_columnar`/`filterColumnar` feeds the same selection vector to
+  its columnar aggregate fold).*
   A2 gathered only **filter-free** aggregates and projections; a `WHERE` predicate forced the full-width
   row path. A3 lifts that: `batch.go filterColumnar` evaluates `plan.filter` over the gathered lanes into a
   **selection vector** (`[]int32` of survivor indices), and the fold (`foldAggColumnar` /
@@ -404,11 +409,11 @@ expanded row vectors.
   columnar path and must agree with the resident row path on rows **and** cost, so a mis-indexed selection
   vector diverges loudly.
 
-Deferred follow-ons (none foreclosed): **the A2/A3 columnar AGGREGATE gather in Rust + TS** — the lone
-remaining port. A1 (touched-column scan wiring), the A2 projection feed, and A3 filter vectorization *for
-projections* have **landed in all three cores** (2026-07); the columnar aggregate gather stays Go-only
-because it is wired into Go's Go-only vectorized aggregate executor (`execVectorizedAgg`), so a Rust/TS
-port would first port that executor (a separate, larger effort). **Nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
+The columnar read-path work is now **complete across all three cores** (2026-07): A1 (touched-column scan
+wiring), the A2 projection feed + aggregate gather, and A3 filter vectorization for both projections and
+aggregates — including the **vectorized aggregate executor** (single-base-table SUM/COUNT/MIN/MAX/AVG,
+whole-table or single-integer-key GROUP BY) that the aggregate gather rides — have all landed in Rust, Go,
+and TS. Deferred follow-ons (none foreclosed): **Nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
 *interior* on repeated access — the narrow residual of §6, not the column-location memo PAX already
 provides); **keys as block-slices** (zero-copy keys under Packed); **in-memory databases adopting
 deferral** only if a Memory pager backing lands ([pager.md §6](pager.md)).
