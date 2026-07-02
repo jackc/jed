@@ -119,6 +119,8 @@ mod on_conflict;
 mod overflow_cost;
 #[path = "../tests/params.rs"]
 mod params;
+#[path = "../tests/plan_cache.rs"]
+mod plan_cache;
 #[path = "../tests/point_lookup.rs"]
 mod point_lookup;
 #[path = "../tests/privileges.rs"]

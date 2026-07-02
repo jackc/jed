@@ -66,12 +66,13 @@ use crate::cancel::CancellationToken;
 use crate::catalog::{CompositeType, Table};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
-    CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState, Snapshot,
-    TxStatus, stmt_is_write,
+    CachedPlan, CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState,
+    Snapshot, TxStatus, stmt_is_write,
 };
 use crate::file::{DatabaseOptions, OpenOptions};
 use crate::privileges::{PrivilegeSet, Privileges};
 use crate::value::Value;
+use std::cell::RefCell;
 
 /// The live-reader registry: a multiset of pinned snapshot versions (transactions.md §8). Each
 /// live [`ReadHandle`] contributes one entry for the version it pinned; several readers may pin
@@ -703,32 +704,38 @@ impl Session {
     /// [`query_prepared`](Session::query_prepared) (route the prepared AST), so a prepared query
     /// streams and pins its snapshot exactly like an ad-hoc one.
     fn query_ast(&mut self, ast: Statement, params: &[Value]) -> Result<Rows> {
+        self.query_ast_cached(&ast, params, None)
+    }
+
+    /// [`query_ast`](Session::query_ast) with an optional prepared-statement plan cache: a scan-shaped
+    /// SELECT plans once and, when `cache` is `Some`, reuses that plan across executes over an
+    /// unchanged catalog (spec/design/api.md §2.4). Ad-hoc [`query`](Session::query) passes `None`.
+    fn query_ast_cached(
+        &mut self,
+        ast: &Statement,
+        params: &[Value],
+        cache: Option<&RefCell<Option<CachedPlan>>>,
+    ) -> Result<Rows> {
         // Route the read before building the streaming cursor: an autocommit (non-block, writable
         // access) read re-pins the latest committed so the snapshot is current (PG-faithful); a
         // read-only session uses its existing pin, and an open block uses its working set.
-        if self.access != Access::ReadOnly && !self.engine.in_transaction() && !stmt_is_write(&ast)
-        {
+        if self.access != Access::ReadOnly && !self.engine.in_transaction() && !stmt_is_write(ast) {
             self.refresh_committed();
         }
-        if let Some(mut rows) = self.engine.try_streaming_query(&ast, params)? {
-            // Register the pinned snapshot version in the watermark (streaming.md §5); the returned
-            // guard deregisters on cursor close/drop, advancing `oldest_live_txid`.
+        // One plan-once scan lane serves streaming AND buffered; a prepared statement reuses its
+        // cached plan (`cache`). Register the pinned snapshot version in the watermark (streaming.md
+        // §5); the returned guard deregisters on cursor close/drop, advancing `oldest_live_txid`.
+        if let Some(mut rows) = self.engine.try_scan_query(ast, params, cache)? {
             rows.attach_pin(self.shared.reader_pin(self.base_version));
             return Ok(rows);
         }
-        if let Some(mut rows) = self.engine.try_buffered_query(&ast, params)? {
-            // A lazy buffered cursor (S4, streaming.md §4) is a live reader too — pin its snapshot
-            // version in the watermark, released on cursor close/drop.
-            rows.attach_pin(self.shared.reader_pin(self.base_version));
-            return Ok(rows);
-        }
-        if let Some(mut rows) = self.engine.try_deferred_query(&ast, params)? {
+        if let Some(mut rows) = self.engine.try_deferred_query(ast, params)? {
             // A lazy deferred set-op / WITH cursor (streaming.md §7) is a live reader too — pin its
             // snapshot version in the watermark, released on cursor close/drop.
             rows.attach_pin(self.shared.reader_pin(self.base_version));
             return Ok(rows);
         }
-        Rows::from_outcome(self.dispatch(ast, params)?)
+        Rows::from_outcome(self.dispatch(ast.clone(), params)?)
     }
 
     /// Run a (possibly mutating) statement under a [`CancellationToken`] (spec/design/api.md §11.4):
@@ -1307,10 +1314,11 @@ impl Session {
     }
     /// Run a prepared **query** on this session, returning a row cursor. The prepared AST routes
     /// through the same lazy lanes as the ad-hoc [`query`](Session::query) (spec/design/streaming.md
-    /// §3/§4/§7) — streaming / buffered / deferred, with the snapshot pinned in the reader-liveness
-    /// watermark — so a prepared query streams identically to a one-shot one.
+    /// §3/§4/§7) — the plan-once scan lane / deferred, with the snapshot pinned in the reader-liveness
+    /// watermark — so a prepared query streams identically to a one-shot one, but reuses its cached
+    /// plan across executes (spec/design/api.md §2.4).
     pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
-        self.query_ast(stmt.ast().clone(), params)
+        self.query_ast_cached(stmt.ast(), params, Some(stmt.cache()))
     }
 }
 

@@ -6,15 +6,25 @@ use crate::ast::Statement;
 use crate::cancel::CancellationToken;
 use crate::cursor::Cursor;
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{Engine, Outcome};
+use crate::executor::{CachedPlan, Engine, Outcome};
 use crate::parser::Parser;
 use crate::value::Value;
+use std::cell::RefCell;
 
-/// A parsed, reusable statement (spec/design/api.md §2.4). It owns only the parsed AST — the
-/// database is supplied at execute/query time, so a `PreparedStatement` never holds a `Engine`
-/// borrow (sidestepping the `&Engine` / `&mut Engine` aliasing problem; api.md §6).
+/// A parsed, reusable statement (spec/design/api.md §2.4). It owns the parsed AST — the database is
+/// supplied at execute/query time, so a `PreparedStatement` never holds a `Engine` borrow
+/// (sidestepping the `&Engine` / `&mut Engine` aliasing problem; api.md §6) — plus a lazily-populated
+/// **plan cache**: a scan-shaped query reuses its resolved plan across executes, re-planning only when
+/// the catalog changes. Because the cached plan is `Rc<SelectPlan>` (the plan holds a regex `Cell`, so
+/// `Arc` buys nothing), a `PreparedStatement` is `!Send` — a non-regression, since the whole
+/// query/cursor path is already thread-affine; a host that wants a statement on another thread
+/// re-prepares there (a cheap re-parse).
 pub struct PreparedStatement {
     ast: Statement,
+    /// The resolved-plan cache (`RefCell` for interior mutability — `query` takes `&self`). Empty
+    /// until the first cacheable query execute fills it; invalidated automatically when the catalog
+    /// generation moves (spec/design/api.md §2.4).
+    cache: RefCell<Option<CachedPlan>>,
 }
 
 impl PreparedStatement {
@@ -25,6 +35,12 @@ impl PreparedStatement {
     /// reach the AST.
     pub(crate) fn ast(&self) -> &Statement {
         &self.ast
+    }
+
+    /// The plan cache — reached by the shared-core `query_prepared` path so a prepared query on a
+    /// [`Session`](crate::Session) also reuses its plan across executes.
+    pub(crate) fn cache(&self) -> &RefCell<Option<CachedPlan>> {
+        &self.cache
     }
 
     /// Run this statement against a low-level [`Engine`] handle, binding `params` to its `$N`
@@ -40,7 +56,7 @@ impl PreparedStatement {
     /// buffers its input but yields its output lazily). Internal: the public path is
     /// [`Database::query_prepared`](crate::Database::query_prepared).
     pub(crate) fn query(&self, db: &mut Engine, params: &[Value]) -> Result<Rows> {
-        db.query_ast(self.ast.clone(), params)
+        db.query_ast_cached(&self.ast, params, Some(&self.cache))
     }
 }
 
@@ -309,6 +325,7 @@ impl Engine {
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
         Ok(PreparedStatement {
             ast: self.parse(sql)?,
+            cache: RefCell::new(None),
         })
     }
 
@@ -341,16 +358,27 @@ impl Engine {
     /// AST), so a prepared query streams identically to an ad-hoc one. (The bare single-handle
     /// [`Engine`]; the watermark pin lives on the shared-core [`Session`](crate::Session) path.)
     pub(crate) fn query_ast(&mut self, ast: Statement, params: &[Value]) -> Result<Rows> {
-        if let Some(rows) = self.try_streaming_query(&ast, params)? {
+        self.query_ast_cached(&ast, params, None)
+    }
+
+    /// [`query_ast`](Engine::query_ast) with an optional prepared-statement plan cache: a scan-shaped
+    /// SELECT plans exactly once (`try_scan_query`) and, when `cache` is `Some`, reuses that plan
+    /// across executes over an unchanged catalog — skipping planning entirely (spec/design/api.md
+    /// §2.4). The ad-hoc [`query`](Engine::query) passes `None` (still plans once). The AST is borrowed
+    /// and cloned only for the materialized fallback (a write / set-op / WITH — never cached).
+    pub(crate) fn query_ast_cached(
+        &mut self,
+        ast: &Statement,
+        params: &[Value],
+        cache: Option<&RefCell<Option<CachedPlan>>>,
+    ) -> Result<Rows> {
+        if let Some(rows) = self.try_scan_query(ast, params, cache)? {
             return Ok(rows);
         }
-        if let Some(rows) = self.try_buffered_query(&ast, params)? {
+        if let Some(rows) = self.try_deferred_query(ast, params)? {
             return Ok(rows);
         }
-        if let Some(rows) = self.try_deferred_query(&ast, params)? {
-            return Ok(rows);
-        }
-        Rows::from_outcome(self.execute_stmt_params(ast, params)?)
+        Rows::from_outcome(self.execute_stmt_params(ast.clone(), params)?)
     }
 
     /// Run a multi-statement `sql` **script** on the default session (spec/design/session.md §4.2):

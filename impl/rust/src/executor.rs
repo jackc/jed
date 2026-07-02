@@ -263,6 +263,14 @@ pub const MAX_COMPOSITE_DEPTH: usize = 32;
 pub struct Snapshot {
     /// The snapshot's version — the commit counter (transactions.md §8; the watermark unit).
     pub(crate) txid: u64,
+    /// The catalog generation — a monotonic counter bumped by every schema mutation (CREATE/DROP/
+    /// ALTER of a table/type/index), carried forward across `clone()` (rides `#[derive(Clone)]`).
+    /// Unlike `txid` it does NOT move on data writes and is defined for in-memory databases too, so
+    /// a prepared statement's plan cache keys its committed-plan validity on it: a cached plan is
+    /// reusable iff the read snapshot's `cat_gen` still equals the plan's (spec/design/api.md §2.4).
+    /// NOT bumped by sequence `nextval` (a data write on the nextval path), only by sequence DDL — a
+    /// SELECT plan binds no sequence.
+    pub(crate) cat_gen: u64,
     tables: HashMap<String, Table>,
     /// User-defined composite (row) types, keyed by lowercased name (spec/design/composite.md).
     /// A database-level object set, separate from `tables`; serialized into the catalog's
@@ -345,14 +353,22 @@ impl Snapshot {
         self.types.get(&name.to_ascii_lowercase())
     }
 
+    /// Advance the catalog generation — called by every schema mutator (see `cat_gen`). A SELECT
+    /// plan cached against a prior generation is thereby invalidated on the next execute.
+    pub(crate) fn bump_cat_gen(&mut self) {
+        self.cat_gen += 1;
+    }
+
     /// Register a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
     /// already resolved field types and checked for a duplicate.
     pub(crate) fn put_type(&mut self, ty: CompositeType) {
+        self.bump_cat_gen();
         self.types.insert(ty.name.to_ascii_lowercase(), ty);
     }
 
     /// Remove a composite type (DROP TYPE). The caller has checked there are no dependents.
     pub(crate) fn remove_type(&mut self, key: &str) {
+        self.bump_cat_gen();
         self.types.remove(key);
     }
 
@@ -695,6 +711,7 @@ impl Snapshot {
     /// owns no B-tree (constraints.md §6), so there is nothing else to remove.
     pub(crate) fn remove_foreign_key(&mut self, table_key: &str, fk_name: &str) {
         if let Some(table) = self.tables.get_mut(table_key) {
+            self.cat_gen += 1;
             table
                 .foreign_keys
                 .retain(|fk| !fk.name.eq_ignore_ascii_case(fk_name));
@@ -885,6 +902,7 @@ impl Snapshot {
         col_types: Vec<ColType>,
         page_size: u32,
     ) {
+        self.bump_cat_gen();
         let key = table.name.to_ascii_lowercase();
         let cap = crate::format::page_payload(page_size);
         self.stores
@@ -895,6 +913,7 @@ impl Snapshot {
     /// Remove a table's definition, its store, and its indexes' stores (DROP TABLE — the
     /// indexes have no independent life, spec/design/indexes.md §2).
     fn remove_table(&mut self, key: &str) {
+        self.bump_cat_gen();
         if let Some(t) = self.tables.get(key) {
             for idx in &t.indexes {
                 self.index_stores.remove(&idx.name.to_ascii_lowercase());
@@ -937,6 +956,7 @@ impl Snapshot {
     /// table's `indexes` in ascending lowercased-name order (the catalog/planner order —
     /// spec/design/indexes.md §6) and create its zero-column store.
     pub(crate) fn put_index(&mut self, table_key: &str, def: IndexDef, page_size: u32) {
+        self.bump_cat_gen();
         let name_key = def.name.to_ascii_lowercase();
         let cap = crate::format::page_payload(page_size);
         self.index_stores
@@ -963,6 +983,7 @@ impl Snapshot {
         if let Some(table) = self.tables.get_mut(table_key) {
             if let Some(col) = table.columns.get_mut(column) {
                 col.default_expr = Some(default_expr);
+                self.cat_gen += 1;
             }
         }
     }
@@ -1029,6 +1050,7 @@ impl Snapshot {
     /// Remove one secondary index (DROP INDEX): its definition from the owning table and
     /// its store.
     fn remove_index(&mut self, table_key: &str, name_key: &str) {
+        self.bump_cat_gen();
         if let Some(t) = self.tables.get_mut(table_key) {
             t.indexes
                 .retain(|i| i.name.to_ascii_lowercase() != name_key);
@@ -11240,42 +11262,66 @@ impl Engine {
         e
     }
 
-    /// Try to serve `ast` as a lazy **streaming** query (spec/design/streaming.md §3/§4, S3) — the
-    /// `query()` fast lane. Returns `Some(Rows)` when `ast` is a top-level read `SELECT` whose plan is
-    /// the single-table, no-blocking-operator streaming scan (the same shape `exec_select_plan` routes
-    /// to [`exec_streaming_scan`](Engine::exec_streaming_scan)); else `None`, and the caller falls back
-    /// to the materialized `execute()` path → a `Buffered` cursor. The conformance corpus drives
-    /// `execute()`, so streaming is invisible to it; this lane only affects `query()` and is per-core
-    /// unit-tested to yield the IDENTICAL rows + total cost under full drain (streaming.md §6), while a
-    /// caller that stops early reads (and charges) less. A write-classified statement — including a
-    /// `nextval`/`setval` SELECT ([`stmt_is_write`]) — never streams (it must take the write gate and
-    /// publish, sequences.md §4), so the frozen snapshot never has to reproduce a sequence advance.
-    pub(crate) fn try_streaming_query(
+    /// Serve `ast` as a lazy **streaming** or **buffered** query (spec/design/streaming.md §3/§4),
+    /// planning it EXACTLY ONCE and classifying streaming-vs-buffered from that single plan — the
+    /// plan-once replacement for the old `try_streaming_query` + `try_buffered_query` pair, each of
+    /// which re-planned the same statement. Returns `Some(Rows)` for a top-level read `SELECT`; `None`
+    /// for a shape no scan lane covers (a non-`SELECT`, a write — incl. a `nextval`/`setval` SELECT,
+    /// [`stmt_is_write`] — or a top-level set-op / VALUES / `WITH`), so the caller falls through to the
+    /// deferred / materialized paths. When `cache` is `Some` (a prepared statement) a repeated execute
+    /// over an unchanged catalog reuses the cached plan and skips planning + the fold; the ad-hoc
+    /// `query()` passes `None` and still plans exactly once. The conformance corpus drives the
+    /// materialized `execute()` path, so this lane stays invisible to it (per-core unit-tested to yield
+    /// identical rows + total cost under full drain, streaming.md §6).
+    pub(crate) fn try_scan_query(
         &self,
         ast: &Statement,
         params: &[Value],
+        cache: Option<&std::cell::RefCell<Option<CachedPlan>>>,
     ) -> Result<Option<Rows>> {
-        // Only a bare top-level SELECT streams: a set operation / WITH / VALUES / DML buffers (it is
-        // blocking or not a scan); a write-classified SELECT (a sequence mutator) buffers too.
+        // Only a bare top-level SELECT is a scan lane: a set operation / WITH / VALUES / DML is
+        // blocking or not a scan; a write-classified SELECT (a sequence mutator) buffers too.
         let Statement::Select(sel) = ast else {
             return Ok(None);
         };
         if stmt_is_write(ast) {
             return Ok(None);
         }
+        let (cur_gen, from_committed) = {
+            let snap = self.read_snap();
+            (snap.cat_gen, std::ptr::eq(snap, &self.committed))
+        };
+        // Cache HIT: the read snapshot's catalog is unchanged since the plan was cached (its `cat_gen`
+        // still matches), so reuse the resolved plan + finalized param types — no `plan_query`, no
+        // fold, no param-type walk. A cached plan carries no subquery to fold (`plan_cacheable`
+        // rejected any), so the shared `Rc` plan is never mutated; params are still bound per execute.
+        if let Some(cell) = cache {
+            let hit = cell
+                .borrow()
+                .as_ref()
+                .filter(|cp| cp.cat_gen == cur_gen)
+                .map(|cp| (std::rc::Rc::clone(&cp.plan), cp.param_types.clone()));
+            if let Some((plan, ptys)) = hit {
+                let bound_params = bind_params(params, &ptys)?;
+                if let Some(rows) = self.build_scan_rows(plan, bound_params, 0)? {
+                    return Ok(Some(rows));
+                }
+            }
+        }
+        // MISS: plan once.
         let qe = QueryExpr::Select(Box::new(sel.clone()));
         let mut ptypes = ParamTypes::default();
         let QueryPlan::Select(mut sp) = self.plan_query(&qe, None, &[], &mut ptypes)? else {
-            return Ok(None);
+            return Ok(None); // set-op / VALUES / WITH — a scan lane does not cover it
         };
-        if !streaming_scan_eligible(&sp) {
-            return Ok(None);
-        }
-        let bound_params = bind_params(params, &ptypes.finalize()?)?;
+        let uncacheable = ptypes.uncacheable;
+        let ptys = ptypes.finalize()?;
+        let bound_params = bind_params(params, &ptys)?;
         // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
         // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
         // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
-        // added to the cursor's reported cost below (mirroring `run_query_expr`'s `r.cost += …`).
+        // added to the cursor's reported cost below. A cacheable plan has no subquery, so this is a
+        // no-op (and is skipped on a hit) — cost stays identical.
         let mut subquery_cost: i64 = 0;
         self.fold_uncorrelated_in_select(
             &mut sp,
@@ -11283,118 +11329,119 @@ impl Engine {
             CteCtx::empty(),
             &mut subquery_cost,
         )?;
-
-        // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical to
-        // `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
-        let reverse = sp.pk_reverse;
-        let (bound, empty) = match &sp.rel_bounds[0] {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, &bound_params, &[], &[]) {
-                Some(b) => (b, false),
-                None => (KeyBound::unbounded(), true),
-            },
-            // Eligibility already excludes index/GIN/GiST bounds; this is defensive.
-            Some(_) => return Ok(None),
-            None => (KeyBound::unbounded(), false),
-        };
-        let snap = self.snapshot_engine();
-        let (overlap, slabs) = if empty {
-            (0, 0)
-        } else {
-            snap.store(&sp.rels[0].table_name)
-                .overlap_scan_units(&bound, &sp.rel_masks[0])?
-        };
-        // Read-only streaming SELECT feed: reconstruct only the touched columns (Track A1). The cursor
-        // is `'static`, so it owns the mask.
-        let recon = Some(sp.rel_masks[0].clone());
-        let scan = snap
-            .store(&sp.rels[0].table_name)
-            .store_scan(bound, reverse, recon);
-        let mut meter = snap.session.new_meter();
-        meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
-        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
-
-        let limit = sp.limit;
-        let offset = sp.offset.unwrap_or(0);
-        let distinct = sp.distinct;
-        let column_names = sp.column_names.clone();
-        let done = empty || limit == Some(0);
-        let stream = StreamingScan {
-            engine: snap,
-            plan: sp,
-            params: bound_params,
-            rng: std::cell::Cell::new(crate::seam::StmtRng::new()),
-            scan,
-            meter,
-            offset,
-            limit,
-            distinct,
-            seen: std::collections::HashSet::new(),
-            passed: 0,
-            produced: 0,
-            done,
-        };
-        Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
+        // Fill the cache only from committed state — so `committed.cat_gen` is strictly increasing over
+        // the engine's life and never aliases a rolled-back working generation, making the `cat_gen`
+        // equality on a later HIT a sound "same catalog" identity check (a statement first executed
+        // inside an open transaction re-plans until the tx commits) — and only for a reusable plan.
+        let cacheable = from_committed && !uncacheable && self.plan_cacheable(&sp);
+        let plan = std::rc::Rc::new(sp);
+        if let (Some(cell), true) = (cache, cacheable) {
+            *cell.borrow_mut() = Some(CachedPlan {
+                cat_gen: cur_gen,
+                plan: std::rc::Rc::clone(&plan),
+                param_types: ptys,
+            });
+        }
+        self.build_scan_rows(plan, bound_params, subquery_cost)
     }
 
-    /// Try to serve `ast` as a lazy **buffered** query (spec/design/streaming.md §4, S4) — the
-    /// `query()` path for a top-level read `SELECT` whose plan has a **blocking operator** (a
-    /// non-PK-ordered `ORDER BY`, `DISTINCT`, aggregate / `GROUP BY`, window, or a join) that the
-    /// streamable fast lane ([`try_streaming_query`]) does not cover. The blocking part still buffers
-    /// its input (correctly — it must), but the **output is yielded one row at a time** via
-    /// [`BufferedScan`]: the cursor runs the blocking part on its first pull (so a `54P01` cost abort
-    /// or an arithmetic trap surfaces *during iteration*, not at `query()` — streaming.md §6), then
-    /// emits its buffer lazily — bounding peak *output* memory and letting a caller's early exit skip
-    /// the projection of rows it never pulls (the top-N-over-the-buffer win). Returns `None` for a
-    /// non-`SELECT` / write-classified statement, or a streamable plan (served by the fast lane), or a
-    /// set-operation / `WITH` top level (a deferred S4 follow-on, streaming.md §7) — those fall back to
-    /// the materialized `execute()` path → a `Buffered` cursor. Under **full drain** the rows + total
-    /// cost are byte-identical to the eager path (the same `Emitter` driven row by row, streaming.md §6).
-    pub(crate) fn try_buffered_query(
+    /// Classify a resolved plan (already folded + params bound) as streaming or buffered and build the
+    /// matching lazy cursor. The streaming branch resolves the PK scan bound + the up-front cost
+    /// block (S3); the buffered branch runs its blocking part lazily on the first pull (S4). `plan` is
+    /// shared (`Rc`) — a cache hit hands the SAME allocation here without re-planning. Returns `None`
+    /// only in the (unreachable, defensive) case that an eligible plan carries a non-PK scan bound, so
+    /// the caller falls through. Under full drain the rows + total cost are byte-identical to the
+    /// eager path.
+    fn build_scan_rows(
         &self,
-        ast: &Statement,
-        params: &[Value],
+        plan: std::rc::Rc<SelectPlan>,
+        bound_params: Vec<Value>,
+        subquery_cost: i64,
     ) -> Result<Option<Rows>> {
-        let Statement::Select(sel) = ast else {
-            return Ok(None);
-        };
-        if stmt_is_write(ast) {
-            return Ok(None);
+        if streaming_scan_eligible(&plan) {
+            // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical
+            // to `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
+            let reverse = plan.pk_reverse;
+            let (bound, empty) = match &plan.rel_bounds[0] {
+                Some(ScanBound::Pk(bp)) => match build_key_bound(bp, &bound_params, &[], &[]) {
+                    Some(b) => (b, false),
+                    None => (KeyBound::unbounded(), true),
+                },
+                // Eligibility already excludes index/GIN/GiST bounds; this is defensive.
+                Some(_) => return Ok(None),
+                None => (KeyBound::unbounded(), false),
+            };
+            let snap = self.snapshot_engine();
+            let (overlap, slabs) = if empty {
+                (0, 0)
+            } else {
+                snap.store(&plan.rels[0].table_name)
+                    .overlap_scan_units(&bound, &plan.rel_masks[0])?
+            };
+            // Read-only streaming SELECT feed: reconstruct only the touched columns (Track A1). The
+            // cursor is `'static`, so it owns the mask.
+            let recon = Some(plan.rel_masks[0].clone());
+            let scan = snap
+                .store(&plan.rels[0].table_name)
+                .store_scan(bound, reverse, recon);
+            let mut meter = snap.session.new_meter();
+            meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
+            meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+
+            let limit = plan.limit;
+            let offset = plan.offset.unwrap_or(0);
+            let distinct = plan.distinct;
+            let column_names = plan.column_names.clone();
+            let done = empty || limit == Some(0);
+            let stream = StreamingScan {
+                engine: snap,
+                plan,
+                params: bound_params,
+                rng: std::cell::Cell::new(crate::seam::StmtRng::new()),
+                scan,
+                meter,
+                offset,
+                limit,
+                distinct,
+                seen: std::collections::HashSet::new(),
+                passed: 0,
+                produced: 0,
+                done,
+            };
+            return Ok(Some(Rows::from_streaming(column_names, Box::new(stream))));
         }
-        let qe = QueryExpr::Select(Box::new(sel.clone()));
-        let mut ptypes = ParamTypes::default();
-        let QueryPlan::Select(mut sp) = self.plan_query(&qe, None, &[], &mut ptypes)? else {
-            return Ok(None);
-        };
-        // A streamable plan is the fast lane's job (`try_streaming_query`), tried first; this path is
-        // only the blocking (buffered) shapes.
-        if streaming_scan_eligible(&sp) {
-            return Ok(None);
-        }
-        let bound_params = bind_params(params, &ptypes.finalize()?)?;
-        // Fold globally-uncorrelated subqueries to constants so the per-row projection re-enters
-        // nothing — keeping the cursor self-contained (streaming.md §5). The fold's own cost was
-        // already charged to the shared lifetime gauge by its sub-executions; it is added to the
-        // cursor's reported cost below (mirroring `run_query_expr`'s `r.cost += …`).
-        let mut subquery_cost: i64 = 0;
-        self.fold_uncorrelated_in_select(
-            &mut sp,
-            &bound_params,
-            CteCtx::empty(),
-            &mut subquery_cost,
-        )?;
+
+        // Blocking (buffered) shape: buffers its input but yields the output one row at a time.
         let snap = self.snapshot_engine();
         let mut meter = snap.session.new_meter();
         meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
-        let column_names = sp.column_names.clone();
+        let column_names = plan.column_names.clone();
         let stream = BufferedScan {
             engine: snap,
-            plan: sp,
+            plan,
             params: bound_params,
             rng: std::cell::Cell::new(crate::seam::StmtRng::new()),
             meter,
             state: BufState::Pending,
         };
         Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
+    }
+
+    /// Whether a resolved scan plan may be memoized on a prepared statement (spec/design/api.md §2.4).
+    /// The subquery / precompiled-regex exclusion is tracked separately ([`ParamTypes::uncacheable`],
+    /// set at the node's birth). Here the relations are vetted: a set-returning / CTE / derived
+    /// relation carries a nested plan or generator we do not vet for reuse, and a temp / shared-temp
+    /// table lives in a snapshot the cache key (`committed.cat_gen`) does not track — so a plan
+    /// referencing any of those is never cached (a point lookup / plain join over persistent base
+    /// tables has none).
+    fn plan_cacheable(&self, sp: &SelectPlan) -> bool {
+        sp.rels.iter().all(|r| {
+            r.srf.is_none()
+                && r.cte.is_none()
+                && r.derived.is_none()
+                && !self.is_temp_table(&r.table_name)
+                && !self.is_shared_temp_table(&r.table_name)
+        })
     }
 
     /// Try to serve `ast` as a lazy **deferred** query (spec/design/streaming.md §4/§7) — the
@@ -21264,7 +21311,7 @@ struct EvalEnv<'a> {
 /// output order the primary-key scan already yields (`pk_ordered`, or no `ORDER BY` with a `LIMIT`
 /// short-circuit), no index/GIN/GiST bound (those read the full admitted set eagerly), and a real
 /// table store (not an SRF / CTE / derived source). Both [`exec_select_plan`](Engine::exec_select_plan)
-/// (which routes to the eager `exec_streaming_scan`) and [`try_streaming_query`](Engine::try_streaming_query)
+/// (which routes to the eager `exec_streaming_scan`) and [`try_scan_query`](Engine::try_scan_query)
 /// (the lazy `query()` lane) gate on this ONE predicate, so the two never drift.
 fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
     plan.rels.len() == 1
@@ -21524,6 +21571,22 @@ fn group_by_int_key(
         .collect()
 }
 
+/// A prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved [`SelectPlan`]
+/// (shared `Rc`, so a cache hit rebuilds the cursor around the SAME plan allocation and re-plans
+/// nothing) plus the finalized `$N` param types, stamped with the committed catalog generation
+/// (`cat_gen`) it was built against. Valid only while that generation still matches; a DDL bumps
+/// `cat_gen` and the next execute re-plans. Filled only for a reusable plan read from committed state
+/// ([`Engine::try_scan_query`]). The plan is `!Send` (it holds a regex `Cell`), so a `PreparedStatement`
+/// carrying one is `!Send` too — a non-regression, the whole query/cursor path is already thread-affine.
+pub(crate) struct CachedPlan {
+    // Fields are private to the executor: api.rs / shared.rs only name the type (to hold the
+    // `RefCell<Option<CachedPlan>>` cache and thread it), never touch the fields — which keeps the
+    // more-private `SelectPlan` out of a pub(crate) field.
+    cat_gen: u64,
+    plan: std::rc::Rc<SelectPlan>,
+    param_types: Vec<ScalarType>,
+}
+
 /// The lazy pull pipeline behind a streaming [`Rows`](crate::Rows) cursor (spec/design/streaming.md
 /// §3/§4, S3): [`exec_streaming_scan`](Engine::exec_streaming_scan)'s per-row loop turned inside out
 /// so the CALLER pulls each row. It owns a frozen snapshot [`Engine`] (eval's `exec`, so the cursor
@@ -21536,7 +21599,10 @@ fn group_by_int_key(
 /// while a caller that stops early reads (and charges) less.
 struct StreamingScan {
     engine: Engine,
-    plan: SelectPlan,
+    /// The resolved plan, shared (`Rc`) so a prepared statement's plan cache and this cursor hold the
+    /// same allocation — a cache hit rebinds params + rebuilds the cursor but re-plans nothing
+    /// (spec/design/api.md §2.4). Read-only during iteration (the fold ran before wrapping).
+    plan: std::rc::Rc<SelectPlan>,
     params: Vec<Value>,
     rng: std::cell::Cell<crate::seam::StmtRng>,
     scan: crate::storage::StoreScan,
@@ -21658,7 +21724,8 @@ impl crate::cursor::RowStream for StreamingScan {
 /// as the eager path (streaming.md §6).
 struct BufferedScan {
     engine: Engine,
-    plan: SelectPlan,
+    /// The resolved plan, shared (`Rc`) with a prepared statement's plan cache (see [`StreamingScan`]).
+    plan: std::rc::Rc<SelectPlan>,
     params: Vec<Value>,
     rng: std::cell::Cell<crate::seam::StmtRng>,
     meter: Meter,
@@ -21714,7 +21781,7 @@ impl crate::cursor::RowStream for BufferedScan {
         // distinct from `self.state` it then assigns.
         if matches!(self.state, BufState::Pending) {
             let emitter = self.engine.exec_select_emit(
-                &self.plan,
+                self.plan.as_ref(),
                 &[],
                 &self.params,
                 CteCtx::empty(),
@@ -25337,6 +25404,11 @@ fn resolve_regex_func(
         }
         _ => None,
     };
+    // A precompiled program carries the one-shot `compile_charged` cost flag mutated on first eval, so
+    // a reused plan would under-charge the 2nd+ execute — never cache such a plan.
+    if program.is_some() {
+        params.uncacheable = true;
+    }
     let result = match func {
         RegexFunc::Replace | RegexFunc::Substr => ResolvedType::Text,
         RegexFunc::Match => ResolvedType::Array(Box::new(ResolvedType::Text)),
@@ -26030,6 +26102,13 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
 #[derive(Default)]
 struct ParamTypes {
     types: Vec<Option<ScalarType>>,
+    /// Set during resolution when a node is created that makes the resolved plan un-reusable across
+    /// executions: an `RExpr::Subquery` (the uncorrelated-subquery fold rewrites it to a constant
+    /// baking in THIS execution's bound params) or a precompiled-regex node (whose one-shot
+    /// `compile_charged` cost flag mutates during eval). A prepared statement's plan cache fills only
+    /// when this stayed false — flagging at the node's birth is complete regardless of where in the
+    /// plan tree it lands (spec/design/api.md §2.4).
+    uncacheable: bool,
 }
 
 impl ParamTypes {
@@ -27839,6 +27918,11 @@ fn plan_subquery(scope: &Scope, inner: &QueryExpr, params: &mut ParamTypes) -> R
             "subqueries are only supported in a SELECT statement",
         ));
     }
+    // Any subquery makes the enclosing plan un-cacheable: the fold pass rewrites an uncorrelated one
+    // (or an uncorrelated one nested inside a correlated one) into a constant using THIS execution's
+    // bound params, so a reused plan would carry another execution's folded constants. Every subquery
+    // form (scalar / EXISTS / IN / quantified) funnels through here.
+    params.uncacheable = true;
     scope
         .catalog
         .plan_query(inner, Some(scope), scope.ctes, params)
@@ -29314,6 +29398,11 @@ fn resolve(
             } else {
                 None
             };
+            // A precompiled program carries the one-shot `compile_charged` cost flag mutated on first
+            // eval, so a reused plan would under-charge the 2nd+ execute — never cache such a plan.
+            if program.is_some() {
+                params.uncacheable = true;
+            }
             Ok((
                 RExpr::Regex {
                     lhs: Box::new(rl),
