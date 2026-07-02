@@ -6744,6 +6744,13 @@ impl Engine {
             (Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
+        // Merged PK point-set (cost.md §3 "OR / IN-list") — LAST RESORT for a mutation, after
+        // PK/GIN/GiST. A secondary-index point-set for DML is a separate follow-on, so mutations
+        // bound only by the primary key here.
+        let pk_set = match (&filter, &pk_bound, &gin_bound, &gist_bound) {
+            (Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
+            _ => None,
+        };
         // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
         // OLD-side references — a returned old value is a logical read of the dropped row,
         // while a `new.col` is the constant NULL row and reads nothing. The RETURNING mask
@@ -6762,9 +6769,9 @@ impl Engine {
                 *m |= ret_mask[i];
             }
         }
-        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound) {
+        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound, &pk_set) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[], &[]) {
+            (Some(bp), _, _, _) => match build_key_bound(bp, &bound, &[], &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&del.table).range_scan_with_units(&b, &mask)?;
@@ -6775,7 +6782,7 @@ impl Engine {
             // GIN-bounded delete (gin.md §6): gather the candidate `(key, row)` pairs through the
             // index; the predicate stays the residual filter, re-applied per candidate in the loop
             // below. `gin_entry` is charged inside; the block (page_read/value_decompress) below.
-            (None, Some(gb), _) => {
+            (None, Some(gb), _, _) => {
                 let query = filter
                     .as_ref()
                     .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
@@ -6783,11 +6790,18 @@ impl Engine {
             }
             // GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree;
             // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
-            (None, None, Some(gb)) => {
+            (None, None, Some(gb), _) => {
                 let query = filter.as_ref().and_then(|f| gist_query_operand(f, gb));
                 self.gist_bound_rows(&del.table, gb, query, &env, &mut meter, &mask)?
             }
-            (None, None, None) => {
+            // Merged PK point-set delete (cost.md §3 "OR / IN-list"): a union of point probes over
+            // the distinct sorted keys; whole rows so index entries can be removed. The predicate
+            // stays the residual filter below.
+            (None, None, None, Some(ks)) => {
+                let store = self.store(&del.table);
+                self.pk_key_set_rows(store, ks, &bound, &[], &mask, &[], false)?
+            }
+            (None, None, None, None) => {
                 let (entries, pages, slabs) = self.store(&del.table).scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
@@ -7123,6 +7137,13 @@ impl Engine {
             (Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
+        // Merged PK point-set (cost.md §3 "OR / IN-list") — LAST RESORT for a mutation, after
+        // PK/GIN/GiST. A secondary-index point-set for DML is a separate follow-on, so mutations
+        // bound only by the primary key here.
+        let pk_set = match (&filter, &pk_bound, &gin_bound, &gist_bound) {
+            (Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
+            _ => None,
+        };
         // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
         // and the RETURNING items' — the NEW side minus the assigned columns (an assigned
         // column's returned value is the freshly computed one, not a storage read), plus the
@@ -7147,9 +7168,9 @@ impl Engine {
                 *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
         }
-        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound) {
+        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound, &pk_set) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[], &[]) {
+            (Some(bp), _, _, _) => match build_key_bound(bp, &bound, &[], &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&upd.table).range_scan_with_units(&b, &mask)?;
@@ -7160,7 +7181,7 @@ impl Engine {
             // GIN-bounded update (gin.md §6): gather the candidate `(key, row)` pairs through the
             // index; the predicate stays the residual filter (re-applied per candidate in the loop
             // below). `gin_entry` charged inside; the page_read/value_decompress block below.
-            (None, Some(gb), _) => {
+            (None, Some(gb), _, _) => {
                 let query = filter
                     .as_ref()
                     .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
@@ -7168,11 +7189,18 @@ impl Engine {
             }
             // GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree;
             // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
-            (None, None, Some(gb)) => {
+            (None, None, Some(gb), _) => {
                 let query = filter.as_ref().and_then(|f| gist_query_operand(f, gb));
                 self.gist_bound_rows(&upd.table, gb, query, &env, &mut meter, &mask)?
             }
-            (None, None, None) => {
+            // Merged PK point-set update (cost.md §3 "OR / IN-list"): a union of point probes over
+            // the distinct sorted keys; whole rows so the rewrite can re-key / update index entries.
+            // The predicate stays the residual filter below.
+            (None, None, None, Some(ks)) => {
+                let store = self.store(&upd.table);
+                self.pk_key_set_rows(store, ks, &bound, &[], &mask, &[], false)?
+            }
+            (None, None, None, None) => {
                 let (entries, pages, slabs) = self.store(&upd.table).scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
@@ -9912,7 +9940,11 @@ impl Engine {
             })
             && !matches!(
                 rel_bounds[0],
-                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+                Some(ScanBound::Index(_))
+                | Some(ScanBound::Gin(_))
+                | Some(ScanBound::Gist(_))
+                | Some(ScanBound::PkSet(_))
+                | Some(ScanBound::IndexSet(_))
             )
             // The inner relation must not be an index-nested-loop relation — it is re-materialized
             // per outer row, so the two-table streaming loop (both materialized once) does not apply
@@ -10872,7 +10904,11 @@ impl Engine {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)) => {
+            Some(ScanBound::Index(_))
+            | Some(ScanBound::Gin(_))
+            | Some(ScanBound::Gist(_))
+            | Some(ScanBound::PkSet(_))
+            | Some(ScanBound::IndexSet(_)) => {
                 unreachable!("the streaming path is gated to PK/full scans")
             }
             None => (KeyBound::unbounded(), false),
@@ -11005,7 +11041,11 @@ impl Engine {
         }
         if matches!(
             plan.rel_bounds[0],
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+            Some(ScanBound::Index(_))
+                | Some(ScanBound::Gin(_))
+                | Some(ScanBound::Gist(_))
+                | Some(ScanBound::PkSet(_))
+                | Some(ScanBound::IndexSet(_))
         ) {
             return false;
         }
@@ -11088,7 +11128,11 @@ impl Engine {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)) => {
+            Some(ScanBound::Index(_))
+            | Some(ScanBound::Gin(_))
+            | Some(ScanBound::Gist(_))
+            | Some(ScanBound::PkSet(_))
+            | Some(ScanBound::IndexSet(_)) => {
                 unreachable!("the windowed top-N path is gated to PK/full scans")
             }
             None => (KeyBound::unbounded(), false),
@@ -11540,7 +11584,11 @@ impl Engine {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)) => {
+            Some(ScanBound::Index(_))
+            | Some(ScanBound::Gin(_))
+            | Some(ScanBound::Gist(_))
+            | Some(ScanBound::PkSet(_))
+            | Some(ScanBound::IndexSet(_)) => {
                 unreachable!("the streaming sort path is gated to PK/full scans")
             }
             None => (KeyBound::unbounded(), false),
@@ -11887,6 +11935,32 @@ impl Engine {
                 // SELECT discards the storage keys (UPDATE/DELETE keep them — gist.md §5).
                 (pairs.into_iter().map(|(_, v)| v).collect(), units)
             }
+            Some(ScanBound::PkSet(ks)) => {
+                // Merged PK point-set (cost.md §3 "OR / IN-list"): a union of point probes over the
+                // distinct sorted keys; the whole WHERE stays the residual filter downstream.
+                let (entries, units) = self.pk_key_set_rows(
+                    store,
+                    ks,
+                    params,
+                    outer,
+                    &plan.rel_masks[ri],
+                    left,
+                    true,
+                )?;
+                // SELECT discards the storage keys (UPDATE/DELETE keep them).
+                (entries.into_iter().map(|(_, v)| v).collect(), units)
+            }
+            Some(ScanBound::IndexSet(ks)) => {
+                // Merged secondary-index point-set (cost.md §3 "OR / IN-list").
+                self.index_key_set_rows(
+                    &rel.table_name,
+                    ks,
+                    params,
+                    outer,
+                    &plan.rel_masks[ri],
+                    left,
+                )?
+            }
             None => {
                 // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
                 let (entries, pages, slabs) = store.scan_with_units_masked(&plan.rel_masks[ri])?;
@@ -12155,7 +12229,11 @@ impl Engine {
         // mechanics and residual filter, so it keeps the scalar path.
         if matches!(
             plan.rel_bounds[0],
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+            Some(ScanBound::Index(_))
+                | Some(ScanBound::Gin(_))
+                | Some(ScanBound::Gist(_))
+                | Some(ScanBound::PkSet(_))
+                | Some(ScanBound::IndexSet(_))
         ) {
             return false;
         }
@@ -12480,7 +12558,11 @@ impl Engine {
             && !plan.distinct
             && !matches!(
                 plan.rel_bounds[0],
-                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+                Some(ScanBound::Index(_))
+                | Some(ScanBound::Gin(_))
+                | Some(ScanBound::Gist(_))
+                | Some(ScanBound::PkSet(_))
+                | Some(ScanBound::IndexSet(_))
             )
             // A set-returning relation takes the eager path (functions.md §10).
             && plan.rels[0].srf.is_none()
@@ -13557,10 +13639,31 @@ impl Engine {
                 Some(_) => return Ok((Vec::new(), (0, 0))),
             }
         }
+        self.index_point_rows(
+            table_name,
+            ib,
+            &agreed.expect("an index bound has at least one term"),
+            mask,
+        )
+    }
+
+    /// Fetch the rows a SINGLE already-encoded index value admits — the prefix scan of the index
+    /// B-tree plus, per admitted entry, the row's point lookup — returning them in index-entry order
+    /// with the scan's up-front `(pages, slabs)` block. Factored out of [`Self::index_bound_rows`]
+    /// so both the single-value equality bound and the OR / IN-list point-set bound
+    /// ([`Self::index_key_set_rows`]) drive the identical per-value fetch — same cost by
+    /// construction (cost.md §3 "index-bounded scan" / "OR / IN-list").
+    fn index_point_rows(
+        &self,
+        table_name: &str,
+        ib: &IndexBound,
+        value_key: &[u8],
+        mask: &[bool],
+    ) -> Result<(Vec<Row>, (usize, usize))> {
         // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
         // is every entry extending the prefix: [prefix, byte-successor(prefix)).
         let mut prefix = vec![0x00u8];
-        prefix.extend_from_slice(&agreed.expect("an index bound has at least one term"));
+        prefix.extend_from_slice(value_key);
         let bound = KeyBound {
             lo: Some(prefix.clone()),
             lo_inc: true,
@@ -13589,6 +13692,95 @@ impl Engine {
             pages += n;
             slabs += s;
             rows.push(row.expect("an index entry references a stored row"));
+        }
+        Ok((rows, (pages, slabs)))
+    }
+
+    /// Execute a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"): each distinct
+    /// encoded key is a point probe `[k, k]` over the row's own B-tree, and the admitted rows are
+    /// concatenated in ascending key order (the same order a full scan would yield). The per-probe
+    /// `(pages, slabs)` blocks sum, so the metered cost is the sum of the individual point lookups —
+    /// a core that full-scans instead computes a different cost (the cross-core contract, §8).
+    /// Returns the `(key, row)` entries so the mutation paths can remove/replace by key; SELECT
+    /// discards the keys. `masked` selects the reconstruction variant (SELECT reconstructs only the
+    /// touched columns; a mutation needs whole rows to re-key / remove index entries) — cost-neutral,
+    /// so both charge the identical `(pages, slabs)` driven by the shared `mask`.
+    #[allow(clippy::too_many_arguments)]
+    fn pk_key_set_rows(
+        &self,
+        store: &TableStore,
+        ks: &PkKeySet,
+        params: &[Value],
+        outer: &[&[Value]],
+        mask: &[bool],
+        left: &[Value],
+        masked: bool,
+    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
+        let mut entries: Vec<(Vec<u8>, Row)> = Vec::new();
+        let mut pages = 0usize;
+        let mut slabs = 0usize;
+        for k in encode_key_set(
+            ks.pk_type,
+            &ks.srcs,
+            params,
+            outer,
+            ks.coll.as_deref(),
+            left,
+        ) {
+            let b = KeyBound {
+                lo: Some(k.clone()),
+                lo_inc: true,
+                hi: Some(k),
+                hi_inc: true,
+            };
+            let (es, p, s) = if masked {
+                store.range_scan_with_units_masked(&b, mask)?
+            } else {
+                store.range_scan_with_units(&b, mask)?
+            };
+            entries.extend(es);
+            pages += p;
+            slabs += s;
+        }
+        Ok((entries, (pages, slabs)))
+    }
+
+    /// Execute a secondary-index OR / IN-list point-set bound (cost.md §3 "OR / IN-list"): each
+    /// distinct encoded value is an index point probe ([`Self::index_point_rows`]), and the rows are
+    /// gathered in ascending value order. Because a row has exactly one value for the indexed column,
+    /// distinct values probe disjoint row sets — no row is fetched twice. The per-probe
+    /// `(pages, slabs)` blocks sum, matching the PK point-set cost contract.
+    fn index_key_set_rows(
+        &self,
+        table_name: &str,
+        ks: &IndexKeySet,
+        params: &[Value],
+        outer: &[&[Value]],
+        mask: &[bool],
+        left: &[Value],
+    ) -> Result<(Vec<Row>, (usize, usize))> {
+        let ib = IndexBound {
+            name_key: ks.name_key.clone(),
+            col_type: ks.col_type,
+            eqs: Vec::new(),
+            coll: ks.coll.clone(),
+            tail_types: ks.tail_types.clone(),
+        };
+        let mut rows: Vec<Row> = Vec::new();
+        let mut pages = 0usize;
+        let mut slabs = 0usize;
+        for k in encode_key_set(
+            ks.col_type,
+            &ks.srcs,
+            params,
+            outer,
+            ks.coll.as_deref(),
+            left,
+        ) {
+            let (r, (p, s)) = self.index_point_rows(table_name, &ib, &k, mask)?;
+            rows.extend(r);
+            pages += p;
+            slabs += s;
         }
         Ok((rows, (pages, slabs)))
     }
@@ -17005,16 +17197,68 @@ struct PkBound {
     coll: Option<std::sync::Arc<Collation>>,
 }
 
+/// The plan-time result of an OR / IN-list disjunction of primary-key equalities
+/// (`pk = a OR pk = b OR …`, or the equivalent `pk IN (a, b, …)` which desugars to that OR-chain
+/// — cost.md §3 "OR / IN-list"). `srcs` is the equality const-sources, one per disjunct, in source
+/// order (a bind param, an outer/correlated column, or a literal — a const-source of the PK type).
+/// At exec time each src encodes into the PK key space; the resulting keys are de-duplicated and
+/// sorted, and each becomes a point probe `[k, k]`. The whole WHERE stays the residual filter (the
+/// union is a superset), so the result is unchanged. `coll` is the PK's key collation (`None` for a
+/// `C` key), as in [`PkBound`].
+struct PkKeySet {
+    pk_type: ScalarType,
+    coll: Option<std::sync::Arc<Collation>>,
+    srcs: Vec<BoundSrc>,
+}
+
+/// The [`PkKeySet`] analog over a leading B-tree secondary-index column (indexes.md §5): each
+/// distinct encoded value becomes an index point probe (prefix scan + per-entry row lookup), and
+/// the rows are gathered in ascending value order. `tail_types` is the remaining key components'
+/// types (as in [`IndexBound`]) — the per-entry key-suffix skip.
+struct IndexKeySet {
+    name_key: String,
+    col_type: ScalarType,
+    coll: Option<std::sync::Arc<Collation>>,
+    tail_types: Vec<ScalarType>,
+    srcs: Vec<BoundSrc>,
+}
+
 /// A per-relation scan bound (cost.md §3): a primary-key range, a secondary-index
-/// equality (spec/design/indexes.md §5), or a GIN-bounded scan over an array column
-/// (spec/design/gin.md §6). The PK bound wins when several apply — it is the row's own key
-/// (no second tree, range-capable, strictly cheaper); the ordered-index equality bound wins
-/// over GIN (the deterministic precedence, gin.md §6).
+/// equality (spec/design/indexes.md §5), a GIN-bounded scan over an array column
+/// (spec/design/gin.md §6), a GiST-bounded scan, or a MERGED point-set (an OR / IN-list of key
+/// equalities lowered to a union of point probes — cost.md §3 "OR / IN-list"). The PK bound wins
+/// when several apply — it is the row's own key (no second tree, range-capable, strictly cheaper);
+/// the ordered-index equality bound wins over GIN (the deterministic precedence, gin.md §6). The
+/// point-set bounds (`PkSet`/`IndexSet`) are a LAST-RESORT access path, chosen only when no
+/// contiguous PK/index/GIN/GiST bound applies, so they never displace an existing plan.
 enum ScanBound {
     Pk(PkBound),
     Index(IndexBound),
     Gin(GinBound),
     Gist(GistBound),
+    PkSet(PkKeySet),
+    IndexSet(IndexKeySet),
+}
+
+impl ScanBound {
+    /// Whether this bound needs the general eager materialize path (`materialize_rel` / the DML
+    /// scan) rather than a single-contiguous-range fast path (streaming scan, columnar project,
+    /// vectorized aggregate, streaming sort, join top-N). True for a second-tree gather
+    /// (index / GIN / GiST) and for a merged OR/IN point-set (`PkSet` / `IndexSet` — a union of
+    /// probes, cost.md §3 "OR / IN-list"); false for a plain PK contiguous bound (which every fast
+    /// path handles via a single `build_key_bound`). Every single-table fast-path gate consults
+    /// this so the point-set bounds are interpreted in exactly ONE place (`materialize_rel`), never
+    /// silently dropped to a full scan by a fast path that only understands `Pk`.
+    fn needs_eager_scan(&self) -> bool {
+        matches!(
+            self,
+            ScanBound::Index(_)
+                | ScanBound::Gin(_)
+                | ScanBound::Gist(_)
+                | ScanBound::PkSet(_)
+                | ScanBound::IndexSet(_)
+        )
+    }
 }
 
 /// The plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST index (lowest
@@ -17185,7 +17429,132 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Engine) -> Option
         return Some(ScanBound::Gist(gb));
     }
     // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
-    detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset).map(ScanBound::Gin)
+    if let Some(gb) = detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset) {
+        return Some(ScanBound::Gin(gb));
+    }
+    // LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes (cost.md §3
+    // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so
+    // this never displaces an existing plan. The primary key wins over a secondary index (its own
+    // key — no second tree), matching `detect_scan_bound`'s PK-then-index ordering.
+    if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
+        let sty = rel.table.columns[pk_local].ty.as_scalar()?;
+        let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
+        let srcs = detect_key_set(filter, rel.offset + pk_local, sty, coll.as_deref())?;
+        Some(ScanBound::PkSet(PkKeySet {
+            pk_type: sty,
+            coll,
+            srcs,
+        }))
+    }) {
+        return Some(b);
+    }
+    for idx in &rel.table.indexes {
+        if idx.kind != IndexKind::Btree {
+            continue;
+        }
+        let ci = idx.columns[0];
+        let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
+            continue;
+        };
+        if idx.columns[1..].iter().any(|&c| {
+            rel.table.columns[c]
+                .ty
+                .as_scalar()
+                .is_none_or(|s| !s.is_fixed_width())
+        }) {
+            continue;
+        }
+        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
+            continue;
+        };
+        if let Some(srcs) = detect_key_set(filter, rel.offset + ci, ty, coll.as_deref()) {
+            return Some(ScanBound::IndexSet(IndexKeySet {
+                name_key: idx.name.to_ascii_lowercase(),
+                col_type: ty,
+                coll,
+                tail_types: idx.columns[1..]
+                    .iter()
+                    .map(|&c| rel.table.columns[c].ty.scalar())
+                    .collect(),
+                srcs,
+            }));
+        }
+    }
+    None
+}
+
+/// Find an OR / IN-list disjunction of equalities on ONE key column (at global index `key_idx`) and
+/// return its equality const-sources (one per disjunct), or `None` if the filter has no such shape
+/// (cost.md §3 "OR / IN-list"). `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c` at resolve
+/// time (grammar.md §20), so an IN-list and a hand-written OR-of-equalities present the identical
+/// tree — this handles both. The filter's top-level AND-chain is flattened; the FIRST conjunct that
+/// reduces to a pure disjunction of `keycol = const` equalities is used (the rest of the WHERE stays
+/// the residual filter). A conjunct reduces iff it is a `keycol = const`, or an OR of two reducing
+/// operands — an AND, a NOT, a range comparison, or an equality on a different column makes it
+/// non-reducing, so a mixed disjunction (`pk = 1 OR x = 2`) or a NOT IN (`NOT (pk = 1 OR …)`)
+/// correctly yields no bound. Conservative + sound: an unrecognized filter contributes no bound.
+fn detect_key_set(
+    filter: &RExpr,
+    key_idx: usize,
+    key_type: ScalarType,
+    coll: Option<&Collation>,
+) -> Option<Vec<BoundSrc>> {
+    let col_coll = coll.map(|c| c.name.as_str());
+    // Walk the top-level AND chain; the FIRST conjunct that reduces to a pure disjunction of
+    // `keycol = const` equalities is used (the rest of the WHERE stays the residual filter).
+    fn walk(
+        e: &RExpr,
+        key_idx: usize,
+        key_type: ScalarType,
+        col_coll: Option<&str>,
+    ) -> Option<Vec<BoundSrc>> {
+        if let RExpr::And(l, r) = e {
+            return walk(l, key_idx, key_type, col_coll)
+                .or_else(|| walk(r, key_idx, key_type, col_coll));
+        }
+        reduce_key_set(e, key_idx, key_type, col_coll)
+    }
+    walk(filter, key_idx, key_type, col_coll)
+}
+
+/// Reduce one predicate to the set of equality const-sources it bounds `key_idx` with, or `None` if
+/// it is not a pure disjunction of `keycol = const` ([`detect_key_set`]). Descends OR nodes only; a
+/// single `keycol = const` leaf is the base case (the same term extraction as
+/// [`collect_bound_terms`], with no sibling references — a once-materialized bound). A comparison
+/// bounds the key only when ITS resolved collation matches the key column's frozen collation.
+fn reduce_key_set(
+    e: &RExpr,
+    key_idx: usize,
+    key_type: ScalarType,
+    col_coll: Option<&str>,
+) -> Option<Vec<BoundSrc>> {
+    if let RExpr::Or(l, r) = e {
+        let mut left = reduce_key_set(l, key_idx, key_type, col_coll)?;
+        let right = reduce_key_set(r, key_idx, key_type, col_coll)?;
+        left.extend(right);
+        return Some(left);
+    }
+    if let RExpr::Compare {
+        op: CmpOp::Eq,
+        lhs,
+        rhs,
+        collation,
+    } = e
+    {
+        if collation.as_ref().map(|c| c.name.as_str()) != col_coll {
+            return None;
+        }
+        let is_key = |x: &RExpr| matches!(x, RExpr::Column(i) if *i == key_idx);
+        let src = if is_key(lhs) {
+            const_source(rhs, key_type, None)
+        } else if is_key(rhs) {
+            const_source(lhs, key_type, None)
+        } else {
+            None
+        };
+        return src.map(|s| vec![s]);
+    }
+    None
 }
 
 /// Detect an **index-nested-loop** scan bound for a join inner relation `rel` (spec/design/cost.md
@@ -18482,6 +18851,34 @@ fn flip_cmp(op: CmpOp) -> CmpOp {
         CmpOp::Eq => CmpOp::Eq,
         CmpOp::Ne => CmpOp::Ne,
     }
+}
+
+/// Encode an OR / IN-list's equality const-sources into the key space and return a SORTED,
+/// DE-DUPLICATED set of encoded keys — the distinct point probes a merged point-set bound visits
+/// (cost.md §3 "OR / IN-list"). A src that is NULL (3VL-never-true) or does not encode into the key
+/// domain (an out-of-range integer — no stored key can equal it) contributes no point and is skipped
+/// (sound: the union stays a superset, and the residual filter re-checks each admitted row). Byte-
+/// dedup == value-dedup and byte-sort == value-sort under the order-preserving key encoding
+/// (encoding.md §2), so probing the sorted distinct keys yields rows in ascending key order with no
+/// row visited twice. Shared by the PK and secondary-index point-set executors.
+fn encode_key_set(
+    key_type: ScalarType,
+    srcs: &[BoundSrc],
+    params: &[Value],
+    outer: &[&[Value]],
+    coll: Option<&Collation>,
+    left: &[Value],
+) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(srcs.len());
+    for src in srcs {
+        match encode_bound_key(key_type, src, params, outer, coll, left) {
+            BoundKey::Null | BoundKey::OutOfRange => continue,
+            BoundKey::Key(k) => keys.push(k),
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Build the concrete key range at exec time: encode each const-source and intersect the half-bounds.
@@ -20642,7 +21039,11 @@ fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
         && (plan.pk_ordered || (!plan.distinct && plan.order.is_empty() && plan.limit.is_some()))
         && !matches!(
             plan.rel_bounds[0],
-            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+            Some(ScanBound::Index(_))
+                | Some(ScanBound::Gin(_))
+                | Some(ScanBound::Gist(_))
+                | Some(ScanBound::PkSet(_))
+                | Some(ScanBound::IndexSet(_))
         )
         && plan.rels[0].srf.is_none()
         && plan.rels[0].cte.is_none()
@@ -20677,7 +21078,11 @@ fn vectorized_project_eligible(plan: &SelectPlan) -> bool {
     // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics.
     if matches!(
         plan.rel_bounds[0],
-        Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
+        Some(ScanBound::Index(_))
+            | Some(ScanBound::Gin(_))
+            | Some(ScanBound::Gist(_))
+            | Some(ScanBound::PkSet(_))
+            | Some(ScanBound::IndexSet(_))
     ) {
         return false;
     }
@@ -25741,7 +26146,27 @@ impl Engine {
         if let Some(gp) = detect_gist_bound(f, &table.indexes, &table.columns, 0) {
             return Some(ScanBound::Gist(gp));
         }
+        if let Some(ks) = self.pk_set_for(table, Some(f)) {
+            return Some(ScanBound::PkSet(ks));
+        }
         None
+    }
+
+    /// The [`Self::pk_bound_for`] analog for an OR / IN-list of primary-key equalities — a merged PK
+    /// point-set bound for the UPDATE/DELETE scan (cost.md §3 "OR / IN-list"). Like `pk_bound_for` it
+    /// applies only to a scalar, non-`Skewed`-collated PK. A secondary-index point-set for DML is the
+    /// separate index-scans-for-DML follow-on, so mutations bound only by the primary key here.
+    fn pk_set_for(&self, table: &Table, filter: Option<&RExpr>) -> Option<PkKeySet> {
+        let f = filter?;
+        let pk_idx = table.primary_key_index()?;
+        let pk_ty = table.columns[pk_idx].ty.as_scalar()?;
+        let coll = key_collation_ctx(self, &table.columns[pk_idx])?;
+        let srcs = detect_key_set(f, pk_idx, pk_ty, coll.as_deref())?;
+        Some(PkKeySet {
+            pk_type: pk_ty,
+            coll,
+            srcs,
+        })
     }
 
     /// Resolve the inner statement into a [`QueryPlan`] WITHOUT executing it — the read-query forms
@@ -26009,6 +26434,13 @@ impl Engine {
             Some(ScanBound::Index(ib)) => format!("{prefix}Index bound: using {}", ib.name_key),
             Some(ScanBound::Gin(gb)) => format!("GIN bound: using {}", gb.name_key),
             Some(ScanBound::Gist(gp)) => format!("GiST bound: using {}", gp.name_key),
+            Some(ScanBound::PkSet(ks)) => format!(
+                "{prefix}PK point set: {}",
+                render_key_set(&self.first_pk_col_name(table_name), &ks.srcs)
+            ),
+            Some(ScanBound::IndexSet(ks)) => {
+                format!("{prefix}Index point set: using {}", ks.name_key)
+            }
         }
     }
 
@@ -26118,6 +26550,15 @@ fn with_note(detail: impl Into<String>, note: &str) -> String {
         return format!("ordered: {note}");
     }
     format!("{detail}; ordered: {note}")
+}
+
+/// Render a merged OR / IN-list point-set bound's const-sources as `col in (a, b, c)` (cost.md §3
+/// "OR / IN-list"), in source order (the plan-time order, before the exec-time encode / dedup /
+/// sort) — deterministic across cores. Each source renders via [`render_bound_src`] (a bind param
+/// as `$N`, a correlated column as `outer`, a literal via its token).
+fn render_key_set(col: &str, srcs: &[BoundSrc]) -> String {
+    let parts: Vec<String> = srcs.iter().map(render_bound_src).collect();
+    format!("{col} in ({})", parts.join(", "))
 }
 
 /// Render a primary-key bound's terms as `col <op> <src>` conjuncts joined by " and " — e.g.

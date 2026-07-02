@@ -36,6 +36,124 @@ gen = "int_uniform"
 min = 1
 max = 100000
 
+# OR / IN-list merged point lookups (spec/design/cost.md §3 "OR / IN-list", query.or_in_point_lookup):
+# a 10-value IN-list on the PRIMARY KEY lowers to 10 point probes over the 1M-row B-tree instead of a
+# full scan — the win this benchmark demonstrates (a handful of root→leaf seeks vs. a walk of every
+# leaf). Before the optimization jed full-scanned every such query. ORDER BY id gives the deterministic
+# cross-engine answer checksum (the PK point-set already yields ascending key order).
+[[bench]]
+name = "in_list_pk"
+description = "10-value IN-list on the PRIMARY KEY over 1M rows — merged point lookups (10 B-tree seeks) vs. a full scan (cost.md §3 \"OR / IN-list\")"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders WHERE id IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ORDER BY id"
+warmup = 2000
+iterations = 40000
+seed = 4222
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+# The same merge over a leading SECONDARY-INDEX column: an 8-value IN-list on customer_id (~10 rows per
+# value) lowers to 8 index point probes + a PK lookup per admitted row, vs. a full scan
+# (query.or_in_point_lookup, the secondary-index path).
+[[bench]]
+name = "in_list_secondary"
+description = "8-value IN-list on a SECONDARY-INDEX column over 1M rows — merged index point probes vs. a full scan (cost.md §3 \"OR / IN-list\")"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders WHERE customer_id IN ($1, $2, $3, $4, $5, $6, $7, $8) ORDER BY id"
+warmup = 1000
+iterations = 15000
+seed = 4223
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
 [[bench]]
 name = "full_scan_agg"
 description = "Full-table aggregate over 1M rows (count + sum)"

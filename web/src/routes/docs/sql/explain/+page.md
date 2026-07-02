@@ -19,6 +19,7 @@ INSERT INTO trip VALUES (1, 3), (2, 1), (3, 3);`;
 	const fullScan = `EXPLAIN SELECT name FROM city ORDER BY name;`;
 	const pkBound = `EXPLAIN SELECT name FROM city WHERE id = 3;`;
 	const indexBound = `EXPLAIN SELECT name FROM city WHERE region = 1;`;
+	const pointSet = `EXPLAIN SELECT name FROM city WHERE id IN (1, 3, 5);`;
 	const indexNestedLoop = `EXPLAIN SELECT c.name
 FROM trip t JOIN city c ON c.id = t.city_id;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
@@ -65,6 +66,15 @@ column and predicate. The original `WHERE` stays as the residual `Filter` above 
 An equality on an indexed non-key column uses the index — `Index bound: using <index>`.
 
 <LiveSql seed={seed} query={indexBound} rows={8} />
+
+## An OR / IN-list of keys
+
+An `IN`-list on the primary key — or the equivalent `id = 1 OR id = 3 OR id = 5` — is a **union of
+point lookups**, not a full scan: the `PK point set` detail lists the keys, and jed seeks each one
+(de-duplicated) instead of walking the whole table. The same applies to an indexed non-key column
+(`Index point set: using <index>`).
+
+<LiveSql seed={seed} query={pointSet} rows={8} />
 
 ## An index-nested-loop join
 

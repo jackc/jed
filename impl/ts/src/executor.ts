@@ -1828,9 +1828,7 @@ function streamingScanEligible(plan: SelectPlan): boolean {
     !plan.isAgg &&
     !plan.hasWindow &&
     (plan.pkOrdered || (!plan.distinct && plan.order.length === 0 && plan.limit !== null)) &&
-    plan.relBounds[0]?.kind !== "index" &&
-    plan.relBounds[0]?.kind !== "gin" &&
-    plan.relBounds[0]?.kind !== "gist" &&
+    !needsEagerScan(plan.relBounds[0]) &&
     plan.rels[0]!.srf === undefined &&
     plan.rels[0]!.cte === undefined &&
     plan.rels[0]!.derived === undefined
@@ -1880,9 +1878,9 @@ function vectorizedProjectEligible(plan: SelectPlan): boolean {
   // No ORDER BY / LIMIT / OFFSET (those route to a streaming / sort / index path). A residual filter is
   // fine — projectColumnar vectorizes it (A3).
   if (plan.order.length !== 0 || plan.limit !== null || plan.offset !== null) return false;
-  // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics.
-  const bk = plan.relBounds[0]?.kind;
-  if (bk === "index" || bk === "gin" || bk === "gist") return false;
+  // Full scan or a primary-key bound only — an index / GIN / GiST / point-set bound changes the scan
+  // mechanics (needsEagerScan), so it keeps the general materialize path.
+  if (needsEagerScan(plan.relBounds[0])) return false;
   // Every projection must be a bare column reference: a bare "column" evaluates to row[index] with zero
   // operator_eval, so gathering it from a dense lane is cost-identical. An expression projection
   // (`c0 + 1`, a function call) charges operator_eval and needs a row — it keeps the row path.
@@ -3664,6 +3662,8 @@ export class Engine {
     if (gb !== null) return { kind: "gin", gin: gb };
     const gp = detectGistBound(filter, table.indexes, table.columns, 0);
     if (gp !== null) return { kind: "gist", gist: gp };
+    const ks = pkSetFor(table, filter, this.readSnap());
+    if (ks !== null) return { kind: "pkSet", pkSet: ks };
     return null;
   }
 
@@ -3891,6 +3891,12 @@ export class Engine {
         return "GIN bound: using " + b.gin.nameKey;
       case "gist":
         return "GiST bound: using " + b.gist.nameKey;
+      case "pkSet":
+        return (
+          prefix + "PK point set: " + renderKeySet(this.firstPKColName(tableName), b.pkSet.srcs)
+        );
+      case "indexSet":
+        return prefix + "Index point set: using " + b.indexSet.nameKey;
     }
   }
 
@@ -5566,10 +5572,25 @@ export class Engine {
       if (agreed === null) agreed = bk.key;
       else if (!bytesEq(agreed, bk.key)) return { rows: [], pages: 0, slabs: 0 };
     }
+    return this.indexPointRows(tableName, ib, agreed!, mask);
+  }
+
+  // indexPointRows fetches the rows a SINGLE already-encoded index value admits — the prefix
+  // scan of the index B-tree plus, per admitted entry, the row's point lookup — returning them
+  // in index-entry order with the scan's up-front (pages, slabs). Factored out of indexBoundRows so
+  // both the single-value equality bound (indexBoundRows) and the OR / IN-list point-set bound
+  // (indexKeySetRows) drive the identical per-value fetch — same cost by construction (cost.md §3
+  // "index-bounded scan" / "OR / IN-list").
+  indexPointRows(
+    tableName: string,
+    ib: IndexBound,
+    valueKey: Uint8Array,
+    mask: boolean[],
+  ): { rows: Row[]; pages: number; slabs: number } {
     // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
     // is every entry extending the prefix: [prefix, byte-successor(prefix)).
-    const prefix = new Uint8Array(1 + agreed!.length);
-    prefix.set(agreed!, 1);
+    const prefix = new Uint8Array(1 + valueKey.length);
+    prefix.set(valueKey, 1);
     const b: KeyBound = {
       lo: prefix,
       loInc: true,
@@ -5597,6 +5618,69 @@ export class Engine {
       slabs += u.slabs;
       if (u.row === undefined) throw new Error("an index entry references a stored row");
       rows.push(u.row);
+    }
+    return { rows, pages, slabs };
+  }
+
+  // pkKeySetRows executes a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"):
+  // each distinct encoded key is a point probe [k, k] over the row's own B-tree, and the admitted
+  // rows are concatenated in ascending key order (the same order a full scan would yield). The
+  // per-probe (pages, slabs) blocks sum, so the metered cost is the sum of the individual point
+  // lookups — a core that full-scans instead computes a different cost (the cross-core contract, §8).
+  // Returns the (key, row) entries so the mutation paths can remove/replace by key; SELECT discards
+  // the keys. masked selects the reconstruction variant (SELECT reconstructs only the touched
+  // columns; a mutation needs whole rows to re-key/remove index entries) — cost-neutral, so both
+  // charge the identical (pages, slabs) driven by the shared mask.
+  pkKeySetRows(
+    store: TableStore,
+    ks: PkKeySet,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+    masked: boolean,
+  ): { entries: Entry[]; pages: number; slabs: number } {
+    const entries: Entry[] = [];
+    let pages = 0;
+    let slabs = 0;
+    for (const k of encodeKeySet(ks.pkType, ks.srcs, params, outer, ks.coll, left)) {
+      const b: KeyBound = { lo: k, loInc: true, hi: k, hiInc: true };
+      const u = masked ? store.rangeScanWithUnitsMasked(b, mask) : store.rangeScanWithUnits(b, mask);
+      for (const e of u.entries) entries.push(e);
+      pages += u.pages;
+      slabs += u.slabs;
+    }
+    return { entries, pages, slabs };
+  }
+
+  // indexKeySetRows executes a secondary-index OR / IN-list point-set bound (cost.md §3 "OR /
+  // IN-list"): each distinct encoded value is an index point probe (indexPointRows), and the rows are
+  // gathered in ascending value order. Because a row has exactly one value for the indexed column,
+  // distinct values probe disjoint row sets — no row is fetched twice. The per-probe (pages, slabs)
+  // blocks sum, matching the PK point-set cost contract.
+  indexKeySetRows(
+    tableName: string,
+    ks: IndexKeySet,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): { rows: Row[]; pages: number; slabs: number } {
+    const ib: IndexBound = {
+      nameKey: ks.nameKey,
+      colType: ks.colType,
+      eqs: [],
+      coll: ks.coll,
+      tailTypes: ks.tailTypes,
+    };
+    const rows: Row[] = [];
+    let pages = 0;
+    let slabs = 0;
+    for (const k of encodeKeySet(ks.colType, ks.srcs, params, outer, ks.coll, left)) {
+      const r = this.indexPointRows(tableName, ib, k, mask);
+      for (const row of r.rows) rows.push(row);
+      pages += r.pages;
+      slabs += r.slabs;
     }
     return { rows, pages, slabs };
   }
@@ -7039,6 +7123,7 @@ export class Engine {
       // this reads the read-your-writes state. ginEntry charged inside; the block below.
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
       const gtb = gb === null ? detectGistBound(filter, table.indexes, table.columns, 0) : null;
+      const ks = gb === null && gtb === null ? pkSetFor(table, filter, this.readSnap()) : null;
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
         const r = this.ginBoundRows(del.table, gb, m?.query ?? null, env, meter, mask);
@@ -7050,6 +7135,14 @@ export class Engine {
         // &&/@> predicate stays the residual filter re-applied per candidate below.
         const q = filter !== null ? gistQueryOperand(filter, gtb) : null;
         const r = this.gistBoundRows(del.table, gtb, q, env, meter, mask);
+        entries = r.entries;
+        overlap = r.pages;
+        slabs = r.slabs;
+      } else if (ks !== null) {
+        // Merged PK point-set delete (cost.md §3 "OR / IN-list"): a union of point probes over the
+        // distinct sorted keys; whole rows so index entries can be removed. The predicate stays the
+        // residual filter below.
+        const r = this.pkKeySetRows(store, ks, bound, [], mask, [], false);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -7332,6 +7425,7 @@ export class Engine {
       // the ordered-index bound stays SELECT-only). ginEntry charged inside; the block below.
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
       const gtb = gb === null ? detectGistBound(filter, table.indexes, table.columns, 0) : null;
+      const ks = gb === null && gtb === null ? pkSetFor(table, filter, this.readSnap()) : null;
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
         const r = this.ginBoundRows(upd.table, gb, m?.query ?? null, env, meter, mask);
@@ -7343,6 +7437,14 @@ export class Engine {
         // the PRE-update state; the &&/@> predicate stays the residual filter re-applied per candidate.
         const q = filter !== null ? gistQueryOperand(filter, gtb) : null;
         const r = this.gistBoundRows(upd.table, gtb, q, env, meter, mask);
+        entries = r.entries;
+        overlap = r.pages;
+        slabs = r.slabs;
+      } else if (ks !== null) {
+        // Merged PK point-set update (cost.md §3 "OR / IN-list"): a union of point probes over the
+        // distinct sorted keys of the PRE-update state; whole rows. The predicate stays the residual
+        // filter below.
+        const r = this.pkKeySetRows(store, ks, bound, [], mask, [], false);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -9378,9 +9480,7 @@ export class Engine {
         (r) =>
           r.lateral !== true && r.srf === undefined && r.cte === undefined && r.derived === undefined,
       ) &&
-      relBounds[0]?.kind !== "index" &&
-      relBounds[0]?.kind !== "gin" &&
-      relBounds[0]?.kind !== "gist" &&
+      !needsEagerScan(relBounds[0]) &&
       relINLBounds[0] === null &&
       relINLBounds[1] === null &&
       order.length <= pkIndices(scope.rels[0]!.table).length
@@ -10397,8 +10497,7 @@ export class Engine {
     let empty = false;
     const sb = plan.relBounds[0]!;
     if (sb !== null) {
-      if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
-        throw new Error("the streaming path is gated to PK/full scans");
+      if (sb.kind !== "pk") throw new Error("the streaming path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer, []);
       if (b === null) empty = true;
       else bound = b;
@@ -10488,8 +10587,7 @@ export class Engine {
     if (plan.rels.length !== 1 || plan.joins.length !== 0) return false;
     const rel = plan.rels[0]!;
     if (rel.srf !== undefined || rel.cte !== undefined || rel.derived !== undefined) return false;
-    const bk = plan.relBounds[0]?.kind;
-    if (bk === "index" || bk === "gin" || bk === "gist") return false;
+    if (needsEagerScan(plan.relBounds[0])) return false;
     if (plan.windowKeys.length !== 0 || plan.orderExprs.length !== 0) return false;
     const table = this.lkpTable(rel.tableName);
     if (table === undefined) return false;
@@ -10555,8 +10653,7 @@ export class Engine {
     let empty = false;
     const sb = plan.relBounds[0]!;
     if (sb !== null) {
-      if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
-        throw new Error("the windowed top-N path is gated to PK/full scans");
+      if (sb.kind !== "pk") throw new Error("the windowed top-N path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer, []);
       if (b === null) empty = true;
       else bound = b;
@@ -10682,8 +10779,7 @@ export class Engine {
     let empty = false;
     const sb = plan.relBounds[0]!;
     if (sb !== null) {
-      if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
-        throw new Error("the streaming sort path is gated to PK/full scans");
+      if (sb.kind !== "pk") throw new Error("the streaming sort path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer, []);
       if (b === null) empty = true;
       else bound = b;
@@ -10956,6 +11052,34 @@ export class Engine {
         nodeCount = u.pages;
         slabs = u.slabs;
       }
+    } else if (relBound !== null && relBound.kind === "pkSet") {
+      // Merged PK point-set (cost.md §3 "OR / IN-list"): a union of point probes over the distinct
+      // sorted keys; the whole WHERE stays the residual filter downstream.
+      const r = this.pkKeySetRows(
+        store,
+        relBound.pkSet,
+        params,
+        outer,
+        plan.relMasks[ri]!,
+        left,
+        true,
+      );
+      rows = r.entries.map((e) => e.row);
+      nodeCount = r.pages;
+      slabs = r.slabs;
+    } else if (relBound !== null && relBound.kind === "indexSet") {
+      // Merged secondary-index point-set (cost.md §3 "OR / IN-list").
+      const r = this.indexKeySetRows(
+        rel.tableName,
+        relBound.indexSet,
+        params,
+        outer,
+        plan.relMasks[ri]!,
+        left,
+      );
+      rows = r.rows;
+      nodeCount = r.pages;
+      slabs = r.slabs;
     } else {
       // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
       const u = store.scanWithUnitsMasked(plan.relMasks[ri]!);
@@ -11154,10 +11278,9 @@ export class Engine {
     ) {
       return false;
     }
-    // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics and
-    // residual filter, so it keeps the scalar path.
-    const bk = plan.relBounds[0]?.kind;
-    if (bk === "index" || bk === "gin" || bk === "gist") return false;
+    // Full scan or a primary-key bound only — an index / GIN / GiST / point-set bound changes the scan
+    // mechanics and residual filter (needsEagerScan), so it keeps the scalar path.
+    if (needsEagerScan(plan.relBounds[0])) return false;
     // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no materialized
     // expression keys (`GROUP BY a + b`), and no GROUPING() calls.
     if (plan.groupSets.length !== 1 || plan.groupExprs.length !== 0 || plan.groupingSpecs.length !== 0) {
@@ -11364,9 +11487,7 @@ export class Engine {
       !plan.isAgg &&
       !plan.hasWindow &&
       !plan.distinct &&
-      plan.relBounds[0]?.kind !== "index" &&
-      plan.relBounds[0]?.kind !== "gin" &&
-      plan.relBounds[0]?.kind !== "gist" &&
+      !needsEagerScan(plan.relBounds[0]) &&
       // A set-returning relation takes the eager path (functions.md §10).
       plan.rels[0]!.srf === undefined &&
       // A CTE reference takes the eager path (cte.md §5).
@@ -12030,15 +12151,60 @@ function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Ro
 // drop to what it touches. The unbounded case keeps the full scan, so its cost never moves.
 
 // ScanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
-// secondary-index equality (spec/design/indexes.md §5), or a GIN-bounded scan over an array
-// column (spec/design/gin.md §6). The PK bound wins when several apply (it is the row's own
-// key — no second tree, range-capable, strictly cheaper); the ordered-index equality bound
-// wins over GIN (gin.md §6).
+// secondary-index equality (spec/design/indexes.md §5), a GIN-bounded scan over an array column
+// (spec/design/gin.md §6), a GiST-bounded scan, or a MERGED point-set (an OR / IN-list of key
+// equalities lowered to a union of point probes — cost.md §3 "OR / IN-list"). The PK bound wins
+// when several apply (it is the row's own key — no second tree, range-capable, strictly cheaper);
+// the ordered-index equality bound wins over GIN (gin.md §6). The point-set bounds (pkSet/indexSet)
+// are a LAST-RESORT access path, chosen only when no contiguous PK/index/GIN/GiST bound applies, so
+// they never displace an existing plan.
 type ScanBound =
   | { kind: "pk"; pk: PkBound }
   | { kind: "index"; index: IndexBound }
   | { kind: "gin"; gin: GinBound }
-  | { kind: "gist"; gist: GistBound };
+  | { kind: "gist"; gist: GistBound }
+  | { kind: "pkSet"; pkSet: PkKeySet }
+  | { kind: "indexSet"; indexSet: IndexKeySet };
+
+// needsEagerScan reports whether a bound needs the general eager materialize path (materializeRel /
+// the DML scan) rather than a single-contiguous-range fast path (streaming scan, columnar project,
+// vectorized aggregate, streaming sort, join top-N). True for a second-tree gather (index / GIN /
+// GiST) and for a merged OR/IN point-set (pkSet / indexSet — a union of probes, cost.md §3
+// "OR / IN-list"); false for a null bound or a plain PK contiguous bound (which every fast path
+// handles via a single buildKeyBound). Every single-table fast-path gate consults this so the
+// point-set bounds are interpreted in exactly ONE place (materializeRel), never silently dropped to
+// a full scan by a fast path that only understands `pk`. Nil-safe (a null/undefined bound is not eager).
+function needsEagerScan(sb: ScanBound | null | undefined): boolean {
+  if (sb === null || sb === undefined) return false;
+  return (
+    sb.kind === "index" ||
+    sb.kind === "gin" ||
+    sb.kind === "gist" ||
+    sb.kind === "pkSet" ||
+    sb.kind === "indexSet"
+  );
+}
+
+// PkKeySet is the plan-time result of an OR / IN-list disjunction of primary-key equalities
+// (`pk = a OR pk = b OR …`, or the equivalent `pk IN (a, b, …)` which desugars to that OR-chain —
+// cost.md §3 "OR / IN-list"). srcs is the equality const-sources, one per disjunct, in source order
+// (a bind param, an outer/correlated column, or a literal — isConstSource of the PK type). At exec
+// time each src encodes into the PK key space; the resulting keys are de-duplicated and sorted, and
+// each becomes a point probe [k, k]. The whole WHERE stays the residual filter (the union is a
+// superset), so the result is unchanged. coll is the PK's key collation (null for a C key).
+type PkKeySet = { pkType: ScalarType; coll: Collation | null; srcs: RExpr[] };
+
+// IndexKeySet is the PkKeySet analog over a leading B-tree secondary-index column (indexes.md §5):
+// each distinct encoded value becomes an index point probe (prefix scan + per-entry row lookup), and
+// the rows are gathered in ascending value order. tailTypes is the remaining key components' types
+// (as in IndexBound) — the per-entry key-suffix skip.
+type IndexKeySet = {
+  nameKey: string;
+  colType: ScalarType;
+  coll: Collation | null;
+  tailTypes: ScalarType[];
+  srcs: RExpr[];
+};
 
 // GistBound is the plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST index
 // (lowest lowercased name whose range column has a `col && const` / `col @> const` conjunct), the
@@ -12166,7 +12332,100 @@ function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBoun
   if (gtb !== null) return { kind: "gist", gist: gtb };
   // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
   const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
-  return gb !== null ? { kind: "gin", gin: gb } : null;
+  if (gb !== null) return { kind: "gin", gin: gb };
+  // LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes (cost.md §3
+  // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so this
+  // never displaces an existing plan. The primary key wins over a secondary index (its own key — no
+  // second tree), matching detectScanBound's ordering.
+  if (pkLocal >= 0) {
+    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
+    if (sty !== undefined) {
+      const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
+      if (ctx !== null) {
+        const srcs = detectKeySet(filter, rel.offset + pkLocal, sty, ctx.coll);
+        if (srcs !== null) return { kind: "pkSet", pkSet: { pkType: sty, coll: ctx.coll, srcs } };
+      }
+    }
+  }
+  for (const idx of rel.table.indexes) {
+    if (idx.kind !== "btree") continue;
+    const ci = idx.columns[0]!;
+    const ty = typeAsScalar(rel.table.columns[ci]!.type);
+    if (ty === undefined) continue;
+    if (
+      idx.columns.slice(1).some((c) => {
+        const ts = typeAsScalar(rel.table.columns[c]!.type);
+        return ts === undefined || !isFixedWidth(ts);
+      })
+    ) {
+      continue;
+    }
+    const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
+    if (ctx === null) continue;
+    const srcs = detectKeySet(filter, rel.offset + ci, ty, ctx.coll);
+    if (srcs !== null) {
+      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
+      return {
+        kind: "indexSet",
+        indexSet: { nameKey: idx.name.toLowerCase(), colType: ty, coll: ctx.coll, tailTypes, srcs },
+      };
+    }
+  }
+  return null;
+}
+
+// detectKeySet finds an OR / IN-list disjunction of equalities on ONE key column (at global index
+// keyIdx) and returns its equality const-sources (one per disjunct), or null if the filter has no
+// such shape (cost.md §3 "OR / IN-list"). `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c` at
+// resolve time (grammar.md §20), so an IN-list and a hand-written OR-of-equalities present the
+// identical tree — this handles both. The filter's top-level AND-chain is flattened; the FIRST
+// conjunct that reduces to a pure disjunction of `keycol = const` equalities is used (the rest of the
+// WHERE stays the residual filter). A conjunct reduces iff it is a `keycol = const`, or an OR of two
+// reducing operands — an AND, a NOT, a range comparison, or an equality on a different column makes it
+// non-reducing, so a mixed disjunction (`pk = 1 OR x = 2`) or a NOT IN (`NOT (pk = 1 OR …)`) correctly
+// yields no bound. Conservative + sound: an unrecognized filter contributes no bound.
+function detectKeySet(
+  filter: RExpr | null,
+  keyIdx: number,
+  keyType: ScalarType,
+  coll: Collation | null,
+): RExpr[] | null {
+  const colColl = coll !== null ? coll.name : null;
+  let found: RExpr[] | null = null;
+  const walkAnd = (e: RExpr | null): void => {
+    if (found !== null || e === null) return;
+    if (e.kind === "and") {
+      walkAnd(e.lhs);
+      walkAnd(e.rhs);
+      return;
+    }
+    const srcs = reduceKeySet(e, keyIdx, keyType, colColl);
+    if (srcs !== null) found = srcs;
+  };
+  walkAnd(filter);
+  return found;
+}
+
+// reduceKeySet reduces one predicate to the set of equality const-sources it bounds keyIdx with, or
+// null if it is not a pure disjunction of `keycol = const` (detectKeySet). Descends OR nodes only; a
+// single `keycol = const` leaf is the base case (reusing asBoundTerm, siblingCutoff -1 — no sibling
+// references in a once-materialized bound).
+function reduceKeySet(
+  e: RExpr,
+  keyIdx: number,
+  keyType: ScalarType,
+  colColl: string | null,
+): RExpr[] | null {
+  if (e.kind === "or") {
+    const l = reduceKeySet(e.lhs, keyIdx, keyType, colColl);
+    if (l === null) return null;
+    const r = reduceKeySet(e.rhs, keyIdx, keyType, colColl);
+    if (r === null) return null;
+    return l.concat(r);
+  }
+  const t = asBoundTerm(e, keyIdx, keyType, colColl, -1);
+  if (t !== null && t.op === "eq") return [t.src];
+  return null;
 }
 
 // detectINLBound detects an index-nested-loop scan bound for a join inner relation rel (cost.md §3
@@ -13676,6 +13935,36 @@ function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | null): B
   return { kind: "outOfRange" };
 }
 
+// encodeKeySet encodes an OR / IN-list's equality const-sources into the key space and returns a
+// SORTED, DE-DUPLICATED set of encoded keys — the distinct point probes a merged point-set bound
+// visits (cost.md §3 "OR / IN-list"). A src that is NULL (3VL-never-true) or does not encode into the
+// key domain (an out-of-range integer — no stored key can equal it) contributes no point and is
+// skipped (sound: the union stays a superset, and the residual filter re-checks each admitted row).
+// Byte-dedup == value-dedup and byte-sort == value-sort under the order-preserving key encoding
+// (encoding.md §2), so probing the sorted distinct keys yields rows in ascending key order with no
+// row visited twice. Shared by the PK and secondary-index point-set executors.
+function encodeKeySet(
+  keyType: ScalarType,
+  srcs: RExpr[],
+  params: Value[],
+  outer: Row[],
+  coll: Collation | null,
+  left: Row,
+): Uint8Array[] {
+  const keys: Uint8Array[] = [];
+  for (const src of srcs) {
+    const bk = encodeBoundKey(keyType, src, params, outer, coll, left);
+    if (bk.kind !== "key") continue;
+    keys.push(bk.key);
+  }
+  keys.sort((a, b) => compareBytes(a, b));
+  const out: Uint8Array[] = [];
+  for (let i = 0; i < keys.length; i++) {
+    if (i === 0 || !bytesEq(keys[i]!, keys[i - 1]!)) out.push(keys[i]!);
+  }
+  return out;
+}
+
 // intersectLo tightens b's lower bound to the more restrictive of (current, key); at an equal key an
 // exclusive bound (inc=false) wins.
 function intersectLo(b: KeyBound, key: Uint8Array, inc: boolean): void {
@@ -13731,6 +14020,23 @@ function mutationPkBound(table: Table, filter: RExpr | null, snap: Snapshot): Pk
   const ctx = keyCollationCtx(snap, table.columns[pkIdx]!);
   if (ctx === null) return null;
   return detectPkBound(filter, pkIdx, sty, ctx.coll);
+}
+
+// pkSetFor is the mutationPkBound analog for an OR / IN-list of primary-key equalities — a merged PK
+// point-set bound for the UPDATE/DELETE scan (cost.md §3 "OR / IN-list"). Like mutationPkBound it
+// applies only to a scalar, non-Skewed-collated PK. A secondary-index point-set for DML is the
+// separate index-scans-for-DML follow-on, so mutations bound only by the primary key here.
+function pkSetFor(table: Table, filter: RExpr | null, snap: Snapshot): PkKeySet | null {
+  if (filter === null) return null;
+  const pkIdx = primaryKeyIndex(table);
+  if (pkIdx < 0) return null;
+  const sty = typeAsScalar(table.columns[pkIdx]!.type);
+  if (sty === undefined) return null;
+  const ctx = keyCollationCtx(snap, table.columns[pkIdx]!);
+  if (ctx === null) return null;
+  const srcs = detectKeySet(filter, pkIdx, sty, ctx.coll);
+  if (srcs !== null) return { pkType: sty, coll: ctx.coll, srcs };
+  return null;
 }
 
 // scanEntries returns the (key,row) entries a mutation scans + the page_read node count: a primary-key
@@ -21839,6 +22145,14 @@ function countTrue(mask: boolean[] | null): number {
 // " and " — e.g. `id = $1`, `id >= 5 and id < 10`.
 function renderBoundTerms(col: string, terms: BoundTerm[]): string {
   return terms.map((t) => `${col} ${boundOpText(t.op)} ${renderBoundSrc(t.src)}`).join(" and ");
+}
+
+// renderKeySet renders a merged OR / IN-list point-set bound's const-sources as `col in (a, b, c)`
+// (cost.md §3 "OR / IN-list"), in source order (the plan-time order, before the exec-time encode /
+// dedup / sort) — deterministic across cores. Each source renders via renderBoundSrc (a bind param as
+// `$N`, a correlated column as `outer`, a literal via its token).
+function renderKeySet(col: string, srcs: RExpr[]): string {
+  return col + " in (" + srcs.map((s) => renderBoundSrc(s)).join(", ") + ")";
 }
 
 // boundOpText is the symbol for a bound comparison operator.

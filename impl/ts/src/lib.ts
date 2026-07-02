@@ -273,6 +273,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.where_eq",
   "query.comparison_order",
   "query.point_lookup",
+  "query.or_in_point_lookup",
   "query.limit_short_circuit",
   "query.order_by_pk_scan",
   "query.order_by_index_scan",

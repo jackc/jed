@@ -340,6 +340,50 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
 `expr/cost.test`, `query/distinct.test`, `query/limit_offset.test`, and `query/select_list.test`
 exercise them in context.
 
+### Bounded scan / OR / IN-list — merged point lookups
+
+The point-lookup bound above flattens the top-level **AND-chain** and *never descends an `OR`* — a
+disjunction is not one contiguous range. But a disjunction of **equalities on ONE key column** —
+`pk = a OR pk = b OR pk = c`, or the equivalent `pk IN (a, b, c)` (which PostgreSQL and jed both
+**desugar to that OR-chain**, grammar.md §20) — is exactly a **union of point lookups**. This lowers
+it to a **merged point-set** bound: a de-duplicated, sorted set of encoded keys (a *bitmap-OR*), each
+key a point probe. It applies to the **primary key** and to a **leading B-tree secondary-index
+column**; it is a deliberate, cost-visible optimization gated by the `query.or_in_point_lookup`
+capability.
+
+- **Which predicates lower.** The top-level AND-chain is flattened, and the **first** conjunct that
+  reduces to a pure disjunction of `keycol = const-source` equalities is the bound (an `OR` node
+  reduces iff **both** operands reduce; a `keycol = const` leaf is the base case — same
+  const-source rule as the point lookup). An `AND`, a `NOT` (so `NOT IN` never lowers), a range
+  comparison, or an equality on a *different* column makes a disjunct non-reducing, so a **mixed**
+  disjunction (`pk = 1 OR x = 2`) correctly does not lower — it stays a full scan. The whole WHERE
+  remains the **residual filter**, so the merged set is always a *superset* of the matching rows and
+  the result is unchanged.
+- **Last resort.** The merged point-set is chosen **only** where no contiguous PK / index / GIN /
+  GiST bound already applies, so it never displaces an existing plan and no already-bounded cost
+  moves. For an **UPDATE / DELETE** it lowers only on the **primary key** (a secondary-index point-set
+  for DML is the separate index-scans-for-DML follow-on).
+- **The cost is the SUM of the per-probe bounded scans.** Each distinct key is one point probe, and
+  the probes' `page_read` (each probe's root→leaf path — for a secondary index, the index-tree path
+  **plus** each admitted row's PK point lookup) and `storage_row_read` (the rows each probe admits)
+  **add up**. So an *N*-key IN-list over a single-leaf table charges *N* × `page_read` (each probe
+  visits the leaf, hit or miss) — which can exceed a full scan's single `page_read` on a tiny table,
+  but drops far below it on any real multi-leaf tree (a few root→leaf paths vs. a walk of every
+  leaf). The residual filter's `operator_eval`s accrue over the admitted rows only. This
+  sum-of-probes rule is the cross-core §8 contract — a core that full-scans instead computes a
+  different cost.
+- **De-duplication and NULLs.** Duplicate list elements merge to one probe (`IN (3, 3, 3)` probes
+  `{3}` once — though the residual OR-chain keeps all three `Eq` nodes, so the *bound* merges but the
+  *filter* cost does not). A **NULL** element (3VL-never-true) and an out-of-range constant (no
+  stored key can equal it) contribute no probe and are skipped; an all-NULL / all-out-of-range set
+  reads nothing. Because the key encoding is order-preserving, byte-dedup is value-dedup and the
+  sorted probes yield rows in ascending key order (for the PK, the same order a full scan would).
+
+A merged point-set bound takes the **eager materialize path** — the single-table streaming / columnar
+/ vectorized-aggregate fast paths (which each interpret only a single contiguous bound) gate **off**
+it, exactly as they do an index / GIN / GiST bound. `spec/conformance/suites/query/or_in_point_lookup.test`
+pins these costs cross-core.
+
 ### Index-bounded scan — a secondary index narrows a base-relation scan
 
 A **secondary index** ([indexes.md](indexes.md)) gives a second bound kind at the same

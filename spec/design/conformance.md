@@ -408,7 +408,11 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   (through EXISTS / scalar / IN, including a NULL outer key), defeated by `inr.id + 0 = o.k`;
   **index** — a secondary-index equality (`v = K` on an indexed column) fetches via the index
   tree + per-row point lookups ([indexes.md §5](indexes.md)), defeated by `v + 0 = K`, checked
-  across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index); **window** —
+  across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index); **or_in** — an
+  OR / IN-list of key equalities (`pk IN (a,b,c)`, `pk = a OR pk = b`, and the secondary-index form)
+  lowers to a **union of point probes** ([cost.md §3](cost.md) "OR / IN-list"), defeated by
+  `pk + 0 IN (…)`, checked with a NULL list element / an absent key / across a PK-IN-list
+  UPDATE/DELETE (the point-set DML path); **window** —
   the window frame **sliding-window optimization** ([window.md §5.2](window.md)): an explicit
   expanding `ROWS UNBOUNDED PRECEDING..CURRENT ROW` aggregate (the sliding path) must equal the
   DEFAULT-frame aggregate (the separate running-pass path) — distinct ids ⇒ no peers ⇒ the two

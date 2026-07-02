@@ -151,11 +151,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   EXPLAIN surfaces `Index-nested-loop PK/Index bound`. → [cost.md §3](spec/design/cost.md) "bounded
   scan / index-nested-loop", `spec/conformance/suites/joins/index_nested_loop.test`. _Follow-ons:_
   combining INL with the two-table streaming top-N join (`join_pk_ordered`); GIN/GiST sibling bounds.
-- [ ] **`OR` / `IN`-list → merged point lookups** — a top-level `OR` is never descended for bounding
-  and `pk IN (1,2,3)` full-scans today (only a single contiguous range pushes down). Lower a
-  disjunction / `IN`-list of PK-or-indexed-column equalities to a **union of point/range probes** over
-  a merged, de-duplicated key set (a bitmap-OR), residual filter unchanged. `IN`-lists especially are
-  ubiquitous. _(size: M; ×3 cores; +NoREC)_
+- [x] **`OR` / `IN`-list → merged point lookups** — ✅ **landed** (`query.or_in_point_lookup`, all
+  three cores). A top-level `OR` is never descended by the contiguous point-lookup bound, and `pk IN
+  (1,2,3)` desugars to `pk = 1 OR pk = 2 OR pk = 3` (grammar.md §20) — a shape that full-scanned. A
+  disjunction of **equalities on one key column** (the PK, or a leading B-tree secondary-index column)
+  now lowers to a **union of point probes** over a de-duplicated, sorted key set (a bitmap-OR), the
+  whole WHERE unchanged as the residual filter. Cost = the SUM of the per-probe bounded scans (the
+  cross-core §8 contract). A **last resort** (fires only where no contiguous PK/index/GIN/GiST bound
+  applies, so no existing plan/cost moves); UPDATE/DELETE lower only on the PK; every single-table
+  streaming/columnar/vectorized fast path gates OFF a point-set bound (`needsEagerScan`) so it is
+  interpreted in exactly one place. EXPLAIN surfaces `PK point set: <col> in (…)` / `Index point set:
+  using <name>`. → [cost.md §3](spec/design/cost.md) "OR / IN-list",
+  `spec/conformance/suites/query/or_in_point_lookup.test`. _Follow-ons:_ **range disjuncts** in the
+  union (`pk = 1 OR pk BETWEEN 10 AND 20` — a mix of point and range probes); intersecting an IN-list
+  with a co-present range conjunct (`pk IN (1..9) AND pk > 4`); a secondary-index point-set for
+  UPDATE/DELETE (rides on the index-scans-for-DML item).
 - [ ] _already tracked in their home sections (all planner follow-ons):_ index **ranges** +
   **multi-column prefix** bounds, **index scans for UPDATE/DELETE**, and the **LIMIT-streaming +
   index-bound** combination (the Secondary-indexes item); **composite-PK prefix pushdown** (the

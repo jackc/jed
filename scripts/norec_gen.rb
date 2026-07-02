@@ -28,6 +28,11 @@
 #              lookups (spec/design/indexes.md §5); `v + 0 = K` is a `BinaryOp`, so the detector
 #              (bare column only) does NOT use the index and it full-scans. Both must return
 #              identical rows — including across UPDATE/DELETE maintenance and a NULL value (3VL).
+#   or_in    — `pk IN (a,b,c)` / `pk = a OR pk = b` (and the secondary-index equivalent) lower to a
+#              UNION of point probes (cost.md §3 "OR / IN-list"); `pk + 0 IN (...)` wraps each
+#              disjunct's key in a `BinaryOp`, so no disjunct is a bare column and it full-scans. Both
+#              must return identical rows — including a NULL list element (adds no match), an absent
+#              key, and across a PK-IN-list UPDATE/DELETE (the point-set DML path).
 #   index_order — `ORDER BY v LIMIT k` over a secondary-indexed non-PK column walks the index tree
 #              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
 #              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
@@ -130,6 +135,10 @@ INDEX_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.in
                      dml.insert_multi_row query.select query.order_by query.order_by_keys
                      query.limit query.offset query.order_by_index_scan types.i32
                      null.three_valued].freeze
+OR_IN_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert dml.insert_multi_row
+               dml.update dml.delete query.select query.where_eq query.order_by
+               query.logical_connectives query.point_lookup query.or_in_point_lookup expr.in_list
+               expr.arithmetic expr.comparison_value types.i32 null.three_valued].freeze
 DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                         dml.insert_multi_row query.select query.distinct query.order_by
                         query.order_by_keys query.limit query.offset query.order_by_pk_scan
@@ -499,6 +508,75 @@ def gen_index(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim}")
   ipair.call("v = #{present} after DELETE removed id #{victim}", present,
              flat.call(with_v.call(present)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: OR / IN-list merged point lookups (union of point probes vs a full scan) ---------
+def gen_or_in(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_v = ids.sample(random: rng)
+  # (id, v, w): v is the indexed column (a small domain so an IN admits several rows); one v is NULL
+  # (a NULL indexed value never matches — 3VL through the index).
+  rows = ids.map { |id| [id, id == null_v ? nil : rng.rand(0..4), rng.rand(-50..50)] }
+  flat = ->(rs) { rs.flat_map { |id, _v, w| [id.to_s, w.to_s] } }
+
+  out = header(seed, OR_IN_REQ, "OR / IN-list merged point lookups (union of point probes vs full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v, w| "(#{id}, #{v.nil? ? 'NULL' : v}, #{w})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_v_idx ON t (v)")
+
+  # An OPTIMIZED form (a bare key column disjunction -> merged point probes) and a
+  # semantically-equivalent form the planner cannot lower (the key wrapped in `+ 0`, so no disjunct is
+  # a bare column -> a full scan) must return identical rows. `x + 0` equals `x` but defeats the bound.
+  pair = lambda do |title, opt, scan, exp|
+    out << "# #{title}"
+    out << "# merged point set (bare key -> union of point probes)"
+    q(out, "II", "SELECT id, w FROM t WHERE #{opt} ORDER BY id", exp)
+    out << "# full scan (+0 defeats the point-set) — MUST match"
+    q(out, "II", "SELECT id, w FROM t WHERE #{scan} ORDER BY id", exp)
+  end
+
+  three = ids.sample(3, random: rng).sort
+  absent = ((1..40).to_a - ids).sample(random: rng)
+  in_pk = ->(set) { flat.call(rows.select { |id, _v, _w| set.include?(id) }) }
+
+  # PK IN-list: three present keys; one absent; a NULL element (3VL-never-true, adds no match); and the
+  # equivalent OR spelling.
+  pair.call("id IN (#{three.join(', ')})",
+            "id IN (#{three.join(', ')})", "id + 0 IN (#{three.join(', ')})", in_pk.call(three))
+  pair.call("id IN (#{three[0]}, #{absent}) (one absent -> present only)",
+            "id IN (#{three[0]}, #{absent})", "id + 0 IN (#{three[0]}, #{absent})",
+            in_pk.call([three[0], absent]))
+  pair.call("id IN (#{three[0]}, NULL, #{three[1]}) (NULL element adds no match)",
+            "id IN (#{three[0]}, NULL, #{three[1]})", "id + 0 IN (#{three[0]}, NULL, #{three[1]})",
+            in_pk.call([three[0], three[1]]))
+  pair.call("id = #{three[0]} OR id = #{three[2]} (OR spelling)",
+            "id = #{three[0]} OR id = #{three[2]}", "id + 0 = #{three[0]} OR id + 0 = #{three[2]}",
+            in_pk.call([three[0], three[2]]))
+
+  # Secondary-index IN-list (a bare indexed column -> index point probes; +0 -> full scan).
+  vals = rows.map { |_id, v, _w| v }.compact.uniq.sample(2, random: rng)
+  vals = [0, 1] if vals.size < 2
+  in_v = ->(set) { flat.call(rows.select { |_id, v, _w| set.include?(v) }) }
+  pair.call("v IN (#{vals.join(', ')}) (secondary index)",
+            "v IN (#{vals.join(', ')})", "v + 0 IN (#{vals.join(', ')})", in_v.call(vals))
+
+  # Maintenance under the metamorphic relation: a PK IN-list UPDATE (the point-set DML path) then a PK
+  # IN-list DELETE change the state; the optimized and full-scan re-queries must keep agreeing with the
+  # by-construction rows.
+  bump = three.first(2)
+  rows = rows.map { |id, v, w| bump.include?(id) ? [id, v, w + 1000] : [id, v, w] }
+  stmt(out, "UPDATE t SET w = w + 1000 WHERE id IN (#{bump.join(', ')})")
+  pair.call("id IN (#{three.join(', ')}) after UPDATE of #{bump.join(', ')}",
+            "id IN (#{three.join(', ')})", "id + 0 IN (#{three.join(', ')})", in_pk.call(three))
+
+  victim = three.last
+  rows = rows.reject { |id, _v, _w| id == victim }
+  stmt(out, "DELETE FROM t WHERE id = #{victim} OR id = #{absent}")
+  pair.call("id IN (#{three.join(', ')}) after DELETE of #{victim}",
+            "id IN (#{three.join(', ')})", "id + 0 IN (#{three.join(', ')})", in_pk.call(three))
 
   out.join("\n") + "\n"
 end
@@ -1315,6 +1393,7 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index_nested_loop" => method(:gen_index_nested_loop),
   "index" => method(:gen_index),
+  "or_in" => method(:gen_or_in),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
   "join_order" => method(:gen_join_order),

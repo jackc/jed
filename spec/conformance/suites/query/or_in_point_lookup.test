@@ -1,0 +1,211 @@
+# OR / IN-list → merged point lookups (spec/design/cost.md §3 "OR / IN-list"). A single relation
+# whose WHERE is a top-level disjunction of equalities on ONE key column — `pk = a OR pk = b OR …`,
+# or the equivalent `pk IN (a, b, …)` which desugars to that OR-chain (grammar.md §20) — is a shape
+# the single contiguous PK/index bound (query.point_lookup) never descends: a disjunction is not one
+# range. This lowers it to a UNION of point probes over a de-duplicated, sorted set of encoded keys
+# (a bitmap-OR): each distinct non-NULL key is a point lookup, and the whole WHERE stays the residual
+# filter (the union is a superset), so the ROWS are unchanged and only the cost drops. The bound is a
+# LAST RESORT — it fires only where no contiguous PK/index/GIN/GiST bound already applies.
+#
+# The metered cost is the SUM of the per-probe bounded scans (page_read to each probe's access-path
+# nodes + storage_row_read to the rows it admits + residual-filter operator_evals per scanned row +
+# row_produced + projection). That is the CROSS-CORE contract pinned here with `# cost:` (cost.md §3;
+# the same units in Rust, Go, TS). `t` is six rows in one leaf, so each point probe charges 1
+# page_read (whether it hits or misses); the win over a full scan shows in storage_row_read and the
+# residual filter — a 3-key IN reads 3 rows, not 6, and re-filters only those. Rows verified against
+# the live PostgreSQL 18 oracle; the merged bound is jed-internal (PG has no comparable cost), so the
+# `# cost:` lines are the jed cross-core pin.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.logical_connectives, query.order_by, query.explain, expr.in_list, expr.comparison_value, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)
+
+# IN-list of three PK values → three point probes over the distinct sorted keys {1,3,5}. 3 page_read
+# (one per probe) + 3 storage_row_read + the residual `Or(Or(Eq,Eq),Eq)` = 5 interior nodes per
+# scanned row (2 or + 3 eq) × 3 = 15 + 3 row_produced + 0 projection (`a` is a leaf) = 24. A full scan
+# of the same query would be 1 + 6 + 30 + 3 = 40.
+# cost: 24
+query I rowsort
+SELECT a FROM t WHERE id IN (1, 3, 5)
+----
+10
+30
+50
+
+# The OR spelling is identical after desugaring — a bare `pk = a OR pk = b` is the same merged bound.
+# 2 probes: 2 page + 2 scanned + `Or(Eq,Eq)` (3 nodes) × 2 = 6 + 2 produced = 12.
+# cost: 12
+query I rowsort
+SELECT a FROM t WHERE id = 1 OR id = 6
+----
+10
+60
+
+# A probe that misses still visits the leaf it would live in (page_read 1) but reads no row: {2,99}
+# → 2 page + 1 scanned (only id=2) + `Or(Eq,Eq)` (3 nodes) × 1 = 3 + 1 produced = 7.
+# cost: 7
+query I rowsort
+SELECT a FROM t WHERE id IN (2, 99)
+----
+20
+
+# Duplicate list elements de-duplicate to ONE probe (a bitmap-OR merges equal keys): {3,3,3} → {3}.
+# 1 page + 1 scanned + the residual STILL has all three Eq nodes (the desugar is not deduplicated) so
+# `Or(Or(Eq,Eq),Eq)` = 5 × 1 = 5 + 1 produced = 8. The bound merged; the residual did not.
+# cost: 8
+query I rowsort
+SELECT a FROM t WHERE id IN (3, 3, 3)
+----
+30
+
+# An all-miss IN reads no rows: {99,100} → 2 page (both probes visit the leaf) + 0 scanned/produced.
+# cost: 2
+query I rowsort
+SELECT a FROM t WHERE id IN (99, 100)
+----
+
+# The OR conjunct can sit inside an AND: `(id = 1 OR id = 4) AND a > 15` bounds by the disjunction
+# {1,4} (2 probes = 2 page, 2 rows scanned), and the WHOLE filter is the residual re-applied per
+# scanned row: `And(Or(Eq,Eq), Gt)` = 5 nodes × 2 = 10. Only id=4 (a=40>15) survives → 1 produced.
+# 2 + 2 + 10 + 1 = 15.
+# cost: 15
+query I rowsort
+SELECT id FROM t WHERE (id = 1 OR id = 4) AND a > 15
+----
+4
+
+# A NULL element contributes no key (3VL-never-true), so `id IN (2, NULL, 4)` probes only {2,4} — the
+# residual re-checks and the NULL disjunct keeps no extra row. 2 page + 2 scanned + `Or(Or(Eq,Eq),Eq)`
+# where the middle Eq is `id = NULL` (still an interior node) = 5 × 2 = 10 + 2 produced = 16.
+# cost: 16
+query I rowsort
+SELECT id FROM t WHERE id IN (2, NULL, 4)
+----
+2
+4
+
+# A mixed disjunction (one disjunct is NOT an equality on the key) does NOT lower to a point set — it
+# falls back to the full scan + residual filter (rows unchanged). `id = 2 OR a = 60` cannot bound by
+# the key alone (a row with a=60 has an unknown id). Full scan: 1 page + 6 scanned + `Or(Eq,Eq)` (3) ×
+# 6 = 18 + 2 produced = 27.
+# cost: 27
+query I rowsort
+SELECT id FROM t WHERE id = 2 OR a = 60
+----
+2
+6
+
+# EXPLAIN surfaces the chosen access path: `PK point set: <col> in (<sources>)` — the const-sources
+# in source order (before the exec-time encode / dedup / sort). The IN-list and the OR spelling render
+# identically (both desugar to the same OR-of-equalities). touched=2 = {id (filter), a (projection)}.
+query ITT nosort
+EXPLAIN SELECT a FROM t WHERE id IN (1, 3, 5)
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+PK point set: id in (1, 3, 5); touched=2
+
+query ITT nosort
+EXPLAIN SELECT id FROM t WHERE id = 1 OR id = 4 OR id = 7
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+PK point set: id in (1, 4, 7); touched=1
+
+# --- Secondary-index point set (indexes.md §5) ---
+# The same merge over a leading B-tree secondary-index column: each distinct value is an index point
+# probe (prefix scan + per-entry row lookup). `x` is non-unique (10 appears on rows 1 and 5).
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, x i32)
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 10)
+
+statement ok
+CREATE INDEX sx ON s (x)
+
+# `x IN (10, 30)` → 2 index probes. Value 10: index leaf (1 page) + two row lookups (rows 1,5: +2) =
+# 3 page, 2 rows. Value 30: index leaf (1) + one row lookup (row 3: +1) = 2 page, 1 row. So 5 page +
+# 3 storage_row_read + `Or(Eq,Eq)` (3) × 3 = 9 + 3 produced = 20.
+# cost: 20
+query I rowsort
+SELECT id FROM s WHERE x IN (10, 30)
+----
+1
+3
+5
+
+# The OR spelling over the index: `x = 20 OR x = 40` → 2 probes, each index leaf (1) + one row lookup
+# (1) = 2 page, so 4 page + 2 scanned + `Or(Eq,Eq)` (3) × 2 = 6 + 2 produced = 14.
+# cost: 14
+query I rowsort
+SELECT id FROM s WHERE x = 20 OR x = 40
+----
+2
+4
+
+# EXPLAIN of the secondary-index point set names the index (like the single-value index bound).
+# touched=2 = {id (projection), x (filter)}.
+query ITT nosort
+EXPLAIN SELECT id FROM s WHERE x IN (10, 30)
+----
+0
+Filter
+conjuncts=1
+1
+Scan s
+Index point set: using sx; touched=2
+
+# --- Text key set ---
+statement ok
+CREATE TABLE w (name text PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO w VALUES ('alice', 1), ('bob', 2), ('carol', 3), ('dave', 4)
+
+# A text PK IN-list merges by the C collation's byte order: {alice, carol} probe two keys.
+query T rowsort
+SELECT name FROM w WHERE name IN ('alice', 'carol')
+----
+alice
+carol
+
+# --- UPDATE / DELETE bound by the PK point set ---
+# A mutation lowers the same merged PK bound (a secondary-index point set for DML is a separate
+# follow-on). DELETE {2,4}: 2 page + 2 storage_row_read + `Or(Eq,Eq)` (3) × 2 = 6 = 10. No rows
+# produced (a bare statement).
+# cost: 10
+statement ok
+DELETE FROM t WHERE id IN (2, 4)
+
+query I rowsort
+SELECT id FROM t
+----
+1
+3
+5
+6
+
+# UPDATE {1,6}: 2 page + 2 storage_row_read + the residual `Or(Eq,Eq)` (3) × 2 = 6 = 10 (the `0` RHS
+# is a leaf).
+# cost: 10
+statement ok
+UPDATE t SET a = 0 WHERE id = 1 OR id = 6
+
+query II rowsort
+SELECT id, a FROM t WHERE id IN (1, 6)
+----
+1
+0
+6
+0
