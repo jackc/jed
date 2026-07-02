@@ -123,6 +123,74 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ---
 
+## Query planner / optimizer
+
+> The planner is a **deterministic rule engine**: it pattern-matches the WHERE shape to pick an
+> access path (PK bound → first-column index equality → GIN → GiST → full scan) and runs joins as
+> left-deep nested loops in FROM order — no cost-based choice, no statistics, no join reordering.
+> `EXPLAIN` (above) now makes those choices inspectable + corpus-assertable, the substrate for this
+> work. **The load-bearing constraint:** cost is **observable and a cross-core contract** (§8; the
+> `# cost:` corpus directive), so (a) any plan change that changes which plan runs changes the metered
+> cost — it must recompute *identically* in all three cores and re-pins the affected `# cost:` entries;
+> (b) a cost-*based* planner is admissible **only** if its estimator is itself a spec'd, deterministic,
+> cross-core-identical artifact (like the cost schedule) — then cost-based plan choice *extends* the §8
+> contract rather than breaking it; (c) some textbook rewrites (constant folding, CSE, short-circuit)
+> are **not** cost-neutral here — they drop `operator_eval` charges — so each needs an explicit cost
+> decision, not a silent apply. Every optimization is a vertical slice carrying a **NoREC relation**
+> (the standing §7 obligation — the sweep does not discover new optimizations).
+
+### Rule-based extensions (results-identical, no statistics)
+
+- [ ] **Index-nested-loop join** — a cross-relation join key (`a JOIN b ON b.pk = a.x`) full-scans `b`
+  for every outer row today (only per-table `col = const` bounds push down — query.join_pushdown).
+  Bound the inner scan to a per-outer-row point/range lookup by feeding the outer column in as the
+  bound's const-source — the **correlated-subquery pushdown machinery already does exactly this**
+  (query.correlated_pushdown), so the inner join relation reuses it. Turns O(N·M) into O(N·log M); the
+  single highest-leverage planner change. → [cost.md §3](spec/design/cost.md) "JOIN" _(size: M; ×3 cores; +NoREC)_
+- [ ] **`OR` / `IN`-list → merged point lookups** — a top-level `OR` is never descended for bounding
+  and `pk IN (1,2,3)` full-scans today (only a single contiguous range pushes down). Lower a
+  disjunction / `IN`-list of PK-or-indexed-column equalities to a **union of point/range probes** over
+  a merged, de-duplicated key set (a bitmap-OR), residual filter unchanged. `IN`-lists especially are
+  ubiquitous. _(size: M; ×3 cores; +NoREC)_
+- [ ] _already tracked in their home sections (all planner follow-ons):_ index **ranges** +
+  **multi-column prefix** bounds, **index scans for UPDATE/DELETE**, and the **LIMIT-streaming +
+  index-bound** combination (the Secondary-indexes item); **composite-PK prefix pushdown** (the
+  Composite `PRIMARY KEY` item); a **hash-join operator** (the spill item — nested-loop is the only
+  join today); the **ORDER BY + LIMIT top-k** heap (bench-driven perf). Each is a rule-based,
+  results-identical win.
+
+### Cost as a plan input (the strategic investment — Path B)
+
+- [ ] **Plan-time cost estimator** — estimate the same cost units the runtime meter charges
+  (`page_read`/`storage_row_read`/`row_produced`/…) for each candidate plan and pick the cheapest,
+  instead of today's structural tie-breaks (lowest index name, FROM order). Authored as a **spec'd,
+  cross-core-identical, deterministic artifact** (the §8 discipline the runtime schedule already
+  follows) so plan choice stays byte-identical across cores. The prerequisite for cost-based selection
+  and the `EXPLAIN` `est_rows`/`est_cost` columns (the EXPLAIN follow-on above). _(size: L–XL; ×3 cores)_
+- [ ] **Table statistics** — the estimator's inputs. Start with a **transactional per-table row count**
+  (cheap; deterministic — it rolls back with its transaction like the `nextval` counter,
+  [determinism.md §5](spec/design/determinism.md)). Per-column distinct-value counts / histograms are a
+  later step, computed by a spec'd pass over the (deterministic) data so they stay cross-core-identical.
+  _(size: M row-count / L histograms)_
+- [ ] **Cost-based access-path + join-order selection** — with the estimator + row counts, choose the
+  cheapest bound per relation and **reorder the left-deep join** (drive the smaller / more-selective
+  relation, enable index-nested-loop) rather than honoring FROM order. Re-pins the affected `# cost:`
+  corpus entries (the observable-cost consequence above). _(size: L; ×3 cores; +NoREC)_
+
+### Planner infrastructure
+
+- [ ] **Explicit optimizer-pass structure** — the planner is fused pattern-matching in `planSelect`
+  today. Split it into logical-plan → rewrite-rules → physical/access-path selection so each
+  optimization is a discrete, testable rule (the "boring, explicit, small modules" stance, §10). A
+  refactor across all three cores; do it once ≥2–3 rules would share it. _(size: L; ×3 cores)_
+- [ ] **Predicate pushdown + simplification** — push WHERE conjuncts into derived tables / CTEs /
+  through joins to the earliest relation, and detect contradictions (`x > 5 AND x < 3` → a provably
+  empty scan). **Caveat:** plan-time **constant folding** / CSE removes `operator_eval` charges and so
+  changes the observable cost — each such rewrite needs an explicit cost decision (the framing above),
+  not a silent apply. _(size: M–L; ×3 cores; +NoREC)_
+
+---
+
 ## Storage maturation (§9)
 
 > Can lag the feature work until write volume makes whole-image rewrites costly. These items
