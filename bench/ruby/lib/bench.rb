@@ -86,7 +86,9 @@ module Bench
     end
   end
 
-  Param = Struct.new(:generator, :min, :max, :start, :min_len, :max_len)
+  # int_window: base is the 0-based index of an EARLIER param; the value is that param's value +
+  # int_uniform(off_min, off_max) — a selective fixed-width range around a base param.
+  Param = Struct.new(:generator, :min, :max, :start, :min_len, :max_len, :base, :off_min, :off_max)
 
   Workload = Struct.new(
     :name, :dataset, :kind, :sql, :warmup, :iterations, :seed, :expect_rows_per_iter,
@@ -106,7 +108,7 @@ module Bench
     (root["bench"] || []).map do |t|
       params = (t["param"] || []).map do |p|
         Param.new(p["gen"] || "", p["min"] || 0, p["max"] || 0, p["start"] || 0,
-          p["min_len"] || 0, p["max_len"] || 0)
+          p["min_len"] || 0, p["max_len"] || 0, p["base"] || 0, p["off_min"] || 0, p["off_max"] || 0)
       end
       Workload.new(
         t["name"] || "", t["dataset"] || "", t["kind"] || "", t["sql"] || "",
@@ -158,14 +160,18 @@ module Bench
     end
 
     def next_args
-      @params.each_with_index.map do |p, i|
-        case p.generator
+      # Built incrementally (not .map) so int_window can reference an EARLIER arg in the same row.
+      args = []
+      @params.each_with_index do |p, i|
+        args << case p.generator
         when "serial" then (v = @serials[i]; @serials[i] += 1; v)
         when "int_uniform" then @prng.int_uniform(p.min, p.max)
+        when "int_window" then args[p.base] + @prng.int_uniform(p.off_min, p.off_max)
         when "text" then @prng.text(p.min_len, p.max_len)
         else raise "unknown param gen #{p.generator}"
         end
       end
+      args
     end
   end
 
