@@ -23,6 +23,7 @@ import {
   recordScanUnits,
   recordSize,
 } from "./format.ts";
+import { isInteger } from "./types.ts";
 
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
@@ -321,6 +322,15 @@ export class TableStore {
   // columnar gather declines on (its lanes carry no unfetched values, and the feed has no resolve step).
   anySpillableTouched(mask: boolean[]): boolean {
     return anySpillableMasked(this.colTypes, mask);
+  }
+
+  // columnIsInteger reports whether column `ord` is a bare scalar-INTEGER column (i16/i32/i64) — the
+  // vectorized aggregate GROUP-BY-key gate (packed-leaf.md §11): a non-NULL integer's int64 bucket key
+  // is a bijection of the value-canonical group key, so an int64 map yields the same buckets as the
+  // scalar distinctRowKey map. A composite/array/range or non-integer scalar column returns false.
+  columnIsInteger(ord: number): boolean {
+    const ct = this.colTypes[ord];
+    return ct !== undefined && ct.kind === "scalar" && isInteger(ct.scalar);
   }
 
   // getWithUnits is the fused single-descent point lookup: the row at key (if any) PLUS the

@@ -1900,6 +1900,117 @@ function filterColumnar(
   return sel;
 }
 
+// vectorizedSpecEligible reports whether one aggregate is a specialized numeric kernel the vectorized
+// aggregate path folds: a plain (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) COUNT(*)
+// / COUNT(col) / SUM(i16|i32) / SUM|AVG(f32|f64) / MIN(col) / MAX(col) whose operand (where it has one)
+// is a bare column reference. SUM(i64|decimal) → "sumDecimal" and AVG(decimal) → "avg" are deferred
+// (their fold charges running-sum-dependent decimalWork); MIN/MAX fold ANY type through valueCmp. The
+// ordered-set / hypothetical / json plans are excluded by the switch's default; reusing the shared
+// foldAcc keeps the fold byte-identical to the scalar path (the scalar grouped path folds through it).
+function vectorizedSpecEligible(spec: AggSpec): boolean {
+  if (spec.distinct === true) return false;
+  if (spec.filter !== undefined && spec.filter !== null) return false;
+  switch (spec.plan) {
+    case "countStar":
+      return spec.operand === null;
+    case "count":
+    case "sumInt":
+    case "sumFloat":
+    case "avgFloat":
+    case "min":
+    case "max":
+      return spec.operand !== null && spec.operand.kind === "column";
+    default:
+      return false;
+  }
+}
+
+// operandCol is the bare-column ordinal an eligible aggregate reads (its operand `{kind:"column"}`), or
+// null for COUNT(*) (which folds no value). Eligibility (vectorizedSpecEligible) guarantees the operand
+// is either absent or a bare column, so this is total over an eligible spec.
+function operandCol(spec: AggSpec): number | null {
+  return spec.operand !== null && spec.operand.kind === "column" ? spec.operand.index : null;
+}
+
+// LaneAt is the survivor value source for the vectorized fold — the ONE seam that differs between the
+// row path (a Row[] of full rows) and the columnar path (dense per-column lanes + an optional A3
+// selection vector). `at(j, col)` reads survivor j's value in column col, so the fold kernels below are
+// written once and run either way. Cost is unaffected: both feed the same values in scan order.
+type LaneAt = (j: number, col: number) => Value;
+
+// foldAggWhole folds one WHOLE-TABLE grand-total group over `nsurv` survivors from `at`, returning the
+// finalized aggregate results [agg0, …] (the synthetic row for a () group — no key columns). It builds
+// one Acc per spec and folds each survivor's operand value through the shared foldAcc (identical acc
+// state, hence finalizeAcc, to the scalar path), charging aggregateAccumulate once per (survivor × spec)
+// in bulk — the identical total to the scalar loop (per row × spec), cost-safe because the caller gates
+// to the unmetered lane (no per-row guard to preserve).
+function foldAggWhole(specs: AggSpec[], at: LaneAt, nsurv: number, meter: Meter): Value[] {
+  const accs = specs.map((s) => newAccFromSpec(s));
+  specs.forEach((spec, si) => {
+    meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv));
+    const oc = operandCol(spec);
+    for (let j = 0; j < nsurv; j++) {
+      foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
+    }
+  });
+  return accs.map((a) => finalizeAcc(a));
+}
+
+// groupByIntKey buckets `nsurv` survivors from `at` by their single INTEGER group-key column and folds
+// each aggregate per group, returning the finalized synthetic rows [key, agg0, …] in scan-order-of-
+// first-appearance. The bucket is a Map<bigint, number> over the raw key (a bijection of the scalar
+// path's value-canonical group key for a fixed-width integer column) plus one sentinel group for NULL
+// keys. The fold reuses foldAcc (byte-identical acc state); aggregateAccumulate is charged once per
+// (survivor × spec) in bulk — the identical total to the scalar loop. The bucketing is unmetered
+// (cost.md §3), so the bigint map is a free internal choice. The caller has verified every needed lane
+// is populated.
+function groupByIntKey(
+  specs: AggSpec[],
+  keyCol: number,
+  at: LaneAt,
+  nsurv: number,
+  meter: Meter,
+): Value[][] {
+  const groups: { key: Value; accs: Acc[] }[] = [];
+  const index = new Map<bigint, number>();
+  let nullGi = -1;
+
+  meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(specs.length));
+  for (let j = 0; j < nsurv; j++) {
+    const kv = at(j, keyCol);
+    let gi: number;
+    if (kv.kind === "int") {
+      const g = index.get(kv.int);
+      if (g === undefined) {
+        gi = groups.length;
+        index.set(kv.int, gi);
+        groups.push({ key: kv, accs: specs.map((s) => newAccFromSpec(s)) });
+      } else {
+        gi = g;
+      }
+    } else {
+      // A NULL integer key (the only other case for an integer column) buckets into one sentinel
+      // group, exactly as the scalar path groups all NULLs together.
+      if (nullGi < 0) {
+        nullGi = groups.length;
+        groups.push({ key: nullValue(), accs: specs.map((s) => newAccFromSpec(s)) });
+      }
+      gi = nullGi;
+    }
+    const accs = groups[gi]!.accs;
+    specs.forEach((spec, si) => {
+      const oc = operandCol(spec);
+      foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
+    });
+  }
+
+  return groups.map((g) => {
+    const srow: Value[] = [g.key];
+    for (const a of g.accs) srow.push(finalizeAcc(a));
+    return srow;
+  });
+}
+
 // streamRows is the lazy pull pipeline behind a streaming cursor (spec/design/streaming.md §3/§4, S3):
 // execStreamingScan's per-row loop as a function* generator (the natural pull form in JS). It scans the
 // snapshot store, resolves touched columns, applies WHERE, and projects — YIELDING ONE output row at a
@@ -10402,6 +10513,180 @@ export class Engine {
     return { rows: [], start: 0, end: nEmit, mode: "columnar", cols, projCols, sel };
   }
 
+  // vectorizedAggEligible reports whether plan is a shape execVectorizedAgg specializes: a single-base-
+  // table SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, over a full or
+  // primary-key-bounded scan, that is EITHER whole-table (no GROUP BY) OR grouped by a single bare
+  // integer column. Mostly pure plan inspection — it charges nothing, so a bail is free and the general
+  // path runs with identical results + cost; the single-key case additionally reads the group-key
+  // column's static type from the table store (a one-time lookup, not per row) to confirm it is a scalar
+  // integer (so the int64-keyed bucket is a bijection of the value-canonical group key — groupByIntKey).
+  private vectorizedAggEligible(plan: SelectPlan): boolean {
+    if (!plan.isAgg) return false;
+    // One base table, no join.
+    if (plan.rels.length !== 1 || plan.joins.length !== 0) return false;
+    const rel = plan.rels[0]!;
+    if (
+      rel.srf !== undefined ||
+      rel.cte !== undefined ||
+      rel.derived !== undefined ||
+      rel.lateral === true
+    ) {
+      return false;
+    }
+    // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics and
+    // residual filter, so it keeps the scalar path.
+    const bk = plan.relBounds[0]?.kind;
+    if (bk === "index" || bk === "gin" || bk === "gist") return false;
+    // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no materialized
+    // expression keys (`GROUP BY a + b`), and no GROUPING() calls.
+    if (plan.groupSets.length !== 1 || plan.groupExprs.length !== 0 || plan.groupingSpecs.length !== 0) {
+      return false;
+    }
+    const gset = plan.groupSets[0]!;
+    if (gset.keyCols.length === 0) {
+      // Whole-table aggregation: the () grand-total group, no master grouping columns.
+      if (plan.groupKeys.length !== 0) return false;
+    } else if (gset.keyCols.length === 1) {
+      // Single-key GROUP BY: the sole master grouping column is this key, its synthetic slot is 0, and
+      // the key is a bare scalar-INTEGER column of the base table.
+      if (plan.groupKeys.length !== 1 || plan.groupKeys[0] !== gset.keyCols[0]) return false;
+      if (gset.slotSrc.length !== 1 || gset.slotSrc[0] !== 0) return false;
+      const store = this.lkpStore(rel.tableName);
+      if (!store.columnIsInteger(gset.keyCols[0]! - rel.offset)) return false;
+    } else {
+      return false;
+    }
+    // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window bounds
+    // below, so it need not bail.
+    if (plan.distinct || plan.having !== null || plan.hasWindow || plan.order.length !== 0) return false;
+    if (plan.aggSpecs.length === 0) return false;
+    return plan.aggSpecs.every((s) => vectorizedSpecEligible(s));
+  }
+
+  // execVectorizedAgg runs a vectorizedAggEligible plan and returns the already-grouped output as a
+  // "project"-mode buffer Emitter under the query's LIMIT/OFFSET window — exactly the emitter the scalar
+  // aggregate branch returns, so emission + cost are identical either way. It reuses the scalar scan
+  // (materializeRel) + WHERE for exact cost + survivor determination, then folds each aggregate over the
+  // survivors with the shared Acc (byte-identical acc state, hence finalize). A file-backed store gathers
+  // only its touched columns columnar (aggColumnar — never a full-width row, the allocation dividend); an
+  // in-memory store (or a columnar decline) folds over the materialized rows. Only runs on the unmetered
+  // lane (the caller gates).
+  private execVectorizedAgg(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    const gset = plan.groupSets[0]!;
+
+    // A2/A3 columnar fast path (packed-leaf.md §11 Track A2/A3): a file-backed aggregate gathers only its
+    // touched columns into dense lanes and folds columnar — never a full-width row. A WHERE (A3) is
+    // applied over the lanes into a selection vector rather than forcing the row path. Declines (null) to
+    // the row path below for an in-memory store or a spillable touched column. Cost-neutral by
+    // construction (aggColumnar charges the identical scan block).
+    let srows = this.aggColumnar(plan, gset, env, params, meter);
+    if (srows === null) {
+      // Row path: scan the single base relation through the same path the eager executor uses (so the
+      // pageRead / valueDecompress / storageRowRead block is charged identically — materializeRel), then
+      // apply the residual WHERE per scanned row through the ordinary evaluator (its operatorEval charges
+      // + 3VL survivor test byte-identical to the scalar WHERE loop).
+      const rows = this.materializeRel(plan, 0, env.outer, env, params, meter);
+      let survivors: Row[];
+      if (plan.filter === null) {
+        survivors = rows;
+      } else {
+        survivors = [];
+        for (const r of rows) if (isTrue(evalExpr(plan.filter, r, env, meter))) survivors.push(r);
+      }
+      const at: LaneAt = (j, col) => survivors[j]![col]!;
+      srows =
+        gset.keyCols.length === 0
+          ? [foldAggWhole(plan.aggSpecs, at, survivors.length, meter)]
+          : groupByIntKey(plan.aggSpecs, gset.keyCols[0]!, at, survivors.length, meter);
+    }
+
+    // LIMIT/OFFSET window over the synthetic rows, mirroring the scalar branch's windowBounds (clamped in
+    // the bigint domain before indexing). Emit as "project" — the drive charges rowProduced + the
+    // projection over each windowed synthetic row exactly as for a scalar aggregate result.
+    const n = BigInt(srows.length);
+    const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
+    const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
+    return { rows: srows, start: Number(start), end: Number(end), mode: "project" };
+  }
+
+  // aggColumnar runs the A2/A3 columnar gather for a vectorized aggregate (packed-leaf.md §11 Track
+  // A2/A3): it scans only the touched columns of the single base relation into dense per-column lanes
+  // (never a full-width Row), charges the identical scan cost block, applies any WHERE predicate over the
+  // lanes into a selection vector (A3), and folds each aggregate columnar over the survivors — returning
+  // the finalized synthetic rows (the whole-table grand total or one per group). Returns null (declining
+  // to the caller's row path) when the store is in-memory (its Decoded leaves share rows zero-copy), when
+  // a touched column can spill (the columnar feed has no value-resolution step — this also covers a
+  // filter over a spillable column), or when a needed column ordinal is out of range / unmasked (a safety
+  // net, never expected for an eligible plan). Cost-neutral by construction: same pageRead /
+  // valueDecompress (0) / storageRowRead / operatorEval (the filter) / aggregateAccumulate / rowProduced
+  // as the row path.
+  private aggColumnar(
+    plan: SelectPlan,
+    gset: GroupSet,
+    env: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Value[][] | null {
+    const rel = plan.rels[0]!;
+    const store = this.lkpStore(rel.tableName);
+    // File-backed only: an in-memory store's row path is already zero-copy.
+    if (!store.isFileBacked()) return null;
+    const mask = plan.relMasks[0]!;
+    // No touched column may spill — so the feed's valueDecompress slab count is 0 and no unfetched value
+    // is left unresolved. This declines a filter or operand over a spillable column to the row path.
+    if (store.anySpillableTouched(mask)) return null;
+    // Every column the fold reads (each aggregate operand + the group key) must be a valid, masked table
+    // ordinal — else its gathered lane would be empty. Also declines a (never-expected) non-zero offset.
+    const need = (idx: number): boolean => idx >= 0 && idx < mask.length && mask[idx] === true;
+    for (const spec of plan.aggSpecs) {
+      if (spec.operand !== null && spec.operand.kind === "column" && !need(spec.operand.index)) {
+        return null;
+      }
+    }
+    if (gset.keyCols.length === 1 && !need(gset.keyCols[0]!)) return null;
+
+    // Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
+    // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely.
+    let cols: Value[][] = mask.map(() => []);
+    let rowCount = 0;
+    let pages = 0;
+    const slabs = 0;
+    let doScan = true;
+    let b = unboundedBound();
+    const relBound = plan.relBounds[0];
+    if (relBound !== null && relBound !== undefined && relBound.kind === "pk") {
+      const bb = buildKeyBound(relBound.pk, params, env.outer);
+      if (bb === null) doScan = false;
+      else b = bb;
+    }
+    if (doScan) {
+      const r = store.columnarScanMasked(b, mask);
+      cols = r.cols;
+      rowCount = r.rowCount;
+      pages = r.pages;
+    }
+    // Charge the scan cost block identically to materializeRel + scanSource: pageRead × nodes,
+    // valueDecompress × slabs (0 here), storageRowRead × rowCount. On the unmetered lane the caller gates,
+    // so this bulk charge reproduces the per-row accrual (guard is a no-op).
+    meter.charge(
+      COSTS.pageRead * BigInt(pages) +
+        COSTS.valueDecompress * BigInt(slabs) +
+        COSTS.storageRowRead * BigInt(rowCount),
+    );
+
+    // A3: apply the WHERE predicate over the lanes into a selection vector (undefined ⇒ all survive).
+    let sel: number[] | undefined;
+    let nsurv = rowCount;
+    if (plan.filter !== null) {
+      sel = filterColumnar(plan.filter, cols, mask, rowCount, env, meter);
+      nsurv = sel.length;
+    }
+    const at: LaneAt = (j, col) => cols[col]![sel !== undefined ? sel[j]! : j]!;
+    return gset.keyCols.length === 0
+      ? [foldAggWhole(plan.aggSpecs, at, nsurv, meter)]
+      : groupByIntKey(plan.aggSpecs, gset.keyCols[0]!, at, nsurv, meter);
+  }
+
   // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
   // output rows (spec/design/streaming.md §4, S4): the scan / join / WHERE / window / ORDER BY / GROUP
   // BY / DISTINCT all run here (charging their cost into meter), producing either a windowed buffer
@@ -10410,6 +10695,18 @@ export class Engine {
   // (a bufferedRows generator, the query() path). The env's StmtRng threads the per-statement entropy
   // through both the blocking part and the (possibly deferred) projection (streaming.md §6).
   execSelectEmit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    // Vectorized single-table aggregate (the PAX/vectorization program's executor track): a
+    // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table or
+    // grouped by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time
+    // group machinery below. Gated to the unmetered lane so a metered query's deterministic abort row
+    // stays the scalar path's; results and accrued cost are byte-identical either way (the conformance
+    // corpus proves both). Ineligible / metered ⇒ skipped and the general aggregate branch runs
+    // unchanged. (An aggregate plan skips every streaming fast-path below — they all require !isAgg — so
+    // this front-position placement is only for clarity, mirroring the Go/Rust cores' ordering.)
+    if (meter.isUnmetered() && this.vectorizedAggEligible(plan)) {
+      return this.execVectorizedAgg(plan, env, meter, params);
+    }
+
     // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
     // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
     // LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
