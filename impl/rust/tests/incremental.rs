@@ -72,9 +72,9 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
 
     // One more row: the incremental commit appends only the rebuilt root→leaf path + catalog —
     // far fewer pages than the whole tree, and bounded by tree height, not table size. We track the
-    // committed `page_count` delta, not the file length — the file is preallocated in chunks ahead
-    // of the high-water (spec/design/pager.md §7), so its physical size jumps by a chunk, not by the
-    // dirty-page count.
+    // committed `page_count` delta, not the file length — the file is preallocated ahead of the
+    // high-water (spec/design/pager.md §7), so its physical size jumps by a geometric preallocation
+    // step, not by the dirty-page count.
     let pc_before = db.page_count();
     db.execute(&format!("INSERT INTO t VALUES (31, 'row-31-{pad}')"), &[])
         .unwrap();
@@ -190,5 +190,40 @@ fn torn_latest_commit_falls_back_to_prior_snapshot() {
         ids(&mut db),
         vec![1],
         "only the prior snapshot's row survives the torn write"
+    );
+}
+
+/// The direct guard for the geometric preallocation policy (spec/design/pager.md §7): a tiny database
+/// must not occupy a fixed 1 MiB on disk. A handful of rows at page_size 256 previously preallocated a
+/// whole 1 MiB chunk (~4096 pages) for ~14 pages of data; with geometric growth the file stays
+/// proportional — bounded by ≈2× the committed image plus the 16 KiB floor. Mirrors the Go/TS tests.
+#[test]
+fn small_database_file_stays_proportional() {
+    let path = tmp("prealloc_small.jed");
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
+        .unwrap()
+        .session(SessionOptions::default());
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+        .unwrap();
+    for i in 0..30 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"), &[])
+            .unwrap();
+    }
+    let logical = db.page_count() as u64 * db.page_size() as u64;
+    drop(db);
+
+    let physical = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        physical < 1024 * 1024,
+        "a tiny database must not preallocate a whole 1 MiB, got physical {physical}"
+    );
+    assert!(
+        physical <= 2 * logical + 16 * 1024, // ≈2× the image + the 16 KiB floor
+        "a {logical}-byte database should stay proportional, got physical {physical}"
+    );
+    assert!(
+        physical >= logical,
+        "the file must still cover the committed {logical}-byte image, got {physical}"
     );
 }

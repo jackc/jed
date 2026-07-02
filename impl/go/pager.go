@@ -15,22 +15,42 @@ package jed
 
 import "encoding/binary"
 
-// preallocChunkBytes is the file-growth step — ~1 MiB worth of pages preallocated at once. Growing
-// the file in chunks of real, durably-allocated zero blocks is what lets a steady-state commit write
-// its body into already-allocated space, so the per-commit fdatasync (pager.sync) carries no ext4
-// metadata-journaling for a file-size change — the durable-commit win (spec/design/pager.md §7,
-// TODO.md). The chunk's one-time allocating fsync (pager.reserve) amortizes across the chunk's commits.
+// preallocChunkBytes is the MAXIMUM file-growth step — ~1 MiB worth of pages. The file grows
+// geometrically (≈doubling its current size — reserve), so a small database's file stays proportional
+// to its data instead of jumping to a fixed 1 MiB; this caps a step so a large database never
+// over-reserves more than ~1 MiB of slack. Real, durably-allocated zero blocks let a steady-state
+// commit write its body into already-allocated space, so the per-commit fdatasync (pager.sync) carries
+// no ext4 metadata-journaling for a file-size change — the durable-commit win (spec/design/pager.md §7,
+// TODO.md). Each allocating fsync (pager.reserve) amortizes across the pages it reserves.
 const preallocChunkBytes = 1024 * 1024
 
-// preallocChunkPages is the preallocation chunk in pages for a file of pageSize bytes: max(1,
-// 1 MiB / pageSize). Page sizes are powers of two ≤ 64 KiB, so this divides 1 MiB evenly — the
-// physical file therefore grows in exact 1 MiB steps regardless of page size.
+// preallocFloorBytes is the MINIMUM file-growth step — 16 KiB worth of pages. It floors the geometric
+// growth so a fresh load does not fsync every page or two while the file is still tiny; above it the
+// doubling does the amortizing. Denominated in bytes (not pages) so it scales with pageSize like the
+// cap — at a 64 KiB page size it bottoms out at a single page, at 256 B it is 64 pages, reserving the
+// same ~16 KiB either way.
+const preallocFloorBytes = 16 * 1024
+
+// preallocChunkPages is the preallocation CAP in pages for a file of pageSize bytes: max(1,
+// 1 MiB / pageSize).
 func preallocChunkPages(pageSize uint32) uint32 {
 	if pageSize == 0 {
 		pageSize = 1
 	}
 	if c := uint32(preallocChunkBytes) / pageSize; c > 0 {
 		return c
+	}
+	return 1
+}
+
+// preallocFloorPages is the preallocation FLOOR in pages for a file of pageSize bytes: max(1,
+// 16 KiB / pageSize). Always ≤ preallocChunkPages (16 KiB ≤ 1 MiB), so reserve's clamp is well-formed.
+func preallocFloorPages(pageSize uint32) uint32 {
+	if pageSize == 0 {
+		pageSize = 1
+	}
+	if f := uint32(preallocFloorBytes) / pageSize; f > 0 {
+		return f
 	}
 	return 1
 }
@@ -169,23 +189,39 @@ func (p *pager) faultOnWrite(index uint32, bytes []byte) error {
 	return injectedCrash()
 }
 
-// reserve ensures the file has at least minPages physically-allocated pages, growing it in fixed
-// chunks (preallocChunkPages) of real, durably-allocated zero blocks when short. persist calls it
-// before each commit's body write with the new committed high-water, so that write — and almost
-// every commit's — lands entirely in already-allocated space and its fdatasync (pager.sync) pays no
-// metadata journaling (spec/design/pager.md §7). The growth itself is a full fsync (f.Sync): the
-// block allocation + the new file size must be durable before commits rely on writing into the
-// region (else the body fdatasync would have to flush that metadata, defeating the point).
-// Crash-safe: the preallocated pages are unreferenced zeros past the committed pageCount, so a crash
-// before the next commit publishes simply ignores them. The preallocation policy (the 1 MiB chunk,
-// the chunk-aligned target) is host-independent and stays here; the durable grow itself — real zero
-// blocks + a full fsync — is the host's setSize, the metadata barrier (hosts.md §2.1/§3).
+// reserve ensures the file has at least minPages physically-allocated pages, growing it GEOMETRICALLY
+// when short: each step adds the current size (≈doubling), floored at preallocFloorPages and capped at
+// preallocChunkPages (1 MiB), of real, durably-allocated zero blocks. So a small database's file stays
+// proportional to its data (no fixed 1 MiB minimum) while a large one still grows in 1 MiB chunks — the
+// physical size stays bounded by ≈2× the committed high-water. persist calls it before each commit's
+// body write with the new committed high-water, so that write — and almost every commit's — lands
+// entirely in already-allocated space and its fdatasync (pager.sync) pays no metadata journaling
+// (spec/design/pager.md §7). The growth itself is a full fsync (f.Sync): the block allocation + the new
+// file size must be durable before commits rely on writing into the region (else the body fdatasync
+// would have to flush that metadata, defeating the point). Crash-safe: the preallocated pages are
+// unreferenced zeros past the committed pageCount, so a crash before the next commit publishes simply
+// ignores them. The preallocation policy is host-independent and stays here; the durable grow itself —
+// real zero blocks + a full fsync — is the host's setSize, the metadata barrier (hosts.md §2.1/§3).
 func (p *pager) reserve(minPages uint32) error {
 	if minPages <= p.allocatedPages {
 		return nil
 	}
+	floor := preallocFloorPages(p.pageSize)
 	chunk := preallocChunkPages(p.pageSize)
-	target := ((minPages + chunk - 1) / chunk) * chunk
+	target := p.allocatedPages
+	for target < minPages {
+		step := target
+		if step < floor {
+			step = floor
+		} else if step > chunk {
+			step = chunk
+		}
+		if target > ^uint32(0)-step { // saturate rather than wrap at the u32 page ceiling
+			target = ^uint32(0)
+			break
+		}
+		target += step
+	}
 	if err := p.store.setSize(int64(target) * int64(p.pageSize)); err != nil {
 		return err
 	}

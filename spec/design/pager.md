@@ -261,14 +261,21 @@ The fix has **two** load-bearing halves — a microbenchmark on the same host sh
 *alone* barely helped (`fsync` still journals the inode timestamp), and `fdatasync` *alone* on a
 growing file still pays the size-metadata journal; only **both together** win:
 
-- **Preallocate file growth in chunks.** The pager tracks an `allocated_pages` high-water (the
+- **Preallocate file growth geometrically.** The pager tracks an `allocated_pages` high-water (the
   physical file length in pages) distinct from the committed logical `page_count`. Before a
-  commit's body write, `reserve(new_page_count)` grows the file — when short — by whole
-  **1 MiB chunks** (`max(1, 1 MiB / page_size)` pages, mirroring `cache_leaves`) of **real,
-  durably-allocated zero blocks** (a write of zeros, not a sparse `ftruncate` — a hole would
-  re-allocate on first write and re-journal). That growth is made durable with **one full
-  `fsync`**, *amortized* across the chunk's worth of commits. Almost every commit then writes its
-  body entirely into **already-allocated** space.
+  commit's body write, `reserve(new_page_count)` grows the file — when short — **geometrically**:
+  each step adds the current size (≈doubling), **floored** at `max(1, 16 KiB / page_size)` pages and
+  **capped** at `max(1, 1 MiB / page_size)` pages, of **real, durably-allocated zero blocks** (a write
+  of zeros, not a sparse `ftruncate` — a hole would re-allocate on first write and re-journal). So a
+  **small** database's file stays proportional to its data (bounded by ≈2× the committed high-water —
+  *not* a fixed 1 MiB minimum, which for an embedded engine's many small databases would be gross
+  over-allocation), while a **large** one still grows in 1 MiB chunks once past that size. Both bounds
+  are denominated in **bytes** (converted to pages), so they scale with `page_size`: at a 64 KiB page
+  size the floor bottoms out at a single page; the amortization economics are per-byte, not per-page.
+  Each growth is made durable with **one full `fsync`**, *amortized* across the pages it reserves — the
+  doubling keeps the number of allocating fsyncs logarithmic while the file is small and identical to
+  the old fixed-chunk behavior once it exceeds 1 MiB. Almost every commit then writes its body entirely
+  into **already-allocated** space.
 - **`fdatasync`, not `fsync`, for the per-commit barrier.** An overwrite into the preallocated
   region changes no file metadata (size fixed, blocks already allocated), and `fdatasync` skips
   the inode-timestamp flush `fsync` forces — so the body and meta syncs become **metadata-free**.
@@ -288,7 +295,7 @@ p50 (~2.7–2.9×), at PostgreSQL's order of magnitude (jed pays two syncs to PG
 - **Cost (§5 / CLAUDE.md §13).** `page_read` is a **logical** count; the physical file size and the
   preallocation are invisible to it.
 - **Crash safety (storage.md §4).** The preallocated zeros are referenced by no committed meta, and
-  the chunk's allocating `fsync` lands *before* any commit relies on the region — so a crash at any
+  each allocating `fsync` lands *before* any commit relies on the region — so a crash at any
   point falls back to a valid prior snapshot exactly as before.
 - **The commit-visibility boundary (transactions.md §9).** Only fsync *timing/flavor* changed, never
   *when* a commit becomes visible. The future `synchronous=off` batching is an orthogonal,
@@ -298,7 +305,9 @@ p50 (~2.7–2.9×), at PostgreSQL's order of magnitude (jed pays two syncs to PG
 barrier in each core, chosen idiomatically: Rust `File::sync_data()`, TS Node `fs.fdatasyncSync`, Go
 `syscall.Fdatasync` (pure Go, no cgo — CLAUDE.md §2) behind a `linux` build tag with a full-`Sync`
 fallback for platforms lacking it (still correct, just without the optimization). The preallocation
-chunk size and `reserve` logic are identical across cores.
+floor/cap and the geometric `reserve` logic are identical across cores (pure integer arithmetic on
+`page_size` and `allocated_pages`); the *physical* file size it produces is **not** a byte contract
+(the tail is unreferenced zeros), so a core need only match the policy, not the exact length.
 
 ## 8. Determinism & cross-core notes
 

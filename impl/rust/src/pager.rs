@@ -14,19 +14,33 @@
 use crate::blockstore::BlockStore;
 use crate::error::{EngineError, Result, SqlState};
 
-/// Pages preallocated per file-growth step — ~1 MiB worth, floored at one page (mirrors
-/// [`crate::paging::cache_leaves`]). Preallocating the file in chunks of real, durably-allocated zero
-/// blocks is what lets a steady-state commit write its body into **already-allocated** space, so the
-/// per-commit `fdatasync` ([`Pager::sync`]) carries **no** ext4 metadata-journaling for a file-size
-/// change — the durable-commit win (spec/design/pager.md §7, TODO.md). The chunk's one-time
-/// allocating `fsync` (in [`Pager::reserve`]) amortizes across the chunk's worth of commits.
+/// The **maximum** file-growth step — ~1 MiB worth of pages. The file grows *geometrically*
+/// (≈doubling its current size — [`Pager::reserve`]), so a small database's file stays proportional to
+/// its data instead of jumping to a fixed 1 MiB; this caps a step so a large database never
+/// over-reserves more than ~1 MiB of slack. Real, durably-allocated zero blocks let a steady-state
+/// commit write its body into **already-allocated** space, so the per-commit `fdatasync`
+/// ([`Pager::sync`]) carries **no** ext4 metadata-journaling for a file-size change — the
+/// durable-commit win (spec/design/pager.md §7, TODO.md). Each allocating `fsync` (in
+/// [`Pager::reserve`]) amortizes across the pages it reserves.
 const PREALLOC_CHUNK_BYTES: u32 = 1024 * 1024;
 
-/// The preallocation chunk in **pages** for a file of `page_size` bytes: `max(1, 1 MiB / page_size)`.
-/// Page sizes are powers of two ≤ 64 KiB, so this divides 1 MiB evenly — the physical file therefore
-/// grows in exact 1 MiB steps regardless of page size.
+/// The **minimum** file-growth step — 16 KiB worth of pages. Floors the geometric growth so a fresh
+/// load does not `fsync` every page or two while the file is still tiny; above it the doubling does the
+/// amortizing. Denominated in bytes (not pages) so it scales with `page_size` like the cap — at a
+/// 64 KiB page size it bottoms out at a single page, at 256 B it is 64 pages, reserving the same
+/// ~16 KiB either way.
+const PREALLOC_FLOOR_BYTES: u32 = 16 * 1024;
+
+/// The preallocation **cap** in **pages** for a file of `page_size` bytes: `max(1, 1 MiB / page_size)`.
 fn prealloc_chunk_pages(page_size: u32) -> u32 {
     (PREALLOC_CHUNK_BYTES / page_size.max(1)).max(1)
+}
+
+/// The preallocation **floor** in **pages** for a file of `page_size` bytes: `max(1, 16 KiB /
+/// page_size)`. Always `≤ prealloc_chunk_pages` (16 KiB ≤ 1 MiB), so the clamp in [`Pager::reserve`]
+/// is well-formed.
+fn prealloc_floor_pages(page_size: u32) -> u32 {
+    (PREALLOC_FLOOR_BYTES / page_size.max(1)).max(1)
 }
 
 /// A block device: fixed-size pages addressed by index, over a [`BlockStore`] host kept open for the
@@ -196,21 +210,29 @@ impl Pager {
         Err(injected_crash())
     }
 
-    /// Ensure the file has at least `min_pages` physically-allocated pages, growing it in fixed
-    /// chunks ([`prealloc_chunk_pages`]) when short. The preallocation *policy* (the 1 MiB chunk, the
-    /// chunk-aligned target) is host-independent and stays here; the durable grow itself — real
-    /// zero blocks + a full `fsync` — is the host's [`set_size`](BlockStore::set_size), the metadata
-    /// barrier (hosts.md §2.1/§3). Called by `persist` before each commit's body write with the new
-    /// committed high-water, so that write — and almost every commit's — lands entirely in
-    /// already-allocated space and its data-only [`sync`](Pager::sync) pays no metadata journaling
-    /// (spec/design/pager.md §7). Crash-safe: the preallocated pages are unreferenced zeros past the
-    /// committed `page_count`, so a crash before the next commit publishes simply ignores them.
+    /// Ensure the file has at least `min_pages` physically-allocated pages, growing it *geometrically*
+    /// when short: each step adds the current size (≈doubling), floored at [`prealloc_floor_pages`] and
+    /// capped at [`prealloc_chunk_pages`] (1 MiB). So a small database's file stays proportional to its
+    /// data (no fixed 1 MiB minimum) while a large one still grows in 1 MiB chunks — the physical size
+    /// stays bounded by ≈2× the committed high-water. The preallocation *policy* is host-independent and
+    /// stays here; the durable grow itself — real zero blocks + a full `fsync` — is the host's
+    /// [`set_size`](BlockStore::set_size), the metadata barrier (hosts.md §2.1/§3). Called by `persist`
+    /// before each commit's body write with the new committed high-water, so that write — and almost
+    /// every commit's — lands entirely in already-allocated space and its data-only [`sync`](Pager::sync)
+    /// pays no metadata journaling (spec/design/pager.md §7). Crash-safe: the preallocated pages are
+    /// unreferenced zeros past the committed `page_count`, so a crash before the next commit publishes
+    /// simply ignores them.
     pub(crate) fn reserve(&mut self, min_pages: u32) -> Result<()> {
         if min_pages <= self.allocated_pages {
             return Ok(());
         }
-        let chunk = prealloc_chunk_pages(self.page_size);
-        let target = min_pages.div_ceil(chunk).saturating_mul(chunk);
+        let floor = prealloc_floor_pages(self.page_size);
+        let cap = prealloc_chunk_pages(self.page_size);
+        let mut target = self.allocated_pages;
+        while target < min_pages {
+            // ≈double, clamped to [floor, cap]; saturate rather than wrap at the u32 page ceiling.
+            target = target.saturating_add(target.clamp(floor, cap));
+        }
         self.store.set_size(target as u64 * self.page_size as u64)?;
         self.allocated_pages = target;
         Ok(())

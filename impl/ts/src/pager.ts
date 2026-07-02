@@ -14,18 +14,32 @@
 import type { BlockStore } from "./blockstore.ts";
 import { type EngineError, engineError } from "./errors.ts";
 
-// PREALLOC_CHUNK_BYTES is the file-growth step — ~1 MiB worth of pages preallocated at once. Growing
-// the file in chunks of real, durably-allocated zero blocks is what lets a steady-state commit write
-// its body into already-allocated space, so the per-commit fdatasync (Pager.sync) carries no ext4
-// metadata-journaling for a file-size change — the durable-commit win (spec/design/pager.md §7,
-// TODO.md). The chunk's one-time allocating fsync (Pager.reserve) amortizes across the chunk's commits.
+// PREALLOC_CHUNK_BYTES is the MAXIMUM file-growth step — ~1 MiB worth of pages. The file grows
+// geometrically (≈doubling its current size — reserve), so a small database's file stays proportional
+// to its data instead of jumping to a fixed 1 MiB; this caps a step so a large database never
+// over-reserves more than ~1 MiB of slack. Real, durably-allocated zero blocks let a steady-state
+// commit write its body into already-allocated space, so the per-commit fdatasync (Pager.sync) carries
+// no ext4 metadata-journaling for a file-size change — the durable-commit win (spec/design/pager.md §7,
+// TODO.md). Each allocating fsync (Pager.reserve) amortizes across the pages it reserves.
 const PREALLOC_CHUNK_BYTES = 1024 * 1024;
 
-// preallocChunkPages is the preallocation chunk in pages for a file of pageSize bytes: max(1,
-// 1 MiB / pageSize). Page sizes are powers of two ≤ 64 KiB, so this divides 1 MiB evenly — the
-// physical file therefore grows in exact 1 MiB steps regardless of page size.
+// PREALLOC_FLOOR_BYTES is the MINIMUM file-growth step — 16 KiB worth of pages. It floors the geometric
+// growth so a fresh load does not fsync every page or two while the file is still tiny; above it the
+// doubling does the amortizing. Denominated in bytes (not pages) so it scales with pageSize like the
+// cap — at a 64 KiB page size it bottoms out at a single page, at 256 B it is 64 pages, reserving the
+// same ~16 KiB either way.
+const PREALLOC_FLOOR_BYTES = 16 * 1024;
+
+// preallocChunkPages is the preallocation CAP in pages for a file of pageSize bytes: max(1,
+// 1 MiB / pageSize).
 function preallocChunkPages(pageSize: number): number {
   return Math.max(1, Math.floor(PREALLOC_CHUNK_BYTES / Math.max(1, pageSize)));
+}
+
+// preallocFloorPages is the preallocation FLOOR in pages for a file of pageSize bytes: max(1,
+// 16 KiB / pageSize). Always ≤ preallocChunkPages (16 KiB ≤ 1 MiB), so reserve's clamp is well-formed.
+function preallocFloorPages(pageSize: number): number {
+  return Math.max(1, Math.floor(PREALLOC_FLOOR_BYTES / Math.max(1, pageSize)));
 }
 
 // FaultPoint selects a point in the commit write sequence at which the fault-injection seam
@@ -149,19 +163,29 @@ export class Pager {
     this.store.writeAt(index * this.pageSize, bytes);
   }
 
-  // reserve ensures the file has at least minPages physically-allocated pages, growing it in fixed
-  // chunks (preallocChunkPages) when short. persistImpl calls it before each commit's body write with
-  // the new committed high-water, so that write — and almost every commit's — lands entirely in
+  // reserve ensures the file has at least minPages physically-allocated pages, growing it GEOMETRICALLY
+  // when short: each step adds the current size (≈doubling), floored at preallocFloorPages and capped at
+  // preallocChunkPages (1 MiB). So a small database's file stays proportional to its data (no fixed
+  // 1 MiB minimum) while a large one still grows in 1 MiB chunks — the physical size stays bounded by
+  // ≈2× the committed high-water. persistImpl calls it before each commit's body write with the new
+  // committed high-water, so that write — and almost every commit's — lands entirely in
   // already-allocated space and its data-only sync (Pager.sync) pays no metadata journaling
-  // (spec/design/pager.md §7). The preallocation policy (the 1 MiB chunk, the chunk-aligned target) is
-  // host-independent and stays here; the durable grow itself — real zero blocks + a full fsync — is the
-  // host's setSize, the metadata barrier (hosts.md §2.1/§3). Crash-safe: the preallocated pages are
-  // unreferenced zeros past the committed pageCount, so a crash before the next commit publishes
-  // simply ignores them.
+  // (spec/design/pager.md §7). The preallocation policy is host-independent and stays here; the durable
+  // grow itself — real zero blocks + a full fsync — is the host's setSize, the metadata barrier
+  // (hosts.md §2.1/§3). Crash-safe: the preallocated pages are unreferenced zeros past the committed
+  // pageCount, so a crash before the next commit publishes simply ignores them.
   reserve(minPages: number): void {
     if (minPages <= this.allocatedPages) return;
+    const floor = preallocFloorPages(this.pageSize);
     const chunk = preallocChunkPages(this.pageSize);
-    const target = Math.ceil(minPages / chunk) * chunk;
+    let target = this.allocatedPages;
+    while (target < minPages) {
+      target += Math.min(chunk, Math.max(floor, target));
+      if (target > 0xffff_ffff) {
+        target = 0xffff_ffff; // saturate rather than exceed the u32 page ceiling (matches Rust/Go)
+        break;
+      }
+    }
     this.store.setSize(target * this.pageSize);
     this.allocatedPages = target;
   }

@@ -212,18 +212,18 @@ func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 	}
 }
 
-// TestCommitPreallocatesFileGrowthInChunks mirrors the Rust/TS preallocation tests (spec/design/pager.md
-// §7, TODO.md durable-commit win): a commit that grows past the allocation high-water extends the file
-// by whole 1 MiB chunks of real zero blocks, so the physical file is a multiple of the chunk and runs
-// ahead of the committed pageCount. The slack is unreferenced (the committed image round-trips
-// exactly), and a later commit that fits within it does not grow the file at all (the steady-state
-// metadata-free path). The logical pageCount is the real high-water — independent of the physical size.
-func TestCommitPreallocatesFileGrowthInChunks(t *testing.T) {
-	const chunk = int64(1024 * 1024) // preallocChunkBytes (pager.go)
+// TestCommitPreallocatesFileGrowthGeometrically mirrors the Rust/TS preallocation tests
+// (spec/design/pager.md §7, TODO.md durable-commit win): a commit that grows past the allocation
+// high-water extends the file GEOMETRICALLY (≈doubling, capped at a 1 MiB chunk) with real zero blocks,
+// so the physical file runs ahead of the committed pageCount but stays bounded by ≈2× it — no fixed
+// 1 MiB minimum. The slack is unreferenced (the committed image round-trips exactly), and a later
+// commit that fits within it does not grow the file at all (the steady-state metadata-free path). The
+// logical pageCount is the real high-water — independent of the physical size.
+func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "prealloc_chunks.jed")
 
-	// A from-scratch image is just the empty catalog — far below one chunk — so the file starts
-	// un-aligned (Create writes exactly pageCount pages, no preallocation).
+	// A from-scratch image is just the empty catalog (Create writes exactly pageCount pages, no
+	// preallocation).
 	db, err := create(path, DefaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -244,11 +244,13 @@ func TestCommitPreallocatesFileGrowthInChunks(t *testing.T) {
 	if db.PageCount() <= 128 {
 		t.Fatalf("the batch should span more than one chunk's worth of pages, got %d", db.PageCount())
 	}
-	if physical%chunk != 0 {
-		t.Fatalf("physical file should grow in whole chunks, got %d (chunk %d)", physical, chunk)
+	// Preallocation runs ahead of the committed image (so steady-state commits are metadata-free) but
+	// is bounded by ≈2× it — the geometric policy, not a fixed 1 MiB multiple.
+	if physical < logical {
+		t.Fatalf("preallocation must cover the %d-byte committed image, got physical %d", logical, physical)
 	}
-	if physical < logical || physical < chunk {
-		t.Fatalf("preallocation should run ahead of the %d-byte committed image, got physical %d", logical, physical)
+	if physical > 2*logical {
+		t.Fatalf("geometric growth must not over-reserve past ≈2× the %d-byte image, got physical %d", logical, physical)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -282,6 +284,38 @@ func TestCommitPreallocatesFileGrowthInChunks(t *testing.T) {
 	}
 	if got := len(selectIDs(t, db)); got != 401 {
 		t.Fatalf("expected 401 rows after the in-slack commit, got %d", got)
+	}
+}
+
+// TestSmallDatabaseFileStaysProportional is the direct guard for the geometric preallocation policy
+// (spec/design/pager.md §7): a tiny database must not occupy a fixed 1 MiB on disk. A handful of rows
+// at page_size 256 previously preallocated a whole 1 MiB chunk (~4096 pages) for ~14 pages of data;
+// with geometric growth the file stays proportional — bounded by ≈2× the committed image plus the
+// 16 KiB floor. Mirrors the Rust/TS small-database tests.
+func TestSmallDatabaseFileStaysProportional(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "small.jed")
+	db, err := create(path, DatabaseOptions{PageSize: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	for i := 0; i < 30; i++ {
+		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i))
+	}
+	logical := int64(db.PageCount()) * int64(db.PageSize())
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	physical := fileSize(t, path)
+	if physical >= 1024*1024 {
+		t.Fatalf("a tiny database must not preallocate a whole 1 MiB, got physical %d", physical)
+	}
+	if physical > 2*logical+16*1024 { // ≈2× the image + the 16 KiB floor
+		t.Fatalf("a %d-byte database should stay proportional, got physical %d", logical, physical)
+	}
+	if physical < logical {
+		t.Fatalf("the file must still cover the committed %d-byte image, got %d", logical, physical)
 	}
 }
 

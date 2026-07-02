@@ -662,20 +662,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Chunked file preallocation (spec/design/pager.md §7, TODO.md durable-commit win): a commit that
-    /// grows past the allocation high-water extends the file by whole 1 MiB chunks of real zero blocks,
-    /// so the physical file is a multiple of the chunk and runs **ahead** of the committed
-    /// `page_count`. The slack is unreferenced (the committed image round-trips exactly), and a later
-    /// commit that fits within it does **not** grow the file at all (the steady-state metadata-free
-    /// path). The logical `page_count` is the real high-water — independent of the physical size.
+    /// Geometric file preallocation (spec/design/pager.md §7, TODO.md durable-commit win): a commit
+    /// that grows past the allocation high-water extends the file *geometrically* (≈doubling, capped at
+    /// a 1 MiB chunk) with real zero blocks, so the physical file runs **ahead** of the committed
+    /// `page_count` but stays bounded by ≈2× it — no fixed 1 MiB minimum. The slack is unreferenced (the
+    /// committed image round-trips exactly), and a later commit that fits within it does **not** grow
+    /// the file at all (the steady-state metadata-free path). The logical `page_count` is the real
+    /// high-water — independent of the physical size.
     #[test]
-    fn commit_preallocates_file_growth_in_chunks_and_reuses_slack() {
-        const CHUNK: u64 = 1024 * 1024; // PREALLOC_CHUNK_BYTES (pager.rs)
+    fn commit_preallocates_file_growth_geometrically_and_reuses_slack() {
         let path = tmp("jed_prealloc_chunks.jed");
         let _ = std::fs::remove_file(&path);
 
-        // A from-scratch image is just the empty catalog — far below one chunk — so the file starts
-        // un-aligned (create writes exactly page_count pages, no preallocation).
+        // A from-scratch image is just the empty catalog (create writes exactly page_count pages, no
+        // preallocation).
         let mut db = Engine::create(&path, DatabaseOptions::default()).unwrap();
         execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
 
@@ -695,10 +695,15 @@ mod tests {
             "the batch should span more than one chunk's worth of pages (got {})",
             db.page_count()
         );
-        assert_eq!(physical % CHUNK, 0, "physical file grows in whole chunks");
+        // Preallocation runs ahead of the committed image (so steady-state commits are metadata-free)
+        // but is bounded by ≈2× it — the geometric policy, not a fixed 1 MiB multiple.
         assert!(
-            physical >= logical && physical >= CHUNK,
-            "preallocation runs ahead of the {logical}-byte committed image (physical {physical})"
+            physical >= logical,
+            "preallocation must cover the {logical}-byte committed image (physical {physical})"
+        );
+        assert!(
+            physical <= 2 * logical,
+            "geometric growth must not over-reserve past ≈2× the {logical}-byte image (physical {physical})"
         );
         db.close().unwrap();
 

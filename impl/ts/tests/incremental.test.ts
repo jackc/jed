@@ -55,9 +55,9 @@ test("a single-row commit appends only the dirty path", () => {
 
     // One more row: the incremental commit appends only the rebuilt root→leaf path + catalog —
     // far fewer pages than the whole tree, and bounded by tree height, not table size. We track the
-    // committed pageCount delta, not the file length — the file is preallocated in chunks ahead of
-    // the high-water (spec/design/pager.md §7), so its physical size jumps by a chunk, not the
-    // dirty-page count.
+    // committed pageCount delta, not the file length — the file is preallocated ahead of the
+    // high-water (spec/design/pager.md §7), so its physical size jumps by a geometric preallocation
+    // step, not the dirty-page count.
     const before = db.pageCount;
     execute(db, `INSERT INTO t VALUES (31, 'row-31-${pad}')`);
     const appended = db.pageCount - before;
@@ -164,19 +164,19 @@ test("a torn latest commit falls back to the prior snapshot", () => {
   }
 });
 
-test("a commit preallocates file growth in chunks and reuses the slack", () => {
-  // Chunked file preallocation (spec/design/pager.md §7, TODO.md durable-commit win): a commit that
-  // grows past the allocation high-water extends the file by whole 1 MiB chunks of real zero blocks,
-  // so the physical file is a multiple of the chunk and runs ahead of the committed pageCount. The
-  // slack is unreferenced (the committed image round-trips exactly), and a later commit that fits
-  // within it does not grow the file at all (the steady-state metadata-free path). The logical
-  // pageCount is the real high-water — independent of the physical size.
-  const CHUNK = 1024 * 1024; // PREALLOC_CHUNK_BYTES (pager.ts)
+test("a commit preallocates file growth geometrically and reuses the slack", () => {
+  // Geometric file preallocation (spec/design/pager.md §7, TODO.md durable-commit win): a commit that
+  // grows past the allocation high-water extends the file geometrically (≈doubling, capped at a 1 MiB
+  // chunk) with real zero blocks, so the physical file runs ahead of the committed pageCount but stays
+  // bounded by ≈2× it — no fixed 1 MiB minimum. The slack is unreferenced (the committed image
+  // round-trips exactly), and a later commit that fits within it does not grow the file at all (the
+  // steady-state metadata-free path). The logical pageCount is the real high-water — independent of the
+  // physical size.
   const dir = tmpDir();
   try {
     const path = join(dir, "prealloc_chunks.jed");
-    // A from-scratch image is just the empty catalog — far below one chunk — so the file starts
-    // un-aligned (create writes exactly pageCount pages, no preallocation).
+    // A from-scratch image is just the empty catalog (create writes exactly pageCount pages, no
+    // preallocation).
     const db = create(path); // default 8 KiB page size
     execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
 
@@ -195,14 +195,15 @@ test("a commit preallocates file growth in chunks and reuses the slack", () => {
       db.pageCount > 128,
       `the batch should span more than one chunk's worth of pages (got ${db.pageCount})`,
     );
-    assert.equal(
-      physical % CHUNK,
-      0,
-      `physical file should grow in whole chunks (got ${physical})`,
+    // Preallocation runs ahead of the committed image (so steady-state commits are metadata-free) but
+    // is bounded by ≈2× it — the geometric policy, not a fixed 1 MiB multiple.
+    assert.ok(
+      physical >= logical,
+      `preallocation must cover the ${logical}-byte committed image (physical ${physical})`,
     );
     assert.ok(
-      physical >= logical && physical >= CHUNK,
-      `preallocation should run ahead of the ${logical}-byte committed image (physical ${physical})`,
+      physical <= 2 * logical,
+      `geometric growth must not over-reserve past ≈2× the ${logical}-byte image (physical ${physical})`,
     );
     close(db);
 
@@ -226,6 +227,38 @@ test("a commit preallocates file growth in chunks and reuses the slack", () => {
     const db3 = open(path);
     assert.equal(ids(db3).length, 401, "the in-slack commit persisted");
     close(db3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a small database file stays proportional (no fixed 1 MiB)", () => {
+  // The direct guard for the geometric preallocation policy (spec/design/pager.md §7): a tiny database
+  // must not occupy a fixed 1 MiB on disk. A handful of rows at page_size 256 previously preallocated a
+  // whole 1 MiB chunk (~4096 pages) for ~14 pages of data; with geometric growth the file stays
+  // proportional — bounded by ≈2× the committed image plus the 16 KiB floor. Mirrors the Rust/Go tests.
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "small.jed");
+    const db = create(path, { pageSize: 256 });
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    for (let i = 0; i < 30; i++) execute(db, `INSERT INTO t VALUES (${i}, ${i})`);
+    const logical = db.pageCount * db.pageSize;
+    close(db);
+
+    const physical = statSync(path).size;
+    assert.ok(
+      physical < 1024 * 1024,
+      `a tiny database must not preallocate a whole 1 MiB (physical ${physical})`,
+    );
+    assert.ok(
+      physical <= 2 * logical + 16 * 1024, // ≈2× the image + the 16 KiB floor
+      `a ${logical}-byte database should stay proportional (physical ${physical})`,
+    );
+    assert.ok(
+      physical >= logical,
+      `the file must still cover the committed ${logical}-byte image (physical ${physical})`,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
