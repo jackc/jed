@@ -6,7 +6,7 @@
 # `FROM t, LATERAL (…)` (a lateral item still sees earlier comma items). Cost is the CROSS-JOIN
 # contract of cost.md §3 (JOIN): storage_row_read per materialized row (sum of cardinalities), NO
 # ON operator_eval for a comma cross, WHERE per surviving combined row, row_produced per emitted row.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.order_by_keys, query.comma_from, query.cross_join, query.join_inner, query.qualified_column, query.derived_table, query.lateral, query.subquery_correlated, expr.arithmetic, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.order_by_keys, query.comma_from, query.cross_join, query.join_inner, query.index_nested_loop, query.qualified_column, query.derived_table, query.lateral, query.subquery_correlated, expr.arithmetic, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE a (id i32 PRIMARY KEY, k i32)
@@ -113,9 +113,14 @@ SELECT a.id, b.id, c.id FROM a, b, c ORDER BY a.id, b.id, c.id
 
 # The comma binds LOOSER than JOIN: `a, b JOIN c ON b.id = c.id` is `a x (b JOIN c)`. The join's ON
 # references only its own comma item (b, c). b JOIN c on id → (b1,c1),(b2,c2); crossed with a's 3
-# rows → 6.
+# rows → 6. The ON `b.id = c.id` compares c's PK to the sibling b.id, so c is bound per outer row by
+# index-nested-loop (query.index_nested_loop): a: 1 page + 3 rows; b: 1 page + 2 rows; c seeks once
+# per (a,b) combined row — 6 point lookups, each `c.id = b.id` a HIT (b.id ∈ {1,2} = c's PKs), 1 page
+# + 1 row each = 6 page + 6 rows; 6 ON evals over the 6 hits; 6 produced. 4 + 3 + 12 + 6 + 6 = 31.
+# (The pre-INL full-inner-scan baseline was 28 — for a single-leaf inner the per-outer seeks cost a
+# little more; the win shows when the inner is large, N·log M ≪ N·M.)
 # names: id, id, id
-# cost: 28
+# cost: 31
 query III nosort
 SELECT a.id, b.id, c.id FROM a, b JOIN c ON b.id = c.id ORDER BY a.id, b.id
 ----

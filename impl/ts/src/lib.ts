@@ -279,6 +279,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.order_by_join_scan",
   "query.correlated_pushdown",
   "query.join_pushdown",
+  "query.index_nested_loop",
   // EXPLAIN — render the planner's chosen plan as a deterministic depth/node/detail result set,
   // without executing the inner statement (spec/design/explain.md).
   "query.explain",

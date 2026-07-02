@@ -2,7 +2,7 @@
 # every relation in scope (no match 42703, two+ matches 42702 ambiguous, exactly one resolves);
 # a qualified `rel.col` names exactly one relation (unknown qualifier 42P01, known relation with
 # no such column 42703) and is never ambiguous. ORDER BY may use a qualified key.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.qualified_column, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.index_nested_loop, query.qualified_column, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t1 (id i32 PRIMARY KEY, shared i32, only1 i32)
@@ -56,10 +56,12 @@ statement error 42703
 SELECT t1.nope FROM t1 JOIN t2 ON t1.shared = t2.shared
 
 # ORDER BY a qualified key from the right relation. The join t1.id = t2.id matches both rows;
-# ordering by t2.shared DESC puts 999 (t1.id 2) before 100 (t1.id 1). 4 materialize + 4 ON +
-# 2 produced = 10 (the sort is unmetered).
+# ordering by t2.shared DESC puts 999 (t1.id 2) before 100 (t1.id 1). The ON compares t2's PK to the
+# sibling t1.id, so t2 is bound per outer row by index-nested-loop (query.index_nested_loop): t1
+# (outer) 1 page + 2 rows = 3; t2 seeks `t2.id = t1.id` twice, both HITs (1 page + 1 row each) = 4;
+# 2 ON evals; 2 produced (the sort is unmetered). 3 + 4 + 2 + 2 = 11.
 # names: id, shared
-# cost: 12
+# cost: 11
 query II nosort
 SELECT t1.id, t1.shared FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t2.shared DESC
 ----

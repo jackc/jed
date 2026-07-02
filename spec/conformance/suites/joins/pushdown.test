@@ -8,7 +8,7 @@
 # one leaf each, so page_read is 1 per non-empty scan and 0 for an empty bound. Sound for outer joins:
 # a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding the
 # NULL-extended side cannot drop a surviving row (the `WHERE b.id = …` LEFT-JOIN case below).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_pushdown, query.point_lookup, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_pushdown, query.index_nested_loop, query.point_lookup, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE a (id i32 PRIMARY KEY, k i32)
@@ -89,11 +89,13 @@ SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.k = 10 ORDER BY a.id
 ----
 1
 
-# Contrast 2 — a CROSS-relation PK predicate `b.id = a.id` does NOT bound (the bound source must be a
-# constant, not a sibling column; binding `b.pk` to `a`'s value per outer row is the deferred
-# index-nested-loop case). So b is a full scan. a: 1 page + 3 rows. b: 1 page + 3 rows. 3x3 = 9 ON (2
-# matches); WHERE `b.id=a.id` on 2 (2), both false; 0 produced. 2 + 6 + 9 + 2 = 19.
-# cost: 19
+# Contrast 2 — a CROSS-relation PK predicate `b.id = a.id` DOES bound now, via index-nested-loop
+# (query.index_nested_loop): b's PK is compared to the sibling column `a.id`, so b is re-materialized
+# per a-row and seeks `b.id = a.id` instead of a full scan. a: 1 page + 3 rows. Per a-row seek b.id =
+# a.id: a.id ∈ {1,2,3} but b's PKs are {10,20,30}, so all THREE are point-lookup MISSES — 1 page + 0
+# rows each. b: 3 page + 0 rows. No combined pair survives the seek, so 0 ON, 0 WHERE, 0 produced.
+# 2 (a page + b's 3 seek pages... a:1 + b:3 = 4) + 3 (a rows) = 7. (The full-double-scan baseline was 19.)
+# cost: 7
 query I nosort
 SELECT a.id FROM a JOIN b ON a.k = b.k WHERE b.id = a.id ORDER BY a.id
 ----

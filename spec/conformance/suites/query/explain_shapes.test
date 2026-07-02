@@ -2,7 +2,7 @@
 # functions, set operations, derived tables / subqueries, CTEs, VALUES, and set-returning functions.
 # The plan tree is rendered in pre-order (depth-numbered), so the rows read top-down as the executor's
 # pipeline reads bottom-up. Deterministic and cross-core-identical, asserted with `nosort`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.point_lookup, query.limit, query.order_by, query.order_by_ordinal, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, types.i32, types.text
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.point_lookup, query.limit, query.order_by, query.order_by_ordinal, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, types.i32, types.text
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -51,6 +51,21 @@ Full scan; touched=3
 1
 Scan u
 Full scan; touched=2
+
+# Index-nested-loop join: the inner relation `t` has its PK compared to the sibling `u.tid`, so its
+# scan is a per-outer-row seek — the access path shows `Index-nested-loop PK bound` (query.index_nested_loop).
+query ITT nosort
+EXPLAIN SELECT * FROM u JOIN t ON t.id = u.tid
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+Scan u
+Full scan; touched=2
+1
+Scan t
+Index-nested-loop PK bound: id = join; touched=3
 
 # A CROSS JOIN with a WHERE: the residual Filter is the parent; the per-table PK bound shows on t.
 query ITT nosort

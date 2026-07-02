@@ -1,0 +1,176 @@
+# Index-nested-loop join (spec/design/cost.md §3 "bounded scan / JOIN"; query.index_nested_loop). A
+# join INNER relation whose PRIMARY KEY (or a leading B-tree secondary-index column) is compared to a
+# SIBLING column of an EARLIER relation — `a JOIN b ON b.pk = a.x`, taken from the ON predicate or the
+# WHERE — is re-materialized ONCE PER outer row, its scan bounded to that outer row's sibling value (a
+# per-outer-row point lookup / range) instead of full-scanning the whole inner table for every outer
+# row. It is the SAME bounded-scan mechanism as query.correlated_pushdown, only the bound source is a
+# sibling column of the current combined left-hand row rather than an enclosing query's column, so the
+# whole ON/WHERE stays the residual filter and the ROWS are identical with or without the pushdown;
+# only the inner re-scan COST drops (O(N·M) → O(N·log M)). That drop is the cross-core contract pinned
+# here with `# cost:` (the same units in Rust, Go, TS). All units weigh 1. `o` and `inr` are four/three
+# rows in one leaf each, so page_read is 1 for any non-empty inner bound and 0 for an empty one; the
+# win shows in storage_row_read + the ON operator_evals — a point lookup reads 0/1 inner rows per outer
+# row and evaluates the ON only over the hits, not all of `inr` for every `o`.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_right, query.cross_join, query.index_nested_loop, query.point_lookup, types.i32, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE inr (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO o VALUES (1, 2), (2, 5), (3, 9), (4, NULL)
+
+statement ok
+INSERT INTO inr VALUES (2, 20), (4, 40), (5, 50)
+
+# INNER, the ON compares inr's PK to the sibling o.k → index-nested-loop: inr seeks `inr.id = o.k`
+# per o-row. o (outer): 1 page + 4 rows = 5. Per o-row: o.k=2 → inr.id=2 HIT (1 page + 1 row); o.k=5
+# → inr.id=5 HIT (1 page + 1 row); o.k=9 → MISS (1 page + 0 rows); o.k=NULL → 3VL-empty (0 page + 0
+# rows) → inr: 3 page + 2 rows = 5. ON `inr.id = o.k` over the 2 hits = 2. 2 produced. 5+5+2+2 = 14.
+# (A full re-scan of inr per o-row — no pushdown — would be 4×|inr| = far more.)
+# cost: 14
+query II nosort
+SELECT o.id, inr.v FROM o JOIN inr ON inr.id = o.k ORDER BY o.id
+----
+1
+20
+2
+50
+
+# LEFT join — index-nested-loop is SOUND for the nullable (inner) side: an empty per-outer bound
+# NULL-extends that outer row, exactly as a full scan with no match would. Same inr seeks as above
+# (3 page + 2 rows = 5); o 5. o.k=9 (MISS) and o.k=NULL (empty) NULL-extend o3/o4; o.k=2/5 match. ON
+# over 2 hits = 2. 4 produced (2 matched + 2 NULL-extended). 5+5+2+4 = 16.
+# cost: 16
+query II nosort
+SELECT o.id, inr.v FROM o LEFT JOIN inr ON inr.id = o.k ORDER BY o.id
+----
+1
+20
+2
+50
+3
+NULL
+4
+NULL
+
+# RANGE sibling bound — `inr.id < o.k` bounds inr to (−∞, o.k) per o-row (the inner still reads every
+# match; it is not LIMIT 1). o 5. o.k=2 → inr.id<2 → none (1 page, 0 rows); o.k=5 → {2,4} (1 page + 2
+# rows); o.k=9 → {2,4,5} (1 page + 3 rows); o.k=NULL → empty (0 page, 0 rows) → inr: 3 page + 5 rows =
+# 8. ON `inr.id < o.k` over 5 combined pairs = 5. 5 produced. 5+8+5+5 = 23.
+# cost: 23
+query II nosort
+SELECT o.id, inr.id FROM o JOIN inr ON inr.id < o.k ORDER BY o.id, inr.id
+----
+2
+2
+2
+4
+3
+2
+3
+4
+3
+5
+
+# The bound may come from the WHERE, not only the ON: an INNER `ON true` with `WHERE inr.id = o.k`
+# bounds inr per o-row identically (the residual WHERE re-checks). Same rows + cost as the ON form.
+# cost: 14
+query II nosort
+SELECT o.id, inr.v FROM o JOIN inr ON true WHERE inr.id = o.k ORDER BY o.id
+----
+1
+20
+2
+50
+
+# A constant term co-occurring with the sibling term tightens the per-outer seek: `inr.id = o.k AND
+# inr.id > 3` seeks the intersection each o-row. o 5. o.k=2 → seek id=2 ∩ id>3 → empty (0 page/rows);
+# o.k=5 → id=5 (>3) HIT (1 page + 1 row); o.k=9 → id=9 MISS (1 page + 0 rows); o.k=NULL → empty. inr:
+# 2 page + 1 row = 3. ON is a 3-node AND (`= AND >`) over the 1 hit = 3. 1 produced. 5+3+3+1 = 12.
+# cost: 12
+query II nosort
+SELECT o.id, inr.v FROM o JOIN inr ON inr.id = o.k AND inr.id > 3 ORDER BY o.id
+----
+2
+50
+
+# CONTRAST — a RIGHT join does NOT bound the (preserved) inner side: `o RIGHT JOIN inr ON inr.id =
+# o.k` must emit every inr row, including those matching no o, so inr cannot be bounded per o-row and
+# is full-scanned. o: 1 page + 4 rows; inr: 1 page + 3 rows. 4×3 = 12 ON evals; inr.id=2↔o.k=2 and
+# inr.id=5↔o.k=5 match, inr.id=4 matches no o → NULL-extended. 4+3(materialize) + 2 page... the
+# full-double-scan baseline. 1+4 + 1+3 + 12 ON + 3 produced = 24.
+# cost: 24
+query II rowsort
+SELECT o.id, inr.id FROM o RIGHT JOIN inr ON inr.id = o.k
+----
+1
+2
+2
+5
+NULL
+4
+
+# Secondary-index sibling bound: the inner's leading B-tree index column compared to a sibling
+# (`child.pref = parent.id`) bounds the inner via that index per outer row (the FK-join shape).
+statement ok
+CREATE TABLE parent (id i32 PRIMARY KEY, label text)
+
+statement ok
+CREATE TABLE child (id i32 PRIMARY KEY, pref i32)
+
+statement ok
+CREATE INDEX child_pref ON child (pref)
+
+statement ok
+INSERT INTO parent VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok
+INSERT INTO child VALUES (10, 1), (11, 1), (12, 2)
+
+# child is bound per parent-row through the `child_pref` index to `child.pref = parent.id`. parent1 →
+# child 10,11; parent2 → child 12; parent3 → none. The rows are identical to a full-scan join; the
+# index bound only narrows which child rows are fetched per parent-row. parent (outer) 1 page + 3
+# rows = 4. Per parent-row the index bound reads the `child_pref` entry-tree overlap (1 page) then a
+# table point lookup per admitted entry (1 page + 1 row each): p1 → 2 entries (child 10,11) = 1 + 2×1
+# = 3 page, 2 rows; p2 → 1 entry (child 12) = 1 + 1 = 2 page, 1 row; p3 → 0 entries = 1 page, 0 rows.
+# child: 6 page + 3 rows = 9. ON `child.pref = parent.id` over 3 hits = 3. 3 produced. 4+9+3+3 = 19.
+# cost: 19
+query II nosort
+SELECT parent.id, child.id FROM parent JOIN child ON child.pref = parent.id ORDER BY parent.id, child.id
+----
+1
+10
+1
+11
+2
+12
+
+# Three-table chain: o JOIN inr (index-nested-loop) then CROSS a two-row tag table — the INL bound on
+# the middle relation composes with a following join. o 5; inr (INL, same seeks as case 1) 3 page + 2
+# rows = 5, leaving 2 combined rows; tag (CROSS, materialized once) 1 page + 2 rows = 3, crossing to
+# 4 rows; ON on the first join = 2; 4 produced. 5+5+2+3+4 = 19.
+statement ok
+CREATE TABLE tag (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO tag VALUES (1), (2)
+
+# cost: 19
+query III nosort
+SELECT o.id, inr.v, tag.id FROM o JOIN inr ON inr.id = o.k CROSS JOIN tag ORDER BY o.id, tag.id
+----
+1
+20
+1
+1
+20
+2
+2
+50
+1
+2
+50
+2

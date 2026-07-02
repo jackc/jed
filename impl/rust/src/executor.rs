@@ -6764,7 +6764,7 @@ impl Engine {
         }
         let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[]) {
+            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[], &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&del.table).range_scan_with_units(&b, &mask)?;
@@ -7149,7 +7149,7 @@ impl Engine {
         }
         let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[]) {
+            (Some(bp), _, _) => match build_key_bound(bp, &bound, &[], &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&upd.table).range_scan_with_units(&b, &mask)?;
@@ -9255,6 +9255,34 @@ impl Engine {
                 _ => None,
             })
             .collect();
+        // Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
+        // indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk =
+        // a.x`) is re-materialized per outer row, seeking instead of full-scanning — O(N·M) →
+        // O(N·log M). Detected from the join's ON and the WHERE. Gated to a base table (a set-returning
+        // function / derived table / CTE / lateral item has no store to seek) that is the RIGHT/nullable
+        // side of an INNER/CROSS/LEFT join (a RIGHT/FULL preserved side cannot be bounded per outer
+        // row). rels[0] has no earlier relation; its join is `sel.joins[i - 1]`. A `Some` entry takes
+        // precedence over the once-materialized `rel_bounds` for that relation.
+        let rel_inl_bounds: Vec<Option<ScanBound>> = scope
+            .rels
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| {
+                if i == 0
+                    || srf_meta[i].is_some()
+                    || derived_meta[i].is_some()
+                    || rel.cte.is_some()
+                    || lateral_flags[i]
+                    || !matches!(
+                        sel.joins[i - 1].kind,
+                        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+                    )
+                {
+                    return None;
+                }
+                detect_inl_bound(join_preds[i - 1].as_ref(), filter.as_ref(), rel, scope.catalog)
+            })
+            .collect();
         // ORDER BY resolution (spec/design/grammar.md §10). Each key is one of three modes (set at
         // parse): an output-column ORDINAL, a COLUMN reference, or a general EXPRESSION. A column /
         // ordinal-to-column key resolves to a real row slot — against the GROUP KEYS in an aggregate
@@ -9881,6 +9909,10 @@ impl Engine {
                 rel_bounds[0],
                 Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_))
             )
+            // The inner relation must not be an index-nested-loop relation — it is re-materialized
+            // per outer row, so the two-table streaming loop (both materialized once) does not apply
+            // (combining the top-N loop with INL is a follow-on).
+            && rel_inl_bounds.iter().all(|b| b.is_none())
             // No ORDER BY key beyond the outer PK: the outer PK is unique over the OUTER table but
             // NOT over the join output (one outer row fans out to many), so an extra key (`ORDER BY
             // a.id, b.x`) is a real tie-break the outer scan order does not satisfy — unlike the
@@ -9916,6 +9948,7 @@ impl Engine {
             index_order,
             join_pk_ordered,
             rel_bounds,
+            rel_inl_bounds,
             rel_masks,
         })
     }
@@ -10830,7 +10863,7 @@ impl Engine {
         // resolves against `env.outer` (the enclosing rows). An INDEX bound never streams — the
         // dispatch gate routes it to the eager path (cost.md §3 "LIMIT short-circuit").
         let (bound, empty) = match &plan.rel_bounds[0] {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer) {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
@@ -11046,7 +11079,7 @@ impl Engine {
         let reverse = plan.pk_reverse;
 
         let (bound, empty) = match &plan.rel_bounds[0] {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer) {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
@@ -11206,7 +11239,7 @@ impl Engine {
         // `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
         let reverse = sp.pk_reverse;
         let (bound, empty) = match &sp.rel_bounds[0] {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, &bound_params, &[]) {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, &bound_params, &[], &[]) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
@@ -11498,7 +11531,7 @@ impl Engine {
         // value_decompress block up front — identical to the eager scan (cost.md §3). An INDEX
         // bound never reaches here (the dispatch gate routes it to the eager path).
         let (bound, empty) = match &plan.rel_bounds[0] {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer) {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
@@ -11628,8 +11661,9 @@ impl Engine {
         // Materialize both relations once, in primary-key order (the page_read block + per-row
         // storage_row_read accrue inside materialize_rel, cost.md §3) — the same full materialization
         // the eager join does; only the nested-loop work short-circuits.
-        let left_rows = self.materialize_rel(plan, 0, params, outer, stmt_rng, env.ctes, meter)?;
-        let right_rows = self.materialize_rel(plan, 1, params, outer, stmt_rng, env.ctes, meter)?;
+        let left_rows = self.materialize_rel(plan, 0, params, outer, &[], stmt_rng, env.ctes, meter)?;
+        let right_rows =
+            self.materialize_rel(plan, 1, params, outer, &[], stmt_rng, env.ctes, meter)?;
         let on = &plan.joins[0].on;
 
         let limit = plan.limit;
@@ -11718,6 +11752,7 @@ impl Engine {
         ri: usize,
         params: &[Value],
         outer: &[&[Value]],
+        left: &[Value],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
         ctes: CteCtx,
         meter: &mut Meter,
@@ -11783,10 +11818,15 @@ impl Engine {
         }
         // A base table: scan in primary-key order via a ScanSource (the page_read block + per-row
         // storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead
-        // of a full walk; an empty bound reads nothing.
+        // of a full walk; an empty bound reads nothing. An index-nested-loop bound (`rel_inl_bounds`)
+        // takes precedence and resolves its `Sibling` source from the current left row (cost.md §3
+        // "JOIN"); else the once-materialized `rel_bounds`.
         let store = self.store(&rel.table_name);
-        let (mut rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer) {
+        let bound = plan.rel_inl_bounds[ri]
+            .as_ref()
+            .or(plan.rel_bounds[ri].as_ref());
+        let (mut rows, (node_count, slabs)) = match bound {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer, left) {
                 Some(b) => {
                     // Read-only SELECT feed: reconstruct only the touched columns (Track A1) — a Packed
                     // leaf skips decoding the untouched ones. Cost- and result-identical to the whole-row
@@ -11799,7 +11839,7 @@ impl Engine {
                 None => (Vec::new(), (0, 0)),
             },
             Some(ScanBound::Index(ib)) => {
-                self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri])?
+                self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri], left)?
             }
             Some(ScanBound::Gin(gb)) => {
                 // Re-find the constant query `Q` in the WHERE filter (the same conjunct the plan-time
@@ -12041,7 +12081,7 @@ impl Engine {
         let mut do_scan = true;
         let mut b = KeyBound::unbounded();
         if let Some(ScanBound::Pk(bp)) = &plan.rel_bounds[0] {
-            match build_key_bound(bp, params, outer) {
+            match build_key_bound(bp, params, outer, &[]) {
                 Some(bb) => b = bb,
                 None => do_scan = false,
             }
@@ -12184,8 +12224,9 @@ impl Engine {
                 // identically (materialize_rel), then apply the residual WHERE per scanned row through
                 // the ordinary evaluator (its operator_eval charges + 3VL survivor test byte-identical
                 // to the scalar WHERE loop).
-                let rows =
-                    self.materialize_rel(plan, 0, env.params, env.outer, env.rng, env.ctes, meter)?;
+                let rows = self.materialize_rel(
+                    plan, 0, env.params, env.outer, &[], env.rng, env.ctes, meter,
+                )?;
                 let survivors: Vec<Row> = match &plan.filter {
                     None => rows,
                     Some(f) => {
@@ -12294,7 +12335,7 @@ impl Engine {
         let mut do_scan = true;
         let mut b = KeyBound::unbounded();
         if let Some(ScanBound::Pk(bp)) = &plan.rel_bounds[0] {
-            match build_key_bound(bp, env.params, env.outer) {
+            match build_key_bound(bp, env.params, env.outer, &[]) {
                 Some(bb) => b = bb,
                 None => do_scan = false,
             }
@@ -12476,14 +12517,18 @@ impl Engine {
         // CORRELATED `LATERAL` relation (§44) depends on the left-hand row, so it cannot be
         // materialized up front — a placeholder holds its slot and the join loop re-materializes it
         // per combined left row.
+        // An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row
+        // (its bound seeks per outer row), so it is not materialized up front either — a placeholder
+        // holds its slot and the join loop re-materializes it per left row.
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for (ri, rel) in plan.rels.iter().enumerate() {
-            if rel.lateral {
+            if rel.lateral || plan.rel_inl_bounds[ri].is_some() {
                 materialized.push(Vec::new());
                 continue;
             }
-            materialized
-                .push(self.materialize_rel(plan, ri, params, outer, stmt_rng, env.ctes, meter)?);
+            materialized.push(self.materialize_rel(
+                plan, ri, params, outer, &[], stmt_rng, env.ctes, meter,
+            )?);
         }
 
         // Left-deep nested-loop join. `running` holds the combined rows over the relations
@@ -12526,6 +12571,48 @@ impl Engine {
                         k + 1,
                         params,
                         &lat_outer,
+                        &[],
+                        stmt_rng,
+                        env.ctes,
+                        meter,
+                    )?;
+                    let mut left_matched = false;
+                    for right in &right_rows {
+                        let mut combined = left.clone();
+                        combined.extend_from_slice(right);
+                        let keep = match on {
+                            None => true,
+                            Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
+                        };
+                        if keep {
+                            next.push(combined);
+                            left_matched = true;
+                        }
+                    }
+                    if emit_left && !left_matched {
+                        let mut combined = left.clone();
+                        combined.resize(combined.len() + right_pad, Value::Null);
+                        next.push(combined);
+                    }
+                }
+                running = next;
+                continue;
+            }
+            // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER
+            // combined left-hand row, its scan bounded per outer row by the `Sibling` columns of that
+            // row (a per-outer-row seek instead of a full scan). Detection restricts this to the
+            // RIGHT/nullable side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT
+            // emission (RIGHT/FULL are excluded — a preserved side cannot be bounded per outer row).
+            // The whole ON/WHERE stays applied (the ON here, the WHERE below), so rows are unchanged.
+            if plan.rel_inl_bounds[k + 1].is_some() {
+                debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
+                for left in &running {
+                    let right_rows = self.materialize_rel(
+                        plan,
+                        k + 1,
+                        params,
+                        outer,
+                        left,
                         stmt_rng,
                         env.ctes,
                         meter,
@@ -13427,13 +13514,15 @@ impl Engine {
         params: &[Value],
         outer: &[&[Value]],
         mask: &[bool],
+        left: &[Value],
     ) -> Result<(Vec<Row>, (usize, usize))> {
         // Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
         // true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
         // integer can equal no stored value — all provably empty.
         let mut agreed: Option<Vec<u8>> = None;
         for src in &ib.eqs {
-            let k = match encode_bound_key(ib.col_type, src, params, outer, ib.coll.as_deref()) {
+            let k = match encode_bound_key(ib.col_type, src, params, outer, ib.coll.as_deref(), left)
+            {
                 BoundKey::Null | BoundKey::OutOfRange => return Ok((Vec::new(), (0, 0))),
                 BoundKey::Key(k) => k,
             };
@@ -16812,6 +16901,14 @@ struct SelectPlan {
     /// a sibling column). The residual filter stays the WHOLE `filter`, re-applied after the
     /// join — the bound only narrows which rows are scanned.
     rel_bounds: Vec<Option<ScanBound>>,
+    /// **Index-nested-loop** scan bounds, one per relation (cost.md §3 "JOIN"). `Some` for a join
+    /// inner relation whose primary key / indexed column is compared to a **sibling** column of an
+    /// earlier relation (`a JOIN b ON b.pk = a.x`) — a `BoundSrc::Sibling` bound resolved per outer
+    /// row from the combined left-hand row. When set, that relation is NOT materialized once up
+    /// front; the join loop re-materializes it per left row (like a correlated `LATERAL`), seeking
+    /// instead of full-scanning — O(N·M) → O(N·log M). `None` ⇒ the ordinary once-materialized
+    /// `rel_bounds` path. A set entry takes precedence over `rel_bounds` for that relation.
+    rel_inl_bounds: Vec<Option<ScanBound>>,
     /// The **touched set** per relation (cost.md §3 "The touched set"; large-values.md §14): which
     /// of its columns this query statically references. Drives the chain-`page_read` /
     /// `value_decompress` portion of the scan's up-front cost block — an untouched spilled or
@@ -16831,11 +16928,15 @@ struct SelectPlan {
 
 /// The constant data extracted from a bound term's const-source operand (avoids cloning the whole
 /// `RExpr` and keeps `PkBound` owned). `Timestamp` covers both timestamp and timestamptz (same
-/// encoding; the PK type disambiguates). `Param` and `Outer` resolve to a value at exec time:
-/// `Param` from the bound parameters, `Outer` from an enclosing query's row (a correlated
+/// encoding; the PK type disambiguates). `Param`, `Outer`, and `Sibling` resolve to a value at exec
+/// time: `Param` from the bound parameters, `Outer` from an enclosing query's row (a correlated
 /// reference — the inner subquery's PK is bounded by the current outer row's column, so it seeks
 /// instead of re-scanning the whole inner table per outer row; spec/design/cost.md §3 "bounded
-/// scan", grammar.md §26).
+/// scan", grammar.md §26), and `Sibling` from the current combined (left/running) row of a
+/// left-deep join — an EARLIER join relation's column, so the inner relation seeks per outer row
+/// instead of full-scanning for every outer row (index-nested-loop join, cost.md §3 "JOIN"). The
+/// `Sibling` source is the join analog of `Outer`: the same per-outer-row bound, resolved from the
+/// sibling row rather than an enclosing query's row.
 enum BoundSrc {
     Int(i64),
     Bool(bool),
@@ -16849,6 +16950,11 @@ enum BoundSrc {
     Null,
     Param(usize),
     Outer { level: usize, index: usize },
+    /// Index-nested-loop: the GLOBAL column index of an earlier join relation, read from the
+    /// current combined left-hand row at exec time (cost.md §3 "JOIN"). Only ever produced by
+    /// `detect_inl_bound` for a join inner relation; never appears in the once-materialized
+    /// `rel_bounds`.
+    Sibling(usize),
 }
 
 /// One `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side (a
@@ -17023,6 +17129,7 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Engine) -> Option
             rel.offset + ci,
             ty,
             coll.as_ref().map(|c| c.name.as_str()),
+            None,
             &mut terms,
         );
         let eqs: Vec<BoundSrc> = terms
@@ -17051,6 +17158,106 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Engine) -> Option
     }
     // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
     detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset).map(ScanBound::Gin)
+}
+
+/// Detect an **index-nested-loop** scan bound for a join inner relation `rel` (spec/design/cost.md
+/// §3 "JOIN"): a primary-key (or leading secondary-index column) comparison to a **sibling** column
+/// of an EARLIER join relation, taken from the join's `on` predicate OR the `where` filter. Unlike
+/// [`detect_scan_bound`] (constants only), this admits a bare sibling column (`BoundSrc::Sibling`,
+/// enabled by `sibling_cutoff = rel.offset`), resolved per outer row from the current combined
+/// left-hand row — the join analog of a correlated subquery's outer reference
+/// (`query.correlated_pushdown`). So the inner relation seeks per outer row instead of full-scanning
+/// for every outer row: O(N·M) → O(N·log M).
+///
+/// Returns `Some` only when the resulting bound has **≥ 1 sibling term** — a constant-only bound is
+/// the ordinary once-materialized `rel_bounds` path, not index-nested-loop. Constant terms on the
+/// same key that co-occur (`b.pk = a.x AND b.pk = 5`) ride along and tighten the per-outer-row seek.
+/// The whole `on`/`where` stays the residual filter (the bound is a superset of the matching rows),
+/// so the **rows are unchanged**; only the inner re-scan cost drops. Caller restricts this to a base
+/// table that is the right/nullable side of an INNER/CROSS/LEFT join (a RIGHT/FULL preserved side
+/// cannot be bounded per outer row — it would drop rows matching no outer row).
+fn detect_inl_bound(
+    on: Option<&RExpr>,
+    where_filter: Option<&RExpr>,
+    rel: &ScopeRel,
+    catalog: &Engine,
+) -> Option<ScanBound> {
+    let cutoff = Some(rel.offset);
+    // Collect the key's bound terms from BOTH the ON and the WHERE (a NULL predicate contributes
+    // none), with sibling columns admitted.
+    let collect = |key_idx: usize, ty: ScalarType, ccoll: Option<&str>| -> Vec<BoundTerm> {
+        let mut terms = Vec::new();
+        if let Some(f) = on {
+            collect_bound_terms(f, key_idx, ty, ccoll, cutoff, &mut terms);
+        }
+        if let Some(f) = where_filter {
+            collect_bound_terms(f, key_idx, ty, ccoll, cutoff, &mut terms);
+        }
+        terms
+    };
+    // Primary-key bound first (the row's own key — range-capable, strictly cheaper).
+    if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
+        let sty = rel.table.columns[pk_local].ty.as_scalar()?;
+        let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
+        let terms = collect(
+            rel.offset + pk_local,
+            sty,
+            coll.as_ref().map(|c| c.name.as_str()),
+        );
+        terms
+            .iter()
+            .any(|t| matches!(t.src, BoundSrc::Sibling(_)))
+            .then(|| {
+                ScanBound::Pk(PkBound {
+                    pk_type: sty,
+                    terms,
+                    coll,
+                })
+            })
+    }) {
+        return Some(b);
+    }
+    // Else a leading secondary-index equality bound to a sibling (indexes held in ascending
+    // lowercased-name order — the deterministic tie-break, matching detect_scan_bound).
+    for idx in &rel.table.indexes {
+        if idx.kind != IndexKind::Btree {
+            continue;
+        }
+        let ci = idx.columns[0];
+        let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
+            continue;
+        };
+        if idx.columns[1..].iter().any(|&c| {
+            rel.table.columns[c]
+                .ty
+                .as_scalar()
+                .is_none_or(|s| !s.is_fixed_width())
+        }) {
+            continue;
+        }
+        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
+            continue;
+        };
+        let terms = collect(rel.offset + ci, ty, coll.as_ref().map(|c| c.name.as_str()));
+        let eqs: Vec<BoundSrc> = terms
+            .into_iter()
+            .filter(|t| matches!(t.op, CmpOp::Eq))
+            .map(|t| t.src)
+            .collect();
+        if eqs.iter().any(|s| matches!(s, BoundSrc::Sibling(_))) {
+            return Some(ScanBound::Index(IndexBound {
+                name_key: idx.name.to_ascii_lowercase(),
+                col_type: ty,
+                eqs,
+                coll,
+                tail_types: idx.columns[1..]
+                    .iter()
+                    .map(|&c| rel.table.columns[c].ty.scalar())
+                    .collect(),
+            }));
+        }
+    }
+    None
 }
 
 /// The collation a key over `col` is STORED under, deciding whether — and how — a comparison bound
@@ -18127,6 +18334,7 @@ fn detect_pk_bound(
         pk_idx,
         pk_type,
         coll.as_ref().map(|c| c.name.as_str()),
+        None,
         &mut terms,
     );
     if terms.is_empty() {
@@ -18140,17 +18348,22 @@ fn detect_pk_bound(
     }
 }
 
+/// `sibling_cutoff` (index-nested-loop join, cost.md §3 "JOIN"): when `Some(cut)`, a bare column
+/// reference whose GLOBAL index is `< cut` — an EARLIER join relation's column — is a valid bound
+/// source (`BoundSrc::Sibling`), resolved per outer row from the combined left-hand row. `None`
+/// (the ordinary once-materialized bound) accepts only literals/params/outer references.
 fn collect_bound_terms(
     e: &RExpr,
     pk_idx: usize,
     pk_type: ScalarType,
     col_coll: Option<&str>,
+    sibling_cutoff: Option<usize>,
     terms: &mut Vec<BoundTerm>,
 ) {
     match e {
         RExpr::And(l, r) => {
-            collect_bound_terms(l, pk_idx, pk_type, col_coll, terms);
-            collect_bound_terms(r, pk_idx, pk_type, col_coll, terms);
+            collect_bound_terms(l, pk_idx, pk_type, col_coll, sibling_cutoff, terms);
+            collect_bound_terms(r, pk_idx, pk_type, col_coll, sibling_cutoff, terms);
         }
         // `<>` is not a contiguous range, so it never seeds an index/PK bound — it stays in the
         // residual filter (a full scan + filter). Skipping it here keeps the deterministic cost
@@ -18177,9 +18390,9 @@ fn collect_bound_terms(
             // The PK on either side (op flipped when it is on the right); the other side a
             // matching-type const-source. Anything else contributes no term.
             let term = if is_pk(lhs) {
-                const_source(rhs, pk_type).map(|src| BoundTerm { op: *op, src })
+                const_source(rhs, pk_type, sibling_cutoff).map(|src| BoundTerm { op: *op, src })
             } else if is_pk(rhs) {
-                const_source(lhs, pk_type).map(|src| BoundTerm {
+                const_source(lhs, pk_type, sibling_cutoff).map(|src| BoundTerm {
                     op: flip_cmp(*op),
                     src,
                 })
@@ -18197,10 +18410,16 @@ fn collect_bound_terms(
 /// Recognize a const-source operand whose static type matches the PK's storage type (a promoted
 /// comparison — e.g. `intpk = 2.5` → a `ConstDecimal` — does not match, so it stays residual). A
 /// bare correlated `OuterColumn` IS a const-source (its value is a runtime constant for a given
-/// outer row); a column of the same query, arithmetic, etc. are not. A type-mismatched outer
-/// reference is wrapped in a `Cast` by the resolver (as for the literal case above), so it never
-/// arrives here bare — the type check is implicit and the match stays sound.
-fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
+/// outer row); arithmetic etc. are not. A type-mismatched outer reference is wrapped in a `Cast` by
+/// the resolver (as for the literal case above), so it never arrives here bare — the type check is
+/// implicit and the match stays sound.
+///
+/// `sibling_cutoff` opens the index-nested-loop door (cost.md §3 "JOIN"): when `Some(cut)`, a bare
+/// `Column(g)` whose GLOBAL index is `< cut` — a column of an EARLIER join relation — is a
+/// `BoundSrc::Sibling`, resolved per outer row from the combined left-hand row. Like `OuterColumn`,
+/// a bare sibling column implies a type match (a mismatch is a `Cast`, never bare — sound). A
+/// same-relation or later-relation column is `>= cut`, so it stays residual (`None`).
+fn const_source(e: &RExpr, pk_type: ScalarType, sibling_cutoff: Option<usize>) -> Option<BoundSrc> {
     match e {
         RExpr::Param(i) => Some(BoundSrc::Param(*i)),
         RExpr::ConstNull => Some(BoundSrc::Null),
@@ -18218,6 +18437,7 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
             level: *level,
             index: *index,
         }),
+        RExpr::Column(g) if sibling_cutoff.is_some_and(|cut| *g < cut) => Some(BoundSrc::Sibling(*g)),
         _ => None,
     }
 }
@@ -18236,13 +18456,21 @@ fn flip_cmp(op: CmpOp) -> CmpOp {
 
 /// Build the concrete key range at exec time: encode each const-source and intersect the half-bounds.
 /// `outer` carries the enclosing rows (innermost last) so a correlated `Outer` source resolves to
-/// the current outer row's value; it is empty for a top-level statement. `None` ⇒ the range admits
-/// no key (a NULL const/value — 3VL — or contradictory bounds), so the scan reads nothing. An
+/// the current outer row's value; it is empty for a top-level statement. `left` is the current
+/// combined left-hand row of a left-deep join, from which an index-nested-loop `Sibling` source
+/// resolves (empty outside the join loop — a `Sibling` never appears there). `None` ⇒ the range
+/// admits no key (a NULL const/value — 3VL — or contradictory bounds), so the scan reads nothing. An
 /// out-of-range integer const drops only its own half-bound (a wider, still sound, scan).
-fn build_key_bound(bp: &PkBound, params: &[Value], outer: &[&[Value]]) -> Option<KeyBound> {
+fn build_key_bound(
+    bp: &PkBound,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> Option<KeyBound> {
     let mut b = KeyBound::unbounded();
     for t in &bp.terms {
-        let key = match encode_bound_key(bp.pk_type, &t.src, params, outer, bp.coll.as_deref()) {
+        let key = match encode_bound_key(bp.pk_type, &t.src, params, outer, bp.coll.as_deref(), left)
+        {
             BoundKey::Null => return None,
             BoundKey::OutOfRange => continue,
             BoundKey::Key(k) => k,
@@ -18267,14 +18495,15 @@ fn build_key_bound(bp: &PkBound, params: &[Value], outer: &[&[Value]]) -> Option
 
 /// Encode a const-source's value into the PK's storage key (the same codec INSERT uses — `encode_int`
 /// for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte `bool-byte` for boolean).
-/// `Param`/`Outer` resolve to a runtime `Value` first (the param table / the enclosing outer row)
-/// and then encode through the shared path.
+/// `Param`/`Outer`/`Sibling` resolve to a runtime `Value` first (the param table / the enclosing
+/// outer row / the current combined left-hand row) and then encode through the shared path.
 fn encode_bound_key(
     pk_ty: ScalarType,
     src: &BoundSrc,
     params: &[Value],
     outer: &[&[Value]],
     coll: Option<&Collation>,
+    left: &[Value],
 ) -> BoundKey {
     match src {
         BoundSrc::Null => BoundKey::Null,
@@ -18299,6 +18528,14 @@ fn encode_bound_key(
         BoundSrc::Outer { level, index } => {
             encode_value_key(pk_ty, &outer[outer.len() - level][*index], coll)
         }
+        // Index-nested-loop: the GLOBAL column index of an earlier join relation, read from the
+        // current combined left-hand row (cost.md §3 "JOIN"). The join loop always passes a `left`
+        // wide enough (the running row spans columns `[0, rel.offset)`, and `Sibling` indices are
+        // `< rel.offset`); a stray out-of-range index widens to a full scan rather than panic.
+        BoundSrc::Sibling(index) => match left.get(*index) {
+            Some(v) => encode_value_key(pk_ty, v, coll),
+            None => BoundKey::OutOfRange,
+        },
     }
 }
 
@@ -25450,7 +25687,7 @@ impl Engine {
         r.emit(
             d,
             format!("Scan {name}"),
-            self.scan_detail(name, bound.as_ref(), &[]),
+            self.scan_detail(name, bound.as_ref(), false, &[]),
         );
     }
 
@@ -25651,8 +25888,13 @@ impl Engine {
             );
             self.render_query_plan(r, derived, depth + 1)
         } else {
-            let detail =
-                self.scan_detail(&rel.table_name, sp.rel_bounds[i].as_ref(), &sp.rel_masks[i]);
+            // An index-nested-loop bound (per-outer-row seek) takes precedence over the
+            // once-materialized bound in the access-path label (cost.md §3 "JOIN").
+            let (bound, inl) = match sp.rel_inl_bounds[i].as_ref() {
+                Some(b) => (Some(b), true),
+                None => (sp.rel_bounds[i].as_ref(), false),
+            };
+            let detail = self.scan_detail(&rel.table_name, bound, inl, &sp.rel_masks[i]);
             r.emit(
                 depth,
                 format!("Scan {}", rel.table_name),
@@ -25707,8 +25949,8 @@ impl Engine {
 
     /// Render a Scan node's attributes: the access path (from the relation's chosen scan bound,
     /// `None` = a full scan), then the touched-column count when the query references any column.
-    fn scan_detail(&self, table_name: &str, b: Option<&ScanBound>, mask: &[bool]) -> String {
-        let mut parts = vec![self.access_path(table_name, b)];
+    fn scan_detail(&self, table_name: &str, b: Option<&ScanBound>, inl: bool, mask: &[bool]) -> String {
+        let mut parts = vec![self.access_path(table_name, b, inl)];
         let n = count_true(mask);
         if n > 0 {
             parts.push(format!("touched={n}"));
@@ -25718,15 +25960,17 @@ impl Engine {
 
     /// Render the chosen access path for a relation (spec/design/explain.md §5): a full scan, a
     /// primary-key range bound, or a secondary-index / GIN / GiST bound (the last three by index name,
-    /// the stored lowercased name).
-    fn access_path(&self, table_name: &str, b: Option<&ScanBound>) -> String {
+    /// the stored lowercased name). `inl` marks an index-nested-loop bound (cost.md §3 "JOIN") — a
+    /// per-outer-row seek whose source is a sibling column — with a leading label.
+    fn access_path(&self, table_name: &str, b: Option<&ScanBound>, inl: bool) -> String {
+        let prefix = if inl { "Index-nested-loop " } else { "" };
         match b {
             None => "Full scan".to_string(),
             Some(ScanBound::Pk(pb)) => format!(
-                "PK bound: {}",
+                "{prefix}PK bound: {}",
                 render_bound_terms(&self.first_pk_col_name(table_name), &pb.terms)
             ),
-            Some(ScanBound::Index(ib)) => format!("Index bound: using {}", ib.name_key),
+            Some(ScanBound::Index(ib)) => format!("{prefix}Index bound: using {}", ib.name_key),
             Some(ScanBound::Gin(gb)) => format!("GIN bound: using {}", gb.name_key),
             Some(ScanBound::Gist(gp)) => format!("GiST bound: using {}", gp.name_key),
         }
@@ -25872,6 +26116,10 @@ fn render_bound_src(src: &BoundSrc) -> String {
     match src {
         BoundSrc::Param(idx) => format!("${}", idx + 1),
         BoundSrc::Outer { .. } => "outer".to_string(),
+        // An index-nested-loop bound source — a column of an earlier join relation resolved per
+        // outer row (cost.md §3 "JOIN"). Rendered generically (the global column index is not a
+        // user-facing name, like the correlated `outer` case above).
+        BoundSrc::Sibling(_) => "join".to_string(),
         BoundSrc::Int(n) => n.to_string(),
         BoundSrc::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
         BoundSrc::Decimal(d) => d.render(),
