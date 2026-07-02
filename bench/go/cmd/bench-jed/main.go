@@ -133,7 +133,7 @@ func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
 			case jed.ValInt:
 				sum.Int(v.Int)
 			case jed.ValText:
-				sum.Text(v.Str)
+				sum.Text(v.Render())
 			default:
 				return n, fmt.Errorf("unexpected result kind %d", v.Kind)
 			}
@@ -197,7 +197,7 @@ func (r jedReader) Query(sql string, args []any, sum *bench.Checksum) (int, erro
 			case jed.ValInt:
 				sum.Int(v.Int)
 			case jed.ValText:
-				sum.Text(v.Str)
+				sum.Text(v.Render())
 			default:
 				return n, fmt.Errorf("unexpected result kind %d", v.Kind)
 			}
