@@ -545,10 +545,10 @@ export class Session {
       rows.attachPin(() => this.core.deregister(version));
       return rows;
     };
-    const streamed = this.engine.tryStreamingQuery(stmt, params);
-    if (streamed !== null) return pin(streamed);
-    const buffered = this.engine.tryBufferedQuery(stmt, params);
-    if (buffered !== null) return pin(buffered);
+    // One plan-once scan lane serves both streaming and buffered shapes (this ad-hoc path plans once
+    // per call, holder null). Both are live readers and pin their snapshot in the watermark.
+    const scanned = this.engine.tryScanQuery(stmt, params, null);
+    if (scanned !== null) return pin(scanned);
     // A top-level set operation / pure-query WITH is served by a lazy DEFERRED cursor (streaming.md §7):
     // it defers the whole run to the first pull and yields the result one row at a time; it is a live
     // reader too and pins its snapshot in the watermark.

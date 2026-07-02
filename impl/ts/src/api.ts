@@ -12,7 +12,7 @@ import {
   type RunResult,
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
-import type { Engine, Outcome } from "./executor.ts";
+import type { Engine, Outcome, ScanCacheHolder } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
 
@@ -22,6 +22,11 @@ import type { Value } from "./value.ts";
 export class PreparedStatement {
   private readonly db: Engine;
   private readonly ast: Statement;
+  // scHolder memoizes the resolved scan plan across query() calls so a repeated execute skips
+  // planning (the plan cache, spec/design/api.md §2.4). Populated lazily on the first cacheable query
+  // execute and invalidated automatically when the catalog generation moves (ScanCache.catGen).
+  // Query-only — execute() (writes / materialized shapes) never touches it.
+  private readonly scHolder: ScanCacheHolder = { cache: null };
 
   constructor(db: Engine, ast: Statement) {
     this.db = db;
@@ -35,12 +40,11 @@ export class PreparedStatement {
   }
 
   // query runs this query statement, returning a row cursor. The prepared AST routes through the same
-  // lazy streaming / buffered / deferred lanes as the ad-hoc query (spec/design/streaming.md §3/§4/§7)
-  // — so a prepared query streams exactly like a one-shot one (a single-table read pulls row-at-a-time;
-  // a blocking read buffers its input but yields its output lazily). A non-query statement is a 42601
-  // (use execute).
+  // lazy scan (streaming/buffered) then deferred lanes as the ad-hoc query (spec/design/streaming.md
+  // §3/§4/§7) — so a prepared query streams exactly like a one-shot one — but reuses its cached plan
+  // across executes (spec/design/api.md §2.4). A non-query statement is a 42601 (use execute).
   query(params: Value[] = []): Rows {
-    return queryStmt(this.db, this.ast, params);
+    return queryStmt(this.db, this.ast, params, this.scHolder);
   }
 }
 
@@ -127,20 +131,23 @@ export function prepare(db: Engine, sql: string): PreparedStatement {
 // at a time. (This is the bare single-handle Engine; the watermark pin lives on the shared-core
 // Session.query path.)
 export function query(db: Engine, sql: string, params: Value[] = []): Rows {
-  return queryStmt(db, db.parse(sql), params);
+  return queryStmt(db, db.parse(sql), params, null);
 }
 
-// queryStmt routes an already-parsed query AST through the lazy streaming / buffered / deferred lanes,
-// falling back to the materialized executeStmtParams for a shape no lazy lane covers (a write, a
-// nextval/setval SELECT, a data-modifying WITH). Shared by query (parse-then-route) and a prepared query
-// (PreparedStatement.query, route the prepared AST), so a prepared query streams identically to an
-// ad-hoc one. (This is the bare single-handle Engine; the watermark pin lives on the shared-core
-// Session.query path.)
-function queryStmt(db: Engine, stmt: Statement, params: Value[] = []): Rows {
-  const streamed = db.tryStreamingQuery(stmt, params);
-  if (streamed !== null) return new Rows(streamed.columnNames, streamed.cursor);
-  const buffered = db.tryBufferedQuery(stmt, params);
-  if (buffered !== null) return new Rows(buffered.columnNames, buffered.cursor);
+// queryStmt routes an already-parsed query AST through the plan-once scan (streaming/buffered) then
+// deferred lanes, falling back to the materialized executeStmtParams for a shape no lazy lane covers
+// (a write, a nextval/setval SELECT, a data-modifying WITH). Shared by query (parse-then-route, holder
+// null) and a prepared query (PreparedStatement.query passes its ScanCacheHolder), so a prepared query
+// streams identically to an ad-hoc one but reuses its cached plan across executes. (This is the bare
+// single-handle Engine; the watermark pin lives on the shared-core Session.query path.)
+function queryStmt(
+  db: Engine,
+  stmt: Statement,
+  params: Value[],
+  holder: ScanCacheHolder | null,
+): Rows {
+  const scanned = db.tryScanQuery(stmt, params, holder);
+  if (scanned !== null) return new Rows(scanned.columnNames, scanned.cursor);
   const deferred = db.tryDeferredQuery(stmt, params);
   if (deferred !== null) return new Rows(deferred.columnNames, deferred.cursor);
   return rowsFromOutcome(db.executeStmtParams(stmt, params));

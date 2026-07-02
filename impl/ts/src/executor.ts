@@ -896,6 +896,13 @@ type FkDependent = {
 export class Snapshot {
   // txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
   txid: bigint;
+  // catGen is the catalog generation — a monotonic counter bumped by every schema mutation
+  // (CREATE/DROP/ALTER of a table/type/index), carried forward across clone(). Unlike txid it does
+  // NOT move on data writes and is defined for in-memory databases too, so a prepared statement's
+  // plan cache keys its committed-plan validity on it: a cached plan is reusable iff the read
+  // snapshot's catGen still equals the plan's (spec/design/api.md §2.4). NOT bumped by sequence
+  // nextval (a data write on the nextval path), only by sequence DDL — a SELECT plan binds no sequence.
+  catGen: bigint = 0n;
   tables: Map<string, Table>;
   // types holds the user-defined composite (row) types, keyed by lowercased name
   // (spec/design/composite.md). A database-level object set, separate from tables; serialized into
@@ -971,7 +978,14 @@ export class Snapshot {
     );
     // GiST trees are never mutated in place — only replaced wholesale — so a shallow Map copy is safe.
     c.gistTrees = new Map(this.gistTrees);
+    c.catGen = this.catGen;
     return c;
+  }
+
+  // bumpCatGen advances the catalog generation — called by every schema mutator (see catGen). A
+  // SELECT plan cached against a prior generation is thereby invalidated on the next execute.
+  bumpCatGen(): void {
+    this.catGen += 1n;
   }
 
   // gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or undefined if
@@ -1045,11 +1059,13 @@ export class Snapshot {
   // putType registers a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
   // already resolved field types and checked for a duplicate.
   putType(ty: CompositeType): void {
+    this.bumpCatGen();
     this.types.set(ty.name.toLowerCase(), ty);
   }
 
   // removeType removes a composite type (DROP TYPE). The caller has checked there are no dependents.
   removeType(key: string): void {
+    this.bumpCatGen();
     this.types.delete(key);
   }
 
@@ -1252,6 +1268,7 @@ export class Snapshot {
   removeForeignKey(tableKey: string, fkName: string): void {
     const old = this.tables.get(tableKey);
     if (old === undefined) return;
+    this.bumpCatGen();
     const fks = old.fks.filter((fk) => fk.name.toLowerCase() !== fkName.toLowerCase());
     this.tables.set(tableKey, { ...old, fks });
   }
@@ -1371,6 +1388,7 @@ export class Snapshot {
   // (spec/design/composite.md §4), so the store needs nothing from the catalog thereafter. The plain
   // putTable resolves against this.types and delegates here.
   putTableResolved(t: Table, colTypes: ColType[], pageSize: number): void {
+    this.bumpCatGen();
     const key = t.name.toLowerCase();
     this.stores.set(key, new TableStore(pagePayload(pageSize), colTypes));
     this.tables.set(key, t);
@@ -1379,6 +1397,7 @@ export class Snapshot {
   // removeTable removes a table's definition, its store, and its indexes' stores (DROP
   // TABLE — the indexes have no independent life, spec/design/indexes.md §2).
   removeTable(key: string): void {
+    this.bumpCatGen();
     const t = this.tables.get(key);
     if (t) for (const idx of t.indexes) this.indexStores.delete(idx.name.toLowerCase());
     this.tables.delete(key);
@@ -1412,6 +1431,7 @@ export class Snapshot {
   // order — spec/design/indexes.md §6) and create its zero-column store. The Table object
   // is re-allocated (catalog Tables are never mutated in place — snapshots share them).
   putIndex(tableKey: string, def: IndexDef, pageSize: number): void {
+    this.bumpCatGen();
     const nameKey = def.name.toLowerCase();
     this.indexStores.set(nameKey, new TableStore(pagePayload(pageSize), []));
     const old = this.tables.get(tableKey)!;
@@ -1434,6 +1454,7 @@ export class Snapshot {
   setColumnDefaultExpr(tableKey: string, column: number, defaultExpr: DefaultExpr): void {
     const old = this.tables.get(tableKey);
     if (old === undefined || column < 0 || column >= old.columns.length) return;
+    this.bumpCatGen();
     const columns = old.columns.map((c, i) => (i === column ? { ...c, defaultExpr } : c));
     this.tables.set(tableKey, { ...old, columns });
   }
@@ -1448,6 +1469,7 @@ export class Snapshot {
   // removeIndex removes one secondary index (DROP INDEX): its definition from the owning
   // table and its store.
   removeIndex(tableKey: string, nameKey: string): void {
+    this.bumpCatGen();
     const old = this.tables.get(tableKey);
     if (old) {
       const indexes = old.indexes.filter((ix) => ix.name.toLowerCase() !== nameKey);
@@ -10286,105 +10308,112 @@ export class Engine {
     return e;
   }
 
-  // tryStreamingQuery tries to serve stmt as a lazy STREAMING query (spec/design/streaming.md §3/§4,
-  // S3) — the query() fast lane. Returns {columnNames, cursor} when stmt is a top-level read SELECT
-  // whose plan is the single-table no-blocking-operator streaming scan (the same shape execSelectPlan
-  // routes to execStreamingScan); else null, and the caller falls back to the materialized execute()
-  // path → a buffered cursor. (It returns a Cursor, not a Rows, to avoid the executor↔api import cycle.)
-  // The conformance corpus drives execute(), so streaming is invisible to it; this lane only affects
-  // query() and is unit-tested to yield the IDENTICAL rows + total cost under full drain (streaming.md
-  // §6), while a caller that stops early reads (and charges) less. A write-classified statement — incl.
-  // a nextval/setval SELECT (stmtIsWrite) — never streams (it must take the write gate and publish,
-  // sequences.md §4), so the frozen snapshot never has to reproduce a sequence advance.
-  tryStreamingQuery(
+  // tryScanQuery serves stmt as a lazy STREAMING or BUFFERED query (spec/design/streaming.md §3/§4),
+  // planning it EXACTLY ONCE and classifying streaming-vs-buffered from that single plan — the
+  // plan-once replacement for the old tryStreamingQuery + tryBufferedQuery pair, each of which
+  // re-planned the same statement. Returns {columnNames, cursor} for a top-level read SELECT; null for
+  // a shape no scan lane covers (a non-SELECT, a write — incl. a nextval/setval SELECT, stmtIsWrite —
+  // or a top-level set-op / VALUES / WITH), so the caller falls through to the deferred / materialized
+  // paths. When holder is non-null (a prepared statement) a repeated execute over an unchanged catalog
+  // reuses the cached plan and skips planning + the fold; ad-hoc callers pass null and still plan once.
+  // (Returns a Cursor, not a Rows, to avoid the executor↔api import cycle.) The conformance corpus
+  // drives the materialized execute() path, so this lane stays invisible to it (unit-tested to yield
+  // identical rows + total cost under full drain, streaming.md §6).
+  tryScanQuery(
     stmt: Statement,
     params: Value[],
+    holder: ScanCacheHolder | null,
   ): { columnNames: string[]; cursor: Cursor } | null {
     if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
+    const snap = this.readSnap();
+    const gen = snap.catGen;
+    // Cache HIT: the read snapshot's catalog is unchanged since the plan was cached (its catGen still
+    // matches), so reuse the resolved plan + finalized param types — no planQuery, no fold, no
+    // param-type walk. A cached plan carries no subquery to fold (planCacheable rejected any), so the
+    // shared plan is never mutated; params are still bound per execute.
+    if (holder !== null && holder.cache !== null && holder.cache.catGen === gen) {
+      const c = holder.cache;
+      return this.buildScanRows(c.sp, bindParams(params, c.ptys), 0n);
+    }
+    // MISS: plan once.
     const ptypes = new ParamTypes();
     const plan = this.planQuery(stmt, null, [], ptypes);
-    if (plan.kind !== "select" || !streamingScanEligible(plan)) return null;
+    if (plan.kind !== "select") return null; // set-op / VALUES / WITH — a scan lane does not cover it
     const sp = plan;
-    const bound = bindParams(params, ptypes.finalize());
+    const ptys = ptypes.finalize();
+    const bound = bindParams(params, ptys);
     // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
     // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
     // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
-    // added to the cursor's reported cost below (mirroring runQueryExpr's r.cost += …).
+    // added to the cursor's reported cost below. A cacheable plan has no subquery, so this is a no-op
+    // (and is skipped on a hit) — cost stays identical.
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInSelect(sp, bound, EMPTY_CTE_CTX, subqueryCost);
-
-    // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical to
-    // execStreamingScan. An empty bound (e.g. pk = NULL) admits no row.
-    let keyB: KeyBound = unboundedBound();
-    let empty = false;
-    const sb = sp.relBounds[0]!;
-    if (sb !== null && sb.kind === "pk") {
-      const b = buildKeyBound(sb.pk, bound, [], []);
-      if (b === null) empty = true;
-      else keyB = b;
+    // Fill the cache only from committed state — so committed.catGen is strictly increasing over the
+    // engine's life and never aliases a rolled-back working generation, making the catGen equality on
+    // a later HIT a sound "same catalog" identity check (a statement first executed inside an open
+    // transaction re-plans until the tx commits) — and only for a reusable plan.
+    if (holder !== null && snap === this.committed && !ptypes.uncacheable && this.planCacheable(sp)) {
+      holder.cache = { catGen: gen, sp, ptys };
     }
-    const snap = this.snapshotEngine();
-    const store = snap.lkpStore(sp.rels[0]!.tableName);
-    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(keyB, sp.relMasks[0]!);
-    const meter = snap.session.newMeter();
-    meter.accrued = subqueryCost.value; // the folded constant cost (lifetime already charged)
-    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
-
-    const env: EvalEnv = {
-      params: bound,
-      outer: [],
-      runSubquery: (p, o) => snap.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
-      seam: snap.session.seam,
-      rng: new StmtRng(),
-      ctes: EMPTY_CTE_CTX,
-      exec: snap,
-    };
-    const gen = streamRows(sp, env, meter, store, keyB, empty);
-    const source: RowSource = {
-      nextRow: () => {
-        const r = gen.next();
-        return r.done ? undefined : r.value;
-      },
-      cost: () => meter.accrued,
-      close: () => {
-        gen.return(undefined);
-      },
-    };
-    return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
+    return this.buildScanRows(sp, bound, subqueryCost.value);
   }
 
-  // tryBufferedQuery tries to serve stmt as a lazy BUFFERED query (spec/design/streaming.md §4, S4) —
-  // the query() path for a top-level read SELECT with a BLOCKING operator (a non-PK-ordered ORDER BY,
-  // DISTINCT, aggregate / GROUP BY, window, or a join) that the streamable fast lane (tryStreamingQuery)
-  // does not cover. The blocking part still buffers its input (correctly — it must), but the OUTPUT is
-  // yielded one row at a time via a bufferedRows generator: the generator runs the blocking part on its
-  // first pull (so a 54P01 cost abort or an arithmetic trap surfaces DURING iteration, not at query() —
-  // streaming.md §6), then emits its buffer lazily — bounding peak output memory and letting a caller's
-  // early exit skip the projection of rows it never pulls (the top-N-over-the-buffer win). Returns null
-  // for a non-SELECT / write-classified statement, a streamable plan (served by the fast lane), or a
-  // set-op / WITH top level (a deferred S4 follow-on, streaming.md §7) — those fall back to the
-  // materialized execute() path → a buffered cursor. Under full drain the rows + total cost are
-  // byte-identical to the eager path (the same Emitter driven row by row, streaming.md §6).
-  tryBufferedQuery(
-    stmt: Statement,
-    params: Value[],
-  ): { columnNames: string[]; cursor: Cursor } | null {
-    if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
-    const ptypes = new ParamTypes();
-    const plan = this.planQuery(stmt, null, [], ptypes);
-    // A streamable plan is the fast lane's job (tryStreamingQuery), tried first; this is the blocking
-    // (buffered) shapes only.
-    if (plan.kind !== "select" || streamingScanEligible(plan)) return null;
-    const sp = plan;
-    const bound = bindParams(params, ptypes.finalize());
-    // Fold globally-uncorrelated subqueries to constants so the per-row projection re-enters nothing —
-    // keeping the cursor self-contained (streaming.md §5). The fold's own cost was already charged to
-    // the shared lifetime gauge; it is added to the cursor's reported cost below.
-    const subqueryCost = { value: 0n };
-    this.foldUncorrelatedInSelect(sp, bound, EMPTY_CTE_CTX, subqueryCost);
+  // buildScanRows classifies a resolved plan (already folded + params bound) as streaming or buffered
+  // and builds the matching lazy cursor. The streaming branch resolves the PK scan bound + the up-front
+  // cost block (S3); the buffered branch runs its blocking part lazily on the first pull (S4). sp is
+  // shared with a prepared statement's plan cache — a cache hit hands the SAME plan object here without
+  // re-planning. Under full drain the rows + total cost are byte-identical to the eager path.
+  buildScanRows(
+    sp: SelectPlan,
+    bound: Value[],
+    subqueryCost: bigint,
+  ): { columnNames: string[]; cursor: Cursor } {
+    if (streamingScanEligible(sp)) {
+      // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
+      // (e.g. pk = NULL) admits no row.
+      let keyB: KeyBound = unboundedBound();
+      let empty = false;
+      const sb = sp.relBounds[0]!;
+      if (sb !== null && sb.kind === "pk") {
+        const b = buildKeyBound(sb.pk, bound, [], []);
+        if (b === null) empty = true;
+        else keyB = b;
+      }
+      const snap = this.snapshotEngine();
+      const store = snap.lkpStore(sp.rels[0]!.tableName);
+      const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(keyB, sp.relMasks[0]!);
+      const meter = snap.session.newMeter();
+      meter.accrued = subqueryCost; // the folded constant cost (lifetime already charged)
+      meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+
+      const env: EvalEnv = {
+        params: bound,
+        outer: [],
+        runSubquery: (p, o) => snap.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+        seam: snap.session.seam,
+        rng: new StmtRng(),
+        ctes: EMPTY_CTE_CTX,
+        exec: snap,
+      };
+      const gen = streamRows(sp, env, meter, store, keyB, empty);
+      const source: RowSource = {
+        nextRow: () => {
+          const r = gen.next();
+          return r.done ? undefined : r.value;
+        },
+        cost: () => meter.accrued,
+        close: () => {
+          gen.return(undefined);
+        },
+      };
+      return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
+    }
+
+    // Blocking (buffered) shape: buffers its input but yields the output one row at a time.
     const snap = this.snapshotEngine();
     const meter = snap.session.newMeter();
-    meter.accrued = subqueryCost.value; // the folded constant cost (lifetime already charged)
+    meter.accrued = subqueryCost; // the folded constant cost (lifetime already charged)
     const env: EvalEnv = {
       params: bound,
       outer: [],
@@ -10406,6 +10435,20 @@ export class Engine {
       },
     };
     return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
+  }
+
+  // planCacheable reports whether a resolved scan plan may be memoized on a prepared statement. The
+  // subquery / precompiled-regex exclusion is tracked separately (ParamTypes.uncacheable, set at the
+  // node's birth). Here the relations are vetted: a set-returning / CTE / derived relation carries a
+  // nested plan or generator we do not vet for reuse, and a temp / shared-temp table lives in a
+  // snapshot the cache key (committed.catGen) does not track — so a plan referencing any of those is
+  // never cached (a point lookup / plain join over persistent base tables has none).
+  planCacheable(sp: SelectPlan): boolean {
+    for (const r of sp.rels) {
+      if (r.srf !== undefined || r.cte !== undefined || r.derived !== undefined) return false;
+      if (this.isTempTable(r.tableName) || this.isSharedTempTable(r.tableName)) return false;
+    }
+    return true;
   }
 
   // tryDeferredQuery tries to serve stmt as a lazy DEFERRED query (spec/design/streaming.md §4/§7) — the
@@ -16461,6 +16504,17 @@ type WithPlan = {
 // derived-table body.
 type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
 
+// ScanCache is a prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved
+// SelectPlan (shared by reference, so a cache hit rebuilds the cursor around the SAME plan object and
+// re-plans nothing) plus the finalized $N param types, stamped with the committed catalog generation
+// (catGen) it was built against. Valid only while that generation still matches; a DDL bumps catGen
+// and the next execute re-plans. Filled only for a reusable plan read from committed state.
+export type ScanCache = { catGen: bigint; sp: SelectPlan; ptys: ScalarType[] };
+// ScanCacheHolder is the mutable slot the executor reads/writes. A PreparedStatement owns one and
+// threads it through queryStmt → tryScanQuery (executor.ts is import-cycle-free of api.ts, so the
+// holder — not the PreparedStatement — crosses the seam). null cache = empty.
+export type ScanCacheHolder = { cache: ScanCache | null };
+
 // CteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
 // from its reference count and [NOT] MATERIALIZED hint: a single-reference CTE is "inline", a
 // multi-reference (or MATERIALIZED) one is "materialize".
@@ -19578,6 +19632,9 @@ function resolveRegexFunc(
     const pat = insensitive ? foldLowerSimple(rargs[1].value, loadedProperty()) : rargs[1].value;
     program = compileRegex(pat);
   }
+  // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so a
+  // reused plan would under-charge the 2nd+ execute — never cache such a plan.
+  if (program !== null) params.uncacheable = true;
   let type: ResolvedType;
   if (func === "replace" || func === "substr") type = { kind: "text" };
   else if (func === "match") type = { kind: "array", elem: { kind: "text" } };
@@ -21401,6 +21458,13 @@ function typeFromResolved(rt: ResolvedType): Type {
 // $1 used in both WHERE and the select list unifies, then finalized.
 class ParamTypes {
   types: (ScalarType | null)[] = [];
+  // uncacheable is set during resolution when a node is created that makes the resolved plan
+  // un-reusable across executions: a subquery (the uncorrelated-subquery fold rewrites it to a
+  // constant baking in THIS execution's bound params) or a precompiled-regex node (whose one-shot
+  // compileCharged cost flag mutates during eval, so a reused plan would under-charge the 2nd+
+  // execute). A prepared statement's plan cache fills only when this stayed false — flagging at the
+  // node's birth is complete regardless of where in the plan tree it lands (spec/design/api.md §2.4).
+  uncacheable = false;
 
   // note records that $(idx0+1) appears with context type ty (null = no context here). It unifies
   // with any prior inference: equal types agree, two integer widths widen to the wider, an
@@ -22650,6 +22714,11 @@ function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): Query
       "subqueries are only supported in a SELECT statement",
     );
   }
+  // Any subquery makes the enclosing plan un-cacheable: the fold pass rewrites an uncorrelated one
+  // (or an uncorrelated one nested inside a correlated one) into a constant using THIS execution's
+  // bound params, so a reused plan would carry another execution's folded constants. Every subquery
+  // form (scalar / EXISTS / IN / quantified) funnels through here.
+  params.uncacheable = true;
   // The subquery inherits the enclosing scope's CTE bindings directly (cte.md §2) — visible at any
   // nesting depth without counting as a correlation level.
   return scope.catalog.planQuery(inner, scope, scope.ctes, params);
@@ -23819,6 +23888,9 @@ function resolve(
         const pat = e.insensitive ? foldLowerSimple(p.rr.value, loadedProperty()) : p.rr.value;
         program = compileRegex(pat);
       }
+      // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so
+      // a reused plan would under-charge the 2nd+ execute — never cache such a plan.
+      if (program !== null) params.uncacheable = true;
       return {
         node: {
           kind: "regex",
