@@ -9280,7 +9280,12 @@ impl Engine {
                 {
                     return None;
                 }
-                detect_inl_bound(join_preds[i - 1].as_ref(), filter.as_ref(), rel, scope.catalog)
+                detect_inl_bound(
+                    join_preds[i - 1].as_ref(),
+                    filter.as_ref(),
+                    rel,
+                    scope.catalog,
+                )
             })
             .collect();
         // ORDER BY resolution (spec/design/grammar.md §10). Each key is one of three modes (set at
@@ -11661,7 +11666,8 @@ impl Engine {
         // Materialize both relations once, in primary-key order (the page_read block + per-row
         // storage_row_read accrue inside materialize_rel, cost.md §3) — the same full materialization
         // the eager join does; only the nested-loop work short-circuits.
-        let left_rows = self.materialize_rel(plan, 0, params, outer, &[], stmt_rng, env.ctes, meter)?;
+        let left_rows =
+            self.materialize_rel(plan, 0, params, outer, &[], stmt_rng, env.ctes, meter)?;
         let right_rows =
             self.materialize_rel(plan, 1, params, outer, &[], stmt_rng, env.ctes, meter)?;
         let on = &plan.joins[0].on;
@@ -11838,9 +11844,14 @@ impl Engine {
                 }
                 None => (Vec::new(), (0, 0)),
             },
-            Some(ScanBound::Index(ib)) => {
-                self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri], left)?
-            }
+            Some(ScanBound::Index(ib)) => self.index_bound_rows(
+                &rel.table_name,
+                ib,
+                params,
+                outer,
+                &plan.rel_masks[ri],
+                left,
+            )?,
             Some(ScanBound::Gin(gb)) => {
                 // Re-find the constant query `Q` in the WHERE filter (the same conjunct the plan-time
                 // `gin_match` chose — gin.md §6); the `@>`/`&&` predicate also stays as the residual
@@ -12225,7 +12236,14 @@ impl Engine {
                 // the ordinary evaluator (its operator_eval charges + 3VL survivor test byte-identical
                 // to the scalar WHERE loop).
                 let rows = self.materialize_rel(
-                    plan, 0, env.params, env.outer, &[], env.rng, env.ctes, meter,
+                    plan,
+                    0,
+                    env.params,
+                    env.outer,
+                    &[],
+                    env.rng,
+                    env.ctes,
+                    meter,
                 )?;
                 let survivors: Vec<Row> = match &plan.filter {
                     None => rows,
@@ -12527,7 +12545,14 @@ impl Engine {
                 continue;
             }
             materialized.push(self.materialize_rel(
-                plan, ri, params, outer, &[], stmt_rng, env.ctes, meter,
+                plan,
+                ri,
+                params,
+                outer,
+                &[],
+                stmt_rng,
+                env.ctes,
+                meter,
             )?);
         }
 
@@ -13521,11 +13546,11 @@ impl Engine {
         // integer can equal no stored value — all provably empty.
         let mut agreed: Option<Vec<u8>> = None;
         for src in &ib.eqs {
-            let k = match encode_bound_key(ib.col_type, src, params, outer, ib.coll.as_deref(), left)
-            {
-                BoundKey::Null | BoundKey::OutOfRange => return Ok((Vec::new(), (0, 0))),
-                BoundKey::Key(k) => k,
-            };
+            let k =
+                match encode_bound_key(ib.col_type, src, params, outer, ib.coll.as_deref(), left) {
+                    BoundKey::Null | BoundKey::OutOfRange => return Ok((Vec::new(), (0, 0))),
+                    BoundKey::Key(k) => k,
+                };
             match &agreed {
                 None => agreed = Some(k),
                 Some(prev) if *prev == k => {}
@@ -16949,7 +16974,10 @@ enum BoundSrc {
     Interval(Interval),
     Null,
     Param(usize),
-    Outer { level: usize, index: usize },
+    Outer {
+        level: usize,
+        index: usize,
+    },
     /// Index-nested-loop: the GLOBAL column index of an earlier join relation, read from the
     /// current combined left-hand row at exec time (cost.md §3 "JOIN"). Only ever produced by
     /// `detect_inl_bound` for a join inner relation; never appears in the once-materialized
@@ -18437,7 +18465,9 @@ fn const_source(e: &RExpr, pk_type: ScalarType, sibling_cutoff: Option<usize>) -
             level: *level,
             index: *index,
         }),
-        RExpr::Column(g) if sibling_cutoff.is_some_and(|cut| *g < cut) => Some(BoundSrc::Sibling(*g)),
+        RExpr::Column(g) if sibling_cutoff.is_some_and(|cut| *g < cut) => {
+            Some(BoundSrc::Sibling(*g))
+        }
         _ => None,
     }
 }
@@ -18469,12 +18499,12 @@ fn build_key_bound(
 ) -> Option<KeyBound> {
     let mut b = KeyBound::unbounded();
     for t in &bp.terms {
-        let key = match encode_bound_key(bp.pk_type, &t.src, params, outer, bp.coll.as_deref(), left)
-        {
-            BoundKey::Null => return None,
-            BoundKey::OutOfRange => continue,
-            BoundKey::Key(k) => k,
-        };
+        let key =
+            match encode_bound_key(bp.pk_type, &t.src, params, outer, bp.coll.as_deref(), left) {
+                BoundKey::Null => return None,
+                BoundKey::OutOfRange => continue,
+                BoundKey::Key(k) => k,
+            };
         match t.op {
             CmpOp::Eq => {
                 intersect_lo(&mut b, &key, true);
@@ -25949,7 +25979,13 @@ impl Engine {
 
     /// Render a Scan node's attributes: the access path (from the relation's chosen scan bound,
     /// `None` = a full scan), then the touched-column count when the query references any column.
-    fn scan_detail(&self, table_name: &str, b: Option<&ScanBound>, inl: bool, mask: &[bool]) -> String {
+    fn scan_detail(
+        &self,
+        table_name: &str,
+        b: Option<&ScanBound>,
+        inl: bool,
+        mask: &[bool],
+    ) -> String {
         let mut parts = vec![self.access_path(table_name, b, inl)];
         let n = count_true(mask);
         if n > 0 {
