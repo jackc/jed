@@ -9702,6 +9702,28 @@ impl Engine {
                 if let Some(op) = &s.operand {
                     collect_touched(op, 0, &mut touched);
                 }
+                // An aggregate reads real input columns beyond its operand: the FILTER predicate
+                // (agg(x) FILTER (WHERE cond) — aggregates.md §11), an ordered-set direct argument, and a
+                // hypothetical-set's WITHIN GROUP key operands / direct args (aggregates.md §13/§19).
+                // Without these the referenced column is left unfetched by the lazy/masked scan
+                // (large-values.md §14) and folds as NULL — a memory-vs-disk divergence (count(*) FILTER,
+                // rank() WITHIN GROUP).
+                if let Some(f) = &s.filter {
+                    collect_touched(f, 0, &mut touched);
+                }
+                if let Some(osa) = &s.osa {
+                    if let Some(frac) = &osa.frac {
+                        collect_touched(frac, 0, &mut touched);
+                    }
+                }
+                if let Some(hypo) = &s.hypo {
+                    for k in &hypo.keys {
+                        collect_touched(k, 0, &mut touched);
+                    }
+                    for a in &hypo.args {
+                        collect_touched(a, 0, &mut touched);
+                    }
+                }
             }
         } else {
             for p in &projections {
@@ -9753,6 +9775,24 @@ impl Engine {
             // resolves its keys against the FROM scope).
             for ke in &window_keys {
                 collect_touched(ke, 0, &mut touched);
+            }
+        }
+        // A set-returning relation's arguments and a LATERAL derived table's body read real input
+        // columns too — an implicitly-lateral SRF arg / lateral body sees an earlier sibling relation
+        // (functions.md §10, grammar.md §44). Applies to aggregate and plain queries alike. Without this
+        // the referenced column is left unfetched by the lazy/masked scan (large-values.md §14) and the
+        // SRF/body reads NULL — a memory-vs-disk divergence.
+        for r in &rels {
+            if let Some(srf) = &r.srf {
+                // A LATERAL SRF (any SRF at position i>0) resolves its sibling columns as OuterColumn at
+                // level 1 (the same frame the runtime pushes) — so collect at depth 1, not 0. An i==0
+                // SRF has no sibling correlation, so depth 1 marks nothing there.
+                for a in &srf.args {
+                    collect_touched(a, 1, &mut touched);
+                }
+            }
+            if let Some(derived) = &r.derived {
+                collect_touched_plan(derived, 1, &mut touched);
             }
         }
         let rel_masks: Vec<Vec<bool>> = rels
@@ -20994,7 +21034,11 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             }
         }
         RExpr::OuterColumn { level, index } => {
-            if *level == depth && depth > 0 {
+            // A correlated reference into the scope we are collecting for (its frame is `depth` levels
+            // up). The index is a slot in that target scope's combined row; bounds-checked like the
+            // Column case. Callers collect at the depth matching the reference's level — a correlated
+            // subquery at its nesting depth, a LATERAL SRF arg at depth 1 (its sibling frame).
+            if *level == depth && depth > 0 && *index < touched.len() {
                 touched[*index] = true;
             }
         }
@@ -21503,6 +21547,26 @@ fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut [bool]) {
             }
             for p in &sp.projections {
                 collect_touched(p, depth, touched);
+            }
+            // A materialized ORDER BY expression and a set-returning relation's args / a LATERAL derived
+            // body can each carry a correlated reference back into the target scope (the same surfaces
+            // select_plan_references_outer checks — query.order_by_correlated, functions.md §10,
+            // grammar.md §44). collect_touched_plan MUST cover every surface that function does, or an
+            // outer column read only through one of them is left unfetched by the lazy/masked scan
+            // (large-values.md §14) and the correlated subquery re-executes against NULL — a
+            // memory-vs-disk divergence.
+            for oe in &sp.order_exprs {
+                collect_touched(oe, depth, touched);
+            }
+            for r in &sp.rels {
+                if let Some(srf) = &r.srf {
+                    for a in &srf.args {
+                        collect_touched(a, depth, touched);
+                    }
+                }
+                if let Some(derived) = &r.derived {
+                    collect_touched_plan(derived, depth + 1, touched);
+                }
             }
         }
         QueryPlan::SetOp(s) => {

@@ -1,3 +1,4 @@
+# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Shared temporary tables — DATABASE-WIDE shared temp tables that make ZERO writes to the database
 # file (spec/design/temp-tables.md §4). They live in a Database-level shared-temp snapshot outside
 # the serialized catalog (no format_version change), share ONE set of rows across every session, and

@@ -1,3 +1,4 @@
+# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # composite-typed columns on a temporary table (spec/design/temp-tables.md §8) — the lifted 0A000
 # narrowing: a temp table (session-local OR database-wide SHARED) now takes a column of a user-defined
 # composite (row) type, exactly like a persistent one. The composite TYPE itself is always persistent

@@ -1,3 +1,4 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Failed-block poisoning (spec/design/transactions.md §6). A statement error inside an explicit
 # block aborts the transaction: it enters the failed state, and every later statement but
 # ROLLBACK / COMMIT is rejected with 25P02 (in_failed_sql_transaction). ROLLBACK clears the

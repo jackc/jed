@@ -218,6 +218,33 @@ These build up cumulatively to the later profiles — `mutation`, `decimal`, `fu
 `timestamps`, `set_operations`, `transactions`, and `subqueries` (18 total). The
 [manifest.toml](../conformance/manifest.toml) is the authoritative, complete list.
 
+### 3.4 Storage modes: memory and disk
+
+Orthogonal to the taxonomy above, each core runs the **whole corpus twice**, in two **storage
+modes**, and every record's rows / error / cost must be **identical** in both. This exists because a
+query's result can depend on *where its input rows live* — resident in the writer's staging area vs.
+**faulted from disk** as compact leaf bytes through the demand-paged buffer pool. The on-disk
+read path decodes only a query's **touched column set** on demand ([lazy-record.md](lazy-record.md),
+[large-values.md](large-values.md) §14); a column the planner fails to mark touched is left
+*unfetched* and folds as `NULL`. The in-memory pass cannot see that class of bug — staging rows are
+always fully materialized — so a single-mode corpus silently passed a windowed aggregate that
+returned `NULL` for every row when read from a committed file (only the wall-clock benchmark, which
+opens a real file, caught it). Running both modes turns that whole class into a corpus failure.
+
+- **`memory`** (default) — a fresh in-memory `Database`; the historical behaviour.
+- **`disk`** (harness arg `disk`) — a file-backed `Database` **reopened before every record**, so
+  each committed read demand-pages (faults) its leaves from disk. Writes reopen too, exercising the
+  resolve-and-rewrite path over a faulted leaf. The reopen re-mints the session, so only committed
+  data (on the file) and the per-record directives (re-applied each record) carry across.
+
+A file whose semantics **cannot survive a per-record reopen** opts out of the disk pass with a
+file-level **`# skip: disk[ — reason]`** directive (honored only in disk mode; the memory pass
+ignores it). This is sound: none of these exercise the on-disk faulted read path. They are:
+session-local **temp tables**, an explicit **transaction** spanning records, a sticky
+**`# lifetime_max_cost:`** budget, and a pre-built **`# fixture:`** image. Concurrency-format files
+(§1) are likewise memory-only (the schedule driver is not a single reopenable handle). `rake
+conformance` runs both modes on all three cores; `rake ci` gates on both.
+
 ## 4. Determinism rules
 
 The agent loop and cross-impl sync both depend on bit-reproducibility (CLAUDE.md §10).

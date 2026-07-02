@@ -4,13 +4,15 @@
 // sqllogictest-style records against a fresh Engine and compare output. Files needing
 // a capability the core does not declare are SKIPPED (not failed). Needs no TOML.
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { loadedCollation, loadUnicodeData } from "../collation.ts";
 import { loadTimeZoneData, resolveZone } from "../timezone.ts";
 import {
   advancingClock,
+  createDatabase,
   Database,
   DEFAULT_MAX_SQL_LENGTH,
   EngineError,
@@ -21,6 +23,7 @@ import {
   privilegeFromName,
   render,
   seededRandomSource,
+  openDatabase,
   type Session,
   SUPPORTED_CAPABILITIES,
 } from "../tooling.ts";
@@ -533,278 +536,303 @@ function assertTypes(expected: string[] | null, actual: string[], sql: string): 
 }
 
 // runFile runs all records in one .test file against a fresh database.
-function runFile(text: string): void {
-  let db = Database.newInMemory().session();
-  const lines = text.split("\n");
-  const c: Cursor = { i: 0 };
-  // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
-  // next record consumes them.
-  let pendingCost: bigint | null = null;
-  let pendingNames: string[] | null = null;
-  let pendingTypes: string[] | null = null;
-  let pendingMaxCost: bigint | null = null;
-  let pendingMaxSqlLength: number | null = null;
-  let pendingSeed: bigint | null = null;
-  let pendingClock: bigint | null = null;
-  let pendingClockAdvance: [bigint, bigint] | null = null;
-  // The session privilege envelope for the next record (spec/design/session.md §5.3); reset after
-  // each record so a directive never leaks forward. grant/revoke accumulate across lines.
-  let pendingDefaultPrivileges: PrivilegeSet | null = null;
-  const pendingGrants: PrivDelta[] = [];
-  const pendingRevokes: PrivDelta[] = [];
-  let pendingAllowDdl: boolean | null = null;
-  let pendingAllowTempDdl: boolean | null = null;
-  let pendingAllowSharedTempDdl: boolean | null = null;
-  let pendingTempBuffers: number | null = null;
-  let pendingSharedTempMem: number | null = null;
-  const pendingVars: Array<[string, string]> = [];
-  let pendingTimezone: string | null = null;
-  while (c.i < lines.length) {
-    const line = lines[c.i]!.trim();
-    if (line === "") {
-      c.i++;
-      continue;
-    }
-    if (line.startsWith("#")) {
-      // `# load-collation:` is an ACTION (assert available now), not a pending assertion: the named
-      // collation must be vendored in this build before the records run
-      // (spec/design/collation.md §2/§9/§10).
-      const lc = parseLoadCollationDirective(line);
-      if (lc !== null) {
-        loadCollation(lc[0]);
+function runFile(text: string, disk: boolean): void {
+  // In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
+  // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
+  // (spec/design/conformance.md §3). The try/finally removes the temp image on every exit path.
+  const tmpDir = disk ? mkdtempSync(join(tmpdir(), "jed-conformance-")) : null;
+  const tmpPath = tmpDir === null ? null : join(tmpDir, "conf.jed");
+  // dbHandle is the reopenable file-backed Database — held so a per-record reopen can close it and
+  // re-open the image; null in memory mode. onTemp tracks whether db/dbHandle still point at the temp
+  // file (a `# fixture:` swap flips it off — but fixtures are `# skip: disk`).
+  let dbHandle: Database | null = tmpPath === null ? null : createDatabase(tmpPath);
+  let onTemp = disk;
+  let db = dbHandle === null ? Database.newInMemory().session() : dbHandle.session();
+  try {
+    const lines = text.split("\n");
+    const c: Cursor = { i: 0 };
+    // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
+    // next record consumes them.
+    let pendingCost: bigint | null = null;
+    let pendingNames: string[] | null = null;
+    let pendingTypes: string[] | null = null;
+    let pendingMaxCost: bigint | null = null;
+    let pendingMaxSqlLength: number | null = null;
+    let pendingSeed: bigint | null = null;
+    let pendingClock: bigint | null = null;
+    let pendingClockAdvance: [bigint, bigint] | null = null;
+    // The session privilege envelope for the next record (spec/design/session.md §5.3); reset after
+    // each record so a directive never leaks forward. grant/revoke accumulate across lines.
+    let pendingDefaultPrivileges: PrivilegeSet | null = null;
+    const pendingGrants: PrivDelta[] = [];
+    const pendingRevokes: PrivDelta[] = [];
+    let pendingAllowDdl: boolean | null = null;
+    let pendingAllowTempDdl: boolean | null = null;
+    let pendingAllowSharedTempDdl: boolean | null = null;
+    let pendingTempBuffers: number | null = null;
+    let pendingSharedTempMem: number | null = null;
+    const pendingVars: Array<[string, string]> = [];
+    let pendingTimezone: string | null = null;
+    while (c.i < lines.length) {
+      const line = lines[c.i]!.trim();
+      if (line === "") {
         c.i++;
         continue;
       }
-      // `# load-timezone: [<zone>]` is an ACTION: load jed's pinned JTZ bundle into the engine-global
-      // set (and optionally assert a zone resolves) before the records that use AT TIME ZONE
-      // (timezones.md §11).
-      const ltz = parseLoadTimezoneDirective(line);
-      if (ltz !== null) {
-        loadTimezone(ltz);
-        c.i++;
-        continue;
-      }
-      // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `new Engine()`
-      // above — appears in the header before any record (spec/design/conformance.md).
-      const fx = parseFixtureDirective(line);
-      if (fx !== null) {
-        db = openFixture(fx);
-        c.i++;
-        continue;
-      }
-      // `# upgrade-collations:` (file-level) runs the COLLATION UPGRADE migration on the running DB —
-      // the privileged host op (db.upgradeCollations) that clears a version-skew (collation.md §12);
-      // the records after it assert the table is read-write again.
-      if (parseUpgradeCollationsDirective(line)) {
-        db.upgradeCollations();
-        c.i++;
-        continue;
-      }
-      // `# cost:` / `# max_cost:` / `# names:` / `# types:` bind to the next record; every other
-      // comment is ignored.
-      const n = parseCostDirective(line);
-      const lmc = parseLifetimeMaxCostDirective(line);
-      const mc = parseMaxCostDirective(line);
-      const msl = parseMaxSqlLengthDirective(line);
-      const dp = parseDefaultPrivilegesDirective(line);
-      const gr = parseGrantDirective(line);
-      const rv = parseRevokeDirective(line);
-      const ad = parseAllowDdlDirective(line);
-      const atd = parseAllowTempDdlDirective(line);
-      const astd = parseAllowSharedTempDdlDirective(line);
-      const tb = parseTempBuffersDirective(line);
-      const stm = parseSharedTempMemDirective(line);
-      const sv = parseSetDirective(line);
-      const tz = parseTimezoneDirective(line);
-      const sd = parseSeedDirective(line);
-      const ck = parseClockDirective(line);
-      const ca = parseClockAdvanceDirective(line);
-      if (n !== null) {
-        pendingCost = n;
-      } else if (lmc !== null) {
-        // Sticky (spec/design/session.md §5.4): apply immediately and persistently — the session
-        // cumulative builds across records, so a later record can assert the 54P02 abort. Not a
-        // pending per-record directive (it must NOT reset between records).
-        db.setLifetimeMaxCost(lmc);
-      } else if (mc !== null) {
-        pendingMaxCost = mc;
-      } else if (msl !== null) {
-        pendingMaxSqlLength = msl;
-      } else if (dp !== null) {
-        pendingDefaultPrivileges = dp;
-      } else if (gr !== null) {
-        pendingGrants.push(gr);
-      } else if (rv !== null) {
-        pendingRevokes.push(rv);
-      } else if (ad !== null) {
-        pendingAllowDdl = ad;
-      } else if (atd !== null) {
-        pendingAllowTempDdl = atd;
-      } else if (astd !== null) {
-        pendingAllowSharedTempDdl = astd;
-      } else if (tb !== null) {
-        pendingTempBuffers = tb;
-      } else if (stm !== null) {
-        pendingSharedTempMem = stm;
-      } else if (sv !== null) {
-        pendingVars.push(...sv);
-      } else if (tz !== null) {
-        pendingTimezone = tz;
-      } else if (sd !== null) {
-        pendingSeed = sd;
-      } else if (ck !== null) {
-        pendingClock = ck;
-      } else if (ca !== null) {
-        pendingClockAdvance = ca;
-      } else {
-        const names = parseNamesDirective(line);
-        if (names !== null) {
-          pendingNames = names;
+      if (line.startsWith("#")) {
+        // `# load-collation:` is an ACTION (assert available now), not a pending assertion: the named
+        // collation must be vendored in this build before the records run
+        // (spec/design/collation.md §2/§9/§10).
+        const lc = parseLoadCollationDirective(line);
+        if (lc !== null) {
+          loadCollation(lc[0]);
+          c.i++;
+          continue;
+        }
+        // `# load-timezone: [<zone>]` is an ACTION: load jed's pinned JTZ bundle into the engine-global
+        // set (and optionally assert a zone resolves) before the records that use AT TIME ZONE
+        // (timezones.md §11).
+        const ltz = parseLoadTimezoneDirective(line);
+        if (ltz !== null) {
+          loadTimezone(ltz);
+          c.i++;
+          continue;
+        }
+        // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `new Engine()`
+        // above — appears in the header before any record (spec/design/conformance.md).
+        const fx = parseFixtureDirective(line);
+        if (fx !== null) {
+          db = openFixture(fx);
+          onTemp = false; // the handle is now the fixture image, not the reopenable temp file
+          c.i++;
+          continue;
+        }
+        // `# upgrade-collations:` (file-level) runs the COLLATION UPGRADE migration on the running DB —
+        // the privileged host op (db.upgradeCollations) that clears a version-skew (collation.md §12);
+        // the records after it assert the table is read-write again.
+        if (parseUpgradeCollationsDirective(line)) {
+          db.upgradeCollations();
+          c.i++;
+          continue;
+        }
+        // `# cost:` / `# max_cost:` / `# names:` / `# types:` bind to the next record; every other
+        // comment is ignored.
+        const n = parseCostDirective(line);
+        const lmc = parseLifetimeMaxCostDirective(line);
+        const mc = parseMaxCostDirective(line);
+        const msl = parseMaxSqlLengthDirective(line);
+        const dp = parseDefaultPrivilegesDirective(line);
+        const gr = parseGrantDirective(line);
+        const rv = parseRevokeDirective(line);
+        const ad = parseAllowDdlDirective(line);
+        const atd = parseAllowTempDdlDirective(line);
+        const astd = parseAllowSharedTempDdlDirective(line);
+        const tb = parseTempBuffersDirective(line);
+        const stm = parseSharedTempMemDirective(line);
+        const sv = parseSetDirective(line);
+        const tz = parseTimezoneDirective(line);
+        const sd = parseSeedDirective(line);
+        const ck = parseClockDirective(line);
+        const ca = parseClockAdvanceDirective(line);
+        if (n !== null) {
+          pendingCost = n;
+        } else if (lmc !== null) {
+          // Sticky (spec/design/session.md §5.4): apply immediately and persistently — the session
+          // cumulative builds across records, so a later record can assert the 54P02 abort. Not a
+          // pending per-record directive (it must NOT reset between records).
+          db.setLifetimeMaxCost(lmc);
+        } else if (mc !== null) {
+          pendingMaxCost = mc;
+        } else if (msl !== null) {
+          pendingMaxSqlLength = msl;
+        } else if (dp !== null) {
+          pendingDefaultPrivileges = dp;
+        } else if (gr !== null) {
+          pendingGrants.push(gr);
+        } else if (rv !== null) {
+          pendingRevokes.push(rv);
+        } else if (ad !== null) {
+          pendingAllowDdl = ad;
+        } else if (atd !== null) {
+          pendingAllowTempDdl = atd;
+        } else if (astd !== null) {
+          pendingAllowSharedTempDdl = astd;
+        } else if (tb !== null) {
+          pendingTempBuffers = tb;
+        } else if (stm !== null) {
+          pendingSharedTempMem = stm;
+        } else if (sv !== null) {
+          pendingVars.push(...sv);
+        } else if (tz !== null) {
+          pendingTimezone = tz;
+        } else if (sd !== null) {
+          pendingSeed = sd;
+        } else if (ck !== null) {
+          pendingClock = ck;
+        } else if (ca !== null) {
+          pendingClockAdvance = ca;
         } else {
-          const types = parseTypesDirective(line);
-          if (types !== null) pendingTypes = types;
+          const names = parseNamesDirective(line);
+          if (names !== null) {
+            pendingNames = names;
+          } else {
+            const types = parseTypesDirective(line);
+            if (types !== null) pendingTypes = types;
+          }
         }
-      }
-      c.i++;
-      continue;
-    }
-    // This record consumes any pending assertions (so they never leak forward).
-    const expectedCost = pendingCost;
-    const expectedNames = pendingNames;
-    const expectedTypes = pendingTypes;
-    pendingCost = null;
-    pendingNames = null;
-    pendingTypes = null;
-    // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
-    db.setMaxCost(pendingMaxCost ?? 0n);
-    pendingMaxCost = null;
-    // Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
-    // `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
-    db.setMaxSqlLength(pendingMaxSqlLength ?? DEFAULT_MAX_SQL_LENGTH);
-    pendingMaxSqlLength = null;
-    // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md §6);
-    // absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
-    if (pendingSeed !== null) db.setRandomSource(seededRandomSource(pendingSeed));
-    else db.clearRandomSource();
-    pendingSeed = null;
-    // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one); a
-    // record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
-    if (pendingClockAdvance !== null) {
-      db.setClockSource(advancingClock(pendingClockAdvance[0], pendingClockAdvance[1]));
-    } else if (pendingClock !== null) {
-      db.setClockSource(fixedClock(pendingClock));
-    } else {
-      db.clearClockSource();
-    }
-    pendingClock = null;
-    pendingClockAdvance = null;
-    // Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to fully
-    // permissive (every table privilege, DDL allowed), then layer the pending directives, so a
-    // # default_privileges: / # grant: / # revoke: / # allow_ddl: decorates only its record and never
-    // leaks forward.
-    db.resetPrivileges();
-    if (pendingDefaultPrivileges !== null) db.setDefaultPrivileges(pendingDefaultPrivileges);
-    for (const g of pendingGrants) db.grant(g.privs, g.object);
-    for (const r of pendingRevokes) db.revoke(r.privs, r.object);
-    if (pendingAllowDdl !== null) db.setAllowDdl(pendingAllowDdl);
-    // `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md §5);
-    // resetPrivileges above set both back to permissive, so each decorates only its record.
-    if (pendingAllowTempDdl !== null) db.setAllowTempDdl(pendingAllowTempDdl);
-    if (pendingAllowSharedTempDdl !== null) db.setAllowSharedTempDdl(pendingAllowSharedTempDdl);
-    pendingDefaultPrivileges = null;
-    pendingGrants.length = 0;
-    pendingRevokes.length = 0;
-    pendingAllowDdl = null;
-    pendingAllowTempDdl = null;
-    pendingAllowSharedTempDdl = null;
-    // Apply the per-record temp-storage budgets (temp-tables.md §7); absent ⇒ unlimited (0), so a
-    // `# temp_buffers:` / `# shared_temp_mem:` directive never leaks past its record. Mirrors `# max_cost:`.
-    db.setTempBuffers(pendingTempBuffers ?? 0);
-    pendingTempBuffers = null;
-    db.setSharedTempMem(pendingSharedTempMem ?? 0);
-    pendingSharedTempMem = null;
-    // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
-    // pending # set: pair, so a directive decorates only its record and never leaks forward.
-    db.resetVars();
-    for (const [name, value] of pendingVars) db.setVar(name, value);
-    pendingVars.length = 0;
-    // Apply the per-record session time zone (spec/design/session.md §6.2, timezones.md §9.4): reset
-    // to UTC, then set the pending # timezone:, so a directive decorates only its record and never
-    // leaks forward. A named zone must already be loaded (# load-timezone:).
-    db.setTimeZone(pendingTimezone ?? "UTC");
-    pendingTimezone = null;
-    const fields = line.split(/\s+/);
-    if (fields[0] === "statement") {
-      // `# names:` / `# types:` assert result columns, which a statement lacks.
-      if (expectedNames !== null) {
-        throw new Error("# names: directive precedes a non-query statement");
-      }
-      if (expectedTypes !== null) {
-        throw new Error("# types: directive precedes a non-query statement");
-      }
-      const expect = fields[1] ?? "";
-      c.i++;
-      const sql = takeSQL(lines, c);
-      let err: unknown = null;
-      let outcome: Outcome | null = null;
-      try {
-        outcome = db.execute(sql);
-      } catch (e) {
-        err = e;
-      }
-      if (expect === "ok") {
-        if (err !== null) {
-          throw new Error(`statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`);
-        }
-        assertCost(expectedCost, outcome!.cost, sql);
-      } else if (expect === "error") {
-        const want = fields[2] ?? "";
-        if (err === null) {
-          throw new Error(`statement expected error ${want}, but it succeeded\n  SQL: ${sql}`);
-        }
-        const got = codeOf(err);
-        if (got !== want) {
-          throw new Error(`statement expected error ${want}, got ${got}\n  SQL: ${sql}`);
-        }
-      } else {
-        throw new Error(`unknown statement kind "${expect}"`);
-      }
-    } else if (fields[0] === "query") {
-      const coltypes = fields[1] ?? "";
-      const sortmode = fields[2] ?? "nosort";
-      c.i++;
-      const sql = takeSQLUntilSeparator(lines, c);
-      const expected: string[] = [];
-      while (c.i < lines.length && lines[c.i]!.trim() !== "") {
-        expected.push(lines[c.i]!.trim());
         c.i++;
+        continue;
       }
-      let outcome: Outcome;
-      try {
-        outcome = db.execute(sql);
-      } catch (e) {
-        throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
+      // DISK mode: reopen the temp image before this record so its reads fault leaves from disk (the
+      // committed state carries on the file; the fresh session re-receives the per-record directives
+      // applied just below). Writes reopen too — an UPDATE/DELETE over a faulted leaf exercises the
+      // resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
+      if (disk && onTemp) {
+        dbHandle!.close();
+        dbHandle = openDatabase(tmpPath!);
+        db = dbHandle.session();
       }
-      const cols = coltypes.length === 0 ? 1 : coltypes.length;
-      const actual = renderOutcome(outcome, cols, sortmode);
-      const exp = applySort(expected, cols, sortmode);
-      // Compare column-aware: an `R` (float) column compares by parsed value within a tolerance
-      // (the R-tag exemption — float.md §9); every other tag is exact string. arrEq is the
-      // exact-only fast path for the no-R-column case.
-      const ok = coltypes.includes("R")
-        ? rowsEqual(coltypes, cols, actual, exp)
-        : arrEq(actual, exp);
-      if (!ok) {
-        throw new Error(
-          `query result mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(exp)}\n  actual:   ${JSON.stringify(actual)}`,
-        );
+      // This record consumes any pending assertions (so they never leak forward).
+      const expectedCost = pendingCost;
+      const expectedNames = pendingNames;
+      const expectedTypes = pendingTypes;
+      pendingCost = null;
+      pendingNames = null;
+      pendingTypes = null;
+      // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
+      db.setMaxCost(pendingMaxCost ?? 0n);
+      pendingMaxCost = null;
+      // Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
+      // `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
+      db.setMaxSqlLength(pendingMaxSqlLength ?? DEFAULT_MAX_SQL_LENGTH);
+      pendingMaxSqlLength = null;
+      // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md §6);
+      // absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
+      if (pendingSeed !== null) db.setRandomSource(seededRandomSource(pendingSeed));
+      else db.clearRandomSource();
+      pendingSeed = null;
+      // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one); a
+      // record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
+      if (pendingClockAdvance !== null) {
+        db.setClockSource(advancingClock(pendingClockAdvance[0], pendingClockAdvance[1]));
+      } else if (pendingClock !== null) {
+        db.setClockSource(fixedClock(pendingClock));
+      } else {
+        db.clearClockSource();
       }
-      assertCost(expectedCost, outcome.cost, sql);
-      assertNames(expectedNames, outcome.kind === "query" ? outcome.columnNames : [], sql);
-      assertTypes(expectedTypes, outcome.kind === "query" ? outcome.columnTypes : [], sql);
-    } else {
-      throw new Error(`unknown record kind "${fields[0]}"`);
+      pendingClock = null;
+      pendingClockAdvance = null;
+      // Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to fully
+      // permissive (every table privilege, DDL allowed), then layer the pending directives, so a
+      // # default_privileges: / # grant: / # revoke: / # allow_ddl: decorates only its record and never
+      // leaks forward.
+      db.resetPrivileges();
+      if (pendingDefaultPrivileges !== null) db.setDefaultPrivileges(pendingDefaultPrivileges);
+      for (const g of pendingGrants) db.grant(g.privs, g.object);
+      for (const r of pendingRevokes) db.revoke(r.privs, r.object);
+      if (pendingAllowDdl !== null) db.setAllowDdl(pendingAllowDdl);
+      // `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md §5);
+      // resetPrivileges above set both back to permissive, so each decorates only its record.
+      if (pendingAllowTempDdl !== null) db.setAllowTempDdl(pendingAllowTempDdl);
+      if (pendingAllowSharedTempDdl !== null) db.setAllowSharedTempDdl(pendingAllowSharedTempDdl);
+      pendingDefaultPrivileges = null;
+      pendingGrants.length = 0;
+      pendingRevokes.length = 0;
+      pendingAllowDdl = null;
+      pendingAllowTempDdl = null;
+      pendingAllowSharedTempDdl = null;
+      // Apply the per-record temp-storage budgets (temp-tables.md §7); absent ⇒ unlimited (0), so a
+      // `# temp_buffers:` / `# shared_temp_mem:` directive never leaks past its record. Mirrors `# max_cost:`.
+      db.setTempBuffers(pendingTempBuffers ?? 0);
+      pendingTempBuffers = null;
+      db.setSharedTempMem(pendingSharedTempMem ?? 0);
+      pendingSharedTempMem = null;
+      // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
+      // pending # set: pair, so a directive decorates only its record and never leaks forward.
+      db.resetVars();
+      for (const [name, value] of pendingVars) db.setVar(name, value);
+      pendingVars.length = 0;
+      // Apply the per-record session time zone (spec/design/session.md §6.2, timezones.md §9.4): reset
+      // to UTC, then set the pending # timezone:, so a directive decorates only its record and never
+      // leaks forward. A named zone must already be loaded (# load-timezone:).
+      db.setTimeZone(pendingTimezone ?? "UTC");
+      pendingTimezone = null;
+      const fields = line.split(/\s+/);
+      if (fields[0] === "statement") {
+        // `# names:` / `# types:` assert result columns, which a statement lacks.
+        if (expectedNames !== null) {
+          throw new Error("# names: directive precedes a non-query statement");
+        }
+        if (expectedTypes !== null) {
+          throw new Error("# types: directive precedes a non-query statement");
+        }
+        const expect = fields[1] ?? "";
+        c.i++;
+        const sql = takeSQL(lines, c);
+        let err: unknown = null;
+        let outcome: Outcome | null = null;
+        try {
+          outcome = db.execute(sql);
+        } catch (e) {
+          err = e;
+        }
+        if (expect === "ok") {
+          if (err !== null) {
+            throw new Error(`statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`);
+          }
+          assertCost(expectedCost, outcome!.cost, sql);
+        } else if (expect === "error") {
+          const want = fields[2] ?? "";
+          if (err === null) {
+            throw new Error(`statement expected error ${want}, but it succeeded\n  SQL: ${sql}`);
+          }
+          const got = codeOf(err);
+          if (got !== want) {
+            throw new Error(`statement expected error ${want}, got ${got}\n  SQL: ${sql}`);
+          }
+        } else {
+          throw new Error(`unknown statement kind "${expect}"`);
+        }
+      } else if (fields[0] === "query") {
+        const coltypes = fields[1] ?? "";
+        const sortmode = fields[2] ?? "nosort";
+        c.i++;
+        const sql = takeSQLUntilSeparator(lines, c);
+        const expected: string[] = [];
+        while (c.i < lines.length && lines[c.i]!.trim() !== "") {
+          expected.push(lines[c.i]!.trim());
+          c.i++;
+        }
+        let outcome: Outcome;
+        try {
+          outcome = db.execute(sql);
+        } catch (e) {
+          throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
+        }
+        const cols = coltypes.length === 0 ? 1 : coltypes.length;
+        const actual = renderOutcome(outcome, cols, sortmode);
+        const exp = applySort(expected, cols, sortmode);
+        // Compare column-aware: an `R` (float) column compares by parsed value within a tolerance
+        // (the R-tag exemption — float.md §9); every other tag is exact string. arrEq is the
+        // exact-only fast path for the no-R-column case.
+        const ok = coltypes.includes("R")
+          ? rowsEqual(coltypes, cols, actual, exp)
+          : arrEq(actual, exp);
+        if (!ok) {
+          throw new Error(
+            `query result mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(exp)}\n  actual:   ${JSON.stringify(actual)}`,
+          );
+        }
+        assertCost(expectedCost, outcome.cost, sql);
+        assertNames(expectedNames, outcome.kind === "query" ? outcome.columnNames : [], sql);
+        assertTypes(expectedTypes, outcome.kind === "query" ? outcome.columnTypes : [], sql);
+      } else {
+        throw new Error(`unknown record kind "${fields[0]}"`);
+      }
     }
+  } finally {
+    if (dbHandle !== null) dbHandle.close();
+    if (tmpDir !== null) rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
@@ -1089,7 +1117,34 @@ function runConcurrencyFile(text: string): void {
   }
 }
 
+// parseSkipDisk reports whether a file carries a `# skip: disk[ — free-text reason]` directive
+// (spec/design/conformance.md §3) — it opts out of the on-disk reopen pass because its session state
+// (temp tables, a spanning transaction, a sticky lifetime_max_cost budget) or its pre-built
+// `# fixture:` image cannot survive a per-record reopen. Honored only in disk mode. The first
+// whitespace token after `skip:` is the mode; any trailing text is a documentary reason.
+function parseSkipDisk(text: string): boolean {
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("#")) continue;
+    const rest = t.slice(1).trimStart();
+    if (rest.startsWith("skip:")) {
+      const first = rest.slice(5).trim().split(/\s+/)[0];
+      if (first === "disk") return true;
+    }
+  }
+  return false;
+}
+
 function main(): number {
+  // The corpus runs in one of two storage MODES (spec/design/conformance.md §3): the default "memory"
+  // mode drives a fresh in-memory Database, and the "disk" mode (arg `disk`) drives a FILE-BACKED
+  // database REOPENED before every record, so each committed read faults its leaves from disk through
+  // the demand-paged buffer pool. The two modes catch DIVERGENCES between resident and on-disk-faulted
+  // reads (the window-operand touched-set bug the in-memory pass could not see). Every record's SQL-in →
+  // rows/error/cost-out must be IDENTICAL in both modes.
+  const disk = process.argv.slice(2).includes("disk");
+  const mode = disk ? "disk" : "memory";
+
   const suites = suitesDir();
   const files = readdirSync(suites, { recursive: true })
     .filter((f): f is string => typeof f === "string" && f.endsWith(".test"))
@@ -1108,12 +1163,23 @@ function main(): number {
       skipped++;
       continue;
     }
+    const isConc = isConcurrencyFormat(text);
+    // Disk mode cannot run a file whose semantics can't survive a per-record REOPEN: the concurrency
+    // driver (multi-session schedule on one Database), or a file carrying reopen-fragile session state —
+    // session-local temp tables, a spanning transaction, a sticky lifetime budget, or a pre-built
+    // fixture image (spec/design/conformance.md §3). These are `# skip: disk` and covered by the memory
+    // pass only; none exercises the on-disk faulted read path anyway.
+    if (disk && (isConc || parseSkipDisk(text))) {
+      console.log(`SKIP ${rel}  (disk-mode)`);
+      skipped++;
+      continue;
+    }
     try {
       // A `# format: concurrency` file is an explicit multi-session schedule run against a Database
       // (spec/design/concurrency-testing.md §4); everything else is the sequential single-handle
       // runner. Both share the result grammar; only the driver differs.
-      if (isConcurrencyFormat(text)) runConcurrencyFile(text);
-      else runFile(text);
+      if (isConc) runConcurrencyFile(text);
+      else runFile(text, disk);
       console.log(`PASS ${rel}`);
       passed++;
     } catch (e) {
@@ -1122,7 +1188,7 @@ function main(): number {
     }
   }
 
-  console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped`);
+  console.log(`\n[${mode}] ${passed} passed, ${failed} failed, ${skipped} skipped`);
   return failed !== 0 ? 1 : 0;
 }
 

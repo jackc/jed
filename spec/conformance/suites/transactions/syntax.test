@@ -1,3 +1,4 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Transaction-statement spellings (spec/design/grammar.md §27). The openers BEGIN,
 # BEGIN TRANSACTION, BEGIN WORK, and START TRANSACTION are equivalent; the closers COMMIT,
 # COMMIT WORK, COMMIT TRANSACTION, and END are equivalent; ROLLBACK accepts the optional WORK /

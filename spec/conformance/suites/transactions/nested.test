@@ -1,3 +1,4 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Transaction control edges (spec/design/transactions.md §4.2). A nested BEGIN — one issued
 # while a block is already open — is 25001 (active_sql_transaction): there is no SAVEPOINT/
 # nesting this slice, so it has no defined action and errors. A COMMIT or ROLLBACK with no open

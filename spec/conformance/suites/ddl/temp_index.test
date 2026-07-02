@@ -1,3 +1,4 @@
+# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Standalone CREATE INDEX / DROP INDEX on a temporary table (spec/design/temp-tables.md §8) — the
 # lifted 0A000 narrowing: a temp table (session-local OR database-wide SHARED) now takes a separate
 # CREATE INDEX, exactly like a persistent one, and the index lives in the matching in-memory temp

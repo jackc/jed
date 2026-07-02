@@ -52,6 +52,15 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // The corpus runs in one of two storage MODES (spec/design/conformance.md §3): the default
+    // "memory" mode drives a fresh in-memory Database, and the "disk" mode (arg `disk`) drives a
+    // FILE-BACKED database REOPENED before every record, so each committed read faults its leaves from
+    // disk through the demand-paged buffer pool. The two modes catch DIVERGENCES between resident and
+    // on-disk-faulted reads (the window-operand touched-set bug the in-memory pass could not see).
+    // Every record's SQL-in → rows/error/cost-out must be IDENTICAL in both modes.
+    let disk = std::env::args().any(|a| a == "disk");
+    let mode = if disk { "disk" } else { "memory" };
+
     let supported: BTreeSet<&str> = SUPPORTED_CAPABILITIES.iter().copied().collect();
     let (mut passed, mut failed, mut skipped) = (0u32, 0u32, 0u32);
 
@@ -71,15 +80,27 @@ fn main() -> ExitCode {
             continue;
         }
 
+        let is_conc = is_concurrency_format(&text);
+        // Disk mode cannot run a file whose semantics can't survive a per-record REOPEN: the
+        // concurrency driver (multi-session schedule on one Database), or a file carrying reopen-fragile
+        // session state — session-local temp tables, a spanning transaction, a sticky lifetime budget,
+        // or a pre-built fixture image (spec/design/conformance.md §3). These are `# skip: disk` and
+        // covered by the memory pass only; none exercises the on-disk faulted read path anyway.
+        if disk && (is_conc || parse_skip_disk(&text)) {
+            println!("SKIP {rel}  (disk-mode)");
+            skipped += 1;
+            continue;
+        }
+
         // A `# format: concurrency` file is an explicit multi-session schedule run against a
         // Database (spec/design/concurrency-testing.md §4); everything else is the sequential
         // single-handle runner. Both share the result grammar; only the driver differs. The binary
         // always runs the canonical stepped-SEQUENTIAL mode; the stepped-threaded mode is exercised
         // by `cargo test` (the concurrency_threaded_tests below).
-        let outcome = if is_concurrency_format(&text) {
+        let outcome = if is_conc {
             run_concurrency_file(&text)
         } else {
-            run_file(&text)
+            run_file(&text, disk)
         };
         match outcome {
             Ok(()) => {
@@ -93,7 +114,7 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("\n{passed} passed, {failed} failed, {skipped} skipped");
+    println!("\n[{mode}] {passed} passed, {failed} failed, {skipped} skipped");
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
@@ -188,6 +209,31 @@ fn parse_timezone_directive(rest: &str) -> Option<String> {
 fn parse_fixture_directive(rest: &str) -> Option<String> {
     let body = rest.trim_start().strip_prefix("fixture:")?.trim();
     (!body.is_empty()).then(|| body.to_string())
+}
+
+/// Whether a file carries a `# skip: disk[ — free-text reason]` directive (spec/design/conformance.md
+/// §3) — it opts out of the on-disk reopen pass because its session state (temp tables, a spanning
+/// transaction, a sticky `lifetime_max_cost` budget) or its pre-built `# fixture:` image cannot
+/// survive a per-record reopen. Honored only in disk mode; the memory pass ignores it. The first
+/// whitespace token after `skip:` is the mode; any trailing text is a documentary reason.
+fn parse_skip_disk(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix('#')
+            .and_then(|rest| rest.trim_start().strip_prefix("skip:"))
+            .and_then(|v| v.split_whitespace().next())
+            == Some("disk")
+    })
+}
+
+/// A unique temp path for a disk-mode file's backing `.jed` image. Deterministic-free (this is the
+/// harness, not the engine — std is fine here), unique per (process, call) so parallel `cargo test`
+/// harness runs never collide.
+fn disk_temp_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("jed-conformance-{}-{n}.jed", std::process::id()))
 }
 
 /// Recognize the `# upgrade-collations:` directive body (any/empty body after the prefix). A
@@ -519,13 +565,37 @@ fn assert_types(
 
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
-fn run_file(text: &str) -> std::result::Result<(), String> {
-    let mut db = Database::new_in_memory();
+fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
+    // A Drop guard removes the disk-mode temp image on every exit path (memory mode: no temp file).
+    struct TempGuard(Option<PathBuf>);
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            if let Some(p) = &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    // Declared BEFORE `db`, so it drops AFTER `db` (reverse declaration order) — the handle closes,
+    // then the file is removed.
+    let tmp_path = if disk { Some(disk_temp_path()) } else { None };
+    let _guard = TempGuard(tmp_path.clone());
+    // In DISK mode the file is a temp .jed image reopened before every record (below), so each
+    // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
+    // (spec/design/conformance.md §3).
+    let mut db = match &tmp_path {
+        Some(p) => Database::create(p, jed::DatabaseOptions::default())
+            .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
+        None => Database::new_in_memory(),
+    };
+    // `on_temp` tracks whether db/sess still point at the reopenable temp-file handle (a `# fixture:`
+    // swap flips it off — but fixtures are `# skip: disk`, so that never coexists with disk mode).
+    let mut on_temp = disk;
     // `Database` no longer owns a persistent default session (it mints a fresh session per
     // convenience call), so the harness drives one explicit session per file. Keeping a single
     // session for the whole file preserves the cross-record state the sequential corpus relies on
     // (sticky `lifetime_max_cost`, session-local temp tables, the per-record `# set:`/privilege
-    // resets). Re-minted whenever a `# fixture:` swaps the underlying database.
+    // resets). Re-minted whenever a `# fixture:` swaps the underlying database, or (disk mode) whenever
+    // the file is reopened before a record.
     let mut sess = db.session(jed::SessionOptions::default());
     let mut lines = text.lines().peekable();
     // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -576,6 +646,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             if let Some(rel) = parse_fixture_directive(rest) {
                 db = open_fixture(&rel)?;
                 sess = db.session(jed::SessionOptions::default());
+                on_temp = false; // the handle is now the fixture image, not the reopenable temp file
                 continue;
             }
             // `# upgrade-collations:` (file-level) runs the COLLATION UPGRADE migration on the running
@@ -631,6 +702,18 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 pending_types = Some(types);
             }
             continue;
+        }
+        // DISK mode: reopen the temp image before this record so its reads fault leaves from disk (the
+        // committed state carries on the file; the fresh session re-receives the per-record directives
+        // applied just below). Writes reopen too — an UPDATE/DELETE over a faulted leaf exercises the
+        // resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
+        // Reassigning drops the old handle first (no file lock — src/paging.rs), so the reopen reads the
+        // just-committed image.
+        if disk && on_temp {
+            let p = tmp_path.as_ref().expect("disk mode has a temp path");
+            db = Database::open(p)
+                .map_err(|e| format!("disk reopen: open {}: {}", p.display(), e.message))?;
+            sess = db.session(jed::SessionOptions::default());
         }
         // This record consumes any pending assertions (so they never leak forward).
         let expected_cost = pending_cost.take();

@@ -1,3 +1,4 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Explicit transaction — ROLLBACK discards the block (spec/design/grammar.md §27,
 # transactions.md §4.2). Every INSERT/UPDATE/DELETE and DDL CREATE/DROP since BEGIN is discarded,
 # restoring the committed state captured at BEGIN (including synthetic-rowid allocations — §7).

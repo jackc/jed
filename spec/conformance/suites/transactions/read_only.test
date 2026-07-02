@@ -1,3 +1,4 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Transaction access modes — READ ONLY vs READ WRITE (spec/design/transactions.md §4.3). A
 # READ ONLY block may read but not write: a write statement inside it is 25006
 # (read_only_sql_transaction). ROLLBACK clears the block and autocommit resumes, so a later write

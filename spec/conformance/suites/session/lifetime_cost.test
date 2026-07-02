@@ -1,3 +1,4 @@
+# skip: disk — the sticky lifetime_max_cost budget does not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Session lifetime cost budget — the per-session cumulative cost meter (spec/design/session.md §5.4).
 # Where `max_cost` bounds ONE statement (54P01, suites/resource/cost_limit.test), `lifetime_max_cost`
 # bounds the whole SESSION: the session holds a running cumulative cost total into which every

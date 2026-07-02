@@ -1,3 +1,4 @@
+# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Shared-temp storage budget — `shared_temp_mem` bounds the GLOBAL shared temporary-table bytes
 # (spec/design/temp-tables.md §7), the shared analogue of `temp_buffers` (resource.temp_budget). Shared
 # temp data is global (one set of rows across every session), so its budget is a Database-level

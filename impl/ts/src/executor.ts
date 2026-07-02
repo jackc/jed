@@ -8817,7 +8817,20 @@ export class Engine {
       // through its materialized groupExprs node instead (aggregates.md §15).
       for (const gk of groupKeys) if (gk < totalCols) touched[gk] = true;
       for (const ge of groupExprs) collectTouched(ge, 0, touched);
-      for (const s of aggSpecs) if (s.operand !== null) collectTouched(s.operand, 0, touched);
+      for (const s of aggSpecs) {
+        if (s.operand !== null) collectTouched(s.operand, 0, touched);
+        // An aggregate reads real input columns beyond its operand: the FILTER predicate
+        // (agg(x) FILTER (WHERE cond) — aggregates.md §11), an ordered-set direct argument, and a
+        // hypothetical-set's WITHIN GROUP key operands / direct args (aggregates.md §13/§19). Without
+        // these the referenced column is left unfetched by the lazy/masked scan (large-values.md §14)
+        // and folds as NULL — a memory-vs-disk divergence (count(*) FILTER, rank() WITHIN GROUP).
+        if (s.filter !== undefined && s.filter !== null) collectTouched(s.filter, 0, touched);
+        if (s.osaFrac !== undefined && s.osaFrac !== null) collectTouched(s.osaFrac, 0, touched);
+        if (s.hypo !== undefined && s.hypo !== null) {
+          for (const k of s.hypo.keys) collectTouched(k, 0, touched);
+          for (const a of s.hypo.args) collectTouched(a, 0, touched);
+        }
+      }
     } else {
       for (const p of projections) collectTouched(p, 0, touched);
       // A column-key ORDER BY slot is a real input column (< totalCols) — mark it; a materialized
@@ -8846,6 +8859,20 @@ export class Engine {
       // Each materialized window-key expression reads real input columns (a plain window query
       // resolves its keys against the FROM scope).
       for (const ke of windowKeys) collectTouched(ke, 0, touched);
+    }
+    // A set-returning relation's arguments and a LATERAL derived table's body read real input columns
+    // too — an implicitly-lateral SRF arg / lateral body sees an earlier sibling relation (functions.md
+    // §10, grammar.md §44). Applies to aggregate and plain queries alike. Without this the referenced
+    // column is left unfetched by the lazy/masked scan (large-values.md §14) and the SRF/body reads
+    // NULL — a memory-vs-disk divergence.
+    for (const r of planRels) {
+      if (r.srf !== undefined) {
+        // A LATERAL SRF (any SRF at position i>0) resolves its sibling columns as outerColumn at level
+        // 1 (the same frame the runtime pushes) — so collect at depth 1, not 0. An i==0 SRF has no
+        // sibling correlation, so depth 1 marks nothing there.
+        for (const a of r.srf.args) collectTouched(a, 1, touched);
+      }
+      if (r.derived !== undefined) collectTouchedPlan(r.derived, 1, touched);
     }
     const relMasks = planRels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
     // ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
@@ -13151,7 +13178,11 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       if (depth === 0 && e.index < touched.length) touched[e.index] = true;
       return;
     case "outerColumn":
-      if (e.level === depth && depth > 0) touched[e.index] = true;
+      // A correlated reference into the scope we are collecting for (its frame is `depth` levels up).
+      // The index is a slot in that target scope's combined row; bounds-checked like the Column case.
+      // Callers collect at the depth matching the reference's level — a correlated subquery at its
+      // nesting depth, a LATERAL SRF arg at depth 1 (its sibling frame — functions.md §10).
+      if (e.level === depth && depth > 0 && e.index < touched.length) touched[e.index] = true;
       return;
     case "subquery":
       if (e.lhs !== null) collectTouched(e.lhs, depth, touched);
@@ -13262,6 +13293,19 @@ function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]):
     for (const s of plan.aggSpecs)
       if (s.operand !== null) collectTouched(s.operand, depth, touched);
     for (const p of plan.projections) collectTouched(p, depth, touched);
+    // A materialized ORDER BY expression and a set-returning relation's args / a LATERAL derived body
+    // can each carry a correlated reference back into the target scope (the same surfaces
+    // selectPlanReferencesOuter checks — query.order_by_correlated, functions.md §10, grammar.md §44).
+    // collectTouchedPlan MUST cover every surface that function does, or an outer column read only
+    // through one of them is left unfetched by the lazy/masked scan (large-values.md §14) and the
+    // correlated subquery re-executes against NULL — a memory-vs-disk divergence.
+    for (const oe of plan.orderExprs) collectTouched(oe, depth, touched);
+    for (const rel of plan.rels) {
+      if (rel.srf !== undefined) {
+        for (const a of rel.srf.args) collectTouched(a, depth, touched);
+      }
+      if (rel.derived !== undefined) collectTouchedPlan(rel.derived, depth + 1, touched);
+    }
   } else if (plan.kind === "values") {
     for (const row of plan.rows) for (const e of row) collectTouched(e, depth, touched);
   } else if (plan.kind === "with") {

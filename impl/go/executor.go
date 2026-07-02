@@ -10866,6 +10866,21 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		}
 		for i := range aggSpecs {
 			collectTouched(aggSpecs[i].operand, 0, touched)
+			// An aggregate reads real input columns beyond its operand: the FILTER predicate
+			// (agg(x) FILTER (WHERE cond) — aggregates.md §11), an ordered-set direct argument, and a
+			// hypothetical-set's WITHIN GROUP key operands / direct args (aggregates.md §13/§19). Without
+			// these the referenced column is left unfetched by the lazy/masked scan (large-values.md §14)
+			// and folds as NULL — a memory-vs-disk divergence (count(*) FILTER, rank() WITHIN GROUP).
+			collectTouched(aggSpecs[i].filter, 0, touched)
+			collectTouched(aggSpecs[i].osaFrac, 0, touched)
+			if aggSpecs[i].hypo != nil {
+				for _, k := range aggSpecs[i].hypo.keys {
+					collectTouched(k, 0, touched)
+				}
+				for _, a := range aggSpecs[i].hypo.args {
+					collectTouched(a, 0, touched)
+				}
+			}
 		}
 	} else {
 		for _, p := range projections {
@@ -10914,6 +10929,25 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		// resolves its keys against the FROM scope).
 		for _, ke := range windowKeys {
 			collectTouched(ke, 0, touched)
+		}
+	}
+	// A set-returning relation's arguments and a LATERAL derived table's body read real input columns
+	// too — an implicitly-lateral SRF arg / lateral body sees an earlier sibling relation (functions.md
+	// §10, grammar.md §44). Applies to aggregate and plain queries alike (an aggregate query can carry a
+	// lateral SRF). Without this the referenced column is left unfetched by the lazy/masked scan
+	// (large-values.md §14) and the SRF/body reads NULL — a memory-vs-disk divergence.
+	for i := range planRels {
+		if planRels[i].srf != nil {
+			// A LATERAL SRF (any SRF at position i>0) resolves its sibling columns as reOuterColumn at
+			// level 1 (resolveSRF's lateralParent, the same frame the runtime pushes) — so collect at
+			// depth 1, not 0. An i==0 SRF has no sibling correlation (constant/param args), so depth 1
+			// marks nothing there. functions.md §10, grammar.md §44.
+			for _, a := range planRels[i].srf.args {
+				collectTouched(a, 1, touched)
+			}
+		}
+		if planRels[i].derived != nil {
+			collectTouchedPlan(planRels[i].derived, 1, touched)
 		}
 	}
 	relMasks := make([][]bool, len(planRels))
@@ -15716,7 +15750,12 @@ func collectTouched(e *rExpr, depth int, touched []bool) {
 		}
 		return
 	case reOuterColumn:
-		if e.level == depth && depth > 0 {
+		// A correlated reference into the scope we are collecting for (its frame is `depth` levels up).
+		// The index is a slot in that target scope's combined row; bounds-checked like the reColumn case
+		// (a synthetic slot beyond the real columns touches no stored data). Callers collect at the depth
+		// matching the reference's level — a correlated subquery at its nesting depth, a LATERAL SRF arg
+		// at depth 1 (its sibling frame — functions.md §10).
+		if e.level == depth && depth > 0 && e.index < len(touched) {
 			touched[e.index] = true
 		}
 		return
@@ -16104,6 +16143,25 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 		}
 		for _, p := range sp.projections {
 			collectTouched(p, depth, touched)
+		}
+		// A materialized ORDER BY expression and a set-returning relation's args / a LATERAL derived
+		// body can each carry a correlated reference back into the target scope (the same surfaces
+		// selectPlanReferencesOuter checks — query.order_by_correlated, functions.md §10, grammar.md
+		// §44). collectTouchedPlan MUST cover every surface that function does, or an outer column read
+		// only through one of them is left unfetched by the lazy/masked scan (large-values.md §14) and
+		// the correlated subquery re-executes against NULL — a memory-vs-disk divergence.
+		for _, oe := range sp.orderExprs {
+			collectTouched(oe, depth, touched)
+		}
+		for i := range sp.rels {
+			if sp.rels[i].srf != nil {
+				for _, a := range sp.rels[i].srf.args {
+					collectTouched(a, depth, touched)
+				}
+			}
+			if sp.rels[i].derived != nil {
+				collectTouchedPlan(sp.rels[i].derived, depth+1, touched)
+			}
 		}
 	}
 	if plan.values != nil {

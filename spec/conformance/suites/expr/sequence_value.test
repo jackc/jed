@@ -1,3 +1,4 @@
+# skip: disk — session currval/nextval state does not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # nextval / currval / setval / lastval — the sequence value functions (spec/design/sequences.md
 # §4/§6, functions.md §14). nextval advances the sequence and returns the new i64 value (first
 # call = START, then +INCREMENT, bounded by MIN/MAXVALUE → 2200H or CYCLE wrap). setval sets the

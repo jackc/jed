@@ -28,6 +28,18 @@ func main() {
 }
 
 func run() int {
+	// The corpus runs in one of two storage MODES (spec/design/conformance.md §3): the default
+	// "memory" mode drives a fresh in-memory Database, and the "disk" mode (arg `disk`) drives a
+	// FILE-BACKED database that is REOPENED before every record, so each committed read faults its
+	// leaves from disk through the demand-paged buffer pool. The two modes catch DIVERGENCES between
+	// resident and on-disk-faulted reads (the window-operand touched-set bug the in-memory pass could
+	// not see). Every record's SQL-in → rows/error/cost-out must be IDENTICAL in both modes.
+	disk := len(os.Args) > 1 && os.Args[1] == "disk"
+	mode := "memory"
+	if disk {
+		mode = "disk"
+	}
+
 	suites := suitesDir()
 	var files []string
 	_ = filepath.WalkDir(suites, func(path string, d os.DirEntry, err error) error {
@@ -66,15 +78,29 @@ func run() int {
 			continue
 		}
 
+		isConc := isConcurrencyFormat(text)
+		// Disk mode cannot run a file whose semantics can't survive a per-record REOPEN: the
+		// concurrency driver (multi-session schedule on one Database), or a file carrying reopen-fragile
+		// session state — session-local temp tables, a spanning transaction, a sticky lifetime budget, or
+		// a pre-built fixture image (spec/design/conformance.md §3). These are gated with `# skip: disk`
+		// and covered by the memory pass only; none exercises the on-disk faulted read path anyway.
+		if disk && (isConc || parseSkipDisk(text)) {
+			fmt.Printf("SKIP %s  (disk-mode)\n", rel)
+			skipped++
+			continue
+		}
+
 		// A `# format: concurrency` file is an explicit multi-session schedule run against a
 		// Database (spec/design/concurrency-testing.md §4); everything else is the sequential
 		// single-handle runner. Both share the result grammar; only the driver differs.
-		runErr := runFile
-		if isConcurrencyFormat(text) {
-			runErr = runConcurrencyFile
+		var runErr error
+		if isConc {
+			runErr = runConcurrencyFile(text)
+		} else {
+			runErr = runFile(text, disk)
 		}
-		if err := runErr(text); err != nil {
-			fmt.Printf("FAIL %s: %v\n", rel, err)
+		if runErr != nil {
+			fmt.Printf("FAIL %s: %v\n", rel, runErr)
 			failed++
 		} else {
 			fmt.Printf("PASS %s\n", rel)
@@ -82,11 +108,33 @@ func run() int {
 		}
 	}
 
-	fmt.Printf("\n%d passed, %d failed, %d skipped\n", passed, failed, skipped)
+	fmt.Printf("\n[%s] %d passed, %d failed, %d skipped\n", mode, passed, failed, skipped)
 	if failed != 0 {
 		return 1
 	}
 	return 0
+}
+
+// parseSkipDisk reports whether a file carries a `# skip: disk` directive (spec/design/conformance.md
+// §3) — it opts out of the on-disk reopen pass because its session state (temp tables, a spanning
+// transaction, a sticky lifetime_max_cost budget) or its pre-built `# fixture:` image cannot survive a
+// per-record reopen. Honored only in disk mode; the memory pass ignores it.
+func parseSkipDisk(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "#") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(t, "#"))
+		// `# skip: disk[ — free-text reason]` — the first whitespace-delimited token after `skip:` is the
+		// mode; any trailing text is a documentary reason.
+		if v, ok := strings.CutPrefix(rest, "skip:"); ok {
+			if fields := strings.Fields(v); len(fields) > 0 && fields[0] == "disk" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func suitesDir() string {
@@ -662,16 +710,64 @@ func assertTypes(expected []string, actual []string, sql string) error {
 
 // runFile runs all records in one .test file against a fresh database, driving the public single-handle
 // *Database (its default autocommit session — the back-compat bridge, spec/design/session.md §2.1).
-func runFile(text string) error {
-	db := jed.NewDatabase()
+func runFile(text string, disk bool) error {
+	// In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
+	// committed read faults from disk; in MEMORY mode it is a fresh in-memory Database. tmpPath is "" in
+	// memory mode. (spec/design/conformance.md §3.)
+	var db *jed.Database
+	tmpPath := ""
+	if disk {
+		f, err := os.CreateTemp("", "jed-conformance-*.jed")
+		if err != nil {
+			return fmt.Errorf("disk mode: temp file: %w", err)
+		}
+		tmpPath = f.Name()
+		f.Close()
+		os.Remove(tmpPath) // CreateDatabase writes the initial image at this path
+		db, err = jed.CreateDatabase(tmpPath, jed.DefaultDatabaseOptions())
+		if err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
+		}
+	} else {
+		db = jed.NewDatabase()
+	}
 	// Database no longer owns a persistent default session (it mints a fresh session per convenience
 	// call), so the harness drives one explicit session per file — preserving the cross-record state the
 	// sequential corpus relies on (sticky lifetime_max_cost, session-local temp tables, the per-record
-	// # set:/privilege resets). Re-minted whenever a `# fixture:` swaps the underlying database.
+	// # set:/privilege resets). Re-minted whenever a `# fixture:` swaps the underlying database, or (disk
+	// mode) whenever the file is reopened before a record.
 	sess := db.Session(jed.SessionOptions{})
+	// onTemp tracks whether db/sess still point at the reopenable temp-file handle (a `# fixture:` swap
+	// flips it off — but fixtures are `# skip: disk`, so that never coexists with disk mode).
+	onTemp := disk
+	// reopenDisk closes the current handle and reopens the temp image, so the next record reads a fully
+	// demand-paged store (leaves fault on access — the on-disk read path the memory pass never reaches).
+	// A fresh session is minted; only per-record directives (re-applied below) and committed data (on the
+	// file) carry across — which is exactly why reopen-fragile files are `# skip: disk`.
+	reopenDisk := func() error {
+		sess.Close()
+		if err := db.Close(); err != nil {
+			return fmt.Errorf("disk reopen: close: %w", err)
+		}
+		reDB, err := jed.OpenDatabase(tmpPath)
+		if err != nil {
+			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
+		}
+		db = reDB
+		sess = db.Session(jed.SessionOptions{})
+		return nil
+	}
 	// cleanup releases the current handle; a `# fixture:` directive swaps in a file-backed handle whose
 	// cleanup also removes the temp image. The deferred call reads the latest cleanup.
 	cleanup := func() {}
+	if disk {
+		cleanup = func() {
+			sess.Close()
+			db.Close()
+			os.Remove(tmpPath)
+		}
+	}
 	defer func() { cleanup() }()
 	lines := strings.Split(text, "\n")
 	i := 0
@@ -735,6 +831,7 @@ func runFile(text string) error {
 				db = fixtureDB
 				cleanup = fixtureCleanup
 				sess = db.Session(jed.SessionOptions{})
+				onTemp = false // the handle is now the fixture image, not the reopenable temp file
 				i++
 				continue
 			}
@@ -794,6 +891,15 @@ func runFile(text string) error {
 			}
 			i++
 			continue
+		}
+		// DISK mode: reopen the temp image before this record so its reads fault leaves from disk (the
+		// committed state carries on the file; the fresh session re-receives the per-record directives
+		// applied just below). Writes reopen too — an UPDATE/DELETE over a faulted leaf exercises the
+		// resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
+		if disk && onTemp {
+			if err := reopenDisk(); err != nil {
+				return err
+			}
 		}
 		// This record consumes any pending assertions (so they never leak forward).
 		expectedCost := pendingCost

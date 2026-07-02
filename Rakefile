@@ -650,23 +650,34 @@ end
 # to be inside the repo (Go needs impl/go for `./cmd/conformance`, Node the impl/ts scripts).
 # Rust runs RELEASE: the debug evaluator's giant frames overflow the native stack on
 # resource/depth_limit.test's deep nesting (the 256-depth limit is budgeted for the release stack).
+# Each core walks the corpus TWICE — the two STORAGE MODES of the §7 contract
+# (spec/design/conformance.md §3): "memory" (a fresh in-memory Database) and "disk" (a file-backed
+# database reopened before every record so committed reads fault their leaves from disk). Every
+# record's rows/error/cost must be IDENTICAL in both modes; the disk pass is what caught the window-
+# operand touched-set divergence the in-memory pass could not see.
 namespace :conformance do
-  desc "Walk the conformance corpus on the Rust core (release — debug overflows depth_limit)"
+  desc "Walk the conformance corpus on the Rust core, both storage modes (release — debug overflows depth_limit)"
   task :rust do
-    puts "conformance: rust"
+    puts "conformance: rust (memory)"
     sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST
+    puts "conformance: rust (disk)"
+    sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", "disk"
   end
 
-  desc "Walk the conformance corpus on the Go core"
+  desc "Walk the conformance corpus on the Go core, both storage modes"
   task :go do
-    puts "conformance: go"
+    puts "conformance: go (memory)"
     Dir.chdir(GO_DIR) { sh "go", "run", "./cmd/conformance" }
+    puts "conformance: go (disk)"
+    Dir.chdir(GO_DIR) { sh "go", "run", "./cmd/conformance", "disk" }
   end
 
-  desc "Walk the conformance corpus on the TS core"
+  desc "Walk the conformance corpus on the TS core, both storage modes"
   task :ts do
-    puts "conformance: ts"
+    puts "conformance: ts (memory)"
     Dir.chdir(TS_DIR) { sh "npm", "run", "--silent", "conformance" }
+    puts "conformance: ts (disk)"
+    Dir.chdir(TS_DIR) { sh "npm", "run", "--silent", "conformance", "--", "disk" }
   end
 end
 desc "Walk the conformance corpus on all three cores (the §7 cross-core contract)"
