@@ -18,9 +18,14 @@ module BenchResults
   module_function
 
   # All run dirs under bench/results/, sorted (the UTC stamp names make that
-  # chronological). Newest is last.
+  # chronological). Newest is last. Restricted to the UTC-stamp naming
+  # (YYYYMMDD-HHMMSS) `rake bench:run` writes, so sibling result families that
+  # live under bench/results/ but are not bench runs — the rqg firehose's
+  # bench/results/rqg/ tree — are not mistaken for the newest run.
   def run_dirs
-    Dir.glob("bench/results/*").select { |d| File.directory?(d) }.sort
+    Dir.glob("bench/results/*")
+       .select { |d| File.directory?(d) && File.basename(d).match?(/\A\d{8}-\d{6}\z/) }
+       .sort
   end
 
   # Resolve the reporters' shared [run_dir, baseline_dir] CLI shape: the run defaults
