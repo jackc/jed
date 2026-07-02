@@ -12,11 +12,15 @@ INSERT INTO city VALUES
   (2, 'Osaka',  1),
   (3, 'Paris',  2),
   (4, 'Lyon',   2),
-  (5, 'Kyoto',  1);`;
+  (5, 'Kyoto',  1);
+CREATE TABLE trip (id i32 PRIMARY KEY, city_id i32 NOT NULL);
+INSERT INTO trip VALUES (1, 3), (2, 1), (3, 3);`;
 
 	const fullScan = `EXPLAIN SELECT name FROM city ORDER BY name;`;
 	const pkBound = `EXPLAIN SELECT name FROM city WHERE id = 3;`;
 	const indexBound = `EXPLAIN SELECT name FROM city WHERE region = 1;`;
+	const indexNestedLoop = `EXPLAIN SELECT c.name
+FROM trip t JOIN city c ON c.id = t.city_id;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
 FROM city GROUP BY region;`;
 	const analyze = `EXPLAIN ANALYZE SELECT name FROM city WHERE id = 3;`;
@@ -61,6 +65,15 @@ column and predicate. The original `WHERE` stays as the residual `Filter` above 
 An equality on an indexed non-key column uses the index — `Index bound: using <index>`.
 
 <LiveSql seed={seed} query={indexBound} rows={8} />
+
+## An index-nested-loop join
+
+When a join's inner relation is matched on **its own primary key** against a column of the outer
+relation (`c.id = t.city_id`), jed seeks that inner row **per outer row** instead of re-scanning the
+whole inner table — an `Index-nested-loop PK bound` on the inner `Scan`. The join turns O(N·M) into
+O(N·log M), and the plan stays a `Nested Loop` whose inner child names the per-outer-row bound.
+
+<LiveSql seed={seed} query={indexNestedLoop} rows={8} />
 
 ## Aggregation
 

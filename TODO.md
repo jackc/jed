@@ -141,12 +141,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ### Rule-based extensions (results-identical, no statistics)
 
-- [ ] **Index-nested-loop join** — a cross-relation join key (`a JOIN b ON b.pk = a.x`) full-scans `b`
-  for every outer row today (only per-table `col = const` bounds push down — query.join_pushdown).
-  Bound the inner scan to a per-outer-row point/range lookup by feeding the outer column in as the
-  bound's const-source — the **correlated-subquery pushdown machinery already does exactly this**
-  (query.correlated_pushdown), so the inner join relation reuses it. Turns O(N·M) into O(N·log M); the
-  single highest-leverage planner change. → [cost.md §3](spec/design/cost.md) "JOIN" _(size: M; ×3 cores; +NoREC)_
+- [x] **Index-nested-loop join** — ✅ **landed** (`query.index_nested_loop`, all three cores). A
+  cross-relation join key (`a JOIN b ON b.pk = a.x`, from the ON or the WHERE) now binds the inner
+  relation's scan to a per-outer-row point/range lookup by feeding the sibling column in as the
+  bound's source — the same bounded-scan machinery as correlated-subquery pushdown
+  (query.correlated_pushdown), with the inner re-materialized per left row (like a correlated
+  `LATERAL`). Turns O(N·M) into O(N·log M). PK + leading secondary-index bounds; gated to the
+  right/nullable side of an INNER/CROSS/LEFT join (RIGHT/FULL preserved sides keep the full scan);
+  EXPLAIN surfaces `Index-nested-loop PK/Index bound`. → [cost.md §3](spec/design/cost.md) "bounded
+  scan / index-nested-loop", `spec/conformance/suites/joins/index_nested_loop.test`. _Follow-ons:_
+  combining INL with the two-table streaming top-N join (`join_pk_ordered`); GIN/GiST sibling bounds.
 - [ ] **`OR` / `IN`-list → merged point lookups** — a top-level `OR` is never descended for bounding
   and `pk IN (1,2,3)` full-scans today (only a single contiguous range pushes down). Lower a
   disjunction / `IN`-list of PK-or-indexed-column equalities to a **union of point/range probes** over

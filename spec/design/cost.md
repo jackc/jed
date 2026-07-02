@@ -141,10 +141,13 @@ exactly the property cost requires.
   pins the cost-ceiling abort point (§6) identically across cores.
 - **It composes exactly like `storage_row_read`.** A **JOIN** materializes each base table
   once, so it charges each table's node count once (Σ over the relations — a self-join counts
-  the table twice, once per alias). A **set operation** charges each operand's scans
-  (`lhs + rhs`). An **uncorrelated** subquery (folded once) charges its tree once; a
-  **correlated** subquery re-scans its inner table **per outer row**, charging that node count
-  each time — identical to how those forms already compose `storage_row_read`.
+  the table twice, once per alias) — *except* an **index-nested-loop** inner relation (the
+  "bounded scan / index-nested-loop" rule below) or a **correlated `LATERAL`** item, which is
+  re-materialized **per outer row** and charges its (bounded) node count each time, like a
+  correlated subquery. A **set operation** charges each operand's scans (`lhs + rhs`). An
+  **uncorrelated** subquery (folded once) charges its tree once; a **correlated** subquery
+  re-scans its inner table **per outer row**, charging that node count each time — identical to
+  how those forms already compose `storage_row_read`.
 - **Logical, not physical.** `page_read` counts the tree's structural node count — a *logical*
   page access — **not** a physical disk fetch. A future buffer pool / demand-paging cache for
   larger-than-RAM files (CLAUDE.md §9) serves a page from memory or disk transparently; the
@@ -538,15 +541,43 @@ by the WHERE conjuncts on **its** primary key against a const-source — exactly
 of the rule above. `SELECT … FROM a JOIN b … WHERE a.pk = 5` materializes a's matching row (a seek)
 and full-scans b; `WHERE a.pk = 5 AND b.pk = 10` seeks both. A point-lookup **miss** on a join key
 (`a.pk = 999`) materializes **zero** rows for that table, so the nested loop has nothing to drive —
-the join collapses to the other tables' scan cost. The bound's source is still a constant
-(literal/param/outer); a **cross-relation** `b.pk = a.x` is **not** bounded — binding b's key to a's
-value per outer row is the index-nested-loop case, a follow-on (a sibling column is not a
-const-source). Bounds come only from the **WHERE**, never an `ON` (an ON failure NULL-extends rather
-than drops, so it is not a post-join filter). **Sound for outer joins:** a non-NULL PK conjunct in
-WHERE is unknown for a NULL-extended row, so it discards every NULL-extension of that relation — the
-LEFT/RIGHT/FULL join degenerates to INNER on the bounded side, and any surviving output row has that
-PK in range, so bounding the table cannot drop it. Gated by `query.join_pushdown`, pinned cross-core
-in `spec/conformance/suites/joins/pushdown.test`.
+the join collapses to the other tables' scan cost. The bound's source here is a constant
+(literal/param/outer). A **cross-relation** `b.pk = a.x` — binding b's key to a **sibling** column's
+value per outer row — is the separate **index-nested-loop** bound below. This constant-bound path
+takes bounds only from the **WHERE**, never an `ON` (an ON failure NULL-extends rather than drops, so
+it is not a post-join filter). **Sound for outer joins:** a non-NULL PK conjunct in WHERE is unknown
+for a NULL-extended row, so it discards every NULL-extension of that relation — the LEFT/RIGHT/FULL
+join degenerates to INNER on the bounded side, and any surviving output row has that PK in range, so
+bounding the table cannot drop it. Gated by `query.join_pushdown`, pinned cross-core in
+`spec/conformance/suites/joins/pushdown.test`.
+
+**Bounded scan / index-nested-loop — the inner bound from a sibling column.** The join analog of the
+correlated bound below. When a join **inner** relation's **primary key** (or a leading B-tree
+secondary-index column) is compared to a **sibling** column of an **earlier** join relation —
+`a JOIN b ON b.pk = a.x` (or `<`, `<=`, `>`, `>=`), taken from the join's **`ON`** predicate or the
+**WHERE** — that relation is **re-materialized once per outer row** (like a correlated `LATERAL`),
+its scan bounded to the current combined left-hand row's sibling value. So the inner **seeks** instead
+of full-scanning for every outer row: across N outer rows the inner's `storage_row_read` drops from
+`N × |inner|` to `N ×` (rows in range, 0/1 for a point lookup) and `page_read` from `N × node_count`
+to `N ×` the access-path nodes — **O(N·M) → O(N·log M)**, the single highest-leverage plan change.
+It is the **same bounded-scan mechanism** as the correlated bound below; the only difference is the
+source is a *sibling* row column rather than an *enclosing-query* column, so the whole `ON`/WHERE stays
+the residual filter (the bound is a **superset** of the matching rows) and the **rows are unchanged** —
+only the inner re-scan cost drops. A constant term co-occurring on the same key (`b.pk = a.x AND
+b.pk = 5`) rides along and tightens the per-outer seek. It is fully deterministic and byte-identical
+across cores (the outer rows, the key codec, and the overlap rule are all shared); a NULL sibling
+value gives a 3VL-empty bound (the inner reads nothing). **Reading the `ON` is sound here** (unlike the
+constant path): the inner is re-materialized per outer row, so a LEFT join's NULL-extension is driven
+per outer row by whether *its* bounded scan (re-checked against the full `ON`) yields a match — an
+empty bound NULL-extends that outer row, exactly as a full scan with no match would. **Gated to the
+RIGHT/nullable side of an INNER/CROSS/LEFT join**: a RIGHT/FULL **preserved** side must emit rows that
+match *no* outer row, so it cannot be bounded per outer row (it keeps the full scan). For tiny inners
+(a single leaf) the per-outer seeks can cost a few `page_read` *more* than one full scan — the rule is
+applied structurally (no cost-based choice yet), and the cost honestly reflects the re-scan; the win
+is asymptotic, on large inners. Gated by `query.index_nested_loop`, pinned cross-core in
+`spec/conformance/suites/joins/index_nested_loop.test` (and it re-pins the affected
+`joins/pushdown.test` / `self_join.test` / `comma.test` / `qualified*.test` cross-relation cases).
+EXPLAIN surfaces the access path as `Index-nested-loop PK bound` / `Index-nested-loop Index bound`.
 
 **Bounded scan / correlated — the inner PK bound from an outer column.** A correlated subquery is
 re-executed once per outer row (see "Subqueries" below). When its inner query is a **single table**
@@ -563,8 +594,9 @@ than a literal/param — so soundness is identical (the whole WHERE stays the re
 and it is byte-identical across cores (the outer value, the key codec, and the overlap rule are all
 shared). A NULL outer value gives a 3VL-empty bound (the inner reads nothing). This is gated by the
 `query.correlated_pushdown` capability and pinned cross-core in
-`spec/conformance/suites/subquery/correlated_pushdown.test`. JOIN base tables and no-PK inners stay
-unbounded (the same follow-on as above).
+`spec/conformance/suites/subquery/correlated_pushdown.test`. The join counterpart — an inner relation
+bounded by a **sibling** column per outer row — is the index-nested-loop bound above
+(`query.index_nested_loop`); a no-PK / no-usable-index inner stays unbounded (a full scan per outer row).
 
 ### LIMIT short-circuit — stopping the scan when the window is filled
 
