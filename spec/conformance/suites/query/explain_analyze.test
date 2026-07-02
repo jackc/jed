@@ -1,0 +1,76 @@
+# EXPLAIN ANALYZE runs the inner statement and reports its ACTUAL accrued cost + row count on an
+# `Analyze` root node, with the plan tree one level deeper (spec/design/explain.md §3). jed's cost
+# meter is a deterministic cross-core contract, so the reported cost is byte-identical across cores
+# (unlike wall-clock ANALYZE) and asserted directly. EXPLAIN ANALYZE of a write EXECUTES the mutation.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.point_lookup, query.aggregates, query.explain, query.explain_analyze, dml.explain, dml.explain_analyze, resource.cost_metering, types.i32, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'a')
+
+statement ok
+INSERT INTO t VALUES (2, 20, 'b')
+
+# A read ANALYZE: the Analyze root carries the real execution cost (page_read + 2 storage_row_read +
+# 2 row_produced = 5) and the row count; the plan tree sits below it. The `# cost:` directive pins the
+# EXPLAIN's OWN cost (one row_produced per plan row = 2), proving it is separate from the inner cost.
+# cost: 2
+query ITT nosort
+EXPLAIN ANALYZE SELECT * FROM t
+----
+0
+Analyze
+cost=5 rows=2
+1
+Scan t
+Full scan; touched=3
+
+# A PK point lookup: cost = page_read + storage_row_read + filter operator_eval + row_produced = 4.
+query ITT nosort
+EXPLAIN ANALYZE SELECT v FROM t WHERE id = 1
+----
+0
+Analyze
+cost=4 rows=1
+1
+Filter
+conjuncts=1
+2
+Scan t
+PK bound: id = 1; touched=2
+
+# A whole-table aggregate: page_read + 2 storage_row_read + 2 aggregate_accumulate + row_produced = 6.
+query ITT nosort
+EXPLAIN ANALYZE SELECT count(*) FROM t
+----
+0
+Analyze
+cost=6 rows=1
+1
+Aggregate
+groups=0 aggs=1
+2
+Scan t
+Full scan
+
+# EXPLAIN ANALYZE of an INSERT EXECUTES it: the Analyze root reports the mutation (1 affected row),
+# the plan renders under it, and the row PERSISTS (the next query sees three rows).
+query ITT nosort
+EXPLAIN ANALYZE INSERT INTO t VALUES (3, 30, 'c')
+----
+0
+Analyze
+cost=0 rows=1
+1
+Insert t
+-
+2
+Values
+rows=1
+
+query I nosort
+SELECT count(*) FROM t
+----
+3

@@ -39,7 +39,7 @@ func (r *explainRender) emit(depth int, node, detail string) {
 // renderQueryPlan walks. The EXPLAIN statement's own cost is one row_produced per emitted plan row.
 func (db *engine) executeExplain(ex *explain, params []Value) (Outcome, error) {
 	if ex.Analyze {
-		return Outcome{}, newError(FeatureNotSupported, "EXPLAIN ANALYZE is not yet supported")
+		return db.executeExplainAnalyze(ex.Inner, params)
 	}
 	if len(params) > 0 {
 		// Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its
@@ -47,37 +47,76 @@ func (db *engine) executeExplain(ex *explain, params []Value) (Outcome, error) {
 		return Outcome{}, newError(SyntaxError, "bind parameters are not allowed in EXPLAIN")
 	}
 	var r explainRender
-	if err := db.renderExplain(&r, ex.Inner); err != nil {
+	if err := db.renderExplain(&r, ex.Inner, 0); err != nil {
 		return Outcome{}, err
 	}
+	return db.explainOutcome(r.rows), nil
+}
+
+// executeExplainAnalyze renders the plan AND runs the inner statement, reporting the inner's ACTUAL
+// accrued cost + row count on an "Analyze" root node (spec/design/explain.md §3). Because jed's cost
+// meter is a deterministic cross-core contract, those figures are byte-identical across cores, so the
+// output is corpus-assertable. The plan is rendered from the pre-execution catalog; then the inner
+// statement executes for real (a DML inner mutates, and the outer autocommit commits it — EXPLAIN
+// ANALYZE of a write IS a write, classified by stmtIsWrite). The EXPLAIN statement's OWN cost is one
+// row_produced per emitted plan row (independent of the inner cost, which appears only in the root).
+func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (Outcome, error) {
+	// Render the plan tree first (plan-only, no execution — pre-mutation).
+	var body explainRender
+	if err := db.renderExplain(&body, inner, 0); err != nil {
+		return Outcome{}, err
+	}
+	// Execute the inner statement for real, capturing its actual accrued cost + row count. Privileges
+	// and the lifetime budget were already admitted on the EXPLAIN (dispatchStmt recurses into the
+	// inner), and the write gate / commit are handled by the outer autocommit.
+	innerOut, err := db.dispatchStmtBody(*inner, params)
+	if err != nil {
+		return Outcome{}, err
+	}
+	actualRows := int64(len(innerOut.Rows))
+	if innerOut.Kind == OutcomeStatement {
+		actualRows = innerOut.RowsAffected // a DML statement without RETURNING
+	}
+	// Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
+	var r explainRender
+	r.emit(0, "Analyze", fmt.Sprintf("cost=%d rows=%d", innerOut.Cost, actualRows))
+	for _, row := range body.rows {
+		r.rows = append(r.rows, []Value{IntValue(row[0].Int + 1), row[1], row[2]})
+	}
+	return db.explainOutcome(r.rows), nil
+}
+
+// explainOutcome wraps rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
+// row_produced per emitted plan row (a deterministic function of the plan-row count).
+func (db *engine) explainOutcome(rows [][]Value) Outcome {
 	meter := db.session.newMeter()
-	meter.Charge(costs.RowProduced * int64(len(r.rows)))
+	meter.Charge(costs.RowProduced * int64(len(rows)))
 	return Outcome{
 		Kind:        OutcomeQuery,
 		ColumnNames: []string{"depth", "node", "detail"},
 		ColumnTypes: []string{"i32", "text", "text"},
-		Rows:        r.rows,
+		Rows:        rows,
 		Cost:        meter.Accrued,
-	}, nil
+	}
 }
 
 // renderExplain renders the plan for the inner statement (spec/design/explain.md). A DML statement is
 // rendered by explainDml (plan-only — never executing, so an EXPLAIN of a DELETE deletes nothing); a
 // read query is planned by planExplainInner and walked by renderQueryPlan.
-func (db *engine) renderExplain(r *explainRender, inner *statement) error {
+func (db *engine) renderExplain(r *explainRender, inner *statement, depth int) error {
 	switch {
 	case inner.Insert != nil:
-		return db.explainInsert(r, inner.Insert, 0)
+		return db.explainInsert(r, inner.Insert, depth)
 	case inner.Update != nil:
-		return db.explainUpdate(r, inner.Update, 0)
+		return db.explainUpdate(r, inner.Update, depth)
 	case inner.Delete != nil:
-		return db.explainDelete(r, inner.Delete, 0)
+		return db.explainDelete(r, inner.Delete, depth)
 	default:
 		qp, err := db.planExplainInner(inner)
 		if err != nil {
 			return err
 		}
-		return db.renderQueryPlan(r, qp, 0)
+		return db.renderQueryPlan(r, qp, depth)
 	}
 }
 

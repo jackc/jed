@@ -197,6 +197,10 @@ var SupportedCapabilities = []string{
 	"query.explain",
 	// EXPLAIN of a DML statement (INSERT/UPDATE/DELETE), plan-only — renders without mutating.
 	"dml.explain",
+	// EXPLAIN ANALYZE — run the inner statement and report its actual accrued cost + row count on
+	// an Analyze root (query = read; dml = the mutation runs and commits). spec/design/explain.md §3
+	"query.explain_analyze",
+	"dml.explain_analyze",
 	// GIN-bounded scan — `col @> const` / `col && const` over a GIN-indexed array column narrows
 	// the SELECT scan to candidate rows (term gather → intersect/union → residual filter); the
 	// result is identical to the full scan (spec/design/gin.md §6).
