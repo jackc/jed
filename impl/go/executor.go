@@ -10900,6 +10900,15 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 					touched[o.idx] = true
 				}
 			}
+			// The window function's ARGUMENT operands (sum(amount)'s amount, lag(v, off, def)'s
+			// value/offset/default) and its FILTER read real input columns too — the row-based
+			// window stage evaluates them per frame row (window.md §5.2). Without this the operand
+			// column is left unfetched by the lazy/masked scan (large-values.md §14) and folds as
+			// NULL. Mirrors the aggregate branch's collectTouched(aggSpecs[i].operand, …) above.
+			for _, a := range spec.args {
+				collectTouched(a, 0, touched)
+			}
+			collectTouched(spec.filter, 0, touched)
 		}
 		// Each materialized window-key expression reads real input columns (a plain window query
 		// resolves its keys against the FROM scope).
