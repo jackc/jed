@@ -4,14 +4,14 @@ package jed
 // APPROXIMATE numeric, the deliberate opposite of decimal: inexact, base-2, and admitting
 // NaN/±Infinity. It is the FIRST type partially exempted from cross-core byte-identity
 // (determinism.md §6), but the exemption is NARROW — storage, the total order, the
-// +-*/ /sqrt kernel, the canonical-fold SUM/AVG, MIN/MAX/COUNT, and cost all stay fully
-// deterministic and cross-core. Only TRANSCENDENTAL function values and text-render LAYOUT
-// are exempt (absorbed by the conformance `R` tag). This file holds the float-specific
-// value logic: the total order, the kernel, the casts, and the canonical-order fold.
+// +-*/ /sqrt kernel, MIN/MAX/COUNT and int/decimal SUM/AVG, and cost all stay fully
+// deterministic and cross-core. TRANSCENDENTAL function values, text-render LAYOUT, and the
+// float SUM/AVG fold ORDER (streaming scan-order — §7) are exempt (absorbed by the conformance
+// `R` tag). This file holds the float-specific value logic: the total order, the kernel, the
+// casts, and the streaming scan-order fold.
 
 import (
 	"math"
-	"sort"
 	"strconv"
 )
 
@@ -397,26 +397,30 @@ func float64ToFloat32(f float64) (float32, error) {
 // --- the order-independent canonical-order SUM/AVG fold (spec/design/float.md §7) ----------
 //
 // Naive float summation is non-associative → order-dependent → not cross-core deterministic.
-// jed defines float SUM/AVG as a CANONICAL-ORDER fold: special values resolved first, then the
-// finite inputs are -0-canonicalized, SORTED by the total order, and folded left with
-// width-correct IEEE add. Identical regardless of row/partition order, bit-identical cross-core.
+// jed defines float SUM/AVG as a STREAMING SCAN-ORDER fold: special-value flags tracked, then each
+// finite input is -0-canonicalized and folded into a single running total in the order the scan
+// produces rows (float.md §7). O(1) memory. The fold ORDER is ledgered non-deterministic
+// (determinism_exceptions.toml `float-sum-order`, class A∩P): cross-core-identical on today's serial
+// executor (every core folds the same PK-scan order with the same IEEE add) but not promised against
+// a future parallel plan. The special-value result and the 22003 overflow trap stay order-independent.
 
-// floatSumAcc accumulates the inputs of a float SUM/AVG so they can be folded in canonical order
-// at finalize. is32 selects the fold width (f32 vs f64). It records the special-value
-// flags and collects the finite inputs (as f64 — f32 widens losslessly for sorting; the
-// FOLD re-narrows per step when is32).
+// floatSumAcc folds the inputs of a float SUM/AVG into a running total. is32 selects the fold width
+// (f32 vs f64): when is32 the running total is re-rounded to binary32 each add (the §7 width-correct
+// f32 fold). It records the special-value flags and the running finite total; NaN/±Inf never enter
+// the total (they are resolved by precedence at finalize).
 type floatSumAcc struct {
 	is32      bool
 	sawNaN    bool
 	sawPosInf bool
 	sawNegInf bool
-	finite    []float64 // -0-canonicalized finite inputs (at f64; narrowed in the fold if is32)
-	count     int64     // non-NULL input count (for AVG)
+	total     float64 // running finite sum (at f64; re-rounded to binary32 each add when is32)
+	count     int64   // non-NULL input count (for AVG)
 }
 
 func newFloatSumAcc(is32 bool) *floatSumAcc { return &floatSumAcc{is32: is32} }
 
-// add folds one non-NULL float input into the accumulator (NULLs are skipped by the caller).
+// add folds one non-NULL float input into the running total (NULLs are skipped by the caller). A
+// special value only sets its flag; a finite value is -0-canonicalized and added in scan order.
 func (a *floatSumAcc) add(v Value) {
 	a.count++
 	f := v.asF64()
@@ -428,12 +432,20 @@ func (a *floatSumAcc) add(v Value) {
 	case math.IsInf(f, -1):
 		a.sawNegInf = true
 	default:
-		a.finite = append(a.finite, canonicalizeFloat64(f))
+		x := canonicalizeFloat64(f)
+		if a.is32 {
+			// Width-correct f32 fold: recover the f32-valued running total, add at binary32, re-widen.
+			a.total = float64(float32(a.total) + float32(x))
+		} else {
+			a.total += x
+		}
 	}
 }
 
-// sumF64 resolves the SUM as a f64 result (the special-value rules, then the canonical fold).
-// ok=false means the group was empty (→ NULL). A running total that overflows to ±Inf traps 22003.
+// sumF64 resolves the SUM as a f64 result (the special-value precedence, then the running total).
+// ok=false means the group was empty (→ NULL). A running total that reached ±Inf from finite inputs
+// is a finite-overflow 22003 — a final isInf test is equivalent to a per-add one, since finite + ±Inf
+// cannot recover to finite.
 func (a *floatSumAcc) sumF64() (float64, bool, error) {
 	if a.count == 0 {
 		return 0, false, nil
@@ -441,21 +453,14 @@ func (a *floatSumAcc) sumF64() (float64, bool, error) {
 	if special, isSpecial := a.specialSum(); isSpecial {
 		return special, true, nil
 	}
-	// Sort finite inputs by the total order, then fold left with f64 add (overflow → 22003).
-	xs := append([]float64(nil), a.finite...)
-	sort.Slice(xs, func(i, j int) bool { return floatTotalCmp(xs[i], xs[j]) < 0 })
-	total := 0.0
-	for _, x := range xs {
-		total += x
-		if math.IsInf(total, 0) {
-			return 0, false, overflowFloatErr()
-		}
+	if math.IsInf(a.total, 0) {
+		return 0, false, overflowFloatErr()
 	}
-	return total, true, nil
+	return a.total, true, nil
 }
 
-// sumF32 resolves the SUM as a f32 result — the same canonical fold, but each add rounds to
-// binary32 (the §7 width-correct fold for f32).
+// sumF32 resolves the SUM as a f32 result — the running total already folded at binary32 width, so
+// float32(total) recovers it exactly.
 func (a *floatSumAcc) sumF32() (float32, bool, error) {
 	if a.count == 0 {
 		return 0, false, nil
@@ -463,16 +468,11 @@ func (a *floatSumAcc) sumF32() (float32, bool, error) {
 	if special, isSpecial := a.specialSum(); isSpecial {
 		return float32(special), true, nil
 	}
-	xs := append([]float64(nil), a.finite...)
-	sort.Slice(xs, func(i, j int) bool { return floatTotalCmp(xs[i], xs[j]) < 0 })
-	var total float32 = 0
-	for _, x := range xs {
-		total += float32(x)
-		if math.IsInf(float64(total), 0) {
-			return 0, false, overflowFloatErr()
-		}
+	t := float32(a.total)
+	if math.IsInf(float64(t), 0) {
+		return 0, false, overflowFloatErr()
 	}
-	return total, true, nil
+	return t, true, nil
 }
 
 // specialSum applies the §7 special-value precedence (NaN dominates; then both ±Inf → NaN; then

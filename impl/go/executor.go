@@ -19131,7 +19131,7 @@ type acc struct {
 	seen     bool
 	cur      Value
 	hasCur   bool
-	floatSum *floatSumAcc // non-nil for the float SUM/AVG plans (the canonical-order fold — float.md §7)
+	floatSum *floatSumAcc // non-nil for the float SUM/AVG plans (the streaming scan-order fold — float.md §7)
 	// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. jsonAsJSON
 	// selects the `json` result type (vs jsonb); jsonStrict skips a NULL-valued row. `seen` is reused
 	// to mark the group non-empty even when the strict filter drops every row (empty group → NULL,
@@ -19233,8 +19233,8 @@ func newAccFromSpec(s aggSpec) *acc {
 func (a *acc) clone() *acc {
 	c := *a // value copy (count/sumInt/sumDec/seen/cur/hasCur are independent)
 	if a.floatSum != nil {
+		// floatSum is a streaming running total (no slice) — a plain value copy is independent.
 		fs := *a.floatSum
-		fs.finite = append([]float64(nil), a.floatSum.finite...)
 		c.floatSum = &fs
 	}
 	if a.jsonNodes != nil {
@@ -19314,9 +19314,9 @@ func (a *acc) fold(v Value, m *costMeter) error {
 			a.count++
 		}
 	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
-		// Float SUM/AVG collect into the canonical-order fold accumulator; NULLs are skipped. The
-		// fold itself happens at finalize (order-independent — spec/design/float.md §7). The
-		// per-row aggregate_accumulate is charged by the caller, so this stays O(1)/row.
+		// Float SUM/AVG fold into the streaming running total in scan order; NULLs are skipped. The
+		// fold order is ledgered non-deterministic (spec/design/float.md §7). The per-row
+		// aggregate_accumulate is charged by the caller, so this stays O(1)/row and O(1) memory.
 		if !v.IsNull() {
 			a.floatSum.add(v)
 		}

@@ -122,7 +122,10 @@ SELECT CAST(f64 'NaN' AS i32)
 statement error 42804
 SELECT id FROM t WHERE id = d
 
-# --- aggregates: canonical-fold SUM/AVG (order-independent), MIN/MAX over the total order ---
+# --- aggregates: streaming scan-order SUM/AVG (fold order ledgered non-deterministic —
+# float.md §7 / determinism_exceptions.toml `float-sum-order`; the `R` tag tolerates it),
+# MIN/MAX over the total order. These values are order-invariant (special-value NaN, and
+# 1.5 + -0.5 = 1.0 folds exactly), so they are stable regardless of fold order. ---
 # SUM over a group containing NaN is NaN (special values resolved before the fold)
 query R nosort
 SELECT sum(d) FROM t

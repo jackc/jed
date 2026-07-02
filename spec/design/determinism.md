@@ -201,10 +201,10 @@ is the design that lets them land without breaking G1/G2.
 the design doc, type-system data, and exception ledger are authored and the types are landed
 across all three cores). They are the *defining* members of class **A**: the one case where a value that **has** a right answer is
 computed *differently per core* (G2) and per platform (G3) and cannot be injected away — but the
-exemption is **narrow** (storage, total order, the `+ − * / sqrt` kernel, the exact-sum
-`SUM`/`AVG`, `MIN`/`MAX`/`COUNT`, and cost all stay in-contract; only transcendental *values* and
-text-rendering *layout* are exempt, both absorbed by the `R` tag's tolerant compare). The three
-ledger entries are in [../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml).
+exemption is **narrow** (storage, total order, the `+ − * / sqrt` kernel, `MIN`/`MAX`/`COUNT`,
+int/decimal `SUM`/`AVG`, and cost all stay in-contract; transcendental *values*, text-rendering
+*layout*, and the float `SUM`/`AVG` *fold order* are exempt, all absorbed by the `R` tag's
+tolerant compare). The ledger entries are in [../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml).
 
 The hard surface and the resolutions taken (full detail in [float.md](float.md)):
 
@@ -218,10 +218,15 @@ The hard surface and the resolutions taken (full detail in [float.md](float.md))
   (the product is a rounded return value before the add sees it), so the real exposure is
   hand-written numeric kernels — i.e. aggregates and transcendentals.
 - **Aggregation** (`SUM`/`AVG`) is non-associative for float → naive folds diverge across
-  cores *and* across parallel schedules. **Recommended:** define float `SUM`/`AVG` as the
-  **correctly-rounded exact sum** (an exact accumulator), which is order-independent by
-  construction → G1+G2+G3 hold and parallelism is free (§7). A documented PG divergence (PG's
-  float sum is order-dependent), but a strictly better one.
+  cores *and* across parallel schedules. The order-independent resolution (an exact
+  accumulator, §7 A) is the hand-rolled cross-core numerical code [float.md](float.md) §1/§6
+  declines to spend on the least on-brand type; the sort-then-fold stand-in (§7 B) is
+  O(n·log n)+O(n) and not even correctly-rounded. jed therefore takes **§7 C — ledger it**
+  (`float-sum-order`): float `SUM`/`AVG` folds as a **streaming scan-order running total**
+  (O(1)), cross-core-identical on today's serial executor but with G2/G3 **withheld** so a
+  future parallel plan may reorder the fold. A documented PG divergence (PG's float sum is
+  likewise order-dependent). Int/decimal `SUM`/`AVG` and `MIN`/`MAX`/`COUNT` stay
+  order-independent and in-contract.
 - **Transcendentals** (`sin`/`exp`/`log`/`pow`) are not IEEE-correctly-rounded; every libm
   differs by an ULP → defer or exclude (or ship bit-pinned implementations later, at
   decimal-limb cost).
@@ -267,7 +272,7 @@ operation rather than discovering sensitivity at runtime:
 | `COUNT`, `MIN`, `MAX`, `bool_and`/`bool_or` | no (commutative+associative+idempotent) | parallel-safe, no work |
 | `SUM`/`AVG` over **int** | no (widens to i64/decimal; intermediates don't overflow) | parallel-safe |
 | `SUM`/`AVG` over **decimal** | no (**resolved**) | values associative; the fold checks the cap only on the **final** result (the `add_uncapped` accumulator path — [decimal.md](decimal.md) §2), matching PG → order-independent. (Previously trapped on the first over-cap intermediate, an order-dependent trap; that edge is closed.) |
-| `SUM`/`AVG` over **float** | yes (value) | **A**: exact accumulator → order-independent (§6) |
+| `SUM`/`AVG` over **float** | yes (value) | **C**: ledgered (`float-sum-order`) — streaming scan-order fold, order-independence declined as float over-investment (§6, float.md §7). Parallelism *joins* this existing exemption, never creates it. |
 | `string_agg`, `array_agg`, `json_agg` | yes (inherently) | **B/C** below — concatenation order *is* the meaning |
 
 **Three resolutions for an order-sensitive operation** (prefer the determinism-preserving):

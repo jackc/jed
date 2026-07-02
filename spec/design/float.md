@@ -41,10 +41,10 @@ So the stance (determinism.md §6, class **A**):
   rounded*, so they are bit-identical across cores **with light discipline** (§5): no x87
   extended precision, round-ties-to-even, no flush-to-zero, and **no FMA contraction** (the
   Go hazard, §5). `sqrt` joins them (IEEE-mandated correctly-rounded).
-- **The exact-sum aggregates** `SUM`/`AVG` — defined as the *correctly-rounded exact sum*
-  via a long accumulator (§7), which is **order-independent by construction** → identical
-  across cores *and* across any future parallel/serial plan (determinism.md §7).
-- **`MIN`/`MAX`/`COUNT`** — order-independent for the total order (§3).
+- **`MIN`/`MAX`/`COUNT`** and the **int / decimal `SUM`/`AVG`** — order-independent (the total
+  order §3; integers widen to i64 and decimals fold uncapped, so intermediates are associative),
+  hence identical across cores *and* across any future parallel/serial plan (determinism.md §7).
+  Only the **float** `SUM`/`AVG` is exempted (below).
 - **Cost** — structural (one `operator_eval` per node, one `aggregate_accumulate` per row);
   it depends on the *count* of operations, never the float *value*, so it stays fully
   deterministic and cross-core, and float queries still carry `# cost:` assertions.
@@ -56,6 +56,12 @@ So the stance (determinism.md §6, class **A**):
 - **Text rendering layout** — each core uses its native shortest-round-trip formatter (§9);
   the corpus's **`R`** render tag compares by *parsing back to f64 within a tolerance*, so
   layout differences and a transcendental's last-ULP divergence never fail a test.
+- **Float `SUM`/`AVG` fold order** — folded as a **streaming running total in scan order**
+  (§7), not order-independently. Because IEEE `+` is non-associative, the low bits depend on
+  the fold order, so the value is exempted (class **A ∩ P** — determinism.md §7): it is
+  cross-core identical *today* (every core folds the same PK-scan order with the same IEEE
+  add) but that is **not promised** — a future parallel plan may reorder the fold. The `R` tag
+  + PG-only oracle absorb it.
 - **Float-gated control flow** — a query whose *row multiset* depends on an exempted value
   (a transcendental result near a `WHERE`/`ORDER BY … LIMIT` boundary) is cross-core
   unspecified (the §4 contamination rule of determinism.md). A float **is** keyable (§10), so a
@@ -64,9 +70,10 @@ So the stance (determinism.md §6, class **A**):
   than prevented by a key narrowing (determinism.md §4). A float at rest is in-contract, so this
   bites only a tainted-float key, never an ordinary one.
 
-Net: a float query that does not call a transcendental is, in practice, cross-core identical;
-the exemption bites only at transcendentals, the PG oracle, and the rendering layout the
-`R` tag already absorbs.
+Net: a float query that does not call a transcendental is, in practice, cross-core identical
+today (float `SUM`/`AVG` included — every core folds the same scan order); the exemption
+withholds the *promise* only at transcendentals, float `SUM`/`AVG` fold order (against a future
+parallel plan), the PG oracle, and the rendering layout the `R` tag already absorbs.
 
 ## 2. Scope — two widths forming a promotion tower
 
@@ -224,33 +231,42 @@ one is lossy or representation-changing:
 `int`/`decimal` → `f64` is explicit (not implicit like `int → decimal`) precisely because
 it is **lossy** — the whole point of the strict matrix.
 
-## 7. `SUM` / `AVG` — the order-independent exact accumulator
+## 7. `SUM` / `AVG` — the streaming scan-order fold (ledgered order-dependent)
 
-Naive float summation is non-associative, so its result depends on the order rows are folded
-— which violates G1 under future parallelism *and* G2 across cores (determinism.md §7). jed
-therefore defines float `SUM`/`AVG` as an **order-independent canonical-order fold**: the inputs
-are reduced in a *canonical order fixed by the data, not by row order*, so the result is identical
-regardless of scan/partition order and **bit-identical across cores** — the in-contract,
-determinism-preserving resolution (determinism.md §7, A). It is a documented divergence from PG
-(whose float sum is order-dependent and sloppy); the value stays within the `R`-tag tolerance of
-PG (§9). (A strictly *correctly-rounded* exact accumulator — round-once over the true mathematical
-sum — is a future refinement; it is harder to keep byte-identical across three hand-written cores
-— the §2/§5 drift hazard — and unnecessary for the contract, which only requires order-independence
-+ cross-core identity, both of which the canonical fold guarantees.)
+Naive float summation is non-associative, so its result depends on the order rows are folded.
+There are three ways to face that (determinism.md §7): **(A)** make it order-independent so the
+value is fixed regardless of fold order; **(B)** pin a canonical fold order; **(C)** ledger it as
+order-dependent. Only a **correctly-rounded exact accumulator** (a superaccumulator / exact
+expansion, round-once over the true mathematical sum) truly achieves (A) at O(1) streaming cost —
+and that is precisely the hand-rolled cross-core numerical code §1/§6 declines to spend on jed's
+least on-brand type. Option (B) as a *sort-then-fold* (jed's prior form) is O(n·log n) time and
+O(n) memory, and — because it still folds with lossy IEEE adds — is not even correctly-rounded: it
+buys determinism at a real cost while delivering an arbitrary (magnitude-sorted) value no more
+"right" than any other. jed therefore takes **(C)**: float `SUM`/`AVG` is a **streaming running
+total folded in scan order**, O(1) memory, and its fold order is **ledgered as non-deterministic**
+(`determinism_exceptions.toml`, `float-sum-order`, class **A ∩ P**).
+
+What this keeps and drops (determinism.md §1): the value is **cross-core identical today** — every
+core folds the same base-table PK-scan order with the same IEEE add, so `rust == go == ts` still
+holds on the current single-threaded executor — but jed **does not promise** it (G2/G3 withheld),
+so a future parallel plan may reorder the fold without a contract break (the point of ledgering it
+now rather than re-visiting under parallelism). It is a documented divergence from PG (whose float
+sum is likewise order-dependent), and the value stays within the `R`-tag tolerance of PG (§9). Int
+and decimal `SUM`/`AVG`, and `MIN`/`MAX`/`COUNT`, remain order-independent and fully in-contract
+(§1) — this exemption is float `SUM`/`AVG` only.
 
 **Algorithm** (the identical steps every core runs — CLAUDE.md §2/§5):
 
-1. **Special values first** (order-independent): if any input is NaN → result `NaN`; else if
-   both `+Inf` and `-Inf` appear → `NaN`; else if `+Inf` appears → `+Inf`; else if `-Inf`
-   appears → `-Inf`; else all-finite → step 2. NULL inputs are skipped (as every aggregate).
-2. **Canonicalize and sort.** Map each finite input's `-0.0 → +0.0`, then sort the values by the
-   §3 total order (equivalently, by the `float-order-preserving` key — encoding.md §2.8). After
-   `-0` canonicalization and NaN/Inf extraction, distinct values have distinct keys, so the sort
-   is **total and deterministic** — every core sees the same sequence.
-3. **Fold left** with width-correct IEEE addition (round-ties-to-even per add; `f32` via the
-   width's rounding — TS `Math.fround` each step). A running total that overflows to ±Inf → `22003`
-   (the §3 finite-overflow rule; PG yields ±Inf — a documented divergence). One canonical order +
-   one rounding rule ⇒ bit-identical across cores and across any serial/parallel plan.
+1. **Special-value flags** (order-independent): track whether any input is `NaN`, `+Inf`, `-Inf`.
+   NULL inputs are skipped (as every aggregate).
+2. **Fold each finite input** into a single running total, in the order the scan produces rows:
+   map `-0.0 → +0.0`, then add with width-correct IEEE addition (round-ties-to-even per add;
+   `f32` re-rounds to binary32 each step — TS `Math.fround`). No collection, no sort.
+3. **Resolve at finalize** (special values dominate the running total): if any `NaN` → `NaN`;
+   else both `+Inf` and `-Inf` → `NaN`; else `+Inf` → `+Inf`; else `-Inf` → `-Inf`; else the
+   running total — which, if it reached ±Inf from finite inputs, is a finite-overflow `22003`
+   (the §3 rule; PG yields ±Inf — a documented divergence). Since finite `+ ±Inf` cannot recover
+   to finite, a final `isInf` check on the running total is equivalent to a per-add check.
 
 `AVG` = `SUM / count` (count exact; the division rounded once at the input width), NULLs skipped,
 empty group → `NULL`. **Result types**: `SUM`/`AVG(f32) → f32`, `SUM`/`AVG(f64) →
@@ -258,9 +274,10 @@ f64` (a float sum/avg stays the input width — `same_as_input`, matching PG `su
 AVG over float stays float, unlike `AVG(int) → decimal`, and a minor divergence from PG which
 widens `AVG(real) → double`). `MIN`/`MAX(floatN) → floatN` (the §3 total order), `COUNT → i64`.
 
-**Cost.** One `aggregate_accumulate` per input row (the accumulator add is O(1) amortized),
-deterministic and cross-core — so float aggregate queries keep `# cost:` assertions even
-though their *values* are PG-oracle-only.
+**Cost.** One `aggregate_accumulate` per input row (the running add is O(1)), deterministic and
+cross-core — so float aggregate queries keep `# cost:` assertions even though their *values* are
+PG-oracle-only. The streaming fold also lets float `SUM`/`AVG` ride the same O(1) fold-during-scan
+path as int/count/min/max (no per-column materialization), unlike the prior collect-and-sort form.
 
 ## 8. Functions — the exact set (in-contract) vs the transcendental set (exempted)
 

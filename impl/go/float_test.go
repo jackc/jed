@@ -212,29 +212,49 @@ func TestExactDecimalFromFloatMatchesParseRoundTrip(t *testing.T) {
 	}
 }
 
-// --- SUM/AVG: the order-independent canonical-order fold ----------------------------------
+// --- SUM/AVG: the streaming scan-order fold (float.md §7) ----------------------------------
+// The fold is a running total in add (scan) order: reproducible for a fixed order (G1) and
+// cross-core-identical on today's serial executor, but its finite low bits are ORDER-DEPENDENT
+// — ledgered non-deterministic (determinism_exceptions.toml `float-sum-order`). This unit test
+// lives per-core because it asserts that deliberate divergence (the corpus, PG-clean, cannot).
 
-func TestFloatSumDirectFoldOrderIndependent(t *testing.T) {
-	// Drive the accumulator directly to assert the canonical fold is independent of add order.
+func TestFloatSumStreamingScanOrder(t *testing.T) {
+	// The running total equals a plain left-fold in add order (streaming, not sorted).
 	xs := []float64{1e16, 1, -1e16, 2.5, -0.5, 3e-8}
-	forward := newFloatSumAcc(false)
+	acc := newFloatSumAcc(false)
+	var want float64
 	for _, x := range xs {
-		forward.add(Float64Value(x))
+		acc.add(Float64Value(x))
+		want += x // -0 canonicalization is a no-op for these inputs
 	}
-	reverse := newFloatSumAcc(false)
+	got, ok, err := acc.sumF64()
+	if err != nil || !ok {
+		t.Fatalf("sumF64: ok=%v err=%v", ok, err)
+	}
+	if got != want {
+		t.Errorf("streaming fold = %v, want left-fold %v", got, want)
+	}
+
+	// Order-DEPENDENCE is now the contract: the reverse add order yields a different low-bit sum
+	// (this is precisely what the ledger exempts). Assert it visibly so a regression to the old
+	// order-independent fold is caught.
+	rev := newFloatSumAcc(false)
 	for i := len(xs) - 1; i >= 0; i-- {
-		reverse.add(Float64Value(xs[i]))
+		rev.add(Float64Value(xs[i]))
 	}
-	fa, _, err := forward.sumF64()
-	if err != nil {
-		t.Fatal(err)
+	rb, _, _ := rev.sumF64()
+	if rb == got {
+		t.Errorf("expected order-dependent streaming fold, but forward==reverse (%v)", got)
 	}
-	rb, _, err := reverse.sumF64()
-	if err != nil {
-		t.Fatal(err)
+
+	// Reproducibility (G1): the same add order always yields identical bits.
+	again := newFloatSumAcc(false)
+	for _, x := range xs {
+		again.add(Float64Value(x))
 	}
-	if fa != rb {
-		t.Errorf("canonical fold not order-independent: %v vs %v", fa, rb)
+	rg, _, _ := again.sumF64()
+	if rg != got {
+		t.Errorf("same-order fold not reproducible: %v vs %v", rg, got)
 	}
 }
 

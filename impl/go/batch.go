@@ -16,17 +16,17 @@ package jed
 //     distinctRowKey — and NULLs bucket together via a sentinel group), then folds each group's
 //     accumulators through the shared acc.fold (byte-identical acc state, hence finalize).
 //     Float SUM/AVG kernels round out the numeric folds (MIN/MAX were already type-agnostic).
-//   - A2 — COLUMNAR GATHER (packed-leaf.md §11 Track A2): a FILTER-FREE file-backed aggregate (either
-//     stage above) gathers ONLY its touched columns into dense per-column lanes straight off the
-//     Packed leaves (aggColumnar → ColumnarScanMasked → foldAggColumnar / groupByIntKeyColumnar),
-//     NEVER materializing a full-width storedRow. This is the allocation dividend the row feed leaves
-//     on the table: a wide-table single-column scan drops from O(rows × columns) to O(rows) allocation
-//     (a 64-column count(*) went from ~100 MB of all-NULL rows to a few KB). Cost-neutral by
-//     construction — it charges the same page_read / value_decompress / storage_row_read block the row
-//     feed does. Gated to file-backed stores (an in-memory store's row path already shares its rows
-//     zero-copy) and declines to the row path on any filter / spillable column, so the fold kernels
-//     stay the same code either way (foldAggColumnar mirrors foldAggBatch, reading lane[i] instead of
-//     survivors[i][idx]).
+//   - A2 — FOLD DURING THE WALK (packed-leaf.md §11 Track A2): a file-backed aggregate (either stage
+//     above) folds each scanned row's touched columns — read on demand via colAt straight off the
+//     Packed leaves — into its accumulator during ONE tree walk (aggColumnar → pMap.foldScan), NEVER
+//     materializing a full-width storedRow OR a per-column lane. Because SUM/COUNT/MIN/MAX/AVG are all
+//     single-pass running accumulators (int/decimal exact; float a streaming scan-order total —
+//     float.md §7), the aggregate needs O(1) state, so the whole-column gather the lane path once did
+//     was pure waste: peak memory drops from O(rows) to O(1) (a full-table count+sum went from ~170 MB
+//     of gathered Values to ~0). Cost-neutral by construction — foldScan visits the same nodes and rows
+//     as the lane scan, so the page_read / value_decompress (0) / storage_row_read / aggregate_accumulate
+//     block is charged identically. Gated to file-backed stores (an in-memory store's row path already
+//     shares its rows zero-copy) and declines to the row path on any spillable touched column.
 //   - A2 PROJECTION FEED (packed-leaf.md §11 Track A2): the same columnar gather for a bare-column
 //     PROJECTION scan (`SELECT c0, c3 FROM t [WHERE pk = …]`, no ORDER BY/LIMIT/aggregate) —
 //     projectColumnar gathers the projected columns into lanes and returns an emitColumnar emitter that
@@ -35,10 +35,11 @@ package jed
 //     file-backed / non-spillable gate; the emitColumnar drive charges row_produced per emitted row
 //     exactly like the emitProject drive over a bare-column projection (a zero-cost slot read).
 //   - A3 — FILTER VECTORIZATION (packed-leaf.md §11 Track A3): a WHERE predicate no longer forces the
-//     row path. filterColumnar evaluates plan.filter over the gathered lanes (via a single reusable
-//     scratch row) into a selection vector of survivor indices, so a FILTERED aggregate or projection
-//     also gathers columnar — the fold / emit then visits only the selected lane positions (never a
-//     full-width row). It reuses the scalar rExpr.eval verbatim, so the filter's operator_eval charges,
+//     row path. A FILTERED aggregate evaluates plan.filter inline during foldScan over a single reusable
+//     masked scratch row (folding only survivors); a filtered PROJECTION runs filterColumnar over the
+//     gathered lanes into a selection vector of survivor indices. Either way the predicate sees only a
+//     masked row (untouched columns NULL) and never a full-width one. It reuses the scalar rExpr.eval
+//     verbatim, so the filter's operator_eval charges,
 //     its 3VL survivor test, AND its result stay byte-identical to the scalar filter loop — the row path
 //     already feeds the filter a masked row (untouched columns NULL), and the filter references only
 //     masked columns (collectTouched includes plan.filter), so a scratch row filled from the lanes is
@@ -344,8 +345,6 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	// Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
 	// empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely (0 pages/rows),
 	// matching materializeRel's `if !empty` guard.
-	cols := make([][]Value, len(mask))
-	rowCount, pages, slabs := 0, 0, 0
 	scan := true
 	b := unboundedBound()
 	if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
@@ -354,53 +353,124 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 			scan = false
 		}
 	}
-	if scan {
-		var err error
-		if cols, rowCount, pages, slabs, err = store.ColumnarScanMasked(b, mask); err != nil {
-			return nil, false, err
-		}
-	}
-	// Charge the scan cost block identically to materializeRel + scanSource: page_read × nodes,
-	// value_decompress × slabs (0 here), storage_row_read × rowCount. On the unmetered lane (the caller
-	// gates) this bulk charge reproduces the scanSource's per-row accrual (Guard is a no-op).
-	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs) + costs.StorageRowRead*int64(rowCount))
 
-	// A3: apply the WHERE predicate over the lanes into a selection vector (nil ⇒ all rows survive). The
-	// filter's operator_eval charges + 3VL survivor test are byte-identical to the scalar filter loop
-	// (filterColumnar reuses plan.filter.eval), and nsurv is the survivor count the fold accumulates.
-	var sel []int32
-	nsurv := rowCount
+	grouped := len(gset.keyCols) == 1
+
+	// Fold each scanned row's touched columns straight into its accumulator during ONE tree walk — no
+	// per-column lane is materialized, so a whole-table / single-int-key aggregate is O(1) memory
+	// instead of the O(rows) whole-column gather the lane path paid (float.md §7, packed-leaf.md §11).
+	// A WHERE predicate (A3) is evaluated over a single reusable masked scratch row read from the leaf
+	// via colAt — byte-identical input + operator_eval to the lane filter. Untouched scratch columns
+	// stay NULL (the zero Value), like the row/lane filter's masked scratch.
+	var accs []*acc // whole-table grand-total accumulators (grouped == false)
+	if !grouped {
+		accs = newAccsForSpecs(plan.aggSpecs)
+	}
+	type vgroup struct {
+		key  Value
+		accs []*acc
+	}
+	var groups []vgroup // grouped == true: one per group, in scan-order-of-first-appearance
+	groupIdx := make(map[int64]int)
+	nullGI := -1
+	keyIdx := 0
+	if grouped {
+		keyIdx = gset.keyCols[0]
+	}
+	var scratch storedRow
 	if plan.filter != nil {
-		var err error
-		if sel, err = filterColumnar(plan.filter, cols, mask, rowCount, env, meter); err != nil {
-			return nil, false, err
-		}
-		nsurv = len(sel)
+		scratch = make(storedRow, len(mask))
 	}
 
-	if len(gset.keyCols) == 0 {
-		accs := newAccsForSpecs(plan.aggSpecs)
-		for i := range plan.aggSpecs {
-			spec := &plan.aggSpecs[i]
-			var lane []Value
-			if spec.operand != nil {
-				lane = cols[spec.operand.index]
+	nsurv := 0
+	rowCount, nodes := 0, 0
+	if scan {
+		var werr error
+		rowCount, nodes, werr = store.rows.foldScan(b, store.leafSrc(), func(n *pnode, i int) error {
+			if plan.filter != nil {
+				for c := range mask {
+					if mask[c] {
+						v, e := n.colAt(i, c)
+						if e != nil {
+							return e
+						}
+						scratch[c] = v
+					}
+				}
+				fv, e := plan.filter.eval(scratch, env, meter)
+				if e != nil {
+					return e
+				}
+				if !fv.IsTrue() {
+					return nil
+				}
 			}
-			if err := foldAggColumnar(accs[i], spec, lane, sel, nsurv, meter); err != nil {
-				return nil, false, err
+			nsurv++
+			a := accs
+			if grouped {
+				kv, e := n.colAt(i, keyIdx)
+				if e != nil {
+					return e
+				}
+				var gi int
+				if kv.Kind == ValNull {
+					if nullGI < 0 {
+						nullGI = len(groups)
+						groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+					}
+					gi = nullGI
+				} else if g, ok := groupIdx[kv.Int]; ok {
+					gi = g
+				} else {
+					gi = len(groups)
+					groupIdx[kv.Int] = gi
+					groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+				}
+				a = groups[gi].accs
 			}
+			for s := range plan.aggSpecs {
+				v := NullValue()
+				if op := plan.aggSpecs[s].operand; op != nil {
+					var e error
+					if v, e = n.colAt(i, op.index); e != nil {
+						return e
+					}
+				}
+				if e := a[s].fold(v, meter); e != nil {
+					return e
+				}
+			}
+			return nil
+		})
+		if werr != nil {
+			return nil, false, werr
 		}
-		srow, err := finalizeGroup(nil, accs)
-		if err != nil {
-			return nil, false, err
+	}
+
+	// Charge the identical cost totals: the scan block (page_read × nodes — the same node visits;
+	// value_decompress × 0 — no spillable touched column gated above; storage_row_read × rowCount) and
+	// aggregate_accumulate once per (survivor × spec), all bulk on the unmetered lane (the caller gates,
+	// so Guard is a no-op — order of charging is invisible). The filter's operator_eval was charged per
+	// scanned row inside foldScan.
+	meter.Charge(costs.PageRead*int64(nodes) + costs.StorageRowRead*int64(rowCount))
+	meter.Charge(costs.AggregateAccumulate * int64(nsurv) * int64(len(plan.aggSpecs)))
+
+	if grouped {
+		out := make([]storedRow, 0, len(groups))
+		for i := range groups {
+			srow, e := finalizeGroup([]Value{groups[i].key}, groups[i].accs)
+			if e != nil {
+				return nil, false, e
+			}
+			out = append(out, srow)
 		}
-		return []storedRow{srow}, true, nil
+		return out, true, nil
 	}
-	srows, err := groupByIntKeyColumnar(plan, gset, cols, sel, nsurv, meter)
-	if err != nil {
-		return nil, false, err
+	srow, e := finalizeGroup(nil, accs)
+	if e != nil {
+		return nil, false, e
 	}
-	return srows, true, nil
+	return []storedRow{srow}, true, nil
 }
 
 // filterColumnar evaluates plan.filter over the gathered per-column lanes and returns the surviving row
@@ -670,140 +740,6 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 		out = append(out, srow)
 	}
 	return out, nil
-}
-
-// groupByIntKeyColumnar is the columnar twin of groupByIntKey (packed-leaf.md §11 Track A2/A3): it
-// buckets the SURVIVOR rows by their single integer group-key column and folds each aggregate per group,
-// reading the pre-gathered dense lanes (cols[keyCols[0]] for the key, cols[operand.index] for each
-// operand) instead of striding a []storedRow — no full-width row. sel is the A3 selection vector (nil ⇒
-// every scanned row survives); nsurv is the survivor count (len(sel), or rowCount when sel is nil). The
-// buckets (a map[int64]int over the raw key plus one sentinel NULL group), the scan-order-of-first-
-// appearance emission, the bulk aggregate_accumulate charge (× nsurv × specs), and acc.fold are
-// byte-identical to groupByIntKey, so the acc state + finalize + cost match. The caller (aggColumnar) has
-// verified every needed lane is populated (need()), so cols[keyCols[0]] and each cols[operand.index] are
-// non-nil of length rowCount.
-func groupByIntKeyColumnar(plan *selectPlan, gset *groupSetPlan, cols [][]Value, sel []int32, nsurv int, meter *costMeter) ([]storedRow, error) {
-	keyLane := cols[gset.keyCols[0]]
-	type vgroup struct {
-		key  Value
-		accs []*acc
-	}
-	var groups []vgroup
-	index := make(map[int64]int)
-	nullGI := -1
-
-	meter.Charge(costs.AggregateAccumulate * int64(nsurv) * int64(len(plan.aggSpecs)))
-	for j := 0; j < nsurv; j++ {
-		i := j
-		if sel != nil {
-			i = int(sel[j])
-		}
-		kv := keyLane[i]
-		var gi int
-		if kv.Kind == ValNull {
-			if nullGI < 0 {
-				nullGI = len(groups)
-				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
-			}
-			gi = nullGI
-		} else {
-			var ok bool
-			if gi, ok = index[kv.Int]; !ok {
-				gi = len(groups)
-				index[kv.Int] = gi
-				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
-			}
-		}
-		accs := groups[gi].accs
-		for s := range plan.aggSpecs {
-			v := NullValue()
-			if op := plan.aggSpecs[s].operand; op != nil {
-				v = cols[op.index][i]
-			}
-			if ferr := accs[s].fold(v, meter); ferr != nil {
-				return nil, ferr
-			}
-		}
-	}
-
-	out := make([]storedRow, 0, len(groups))
-	for i := range groups {
-		srow, ferr := finalizeGroup([]Value{groups[i].key}, groups[i].accs)
-		if ferr != nil {
-			return nil, ferr
-		}
-		out = append(out, srow)
-	}
-	return out, nil
-}
-
-// foldAggColumnar is the columnar twin of foldAggBatch (packed-leaf.md §11 Track A2/A3): it folds one
-// WHOLE-TABLE aggregate over a pre-gathered dense column lane (nil for COUNT(*), whose count needs no
-// values), reading the lane directly with no full-width storedRow. sel is the A3 selection vector (nil ⇒
-// every scanned row survives); nsurv is the survivor count (len(sel), or the lane length when sel is
-// nil). It reconstructs exactly the acc state foldAggBatch would leave so acc.finalize is unchanged, and
-// charges aggregate_accumulate once per SURVIVOR (× nsurv), bulk on the unmetered lane. The
-// int/float/min/max kernels are identical to foldAggBatch's, reading lane[sel[j]] (or lane[i] when
-// unfiltered) instead of survivors[i][idx]. laneAt centralizes the sel indirection so the kernels read
-// survivors in scan order either way (the overflow trap lands at the same running point).
-func foldAggColumnar(a *acc, spec *aggSpec, lane []Value, sel []int32, nsurv int, meter *costMeter) error {
-	meter.Charge(costs.AggregateAccumulate * int64(nsurv))
-	laneAt := func(j int) Value {
-		if sel != nil {
-			return lane[sel[j]]
-		}
-		return lane[j]
-	}
-	switch spec.plan {
-	case planCountStar:
-		a.count += int64(nsurv)
-	case planCount:
-		for j := 0; j < nsurv; j++ {
-			if laneAt(j).Kind != ValNull {
-				a.count++
-			}
-		}
-	case planSumInt:
-		for j := 0; j < nsurv; j++ {
-			v := laneAt(j)
-			if v.Kind == ValNull {
-				continue
-			}
-			// The identical i64 overflow trap (22003) as foldAggBatch / the scalar SUM fold, at the same
-			// running point in scan order.
-			s := a.sumInt + v.Int
-			if (v.Int > 0 && s < a.sumInt) || (v.Int < 0 && s > a.sumInt) {
-				return overflowErr(scalarInt64)
-			}
-			a.sumInt = s
-			a.seen = true
-		}
-	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
-		for j := 0; j < nsurv; j++ {
-			if v := laneAt(j); v.Kind != ValNull {
-				a.floatSum.add(v)
-			}
-		}
-	case planMin, planMax:
-		for j := 0; j < nsurv; j++ {
-			v := laneAt(j)
-			if v.Kind == ValNull {
-				continue
-			}
-			if !a.hasCur {
-				a.cur, a.hasCur = v, true
-				continue
-			}
-			c := valueCmp(a.cur, v)
-			keepCur := (spec.plan == planMin && c <= 0) || (spec.plan == planMax && c >= 0)
-			if !keepCur {
-				a.cur = v
-			}
-		}
-	default:
-		panic("foldAggColumnar: ineligible aggregate plan")
-	}
-	return nil
 }
 
 // foldAggBatch folds one WHOLE-TABLE aggregate over the survivor rows into acc, reconstructing

@@ -586,6 +586,60 @@ func (m *pMap) columnarScan(b keyBound, src leafSource, mask []bool) ([][]Value,
 	return cols, rowCount, nodes, nil
 }
 
+// foldScan walks the bounded scan calling visit(n, i) for each row i (in scan / key order) of the
+// node n it belongs to, faulting leaves via src — the fold-during-walk twin of columnarScan
+// (packed-leaf.md §11): the aggregate folds each row's touched columns (read on demand via n.colAt)
+// straight into its accumulator, so a whole-table/grouped aggregate never materializes a per-column
+// lane (O(1) memory instead of O(rows)). It visits the IDENTICAL nodes columnarScan does and returns
+// the same (rowCount, nodeCount), so the caller charges the identical page_read / storage_row_read.
+// visit's error aborts the walk.
+func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) error) (rowCount, nodes int, err error) {
+	var walk func(n *pnode) error
+	walk = func(n *pnode) error {
+		nodes++
+		ef, el := b.entryWindow(n)
+		emit := func(i int) error {
+			rowCount++
+			return visit(n, i)
+		}
+		if n.isLeaf() {
+			for i := ef; i < el; i++ {
+				if e := emit(i); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
+		cf, cl := b.childWindow(n)
+		if ef < cf {
+			if e := emit(ef); e != nil {
+				return e
+			}
+		}
+		for i := cf; i <= cl; i++ {
+			child, e := resolveChild(n.children[i], src)
+			if e != nil {
+				return e
+			}
+			if e := walk(child); e != nil {
+				return e
+			}
+			if i >= ef && i < el {
+				if e := emit(i); e != nil {
+					return e
+				}
+			}
+		}
+		return nil
+	}
+	if m.root != nil {
+		if e := walk(m.root); e != nil {
+			return 0, 0, e
+		}
+	}
+	return rowCount, nodes, nil
+}
+
 // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
 // charges (spec/design/cost.md §3). It mirrors rangeEntries' traversal exactly (same childWindow
 // prune, root always visited), counting an OnDisk leaf as one node WITHOUT faulting it (the
