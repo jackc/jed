@@ -299,3 +299,20 @@ test('docs search (Pagefind) returns results from the built index', async ({ pag
   await expect(page.getByTestId('search-results')).toBeVisible();
   await expect(page.getByTestId('search-results')).toContainText('Types');
 });
+
+test('the explain page renders a live plan with the PK-bound access path', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Second panel = EXPLAIN SELECT ... WHERE id = 3: a PK point lookup under the residual Filter.
+  const panel = page.getByTestId('live-sql').nth(1);
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
+  await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 3');
+  await expect(panel.getByTestId('result-rows')).toContainText('Filter');
+});
+
+test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Fifth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
+  const panel = page.getByTestId('live-sql').nth(4);
+  await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
+  await expect(panel.getByTestId('result-rows')).toContainText('cost=');
+});
