@@ -3652,7 +3652,7 @@ export class Engine {
       r.emit(d, "Filter", `conjuncts=${conjunctCount(filter)}`);
       d++;
     }
-    r.emit(d, "Scan " + name, this.scanDetail(name, this.dmlScanBound(table, filter), null));
+    r.emit(d, "Scan " + name, this.scanDetail(name, this.dmlScanBound(table, filter), false, null));
   }
 
   // dmlScanBound picks an UPDATE/DELETE target's scan bound with the executor's own detectors: the
@@ -3816,10 +3816,14 @@ export class Engine {
       this.renderQueryPlan(r, rel.derived, depth + 1);
       return;
     }
+    // An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
+    // bound in the access-path label (cost.md §3 "JOIN").
+    const inl = sp.relINLBounds[i] !== null;
+    const bound = inl ? sp.relINLBounds[i]! : sp.relBounds[i]!;
     r.emit(
       depth,
       "Scan " + rel.tableName,
-      withNote(this.scanDetail(rel.tableName, sp.relBounds[i]!, sp.relMasks[i]!), note),
+      withNote(this.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]!), note),
     );
   }
 
@@ -3859,8 +3863,13 @@ export class Engine {
 
   // scanDetail renders a Scan node's attributes: the access path (from the relation's chosen scan
   // bound, null = a full scan), then the touched-column count when the query references any column.
-  private scanDetail(tableName: string, b: ScanBound | null, mask: boolean[] | null): string {
-    const parts = [this.accessPath(tableName, b)];
+  private scanDetail(
+    tableName: string,
+    b: ScanBound | null,
+    inl: boolean,
+    mask: boolean[] | null,
+  ): string {
+    const parts = [this.accessPath(tableName, b, inl)];
     const n = countTrue(mask);
     if (n > 0) parts.push(`touched=${n}`);
     return parts.join("; ");
@@ -3868,13 +3877,16 @@ export class Engine {
 
   // accessPath renders the chosen access path for a relation (spec/design/explain.md §5): a full scan,
   // a primary-key range bound, or a secondary-index / GIN / GiST bound (the last three by index name).
-  private accessPath(tableName: string, b: ScanBound | null): string {
+  // inl marks an index-nested-loop bound (cost.md §3 "JOIN") — a per-outer-row seek whose source is a
+  // sibling column — with a leading label.
+  private accessPath(tableName: string, b: ScanBound | null, inl: boolean): string {
     if (b === null) return "Full scan";
+    const prefix = inl ? "Index-nested-loop " : "";
     switch (b.kind) {
       case "pk":
-        return "PK bound: " + renderBoundTerms(this.firstPKColName(tableName), b.pk.terms);
+        return prefix + "PK bound: " + renderBoundTerms(this.firstPKColName(tableName), b.pk.terms);
       case "index":
-        return "Index bound: using " + b.index.nameKey;
+        return prefix + "Index bound: using " + b.index.nameKey;
       case "gin":
         return "GIN bound: using " + b.gin.nameKey;
       case "gist":
@@ -5542,13 +5554,14 @@ export class Engine {
     params: Value[],
     outer: Row[],
     mask: boolean[],
+    left: Row,
   ): { rows: Row[]; pages: number; slabs: number } {
     // Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
     // true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
     // integer can equal no stored value — all provably empty.
     let agreed: Uint8Array | null = null;
     for (const src of ib.eqs) {
-      const bk = encodeBoundKey(ib.colType, src, params, outer, ib.coll);
+      const bk = encodeBoundKey(ib.colType, src, params, outer, ib.coll, left);
       if (bk.kind !== "key") return { rows: [], pages: 0, slabs: 0 };
       if (agreed === null) agreed = bk.key;
       else if (!bytesEq(agreed, bk.key)) return { rows: [], pages: 0, slabs: 0 };
@@ -9200,6 +9213,27 @@ export class Engine {
         ? null
         : detectScanBound(filter, rel, this.readSnap()),
     );
+    // Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key / indexed
+    // column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk = a.x`) is
+    // re-materialized per outer row, seeking instead of full-scanning — O(N·M) → O(N·log M). Detected
+    // from the join's ON and the WHERE. Gated to a base table (an SRF / derived table / CTE / lateral
+    // item has no store to seek) that is the RIGHT/nullable side of an INNER/CROSS/LEFT join (a
+    // RIGHT/FULL preserved side cannot be bounded per outer row). rels[0] has no earlier relation; its
+    // join is sel.joins[i-1]. A non-null entry takes precedence over the once-materialized relBounds.
+    const relINLBounds: (ScanBound | null)[] = rels.map((rel, i) => {
+      if (
+        i === 0 ||
+        srfPlans[i] !== undefined ||
+        derivedPlans[i] !== undefined ||
+        rel.cte !== undefined ||
+        lateralFlags[i]
+      ) {
+        return null;
+      }
+      const k = sel.joins[i - 1]!.kind;
+      if (k !== "inner" && k !== "cross" && k !== "left") return null;
+      return detectINLBound(joinPreds[i - 1]!, filter, rel, this.readSnap());
+    });
 
     // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
     // plan outlives the scope and a correlated subquery can re-execute it per row).
@@ -9347,6 +9381,8 @@ export class Engine {
       relBounds[0]?.kind !== "index" &&
       relBounds[0]?.kind !== "gin" &&
       relBounds[0]?.kind !== "gist" &&
+      relINLBounds[0] === null &&
+      relINLBounds[1] === null &&
       order.length <= pkIndices(scope.rels[0]!.table).length
     ) {
       const dir = orderSatisfiedByPK(this.readSnap(), scope.rels[0]!.table, planRels[0]!.offset, order);
@@ -9380,6 +9416,7 @@ export class Engine {
       indexOrder,
       joinPkOrdered,
       relBounds,
+      relINLBounds,
       relMasks,
     };
   }
@@ -10183,7 +10220,7 @@ export class Engine {
     let empty = false;
     const sb = sp.relBounds[0]!;
     if (sb !== null && sb.kind === "pk") {
-      const b = buildKeyBound(sb.pk, bound, []);
+      const b = buildKeyBound(sb.pk, bound, [], []);
       if (b === null) empty = true;
       else keyB = b;
     }
@@ -10362,7 +10399,7 @@ export class Engine {
     if (sb !== null) {
       if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
         throw new Error("the streaming path is gated to PK/full scans");
-      const b = buildKeyBound(sb.pk, params, env.outer);
+      const b = buildKeyBound(sb.pk, params, env.outer, []);
       if (b === null) empty = true;
       else bound = b;
     }
@@ -10520,7 +10557,7 @@ export class Engine {
     if (sb !== null) {
       if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
         throw new Error("the windowed top-N path is gated to PK/full scans");
-      const b = buildKeyBound(sb.pk, params, env.outer);
+      const b = buildKeyBound(sb.pk, params, env.outer, []);
       if (b === null) empty = true;
       else bound = b;
     }
@@ -10647,7 +10684,7 @@ export class Engine {
     if (sb !== null) {
       if (sb.kind === "index" || sb.kind === "gin" || sb.kind === "gist")
         throw new Error("the streaming sort path is gated to PK/full scans");
-      const b = buildKeyBound(sb.pk, params, env.outer);
+      const b = buildKeyBound(sb.pk, params, env.outer, []);
       if (b === null) empty = true;
       else bound = b;
     }
@@ -10739,8 +10776,8 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
-    const leftRows = this.materializeRel(plan, 0, outer, env, params, meter);
-    const rightRows = this.materializeRel(plan, 1, outer, env, params, meter);
+    const leftRows = this.materializeRel(plan, 0, outer, [], env, params, meter);
+    const rightRows = this.materializeRel(plan, 1, outer, [], env, params, meter);
     const on = plan.joins[0]!.on;
 
     const limit = plan.limit;
@@ -10799,6 +10836,7 @@ export class Engine {
     plan: SelectPlan,
     ri: number,
     outer: Row[],
+    left: Row,
     baseEnv: EvalEnv,
     params: Value[],
     meter: Meter,
@@ -10864,7 +10902,10 @@ export class Engine {
     let rows: Row[];
     let nodeCount: number;
     let slabs = 0;
-    const relBound = plan.relBounds[ri]!;
+    // An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized bound
+    // and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
+    // once-materialized relBounds.
+    const relBound = plan.relINLBounds[ri] ?? plan.relBounds[ri]!;
     if (relBound !== null && relBound.kind === "index") {
       const r = this.indexBoundRows(
         rel.tableName,
@@ -10872,6 +10913,7 @@ export class Engine {
         params,
         outer,
         plan.relMasks[ri]!,
+        left,
       );
       rows = r.rows;
       nodeCount = r.pages;
@@ -10901,7 +10943,7 @@ export class Engine {
       nodeCount = r.pages;
       slabs = r.slabs;
     } else if (relBound !== null && relBound.kind === "pk") {
-      const b = buildKeyBound(relBound.pk, params, outer);
+      const b = buildKeyBound(relBound.pk, params, outer, left);
       if (b === null) {
         rows = [];
         nodeCount = 0;
@@ -11062,7 +11104,7 @@ export class Engine {
     let b = unboundedBound();
     const relBound = plan.relBounds[0];
     if (relBound !== null && relBound !== undefined && relBound.kind === "pk") {
-      const bb = buildKeyBound(relBound.pk, params, env.outer);
+      const bb = buildKeyBound(relBound.pk, params, env.outer, []);
       if (bb === null) doScan = false;
       else b = bb;
     }
@@ -11164,7 +11206,7 @@ export class Engine {
       // pageRead / valueDecompress / storageRowRead block is charged identically — materializeRel), then
       // apply the residual WHERE per scanned row through the ordinary evaluator (its operatorEval charges
       // + 3VL survivor test byte-identical to the scalar WHERE loop).
-      const rows = this.materializeRel(plan, 0, env.outer, env, params, meter);
+      const rows = this.materializeRel(plan, 0, env.outer, [], env, params, meter);
       let survivors: Row[];
       if (plan.filter === null) {
         survivors = rows;
@@ -11234,7 +11276,7 @@ export class Engine {
     let b = unboundedBound();
     const relBound = plan.relBounds[0];
     if (relBound !== null && relBound !== undefined && relBound.kind === "pk") {
-      const bb = buildKeyBound(relBound.pk, params, env.outer);
+      const bb = buildKeyBound(relBound.pk, params, env.outer, []);
       if (bb === null) doScan = false;
       else b = bb;
     }
@@ -11372,8 +11414,13 @@ export class Engine {
     // loop re-reads from these in-memory buffers, which are not stores and charge nothing. A
     // CORRELATED LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up
     // front — an empty placeholder holds its slot and the join loop re-materializes it per left row.
+    // An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row (its
+    // bound seeks per outer row), so it is not materialized up front either — an empty placeholder
+    // holds its slot and the join loop re-materializes it per left row.
     const materialized: Row[][] = plan.rels.map((rel, ri) =>
-      rel.lateral === true ? [] : this.materializeRel(plan, ri, env.outer, env, params, meter),
+      rel.lateral === true || plan.relINLBounds[ri] !== null
+        ? []
+        : this.materializeRel(plan, ri, env.outer, [], env, params, meter),
     );
 
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
@@ -11406,7 +11453,37 @@ export class Engine {
       // lateral is 42P10), so there is no unmatched-right emission.
       if (plan.rels[k + 1]!.lateral === true) {
         for (const left of running) {
-          const rightRows = this.materializeRel(plan, k + 1, [...env.outer, left], env, params, meter);
+          const rightRows = this.materializeRel(
+            plan,
+            k + 1,
+            [...env.outer, left],
+            [],
+            env,
+            params,
+            meter,
+          );
+          let leftMatched = false;
+          for (const right of rightRows) {
+            const combined = left.concat(right);
+            if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+              next.push(combined);
+              leftMatched = true;
+            }
+          }
+          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+        }
+        running = next;
+        continue;
+      }
+      // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER combined
+      // left-hand row, its scan bounded per outer row by the SIBLING columns of that row (a
+      // per-outer-row seek instead of a full scan). Detection restricts this to the RIGHT/nullable side
+      // of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL are
+      // excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays applied
+      // (the ON here, the WHERE below), so rows are unchanged.
+      if (plan.relINLBounds[k + 1] !== null) {
+        for (const left of running) {
+          const rightRows = this.materializeRel(plan, k + 1, env.outer, left, env, params, meter);
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
@@ -12090,6 +12167,93 @@ function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBoun
   // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
   const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
   return gb !== null ? { kind: "gin", gin: gb } : null;
+}
+
+// detectINLBound detects an index-nested-loop scan bound for a join inner relation rel (cost.md §3
+// "JOIN"): a primary-key (or leading secondary-index column) comparison to a SIBLING column of an
+// EARLIER join relation, taken from the join's `on` predicate OR the `whereFilter`. Unlike
+// detectScanBound (constants only), this admits a bare sibling column (a "column" node whose global
+// index is < rel.offset), resolved per outer row from the current combined left-hand row — the join
+// analog of a correlated subquery's outer reference (query.correlated_pushdown). So the inner relation
+// seeks per outer row instead of full-scanning for every outer row: O(N·M) → O(N·log M).
+//
+// Returns non-null only when the resulting bound has >= 1 sibling term (a "column" src); a
+// constant-only bound is the ordinary once-materialized relBounds path. Constant terms on the same key
+// ride along and tighten the per-outer-row seek. The whole on/where stays the residual filter (a
+// superset), so the ROWS are unchanged; only the inner re-scan cost drops. Caller restricts this to a
+// base table that is the right/nullable side of an INNER/CROSS/LEFT join.
+function detectINLBound(
+  on: RExpr | null,
+  whereFilter: RExpr | null,
+  rel: ScopeRel,
+  snap: Snapshot,
+): ScanBound | null {
+  const cutoff = rel.offset;
+  const collect = (keyIdx: number, ty: ScalarType, coll: Collation | null): BoundTerm[] => {
+    const colColl = coll !== null ? coll.name : null;
+    const terms: BoundTerm[] = [];
+    const walk = (e: RExpr | null): void => {
+      if (e === null) return;
+      if (e.kind === "and") {
+        walk(e.lhs);
+        walk(e.rhs);
+        return;
+      }
+      const t = asBoundTerm(e, keyIdx, ty, colColl, cutoff);
+      if (t !== null) terms.push(t);
+    };
+    walk(on);
+    walk(whereFilter);
+    return terms;
+  };
+  const hasSibling = (terms: BoundTerm[]): boolean => terms.some((t) => t.src.kind === "column");
+  // Primary-key bound first (the row's own key — range-capable, strictly cheaper).
+  const pkLocal = primaryKeyIndex(rel.table);
+  if (pkLocal >= 0) {
+    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
+    if (sty !== undefined) {
+      const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
+      if (ctx !== null) {
+        const terms = collect(rel.offset + pkLocal, sty, ctx.coll);
+        if (hasSibling(terms)) return { kind: "pk", pk: { pkType: sty, terms, coll: ctx.coll } };
+      }
+    }
+  }
+  // Else a leading secondary-index equality bound to a sibling (indexes in ascending lowercased name
+  // order — the deterministic tie-break, matching detectScanBound).
+  for (const idx of rel.table.indexes) {
+    if (idx.kind !== "btree") continue;
+    const ci = idx.columns[0]!;
+    const ty = typeAsScalar(rel.table.columns[ci]!.type);
+    if (ty === undefined) continue;
+    if (
+      idx.columns.slice(1).some((c) => {
+        const ts = typeAsScalar(rel.table.columns[c]!.type);
+        return ts === undefined || !isFixedWidth(ts);
+      })
+    ) {
+      continue;
+    }
+    const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
+    if (ctx === null) continue;
+    const terms = collect(rel.offset + ci, ty, ctx.coll);
+    const eqs: RExpr[] = [];
+    let siblingEq = false;
+    for (const t of terms) {
+      if (t.op === "eq") {
+        eqs.push(t.src);
+        if (t.src.kind === "column") siblingEq = true;
+      }
+    }
+    if (siblingEq) {
+      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
+      return {
+        kind: "index",
+        index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, coll: ctx.coll, tailTypes },
+      };
+    }
+  }
+  return null;
 }
 
 // keyCollationCtx reports the collation a key over col is STORED under, deciding whether — and how —
@@ -13282,7 +13446,7 @@ function detectPkBound(
       walk(e.rhs);
       return;
     }
-    const t = asBoundTerm(e, pkIdx, pkType, colColl);
+    const t = asBoundTerm(e, pkIdx, pkType, colColl, -1);
     if (t !== null) terms.push(t);
   };
   walk(filter);
@@ -13298,6 +13462,7 @@ function asBoundTerm(
   pkIdx: number,
   pkType: ScalarType,
   colColl: string | null,
+  siblingCutoff: number,
 ): BoundTerm | null {
   if (e.kind !== "compare") return null;
   // A comparison bounds the key only when ITS resolved collation matches the key column's frozen
@@ -13314,8 +13479,9 @@ function asBoundTerm(
   if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge")
     return null;
   const isPk = (x: RExpr): boolean => x.kind === "column" && x.index === pkIdx;
-  if (isPk(e.lhs) && isConstSource(e.rhs, pkType)) return { op: e.op, src: e.rhs };
-  if (isPk(e.rhs) && isConstSource(e.lhs, pkType)) return { op: flipCmp(e.op), src: e.lhs };
+  if (isPk(e.lhs) && isConstSource(e.rhs, pkType, siblingCutoff)) return { op: e.op, src: e.rhs };
+  if (isPk(e.rhs) && isConstSource(e.lhs, pkType, siblingCutoff))
+    return { op: flipCmp(e.op), src: e.lhs };
   return null;
 }
 
@@ -13325,12 +13491,20 @@ function asBoundTerm(
 // inner subquery's PK is bounded by the current outer row's column and seeks instead of re-scanning the
 // whole inner table per outer row (cost.md §3 "bounded scan", grammar.md §26). A type-mismatched outer
 // reference is wrapped in a cast by the resolver (as for a const literal), so it never arrives here bare.
-function isConstSource(e: RExpr, pkType: ScalarType): boolean {
+//
+// siblingCutoff opens the index-nested-loop door (cost.md §3 "JOIN"): when >= 0, a bare "column" node
+// whose GLOBAL index is < siblingCutoff — a column of an EARLIER join relation — is a valid bound source,
+// resolved per outer row from the combined left-hand row (like "outerColumn", a bare sibling column implies
+// a type match — a mismatch is a cast, never bare). -1 (the ordinary once-materialized bound) accepts only
+// literals/params/outer references.
+function isConstSource(e: RExpr, pkType: ScalarType, siblingCutoff: number): boolean {
   switch (e.kind) {
     case "param":
     case "constNull":
     case "outerColumn":
       return true;
+    case "column":
+      return siblingCutoff >= 0 && e.index < siblingCutoff;
     case "constInt":
       return isInteger(pkType);
     case "constBool":
@@ -13377,11 +13551,13 @@ function flipCmp(op: BinaryOp): BinaryOp {
 // contradictory bounds), so the scan reads nothing. An out-of-range integer const drops only its own
 // half-bound (a wider, still sound, scan).
 // outer carries the enclosing rows (innermost last) so a correlated "outerColumn" source resolves to
-// the current outer row's value; it is empty for a top-level statement.
-function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | null {
+// the current outer row's value; it is empty for a top-level statement. left is the current combined
+// left-hand row of a left-deep join, from which an index-nested-loop "column" (sibling) source resolves
+// (empty outside the join loop — a sibling never appears there).
+function buildKeyBound(bp: PkBound, params: Value[], outer: Row[], left: Row): KeyBound | null {
   const b = unboundedBound();
   for (const t of bp.terms) {
-    const r = encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll);
+    const r = encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll, left);
     if (r.kind === "null") return null;
     if (r.kind === "outOfRange") continue;
     const key = r.key;
@@ -13417,6 +13593,7 @@ function encodeBoundKey(
   params: Value[],
   outer: Row[],
   coll: Collation | null,
+  left: Row,
 ): BoundKey {
   switch (src.kind) {
     case "constNull":
@@ -13447,6 +13624,14 @@ function encodeBoundKey(
       // A correlated reference: column index of the enclosing row level hops out — the same indexing
       // the evaluator uses for "outerColumn" (innermost outer row is last).
       return encodeValueKey(pkType, outer[outer.length - src.level]![src.index]!, coll);
+    case "column":
+      // Index-nested-loop: the GLOBAL column index of an earlier join relation, read from the current
+      // combined left-hand row (cost.md §3 "JOIN"). The join loop always passes a `left` wide enough
+      // (the running row spans columns [0, rel.offset), and a sibling index is < rel.offset); a stray
+      // out-of-range index widens to a full scan rather than throw.
+      return src.index < left.length
+        ? encodeValueKey(pkType, left[src.index]!, coll)
+        : { kind: "outOfRange" };
     default:
       return { kind: "outOfRange" };
   }
@@ -13559,7 +13744,7 @@ function scanEntries(
 ): { entries: Entry[] | null; overlap: number; slabs: number } {
   if (pkBound !== null) {
     // Top-level statement: no enclosing query, so the bound never has a correlated source.
-    const b = buildKeyBound(pkBound, params, []);
+    const b = buildKeyBound(pkBound, params, [], []);
     if (b === null) return { entries: null, overlap: 0, slabs: 0 };
     const u = store.rangeScanWithUnits(b, mask);
     return { entries: u.entries, overlap: u.pages, slabs: u.slabs };
@@ -15745,6 +15930,14 @@ type SelectPlan = {
   // (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case (a
   // follow-on). The residual filter stays the WHOLE `filter`, re-applied after the join.
   relBounds: (ScanBound | null)[];
+  // relINLBounds is the INDEX-NESTED-LOOP scan bounds, one per relation (cost.md §3 "JOIN"). Non-null
+  // for a join inner relation whose primary key / indexed column is compared to a SIBLING column of an
+  // earlier relation (`a JOIN b ON b.pk = a.x`) — a per-outer-row bound resolved from the combined
+  // left-hand row. When set, that relation is NOT materialized once up front; the join loop
+  // re-materializes it per left row (like a correlated LATERAL), seeking instead of full-scanning —
+  // O(N·M) → O(N·log M). null ⇒ the ordinary once-materialized relBounds path. A non-null entry takes
+  // precedence over relBounds for that relation.
+  relINLBounds: (ScanBound | null)[];
   // relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md §14):
   // which of its columns this query statically references. Drives the chain-pageRead /
   // valueDecompress portion of the scan's up-front cost block — an untouched spilled or
@@ -21678,7 +21871,10 @@ function renderBoundSrc(e: RExpr | null): string {
     case "outerColumn":
       return "outer";
     case "column":
-      return "col";
+      // An index-nested-loop bound source — a column of an earlier join relation resolved per outer
+      // row (cost.md §3 "JOIN"). Rendered generically (the global column index is not a user-facing
+      // name, like the correlated `outer` case above).
+      return "join";
     default:
       return renderBoundLit(e);
   }
